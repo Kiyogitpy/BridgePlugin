@@ -32,6 +32,9 @@ public interface ControllerConfig extends Config
 	@ConfigSection(name = "Safety", description = "Emergency stops and limits", position = 6)
 	String safetySection = "safety";
 
+	@ConfigSection(name = "Clicking", description = "Force which action a click resolves to", position = 7)
+	String clickingSection = "clicking";
+
 	// --- General ---
 
 	@ConfigItem(
@@ -378,19 +381,6 @@ public interface ControllerConfig extends Config
 	// --- Safety ---
 
 	@ConfigItem(
-		keyName = "emergencyLogoutHp",
-		name = "Emergency Logout HP",
-		description = "Log out immediately if HP drops to or below this (0 = disabled).",
-		section = safetySection,
-		position = 0
-	)
-	@Range(min = 0, max = 99)
-	default int emergencyLogoutHp()
-	{
-		return 0;
-	}
-
-	@ConfigItem(
 		keyName = "stopOnDeath",
 		name = "Stop On Death",
 		description = "Stop the controller after dying.",
@@ -425,5 +415,34 @@ public interface ControllerConfig extends Config
 	default int maxRuntimeHours()
 	{
 		return 0;
+	}
+
+	// --- Clicking ---
+
+	@ConfigItem(
+		keyName = "forceClickPriority",
+		name = "Force Click Priority",
+		description = "Same trick as shift-click forcing \"Walk here\": reorder the menu so Attack (target NPCs), " +
+			"Take (loot whitelist items) and priority objects are what a plain click resolves to, even if " +
+			"something else (like a tree in front of a cave entrance) would otherwise win.",
+		section = clickingSection,
+		position = 0
+	)
+	default boolean forceClickPriority()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "targetObjectNames",
+		name = "Priority Objects",
+		description = "Comma-separated object names (e.g. \"Cave entrance\") that should always win a click over " +
+			"anything else in the way, such as a tree blocking a cave mouth.",
+		section = clickingSection,
+		position = 1
+	)
+	default String targetObjectNames()
+	{
+		return "";
 	}
 }

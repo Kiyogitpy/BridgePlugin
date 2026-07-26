@@ -60,7 +60,6 @@ public final class ConfigExporter
 		data.put("breaks", breaks);
 
 		Map<String, Object> safety = new LinkedHashMap<>();
-		safety.put("emergencyLogoutHp", config.emergencyLogoutHp());
 		safety.put("stopOnDeath", config.stopOnDeath());
 		safety.put("stopOnInventoryFull", config.stopOnInventoryFull());
 		safety.put("maxRuntimeHours", config.maxRuntimeHours());

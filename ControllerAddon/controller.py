@@ -86,14 +86,7 @@ import requests
 import serial
 import win32gui
 
-API_BASE = "http://localhost:8080"
-UDP_PORT = 50555
-SERIAL_PORT = os.environ.get("BRIDGE_SERIAL_PORT", "COM6")
-SERIAL_BAUD = 115200
-
-CONFIG_POLL_INTERVAL = 1.0   # how often GET /config is refreshed
-STATE_POLL_INTERVAL = 0.3    # pace of the main decision loop
-INVENTORY_SIZE = 28
+from settings import *  # noqa: F401,F403 -- all tunables collected in settings.py
 
 
 # ---------------- panic button ----------------
@@ -160,6 +153,19 @@ def get_inventory():
 
 def get_config():
     return api_get("/config")
+
+
+def get_npc_screen_pos(npc_id: int):
+    """Fresh (screenX, screenY) for the nearest NPC of this type, or None if it's
+    no longer found. Used to re-aim mid-flight at a target that's walked since the
+    click was first queued -- see move_to_human's refresh_target."""
+    data = api_get("/npc/nearest", params={"id": npc_id})
+    if not data or not data.get("found"):
+        return None
+    x, y = data.get("screenX"), data.get("screenY")
+    if x is None or y is None:
+        return None
+    return int(x), int(y)
 
 
 def is_logged_in():
@@ -357,15 +363,37 @@ def micro_pause_chance(dist: float) -> bool:
 
 
 # ---------------- Aim radius + optional overshoot ----------------
-DEFAULT_AIM_RADIUS = 10
-DEFAULT_OVERSHOOT_PX = 12
-DEFAULT_OVERSHOOT_CHANCE = 0.25
+# Tunable defaults (DEFAULT_AIM_RADIUS, DEFAULT_OVERSHOOT_PX,
+# DEFAULT_OVERSHOOT_CHANCE, MOVING_TARGET_MIN_DIST,
+# MOVING_TARGET_MIDFLIGHT_FRACTION) live in settings.py.
+
+# ---------------- movement abort signal ----------------
+# A move+click can take up to ~1s (see estimate_duration_ms). Without this, a
+# safety stop firing mid-flight (see ControllerState.trigger_safety_stop) would
+# sit unnoticed until the current animation finished and the main loop came
+# back around. _move_to_human_exact checks this between steps and bails
+# immediately instead. A plain module-level flag rather than threading a
+# callback through every click_entity/move_to_human call site.
+_movement_abort = threading.Event()
+
+
+def request_movement_abort():
+    _movement_abort.set()
+
+
+def clear_movement_abort():
+    _movement_abort.clear()
 
 
 def pick_aim_point(x: int, y: int, radius: int) -> tuple:
     if radius <= 0:
         return x, y
-    return x + random.randint(-radius, radius), y + random.randint(-radius, radius)
+    # Uniform over the disc (sqrt of a uniform draw), not the bounding square --
+    # a square jitter can land up to radius*sqrt(2) away, which can miss a
+    # small clickbox even though it looks "within radius".
+    r = radius * math.sqrt(random.random())
+    theta = random.uniform(0, 2 * math.pi)
+    return int(round(x + r * math.cos(theta))), int(round(y + r * math.sin(theta)))
 
 
 def maybe_overshoot_point(start, aim, *, overshoot_px=DEFAULT_OVERSHOOT_PX, chance=DEFAULT_OVERSHOOT_CHANCE):
@@ -401,17 +429,49 @@ def move_to_human(
     aim_radius: int = DEFAULT_AIM_RADIUS,
     overshoot_px: int = DEFAULT_OVERSHOOT_PX,
     overshoot_chance: float = DEFAULT_OVERSHOOT_CHANCE,
+    refresh_target=None,
 ) -> None:
+    """
+    refresh_target, if given, is a zero-arg callable returning the target's current
+    (x, y) screen position, or None if it's no longer found. For moving targets
+    (NPCs), a long flight is split so the final approach re-aims at where the
+    target actually is now instead of a stale snapshot from when the move
+    started -- otherwise a walking NPC can drift out from under the click.
+    """
     start = get_cursor_pos()
     aim = pick_aim_point(x, y, aim_radius)
 
     over = maybe_overshoot_point(start, aim, overshoot_px=overshoot_px, chance=overshoot_chance)
     if over is not None:
         _move_to_human_exact(ser, over[0], over[1], fps=fps)
+        if _movement_abort.is_set():
+            return
         time.sleep(random.uniform(0.01, 0.05))
+        aim = _reaim(aim, refresh_target, aim_radius)
         _move_to_human_exact(ser, aim[0], aim[1], fps=max(90, fps - 25))
-    else:
-        _move_to_human_exact(ser, aim[0], aim[1], fps=fps)
+        return
+
+    dist = math.hypot(aim[0] - start[0], aim[1] - start[1])
+    if refresh_target is not None and dist >= MOVING_TARGET_MIN_DIST:
+        mid_x = start[0] + (aim[0] - start[0]) * MOVING_TARGET_MIDFLIGHT_FRACTION
+        mid_y = start[1] + (aim[1] - start[1]) * MOVING_TARGET_MIDFLIGHT_FRACTION
+        _move_to_human_exact(ser, int(round(mid_x)), int(round(mid_y)), fps=fps)
+        if _movement_abort.is_set():
+            return
+        aim = _reaim(aim, refresh_target, aim_radius)
+        _move_to_human_exact(ser, aim[0], aim[1], fps=max(110, fps - 15))
+        return
+
+    _move_to_human_exact(ser, aim[0], aim[1], fps=fps)
+
+
+def _reaim(fallback_aim: tuple, refresh_target, aim_radius: int) -> tuple:
+    if refresh_target is None:
+        return fallback_aim
+    updated = refresh_target()
+    if updated is None:
+        return fallback_aim
+    return pick_aim_point(updated[0], updated[1], aim_radius)
 
 
 def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140) -> None:
@@ -430,6 +490,9 @@ def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140) 
     pause_step = random.randint(int(steps * 0.35), int(steps * 0.7)) if pause_mid else -1
 
     for i in range(1, steps + 1):
+        if _movement_abort.is_set():
+            return
+
         t = i / steps
         te = ease_in_out(t)
 
@@ -466,6 +529,9 @@ def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140) 
             time.sleep(sleep_s)
 
     for _ in range(40):
+        if _movement_abort.is_set():
+            return
+
         cx, cy = get_cursor_pos()
         dx = ex - cx
         dy = ey - cy
@@ -482,12 +548,20 @@ def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140) 
 # ConsumablesProvider, PrayerProvider, ObjectProvider) already returns
 # *absolute* screen coordinates (canvas offset baked in server-side) -- do
 # not add the canvas offset again here.
-def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7)) -> bool:
+def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_target=None) -> bool:
     x, y = entity.get("screenX"), entity.get("screenY")
     if x is None or y is None:
         return False
 
-    move_to_human(ser, int(x) + offset[0], int(y) + offset[1], aim_radius=3, overshoot_chance=0.25)
+    move_to_human(
+        ser,
+        int(x) + offset[0],
+        int(y) + offset[1],
+        aim_radius=ENTITY_AIM_RADIUS,
+        refresh_target=refresh_target,
+    )
+    if _movement_abort.is_set():
+        return False
     click_human(ser)
     return True
 
@@ -521,6 +595,8 @@ class ControllerState:
         self.next_break_at = None
         self.break_until = None
 
+        clear_movement_abort()
+
     def refresh_bridge_config(self, force: bool = False):
         now = time.time()
         if force or self.bridge_config is None or now - self._bridge_config_fetched_at >= CONFIG_POLL_INTERVAL:
@@ -535,6 +611,7 @@ class ControllerState:
             return
         self.safety_stopped = True
         self.safety_reason = reason
+        request_movement_abort()
         print(f"[!] Safety stop: {reason}. Automation paused -- fix the issue and restart.")
 
     def print_safety_reminder(self):
@@ -595,13 +672,6 @@ def check_safety(state: ControllerState, config: dict):
     if max_hours and (time.time() - state.start_time) / 3600 >= max_hours:
         state.trigger_safety_stop(f"max runtime of {max_hours}h reached")
         return
-
-    logout_hp = safety.get("emergencyLogoutHp", 0)
-    if logout_hp:
-        hp = get_player().get("hp")
-        if hp is not None and hp <= logout_hp:
-            state.trigger_safety_stop(f"hp dropped to {hp} (emergency threshold {logout_hp})")
-            return
 
     if safety.get("stopOnInventoryFull") and len(get_inventory()) >= INVENTORY_SIZE:
         state.trigger_safety_stop("inventory full")

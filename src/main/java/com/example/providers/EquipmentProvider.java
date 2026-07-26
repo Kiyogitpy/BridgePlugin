@@ -10,10 +10,15 @@ import java.util.Map;
 public class EquipmentProvider extends BridgeProvider
 {
 	private static final int SLOT_HELMET = 0;
+	private static final int SLOT_CAPE = 1;
+	private static final int SLOT_AMULET = 2;
 	private static final int SLOT_BODY = 4;
 	private static final int SLOT_LEGS = 7;
 	private static final int SLOT_WEAPON = 3;
 	private static final int SLOT_SHIELD = 5;
+	private static final int SLOT_GLOVES = 9;
+	private static final int SLOT_BOOTS = 10;
+	private static final int SLOT_RING = 12;
 	private static final int SLOT_AMMO = 13;
 
 	public EquipmentProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
@@ -38,10 +43,15 @@ public class EquipmentProvider extends BridgeProvider
 
 		Item[] items = equipment.getItems();
 		data.put("helmet", slotItem(items, SLOT_HELMET));
+		data.put("cape", slotItem(items, SLOT_CAPE));
+		data.put("amulet", slotItem(items, SLOT_AMULET));
 		data.put("body", slotItem(items, SLOT_BODY));
 		data.put("legs", slotItem(items, SLOT_LEGS));
 		data.put("weapon", slotItem(items, SLOT_WEAPON));
 		data.put("shield", slotItem(items, SLOT_SHIELD));
+		data.put("gloves", slotItem(items, SLOT_GLOVES));
+		data.put("boots", slotItem(items, SLOT_BOOTS));
+		data.put("ring", slotItem(items, SLOT_RING));
 		data.put("ammo", slotItem(items, SLOT_AMMO));
 		return data;
 	}

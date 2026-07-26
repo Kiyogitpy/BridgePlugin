@@ -1,7 +1,9 @@
 package com.example.controller;
 
+import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
 import net.runelite.api.NPC;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
@@ -17,6 +19,7 @@ import java.util.List;
 public class SettingsPanel extends PluginPanel
 {
 	private final Client client;
+	private final ClientThread clientThread;
 	private final ConfigManager configManager;
 	private final ControllerConfig config;
 
@@ -27,9 +30,10 @@ public class SettingsPanel extends PluginPanel
 	private final Map<String, JCheckBox> npcCheckboxes = new LinkedHashMap<>();
 
 	@Inject
-	SettingsPanel(Client client, ConfigManager configManager, ControllerConfig config)
+	SettingsPanel(Client client, ClientThread clientThread, ConfigManager configManager, ControllerConfig config)
 	{
 		this.client = client;
+		this.clientThread = clientThread;
 		this.configManager = configManager;
 		this.config = config;
 
@@ -133,16 +137,20 @@ public class SettingsPanel extends PluginPanel
 		npcCheckboxes.clear();
 
 		Set<String> selected = new LinkedHashSet<>(ConfigExporter.parseList(config.targetNpcNames()));
-		Map<Integer, String> types = new TreeMap<>(Comparator.comparingInt(id -> id));
 
-		for (NPC npc : client.getNpcs())
-		{
-			if (npc == null || npc.getName() == null || npc.getName().isEmpty())
+		@SuppressWarnings("unchecked")
+		Map<Integer, String> types = (Map<Integer, String>) RuneLiteUtil.runOnClientThread(client, clientThread, () -> {
+			Map<Integer, String> found = new TreeMap<>(Comparator.comparingInt(id -> id));
+			for (NPC npc : client.getNpcs())
 			{
-				continue;
+				if (npc == null || npc.getName() == null || npc.getName().isEmpty())
+				{
+					continue;
+				}
+				found.putIfAbsent(npc.getId(), npc.getName());
 			}
-			types.putIfAbsent(npc.getId(), npc.getName());
-		}
+			return found;
+		});
 
 		if (types.isEmpty())
 		{

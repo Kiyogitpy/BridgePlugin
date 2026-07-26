@@ -28,7 +28,6 @@ DEFAULT_CONFIG = {
         "microBreaks": True,
     },
     "safety": {
-        "emergencyLogoutHp": 0,
         "stopOnDeath": True,
         # No drop/bank logic below, so let the engine's generic safety stop
         # pause things once the inventory can't hold any more ore.

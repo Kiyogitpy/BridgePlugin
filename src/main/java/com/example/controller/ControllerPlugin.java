@@ -125,6 +125,12 @@ public class ControllerPlugin extends Plugin
 	}
 
 	@Subscribe
+	public void onMenuOpened(MenuOpened event)
+	{
+		MenuPriority.apply(client, config, event);
+	}
+
+	@Subscribe
 	public void onConfigChanged(ConfigChanged event)
 	{
 		if (ControllerConfig.GROUP.equals(event.getGroup()) && udpSender != null)

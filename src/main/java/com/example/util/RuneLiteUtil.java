@@ -51,7 +51,11 @@ public final class RuneLiteUtil
 	public static Point getCanvasScreenLocation(Client client)
 	{
 		Canvas canvas = client.getCanvas();
-		return canvas != null ? canvas.getLocationOnScreen() : new Point(0, 0);
+		if (canvas == null || !canvas.isShowing())
+		{
+			return new Point(0, 0);
+		}
+		return canvas.getLocationOnScreen();
 	}
 
 	public static net.runelite.api.Point localToScreen(Client client, LocalPoint local, int plane)

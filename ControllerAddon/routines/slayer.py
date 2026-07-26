@@ -166,10 +166,15 @@ def engage_target(ctx, combat: dict):
             n.get("id") == current_target_id and n.get("hpRatio") != 0
             for n in npcs
         )
-        if not still_alive:
-            ctx.state.data["current_target_id"] = None
-        elif combat.get("inCombat"):
-            return  # already fighting our current target
+        if still_alive:
+            # Committed until this one dies. Some areas enforce strict 1v1
+            # combat and reject a second target with "you are already
+            # attacking a different monster" -- combat.inCombat can read
+            # False for a tick between attack animations even while the zone
+            # still has us locked, so don't use it to decide whether to
+            # re-engage; only "is our tracked target still alive" matters.
+            return
+        ctx.state.data["current_target_id"] = None
 
     if config.get("onlyAttackWhenIdle") and not combat.get("isIdle", True):
         return
@@ -180,5 +185,10 @@ def engage_target(ctx, combat: dict):
 
     print(f"[combat] attacking {target.get('name')} (id={target['id']}, dist={target.get('distance')})")
     time.sleep(random.uniform(0.15, 0.6))
-    if controller.click_entity(ctx.ser, target):
-        ctx.state.data["current_target_id"] = target["id"]
+    target_id = target["id"]
+    if controller.click_entity(
+        ctx.ser,
+        target,
+        refresh_target=lambda: controller.get_npc_screen_pos(target_id),
+    ):
+        ctx.state.data["current_target_id"] = target_id
