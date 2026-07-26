@@ -1,10 +1,75 @@
 # controller.py
 #
-# Drives combat, prayer, food/potions, looting, breaks and safety stops
-# using the live settings exposed by the RuneLite "Controller" plugin's
-# Controller Settings panel (GET /config), instead of hardcoded target IDs.
+# Generic engine for the RuneLite HTTP/UDP bridge. controller.py owns the
+# *plumbing*: talking to the bridge (HTTP state + UDP events), driving the
+# Arduino mouse/keyboard, the panic key, and cross-cutting concerns like
+# safety stops and human-like breaks.
+#
+# It knows nothing about slayer, mining, or any other activity. What to
+# actually do is supplied by a "routine" -- a separate .py file. Normally
+# you just run:
+#
+#     python controller.py
+#
+# and controller.py picks the routine for you based on the "Profile"
+# dropdown in the RuneLite Controller Settings panel (see PROFILE_ROUTINES
+# below, which maps each Profile enum value to a routine file). Switching
+# the dropdown in-game swaps the running routine live, no restart needed.
+#
+# You can also pin a specific routine on the command line, which ignores the
+# dropdown entirely -- handy while writing a new routine that isn't wired
+# into Profile.java yet:
+#
+#     python controller.py routines/slayer.py
+#     python controller.py routines/mining.py
+#
+# ---------------------------------------------------------------------------
+# Routine contract
+# ---------------------------------------------------------------------------
+# A routine is a plain Python module. It may define any of the following:
+#
+#   DEFAULT_CONFIG = {...}
+#       Optional. A config dict the routine falls back to if it doesn't need
+#       anything from the bridge's GET /config (which only reflects the
+#       Controller plugin's combat/slayer panel today).
+#
+#   def get_config(bridge_config: dict | None) -> dict:
+#       Optional. Called once per cycle with whatever GET /config returns
+#       (None if the bridge hasn't responded yet). Return the config dict the
+#       rest of the routine should use. If omitted, controller.py uses
+#       bridge_config when available, else DEFAULT_CONFIG.
+#
+#   def setup(ctx: Context) -> None:
+#       Optional. Called once, after the serial connection is open, before
+#       the main loop starts.
+#
+#   def tick(ctx: Context) -> None:
+#       Required. Called once per loop iteration to do the actual work.
+#       Only called while logged in, the game window is focused, no safety
+#       stop is active, the resolved config's "enabled" flag is true, and
+#       the routine isn't on a break.
+#
+#   def on_event(ctx: Context, event_type: str, payload: dict | None) -> None:
+#       Optional. Called once for every UDP event the bridge sends (e.g.
+#       "PLAYER_DIED", "NPC_DIED", "LEVEL_UP", "HP_CHANGED"), regardless of
+#       whether the routine is currently ticking.
+#
+# ctx (a Context instance) is what routines use to act:
+#
+#   ctx.ser         -- open serial.Serial connection; pass to click_entity,
+#                      move_to_human, key_tap, etc.
+#   ctx.state       -- the shared ControllerState (ctx.state.config is the
+#                      resolved config for this cycle; ctx.state.data is a
+#                      plain dict routines can use for their own bookkeeping,
+#                      e.g. a current target id)
+#
+# Everything else a routine needs -- get_player(), get_npcs(), get_objects(),
+# click_entity(), move_to_human(), consume_first(), ... -- lives at module
+# level in controller.py. Routines just `import controller` and call them.
 
+import argparse
 import ctypes
+import importlib.util
 import json
 import math
 import os
@@ -26,7 +91,7 @@ UDP_PORT = 50555
 SERIAL_PORT = os.environ.get("BRIDGE_SERIAL_PORT", "COM6")
 SERIAL_BAUD = 115200
 
-CONFIG_POLL_INTERVAL = 1.0   # how often /config is refreshed
+CONFIG_POLL_INTERVAL = 1.0   # how often GET /config is refreshed
 STATE_POLL_INTERVAL = 0.3    # pace of the main decision loop
 INVENTORY_SIZE = 28
 
@@ -75,6 +140,10 @@ def get_prayers():
 
 def get_npcs():
     return api_get("/npcs") or []
+
+
+def get_objects():
+    return api_get("/objects") or []
 
 
 def get_consumables():
@@ -410,9 +479,9 @@ def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140) 
 
 # ---------------- clicking bridge entities ----------------
 # NOTE: every provider (NPCProvider, GroundItemProvider, InventoryProvider,
-# ConsumablesProvider, PrayerProvider) already returns *absolute* screen
-# coordinates (canvas offset baked in server-side) -- do not add the canvas
-# offset again here.
+# ConsumablesProvider, PrayerProvider, ObjectProvider) already returns
+# *absolute* screen coordinates (canvas offset baked in server-side) -- do
+# not add the canvas offset again here.
 def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7)) -> bool:
     x, y = entity.get("screenX"), entity.get("screenY")
     if x is None or y is None:
@@ -429,66 +498,37 @@ def consume_first(ser: serial.Serial, items: list) -> bool:
     return click_entity(ser, items[0])
 
 
-# ---------------- config-driven targeting ----------------
-def resolve_targets(config: dict):
-    ids = set(config.get("targets") or [])
-    names = {n.lower() for n in (config.get("targetNames") or [])}
-    return ids, names
-
-
-def pick_target(npcs: list, config: dict):
-    ids, names = resolve_targets(config)
-    if not ids and not names:
-        return None
-
-    max_dist = config.get("maxTargetDistance", 15)
-    skip_in_combat = config.get("skipNpcInCombat", True)
-
-    candidates = []
-    for npc in npcs:
-        if not npc.get("attackable"):
-            continue
-        if npc.get("id") not in ids and (npc.get("name") or "").lower() not in names:
-            continue
-
-        dist = npc.get("distance", 9999)
-        if dist < 0 or dist > max_dist:
-            continue
-
-        if skip_in_combat and npc.get("inCombat") and not npc.get("interactingPlayer"):
-            continue
-
-        candidates.append(npc)
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda n: n.get("distance", 9999))
-    return candidates[0]
-
-
 # ---------------- controller state ----------------
 class ControllerState:
+    """Cross-cutting state shared by the engine and every routine.
+
+    `config` is whatever this cycle's resolve_config() produced -- routines
+    should read from it, not from the bridge directly. `data` is a free-form
+    dict routines can use for their own bookkeeping (e.g. a current target
+    id) without controller.py needing to know about it.
+    """
+
     def __init__(self):
+        self.bridge_config = None
+        self._bridge_config_fetched_at = 0.0
         self.config = None
-        self.config_fetched_at = 0.0
-        self.current_target_id = None
+        self.data = {}
+
         self.start_time = time.time()
         self.safety_stopped = False
         self.safety_reason = None
         self._safety_reminder_at = 0.0
         self.next_break_at = None
         self.break_until = None
-        self._warned_no_individual_prayers = False
 
-    def refresh_config(self, force: bool = False):
+    def refresh_bridge_config(self, force: bool = False):
         now = time.time()
-        if force or self.config is None or now - self.config_fetched_at >= CONFIG_POLL_INTERVAL:
+        if force or self.bridge_config is None or now - self._bridge_config_fetched_at >= CONFIG_POLL_INTERVAL:
             cfg = get_config()
             if cfg is not None:
-                self.config = cfg
-                self.config_fetched_at = now
-        return self.config
+                self.bridge_config = cfg
+                self._bridge_config_fetched_at = now
+        return self.bridge_config
 
     def trigger_safety_stop(self, reason: str):
         if self.safety_stopped:
@@ -540,149 +580,146 @@ class ControllerState:
         return self.break_until is not None and time.time() < self.break_until
 
 
-def handle_udp_events(ctrl: ControllerState, events: list):
-    for event_type, payload in events:
-        if event_type == "PLAYER_DIED":
-            stop_on_death = ((ctrl.config or {}).get("safety") or {}).get("stopOnDeath", True)
-            if stop_on_death:
-                ctrl.trigger_safety_stop("player died")
-        elif event_type == "NPC_DIED" and payload:
-            if payload.get("id") == ctrl.current_target_id:
-                ctrl.current_target_id = None
+class Context:
+    """Everything a routine needs that isn't a bare module-level function."""
+
+    def __init__(self, ser: serial.Serial, state: ControllerState):
+        self.ser = ser
+        self.state = state
 
 
-def check_safety(ctrl: ControllerState, config: dict):
+def check_safety(state: ControllerState, config: dict):
     safety = config.get("safety", {})
 
     max_hours = safety.get("maxRuntimeHours", 0)
-    if max_hours and (time.time() - ctrl.start_time) / 3600 >= max_hours:
-        ctrl.trigger_safety_stop(f"max runtime of {max_hours}h reached")
+    if max_hours and (time.time() - state.start_time) / 3600 >= max_hours:
+        state.trigger_safety_stop(f"max runtime of {max_hours}h reached")
         return
 
     logout_hp = safety.get("emergencyLogoutHp", 0)
     if logout_hp:
         hp = get_player().get("hp")
         if hp is not None and hp <= logout_hp:
-            ctrl.trigger_safety_stop(f"hp dropped to {hp} (emergency threshold {logout_hp})")
+            state.trigger_safety_stop(f"hp dropped to {hp} (emergency threshold {logout_hp})")
             return
 
     if safety.get("stopOnInventoryFull") and len(get_inventory()) >= INVENTORY_SIZE:
-        ctrl.trigger_safety_stop("inventory full")
+        state.trigger_safety_stop("inventory full")
 
 
-def maintain_prayer(ser: serial.Serial, ctrl: ControllerState, combat: dict):
-    prayer_cfg = ctrl.config.get("prayer", {})
-    if not prayer_cfg.get("enabled"):
-        return
-
-    prayers = get_prayers()
-
-    if prayer_cfg.get("useQuickPrayers"):
-        want_on = bool(combat.get("inCombat"))
-        is_on = prayers.get("quickPrayerEnabled", False)
-        if want_on != is_on:
-            ox, oy = prayers.get("quickOrbScreenX"), prayers.get("quickOrbScreenY")
-            if ox is not None and oy is not None:
-                click_entity(ser, {"screenX": ox, "screenY": oy}, offset=(0, 0))
-    elif not ctrl._warned_no_individual_prayers:
-        print("[prayer] usePrayer is on with useQuickPrayers off -- individual prayer "
-              "icons aren't exposed with screen coordinates by the bridge yet, so only "
-              "quick prayers can be toggled automatically. Enable quick prayers in "
-              "Controller Settings and set up the matching quick-prayer loadout in-game.")
-        ctrl._warned_no_individual_prayers = True
-
-    potions_cfg = ctrl.config.get("potions", {})
-    if potions_cfg.get("prayerEnabled"):
-        restore_at = prayer_cfg.get("restoreAt", 18)
-        current_prayer = get_player().get("prayer")
-        if current_prayer is not None and current_prayer <= restore_at:
-            if consume_first(ser, get_consumables().get("prayer", [])):
-                print(f"[prayer] drank prayer restore (prayer={current_prayer})")
+def handle_generic_events(state: ControllerState, events: list):
+    """Engine-level event handling that applies no matter which routine is loaded."""
+    for event_type, payload in events:
+        if event_type == "PLAYER_DIED":
+            stop_on_death = ((state.config or {}).get("safety") or {}).get("stopOnDeath", True)
+            if stop_on_death:
+                state.trigger_safety_stop("player died")
 
 
-def maintain_supplies(ser: serial.Serial, ctrl: ControllerState):
-    food_cfg = ctrl.config.get("food", {})
-    potions_cfg = ctrl.config.get("potions", {})
-
-    player = get_player()
-    hp = player.get("hp")
-
-    if food_cfg.get("enabled") and hp is not None and hp <= food_cfg.get("eatAt", 0):
-        if consume_first(ser, get_consumables().get("food", [])):
-            print(f"[supplies] ate food (hp={hp})")
-            return  # avoid eating and drinking in the same tick
-
-    if potions_cfg.get("combatEnabled"):
-        # The bridge doesn't expose buff/potion timers yet (no varbit/timer
-        # endpoint), so we can't tell when a combat potion has expired.
-        # Left as a no-op until a BuffProvider-style endpoint exists.
-        pass
+# ---------------- routine loading ----------------
+# Maps the ControllerConfig.Profile enum (RuneLite "Profile" dropdown) to a
+# routine file, relative to this file's directory. Add an entry here for
+# every value you add to Profile.java.
+PROFILE_ROUTINES = {
+    "SLAYER": "routines/slayer.py",
+    "MINING": "routines/mining.py",
+}
 
 
-def maybe_loot(ser: serial.Serial, config: dict):
-    loot_cfg = config.get("loot", {})
-
-    whitelist = [w.lower() for w in loot_cfg.get("items", [])]
-    if whitelist:
-        for item in get_ground_items():
-            name = (item.get("name") or "").lower()
-            if item.get("clickable") and any(w in name for w in whitelist):
-                print(f"[loot] picking up {item.get('name')}")
-                time.sleep(random.uniform(0.2, 0.5))
-                click_entity(ser, item)
-                break
-
-    if loot_cfg.get("buryBones"):
-        for item in get_inventory():
-            name = (item.get("name") or "").lower()
-            if "bones" in name:
-                print(f"[loot] burying {item.get('name')}")
-                click_entity(ser, item)
-                break
+def routine_full_path(rel_path: str) -> str:
+    if os.path.isabs(rel_path):
+        return rel_path
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel_path)
 
 
-def engage_target(ser: serial.Serial, ctrl: ControllerState, config: dict, combat: dict):
-    npcs = get_npcs()
+def load_routine(path: str):
+    spec = importlib.util.spec_from_file_location("routine", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"Could not load routine from '{path}'")
 
-    if ctrl.current_target_id is not None:
-        still_alive = any(
-            n.get("id") == ctrl.current_target_id and n.get("hpRatio") != 0
-            for n in npcs
-        )
-        if not still_alive:
-            ctrl.current_target_id = None
-        elif combat.get("inCombat"):
-            return  # already fighting our current target
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
 
-    if config.get("onlyAttackWhenIdle") and not combat.get("isIdle", True):
-        return
+    if not hasattr(module, "tick"):
+        raise SystemExit(f"Routine '{path}' must define a tick(ctx) function")
 
-    target = pick_target(npcs, config)
-    if not target:
-        return
+    return module
 
-    print(f"[combat] attacking {target.get('name')} (id={target['id']}, dist={target.get('distance')})")
-    time.sleep(random.uniform(0.15, 0.6))
-    if click_entity(ser, target):
-        ctrl.current_target_id = target["id"]
+
+def resolve_config(routine, bridge_config):
+    if hasattr(routine, "get_config"):
+        return routine.get_config(bridge_config)
+    if bridge_config is not None:
+        return bridge_config
+    return getattr(routine, "DEFAULT_CONFIG", None)
 
 
 def main():
-    start_panic_listener()
+    parser = argparse.ArgumentParser(description="Generic RuneLite bridge controller")
+    parser.add_argument(
+        "routine",
+        nargs="?",
+        default=None,
+        help=(
+            "Path to a routine .py file, e.g. routines/mining.py. Pins the "
+            "controller to that routine and ignores the in-game Profile "
+            "dropdown -- handy while developing a routine that isn't wired "
+            "into Profile.java / PROFILE_ROUTINES yet. Omit this to let the "
+            "RuneLite Controller Settings panel's Profile dropdown pick the "
+            "routine via PROFILE_ROUTINES."
+        ),
+    )
+    args = parser.parse_args()
 
+    start_panic_listener()
     udp = make_udp_listener(UDP_PORT)
-    ctrl = ControllerState()
+    state = ControllerState()
 
     with serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1) as ser:
         time.sleep(2.0)  # Pro Micro reset
 
-        while True:
-            handle_udp_events(ctrl, poll_udp(udp))
+        ctx = Context(ser, state)
+        routine = None
+        active_path = None
+        last_warned_profile = "__unset__"
 
-            config = ctrl.refresh_config()
+        while True:
+            events = poll_udp(udp)
+            handle_generic_events(state, events)
+            if routine is not None and hasattr(routine, "on_event"):
+                for event_type, payload in events:
+                    routine.on_event(ctx, event_type, payload)
+
+            bridge_config = state.refresh_bridge_config()
+
+            if args.routine:
+                desired_path = args.routine
+            else:
+                profile_key = (bridge_config or {}).get("profile")
+                desired_path = PROFILE_ROUTINES.get(profile_key) if profile_key else None
+                if desired_path is None and profile_key != last_warned_profile:
+                    if profile_key is not None:
+                        print(f"[!] No routine registered for profile '{profile_key}' "
+                              f"-- add it to PROFILE_ROUTINES in controller.py.")
+                    last_warned_profile = profile_key
+
+            if desired_path is None:
+                time.sleep(0.5)
+                continue
+
+            if desired_path != active_path:
+                routine = load_routine(routine_full_path(desired_path))
+                active_path = desired_path
+                state.data = {}
+                print(f"[profile] running {desired_path}")
+                if hasattr(routine, "setup"):
+                    routine.setup(ctx)
+
+            config = resolve_config(routine, bridge_config)
             if config is None:
                 time.sleep(0.5)
                 continue
+            state.config = config
 
             if not is_logged_in():
                 time.sleep(1.0)
@@ -693,34 +730,22 @@ def main():
                 time.sleep(0.5)
                 continue
 
-            check_safety(ctrl, config)
-            if ctrl.safety_stopped:
-                ctrl.print_safety_reminder()
+            check_safety(state, config)
+            if state.safety_stopped:
+                state.print_safety_reminder()
                 time.sleep(2.0)
                 continue
 
-            if not config.get("enabled"):
+            if not config.get("enabled", True):
                 time.sleep(0.5)
                 continue
 
-            ammo = get_ammo_count()
-            if ammo is not None and ammo <= 0:
-                print("Out of ammo -- stopping script")
-                sys.exit()
-
-            ctrl.maybe_toggle_break(config.get("breaks", {}))
-            if ctrl.on_break():
+            state.maybe_toggle_break(config.get("breaks", {}))
+            if state.on_break():
                 time.sleep(1.0)
                 continue
 
-            combat = get_combat()
-            maintain_prayer(ser, ctrl, combat)
-            maintain_supplies(ser, ctrl)
-
-            if config.get("loot", {}).get("enabled"):
-                maybe_loot(ser, config)
-
-            engage_target(ser, ctrl, config, combat)
+            routine.tick(ctx)
 
             if config.get("breaks", {}).get("microBreaks") and random.random() < 0.15:
                 time.sleep(random.uniform(0.3, 1.2))

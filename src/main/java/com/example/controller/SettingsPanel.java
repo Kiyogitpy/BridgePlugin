@@ -78,18 +78,37 @@ public class SettingsPanel extends PluginPanel
 		enabledRow.setAlignmentX(Component.LEFT_ALIGNMENT);
 
 		JCheckBox enabledBox = new JCheckBox("Controller Enabled");
-		enabledBox.setSelected(config.botEnabled());
+		enabledBox.setSelected(config.controllerEnabled());
 		enabledBox.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		enabledBox.setForeground(Color.WHITE);
 		enabledBox.addActionListener(e -> {
 			configManager.setConfiguration(
 				ControllerConfig.GROUP,
-				"botEnabled",
+				"controllerEnabled",
 				enabledBox.isSelected()
 			);
 		});
 		enabledRow.add(enabledBox);
 		header.add(enabledRow);
+
+		JPanel profileRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+		profileRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		profileRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+		profileRow.setBorder(new EmptyBorder(4, 0, 0, 0));
+
+		JLabel profileLabel = new JLabel("Profile:");
+		profileLabel.setForeground(Color.WHITE);
+		profileRow.add(profileLabel);
+
+		JComboBox<Profile> profileCombo = new JComboBox<>(Profile.values());
+		profileCombo.setSelectedItem(config.profile());
+		profileCombo.addActionListener(e -> configManager.setConfiguration(
+			ControllerConfig.GROUP,
+			"profile",
+			profileCombo.getSelectedItem()
+		));
+		profileRow.add(profileCombo);
+		header.add(profileRow);
 
 		add(header, BorderLayout.NORTH);
 

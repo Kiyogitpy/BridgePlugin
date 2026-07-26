@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bridge Dashboard</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #1e1e24;
+    --panel: #26262e;
+    --border: #3a3a44;
+    --text: #d8d8e0;
+    --dim: #8a8a96;
+    --ok: #4caf50;
+    --err: #e05a5a;
+    --key: #7fb0ff;
+    --str: #b7e39a;
+    --num: #f0c674;
+    --bool: #d693f0;
+    --flash: #4a3a1a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: Consolas, "Cascadia Code", monospace;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    font-size: 14px;
+    margin: 0;
+    font-weight: 600;
+    color: var(--text);
+  }
+  header label {
+    font-size: 12px;
+    color: var(--dim);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  header input[type=text] {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 3px 6px;
+    width: 60px;
+    font-family: inherit;
+    font-size: 12px;
+  }
+  #status {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--dim);
+  }
+  #grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 10px;
+    padding: 10px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    background: #2c2c36;
+  }
+  .card-head .path {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text);
+  }
+  .card-head .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--dim);
+  }
+  .card-head .dot.ok { background: var(--ok); }
+  .card-head .dot.err { background: var(--err); }
+  .card-head .age {
+    font-size: 11px;
+    color: var(--dim);
+  }
+  .card pre {
+    margin: 0;
+    padding: 8px 10px;
+    font-size: 12px;
+    line-height: 1.45;
+    overflow: auto;
+    max-height: 320px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .card.paused .card-head .path { opacity: 0.5; }
+  .k { color: var(--key); }
+  .s { color: var(--str); }
+  .n { color: var(--num); }
+  .b { color: var(--bool); }
+  .flash { animation: flash 1s ease-out; }
+  @keyframes flash {
+    from { background: var(--flash); }
+    to { background: transparent; }
+  }
+  button {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  button:hover { background: #33333d; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Bridge Dashboard</h1>
+  <label>base <input id="base" type="text" value="http://localhost:8080"></label>
+  <label>interval (ms) <input id="interval" type="text" value="600"></label>
+  <button id="toggle">Pause all</button>
+  <span id="status">starting...</span>
+</header>
+<div id="grid"></div>
+
+<script>
+const ENDPOINTS = [
+  "/state", "/player", "/combat", "/prayers", "/skills",
+  "/camera", "/equipment", "/inventory", "/npcs", "/npc-types",
+  "/objects", "/ground-items", "/tiles", "/config", "/consumables", "/path"
+];
+
+const grid = document.getElementById("grid");
+const baseInput = document.getElementById("base");
+const intervalInput = document.getElementById("interval");
+const statusEl = document.getElementById("status");
+const toggleBtn = document.getElementById("toggle");
+
+let globalPause = false;
+let okCount = 0, errCount = 0;
+
+function syntaxHighlight(json) {
+  const esc = json.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return esc.replace(
+    /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g,
+    (match) => {
+      let cls = "n";
+      if (/^"/.test(match)) {
+        cls = /:$/.test(match) ? "k" : "s";
+      } else if (/true|false|null/.test(match)) {
+        cls = "b";
+      }
+      return `<span class="${cls}">${match}</span>`;
+    }
+  );
+}
+
+function diffKeys(prevStr, nextStr) {
+  return prevStr !== null && prevStr !== nextStr;
+}
+
+const cards = {};
+
+function buildCard(path) {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `
+    <div class="card-head">
+      <span class="dot"></span>
+      <span class="path">${path}</span>
+      <span class="age"></span>
+      <button class="pause">Pause</button>
+    </div>
+    <pre class="body">(waiting...)</pre>
+  `;
+  grid.appendChild(card);
+
+  const state = {
+    path,
+    paused: false,
+    lastText: null,
+    lastAt: 0,
+    dot: card.querySelector(".dot"),
+    age: card.querySelector(".age"),
+    body: card.querySelector(".body"),
+  };
+
+  card.querySelector(".pause").addEventListener("click", () => {
+    state.paused = !state.paused;
+    card.classList.toggle("paused", state.paused);
+  });
+
+  cards[path] = state;
+  return state;
+}
+
+ENDPOINTS.forEach(buildCard);
+
+async function pollOne(state) {
+  if (state.paused || globalPause) return;
+  const base = baseInput.value.replace(/\/$/, "");
+  try {
+    const res = await fetch(base + state.path, { cache: "no-store" });
+    const text = await res.text();
+    let pretty;
+    try {
+      pretty = JSON.stringify(JSON.parse(text), null, 2);
+    } catch {
+      pretty = text;
+    }
+    const changed = diffKeys(state.lastText, pretty);
+    state.lastText = pretty;
+    state.lastAt = Date.now();
+    state.dot.className = "dot ok";
+    state.body.innerHTML = syntaxHighlight(pretty);
+    if (changed) {
+      state.body.classList.remove("flash");
+      void state.body.offsetWidth;
+      state.body.classList.add("flash");
+    }
+    okCount++;
+  } catch (e) {
+    state.dot.className = "dot err";
+    state.body.textContent = "(request failed: " + e.message + ")";
+    errCount++;
+  }
+}
+
+function tickAges() {
+  const now = Date.now();
+  Object.values(cards).forEach((s) => {
+    if (s.lastAt) {
+      s.age.textContent = ((now - s.lastAt) / 1000).toFixed(1) + "s ago";
+    }
+  });
+}
+
+function pollAll() {
+  Object.values(cards).forEach(pollOne);
+}
+
+toggleBtn.addEventListener("click", () => {
+  globalPause = !globalPause;
+  toggleBtn.textContent = globalPause ? "Resume all" : "Pause all";
+});
+
+let pollTimer = null;
+function restartLoop() {
+  if (pollTimer) clearInterval(pollTimer);
+  const ms = Math.max(100, parseInt(intervalInput.value, 10) || 600);
+  pollTimer = setInterval(pollAll, ms);
+}
+intervalInput.addEventListener("change", restartLoop);
+baseInput.addEventListener("change", () => { Object.values(cards).forEach(s => { s.lastText = null; }); });
+
+setInterval(() => {
+  statusEl.textContent = `ok=${okCount} err=${errCount}`;
+  tickAges();
+}, 1000);
+
+restartLoop();
+pollAll();
+</script>
+</body>
+</html>

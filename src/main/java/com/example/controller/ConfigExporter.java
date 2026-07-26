@@ -16,7 +16,8 @@ public final class ConfigExporter
 	{
 		Map<String, Object> data = new LinkedHashMap<>();
 
-		data.put("enabled", config.botEnabled());
+		data.put("enabled", config.controllerEnabled());
+		data.put("profile", config.profile().name());
 		data.put("targets", resolveTargetIds(client, config));
 		data.put("targetNames", parseList(config.targetNpcNames()));
 		data.put("maxTargetDistance", config.maxTargetDistance());
@@ -65,7 +66,7 @@ public final class ConfigExporter
 		safety.put("maxRuntimeHours", config.maxRuntimeHours());
 		data.put("safety", safety);
 
-		// Flat aliases for simple Python clients
+
 		data.put("eatAt", config.eatAtHp());
 		data.put("restorePrayerAt", config.restorePrayerAt());
 		data.put("prayerPotion", config.prayerPotion());

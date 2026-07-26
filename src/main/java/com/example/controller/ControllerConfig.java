@@ -9,9 +9,9 @@ import net.runelite.client.config.Range;
 @ConfigGroup(ControllerConfig.GROUP)
 public interface ControllerConfig extends Config
 {
-	String GROUP = "botcontroller";
+	String GROUP = "controller";
 
-	@ConfigSection(name = "General", description = "Master bot controls", position = 0)
+	@ConfigSection(name = "General", description = "Master controller controls", position = 0)
 	String generalSection = "general";
 
 	@ConfigSection(name = "Targets", description = "Which monsters to attack", position = 1)
@@ -35,15 +35,27 @@ public interface ControllerConfig extends Config
 	// --- General ---
 
 	@ConfigItem(
-		keyName = "botEnabled",
+		keyName = "controllerEnabled",
 		name = "Controller Enabled",
 		description = "Master switch. Python should only act when this is on.",
 		section = generalSection,
 		position = 0
 	)
-	default boolean botEnabled()
+	default boolean controllerEnabled()
 	{
 		return false;
+	}
+
+	@ConfigItem(
+		keyName = "profile",
+		name = "Profile",
+		description = "Which controller.py routine to run. Add new routines to controller.py's PROFILE_ROUTINES map to add options here.",
+		section = generalSection,
+		position = 1
+	)
+	default Profile profile()
+	{
+		return Profile.SLAYER;
 	}
 
 	// --- Targets ---
@@ -290,7 +302,7 @@ public interface ControllerConfig extends Config
 	@ConfigItem(
 		keyName = "takeBreaks",
 		name = "Take Breaks",
-		description = "Periodically pause the bot for human-like breaks.",
+		description = "Periodically pause the controller for human-like breaks.",
 		section = breaksSection,
 		position = 0
 	)
@@ -381,7 +393,7 @@ public interface ControllerConfig extends Config
 	@ConfigItem(
 		keyName = "stopOnDeath",
 		name = "Stop On Death",
-		description = "Stop the bot after dying.",
+		description = "Stop the controller after dying.",
 		section = safetySection,
 		position = 1
 	)

@@ -95,6 +95,7 @@ public class BridgeHttpServer
 			byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
 
 			exchange.getResponseHeaders().add("Content-Type", "application/json");
+			exchange.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
 			exchange.sendResponseHeaders(200, bytes.length);
 
 			try (OutputStream os = exchange.getResponseBody())
