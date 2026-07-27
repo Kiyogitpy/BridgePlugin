@@ -7,12 +7,14 @@
 #      pixels by the game engine itself, not a widget or Swing component
 #      (confirmed empirically: both a full widget-tree dump and a Swing/AWT
 #      component-tree dump came back with nothing for it). Its click point
-#      is a canvas-relative fraction captured once by hovering the mouse
-#      over it and reading /state's mouseCanvasX/Y -- not something read
-#      fresh each time. If it stops working (different saved-account list,
-#      a client update that reflows the screen), it needs recapturing the
-#      same way: hover the tile, read the fraction, update
-#      LoginProvider.java's ACCOUNT_TILE_FRACTION_X/Y.
+#      is a fraction of the canvas's actual on-screen size, captured once
+#      from a confirmed on-screen point -- NOT a fraction of /state's raw
+#      mouseCanvasX/Y, which is in RuneLite's pre-stretch render space and
+#      mixes units if divided directly by the stretched canvas width. Not
+#      something read fresh each time. If it stops working (different
+#      saved-account list, a client update that reflows the screen), it
+#      needs recapturing: hover the tile, note the true on-screen point,
+#      update LoginProvider.java's ACCOUNT_TILE_FRACTION_X/Y.
 #
 #   2. The "Welcome to Old School RuneScape" / CLICK HERE TO PLAY screen,
 #      shown right after (GameState is already LOGGED_IN by this point,

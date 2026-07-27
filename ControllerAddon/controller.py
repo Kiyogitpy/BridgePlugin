@@ -339,6 +339,14 @@ def key_tap(ser: serial.Serial, key: str) -> None:
     send_line(ser, f"KT {key}")
 
 
+def key_down(ser: serial.Serial, key: str) -> None:
+    send_line(ser, f"KD {key}")
+
+
+def key_up(ser: serial.Serial, key: str) -> None:
+    send_line(ser, f"KU {key}")
+
+
 # ---------------- Human-like trajectory generation ----------------
 def clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
@@ -595,6 +603,74 @@ def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140) 
 
 
 # ---------------- clicking bridge entities ----------------
+def is_point_within_window(x: int, y: int) -> bool:
+    """False if (x, y) falls outside the actual RuneLite window. A provider's
+    "clickable" flag only checks against the 3D viewport as RuneLite itself
+    understands it; a target computed just before/after a camera rotation (or
+    one that's only barely onScreen) can still resolve to a point beyond the
+    client entirely -- e.g. onto the desktop or another window -- and that
+    must never be blind-clicked into."""
+    state = get_state()
+    wx, wy = state.get("windowX"), state.get("windowY")
+    ww, wh = state.get("windowWidth"), state.get("windowHeight")
+    if wx is None or wy is None or ww is None or wh is None:
+        return True  # can't verify -- fail open rather than block every click
+    return wx <= x < wx + ww and wy <= y < wy + wh
+
+
+def is_point_blocked_by_ui(x: int, y: int):
+    """Returns the UI panel rect covering (x, y), or None if it's clear. See
+    GameStateProvider's "uiBlockers" (e.g. the resizable layouts' inventory
+    panel) -- entities' screenX/Y only account for viewport bounds, not
+    whatever's drawn on top of it."""
+    for rect in get_state().get("uiBlockers", []):
+        rx, ry = rect.get("x", 0), rect.get("y", 0)
+        rw, rh = rect.get("width", 0), rect.get("height", 0)
+        if rx <= x < rx + rw and ry <= y < ry + rh:
+            return rect
+    return None
+
+
+def nudge_camera_yaw(ser: serial.Serial, key: str) -> None:
+    """Hold the given arrow key just long enough for a small camera turn,
+    then release -- shared by both camera-nudge use cases below."""
+    key_down(ser, key)
+    time.sleep(random.uniform(0.15, 0.35))
+    key_up(ser, key)
+    time.sleep(random.uniform(0.1, 0.2))
+
+
+def rotate_camera_away_from_ui(ser: serial.Serial, blocker: dict) -> None:
+    """A human just spins the camera when something's obscured -- nudge it
+    away from whichever side the blocking panel sits on, then let the caller
+    re-resolve the target's (now-shifted) screen position on its next
+    attempt. The panel is screen-anchored but a target's projected position
+    depends on camera yaw, so repeated nudges in the same direction are
+    guaranteed to eventually clear it even if this first guess is backwards."""
+    state = get_state()
+    canvas_center_x = state.get("canvasScreenX", 0) + state.get("canvasWidth", 0) / 2
+    blocker_center_x = blocker.get("x", 0) + blocker.get("width", 0) / 2
+    key = "LEFT" if blocker_center_x >= canvas_center_x else "RIGHT"
+
+    print(f"[!] Aim point is behind a UI panel -- rotating camera ({key}) to work around it")
+    nudge_camera_yaw(ser, key)
+
+
+def rotate_camera_to_reveal(ser: serial.Serial, x) -> None:
+    """A target can be "visible" (the engine projected some point for it)
+    without being "clickable" (that point falls outside the viewport) -- e.g.
+    right after climbing through a tunnel, facing a new direction. Nudge the
+    camera back toward it: same self-correcting logic as
+    rotate_camera_away_from_ui, just steering toward a point instead of away
+    from a rect."""
+    state = get_state()
+    canvas_center_x = state.get("canvasScreenX", 0) + state.get("canvasWidth", 0) / 2
+    key = "RIGHT" if x < canvas_center_x else "LEFT"
+
+    print(f"[!] Target is off-screen -- rotating camera ({key}) to bring it into view")
+    nudge_camera_yaw(ser, key)
+
+
 # NOTE: every provider (NPCProvider, GroundItemProvider, InventoryProvider,
 # ConsumablesProvider, PrayerProvider, ObjectProvider) already returns
 # *absolute* screen coordinates (canvas offset baked in server-side) -- do
@@ -604,10 +680,21 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
     if x is None or y is None:
         return False
 
+    aim_x, aim_y = int(x) + offset[0], int(y) + offset[1]
+
+    if not is_point_within_window(aim_x, aim_y):
+        print(f"[!] Skipping click on {entity.get('name')} -- aim point is outside the RuneLite window")
+        return False
+
+    blocker = is_point_blocked_by_ui(aim_x, aim_y)
+    if blocker is not None:
+        rotate_camera_away_from_ui(ser, blocker)
+        return False
+
     move_to_human(
         ser,
-        int(x) + offset[0],
-        int(y) + offset[1],
+        aim_x,
+        aim_y,
         aim_radius=ENTITY_AIM_RADIUS,
         refresh_target=refresh_target,
     )
@@ -766,6 +853,22 @@ def check_pvp_threat(ctx, state: ControllerState, config: dict):
             return
 
 
+def check_stray_dialog(ctx):
+    """Dismiss a "click here to continue"-style dialogue via Space, e.g. one
+    left over from a misclick on scenery sharing a pixel with an intended
+    target (see routines/gemstone_crab.py's Priority Objects note). Engine-
+    level like check_safety above, so any routine gets this for free instead
+    of a stray dialogue silently eating every click after it until a human
+    notices. Deliberately does not touch a multiple-choice dialogue (GET
+    /state's "dialogOpen" already excludes DIALOG_OPTION) -- continuing that
+    blind would mean guessing a choice.
+    """
+    if get_state().get("dialogOpen"):
+        print("[!] Dismissing a stray dialogue box (Space)")
+        key_tap(ctx.ser, "SPACE")
+        time.sleep(random.uniform(0.3, 0.6))
+
+
 def handle_generic_events(state: ControllerState, events: list):
     """Engine-level event handling that applies no matter which routine is loaded."""
     for event_type, payload in events:
@@ -833,6 +936,9 @@ def main():
     )
     args = parser.parse_args()
 
+    set_dpi_aware()  # must happen before any cursor/window coordinate queries below,
+                      # otherwise Windows silently virtualizes them to 96 DPI while
+                      # RuneLite's Java window reports/receives real physical pixels
     start_panic_listener()
     udp = make_udp_listener(UDP_PORT)
     state = ControllerState()
@@ -909,6 +1015,7 @@ def main():
                 time.sleep(1.0)
                 continue
 
+            check_stray_dialog(ctx)
             routine.tick(ctx)
 
             if config.get("breaks", {}).get("microBreaks") and random.random() < 0.15:

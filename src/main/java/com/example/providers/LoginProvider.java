@@ -21,11 +21,14 @@ import java.util.Map;
  *  1. The saved-account tile chooser, shown at GameState.LOGIN_SCREEN. This is drawn as raw
  *     pixels by the game engine itself -- confirmed empirically, both client.getWidgetRoots()
  *     (rootCount: 0, not null) and a full Swing/AWT component-tree walk found nothing for it.
- *     There is no API surface to read its layout, so its click point is a canvas-relative
- *     fraction captured once by hovering the mouse over it and reading GET /state's
- *     mouseCanvasX/Y. This is inherently approximate -- it assumes the tile stays in the same
- *     relative position -- and will need recapturing if that ever stops being true (different
- *     number of saved accounts, a client update that reflows the screen, etc.).
+ *     There is no API surface to read its layout, so its click point is a fraction of the
+ *     canvas's actual on-screen size (canvas.getWidth()/getHeight(), i.e. post-stretch), captured
+ *     once from a confirmed on-screen point. NOT a fraction of GET /state's raw mouseCanvasX/Y --
+ *     that's in RuneLite's internal pre-stretch render space, and dividing it directly by the
+ *     stretched canvas width mixes units, silently off by the stretch-mode scale factor. This is
+ *     inherently approximate -- it assumes the tile stays in the same relative position -- and
+ *     will need recapturing if that ever stops being true (different number of saved accounts, a
+ *     client update that reflows the screen, etc.).
  *
  *  2. The "Welcome to Old School RuneScape" / CLICK HERE TO PLAY screen shown right after
  *     (GameState is already LOGGED_IN by this point, even though you're not really in the
@@ -38,10 +41,14 @@ public class LoginProvider extends BridgeProvider
 	private static final int CLICK_TO_PLAY_GROUP = 378;
 	private static final int CLICK_TO_PLAY_CHILD = 77;
 
-	// Captured by hovering the account tile and reading /state's mouseCanvasX/Y at the time,
-	// divided by the canvas size at that moment (1505x889).
-	private static final double ACCOUNT_TILE_FRACTION_X = 426.0 / 1505.0;
-	private static final double ACCOUNT_TILE_FRACTION_Y = 263.0 / 889.0;
+	// Fraction of the canvas size (canvas.getWidth()/getHeight() below, i.e. the actual
+	// on-screen/stretched size), NOT of client.getMouseCanvasPosition() -- that's in
+	// RuneLite's internal pre-stretch render space, and naively dividing it by the
+	// stretched canvas width mixes units, silently off by the stretch-mode scale factor
+	// (~2x was observed). Derived here from a confirmed on-screen point (1141, 570) while
+	// canvasScreenLoc was (0, 23) and the canvas was 2287x1377.
+	private static final double ACCOUNT_TILE_FRACTION_X = 1141.0 / 2287.0;
+	private static final double ACCOUNT_TILE_FRACTION_Y = 547.0 / 1377.0;
 
 	public LoginProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
 	{
