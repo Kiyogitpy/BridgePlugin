@@ -151,14 +151,35 @@ def get_inventory():
     return api_get("/inventory") or []
 
 
+def get_bank():
+    return api_get("/bank") or {"open": False}
+
+
+def get_minimap_walk_point(x: int, y: int, plane: int):
+    return api_get("/minimap/walk", params={"x": x, "y": y, "plane": plane}) or {"onMinimap": False}
+
+
+def request_shortest_path(x: int, y: int, plane: int):
+    """Ask the (separately installed) Shortest Path plugin to compute a
+    route to (x, y, plane). requested=False if that plugin isn't
+    installed/running -- see get_shortest_path_result to poll for it."""
+    return api_get("/shortest-path/request", params={"x": x, "y": y, "plane": plane}) or {"requested": False}
+
+
+def get_shortest_path_result():
+    return api_get("/shortest-path/result") or {"active": False, "done": False, "steps": []}
+
+
 def get_config():
     return api_get("/config")
 
 
 def get_npc_screen_pos(npc_id: int):
-    """Fresh (screenX, screenY) for the nearest NPC of this type, or None if it's
-    no longer found. Used to re-aim mid-flight at a target that's walked since the
-    click was first queued -- see move_to_human's refresh_target."""
+    """Fresh (screenX, screenY) for the nearest NPC of this *type*, or None if
+    none is found. Fine for picking a new target, but NOT for re-checking one
+    you've already committed to -- in a pack of identical monsters this can
+    return a different individual than the one you started attacking. See
+    get_npc_screen_pos_by_index for that case."""
     data = api_get("/npc/nearest", params={"id": npc_id})
     if not data or not data.get("found"):
         return None
@@ -168,8 +189,34 @@ def get_npc_screen_pos(npc_id: int):
     return int(x), int(y)
 
 
+def get_npc_by_index(npc_index: int):
+    """Fresh data for the exact NPC instance (stable per-monster identifier,
+    distinct from its shared type id), or None if it's no longer found (e.g.
+    it died or despawned). Use this to re-check/re-aim at a specific target
+    already committed to -- unlike get_npc_screen_pos (by type), this can
+    never resolve to a different individual of the same species."""
+    data = api_get("/npc/by-index", params={"index": npc_index})
+    if not data or not data.get("found"):
+        return None
+    return data
+
+
+def get_npc_screen_pos_by_index(npc_index: int):
+    data = get_npc_by_index(npc_index)
+    if data is None:
+        return None
+    x, y = data.get("screenX"), data.get("screenY")
+    if x is None or y is None:
+        return None
+    return int(x), int(y)
+
+
 def is_logged_in():
     return get_state().get("loggedIn", False)
+
+
+def get_login_status():
+    return api_get("/login/status") or {"gameState": "UNKNOWN", "loggedIn": False}
 
 
 def get_ammo_count():
@@ -693,6 +740,7 @@ def handle_generic_events(state: ControllerState, events: list):
 PROFILE_ROUTINES = {
     "SLAYER": "routines/slayer.py",
     "MINING": "routines/mining.py",
+    "GEMSTONE_CRAB": "routines/gemstone_crab.py",
 }
 
 
@@ -725,6 +773,8 @@ def resolve_config(routine, bridge_config):
 
 
 def main():
+    import login  # local import: login.py imports controller back, deferred to avoid circularity
+
     parser = argparse.ArgumentParser(description="Generic RuneLite bridge controller")
     parser.add_argument(
         "routine",
@@ -791,8 +841,9 @@ def main():
                 continue
             state.config = config
 
-            if not is_logged_in():
-                time.sleep(1.0)
+            if not login.is_fully_logged_in():
+                login.attempt_login(ctx)
+                time.sleep(login.LOGIN_RETRY_INTERVAL_S)
                 continue
 
             if not get_state().get("windowFocused", True):

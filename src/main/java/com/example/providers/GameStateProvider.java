@@ -30,6 +30,7 @@ public class GameStateProvider extends BridgeProvider
 		Map<String, Object> data = new HashMap<>();
 
 		data.put("loggedIn", client.getGameState() == GameState.LOGGED_IN);
+		data.put("gameState", client.getGameState().name());
 		data.put("tick", client.getTickCount());
 
 		Canvas canvas = client.getCanvas();

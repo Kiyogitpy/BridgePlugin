@@ -9,9 +9,12 @@ import net.runelite.api.events.*;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.PluginManager;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.util.ImageUtil;
@@ -44,6 +47,15 @@ public class ControllerPlugin extends Plugin
 
 	@Inject
 	private ControllerConfig config;
+
+	@Inject
+	private ItemManager itemManager;
+
+	@Inject
+	private PluginManager pluginManager;
+
+	@Inject
+	private EventBus eventBus;
 
 	private NavigationButton navButton;
 	private BridgeHttpServer server;
@@ -92,12 +104,25 @@ public class ControllerPlugin extends Plugin
 		new CameraProvider(client, clientThread, server).register();
 		new EquipmentProvider(client, clientThread, server).register();
 		new InventoryProvider(client, clientThread, server).register();
+		new BankProvider(client, clientThread, server).register();
 		new NPCProvider(client, clientThread, server).register();
 		new ObjectProvider(client, clientThread, server).register();
-		new GroundItemProvider(client, clientThread, server).register();
+		new GroundItemProvider(client, clientThread, server, itemManager).register();
 		new TileProvider(client, clientThread, server).register();
 		new ConfigProvider(client, clientThread, server, config).register();
 		new ConsumablesProvider(client, clientThread, server, config).register();
+		new WidgetDumpProvider(client, clientThread, server).register();
+		new SwingDumpProvider(client, clientThread, server).register();
+		new LoginProvider(client, clientThread, server).register();
+
+		try
+		{
+			new ShortestPathProvider(client, clientThread, server, pluginManager, eventBus).register();
+		}
+		catch (Throwable t)
+		{
+			System.out.println("Shortest Path integration unavailable: " + t);
+		}
 	}
 
 	@Override
@@ -202,6 +227,7 @@ public class ControllerPlugin extends Plugin
 			NPC npc = (NPC) actor;
 			Map<String, Object> payload = new HashMap<>();
 			payload.put("id", npc.getId());
+			payload.put("index", npc.getIndex());
 			payload.put("name", npc.getName());
 			udpSender.send("NPC_DIED", payload);
 		}

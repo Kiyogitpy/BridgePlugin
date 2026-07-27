@@ -23,6 +23,7 @@ public class NPCProvider extends BridgeProvider
 	{
 		server.register("/npcs", () -> onClient(this::getNPCs));
 		server.registerQuery("/npc/nearest", query -> onClient(() -> getNearestNpc(query)));
+		server.registerQuery("/npc/by-index", query -> onClient(() -> getNpcByIndex(query)));
 		server.register("/npc-types", () -> onClient(this::getNpcTypes));
 	}
 
@@ -106,6 +107,47 @@ public class NPCProvider extends BridgeProvider
 		return data;
 	}
 
+	/**
+	 * Exact lookup by NPC instance (client.getIndex(), stable for that specific monster's
+	 * lifetime), not by type -- unlike /npc/nearest?id=, which picks whichever NPC of a given
+	 * type happens to be closest. Used to re-check/re-aim at a target already committed to,
+	 * where a same-species neighbor must never be substituted.
+	 */
+	private Object getNpcByIndex(Map<String, String> query)
+	{
+		Map<String, Object> notFound = new HashMap<>();
+		notFound.put("found", false);
+
+		String indexStr = query.get("index");
+		if (indexStr == null || indexStr.isEmpty())
+		{
+			return notFound;
+		}
+
+		int index;
+		try
+		{
+			index = Integer.parseInt(indexStr);
+		}
+		catch (NumberFormatException e)
+		{
+			return notFound;
+		}
+
+		Player local = client.getLocalPlayer();
+		for (NPC npc : client.getNpcs())
+		{
+			if (npc != null && npc.getIndex() == index)
+			{
+				Map<String, Object> data = buildNpcData(npc, local);
+				data.put("found", true);
+				return data;
+			}
+		}
+
+		return notFound;
+	}
+
 	private Object getNpcTypes()
 	{
 		Map<Integer, String> types = new LinkedHashMap<>();
@@ -138,6 +180,7 @@ public class NPCProvider extends BridgeProvider
 		boolean alive = !RuneLiteUtil.isNpcDead(npc);
 
 		data.put("id", npc.getId());
+		data.put("index", npc.getIndex());
 		data.put("name", npc.getName());
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());

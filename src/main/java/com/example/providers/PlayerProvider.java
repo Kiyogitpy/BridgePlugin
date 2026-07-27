@@ -38,6 +38,7 @@ public class PlayerProvider extends BridgeProvider
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
 		data.put("plane", wp.getPlane());
+		data.put("inWilderness", client.getVarbitValue(Varbits.IN_WILDERNESS) != 0);
 		data.put("animation", p.getAnimation());
 		data.put("poseAnimation", p.getPoseAnimation());
 		data.put("hp", client.getBoostedSkillLevel(Skill.HITPOINTS));

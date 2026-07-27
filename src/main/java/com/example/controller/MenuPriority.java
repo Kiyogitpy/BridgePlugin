@@ -39,6 +39,7 @@ final class MenuPriority
 		Set<String> targetNpcs = normalizedSet(config.targetNpcNames());
 		Set<String> lootItems = normalizedSet(config.lootWhitelist());
 		Set<String> targetObjects = normalizedSet(config.targetObjectNames());
+		Set<String> forcedActions = normalizedSet(config.forcedActions());
 
 		for (int i = lastIndex - 1; i >= 0; i--)
 		{
@@ -49,7 +50,8 @@ final class MenuPriority
 			boolean wanted =
 				("attack".equals(option) && targetNpcs.contains(target))
 					|| ("take".equals(option) && lootItems.contains(target))
-					|| (targetObjects.contains(target) && !"examine".equals(option) && !"cancel".equals(option));
+					|| (targetObjects.contains(target) && !"examine".equals(option) && !"cancel".equals(option))
+					|| forcedActions.contains(option);
 
 			if (wanted)
 			{

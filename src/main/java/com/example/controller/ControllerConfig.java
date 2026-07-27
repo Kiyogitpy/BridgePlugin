@@ -35,6 +35,9 @@ public interface ControllerConfig extends Config
 	@ConfigSection(name = "Clicking", description = "Force which action a click resolves to", position = 7)
 	String clickingSection = "clicking";
 
+	@ConfigSection(name = "Banking", description = "Restock and deposit loot when banking is needed", position = 8)
+	String bankSection = "bank";
+
 	// --- General ---
 
 	@ConfigItem(
@@ -262,6 +265,43 @@ public interface ControllerConfig extends Config
 		return "Super combat potion";
 	}
 
+	@ConfigItem(
+		keyName = "useWildernessSupplies",
+		name = "Use Wilderness Supplies",
+		description = "Eat/drink and withdraw-when-banking the wilderness food/prayer potion below instead of the " +
+			"normal ones (e.g. blighted variants that heal less but don't need banking runs out of the wilderness).",
+		section = suppliesSection,
+		position = 7
+	)
+	default boolean useWildernessSupplies()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "wildernessFood",
+		name = "Wilderness Food",
+		description = "Food used instead of Food above when Use Wilderness Supplies is on.",
+		section = suppliesSection,
+		position = 8
+	)
+	default String wildernessFood()
+	{
+		return "Blighted manta ray";
+	}
+
+	@ConfigItem(
+		keyName = "wildernessPrayerPotion",
+		name = "Wilderness Prayer Potion",
+		description = "Prayer restore used instead of Prayer Potion above when Use Wilderness Supplies is on.",
+		section = suppliesSection,
+		position = 9
+	)
+	default String wildernessPrayerPotion()
+	{
+		return "Blighted super restore";
+	}
+
 	// --- Loot ---
 
 	@ConfigItem(
@@ -289,11 +329,25 @@ public interface ControllerConfig extends Config
 	}
 
 	@ConfigItem(
+		keyName = "minLootValue",
+		name = "Min Loot Value (GP)",
+		description = "Also pick up any ground item worth at least this much GE value, regardless of the " +
+			"whitelist above (e.g. a Rune platebody drop at 14k GE value gets picked up if this is set to 9000). " +
+			"0 = off, whitelist only.",
+		section = lootSection,
+		position = 2
+	)
+	default int minLootValue()
+	{
+		return 5000;
+	}
+
+	@ConfigItem(
 		keyName = "buryBones",
 		name = "Bury Bones",
 		description = "Automatically bury bones from inventory.",
 		section = lootSection,
-		position = 2
+		position = 3
 	)
 	default boolean buryBones()
 	{
@@ -436,12 +490,103 @@ public interface ControllerConfig extends Config
 	@ConfigItem(
 		keyName = "targetObjectNames",
 		name = "Priority Objects",
-		description = "Comma-separated object names (e.g. \"Cave entrance\") that should always win a click over " +
-			"anything else in the way, such as a tree blocking a cave mouth.",
+		description = "Comma-separated object names (e.g. \"Cave\") that should always win a click over anything " +
+			"else in the way, such as a tree blocking a cave mouth.",
 		section = clickingSection,
 		position = 1
 	)
 	default String targetObjectNames()
+	{
+		return "Cave";
+	}
+
+	@ConfigItem(
+		keyName = "forcedActions",
+		name = "Forced Actions",
+		description = "Comma-separated menu option text (e.g. \"Ferox Enclave\") that should always win a click " +
+			"regardless of target, for items/objects with multiple actions like a multi-teleport ring where the " +
+			"default action isn't the one you want.",
+		section = clickingSection,
+		position = 2
+	)
+	default String forcedActions()
+	{
+		return "";
+	}
+
+	// --- Banking ---
+
+	@ConfigItem(
+		keyName = "bankEnabled",
+		name = "Enable Banking",
+		description = "Bank for more supplies when inventory is full instead of just stopping.",
+		section = bankSection,
+		position = 0
+	)
+	default boolean bankEnabled()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "bankTeleportFallback",
+		name = "Teleport If No Bank Nearby",
+		description = "Use the ring of dueling to Ferox Enclave when no bank is within walking distance.",
+		section = bankSection,
+		position = 1
+	)
+	default boolean bankTeleportFallback()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "bankFoodQuantity",
+		name = "Food To Withdraw",
+		description = "How many of the Food item (Food & Potions section) to withdraw when banking. 0 = don't withdraw food.",
+		section = bankSection,
+		position = 2
+	)
+	@Range(min = 0, max = 28)
+	default int bankFoodQuantity()
+	{
+		return 10;
+	}
+
+	@ConfigItem(
+		keyName = "bankPrayerPotionQuantity",
+		name = "Prayer Potions To Withdraw",
+		description = "How many of the Prayer Potion item to withdraw when banking. 0 = don't withdraw.",
+		section = bankSection,
+		position = 3
+	)
+	@Range(min = 0, max = 28)
+	default int bankPrayerPotionQuantity()
+	{
+		return 4;
+	}
+
+	@ConfigItem(
+		keyName = "bankCombatPotionQuantity",
+		name = "Combat Potions To Withdraw",
+		description = "How many of the Combat Potion item to withdraw when banking. 0 = don't withdraw.",
+		section = bankSection,
+		position = 4
+	)
+	@Range(min = 0, max = 28)
+	default int bankCombatPotionQuantity()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "bankKeepItems",
+		name = "Never Deposit",
+		description = "Comma-separated item names never deposited while banking (e.g. clue caskets, teleport items).",
+		section = bankSection,
+		position = 5
+	)
+	default String bankKeepItems()
 	{
 		return "";
 	}

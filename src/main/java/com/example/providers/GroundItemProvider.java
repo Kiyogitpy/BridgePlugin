@@ -5,6 +5,7 @@ import com.example.util.RuneLiteUtil;
 import net.runelite.api.*;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.game.ItemManager;
 
 import java.awt.Point;
 import java.util.ArrayList;
@@ -14,9 +15,12 @@ import java.util.Map;
 
 public class GroundItemProvider extends BridgeProvider
 {
-	public GroundItemProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
+	private final ItemManager itemManager;
+
+	public GroundItemProvider(Client client, ClientThread clientThread, BridgeHttpServer server, ItemManager itemManager)
 	{
 		super(client, clientThread, server);
+		this.itemManager = itemManager;
 	}
 
 	@Override
@@ -73,6 +77,10 @@ public class GroundItemProvider extends BridgeProvider
 						data.put("name", comp.getName());
 						data.put("stackable", comp.isStackable());
 					}
+
+					int gePrice = itemManager.getItemPrice(item.getId());
+					data.put("value", gePrice);
+					data.put("totalValue", gePrice * (long) item.getQuantity());
 
 					net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, tile.getLocalLocation(), plane);
 					if (point != null)

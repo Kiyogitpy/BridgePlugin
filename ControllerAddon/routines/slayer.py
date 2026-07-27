@@ -12,7 +12,10 @@
 import random
 import time
 
+import banker
 import controller
+import settings
+import travel
 
 
 # Use the bridge's /config as-is -- this routine has no config of its own.
@@ -22,8 +25,10 @@ def get_config(bridge_config):
 
 def on_event(ctx, event_type, payload):
     if event_type == "NPC_DIED" and payload:
-        if payload.get("id") == ctx.state.data.get("current_target_id"):
-            ctx.state.data["current_target_id"] = None
+        # Matched by instance index, not type id -- a different monster of
+        # the same species dying nearby must not clear our current target.
+        if payload.get("index") == ctx.state.data.get("current_target_index"):
+            ctx.state.data["current_target_index"] = None
 
 
 def tick(ctx):
@@ -34,6 +39,13 @@ def tick(ctx):
         ctx.state.trigger_safety_stop("out of ammo")
         return
 
+    bank_cfg = config.get("bank", {})
+    if bank_cfg.get("enabled") and needs_banking(ctx):
+        print("[bank] inventory full, banking")
+        ctx.state.data["current_target_index"] = None  # don't try to resume a fight through a bank trip
+        banker.bank_up(ctx, bank_cfg)
+        return
+
     combat = controller.get_combat()
     maintain_prayer(ctx, combat)
     maintain_supplies(ctx)
@@ -42,6 +54,66 @@ def tick(ctx):
         maybe_loot(ctx)
 
     engage_target(ctx, combat)
+
+
+def inventory_full() -> bool:
+    return len(controller.get_inventory()) >= settings.INVENTORY_SIZE
+
+
+def needs_banking(ctx) -> bool:
+    if not inventory_full():
+        return False
+
+    # In the wilderness with a looting bag, a "full" inventory might just
+    # mean it's time to offload into the bag rather than bank -- it holds
+    # another 28 slots that don't otherwise show up in get_inventory().
+    if controller.get_player().get("inWilderness") and banker.has_looting_bag():
+        print("[bank] inventory full in the wilderness -- trying the looting bag first")
+        if banker.fill_looting_bag(ctx):
+            return False
+
+    if not has_bankable_loot(ctx.state.config):
+        # Full, but only with supplies we brought on purpose (food, potions,
+        # the ring, the bag, whatever's on the keep list) -- there's nothing
+        # to gain from a bank trip, we'd just deposit and rewithdraw the same
+        # things. This is also what stops banking from firing immediately on
+        # a trip that simply started with a full inventory of supplies.
+        return False
+
+    return True
+
+
+def has_bankable_loot(config: dict) -> bool:
+    # Substring match, not exact -- item names carry dose/charge suffixes
+    # (e.g. "Super restore(4)") that a configured preference like "Super
+    # restore" won't equal exactly. Matches the same convention
+    # ConsumablesProvider uses server-side.
+    protected_names = protected_supply_names(config)
+    for item in controller.get_inventory():
+        name = (item.get("name") or "").lower()
+        if name and not any(protected in name for protected in protected_names):
+            return True
+    return False
+
+
+def protected_supply_names(config: dict) -> set:
+    names = {n.lower() for n in config.get("bank", {}).get("keepItems", [])}
+
+    food_name = config.get("food", {}).get("name")
+    if food_name:
+        names.add(food_name.lower())
+
+    prayer_potion = config.get("potions", {}).get("prayerPotion")
+    if prayer_potion:
+        names.add(prayer_potion.lower())
+
+    combat_potion = config.get("potions", {}).get("combatPotion")
+    if combat_potion:
+        names.add(combat_potion.lower())
+
+    names.add(travel.RING_OF_DUELING_NAME)
+    names.add(banker.LOOTING_BAG_NAME)
+    return names
 
 
 # ---------------- config-driven targeting ----------------
@@ -138,14 +210,23 @@ def maybe_loot(ctx):
     loot_cfg = config.get("loot", {})
 
     whitelist = [w.lower() for w in loot_cfg.get("items", [])]
-    if whitelist:
-        for item in controller.get_ground_items():
-            name = (item.get("name") or "").lower()
-            if item.get("clickable") and any(w in name for w in whitelist):
-                print(f"[loot] picking up {item.get('name')}")
-                time.sleep(random.uniform(0.2, 0.5))
-                controller.click_entity(ctx.ser, item)
-                break
+    min_value = loot_cfg.get("minValue", 0)
+
+    for item in controller.get_ground_items():
+        if not item.get("clickable"):
+            continue
+
+        name = (item.get("name") or "").lower()
+        name_match = bool(whitelist) and any(w in name for w in whitelist)
+        # totalValue is GE price * quantity, computed server-side (GroundItemProvider).
+        value_match = min_value > 0 and item.get("totalValue", 0) >= min_value
+
+        if name_match or value_match:
+            reason = "whitelist" if name_match else f"worth {item.get('totalValue')}gp"
+            print(f"[loot] picking up {item.get('name')} ({reason})")
+            time.sleep(random.uniform(0.2, 0.5))
+            controller.click_entity(ctx.ser, item)
+            break
 
     if loot_cfg.get("buryBones"):
         for item in controller.get_inventory():
@@ -160,10 +241,13 @@ def engage_target(ctx, combat: dict):
     config = ctx.state.config
     npcs = controller.get_npcs()
 
-    current_target_id = ctx.state.data.get("current_target_id")
-    if current_target_id is not None:
+    # Tracked by instance index (stable per-monster identifier), not the
+    # shared type id -- in a pack of identical monsters, "any NPC of this
+    # type is alive" can't tell your target apart from its neighbors.
+    current_target_index = ctx.state.data.get("current_target_index")
+    if current_target_index is not None:
         still_alive = any(
-            n.get("id") == current_target_id and n.get("hpRatio") != 0
+            n.get("index") == current_target_index and n.get("hpRatio") != 0
             for n in npcs
         )
         if still_alive:
@@ -174,7 +258,7 @@ def engage_target(ctx, combat: dict):
             # still has us locked, so don't use it to decide whether to
             # re-engage; only "is our tracked target still alive" matters.
             return
-        ctx.state.data["current_target_id"] = None
+        ctx.state.data["current_target_index"] = None
 
     if config.get("onlyAttackWhenIdle") and not combat.get("isIdle", True):
         return
@@ -183,12 +267,15 @@ def engage_target(ctx, combat: dict):
     if not target:
         return
 
-    print(f"[combat] attacking {target.get('name')} (id={target['id']}, dist={target.get('distance')})")
+    print(
+        f"[combat] attacking {target.get('name')} "
+        f"(id={target['id']}, index={target['index']}, dist={target.get('distance')})"
+    )
     time.sleep(random.uniform(0.15, 0.6))
-    target_id = target["id"]
+    target_index = target["index"]
     if controller.click_entity(
         ctx.ser,
         target,
-        refresh_target=lambda: controller.get_npc_screen_pos(target_id),
+        refresh_target=lambda: controller.get_npc_screen_pos_by_index(target_index),
     ):
-        ctx.state.data["current_target_id"] = target_id
+        ctx.state.data["current_target_index"] = target_index

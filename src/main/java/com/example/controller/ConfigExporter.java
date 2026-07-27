@@ -31,15 +31,18 @@ public final class ConfigExporter
 		prayer.put("restoreAt", config.restorePrayerAt());
 		data.put("prayer", prayer);
 
+		String foodName = config.useWildernessSupplies() ? config.wildernessFood() : config.food();
+		String prayerPotionName = config.useWildernessSupplies() ? config.wildernessPrayerPotion() : config.prayerPotion();
+
 		Map<String, Object> food = new LinkedHashMap<>();
 		food.put("enabled", config.useFood());
-		food.put("name", config.food());
+		food.put("name", foodName);
 		food.put("eatAt", config.eatAtHp());
 		data.put("food", food);
 
 		Map<String, Object> potions = new LinkedHashMap<>();
 		potions.put("prayerEnabled", config.usePrayerPotions());
-		potions.put("prayerPotion", config.prayerPotion());
+		potions.put("prayerPotion", prayerPotionName);
 		potions.put("combatEnabled", config.useCombatPotions());
 		potions.put("combatPotion", config.combatPotion());
 		data.put("potions", potions);
@@ -47,6 +50,7 @@ public final class ConfigExporter
 		Map<String, Object> loot = new LinkedHashMap<>();
 		loot.put("enabled", config.lootEnabled());
 		loot.put("items", parseList(config.lootWhitelist()));
+		loot.put("minValue", config.minLootValue());
 		loot.put("buryBones", config.buryBones());
 		data.put("loot", loot);
 
@@ -65,12 +69,37 @@ public final class ConfigExporter
 		safety.put("maxRuntimeHours", config.maxRuntimeHours());
 		data.put("safety", safety);
 
+		Map<String, Object> bank = new LinkedHashMap<>();
+		bank.put("enabled", config.bankEnabled());
+		bank.put("teleportFallback", config.bankTeleportFallback());
+		bank.put("keepItems", parseList(config.bankKeepItems()));
+
+		List<Map<String, Object>> withdraw = new ArrayList<>();
+		addWithdrawEntry(withdraw, foodName, config.bankFoodQuantity());
+		addWithdrawEntry(withdraw, prayerPotionName, config.bankPrayerPotionQuantity());
+		addWithdrawEntry(withdraw, config.combatPotion(), config.bankCombatPotionQuantity());
+		bank.put("withdraw", withdraw);
+
+		data.put("bank", bank);
 
 		data.put("eatAt", config.eatAtHp());
 		data.put("restorePrayerAt", config.restorePrayerAt());
-		data.put("prayerPotion", config.prayerPotion());
+		data.put("prayerPotion", prayerPotionName);
 
 		return data;
+	}
+
+	private static void addWithdrawEntry(List<Map<String, Object>> withdraw, String name, int quantity)
+	{
+		if (name == null || name.trim().isEmpty() || quantity <= 0)
+		{
+			return;
+		}
+
+		Map<String, Object> entry = new LinkedHashMap<>();
+		entry.put("name", name.trim());
+		entry.put("quantity", quantity);
+		withdraw.add(entry);
 	}
 
 	public static List<Integer> resolveTargetIds(Client client, ControllerConfig config)

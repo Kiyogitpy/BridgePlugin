@@ -8,7 +8,8 @@ package com.example.controller;
 public enum Profile
 {
 	SLAYER("Slayer / Combat"),
-	MINING("Mining");
+	MINING("Mining"),
+	GEMSTONE_CRAB("Gemstone Crab");
 
 	private final String label;
 
