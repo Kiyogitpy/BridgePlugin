@@ -38,6 +38,9 @@ public interface ControllerConfig extends Config
 	@ConfigSection(name = "Banking", description = "Restock and deposit loot when banking is needed", position = 8)
 	String bankSection = "bank";
 
+	@ConfigSection(name = "PvP Safety", description = "Wilderness flee-on-threat behavior", position = 9)
+	String pvpSafetySection = "pvpSafety";
+
 	// --- General ---
 
 	@ConfigItem(
@@ -589,5 +592,19 @@ public interface ControllerConfig extends Config
 	default String bankKeepItems()
 	{
 		return "";
+	}
+
+	// --- PvP Safety ---
+
+	@ConfigItem(
+		keyName = "pvpFleeEnabled",
+		name = "Flee From Attackers",
+		description = "In the wilderness, teleport away via royal seed pod if another player is within the current wilderness level's attack range.",
+		section = pvpSafetySection,
+		position = 0
+	)
+	default boolean pvpFleeEnabled()
+	{
+		return false;
 	}
 }

@@ -112,14 +112,41 @@ def protected_supply_names(config: dict) -> set:
         names.add(combat_potion.lower())
 
     names.add(travel.RING_OF_DUELING_NAME)
+    names.add(travel.ROYAL_SEED_POD_NAME)
     names.add(banker.LOOTING_BAG_NAME)
     return names
 
 
 # ---------------- config-driven targeting ----------------
+def _singularize(word: str) -> str:
+    """Best-effort strip of a plural task-category label (e.g. as picked from
+    the Controller Settings search bar's SlayerMonsters.java list) down to a
+    form likely to appear inside the real, singular NPC name it actually
+    covers -- "Bloodvelds" -> "bloodveld", "Zombies" -> "zombie", "Lizardmen"
+    -> "lizardman" (irregular -men/-man plural). Slayer task category labels
+    are frequently NOT literal NPC names at all (there's no NPC actually
+    named "Lizardmen" -- the real ones are "Lizardman shaman", "Lizardman
+    brute", etc.), so pick_target below matches substrings against this
+    stripped form rather than requiring an exact name match."""
+    w = word.lower().strip()
+    if w.endswith("men") and not w.endswith("omen"):
+        return w[:-3] + "man"
+    if w.endswith("ies") and len(w) > 3:
+        return w[:-3] + "y"
+    if w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
 def resolve_targets(config: dict):
     ids = set(config.get("targets") or [])
-    names = {n.lower() for n in (config.get("targetNames") or [])}
+    names = set()
+    for n in (config.get("targetNames") or []):
+        n_lower = n.lower().strip()
+        if not n_lower:
+            continue
+        names.add(n_lower)
+        names.add(_singularize(n_lower))
     return ids, names
 
 
@@ -135,7 +162,8 @@ def pick_target(npcs: list, config: dict):
     for npc in npcs:
         if not npc.get("attackable"):
             continue
-        if npc.get("id") not in ids and (npc.get("name") or "").lower() not in names:
+        npc_name = (npc.get("name") or "").lower()
+        if npc.get("id") not in ids and not any(n in npc_name for n in names if n):
             continue
 
         dist = npc.get("distance", 9999)

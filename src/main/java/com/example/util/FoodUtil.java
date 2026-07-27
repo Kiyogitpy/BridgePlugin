@@ -1,15 +1,26 @@
 package com.example.util;
 
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 
 public final class FoodUtil
 {
-	private static final Map<String, Integer> HEAL_BY_NAME = new HashMap<>();
+	// LinkedHashMap, not HashMap -- getHealAmount matches in insertion order, so the
+	// blighted variants below must come before their regular-food counterparts. Both
+	// "Blighted manta ray" and "Blighted anglerfish" also contain "manta ray"/"anglerfish",
+	// so if the regular entry were checked first (a plain HashMap gives no ordering
+	// guarantee either way), a blighted item would silently report the regular item's
+	// (higher) heal value instead of its own lower one.
+	private static final Map<String, Integer> HEAL_BY_NAME = new LinkedHashMap<>();
 
 	static
 	{
+		// TODO verify these exact heal amounts in-game/wiki -- recalled, not confirmed.
+		HEAL_BY_NAME.put("blighted manta ray", 8);
+		HEAL_BY_NAME.put("blighted anglerfish", 8);
+		HEAL_BY_NAME.put("blighted karambwan", 8);
+
 		HEAL_BY_NAME.put("shark", 20);
 		HEAL_BY_NAME.put("manta ray", 22);
 		HEAL_BY_NAME.put("dark crab", 22);
@@ -64,6 +75,7 @@ public final class FoodUtil
 		String lower = itemName.toLowerCase(Locale.ENGLISH);
 		return lower.contains("prayer potion")
 			|| lower.contains("super restore")
+			|| lower.contains("blighted super restore")
 			|| lower.contains("sanfew serum")
 			|| lower.contains("moonlight potion")
 			|| lower.contains("restore potion");

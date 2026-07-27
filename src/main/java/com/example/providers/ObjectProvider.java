@@ -50,34 +50,59 @@ public class ObjectProvider extends BridgeProvider
 
 				for (GameObject obj : tile.getGameObjects())
 				{
-					if (obj == null)
+					if (obj != null)
 					{
-						continue;
+						list.add(buildObjectData(obj, "GameObject", plane, canvasScreenLoc));
 					}
+				}
 
-					Map<String, Object> data = new HashMap<>();
-					WorldPoint wp = WorldPoint.fromLocal(client, obj.getLocalLocation());
+				// Doors, gates, and fences are WallObjects, not GameObjects -- transports.tsv's
+				// "Open Door"/"Open Gate" entries need these to be findable too, not just the
+				// staircases/ladders that do tend to be GameObjects.
+				WallObject wallObj = tile.getWallObject();
+				if (wallObj != null)
+				{
+					list.add(buildObjectData(wallObj, "WallObject", plane, canvasScreenLoc));
+				}
 
-					data.put("id", obj.getId());
-					ObjectComposition comp = client.getObjectDefinition(obj.getId());
-					data.put("name", comp != null ? comp.getName() : "Unknown");
-					data.put("x", wp.getX());
-					data.put("y", wp.getY());
-					data.put("plane", wp.getPlane());
+				GroundObject groundObj = tile.getGroundObject();
+				if (groundObj != null)
+				{
+					list.add(buildObjectData(groundObj, "GroundObject", plane, canvasScreenLoc));
+				}
 
-					net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, obj.getLocalLocation(), plane);
-					if (point != null)
-					{
-						data.put("screenX", point.getX() + canvasScreenLoc.x);
-						data.put("screenY", point.getY() + canvasScreenLoc.y);
-					}
-
-					data.put("distance", RuneLiteUtil.distanceToPlayer(client, wp));
-					data.putAll(RuneLiteUtil.visibility(client, obj.getLocalLocation(), plane, true));
-					list.add(data);
+				DecorativeObject decorativeObj = tile.getDecorativeObject();
+				if (decorativeObj != null)
+				{
+					list.add(buildObjectData(decorativeObj, "DecorativeObject", plane, canvasScreenLoc));
 				}
 			}
 		}
 		return list;
+	}
+
+	private Map<String, Object> buildObjectData(TileObject obj, String objectType, int plane, Point canvasScreenLoc)
+	{
+		Map<String, Object> data = new HashMap<>();
+		WorldPoint wp = WorldPoint.fromLocal(client, obj.getLocalLocation());
+
+		data.put("id", obj.getId());
+		data.put("objectType", objectType);
+		ObjectComposition comp = client.getObjectDefinition(obj.getId());
+		data.put("name", comp != null ? comp.getName() : "Unknown");
+		data.put("x", wp.getX());
+		data.put("y", wp.getY());
+		data.put("plane", wp.getPlane());
+
+		net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, obj.getLocalLocation(), plane);
+		if (point != null)
+		{
+			data.put("screenX", point.getX() + canvasScreenLoc.x);
+			data.put("screenY", point.getY() + canvasScreenLoc.y);
+		}
+
+		data.put("distance", RuneLiteUtil.distanceToPlayer(client, wp));
+		data.putAll(RuneLiteUtil.visibility(client, obj.getLocalLocation(), plane, true));
+		return data;
 	}
 }

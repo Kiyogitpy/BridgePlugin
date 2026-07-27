@@ -292,9 +292,13 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
         print("[bank] failed to open the Ferox Enclave bank")
         return False
 
-    # Never deposit the ring itself, or every trip after this one is stranded.
+    # Never deposit the ring or seed pod themselves, or every trip after this
+    # one is stranded (no way back, or no wilderness escape).
     deposit_config = dict(config)
-    deposit_config["keepItems"] = list(config.get("keepItems", [])) + [travel.RING_OF_DUELING_NAME]
+    deposit_config["keepItems"] = list(config.get("keepItems", [])) + [
+        travel.RING_OF_DUELING_NAME,
+        travel.ROYAL_SEED_POD_NAME,
+    ]
     deposit_inventory(ctx, deposit_config)
     withdraw_loadout(ctx, config)
     close_bank(ctx)

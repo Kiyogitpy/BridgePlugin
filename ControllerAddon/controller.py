@@ -135,6 +135,10 @@ def get_npcs():
     return api_get("/npcs") or []
 
 
+def get_players():
+    return api_get("/players") or []
+
+
 def get_objects():
     return api_get("/objects") or []
 
@@ -724,6 +728,44 @@ def check_safety(state: ControllerState, config: dict):
         state.trigger_safety_stop("inventory full")
 
 
+def check_pvp_threat(ctx, state: ControllerState, config: dict):
+    """Flee via royal seed pod if another player is within the current
+    wilderness level's attack range. Engine-level, like check_safety above --
+    runs every tick regardless of which routine is active, so no routine
+    needs its own copy of this.
+
+    Range formula: attackable if abs(their combat level - ours) <= our
+    current wilderness level. This is the commonly-cited approximation of
+    the game's real level-range calculation -- recalled, not re-verified
+    in-game, and doesn't account for a skulled attacker's extended range, so
+    treat it as a reasonable default rather than an exact rule.
+    """
+    import travel  # local import: travel.py imports controller back (same reason login's import is deferred in main())
+
+    pvp_cfg = config.get("pvpSafety", {})
+    if not pvp_cfg.get("fleeEnabled") or state.safety_stopped:
+        return
+
+    player = get_player()
+    if not player.get("inWilderness"):
+        return
+
+    wilderness_level = player.get("wildernessLevel")
+    my_combat = player.get("combatLevel")
+    if wilderness_level is None or my_combat is None:
+        return
+
+    for other in get_players():
+        other_combat = other.get("combatLevel")
+        if other_combat is None:
+            continue
+        if abs(other_combat - my_combat) <= wilderness_level:
+            print(f"[!] PvP threat: {other.get('name')} (combat {other_combat}) is within attack range")
+            travel.flee_royal_seed_pod(ctx)
+            state.trigger_safety_stop(f"fled from {other.get('name')} in the wilderness")
+            return
+
+
 def handle_generic_events(state: ControllerState, events: list):
     """Engine-level event handling that applies no matter which routine is loaded."""
     for event_type, payload in events:
@@ -852,6 +894,7 @@ def main():
                 continue
 
             check_safety(state, config)
+            check_pvp_threat(ctx, state, config)
             if state.safety_stopped:
                 state.print_safety_reminder()
                 time.sleep(2.0)

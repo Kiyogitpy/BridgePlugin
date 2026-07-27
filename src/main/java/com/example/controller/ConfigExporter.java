@@ -82,6 +82,10 @@ public final class ConfigExporter
 
 		data.put("bank", bank);
 
+		Map<String, Object> pvpSafety = new LinkedHashMap<>();
+		pvpSafety.put("fleeEnabled", config.pvpFleeEnabled());
+		data.put("pvpSafety", pvpSafety);
+
 		data.put("eatAt", config.eatAtHp());
 		data.put("restorePrayerAt", config.restorePrayerAt());
 		data.put("prayerPotion", prayerPotionName);

@@ -4,11 +4,15 @@ import com.example.bridge.BridgeHttpServer;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetInfo;
 import net.runelite.client.callback.ClientThread;
 
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class PlayerProvider extends BridgeProvider
 {
@@ -35,10 +39,27 @@ public class PlayerProvider extends BridgeProvider
 		Map<String, Object> data = new HashMap<>();
 
 		data.put("name", p.getName());
+		data.put("combatLevel", p.getCombatLevel());
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
 		data.put("plane", wp.getPlane());
 		data.put("inWilderness", client.getVarbitValue(Varbits.IN_WILDERNESS) != 0);
+
+		Widget wildernessLevelWidget = client.getWidget(WidgetInfo.PVP_WILDERNESS_LEVEL);
+		if (wildernessLevelWidget != null && !wildernessLevelWidget.isHidden())
+		{
+			String text = wildernessLevelWidget.getText();
+			data.put("wildernessLevelText", text);
+
+			if (text != null)
+			{
+				Matcher matcher = Pattern.compile("\\d+").matcher(text);
+				if (matcher.find())
+				{
+					data.put("wildernessLevel", Integer.parseInt(matcher.group()));
+				}
+			}
+		}
 		data.put("animation", p.getAnimation());
 		data.put("poseAnimation", p.getPoseAnimation());
 		data.put("hp", client.getBoostedSkillLevel(Skill.HITPOINTS));

@@ -39,6 +39,12 @@ RING_OF_DUELING_NAME = "ring of dueling"
 FOUNTAIN_NAME = "Pool of Refreshment"
 FOUNTAIN_MAX_DISTANCE = 15
 
+# Royal seed pod: used as the wilderness panic-escape teleport specifically
+# because (recalled, not re-verified in-game this session) it still works
+# while teleblocked, unlike most other teleports -- the whole point of an
+# escape item used only when a PKer is already in attack range.
+ROYAL_SEED_POD_NAME = "royal seed pod"
+
 WALK_HOP_MIN_TILES = 10      # never aim a hop shorter than this
 WALK_HOP_MAX_TILES = 16      # ...or longer than this, to stay safely within minimap range
 WALK_ARRIVAL_TOLERANCE = 3   # tiles; close enough to call a hop, or the whole trip, arrived
@@ -69,6 +75,28 @@ def teleport_to_ferox(ctx) -> bool:
 
     print("[travel] teleporting to Ferox Enclave")
     if not controller.click_entity(ctx.ser, ring):
+        return False
+
+    time.sleep(random.uniform(3.0, 3.6))  # teleport animation + loading transition
+    return True
+
+
+def flee_royal_seed_pod(ctx) -> bool:
+    """Emergency wilderness escape: use the royal seed pod. A plain
+    left-click resolves through whatever menu option the pod actually uses
+    (recalled as "Rub", not re-verified) -- add that option to Controller
+    Settings -> Clicking -> Forced Actions if a plain click doesn't already
+    resolve to it, same as Ferox Enclave above."""
+    pod = next(
+        (i for i in controller.get_inventory() if ROYAL_SEED_POD_NAME in (i.get("name") or "").lower()),
+        None,
+    )
+    if pod is None:
+        print("[travel] no royal seed pod in inventory -- cannot flee!")
+        return False
+
+    print("[travel] PvP threat detected -- using royal seed pod to escape")
+    if not controller.click_entity(ctx.ser, pod):
         return False
 
     time.sleep(random.uniform(3.0, 3.6))  # teleport animation + loading transition
@@ -141,7 +169,15 @@ def _walk_along_path(ctx, steps: list, target: dict) -> bool:
     """Walk a computed route by repeatedly aiming a random number of tiles
     ahead along it (not straight-line toward the final target) and clicking
     via the minimap, same hop-and-click trick as _walk_greedy but following
-    an actual obstacle-aware route instead of a straight line."""
+    an actual obstacle-aware route instead of a straight line.
+
+    Some steps carry a "transport" (see ShortestPathProvider.describeTransport
+    -- a door, gate, staircase, ladder, cave entrance, or an NPC that ferries
+    you, e.g. a boat captain): minimap-clicking past those doesn't work, since
+    the tile on the far side often isn't reachable by ordinary walking at all
+    (a different floor, a boat's deck, a cave's own coordinate space). When
+    the next transport is within the upcoming hop, this walks right up to it
+    instead of hopping past it, then hands off to _use_transport."""
     index = 0
 
     for _ in range(WALK_MAX_HOPS):
@@ -153,13 +189,113 @@ def _walk_along_path(ctx, steps: list, target: dict) -> bool:
         if _within_tolerance(px, py, target["x"], target["y"]):
             return True
 
-        index = min(index + random.randint(WALK_HOP_MIN_TILES, WALK_HOP_MAX_TILES), len(steps) - 1)
-        waypoint = steps[index]
+        hop_index = min(index + random.randint(WALK_HOP_MIN_TILES, WALK_HOP_MAX_TILES), len(steps) - 1)
+        transport_index = _find_next_transport_index(steps, index)
 
+        if transport_index is not None and transport_index <= hop_index:
+            origin_index = transport_index - 1
+            if origin_index > index:
+                origin = steps[origin_index]
+                if not _hop_to(ctx, origin["x"], origin["y"], origin["plane"]):
+                    return False
+
+            waypoint = steps[transport_index]
+            if not _use_transport(ctx, waypoint["transport"], waypoint):
+                print("[travel] couldn't use the transport automatically -- trying to walk through it anyway")
+                if not _hop_to(ctx, waypoint["x"], waypoint["y"], waypoint["plane"]):
+                    return False
+
+            index = transport_index
+            continue
+
+        waypoint = steps[hop_index]
         if not _hop_to(ctx, waypoint["x"], waypoint["y"], waypoint["plane"]):
             return False
+        index = hop_index
 
     return False
+
+
+def _find_next_transport_index(steps: list, from_index: int):
+    """Index of the next step carrying transport info after from_index, or
+    None if the rest of the route is ordinary walking."""
+    for i in range(from_index + 1, len(steps)):
+        if steps[i].get("transport"):
+            return i
+    return None
+
+
+TRANSPORT_INTERACT_TIMEOUT_S = 8.0
+
+
+def _use_transport(ctx, transport: dict, waypoint: dict) -> bool:
+    """Interact with a transport edge instead of trying to walk through it.
+
+    Only handles the "menu option on a specific object or NPC" case
+    (transport["objectId"]/["objectName"] present, from ShortestPathProvider
+    parsing e.g. "Open Door 9398" or "Travel Holgart 7789") -- transports
+    that instead rely on an inventory item, a spell, or a UI (fairy ring
+    codes, spirit trees, minecarts, teleport tablets) aren't covered here and
+    this returns False for those so the caller falls back to a plain walk
+    attempt. The same object/NPC name+id can belong to either a game object
+    or an NPC (boat "captains" use this exact same tsv column), so both are
+    tried."""
+    object_id = transport.get("objectId")
+    name = transport.get("objectName")
+    option = transport.get("objectOption")
+    if object_id is None or not name:
+        print(f"[travel] transport '{transport.get('displayInfo') or transport.get('type')}' "
+              f"has no object/NPC info -- can't auto-use it yet (item/spell/UI-based transports "
+              f"aren't handled)")
+        return False
+
+    entity = _find_transport_object(object_id) or _find_transport_npc(name)
+    if entity is None:
+        print(f"[travel] couldn't find '{option} {name}' ({transport.get('type')}) nearby")
+        return False
+
+    print(f"[travel] using transport: {option} {name} ({transport.get('type')})")
+    if not controller.click_entity(ctx.ser, entity):
+        return False
+
+    # transport["duration"] is in game ticks (0.6s each) per transports.tsv; add slack for
+    # loading transitions (floor changes, boat departures) that a fixed tick count won't cover.
+    time.sleep(max(transport.get("duration", 1), 1) * 0.6 + random.uniform(0.8, 1.4))
+
+    waited = 0.0
+    while waited < TRANSPORT_INTERACT_TIMEOUT_S:
+        player = controller.get_player()
+        px, py, plane = player.get("x"), player.get("y"), player.get("plane")
+        if px is not None and plane == waypoint["plane"] and _within_tolerance(px, py, waypoint["x"], waypoint["y"]):
+            return True
+        time.sleep(0.6)
+        waited += 0.6
+
+    print("[travel] used the transport but didn't arrive where expected -- continuing from wherever we ended up")
+    return True
+
+
+def _find_transport_object(object_id: int):
+    candidates = [
+        o for o in controller.get_objects()
+        if o.get("id") == object_id and o.get("clickable")
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda o: o.get("distance", 9999))
+    return candidates[0]
+
+
+def _find_transport_npc(name: str):
+    name_lower = name.lower()
+    candidates = [
+        n for n in controller.get_npcs()
+        if name_lower in (n.get("name") or "").lower() and n.get("screenX") is not None
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda n: n.get("distance", 9999))
+    return candidates[0]
 
 
 def _walk_greedy(ctx, target: dict) -> bool:
