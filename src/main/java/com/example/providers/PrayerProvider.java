@@ -48,9 +48,9 @@ public class PrayerProvider extends BridgeProvider
 		if (orb != null && !orb.isHidden())
 		{
 			Rectangle bounds = orb.getBounds();
-			Point canvasLoc = RuneLiteUtil.getCanvasScreenLocation(client);
-			data.put("quickOrbScreenX", (int) bounds.getCenterX() + canvasLoc.x);
-			data.put("quickOrbScreenY", (int) bounds.getCenterY() + canvasLoc.y);
+			Point screen = RuneLiteUtil.canvasToScreen(client, (int) bounds.getCenterX(), (int) bounds.getCenterY());
+			data.put("quickOrbScreenX", screen.x);
+			data.put("quickOrbScreenY", screen.y);
 		}
 
 		return data;

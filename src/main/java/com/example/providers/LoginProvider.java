@@ -81,9 +81,10 @@ public class LoginProvider extends BridgeProvider
 			Rectangle bounds = clickToPlay.getBounds();
 			if (bounds != null)
 			{
+				Point screen = RuneLiteUtil.canvasToScreen(client, (int) bounds.getCenterX(), (int) bounds.getCenterY());
 				Map<String, Object> button = new HashMap<>();
-				button.put("screenX", (int) bounds.getCenterX() + canvasScreenLoc.x);
-				button.put("screenY", (int) bounds.getCenterY() + canvasScreenLoc.y);
+				button.put("screenX", screen.x);
+				button.put("screenY", screen.y);
 				data.put("clickToPlay", button);
 			}
 		}

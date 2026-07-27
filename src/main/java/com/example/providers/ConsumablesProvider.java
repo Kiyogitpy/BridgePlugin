@@ -43,7 +43,6 @@ public class ConsumablesProvider extends BridgeProvider
 		}
 
 		Widget invWidget = client.getWidget(WidgetInfo.INVENTORY);
-		Point canvasScreenLoc = com.example.util.RuneLiteUtil.getCanvasScreenLocation(client);
 		Item[] items = inv.getItems();
 
 		for (int i = 0; i < items.length; i++)
@@ -69,7 +68,7 @@ public class ConsumablesProvider extends BridgeProvider
 				entry.put("name", name);
 				entry.put("heal", FoodUtil.getHealAmount(name));
 				entry.put("qty", item.getQuantity());
-				addScreenCoords(entry, invWidget, i, canvasScreenLoc);
+				addScreenCoords(entry, invWidget, i);
 				food.add(entry);
 			}
 			else if (FoodUtil.isPrayerPotion(name))
@@ -79,7 +78,7 @@ public class ConsumablesProvider extends BridgeProvider
 				entry.put("id", item.getId());
 				entry.put("name", name);
 				entry.put("qty", item.getQuantity());
-				addScreenCoords(entry, invWidget, i, canvasScreenLoc);
+				addScreenCoords(entry, invWidget, i);
 				prayer.add(entry);
 			}
 		}
@@ -103,7 +102,7 @@ public class ConsumablesProvider extends BridgeProvider
 		return data;
 	}
 
-	private void addScreenCoords(Map<String, Object> entry, Widget invWidget, int slot, Point canvasScreenLoc)
+	private void addScreenCoords(Map<String, Object> entry, Widget invWidget, int slot)
 	{
 		if (invWidget == null)
 		{
@@ -114,8 +113,9 @@ public class ConsumablesProvider extends BridgeProvider
 		if (slotWidget != null)
 		{
 			Rectangle bounds = slotWidget.getBounds();
-			entry.put("screenX", (int) bounds.getCenterX() + canvasScreenLoc.x);
-			entry.put("screenY", (int) bounds.getCenterY() + canvasScreenLoc.y);
+			Point screen = com.example.util.RuneLiteUtil.canvasToScreen(client, (int) bounds.getCenterX(), (int) bounds.getCenterY());
+			entry.put("screenX", screen.x);
+			entry.put("screenY", screen.y);
 		}
 	}
 }

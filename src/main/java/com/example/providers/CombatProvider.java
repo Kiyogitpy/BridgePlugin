@@ -120,10 +120,10 @@ public class CombatProvider extends BridgeProvider
 				return data;
 			}
 
-			Point canvasLoc = RuneLiteUtil.getCanvasScreenLocation(client);
+			Point screen = RuneLiteUtil.canvasToScreen(client, point.getX(), point.getY());
 			data.put("onMinimap", true);
-			data.put("screenX", point.getX() + canvasLoc.x);
-			data.put("screenY", point.getY() + canvasLoc.y);
+			data.put("screenX", screen.x);
+			data.put("screenY", screen.y);
 		}
 		catch (Exception ignored)
 		{

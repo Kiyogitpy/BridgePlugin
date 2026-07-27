@@ -36,7 +36,6 @@ public class ObjectProvider extends BridgeProvider
 
 		Tile[][][] tiles = scene.getTiles();
 		int plane = client.getPlane();
-		Point canvasScreenLoc = RuneLiteUtil.getCanvasScreenLocation(client);
 
 		for (int x = 0; x < tiles[plane].length; x++)
 		{
@@ -52,7 +51,7 @@ public class ObjectProvider extends BridgeProvider
 				{
 					if (obj != null)
 					{
-						list.add(buildObjectData(obj, "GameObject", plane, canvasScreenLoc));
+						list.add(buildObjectData(obj, "GameObject", plane));
 					}
 				}
 
@@ -62,26 +61,26 @@ public class ObjectProvider extends BridgeProvider
 				WallObject wallObj = tile.getWallObject();
 				if (wallObj != null)
 				{
-					list.add(buildObjectData(wallObj, "WallObject", plane, canvasScreenLoc));
+					list.add(buildObjectData(wallObj, "WallObject", plane));
 				}
 
 				GroundObject groundObj = tile.getGroundObject();
 				if (groundObj != null)
 				{
-					list.add(buildObjectData(groundObj, "GroundObject", plane, canvasScreenLoc));
+					list.add(buildObjectData(groundObj, "GroundObject", plane));
 				}
 
 				DecorativeObject decorativeObj = tile.getDecorativeObject();
 				if (decorativeObj != null)
 				{
-					list.add(buildObjectData(decorativeObj, "DecorativeObject", plane, canvasScreenLoc));
+					list.add(buildObjectData(decorativeObj, "DecorativeObject", plane));
 				}
 			}
 		}
 		return list;
 	}
 
-	private Map<String, Object> buildObjectData(TileObject obj, String objectType, int plane, Point canvasScreenLoc)
+	private Map<String, Object> buildObjectData(TileObject obj, String objectType, int plane)
 	{
 		Map<String, Object> data = new HashMap<>();
 		WorldPoint wp = WorldPoint.fromLocal(client, obj.getLocalLocation());
@@ -97,8 +96,9 @@ public class ObjectProvider extends BridgeProvider
 		net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, obj.getLocalLocation(), plane);
 		if (point != null)
 		{
-			data.put("screenX", point.getX() + canvasScreenLoc.x);
-			data.put("screenY", point.getY() + canvasScreenLoc.y);
+			Point screen = RuneLiteUtil.canvasToScreen(client, point.getX(), point.getY());
+			data.put("screenX", screen.x);
+			data.put("screenY", screen.y);
 		}
 
 		data.put("distance", RuneLiteUtil.distanceToPlayer(client, wp));

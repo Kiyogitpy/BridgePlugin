@@ -120,8 +120,6 @@ public class PvpProvider extends BridgeProvider
 			return list;
 		}
 
-		Point canvasScreenLoc = RuneLiteUtil.getCanvasScreenLocation(client);
-
 		for (Player player : client.getPlayers())
 		{
 			if (player == null || player == local || player.getName() == null)
@@ -171,8 +169,9 @@ public class PvpProvider extends BridgeProvider
 			net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, player.getLocalLocation(), wp.getPlane());
 			if (point != null)
 			{
-				data.put("screenX", point.getX() + canvasScreenLoc.x);
-				data.put("screenY", point.getY() + canvasScreenLoc.y);
+				Point screen = RuneLiteUtil.canvasToScreen(client, point.getX(), point.getY());
+				data.put("screenX", screen.x);
+				data.put("screenY", screen.y);
 			}
 
 			list.add(data);

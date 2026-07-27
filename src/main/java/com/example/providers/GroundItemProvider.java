@@ -40,7 +40,6 @@ public class GroundItemProvider extends BridgeProvider
 
 		Tile[][][] tiles = scene.getTiles();
 		int plane = client.getPlane();
-		Point canvasScreenLoc = RuneLiteUtil.getCanvasScreenLocation(client);
 
 		for (int x = 0; x < tiles[plane].length; x++)
 		{
@@ -85,8 +84,9 @@ public class GroundItemProvider extends BridgeProvider
 					net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, tile.getLocalLocation(), plane);
 					if (point != null)
 					{
-						data.put("screenX", point.getX() + canvasScreenLoc.x);
-						data.put("screenY", point.getY() + canvasScreenLoc.y);
+						Point screen = RuneLiteUtil.canvasToScreen(client, point.getX(), point.getY());
+						data.put("screenX", screen.x);
+						data.put("screenY", screen.y);
 					}
 
 					data.put("distance", RuneLiteUtil.distanceToPlayer(client, wp));

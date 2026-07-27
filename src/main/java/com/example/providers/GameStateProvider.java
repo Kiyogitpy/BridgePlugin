@@ -60,10 +60,12 @@ public class GameStateProvider extends BridgeProvider
 		if (minimapDrawArea != null && !minimapDrawArea.isHidden())
 		{
 			Rectangle bounds = minimapDrawArea.getBounds();
-			data.put("minimapX", bounds.x + canvasScreenLoc.x);
-			data.put("minimapY", bounds.y + canvasScreenLoc.y);
-			data.put("minimapWidth", bounds.width);
-			data.put("minimapHeight", bounds.height);
+			double[] scale = com.example.util.RuneLiteUtil.getStretchScale(client);
+			Point minimapScreen = com.example.util.RuneLiteUtil.canvasToScreen(client, bounds.x, bounds.y);
+			data.put("minimapX", minimapScreen.x);
+			data.put("minimapY", minimapScreen.y);
+			data.put("minimapWidth", (int) Math.round(bounds.width * scale[0]));
+			data.put("minimapHeight", (int) Math.round(bounds.height * scale[1]));
 		}
 
 		data.put("viewportWidth", client.getViewportWidth());

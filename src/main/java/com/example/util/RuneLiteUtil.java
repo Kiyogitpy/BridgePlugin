@@ -8,6 +8,7 @@ import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 
 import java.awt.Canvas;
+import java.awt.Dimension;
 import java.awt.Point;import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -67,15 +68,52 @@ public final class RuneLiteUtil
 		return Perspective.localToCanvas(client, local, plane);
 	}
 
+	/**
+	 * Ratio between the canvas's actual on-screen pixel size and the game's internal render
+	 * resolution. Widget bounds and Perspective's screen projections are always computed in
+	 * that internal resolution, so in stretched mode (canvas resized without the game engine
+	 * re-rendering at that size) a raw canvas-space coordinate lands in the wrong place unless
+	 * scaled back up by this ratio first. 1:1 whenever stretched mode is off.
+	 */
+	public static double[] getStretchScale(Client client)
+	{
+		if (!client.isStretchedEnabled())
+		{
+			return new double[]{1.0, 1.0};
+		}
+
+		Dimension real = client.getRealDimensions();
+		Dimension stretched = client.getStretchedDimensions();
+		if (real == null || stretched == null || real.width <= 0 || real.height <= 0)
+		{
+			return new double[]{1.0, 1.0};
+		}
+
+		return new double[]{(double) stretched.width / real.width, (double) stretched.height / real.height};
+	}
+
+	/**
+	 * Converts a canvas-space coordinate (as returned by Perspective/Widget.getBounds()) into
+	 * an absolute on-screen point, accounting for stretched-mode scaling.
+	 */
+	public static Point canvasToScreen(Client client, int canvasX, int canvasY)
+	{
+		double[] scale = getStretchScale(client);
+		Point canvasLoc = getCanvasScreenLocation(client);
+		int x = canvasLoc.x + (int) Math.round(canvasX * scale[0]);
+		int y = canvasLoc.y + (int) Math.round(canvasY * scale[1]);
+		return new Point(x, y);
+	}
+
 	public static Map<String, Object> screenCoords(Client client, LocalPoint local, int plane)
 	{
 		Map<String, Object> coords = new HashMap<>();
 		net.runelite.api.Point point = localToScreen(client, local, plane);
 		if (point != null)
 		{
-			Point canvasLoc = getCanvasScreenLocation(client);
-			coords.put("screenX", point.getX() + canvasLoc.x);
-			coords.put("screenY", point.getY() + canvasLoc.y);
+			Point screen = canvasToScreen(client, point.getX(), point.getY());
+			coords.put("screenX", screen.x);
+			coords.put("screenY", screen.y);
 		}
 		return coords;
 	}

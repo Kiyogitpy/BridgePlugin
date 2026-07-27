@@ -41,7 +41,6 @@ public class InventoryProvider extends BridgeProvider
 			return list;
 		}
 
-		Point canvasScreenLoc = RuneLiteUtil.getCanvasScreenLocation(client);
 		int equippedAmmoId = getEquippedAmmoId();
 
 		Item[] items = inv.getItems();
@@ -53,7 +52,7 @@ public class InventoryProvider extends BridgeProvider
 				continue;
 			}
 
-			Map<String, Object> data = buildSlotData(i, item, invWidget, canvasScreenLoc);
+			Map<String, Object> data = buildSlotData(i, item, invWidget);
 			if (item.getId() == equippedAmmoId)
 			{
 				data.put("equippedAmmo", true);
@@ -111,7 +110,6 @@ public class InventoryProvider extends BridgeProvider
 			return notFound;
 		}
 
-		Point canvasScreenLoc = RuneLiteUtil.getCanvasScreenLocation(client);
 		Item[] items = inv.getItems();
 
 		for (int i = 0; i < items.length; i++)
@@ -122,7 +120,7 @@ public class InventoryProvider extends BridgeProvider
 				continue;
 			}
 
-			Map<String, Object> result = buildSlotData(i, item, invWidget, canvasScreenLoc);
+			Map<String, Object> result = buildSlotData(i, item, invWidget);
 			result.put("exists", true);
 			return result;
 		}
@@ -130,7 +128,7 @@ public class InventoryProvider extends BridgeProvider
 		return notFound;
 	}
 
-	private Map<String, Object> buildSlotData(int slot, Item item, Widget invWidget, Point canvasScreenLoc)
+	private Map<String, Object> buildSlotData(int slot, Item item, Widget invWidget)
 	{
 		Map<String, Object> data = new HashMap<>();
 		data.put("slot", slot);
@@ -147,8 +145,9 @@ public class InventoryProvider extends BridgeProvider
 		if (slotWidget != null)
 		{
 			Rectangle bounds = slotWidget.getBounds();
-			data.put("screenX", (int) bounds.getCenterX() + canvasScreenLoc.x);
-			data.put("screenY", (int) bounds.getCenterY() + canvasScreenLoc.y);
+			Point screen = RuneLiteUtil.canvasToScreen(client, (int) bounds.getCenterX(), (int) bounds.getCenterY());
+			data.put("screenX", screen.x);
+			data.put("screenY", screen.y);
 		}
 		return data;
 	}
