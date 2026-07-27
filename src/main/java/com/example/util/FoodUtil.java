@@ -16,11 +16,9 @@ public final class FoodUtil
 
 	static
 	{
-		// TODO verify these exact heal amounts in-game/wiki -- recalled, not confirmed.
-		HEAL_BY_NAME.put("blighted manta ray", 8);
-		HEAL_BY_NAME.put("blighted anglerfish", 8);
-		HEAL_BY_NAME.put("blighted karambwan", 8);
-
+		HEAL_BY_NAME.put("blighted karambwan", 10);
+		HEAL_BY_NAME.put("blighted manta ray", 22);
+		HEAL_BY_NAME.put("blighted anglerfish", 22);
 		HEAL_BY_NAME.put("shark", 20);
 		HEAL_BY_NAME.put("manta ray", 22);
 		HEAL_BY_NAME.put("dark crab", 22);
