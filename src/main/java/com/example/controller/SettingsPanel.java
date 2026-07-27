@@ -132,6 +132,9 @@ public class SettingsPanel extends PluginPanel
 		JScrollPane bodyScroll = new JScrollPane(body);
 		bodyScroll.setBorder(BorderFactory.createEmptyBorder());
 		bodyScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+		// Scrollbar hidden entirely (mouse wheel still scrolls fine) -- a visible one was both an
+		// eyesore and ate into the sidebar's already-narrow width, clipping text near the right edge.
+		bodyScroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER);
 		bodyScroll.getVerticalScrollBar().setUnitIncrement(16);
 		add(bodyScroll, BorderLayout.CENTER);
 
@@ -190,6 +193,7 @@ public class SettingsPanel extends PluginPanel
 		resultsScroll.setPreferredSize(new Dimension(0, 220));
 		resultsScroll.setBorder(BorderFactory.createLineBorder(ColorScheme.MEDIUM_GRAY_COLOR));
 		resultsScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+		resultsScroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER);
 		section.add(resultsScroll, BorderLayout.SOUTH);
 
 		JLabel resultsHint = new JLabel("<html>Double-click a task to add all its monsters,<br>or a monster to add just that one</html>");
@@ -231,6 +235,7 @@ public class SettingsPanel extends PluginPanel
 		selectedScroll.setPreferredSize(new Dimension(0, 160));
 		selectedScroll.setBorder(BorderFactory.createLineBorder(ColorScheme.MEDIUM_GRAY_COLOR));
 		selectedScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+		selectedScroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER);
 		section.add(selectedScroll, BorderLayout.CENTER);
 
 		JLabel hint = new JLabel("<html>Click × to remove. A location dropdown appears<br>for tasks with more than one known spot.</html>");
@@ -277,7 +282,7 @@ public class SettingsPanel extends PluginPanel
 		scroll.setPreferredSize(new Dimension(0, 200));
 		scroll.setBorder(BorderFactory.createLineBorder(ColorScheme.MEDIUM_GRAY_COLOR));
 		scroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
-		scroll.getVerticalScrollBar().setPreferredSize(new Dimension(8, 0));
+		scroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER);
 		section.add(scroll, BorderLayout.CENTER);
 
 		errorPanel.setContent("Controller Settings", "Walk near monsters and click Refresh to populate this list.");
