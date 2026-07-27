@@ -175,6 +175,42 @@ def empty_looting_bag(ctx) -> bool:
     return True
 
 
+def _click_bank_button(ctx, button_key: str) -> bool:
+    """Click one of the bank's one-shot deposit-all buttons (depositInventory,
+    depositEquipment, depositContainers) if it's currently visible. Standalone
+    helpers, not wired into deposit_inventory()'s own flow above -- that one
+    keeps its existing keepItems-aware, looting-bag-then-deposit-all logic
+    unchanged. These exist so a routine can reach for one directly instead."""
+    bank = controller.get_bank()
+    if not bank.get("open"):
+        return False
+
+    button = bank.get(button_key) or {}
+    if button.get("screenX") is None:
+        return False
+
+    controller.click_entity(ctx.ser, button, offset=(0, 0))
+    time.sleep(random.uniform(0.3, 0.6))
+    return True
+
+
+def deposit_all_inventory(ctx) -> bool:
+    return _click_bank_button(ctx, "depositInventory")
+
+
+def deposit_all_worn(ctx) -> bool:
+    return _click_bank_button(ctx, "depositEquipment")
+
+
+def deposit_all_containers(ctx) -> bool:
+    """Deposits the contents of every gatherer-bag/container in inventory at
+    once -- looting bag, herb sack, seed box, gem bag, coal bag, etc. -- via
+    the bank's own dedicated button, in a single click, without needing the
+    bag's own Fill/Empty forced-action (and its documented ambiguity caveat
+    on fill_looting_bag/empty_looting_bag above) at all."""
+    return _click_bank_button(ctx, "depositContainers")
+
+
 def deposit_inventory(ctx, config: dict) -> None:
     keep = {n.lower() for n in config.get("keepItems", [])}
 

@@ -64,6 +64,18 @@ def save_location():
     return {"x": x, "y": y, "plane": plane}
 
 
+def task_location(config: dict, category: str):
+    """Wilderness spawn location for a Krystilia slayer task category (see
+    SlayerLocations.java on the Java side), as chosen via the Controller
+    Settings sidebar's per-target location dropdown when a category has more
+    than one known spot -- or None if this category has no location data at
+    all. Shape: {"x", "y", "plane", "wildernessLevel", "note", "optionCount"}.
+    `category` is the task category name (e.g. "Ice giants"), not a specific
+    monster name -- see SlayerMonsters.TASKS on the Java side for that
+    mapping if you only have a monster name on hand."""
+    return (config.get("taskLocations") or {}).get(category)
+
+
 def teleport_to_ferox(ctx) -> bool:
     ring = next(
         (i for i in controller.get_inventory() if RING_OF_DUELING_NAME in (i.get("name") or "").lower()),

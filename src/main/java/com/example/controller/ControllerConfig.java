@@ -41,6 +41,9 @@ public interface ControllerConfig extends Config
 	@ConfigSection(name = "PvP Safety", description = "Wilderness flee-on-threat behavior", position = 9)
 	String pvpSafetySection = "pvpSafety";
 
+	@ConfigSection(name = "Travel", description = "Chosen location for slayer task categories with more than one known spot", position = 10)
+	String travelSection = "travel";
+
 	// --- General ---
 
 	@ConfigItem(
@@ -606,5 +609,19 @@ public interface ControllerConfig extends Config
 	default boolean pvpFleeEnabled()
 	{
 		return false;
+	}
+
+	// --- Travel ---
+
+	@ConfigItem(
+		keyName = "taskLocationChoices",
+		name = "Task Location Choices",
+		description = "Managed by the Controller Settings sidebar panel -- which location was picked for each slayer task category that has more than one known spot (e.g. Ice giants: cave vs. Frozen Waste Plateau). Format: \"Category=index;Category2=index\".",
+		section = travelSection,
+		position = 0
+	)
+	default String taskLocationChoices()
+	{
+		return "";
 	}
 }

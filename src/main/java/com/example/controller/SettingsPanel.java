@@ -42,8 +42,11 @@ public class SettingsPanel extends PluginPanel
 	private final DefaultListModel<ResultRow> searchResultsModel = new DefaultListModel<>();
 	private final JList<ResultRow> searchResultsList = new JList<>(searchResultsModel);
 
-	private final DefaultListModel<String> selectedListModel = new DefaultListModel<>();
-	private final JList<String> selectedList = new JList<>(selectedListModel);
+	private final JPanel selectedTargetsPanel = new JPanel();
+
+	// Chosen location index per task category, for categories with more than one known spot
+	// (see SlayerLocations.java) -- persisted to the "taskLocationChoices" config key.
+	private final Map<String, Integer> categoryLocationChoice = new LinkedHashMap<>();
 
 	@Inject
 	SettingsPanel(Client client, ClientThread clientThread, ConfigManager configManager, ControllerConfig config)
@@ -54,6 +57,7 @@ public class SettingsPanel extends PluginPanel
 		this.config = config;
 
 		selectedTargets.addAll(ConfigExporter.parseList(config.targetNpcNames()));
+		categoryLocationChoice.putAll(ConfigExporter.parseLocationChoices(config.taskLocationChoices()));
 
 		setLayout(new BorderLayout());
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -64,15 +68,18 @@ public class SettingsPanel extends PluginPanel
 		header.setBackground(ColorScheme.DARK_GRAY_COLOR);
 
 		JLabel title = new JLabel("Controller Settings");
+		title.setForeground(Color.WHITE);
 		title.setFont(title.getFont().deriveFont(Font.BOLD, 16f));
 		title.setAlignmentX(Component.LEFT_ALIGNMENT);
 		header.add(title);
 
 		JLabel hint = new JLabel("<html>Search any slayer task monster, pick from nearby monsters, or both.<br>Settings are exposed at <b>/config</b>.</html>");
+		hint.setForeground(Color.WHITE);
 		hint.setBorder(new EmptyBorder(6, 0, 8, 0));
 		hint.setAlignmentX(Component.LEFT_ALIGNMENT);
 		header.add(hint);
 
+		statusLabel.setForeground(Color.WHITE);
 		statusLabel.setBorder(new EmptyBorder(4, 0, 4, 0));
 		statusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
 		header.add(statusLabel);
@@ -118,9 +125,9 @@ public class SettingsPanel extends PluginPanel
 		body.setLayout(new BoxLayout(body, BoxLayout.Y_AXIS));
 		body.setBackground(ColorScheme.DARK_GRAY_COLOR);
 
-		body.add(buildSearchSection());
-		body.add(buildSelectedSection());
-		body.add(buildNearbySection());
+		body.add(collapsibleSection("Add Slayer Task Monster", buildSearchSection(), true));
+		body.add(collapsibleSection("Selected Targets", buildSelectedSection(), true));
+		body.add(collapsibleSection("Monsters In Current Area", buildNearbySection(), true));
 
 		JScrollPane bodyScroll = new JScrollPane(body);
 		bodyScroll.setBorder(BorderFactory.createEmptyBorder());
@@ -129,7 +136,7 @@ public class SettingsPanel extends PluginPanel
 		add(bodyScroll, BorderLayout.CENTER);
 
 		refreshSearchResults();
-		refreshSelectedListModel();
+		refreshSelectedTargetsPanel();
 		refreshNpcList();
 	}
 
@@ -139,9 +146,6 @@ public class SettingsPanel extends PluginPanel
 		section.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		section.setBorder(new EmptyBorder(0, 0, 8, 0));
 		section.setAlignmentX(Component.LEFT_ALIGNMENT);
-
-		JLabel label = sectionLabel("Add Slayer Task Monster");
-		section.add(label, BorderLayout.NORTH);
 
 		JPanel fieldWrap = new JPanel(new BorderLayout());
 		fieldWrap.setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -208,14 +212,6 @@ public class SettingsPanel extends PluginPanel
 		section.setBorder(new EmptyBorder(0, 0, 8, 0));
 		section.setAlignmentX(Component.LEFT_ALIGNMENT);
 
-		JPanel labelRow = new JPanel();
-		labelRow.setLayout(new BoxLayout(labelRow, BoxLayout.Y_AXIS));
-		labelRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
-
-		JLabel selectedLabel = sectionLabel("Selected Targets");
-		selectedLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		labelRow.add(selectedLabel);
-
 		JPanel clearRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
 		clearRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		clearRow.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -226,31 +222,18 @@ public class SettingsPanel extends PluginPanel
 			persistSelections();
 		});
 		clearRow.add(clearBtn);
-		labelRow.add(clearRow);
-		section.add(labelRow, BorderLayout.NORTH);
+		section.add(clearRow, BorderLayout.NORTH);
 
-		selectedList.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		selectedList.setForeground(Color.WHITE);
-		selectedList.setSelectionBackground(ColorScheme.MEDIUM_GRAY_COLOR);
-		selectedList.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseClicked(MouseEvent e)
-			{
-				if (e.getClickCount() == 2)
-				{
-					removeSelected(selectedList.getSelectedValue());
-				}
-			}
-		});
+		selectedTargetsPanel.setLayout(new BoxLayout(selectedTargetsPanel, BoxLayout.Y_AXIS));
+		selectedTargetsPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
 
-		JScrollPane selectedScroll = new JScrollPane(selectedList);
-		selectedScroll.setPreferredSize(new Dimension(0, 120));
+		JScrollPane selectedScroll = new JScrollPane(selectedTargetsPanel);
+		selectedScroll.setPreferredSize(new Dimension(0, 160));
 		selectedScroll.setBorder(BorderFactory.createLineBorder(ColorScheme.MEDIUM_GRAY_COLOR));
 		selectedScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
 		section.add(selectedScroll, BorderLayout.CENTER);
 
-		JLabel hint = new JLabel("Double-click to remove");
+		JLabel hint = new JLabel("<html>Click × to remove. A location dropdown appears<br>for tasks with more than one known spot.</html>");
 		hint.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
 		hint.setFont(hint.getFont().deriveFont(11f));
 
@@ -269,18 +252,6 @@ public class SettingsPanel extends PluginPanel
 		section.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		section.setAlignmentX(Component.LEFT_ALIGNMENT);
 
-		JPanel labelRow = new JPanel();
-		labelRow.setLayout(new BoxLayout(labelRow, BoxLayout.Y_AXIS));
-		labelRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
-
-		JLabel nearbyLabel = sectionLabel("Monsters In Current Area");
-		nearbyLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		labelRow.add(nearbyLabel);
-
-		// A single BorderLayout row (label WEST, buttons EAST) doesn't fit this sidebar's width
-		// -- WEST/EAST don't wrap, so the buttons (including Refresh) were being clipped off
-		// entirely. Stacking the buttons on their own line below the label instead guarantees
-		// they always have room.
 		JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
 		buttons.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -297,8 +268,7 @@ public class SettingsPanel extends PluginPanel
 		clearBtn.addActionListener(e -> setAllNearbySelected(false));
 		buttons.add(clearBtn);
 
-		labelRow.add(buttons);
-		section.add(labelRow, BorderLayout.NORTH);
+		section.add(buttons, BorderLayout.NORTH);
 
 		npcListPanel.setLayout(new BoxLayout(npcListPanel, BoxLayout.Y_AXIS));
 		npcListPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
@@ -314,6 +284,48 @@ public class SettingsPanel extends PluginPanel
 		section.add(errorPanel, BorderLayout.SOUTH);
 
 		return section;
+	}
+
+	/** Wraps `content` behind a clickable header showing `title` and a collapse arrow -- click
+	 * the header to show/hide the section, so a narrow sidebar with several stacked sections
+	 * doesn't force constant scrolling once you only care about one or two of them. */
+	private JPanel collapsibleSection(String title, JComponent content, boolean initiallyExpanded)
+	{
+		JPanel wrapper = new JPanel(new BorderLayout());
+		wrapper.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		wrapper.setAlignmentX(Component.LEFT_ALIGNMENT);
+		wrapper.setBorder(new EmptyBorder(0, 0, 8, 0));
+
+		JLabel arrow = new JLabel(initiallyExpanded ? "▼" : "▶");
+		arrow.setForeground(Color.WHITE);
+		arrow.setBorder(new EmptyBorder(0, 0, 0, 4));
+
+		JLabel titleLabel = sectionLabel(title);
+
+		JPanel header = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 2));
+		header.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		header.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+		header.add(arrow);
+		header.add(titleLabel);
+
+		content.setVisible(initiallyExpanded);
+
+		header.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseClicked(MouseEvent e)
+			{
+				boolean nowExpanded = !content.isVisible();
+				content.setVisible(nowExpanded);
+				arrow.setText(nowExpanded ? "▼" : "▶");
+				wrapper.revalidate();
+				wrapper.repaint();
+			}
+		});
+
+		wrapper.add(header, BorderLayout.NORTH);
+		wrapper.add(content, BorderLayout.CENTER);
+		return wrapper;
 	}
 
 	private JLabel sectionLabel(String text)
@@ -495,19 +507,106 @@ public class SettingsPanel extends PluginPanel
 			entry.getValue().setSelected(selectedTargets.contains(entry.getKey()));
 		}
 
-		refreshSelectedListModel();
+		refreshSelectedTargetsPanel();
 		updateStatusLabel(npcCheckboxes.size());
 	}
 
-	private void refreshSelectedListModel()
+	private void refreshSelectedTargetsPanel()
 	{
-		selectedListModel.clear();
+		selectedTargetsPanel.removeAll();
+
 		List<String> sorted = new ArrayList<>(selectedTargets);
 		sorted.sort(String.CASE_INSENSITIVE_ORDER);
+
 		for (String name : sorted)
 		{
-			selectedListModel.addElement(name);
+			selectedTargetsPanel.add(buildSelectedTargetRow(name));
 		}
+
+		selectedTargetsPanel.revalidate();
+		selectedTargetsPanel.repaint();
+	}
+
+	private JPanel buildSelectedTargetRow(String name)
+	{
+		JPanel row = new JPanel(new BorderLayout(4, 0));
+		row.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		row.setBorder(new EmptyBorder(2, 4, 2, 4));
+		row.setAlignmentX(Component.LEFT_ALIGNMENT);
+		row.setMaximumSize(new Dimension(Integer.MAX_VALUE, row.getPreferredSize().height + 20));
+
+		JLabel nameLabel = new JLabel(name);
+		nameLabel.setForeground(Color.WHITE);
+		row.add(nameLabel, BorderLayout.CENTER);
+
+		JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+		right.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+		String category = categoryForMonster(name);
+		List<SlayerLocations.Location> locations = category == null ? null : SlayerLocations.LOCATIONS.get(category);
+		if (locations != null && locations.size() > 1)
+		{
+			JComboBox<String> locationCombo = new JComboBox<>();
+			for (SlayerLocations.Location loc : locations)
+			{
+				locationCombo.addItem(loc.note);
+			}
+			int chosen = categoryLocationChoice.getOrDefault(category, 0);
+			if (chosen < 0 || chosen >= locations.size())
+			{
+				chosen = 0;
+			}
+			locationCombo.setSelectedIndex(chosen);
+
+			String finalCategory = category;
+			locationCombo.addActionListener(e -> {
+				categoryLocationChoice.put(finalCategory, locationCombo.getSelectedIndex());
+				persistLocationChoices();
+			});
+			right.add(locationCombo);
+		}
+
+		JButton removeBtn = new JButton("×");
+		removeBtn.setMargin(new Insets(0, 4, 0, 4));
+		removeBtn.addActionListener(e -> removeSelected(name));
+		right.add(removeBtn);
+
+		row.add(right, BorderLayout.EAST);
+		return row;
+	}
+
+	/** Which SlayerMonsters.TASKS category (if any) a selected monster name belongs to -- e.g.
+	 * "Lizardman shaman" -> "Lizardmen". Returns null for names not found in that table (e.g.
+	 * something picked from the nearby-monster checkboxes that isn't a known slayer task
+	 * monster), which is fine -- those just don't get a location dropdown. */
+	private String categoryForMonster(String monsterName)
+	{
+		String lower = monsterName.toLowerCase(Locale.ENGLISH);
+		for (Map.Entry<String, List<String>> entry : SlayerMonsters.TASKS.entrySet())
+		{
+			for (String candidate : entry.getValue())
+			{
+				if (candidate.toLowerCase(Locale.ENGLISH).equals(lower))
+				{
+					return entry.getKey();
+				}
+			}
+		}
+		return null;
+	}
+
+	private void persistLocationChoices()
+	{
+		StringBuilder sb = new StringBuilder();
+		for (Map.Entry<String, Integer> entry : categoryLocationChoice.entrySet())
+		{
+			if (sb.length() > 0)
+			{
+				sb.append(";");
+			}
+			sb.append(entry.getKey()).append("=").append(entry.getValue());
+		}
+		configManager.setConfiguration(ControllerConfig.GROUP, "taskLocationChoices", sb.toString());
 	}
 
 	private void updateStatusLabel(int nearbyCount)

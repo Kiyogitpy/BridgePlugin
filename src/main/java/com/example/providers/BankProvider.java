@@ -64,6 +64,11 @@ public class BankProvider extends BridgeProvider
 		data.put("depositInventory", buttonPoint(WidgetInfo.BANK_DEPOSIT_INVENTORY, canvasScreenLoc));
 		data.put("depositEquipment", buttonPoint(WidgetInfo.BANK_DEPOSIT_EQUIPMENT, canvasScreenLoc));
 
+		// Deposits the contents of every gatherer-bag/container in inventory at once (looting
+		// bag, herb sack, seed box, gem bag, coal bag, etc.) -- not in the older WidgetInfo enum,
+		// same as the quantity buttons below, only in the newer InterfaceID constants.
+		data.put("depositContainers", buttonPoint(InterfaceID.Bankmain.DEPOSITCONTAINERS, canvasScreenLoc));
+
 		// The withdraw quantity-mode buttons (1/5/10/X/All) aren't in the older WidgetInfo enum,
 		// only the newer generated InterfaceID constants -- packed group/child ints, same
 		// client.getWidget(int) lookup either way.

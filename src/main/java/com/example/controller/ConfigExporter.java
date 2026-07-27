@@ -86,6 +86,8 @@ public final class ConfigExporter
 		pvpSafety.put("fleeEnabled", config.pvpFleeEnabled());
 		data.put("pvpSafety", pvpSafety);
 
+		data.put("taskLocations", resolveTaskLocations(config));
+
 		data.put("eatAt", config.eatAtHp());
 		data.put("restorePrayerAt", config.restorePrayerAt());
 		data.put("prayerPotion", prayerPotionName);
@@ -104,6 +106,63 @@ public final class ConfigExporter
 		entry.put("name", name.trim());
 		entry.put("quantity", quantity);
 		withdraw.add(entry);
+	}
+
+	/**
+	 * Every slayer task category that has known wilderness location data (see
+	 * SlayerLocations.java), each resolved to a single chosen location -- the one picked via the
+	 * Controller Settings sidebar's per-target dropdown for categories with more than one known
+	 * spot, or index 0 (whatever's first/safest) if nothing's been chosen yet.
+	 */
+	public static Map<String, Object> resolveTaskLocations(ControllerConfig config)
+	{
+		Map<String, Integer> choices = parseLocationChoices(config.taskLocationChoices());
+		Map<String, Object> result = new LinkedHashMap<>();
+
+		for (Map.Entry<String, List<SlayerLocations.Location>> entry : SlayerLocations.LOCATIONS.entrySet())
+		{
+			String category = entry.getKey();
+			List<SlayerLocations.Location> locations = entry.getValue();
+
+			int index = choices.getOrDefault(category, 0);
+			if (index < 0 || index >= locations.size())
+			{
+				index = 0;
+			}
+			SlayerLocations.Location loc = locations.get(index);
+
+			Map<String, Object> locData = new LinkedHashMap<>();
+			locData.put("x", loc.x);
+			locData.put("y", loc.y);
+			locData.put("plane", loc.plane);
+			locData.put("wildernessLevel", loc.wildernessLevel);
+			locData.put("note", loc.note);
+			locData.put("optionCount", locations.size());
+			result.put(category, locData);
+		}
+
+		return result;
+	}
+
+	public static Map<String, Integer> parseLocationChoices(String raw)
+	{
+		Map<String, Integer> choices = new LinkedHashMap<>();
+		for (String part : parseList(raw == null ? null : raw.replace(";", ",")))
+		{
+			int eq = part.indexOf('=');
+			if (eq <= 0)
+			{
+				continue;
+			}
+			try
+			{
+				choices.put(part.substring(0, eq).trim(), Integer.parseInt(part.substring(eq + 1).trim()));
+			}
+			catch (NumberFormatException ignored)
+			{
+			}
+		}
+		return choices;
 	}
 
 	public static List<Integer> resolveTargetIds(Client client, ControllerConfig config)
