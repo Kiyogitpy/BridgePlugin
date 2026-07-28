@@ -150,184 +150,156 @@ public class ControllerPlugin extends Plugin
 		return configManager.getConfig(ControllerConfig.class);
 	}
 
-	// TEMPORARY perf diagnostic (stutter hunt) -- wraps every @Subscribe handler below to print
-	// how long it actually took on the client thread whenever that exceeds SLOW_HANDLER_MILLIS.
-	// Remove this once the cause is found; it's not meant to stay.
-	private static final double SLOW_HANDLER_MILLIS = 4.0;
-
-	private void timed(String label, Runnable body)
-	{
-		long start = System.nanoTime();
-		body.run();
-		double elapsedMs = (System.nanoTime() - start) / 1_000_000.0;
-		if (elapsedMs > SLOW_HANDLER_MILLIS)
-		{
-			System.out.println("[perf] " + label + " took " + elapsedMs + "ms");
-		}
-	}
-
 	@Subscribe
 	public void onMenuOpened(MenuOpened event)
 	{
-		timed("onMenuOpened", () -> MenuPriority.apply(client, config, event));
+		MenuPriority.apply(client, config, event);
 	}
 
 	@Subscribe
 	public void onConfigChanged(ConfigChanged event)
 	{
-		timed("onConfigChanged", () -> {
-			if (!ControllerConfig.GROUP.equals(event.getGroup()))
-			{
-				return;
-			}
+		if (!ControllerConfig.GROUP.equals(event.getGroup()))
+		{
+			return;
+		}
 
-			if (udpSender != null)
-			{
-				udpSender.send("CONFIG_CHANGED");
-			}
+		if (udpSender != null)
+		{
+			udpSender.send("CONFIG_CHANGED");
+		}
 
-			// Keeps the sidebar panel's Controller Enabled/Profile/target selections live with
-			// whatever just changed -- including edits made from the wrench-icon config screen,
-			// which this panel doesn't otherwise hear about.
-			panel.syncFromConfig();
-		});
+		// Keeps the sidebar panel's Controller Enabled/Profile/target selections live with
+		// whatever just changed -- including edits made from the wrench-icon config screen,
+		// which this panel doesn't otherwise hear about.
+		panel.syncFromConfig();
 	}
 
 	@Subscribe
 	public void onGameTick(GameTick event)
 	{
-		timed("onGameTick", () -> {
-			udpSender.send("TICK");
+		udpSender.send("TICK");
 
-			int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
-			if (lastHp >= 0 && hp != lastHp)
+		int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
+		if (lastHp >= 0 && hp != lastHp)
+		{
+			Map<String, Object> payload = new HashMap<>();
+			payload.put("hp", hp);
+			payload.put("maxHp", client.getRealSkillLevel(Skill.HITPOINTS));
+			udpSender.send("HP_CHANGED", payload);
+		}
+		lastHp = hp;
+
+		int prayer = client.getBoostedSkillLevel(Skill.PRAYER);
+		if (lastPrayer >= 0 && prayer != lastPrayer)
+		{
+			Map<String, Object> payload = new HashMap<>();
+			payload.put("prayer", prayer);
+			payload.put("maxPrayer", client.getRealSkillLevel(Skill.PRAYER));
+			udpSender.send("PRAYER_CHANGED", payload);
+		}
+		lastPrayer = prayer;
+
+		Player local = client.getLocalPlayer();
+		if (local != null)
+		{
+			int anim = local.getAnimation();
+			if (lastAnimation >= 0 && anim != lastAnimation)
 			{
 				Map<String, Object> payload = new HashMap<>();
-				payload.put("hp", hp);
-				payload.put("maxHp", client.getRealSkillLevel(Skill.HITPOINTS));
-				udpSender.send("HP_CHANGED", payload);
+				payload.put("animation", anim);
+				udpSender.send("ANIMATION_CHANGED", payload);
 			}
-			lastHp = hp;
+			lastAnimation = anim;
 
-			int prayer = client.getBoostedSkillLevel(Skill.PRAYER);
-			if (lastPrayer >= 0 && prayer != lastPrayer)
+			Actor target = local.getInteracting();
+			String targetKey = target == null ? "" : targetKey(target);
+			if (!targetKey.equals(lastTargetKey))
 			{
 				Map<String, Object> payload = new HashMap<>();
-				payload.put("prayer", prayer);
-				payload.put("maxPrayer", client.getRealSkillLevel(Skill.PRAYER));
-				udpSender.send("PRAYER_CHANGED", payload);
-			}
-			lastPrayer = prayer;
-
-			Player local = client.getLocalPlayer();
-			if (local != null)
-			{
-				int anim = local.getAnimation();
-				if (lastAnimation >= 0 && anim != lastAnimation)
+				payload.put("target", targetKey.isEmpty() ? null : targetKey);
+				if (target instanceof NPC)
 				{
-					Map<String, Object> payload = new HashMap<>();
-					payload.put("animation", anim);
-					udpSender.send("ANIMATION_CHANGED", payload);
+					payload.put("targetId", ((NPC) target).getId());
+					payload.put("targetName", target.getName());
 				}
-				lastAnimation = anim;
-
-				Actor target = local.getInteracting();
-				String targetKey = target == null ? "" : targetKey(target);
-				if (!targetKey.equals(lastTargetKey))
-				{
-					Map<String, Object> payload = new HashMap<>();
-					payload.put("target", targetKey.isEmpty() ? null : targetKey);
-					if (target instanceof NPC)
-					{
-						payload.put("targetId", ((NPC) target).getId());
-						payload.put("targetName", target.getName());
-					}
-					udpSender.send("TARGET_CHANGED", payload);
-					lastTargetKey = targetKey;
-				}
+				udpSender.send("TARGET_CHANGED", payload);
+				lastTargetKey = targetKey;
 			}
-		});
+		}
 	}
 
 	@Subscribe
 	public void onActorDeath(ActorDeath event)
 	{
-		timed("onActorDeath", () -> {
-			Actor actor = event.getActor();
-			if (actor instanceof NPC)
-			{
-				NPC npc = (NPC) actor;
-				Map<String, Object> payload = new HashMap<>();
-				payload.put("id", npc.getId());
-				payload.put("index", npc.getIndex());
-				payload.put("name", npc.getName());
-				udpSender.send("NPC_DIED", payload);
-			}
-			else if (actor instanceof Player && actor == client.getLocalPlayer())
-			{
-				udpSender.send("PLAYER_DIED");
-			}
-		});
+		Actor actor = event.getActor();
+		if (actor instanceof NPC)
+		{
+			NPC npc = (NPC) actor;
+			Map<String, Object> payload = new HashMap<>();
+			payload.put("id", npc.getId());
+			payload.put("index", npc.getIndex());
+			payload.put("name", npc.getName());
+			udpSender.send("NPC_DIED", payload);
+		}
+		else if (actor instanceof Player && actor == client.getLocalPlayer())
+		{
+			udpSender.send("PLAYER_DIED");
+		}
 	}
 
 	@Subscribe
 	public void onStatChanged(StatChanged event)
 	{
-		timed("onStatChanged", () -> {
-			Skill skill = event.getSkill();
-			int realLevel = client.getRealSkillLevel(skill);
-			Integer previous = lastRealLevels.put(skill, realLevel);
+		Skill skill = event.getSkill();
+		int realLevel = client.getRealSkillLevel(skill);
+		Integer previous = lastRealLevels.put(skill, realLevel);
 
-			if (previous == null || realLevel <= previous)
-			{
-				return;
-			}
+		if (previous == null || realLevel <= previous)
+		{
+			return;
+		}
 
-			Map<String, Object> payload = new HashMap<>();
-			payload.put("skill", skill.getName());
-			payload.put("level", realLevel);
-			payload.put("previousLevel", previous);
-			payload.put("xp", client.getSkillExperience(skill));
-			udpSender.send("LEVEL_UP", payload);
-		});
+		Map<String, Object> payload = new HashMap<>();
+		payload.put("skill", skill.getName());
+		payload.put("level", realLevel);
+		payload.put("previousLevel", previous);
+		payload.put("xp", client.getSkillExperience(skill));
+		udpSender.send("LEVEL_UP", payload);
 	}
 
 	@Subscribe
 	public void onItemContainerChanged(ItemContainerChanged event)
 	{
-		timed("onItemContainerChanged", () -> {
-			if (event.getContainerId() != InventoryID.INVENTORY.getId())
-			{
-				return;
-			}
+		if (event.getContainerId() != InventoryID.INVENTORY.getId())
+		{
+			return;
+		}
 
-			ItemContainer container = event.getItemContainer();
-			int hash = inventoryHash(container);
-			if (hash != lastInventoryHash)
-			{
-				lastInventoryHash = hash;
-				udpSender.send("INVENTORY_CHANGED");
-			}
-		});
+		ItemContainer container = event.getItemContainer();
+		int hash = inventoryHash(container);
+		if (hash != lastInventoryHash)
+		{
+			lastInventoryHash = hash;
+			udpSender.send("INVENTORY_CHANGED");
+		}
 	}
 
 	@Subscribe
 	public void onChatMessage(ChatMessage event)
 	{
-		timed("onChatMessage", () -> {
-			if (event.getType() != ChatMessageType.GAMEMESSAGE
-				&& event.getType() != ChatMessageType.SPAM
-				&& event.getType() != ChatMessageType.DIALOG)
-			{
-				return;
-			}
+		if (event.getType() != ChatMessageType.GAMEMESSAGE
+			&& event.getType() != ChatMessageType.SPAM
+			&& event.getType() != ChatMessageType.DIALOG)
+		{
+			return;
+		}
 
-			Map<String, Object> payload = new HashMap<>();
-			payload.put("type", event.getType().name());
-			payload.put("message", event.getMessage());
-			payload.put("sender", event.getName());
-			udpSender.send("CHAT_MESSAGE", payload);
-		});
+		Map<String, Object> payload = new HashMap<>();
+		payload.put("type", event.getType().name());
+		payload.put("message", event.getMessage());
+		payload.put("sender", event.getName());
+		udpSender.send("CHAT_MESSAGE", payload);
 	}
 
 	private String targetKey(Actor actor)
