@@ -48,6 +48,12 @@ public class SettingsPanel extends PluginPanel
 	// (see SlayerLocations.java) -- persisted to the "taskLocationChoices" config key.
 	private final Map<String, Integer> categoryLocationChoice = new LinkedHashMap<>();
 
+	// Fields (not locals) so syncFromConfig() below can re-sync them whenever this config
+	// changes from somewhere other than this panel, e.g. the wrench-icon config screen --
+	// controllerEnabled/profile/targetNpcNames/taskLocationChoices are all editable from both.
+	private final JCheckBox enabledBox = new JCheckBox("Controller Enabled");
+	private final JComboBox<Profile> profileCombo = new JComboBox<>(Profile.values());
+
 	@Inject
 	SettingsPanel(Client client, ClientThread clientThread, ConfigManager configManager, ControllerConfig config)
 	{
@@ -88,15 +94,19 @@ public class SettingsPanel extends PluginPanel
 		enabledRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		enabledRow.setAlignmentX(Component.LEFT_ALIGNMENT);
 
-		JCheckBox enabledBox = new JCheckBox("Controller Enabled");
 		enabledBox.setSelected(config.controllerEnabled());
 		enabledBox.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		enabledBox.setForeground(Color.WHITE);
-		enabledBox.addActionListener(e -> configManager.setConfiguration(
-			ControllerConfig.GROUP,
-			"controllerEnabled",
-			enabledBox.isSelected()
-		));
+		enabledBox.addActionListener(e -> {
+			// Guard against redundant writes -- setSelected() (used by syncFromConfig() to mirror
+			// an external change) never fires this listener on its own, but this still avoids
+			// persisting a no-op if that ever changes.
+			boolean selected = enabledBox.isSelected();
+			if (selected != config.controllerEnabled())
+			{
+				configManager.setConfiguration(ControllerConfig.GROUP, "controllerEnabled", selected);
+			}
+		});
 		enabledRow.add(enabledBox);
 		header.add(enabledRow);
 
@@ -109,13 +119,18 @@ public class SettingsPanel extends PluginPanel
 		profileLabel.setForeground(Color.WHITE);
 		profileRow.add(profileLabel);
 
-		JComboBox<Profile> profileCombo = new JComboBox<>(Profile.values());
 		profileCombo.setSelectedItem(config.profile());
-		profileCombo.addActionListener(e -> configManager.setConfiguration(
-			ControllerConfig.GROUP,
-			"profile",
-			profileCombo.getSelectedItem()
-		));
+		profileCombo.addActionListener(e -> {
+			// JComboBox fires its ActionListener on every setSelectedItem() call, even when the
+			// value doesn't change -- without this guard, syncFromConfig() mirroring an external
+			// profile change would bounce straight back into another config write (and another
+			// ConfigChanged, and another syncFromConfig() call).
+			Object selected = profileCombo.getSelectedItem();
+			if (selected != config.profile())
+			{
+				configManager.setConfiguration(ControllerConfig.GROUP, "profile", selected);
+			}
+		});
 		profileRow.add(profileCombo);
 		header.add(profileRow);
 
@@ -612,6 +627,35 @@ public class SettingsPanel extends PluginPanel
 			sb.append(entry.getKey()).append("=").append(entry.getValue());
 		}
 		configManager.setConfiguration(ControllerConfig.GROUP, "taskLocationChoices", sb.toString());
+	}
+
+	/** Re-syncs every control here from the current config -- called by ControllerPlugin whenever
+	 * ControllerConfig changes from anywhere, so this panel never shows a stale value for a
+	 * setting it shares with the wrench-icon config screen (Controller Enabled, Profile, target
+	 * NPCs, and task location choices are all editable from both places). Safe to call after a
+	 * change originating from this panel too: JCheckBox#setSelected doesn't fire its
+	 * ActionListener at all, and while JComboBox#setSelectedItem fires its ActionListener
+	 * unconditionally (even when the value is unchanged), that listener's own equality guard
+	 * (see profileCombo's addActionListener above) stops it from writing back to config and
+	 * looping. */
+	void syncFromConfig()
+	{
+		enabledBox.setSelected(config.controllerEnabled());
+		profileCombo.setSelectedItem(config.profile());
+
+		selectedTargets.clear();
+		selectedTargets.addAll(ConfigExporter.parseList(config.targetNpcNames()));
+
+		categoryLocationChoice.clear();
+		categoryLocationChoice.putAll(ConfigExporter.parseLocationChoices(config.taskLocationChoices()));
+
+		for (Map.Entry<String, JCheckBox> entry : npcCheckboxes.entrySet())
+		{
+			entry.getValue().setSelected(selectedTargets.contains(entry.getKey()));
+		}
+
+		refreshSelectedTargetsPanel();
+		updateStatusLabel(npcCheckboxes.size());
 	}
 
 	private void updateStatusLabel(int nearbyCount)

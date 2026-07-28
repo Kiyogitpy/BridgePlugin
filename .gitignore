@@ -8,3 +8,4 @@ __pycache__/
 nbactions.xml
 nb-configuration.xml
 nbproject/
+data/

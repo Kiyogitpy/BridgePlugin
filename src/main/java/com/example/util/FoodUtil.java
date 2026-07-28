@@ -75,7 +75,6 @@ public final class FoodUtil
 			|| lower.contains("super restore")
 			|| lower.contains("blighted super restore")
 			|| lower.contains("sanfew serum")
-			|| lower.contains("moonlight potion")
-			|| lower.contains("restore potion");
+			|| lower.contains("moonlight potion");
 	}
 }

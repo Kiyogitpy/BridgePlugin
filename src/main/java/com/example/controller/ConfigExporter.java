@@ -31,8 +31,8 @@ public final class ConfigExporter
 		prayer.put("restoreAt", config.restorePrayerAt());
 		data.put("prayer", prayer);
 
-		String foodName = config.useWildernessSupplies() ? config.wildernessFood() : config.food();
-		String prayerPotionName = config.useWildernessSupplies() ? config.wildernessPrayerPotion() : config.prayerPotion();
+		String foodName = (config.useWildernessSupplies() ? config.wildernessFood() : config.food()).getItemName();
+		String prayerPotionName = (config.useWildernessSupplies() ? config.wildernessPrayerPotion() : config.prayerPotion()).getItemName();
 
 		Map<String, Object> food = new LinkedHashMap<>();
 		food.put("enabled", config.useFood());

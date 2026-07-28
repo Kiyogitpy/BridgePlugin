@@ -1,22 +1,17 @@
 # routines/gemstone_crab.py
 #
-# Gemstone Crab routine: attack the crab. Once it's killed it leaves a
-# carcass (same name, but no longer attackable) instead of just despawning,
-# and the next crab only comes out once the cave ("Cave") has been climbed
-# through -- but exactly once per carcass. Reclicking the cave while the same
-# carcass is still lying there does nothing but spam it, and the routine has
-# no reliable way to tell "new crab is still coming out" from "climb didn't
-# register" other than waiting for either a fresh attackable crab or a new
-# carcass to show up. There's no RuneLite settings panel for this yet (same
-# as mining.py), so it just keeps its own DEFAULT_CONFIG instead of reading
-# GET /config.
-#
+# Gemstone Crab routine: attack the crab; when it's no longer found (it's
+# fled underground), follow it by clicking the tunnel ("Cave"), then repeat.
+# There's no RuneLite settings panel for this yet (same as mining.py), so it
+# just keeps its own DEFAULT_CONFIG instead of reading GET /config.
+#image.pngst
+
 # Run with:
 #     python controller.py routines/gemstone_crab.py
 #
 # IMPORTANT: the cave tends to have other objects (trees, rocks) rendered
 # near it, and a plain click can resolve to whichever one happens to share
-# that pixel -- add "Cave" to Controller Settings -> Clicking -> Priority
+# that pixel -- add "Cave" to Coroller Settings -> Clicking -> Priority
 # Objects so the click always resolves to it regardless of what's in the
 # way (same trick as shift-click forcing "Walk here", already built for
 # exactly this kind of case). setup() below prints a one-time reminder.
@@ -28,6 +23,7 @@ import random
 import time
 
 import controller
+import travel
 
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -64,87 +60,77 @@ def setup(ctx):
     )
 
 
-# Applied before every click below (attacking, climbing the cave) so the routine
-# doesn't react to a newly-found target instantly every single time -- one
-# shared range instead of a different one-off sleep per click.
-REACTION_DELAY_SECONDS = (0.2, 0.5)
+# After following the crab into the tunnel, it takes a bit to resurface on the
+# other side -- without a cooldown, tick() would find the same tunnel again
+# every cycle in the meantime and keep re-clicking it.
+TUNNEL_RESPAWN_WAIT_SECONDS = (5.0, 8.0)
 
-# Settle time after climbing through the cave, before the routine starts
-# looking for the next crab.
-POST_CLIMB_DELAY_SECONDS = (1.0, 1.5)
-
-# Guessed generously since the real respawn timing isn't known -- tune down if
-# a successful climb reliably produces a new crab much sooner than this. If the
-# tunnel click missed (blocked by UI, overshot onto a neighboring tree/rock --
-# see the Priority Objects note above) the latch would otherwise never clear,
-# since no new crab is ever coming to trigger it. This timeout supersedes the
-# latch so a failed click gets retried instead of stranding the routine.
-CLIMB_RETRY_TIMEOUT_SECONDS = (18.0, 25.0)
+# Rolled once per tick while mid-fight (isIdle False) until it fires -- gives
+# a natural-feeling delay before the mouse drifts toward the tunnel, rather
+# than snapping over there the instant combat starts.
+HOVER_NEXT_STEP_CHANCE = 0.08
 
 
 def tick(ctx):
     config = ctx.state.config
-    data = ctx.state.data
+    combat = controller.get_combat()
 
-    if not controller.get_combat().get("isIdle", True):
+    if not combat.get("isIdle", True):
+        maybe_hover_next_step(ctx, config)
         return  # already mid-swing or walking -- don't reclick
 
-    # Not gated on clickable here: an attackable crab that isn't clickable
-    # (off-screen) is still very much alive, and must not fall through to the
-    # carcass check below -- that search doesn't filter on attackable at all,
-    # so an off-screen live crab would otherwise get mistaken for a carcass
-    # and trigger a needless tunnel climb.
     crab = find_nearby(controller.get_npcs(), config, "crabName", require_attackable=True)
     if crab:
-        if not crab.get("clickable", True):
-            print("[crab] found but off-screen -- rotating camera to bring it into view")
-            controller.rotate_camera_to_reveal(ctx.ser, crab.get("screenX", 0))
+        # inCombat stays True for the whole fight even on an idle tick between attack
+        # animations -- without checking it, a re-evaluation mid-fight could wander off
+        # to approach a tile instead of just continuing the attack.
+        if travel.maybe_approach_before_click(ctx, crab, already_engaged=combat.get("inCombat", False)):
+            ctx.state.data["tunnel_wait_until"] = None
             return
-
         print(f"[crab] attacking (dist={crab.get('distance')})")
-        time.sleep(random.uniform(*REACTION_DELAY_SECONDS))
+        time.sleep(random.uniform(0.15, 0.4))
         controller.click_entity(ctx.ser, crab)
-        data["climbed_for_carcass"] = False  # a fresh crab -- next carcass gets its own one-time climb
-        data["crab_confirmed_dead"] = False  # ditto for the kill-confirmation latch below
+        ctx.state.data["tunnel_wait_until"] = None
+        ctx.state.data["hovered_next_step"] = False  # fresh fight -- allow one more anticipatory hover
         return
 
-    # Latched rather than re-checked live: a carcass can despawn before we get
-    # around to clicking the cave (e.g. it took a few ticks to notice, or the
-    # first climb attempt missed), and without remembering "a kill happened"
-    # independently of the corpse still being visible, the routine would just
-    # stall forever once it's gone -- never found not attackable via the
-    # first search, so it'd never be revisited despite knowing better once.
-    carcass = find_nearby(controller.get_npcs(), config, "crabName", require_attackable=False)
-    if carcass:
-        data["crab_confirmed_dead"] = True
-
-    if not data.get("crab_confirmed_dead"):
-        print("[crab] neither the crab nor a carcass is visible nearby")
-        return
-
-    if data.get("climbed_for_carcass"):
-        if time.time() < data.get("climbed_for_carcass_deadline", 0):
-            return  # still within the normal respawn window -- don't spam the cave
-        print("[crab] no new crab since climbing -- click may have missed, retrying the cave")
-        data["climbed_for_carcass"] = False
+    wait_until = ctx.state.data.get("tunnel_wait_until")
+    if wait_until is not None:
+        if time.time() < wait_until:
+            return  # crab is still resurfacing -- don't spam the tunnel meanwhile
+        ctx.state.data["tunnel_wait_until"] = None
 
     tunnel = find_nearby(controller.get_objects(), config, "tunnelName")
     if tunnel:
-        if not tunnel.get("clickable", True):
-            print("[crab] cave found but off-screen -- rotating camera to bring it into view")
-            controller.rotate_camera_to_reveal(ctx.ser, tunnel.get("screenX", 0))
+        if travel.maybe_approach_before_click(ctx, tunnel, already_engaged=combat.get("inCombat", False)):
             return
-
-        print("[crab] confirmed a kill -- climbing through the cave (once) to bring out the next crab")
-        time.sleep(random.uniform(*REACTION_DELAY_SECONDS))
-        clicked = controller.click_entity(ctx.ser, tunnel)
-        time.sleep(random.uniform(*POST_CLIMB_DELAY_SECONDS))  # entering transition
-        if clicked:
-            data["climbed_for_carcass"] = True
-            data["climbed_for_carcass_deadline"] = time.time() + random.uniform(*CLIMB_RETRY_TIMEOUT_SECONDS)
+        print("[crab] not found -- following it into the tunnel")
+        time.sleep(random.uniform(0.2, 0.5))
+        controller.click_entity(ctx.ser, tunnel)
+        time.sleep(random.uniform(1.0, 1.5))  # entering transition
+        ctx.state.data["tunnel_wait_until"] = time.time() + random.uniform(*TUNNEL_RESPAWN_WAIT_SECONDS)
         return
 
-    print("[crab] confirmed a kill but no cave nearby to climb through")
+    print("[crab] neither the crab nor the tunnel is visible nearby")
+
+
+def maybe_hover_next_step(ctx, config: dict) -> None:
+    """While mid-fight and otherwise doing nothing, occasionally drift the
+    mouse toward the tunnel -- the next thing this routine will need once
+    the crab dies -- instead of just sitting still until then. Fires at
+    most once per fight (tracked via ctx.state.data["hovered_next_step"],
+    reset whenever a new crab attack starts)."""
+    if ctx.state.data.get("hovered_next_step"):
+        return
+    if random.random() > HOVER_NEXT_STEP_CHANCE:
+        return
+
+    tunnel = find_nearby(controller.get_objects(), config, "tunnelName")
+    if not tunnel:
+        return
+
+    if controller.hover_entity(ctx.ser, tunnel):
+        ctx.state.data["hovered_next_step"] = True
 
 
 def find_nearby(entities: list, config: dict, name_key: str, require_attackable: bool = False):

@@ -37,6 +37,15 @@ public class TileProvider extends BridgeProvider
 		int plane = client.getPlane();
 		Tile[][][] tiles = scene.getTiles();
 		Player local = client.getLocalPlayer();
+		if (tiles == null || plane < 0 || plane >= tiles.length || tiles[plane] == null)
+		{
+			// The scene object exists but this plane's tile grid isn't populated yet -- e.g. not
+			// logged in, or mid floor-transition/teleport. Bailing out here (instead of throwing)
+			// matters beyond correctness: an uncaught NPE here runs on the client thread and gets
+			// logged with a full stack trace on every single poll, which for a caller hitting this
+			// endpoint every tick is a real, continuous source of stutter, not just a cosmetic error.
+			return list;
+		}
 
 		for (int sx = 0; sx < tiles[plane].length; sx++)
 		{

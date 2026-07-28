@@ -35,3 +35,39 @@ DEFAULT_OVERSHOOT_CHANCE = 0.25  # probability a given move overshoots before co
 # ---------------- Moving-target re-aiming ----------------
 MOVING_TARGET_MIN_DIST = 60             # px; shorter moves finish too fast to bother re-aiming
 MOVING_TARGET_MIDFLIGHT_FRACTION = 0.6  # fly this far toward the stale point before re-aiming
+
+# ---------------- Human mistake simulation ----------------
+# Small, deliberately-imperfect behaviors so supply/prayer upkeep and
+# clicking don't look like a flawless state machine -- real players
+# occasionally eat a bite too early, drink a potion before they needed it,
+# fumble a prayer toggle, or click empty ground. Kept low-probability and
+# rolled independently per check so they show up occasionally, not in
+# clusters. See slayer.maintain_supplies/maintain_prayer and
+# controller.maybe_misclick.
+MISTAKE_OVEREAT_CHANCE = 0.04             # chance/tick to eat before actually hitting eatAt
+MISTAKE_OVEREAT_MIN_HP_FRACTION = 0.75    # ...but only once hp is already at least this fraction of real hp
+MISTAKE_OVERDRINK_CHANCE = 0.03           # chance/tick to drink a prayer potion before actually hitting restoreAt
+MISTAKE_OVERDRINK_MIN_PRAYER_FRACTION = 0.75  # ...but only once prayer is already at least this fraction of real prayer
+MISTAKE_PRAYER_FUMBLE_CHANCE = 0.03       # chance to toggle quick prayers to the wrong state for a tick
+MISTAKE_RANDOM_CLICK_CHANCE = 0.02        # chance/tick to click a random viewport point instead of acting
+
+# ---------------- Idle mouse drift ----------------
+# Every so often, nudge the cursor a short distance from wherever it already
+# is, slowly, with no click -- see controller.maybe_idle_mouse_move. A cursor
+# that only ever moves with clear purpose (straight toward the next target,
+# every single time, at normal click speed) is a tell; real players glance
+# the mouse around between actions too, but that's a small resting-hand
+# shift, not a full click-speed traverse across the viewport.
+IDLE_MOUSE_MOVE_MIN_INTERVAL_S = 15.0
+IDLE_MOUSE_MOVE_MAX_INTERVAL_S = 20.0
+IDLE_MOUSE_MOVE_RADIUS_PX = 20      # px; how far the idle drift wanders from the cursor's current spot
+IDLE_MOUSE_MOVE_SPEED_SCALE = 3.5   # multiplies move_to_human's normal travel time -- idle drift should look slow
+
+# ---------------- Approach-tile humanization ----------------
+# See travel.maybe_approach_before_click -- occasionally walk partway toward
+# a target via a plain tile click instead of always relying on the
+# click-the-entity-and-let-the-game-auto-walk shortcut every single time.
+APPROACH_TILE_CHANCE = 0.35        # probability of taking an approach hop instead of clicking straight through
+APPROACH_TILE_MIN_DISTANCE = 6     # tiles; don't bother approaching once already this close
+APPROACH_TILE_FRACTION_MIN = 0.35  # how far along the player->target line the approach tile lands
+APPROACH_TILE_FRACTION_MAX = 0.70

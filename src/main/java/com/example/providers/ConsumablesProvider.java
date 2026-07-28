@@ -83,14 +83,14 @@ public class ConsumablesProvider extends BridgeProvider
 			}
 		}
 
-		String configuredFood = config.food();
+		String configuredFood = config.food().getItemName();
 		if (configuredFood != null && !configuredFood.isEmpty())
 		{
 			food.sort(Comparator.comparing(entry -> !entry.get("name").toString()
 				.toLowerCase().contains(configuredFood.toLowerCase())));
 		}
 
-		String configuredPrayer = config.prayerPotion();
+		String configuredPrayer = config.prayerPotion().getItemName();
 		if (configuredPrayer != null && !configuredPrayer.isEmpty())
 		{
 			prayer.sort(Comparator.comparing(entry -> !entry.get("name").toString()

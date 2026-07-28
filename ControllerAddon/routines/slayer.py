@@ -64,14 +64,6 @@ def needs_banking(ctx) -> bool:
     if not inventory_full():
         return False
 
-    # In the wilderness with a looting bag, a "full" inventory might just
-    # mean it's time to offload into the bag rather than bank -- it holds
-    # another 28 slots that don't otherwise show up in get_inventory().
-    if controller.get_player().get("inWilderness") and banker.has_looting_bag():
-        print("[bank] inventory full in the wilderness -- trying the looting bag first")
-        if banker.fill_looting_bag(ctx):
-            return False
-
     if not has_bankable_loot(ctx.state.config):
         # Full, but only with supplies we brought on purpose (food, potions,
         # the ring, the bag, whatever's on the keep list) -- there's nothing
@@ -189,9 +181,16 @@ def maintain_prayer(ctx, combat: dict):
         return
 
     prayers = controller.get_prayers()
+    player = controller.get_player()
 
     if prayer_cfg.get("useQuickPrayers"):
         want_on = bool(combat.get("inCombat"))
+        if random.random() < settings.MISTAKE_PRAYER_FUMBLE_CHANCE:
+            # Fumble the toggle -- click the orb as if we meant the opposite
+            # state. Self-corrects on a later tick once want_on/is_on
+            # disagree again for real, same as a human noticing and
+            # re-clicking a moment later.
+            want_on = not want_on
         is_on = prayers.get("quickPrayerEnabled", False)
         if want_on != is_on:
             ox, oy = prayers.get("quickOrbScreenX"), prayers.get("quickOrbScreenY")
@@ -207,10 +206,18 @@ def maintain_prayer(ctx, combat: dict):
     potions_cfg = config.get("potions", {})
     if potions_cfg.get("prayerEnabled"):
         restore_at = prayer_cfg.get("restoreAt", 18)
-        current_prayer = controller.get_player().get("prayer")
-        if current_prayer is not None and current_prayer <= restore_at:
-            if controller.consume_first(ctx.ser, controller.get_consumables().get("prayer", [])):
-                print(f"[prayer] drank prayer restore (prayer={current_prayer})")
+        current_prayer, prayer_max = player.get("prayer"), player.get("prayerReal")
+        if current_prayer is None:
+            return
+
+        should_drink = current_prayer <= restore_at
+        mistake = False
+        if not should_drink and prayer_max and current_prayer >= prayer_max * settings.MISTAKE_OVERDRINK_MIN_PRAYER_FRACTION \
+                and random.random() < settings.MISTAKE_OVERDRINK_CHANCE:
+            should_drink, mistake = True, True  # wastes a dose we didn't actually need yet
+
+        if should_drink and controller.consume_first(ctx.ser, controller.get_consumables().get("prayer", [])):
+            print(f"[prayer] {'(mistake) ' if mistake else ''}drank prayer restore (prayer={current_prayer})")
 
 
 def maintain_supplies(ctx):
@@ -219,11 +226,17 @@ def maintain_supplies(ctx):
     potions_cfg = config.get("potions", {})
 
     player = controller.get_player()
-    hp = player.get("hp")
+    hp, hp_max = player.get("hp"), player.get("hpReal")
 
-    if food_cfg.get("enabled") and hp is not None and hp <= food_cfg.get("eatAt", 0):
-        if controller.consume_first(ctx.ser, controller.get_consumables().get("food", [])):
-            print(f"[supplies] ate food (hp={hp})")
+    if food_cfg.get("enabled") and hp is not None:
+        should_eat = hp <= food_cfg.get("eatAt", 0)
+        mistake = False
+        if not should_eat and hp_max and hp >= hp_max * settings.MISTAKE_OVEREAT_MIN_HP_FRACTION \
+                and random.random() < settings.MISTAKE_OVEREAT_CHANCE:
+            should_eat, mistake = True, True  # eats a bite we didn't actually need, e.g. right up near full hp
+
+        if should_eat and controller.consume_first(ctx.ser, controller.get_consumables().get("food", [])):
+            print(f"[supplies] {'(mistake) ' if mistake else ''}ate food (hp={hp})")
             return  # avoid eating and drinking in the same tick
 
     if potions_cfg.get("combatEnabled"):

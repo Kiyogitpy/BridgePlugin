@@ -488,6 +488,7 @@ def move_to_human(
     aim_radius: int = DEFAULT_AIM_RADIUS,
     overshoot_px: int = DEFAULT_OVERSHOOT_PX,
     overshoot_chance: float = DEFAULT_OVERSHOOT_CHANCE,
+    duration_scale: float = 1.0,
     refresh_target=None,
 ) -> None:
     """
@@ -496,32 +497,37 @@ def move_to_human(
     (NPCs), a long flight is split so the final approach re-aims at where the
     target actually is now instead of a stale snapshot from when the move
     started -- otherwise a walking NPC can drift out from under the click.
+
+    duration_scale multiplies the travel time _move_to_human_exact would
+    otherwise pick for the distance involved -- 1.0 (the default) is normal
+    click-speed movement; pass something higher (e.g. from
+    maybe_idle_mouse_move) for a deliberately slower, more idle-looking drift.
     """
     start = get_cursor_pos()
     aim = pick_aim_point(x, y, aim_radius)
 
     over = maybe_overshoot_point(start, aim, overshoot_px=overshoot_px, chance=overshoot_chance)
     if over is not None:
-        _move_to_human_exact(ser, over[0], over[1], fps=fps)
+        _move_to_human_exact(ser, over[0], over[1], fps=fps, duration_scale=duration_scale)
         if _movement_abort.is_set():
             return
         time.sleep(random.uniform(0.01, 0.05))
         aim = _reaim(aim, refresh_target, aim_radius)
-        _move_to_human_exact(ser, aim[0], aim[1], fps=max(90, fps - 25))
+        _move_to_human_exact(ser, aim[0], aim[1], fps=max(90, fps - 25), duration_scale=duration_scale)
         return
 
     dist = math.hypot(aim[0] - start[0], aim[1] - start[1])
     if refresh_target is not None and dist >= MOVING_TARGET_MIN_DIST:
         mid_x = start[0] + (aim[0] - start[0]) * MOVING_TARGET_MIDFLIGHT_FRACTION
         mid_y = start[1] + (aim[1] - start[1]) * MOVING_TARGET_MIDFLIGHT_FRACTION
-        _move_to_human_exact(ser, int(round(mid_x)), int(round(mid_y)), fps=fps)
+        _move_to_human_exact(ser, int(round(mid_x)), int(round(mid_y)), fps=fps, duration_scale=duration_scale)
         if _movement_abort.is_set():
             return
         aim = _reaim(aim, refresh_target, aim_radius)
-        _move_to_human_exact(ser, aim[0], aim[1], fps=max(110, fps - 15))
+        _move_to_human_exact(ser, aim[0], aim[1], fps=max(110, fps - 15), duration_scale=duration_scale)
         return
 
-    _move_to_human_exact(ser, aim[0], aim[1], fps=fps)
+    _move_to_human_exact(ser, aim[0], aim[1], fps=fps, duration_scale=duration_scale)
 
 
 def _reaim(fallback_aim: tuple, refresh_target, aim_radius: int) -> tuple:
@@ -533,7 +539,7 @@ def _reaim(fallback_aim: tuple, refresh_target, aim_radius: int) -> tuple:
     return pick_aim_point(updated[0], updated[1], aim_radius)
 
 
-def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140) -> None:
+def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140, duration_scale: float = 1.0) -> None:
     sx, sy = get_cursor_pos()
     ex, ey = x, y
     dist = math.hypot(ex - sx, ey - sy)
@@ -541,7 +547,7 @@ def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140) 
         return
 
     bez = build_bezier_path((sx, sy), (ex, ey))
-    duration_ms = estimate_duration_ms(dist)
+    duration_ms = estimate_duration_ms(dist) * duration_scale
     steps = max(18, int((duration_ms / 1000.0) * fps))
     t0 = time.perf_counter()
 
@@ -704,10 +710,98 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
     return True
 
 
+def hover_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_target=None) -> bool:
+    """Move the cursor onto `entity` (same aim jitter as click_entity) without
+    clicking -- for anticipatory hovering over something a routine already
+    knows it'll need next, while it's otherwise idle-waiting on the current
+    action to resolve (e.g. drifting toward the tunnel while a crab is still
+    being fought). Unlike click_entity this is just a courtesy move, not a
+    real interaction attempt: it silently no-ops (no camera nudge, no log)
+    if the point isn't safely reachable right now, rather than trying to
+    work around it.
+    """
+    x, y = entity.get("screenX"), entity.get("screenY")
+    if x is None or y is None:
+        return False
+
+    aim_x, aim_y = int(x) + offset[0], int(y) + offset[1]
+    if not is_point_within_window(aim_x, aim_y) or is_point_blocked_by_ui(aim_x, aim_y) is not None:
+        return False
+
+    move_to_human(ser, aim_x, aim_y, aim_radius=ENTITY_AIM_RADIUS, refresh_target=refresh_target)
+    return not _movement_abort.is_set()
+
+
 def consume_first(ser: serial.Serial, items: list) -> bool:
     if not items:
         return False
     return click_entity(ser, items[0])
+
+
+def random_viewport_point():
+    """A random absolute screen point somewhere inside the 3D game viewport
+    (not the minimap, inventory, or any other UI chrome), or None if the
+    viewport isn't known yet (e.g. still loading)."""
+    state = get_state()
+    canvas_x, canvas_y = state.get("canvasScreenX"), state.get("canvasScreenY")
+    vp_x_off, vp_y_off = state.get("viewportXOffset"), state.get("viewportYOffset")
+    vp_w, vp_h = state.get("viewportWidth"), state.get("viewportHeight")
+    if None in (canvas_x, canvas_y, vp_x_off, vp_y_off, vp_w, vp_h) or vp_w <= 0 or vp_h <= 0:
+        return None
+    x = canvas_x + vp_x_off + random.randint(0, vp_w - 1)
+    y = canvas_y + vp_y_off + random.randint(0, vp_h - 1)
+    return x, y
+
+
+def maybe_misclick(ctx, chance: float = MISTAKE_RANDOM_CLICK_CHANCE) -> bool:
+    """With `chance` probability, click a random point in the game viewport
+    instead of doing anything purposeful this tick -- a stray misclick (an
+    empty patch of ground, a random tree, whatever happens to be under the
+    cursor) rather than every click in a session being deliberate. Engine-
+    level like check_stray_dialog, so every routine gets it for free.
+
+    Returns True if it fired (caller should skip its real action this tick
+    and let the next tick carry on normally), False otherwise.
+    """
+    if random.random() > chance:
+        return False
+
+    point = random_viewport_point()
+    if point is None:
+        return False
+
+    x, y = point
+    if is_point_blocked_by_ui(x, y):
+        return False
+
+    print("[!] Misclick -- clicked a random point instead of the intended target")
+    click_entity(ctx.ser, {"screenX": x, "screenY": y, "name": "(random point)"}, offset=(0, 0))
+    return True
+
+
+def maybe_idle_mouse_move(ctx, state: "ControllerState") -> None:
+    """Every IDLE_MOUSE_MOVE_MIN/MAX_INTERVAL_S seconds or so, drift the
+    cursor a short distance from wherever it already is, slowly, with no
+    click. A small nearby nudge (not a jump clear across the viewport at
+    normal click speed) reads as a resting hand shifting slightly, not a
+    purposeful move -- the whole point of this being "idle". Purely cosmetic
+    movement -- it always runs before the caller's real action for this
+    tick, never instead of it (unlike maybe_misclick, which deliberately
+    eats a tick), so it never delays or replaces an actual click.
+    """
+    now = time.time()
+    if state.next_idle_move_at is None:
+        state.next_idle_move_at = now + random.uniform(IDLE_MOUSE_MOVE_MIN_INTERVAL_S, IDLE_MOUSE_MOVE_MAX_INTERVAL_S)
+        return
+    if now < state.next_idle_move_at:
+        return
+
+    cx, cy = get_cursor_pos()
+    point = pick_aim_point(cx, cy, IDLE_MOUSE_MOVE_RADIUS_PX)
+    if is_point_within_window(*point):
+        move_to_human(ctx.ser, point[0], point[1], duration_scale=IDLE_MOUSE_MOVE_SPEED_SCALE)
+
+    state.next_idle_move_at = now + random.uniform(IDLE_MOUSE_MOVE_MIN_INTERVAL_S, IDLE_MOUSE_MOVE_MAX_INTERVAL_S)
 
 
 # ---------------- controller state ----------------
@@ -732,6 +826,7 @@ class ControllerState:
         self._safety_reminder_at = 0.0
         self.next_break_at = None
         self.break_until = None
+        self.next_idle_move_at = None
 
         clear_movement_abort()
 
@@ -1016,7 +1111,9 @@ def main():
                 continue
 
             check_stray_dialog(ctx)
-            routine.tick(ctx)
+            maybe_idle_mouse_move(ctx, state)
+            if not maybe_misclick(ctx):
+                routine.tick(ctx)
 
             if config.get("breaks", {}).get("microBreaks") and random.random() < 0.15:
                 time.sleep(random.uniform(0.3, 1.2))

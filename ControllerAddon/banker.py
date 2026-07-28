@@ -95,70 +95,21 @@ def close_bank(ctx) -> None:
 
 
 LOOTING_BAG_NAME = "looting bag"
-LOOTING_BAG_CAPACITY = 28
 
-# The bridge can't read the looting bag's contents without opening it (same
-# "Open" forced-action problem as Fill/Empty below), so its fill level is
-# tracked ourselves in ctx.state.data instead of ever being queried from the
-# game: assumed empty when the script starts, then adjusted from the actual
-# inventory deltas fill_looting_bag/empty_looting_bag already observe. This
-# also means fill_looting_bag can skip clicking at all once it knows the bag
-# is full, rather than firing a click that (per the ambiguity below) could
-# possibly resolve to the wrong action.
+# Loot picked up while the bag is open routes straight into it ahead of the
+# main inventory (standard wilderness looting-bag behavior), so there's no
+# need to ever click Fill ourselves -- just empty it back at the bank.
 
 
 def has_looting_bag() -> bool:
     return any(LOOTING_BAG_NAME in (i.get("name") or "").lower() for i in controller.get_inventory())
 
 
-def looting_bag_count(ctx) -> int:
-    return ctx.state.data.get("looting_bag_count", 0)
-
-
-def looting_bag_full(ctx) -> bool:
-    return looting_bag_count(ctx) >= LOOTING_BAG_CAPACITY
-
-
-def fill_looting_bag(ctx) -> bool:
-    """Click Fill on the looting bag (wilderness only) to move eligible loot
-    from inventory into it. "Fill" is a right-click option on the bag item
-    itself, not a widget button -- add "Fill" to Controller Settings ->
-    Clicking -> Forced Actions if that's not already its default left-click.
-
-    CAVEAT: if both "Fill" and "Empty" end up in Forced Actions at once,
-    forcing is currently a single global rule with no notion of "which one
-    right now" -- whichever appears first in the game's own menu order wins,
-    not necessarily the one this function wants. Only add whichever one
-    isn't already the bag's natural default, and if you need both, this
-    needs revisiting (e.g. a per-call forced-action override) rather than
-    two permanent entries.
-
-    Returns True if the inventory count actually went down."""
-    if looting_bag_full(ctx):
-        return False
-
-    bag = next(
-        (i for i in controller.get_inventory() if LOOTING_BAG_NAME in (i.get("name") or "").lower()),
-        None,
-    )
-    if bag is None:
-        return False
-
-    before = len(controller.get_inventory())
-    if not controller.click_entity(ctx.ser, bag):
-        return False
-
-    time.sleep(random.uniform(0.6, 1.0))
-    moved = before - len(controller.get_inventory())
-    if moved > 0:
-        ctx.state.data["looting_bag_count"] = min(looting_bag_count(ctx) + moved, LOOTING_BAG_CAPACITY)
-    return moved > 0
-
-
 def empty_looting_bag(ctx) -> bool:
     """Click Empty on the looting bag to dump its contents into an open bank.
-    Same forced-action caveat as fill_looting_bag -- add "Empty" to Forced
-    Actions if needed."""
+    "Empty" is a right-click option on the bag item itself, not a widget
+    button -- add "Empty" to Controller Settings -> Clicking -> Forced
+    Actions if that's not already its default left-click."""
     bag = next(
         (i for i in controller.get_inventory() if LOOTING_BAG_NAME in (i.get("name") or "").lower()),
         None,
@@ -166,12 +117,11 @@ def empty_looting_bag(ctx) -> bool:
     if bag is None:
         return False
 
-    print(f"[bank] emptying looting bag (tracked {looting_bag_count(ctx)} items)")
+    print("[bank] emptying looting bag")
     if not controller.click_entity(ctx.ser, bag):
         return False
 
     time.sleep(random.uniform(0.6, 1.0))
-    ctx.state.data["looting_bag_count"] = 0
     return True
 
 
@@ -206,8 +156,7 @@ def deposit_all_containers(ctx) -> bool:
     """Deposits the contents of every gatherer-bag/container in inventory at
     once -- looting bag, herb sack, seed box, gem bag, coal bag, etc. -- via
     the bank's own dedicated button, in a single click, without needing the
-    bag's own Fill/Empty forced-action (and its documented ambiguity caveat
-    on fill_looting_bag/empty_looting_bag above) at all."""
+    bag's own Empty forced-action at all."""
     return _click_bank_button(ctx, "depositContainers")
 
 

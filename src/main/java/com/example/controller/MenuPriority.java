@@ -8,6 +8,7 @@ import net.runelite.client.util.Text;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -18,6 +19,16 @@ import java.util.Set;
  */
 final class MenuPriority
 {
+	// MenuOpened fires on the client thread every time the client resolves a click/hover, not
+	// just on an actual right-click -- i.e. constantly during normal play. Re-parsing all four
+	// config lists into fresh Sets on every single firing churned enough small garbage to be a
+	// real source of GC-pause stutter, even though no single call was expensive. These caches
+	// only re-parse when the underlying config string actually changed since the last call.
+	private static final CachedSet targetNpcsCache = new CachedSet();
+	private static final CachedSet lootItemsCache = new CachedSet();
+	private static final CachedSet targetObjectsCache = new CachedSet();
+	private static final CachedSet forcedActionsCache = new CachedSet();
+
 	private MenuPriority()
 	{
 	}
@@ -36,10 +47,10 @@ final class MenuPriority
 			return;
 		}
 
-		Set<String> targetNpcs = normalizedSet(config.targetNpcNames());
-		Set<String> lootItems = normalizedSet(config.lootWhitelist());
-		Set<String> targetObjects = normalizedSet(config.targetObjectNames());
-		Set<String> forcedActions = normalizedSet(config.forcedActions());
+		Set<String> targetNpcs = targetNpcsCache.get(config.targetNpcNames());
+		Set<String> lootItems = lootItemsCache.get(config.lootWhitelist());
+		Set<String> targetObjects = targetObjectsCache.get(config.targetObjectNames());
+		Set<String> forcedActions = forcedActionsCache.get(config.forcedActions());
 
 		for (int i = lastIndex - 1; i >= 0; i--)
 		{
@@ -83,5 +94,24 @@ final class MenuPriority
 			stripped = stripped.substring(0, parenIndex);
 		}
 		return stripped.toLowerCase(Locale.ENGLISH);
+	}
+
+	/** Remembers the last raw config string it parsed, so a call with the same string back-to-back
+	 * (the overwhelmingly common case -- config rarely changes between one menu build and the
+	 * next) returns the existing Set instead of re-parsing and re-allocating one from scratch. */
+	private static final class CachedSet
+	{
+		private String lastRaw;
+		private Set<String> value = new HashSet<>();
+
+		Set<String> get(String raw)
+		{
+			if (!Objects.equals(raw, lastRaw))
+			{
+				lastRaw = raw;
+				value = normalizedSet(raw);
+			}
+			return value;
+		}
 	}
 }

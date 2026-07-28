@@ -367,3 +367,58 @@ def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
 
 def _within_tolerance(x1: float, y1: float, x2: float, y2: float) -> bool:
     return math.hypot(x2 - x1, y2 - y1) <= WALK_ARRIVAL_TOLERANCE
+
+
+def maybe_approach_before_click(ctx, entity: dict, already_engaged: bool = False,
+                                 chance: float = controller.APPROACH_TILE_CHANCE) -> bool:
+    """With `chance` probability, click a ground tile partway between the
+    player and `entity` (same minimap-hop trick as _hop_to) instead of
+    clicking the entity itself. A real player often closes some of the
+    distance to something a few tiles off manually rather than always
+    relying on the game's own click-to-walk-then-interact -- doing the
+    latter 100% of the time is a tell.
+
+    This is only for *approaching* something, never appropriate once you're
+    already committed to it -- pass already_engaged=True (e.g. from
+    get_combat().inCombat) whenever the caller might already be mid-fight
+    with this exact entity: isIdle can read True for a single tick between
+    attack animations while inCombat stays True for the whole fight, and
+    without this a routine re-evaluating on that idle tick could wander off
+    to some tile mid-fight instead of just continuing the attack.
+
+    Returns True if it clicked an approach tile instead (the caller should
+    skip its own click this tick -- get_combat().isIdle will read False
+    while walking, so the routine's usual "already busy" check naturally
+    holds off the real click until a later tick, once the player has closed
+    the distance). Returns False if already_engaged, if it rolled against
+    approaching, or if entity/player position data wasn't available --
+    caller should click the entity as normal.
+    """
+    if already_engaged:
+        return False
+
+    x, y, plane = entity.get("x"), entity.get("y"), entity.get("plane")
+    dist = entity.get("distance")
+    if x is None or y is None or plane is None or dist is None:
+        return False
+    if dist < controller.APPROACH_TILE_MIN_DISTANCE:
+        return False
+    if random.random() > chance:
+        return False
+
+    player = controller.get_player()
+    px, py = player.get("x"), player.get("y")
+    if px is None:
+        return False
+
+    frac = random.uniform(controller.APPROACH_TILE_FRACTION_MIN, controller.APPROACH_TILE_FRACTION_MAX)
+    hop_x = int(round(px + (x - px) * frac))
+    hop_y = int(round(py + (y - py) * frac))
+
+    point = controller.get_minimap_walk_point(hop_x, hop_y, plane)
+    if not point.get("onMinimap"):
+        return False
+
+    print(f"[travel] closing some distance to {entity.get('name')} before the final click")
+    controller.click_entity(ctx.ser, point, offset=(0, 0))
+    return True

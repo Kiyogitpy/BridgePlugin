@@ -201,13 +201,13 @@ public interface ControllerConfig extends Config
 	@ConfigItem(
 		keyName = "food",
 		name = "Food",
-		description = "Preferred food name (partial match, e.g. Shark).",
+		description = "Preferred food -- eaten first if more than one type is in your inventory.",
 		section = suppliesSection,
 		position = 1
 	)
-	default String food()
+	default FoodChoice food()
 	{
-		return "Shark";
+		return FoodChoice.SHARK;
 	}
 
 	@ConfigItem(
@@ -238,13 +238,13 @@ public interface ControllerConfig extends Config
 	@ConfigItem(
 		keyName = "prayerPotion",
 		name = "Prayer Potion",
-		description = "Preferred prayer restore item (partial match, e.g. Super restore).",
+		description = "Preferred prayer restore -- drunk first if more than one type is in your inventory.",
 		section = suppliesSection,
 		position = 4
 	)
-	default String prayerPotion()
+	default PrayerPotionChoice prayerPotion()
 	{
-		return "Super restore";
+		return PrayerPotionChoice.SUPER_RESTORE;
 	}
 
 	@ConfigItem(
@@ -291,9 +291,9 @@ public interface ControllerConfig extends Config
 		section = suppliesSection,
 		position = 8
 	)
-	default String wildernessFood()
+	default FoodChoice wildernessFood()
 	{
-		return "Blighted manta ray";
+		return FoodChoice.BLIGHTED_MANTA_RAY;
 	}
 
 	@ConfigItem(
@@ -303,9 +303,9 @@ public interface ControllerConfig extends Config
 		section = suppliesSection,
 		position = 9
 	)
-	default String wildernessPrayerPotion()
+	default PrayerPotionChoice wildernessPrayerPotion()
 	{
-		return "Blighted super restore";
+		return PrayerPotionChoice.BLIGHTED_SUPER_RESTORE;
 	}
 
 	// --- Loot ---
