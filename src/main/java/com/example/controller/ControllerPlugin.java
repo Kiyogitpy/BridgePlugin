@@ -112,8 +112,6 @@ public class ControllerPlugin extends Plugin
 		new TileProvider(client, clientThread, server).register();
 		new ConfigProvider(client, clientThread, server, config).register();
 		new ConsumablesProvider(client, clientThread, server, config).register();
-		new WidgetDumpProvider(client, clientThread, server).register();
-		new SwingDumpProvider(client, clientThread, server).register();
 		new LoginProvider(client, clientThread, server).register();
 
 		try
