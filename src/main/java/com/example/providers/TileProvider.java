@@ -13,6 +13,14 @@ import java.util.Map;
 
 public class TileProvider extends BridgeProvider
 {
+	// See ObjectProvider's identical cache for why -- walking the whole tile grid is real work,
+	// and a caller polling faster than the game state changes (confirmed: something was hitting
+	// /tiles, /objects, and /ground-items multiple times a second) turns that into repeated full
+	// walks and was a real, measurable source of client stutter. Tiles only change once per game
+	// tick regardless of poll rate, so caching by tick count adds no real staleness.
+	private int cachedTick = -1;
+	private List<Map<String, Object>> cachedTiles;
+
 	public TileProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
 	{
 		super(client, clientThread, server);
@@ -25,6 +33,17 @@ public class TileProvider extends BridgeProvider
 	}
 
 	private Object getTiles()
+	{
+		int tick = client.getTickCount();
+		if (cachedTiles == null || tick != cachedTick)
+		{
+			cachedTiles = computeTiles();
+			cachedTick = tick;
+		}
+		return cachedTiles;
+	}
+
+	private List<Map<String, Object>> computeTiles()
 	{
 		List<Map<String, Object>> list = new ArrayList<>();
 		Scene scene = client.getScene();

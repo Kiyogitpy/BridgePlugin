@@ -14,6 +14,17 @@ import java.util.Map;
 
 public class ObjectProvider extends BridgeProvider
 {
+	// Walking the whole scene's tile grid (and building screen-projection/composition data for
+	// every object in it) is real, non-trivial work on the client thread -- cheap for one call,
+	// but a caller hitting this endpoint faster than the game state actually changes (confirmed:
+	// something was polling /objects, /tiles, and /ground-items multiple times a second) turns
+	// into repeated full scene walks and was a real, measurable source of client stutter. The
+	// scene only changes once per game tick regardless of how often this is polled, so caching by
+	// tick count adds no real staleness while capping the expensive work to once per tick no
+	// matter how many times something calls in.
+	private int cachedTick = -1;
+	private List<Map<String, Object>> cachedObjects;
+
 	public ObjectProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
 	{
 		super(client, clientThread, server);
@@ -26,6 +37,17 @@ public class ObjectProvider extends BridgeProvider
 	}
 
 	private Object getObjects()
+	{
+		int tick = client.getTickCount();
+		if (cachedObjects == null || tick != cachedTick)
+		{
+			cachedObjects = computeObjects();
+			cachedTick = tick;
+		}
+		return cachedObjects;
+	}
+
+	private List<Map<String, Object>> computeObjects()
 	{
 		List<Map<String, Object>> list = new ArrayList<>();
 		Scene scene = client.getScene();

@@ -17,6 +17,14 @@ public class GroundItemProvider extends BridgeProvider
 {
 	private final ItemManager itemManager;
 
+	// See ObjectProvider's identical cache for why -- walking the whole tile grid is real work,
+	// and a caller polling faster than the game state changes (confirmed: something was hitting
+	// /ground-items, /objects, and /tiles multiple times a second) turns that into repeated full
+	// walks and was a real, measurable source of client stutter. Ground items only change once
+	// per game tick regardless of poll rate, so caching by tick count adds no real staleness.
+	private int cachedTick = -1;
+	private List<Map<String, Object>> cachedGroundItems;
+
 	public GroundItemProvider(Client client, ClientThread clientThread, BridgeHttpServer server, ItemManager itemManager)
 	{
 		super(client, clientThread, server);
@@ -30,6 +38,17 @@ public class GroundItemProvider extends BridgeProvider
 	}
 
 	private Object getGroundItems()
+	{
+		int tick = client.getTickCount();
+		if (cachedGroundItems == null || tick != cachedTick)
+		{
+			cachedGroundItems = computeGroundItems();
+			cachedTick = tick;
+		}
+		return cachedGroundItems;
+	}
+
+	private List<Map<String, Object>> computeGroundItems()
 	{
 		List<Map<String, Object>> list = new ArrayList<>();
 		Scene scene = client.getScene();
