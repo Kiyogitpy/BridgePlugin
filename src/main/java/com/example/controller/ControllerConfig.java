@@ -148,15 +148,27 @@ public interface ControllerConfig extends Config
 	}
 
 	@ConfigItem(
-		keyName = "combatPrayer",
-		name = "Combat Prayer",
-		description = "Prayer to activate while in combat.",
+		keyName = "defensivePrayer",
+		name = "Defensive Prayer",
+		description = "Protect-from prayer to keep on for the whole fight.",
 		section = prayerSection,
 		position = 1
 	)
-	default CombatPrayer combatPrayer()
+	default DefensivePrayerChoice defensivePrayer()
 	{
-		return CombatPrayer.NONE;
+		return DefensivePrayerChoice.NONE;
+	}
+
+	@ConfigItem(
+		keyName = "offensivePrayer",
+		name = "Offensive Prayer",
+		description = "Stat-boosting prayer to flick on right before each of your own attack and off once it lands.",
+		section = prayerSection,
+		position = 2
+	)
+	default OffensivePrayerChoice offensivePrayer()
+	{
+		return OffensivePrayerChoice.NONE;
 	}
 
 	@ConfigItem(
@@ -164,7 +176,7 @@ public interface ControllerConfig extends Config
 		name = "Use Quick Prayers",
 		description = "Toggle quick-prayer orb instead of individual prayers (uses your RuneLite quick-prayer setup).",
 		section = prayerSection,
-		position = 2
+		position = 3
 	)
 	default boolean useQuickPrayers()
 	{
@@ -176,7 +188,7 @@ public interface ControllerConfig extends Config
 		name = "Restore Prayer At",
 		description = "Drink a prayer potion when prayer points drop to or below this value.",
 		section = prayerSection,
-		position = 3
+		position = 4
 	)
 	@Range(min = 1, max = 99)
 	default int restorePrayerAt()
