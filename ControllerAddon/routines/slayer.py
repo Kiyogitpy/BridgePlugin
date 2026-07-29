@@ -210,6 +210,32 @@ AUTO_PRAYER_LADDERS = {
 }
 
 
+def resolve_combat_prayer(combat_prayer: str, prayer_level):
+    """Resolve a Defensive/Offensive Prayer config value down to a concrete prayer name
+    (a key into PrayerProvider's active/icons maps), or None if nothing should be active
+    right now. Auto (Melee/Ranged/Magic) walks its ladder and returns the first entry the
+    account's level covers. A manually-picked prayer the account hasn't unlocked yet also
+    resolves to None -- surfaced once via the caller's own warning, rather than silently
+    retried forever."""
+    if not combat_prayer or combat_prayer == "NONE":
+        return None
+
+    ladder = AUTO_PRAYER_LADDERS.get(combat_prayer)
+    if ladder is not None:
+        if prayer_level is None:
+            return None
+        for candidate in ladder:
+            if prayer_level >= PRAYER_LEVELS.get(candidate, 999):
+                return candidate
+        return None
+
+    required = PRAYER_LEVELS.get(combat_prayer)
+    if required is not None and (prayer_level is None or prayer_level < required):
+        return None
+
+    return combat_prayer
+
+
 def maintain_defensive_prayer(ctx, combat: dict):
     """Keeps a single defensive (Protect from X) prayer on for the whole fight --
     LAZY behavior (see docs/superpowers/specs/2026-07-29-split-defensive-offensive-prayer-design.md),
