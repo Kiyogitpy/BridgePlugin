@@ -209,6 +209,11 @@ AUTO_PRAYER_LADDERS = {
     "AUTO_MAGIC": ["AUGURY", "MYSTIC_MIGHT", "MYSTIC_LORE"],
 }
 
+# maintain_offensive_prayer gives up trying to click the flick-off icon (and just clears its
+# own tracking) after this many ticks of the icon lookup failing, rather than staying stuck
+# unable to ever detect "off" again.
+OFFENSIVE_PRAYER_STUCK_ON_TICKS = 3
+
 
 def resolve_combat_prayer(combat_prayer: str, prayer_level):
     """Resolve a Defensive/Offensive Prayer config value down to a concrete prayer name
@@ -360,15 +365,32 @@ def maintain_offensive_prayer(ctx, combat: dict):
     hp_xp_at_flick = ctx.state.data.get("offensive_prayer_hp_xp_at_flick")
     hit_landed = hp_xp is not None and hp_xp_at_flick is not None and hp_xp > hp_xp_at_flick
     tick_passed = flicked_on_tick is not None and combat.get("tick") is not None and combat.get("tick") > flicked_on_tick
+    # is_on but we never tracked flicking it on ourselves (e.g. a script restart mid-flick) --
+    # we have no idea how long it's actually been on, so treat it the same as "time to turn
+    # it off" rather than leaving it lit with nothing ever able to notice.
+    untracked = flicked_on_tick is None
 
-    if hit_landed or tick_passed:
+    if hit_landed or tick_passed or untracked:
         controller.open_prayer_tab(ctx.ser)
         icon = controller.get_prayers().get("icons", {}).get(offensive_prayer)
+        cleared = False
         if icon:
-            print(f"[prayer] flicking off {offensive_prayer} ({'hit landed' if hit_landed else 'attack tick passed'})")
+            reason = "hit landed" if hit_landed else ("untracked" if untracked else "attack tick passed")
+            print(f"[prayer] flicking off {offensive_prayer} ({reason})")
             controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False)
-        ctx.state.data["offensive_prayer_on_since_tick"] = None
-        ctx.state.data["offensive_prayer_hp_xp_at_flick"] = None
+            cleared = True
+        elif tick_passed and combat.get("tick") - flicked_on_tick >= OFFENSIVE_PRAYER_STUCK_ON_TICKS:
+            # The icon lookup has failed for several ticks running -- clear our own tracking
+            # anyway rather than staying permanently unable to ever detect "off" again. The
+            # prayer may stay lit in-game a tick or two longer than intended, but that beats
+            # draining prayer points forever with nothing able to notice.
+            print(f"[prayer] giving up on flicking off {offensive_prayer} -- icon not found for "
+                  f"{OFFENSIVE_PRAYER_STUCK_ON_TICKS}+ ticks, clearing tracked state anyway")
+            cleared = True
+
+        if cleared:
+            ctx.state.data["offensive_prayer_on_since_tick"] = None
+            ctx.state.data["offensive_prayer_hp_xp_at_flick"] = None
 
 
 def maintain_supplies(ctx):
