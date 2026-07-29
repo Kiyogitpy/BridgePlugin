@@ -174,6 +174,41 @@ def pick_target(npcs: list, config: dict):
     return candidates[0]
 
 
+# Prayer level requirements, mirroring com.example.controller.DefensivePrayerChoice /
+# OffensivePrayerChoice on the Java side (keep both in sync if either changes) --
+# standard OSRS prayer levels, not re-verified against a live client but stable/
+# well-known. Used to skip a manually-picked prayer the account hasn't unlocked yet
+# (rather than looping forever re-clicking a locked icon) and to resolve the three
+# Auto entries below.
+PRAYER_LEVELS = {
+    "PROTECT_FROM_MAGIC": 37,
+    "PROTECT_FROM_MISSILES": 40,
+    "PROTECT_FROM_MELEE": 43,
+    "STEEL_SKIN": 28,
+    "ULTIMATE_STRENGTH": 31,
+    "INCREDIBLE_REFLEXES": 34,
+    "CHIVALRY": 60,
+    "PIETY": 70,
+    "EAGLE_EYE": 44,
+    "DEADEYE": 62,
+    "RIGOUR": 74,
+    "MYSTIC_LORE": 27,
+    "MYSTIC_MIGHT": 45,
+    "AUGURY": 77,
+}
+
+# Best-to-worst per combat style -- AUTO_* resolves to the first entry the account's
+# prayer level actually covers. DEADEYE is deliberately not in AUTO_RANGED's ladder:
+# unlocking it needs a Royal Titans scroll drop on top of the level requirement,
+# which this level-only check can't verify -- accounts that have it unlocked can
+# pick it directly instead of via Auto.
+AUTO_PRAYER_LADDERS = {
+    "AUTO_MELEE": ["PIETY", "CHIVALRY", "STEEL_SKIN"],
+    "AUTO_RANGED": ["RIGOUR", "EAGLE_EYE"],
+    "AUTO_MAGIC": ["AUGURY", "MYSTIC_MIGHT", "MYSTIC_LORE"],
+}
+
+
 def maintain_prayer(ctx, combat: dict):
     config = ctx.state.config
     prayer_cfg = config.get("prayer", {})
