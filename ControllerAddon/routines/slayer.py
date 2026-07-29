@@ -47,7 +47,8 @@ def tick(ctx):
         return
 
     combat = controller.get_combat()
-    maintain_prayer(ctx, combat)
+    maintain_defensive_prayer(ctx, combat)
+    maintain_offensive_prayer(ctx, combat)
     maintain_supplies(ctx)
 
     if config.get("loot", {}).get("enabled"):
@@ -209,7 +210,11 @@ AUTO_PRAYER_LADDERS = {
 }
 
 
-def maintain_prayer(ctx, combat: dict):
+def maintain_defensive_prayer(ctx, combat: dict):
+    """Keeps a single defensive (Protect from X) prayer on for the whole fight --
+    LAZY behavior (see docs/superpowers/specs/2026-07-29-split-defensive-offensive-prayer-design.md),
+    unlike maintain_offensive_prayer's flick-on/flick-off. Also drives prayer-potion
+    upkeep, since that's independent of which prayer(s) are actually selected."""
     config = ctx.state.config
     prayer_cfg = config.get("prayer", {})
     if not prayer_cfg.get("enabled"):
@@ -218,25 +223,44 @@ def maintain_prayer(ctx, combat: dict):
     prayers = controller.get_prayers()
     player = controller.get_player()
 
+    raw_defensive_prayer = prayer_cfg.get("defensivePrayer", "NONE")
+    defensive_prayer = resolve_combat_prayer(raw_defensive_prayer, player.get("prayerReal"))
+
     if prayer_cfg.get("useQuickPrayers"):
         want_on = bool(combat.get("inCombat"))
-        if random.random() < settings.MISTAKE_PRAYER_FUMBLE_CHANCE:
-            # Fumble the toggle -- click the orb as if we meant the opposite
-            # state. Self-corrects on a later tick once want_on/is_on
-            # disagree again for real, same as a human noticing and
-            # re-clicking a moment later.
-            want_on = not want_on
         is_on = prayers.get("quickPrayerEnabled", False)
         if want_on != is_on:
             ox, oy = prayers.get("quickOrbScreenX"), prayers.get("quickOrbScreenY")
             if ox is not None and oy is not None:
                 controller.click_entity(ctx.ser, {"screenX": ox, "screenY": oy}, offset=(0, 0))
-    elif not ctx.state.data.get("warned_no_individual_prayers"):
-        print("[prayer] usePrayer is on with useQuickPrayers off -- individual prayer "
-              "icons aren't exposed with screen coordinates by the bridge yet, so only "
-              "quick prayers can be toggled automatically. Enable quick prayers in "
-              "Controller Settings and set up the matching quick-prayer loadout in-game.")
-        ctx.state.data["warned_no_individual_prayers"] = True
+    elif defensive_prayer:
+        want_on = bool(combat.get("inCombat"))
+        is_on = prayers.get("active", {}).get(defensive_prayer, False)
+        if want_on != is_on:
+            # Prayer icons only get live screen coords while the Prayer tab is open --
+            # switch to it, then re-fetch (the "prayers" snapshot above was taken before
+            # we knew we'd need it, so its "icons" may still be from whatever tab was
+            # open a moment ago).
+            controller.open_prayer_tab(ctx.ser)
+            icon = controller.get_prayers().get("icons", {}).get(defensive_prayer)
+            if icon:
+                print(f"[prayer] {'turning on' if want_on else 'turning off'} {defensive_prayer}")
+                controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False)
+    elif raw_defensive_prayer in (None, "", "NONE"):
+        if not ctx.state.data.get("warned_no_defensive_prayer"):
+            print("[prayer] usePrayer is on with useQuickPrayers off, but Defensive Prayer is "
+                  "set to None in Controller Settings -- nothing to toggle. Pick a prayer there "
+                  "(e.g. Protect from Melee) or enable Use Quick Prayers instead.")
+            ctx.state.data["warned_no_defensive_prayer"] = True
+    elif not ctx.state.data.get("warned_defensive_prayer_level_too_low"):
+        # Either a manually-picked prayer this account hasn't unlocked, or an Auto ladder
+        # with nothing on it affordable yet -- either way, nothing usable right now. Surfaced
+        # once rather than resolve_combat_prayer's None silently looking identical to "nothing
+        # configured", which would otherwise be confusing to debug from the logs alone.
+        print(f"[prayer] Defensive Prayer is set to {raw_defensive_prayer} in Controller "
+              f"Settings, but nothing in that selection is usable yet at prayer level "
+              f"{player.get('prayerReal')} -- nothing to toggle until it's leveled up.")
+        ctx.state.data["warned_defensive_prayer_level_too_low"] = True
 
     potions_cfg = config.get("potions", {})
     if potions_cfg.get("prayerEnabled"):
@@ -245,14 +269,80 @@ def maintain_prayer(ctx, combat: dict):
         if current_prayer is None:
             return
 
-        should_drink = current_prayer <= restore_at
+        # Drinking at the exact same prayer point every time is a tell -- roll a fresh
+        # threshold somewhere in [restore_at, restore_at + spread] instead, so some fights
+        # get topped up right at the floor and others earlier, same as a real player
+        # glancing at the orb rather than watching it like a hawk. Sticks until a drink
+        # actually happens, then re-rolls for next time.
+        threshold = ctx.state.data.get("prayer_drink_threshold")
+        if threshold is None:
+            threshold = random.uniform(restore_at, restore_at + settings.PRAYER_RESTORE_SPREAD)
+            ctx.state.data["prayer_drink_threshold"] = threshold
+
+        should_drink = current_prayer <= threshold
         mistake = False
         if not should_drink and prayer_max and current_prayer >= prayer_max * settings.MISTAKE_OVERDRINK_MIN_PRAYER_FRACTION \
                 and random.random() < settings.MISTAKE_OVERDRINK_CHANCE:
             should_drink, mistake = True, True  # wastes a dose we didn't actually need yet
 
-        if should_drink and controller.consume_first(ctx.ser, controller.get_consumables().get("prayer", [])):
-            print(f"[prayer] {'(mistake) ' if mistake else ''}drank prayer restore (prayer={current_prayer})")
+        if should_drink and controller.consume_first(ctx.ser, "prayer"):
+            print(f"[prayer] {'(mistake) ' if mistake else ''}drank prayer restore "
+                  f"(prayer={current_prayer}, threshold={threshold:.0f})")
+            ctx.state.data["prayer_drink_threshold"] = None
+
+
+def maintain_offensive_prayer(ctx, combat: dict):
+    """Flicks a single offensive (stat-boosting) prayer on right before the player's
+    own attack lands and off once it registers -- LAZY_FLICK-style behavior (see
+    docs/superpowers/specs/2026-07-29-split-defensive-offensive-prayer-design.md),
+    scoped down from the full damage-prediction system a reference community fork
+    (ZombieLite) uses for the same idea, since this project has no equivalent and
+    can't reliably hit tick-perfect timing through external input anyway. Requires
+    the Attack Timer Metronome plugin to be loaded -- if combat.ticksUntilNextAttack
+    is ever absent, this is a permanent no-op (never guesses a fallback timing)."""
+    config = ctx.state.config
+    prayer_cfg = config.get("prayer", {})
+    if not prayer_cfg.get("enabled"):
+        return
+
+    raw_offensive_prayer = prayer_cfg.get("offensivePrayer", "NONE")
+    player = controller.get_player()
+    offensive_prayer = resolve_combat_prayer(raw_offensive_prayer, player.get("prayerReal"))
+    if not offensive_prayer:
+        return
+
+    ticks_until_attack = combat.get("ticksUntilNextAttack")
+    if ticks_until_attack is None:
+        return
+
+    prayers = controller.get_prayers()
+    is_on = prayers.get("active", {}).get(offensive_prayer, False)
+    hp_xp = player.get("hitpointsXp")
+    flicked_on_tick = ctx.state.data.get("offensive_prayer_on_since_tick")
+
+    if not is_on:
+        if ticks_until_attack == 1 and combat.get("inCombat"):
+            controller.open_prayer_tab(ctx.ser)
+            icon = controller.get_prayers().get("icons", {}).get(offensive_prayer)
+            if icon:
+                print(f"[prayer] flicking on {offensive_prayer}")
+                controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False)
+                ctx.state.data["offensive_prayer_on_since_tick"] = combat.get("tick")
+                ctx.state.data["offensive_prayer_hp_xp_at_flick"] = hp_xp
+        return
+
+    hp_xp_at_flick = ctx.state.data.get("offensive_prayer_hp_xp_at_flick")
+    hit_landed = hp_xp is not None and hp_xp_at_flick is not None and hp_xp > hp_xp_at_flick
+    tick_passed = flicked_on_tick is not None and combat.get("tick") is not None and combat.get("tick") > flicked_on_tick
+
+    if hit_landed or tick_passed:
+        controller.open_prayer_tab(ctx.ser)
+        icon = controller.get_prayers().get("icons", {}).get(offensive_prayer)
+        if icon:
+            print(f"[prayer] flicking off {offensive_prayer} ({'hit landed' if hit_landed else 'attack tick passed'})")
+            controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False)
+        ctx.state.data["offensive_prayer_on_since_tick"] = None
+        ctx.state.data["offensive_prayer_hp_xp_at_flick"] = None
 
 
 def maintain_supplies(ctx):
