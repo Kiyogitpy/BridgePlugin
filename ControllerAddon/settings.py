@@ -40,9 +40,9 @@ MOVING_TARGET_MIDFLIGHT_FRACTION = 0.6  # fly this far toward the stale point be
 # Small, deliberately-imperfect behaviors so supply/prayer upkeep and
 # clicking don't look like a flawless state machine -- real players
 # occasionally eat a bite too early, drink a potion before they needed it,
-# fumble a prayer toggle, or click empty ground. Kept low-probability and
-# rolled independently per check so they show up occasionally, not in
-# clusters. See slayer.maintain_supplies/maintain_prayer and
+# or click empty ground. Kept low-probability and rolled independently per
+# check so they show up occasionally, not in clusters. See
+# slayer.maintain_supplies/maintain_defensive_prayer and
 # controller.maybe_misclick.
 MISTAKE_OVEREAT_CHANCE = 0.04             # chance/tick to eat before actually hitting eatAt
 MISTAKE_OVEREAT_MIN_HP_FRACTION = 0.75    # ...but only once hp is already at least this fraction of real hp
@@ -53,7 +53,6 @@ MISTAKE_OVERDRINK_MIN_PRAYER_FRACTION = 0.75  # ...but only once prayer is alrea
 # [restoreAt, restoreAt + PRAYER_RESTORE_SPREAD] each cycle instead of always
 # waiting for exactly the configured restoreAt floor.
 PRAYER_RESTORE_SPREAD = 25
-MISTAKE_PRAYER_FUMBLE_CHANCE = 0.03       # chance to toggle quick prayers to the wrong state for a tick
 MISTAKE_MISCLICK_CHANCE = 0.045           # chance per click_entity call to aim beside the target instead of on it
 MISCLICK_OFFSET_PX = (20, 45)             # px; how far off that miss lands -- roughly one tile over, not a wild miss
 MISTAKE_RANDOM_CLICK_CHANCE = 0.02        # chance/tick to click a random viewport point instead of acting

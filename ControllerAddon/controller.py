@@ -159,6 +159,18 @@ def get_bank():
     return api_get("/bank") or {"open": False}
 
 
+def get_equipment():
+    return api_get("/equipment") or {}
+
+
+def get_graphics_objects():
+    return api_get("/graphics-objects") or []
+
+
+def get_tormented_demon_config():
+    return api_get("/tormented-demon-config")
+
+
 def get_minimap_walk_point(x: int, y: int, plane: int):
     return api_get("/minimap/walk", params={"x": x, "y": y, "plane": plane}) or {"onMinimap": False}
 
@@ -781,7 +793,12 @@ def hover_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
     return not _movement_abort.is_set()
 
 
-def consume_first(ser: serial.Serial, items: list) -> bool:
+def consume_first(ser: serial.Serial, category: str) -> bool:
+    """Click the first inventory item ConsumablesProvider tags as `category` (e.g. "food",
+    "prayer"). Only resolves item screen coords while the Inventory tab is open, so switch
+    to it first -- same reasoning as open_prayer_tab for prayer icons."""
+    open_inventory_tab(ser)
+    items = get_consumables().get(category, [])
     if not items:
         return False
     return click_entity(ser, items[0])

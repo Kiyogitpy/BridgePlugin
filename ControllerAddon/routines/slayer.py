@@ -276,7 +276,7 @@ def maintain_defensive_prayer(ctx, combat: dict):
             icon = controller.get_prayers().get("icons", {}).get(defensive_prayer)
             if icon:
                 print(f"[prayer] {'turning on' if want_on else 'turning off'} {defensive_prayer}")
-                controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False)
+                controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
     elif raw_defensive_prayer in (None, "", "NONE"):
         if not ctx.state.data.get("warned_no_defensive_prayer"):
             print("[prayer] usePrayer is on with useQuickPrayers off, but Defensive Prayer is "
@@ -307,7 +307,13 @@ def maintain_defensive_prayer(ctx, combat: dict):
         # actually happens, then re-rolls for next time.
         threshold = ctx.state.data.get("prayer_drink_threshold")
         if threshold is None:
-            threshold = random.uniform(restore_at, restore_at + settings.PRAYER_RESTORE_SPREAD)
+            # Clamp below prayer_max -- otherwise a low real Prayer level (restore_at + spread
+            # exceeding max) would make should_drink permanently True instead of "occasionally
+            # a bit early".
+            spread_max = restore_at + settings.PRAYER_RESTORE_SPREAD
+            if prayer_max:
+                spread_max = min(spread_max, prayer_max)
+            threshold = random.uniform(restore_at, max(restore_at, spread_max))
             ctx.state.data["prayer_drink_threshold"] = threshold
 
         should_drink = current_prayer <= threshold
@@ -357,7 +363,7 @@ def maintain_offensive_prayer(ctx, combat: dict):
             icon = controller.get_prayers().get("icons", {}).get(offensive_prayer)
             if icon:
                 print(f"[prayer] flicking on {offensive_prayer}")
-                controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False)
+                controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
                 ctx.state.data["offensive_prayer_on_since_tick"] = combat.get("tick")
                 ctx.state.data["offensive_prayer_hp_xp_at_flick"] = hp_xp
         return
@@ -377,7 +383,7 @@ def maintain_offensive_prayer(ctx, combat: dict):
         if icon:
             reason = "hit landed" if hit_landed else ("untracked" if untracked else "attack tick passed")
             print(f"[prayer] flicking off {offensive_prayer} ({reason})")
-            controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False)
+            controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
             cleared = True
         elif tick_passed and combat.get("tick") - flicked_on_tick >= OFFENSIVE_PRAYER_STUCK_ON_TICKS:
             # The icon lookup has failed for several ticks running -- clear our own tracking
@@ -408,7 +414,7 @@ def maintain_supplies(ctx):
                 and random.random() < settings.MISTAKE_OVEREAT_CHANCE:
             should_eat, mistake = True, True  # eats a bite we didn't actually need, e.g. right up near full hp
 
-        if should_eat and controller.consume_first(ctx.ser, controller.get_consumables().get("food", [])):
+        if should_eat and controller.consume_first(ctx.ser, "food"):
             print(f"[supplies] {'(mistake) ' if mistake else ''}ate food (hp={hp})")
             return  # avoid eating and drinking in the same tick
 

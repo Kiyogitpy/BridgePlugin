@@ -162,7 +162,9 @@ public interface ControllerConfig extends Config
 	@ConfigItem(
 		keyName = "offensivePrayer",
 		name = "Offensive Prayer",
-		description = "Stat-boosting prayer to flick on right before each of your own attack and off once it lands.",
+		description = "Stat-boosting prayer to flick on right before each of your own attacks and off once it "
+			+ "lands. Requires the separately-installed \"Attack Timer Metronome\" plugin to be enabled -- "
+			+ "without it, this setting silently does nothing.",
 		section = prayerSection,
 		position = 2
 	)

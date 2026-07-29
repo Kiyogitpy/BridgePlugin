@@ -15,10 +15,12 @@ import java.util.Map;
 
 public class CombatProvider extends BridgeProvider
 {
+	private static final long METRONOME_HOOK_RETRY_INTERVAL_MS = 10_000;
+
 	private final PluginManager pluginManager;
 	private Plugin metronomePlugin;
 	private java.lang.reflect.Method ticksUntilNextAttackMethod;
-	private boolean metronomeHooked = false;
+	private long lastMetronomeHookAttemptMs = -METRONOME_HOOK_RETRY_INTERVAL_MS;
 
 	public CombatProvider(Client client, ClientThread clientThread, BridgeHttpServer server, PluginManager pluginManager)
 	{
@@ -110,16 +112,24 @@ public class CombatProvider extends BridgeProvider
 	// Attack Timer Metronome has no official RuneLite API surface -- this reflects into it by
 	// name, same technique as UnsafeNpcOverheadIcon and the same technique the community
 	// ZombieLite fork uses for the same plugin (see its ZombiePrayerPlugin
-	// .hookAttackTimerMetronome()). Hooked once (first call); if the plugin isn't loaded or
-	// this method no longer exists on it, ticksUntilNextAttack is simply absent from every
-	// /combat response afterward -- no error, no fallback guess.
+	// .hookAttackTimerMetronome()). Retried on a cooldown rather than a one-shot latch --
+	// the user may enable the plugin (or RuneLite may start it) after this provider's first
+	// /combat poll, and a permanent latch would otherwise mean restarting RuneLite to pick it
+	// up. If the plugin genuinely isn't installed, or this method no longer exists on it,
+	// ticksUntilNextAttack is simply absent from every /combat response -- no error, no
+	// fallback guess.
 	private void hookMetronomeIfNeeded()
 	{
-		if (metronomeHooked)
+		if (metronomePlugin != null)
 		{
 			return;
 		}
-		metronomeHooked = true;
+		long now = System.currentTimeMillis();
+		if (now - lastMetronomeHookAttemptMs < METRONOME_HOOK_RETRY_INTERVAL_MS)
+		{
+			return;
+		}
+		lastMetronomeHookAttemptMs = now;
 
 		Plugin plugin = pluginManager.getPlugins().stream()
 			.filter(p -> p.getClass().getName().equals("com.attacktimer.AttackTimerMetronomePlugin"))
