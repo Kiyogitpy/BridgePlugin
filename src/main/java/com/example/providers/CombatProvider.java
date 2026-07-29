@@ -6,6 +6,8 @@ import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginManager;
 
 import java.awt.Point;
 import java.util.HashMap;
@@ -13,9 +15,15 @@ import java.util.Map;
 
 public class CombatProvider extends BridgeProvider
 {
-	public CombatProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
+	private final PluginManager pluginManager;
+	private Plugin metronomePlugin;
+	private java.lang.reflect.Method ticksUntilNextAttackMethod;
+	private boolean metronomeHooked = false;
+
+	public CombatProvider(Client client, ClientThread clientThread, BridgeHttpServer server, PluginManager pluginManager)
 	{
 		super(client, clientThread, server);
+		this.pluginManager = pluginManager;
 	}
 
 	@Override
@@ -37,6 +45,13 @@ public class CombatProvider extends BridgeProvider
 		}
 
 		data.put("tick", client.getTickCount());
+
+		Integer ticksUntilNextAttack = getTicksUntilNextAttack();
+		if (ticksUntilNextAttack != null)
+		{
+			data.put("ticksUntilNextAttack", ticksUntilNextAttack);
+		}
+
 		data.put("animation", local.getAnimation());
 		data.put("poseAnimation", local.getPoseAnimation());
 
@@ -90,6 +105,61 @@ public class CombatProvider extends BridgeProvider
 		data.put("isIdle", idle);
 
 		return data;
+	}
+
+	// Attack Timer Metronome has no official RuneLite API surface -- this reflects into it by
+	// name, same technique as UnsafeNpcOverheadIcon and the same technique the community
+	// ZombieLite fork uses for the same plugin (see its ZombiePrayerPlugin
+	// .hookAttackTimerMetronome()). Hooked once (first call); if the plugin isn't loaded or
+	// this method no longer exists on it, ticksUntilNextAttack is simply absent from every
+	// /combat response afterward -- no error, no fallback guess.
+	private void hookMetronomeIfNeeded()
+	{
+		if (metronomeHooked)
+		{
+			return;
+		}
+		metronomeHooked = true;
+
+		Plugin plugin = pluginManager.getPlugins().stream()
+			.filter(p -> p.getClass().getName().equals("com.attacktimer.AttackTimerMetronomePlugin"))
+			.findFirst().orElse(null);
+		if (plugin == null)
+		{
+			return;
+		}
+
+		try
+		{
+			java.lang.reflect.Method method = plugin.getClass().getDeclaredMethod("getTicksUntilNextAttack");
+			if (method.getReturnType() != int.class)
+			{
+				return;
+			}
+			method.setAccessible(true);
+			metronomePlugin = plugin;
+			ticksUntilNextAttackMethod = method;
+		}
+		catch (NoSuchMethodException | SecurityException ignored)
+		{
+		}
+	}
+
+	private Integer getTicksUntilNextAttack()
+	{
+		hookMetronomeIfNeeded();
+		if (metronomePlugin == null || ticksUntilNextAttackMethod == null)
+		{
+			return null;
+		}
+		try
+		{
+			return (int) ticksUntilNextAttackMethod.invoke(metronomePlugin);
+		}
+		catch (Exception ignored)
+		{
+			return null;
+		}
 	}
 
 	/**

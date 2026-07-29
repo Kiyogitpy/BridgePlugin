@@ -99,7 +99,7 @@ public class ControllerPlugin extends Plugin
 		new GameStateProvider(client, clientThread, server).register();
 		new PlayerProvider(client, clientThread, server).register();
 		new PvpProvider(client, clientThread, server).register();
-		new CombatProvider(client, clientThread, server).register();
+		new CombatProvider(client, clientThread, server, pluginManager).register();
 		new PrayerProvider(client, clientThread, server).register();
 		new SkillProvider(client, clientThread, server).register();
 		new CameraProvider(client, clientThread, server).register();
