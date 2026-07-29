@@ -109,6 +109,7 @@ public class ControllerPlugin extends Plugin
 		new NPCProvider(client, clientThread, server).register();
 		new ObjectProvider(client, clientThread, server).register();
 		new GroundItemProvider(client, clientThread, server, itemManager).register();
+		new GraphicsObjectProvider(client, clientThread, server).register();
 		new TileProvider(client, clientThread, server).register();
 		new ConfigProvider(client, clientThread, server, config).register();
 		new ConsumablesProvider(client, clientThread, server, config).register();
@@ -146,6 +147,19 @@ public class ControllerPlugin extends Plugin
 	ControllerConfig provideConfig(ConfigManager configManager)
 	{
 		return configManager.getConfig(ControllerConfig.class);
+	}
+
+	/**
+	 * Lets sibling plugins (declared via @PluginDependency(ControllerPlugin.class), e.g.
+	 * MiningPlugin/GemstoneCrabPlugin/TormentedDemonPlugin) register their own config
+	 * endpoints on this same bridge instead of each standing up a separate HTTP server.
+	 * @PluginDependency guarantees this plugin's startUp() (which creates the server) runs
+	 * before any dependent plugin's startUp() runs, so this is never null by the time a
+	 * dependent needs it.
+	 */
+	public BridgeHttpServer getServer()
+	{
+		return server;
 	}
 
 	@Subscribe

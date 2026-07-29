@@ -103,6 +103,13 @@ public class GameStateProvider extends BridgeProvider
 			|| isWidgetVisible(WidgetInfo.DIALOG_SPRITE_TEXT)
 			|| isWidgetVisible(WidgetInfo.DIALOG_DOUBLE_SPRITE_TEXT));
 
+		// True only while the Inventory sidebar tab is the one currently selected -- the
+		// INVENTORY widget group (what ConsumablesProvider/InventoryProvider resolve item
+		// screen coords from) only holds live bounds while its tab is on screen. Routines
+		// must switch to this tab (see controller.py's open_inventory_tab) before trusting
+		// any inventory item's screenX/Y, or before treating a click on one as reachable.
+		data.put("inventoryTabOpen", isWidgetVisible(WidgetInfo.INVENTORY));
+
 		return data;
 	}
 

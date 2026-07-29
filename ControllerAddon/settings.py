@@ -29,8 +29,8 @@ INVENTORY_SIZE = 28
 DEFAULT_AIM_RADIUS = 10         # px; move_to_human's own fallback when a caller doesn't specify one
 ENTITY_AIM_RADIUS = 3           # px; used by click_entity -- tighter than the generic default since
                                  # ground items and inventory slots have small clickboxes
-DEFAULT_OVERSHOOT_PX = 12       # px; how far a simulated overshoot flies past the target
-DEFAULT_OVERSHOOT_CHANCE = 0.25  # probability a given move overshoots before correcting
+DEFAULT_OVERSHOOT_PX = 22       # px; how far a simulated overshoot flies past the target
+DEFAULT_OVERSHOOT_CHANCE = 0.42  # probability a given move overshoots before correcting
 
 # ---------------- Moving-target re-aiming ----------------
 MOVING_TARGET_MIN_DIST = 60             # px; shorter moves finish too fast to bother re-aiming
@@ -48,7 +48,14 @@ MISTAKE_OVEREAT_CHANCE = 0.04             # chance/tick to eat before actually h
 MISTAKE_OVEREAT_MIN_HP_FRACTION = 0.75    # ...but only once hp is already at least this fraction of real hp
 MISTAKE_OVERDRINK_CHANCE = 0.03           # chance/tick to drink a prayer potion before actually hitting restoreAt
 MISTAKE_OVERDRINK_MIN_PRAYER_FRACTION = 0.75  # ...but only once prayer is already at least this fraction of real prayer
+# Drinking at the exact same prayer point every single time is a tell -- see
+# slayer.maintain_defensive_prayer, which rolls an actual drink threshold somewhere in
+# [restoreAt, restoreAt + PRAYER_RESTORE_SPREAD] each cycle instead of always
+# waiting for exactly the configured restoreAt floor.
+PRAYER_RESTORE_SPREAD = 25
 MISTAKE_PRAYER_FUMBLE_CHANCE = 0.03       # chance to toggle quick prayers to the wrong state for a tick
+MISTAKE_MISCLICK_CHANCE = 0.045           # chance per click_entity call to aim beside the target instead of on it
+MISCLICK_OFFSET_PX = (20, 45)             # px; how far off that miss lands -- roughly one tile over, not a wild miss
 MISTAKE_RANDOM_CLICK_CHANCE = 0.02        # chance/tick to click a random viewport point instead of acting
 
 # ---------------- Idle mouse drift ----------------

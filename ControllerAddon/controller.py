@@ -347,13 +347,37 @@ def key_up(ser: serial.Serial, key: str) -> None:
     send_line(ser, f"KU {key}")
 
 
+INVENTORY_TAB_KEY = "w"
+PRAYER_TAB_KEY = "r"
+
+
+def open_inventory_tab(ser: serial.Serial) -> None:
+    if get_state().get("inventoryTabOpen"):
+        return
+    key_tap(ser, INVENTORY_TAB_KEY)
+    time.sleep(random.uniform(0.2, 0.35))
+
+
+def open_prayer_tab(ser: serial.Serial) -> None:
+    """Tap the prayer-tab hotkey unless it's already open -- PrayerProvider's "icons"
+    are only populated while it is (see its "tabOpen" flag)."""
+    if get_prayers().get("tabOpen"):
+        return
+    key_tap(ser, PRAYER_TAB_KEY)
+    time.sleep(random.uniform(0.2, 0.35))
+
+
 # ---------------- Human-like trajectory generation ----------------
 def clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
 
 
 def ease_in_out(t: float) -> float:
-    return t * t * (3.0 - 2.0 * t)
+    # Real click-to-click recordings show speed peaking near t=1/3 (a fast
+    # ballistic ramp-up, then a longer decel tail) rather than the symmetric
+    # peak-at-0.5 bell a plain smoothstep produces. This is the CDF of
+    # t**2 * (1-t)**4, whose density peaks at t=1/3.
+    return 35 * t**3 - 105 * t**4 + 126 * t**5 - 70 * t**6 + 15 * t**7
 
 
 @dataclass
@@ -391,16 +415,20 @@ def build_bezier_path(start: tuple, end: tuple) -> Bezier:
         perp_x = -dy / dist
         perp_y = dx / dist
 
-    curve_mag = clamp(dist * random.uniform(0.10, 0.25), 8.0, 220.0)
+    curve_mag = clamp(dist * random.uniform(0.15, 0.35), 8.0, 300.0)
     curve_sign = random.choice([-1.0, 1.0])
+    # Real aim-trainer recordings show ~2/3 of moves cross back over the
+    # straight line at least once -- about half here, since c2 is only one
+    # of two places a reversal can come from (the other being end-jitter).
+    c2_sign = -1.0 if random.random() < 0.50 else 1.0
 
     c1_t = random.uniform(0.20, 0.38)
     c2_t = random.uniform(0.62, 0.82)
 
     c1x = sx + dx * c1_t + perp_x * curve_mag * curve_sign * random.uniform(0.6, 1.1)
     c1y = sy + dy * c1_t + perp_y * curve_mag * curve_sign * random.uniform(0.6, 1.1)
-    c2x = sx + dx * c2_t - perp_x * curve_mag * curve_sign * random.uniform(0.4, 1.0)
-    c2y = sy + dy * c2_t - perp_y * curve_mag * curve_sign * random.uniform(0.4, 1.0)
+    c2x = sx + dx * c2_t + perp_x * curve_mag * curve_sign * c2_sign * random.uniform(0.4, 1.0)
+    c2y = sy + dy * c2_t + perp_y * curve_mag * curve_sign * c2_sign * random.uniform(0.4, 1.0)
 
     ex2 = ex + random.uniform(-0.4, 0.4)
     ey2 = ey + random.uniform(-0.4, 0.4)
@@ -411,8 +439,13 @@ def build_bezier_path(start: tuple, end: tuple) -> Bezier:
 def estimate_duration_ms(dist: float) -> float:
     base = 90 + 0.55 * dist
     base = base ** 0.92
+    # Real click-to-click recordings (aim trainer and live OSRS play) run
+    # ~4-4.5x longer than this base estimate, but part of that gap is
+    # decision/scan latency before the hand starts moving, not slower
+    # movement itself -- take roughly half the gap here.
+    base *= 1.9
     jitter = random.uniform(0.85, 1.15)
-    return clamp(base * jitter, 110, 950)
+    return clamp(base * jitter, 200, 1800)
 
 
 def micro_pause_chance(dist: float) -> bool:
@@ -563,10 +596,11 @@ def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140, 
 
         tx, ty = bez.point(te)
 
-        if t > 0.65:
-            jitter = clamp(dist / 900.0, 0.2, 1.2)
-            tx += random.uniform(-jitter, jitter)
-            ty += random.uniform(-jitter, jitter)
+        jitter = clamp(dist / 900.0, 0.3, 1.2)
+        if t > 0.75:
+            jitter *= 0.55  # settles down on final approach, matching recorded late-third tremor
+        tx += random.uniform(-jitter, jitter)
+        ty += random.uniform(-jitter, jitter)
 
         cx, cy = get_cursor_pos()
         dx = int(round(tx)) - cx
@@ -681,21 +715,36 @@ def rotate_camera_to_reveal(ser: serial.Serial, x) -> None:
 # ConsumablesProvider, PrayerProvider, ObjectProvider) already returns
 # *absolute* screen coordinates (canvas offset baked in server-side) -- do
 # not add the canvas offset again here.
-def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_target=None) -> bool:
+def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_target=None,
+                  check_ui_blockers=True, simulate_mistakes=True) -> bool:
     x, y = entity.get("screenX"), entity.get("screenY")
     if x is None or y is None:
         return False
 
     aim_x, aim_y = int(x) + offset[0], int(y) + offset[1]
 
+    if simulate_mistakes and random.random() < MISTAKE_MISCLICK_CHANCE:
+        # Simulate a near-miss -- aimed at the ground/tile beside the target instead of on
+        # it (e.g. clicked next to the crab instead of the crab itself), rather than a wild
+        # click somewhere unrelated in the viewport. Applies everywhere (including mid-combat)
+        # rather than checking combat state first, which would mean an extra bridge round-trip
+        # on every single click_entity call -- not worth it for a miss this mild; the next tick
+        # just re-clicks normally.
+        angle = random.uniform(0, 2 * math.pi)
+        miss_dist = random.uniform(*MISCLICK_OFFSET_PX)
+        aim_x += int(round(miss_dist * math.cos(angle)))
+        aim_y += int(round(miss_dist * math.sin(angle)))
+        print(f"[!] Misclick -- aimed beside {entity.get('name')} instead of on it")
+
     if not is_point_within_window(aim_x, aim_y):
         print(f"[!] Skipping click on {entity.get('name')} -- aim point is outside the RuneLite window")
         return False
 
-    blocker = is_point_blocked_by_ui(aim_x, aim_y)
-    if blocker is not None:
-        rotate_camera_away_from_ui(ser, blocker)
-        return False
+    if check_ui_blockers:
+        blocker = is_point_blocked_by_ui(aim_x, aim_y)
+        if blocker is not None:
+            rotate_camera_away_from_ui(ser, blocker)
+            return False
 
     move_to_human(
         ser,
