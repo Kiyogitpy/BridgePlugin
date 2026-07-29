@@ -26,7 +26,8 @@ public final class ConfigExporter
 
 		Map<String, Object> prayer = new LinkedHashMap<>();
 		prayer.put("enabled", config.usePrayer());
-		prayer.put("combatPrayer", config.combatPrayer().name());
+		prayer.put("defensivePrayer", config.defensivePrayer().name());
+		prayer.put("offensivePrayer", config.offensivePrayer().name());
 		prayer.put("useQuickPrayers", config.useQuickPrayers());
 		prayer.put("restoreAt", config.restorePrayerAt());
 		data.put("prayer", prayer);
