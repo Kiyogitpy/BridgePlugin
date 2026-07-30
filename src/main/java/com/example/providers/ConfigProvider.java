@@ -1,11 +1,11 @@
 package com.example.providers;
 
-import com.example.controller.ConfigExporter;
 import com.example.controller.ControllerConfig;
 import com.example.bridge.BridgeHttpServer;
 import net.runelite.api.Client;
 import net.runelite.client.callback.ClientThread;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 public class ConfigProvider extends BridgeProvider
@@ -24,8 +24,14 @@ public class ConfigProvider extends BridgeProvider
 		server.register("/config", () -> onClient(this::getConfig));
 	}
 
+	// Just the master switch and which routine to run -- routine-specific settings moved to
+	// SlayerConfig, exported separately by SlayerPlugin's own /slayer-config endpoint (see
+	// SlayerConfigProvider).
 	private Object getConfig()
 	{
-		return ConfigExporter.export(client, config);
+		Map<String, Object> data = new LinkedHashMap<>();
+		data.put("enabled", config.controllerEnabled());
+		data.put("routine", config.routine().name());
+		return data;
 	}
 }

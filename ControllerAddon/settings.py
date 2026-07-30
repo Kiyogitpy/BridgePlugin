@@ -55,7 +55,12 @@ MISTAKE_OVERDRINK_MIN_PRAYER_FRACTION = 0.75  # ...but only once prayer is alrea
 PRAYER_RESTORE_SPREAD = 25
 MISTAKE_MISCLICK_CHANCE = 0.045           # chance per click_entity call to aim beside the target instead of on it
 MISCLICK_OFFSET_PX = (20, 45)             # px; how far off that miss lands -- roughly one tile over, not a wild miss
-MISTAKE_RANDOM_CLICK_CHANCE = 0.02        # chance/tick to click a random viewport point instead of acting
+MISTAKE_RANDOM_CLICK_CHANCE = 0.004       # chance/tick to click a random viewport point instead of acting --
+                                           # kept low since this fires unconditionally, even mid-combat (no
+                                           # cheap per-tick combat check available before routine.tick's own
+                                           # /combat fetch) -- at 0.02 it read as yanking the click away from
+                                           # the fight roughly every 15s, which is far more scattered than a
+                                           # real player actually is while paying attention to a fight
 
 # ---------------- Idle mouse drift ----------------
 # Every so often, nudge the cursor a short distance from wherever it already

@@ -20,6 +20,14 @@ import java.util.Map;
  */
 public class GraphicsObjectProvider extends BridgeProvider
 {
+	// Same reasoning as ObjectProvider/NPCProvider/GroundItemProvider/TileProvider: a caller
+	// polling faster than the game state actually changes turns repeated per-object WorldPoint/
+	// distance work into a real source of client stutter, worst exactly when it matters most --
+	// a busy fight with many active effects onscreen. Caching by tick count adds no staleness
+	// since these only move/spawn/finish on game tick boundaries anyway.
+	private int cachedTick = -1;
+	private List<Map<String, Object>> cachedGraphicsObjects;
+
 	public GraphicsObjectProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
 	{
 		super(client, clientThread, server);
@@ -32,6 +40,17 @@ public class GraphicsObjectProvider extends BridgeProvider
 	}
 
 	private Object getGraphicsObjects()
+	{
+		int tick = client.getTickCount();
+		if (cachedGraphicsObjects == null || tick != cachedTick)
+		{
+			cachedGraphicsObjects = computeGraphicsObjects();
+			cachedTick = tick;
+		}
+		return cachedGraphicsObjects;
+	}
+
+	private List<Map<String, Object>> computeGraphicsObjects()
 	{
 		List<Map<String, Object>> list = new ArrayList<>();
 		for (GraphicsObject obj : client.getGraphicsObjects())

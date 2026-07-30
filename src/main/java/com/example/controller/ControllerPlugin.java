@@ -15,19 +15,15 @@ import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.PluginManager;
-import net.runelite.client.ui.ClientToolbar;
-import net.runelite.client.ui.NavigationButton;
-import net.runelite.client.util.ImageUtil;
 
 import javax.inject.Inject;
-import java.awt.image.BufferedImage;
 import java.util.HashMap;
 import java.util.Map;
 
 @PluginDescriptor(
-	name = "HttpBridge",
-	description = "Configure combat targets, prayers, food, potions, breaks, and safety limits; exposes game state over HTTP/UDP for the external controller.",
-	tags = {"controller", "config", "combat", "slayer", "bridge", "http"}
+	name = "* HttpBridge",
+	description = "Master enable switch, plus the shared HTTP/UDP bridge every other Controller plugin (Slayer, Mining, Gemstone Crab, Tormented Demon) talks to.",
+	tags = {"controller", "config", "bridge", "http"}
 )
 public class ControllerPlugin extends Plugin
 {
@@ -40,13 +36,10 @@ public class ControllerPlugin extends Plugin
 	private ClientThread clientThread;
 
 	@Inject
-	private SettingsPanel panel;
-
-	@Inject
-	private ClientToolbar clientToolbar;
-
-	@Inject
 	private ControllerConfig config;
+
+	@Inject
+	private ConfigManager configManager;
 
 	@Inject
 	private ItemManager itemManager;
@@ -57,7 +50,6 @@ public class ControllerPlugin extends Plugin
 	@Inject
 	private EventBus eventBus;
 
-	private NavigationButton navButton;
 	private BridgeHttpServer server;
 	private UdpEventSender udpSender;
 
@@ -71,25 +63,6 @@ public class ControllerPlugin extends Plugin
 	@Override
 	protected void startUp()
 	{
-		BufferedImage icon;
-		try
-		{
-			icon = ImageUtil.loadImageResource(getClass(), "/controller_icon.png");
-		}
-		catch (IllegalArgumentException e)
-		{
-			icon = createFallbackIcon();
-		}
-
-		navButton = NavigationButton.builder()
-			.tooltip("Controller Settings")
-			.icon(icon)
-			.priority(5)
-			.panel(panel)
-			.build();
-
-		clientToolbar.addNavigation(navButton);
-
 		udpSender = new UdpEventSender();
 		udpSender.start();
 
@@ -128,8 +101,6 @@ public class ControllerPlugin extends Plugin
 	@Override
 	protected void shutDown()
 	{
-		clientToolbar.removeNavigation(navButton);
-
 		if (server != null)
 		{
 			server.stop();
@@ -165,7 +136,11 @@ public class ControllerPlugin extends Plugin
 	@Subscribe
 	public void onMenuOpened(MenuOpened event)
 	{
-		MenuPriority.apply(client, config, event);
+		// SlayerConfig isn't @Inject-ed here -- its @Provides binding lives on SlayerPlugin
+		// (needed there for RuneLite to associate it with that plugin's own config screen), and
+		// a dependent plugin's binding isn't visible back to the plugin it depends on. Fetching
+		// it straight from ConfigManager sidesteps needing a Guice binding here at all.
+		MenuPriority.apply(client, config, configManager.getConfig(SlayerConfig.class), event);
 	}
 
 	@Subscribe
@@ -180,11 +155,6 @@ public class ControllerPlugin extends Plugin
 		{
 			udpSender.send("CONFIG_CHANGED");
 		}
-
-		// Keeps the sidebar panel's Controller Enabled/Profile/target selections live with
-		// whatever just changed -- including edits made from the wrench-icon config screen,
-		// which this panel doesn't otherwise hear about.
-		panel.syncFromConfig();
 	}
 
 	@Subscribe
@@ -343,18 +313,5 @@ public class ControllerPlugin extends Plugin
 			}
 		}
 		return hash;
-	}
-
-	private static BufferedImage createFallbackIcon()
-	{
-		BufferedImage img = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
-		java.awt.Graphics2D g = img.createGraphics();
-		g.setColor(new java.awt.Color(0x4CAF50));
-		g.fillOval(1, 1, 14, 14);
-		g.setColor(java.awt.Color.WHITE);
-		g.fillRect(5, 4, 2, 8);
-		g.fillRect(9, 6, 2, 6);
-		g.dispose();
-		return img;
 	}
 }

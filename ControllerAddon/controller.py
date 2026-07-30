@@ -6,19 +6,10 @@
 # safety stops and human-like breaks.
 #
 # It knows nothing about slayer, mining, or any other activity. What to
-# actually do is supplied by a "routine" -- a separate .py file. Normally
-# you just run:
-#
-#     python controller.py
-#
-# and controller.py picks the routine for you based on the "Profile"
-# dropdown in the RuneLite Controller Settings panel (see PROFILE_ROUTINES
-# below, which maps each Profile enum value to a routine file). Switching
-# the dropdown in-game swaps the running routine live, no restart needed.
-#
-# You can also pin a specific routine on the command line, which ignores the
-# dropdown entirely -- handy while writing a new routine that isn't wired
-# into Profile.java yet:
+# actually do is supplied by a "routine" -- a separate .py file, passed as a
+# required command-line argument (each Controller-family RuneLite plugin
+# owns its own settings screen now, so there's no in-game dropdown to fall
+# back to):
 #
 #     python controller.py routines/slayer.py
 #     python controller.py routines/mining.py
@@ -188,6 +179,10 @@ def get_shortest_path_result():
 
 def get_config():
     return api_get("/config")
+
+
+def get_slayer_config():
+    return api_get("/slayer-config") or {}
 
 
 def get_npc_screen_pos(npc_id: int):
@@ -796,7 +791,12 @@ def hover_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
 def consume_first(ser: serial.Serial, category: str) -> bool:
     """Click the first inventory item ConsumablesProvider tags as `category` (e.g. "food",
     "prayer"). Only resolves item screen coords while the Inventory tab is open, so switch
-    to it first -- same reasoning as open_prayer_tab for prayer icons."""
+    to it first -- same reasoning as open_prayer_tab for prayer icons. Checks for a matching
+    item BEFORE switching tabs, so running out of food/potions doesn't steal the tab away
+    from something else that needs it (e.g. offensive prayer flicking on the Prayer tab)
+    every single tick for nothing."""
+    if not get_consumables().get(category, []):
+        return False
     open_inventory_tab(ser)
     items = get_consumables().get(category, [])
     if not items:
@@ -1039,15 +1039,6 @@ def handle_generic_events(state: ControllerState, events: list):
                 state.trigger_safety_stop("player died")
 
 
-# ---------------- routine loading ----------------
-# Maps the ControllerConfig.Profile enum (RuneLite "Profile" dropdown) to a
-# routine file, relative to this file's directory. Add an entry here for
-# every value you add to Profile.java.
-PROFILE_ROUTINES = {
-    "SLAYER": "routines/slayer.py",
-    "MINING": "routines/mining.py",
-    "GEMSTONE_CRAB": "routines/gemstone_crab.py",
-}
 
 
 def routine_full_path(rel_path: str) -> str:
@@ -1070,6 +1061,17 @@ def load_routine(path: str):
     return module
 
 
+# Maps the RoutineChoice enum (RuneLite HttpBridge plugin's "Routine" dropdown) to a routine
+# file, relative to this file's directory. Add an entry here for every value you add to
+# RoutineChoice.java. Only consulted when no routine is pinned on the command line.
+ROUTINE_FILES = {
+    "SLAYER": "routines/slayer.py",
+    "MINING": "routines/mining.py",
+    "GEMSTONE_CRAB": "routines/gemstone_crab.py",
+    "TORMENTED_DEMON": "routines/tormented_demon.py",
+}
+
+
 def resolve_config(routine, bridge_config):
     if hasattr(routine, "get_config"):
         return routine.get_config(bridge_config)
@@ -1087,12 +1089,10 @@ def main():
         nargs="?",
         default=None,
         help=(
-            "Path to a routine .py file, e.g. routines/mining.py. Pins the "
-            "controller to that routine and ignores the in-game Profile "
-            "dropdown -- handy while developing a routine that isn't wired "
-            "into Profile.java / PROFILE_ROUTINES yet. Omit this to let the "
-            "RuneLite Controller Settings panel's Profile dropdown pick the "
-            "routine via PROFILE_ROUTINES."
+            "Path to a routine .py file, e.g. routines/slayer.py. Pins the controller to that "
+            "routine and ignores the HttpBridge plugin's Routine dropdown -- handy while "
+            "developing a routine that isn't wired into ROUTINE_FILES yet. Omit this to pick "
+            "the routine live from the RuneLite HttpBridge plugin's Routine setting instead."
         ),
     )
     args = parser.parse_args()
@@ -1110,7 +1110,7 @@ def main():
         ctx = Context(ser, state)
         routine = None
         active_path = None
-        last_warned_profile = "__unset__"
+        last_warned_routine = "__unset__"
 
         while True:
             events = poll_udp(udp)
@@ -1124,13 +1124,13 @@ def main():
             if args.routine:
                 desired_path = args.routine
             else:
-                profile_key = (bridge_config or {}).get("profile")
-                desired_path = PROFILE_ROUTINES.get(profile_key) if profile_key else None
-                if desired_path is None and profile_key != last_warned_profile:
-                    if profile_key is not None:
-                        print(f"[!] No routine registered for profile '{profile_key}' "
-                              f"-- add it to PROFILE_ROUTINES in controller.py.")
-                    last_warned_profile = profile_key
+                routine_key = (bridge_config or {}).get("routine")
+                desired_path = ROUTINE_FILES.get(routine_key) if routine_key else None
+                if desired_path is None and routine_key != last_warned_routine:
+                    if routine_key is not None and routine_key != "NONE":
+                        print(f"[!] No routine registered for '{routine_key}' "
+                              f"-- add it to ROUTINE_FILES in controller.py.")
+                    last_warned_routine = routine_key
 
             if desired_path is None:
                 time.sleep(0.5)
@@ -1140,7 +1140,7 @@ def main():
                 routine = load_routine(routine_full_path(desired_path))
                 active_path = desired_path
                 state.data = {}
-                print(f"[profile] running {desired_path}")
+                print(f"[routine] running {desired_path}")
                 if hasattr(routine, "setup"):
                     routine.setup(ctx)
 

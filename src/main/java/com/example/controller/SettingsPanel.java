@@ -26,6 +26,7 @@ public class SettingsPanel extends PluginPanel
 	private final ClientThread clientThread;
 	private final ConfigManager configManager;
 	private final ControllerConfig config;
+	private final SlayerConfig slayerConfig;
 
 	private final JPanel npcListPanel = new JPanel();
 	private final PluginErrorPanel errorPanel = new PluginErrorPanel();
@@ -50,20 +51,20 @@ public class SettingsPanel extends PluginPanel
 
 	// Fields (not locals) so syncFromConfig() below can re-sync them whenever this config
 	// changes from somewhere other than this panel, e.g. the wrench-icon config screen --
-	// controllerEnabled/profile/targetNpcNames/taskLocationChoices are all editable from both.
+	// controllerEnabled/targetNpcNames/taskLocationChoices are all editable from both.
 	private final JCheckBox enabledBox = new JCheckBox("Controller Enabled");
-	private final JComboBox<Profile> profileCombo = new JComboBox<>(Profile.values());
 
 	@Inject
-	SettingsPanel(Client client, ClientThread clientThread, ConfigManager configManager, ControllerConfig config)
+	SettingsPanel(Client client, ClientThread clientThread, ConfigManager configManager, ControllerConfig config, SlayerConfig slayerConfig)
 	{
 		this.client = client;
 		this.clientThread = clientThread;
 		this.configManager = configManager;
 		this.config = config;
+		this.slayerConfig = slayerConfig;
 
-		selectedTargets.addAll(ConfigExporter.parseList(config.targetNpcNames()));
-		categoryLocationChoice.putAll(ConfigExporter.parseLocationChoices(config.taskLocationChoices()));
+		selectedTargets.addAll(ConfigExporter.parseList(slayerConfig.targetNpcNames()));
+		categoryLocationChoice.putAll(ConfigExporter.parseLocationChoices(slayerConfig.taskLocationChoices()));
 
 		setLayout(new BorderLayout());
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -109,30 +110,6 @@ public class SettingsPanel extends PluginPanel
 		});
 		enabledRow.add(enabledBox);
 		header.add(enabledRow);
-
-		JPanel profileRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
-		profileRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		profileRow.setAlignmentX(Component.LEFT_ALIGNMENT);
-		profileRow.setBorder(new EmptyBorder(4, 0, 0, 0));
-
-		JLabel profileLabel = new JLabel("Profile:");
-		profileLabel.setForeground(Color.WHITE);
-		profileRow.add(profileLabel);
-
-		profileCombo.setSelectedItem(config.profile());
-		profileCombo.addActionListener(e -> {
-			// JComboBox fires its ActionListener on every setSelectedItem() call, even when the
-			// value doesn't change -- without this guard, syncFromConfig() mirroring an external
-			// profile change would bounce straight back into another config write (and another
-			// ConfigChanged, and another syncFromConfig() call).
-			Object selected = profileCombo.getSelectedItem();
-			if (selected != config.profile())
-			{
-				configManager.setConfiguration(ControllerConfig.GROUP, "profile", selected);
-			}
-		});
-		profileRow.add(profileCombo);
-		header.add(profileRow);
 
 		add(header, BorderLayout.NORTH);
 
@@ -517,7 +494,7 @@ public class SettingsPanel extends PluginPanel
 	private void persistSelections()
 	{
 		configManager.setConfiguration(
-			ControllerConfig.GROUP,
+			SlayerConfig.GROUP,
 			"targetNpcNames",
 			String.join(", ", selectedTargets)
 		);
@@ -626,28 +603,24 @@ public class SettingsPanel extends PluginPanel
 			}
 			sb.append(entry.getKey()).append("=").append(entry.getValue());
 		}
-		configManager.setConfiguration(ControllerConfig.GROUP, "taskLocationChoices", sb.toString());
+		configManager.setConfiguration(SlayerConfig.GROUP, "taskLocationChoices", sb.toString());
 	}
 
 	/** Re-syncs every control here from the current config -- called by ControllerPlugin whenever
-	 * ControllerConfig changes from anywhere, so this panel never shows a stale value for a
-	 * setting it shares with the wrench-icon config screen (Controller Enabled, Profile, target
-	 * NPCs, and task location choices are all editable from both places). Safe to call after a
-	 * change originating from this panel too: JCheckBox#setSelected doesn't fire its
-	 * ActionListener at all, and while JComboBox#setSelectedItem fires its ActionListener
-	 * unconditionally (even when the value is unchanged), that listener's own equality guard
-	 * (see profileCombo's addActionListener above) stops it from writing back to config and
-	 * looping. */
+	 * ControllerConfig or SlayerConfig changes from anywhere, so this panel never shows a stale
+	 * value for a setting it shares with the wrench-icon config screens (Controller Enabled,
+	 * target NPCs, and task location choices are all editable from both places). Safe to call
+	 * after a change originating from this panel too: JCheckBox#setSelected doesn't fire its
+	 * ActionListener at all. */
 	void syncFromConfig()
 	{
 		enabledBox.setSelected(config.controllerEnabled());
-		profileCombo.setSelectedItem(config.profile());
 
 		selectedTargets.clear();
-		selectedTargets.addAll(ConfigExporter.parseList(config.targetNpcNames()));
+		selectedTargets.addAll(ConfigExporter.parseList(slayerConfig.targetNpcNames()));
 
 		categoryLocationChoice.clear();
-		categoryLocationChoice.putAll(ConfigExporter.parseLocationChoices(config.taskLocationChoices()));
+		categoryLocationChoice.putAll(ConfigExporter.parseLocationChoices(slayerConfig.taskLocationChoices()));
 
 		for (Map.Entry<String, JCheckBox> entry : npcCheckboxes.entrySet())
 		{

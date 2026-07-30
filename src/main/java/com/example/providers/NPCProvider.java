@@ -13,6 +13,15 @@ import java.util.stream.Collectors;
 
 public class NPCProvider extends BridgeProvider
 {
+	// Same reasoning as ObjectProvider/GroundItemProvider/TileProvider: building screen-coord/
+	// distance/health data for every NPC on screen is real work on the client thread, and a
+	// caller polling this faster than the game state actually changes (confirmed: /npcs gets
+	// polled multiple times a second) turns into repeated full-list rebuilds -- a real, measurable
+	// source of client stutter. NPCs only change once per game tick regardless of poll rate, so
+	// caching by tick count adds no staleness while capping the work to once per tick.
+	private int cachedTick = -1;
+	private List<Map<String, Object>> cachedNpcs;
+
 	public NPCProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
 	{
 		super(client, clientThread, server);
@@ -28,6 +37,17 @@ public class NPCProvider extends BridgeProvider
 	}
 
 	private Object getNPCs()
+	{
+		int tick = client.getTickCount();
+		if (cachedNpcs == null || tick != cachedTick)
+		{
+			cachedNpcs = computeNpcs();
+			cachedTick = tick;
+		}
+		return cachedNpcs;
+	}
+
+	private List<Map<String, Object>> computeNpcs()
 	{
 		List<Map<String, Object>> list = new ArrayList<>();
 		Player local = client.getLocalPlayer();

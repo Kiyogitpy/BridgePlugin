@@ -18,9 +18,11 @@ import settings
 import travel
 
 
-# Use the bridge's /config as-is -- this routine has no config of its own.
+# GET /slayer-config already includes the master switch (SlayerConfigProvider reads it off
+# ControllerConfig too) alongside every slayer-specific setting -- bridge_config (GET /config)
+# isn't needed here.
 def get_config(bridge_config):
-    return bridge_config
+    return controller.get_slayer_config()
 
 
 def on_event(ctx, event_type, payload):
@@ -358,7 +360,13 @@ def maintain_offensive_prayer(ctx, combat: dict):
     flicked_on_tick = ctx.state.data.get("offensive_prayer_on_since_tick")
 
     if not is_on:
-        if ticks_until_attack == 1 and combat.get("inCombat"):
+        # Triggers a couple of ticks out rather than right on the last one -- live timing
+        # measurements (open-tab + click round trip through the bridge) showed 1-2 game
+        # ticks (525-1121ms) between the decision and the click actually landing, so firing
+        # at ticks_until_attack == 1 routinely landed the boost a tick after the attack it
+        # was meant to cover. 2 ticks of lead covers the observed worst case with a little
+        # margin to spare.
+        if ticks_until_attack <= 2 and combat.get("inCombat"):
             controller.open_prayer_tab(ctx.ser)
             icon = controller.get_prayers().get("icons", {}).get(offensive_prayer)
             if icon:

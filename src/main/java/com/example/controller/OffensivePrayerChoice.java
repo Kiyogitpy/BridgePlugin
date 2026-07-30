@@ -4,7 +4,7 @@ import net.runelite.api.Prayer;
 
 /**
  * Selectable offensive (stat-boosting) prayers for the Offensive Prayer config
- * dropdown, plus three "Auto" pseudo-entries (prayer == null, resolved
+ * dropdown, plus three "Lazy Flick" pseudo-entries (prayer == null, resolved
  * client-side in slayer.py's PRAYER_LEVELS/AUTO_PRAYER_LADDERS, which must stay
  * in sync with the levels here) that pick the best of these the account has
  * actually unlocked for a given combat style. Unlike DefensivePrayerChoice, the
@@ -20,9 +20,9 @@ import net.runelite.api.Prayer;
 public enum OffensivePrayerChoice
 {
 	NONE(null, "None", 1),
-	AUTO_MELEE(null, "Auto (Melee)", 1),
-	AUTO_RANGED(null, "Auto (Ranged)", 1),
-	AUTO_MAGIC(null, "Auto (Magic)", 1),
+	AUTO_MELEE(null, "Lazy Flick (Melee)", 1),
+	AUTO_RANGED(null, "Lazy Flick (Ranged)", 1),
+	AUTO_MAGIC(null, "Lazy Flick (Magic)", 1),
 	STEEL_SKIN(Prayer.STEEL_SKIN, "Steel Skin", 28),
 	ULTIMATE_STRENGTH(Prayer.ULTIMATE_STRENGTH, "Ultimate Strength", 31),
 	INCREDIBLE_REFLEXES(Prayer.INCREDIBLE_REFLEXES, "Incredible Reflexes", 34),

@@ -18,6 +18,13 @@ import java.util.Map;
 
 public class BankProvider extends BridgeProvider
 {
+	// Same reasoning as ObjectProvider/NPCProvider/GroundItemProvider/TileProvider -- a bank can
+	// hold hundreds of slots, each needing a widget-bounds/composition lookup, and banker.py
+	// polls this repeatedly for the whole duration of a banking trip. Caching by tick count caps
+	// that walk to once per tick no matter how many times something calls in.
+	private int cachedTick = -1;
+	private Map<String, Object> cachedBank;
+
 	public BankProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
 	{
 		super(client, clientThread, server);
@@ -30,6 +37,17 @@ public class BankProvider extends BridgeProvider
 	}
 
 	private Object getBank()
+	{
+		int tick = client.getTickCount();
+		if (cachedBank == null || tick != cachedTick)
+		{
+			cachedBank = computeBank();
+			cachedTick = tick;
+		}
+		return cachedBank;
+	}
+
+	private Map<String, Object> computeBank()
 	{
 		Map<String, Object> data = new HashMap<>();
 

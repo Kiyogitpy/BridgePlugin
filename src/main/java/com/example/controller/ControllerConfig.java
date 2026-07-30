@@ -6,6 +6,14 @@ import net.runelite.client.config.ConfigItem;
 import net.runelite.client.config.ConfigSection;
 import net.runelite.client.config.Range;
 
+/**
+ * The shared HTTP/UDP bridge plugin's own config -- the master enable switch, plus general
+ * combat mechanics that aren't slayer-task-specific (Prayer, Food & Potions, Breaks, Safety,
+ * Clicking, PvP Safety). Slayer-specific settings (which monster to attack, loot, banking,
+ * travel) live on SlayerConfig instead, exposed through its own standalone SlayerPlugin,
+ * consistent with how Mining/Gemstone Crab/Tormented Demon each own their settings rather than
+ * sharing this one.
+ */
 @ConfigGroup(ControllerConfig.GROUP)
 public interface ControllerConfig extends Config
 {
@@ -14,17 +22,11 @@ public interface ControllerConfig extends Config
 	@ConfigSection(name = "General", description = "Master controller controls", position = 0)
 	String generalSection = "general";
 
-	@ConfigSection(name = "Targets", description = "Which monsters to attack", position = 1)
-	String targetsSection = "targets";
-
 	@ConfigSection(name = "Prayer", description = "Prayer usage", position = 2)
 	String prayerSection = "prayer";
 
 	@ConfigSection(name = "Food & Potions", description = "Healing and supplies", position = 3)
 	String suppliesSection = "supplies";
-
-	@ConfigSection(name = "Loot", description = "Ground item pickup", position = 4)
-	String lootSection = "loot";
 
 	@ConfigSection(name = "Breaks", description = "Human-like break schedule", position = 5)
 	String breaksSection = "breaks";
@@ -35,16 +37,8 @@ public interface ControllerConfig extends Config
 	@ConfigSection(name = "Clicking", description = "Force which action a click resolves to", position = 7)
 	String clickingSection = "clicking";
 
-	@ConfigSection(name = "Banking", description = "Restock and deposit loot when banking is needed", position = 8)
-	String bankSection = "bank";
-
 	@ConfigSection(name = "PvP Safety", description = "Wilderness flee-on-threat behavior", position = 9)
 	String pvpSafetySection = "pvpSafety";
-
-	@ConfigSection(name = "Travel", description = "Chosen location for slayer task categories with more than one known spot", position = 10)
-	String travelSection = "travel";
-
-	// --- General ---
 
 	@ConfigItem(
 		keyName = "controllerEnabled",
@@ -59,78 +53,17 @@ public interface ControllerConfig extends Config
 	}
 
 	@ConfigItem(
-		keyName = "profile",
-		name = "Profile",
-		description = "Which controller.py routine to run. Add new routines to controller.py's PROFILE_ROUTINES map to add options here.",
+		keyName = "routine",
+		name = "Routine",
+		description = "Which controller.py routine to run. Add new routines to controller.py's "
+			+ "ROUTINE_FILES map to add options here. Defaults to None so nothing runs until you "
+			+ "deliberately pick one.",
 		section = generalSection,
 		position = 1
 	)
-	default Profile profile()
+	default RoutineChoice routine()
 	{
-		return Profile.SLAYER;
-	}
-
-	// --- Targets ---
-
-	@ConfigItem(
-		keyName = "targetNpcNames",
-		name = "Target NPCs",
-		description = "Comma-separated NPC names. Use the Controller Settings sidebar panel to pick from nearby monsters.",
-		section = targetsSection,
-		position = 0
-	)
-	default String targetNpcNames()
-	{
-		return "";
-	}
-
-	@ConfigItem(
-		keyName = "targetNpcIds",
-		name = "Target NPC IDs",
-		description = "Optional extra NPC IDs (comma-separated), added to names above.",
-		section = targetsSection,
-		position = 1
-	)
-	default String targetNpcIds()
-	{
-		return "";
-	}
-
-	@ConfigItem(
-		keyName = "maxTargetDistance",
-		name = "Max Target Distance",
-		description = "Only attack NPCs within this many tiles.",
-		section = targetsSection,
-		position = 2
-	)
-	@Range(min = 1, max = 30)
-	default int maxTargetDistance()
-	{
-		return 15;
-	}
-
-	@ConfigItem(
-		keyName = "skipNpcInCombat",
-		name = "Skip NPCs In Combat",
-		description = "Do not attack NPCs already fighting another player.",
-		section = targetsSection,
-		position = 3
-	)
-	default boolean skipNpcInCombat()
-	{
-		return true;
-	}
-
-	@ConfigItem(
-		keyName = "onlyAttackWhenIdle",
-		name = "Only Attack When Idle",
-		description = "Wait until you are not moving or in combat before finding a new target.",
-		section = targetsSection,
-		position = 4
-	)
-	default boolean onlyAttackWhenIdle()
-	{
-		return true;
+		return RoutineChoice.NONE;
 	}
 
 	// --- Prayer ---
@@ -322,58 +255,6 @@ public interface ControllerConfig extends Config
 		return PrayerPotionChoice.BLIGHTED_SUPER_RESTORE;
 	}
 
-	// --- Loot ---
-
-	@ConfigItem(
-		keyName = "lootEnabled",
-		name = "Pick Up Loot",
-		description = "Enable looting ground items on the whitelist.",
-		section = lootSection,
-		position = 0
-	)
-	default boolean lootEnabled()
-	{
-		return true;
-	}
-
-	@ConfigItem(
-		keyName = "lootWhitelist",
-		name = "Loot Whitelist",
-		description = "Comma-separated item names to pick up.",
-		section = lootSection,
-		position = 1
-	)
-	default String lootWhitelist()
-	{
-		return "";
-	}
-
-	@ConfigItem(
-		keyName = "minLootValue",
-		name = "Min Loot Value (GP)",
-		description = "Also pick up any ground item worth at least this much GE value, regardless of the " +
-			"whitelist above (e.g. a Rune platebody drop at 14k GE value gets picked up if this is set to 9000). " +
-			"0 = off, whitelist only.",
-		section = lootSection,
-		position = 2
-	)
-	default int minLootValue()
-	{
-		return 5000;
-	}
-
-	@ConfigItem(
-		keyName = "buryBones",
-		name = "Bury Bones",
-		description = "Automatically bury bones from inventory.",
-		section = lootSection,
-		position = 3
-	)
-	default boolean buryBones()
-	{
-		return false;
-	}
-
 	// --- Breaks ---
 
 	@ConfigItem(
@@ -534,83 +415,6 @@ public interface ControllerConfig extends Config
 		return "";
 	}
 
-	// --- Banking ---
-
-	@ConfigItem(
-		keyName = "bankEnabled",
-		name = "Enable Banking",
-		description = "Bank for more supplies when inventory is full instead of just stopping.",
-		section = bankSection,
-		position = 0
-	)
-	default boolean bankEnabled()
-	{
-		return false;
-	}
-
-	@ConfigItem(
-		keyName = "bankTeleportFallback",
-		name = "Teleport If No Bank Nearby",
-		description = "Use the ring of dueling to Ferox Enclave when no bank is within walking distance.",
-		section = bankSection,
-		position = 1
-	)
-	default boolean bankTeleportFallback()
-	{
-		return true;
-	}
-
-	@ConfigItem(
-		keyName = "bankFoodQuantity",
-		name = "Food To Withdraw",
-		description = "How many of the Food item (Food & Potions section) to withdraw when banking. 0 = don't withdraw food.",
-		section = bankSection,
-		position = 2
-	)
-	@Range(min = 0, max = 28)
-	default int bankFoodQuantity()
-	{
-		return 10;
-	}
-
-	@ConfigItem(
-		keyName = "bankPrayerPotionQuantity",
-		name = "Prayer Potions To Withdraw",
-		description = "How many of the Prayer Potion item to withdraw when banking. 0 = don't withdraw.",
-		section = bankSection,
-		position = 3
-	)
-	@Range(min = 0, max = 28)
-	default int bankPrayerPotionQuantity()
-	{
-		return 4;
-	}
-
-	@ConfigItem(
-		keyName = "bankCombatPotionQuantity",
-		name = "Combat Potions To Withdraw",
-		description = "How many of the Combat Potion item to withdraw when banking. 0 = don't withdraw.",
-		section = bankSection,
-		position = 4
-	)
-	@Range(min = 0, max = 28)
-	default int bankCombatPotionQuantity()
-	{
-		return 0;
-	}
-
-	@ConfigItem(
-		keyName = "bankKeepItems",
-		name = "Never Deposit",
-		description = "Comma-separated item names never deposited while banking (e.g. clue caskets, teleport items).",
-		section = bankSection,
-		position = 5
-	)
-	default String bankKeepItems()
-	{
-		return "";
-	}
-
 	// --- PvP Safety ---
 
 	@ConfigItem(
@@ -623,19 +427,5 @@ public interface ControllerConfig extends Config
 	default boolean pvpFleeEnabled()
 	{
 		return false;
-	}
-
-	// --- Travel ---
-
-	@ConfigItem(
-		keyName = "taskLocationChoices",
-		name = "Task Location Choices",
-		description = "Managed by the Controller Settings sidebar panel -- which location was picked for each slayer task category that has more than one known spot (e.g. Ice giants: cave vs. Frozen Waste Plateau). Format: \"Category=index;Category2=index\".",
-		section = travelSection,
-		position = 0
-	)
-	default String taskLocationChoices()
-	{
-		return "";
 	}
 }
