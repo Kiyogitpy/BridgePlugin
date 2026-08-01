@@ -48,6 +48,21 @@ public class PlayerProvider extends BridgeProvider
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
 
+		// The boat's own reference position, separate from the player's own foot position above --
+		// confirmed live 2026-08-02: standing at one end of a Sailing boat (its own WorldView is
+		// only ~8 tiles per side) can be several tiles from the opposite end, which matters for a
+		// routine's maxDistance-style range check against something the *boat* needs to be near,
+		// not specifically wherever the player happens to be standing on deck. x/y above stays the
+		// player's own foot position -- e.g. sailing.py's hop-based steering math wants that, not
+		// this. null (both fields omitted) when not aboard a WorldEntity at all.
+		WorldPoint boatWp = RuneLiteUtil.getBoatOrActorWorldLocation(client, p);
+		if (!boatWp.equals(wp))
+		{
+			data.put("boatX", boatWp.getX());
+			data.put("boatY", boatWp.getY());
+			data.put("boatPlane", boatWp.getPlane());
+		}
+
 		// General-purpose debug fields: direct visibility into which WorldView the player is
 		// currently registered in and how big its scene is. Not consumed by any routine -- kept
 		// for the same reason as GameStateProvider's /debug-menu (see its comment): this is what

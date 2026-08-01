@@ -251,4 +251,97 @@ public final class RuneLiteUtil
 		LocalPoint local = actor.getLocalLocation();
 		return local != null ? toTopLevelWorldPoint(client, local) : actor.getWorldLocation();
 	}
+
+	// Recursion guard for findTopLevelWorldEntityContaining -- see the matching one in
+	// ObjectProvider.walkWorldViewRecursively for why this is just insurance, not expected to
+	// ever actually trigger for a well-formed WorldView tree.
+	private static final int MAX_WORLD_VIEW_SEARCH_DEPTH = 6;
+
+	/**
+	 * The top-level WorldEntity (e.g. a Sailing boat) whose own WorldView is, or contains
+	 * (possibly several levels deep -- see the boat's Helm needing two levels, confirmed live
+	 * 2026-08-02), the given WorldView. Returns null if {@code view} is already top-level, or no
+	 * containing entity is found.
+	 * <p>
+	 * Added to get the boat's own reference position instead of the player's for distance
+	 * purposes -- confirmed live 2026-08-02 that a player standing at one end of an ~8-tile boat
+	 * (its own WorldView is that small, see PlayerProvider's debugWorldViewSizeX/Y) can be
+	 * several tiles from the opposite end, which matters for maxDistance-style range checks
+	 * against something the *boat* needs to be near, not specifically wherever the player happens
+	 * to be standing on deck.
+	 */
+	public static WorldEntity findTopLevelWorldEntityContaining(Client client, WorldView view)
+	{
+		if (view == null || view.isTopLevel())
+		{
+			return null;
+		}
+
+		WorldView topLevel = client.getTopLevelWorldView();
+		if (topLevel == null)
+		{
+			return null;
+		}
+
+		for (WorldEntity entity : topLevel.worldEntities())
+		{
+			WorldView entityView = entity.getWorldView();
+			if (entityView == null)
+			{
+				continue;
+			}
+			if (entityView.getId() == view.getId() || viewContainsId(entityView, view.getId(), 0))
+			{
+				return entity;
+			}
+		}
+
+		return null;
+	}
+
+	private static boolean viewContainsId(WorldView view, int targetId, int depth)
+	{
+		if (depth > MAX_WORLD_VIEW_SEARCH_DEPTH)
+		{
+			return false;
+		}
+
+		for (WorldEntity child : view.worldEntities())
+		{
+			WorldView childView = child.getWorldView();
+			if (childView == null)
+			{
+				continue;
+			}
+			if (childView.getId() == targetId || viewContainsId(childView, targetId, depth + 1))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * The boat's own position (its containing WorldEntity's own top-level location) if the given
+	 * actor is aboard one, or the actor's own top-level position otherwise (e.g. on foot, or the
+	 * WorldEntity's position genuinely isn't resolvable right now). See
+	 * {@link #findTopLevelWorldEntityContaining} for why this differs from the actor's own
+	 * position while aboard a boat.
+	 */
+	public static WorldPoint getBoatOrActorWorldLocation(Client client, Actor actor)
+	{
+		WorldView actorView = actor.getWorldView();
+		WorldEntity boat = actorView != null ? findTopLevelWorldEntityContaining(client, actorView) : null;
+		if (boat != null)
+		{
+			LocalPoint boatLocal = boat.getLocalLocation();
+			if (boatLocal != null)
+			{
+				return WorldPoint.fromLocal(client, boatLocal);
+			}
+		}
+
+		return getTopLevelWorldLocation(client, actor);
+	}
 }

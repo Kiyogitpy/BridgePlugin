@@ -139,25 +139,47 @@ SUNK_SHIPWRECK_IDS = frozenset({60465, 60467, 60469, 60471, 60473, 60475, 60477,
 
 
 def find_nearby_wreck(config: dict, max_dist: float):
-    """Nearest ACTIVE object matching config["wreckNames"] within max_dist tiles, or None (sunk
-    wrecks -- see SUNK_SHIPWRECK_IDS -- are filtered out; matching them would let the routine
-    treat a dead wreck as "in range" and never look for a real one). Pure range test otherwise --
-    the wreck itself is never clicked (only the boat's own salvaging hook is), so
-    on-screen-projectability doesn't matter here, only world position. ObjectProvider always
-    sets x/y/distance from the object's WorldPoint regardless of whether it's currently
-    on-screen, which is exactly what both the hook-operating-range check and the farther
-    sail-range check need."""
+    """Nearest ACTIVE object matching config["wreckNames"] within max_dist tiles of the BOAT (not
+    the player), or None (sunk wrecks -- see SUNK_SHIPWRECK_IDS -- are filtered out; matching them
+    would let the routine treat a dead wreck as "in range" and never look for a real one).
+
+    Measures from /player's boatX/boatY (falling back to the player's own x/y if not aboard a
+    WorldEntity) rather than trusting ObjectProvider's own player-relative "distance" field.
+    CONFIRMED live 2026-08-02: a Sailing boat's own WorldView is only ~8 tiles per side, and
+    standing at one end can be several tiles from the opposite end -- maxDistance is a range check
+    against something the *boat*'s hook needs to reach, not specifically wherever the player
+    happens to be standing on deck, so the player-relative distance could read "out of range" (or
+    "in range") wrongly by that same margin.
+
+    Pure range test otherwise -- the wreck itself is never clicked (only the boat's own salvaging
+    hook is), so on-screen-projectability doesn't matter here, only world position. ObjectProvider
+    always sets x/y from the object's WorldPoint regardless of whether it's currently on-screen,
+    which is exactly what both the hook-operating-range check and the farther sail-range check
+    need. Chebyshev distance (max(|dx|, |dy|)), matching WorldPoint.distanceTo2D's own convention
+    on the Java side."""
     names = {n.lower() for n in config.get("wreckNames", [])}
 
-    candidates = [
-        o for o in controller.get_objects()
-        if (o.get("name") or "").lower() in names
-        and o.get("id") not in SUNK_SHIPWRECK_IDS
-        and o.get("x") is not None
-        and 0 <= o.get("distance", 9999) <= max_dist
-    ]
-    if not candidates:
+    player = controller.get_player()
+    origin_x = player.get("boatX", player.get("x"))
+    origin_y = player.get("boatY", player.get("y"))
+    if origin_x is None or origin_y is None:
         return None
 
-    candidates.sort(key=lambda o: o.get("distance", 9999))
-    return candidates[0]
+    best = None
+    best_dist = None
+    for o in controller.get_objects():
+        if (o.get("name") or "").lower() not in names:
+            continue
+        if o.get("id") in SUNK_SHIPWRECK_IDS:
+            continue
+        wx, wy = o.get("x"), o.get("y")
+        if wx is None or wy is None:
+            continue
+
+        dist = max(abs(wx - origin_x), abs(wy - origin_y))
+        if dist > max_dist:
+            continue
+        if best_dist is None or dist < best_dist:
+            best, best_dist = o, dist
+
+    return best
