@@ -220,6 +220,15 @@ anticipate needing:
    This likely explains every other "null"-named object seen scattered throughout this session's
    `/objects` dumps too (several other boat fixtures), not just the Helm. Fixed by resolving
    through `getImpostor()` whenever `getImpostorIds() != null`, in `ObjectProvider.buildObjectData`.
+7. **Even with a correct clickbox, the click can still miss a thin/non-convex model.** After fix
+   4, clicking the Helm (a rudder, not a wheel -- thin and likely rendered at an angle) still
+   landed on the tile behind it, not the model. `debugHasClickbox` (a debug field added to chase
+   this) confirmed `getClickbox()` *was* returning a real shape -- the bug was using
+   `clickBounds.getCenterX()/getCenterY()`, the bounding *box's* center, which for a thin or
+   angled model can fall in empty space beside the actual (non-rectangular) clickable area
+   entirely. Fixed by `ObjectProvider.pointInsideShape`: sample a small grid of candidate points
+   across the bounding box and use the first one `Shape.contains()` confirms is real, falling
+   back to a vertex from the shape's own outline if none land inside.
 
 These fixes are generic (in `RuneLiteUtil`/`ObjectProvider`/`PlayerProvider`/`GameStateProvider`,
 not shipwreck-salvaging-specific code) and benefit any future routine that might run while the
