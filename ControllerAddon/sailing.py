@@ -13,12 +13,17 @@
 #   - SAIL_HOP_MIN/MAX_TILES and SAIL_ARRIVAL_TOLERANCE below are a starting guess at how coarse
 #     the boat's heading snapping actually is -- tune once observed live (#1).
 #   - SAILING_OPTIONS_TAB_KEY: CONFIRMED live 2026-08-01, "q" is correct (#6, resolved).
-#   - HELM_NAME: CONFIRMED live 2026-08-01 -- the interactive steering control is the boat's
-#     "Sails" object (right-click menu shows "Navigate"/"Escape"), NOT a separate "Ship's wheel"
-#     prop as the wiki's text suggested. Still unconfirmed: whether a plain LEFT-click resolves
-#     straight to "Navigate" by default, or needs "Navigate" added to Controller Settings ->
-#     Clicking -> Forced Actions (#5) -- the user checked this via a right-click menu, not a
-#     plain left-click yet.
+#   - HELM_NAME: CONFIRMED live 2026-08-01 -- the boat's steering control is an object literally
+#     named "Helm" (id 59578, not the wiki's "Ship's wheel", and not any of the ObjectProvider ids
+#     guessed earlier from the stale source checkout). Confirmed via the live cache (not just the
+#     stale checkout): its ops are {0: "Navigate", 3: "Escape"} -- index 0 is this codebase's
+#     established left-click-default convention (same as the salvaging hook's 0: "Deploy"), so a
+#     plain click_entity should resolve straight to Navigate with no Forced Actions tweak needed.
+#     Resolves #5. It was initially misidentified as the "Sails" object (the only object
+#     ObjectProvider reported at the player's exact tile at the time) -- that attribution was
+#     wrong: "Helm" wasn't showing up in /objects at all yet because of the plane-walking gap
+#     described next, not because it doesn't exist, so the right-click result seen then was very
+#     likely actually on "Helm" all along, just misattributed to whatever WAS visible nearby.
 #   - SailingProvider.java's "Take down sails" widget lookup is a best-effort text match, not yet
 #     confirmed against the live client (#2).
 
@@ -28,7 +33,7 @@ import time
 
 import controller
 
-HELM_NAME = "sails"  # CONFIRMED live 2026-08-01 -- see module header
+HELM_NAME = "helm"  # CONFIRMED live 2026-08-01 -- see module header
 SAILING_OPTIONS_TAB_KEY = "q"  # TODO verify -- see module header
 
 SAIL_HOP_MIN_TILES = 6       # shorter than travel.WALK_HOP_MIN_TILES -- coarse heading means
@@ -50,9 +55,9 @@ def open_sailing_options_tab(ctx) -> None:
 
 
 def use_helm(ctx) -> bool:
-    """Click the boat's own steering control (the "Sails" object -- confirmed live, not a
-    separate "Ship's wheel" prop). Confirmed by the user: this both retrieves any
-    currently-deployed salvaging hook and engages steering in one action -- no separate
+    """Click the boat's own steering control (an object literally named "Helm" -- confirmed live,
+    not the wiki's "Ship's wheel"; see module header). Confirmed by the user: this both retrieves
+    any currently-deployed salvaging hook and engages steering in one action -- no separate
     stop/retrieve step needed first."""
     helm = next(
         (o for o in controller.get_objects()

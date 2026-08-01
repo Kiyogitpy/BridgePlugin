@@ -180,6 +180,15 @@ anticipate needing:
    x/y/plane/distance to real top-level coordinates via the same `toTopLevelWorldPoint` either way
    (screenX/Y still uses each object's own raw `LocalPoint`, since `Perspective` already handles a
    nested-WorldView point correctly on its own).
+3. **Single-plane walking wasn't enough either.** Even after fix 2, the boat's "Helm" object was
+   still missing from `/objects` while a salvaging hook on the main deck showed up fine -- both
+   fixtures on the same boat, same nested `WorldView`. Unlike the top-level world (mutually
+   exclusive floors you switch between one at a time), a boat's whole small deck structure -- main
+   deck, an apparently-elevated helm/quarterdeck -- is rendered as one nested `WorldView` with
+   multiple planes all at once, and the fix initially only walked
+   `playerView.getPlane()` (wherever the player currently stood). Fixed by walking every plane a
+   scene can have (`Constants.MAX_Z` = 4) for the nested-view case -- cheap for a boat's tiny
+   scene, unlike doing the same for the top-level world.
 
 This fix is generic (in `RuneLiteUtil`/`ObjectProvider`/`PlayerProvider`, not
 shipwreck-salvaging-specific code) and benefits any future routine that might run while the player
@@ -237,21 +246,23 @@ is aboard a boat, not just this one.
    Small shipwreck's entire ~1-minute lifespan (see the wiki's "Average
    duration" column), so it could have sat through a whole extra wreck cycle
    before ever reacting.
-5. **Partially confirmed live 2026-08-01: the steering control's identity
-   was wrong, now fixed.** The wiki's "Helm.txt" article describes a
-   separate "Ship's wheel" boat part, and that's what the original design
-   (and `sailing.HELM_NAME`) targeted -- but on the user's actual boat, the
-   object at their own tile with "Navigate"/"Escape" in its right-click menu
-   is the **"Sails"** object (id 29516), not a wheel prop at all (no
-   "Ship's wheel"-named or `BOATKIT_HELM01`-id object was found anywhere in
-   a full live `/objects` dump while standing right next to where steering
-   engages). `sailing.HELM_NAME` is now `"sails"`. **Still open:** whether a
-   plain LEFT-click resolves straight to "Navigate" by default, or needs
-   "Navigate" added to Controller Settings -> Clicking -> Forced Actions --
-   the user confirmed this via a right-click menu, not a plain left-click
-   yet, same convention as every other non-default click in this codebase
-   (the ring of dueling, the looting bag's "Empty", the gemstone crab
-   tunnel).
+5. **CONFIRMED live 2026-08-01 (fully resolved, after one wrong turn).** The
+   wiki's "Helm.txt" article describes a "Ship's wheel" boat part, and
+   that's what the original design (and `sailing.HELM_NAME`) targeted, but
+   no such object (or the `BOATKIT_HELM01` id guessed from the stale source
+   checkout) was ever found live. The steering control turned out to be an
+   object literally named **"Helm"** (id `59578`, found via the client's own
+   Examine debug tool + confirmed against the live cache: `ops = {0:
+   "Navigate", 3: "Escape"}`) -- it simply wasn't showing up in `/objects`
+   yet due to the plane-walking gap in the "Architecture fix" section below,
+   which made it look absent. An intermediate live test misattributed the
+   right-click result to a different, genuinely-nearby "Sails" object
+   (id `29516`) purely because that was the only thing `/objects` reported
+   at the player's tile at the time -- `sailing.HELM_NAME` briefly targeted
+   `"sails"` before this correction; it's `"helm"` now. Index `0` for
+   "Navigate" is this codebase's established left-click-default convention
+   (matching the salvaging hook's own `0: "Deploy"`), so a plain
+   `click_entity` needs no Forced Actions tweak.
 6. **CONFIRMED live 2026-08-01: 'Q' is the correct keybind** for revealing
    the Sailing Options panel. `sailing.py`'s `SAILING_OPTIONS_TAB_KEY = "q"`
    guess was right, no code change needed.

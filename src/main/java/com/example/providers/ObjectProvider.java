@@ -61,9 +61,9 @@ public class ObjectProvider extends BridgeProvider
 		// Sailing's boats are WorldEntities with their own separate WorldView (own scene, own
 		// plane numbering) -- fixtures built on the boat itself (the helm, a salvaging hook, ...)
 		// live there, not in the top-level scene walked above, so standing on your own boat would
-		// otherwise never see them at all. Confirmed live 2026-08-01: "Ship's wheel" and a
-		// salvaging hook were completely absent from this endpoint while aboard a boat before this
-		// was added, even though both were right in front of the player.
+		// otherwise never see them at all. Confirmed live 2026-08-01: the helm and a salvaging
+		// hook were completely absent from this endpoint while aboard a boat before this was
+		// added, even though both were right in front of the player.
 		Player localPlayer = client.getLocalPlayer();
 		WorldView playerView = localPlayer != null ? localPlayer.getWorldView() : null;
 		if (playerView != null && !playerView.isTopLevel())
@@ -71,7 +71,19 @@ public class ObjectProvider extends BridgeProvider
 			Scene playerScene = playerView.getScene();
 			if (playerScene != null)
 			{
-				walkScene(playerScene, playerView.getPlane(), list);
+				// Unlike the top-level world (mutually-exclusive floors you switch between), a
+				// boat's whole small deck structure -- main deck, a raised helm/quarterdeck, etc.
+				// -- is rendered together as one nested WorldView, all planes at once. Confirmed
+				// live 2026-08-01: the helm object was still missing even after adding the walk
+				// above, because it turned out to sit on a different plane than
+				// playerView.getPlane() within this same small nested scene (a salvaging hook on
+				// the main deck was found fine -- only objects on the player's own current plane
+				// were). Walking every plane a scene can have (Constants.MAX_Z) is cheap for a
+				// boat's tiny nested scene, unlike doing the same for the top-level world.
+				for (int nestedPlane = 0; nestedPlane < Constants.MAX_Z; nestedPlane++)
+				{
+					walkScene(playerScene, nestedPlane, list);
+				}
 			}
 		}
 
