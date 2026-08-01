@@ -82,17 +82,26 @@ def tick(ctx):
         # like mining.py -- isIdle can stay False for a wreck's entire lifespan, so gating the
         # branch on it meant the routine never noticed the near wreck was gone and never looked
         # for a farther one to sail to.
+        # No "not navigating" gate here (there used to be one) -- CONFIRMED live 2026-08-02:
+        # get_sailing()["navigating"] reflects whether the helm/steering interface is still
+        # engaged, not whether the boat is physically moving, and it can stay True even after the
+        # boat has fully stopped (sails down) until the helm is explicitly left somehow. Gating on
+        # it here got the routine permanently stuck ("stuck at the helm... not clicking the
+        # hook") once navigating got stuck True. stop_boat() already waits for the boat's actual
+        # *position* to stabilize before returning, which is the real "safe to deploy" signal.
         idle = controller.get_combat().get("isIdle", True)
         cooldown_elapsed = time.time() - ctx.state.data.get("last_deploy_click_at", 0) > HOOK_CLICK_COOLDOWN_S
-        if idle and cooldown_elapsed and not controller.get_sailing().get("navigating"):
+        if idle and cooldown_elapsed:
             sailing.deploy_hook(ctx, config.get("hookName", ""))
             ctx.state.data["last_deploy_click_at"] = time.time()
         return
 
     far_wreck = find_nearby_wreck(config, config.get("maxSailDistance", 60))
     if far_wreck is not None:
-        if sailing.sail_to(ctx, far_wreck) and not controller.get_sailing().get("navigating"):
+        # No "not navigating" gate here either -- see the near-wreck branch's comment above.
+        if sailing.sail_to(ctx, far_wreck):
             sailing.deploy_hook(ctx, config.get("hookName", ""))
+            ctx.state.data["last_deploy_click_at"] = time.time()
         return
 
     now = time.time()
