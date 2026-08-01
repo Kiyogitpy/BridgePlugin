@@ -15,11 +15,15 @@ every existing routine:
    an `Inspect` option (confirmed live against the game cache, see
    "Confirmed facts" below) -- the real interaction is the player's own
    Salvaging hook facility object, built on their boat.
-2. **There's no foot-pathing.** Every existing routine (`mining.py`,
-   `gemstone_crab.py`, `travel.py`'s walk helpers) assumes the player can
-   reach a target by clicking it and letting the game's own click-to-walk
-   handle the approach. On open ocean there's no walking at all -- moving the
-   boat requires an explicit helm -> steer -> stop sequence.
+2. **There's no foot-pathing, and steering is coarse.** Every existing
+   routine (`mining.py`, `gemstone_crab.py`, `travel.py`'s walk helpers)
+   assumes the player can reach a target by clicking it and letting the
+   game's own click-to-walk handle the approach. On open ocean there's no
+   walking at all -- moving the boat requires an explicit helm -> steer ->
+   stop sequence, and (per the user's firsthand testing) minimap clicks do
+   drive the boat once the helm is engaged, but the heading only snaps to a
+   handful of coarse compass directions rather than plotting a precise route
+   the way normal walking does.
 
 ## Scope
 
@@ -28,10 +32,14 @@ every existing routine:
    (no bank trips, no sorting-at-a-station in v1), reposition the boat via a
    new `sailing.py` helper when nothing is in hook range.
 2. A new `sailing.py` (parallel to `travel.py`): boat-specific navigation --
-   helm interaction, steering HUD, stopping via the Sailing Options panel.
+   helm interaction, coarse minimap-based steering (reusing `travel.py`'s
+   existing hop-and-click mechanism, not a bespoke steering widget), stopping
+   via the Sailing Options panel.
 3. A new `SailingProvider.java` exposing whatever the Python side needs that
-   existing providers don't already cover (the steering HUD's buttons, the
-   Sailing Options panel's Take-down-sails control).
+   existing providers don't already cover -- in practice this is now mostly
+   just the Sailing Options panel's Take-down-sails control, since steering
+   input turned out to reuse the existing generic minimap-click machinery
+   (see "Confirmed facts" and Design section 2 below).
 4. Wiring: `ROUTINE_FILES` in `controller.py`, a new `SHIPWRECK_SALVAGING`
    entry in `RoutineChoice.java`.
 5. Explicitly NOT in scope: crew/crewmate management, sorting salvage at a
@@ -116,6 +124,16 @@ Implications:
 
 - Moving the boat: click the helm ("Ship's wheel") to enter steering mode,
   then steer toward the destination.
+- **Steering itself reuses the existing minimap-click input** -- clicking a
+  point on the minimap while the helm is engaged does move the boat, the
+  same click mechanism `travel.py` already uses for foot-pathing
+  (`get_minimap_walk_point` + `click_entity`). The difference from walking:
+  heading only snaps to a handful of coarse compass directions (the user
+  observed N/NE/E/SE/S/SW/W/NE-ish increments; finer sub-steps like NNE are
+  unconfirmed) rather than plotting a precise line to the clicked point.
+  This means `sailing.py` can reuse `travel.py`'s existing hop-and-click
+  loop shape almost directly instead of a bespoke steering widget -- see
+  Design section 2.
 - Stopping the boat: before it actually stops, tap `Q`, then click the
   "Take down sails" UI element (un-sets the sails, boat decelerates to a
   stop). This lives in the Sailing Options panel per the wiki's description
@@ -127,14 +145,20 @@ Implications:
 
 ## Still unverified -- flagged for in-game testing, not blocking a first cut
 
-1. **Steering HUD widget ids.** Interface group `604` in the stale source
-   checkout (internal cache name `FossilquestSailing`, reused from an old
-   Fossil Island sequence) has `BEARING`/`THROTTLE`/`DIRECTION` sub-widgets
-   with concrete component ids (`THROTTLE_INCREASE`/`THROTTLE_DECREASE`/
-   `DIRECTION_RIGHT`/`DIRECTION_LEFT` look like the actual drive controls).
-   The component *names* and structure strongly suggest this is the real
-   boat-piloting HUD, but it could not be cross-checked live (no interface
-   loader in cache2) and the source checkout is 5 months stale.
+1. **Exact heading quantization and hop tolerance.** Confirmed live that
+   minimap clicks steer the boat, but not exactly how coarse the snapping is
+   (the user observed roughly 8 compass directions; sub-increments like NNE
+   are unconfirmed) or how far a single "hop" travels before needing a
+   re-aim. This governs `WALK_HOP_MIN/MAX_TILES`-equivalent tuning for the
+   boat version in `sailing.py` -- start from `travel.py`'s existing
+   constants and adjust once this is observed live. Downgraded from a
+   blocking unknown: interface group `604` in the stale source checkout
+   (internal cache name `FossilquestSailing`, with `BEARING`/`THROTTLE`/
+   `DIRECTION` sub-widgets incl. `THROTTLE_INCREASE`/`DECREASE`/
+   `DIRECTION_LEFT`/`RIGHT`) looked like a bespoke steering HUD before this
+   confirmation; it's kept only as a fallback note in case minimap-click
+   steering turns out insufficient (e.g. too coarse to reliably reach a
+   specific wreck), not as the primary mechanism.
 2. **"Take down sails" button location.** Interface group `937`
    (`SailingSidepanel`) is confirmed as the Sailing Options panel (Facilities/
    Stats/Crew tabs), but the steering section's individual buttons are
@@ -172,24 +196,26 @@ Registered alongside the other providers (see `BridgeProvider` subclasses in
 
 ```java
 {
-  "navigating": bool,              // is the steering HUD (interface 604) open
-  "directionLeft":  {screenX, screenY} | null,   // DIRECTION_LEFT button
-  "directionRight": {screenX, screenY} | null,   // DIRECTION_RIGHT button
-  "throttleIncrease": {screenX, screenY} | null,
-  "throttleDecrease": {screenX, screenY} | null,
+  "navigating": bool,              // is the helm currently engaged
   "facilitiesTabOpen": bool,       // is Sailing Options -> Facilities selected
   "takeDownSails": {screenX, screenY} | null,    // dynamic text-scan of FACILITIES_ROWS, null if not found
   "setSail": {screenX, screenY} | null           // same row, opposite state
 }
 ```
 
-Follows `BankProvider.java`'s existing pattern for widget-bounds lookups
-(`buttonPoint(WidgetInfo)` for the fixed steering-HUD buttons,
-`buttonPoint(int packedWidgetId)` plus a children-scan loop, mirroring
-`BankProvider`'s `BANK_ITEM_CONTAINER` handling, for `takeDownSails`/
-`setSail`). All fixed ids marked with `// TODO verify` comments pointing at
-this spec's "Still unverified" section 1/2, exactly the codebase's existing
-convention for unverified assumptions (see `travel.py`'s module header).
+Slimmer than originally sketched: since steering input reuses the existing
+generic minimap-click machinery (`get_minimap_walk_point` in
+`controller.py`, already provider-backed for foot travel), no bespoke
+steering-HUD widget lookups are needed here. `takeDownSails`/`setSail`
+follow `BankProvider.java`'s existing pattern for widget-bounds lookups
+(`buttonPoint(int packedWidgetId)` plus a children-scan loop, mirroring
+`BankProvider`'s `BANK_ITEM_CONTAINER` handling) -- marked with a
+`// TODO verify` comment pointing at this spec's "Still unverified" section
+2, exactly the codebase's existing convention for unverified assumptions
+(see `travel.py`'s module header). If in-game testing shows minimap-click
+steering is too coarse to be usable, `directionLeft/Right` and
+`throttleIncrease/Decrease` (interface group `604`, see "Still unverified"
+section 1) would be added here as a fallback -- not built preemptively.
 
 ### 2. `sailing.py` (new, parallel to `travel.py`)
 
@@ -204,16 +230,22 @@ def open_sailing_options_tab(ctx) -> None:
 
 def use_helm(ctx) -> bool:
     # find + click the "Ship's wheel" object via get_objects(); this both
-    # retrieves any currently-deployed hook and opens the steering HUD
+    # retrieves any currently-deployed hook and engages steering
     # (confirmed by the user -- no separate stop step).
     ...
 
-def steer_toward(ctx, target: dict, timeout_s: float = ...) -> bool:
-    # poll get_player() position vs target each loop; nudge
-    # get_sailing()["directionLeft"/"directionRight"] to correct heading,
-    # click throttleIncrease to get moving. Same hop-and-check shape as
-    # travel._walk_greedy, just driving via the steering HUD instead of
-    # minimap clicks.
+def steer_toward(ctx, target: dict) -> bool:
+    # Confirmed live: minimap clicks drive the boat once the helm is
+    # engaged, same input as foot travel -- reuses controller.click_entity +
+    # controller.get_minimap_walk_point directly, i.e. the same hop-and-check
+    # loop shape as travel._walk_greedy (recompute next hop from current
+    # position each iteration; no Shortest Path route needed for a
+    # same-hotspot reposition over open, obstacle-free water). The one real
+    # difference from travel._walk_greedy: heading only snaps to a handful
+    # of coarse compass directions rather than plotting straight toward the
+    # exact clicked point, so hops likely need a wider WALK_ARRIVAL_TOLERANCE
+    # and/or more hops than the foot-travel constants -- tune once observed
+    # live (see "Still unverified" section 1).
     ...
 
 def stop_boat(ctx) -> bool:
@@ -286,9 +318,11 @@ than usual before it's trustworthy unattended:
 
 1. Confirm object/click facts already covered live via cache2 (done, see
    "Confirmed facts").
-2. Manually drive through one full cycle in-game first (helm click, steer,
-   Q + Take down sails, hook deploy) to nail down items 1, 2, and 5, noting
-   actual widget ids via the RuneLite Widget Inspector devtool while there.
+2. Manually drive through one full cycle in-game first (helm click,
+   minimap-steer, Q + Take down sails, hook deploy) to nail down items 1, 2,
+   and 5 -- specifically the heading quantization/hop tolerance for item 1,
+   and the Take-down-sails widget location for item 2 via the RuneLite
+   Widget Inspector devtool.
 3. Run the routine live for a single wreck-to-wreck cycle (including one
    sink-and-reposition transition) watching the `[sailing]`/`[salvage]` log
    lines, to confirm items 3 and 4 (deployed-hook re-click safety, whether
