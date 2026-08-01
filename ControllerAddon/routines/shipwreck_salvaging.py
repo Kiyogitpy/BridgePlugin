@@ -59,6 +59,12 @@ def get_config(bridge_config):
 
 
 WAITING_MESSAGE_INTERVAL_S = 30.0
+HOOK_CLICK_COOLDOWN_S = 3.0  # don't reclick the hook again within this long of the last click --
+                              # CONFIRMED live 2026-08-02: isIdle can read True for a tick or two
+                              # right after clicking, before the salvaging animation actually
+                              # starts, causing back-to-back redundant clicks without this. Still
+                              # short enough to redeploy quickly for a genuine stop (wreck sank,
+                              # misclick retrieved it, ...), just not on literally every tick.
 
 
 def tick(ctx):
@@ -76,8 +82,11 @@ def tick(ctx):
         # like mining.py -- isIdle can stay False for a wreck's entire lifespan, so gating the
         # branch on it meant the routine never noticed the near wreck was gone and never looked
         # for a farther one to sail to.
-        if controller.get_combat().get("isIdle", True) and not controller.get_sailing().get("navigating"):
+        idle = controller.get_combat().get("isIdle", True)
+        cooldown_elapsed = time.time() - ctx.state.data.get("last_deploy_click_at", 0) > HOOK_CLICK_COOLDOWN_S
+        if idle and cooldown_elapsed and not controller.get_sailing().get("navigating"):
             sailing.deploy_hook(ctx, config.get("hookName", ""))
+            ctx.state.data["last_deploy_click_at"] = time.time()
         return
 
     far_wreck = find_nearby_wreck(config, config.get("maxSailDistance", 60))
