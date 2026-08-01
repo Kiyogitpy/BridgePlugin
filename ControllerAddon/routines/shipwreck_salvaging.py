@@ -12,9 +12,13 @@
 #
 # ASSUMPTIONS TO VERIFY IN-GAME (see the spec's "Still unverified" section for the full list):
 #   - CONFIRMED live 2026-08-02 (#3): re-clicking an already-deployed hook IS safe -- it does not
-#     retrieve/stop it. tick() below re-clicks whenever idle, same pattern as mining.py's
-#     click-the-rock-whenever-idle loop, which self-heals from any stop reason (the wreck sank, a
-#     stray misclick retrieved it, ...) instead of needing to track why it stopped.
+#     retrieve/stop it. tick() below re-clicks whenever idle, self-healing from any stop reason
+#     (the wreck sank, a stray misclick retrieved it, ...) instead of needing to track why it
+#     stopped. UNLIKE mining.py's click-the-rock-whenever-idle loop, the isIdle check only gates
+#     the reclick itself, not the whole near-wreck branch -- salvaging turned out to be a
+#     continuous multi-tick channel (isIdle can stay False for a wreck's entire lifespan), so
+#     gating the branch on it meant the routine never noticed a sunk wreck and never looked
+#     farther out, confirmed live 2026-08-02.
 #   - CONFIRMED live 2026-08-01 (#4): the hook does NOT keep working on its own once its wreck
 #     sinks, even if a different active wreck of the same name is still in range -- salvaging
 #     visibly stopped. No longer tracked explicitly (see #3 above) -- the idle-triggered re-click
@@ -64,12 +68,15 @@ def tick(ctx):
         drop_salvage(ctx)
         return
 
-    if not controller.get_combat().get("isIdle", True):
-        return  # already mid-roll -- don't reclick
-
     near_wreck = find_nearby_wreck(config, config.get("maxDistance", 15))
     if near_wreck is not None:
-        if not controller.get_sailing().get("navigating"):
+        # isIdle only gates the reclick itself (avoid spam-clicking mid-channel) -- it must NOT
+        # gate this whole branch, or the far-wreck check below never runs. CONFIRMED live
+        # 2026-08-02: salvaging is a continuous multi-tick channel, not brief per-swing bursts
+        # like mining.py -- isIdle can stay False for a wreck's entire lifespan, so gating the
+        # branch on it meant the routine never noticed the near wreck was gone and never looked
+        # for a farther one to sail to.
+        if controller.get_combat().get("isIdle", True) and not controller.get_sailing().get("navigating"):
             sailing.deploy_hook(ctx, config.get("hookName", ""))
         return
 
