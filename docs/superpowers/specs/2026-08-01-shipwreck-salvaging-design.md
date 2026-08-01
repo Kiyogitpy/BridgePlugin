@@ -145,20 +145,24 @@ Implications:
 
 ## Still unverified -- flagged for in-game testing, not blocking a first cut
 
-1. **Exact heading quantization and hop tolerance.** Confirmed live that
-   minimap clicks steer the boat, but not exactly how coarse the snapping is
-   (the user observed roughly 8 compass directions; sub-increments like NNE
-   are unconfirmed) or how far a single "hop" travels before needing a
-   re-aim. This governs `WALK_HOP_MIN/MAX_TILES`-equivalent tuning for the
-   boat version in `sailing.py` -- start from `travel.py`'s existing
-   constants and adjust once this is observed live. Downgraded from a
-   blocking unknown: interface group `604` in the stale source checkout
-   (internal cache name `FossilquestSailing`, with `BEARING`/`THROTTLE`/
-   `DIRECTION` sub-widgets incl. `THROTTLE_INCREASE`/`DECREASE`/
-   `DIRECTION_LEFT`/`RIGHT`) looked like a bespoke steering HUD before this
-   confirmation; it's kept only as a fallback note in case minimap-click
-   steering turns out insufficient (e.g. too coarse to reliably reach a
-   specific wreck), not as the primary mechanism.
+1. **Heading quantization: CONFIRMED, 16-point compass.** The user tested
+   this live: going clockwise from North back to North is 16 discrete steps
+   (22.5&deg; increments -- N, NNE, NE, ENE, E, ESE, SE, SSE, S, SSW, SW,
+   WSW, W, WNW, NW, NNW), finer than the "roughly 8 directions" first
+   assumed. This resolves the quantization half of this item. **Still open:**
+   how far a single "hop" actually travels before needing a re-aim, and
+   whether `SAIL_HOP_MIN/MAX_TILES`/`SAIL_ARRIVAL_TOLERANCE` in `sailing.py`
+   (currently 6/10/5, deliberately shorter/wider than `travel.py`'s
+   walking-equivalent 10/16/3 on the assumption heading was coarser than it
+   turns out to be) are still appropriately tuned now that the heading
+   resolution is known to be roughly twice as fine as assumed -- needs an
+   observed hop-tracking test (overshoot/stall behavior) before adjusting,
+   not just the angular resolution alone. Interface group `604` in the stale
+   source checkout (internal cache name `FossilquestSailing`, with
+   `BEARING`/`THROTTLE`/`DIRECTION` sub-widgets incl.
+   `THROTTLE_INCREASE`/`DECREASE`/`DIRECTION_LEFT`/`RIGHT`) remains an
+   unused fallback note, not the primary mechanism -- minimap-click steering
+   is confirmed sufficient.
 2. **"Take down sails" button location.** Interface group `937`
    (`SailingSidepanel`) is confirmed as the Sailing Options panel (Facilities/
    Stats/Crew tabs), but the steering section's individual buttons are
