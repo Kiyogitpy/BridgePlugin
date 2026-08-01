@@ -872,7 +872,12 @@ def maybe_misclick(ctx, chance: float = MISTAKE_RANDOM_CLICK_CHANCE) -> bool:
     Never fires while actively in combat -- a real player doesn't throw in a
     stray click mid-fight, and for a routine tracking a specific target (e.g.
     gemstone_crab's crab-then-tunnel sequence) a stray click elsewhere is
-    indistinguishable from actually clicking away from what it's doing.
+    indistinguishable from actually clicking away from what it's doing. Same
+    reasoning for Sailing's helm/steering mode (get_sailing().navigating) --
+    CONFIRMED live 2026-08-02: a stray click while engaged with the helm was
+    "making so many problems" (e.g. clicking away from a deployed salvaging
+    hook retrieves it, confirmed separately -- a misclick mid-navigation is
+    exactly that kind of unwanted "clicked away").
 
     Returns True if it fired (caller should skip its real action this tick
     and let the next tick carry on normally), False otherwise.
@@ -881,6 +886,9 @@ def maybe_misclick(ctx, chance: float = MISTAKE_RANDOM_CLICK_CHANCE) -> bool:
         return False
 
     if get_combat().get("inCombat"):
+        return False
+
+    if get_sailing().get("navigating"):
         return False
 
     point = _misclick_target_point() or random_viewport_point()
