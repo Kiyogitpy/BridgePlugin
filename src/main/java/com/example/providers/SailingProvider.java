@@ -42,7 +42,7 @@ public class SailingProvider extends BridgeProvider
 		// FossilquestSailing (interface group 604) is the boat-piloting HUD that the wiki
 		// describes opening when the helm's Navigate option is used -- its visibility is the
 		// most direct signal for "is the helm currently engaged". TODO verify in-game (see spec
-		// "Still unverified" #1) -- this interface group's real purpose was never confirmed live,
+		// "Still unverified" #7) -- this interface group's real purpose was never confirmed live,
 		// only inferred from its component names in a stale source checkout.
 		Widget steeringHud = client.getWidget(InterfaceID.FossilquestSailing.UNIVERSAL);
 		data.put("navigating", steeringHud != null && !steeringHud.isHidden());

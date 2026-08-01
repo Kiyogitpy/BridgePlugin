@@ -189,6 +189,17 @@ Implications:
 6. **Whether 'Q' is the correct keybind for revealing the Sailing Options
    panel.** `sailing.py`'s `SAILING_OPTIONS_TAB_KEY` is a guess, not
    confirmed against the live client.
+7. **Whether `FossilquestSailing.UNIVERSAL`'s visibility actually means
+   "helm engaged."** `SailingProvider.java` derives `navigating` from whether
+   this widget is visible -- inferred from the interface group's name and
+   component layout in the stale source checkout (see item 1 above), never
+   confirmed live. This is the single highest-consequence unverified
+   assumption in the whole feature: every other item on this list degrades
+   gracefully (a wrong keybind guess just needs a Forced Actions tweak, a
+   wrong hop-tolerance just needs retuning), but if this widget mapping is
+   wrong, `sailing.use_helm` would never observe `navigating` becoming
+   `True`, `sail_to` would always fail its `NAVIGATE_TIMEOUT_S` wait, and the
+   routine would never be able to reposition the boat at all.
 
 ## Design
 
@@ -201,8 +212,8 @@ Registered alongside the other providers (see `BridgeProvider` subclasses in
 {
   "navigating": bool,              // is the helm currently engaged
   "facilitiesTabOpen": bool,       // is Sailing Options -> Facilities selected
-  "takeDownSails": {screenX, screenY} | null,    // dynamic text-scan of FACILITIES_ROWS, null if not found
-  "setSail": {screenX, screenY} | null           // same row, opposite state
+  "takeDownSails": {screenX, screenY} | {},    // dynamic text-scan of FACILITIES_ROWS, {} if not found
+  "setSail": {screenX, screenY} | {}           // same row, opposite state
 }
 ```
 

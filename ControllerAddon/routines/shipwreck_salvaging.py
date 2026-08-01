@@ -52,6 +52,7 @@ def get_config(bridge_config):
 
 
 WAITING_MESSAGE_INTERVAL_S = 30.0
+HOOK_STALL_TIMEOUT_S = 300.0  # no inventory growth this long after "deploying" means it didn't take
 
 
 def tick(ctx):
@@ -63,17 +64,29 @@ def tick(ctx):
 
     near_wreck = find_nearby_wreck(config, config.get("maxDistance", 15))
     if near_wreck is not None:
-        if not ctx.state.data.get("hook_deployed"):
+        if ctx.state.data.get("hook_deployed"):
+            stalled = (
+                time.time() - ctx.state.data.get("hook_deployed_at", 0) > HOOK_STALL_TIMEOUT_S
+                and len(controller.get_inventory()) <= ctx.state.data.get("hook_deployed_inventory_count", 0)
+            )
+            if stalled:
+                ctx.state.data["hook_deployed"] = False
+
+        if not ctx.state.data.get("hook_deployed") and not controller.get_sailing().get("navigating"):
             if sailing.deploy_hook(ctx, config.get("hookName", "")):
                 ctx.state.data["hook_deployed"] = True
+                ctx.state.data["hook_deployed_at"] = time.time()
+                ctx.state.data["hook_deployed_inventory_count"] = len(controller.get_inventory())
         return
 
-    far_wreck = find_nearby_wreck(config, config.get("maxSailDistance", 60), require_visible=False)
+    far_wreck = find_nearby_wreck(config, config.get("maxSailDistance", 60))
     if far_wreck is not None:
         ctx.state.data["hook_deployed"] = False
-        if sailing.sail_to(ctx, far_wreck):
+        if sailing.sail_to(ctx, far_wreck) and not controller.get_sailing().get("navigating"):
             if sailing.deploy_hook(ctx, config.get("hookName", "")):
                 ctx.state.data["hook_deployed"] = True
+                ctx.state.data["hook_deployed_at"] = time.time()
+                ctx.state.data["hook_deployed_inventory_count"] = len(controller.get_inventory())
         return
 
     now = time.time()
@@ -90,6 +103,7 @@ def drop_salvage(ctx):
     ctx.state.data["hook_deployed"] -- dropping items doesn't retrieve the hook (only clicking
     away from it, e.g. the helm, does that -- confirmed by the user), so re-deploying here would
     be an unnecessary, possibly-unsafe re-click (see module header)."""
+    controller.open_inventory_tab(ctx.ser)
     for item in controller.get_inventory():
         name = (item.get("name") or "").lower()
         if name.endswith("salvage"):
@@ -97,19 +111,18 @@ def drop_salvage(ctx):
             time.sleep(random.uniform(0.2, 0.4))
 
 
-def find_nearby_wreck(config: dict, max_dist: float, require_visible: bool = True):
-    """Nearest object matching config["wreckNames"] within max_dist tiles, or None.
-    require_visible=True (the default, used for the hook-operating-range check) also requires
-    the object to be on-screen-projectable right now. require_visible=False (used for the
-    farther sail-range check) only needs its world x/y/plane -- ObjectProvider always sets those
-    from the object's WorldPoint regardless of whether it's currently on-screen, which is exactly
-    what sailing.sail_to needs to steer toward it."""
+def find_nearby_wreck(config: dict, max_dist: float):
+    """Nearest object matching config["wreckNames"] within max_dist tiles, or None. Pure range
+    test -- the wreck itself is never clicked (only the boat's own salvaging hook is), so
+    on-screen-projectability doesn't matter here, only world position. ObjectProvider always
+    sets x/y/distance from the object's WorldPoint regardless of whether it's currently
+    on-screen, which is exactly what both the hook-operating-range check and the farther
+    sail-range check need."""
     names = {n.lower() for n in config.get("wreckNames", [])}
 
     candidates = [
         o for o in controller.get_objects()
         if (o.get("name") or "").lower() in names
-        and (not require_visible or o.get("visible", True))
         and o.get("x") is not None
         and 0 <= o.get("distance", 9999) <= max_dist
     ]
