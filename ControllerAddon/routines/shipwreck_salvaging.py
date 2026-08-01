@@ -103,7 +103,7 @@ def drop_salvage(ctx):
         name = (item.get("name") or "").lower()
         if name.endswith("salvage"):
             controller.click_entity(ctx.ser, item, check_ui_blockers=False)
-            time.sleep(random.uniform(0.2, 0.4))
+            time.sleep(random.uniform(0.1, 0.2))  # ~2x faster than the original 0.2-0.4s, per request
 
 
 # Sinking swaps a wreck's object out entirely for a "stump" variant that keeps the exact same
