@@ -189,6 +189,17 @@ anticipate needing:
    `playerView.getPlane()` (wherever the player currently stood). Fixed by walking every plane a
    scene can have (`Constants.MAX_Z` = 4) for the nested-view case -- cheap for a boat's tiny
    scene, unlike doing the same for the top-level world.
+4. **Ground-tile projection isn't accurate enough for boat fixtures.** Even once the salvaging
+   hook was found and being clicked, the click landed on the deck tile beside it, not the hook
+   itself -- confirmed live 2026-08-01. `ObjectProvider` computed `screenX`/`screenY` via a plain
+   ground-tile projection (`Perspective.localToCanvas`), which `TileObject.getClickbox()`'s own
+   javadoc warns against ("you don't want this, use getClickbox() instead") -- the hook's visible
+   model sits off the tile's ground height enough for the two points to diverge. Fixed by
+   preferring `TileObject.getClickbox()`'s actual on-screen clickable-area bounds (falling back to
+   the old ground-tile projection only when no clickbox is available, e.g. not currently
+   rendered). This is a general accuracy fix, not boat-specific -- it likely improves clicking
+   reliability for any object whose model isn't flush with its tile's ground height, not only
+   things on a boat.
 
 This fix is generic (in `RuneLiteUtil`/`ObjectProvider`/`PlayerProvider`, not
 shipwreck-salvaging-specific code) and benefits any future routine that might run while the player

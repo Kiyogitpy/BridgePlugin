@@ -162,21 +162,47 @@ public class ObjectProvider extends BridgeProvider
 		data.put("y", wp.getY());
 		data.put("plane", wp.getPlane());
 
-		// Screen projection uses the object's own raw (possibly boat-local) LocalPoint, not the
-		// top-level-transformed WorldPoint above -- Perspective.localToCanvas already handles a
-		// LocalPoint tagged with a nested WorldView correctly on its own (it special-cases
-		// LocalPoint.getWorldView() > -1 internally), and re-deriving a fresh LocalPoint from the
-		// transformed WorldPoint would just be a lossier round-trip of the same information.
-		net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, local, plane);
-		if (point != null)
+		// Prefer the object's actual on-screen clickable area (its model's real convex hull) over
+		// a plain ground-tile projection -- TileObject.getClickbox()'s own javadoc says as much
+		// ("you don't want [localToCanvas], use getClickbox() instead"). Confirmed live
+		// 2026-08-01: clicking the ground-tile-projected point for the salvaging hook landed on
+		// the deck tile beside it, not the hook itself, and did nothing -- the hook's visible
+		// model sits off the tile's ground height enough for the two to diverge. Falls back to
+		// the previous ground-tile projection when no clickbox is available right now (e.g. the
+		// object isn't currently rendered) -- same behavior as before for that case. Uses the
+		// object's own raw (possibly boat-local) LocalPoint/clickbox, not the top-level-transformed
+		// WorldPoint above -- both Perspective.localToCanvas and getClickbox already handle a
+		// LocalPoint tagged with a nested WorldView correctly on their own.
+		java.awt.Shape clickbox = obj.getClickbox();
+		java.awt.Rectangle clickBounds = clickbox != null ? clickbox.getBounds() : null;
+
+		if (clickBounds != null && clickBounds.width > 0 && clickBounds.height > 0)
 		{
-			Point screen = RuneLiteUtil.canvasToScreen(client, point.getX(), point.getY());
+			int canvasX = (int) clickBounds.getCenterX();
+			int canvasY = (int) clickBounds.getCenterY();
+
+			Point screen = RuneLiteUtil.canvasToScreen(client, canvasX, canvasY);
 			data.put("screenX", screen.x);
 			data.put("screenY", screen.y);
+
+			boolean onScreen = RuneLiteUtil.isOnScreen(client, new net.runelite.api.Point(canvasX, canvasY));
+			data.put("visible", true);
+			data.put("onScreen", onScreen);
+			data.put("clickable", onScreen);
+		}
+		else
+		{
+			net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, local, plane);
+			if (point != null)
+			{
+				Point screen = RuneLiteUtil.canvasToScreen(client, point.getX(), point.getY());
+				data.put("screenX", screen.x);
+				data.put("screenY", screen.y);
+			}
+			data.putAll(RuneLiteUtil.visibility(client, local, plane, true));
 		}
 
 		data.put("distance", RuneLiteUtil.distanceToPlayer(client, wp));
-		data.putAll(RuneLiteUtil.visibility(client, local, plane, true));
 		return data;
 	}
 }
