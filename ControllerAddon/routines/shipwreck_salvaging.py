@@ -65,6 +65,17 @@ HOOK_CLICK_COOLDOWN_S = 3.0  # don't reclick the hook again within this long of 
                               # starts, causing back-to-back redundant clicks without this. Still
                               # short enough to redeploy quickly for a genuine stop (wreck sank,
                               # misclick retrieved it, ...), just not on literally every tick.
+HOOK_ENGAGE_TIMEOUT_S = 12.0  # CONFIRMED live 2026-08-02: maxDistance (the configured
+                               # hook-operating range) is only a guess at the hook's real
+                               # functional range -- observed live standing exactly at a wreck
+                               # 15 tiles away (the configured default), isIdle stayed True and
+                               # animation stayed -1 no matter how many times the hook got
+                               # reclicked, because the wreck was actually still too far for the
+                               # hook to engage even though it passed the maxDistance check. If
+                               # isIdle never goes False for this long despite repeated reclicks,
+                               # the wreck is probably out of real range regardless of what
+                               # maxDistance said -- reposition closer instead of reclicking
+                               # forever.
 
 
 def tick(ctx):
@@ -90,11 +101,21 @@ def tick(ctx):
         # hook") once navigating got stuck True. stop_boat() already waits for the boat's actual
         # *position* to stabilize before returning, which is the real "safe to deploy" signal.
         idle = controller.get_combat().get("isIdle", True)
-        cooldown_elapsed = time.time() - ctx.state.data.get("last_deploy_click_at", 0) > HOOK_CLICK_COOLDOWN_S
+        now = time.time()
+        if not idle:
+            # Channel confirmed actually running -- clear the stuck tracker below.
+            ctx.state.data.pop("hook_engage_attempt_at", None)
+        cooldown_elapsed = now - ctx.state.data.get("last_deploy_click_at", 0) > HOOK_CLICK_COOLDOWN_S
         if idle and cooldown_elapsed:
+            attempt_start = ctx.state.data.setdefault("hook_engage_attempt_at", now)
+            if now - attempt_start > HOOK_ENGAGE_TIMEOUT_S:
+                print("[salvage] hook isn't engaging after repeated clicks -- repositioning closer")
+                sailing.sail_to(ctx, near_wreck)
+                ctx.state.data.pop("hook_engage_attempt_at", None)
             sailing.deploy_hook(ctx, config.get("hookName", ""))
-            ctx.state.data["last_deploy_click_at"] = time.time()
+            ctx.state.data["last_deploy_click_at"] = now
         return
+    ctx.state.data.pop("hook_engage_attempt_at", None)
 
     far_wreck = find_nearby_wreck(config, config.get("maxSailDistance", 60))
     if far_wreck is not None:
