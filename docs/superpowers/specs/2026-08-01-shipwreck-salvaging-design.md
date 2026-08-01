@@ -200,10 +200,32 @@ anticipate needing:
    rendered). This is a general accuracy fix, not boat-specific -- it likely improves clicking
    reliability for any object whose model isn't flush with its tile's ground height, not only
    things on a boat.
+5. **Even the fixed-up walk still missed the Helm -- it lives in a further-nested `WorldView`.**
+   Confirmed live 2026-08-02 via a new general-purpose debug endpoint (`GET /debug-menu` on
+   `GameStateProvider`, dumps whatever menu entries the client currently has built -- the same
+   ground truth the client's own Examine debug tool reads from): hovering the Helm showed its
+   `EXAMINE_OBJECT` entry's identifier (`59578`, matching what Examine itself reports) was
+   *different* from its actual `GAME_OBJECT_FIRST_OPTION`/`GAME_OBJECT_FOURTH_OPTION`
+   ("Navigate"/"Escape") entries' identifier (`59576`) -- and, more importantly, those entries'
+   `worldViewId` (`3083`) differed from the player's own (`3078`, exposed via new
+   `debugWorldViewId`-prefixed fields on `/player`). `WorldView.worldEntities()` supports nesting
+   a view inside another view's own `WorldEntity`s, and the Helm turned out to live one level
+   deeper than the boat's main view the player stands in. Fixed by replacing the
+   single-player's-own-view walk with a full recursive walk of every `WorldEntity`'s `WorldView`
+   starting from the top level, at any depth (`ObjectProvider.walkWorldViewRecursively`).
+6. **The Helm's name still needed impostor resolution.** Even once found via fix 5, `id 59576`'s
+   plain `ObjectComposition` reports name `"null"` -- it's a multiloc (varbit-conditional
+   appearance) object, and the base composition is only a template; the real displayed name
+   ("Helm", matching the menu's target text) only resolves through `ObjectComposition.getImpostor()`.
+   This likely explains every other "null"-named object seen scattered throughout this session's
+   `/objects` dumps too (several other boat fixtures), not just the Helm. Fixed by resolving
+   through `getImpostor()` whenever `getImpostorIds() != null`, in `ObjectProvider.buildObjectData`.
 
-This fix is generic (in `RuneLiteUtil`/`ObjectProvider`/`PlayerProvider`, not
-shipwreck-salvaging-specific code) and benefits any future routine that might run while the player
-is aboard a boat, not just this one.
+These fixes are generic (in `RuneLiteUtil`/`ObjectProvider`/`PlayerProvider`/`GameStateProvider`,
+not shipwreck-salvaging-specific code) and benefit any future routine that might run while the
+player is aboard a boat, not just this one. `GET /debug-menu` and `/player`'s
+`debugWorldViewId`-prefixed fields are kept as general-purpose debugging tools (see their code
+comments), not removed once this specific investigation closed.
 
 ## Still unverified -- flagged for in-game testing, not blocking a first cut
 

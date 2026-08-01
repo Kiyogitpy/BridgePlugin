@@ -25,6 +25,32 @@ public class GameStateProvider extends BridgeProvider
 	public void register()
 	{
 		server.register("/state", () -> onClient(this::getState));
+		server.register("/debug-menu", () -> onClient(this::getDebugMenu));
+	}
+
+	// General-purpose debug endpoint: dumps whatever menu entries the client currently has built
+	// (hover a target, then query this) -- the same ground truth the client's own Examine debug
+	// tool reads from. Earned its keep finding a real bug 2026-08-02: it's what showed a boat's
+	// "Helm" object resolves to a DIFFERENT clickable id (its EXAMINE_OBJECT entry's identifier
+	// differed from its GAME_OBJECT_FIRST_OPTION entries' identifier) in a DIFFERENT worldViewId
+	// than the player's own -- neither fact discoverable from ObjectProvider's own output alone.
+	// Worth keeping for the next time an object/menu mismatch like that needs chasing down.
+	private Object getDebugMenu()
+	{
+		List<Map<String, Object>> entries = new ArrayList<>();
+		for (net.runelite.api.MenuEntry entry : client.getMenuEntries())
+		{
+			Map<String, Object> e = new HashMap<>();
+			e.put("option", entry.getOption());
+			e.put("target", entry.getTarget());
+			e.put("identifier", entry.getIdentifier());
+			e.put("type", entry.getType() != null ? entry.getType().name() : null);
+			e.put("param0", entry.getParam0());
+			e.put("param1", entry.getParam1());
+			e.put("worldViewId", entry.getWorldViewId());
+			entries.add(e);
+		}
+		return entries;
 	}
 
 	private Object getState()

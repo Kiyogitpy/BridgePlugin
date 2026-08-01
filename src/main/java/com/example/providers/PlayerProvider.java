@@ -47,6 +47,23 @@ public class PlayerProvider extends BridgeProvider
 		data.put("combatLevel", p.getCombatLevel());
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
+
+		// General-purpose debug fields: direct visibility into which WorldView the player is
+		// currently registered in and how big its scene is. Not consumed by any routine -- kept
+		// for the same reason as GameStateProvider's /debug-menu (see its comment): this is what
+		// confirmed the player's own WorldView (3078) differed from the Helm's actual clickable
+		// WorldView (3083) on 2026-08-02, which ObjectProvider's own output couldn't reveal.
+		WorldView pv = p.getWorldView();
+		if (pv != null)
+		{
+			data.put("debugWorldViewId", pv.getId());
+			data.put("debugWorldViewIsTopLevel", pv.isTopLevel());
+			data.put("debugWorldViewSizeX", pv.getSizeX());
+			data.put("debugWorldViewSizeY", pv.getSizeY());
+			data.put("debugWorldViewPlane", pv.getPlane());
+			Scene pvScene = pv.getScene();
+			data.put("debugWorldViewSceneNull", pvScene == null);
+		}
 		data.put("plane", wp.getPlane());
 		data.put("inWilderness", client.getVarbitValue(Varbits.IN_WILDERNESS) != 0);
 

@@ -48,46 +48,78 @@ public class ObjectProvider extends BridgeProvider
 		return cachedObjects;
 	}
 
+	// Recursion guard for walkWorldViewRecursively -- WorldEntity/WorldView nesting is expected to
+	// be a shallow tree (confirmed live 2026-08-02: the boat's helm alone needed 2 levels below
+	// the top level -- the player's own view, plus one further WorldEntity nested inside that),
+	// this is just insurance against an unexpected cycle turning into a runaway walk.
+	private static final int MAX_WORLD_VIEW_DEPTH = 6;
+
 	private List<Map<String, Object>> computeObjects()
 	{
 		List<Map<String, Object>> list = new ArrayList<>();
 
-		Scene topLevelScene = client.getScene();
-		if (topLevelScene != null)
+		WorldView topLevel = client.getTopLevelWorldView();
+		if (topLevel != null)
 		{
-			walkScene(topLevelScene, client.getPlane(), list);
+			walkWorldViewRecursively(topLevel, true, list, 0);
 		}
 
-		// Sailing's boats are WorldEntities with their own separate WorldView (own scene, own
-		// plane numbering) -- fixtures built on the boat itself (the helm, a salvaging hook, ...)
-		// live there, not in the top-level scene walked above, so standing on your own boat would
-		// otherwise never see them at all. Confirmed live 2026-08-01: the helm and a salvaging
-		// hook were completely absent from this endpoint while aboard a boat before this was
-		// added, even though both were right in front of the player.
-		Player localPlayer = client.getLocalPlayer();
-		WorldView playerView = localPlayer != null ? localPlayer.getWorldView() : null;
-		if (playerView != null && !playerView.isTopLevel())
+		return list;
+	}
+
+	// Sailing's boats are WorldEntities with their own separate WorldView (own scene, own plane
+	// numbering) -- fixtures built on the boat itself (the helm, a salvaging hook, ...) live
+	// there, not in the top-level scene, so standing on your own boat would otherwise never see
+	// them at all. Confirmed live 2026-08-01/02, in stages:
+	//   1. Walking only the top-level scene missed every boat fixture entirely.
+	//   2. Walking the player's own current WorldView (client.getLocalPlayer().getWorldView())
+	//      found some fixtures (a salvaging hook) but not others (the helm) -- the helm turned
+	//      out to sit on a different plane than the player within that same nested scene, fixed
+	//      by walking every plane (Constants.MAX_Z) of a nested view instead of just the
+	//      player's current one.
+	//   3. Still missing: a /debug-menu dump of the actual menu entries under the mouse while
+	//      hovering the helm showed its real clickable id resolves in a DIFFERENT worldViewId
+	//      than the player's own (client.getLocalPlayer().getWorldView().getId()) -- i.e. the
+	//      helm lives in a WorldEntity nested *inside* the boat's main WorldView, not the player's
+	//      own view directly. WorldView.worldEntities() supports exactly this (a view can contain
+	//      further WorldEntities, each with their own child WorldView), so rather than walking
+	//      only the player's specific view, this recurses through every WorldEntity's view
+	//      starting from the top level, at any depth, catching sub-views nothing else pointed at.
+	private void walkWorldViewRecursively(WorldView view, boolean isTopLevel, List<Map<String, Object>> out, int depth)
+	{
+		if (depth > MAX_WORLD_VIEW_DEPTH)
 		{
-			Scene playerScene = playerView.getScene();
-			if (playerScene != null)
+			return;
+		}
+
+		Scene scene = view.getScene();
+		if (scene != null)
+		{
+			if (isTopLevel)
+			{
+				walkScene(scene, client.getPlane(), out);
+			}
+			else
 			{
 				// Unlike the top-level world (mutually-exclusive floors you switch between), a
-				// boat's whole small deck structure -- main deck, a raised helm/quarterdeck, etc.
-				// -- is rendered together as one nested WorldView, all planes at once. Confirmed
-				// live 2026-08-01: the helm object was still missing even after adding the walk
-				// above, because it turned out to sit on a different plane than
-				// playerView.getPlane() within this same small nested scene (a salvaging hook on
-				// the main deck was found fine -- only objects on the player's own current plane
-				// were). Walking every plane a scene can have (Constants.MAX_Z) is cheap for a
-				// boat's tiny nested scene, unlike doing the same for the top-level world.
+				// nested WorldView's whole small structure is rendered together, all planes at
+				// once -- walking every plane a scene can have is cheap for one this tiny, unlike
+				// doing the same for the top-level world.
 				for (int nestedPlane = 0; nestedPlane < Constants.MAX_Z; nestedPlane++)
 				{
-					walkScene(playerScene, nestedPlane, list);
+					walkScene(scene, nestedPlane, out);
 				}
 			}
 		}
 
-		return list;
+		for (WorldEntity entity : view.worldEntities())
+		{
+			WorldView childView = entity.getWorldView();
+			if (childView != null)
+			{
+				walkWorldViewRecursively(childView, false, out, depth + 1);
+			}
+		}
 	}
 
 	private void walkScene(Scene scene, int plane, List<Map<String, Object>> out)
@@ -157,6 +189,16 @@ public class ObjectProvider extends BridgeProvider
 		data.put("id", obj.getId());
 		data.put("objectType", objectType);
 		ObjectComposition comp = client.getObjectDefinition(obj.getId());
+		if (comp != null && comp.getImpostorIds() != null)
+		{
+			// Multiloc (varbit-conditional appearance) object -- the base composition's own name
+			// is often a placeholder ("null") with the real displayed name only resolvable
+			// through its current impostor variant. Confirmed live 2026-08-02: this is why the
+			// boat's "Helm" (and several other boat fixtures seen throughout this session) kept
+			// reporting name "null" here even once found -- the game's own menu-text resolution
+			// (what a right-click label shows) already does this same impostor lookup.
+			comp = comp.getImpostor();
+		}
 		data.put("name", comp != null ? comp.getName() : "Unknown");
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
