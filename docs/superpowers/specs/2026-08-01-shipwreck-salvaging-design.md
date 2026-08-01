@@ -257,16 +257,41 @@ comments), not removed once this specific investigation closed.
    `THROTTLE_INCREASE`/`DECREASE`/`DIRECTION_LEFT`/`RIGHT`) remains an
    unused fallback note, not the primary mechanism -- minimap-click steering
    is confirmed sufficient.
-2. **"Take down sails" button location.** Interface group `937`
-   (`SailingSidepanel`) is confirmed as the Sailing Options panel (Facilities/
-   Stats/Crew tabs), but the steering section's individual buttons are
-   dynamically built inside `FACILITIES_ROWS` rather than fixed constants --
-   same situation `BankProvider.java` already handles for individual bank
-   item slots (dynamic children, matched at runtime, not a fixed id).
-   `SailingProvider.java` will need to scan that container's dynamic
-   children by text (`"Take down sails"` / `"Set sail"`) the same way, and
-   this needs in-game confirmation that the text match actually finds the
-   right child.
+2. **CONFIRMED live 2026-08-02, fixed and working.** Interface group `937`
+   (`SailingSidepanel`) was already confirmed as the Sailing Options panel,
+   and the steering controls are indeed dynamically built inside
+   `FACILITIES_ROWS`, as guessed -- but the original plan (scan by text,
+   `"Take down sails"` / `"Set sail"`) was wrong on two counts: (a) there's
+   only **one** toggle icon, not two separately-labeled buttons -- its menu
+   action just flips between `"Set sails"` and `"Un-set sails"` depending on
+   current state; (b) that icon carries **no text of its own at all** --
+   confirmed by dumping all 73 of `FACILITIES_ROWS`'s dynamic children live
+   (a new debug field, `SailingProvider.getDebugFacilitiesChildren`-style),
+   every one had an empty `getText()` except the fixed `"Steering"`/
+   `"Repairs: No kits"` section labels. A text-match approach could never
+   have worked here.
+
+   Root cause understood via a new general-purpose `GET /debug-menu`
+   endpoint (dumps the client's current menu entries, same ground truth the
+   Examine debug tool reads from -- see the "Architecture fix" section
+   above, item 5's investigation used the same tool): hovering the icon and
+   checking that endpoint showed its menu action resolves through **one
+   shared click-layer widget** (`FACILITIES_CONTENT_CLICKLAYER`) common to
+   *every* icon in the Facilities tab, discriminated by a per-icon
+   `MenuEntry.getParam0()` (confirmed `0` for the sail toggle, `1` for the
+   confirmed-adjacent "Reverse" button) rather than by a distinct widget id
+   per icon.
+
+   Each icon renders as an 11-entry tile cluster within `FACILITIES_ROWS`'s
+   dynamic children (8 corner/edge pieces + its own center point repeated
+   3x), always in the same fixed order -- the Steering section's controls
+   come first (matching the wiki's "set or un-set the sails, change the
+   speed of the boat, or reverse the boat"), and cross-checking the
+   confirmed-by-hover sail icon's on-screen position against a fresh dump
+   showed it's reliably the array's first cluster. `SailingProvider.java`
+   now just uses `children[0]`'s bounds directly (exposed as a single
+   `sailToggle` field, replacing the two-button `takeDownSails`/`setSail`
+   shape) instead of matching by text or a fixed widget id.
 3. **CONFIRMED live 2026-08-02: re-clicking an already-deployed hook IS
    safe.** The `Hidden` conditional op (index 2) on the hook object had
    raised the question of whether the *default* (left-click) option might
@@ -350,21 +375,23 @@ Registered alongside the other providers (see `BridgeProvider` subclasses in
 
 ```java
 {
-  "navigating": bool,              // is the helm currently engaged
+  "navigating": bool,              // WorldView.getYellowClickAction() == CLICK_ACTION_SET_HEADING (see item 7)
   "facilitiesTabOpen": bool,       // is Sailing Options -> Facilities selected
-  "takeDownSails": {screenX, screenY} | {},    // dynamic text-scan of FACILITIES_ROWS, {} if not found
-  "setSail": {screenX, screenY} | {}           // same row, opposite state
+  "sailToggle": {screenX, screenY} | {}   // FACILITIES_ROWS's first dynamic-child cluster (see item 2), {} if not found
 }
 ```
 
-Slimmer than originally sketched: since steering input reuses the existing
-generic minimap-click machinery (`get_minimap_walk_point` in
-`controller.py`, already provider-backed for foot travel), no bespoke
-steering-HUD widget lookups are needed here. `takeDownSails`/`setSail`
-follow `BankProvider.java`'s existing pattern for widget-bounds lookups
-(`buttonPoint(int packedWidgetId)` plus a children-scan loop, mirroring
-`BankProvider`'s `BANK_ITEM_CONTAINER` handling) -- marked with a
-`// TODO verify` comment pointing at this spec's "Still unverified" section
+*(Historical note: this shape as originally sketched had `takeDownSails`/
+`setSail` as two separate text-matched buttons, and `navigating` derived
+from a guessed widget's visibility -- both wrong, see items 2 and 7 below
+for what actually shipped.)* Slimmer than originally sketched: since
+steering input reuses the existing generic minimap-click machinery
+(`get_minimap_walk_point` in `controller.py`, already provider-backed for
+foot travel), no bespoke steering-HUD widget lookups are needed here.
+`sailToggle` follows `BankProvider.java`'s existing pattern for
+widget-bounds lookups (`buttonPoint(int packedWidgetId)` plus a
+children-scan loop, mirroring `BankProvider`'s `BANK_ITEM_CONTAINER`
+handling) -- marked with a `// TODO verify` comment pointing at this spec's "Still unverified" section
 2, exactly the codebase's existing convention for unverified assumptions
 (see `travel.py`'s module header). If in-game testing shows minimap-click
 steering is too coarse to be usable, `directionLeft/Right` and
@@ -403,8 +430,9 @@ def steer_toward(ctx, target: dict) -> bool:
     ...
 
 def stop_boat(ctx) -> bool:
-    # tap Q (open_sailing_options_tab), click get_sailing()["takeDownSails"],
-    # wait for player position to stop changing between polls.
+    # tap Q (open_sailing_options_tab), click get_sailing()["sailToggle"] (see item 2 --
+    # a single toggle icon, not two separate buttons), wait for player position to stop
+    # changing between polls.
     ...
 
 def deploy_hook(ctx, hook_name: str) -> bool:
