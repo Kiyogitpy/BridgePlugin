@@ -1078,6 +1078,7 @@ ROUTINE_FILES = {
     "MINING": "routines/mining.py",
     "GEMSTONE_CRAB": "routines/gemstone_crab.py",
     "TORMENTED_DEMON": "routines/tormented_demon.py",
+    "SHIPWRECK_SALVAGING": "routines/shipwreck_salvaging.py",
 }
 
 

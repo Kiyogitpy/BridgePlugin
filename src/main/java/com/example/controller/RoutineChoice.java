@@ -12,7 +12,8 @@ public enum RoutineChoice
 	SLAYER("Slayer / Combat"),
 	MINING("Mining"),
 	GEMSTONE_CRAB("Gemstone Crab"),
-	TORMENTED_DEMON("Tormented Demon");
+	TORMENTED_DEMON("Tormented Demon"),
+	SHIPWRECK_SALVAGING("Shipwreck Salvaging");
 
 	private final String label;
 
