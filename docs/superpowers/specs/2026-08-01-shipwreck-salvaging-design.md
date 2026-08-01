@@ -275,12 +275,24 @@ comments), not removed once this specific investigation closed.
    below (the hook not auto-continuing), the routine no longer tries to
    track "did we already deploy" at all: `tick()` now just checks
    `controller.get_combat().get("isIdle")` and re-clicks the hook whenever
-   idle and a wreck is in range, the same click-whenever-idle pattern
-   `mining.py` already uses. This self-heals from *any* stop reason (wreck
-   sank, stray misclick retrieved it, ...) uniformly instead of needing
-   separate detection logic per cause -- the `deployed_wreck_key`/
+   idle and a wreck is in range. This self-heals from *any* stop reason
+   (wreck sank, stray misclick retrieved it, ...) uniformly instead of
+   needing separate detection logic per cause -- the `deployed_wreck_key`/
    `HOOK_STALL_TIMEOUT_S` bookkeeping item 4 originally added is gone,
    superseded by this simpler mechanism.
+   **Follow-up bug, also confirmed live 2026-08-02:** unlike `mining.py`'s
+   click-the-rock-whenever-idle loop (where `isIdle` gates the *entire*
+   `tick()`), salvaging turned out to be a continuous multi-tick channel --
+   `/combat`'s `isIdle` can read `False` for a wreck's *entire lifespan*, not
+   brief per-swing bursts. Gating the whole near-wreck branch on `isIdle`
+   (matching `mining.py`'s pattern) meant the routine never got past that
+   check to notice the near wreck was gone, so it never fell through to look
+   for a farther one -- this looked like "won't sail to nearby wrecks" /
+   "max sail range too short" from the outside, but was never a range
+   problem. Fixed: `isIdle` now only gates the reclick itself, inside the
+   near-wreck branch -- the branch's own control flow (falling through to
+   the far-tier check once `near_wreck` is `None`) runs every tick
+   regardless of animation state.
 4. **CONFIRMED live 2026-08-01: the hook does NOT auto-continue.** Once the
    specific wreck the hook was deployed at sinks, salvaging stops even if a
    different active wreck of the same name is still within `maxDistance` --
