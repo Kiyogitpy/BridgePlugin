@@ -154,6 +154,9 @@ def stop_boat(ctx) -> bool:
         print("[sailing] sail toggle not found")
         return False
 
+    start_player = controller.get_player()
+    start_pos = (start_player.get("x"), start_player.get("y"))
+
     print("[sailing] toggling sails")
     controller.click_entity(ctx.ser, button, offset=(0, 0))
 
@@ -165,6 +168,14 @@ def stop_boat(ctx) -> bool:
         player = controller.get_player()
         pos = (player.get("x"), player.get("y"))
         if pos[0] is not None and pos == last_pos:
+            # Drift measurement (2026-08-02): the boat keeps coasting for a bit after un-setting
+            # sails rather than stopping instantly (confirmed live), which can carry it well past
+            # where steer_toward's SAIL_ARRIVAL_TOLERANCE said "close enough, stop now". Logging
+            # the actual distance to see how much to compensate for -- e.g. triggering the stop
+            # earlier, or padding the tolerance -- once this has been observed a few times live.
+            if start_pos[0] is not None and pos[0] is not None:
+                drift = math.hypot(pos[0] - start_pos[0], pos[1] - start_pos[1])
+                print(f"[sailing] stopped -- drifted {drift:.1f} tiles after toggling sails")
             return True
         last_pos = pos
 
