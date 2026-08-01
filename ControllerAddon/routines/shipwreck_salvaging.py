@@ -122,12 +122,20 @@ def drop_salvage(ctx):
     same convention as the looting bag's "Empty" elsewhere in this codebase. Does NOT touch
     ctx.state.data["hook_deployed"] -- dropping items doesn't retrieve the hook (only clicking
     away from it, e.g. the helm, does that -- confirmed by the user), so re-deploying here would
-    be an unnecessary, possibly-unsafe re-click (see module header)."""
+    be an unnecessary, possibly-unsafe re-click (see module header).
+
+    check_ui_blockers=False: CONFIRMED live 2026-08-01 -- click_entity's default UI-blocker check
+    exists to catch a *world* click accidentally landing on the floating inventory panel (in
+    Resizable-Classic layout), but an inventory item's own screen position is naturally *inside*
+    that same panel -- the check flagged every salvage-item click as "blocked", endlessly rotated
+    the camera trying to un-block something that was never a world click, and never actually
+    clicked anything, so salvage silently never dropped. Not appropriate for any inventory-item
+    click, so skip it here same as the rest of this file's world-object clicks keep it on."""
     controller.open_inventory_tab(ctx.ser)
     for item in controller.get_inventory():
         name = (item.get("name") or "").lower()
         if name.endswith("salvage"):
-            controller.click_entity(ctx.ser, item)
+            controller.click_entity(ctx.ser, item, check_ui_blockers=False)
             time.sleep(random.uniform(0.2, 0.4))
 
 
