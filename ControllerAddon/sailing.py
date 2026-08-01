@@ -24,8 +24,9 @@
 #     wrong: "Helm" wasn't showing up in /objects at all yet because of the plane-walking gap
 #     described next, not because it doesn't exist, so the right-click result seen then was very
 #     likely actually on "Helm" all along, just misattributed to whatever WAS visible nearby.
-#   - SailingProvider.java's "Take down sails" widget lookup is a best-effort text match, not yet
-#     confirmed against the live client (#2).
+#   - CONFIRMED live 2026-08-02 (#2): the sail control is a single untextted toggle icon, not two
+#     separately-labeled buttons -- see stop_boat()'s docstring and SailingProvider.java for the
+#     full story (a text-match approach could never have worked here at all).
 
 import math
 import random
@@ -139,17 +140,21 @@ def _within_tolerance(x1: float, y1: float, x2: float, y2: float) -> bool:
 
 
 def stop_boat(ctx) -> bool:
-    """Open the Sailing Options panel, click Take down sails, and wait for the boat to actually
-    stop moving."""
+    """Open the Sailing Options panel and click the sail toggle to un-set the sails, then wait
+    for the boat to actually stop moving. CONFIRMED live 2026-08-02: this isn't two separately
+    labeled buttons ("Take down sails"/"Set sail", the original guess) -- it's a single toggle
+    icon (no text of its own) whose menu action just flips between "Set sails" and "Un-set sails"
+    depending on current state, so clicking it here always resolves to whichever one is actually
+    valid right now (matching the confirmed-safe re-click precedent for the salvaging hook)."""
     open_sailing_options_tab(ctx)
 
     sailing_state = controller.get_sailing()
-    button = sailing_state.get("takeDownSails") or {}
+    button = sailing_state.get("sailToggle") or {}
     if button.get("screenX") is None:
-        print("[sailing] Take down sails button not found")
+        print("[sailing] sail toggle not found")
         return False
 
-    print("[sailing] taking down sails")
+    print("[sailing] toggling sails")
     controller.click_entity(ctx.ser, button, offset=(0, 0))
 
     waited = 0.0

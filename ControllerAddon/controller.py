@@ -154,8 +154,7 @@ def get_sailing():
     return api_get("/sailing") or {
         "navigating": False,
         "facilitiesTabOpen": False,
-        "takeDownSails": {},
-        "setSail": {},
+        "sailToggle": {},
     }
 
 
@@ -173,6 +172,10 @@ def get_tormented_demon_config():
 
 def get_minimap_walk_point(x: int, y: int, plane: int):
     return api_get("/minimap/walk", params={"x": x, "y": y, "plane": plane}) or {"onMinimap": False}
+
+
+def get_ground_walk_point(x: int, y: int, plane: int):
+    return api_get("/ground/walk", params={"x": x, "y": y, "plane": plane}) or {"onScreen": False}
 
 
 def request_shortest_path(x: int, y: int, plane: int):
@@ -828,12 +831,48 @@ def random_viewport_point():
     return x, y
 
 
+ADJACENT_TILE_OFFSETS = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if (dx, dy) != (0, 0)]
+
+
+def _misclick_target_point():
+    """A screen point one tile off from whatever's actually nearest -- the
+    nearest visible NPC or object, not restricted to either -- or None if
+    nothing nearby has an on-screen adjacent tile to aim at. Tries the 8
+    surrounding tiles in random order, since not all of them are necessarily
+    reachable/on-screen (e.g. a target against a wall)."""
+    candidates = [
+        e for e in (get_npcs() + get_objects())
+        if e.get("visible", True) and e.get("x") is not None and e.get("distance") is not None
+    ]
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda e: e.get("distance", 9999))
+    target = candidates[0]
+    tx, ty, plane = target["x"], target["y"], target.get("plane", 0)
+
+    offsets = list(ADJACENT_TILE_OFFSETS)
+    random.shuffle(offsets)
+    for dx, dy in offsets:
+        point = get_ground_walk_point(tx + dx, ty + dy, plane)
+        if point.get("onScreen"):
+            return point["screenX"], point["screenY"]
+
+    return None
+
+
 def maybe_misclick(ctx, chance: float = MISTAKE_RANDOM_CLICK_CHANCE) -> bool:
-    """With `chance` probability, click a random point in the game viewport
-    instead of doing anything purposeful this tick -- a stray misclick (an
-    empty patch of ground, a random tree, whatever happens to be under the
-    cursor) rather than every click in a session being deliberate. Engine-
-    level like check_stray_dialog, so every routine gets it for free.
+    """With `chance` probability, click a tile adjacent to whatever's nearest
+    instead of doing anything purposeful this tick -- a stray misclick (aimed
+    near what you were looking at and missed the tile) rather than every
+    click in a session being deliberate. Falls back to a genuinely random
+    viewport point if nothing's nearby to aim beside. Engine-level like
+    check_stray_dialog, so every routine gets it for free.
+
+    Never fires while actively in combat -- a real player doesn't throw in a
+    stray click mid-fight, and for a routine tracking a specific target (e.g.
+    gemstone_crab's crab-then-tunnel sequence) a stray click elsewhere is
+    indistinguishable from actually clicking away from what it's doing.
 
     Returns True if it fired (caller should skip its real action this tick
     and let the next tick carry on normally), False otherwise.
@@ -841,7 +880,10 @@ def maybe_misclick(ctx, chance: float = MISTAKE_RANDOM_CLICK_CHANCE) -> bool:
     if random.random() > chance:
         return False
 
-    point = random_viewport_point()
+    if get_combat().get("inCombat"):
+        return False
+
+    point = _misclick_target_point() or random_viewport_point()
     if point is None:
         return False
 
@@ -849,7 +891,7 @@ def maybe_misclick(ctx, chance: float = MISTAKE_RANDOM_CLICK_CHANCE) -> bool:
     if is_point_blocked_by_ui(x, y):
         return False
 
-    print("[!] Misclick -- clicked a random point instead of the intended target")
+    print("[!] Misclick -- clicked a tile beside the nearest target instead of acting")
     click_entity(ctx.ser, {"screenX": x, "screenY": y, "name": "(random point)"}, offset=(0, 0))
     return True
 

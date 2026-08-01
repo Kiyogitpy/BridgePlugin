@@ -16,16 +16,6 @@ import java.util.Map;
 
 public class SailingProvider extends BridgeProvider
 {
-	// "Take down sails" / "Set sail" aren't fixed WidgetInfo/InterfaceID constants -- they're
-	// dynamically built rows inside the Sailing Options panel's Facilities tab (same situation
-	// BankProvider.java already handles for individual bank item slots: dynamic children,
-	// matched by their own text at runtime, not a fixed component id). TODO verify in-game (see
-	// docs/superpowers/specs/2026-08-01-shipwreck-salvaging-design.md, "Still unverified" #2)
-	// that this text match actually finds the right child -- the row's exact text/position
-	// hasn't been confirmed live yet.
-	private static final String TAKE_DOWN_SAILS_TEXT = "Take down sails";
-	private static final String SET_SAIL_TEXT = "Set sail";
-
 	public SailingProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
 	{
 		super(client, clientThread, server);
@@ -62,40 +52,34 @@ public class SailingProvider extends BridgeProvider
 		boolean facilitiesTabOpen = facilitiesContent != null && !facilitiesContent.isHidden();
 		data.put("facilitiesTabOpen", facilitiesTabOpen);
 
-		Map<String, Object> takeDownSails = new HashMap<>();
-		Map<String, Object> setSail = new HashMap<>();
+		// CONFIRMED live 2026-08-02: the sail control isn't two separately-labeled buttons
+		// ("Take down sails" / "Set sail", the original guess) -- it's a single toggle icon whose
+		// menu text just flips between "Set sails" and "Un-set sails" depending on current state.
+		// Confirmed the icon itself carries no text at all (every one of 73 dumped dynamic
+		// children under FACILITIES_ROWS had empty getText() -- "Steering"/"Repairs: No kits"
+		// section labels were the only non-empty text found), so text-matching could never work
+		// here to begin with. The real click target is a single big invisible click-layer
+		// (FACILITIES_CONTENT_CLICKLAYER) sitting over the whole icon grid -- confirmed via
+		// GameStateProvider's /debug-menu while hovering the icon, whose menu entry resolved
+		// through that layer's widget id, not a per-icon one. Each icon instead renders as an
+		// 11-entry tile cluster (8 corner/edge pieces + its own center point repeated 3x) within
+		// FACILITIES_ROWS's dynamic children, in a fixed layout order: the Steering section's
+		// three controls (confirmed live: sails / speed / reverse, matching the wiki's "set or
+		// un-set the sails, change the speed of the boat, or reverse the boat") always come
+		// first, and cross-checking the confirmed-by-hover sail-icon's on-screen position against
+		// this array showed it's always the FIRST cluster (children[0]'s own bounds). So: use
+		// that position directly, rather than trying to match by text or a fixed widget id.
+		Map<String, Object> sailToggle = new HashMap<>();
 		if (facilitiesTabOpen)
 		{
 			Widget rows = client.getWidget(InterfaceID.SailingSidepanel.FACILITIES_ROWS);
 			Widget[] children = rows != null ? rows.getDynamicChildren() : null;
-			if (children != null)
+			if (children != null && children.length > 0 && children[0] != null && !children[0].isHidden())
 			{
-				for (Widget child : children)
-				{
-					if (child == null || child.isHidden())
-					{
-						continue;
-					}
-
-					String text = child.getText();
-					if (text == null)
-					{
-						continue;
-					}
-
-					if (text.equalsIgnoreCase(TAKE_DOWN_SAILS_TEXT))
-					{
-						takeDownSails.putAll(boundsPoint(child));
-					}
-					else if (text.equalsIgnoreCase(SET_SAIL_TEXT))
-					{
-						setSail.putAll(boundsPoint(child));
-					}
-				}
+				sailToggle.putAll(boundsPoint(children[0]));
 			}
 		}
-		data.put("takeDownSails", takeDownSails);
-		data.put("setSail", setSail);
+		data.put("sailToggle", sailToggle);
 
 		return data;
 	}

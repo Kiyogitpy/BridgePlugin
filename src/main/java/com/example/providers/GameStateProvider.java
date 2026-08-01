@@ -107,6 +107,14 @@ public class GameStateProvider extends BridgeProvider
 		{
 			data.put("mouseCanvasX", mouse.getX());
 			data.put("mouseCanvasY", mouse.getY());
+
+			// Absolute screen position, same coordinate space every provider's own screenX/screenY
+			// fields already use (via RuneLiteUtil.canvasToScreen) -- added 2026-08-02 so the
+			// cursor's position can be directly compared against those without the caller needing
+			// to redo the stretch-scale conversion itself.
+			Point mouseScreen = com.example.util.RuneLiteUtil.canvasToScreen(client, mouse.getX(), mouse.getY());
+			data.put("mouseScreenX", mouseScreen.x);
+			data.put("mouseScreenY", mouseScreen.y);
 		}
 
 		// screen-space rectangles a click can land on top of without actually reaching the game
