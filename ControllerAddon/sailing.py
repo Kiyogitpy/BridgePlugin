@@ -186,7 +186,16 @@ def stop_boat(ctx) -> bool:
 def deploy_hook(ctx, hook_name: str) -> bool:
     """Click the boat's own salvaging hook facility object by name (e.g. "Bronze salvaging
     hook") -- this is the actual salvaging interaction; the shipwreck object itself only has an
-    Inspect option."""
+    Inspect option.
+
+    offset=(0, 0): CONFIRMED live 2026-08-02 -- click_entity's default offset=(-7, 7) is a blind
+    pixel nudge tuned for other entity types, and on the boat's cramped deck it was carrying the
+    aim point off the hook's clickbox and onto the physical 3D sail model rendered right next to
+    it, toggling the sails exactly as if the UI sail-toggle button had been clicked and sending
+    the routine into a cascading fail loop. ObjectProvider's screenX/Y already comes from
+    pointInsideShape (a point verified to be inside the actual clickbox, not a bounding-box
+    corner), so no extra offset is needed here -- same reasoning as stop_boat's own sail-toggle
+    click, which already used offset=(0, 0) for the same reason."""
     hook = next(
         (o for o in controller.get_objects()
          if hook_name.lower() in (o.get("name") or "").lower() and o.get("visible", True)),
@@ -197,7 +206,7 @@ def deploy_hook(ctx, hook_name: str) -> bool:
         return False
 
     print(f"[sailing] deploying {hook.get('name')}")
-    return controller.click_entity(ctx.ser, hook)
+    return controller.click_entity(ctx.ser, hook, offset=(0, 0))
 
 
 def sail_to(ctx, target: dict) -> bool:
