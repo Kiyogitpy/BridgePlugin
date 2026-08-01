@@ -257,28 +257,25 @@ comments), not removed once this specific investigation closed.
    children by text (`"Take down sails"` / `"Set sail"`) the same way, and
    this needs in-game confirmation that the text match actually finds the
    right child.
-3. **Whether re-clicking an already-deployed hook is safe.** The `Hidden`
-   conditional op (index 2) on the hook object suggests its available
-   options change based on state, which raises the question of whether the
-   *default* (left-click) option itself swaps to something undesirable
-   (e.g. "Retrieve") once deployed. Until verified, the routine deploys the
-   hook exactly once per arrival (tracked in `ctx.state.data`), never
-   re-clicking on later ticks.
+3. **CONFIRMED live 2026-08-02: re-clicking an already-deployed hook IS
+   safe.** The `Hidden` conditional op (index 2) on the hook object had
+   raised the question of whether the *default* (left-click) option might
+   swap to something undesirable (e.g. "Retrieve") once deployed -- the user
+   tested this directly and confirmed it does not. Combined with item 4
+   below (the hook not auto-continuing), the routine no longer tries to
+   track "did we already deploy" at all: `tick()` now just checks
+   `controller.get_combat().get("isIdle")` and re-clicks the hook whenever
+   idle and a wreck is in range, the same click-whenever-idle pattern
+   `mining.py` already uses. This self-heals from *any* stop reason (wreck
+   sank, stray misclick retrieved it, ...) uniformly instead of needing
+   separate detection logic per cause -- the `deployed_wreck_key`/
+   `HOOK_STALL_TIMEOUT_S` bookkeeping item 4 originally added is gone,
+   superseded by this simpler mechanism.
 4. **CONFIRMED live 2026-08-01: the hook does NOT auto-continue.** Once the
    specific wreck the hook was deployed at sinks, salvaging stops even if a
    different active wreck of the same name is still within `maxDistance` --
-   observed directly (salvage stopped accumulating while the routine still
-   believed `hook_deployed=True`, since a same-name wreck was still "in
-   range"). Fixed: `tick()` now tracks which wreck (by `(x, y)` tile) the
-   hook was actually deployed at in `ctx.state.data["deployed_wreck_key"]`
-   and forces a redeploy the instant `find_nearby_wreck`'s result no longer
-   matches that tile, rather than trusting "a wreck is nearby" alone. The
-   stall-timeout fallback (item 3's `HOOK_STALL_TIMEOUT_S`) still exists for
-   everything else (e.g. a misclick retrieving the hook while its wreck is
-   still alive) but was shortened from 300s to 90s -- 300s was longer than a
-   Small shipwreck's entire ~1-minute lifespan (see the wiki's "Average
-   duration" column), so it could have sat through a whole extra wreck cycle
-   before ever reacting.
+   observed directly. See item 3 above for how this is now handled (the
+   idle-triggered re-click covers it, no special-casing needed).
 5. **CONFIRMED live 2026-08-01 (fully resolved, after one wrong turn).** The
    wiki's "Helm.txt" article describes a "Ship's wheel" boat part, and
    that's what the original design (and `sailing.HELM_NAME`) targeted, but
