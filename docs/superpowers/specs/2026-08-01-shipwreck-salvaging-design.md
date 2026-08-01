@@ -186,6 +186,9 @@ Implications:
    Actions -- same convention as every other non-default click in this
    codebase (the ring of dueling, the looting bag's "Empty", the gemstone
    crab tunnel).
+6. **Whether 'Q' is the correct keybind for revealing the Sailing Options
+   panel.** `sailing.py`'s `SAILING_OPTIONS_TAB_KEY` is a guess, not
+   confirmed against the live client.
 
 ## Design
 

@@ -13,7 +13,7 @@
 #   - SAIL_HOP_MIN/MAX_TILES and SAIL_ARRIVAL_TOLERANCE below are a starting guess at how coarse
 #     the boat's heading snapping actually is -- tune once observed live (#1).
 #   - SAILING_OPTIONS_TAB_KEY is a guess at the keybind that reveals the Sailing Options panel,
-#     same idempotent-tap idea as controller.py's INVENTORY_TAB_KEY/PRAYER_TAB_KEY (#5).
+#     same idempotent-tap idea as controller.py's INVENTORY_TAB_KEY/PRAYER_TAB_KEY (#6).
 #   - HELM_NAME assumes a plain left-click on the helm resolves to "Navigate" -- if not, add
 #     "Navigate" to Controller Settings -> Clicking -> Forced Actions (#5).
 #   - SailingProvider.java's "Take down sails" widget lookup is a best-effort text match, not yet
