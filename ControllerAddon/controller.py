@@ -150,6 +150,15 @@ def get_bank():
     return api_get("/bank") or {"open": False}
 
 
+def get_sailing():
+    return api_get("/sailing") or {
+        "navigating": False,
+        "facilitiesTabOpen": False,
+        "takeDownSails": {},
+        "setSail": {},
+    }
+
+
 def get_equipment():
     return api_get("/equipment") or {}
 
