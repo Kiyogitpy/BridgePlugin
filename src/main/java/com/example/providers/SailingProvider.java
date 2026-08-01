@@ -3,6 +3,8 @@ package com.example.providers;
 import com.example.bridge.BridgeHttpServer;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
+import net.runelite.api.Constants;
+import net.runelite.api.WorldView;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
@@ -39,13 +41,22 @@ public class SailingProvider extends BridgeProvider
 	{
 		Map<String, Object> data = new HashMap<>();
 
-		// FossilquestSailing (interface group 604) is the boat-piloting HUD that the wiki
-		// describes opening when the helm's Navigate option is used -- its visibility is the
-		// most direct signal for "is the helm currently engaged". TODO verify in-game (see spec
-		// "Still unverified" #7) -- this interface group's real purpose was never confirmed live,
-		// only inferred from its component names in a stale source checkout.
-		Widget steeringHud = client.getWidget(InterfaceID.FossilquestSailing.UNIVERSAL);
-		data.put("navigating", steeringHud != null && !steeringHud.isHidden());
+		// CONFIRMED WRONG live 2026-08-02 (was spec "Still unverified" #7, the single
+		// highest-consequence guess in this whole feature): FossilquestSailing (interface group
+		// 604)'s visibility never reflects engaging the helm -- clicking it (confirmed working,
+		// resolves to Navigate) never made this widget appear. That guess assumed the wiki's
+		// bearing/throttle steering HUD opens on Navigate, but minimap-click steering (the actual
+		// mechanism this project uses, see travel-style steer_toward in sailing.py) apparently
+		// never needs that HUD at all, so its visibility was never a meaningful signal here.
+		//
+		// WorldView.getYellowClickAction() is the real, direct signal instead: it reports whether
+		// a tile click currently resolves to CLICK_ACTION_WALK (normal foot movement) or
+		// CLICK_ACTION_SET_HEADING (boat steering engaged) for that view -- exactly what
+		// "navigating" needs to mean, from an API built for precisely this purpose rather than an
+		// inferred side effect of some widget's visibility.
+		WorldView topLevelView = client.getTopLevelWorldView();
+		int yellowClickAction = topLevelView != null ? topLevelView.getYellowClickAction() : Constants.CLICK_ACTION_WALK;
+		data.put("navigating", yellowClickAction == Constants.CLICK_ACTION_SET_HEADING);
 
 		Widget facilitiesContent = client.getWidget(InterfaceID.SailingSidepanel.FACILITIES_CONTENT_CONTAINER);
 		boolean facilitiesTabOpen = facilitiesContent != null && !facilitiesContent.isHidden();

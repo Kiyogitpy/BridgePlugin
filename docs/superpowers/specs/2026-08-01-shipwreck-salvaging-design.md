@@ -318,17 +318,28 @@ comments), not removed once this specific investigation closed.
 6. **CONFIRMED live 2026-08-01: 'Q' is the correct keybind** for revealing
    the Sailing Options panel. `sailing.py`'s `SAILING_OPTIONS_TAB_KEY = "q"`
    guess was right, no code change needed.
-7. **Whether `FossilquestSailing.UNIVERSAL`'s visibility actually means
-   "helm engaged."** `SailingProvider.java` derives `navigating` from whether
-   this widget is visible -- inferred from the interface group's name and
-   component layout in the stale source checkout (see item 1 above), never
-   confirmed live. This is the single highest-consequence unverified
-   assumption in the whole feature: every other item on this list degrades
-   gracefully (a wrong keybind guess just needs a Forced Actions tweak, a
-   wrong hop-tolerance just needs retuning), but if this widget mapping is
-   wrong, `sailing.use_helm` would never observe `navigating` becoming
-   `True`, `sail_to` would always fail its `NAVIGATE_TIMEOUT_S` wait, and the
-   routine would never be able to reposition the boat at all.
+7. **CONFIRMED WRONG live 2026-08-02, now fixed with a better signal.** This
+   was flagged as the single highest-consequence unverified assumption in
+   the whole feature, and it was indeed wrong: `FossilquestSailing.UNIVERSAL`
+   widget visibility never reflects engaging the helm. The user confirmed
+   clicking the helm/rudder consistently worked (resolved to Navigate), but
+   `sailing.use_helm`'s poll loop always timed out
+   (`[sailing] clicked the helm but never saw navigate mode engage`) --
+   `sail_to` always failed as a result, so the routine could never
+   reposition. Root cause: that widget guess assumed the wiki's
+   bearing/throttle steering HUD opens on Navigate, but minimap-click
+   steering (the mechanism this project actually uses, confirmed sufficient
+   back in item 1) apparently never needs that HUD at all, so its visibility
+   was never a meaningful signal to begin with.
+
+   Fixed with a much more direct API found while chasing this:
+   `WorldView.getYellowClickAction()` reports whether a tile click currently
+   resolves to `CLICK_ACTION_WALK` or `CLICK_ACTION_SET_HEADING` for that
+   view -- exactly what "navigating" needs to mean, from an API built for
+   precisely this purpose rather than an inferred side effect of a widget's
+   visibility. `SailingProvider.java` now checks
+   `client.getTopLevelWorldView().getYellowClickAction() ==
+   Constants.CLICK_ACTION_SET_HEADING` instead.
 
 ## Design
 
