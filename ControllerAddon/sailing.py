@@ -12,10 +12,13 @@
 # docs/superpowers/specs/2026-08-01-shipwreck-salvaging-design.md's "Still unverified" section):
 #   - SAIL_HOP_MIN/MAX_TILES and SAIL_ARRIVAL_TOLERANCE below are a starting guess at how coarse
 #     the boat's heading snapping actually is -- tune once observed live (#1).
-#   - SAILING_OPTIONS_TAB_KEY is a guess at the keybind that reveals the Sailing Options panel,
-#     same idempotent-tap idea as controller.py's INVENTORY_TAB_KEY/PRAYER_TAB_KEY (#6).
-#   - HELM_NAME assumes a plain left-click on the helm resolves to "Navigate" -- if not, add
-#     "Navigate" to Controller Settings -> Clicking -> Forced Actions (#5).
+#   - SAILING_OPTIONS_TAB_KEY: CONFIRMED live 2026-08-01, "q" is correct (#6, resolved).
+#   - HELM_NAME: CONFIRMED live 2026-08-01 -- the interactive steering control is the boat's
+#     "Sails" object (right-click menu shows "Navigate"/"Escape"), NOT a separate "Ship's wheel"
+#     prop as the wiki's text suggested. Still unconfirmed: whether a plain LEFT-click resolves
+#     straight to "Navigate" by default, or needs "Navigate" added to Controller Settings ->
+#     Clicking -> Forced Actions (#5) -- the user checked this via a right-click menu, not a
+#     plain left-click yet.
 #   - SailingProvider.java's "Take down sails" widget lookup is a best-effort text match, not yet
 #     confirmed against the live client (#2).
 
@@ -25,7 +28,7 @@ import time
 
 import controller
 
-HELM_NAME = "ship's wheel"
+HELM_NAME = "sails"  # CONFIRMED live 2026-08-01 -- see module header
 SAILING_OPTIONS_TAB_KEY = "q"  # TODO verify -- see module header
 
 SAIL_HOP_MIN_TILES = 6       # shorter than travel.WALK_HOP_MIN_TILES -- coarse heading means
@@ -47,8 +50,9 @@ def open_sailing_options_tab(ctx) -> None:
 
 
 def use_helm(ctx) -> bool:
-    """Click the boat's own helm ("Ship's wheel"). Confirmed by the user: this both retrieves
-    any currently-deployed salvaging hook and engages steering in one action -- no separate
+    """Click the boat's own steering control (the "Sails" object -- confirmed live, not a
+    separate "Ship's wheel" prop). Confirmed by the user: this both retrieves any
+    currently-deployed salvaging hook and engages steering in one action -- no separate
     stop/retrieve step needed first."""
     helm = next(
         (o for o in controller.get_objects()

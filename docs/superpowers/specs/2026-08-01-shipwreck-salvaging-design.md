@@ -142,6 +142,48 @@ Implications:
   helm to reposition both ends gathering and opens steering mode in one
   action. No separate "stop/retrieve" step is needed before heading to the
   helm.
+- **The steering control is the "Sails" object, not a separate "Ship's
+  wheel" prop** -- see item 5 below, this corrected `sailing.HELM_NAME`.
+- **A sunk wreck keeps the exact same display name as the active one** --
+  confirmed both live (`/objects` while both an active and a sunk "Small
+  shipwreck" sat within a few tiles of each other, same name, different
+  object id: `60464` active vs. `60465` sunk) and earlier via cache2. Name
+  alone can't distinguish them; `find_nearby_wreck` now also excludes the
+  known stump ids for all 8 tiers (`SUNK_SHIPWRECK_IDS` in
+  `routines/shipwreck_salvaging.py`) -- without this, the routine could
+  treat a dead wreck as "in range" and never look for a live one.
+
+## Architecture fix: boats are their own nested WorldView
+
+Discovered live 2026-08-01, not anticipated by the original design: Sailing's boats are
+`WorldEntity`s with their **own separate `WorldView`** (own scene, own plane numbering, own
+coordinate base) -- confirmed by querying `/player` and `/objects` directly while aboard one (see
+`AGENTS.md`'s "Live bridge data" section). This broke two things the original design didn't
+anticipate needing:
+
+1. **Distance/position math.** `Actor.getWorldLocation()` while aboard a boat returns coordinates
+   local to the boat's own view (plane 1, huge nonsensical x/y), not real Gielinor coordinates --
+   `GeometryUtil.distanceToPlayer` (`WorldPoint.distanceTo`) silently returned `Integer.MAX_VALUE`
+   for every single object in the scene as a result (that sentinel fires whenever two points are
+   on different planes, which a boat-local point and a top-level-world point always are). Fixed
+   via `RuneLiteUtil.toTopLevelWorldPoint(Client, LocalPoint)`, which detects a non-top-level
+   `LocalPoint` and resolves it through the owning `WorldEntity.transformToMainWorld()` --
+   mirroring the lookup `Perspective.localToCanvas` already does internally
+   (`worldView.worldEntities().byIndex(id)`, not a linear search). Wired into
+   `GeometryUtil.distanceToPlayer` (used by every provider's "distance" field) and
+   `PlayerProvider`'s `/player` x/y/plane.
+2. **Object visibility.** `ObjectProvider` only ever walked `client.getScene()`, which RuneLite's
+   own `Client.java` documents as `@Deprecated` and hardcoded to the top-level world only -- so
+   fixtures built on the boat itself (the steering control, the salvaging hook) were completely
+   absent from `/objects` while standing right next to them. Fixed by also walking the player's
+   own `WorldView`'s scene when it isn't the top-level one, normalizing every returned object's
+   x/y/plane/distance to real top-level coordinates via the same `toTopLevelWorldPoint` either way
+   (screenX/Y still uses each object's own raw `LocalPoint`, since `Perspective` already handles a
+   nested-WorldView point correctly on its own).
+
+This fix is generic (in `RuneLiteUtil`/`ObjectProvider`/`PlayerProvider`, not
+shipwreck-salvaging-specific code) and benefits any future routine that might run while the player
+is aboard a boat, not just this one.
 
 ## Still unverified -- flagged for in-game testing, not blocking a first cut
 
@@ -185,14 +227,24 @@ Implications:
    routine's default behavior is to assume it keeps working (do nothing) as
    long as a matching wreck stays within `maxDistance`, and only go through
    the full reposition sequence when nothing matches nearby at all.
-5. **Whether left-click on the helm resolves straight to "Navigate"**, or
-   needs "Navigate" added to Controller Settings -> Clicking -> Forced
-   Actions -- same convention as every other non-default click in this
-   codebase (the ring of dueling, the looting bag's "Empty", the gemstone
-   crab tunnel).
-6. **Whether 'Q' is the correct keybind for revealing the Sailing Options
-   panel.** `sailing.py`'s `SAILING_OPTIONS_TAB_KEY` is a guess, not
-   confirmed against the live client.
+5. **Partially confirmed live 2026-08-01: the steering control's identity
+   was wrong, now fixed.** The wiki's "Helm.txt" article describes a
+   separate "Ship's wheel" boat part, and that's what the original design
+   (and `sailing.HELM_NAME`) targeted -- but on the user's actual boat, the
+   object at their own tile with "Navigate"/"Escape" in its right-click menu
+   is the **"Sails"** object (id 29516), not a wheel prop at all (no
+   "Ship's wheel"-named or `BOATKIT_HELM01`-id object was found anywhere in
+   a full live `/objects` dump while standing right next to where steering
+   engages). `sailing.HELM_NAME` is now `"sails"`. **Still open:** whether a
+   plain LEFT-click resolves straight to "Navigate" by default, or needs
+   "Navigate" added to Controller Settings -> Clicking -> Forced Actions --
+   the user confirmed this via a right-click menu, not a plain left-click
+   yet, same convention as every other non-default click in this codebase
+   (the ring of dueling, the looting bag's "Empty", the gemstone crab
+   tunnel).
+6. **CONFIRMED live 2026-08-01: 'Q' is the correct keybind** for revealing
+   the Sailing Options panel. `sailing.py`'s `SAILING_OPTIONS_TAB_KEY = "q"`
+   guess was right, no code change needed.
 7. **Whether `FossilquestSailing.UNIVERSAL`'s visibility actually means
    "helm engaged."** `SailingProvider.java` derives `navigating` from whether
    this widget is visible -- inferred from the interface group's name and

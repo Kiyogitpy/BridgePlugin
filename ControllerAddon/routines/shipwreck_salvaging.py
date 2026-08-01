@@ -111,9 +111,18 @@ def drop_salvage(ctx):
             time.sleep(random.uniform(0.2, 0.4))
 
 
+# Sinking swaps a wreck's object out entirely for a "stump" variant that keeps the exact same
+# display name as the active wreck (confirmed live via cache2 -- see
+# docs/superpowers/specs/2026-08-01-shipwreck-salvaging-design.md) -- id is the only way to tell
+# them apart. One stump id per tier (Small..Merchant), confirmed against the live game cache.
+SUNK_SHIPWRECK_IDS = frozenset({60465, 60467, 60469, 60471, 60473, 60475, 60477, 60479})
+
+
 def find_nearby_wreck(config: dict, max_dist: float):
-    """Nearest object matching config["wreckNames"] within max_dist tiles, or None. Pure range
-    test -- the wreck itself is never clicked (only the boat's own salvaging hook is), so
+    """Nearest ACTIVE object matching config["wreckNames"] within max_dist tiles, or None (sunk
+    wrecks -- see SUNK_SHIPWRECK_IDS -- are filtered out; matching them would let the routine
+    treat a dead wreck as "in range" and never look for a real one). Pure range test otherwise --
+    the wreck itself is never clicked (only the boat's own salvaging hook is), so
     on-screen-projectability doesn't matter here, only world position. ObjectProvider always
     sets x/y/distance from the object's WorldPoint regardless of whether it's currently
     on-screen, which is exactly what both the hook-operating-range check and the farther
@@ -123,6 +132,7 @@ def find_nearby_wreck(config: dict, max_dist: float):
     candidates = [
         o for o in controller.get_objects()
         if (o.get("name") or "").lower() in names
+        and o.get("id") not in SUNK_SHIPWRECK_IDS
         and o.get("x") is not None
         and 0 <= o.get("distance", 9999) <= max_dist
     ]
