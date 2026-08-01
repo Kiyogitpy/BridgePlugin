@@ -243,6 +243,12 @@ anticipate needing:
    wants). `find_nearby_wreck` now computes Chebyshev distance itself
    (`max(|dx|,|dy|)`, matching `WorldPoint.distanceTo2D`'s convention) from `boatX`/`boatY`
    instead of trusting `ObjectProvider`'s player-relative `distance` field.
+   **Related, separately tracked:** the boat also keeps coasting for a bit after un-setting sails
+   rather than stopping instantly (`sailing.stop_boat` now logs the drift distance). Two live
+   samples so far: 2.2 and 5.0 tiles -- variable, likely scaling with speed at the moment of
+   toggling. Both still comfortably within `maxDistance` (15), so not adjusting
+   `SAIL_ARRIVAL_TOLERANCE` (currently 5) preemptively; revisit if a stop is ever observed landing
+   outside hook range.
 9. **Misclicks during navigation caused real problems.** `controller.py`'s engine-level
    `maybe_misclick` (a human-like stray-click simulation that runs before every routine's own
    `tick()`) already skips firing during combat; confirmed live it needed the same guard for
