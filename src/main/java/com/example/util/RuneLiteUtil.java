@@ -1,9 +1,12 @@
 package com.example.util;
 
+import net.runelite.api.Actor;
 import net.runelite.api.Client;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.NPC;
 import net.runelite.api.Perspective;
+import net.runelite.api.WorldEntity;
+import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 
@@ -192,5 +195,60 @@ public final class RuneLiteUtil
 	public static int distanceToPlayer(Client client, WorldPoint wp)
 	{
 		return GeometryUtil.distanceToPlayer(client, wp);
+	}
+
+	/**
+	 * An actor's position in the top-level world, even when the actor is currently registered
+	 * in a nested WorldView -- e.g. standing on one of Sailing's boats, which are WorldEntities
+	 * with their own separate WorldView (own scene, own plane numbering, own coordinate base).
+	 * Actor.getWorldLocation() in that case returns coordinates local to the boat's own view,
+	 * not real Gielinor coordinates -- silently meaningless when compared against a WorldPoint
+	 * from the top-level world (e.g. anything ObjectProvider/NPCProvider return, since those walk
+	 * the deprecated Client.getScene()/getPlane(), which only ever see the top-level WorldView).
+	 * Confirmed live 2026-08-01: every object's computed "distance" read back as
+	 * Integer.MAX_VALUE while on a boat, because WorldPoint.distanceTo() returns that sentinel
+	 * whenever the two points are on different planes -- which they always are here, since the
+	 * boat's own WorldView numbers its plane independently of the top-level world's.
+	 */
+	public static WorldPoint getTopLevelWorldLocation(Client client, Actor actor)
+	{
+		WorldPoint fallback = actor.getWorldLocation();
+
+		WorldView actorView = actor.getWorldView();
+		if (actorView == null || actorView.isTopLevel())
+		{
+			return fallback;
+		}
+
+		WorldView topLevel = client.getTopLevelWorldView();
+		if (topLevel == null)
+		{
+			return fallback;
+		}
+
+		for (WorldEntity entity : topLevel.worldEntities())
+		{
+			WorldView entityView = entity.getWorldView();
+			if (entityView == null || entityView.getId() != actorView.getId())
+			{
+				continue;
+			}
+
+			LocalPoint local = actor.getLocalLocation();
+			if (local == null)
+			{
+				break;
+			}
+
+			LocalPoint mainWorldLocal = entity.transformToMainWorld(local);
+			if (mainWorldLocal == null)
+			{
+				break;
+			}
+
+			return WorldPoint.fromLocal(client, mainWorldLocal);
+		}
+
+		return fallback;
 	}
 }

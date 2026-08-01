@@ -17,6 +17,6 @@ public final class GeometryUtil
 		{
 			return -1;
 		}
-		return p.getWorldLocation().distanceTo(wp);
+		return RuneLiteUtil.getTopLevelWorldLocation(client, p).distanceTo(wp);
 	}
 }

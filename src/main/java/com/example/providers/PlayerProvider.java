@@ -1,6 +1,7 @@
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
+import com.example.util.RuneLiteUtil;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
@@ -35,7 +36,11 @@ public class PlayerProvider extends BridgeProvider
 			return Collections.emptyMap();
 		}
 
-		WorldPoint wp = p.getWorldLocation();
+		// Not p.getWorldLocation() directly -- that's local to whatever WorldView the player is
+		// currently registered in, which is meaningless outside it (e.g. standing on a Sailing
+		// boat's own nested WorldView). This resolves to the true top-level-world position either
+		// way, matching what ObjectProvider/NPCProvider's coordinates already are.
+		WorldPoint wp = RuneLiteUtil.getTopLevelWorldLocation(client, p);
 		Map<String, Object> data = new HashMap<>();
 
 		data.put("name", p.getName());
