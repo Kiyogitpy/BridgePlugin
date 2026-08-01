@@ -231,9 +231,28 @@ anticipate needing:
    `Shape.contains()` confirms is real, falling back to a vertex from the shape's own outline if
    none land inside. User confirmed clicking the rudder now works correctly.
 
-These fixes are generic (in `RuneLiteUtil`/`ObjectProvider`/`PlayerProvider`/`GameStateProvider`,
-not shipwreck-salvaging-specific code) and benefit any future routine that might run while the
-player is aboard a boat, not just this one. `GET /debug-menu` and `/player`'s
+8. **The player's own position isn't the right reference point for range checks.** Confirmed
+   live: a Sailing boat's own `WorldView` is only ~8 tiles per side (`debugWorldViewSizeX/Y`), so
+   standing at one end can be several tiles from the opposite end -- `maxDistance` is a range
+   check against something the *boat*'s hook needs to reach, not wherever the player happens to
+   be standing on deck. Fixed via `RuneLiteUtil.findTopLevelWorldEntityContaining` +
+   `getBoatOrActorWorldLocation` (find the boat's own `WorldEntity` and use its position --
+   `WorldEntity.getLocalLocation()` is already resolved to top-level coordinates per its own
+   javadoc), exposed as new `boatX`/`boatY`/`boatPlane` fields on `/player` (the existing `x`/`y`
+   stays the player's own foot position, which `sailing.py`'s hop-based steering math still
+   wants). `find_nearby_wreck` now computes Chebyshev distance itself
+   (`max(|dx|,|dy|)`, matching `WorldPoint.distanceTo2D`'s convention) from `boatX`/`boatY`
+   instead of trusting `ObjectProvider`'s player-relative `distance` field.
+9. **Misclicks during navigation caused real problems.** `controller.py`'s engine-level
+   `maybe_misclick` (a human-like stray-click simulation that runs before every routine's own
+   `tick()`) already skips firing during combat; confirmed live it needed the same guard for
+   `get_sailing().navigating` -- clicking away from a deployed salvaging hook is already confirmed
+   to retrieve it, so a misclick mid-navigation is exactly that kind of unwanted "clicked away"
+   landing somewhere unintended. Fixed with one more guard clause in `maybe_misclick`.
+
+These fixes are generic (in `RuneLiteUtil`/`ObjectProvider`/`PlayerProvider`/`GameStateProvider`/
+`controller.py`, not shipwreck-salvaging-specific code) and benefit any future routine that might
+run while the player is aboard a boat, not just this one. `GET /debug-menu` and `/player`'s
 `debugWorldViewId`-prefixed fields are kept as general-purpose debugging tools (see their code
 comments), not removed once this specific investigation closed.
 
