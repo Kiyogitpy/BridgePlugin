@@ -3,6 +3,7 @@ package com.example.providers;
 import com.example.bridge.BridgeHttpServer;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.*;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
 
@@ -50,14 +51,36 @@ public class ObjectProvider extends BridgeProvider
 	private List<Map<String, Object>> computeObjects()
 	{
 		List<Map<String, Object>> list = new ArrayList<>();
-		Scene scene = client.getScene();
-		if (scene == null)
+
+		Scene topLevelScene = client.getScene();
+		if (topLevelScene != null)
 		{
-			return list;
+			walkScene(topLevelScene, client.getPlane(), list);
 		}
 
+		// Sailing's boats are WorldEntities with their own separate WorldView (own scene, own
+		// plane numbering) -- fixtures built on the boat itself (the helm, a salvaging hook, ...)
+		// live there, not in the top-level scene walked above, so standing on your own boat would
+		// otherwise never see them at all. Confirmed live 2026-08-01: "Ship's wheel" and a
+		// salvaging hook were completely absent from this endpoint while aboard a boat before this
+		// was added, even though both were right in front of the player.
+		Player localPlayer = client.getLocalPlayer();
+		WorldView playerView = localPlayer != null ? localPlayer.getWorldView() : null;
+		if (playerView != null && !playerView.isTopLevel())
+		{
+			Scene playerScene = playerView.getScene();
+			if (playerScene != null)
+			{
+				walkScene(playerScene, playerView.getPlane(), list);
+			}
+		}
+
+		return list;
+	}
+
+	private void walkScene(Scene scene, int plane, List<Map<String, Object>> out)
+	{
 		Tile[][][] tiles = scene.getTiles();
-		int plane = client.getPlane();
 		if (tiles == null || plane < 0 || plane >= tiles.length || tiles[plane] == null)
 		{
 			// The scene object exists but this plane's tile grid isn't populated yet -- e.g. not
@@ -65,7 +88,7 @@ public class ObjectProvider extends BridgeProvider
 			// matters beyond correctness: an uncaught NPE here runs on the client thread and gets
 			// logged with a full stack trace on every single poll, which for a caller hitting this
 			// endpoint every tick is a real, continuous source of stutter, not just a cosmetic error.
-			return list;
+			return;
 		}
 
 		for (int x = 0; x < tiles[plane].length; x++)
@@ -82,7 +105,7 @@ public class ObjectProvider extends BridgeProvider
 				{
 					if (obj != null)
 					{
-						list.add(buildObjectData(obj, "GameObject", plane));
+						out.add(buildObjectData(obj, "GameObject", plane));
 					}
 				}
 
@@ -92,29 +115,32 @@ public class ObjectProvider extends BridgeProvider
 				WallObject wallObj = tile.getWallObject();
 				if (wallObj != null)
 				{
-					list.add(buildObjectData(wallObj, "WallObject", plane));
+					out.add(buildObjectData(wallObj, "WallObject", plane));
 				}
 
 				GroundObject groundObj = tile.getGroundObject();
 				if (groundObj != null)
 				{
-					list.add(buildObjectData(groundObj, "GroundObject", plane));
+					out.add(buildObjectData(groundObj, "GroundObject", plane));
 				}
 
 				DecorativeObject decorativeObj = tile.getDecorativeObject();
 				if (decorativeObj != null)
 				{
-					list.add(buildObjectData(decorativeObj, "DecorativeObject", plane));
+					out.add(buildObjectData(decorativeObj, "DecorativeObject", plane));
 				}
 			}
 		}
-		return list;
 	}
 
 	private Map<String, Object> buildObjectData(TileObject obj, String objectType, int plane)
 	{
 		Map<String, Object> data = new HashMap<>();
-		WorldPoint wp = WorldPoint.fromLocal(client, obj.getLocalLocation());
+		LocalPoint local = obj.getLocalLocation();
+		// x/y/plane/distance always resolved to real top-level-world coordinates (even for an
+		// object that lives in a boat's own nested WorldView), so every object this endpoint
+		// returns is comparable on equal terms -- see RuneLiteUtil.toTopLevelWorldPoint.
+		WorldPoint wp = RuneLiteUtil.toTopLevelWorldPoint(client, local);
 
 		data.put("id", obj.getId());
 		data.put("objectType", objectType);
@@ -124,7 +150,12 @@ public class ObjectProvider extends BridgeProvider
 		data.put("y", wp.getY());
 		data.put("plane", wp.getPlane());
 
-		net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, obj.getLocalLocation(), plane);
+		// Screen projection uses the object's own raw (possibly boat-local) LocalPoint, not the
+		// top-level-transformed WorldPoint above -- Perspective.localToCanvas already handles a
+		// LocalPoint tagged with a nested WorldView correctly on its own (it special-cases
+		// LocalPoint.getWorldView() > -1 internally), and re-deriving a fresh LocalPoint from the
+		// transformed WorldPoint would just be a lossier round-trip of the same information.
+		net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, local, plane);
 		if (point != null)
 		{
 			Point screen = RuneLiteUtil.canvasToScreen(client, point.getX(), point.getY());
@@ -133,7 +164,7 @@ public class ObjectProvider extends BridgeProvider
 		}
 
 		data.put("distance", RuneLiteUtil.distanceToPlayer(client, wp));
-		data.putAll(RuneLiteUtil.visibility(client, obj.getLocalLocation(), plane, true));
+		data.putAll(RuneLiteUtil.visibility(client, local, plane, true));
 		return data;
 	}
 }

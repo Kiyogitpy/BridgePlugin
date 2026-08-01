@@ -198,57 +198,57 @@ public final class RuneLiteUtil
 	}
 
 	/**
-	 * An actor's position in the top-level world, even when the actor is currently registered
-	 * in a nested WorldView -- e.g. standing on one of Sailing's boats, which are WorldEntities
-	 * with their own separate WorldView (own scene, own plane numbering, own coordinate base).
-	 * Actor.getWorldLocation() in that case returns coordinates local to the boat's own view,
-	 * not real Gielinor coordinates -- silently meaningless when compared against a WorldPoint
-	 * from the top-level world (e.g. anything ObjectProvider/NPCProvider return, since those walk
-	 * the deprecated Client.getScene()/getPlane(), which only ever see the top-level WorldView).
-	 * Confirmed live 2026-08-01: every object's computed "distance" read back as
-	 * Integer.MAX_VALUE while on a boat, because WorldPoint.distanceTo() returns that sentinel
-	 * whenever the two points are on different planes -- which they always are here, since the
-	 * boat's own WorldView numbers its plane independently of the top-level world's.
+	 * A local point's position in the top-level world, even when the point belongs to a nested
+	 * WorldView -- e.g. anything on one of Sailing's boats, which are WorldEntities with their
+	 * own separate WorldView (own scene, own plane numbering, own coordinate base).
+	 * WorldPoint.fromLocal(client, local) alone resolves against whichever WorldView the point's
+	 * own LocalPoint.getWorldView() names, which for a boat-local point means coordinates local
+	 * to the boat's own view, not real Gielinor coordinates -- silently meaningless when compared
+	 * against a WorldPoint from the top-level world (e.g. anything ObjectProvider/NPCProvider
+	 * return by default, since those walk the deprecated Client.getScene()/getPlane(), which only
+	 * ever see the top-level WorldView). Confirmed live 2026-08-01: every object's computed
+	 * "distance" read back as Integer.MAX_VALUE while on a boat, because WorldPoint.distanceTo()
+	 * returns that sentinel whenever the two points are on different planes -- which they always
+	 * are here, since the boat's own WorldView numbers its plane independently of the top-level
+	 * world's.
+	 * <p>
+	 * Mirrors the lookup Perspective.localToCanvas itself uses internally for the same
+	 * point.getWorldView() &gt; -1 case (WorldView.TOPLEVEL) -- the owning WorldEntity is
+	 * addressable directly via the top-level view's own worldEntities().byIndex(id), not a
+	 * linear search.
 	 */
-	public static WorldPoint getTopLevelWorldLocation(Client client, Actor actor)
+	public static WorldPoint toTopLevelWorldPoint(Client client, LocalPoint local)
 	{
-		WorldPoint fallback = actor.getWorldLocation();
-
-		WorldView actorView = actor.getWorldView();
-		if (actorView == null || actorView.isTopLevel())
+		if (local.getWorldView() <= WorldView.TOPLEVEL)
 		{
-			return fallback;
+			return WorldPoint.fromLocal(client, local);
 		}
 
 		WorldView topLevel = client.getTopLevelWorldView();
 		if (topLevel == null)
 		{
-			return fallback;
+			return WorldPoint.fromLocal(client, local);
 		}
 
-		for (WorldEntity entity : topLevel.worldEntities())
+		WorldEntity entity = topLevel.worldEntities().byIndex(local.getWorldView());
+		if (entity == null)
 		{
-			WorldView entityView = entity.getWorldView();
-			if (entityView == null || entityView.getId() != actorView.getId())
-			{
-				continue;
-			}
-
-			LocalPoint local = actor.getLocalLocation();
-			if (local == null)
-			{
-				break;
-			}
-
-			LocalPoint mainWorldLocal = entity.transformToMainWorld(local);
-			if (mainWorldLocal == null)
-			{
-				break;
-			}
-
-			return WorldPoint.fromLocal(client, mainWorldLocal);
+			return WorldPoint.fromLocal(client, local);
 		}
 
-		return fallback;
+		LocalPoint mainWorldLocal = entity.transformToMainWorld(local);
+		return mainWorldLocal != null
+			? WorldPoint.fromLocal(client, mainWorldLocal)
+			: WorldPoint.fromLocal(client, local);
+	}
+
+	/**
+	 * Convenience wrapper of {@link #toTopLevelWorldPoint(Client, LocalPoint)} for an Actor --
+	 * see that method for why this is needed instead of Actor.getWorldLocation() directly.
+	 */
+	public static WorldPoint getTopLevelWorldLocation(Client client, Actor actor)
+	{
+		LocalPoint local = actor.getLocalLocation();
+		return local != null ? toTopLevelWorldPoint(client, local) : actor.getWorldLocation();
 	}
 }
