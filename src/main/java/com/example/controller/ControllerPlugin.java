@@ -79,6 +79,7 @@ public class ControllerPlugin extends Plugin
 		new EquipmentProvider(client, clientThread, server).register();
 		new InventoryProvider(client, clientThread, server).register();
 		new BankProvider(client, clientThread, server).register();
+		new SailingProvider(client, clientThread, server).register();
 		new NPCProvider(client, clientThread, server).register();
 		new ObjectProvider(client, clientThread, server).register();
 		new GroundItemProvider(client, clientThread, server, itemManager).register();
