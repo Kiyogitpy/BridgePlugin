@@ -222,11 +222,21 @@ is aboard a boat, not just this one.
    (e.g. "Retrieve") once deployed. Until verified, the routine deploys the
    hook exactly once per arrival (tracked in `ctx.state.data`), never
    re-clicking on later ticks.
-4. **Whether the hook auto-continues onto a newly-risen wreck** in the same
-   spot once the current one sinks, or needs re-deploying. Given (3), the
-   routine's default behavior is to assume it keeps working (do nothing) as
-   long as a matching wreck stays within `maxDistance`, and only go through
-   the full reposition sequence when nothing matches nearby at all.
+4. **CONFIRMED live 2026-08-01: the hook does NOT auto-continue.** Once the
+   specific wreck the hook was deployed at sinks, salvaging stops even if a
+   different active wreck of the same name is still within `maxDistance` --
+   observed directly (salvage stopped accumulating while the routine still
+   believed `hook_deployed=True`, since a same-name wreck was still "in
+   range"). Fixed: `tick()` now tracks which wreck (by `(x, y)` tile) the
+   hook was actually deployed at in `ctx.state.data["deployed_wreck_key"]`
+   and forces a redeploy the instant `find_nearby_wreck`'s result no longer
+   matches that tile, rather than trusting "a wreck is nearby" alone. The
+   stall-timeout fallback (item 3's `HOOK_STALL_TIMEOUT_S`) still exists for
+   everything else (e.g. a misclick retrieving the hook while its wreck is
+   still alive) but was shortened from 300s to 90s -- 300s was longer than a
+   Small shipwreck's entire ~1-minute lifespan (see the wiki's "Average
+   duration" column), so it could have sat through a whole extra wreck cycle
+   before ever reacting.
 5. **Partially confirmed live 2026-08-01: the steering control's identity
    was wrong, now fixed.** The wiki's "Helm.txt" article describes a
    separate "Ship's wheel" boat part, and that's what the original design
