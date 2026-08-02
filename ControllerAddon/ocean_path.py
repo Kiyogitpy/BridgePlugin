@@ -27,6 +27,9 @@ _FALLBACK_CLEARANCE_TILES = 2  # dilation radius used when the boat's true bound
                                 # for the boat's own current position). 2 keeps a real margin while
                                 # still leaving usable channels; the stuck-detection safety net in
                                 # sailing.py covers cases this margin turns out too tight for.
+                                # _boat_clearance_tiles can now compute a similarly large radius from
+                                # the boat's real bounds -- the retry-ladder in find_ocean_route falls
+                                # back to this constant when that happens, for exactly this reason.
 
 # 8-directional grid movement -- fine-grained enough for the compass-snapped heading steer_toward
 # already handles; the grid is only used to find a route around obstacles, not to model the boat's
@@ -73,6 +76,13 @@ def find_ocean_route(start: dict, target: dict) -> list | None:
     passable.add(target_xy)
 
     raw_path = _astar(start_xy, target_xy, passable)
+    if raw_path is None and clearance_tiles > _FALLBACK_CLEARANCE_TILES:
+        # The true-bounds radius can disconnect a dense island cluster outright (see
+        # _FALLBACK_CLEARANCE_TILES's comment) -- a tighter-but-usable route beats no route.
+        passable = _build_passable_set(tiles, plane, blocked, _FALLBACK_CLEARANCE_TILES)
+        passable.add(start_xy)
+        passable.add(target_xy)
+        raw_path = _astar(start_xy, target_xy, passable)
     if raw_path is None:
         return None
 
@@ -87,16 +97,20 @@ def _boat_clearance_tiles(player: dict) -> int:
     hull footprint (PlayerProvider's boatWidth/boatHeight -- RuneLite's own WorldEntityConfig
     bounds, see data/decompiled/sailing-plugin's TrueTileIndicator for the reference usage this is
     modeled on) instead of a guessed constant. Uses the larger of width/height, halved and rounded
-    up, so the radius covers the hull regardless of current heading -- this dilation still has no
-    orientation awareness, same as before (see the 2026-08-02 design note on scope: full oriented-
-    rectangle collision was explicitly out of scope). Falls back to the original hand-tuned guess
-    when the boat's true bounds aren't available (not aboard a boat, or an older bridge build
-    without these fields)."""
+    up -- sized to the hull's largest side rather than its diagonal, a deliberate under-
+    approximation; this dilation still has no orientation awareness, same as before (see the
+    2026-08-02 design note on scope: full oriented-rectangle collision was explicitly out of
+    scope). Falls back to the original hand-tuned guess when the boat's true bounds aren't
+    available (not aboard a boat, an older bridge build without these fields, a non-positive
+    value, or an implausibly large value that likely indicates a unit-conversion bug upstream)."""
     width = player.get("boatWidth")
     height = player.get("boatHeight")
-    if width is None or height is None:
+    if width is None or height is None or width <= 0 or height <= 0:
         return _FALLBACK_CLEARANCE_TILES
-    return max(1, math.ceil(max(width, height) / 2))
+    largest = max(width, height)
+    if largest > 100:  # implausible for a real boat hull -- likely a unit-conversion bug upstream
+        return _FALLBACK_CLEARANCE_TILES
+    return max(1, math.ceil(largest / 2))
 
 
 def _build_passable_set(tiles, plane, blocked, clearance_tiles):
