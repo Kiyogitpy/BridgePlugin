@@ -33,7 +33,12 @@ import sailing
 DEFAULT_CONFIG = {
     "enabled": True,
     "wreckNames": ["Small shipwreck", "Fisherman's shipwreck"],
-    "hookName": "Bronze salvaging hook",
+    "hookName": "salvaging hook",  # tier-agnostic on purpose: deploy_hook() matches this as a
+                                    # substring against the boat's actual hook name, and the boat's
+                                    # hook tier (Bronze/Iron/.../Dragon, see
+                                    # data/decompiled/sailing-plugin's SalvagingHookTier) changes
+                                    # independently of this routine's config -- pinning to one tier
+                                    # name broke the moment the boat's hook got upgraded to Steel.
     "maxDistance": 8,        # hook-operating range -- gathering happens here, no boat movement
     "maxSailDistance": 60,   # a farther wreck worth repositioning the boat for
 
