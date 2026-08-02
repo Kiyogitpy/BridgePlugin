@@ -12,19 +12,21 @@
 # bounded by maxSailDistance (60 tiles), well within that range.
 
 import heapq
+import math
 
 import controller
 
-BOAT_CLEARANCE_TILES = 2  # dilation radius around blocked tiles -- so a route's center-line
-                           # staying clear of a blocked tile doesn't mean the boat's actual hull
-                           # does too. CONFIRMED live 2026-08-02: the original guess (4, half the
-                           # boat's ~8-tile WorldView footprint) sealed off routing entirely in a
-                           # real dense island cluster (2708 of 10816 loaded tiles blocked --
-                           # dilating by 4 shrank passable water to ~2700 tiles, disconnected, so
-                           # find_ocean_route returned None even for the boat's own current
-                           # position). 2 keeps a real margin while still leaving usable channels;
-                           # the stuck-detection safety net in sailing.py covers cases this margin
-                           # turns out too tight for.
+_FALLBACK_CLEARANCE_TILES = 2  # dilation radius used when the boat's true bounds aren't
+                                # available (not aboard a boat, or an older bridge build without
+                                # PlayerProvider's boatWidth/boatHeight fields). CONFIRMED live
+                                # 2026-08-02 as a reasonable default in its own right: the original
+                                # guess (4, half the boat's ~8-tile WorldView footprint) sealed off
+                                # routing entirely in a real dense island cluster (2708 of 10816
+                                # loaded tiles blocked -- dilating by 4 shrank passable water to
+                                # ~2700 tiles, disconnected, so find_ocean_route returned None even
+                                # for the boat's own current position). 2 keeps a real margin while
+                                # still leaving usable channels; the stuck-detection safety net in
+                                # sailing.py covers cases this margin turns out too tight for.
 
 # 8-directional grid movement -- fine-grained enough for the compass-snapped heading steer_toward
 # already handles; the grid is only used to find a route around obstacles, not to model the boat's
@@ -59,7 +61,8 @@ def find_ocean_route(start: dict, target: dict) -> list | None:
         # Genuinely standing on/aiming at land isn't a routing problem this module can solve.
         return None
 
-    passable = _build_passable_set(tiles, plane, blocked)
+    clearance_tiles = _boat_clearance_tiles(controller.get_player())
+    passable = _build_passable_set(tiles, plane, blocked, clearance_tiles)
     # The endpoints are always allowed even if they fall inside another obstacle's clearance
     # dilation -- CONFIRMED live 2026-08-02: excluding them made find_ocean_route return None for
     # the boat's own current position after it ran aground once (a dense island cluster easily
@@ -79,15 +82,32 @@ def find_ocean_route(start: dict, target: dict) -> list | None:
     return [{"x": x, "y": y, "plane": start["plane"]} for x, y in waypoints[1:]]
 
 
-def _build_passable_set(tiles, plane, blocked):
-    """Every loaded tile that ISN'T within BOAT_CLEARANCE_TILES (Chebyshev) of a blocked tile --
+def _boat_clearance_tiles(player: dict) -> int:
+    """Isotropic dilation radius (in tiles) around blocked tiles, sized to the boat's own true
+    hull footprint (PlayerProvider's boatWidth/boatHeight -- RuneLite's own WorldEntityConfig
+    bounds, see data/decompiled/sailing-plugin's TrueTileIndicator for the reference usage this is
+    modeled on) instead of a guessed constant. Uses the larger of width/height, halved and rounded
+    up, so the radius covers the hull regardless of current heading -- this dilation still has no
+    orientation awareness, same as before (see the 2026-08-02 design note on scope: full oriented-
+    rectangle collision was explicitly out of scope). Falls back to the original hand-tuned guess
+    when the boat's true bounds aren't available (not aboard a boat, or an older bridge build
+    without these fields)."""
+    width = player.get("boatWidth")
+    height = player.get("boatHeight")
+    if width is None or height is None:
+        return _FALLBACK_CLEARANCE_TILES
+    return max(1, math.ceil(max(width, height) / 2))
+
+
+def _build_passable_set(tiles, plane, blocked, clearance_tiles):
+    """Every loaded tile that ISN'T within clearance_tiles (Chebyshev) of a blocked tile --
     dilating outward from each blocked tile is cheaper than testing every candidate tile against
     every blocked tile."""
     passable = {(t["x"], t["y"]) for t in tiles if t.get("plane") == plane}
     clearance_zone = set()
     for (bx, by) in blocked:
-        for dx in range(-BOAT_CLEARANCE_TILES, BOAT_CLEARANCE_TILES + 1):
-            for dy in range(-BOAT_CLEARANCE_TILES, BOAT_CLEARANCE_TILES + 1):
+        for dx in range(-clearance_tiles, clearance_tiles + 1):
+            for dy in range(-clearance_tiles, clearance_tiles + 1):
                 clearance_zone.add((bx + dx, by + dy))
     return passable - clearance_zone
 
