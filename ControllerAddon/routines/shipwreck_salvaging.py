@@ -194,6 +194,16 @@ SUNK_SHIPWRECK_IDS = frozenset({60465, 60467, 60469, 60471, 60473, 60475, 60477,
 # player-centered box and get silently missed.
 WRECK_SEARCH_RADIUS_PADDING = 10
 
+# Max distance (tiles, between the two wrecks themselves) for find_wreck_pair_target to treat two
+# active wrecks as a pair worth positioning between. Shipwrecks spawn in close pairs at each
+# hotspot (wiki-confirmed: "a different pair of shipwrecks", "double Salvage spots" -- see
+# data/raw/S/Shipwreck salvaging.txt), and the hook does NOT auto-continue onto a different active
+# wreck once its own sinks (CONFIRMED live 2026-08-01) -- so pre-positioning at the midpoint of a
+# pair means a re-click after the first sinks can pick up the second immediately, no second sail
+# trip needed. Initial estimate (not yet live-tuned): twice the hook's maxDistance (8), so a
+# midpoint puts both wrecks within hook range.
+PAIR_MAX_TILES = 16
+
 
 def find_nearby_wreck(config: dict, max_dist: float):
     """Nearest ACTIVE object matching config["wreckNames"] within max_dist tiles of the BOAT (not
@@ -246,3 +256,48 @@ def find_nearby_wreck(config: dict, max_dist: float):
             best, best_dist = o, dist
 
     return best
+
+
+def find_wreck_pair_target(config: dict, wreck: dict) -> dict:
+    """Given a wreck the routine is about to sail to, look for a second matching active wreck
+    within PAIR_MAX_TILES of it (same tier names as wreck, same plane, not sunk) and target their
+    midpoint instead of the lone wreck -- see PAIR_MAX_TILES's comment for why. Falls back to the
+    given wreck's own position if no partner is found nearby (confirmed with the user: a lone
+    wreck is still worth sailing to directly, pairing is an optimization, not a requirement).
+
+    Returns a plain {"x", "y", "plane"} dict, the same shape sailing.sail_to already expects as
+    its target -- not a raw ObjectProvider entry, since a midpoint isn't a real game object."""
+    names = {n.lower() for n in config.get("wreckNames", [])}
+    wx, wy, wplane = wreck.get("x"), wreck.get("y"), wreck.get("plane")
+
+    best_partner = None
+    best_dist = None
+    for o in controller.get_objects(radius=int(PAIR_MAX_TILES) + WRECK_SEARCH_RADIUS_PADDING):
+        if (o.get("name") or "").lower() not in names:
+            continue
+        if o.get("id") in SUNK_SHIPWRECK_IDS:
+            continue
+        if o.get("plane") != wplane:
+            continue
+        ox, oy = o.get("x"), o.get("y")
+        if ox is None or oy is None:
+            continue
+        if ox == wx and oy == wy:
+            # This is the wreck itself, not a partner.
+            continue
+
+        dist = max(abs(ox - wx), abs(oy - wy))
+        if dist > PAIR_MAX_TILES:
+            continue
+        if best_dist is None or dist < best_dist:
+            best_partner, best_dist = o, dist
+
+    if best_partner is None:
+        return {"x": wx, "y": wy, "plane": wplane}
+
+    print(f"[salvage] found a wreck pair {best_dist} tiles apart -- sailing to the midpoint")
+    return {
+        "x": (wx + best_partner["x"]) // 2,
+        "y": (wy + best_partner["y"]) // 2,
+        "plane": wplane,
+    }
