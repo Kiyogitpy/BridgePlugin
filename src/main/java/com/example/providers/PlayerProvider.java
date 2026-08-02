@@ -61,6 +61,22 @@ public class PlayerProvider extends BridgeProvider
 			data.put("boatX", boatWp.getX());
 			data.put("boatY", boatWp.getY());
 			data.put("boatPlane", boatWp.getPlane());
+
+			// True hull footprint, in tiles -- RuneLite's own WorldEntityConfig bounds on the
+			// boat's WorldEntity, not a guessed size. Modeled on the reference usage in the
+			// sideloaded Sailing plugin's TrueTileIndicator.renderBoatArea (see
+			// data/decompiled/sailing-plugin/). 128 local units per tile is RuneLite's standard
+			// LOCAL_TILE_SIZE conversion factor. Omitted (like the boat fields above) whenever
+			// the boat's WorldEntity or its config isn't resolvable.
+			// UNVERIFIED live as of 2026-08-02 -- values not yet cross-checked against an actual
+			// boat's known size class in-game.
+			WorldEntity boat = RuneLiteUtil.findTopLevelWorldEntityContaining(client, p.getWorldView());
+			WorldEntityConfig boatConfig = boat != null ? boat.getConfig() : null;
+			if (boatConfig != null)
+			{
+				data.put("boatWidth", boatConfig.getBoundsWidth() / 128.0);
+				data.put("boatHeight", boatConfig.getBoundsHeight() / 128.0);
+			}
 		}
 
 		// General-purpose debug fields: direct visibility into which WorldView the player is
