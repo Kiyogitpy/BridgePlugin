@@ -110,7 +110,7 @@ def tick(ctx):
             attempt_start = ctx.state.data.setdefault("hook_engage_attempt_at", now)
             if now - attempt_start > HOOK_ENGAGE_TIMEOUT_S:
                 print("[salvage] hook isn't engaging after repeated clicks -- repositioning closer")
-                sailing.sail_to(ctx, near_wreck)
+                sailing.sail_to(ctx, find_wreck_pair_target(config, near_wreck))
                 ctx.state.data.pop("hook_engage_attempt_at", None)
             sailing.deploy_hook(ctx, config.get("hookName", ""))
             ctx.state.data["last_deploy_click_at"] = now
@@ -120,7 +120,7 @@ def tick(ctx):
     far_wreck = find_nearby_wreck(config, config.get("maxSailDistance", 60))
     if far_wreck is not None:
         # No "not navigating" gate here either -- see the near-wreck branch's comment above.
-        if sailing.sail_to(ctx, far_wreck):
+        if sailing.sail_to(ctx, find_wreck_pair_target(config, far_wreck)):
             sailing.deploy_hook(ctx, config.get("hookName", ""))
             ctx.state.data["last_deploy_click_at"] = time.time()
         return
