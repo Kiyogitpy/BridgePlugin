@@ -34,6 +34,7 @@ public class CombatProvider extends BridgeProvider
 		server.register("/combat", () -> onClient(this::getCombat));
 		server.register("/path", () -> onClient(this::getPath));
 		server.registerQuery("/minimap/walk", query -> onClient(() -> getMinimapWalkPoint(query)));
+		server.registerQuery("/ground/walk", query -> onClient(() -> getGroundWalkPoint(query)));
 	}
 
 	private Object getCombat()
@@ -208,6 +209,48 @@ public class CombatProvider extends BridgeProvider
 		catch (Exception ignored)
 		{
 			// missing/invalid x, y -> onMinimap stays false
+		}
+
+		return data;
+	}
+
+	/**
+	 * Projects a world tile onto the 3D viewport (not the minimap) so a caller can click a
+	 * nearby ground tile the same way a player closing a short distance to something on-screen
+	 * would, instead of routing every approach through a minimap click.
+	 */
+	private Object getGroundWalkPoint(Map<String, String> query)
+	{
+		Map<String, Object> data = new HashMap<>();
+		data.put("onScreen", false);
+
+		try
+		{
+			int x = Integer.parseInt(query.get("x"));
+			int y = Integer.parseInt(query.get("y"));
+			int plane = query.containsKey("plane") ? Integer.parseInt(query.get("plane")) : client.getPlane();
+
+			WorldPoint wp = new WorldPoint(x, y, plane);
+			LocalPoint lp = LocalPoint.fromWorld(client, wp);
+			if (lp == null)
+			{
+				return data;
+			}
+
+			net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, lp, plane);
+			if (!RuneLiteUtil.isOnScreen(client, point))
+			{
+				return data;
+			}
+
+			Point screen = RuneLiteUtil.canvasToScreen(client, point.getX(), point.getY());
+			data.put("onScreen", true);
+			data.put("screenX", screen.x);
+			data.put("screenY", screen.y);
+		}
+		catch (Exception ignored)
+		{
+			// missing/invalid x, y -> onScreen stays false
 		}
 
 		return data;

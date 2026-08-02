@@ -60,10 +60,12 @@ def setup(ctx):
     )
 
 
-# After following the crab into the tunnel, it takes a bit to resurface on the
-# other side -- without a cooldown, tick() would find the same tunnel again
-# every cycle in the meantime and keep re-clicking it.
-TUNNEL_RESPAWN_WAIT_SECONDS = (5.0, 8.0)
+# After clicking the tunnel to follow the crab across, it takes a while to resurface on the
+# other side. This is a generous fallback only -- tick() must not just re-click the tunnel
+# every time it's still visible and the crab hasn't shown up yet, or it ping-pongs back and
+# forth across the tunnel instead of waiting. It only fires if the crab genuinely never shows
+# up in this long (wrong side, died to something else, etc.), as a recovery, not a retry timer.
+TUNNEL_RETRY_TIMEOUT_SECONDS = 45.0
 
 # Rolled once per tick while mid-fight (isIdle False) until it fires -- gives
 # a natural-feeling delay before the mouse drifts toward the tunnel, rather
@@ -84,21 +86,23 @@ def tick(ctx):
         # inCombat stays True for the whole fight even on an idle tick between attack
         # animations -- without checking it, a re-evaluation mid-fight could wander off
         # to approach a tile instead of just continuing the attack.
-        if travel.maybe_approach_before_click(ctx, crab, already_engaged=combat.get("inCombat", False)):
-            ctx.state.data["tunnel_wait_until"] = None
+        if travel.maybe_approach_before_click(ctx, crab, already_engaged=combat.get("inCombat", False),
+                                               via_minimap=False):
+            ctx.state.data["tunnel_retry_at"] = None
             return
         print(f"[crab] attacking (dist={crab.get('distance')})")
         time.sleep(random.uniform(0.15, 0.4))
         controller.click_entity(ctx.ser, crab)
-        ctx.state.data["tunnel_wait_until"] = None
+        ctx.state.data["tunnel_retry_at"] = None
         ctx.state.data["hovered_next_step"] = False  # fresh fight -- allow one more anticipatory hover
         return
 
-    wait_until = ctx.state.data.get("tunnel_wait_until")
-    if wait_until is not None:
-        if time.time() < wait_until:
-            return  # crab is still resurfacing -- don't spam the tunnel meanwhile
-        ctx.state.data["tunnel_wait_until"] = None
+    retry_at = ctx.state.data.get("tunnel_retry_at")
+    if retry_at is not None:
+        if time.time() < retry_at:
+            return  # already followed the crab across -- give it time to resurface, don't touch the tunnel again
+        print("[crab] crab still hasn't shown up since crossing -- trying the tunnel again")
+        ctx.state.data["tunnel_retry_at"] = None
 
     tunnel = find_nearby(controller.get_objects(), config, "tunnelName")
     if tunnel:
@@ -108,7 +112,7 @@ def tick(ctx):
         time.sleep(random.uniform(0.2, 0.5))
         controller.click_entity(ctx.ser, tunnel)
         time.sleep(random.uniform(1.0, 1.5))  # entering transition
-        ctx.state.data["tunnel_wait_until"] = time.time() + random.uniform(*TUNNEL_RESPAWN_WAIT_SECONDS)
+        ctx.state.data["tunnel_retry_at"] = time.time() + TUNNEL_RETRY_TIMEOUT_SECONDS
         return
 
     print("[crab] neither the crab nor the tunnel is visible nearby")
