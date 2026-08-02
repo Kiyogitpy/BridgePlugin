@@ -436,6 +436,73 @@ Both starting numbers (`SAIL_BRAKE_TRIGGER_TILES=10`, `PAIR_MAX_TILES=16`) are i
 from known drift/hook-range figures, not live-measured -- flagged for tuning once observed, same
 convention as every other numeric constant in this spec.
 
+## Design update: obstacle-aware route planning (2026-08-02)
+
+User-reported: the boat runs aground on islands during repositioning and comes to a **hard dead
+stop** (confirmed with the user -- not a slow/inefficient detour that self-corrects, a real hang
+requiring manual intervention to free). `steer_toward`/`sail_to` currently steer in a straight line
+from current position to target with no obstacle awareness at all.
+
+**Data source, live-verified before committing to this design.** `TileProvider.java`'s `/tiles`
+already exposes per-tile `walkable`/`blocked` flags from RuneLite's own collision map
+(`CollisionDataFlag.BLOCK_MOVEMENT_FULL`), computed for the whole loaded scene but never queried
+by `sailing.py` until now. Checked live 2026-08-02 before relying on it (real risk: OSRS's
+standard collision grid historically has no notion of open-ocean tiles at all, since foot travel
+never went there before Sailing existed -- worth confirming rather than assuming): boat's current
+position and surrounding water all read `walkable: true, blocked: false`, and a tight, contiguous
+cluster of `blocked` tiles sits 3-5 tiles away, consistent with a real landmass rather than noise.
+Confirms this data source distinguishes sailable water from land correctly.
+
+**Scope is naturally bounded to the loaded scene.** `/tiles` only covers the currently loaded
+scene (~104x104 tiles around the player, one plane). This is sufficient here without needing
+incremental/off-scene pathfinding: repositioning targets come from `find_nearby_wreck`, bounded by
+`maxSailDistance` (60 tiles) -- well within the loaded scene's extent, confirmed against the live
+tile dump's own coordinate range this session.
+
+**New `ocean_path.py`** (parallel to `travel.py`/`sailing.py`, one job: obstacle-aware routing over
+the tile grid `/tiles` already exposes):
+
+```python
+BOAT_CLEARANCE_TILES = 4  # dilation radius around blocked tiles -- half the boat's own ~8-tile
+                           # WorldView footprint (confirmed live, PlayerProvider's
+                           # debugWorldViewSizeX/Y), so a route's center-line staying clear of a
+                           # blocked tile doesn't mean the boat's actual hull does too.
+
+def find_ocean_route(start: dict, target: dict) -> list[dict] | None:
+    # 1. Fetch /tiles (one-time cost per reposition decision, not per-hop -- this must NOT be
+    #    called every hop/tick, same stutter risk /objects had before its own radius fix).
+    # 2. Build a blocked-tile set, dilated by BOAT_CLEARANCE_TILES.
+    # 3. A* from start to target, 8-directional grid movement, Chebyshev heuristic -- fast enough
+    #    on a ~104x104 scene that no timeout/node-cap handling is needed.
+    # 4. Simplify the raw tile-by-tile path down to just its corner points (where heading needs
+    #    to actually change), producing a handful of waypoints instead of dozens of tiles.
+    # Returns None if start or target falls outside the loaded scene, or no route exists at all --
+    # caller falls back to going direct, same as today's behavior (not worse than before pathing
+    # existed).
+    ...
+```
+
+**Wired into `sailing.sail_to`:** calls `find_ocean_route` first; if it returns waypoints,
+`steer_toward`s through each one in sequence with no braking/stopping between legs -- only the
+*final* leg (the real target) uses the existing wide `SAIL_BRAKE_TRIGGER_TILES` stop-and-brake
+logic from the previous fix. This needs `steer_toward`'s arrival distance promoted from the
+hardcoded `SAIL_BRAKE_TRIGGER_TILES` to a parameter (`arrival_tolerance: float =
+SAIL_BRAKE_TRIGGER_TILES`, default preserves today's direct-target behavior unchanged), so
+intermediate legs can pass the tighter `SAIL_ARRIVAL_TOLERANCE` instead -- an intermediate waypoint
+exists specifically to route around something, so cutting the corner early on it would defeat the
+point. If `find_ocean_route` returns `None`, `sail_to` falls back to a single direct
+`steer_toward(ctx, target)` call, unchanged from today.
+
+**Stuck-detection safety net, kept as a backstop even with routing in place** (scene not fully
+loaded at plan time, a moving obstacle, or the coarse compass-snapped heading cutting a corner the
+plan avoided could all still ground the boat): track position across hops in `steer_toward`'s loop;
+if it hasn't moved meaningfully despite issuing steering commands across some threshold, treat it
+as grounded and re-plan a route from the *current* (stuck) position via `find_ocean_route` again,
+rather than blindly retrying the same heading that just failed.
+
+`BOAT_CLEARANCE_TILES=4` is an initial estimate from the boat's known footprint, not live-tuned --
+flagged for adjustment once observed, same convention as every other numeric constant in this spec.
+
 ## Design
 
 ### 1. `SailingProvider.java` (new)
