@@ -130,8 +130,18 @@ def get_players():
     return api_get("/players") or []
 
 
-def get_objects():
-    return api_get("/objects") or []
+def get_objects(radius=None):
+    # radius (tiles, optional): bounds the scene walk to a box around the player instead of the
+    # whole loaded scene. CONFIRMED live 2026-08-02 -- building screen-projection data for every
+    # object in the entire scene, every game tick, regardless of whether any caller actually cares
+    # about it, was a real source of client stutter. Every caller here already filters results by
+    # its own distance check afterward, so passing that same bound through costs nothing.
+    params = {"radius": radius} if radius is not None else None
+    return api_get("/objects", params=params) or []
+
+
+def get_tiles():
+    return api_get("/tiles") or []
 
 
 def get_consumables():
