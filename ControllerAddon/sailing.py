@@ -33,6 +33,7 @@ import random
 import time
 
 import controller
+import ocean_path
 
 HELM_NAME = "helm"  # CONFIRMED live 2026-08-01 -- see module header
 SAILING_OPTIONS_TAB_KEY = "q"  # TODO verify -- see module header
@@ -55,6 +56,18 @@ STOP_TIMEOUT_S = 15.0
 # of through it. Initial estimate (not yet live-tuned): bigger than the max observed drift (5.0)
 # with margin, small enough that the resulting stop still lands within hook range (maxDistance).
 SAIL_BRAKE_TRIGGER_TILES = 10
+
+STUCK_HOP_LIMIT = 3  # consecutive hops with no meaningful position change before steer_toward
+                       # gives up on the current leg and reports failure (False), letting sail_to
+                       # replan a fresh route instead of grinding through all SAIL_MAX_HOPS against
+                       # a wall. CONFIRMED live 2026-08-02: running aground is a hard dead stop,
+                       # not something that resolves itself by retrying the same heading.
+STUCK_MOVEMENT_THRESHOLD_TILES = 1.5  # position change below this, across one hop, doesn't count
+                                        # as real progress -- generous enough to allow for the
+                                        # boat's own post-hop settle jitter.
+MAX_ROUTE_ATTEMPTS = 3  # how many times sail_to will re-plan a fresh route after a leg reports
+                          # getting stuck, before giving up and reporting failure -- same
+                          # bounded-retry philosophy as SAIL_MAX_HOPS.
 
 # Radius passed to /objects when looking up boat fixtures (helm, salvaging hook) -- CONFIRMED
 # live 2026-08-02: an unbounded full-scene walk building screen-projection data for every object
@@ -103,18 +116,28 @@ def use_helm(ctx) -> bool:
     return False
 
 
-def steer_toward(ctx, target: dict) -> bool:
-    """Drive the boat to within SAIL_BRAKE_TRIGGER_TILES tiles of target ({"x", "y", "plane"}),
-    same hop-and-click-minimap loop shape as travel._walk_greedy -- confirmed live that minimap
-    clicks steer the boat once the helm is engaged, just with coarser (compass-snapped) heading
-    than foot travel.
+def steer_toward(ctx, target: dict, arrival_tolerance: float = SAIL_BRAKE_TRIGGER_TILES) -> bool:
+    """Drive the boat to within arrival_tolerance tiles of target ({"x", "y", "plane"}), same
+    hop-and-click-minimap loop shape as travel._walk_greedy -- confirmed live that minimap clicks
+    steer the boat once the helm is engaged, just with coarser (compass-snapped) heading than foot
+    travel.
 
-    Stops at SAIL_BRAKE_TRIGGER_TILES, not the tighter SAIL_ARRIVAL_TOLERANCE -- CONFIRMED live
+    Defaults to SAIL_BRAKE_TRIGGER_TILES, not the tighter SAIL_ARRIVAL_TOLERANCE -- CONFIRMED live
     2026-08-02: the boat keeps coasting under full sail for as long as this function keeps
     running, so returning only once already within the tight tolerance left no room to brake
-    before ramming the target. sail_to calls stop_boat() immediately after this returns, and the
-    already-measured post-toggle drift closes the remaining distance."""
+    before ramming the target. sail_to calls stop_boat() immediately after the FINAL leg of a
+    route returns, and the already-measured post-toggle drift closes the remaining distance.
+    Intermediate route waypoints (see sail_to) pass the tighter SAIL_ARRIVAL_TOLERANCE instead --
+    they exist specifically to route around an obstacle, so cutting the corner early would defeat
+    the point.
+
+    Returns False (instead of exhausting all SAIL_MAX_HOPS) once STUCK_HOP_LIMIT consecutive hops
+    show no meaningful position change -- CONFIRMED live 2026-08-02: running aground on an island
+    is a hard dead stop, not something that resolves itself by continuing to retry the same
+    heading. sail_to treats this as a signal to re-plan a fresh route from the current position."""
     target_x, target_y, target_plane = target["x"], target["y"], target["plane"]
+    last_pos = None
+    stuck_hops = 0
 
     for _ in range(SAIL_MAX_HOPS):
         player = controller.get_player()
@@ -126,8 +149,17 @@ def steer_toward(ctx, target: dict) -> bool:
             print("[sailing] target is on a different plane -- can't sail there")
             return False
 
-        if _within_tolerance(px, py, target_x, target_y, SAIL_BRAKE_TRIGGER_TILES):
+        if _within_tolerance(px, py, target_x, target_y, arrival_tolerance):
             return True
+
+        if last_pos is not None and _within_tolerance(px, py, last_pos[0], last_pos[1], STUCK_MOVEMENT_THRESHOLD_TILES):
+            stuck_hops += 1
+            if stuck_hops >= STUCK_HOP_LIMIT:
+                print("[sailing] stuck -- position hasn't changed across repeated hops, likely aground")
+                return False
+        else:
+            stuck_hops = 0
+        last_pos = (px, py)
 
         dist = math.hypot(target_x - px, target_y - py)
         hop_dist = min(dist, random.randint(SAIL_HOP_MIN_TILES, SAIL_HOP_MAX_TILES))
@@ -235,10 +267,37 @@ def deploy_hook(ctx, hook_name: str) -> bool:
 
 
 def sail_to(ctx, target: dict) -> bool:
-    """Full reposition: engage the helm, steer to target, take down sails. Does not redeploy the
-    hook afterward -- the caller decides when that's appropriate."""
+    """Full reposition: engage the helm, plan an obstacle-aware route (falling back to a direct
+    line if no route is needed or none can be found), steer through it leg by leg, take down
+    sails at the end. Does not redeploy the hook afterward -- the caller decides when that's
+    appropriate.
+
+    Re-plans from the current position (up to MAX_ROUTE_ATTEMPTS times) if a leg reports getting
+    stuck -- CONFIRMED live 2026-08-02: running aground is a hard dead stop needing a real course
+    change to recover from, not something retrying the exact same heading resolves on its own."""
     if not use_helm(ctx):
         return False
-    if not steer_toward(ctx, target):
-        return False
-    return stop_boat(ctx)
+
+    for attempt in range(MAX_ROUTE_ATTEMPTS):
+        player = controller.get_player()
+        start = {"x": player.get("x"), "y": player.get("y"), "plane": player.get("plane")}
+        if start["x"] is None:
+            return False
+
+        route = ocean_path.find_ocean_route(start, target)
+        legs = route if route else [target]
+
+        stuck = False
+        for i, leg in enumerate(legs):
+            is_final_leg = (i == len(legs) - 1)
+            tolerance = SAIL_BRAKE_TRIGGER_TILES if is_final_leg else SAIL_ARRIVAL_TOLERANCE
+            if not steer_toward(ctx, leg, arrival_tolerance=tolerance):
+                print(f"[sailing] got stuck heading to a waypoint (attempt {attempt + 1}/{MAX_ROUTE_ATTEMPTS}) -- replanning")
+                stuck = True
+                break
+
+        if not stuck:
+            return stop_boat(ctx)
+
+    print("[sailing] couldn't find a working route after repeated attempts -- giving up")
+    return False
