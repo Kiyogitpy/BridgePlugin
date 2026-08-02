@@ -45,6 +45,25 @@ SAIL_MAX_HOPS = 40
 NAVIGATE_TIMEOUT_S = 8.0
 STOP_TIMEOUT_S = 15.0
 
+# CONFIRMED live 2026-08-02: steer_toward previously only stopped hopping once within
+# SAIL_ARRIVAL_TOLERANCE (5 tiles) of the target -- but the sails stay up and the boat keeps
+# coasting under full sail the entire approach, so by the time sail_to finally called stop_boat,
+# the boat was already point-blank, and stop_boat's own measured post-toggle drift (2.2-5.0 tiles,
+# two live samples) carried it into the wreck (a real collision, not cosmetic). Now steer_toward
+# stops hopping -- and sail_to calls stop_boat -- once within THIS wider distance instead, letting
+# the already-measured drift close the remaining gap and land the boat short of the target instead
+# of through it. Initial estimate (not yet live-tuned): bigger than the max observed drift (5.0)
+# with margin, small enough that the resulting stop still lands within hook range (maxDistance).
+SAIL_BRAKE_TRIGGER_TILES = 10
+
+# Radius passed to /objects when looking up boat fixtures (helm, salvaging hook) -- CONFIRMED
+# live 2026-08-02: an unbounded full-scene walk building screen-projection data for every object
+# in the loaded scene, every game tick, was a real source of client stutter. These fixtures live
+# in the boat's own nested WorldView, which ObjectProvider always walks in full regardless of
+# radius (it's tiny -- see ObjectProvider.java), so this only trims the unrelated top-level ocean
+# scan; a boat's WorldView is ~8 tiles per side (confirmed live), so 20 is comfortable margin.
+BOAT_OBJECT_SEARCH_RADIUS = 20
+
 
 def open_sailing_options_tab(ctx) -> None:
     """Tap the Sailing Options tab hotkey unless it's already open -- same idempotent-tap idea
@@ -61,7 +80,7 @@ def use_helm(ctx) -> bool:
     any currently-deployed salvaging hook and engages steering in one action -- no separate
     stop/retrieve step needed first."""
     helm = next(
-        (o for o in controller.get_objects()
+        (o for o in controller.get_objects(radius=BOAT_OBJECT_SEARCH_RADIUS)
          if HELM_NAME in (o.get("name") or "").lower() and o.get("visible", True)),
         None,
     )
@@ -85,10 +104,16 @@ def use_helm(ctx) -> bool:
 
 
 def steer_toward(ctx, target: dict) -> bool:
-    """Drive the boat to within SAIL_ARRIVAL_TOLERANCE tiles of target ({"x", "y", "plane"}),
+    """Drive the boat to within SAIL_BRAKE_TRIGGER_TILES tiles of target ({"x", "y", "plane"}),
     same hop-and-click-minimap loop shape as travel._walk_greedy -- confirmed live that minimap
     clicks steer the boat once the helm is engaged, just with coarser (compass-snapped) heading
-    than foot travel."""
+    than foot travel.
+
+    Stops at SAIL_BRAKE_TRIGGER_TILES, not the tighter SAIL_ARRIVAL_TOLERANCE -- CONFIRMED live
+    2026-08-02: the boat keeps coasting under full sail for as long as this function keeps
+    running, so returning only once already within the tight tolerance left no room to brake
+    before ramming the target. sail_to calls stop_boat() immediately after this returns, and the
+    already-measured post-toggle drift closes the remaining distance."""
     target_x, target_y, target_plane = target["x"], target["y"], target["plane"]
 
     for _ in range(SAIL_MAX_HOPS):
@@ -101,7 +126,7 @@ def steer_toward(ctx, target: dict) -> bool:
             print("[sailing] target is on a different plane -- can't sail there")
             return False
 
-        if _within_tolerance(px, py, target_x, target_y):
+        if _within_tolerance(px, py, target_x, target_y, SAIL_BRAKE_TRIGGER_TILES):
             return True
 
         dist = math.hypot(target_x - px, target_y - py)
@@ -135,8 +160,8 @@ def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
     return True
 
 
-def _within_tolerance(x1: float, y1: float, x2: float, y2: float) -> bool:
-    return math.hypot(x2 - x1, y2 - y1) <= SAIL_ARRIVAL_TOLERANCE
+def _within_tolerance(x1: float, y1: float, x2: float, y2: float, tolerance: float = SAIL_ARRIVAL_TOLERANCE) -> bool:
+    return math.hypot(x2 - x1, y2 - y1) <= tolerance
 
 
 def stop_boat(ctx) -> bool:
@@ -197,7 +222,7 @@ def deploy_hook(ctx, hook_name: str) -> bool:
     corner), so no extra offset is needed here -- same reasoning as stop_boat's own sail-toggle
     click, which already used offset=(0, 0) for the same reason."""
     hook = next(
-        (o for o in controller.get_objects()
+        (o for o in controller.get_objects(radius=BOAT_OBJECT_SEARCH_RADIUS)
          if hook_name.lower() in (o.get("name") or "").lower() and o.get("visible", True)),
         None,
     )
