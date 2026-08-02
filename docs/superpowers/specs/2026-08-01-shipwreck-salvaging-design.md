@@ -391,6 +391,51 @@ comments), not removed once this specific investigation closed.
    `client.getTopLevelWorldView().getYellowClickAction() ==
    Constants.CLICK_ACTION_SET_HEADING` instead.
 
+## Design update: approach braking + pair-midpoint targeting (2026-08-02)
+
+Live testing surfaced two related navigation problems, reported directly by the user: the boat
+physically rams the wreck (a real collision, not cosmetic) instead of stopping short of it, and
+positioning only ever targets a single wreck even though shipwrecks spawn in close pairs at each
+hotspot (wiki-confirmed: "a different pair of shipwrecks", "double Salvage spots" -- see
+`data/raw/S/Shipwreck salvaging.txt`).
+
+**Root cause of the ramming.** `steer_toward`'s outer loop only calls `stop_boat()` once the
+player is within `SAIL_ARRIVAL_TOLERANCE` (5 tiles) of the target -- but the sails stay up and the
+boat keeps coasting under full sail for the entire approach, right up until that check passes. By
+the time `sail_to` finally triggers the stop, the boat is already point-blank, and `stop_boat`'s
+own measured post-toggle drift (2.2-5.0 tiles, two live samples logged in item 8 above) carries it
+the rest of the way into the wreck. This was previously assumed safe ("both still comfortably
+within `maxDistance` (15)") -- true at the old 15-tile range, no longer true now that `maxDistance`
+is 8 (see the hook-range fix from live testing this session).
+
+**Fix: brake early, let the known drift close the gap.** Add `SAIL_BRAKE_TRIGGER_TILES` (10). Once
+remaining distance to the navigation target drops under this, `steer_toward` stops issuing further
+hops and returns immediately -- no click is ever aimed at or through the target itself. `sail_to`
+then calls `stop_boat()` right away, and the already-measured 2.2-5.0 tile coast lands the boat
+roughly 5-8 tiles short of the target: inside the hook's 8-tile range, never touching the wreck.
+`SAIL_ARRIVAL_TOLERANCE` (5) is unchanged and keeps its existing job -- `_hop_to`'s own
+intermediate-hop tracking during the cruise phase, unrelated to the final stop decision. If actual
+drift ever falls outside the 2.2-5.0 tile range observed so far and the boat lands just past
+hook range, the existing `HOOK_ENGAGE_TIMEOUT_S` self-heal (sail closer if the hook never actually
+engages) already covers it as a backstop -- no new fallback needed.
+
+**Pair-midpoint targeting.** New helper (in `routines/shipwreck_salvaging.py`): given the nearest
+matching active wreck, look for a second matching active wreck within `PAIR_MAX_TILES` (16 -- twice
+the hook's 8-tile `maxDistance`, so a midpoint puts both within range; confirmed with the user that
+paired wrecks are typically close enough for this). If found, the navigation target is their
+midpoint; otherwise it falls back to the lone wreck (confirmed with the user: a lone wreck is still
+worth sailing to directly, pairing is an optimization, not a requirement). This replaces the raw
+wreck-tile target in both places `sail_to` is currently called for a wreck: the initial far-wreck
+approach (`tick()`'s far-wreck branch) and the near-wreck stuck-reposition self-heal from the
+`HOOK_ENGAGE_TIMEOUT_S` fix (same ramming risk, same fix applies). The payoff isn't simultaneous
+salvage from one click -- item 4 above already confirmed the hook doesn't auto-continue onto a
+different active wreck once its current one sinks -- it's that a pre-positioned midpoint means the
+*next* wreck is already in range after a reclick, with no second sail trip needed.
+
+Both starting numbers (`SAIL_BRAKE_TRIGGER_TILES=10`, `PAIR_MAX_TILES=16`) are initial estimates
+from known drift/hook-range figures, not live-measured -- flagged for tuning once observed, same
+convention as every other numeric constant in this spec.
+
 ## Design
 
 ### 1. `SailingProvider.java` (new)
