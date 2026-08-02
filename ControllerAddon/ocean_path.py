@@ -15,11 +15,16 @@ import heapq
 
 import controller
 
-BOAT_CLEARANCE_TILES = 4  # dilation radius around blocked tiles -- half the boat's own ~8-tile
-                           # WorldView footprint (confirmed live, PlayerProvider's
-                           # debugWorldViewSizeX/Y), so a route's center-line staying clear of a
-                           # blocked tile doesn't mean the boat's actual hull does too. Initial
-                           # estimate, not yet live-tuned.
+BOAT_CLEARANCE_TILES = 2  # dilation radius around blocked tiles -- so a route's center-line
+                           # staying clear of a blocked tile doesn't mean the boat's actual hull
+                           # does too. CONFIRMED live 2026-08-02: the original guess (4, half the
+                           # boat's ~8-tile WorldView footprint) sealed off routing entirely in a
+                           # real dense island cluster (2708 of 10816 loaded tiles blocked --
+                           # dilating by 4 shrank passable water to ~2700 tiles, disconnected, so
+                           # find_ocean_route returned None even for the boat's own current
+                           # position). 2 keeps a real margin while still leaving usable channels;
+                           # the stuck-detection safety net in sailing.py covers cases this margin
+                           # turns out too tight for.
 
 # 8-directional grid movement -- fine-grained enough for the compass-snapped heading steer_toward
 # already handles; the grid is only used to find a route around obstacles, not to model the boat's
@@ -32,23 +37,37 @@ _STRAIGHT_COST = 1.0
 def find_ocean_route(start: dict, target: dict) -> list | None:
     """A* route from start to target ({"x", "y", "plane"} each) over /tiles' collision data,
     simplified to a handful of corner waypoints. Returns None if either point falls outside the
-    currently loaded scene, if nothing in the scene is even blocked (no detour needed), or if no
-    route exists at all -- callers should fall back to steering directly at the target in every
-    None case, same as sailing.py's behavior before this module existed."""
+    currently loaded scene or is itself on a blocked tile, if nothing in the scene is even blocked
+    (no detour needed), or if no route exists at all -- callers should fall back to steering
+    directly at the target in every None case, same as sailing.py's behavior before this module
+    existed."""
     if start["plane"] != target["plane"]:
         return None
 
     tiles = controller.get_tiles()
-    blocked = {(t["x"], t["y"]) for t in tiles if t.get("blocked") and t.get("plane") == start["plane"]}
+    plane = start["plane"]
+    loaded = {(t["x"], t["y"]) for t in tiles if t.get("plane") == plane}
+    blocked = {(t["x"], t["y"]) for t in tiles if t.get("blocked") and t.get("plane") == plane}
     if not blocked:
         return None
 
-    passable = _build_passable_set(tiles, start["plane"], blocked)
-
     start_xy = (start["x"], start["y"])
     target_xy = (target["x"], target["y"])
-    if start_xy not in passable or target_xy not in passable:
+    if start_xy not in loaded or target_xy not in loaded:
         return None
+    if start_xy in blocked or target_xy in blocked:
+        # Genuinely standing on/aiming at land isn't a routing problem this module can solve.
+        return None
+
+    passable = _build_passable_set(tiles, plane, blocked)
+    # The endpoints are always allowed even if they fall inside another obstacle's clearance
+    # dilation -- CONFIRMED live 2026-08-02: excluding them made find_ocean_route return None for
+    # the boat's own current position after it ran aground once (a dense island cluster easily
+    # puts the boat's actual position within BOAT_CLEARANCE_TILES of SOME nearby land), which meant
+    # every "replan from where we're stuck" attempt fell straight back to the same doomed direct
+    # line that got it stuck in the first place. Only intermediate waypoints need to stay clear.
+    passable.add(start_xy)
+    passable.add(target_xy)
 
     raw_path = _astar(start_xy, target_xy, passable)
     if raw_path is None:
