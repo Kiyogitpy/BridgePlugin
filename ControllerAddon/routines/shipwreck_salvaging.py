@@ -153,22 +153,25 @@ def drop_salvage(ctx):
     salvage item, dropping nothing. Bypass the check and force the tab switch whenever the
     Facilities panel is open.
 
-    Enter fallback if "w" still didn't switch tabs: CONFIRMED live 2026-08-02 -- when the
+    Space fallback if "w" still didn't switch tabs: CONFIRMED live 2026-08-02 -- when the
     inventory fills up completely while on the Facilities tab, a standard-looking blue "click
     here to continue" dialogue appears and eats the "w" press entirely, leaving the Facilities
     tab open. It's not caught by controller.check_stray_dialog (GET /state's dialogOpen stayed
     False while the user confirmed the dialogue was still on screen) -- like every other Sailing
     UI element found this session, it apparently doesn't wire through the widgets it visually
-    resembles. Only retried with Enter (not pressed proactively every call) to avoid the real
-    risk of Enter opening the chat-message text box and eating a later "w" as a literal typed
-    character when nothing was actually blocking -- this checks facilitiesTabOpen again first and
-    only falls back once the plain "w" attempt is confirmed to have failed."""
+    resembles. Dismissed with Space specifically (CONFIRMED live 2026-08-02 -- Enter was tried
+    first and the user corrected this: it isn't right, Space is), matching
+    controller.check_stray_dialog's own existing convention for this exact dialogue style. Only
+    retried (not pressed proactively every call) to avoid the same risk that ruled out Enter --
+    a key that isn't actually needed doing something unwanted when nothing was actually blocking
+    -- this checks facilitiesTabOpen again first and only falls back once the plain "w" attempt is
+    confirmed to have failed."""
     if controller.get_sailing().get("facilitiesTabOpen"):
         controller.key_tap(ctx.ser, controller.INVENTORY_TAB_KEY)
         time.sleep(random.uniform(0.2, 0.35))
         if controller.get_sailing().get("facilitiesTabOpen"):
-            print("[salvage] still on the sail menu after 'w' -- dismissing a likely dialogue with Enter")
-            controller.key_tap(ctx.ser, "ENTER")
+            print("[salvage] still on the sail menu after 'w' -- dismissing a likely dialogue with Space")
+            controller.key_tap(ctx.ser, "SPACE")
             time.sleep(random.uniform(0.3, 0.5))
             controller.key_tap(ctx.ser, controller.INVENTORY_TAB_KEY)
             time.sleep(random.uniform(0.2, 0.35))
