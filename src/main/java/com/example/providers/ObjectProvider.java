@@ -24,6 +24,10 @@ public class ObjectProvider extends BridgeProvider
 	// tick count adds no real staleness while capping the expensive work to once per tick no
 	// matter how many times something calls in.
 	private int cachedTick = -1;
+	// -1 means "no radius filter" (the old full-scene behavior) -- distinct from any real radius
+	// value so a radius-bounded call and an unbounded call in the same tick don't share a stale
+	// cache entry for the wrong scope.
+	private int cachedRadius = -1;
 	private List<Map<String, Object>> cachedObjects;
 
 	public ObjectProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
@@ -34,16 +38,31 @@ public class ObjectProvider extends BridgeProvider
 	@Override
 	public void register()
 	{
-		server.register("/objects", () -> onClient(this::getObjects));
+		server.registerQuery("/objects", query -> onClient(() -> getObjects(query)));
 	}
 
-	private Object getObjects()
+	private Object getObjects(Map<String, String> query)
 	{
-		int tick = client.getTickCount();
-		if (cachedObjects == null || tick != cachedTick)
+		Integer radius = null;
+		String radiusStr = query.get("radius");
+		if (radiusStr != null && !radiusStr.isEmpty())
 		{
-			cachedObjects = computeObjects();
+			try
+			{
+				radius = Integer.parseInt(radiusStr);
+			}
+			catch (NumberFormatException ignored)
+			{
+			}
+		}
+		int radiusKey = radius == null ? -1 : radius;
+
+		int tick = client.getTickCount();
+		if (cachedObjects == null || tick != cachedTick || radiusKey != cachedRadius)
+		{
+			cachedObjects = computeObjects(radius);
 			cachedTick = tick;
+			cachedRadius = radiusKey;
 		}
 		return cachedObjects;
 	}
@@ -54,14 +73,14 @@ public class ObjectProvider extends BridgeProvider
 	// this is just insurance against an unexpected cycle turning into a runaway walk.
 	private static final int MAX_WORLD_VIEW_DEPTH = 6;
 
-	private List<Map<String, Object>> computeObjects()
+	private List<Map<String, Object>> computeObjects(Integer radius)
 	{
 		List<Map<String, Object>> list = new ArrayList<>();
 
 		WorldView topLevel = client.getTopLevelWorldView();
 		if (topLevel != null)
 		{
-			walkWorldViewRecursively(topLevel, true, list, 0);
+			walkWorldViewRecursively(topLevel, true, list, 0, radius);
 		}
 
 		return list;
@@ -85,7 +104,7 @@ public class ObjectProvider extends BridgeProvider
 	//      further WorldEntities, each with their own child WorldView), so rather than walking
 	//      only the player's specific view, this recurses through every WorldEntity's view
 	//      starting from the top level, at any depth, catching sub-views nothing else pointed at.
-	private void walkWorldViewRecursively(WorldView view, boolean isTopLevel, List<Map<String, Object>> out, int depth)
+	private void walkWorldViewRecursively(WorldView view, boolean isTopLevel, List<Map<String, Object>> out, int depth, Integer radius)
 	{
 		if (depth > MAX_WORLD_VIEW_DEPTH)
 		{
@@ -97,17 +116,25 @@ public class ObjectProvider extends BridgeProvider
 		{
 			if (isTopLevel)
 			{
-				walkScene(scene, client.getPlane(), out);
+				// radius (tiles, scene-local) bounds the walk to a box around the player instead
+				// of the whole loaded scene (up to 104x104 tiles) -- confirmed live 2026-08-02:
+				// building clickbox/screen-projection data for every single object in the scene,
+				// every game tick, on the client thread was a real source of client stutter for a
+				// routine that only ever cares about objects within its own maxDistance/
+				// maxSailDistance anyway. null preserves the old unbounded behavior for callers
+				// that genuinely need the whole scene.
+				walkScene(scene, client.getPlane(), out, radius);
 			}
 			else
 			{
 				// Unlike the top-level world (mutually-exclusive floors you switch between), a
 				// nested WorldView's whole small structure is rendered together, all planes at
 				// once -- walking every plane a scene can have is cheap for one this tiny, unlike
-				// doing the same for the top-level world.
+				// doing the same for the top-level world. Never radius-bounded -- a boat's own
+				// deck is already far smaller than any reasonable radius.
 				for (int nestedPlane = 0; nestedPlane < Constants.MAX_Z; nestedPlane++)
 				{
-					walkScene(scene, nestedPlane, out);
+					walkScene(scene, nestedPlane, out, null);
 				}
 			}
 		}
@@ -117,12 +144,12 @@ public class ObjectProvider extends BridgeProvider
 			WorldView childView = entity.getWorldView();
 			if (childView != null)
 			{
-				walkWorldViewRecursively(childView, false, out, depth + 1);
+				walkWorldViewRecursively(childView, false, out, depth + 1, radius);
 			}
 		}
 	}
 
-	private void walkScene(Scene scene, int plane, List<Map<String, Object>> out)
+	private void walkScene(Scene scene, int plane, List<Map<String, Object>> out, Integer radius)
 	{
 		Tile[][][] tiles = scene.getTiles();
 		if (tiles == null || plane < 0 || plane >= tiles.length || tiles[plane] == null)
@@ -135,9 +162,32 @@ public class ObjectProvider extends BridgeProvider
 			return;
 		}
 
-		for (int x = 0; x < tiles[plane].length; x++)
+		int width = tiles[plane].length;
+		int height = width > 0 ? tiles[plane][0].length : 0;
+		int xStart = 0, xEnd = width;
+		int yStart = 0, yEnd = height;
+
+		if (radius != null)
 		{
-			for (int y = 0; y < tiles[plane][x].length; y++)
+			// Scene-local bounds derived from the player's TOP-LEVEL world position (via
+			// RuneLiteUtil.getTopLevelWorldLocation, same helper used elsewhere for this exact
+			// nested-WorldView problem) and the scene's own base offset, not LocalPoint.getSceneX/Y
+			// directly -- this branch only ever runs for the top-level scene (see the isTopLevel
+			// check above), but a player standing on their own boat has a LocalLocation tagged to
+			// the boat's nested WorldView, not the top level, so its raw scene coords would be
+			// relative to the wrong (tiny, boat-local) scene entirely.
+			WorldPoint playerWp = RuneLiteUtil.getTopLevelWorldLocation(client, client.getLocalPlayer());
+			int px = playerWp.getX() - scene.getBaseX();
+			int py = playerWp.getY() - scene.getBaseY();
+			xStart = Math.max(0, px - radius);
+			xEnd = Math.min(width, px + radius + 1);
+			yStart = Math.max(0, py - radius);
+			yEnd = Math.min(height, py + radius + 1);
+		}
+
+		for (int x = xStart; x < xEnd; x++)
+		{
+			for (int y = yStart; y < yEnd; y++)
 			{
 				Tile tile = tiles[plane][x][y];
 				if (tile == null)

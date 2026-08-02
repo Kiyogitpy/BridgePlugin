@@ -154,6 +154,13 @@ const ENDPOINTS = [
   "/objects", "/ground-items", "/tiles", "/config", "/consumables", "/path"
 ];
 
+// These do a full scene-tile walk (screen-projection, clickboxes, ...) on the client thread every
+// time they're hit -- confirmed 2026-08-02 that polling them continuously in the background here,
+// independent of and in addition to whatever a live routine needs, was a real source of client
+// stutter. Start paused so opening this dashboard doesn't add that load by default; unpause a
+// card manually when actually debugging that endpoint.
+const HEAVY_ENDPOINTS = new Set(["/objects", "/npcs", "/tiles", "/ground-items"]);
+
 const grid = document.getElementById("grid");
 const baseInput = document.getElementById("base");
 const intervalInput = document.getElementById("interval");
@@ -186,22 +193,24 @@ function diffKeys(prevStr, nextStr) {
 const cards = {};
 
 function buildCard(path) {
+  const startPaused = HEAVY_ENDPOINTS.has(path);
+
   const card = document.createElement("div");
-  card.className = "card";
+  card.className = "card" + (startPaused ? " paused" : "");
   card.innerHTML = `
     <div class="card-head">
       <span class="dot"></span>
       <span class="path">${path}</span>
       <span class="age"></span>
-      <button class="pause">Pause</button>
+      <button class="pause">${startPaused ? "Resume" : "Pause"}</button>
     </div>
-    <pre class="body">(waiting...)</pre>
+    <pre class="body">${startPaused ? "(paused -- full scene walk, unpause to poll)" : "(waiting...)"}</pre>
   `;
   grid.appendChild(card);
 
   const state = {
     path,
-    paused: false,
+    paused: startPaused,
     lastText: null,
     lastAt: 0,
     dot: card.querySelector(".dot"),
@@ -209,9 +218,11 @@ function buildCard(path) {
     body: card.querySelector(".body"),
   };
 
-  card.querySelector(".pause").addEventListener("click", () => {
+  const pauseBtn = card.querySelector(".pause");
+  pauseBtn.addEventListener("click", () => {
     state.paused = !state.paused;
     card.classList.toggle("paused", state.paused);
+    pauseBtn.textContent = state.paused ? "Resume" : "Pause";
   });
 
   cards[path] = state;
