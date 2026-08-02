@@ -32,9 +32,9 @@ import sailing
 
 DEFAULT_CONFIG = {
     "enabled": True,
-    "wreckNames": ["Small shipwreck"],
+    "wreckNames": ["Small shipwreck", "Fisherman's shipwreck"],
     "hookName": "Bronze salvaging hook",
-    "maxDistance": 15,       # hook-operating range -- gathering happens here, no boat movement
+    "maxDistance": 8,        # hook-operating range -- gathering happens here, no boat movement
     "maxSailDistance": 60,   # a farther wreck worth repositioning the boat for
 
     "breaks": {
@@ -143,7 +143,35 @@ def drop_salvage(ctx):
     that same panel -- the check flagged every salvage-item click as "blocked", endlessly rotated
     the camera trying to un-block something that was never a world click, and never actually
     clicked anything, so salvage silently never dropped. Not appropriate for any inventory-item
-    click, so skip it here same as the rest of this file's world-object clicks keep it on."""
+    click, so skip it here same as the rest of this file's world-object clicks keep it on.
+
+    Forced "w" press when facilitiesTabOpen: CONFIRMED live 2026-08-02 -- the boat's Sailing
+    Options (Facilities) panel, left open after any sail_to reposition, visually covers the
+    inventory panel without clearing GameStateProvider's inventoryTabOpen flag (the inventory
+    widget is still technically visible underneath), so open_inventory_tab's idempotent check
+    silently skipped the "w" press and every item click landed on the sail menu instead of a
+    salvage item, dropping nothing. Bypass the check and force the tab switch whenever the
+    Facilities panel is open.
+
+    Enter fallback if "w" still didn't switch tabs: CONFIRMED live 2026-08-02 -- when the
+    inventory fills up completely while on the Facilities tab, a standard-looking blue "click
+    here to continue" dialogue appears and eats the "w" press entirely, leaving the Facilities
+    tab open. It's not caught by controller.check_stray_dialog (GET /state's dialogOpen stayed
+    False while the user confirmed the dialogue was still on screen) -- like every other Sailing
+    UI element found this session, it apparently doesn't wire through the widgets it visually
+    resembles. Only retried with Enter (not pressed proactively every call) to avoid the real
+    risk of Enter opening the chat-message text box and eating a later "w" as a literal typed
+    character when nothing was actually blocking -- this checks facilitiesTabOpen again first and
+    only falls back once the plain "w" attempt is confirmed to have failed."""
+    if controller.get_sailing().get("facilitiesTabOpen"):
+        controller.key_tap(ctx.ser, controller.INVENTORY_TAB_KEY)
+        time.sleep(random.uniform(0.2, 0.35))
+        if controller.get_sailing().get("facilitiesTabOpen"):
+            print("[salvage] still on the sail menu after 'w' -- dismissing a likely dialogue with Enter")
+            controller.key_tap(ctx.ser, "ENTER")
+            time.sleep(random.uniform(0.3, 0.5))
+            controller.key_tap(ctx.ser, controller.INVENTORY_TAB_KEY)
+            time.sleep(random.uniform(0.2, 0.35))
     controller.open_inventory_tab(ctx.ser)
     for item in controller.get_inventory():
         name = (item.get("name") or "").lower()
@@ -157,6 +185,14 @@ def drop_salvage(ctx):
 # docs/superpowers/specs/2026-08-01-shipwreck-salvaging-design.md) -- id is the only way to tell
 # them apart. One stump id per tier (Small..Merchant), confirmed against the live game cache.
 SUNK_SHIPWRECK_IDS = frozenset({60465, 60467, 60469, 60471, 60473, 60475, 60477, 60479})
+
+# Padding added on top of max_dist when bounding /objects' radius-limited scene walk (see
+# find_nearby_wreck below). CONFIRMED live 2026-08-02: ObjectProvider's radius is centered on the
+# PLAYER, but find_nearby_wreck measures from the BOAT's reference position, which can differ from
+# the player's exact tile by up to the boat's own WorldView size (~8 tiles per side, confirmed
+# live) -- without this padding, a wreck could be within max_dist of the boat but just outside the
+# player-centered box and get silently missed.
+WRECK_SEARCH_RADIUS_PADDING = 10
 
 
 def find_nearby_wreck(config: dict, max_dist: float):
@@ -177,7 +213,13 @@ def find_nearby_wreck(config: dict, max_dist: float):
     always sets x/y from the object's WorldPoint regardless of whether it's currently on-screen,
     which is exactly what both the hook-operating-range check and the farther sail-range check
     need. Chebyshev distance (max(|dx|, |dy|)), matching WorldPoint.distanceTo2D's own convention
-    on the Java side."""
+    on the Java side.
+
+    Passes max_dist (plus padding, see WRECK_SEARCH_RADIUS_PADDING) as /objects' radius --
+    CONFIRMED live 2026-08-02: an unbounded full-scene walk building screen-projection data for
+    every object in the loaded scene, every game tick, was a real source of client stutter. This
+    routine only ever cares about objects within max_dist anyway, so bounding the scan costs
+    nothing here."""
     names = {n.lower() for n in config.get("wreckNames", [])}
 
     player = controller.get_player()
@@ -188,7 +230,7 @@ def find_nearby_wreck(config: dict, max_dist: float):
 
     best = None
     best_dist = None
-    for o in controller.get_objects():
+    for o in controller.get_objects(radius=int(max_dist) + WRECK_SEARCH_RADIUS_PADDING):
         if (o.get("name") or "").lower() not in names:
             continue
         if o.get("id") in SUNK_SHIPWRECK_IDS:
