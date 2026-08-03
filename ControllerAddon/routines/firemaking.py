@@ -25,6 +25,20 @@
 #     deliberately NOT implemented here -- waiting for full isIdle between logs is simpler and
 #     safer, matching this routine's "pretty simple" scope.
 #
+# Inventory-click quirks handled here (see tick() below for the actual code):
+#   - GameStateProvider.java documents inventory item screenX/screenY as only valid while the
+#     Inventory sidebar tab is selected, so tick() calls controller.open_inventory_tab(ctx.ser)
+#     (a no-op if already open) before reading tinderbox/log positions.
+#   - In resizable-viewport layouts the inventory panel itself is a registered UI-blocker rect
+#     (RESIZABLE_VIEWPORT_INVENTORY_CONTAINER / ..._BOTTOM_LINE_INVENTORY_CONTAINER in
+#     GameStateProvider.java) -- exactly where the tinderbox and log live -- so both
+#     click_entity() calls pass check_ui_blockers=False, same fix tormented_demon.py already
+#     established for inventory-item clicks.
+#   - The bridge polls roughly every half a game tick, and neither inventory click makes
+#     isMoving true the way clicking a distant object would, so tick() sleeps briefly after the
+#     second click to avoid re-reading isIdle == True and firing a duplicate click pair before
+#     the light has registered server-side.
+#
 # Run with:
 #     python controller.py routines/firemaking.py
 
@@ -35,10 +49,10 @@ import banker
 import controller
 
 # Firemaking level required to burn each log type -- Firemaking.txt's "List of combustible
-# logs" table. Used only for a one-time sanity check in setup() (stop early with a clear
-# message instead of silently retrying forever against a log the account isn't leveled for
-# yet) -- not needed by the burn loop itself, which already handles the success-chance rolls
-# above by retrying every tick until isIdle flips.
+# logs" table. Used only for a one-time-per-activation sanity check run from inside tick()
+# (stop early with a clear message instead of silently retrying forever against a log the
+# account isn't leveled for yet) -- not needed by the burn loop itself, which already handles
+# the success-chance rolls above by retrying every tick until isIdle flips.
 LOG_LEVEL_REQUIREMENTS = {
     "logs": 1,
     "achey tree logs": 1,
@@ -92,11 +106,15 @@ def get_config(bridge_config):
     return config if config is not None else DEFAULT_CONFIG
 
 
-def setup(ctx):
-    """One-time under-level sanity check -- see LOG_LEVEL_REQUIREMENTS above. Resolves config
-    the same way get_config() will, since ctx.state.config isn't populated yet at this point
-    in the routine-switch lifecycle (same reasoning as tormented_demon.py's setup())."""
-    config = get_config(None)
+def check_level_requirement(ctx, config: dict) -> None:
+    """One-time-per-activation under-level sanity check -- see LOG_LEVEL_REQUIREMENTS above.
+    Deliberately run from inside tick() rather than a setup() hook: controller.py's main loop
+    calls routine.setup(ctx) at routine-load time, BEFORE the login.is_fully_logged_in() gate,
+    so /skills could be queried pre-login (returning zeros/stale data) and false-trigger a
+    permanent trigger_safety_stop() on an account that's actually fine once logged in. tick()
+    only ever runs while fully logged in (per that same gate), so the level reading here is
+    reliable. Gated by a ctx.state.data flag so it runs exactly once per routine-activation --
+    state.data is reset to {} by controller.py whenever the active routine file changes."""
     log_name = (config.get("logName") or "").strip().lower()
     required = LOG_LEVEL_REQUIREMENTS.get(log_name)
     if required is None:
@@ -113,26 +131,49 @@ def setup(ctx):
 def tick(ctx):
     config = ctx.state.config
 
+    if not ctx.state.data.get("firemaking_level_checked"):
+        check_level_requirement(ctx, config)
+        ctx.state.data["firemaking_level_checked"] = True
+        if ctx.state.safety_stopped:
+            return
+
     if not controller.get_combat().get("isIdle", True):
         return  # still lighting the last log, or stepping away from the new fire
+
+    # Inventory item screenX/screenY are only valid while the Inventory sidebar tab is
+    # selected (GameStateProvider.java) -- make sure it is before reading/clicking items below.
+    controller.open_inventory_tab(ctx.ser)
 
     tinderbox = find_item(config.get("tinderboxName", "tinderbox"))
     log = find_item(config.get("logName", "logs"))
 
-    if tinderbox is None or log is None:
+    if tinderbox is None:
+        # Banking can't fix this -- the bank withdraw loadout only ever contains the log
+        # (banker.py's keepItems just prevents depositing a tinderbox already held, it never
+        # withdraws one), so banking here would just loop forever rediscovering the same
+        # problem. Stop regardless of the bank setting.
+        ctx.state.trigger_safety_stop("no tinderbox in inventory")
+        return
+
+    if log is None:
         bank_cfg = config.get("bank", {})
         if bank_cfg.get("enabled"):
-            print("[firemaking] out of logs or no tinderbox -- banking")
-            banker.bank_up(ctx, bank_cfg)
+            print("[firemaking] out of logs -- banking")
+            if not banker.bank_up(ctx, bank_cfg):
+                ctx.state.trigger_safety_stop("couldn't reach a bank to restock logs")
         else:
-            ctx.state.trigger_safety_stop("out of logs or no tinderbox in inventory")
+            ctx.state.trigger_safety_stop("out of logs and banking is disabled")
         return
 
     print(f"[firemaking] lighting {log.get('name')}")
     time.sleep(random.uniform(0.15, 0.35))
-    controller.click_entity(ctx.ser, tinderbox)
+    controller.click_entity(ctx.ser, tinderbox, check_ui_blockers=False)
     time.sleep(random.uniform(0.1, 0.25))
-    controller.click_entity(ctx.ser, log)
+    controller.click_entity(ctx.ser, log, check_ui_blockers=False)
+    # Let the light register server-side before the next isIdle poll -- neither inventory
+    # click makes isMoving true the way clicking a distant object would, so without this the
+    # very next ~0.3s poll can still read isIdle == True and fire a duplicate click pair.
+    time.sleep(random.uniform(0.6, 1.0))
 
 
 def find_item(name: str):
