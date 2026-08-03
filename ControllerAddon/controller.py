@@ -180,6 +180,18 @@ def get_tormented_demon_config():
     return api_get("/tormented-demon-config")
 
 
+def get_firemaking_config():
+    return api_get("/firemaking-config")
+
+
+def get_skills():
+    return api_get("/skills") or {}
+
+
+def get_blast_furnace_config():
+    return api_get("/blast-furnace-config")
+
+
 def get_minimap_walk_point(x: int, y: int, plane: int):
     return api_get("/minimap/walk", params={"x": x, "y": y, "plane": plane}) or {"onMinimap": False}
 
@@ -374,6 +386,25 @@ def key_down(ser: serial.Serial, key: str) -> None:
 
 def key_up(ser: serial.Serial, key: str) -> None:
     send_line(ser, f"KU {key}")
+
+
+def type_digits_and_enter(ser: serial.Serial, text: str) -> None:
+    """Type each character of `text` (expected to be a plain digit string, e.g. a coin
+    amount) via key_tap, then press Enter -- for chatbox "Enter amount" numeric prompts
+    (e.g. the Blast Furnace coffer's Use action, see routines/blast_furnace.py).
+
+    ASSUMPTION, NOT YET VERIFIED LIVE: that the Arduino firmware accepts single-digit-
+    character key names ("0".."9") the same way it already accepts named keys like "ESC"/
+    "SPACE" elsewhere in this file, and that "ENTER" is a valid key name for it. Verify with
+    a small manual test (e.g. typing an amount into any existing "Enter amount" prompt)
+    before relying on this for an unattended coffer top-up -- same epistemic honesty as this
+    project's other live-verification-needed assumptions (see travel.py's Forced Actions
+    notes, tormented_demon.py's reflection caveats)."""
+    for ch in text:
+        key_tap(ser, ch)
+        time.sleep(random.uniform(0.05, 0.12))
+    key_tap(ser, "ENTER")
+    time.sleep(random.uniform(0.2, 0.4))
 
 
 INVENTORY_TAB_KEY = "w"
@@ -1139,6 +1170,8 @@ ROUTINE_FILES = {
     "GEMSTONE_CRAB": "routines/gemstone_crab.py",
     "TORMENTED_DEMON": "routines/tormented_demon.py",
     "SHIPWRECK_SALVAGING": "routines/shipwreck_salvaging.py",
+    "FIREMAKING": "routines/firemaking.py",
+    "BLAST_FURNACE": "routines/blast_furnace.py",
 }
 
 
