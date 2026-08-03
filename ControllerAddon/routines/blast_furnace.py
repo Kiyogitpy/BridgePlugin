@@ -214,7 +214,10 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
     from the previous trip along the way, via the normal keepItems-aware deposit), walk to
     the conveyor belt, deposit coal (if any) before the primary ore, then collect bars if
     this trip ends with a collect. Returns False if something is missing and a safety-stop or
-    retry was already handled; True once the trip's deposits (and any collect) completed."""
+    retry was already handled; True once the trip's deposits (and any collect) completed.
+
+    Note: the Ferox teleport fallback cannot fill the coal bag (banker.bank_up doesn't
+    support it), so it only works for bar types that don't require coal (bronze/iron/silver/gold)."""
     withdraw, need_bag_fill = plan_bank_withdrawals(trip)
     bank_cfg = {"keepItems": ["coal bag"], "withdraw": withdraw}
 
@@ -229,6 +232,12 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
         banker.withdraw_loadout(ctx, bank_cfg)
         banker.close_bank(ctx)
     elif config.get("bank", {}).get("teleportFallback"):
+        if need_bag_fill:
+            ctx.state.trigger_safety_stop(
+                "the Ferox teleport fallback can't fill the coal bag -- disable Banking > Teleport If No Bank Nearby, "
+                "or make sure a bank is reachable near the Blast Furnace for coal-needing bar types"
+            )
+            return False
         if not banker.bank_up(ctx, dict(bank_cfg, teleportFallback=True)):
             ctx.state.trigger_safety_stop("couldn't reach a bank to restock materials")
             return False
