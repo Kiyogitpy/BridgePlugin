@@ -125,6 +125,57 @@ def empty_looting_bag(ctx) -> bool:
     return True
 
 
+COAL_BAG_NAME = "coal bag"
+
+
+def has_coal_bag() -> bool:
+    return any(COAL_BAG_NAME in (i.get("name") or "").lower() for i in controller.get_inventory())
+
+
+def fill_coal_bag(ctx) -> bool:
+    """Click Fill on the coal bag to top it up (to 27 coal, 36 with a Smithing cape -- this
+    project doesn't special-case the cape) from an open bank. "Fill" is listed first among
+    the item's own options (Fill, Open, Check, Empty, Destroy), so it's likely this project's
+    plain-left-click default the way most single-primary-action tools already are elsewhere
+    in this codebase -- unlike Empty below, this one is NOT expected to need Forced Actions,
+    but verify live."""
+    bag = next(
+        (i for i in controller.get_inventory() if COAL_BAG_NAME in (i.get("name") or "").lower()),
+        None,
+    )
+    if bag is None:
+        return False
+
+    print("[bank] filling coal bag")
+    if not controller.click_entity(ctx.ser, bag):
+        return False
+
+    time.sleep(random.uniform(0.6, 1.0))
+    return True
+
+
+def empty_coal_bag(ctx) -> bool:
+    """Click Empty on the coal bag to dump its coal into inventory -- e.g. before depositing
+    it onto the Blast Furnace conveyor belt one piece at a time, since there's no direct
+    bag-to-object deposit shortcut (see routines/blast_furnace.py). Same situation as
+    empty_looting_bag above: "Empty" is not the item's first-listed (default) option, so add
+    it to Controller Settings -> Clicking -> Forced Actions if a plain click doesn't already
+    resolve to it."""
+    bag = next(
+        (i for i in controller.get_inventory() if COAL_BAG_NAME in (i.get("name") or "").lower()),
+        None,
+    )
+    if bag is None:
+        return False
+
+    print("[bank] emptying coal bag")
+    if not controller.click_entity(ctx.ser, bag):
+        return False
+
+    time.sleep(random.uniform(0.6, 1.0))
+    return True
+
+
 def _click_bank_button(ctx, button_key: str) -> bool:
     """Click one of the bank's one-shot deposit-all buttons (depositInventory,
     depositEquipment, depositContainers) if it's currently visible. Standalone

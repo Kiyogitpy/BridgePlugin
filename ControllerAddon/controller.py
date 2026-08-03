@@ -362,6 +362,25 @@ def key_up(ser: serial.Serial, key: str) -> None:
     send_line(ser, f"KU {key}")
 
 
+def type_digits_and_enter(ser: serial.Serial, text: str) -> None:
+    """Type each character of `text` (expected to be a plain digit string, e.g. a coin
+    amount) via key_tap, then press Enter -- for chatbox "Enter amount" numeric prompts
+    (e.g. the Blast Furnace coffer's Use action, see routines/blast_furnace.py).
+
+    ASSUMPTION, NOT YET VERIFIED LIVE: that the Arduino firmware accepts single-digit-
+    character key names ("0".."9") the same way it already accepts named keys like "ESC"/
+    "SPACE" elsewhere in this file, and that "ENTER" is a valid key name for it. Verify with
+    a small manual test (e.g. typing an amount into any existing "Enter amount" prompt)
+    before relying on this for an unattended coffer top-up -- same epistemic honesty as this
+    project's other live-verification-needed assumptions (see travel.py's Forced Actions
+    notes, tormented_demon.py's reflection caveats)."""
+    for ch in text:
+        key_tap(ser, ch)
+        time.sleep(random.uniform(0.05, 0.12))
+    key_tap(ser, "ENTER")
+    time.sleep(random.uniform(0.2, 0.4))
+
+
 INVENTORY_TAB_KEY = "w"
 PRAYER_TAB_KEY = "r"
 
