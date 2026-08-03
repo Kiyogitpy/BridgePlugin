@@ -1,4 +1,4 @@
-﻿# controller.py
+# controller.py
 #
 # Generic engine for the RuneLite HTTP/UDP bridge. controller.py owns the
 # *plumbing*: talking to the bridge (HTTP state + UDP events), driving the
