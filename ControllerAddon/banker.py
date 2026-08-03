@@ -133,12 +133,15 @@ def has_coal_bag() -> bool:
 
 
 def fill_coal_bag(ctx) -> bool:
-    """Click Fill on the coal bag to top it up (to 27 coal, 36 with a Smithing cape -- this
-    project doesn't special-case the cape) from an open bank. "Fill" is listed first among
-    the item's own options (Fill, Open, Check, Empty, Destroy), so it's likely this project's
-    plain-left-click default the way most single-primary-action tools already are elsewhere
-    in this codebase -- unlike Empty below, this one is NOT expected to need Forced Actions,
-    but verify live."""
+    """Click the coal bag at an open bank to fill it (to 27 coal, 36 with a Smithing cape --
+    this project doesn't special-case the cape). UNCERTAIN which of Fill/Empty a plain
+    left-click resolves to once the bag already holds coal -- the OSRS Wiki's Blast Furnace
+    strategy guide notes the bank-side option can become "Empty" once the bag isn't empty,
+    the opposite problem from empty_coal_bag below. Verify live which action a plain click
+    actually performs in each state; add the wrong one to Controller Settings -> Clicking ->
+    Forced Actions if needed. check_ui_blockers=False since this is an inventory-item click,
+    same reasoning as every other inventory click in this codebase (see
+    routines/firemaking.py's/routines/blast_furnace.py's own notes on this)."""
     bag = next(
         (i for i in controller.get_inventory() if COAL_BAG_NAME in (i.get("name") or "").lower()),
         None,
@@ -147,7 +150,7 @@ def fill_coal_bag(ctx) -> bool:
         return False
 
     print("[bank] filling coal bag")
-    if not controller.click_entity(ctx.ser, bag):
+    if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False):
         return False
 
     time.sleep(random.uniform(0.6, 1.0))
@@ -158,9 +161,14 @@ def empty_coal_bag(ctx) -> bool:
     """Click Empty on the coal bag to dump its coal into inventory -- e.g. before depositing
     it onto the Blast Furnace conveyor belt one piece at a time, since there's no direct
     bag-to-object deposit shortcut (see routines/blast_furnace.py). Same situation as
-    empty_looting_bag above: "Empty" is not the item's first-listed (default) option, so add
-    it to Controller Settings -> Clicking -> Forced Actions if a plain click doesn't already
-    resolve to it."""
+    empty_looting_bag above: "Empty" is not always the item's default option, so add it to
+    Controller Settings -> Clicking -> Forced Actions if a plain click doesn't already
+    resolve to it -- though per fill_coal_bag's note above, a non-empty bag may resolve to
+    Empty by default anyway. check_ui_blockers=False since this is an inventory-item click:
+    unlike empty_looting_bag (only ever called with a bank open, where the inventory sidebar
+    widget is hidden), this is the first coal-bag call site used OUTSIDE a bank interface, at
+    the conveyor belt, where the inventory panel itself is a live UI-blocker rect in
+    resizable layouts."""
     bag = next(
         (i for i in controller.get_inventory() if COAL_BAG_NAME in (i.get("name") or "").lower()),
         None,
@@ -169,7 +177,7 @@ def empty_coal_bag(ctx) -> bool:
         return False
 
     print("[bank] emptying coal bag")
-    if not controller.click_entity(ctx.ser, bag):
+    if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False):
         return False
 
     time.sleep(random.uniform(0.6, 1.0))

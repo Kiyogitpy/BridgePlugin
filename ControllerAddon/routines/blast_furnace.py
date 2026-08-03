@@ -18,10 +18,23 @@
 #     ore/coal item, then click the conveyor belt -- same item-then-target idiom
 #     routines/firemaking.py established for tinderbox+log, just with a world object as the
 #     second click.
-#   - Coal must land before the primary ore or the furnace yields the wrong (lower-tier) bar
-#     -- every trip pattern below deposits coal first.
-#   - The coal bag has no direct bag-to-conveyor shortcut: its coal is emptied into inventory
-#     first (banker.empty_coal_bag), then deposited item-by-item like loose coal.
+#   - A genuinely cold furnace with no coal in it at all can yield the wrong (lower-tier) bar
+#     if ore arrives with no coal ever present -- but see the ordering note in run_trip below
+#     for why this routine deposits ore before the coal bag's contents on every trip after
+#     the first (there's no free inventory slot to empty the bag into otherwise).
+#   - Every trip pattern here already uses all 28 inventory slots (the wiki's own
+#     maximally-efficient patterns), including the coal bag's own slot on coal-needing trips
+#     -- there is no spare slot to also carry loose coins during a materials trip. So the
+#     coffer top-up (see maybe_top_up_coffer) does its own separate, dedicated bank visit for
+#     coins rather than folding coin-carrying into run_trip's ore/coal banking.
+#   - The coal bag has no direct bag-to-conveyor shortcut: its coal must be emptied into
+#     inventory first (banker.empty_coal_bag), then deposited item-by-item like loose coal --
+#     but since every coal-needing trip already fills all 28 slots the moment materials are
+#     withdrawn, the bag can't be emptied until *something* is deposited first to free room
+#     for it. So run_trip deposits the primary ore, then any loose coal (withdrawn straight
+#     into inventory), THEN empties the bag into the now-free slots, THEN deposits that too --
+#     matching the money-making guides' own sequence (e.g. the runite guide: ore onto the
+#     belt first, "then emptying your coal bag of coal and depositing that right after").
 #   - The coffer drains 1,200 coins/minute while active and has no bridge-exposed live
 #     balance -- top-up here is a blind, time-based deposit, not balance-aware.
 #   - ASSUMPTION, NOT YET VERIFIED LIVE: clicking the coffer (its only option is "Use") opens
@@ -44,8 +57,10 @@ COAL_BAG_CAPACITY = 27
 
 # Per-bar-type trip patterns, reproduced verbatim from Blast Furnace_Strategies.txt's "Bar
 # patterns" table (which assumes a coal bag + ice gloves). Each trip is a "deposit" list of
-# (item name, quantity) pairs -- coal always listed first, per the coal-before-ore ordering
-# rule above -- and a "collect" flag for whether to gather bars at the end of that trip.
+# (item name, quantity) pairs -- listed here with "Coal" first for readability against the
+# wiki table, though run_trip actually deposits the non-coal entries first at the conveyor
+# (see its docstring for why) -- and a "collect" flag for whether to gather bars at the end
+# of that trip.
 # tick() advances through a bar type's trip list in order and wraps back to the start after
 # the last one, so single-trip bar types (bronze/iron/silver/steel/gold) just repeat trip 0
 # forever with no special-casing needed.
@@ -161,9 +176,20 @@ def check_level_requirement(ctx, config: dict) -> None:
         )
 
 
+def current_coins() -> int:
+    coins = find_item("Coins")
+    return coins.get("qty", 0) if coins else 0
+
+
 def maybe_top_up_coffer(ctx, config: dict) -> None:
     """Blind, time-based coffer top-up -- see module header for why this can't be
-    balance-aware. Checked once per tick alongside the main trip logic, same as how other
+    balance-aware. Does its own dedicated bank visit for coins (withdrawing only if the
+    current holding is short) rather than folding coin-carrying into run_trip's ore/coal
+    banking: every trip pattern here already fills all 28 inventory slots with ore/coal, so
+    there's no spare slot to also carry coins alongside a materials trip. The withdrawn coins
+    are spent into the coffer within this same call, so by the time run_trip runs later this
+    tick, inventory is back to holding no loose coins and its own slot budgeting is
+    undisturbed. Checked once per tick alongside the main trip logic, same as how other
     routines interleave periodic side-actions (e.g. slayer.py's supply/prayer checks) with
     their main loop."""
     coffer_cfg = config.get("coffer", {})
@@ -176,13 +202,27 @@ def maybe_top_up_coffer(ctx, config: dict) -> None:
         return
 
     interval_s = coffer_cfg.get("topUpIntervalMinutes", 30) * 60
+    amount = coffer_cfg.get("topUpAmount", 40000)
+
+    if current_coins() < amount:
+        bank_obj = banker.find_nearby_bank({})
+        if bank_obj is None:
+            print("[blast furnace] no bank found for coffer top-up -- will retry shortly")
+            ctx.state.data["bf_coffer_next_topup_at"] = now + 60
+            return
+        if not banker.open_bank(ctx, bank_obj):
+            print("[blast furnace] couldn't open the bank for coffer top-up -- will retry shortly")
+            ctx.state.data["bf_coffer_next_topup_at"] = now + 60
+            return
+        banker.withdraw_loadout(ctx, {"withdraw": [{"name": "Coins", "quantity": amount}]})
+        banker.close_bank(ctx)
+
     coffer = find_object(config, "Coffer")
     if coffer is None:
         print("[blast furnace] coffer not found nearby -- will retry shortly")
         ctx.state.data["bf_coffer_next_topup_at"] = now + 60
         return
 
-    amount = coffer_cfg.get("topUpAmount", 40000)
     print(f"[blast furnace] topping up coffer with {amount} coins")
     controller.click_entity(ctx.ser, coffer)
     time.sleep(random.uniform(0.8, 1.2))  # wait for the amount prompt to appear
@@ -192,34 +232,56 @@ def maybe_top_up_coffer(ctx, config: dict) -> None:
 
 
 def plan_bank_withdrawals(trip: dict) -> tuple:
-    """Given one trip's deposit list, compute the bank withdraw list and whether the coal
-    bag needs filling. A "Coal" entry over COAL_BAG_CAPACITY splits into a full bag (27) plus
-    loose coal withdrawn directly into inventory for the remainder (e.g. 54 Coal -> fill the
-    bag, withdraw 27 loose)."""
+    """Given one trip's deposit list, compute the bank withdraw list, whether the coal bag
+    needs filling, and the loose/bag coal split. A "Coal" entry over COAL_BAG_CAPACITY splits
+    into a full bag (27) plus loose coal withdrawn directly into inventory for the remainder
+    (e.g. 54 Coal -> fill the bag, withdraw 27 loose). Returns
+    (withdraw, need_bag_fill, loose_coal, bag_coal)."""
     withdraw = []
     need_bag_fill = False
+    loose_coal = 0
+    bag_coal = 0
     for name, qty in trip["deposit"]:
         if name.lower() == "coal":
             need_bag_fill = True
-            loose = max(0, qty - COAL_BAG_CAPACITY)
-            if loose > 0:
-                withdraw.append({"name": "Coal", "quantity": loose})
+            bag_coal = min(qty, COAL_BAG_CAPACITY)
+            loose_coal = max(0, qty - COAL_BAG_CAPACITY)
+            if loose_coal > 0:
+                withdraw.append({"name": "Coal", "quantity": loose_coal})
         else:
             withdraw.append({"name": name, "quantity": qty})
-    return withdraw, need_bag_fill
+    return withdraw, need_bag_fill, loose_coal, bag_coal
 
 
 def run_trip(ctx, config: dict, trip: dict) -> bool:
     """Execute one full trip: bank for this trip's materials (depositing any bars/leftovers
     from the previous trip along the way, via the normal keepItems-aware deposit), walk to
-    the conveyor belt, deposit coal (if any) before the primary ore, then collect bars if
-    this trip ends with a collect. Returns False if something is missing and a safety-stop or
-    retry was already handled; True once the trip's deposits (and any collect) completed.
+    the conveyor belt, deposit the primary ore and any loose coal before the coal bag's
+    contents (see the ordering note where the deposit loop starts, below), then collect bars
+    if this trip ends with a collect. Returns False if something is missing and a safety-stop
+    or retry was already handled; True once the trip's deposits (and any collect) completed.
 
     Note: the Ferox teleport fallback cannot fill the coal bag (banker.bank_up doesn't
-    support it), so it only works for bar types that don't require coal (bronze/iron/silver/gold)."""
-    withdraw, need_bag_fill = plan_bank_withdrawals(trip)
-    bank_cfg = {"keepItems": ["coal bag"], "withdraw": withdraw}
+    support it), so it only works for bar types that don't require coal (bronze/iron/silver/gold).
+
+    Coal handling: the coal bag is only kept across trips (not deposited) for bar types that
+    actually need coal -- freeing its slot for bar types that don't, since every trip pattern
+    here already budgets all 28 inventory slots and a carried-but-unneeded bag would overflow
+    that by one (see plan_bank_withdrawals). If the bag isn't currently held (e.g. a prior
+    non-coal trip banked it away, or this is the first coal-needing trip of the session),
+    it's withdrawn back from the bank before being filled. Loose coal is deposited before the
+    bag is emptied, since the bag can only be emptied into slots that are actually free (see
+    module header). Coffer coins are handled entirely separately by maybe_top_up_coffer's own
+    dedicated bank visit, so this function never carries coins itself."""
+    withdraw, need_bag_fill, loose_coal, bag_coal = plan_bank_withdrawals(trip)
+
+    keep_items = []
+    if need_bag_fill:
+        keep_items.append("coal bag")
+        if not banker.has_coal_bag():
+            withdraw.append({"name": "coal bag", "quantity": 1})
+
+    bank_cfg = {"keepItems": keep_items, "withdraw": withdraw}
 
     bank_obj = banker.find_nearby_bank(bank_cfg)
     if bank_obj is not None:
@@ -227,9 +289,12 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
             ctx.state.trigger_safety_stop("failed to open the Blast Furnace bank chest")
             return False
         banker.deposit_inventory(ctx, bank_cfg)
-        if need_bag_fill:
-            banker.fill_coal_bag(ctx)
         banker.withdraw_loadout(ctx, bank_cfg)
+        if need_bag_fill:
+            if not banker.fill_coal_bag(ctx):
+                banker.close_bank(ctx)
+                ctx.state.trigger_safety_stop("no coal bag in inventory or bank -- this bar type needs one")
+                return False
         banker.close_bank(ctx)
     elif config.get("bank", {}).get("teleportFallback"):
         if need_bag_fill:
@@ -250,16 +315,46 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
         ctx.state.trigger_safety_stop("conveyor belt not found nearby -- are you at the Blast Furnace?")
         return False
 
-    if need_bag_fill:
-        banker.empty_coal_bag(ctx)
-        time.sleep(random.uniform(0.3, 0.6))
-
     controller.open_inventory_tab(ctx.ser)
+
+    # Deposit the primary ore (and any loose coal beyond the bag's capacity) FIRST, before
+    # touching the bag -- withdraw_loadout above already filled every slot this trip budgets
+    # for (see plan_bank_withdrawals), so the coal bag has nowhere to empty into until
+    # something else has been deposited to free room. This also matches the real click order
+    # the money-making guides describe for coal-bag trips (e.g. the runite guide: ore onto
+    # the belt first, "then emptying your coal bag of coal and depositing that right after"),
+    # not a strict coal-always-first rule. The coal-before-ore caution in Blast Furnace.txt is
+    # about a genuinely cold furnace with no coal in it at all, not the steady-state cycle
+    # this routine repeats -- watch the very first cycle closely during live verification
+    # (Step 3) in case a cold start needs an explicit priming trip this plan didn't include
+    # for Steel specifically.
     for name, qty in trip["deposit"]:
+        if name.lower() == "coal":
+            continue  # coal (loose and/or bagged) is handled below, after ore frees room
         deposited = deposit_items(ctx, name, qty, conveyor)
         if deposited < qty:
             ctx.state.trigger_safety_stop(
                 f"only deposited {deposited}/{qty} {name} onto the conveyor belt -- ran out?"
+            )
+            return False
+
+    if loose_coal > 0:
+        deposited = deposit_items(ctx, "Coal", loose_coal, conveyor)
+        if deposited < loose_coal:
+            ctx.state.trigger_safety_stop(
+                f"only deposited {deposited}/{loose_coal} loose Coal onto the conveyor belt -- ran out?"
+            )
+            return False
+
+    if need_bag_fill and bag_coal > 0:
+        if not banker.empty_coal_bag(ctx):
+            ctx.state.trigger_safety_stop("couldn't empty the coal bag at the conveyor belt")
+            return False
+        time.sleep(random.uniform(0.3, 0.6))
+        deposited = deposit_items(ctx, "Coal", bag_coal, conveyor)
+        if deposited < bag_coal:
+            ctx.state.trigger_safety_stop(
+                f"only deposited {deposited}/{bag_coal} bagged Coal onto the conveyor belt -- ran out?"
             )
             return False
 
@@ -282,20 +377,24 @@ def deposit_items(ctx, name: str, quantity: int, target: dict) -> int:
     conveyor. Ore/coal aren't stackable in inventory, so this is a real loop, one click pair
     per item, not a single bulk action. Each iteration re-looks-up the item fresh via
     find_item rather than reusing one slot reference repeatedly (unlike bank-slot
-    withdrawals, which target a persistent bank-side stack): depositing an item removes it
-    from its inventory slot and shifts the rest, so a stale reference from an earlier
-    iteration could click whatever shifted into that slot instead. Returns how many were
-    actually deposited, so the caller can tell a real shortfall (ran out of that item) from
-    success."""
+    withdrawals, which target a persistent bank-side stack): depositing an item empties its
+    inventory slot, so a stale reference from an earlier iteration could click whatever ends
+    up in that slot next instead. Only counts an item as deposited when BOTH clicks actually
+    register (click_entity can return False on a blocked/off-window aim point or a simulated
+    misclick) -- an unregistered attempt just tries again next iteration against a fresh
+    find_item lookup, up to the `quantity` cap. Returns how many were actually deposited, so
+    the caller can tell a real shortfall (ran out of that item) from success."""
     deposited = 0
     for _ in range(quantity):
         item = find_item(name)
         if item is None:
             break
-        controller.click_entity(ctx.ser, item, check_ui_blockers=False)
-        time.sleep(random.uniform(0.1, 0.2))
-        controller.click_entity(ctx.ser, target)
-        time.sleep(random.uniform(0.2, 0.4))
+        if not controller.click_entity(ctx.ser, item, check_ui_blockers=False):
+            continue
+        time.sleep(random.uniform(0.15, 0.3))
+        if not controller.click_entity(ctx.ser, target):
+            continue
+        time.sleep(random.uniform(0.3, 0.5))
         deposited += 1
     return deposited
 
@@ -332,12 +431,15 @@ def tick(ctx):
 
 
 def find_item(name: str):
-    """First inventory item whose name contains `name` (case-insensitive substring, same
-    idiom as firemaking.py/travel.py/banker.py) -- kept local rather than shared, matching
-    this codebase's established convention of duplicating small per-file lookup helpers."""
+    """Inventory item whose name matches `name` exactly (case-insensitive) -- exact rather
+    than substring match. This file only ever looks up fixed canonical item names (e.g.
+    "Coal", "Iron ore", "Coins", "coal bag"), and a substring match would wrongly match a
+    same-named container too -- e.g. "Coal" matching "Coal bag", the very item this routine
+    also carries. Unlike firemaking.py's find_item, which intentionally supports arbitrary
+    user-configured substring names, there's no equivalent need for that flexibility here."""
     name_lower = name.lower()
     return next(
-        (i for i in controller.get_inventory() if name_lower in (i.get("name") or "").lower()),
+        (i for i in controller.get_inventory() if (i.get("name") or "").lower() == name_lower),
         None,
     )
 
