@@ -186,13 +186,28 @@ def withdraw_coins_via_x(ctx, amount: int) -> bool:
     banker.withdraw_loadout's per-unit click loop -- that loop clicks a slot once per unit of
     quantity (fine for the handful of potions/food every other routine withdraws), which for
     a coin amount in the tens of thousands would mean tens of thousands of individual clicks.
-    "X" mode prompts the same chatbox "Enter amount" numeric input the coffer's own Use
-    action does, so this reuses controller.type_digits_and_enter."""
+
+    ASSUMPTION, NOT YET VERIFIED LIVE: that selecting "X" mode first and then clicking the
+    item is what triggers the chatbox "Enter amount" prompt (the same one the coffer's own
+    Use action opens, hence reusing controller.type_digits_and_enter here) -- as opposed to
+    the X button itself prompting and storing a quantity that a later plain click withdraws
+    silently. If it's the latter, this either withdraws some previously-stored amount or
+    nothing useful; maybe_top_up_coffer's post-withdrawal current_coins() check catches the
+    resulting shortfall either way and soft-retries rather than proceeding on a false
+    success, but verify this live before trusting unattended coffer top-ups -- same
+    epistemic honesty as the module header's coffer-prompt assumption above.
+
+    Requires the bank slot to actually hold at least `amount` coins (skips a placeholder --
+    a real item entry with qty 0 left behind by a full withdrawal -- rather than clicking it
+    and silently withdrawing nothing)."""
     if not banker.set_quantity_mode(ctx, "x"):
         return False
     bank = controller.get_bank()
     slot = next(
-        (s for s in bank.get("items", []) if "coins" in (s.get("name") or "").lower()),
+        (
+            s for s in bank.get("items", [])
+            if "coins" in (s.get("name") or "").lower() and s.get("qty", 0) >= amount
+        ),
         None,
     )
     if slot is None:
@@ -302,23 +317,24 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
     here already budgets all 28 inventory slots and a carried-but-unneeded bag would overflow
     that by one (see plan_bank_withdrawals). If the bag isn't currently held (e.g. a prior
     non-coal trip banked it away, or this is the first coal-needing trip of the session),
-    it's withdrawn back from the bank before being filled -- inserted FIRST in the withdraw
-    list, ahead of any loose-"Coal" entry: banker.withdraw_loadout re-fetches the bank's item
-    list fresh for each entry, and its substring match (unlike this file's own exact-match
-    find_item) would otherwise risk a "Coal" search resolving to a still-in-the-bank "Coal
-    bag" slot if the bag happened to be listed first. Withdrawing the bag first removes it
-    from the bank before the "Coal" entry is ever searched, so the two can never collide.
-    Loose coal is deposited before the bag is emptied, since the bag can only be emptied into
-    slots that are actually free (see module header). Coffer coins are handled entirely
-    separately by maybe_top_up_coffer's own dedicated bank visit, so this function never
-    carries coins itself."""
+    it's withdrawn back from the bank in its OWN withdraw_loadout call, before the materials
+    withdrawal: the bridge's /bank endpoint is cached per game tick (BankProvider.java), so a
+    same-tick re-fetch between two entries in a single withdraw_loadout call can still return
+    a stale, pre-withdrawal snapshot -- putting the bag first in the SAME call (as an earlier
+    version of this function tried) doesn't reliably avoid banker.withdraw_loadout's
+    substring-matching "Coal" search resolving to a still-cached "Coal bag" slot. A full-tick
+    settle sleep after the bag's own withdrawal call is what actually guarantees the next
+    /bank read reflects the bag being gone. Loose coal is deposited before the bag is
+    emptied, since the bag can only be emptied into slots that are actually free (see module
+    header). Coffer coins are handled entirely separately by maybe_top_up_coffer's own
+    dedicated bank visit, so this function never carries coins itself."""
     withdraw, need_bag_fill, loose_coal, bag_coal = plan_bank_withdrawals(trip)
 
     keep_items = []
+    need_bag_withdraw = False
     if need_bag_fill:
         keep_items.append("coal bag")
-        if not banker.has_coal_bag():
-            withdraw.insert(0, {"name": "coal bag", "quantity": 1})
+        need_bag_withdraw = not banker.has_coal_bag()
 
     bank_cfg = {"keepItems": keep_items, "withdraw": withdraw}
 
@@ -327,7 +343,18 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
         if not banker.open_bank(ctx, bank_obj):
             ctx.state.trigger_safety_stop("failed to open the Blast Furnace bank chest")
             return False
+        # The bank's quantity-mode selector (1/5/10/X/All) persists across close/reopen, so a
+        # prior maybe_top_up_coffer visit earlier this same tick can leave it on "X" -- reset
+        # before deposit_inventory's keepItems-aware path (which clicks individual items,
+        # unlike the mode-independent deposit-all button) runs in whatever mode was left over.
+        banker.set_quantity_mode(ctx, "one")
         banker.deposit_inventory(ctx, bank_cfg)
+        if need_bag_withdraw:
+            banker.withdraw_loadout(ctx, {"withdraw": [{"name": "coal bag", "quantity": 1}]})
+            # Let a full game tick pass so the bridge's per-tick-cached /bank read reflects
+            # the bag actually being gone before the materials withdrawal below searches it
+            # for "Coal" -- see the docstring above.
+            time.sleep(random.uniform(0.9, 1.3))
         banker.withdraw_loadout(ctx, bank_cfg)
         if need_bag_fill:
             time.sleep(random.uniform(0.3, 0.5))  # let a just-withdrawn bag register in
