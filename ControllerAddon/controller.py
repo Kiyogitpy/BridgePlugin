@@ -170,6 +170,10 @@ def get_skills():
     return api_get("/skills") or {}
 
 
+def get_blast_furnace_config():
+    return api_get("/blast-furnace-config")
+
+
 def get_minimap_walk_point(x: int, y: int, plane: int):
     return api_get("/minimap/walk", params={"x": x, "y": y, "plane": plane}) or {"onMinimap": False}
 
@@ -1097,6 +1101,7 @@ ROUTINE_FILES = {
     "GEMSTONE_CRAB": "routines/gemstone_crab.py",
     "TORMENTED_DEMON": "routines/tormented_demon.py",
     "FIREMAKING": "routines/firemaking.py",
+    "BLAST_FURNACE": "routines/blast_furnace.py",
 }
 
 

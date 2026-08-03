@@ -13,7 +13,8 @@ public enum RoutineChoice
 	MINING("Mining"),
 	GEMSTONE_CRAB("Gemstone Crab"),
 	TORMENTED_DEMON("Tormented Demon"),
-	FIREMAKING("Firemaking");
+	FIREMAKING("Firemaking"),
+	BLAST_FURNACE("Blast Furnace");
 
 	private final String label;
 
