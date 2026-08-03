@@ -1,4 +1,4 @@
-# controller.py
+﻿# controller.py
 #
 # Generic engine for the RuneLite HTTP/UDP bridge. controller.py owns the
 # *plumbing*: talking to the bridge (HTTP state + UDP events), driving the
@@ -160,6 +160,14 @@ def get_graphics_objects():
 
 def get_tormented_demon_config():
     return api_get("/tormented-demon-config")
+
+
+def get_firemaking_config():
+    return api_get("/firemaking-config")
+
+
+def get_skills():
+    return api_get("/skills") or {}
 
 
 def get_minimap_walk_point(x: int, y: int, plane: int):
@@ -1069,6 +1077,7 @@ ROUTINE_FILES = {
     "MINING": "routines/mining.py",
     "GEMSTONE_CRAB": "routines/gemstone_crab.py",
     "TORMENTED_DEMON": "routines/tormented_demon.py",
+    "FIREMAKING": "routines/firemaking.py",
 }
 
 
