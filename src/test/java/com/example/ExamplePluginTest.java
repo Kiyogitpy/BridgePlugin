@@ -1,6 +1,7 @@
 package com.example;
 
 import com.example.controller.ControllerPlugin;
+import com.example.controller.FiremakingPlugin;
 import com.example.controller.GemstoneCrabPlugin;
 import com.example.controller.MiningPlugin;
 import com.example.controller.SlayerPlugin;
@@ -20,7 +21,8 @@ public class ExamplePluginTest
 			SlayerPlugin.class,
 			MiningPlugin.class,
 			GemstoneCrabPlugin.class,
-			TormentedDemonPlugin.class
+			TormentedDemonPlugin.class,
+			FiremakingPlugin.class
 		);
 		RuneLite.main(args);
 	}
