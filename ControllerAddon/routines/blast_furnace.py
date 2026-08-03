@@ -181,17 +181,44 @@ def current_coins() -> int:
     return coins.get("qty", 0) if coins else 0
 
 
+def withdraw_coins_via_x(ctx, amount: int) -> bool:
+    """Withdraw an exact coin amount using the bank's custom-quantity ("X") mode rather than
+    banker.withdraw_loadout's per-unit click loop -- that loop clicks a slot once per unit of
+    quantity (fine for the handful of potions/food every other routine withdraws), which for
+    a coin amount in the tens of thousands would mean tens of thousands of individual clicks.
+    "X" mode prompts the same chatbox "Enter amount" numeric input the coffer's own Use
+    action does, so this reuses controller.type_digits_and_enter."""
+    if not banker.set_quantity_mode(ctx, "x"):
+        return False
+    bank = controller.get_bank()
+    slot = next(
+        (s for s in bank.get("items", []) if "coins" in (s.get("name") or "").lower()),
+        None,
+    )
+    if slot is None:
+        return False
+    if not controller.click_entity(ctx.ser, slot):
+        return False
+    time.sleep(random.uniform(0.4, 0.7))  # wait for the amount prompt to appear
+    controller.type_digits_and_enter(ctx.ser, str(amount))
+    time.sleep(random.uniform(0.3, 0.5))
+    return True
+
+
 def maybe_top_up_coffer(ctx, config: dict) -> None:
     """Blind, time-based coffer top-up -- see module header for why this can't be
     balance-aware. Does its own dedicated bank visit for coins (withdrawing only if the
     current holding is short) rather than folding coin-carrying into run_trip's ore/coal
     banking: every trip pattern here already fills all 28 inventory slots with ore/coal, so
-    there's no spare slot to also carry coins alongside a materials trip. The withdrawn coins
-    are spent into the coffer within this same call, so by the time run_trip runs later this
-    tick, inventory is back to holding no loose coins and its own slot budgeting is
-    undisturbed. Checked once per tick alongside the main trip logic, same as how other
-    routines interleave periodic side-actions (e.g. slayer.py's supply/prayer checks) with
-    their main loop."""
+    there's no spare slot to also carry coins alongside a materials trip. This runs at the
+    top of tick(), right after the previous trip's bar collection -- inventory can be
+    completely full of bars at that moment, so deposit_inventory (with no keepItems at all)
+    clears everything away before withdrawing coins, guaranteeing the coin stack has a slot.
+    The withdrawn coins are spent into the coffer within this same call, so by the time
+    run_trip runs later this tick, inventory is back to holding no loose coins and its own
+    slot budgeting is undisturbed. Checked once per tick alongside the main trip logic, same
+    as how other routines interleave periodic side-actions (e.g. slayer.py's supply/prayer
+    checks) with their main loop."""
     coffer_cfg = config.get("coffer", {})
     if not coffer_cfg.get("topUpEnabled"):
         return
@@ -214,8 +241,14 @@ def maybe_top_up_coffer(ctx, config: dict) -> None:
             print("[blast furnace] couldn't open the bank for coffer top-up -- will retry shortly")
             ctx.state.data["bf_coffer_next_topup_at"] = now + 60
             return
-        banker.withdraw_loadout(ctx, {"withdraw": [{"name": "Coins", "quantity": amount}]})
+        banker.deposit_inventory(ctx, {"keepItems": []})
+        withdrew = withdraw_coins_via_x(ctx, amount)
         banker.close_bank(ctx)
+        time.sleep(random.uniform(0.3, 0.6))  # let the bank-closing transition settle
+        if not withdrew or current_coins() < amount:
+            print("[blast furnace] couldn't withdraw enough coins for coffer top-up -- will retry shortly")
+            ctx.state.data["bf_coffer_next_topup_at"] = now + 60
+            return
 
     coffer = find_object(config, "Coffer")
     if coffer is None:
@@ -269,17 +302,23 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
     here already budgets all 28 inventory slots and a carried-but-unneeded bag would overflow
     that by one (see plan_bank_withdrawals). If the bag isn't currently held (e.g. a prior
     non-coal trip banked it away, or this is the first coal-needing trip of the session),
-    it's withdrawn back from the bank before being filled. Loose coal is deposited before the
-    bag is emptied, since the bag can only be emptied into slots that are actually free (see
-    module header). Coffer coins are handled entirely separately by maybe_top_up_coffer's own
-    dedicated bank visit, so this function never carries coins itself."""
+    it's withdrawn back from the bank before being filled -- inserted FIRST in the withdraw
+    list, ahead of any loose-"Coal" entry: banker.withdraw_loadout re-fetches the bank's item
+    list fresh for each entry, and its substring match (unlike this file's own exact-match
+    find_item) would otherwise risk a "Coal" search resolving to a still-in-the-bank "Coal
+    bag" slot if the bag happened to be listed first. Withdrawing the bag first removes it
+    from the bank before the "Coal" entry is ever searched, so the two can never collide.
+    Loose coal is deposited before the bag is emptied, since the bag can only be emptied into
+    slots that are actually free (see module header). Coffer coins are handled entirely
+    separately by maybe_top_up_coffer's own dedicated bank visit, so this function never
+    carries coins itself."""
     withdraw, need_bag_fill, loose_coal, bag_coal = plan_bank_withdrawals(trip)
 
     keep_items = []
     if need_bag_fill:
         keep_items.append("coal bag")
         if not banker.has_coal_bag():
-            withdraw.append({"name": "coal bag", "quantity": 1})
+            withdraw.insert(0, {"name": "coal bag", "quantity": 1})
 
     bank_cfg = {"keepItems": keep_items, "withdraw": withdraw}
 
@@ -291,11 +330,15 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
         banker.deposit_inventory(ctx, bank_cfg)
         banker.withdraw_loadout(ctx, bank_cfg)
         if need_bag_fill:
+            time.sleep(random.uniform(0.3, 0.5))  # let a just-withdrawn bag register in
+                                                    # get_inventory() before fill_coal_bag
+                                                    # looks for it
             if not banker.fill_coal_bag(ctx):
                 banker.close_bank(ctx)
                 ctx.state.trigger_safety_stop("no coal bag in inventory or bank -- this bar type needs one")
                 return False
         banker.close_bank(ctx)
+        time.sleep(random.uniform(0.3, 0.6))  # let the bank-closing transition settle
     elif config.get("bank", {}).get("teleportFallback"):
         if need_bag_fill:
             ctx.state.trigger_safety_stop(
@@ -379,20 +422,26 @@ def deposit_items(ctx, name: str, quantity: int, target: dict) -> int:
     find_item rather than reusing one slot reference repeatedly (unlike bank-slot
     withdrawals, which target a persistent bank-side stack): depositing an item empties its
     inventory slot, so a stale reference from an earlier iteration could click whatever ends
-    up in that slot next instead. Only counts an item as deposited when BOTH clicks actually
-    register (click_entity can return False on a blocked/off-window aim point or a simulated
-    misclick) -- an unregistered attempt just tries again next iteration against a fresh
-    find_item lookup, up to the `quantity` cap. Returns how many were actually deposited, so
-    the caller can tell a real shortfall (ran out of that item) from success."""
+    up in that slot next instead. Only counts an item as deposited when BOTH clicks return
+    True (click_entity returns False on a blocked or off-window aim point; note this does
+    NOT catch every near-miss -- a small chance of an intentionally jittered "close but not
+    on target" click still resolves as a normal, successful click in the game's own menu
+    resolution, so the shortfall check below is a real improvement but not an absolute
+    guarantee) -- an unregistered attempt sleeps briefly and tries again next iteration
+    against a fresh find_item lookup, up to the `quantity` cap. Returns how many were
+    actually deposited, so the caller can tell a real shortfall (ran out of that item) from
+    success."""
     deposited = 0
     for _ in range(quantity):
         item = find_item(name)
         if item is None:
             break
         if not controller.click_entity(ctx.ser, item, check_ui_blockers=False):
+            time.sleep(random.uniform(0.2, 0.4))
             continue
         time.sleep(random.uniform(0.15, 0.3))
         if not controller.click_entity(ctx.ser, target):
+            time.sleep(random.uniform(0.2, 0.4))
             continue
         time.sleep(random.uniform(0.3, 0.5))
         deposited += 1
