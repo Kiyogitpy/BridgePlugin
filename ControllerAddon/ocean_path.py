@@ -31,12 +31,33 @@ _FALLBACK_CLEARANCE_TILES = 2  # dilation radius used when the boat's true bound
                                 # the boat's real bounds -- the retry-ladder in find_ocean_route falls
                                 # back to this constant when that happens, for exactly this reason.
 
-# 8-directional grid movement -- fine-grained enough for the compass-snapped heading steer_toward
-# already handles; the grid is only used to find a route around obstacles, not to model the boat's
-# exact heading options.
-_NEIGHBOR_OFFSETS = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+# 16-directional grid movement -- the standard 8 compass offsets plus 8 "knight-move" offsets
+# ((+-1,+-2)/(+-2,+-1)), which approximate the 22.5-degree angles a square grid can't represent as
+# single unit steps. This is still just the route-PLANNING grid, not a model of the boat's real
+# heading options -- steer_toward's hops get compass-snapped to ~8 headings regardless of how many
+# directions this grid uses (see steer_toward), so the payoff is purely straighter/tighter routes
+# around obstacles (less zig-zag overshoot than 8-directional's 45-degree-only diagonals), not
+# finer boat control. UNVERIFIED live -- not yet observed producing a measurably tighter route
+# through a real narrow channel; flagged for confirmation same as this file's other constants.
+_NEIGHBOR_OFFSETS = [
+    (-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1),
+    (-2, -1), (-2, 1), (2, -1), (2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2),
+]
 _DIAGONAL_COST = 1.4142135
 _STRAIGHT_COST = 1.0
+_KNIGHT_COST = 2.2360680
+
+# For each knight offset, the two flanking one-step cells it "jumps past" -- CONFIRMED by
+# inspection, not live: without this check a knight move could cut straight through a blocked tile
+# sitting between its start and end (the same corner-cutting risk that 2-tile-diagonal jumps always
+# carry, but the existing 8-directional moves never had to guard against since they only ever
+# jump 1 tile). Both flanking cells must be passable for the knight move to be allowed.
+_KNIGHT_CHECK_CELLS = {
+    (-2, -1): ((-1, 0), (-1, -1)), (-2, 1): ((-1, 0), (-1, 1)),
+    (2, -1): ((1, 0), (1, -1)), (2, 1): ((1, 0), (1, 1)),
+    (-1, -2): ((0, -1), (-1, -1)), (-1, 2): ((0, 1), (-1, 1)),
+    (1, -2): ((0, -1), (1, -1)), (1, 2): ((0, 1), (1, 1)),
+}
 
 
 def find_ocean_route(start: dict, target: dict) -> list | None:
@@ -146,21 +167,31 @@ def _astar(start_xy, target_xy, passable):
             neighbor = (cx + dx, cy + dy)
             if neighbor not in passable:
                 continue
-            step_cost = _DIAGONAL_COST if dx != 0 and dy != 0 else _STRAIGHT_COST
+            check_cells = _KNIGHT_CHECK_CELLS.get((dx, dy))
+            if check_cells is not None:
+                if not all((cx + ox, cy + oy) in passable for ox, oy in check_cells):
+                    continue
+                step_cost = _KNIGHT_COST
+            else:
+                step_cost = _DIAGONAL_COST if dx != 0 and dy != 0 else _STRAIGHT_COST
             tentative_g = g_score[current] + step_cost
             if tentative_g < g_score.get(neighbor, float("inf")):
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_g
-                f_score = tentative_g + _octile_heuristic(neighbor, target_xy)
+                f_score = tentative_g + _heuristic(neighbor, target_xy)
                 heapq.heappush(open_heap, (f_score, neighbor))
 
     return None
 
 
-def _octile_heuristic(a, b):
-    dx = abs(a[0] - b[0])
-    dy = abs(a[1] - b[1])
-    return max(dx, dy) + 0.4142135 * min(dx, dy)
+def _heuristic(a, b):
+    # Plain Euclidean distance, not the old octile estimate -- CONFIRMED by inspection: octile
+    # assumes only straight/diagonal moves and would overestimate (become inadmissible) now that a
+    # knight move covers displacement (1,2)/(2,1) for less cost (sqrt(5) ~= 2.236) than the
+    # equivalent straight+diagonal combo octile assumes (2 + sqrt(2)-1 ~= 2.414). Euclidean distance
+    # never exceeds any move's real cost regardless of move set (every step's cost >= its straight-
+    # line length here), so it stays admissible without needing to special-case the knight moves.
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
 def _simplify_path(path):

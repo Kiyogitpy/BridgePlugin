@@ -592,6 +592,36 @@ both squares -- so `WRECK_SQUARE_SIZE` itself, not double it, is the correct bou
 check still can't see (scene/tile lag, etc.), but its docstring no longer blames `maxDistance` for
 the failure case it was originally added to catch.
 
+## Design update: `ocean_path.py` A* moved from 8- to 16-directional grid movement (2026-08-04)
+
+`find_ocean_route`'s A* grid (see the "obstacle-aware route planning" update above) used the
+standard 8 compass offsets, matching `steer_toward`'s own compass-snapped heading options at the
+time this was written. Revisited: the grid only decides route-planning *waypoints* -- the actual
+hop clicks that follow always get compass-snapped to ~8 headings regardless of how many directions
+the grid itself uses (see `steer_toward`), so there was never an actual requirement to keep the two
+in lock-step. Widened to 16 directions (the existing 8 plus 8 "knight-move" offsets,
+`(+-1,+-2)`/`(+-2,+-1)`) purely for straighter/tighter routes around obstacles -- approximates the
+22.5-degree angles a square grid can't represent as single unit steps, reducing the zig-zag
+overshoot 8-directional's 45-degree-only diagonals can produce in a tight channel.
+
+Two correctness details needed for this to be more than a cosmetic list change, both in
+`ocean_path.py`:
+- **Corner-cutting.** A knight move jumps two tiles in one direction, which raised a risk the
+  original 8-directional moves never had to guard against (they only ever jump one tile): the move
+  could cut straight through a blocked tile sitting between its start and end. Each knight offset
+  now has two flanking one-step cells (`_KNIGHT_CHECK_CELLS`) that must both be passable for the
+  move to be allowed.
+- **Heuristic admissibility.** The old `_octile_heuristic` assumed only straight/diagonal moves and
+  overestimates cost now that a knight move covers a `(1, 2)`-style displacement for `sqrt(5) ≈
+  2.236` versus the `2.414` an equivalent straight+diagonal combo would cost under the old move set
+  -- an inadmissible heuristic doesn't produce a wrong or unsafe route, but can produce a
+  needlessly longer one, defeating the point of widening the move set to begin with. Replaced with
+  plain Euclidean distance, which never exceeds any move's real cost regardless of move set.
+
+Not yet live-tested: whether 16-directional movement actually produces a measurably tighter route
+through a real narrow channel, or whether the difference is negligible in practice given routes are
+already simplified down to corner waypoints.
+
 ## Design
 
 ### 1. `SailingProvider.java` (new)
