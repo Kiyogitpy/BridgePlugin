@@ -503,6 +503,95 @@ rather than blindly retrying the same heading that just failed.
 `BOAT_CLEARANCE_TILES=4` is an initial estimate from the boat's known footprint, not live-tuned --
 flagged for adjustment once observed, same convention as every other numeric constant in this spec.
 
+## Design update: pair-midpoint zone size + verified arrival (2026-08-03)
+
+Live testing surfaced two problems with the pair-midpoint targeting added 2026-08-02, both reported
+directly by the user: it was landing on only one of the two wrecks instead of their midpoint, and
+even after that was fixed the boat still missed the intended point by a wide margin.
+
+**Zone size -- tried and reverted.** `PAIR_MAX_TILES` (16) was originally derived from twice the
+hook's `maxDistance` (8). On 2026-08-03, based on a user-observed on-screen range overlay (two
+green squares in the salvaging UI, one per wreck) that looked like a 15-tile per-wreck zone, this
+was changed to `WRECK_ZONE_TILES = 15` / `PAIR_MAX_TILES = WRECK_ZONE_TILES * 2` (30) on the theory
+that this overlay represented the real max-salvage-yield range. **Reverted 2026-08-04** (user
+report: "it is literally sitting on two squares but tries to go away from them") -- that overlay is
+NOT the hook's functional engage range. With `PAIR_MAX_TILES=30`, a computed midpoint could land up
+to 15 tiles from either wreck, well outside the 8-tile range the hook can actually reach, so
+`find_nearby_wreck(maxDistance=8)` kept reporting nothing in range even while the boat sat squarely
+between both wrecks -- the routine never stopped trying to reposition. `PAIR_MAX_TILES` is back to
+16 (`2 * maxDistance`), the only figure that's actually CONFIRMED live to matter for whether the
+hook can engage.
+
+**Root cause of only-one-wreck targeting.** `find_wreck_pair_target`'s partner search calls
+`controller.get_objects(radius=PAIR_MAX_TILES + padding)` -- but that radius is centered on the
+PLAYER (see `controller.get_objects`), not on `wreck`, the position actually being searched
+around. On the routine's normal initial approach this runs against `far_wreck`, which can be up to
+`maxSailDistance` (60) tiles from the player -- so a real partner sitting near `far_wreck` was
+almost always outside the (much smaller) player-centered search box and silently never found.
+Fixed by widening the search radius by however far the player currently is from `wreck`, so the box
+reaches `PAIR_MAX_TILES` past `wreck` regardless of where the player is standing.
+
+**Root cause of the remaining margin, after the search bug was fixed.** `sail_to`'s final-leg
+arrival used the wide `SAIL_BRAKE_TRIGGER_TILES` (10) tolerance plus `stop_boat`'s own 2.2-5.0 tile
+drift -- deliberate slop from the 2026-08-02 anti-ramming fix, appropriate when the target is a
+solid wreck but far too loose for a computed midpoint over open water, where there's no collision
+risk and precision is what actually matters. `sailing.sail_to` now takes a `brake: bool = True`
+parameter; `brake=False` uses the tighter `SAIL_ARRIVAL_TOLERANCE` (5) for the final leg instead of
+`SAIL_BRAKE_TRIGGER_TILES`.
+
+**Verified arrival, not just trusted.** `find_wreck_pair_target` now returns `(target, partner)`
+instead of just `target`, so the caller can tell a real midpoint (partner found, safe to skip
+braking) apart from the single-wreck fallback (a real solid object, still needs the wide brake
+tolerance). New `sail_to_pair(ctx, config, wreck)` wraps this: sails with `brake=False` only when a
+partner exists, then explicitly checks the boat's landed position is within `config`'s actual
+`maxDistance` of *both* wrecks (Chebyshev, matching every other range check in this file) -- if
+not, one corrective `brake=False` re-sail. Checking against `maxDistance` specifically (not the
+reverted `WRECK_ZONE_TILES` above) matters for the same reason: verifying against a looser zone
+could report "landed fine" even when the hook genuinely couldn't reach either wreck from there.
+Both `tick()` call sites (initial far-wreck approach, near-wreck stuck self-heal) now go through
+`sail_to_pair` instead of calling `sailing.sail_to` directly on `find_wreck_pair_target`'s result.
+
+Not yet live-tuned: whether one corrective re-sail is consistently enough to close the gap, or
+whether the tighter `SAIL_ARRIVAL_TOLERANCE` still leaves occasional edge-of-zone landings needing
+more than one retry.
+
+## Design update: `WRECK_SQUARE_SIZE` + true-tile hull replaces `maxDistance` entirely (2026-08-04)
+
+The `maxDistance` figure (15, then 8 after live tuning) was always an approximation standing in for
+two things this session finally pinned down precisely:
+
+1. **`SalvagingHighlight.java`'s `SIZE_SALVAGEABLE_AREA = 15`** -- re-examined against
+   `runelite-api`'s actual `Perspective.getCanvasTileAreaPoly` source (not available in this
+   project's own obfuscated-client decompile, but present in the separate `IdeaProjects/runelite`
+   checkout): its own doc comment states `size` is a **centered** square ("3x3 AoE evaluates to
+   size 3"), implemented as `localLocation ± (size * LOCAL_TILE_SIZE / 2)`. So `15` is a 15x15
+   square split evenly around the wreck -- 7.5 tiles to each side -- not a one-directional radius,
+   and not the "unrelated cosmetic overlay" the 2026-08-03/04 revert (above) had concluded. That
+   revert's real bug was a units mix-up (using `15` directly as a radius, doubling it again for
+   `PAIR_MAX_TILES`), not a wrong overlay.
+2. **The boat's true-tile hull footprint** -- `PlayerProvider.java` already exposed
+   `boatWidth`/`boatHeight` (RuneLite's own `WorldEntityConfig` bounds, modeled on the sideloaded
+   Sailing plugin's `TrueTileIndicator.renderBoatArea`) but flagged them `UNVERIFIED live` since
+   2026-08-02.
+
+**CONFIRMED live 2026-08-04 (user report):** both of the above are exact -- the wreck's real
+salvageable range is precisely its `SIZE_SALVAGEABLE_AREA` square, and the boat's real hull extent
+for range purposes is precisely its true-tile bounding box. `maxDistance` is removed entirely (no
+longer in `DEFAULT_CONFIG`) and replaced with `WRECK_SQUARE_SIZE = 15` / `WRECK_SQUARE_HALF = 7.5`
+plus a rectangle/square overlap test (`_boat_hull_rect`, `_wreck_in_hook_range` in
+`shipwreck_salvaging.py`) between the boat's hull box and each wreck's centered square, instead of
+a single-point Chebyshev distance check. `find_wreck_in_hook_range` replaces the near-wreck
+`find_nearby_wreck(config, maxDistance)` call in `tick()`; `find_nearby_wreck` itself is now only
+used for the farther `maxSailDistance` "worth sailing to" search, which was never about hook range
+in the first place.
+
+`PAIR_MAX_TILES` is now derived directly as `WRECK_SQUARE_SIZE` (15, down from the old
+`2 * maxDistance` = 16): a boat sitting at the midpoint of two wrecks is `WRECK_SQUARE_SIZE / 2`
+from each one exactly when their centers are `WRECK_SQUARE_SIZE` tiles apart -- the shared edge of
+both squares -- so `WRECK_SQUARE_SIZE` itself, not double it, is the correct bound. `HOOK_ENGAGE_TIMEOUT_S`'s reclick-stuck self-heal is kept as a backstop for whatever the geometric
+check still can't see (scene/tile lag, etc.), but its docstring no longer blames `maxDistance` for
+the failure case it was originally added to catch.
+
 ## Design
 
 ### 1. `SailingProvider.java` (new)

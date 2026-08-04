@@ -32,14 +32,13 @@ import sailing
 
 DEFAULT_CONFIG = {
     "enabled": True,
-    "wreckNames": ["Small shipwreck", "Fisherman's shipwreck"],
+    "wreckNames": ["Small shipwreck", "Fisherman's shipwreck", "Large shipwreck"],
     "hookName": "salvaging hook",  # tier-agnostic on purpose: deploy_hook() matches this as a
                                     # substring against the boat's actual hook name, and the boat's
                                     # hook tier (Bronze/Iron/.../Dragon, see
                                     # data/decompiled/sailing-plugin's SalvagingHookTier) changes
                                     # independently of this routine's config -- pinning to one tier
                                     # name broke the moment the boat's hook got upgraded to Steel.
-    "maxDistance": 8,        # hook-operating range -- gathering happens here, no boat movement
     "maxSailDistance": 60,   # a farther wreck worth repositioning the boat for
 
     "breaks": {
@@ -70,17 +69,15 @@ HOOK_CLICK_COOLDOWN_S = 3.0  # don't reclick the hook again within this long of 
                               # starts, causing back-to-back redundant clicks without this. Still
                               # short enough to redeploy quickly for a genuine stop (wreck sank,
                               # misclick retrieved it, ...), just not on literally every tick.
-HOOK_ENGAGE_TIMEOUT_S = 12.0  # CONFIRMED live 2026-08-02: maxDistance (the configured
-                               # hook-operating range) is only a guess at the hook's real
-                               # functional range -- observed live standing exactly at a wreck
-                               # 15 tiles away (the configured default), isIdle stayed True and
-                               # animation stayed -1 no matter how many times the hook got
-                               # reclicked, because the wreck was actually still too far for the
-                               # hook to engage even though it passed the maxDistance check. If
-                               # isIdle never goes False for this long despite repeated reclicks,
-                               # the wreck is probably out of real range regardless of what
-                               # maxDistance said -- reposition closer instead of reclicking
-                               # forever.
+HOOK_ENGAGE_TIMEOUT_S = 12.0  # Kept as a backstop even after switching to the geometric
+                               # WRECK_SQUARE_SIZE check (CONFIRMED live 2026-08-04). History: this
+                               # was originally added because a flat maxDistance guess (15, then 8)
+                               # didn't reliably predict real engagement -- observed live standing
+                               # at a wreck that still failed to engage despite passing the
+                               # distance check. If isIdle never goes False for this long despite
+                               # repeated reclicks even though _wreck_in_hook_range said yes,
+                               # reposition closer instead of reclicking forever -- covers any edge
+                               # case the geometric check still misses (e.g. scene/tile lag).
 
 
 def tick(ctx):
@@ -90,7 +87,7 @@ def tick(ctx):
         drop_salvage(ctx)
         return
 
-    near_wreck = find_nearby_wreck(config, config.get("maxDistance", 15))
+    near_wreck = find_wreck_in_hook_range(config)
     if near_wreck is not None:
         # isIdle only gates the reclick itself (avoid spam-clicking mid-channel) -- it must NOT
         # gate this whole branch, or the far-wreck check below never runs. CONFIRMED live
@@ -115,7 +112,7 @@ def tick(ctx):
             attempt_start = ctx.state.data.setdefault("hook_engage_attempt_at", now)
             if now - attempt_start > HOOK_ENGAGE_TIMEOUT_S:
                 print("[salvage] hook isn't engaging after repeated clicks -- repositioning closer")
-                sailing.sail_to(ctx, find_wreck_pair_target(config, near_wreck))
+                sail_to_pair(ctx, config, near_wreck)
                 ctx.state.data.pop("hook_engage_attempt_at", None)
             sailing.deploy_hook(ctx, config.get("hookName", ""))
             ctx.state.data["last_deploy_click_at"] = now
@@ -125,7 +122,7 @@ def tick(ctx):
     far_wreck = find_nearby_wreck(config, config.get("maxSailDistance", 60))
     if far_wreck is not None:
         # No "not navigating" gate here either -- see the near-wreck branch's comment above.
-        if sailing.sail_to(ctx, find_wreck_pair_target(config, far_wreck)):
+        if sail_to_pair(ctx, config, far_wreck):
             sailing.deploy_hook(ctx, config.get("hookName", ""))
             ctx.state.data["last_deploy_click_at"] = time.time()
         return
@@ -202,15 +199,28 @@ SUNK_SHIPWRECK_IDS = frozenset({60465, 60467, 60469, 60471, 60473, 60475, 60477,
 # player-centered box and get silently missed.
 WRECK_SEARCH_RADIUS_PADDING = 10
 
+# The sideloaded Sailing plugin's SalvagingHighlight.java SIZE_SALVAGEABLE_AREA -- CONFIRMED live
+# 2026-08-04 (user report) to be the hook's real engage boundary, replacing the earlier maxDistance
+# guess (15, then 8) entirely. runelite-api's own Perspective.getCanvasTileAreaPoly centers this on
+# the wreck's own tile ("size the size of the area (ie. 3x3 AoE evaluates to size 3)", and the
+# implementation offsets by size * LOCAL_TILE_SIZE / 2 to each side) -- so it's a size x size
+# square split evenly around the wreck, not a one-directional radius on its own.
+WRECK_SQUARE_SIZE = 15
+WRECK_SQUARE_HALF = WRECK_SQUARE_SIZE / 2.0
+
 # Max distance (tiles, between the two wrecks themselves) for find_wreck_pair_target to treat two
 # active wrecks as a pair worth positioning between. Shipwrecks spawn in close pairs at each
 # hotspot (wiki-confirmed: "a different pair of shipwrecks", "double Salvage spots" -- see
 # data/raw/S/Shipwreck salvaging.txt), and the hook does NOT auto-continue onto a different active
 # wreck once its own sinks (CONFIRMED live 2026-08-01) -- so pre-positioning at the midpoint of a
 # pair means a re-click after the first sinks can pick up the second immediately, no second sail
-# trip needed. Initial estimate (not yet live-tuned): twice the hook's maxDistance (8), so a
-# midpoint puts both wrecks within hook range.
-PAIR_MAX_TILES = 16
+# trip needed. Derived from WRECK_SQUARE_SIZE: a boat sitting at the midpoint of two wrecks is
+# WRECK_SQUARE_SIZE/2 from each wreck once their centers are WRECK_SQUARE_SIZE tiles apart --
+# exactly the shared edge of both squares -- so WRECK_SQUARE_SIZE itself is the right geometric
+# bound. (History, see the design spec's 2026-08-03/04 updates: two earlier values -- 30 from
+# doubling WRECK_SQUARE_SIZE, and 16 from doubling the old maxDistance=8 -- were both wrong for the
+# same reason, mixing up a diameter with a radius.)
+PAIR_MAX_TILES = WRECK_SQUARE_SIZE
 
 
 def find_nearby_wreck(config: dict, max_dist: float):
@@ -218,20 +228,23 @@ def find_nearby_wreck(config: dict, max_dist: float):
     the player), or None (sunk wrecks -- see SUNK_SHIPWRECK_IDS -- are filtered out; matching them
     would let the routine treat a dead wreck as "in range" and never look for a real one).
 
+    Only used for the farther "is this wreck worth sailing to" check (maxSailDistance) now -- the
+    near/hook-range case uses find_wreck_in_hook_range's WRECK_SQUARE_SIZE geometry instead (see
+    its own docstring for why a flat max_dist guess didn't hold up for that purpose).
+
     Measures from /player's boatX/boatY (falling back to the player's own x/y if not aboard a
     WorldEntity) rather than trusting ObjectProvider's own player-relative "distance" field.
     CONFIRMED live 2026-08-02: a Sailing boat's own WorldView is only ~8 tiles per side, and
-    standing at one end can be several tiles from the opposite end -- maxDistance is a range check
-    against something the *boat*'s hook needs to reach, not specifically wherever the player
-    happens to be standing on deck, so the player-relative distance could read "out of range" (or
-    "in range") wrongly by that same margin.
+    standing at one end can be several tiles from the opposite end -- this is a range check against
+    something the *boat* needs to reach, not specifically wherever the player happens to be
+    standing on deck, so the player-relative distance could read "out of range" (or "in range")
+    wrongly by that same margin.
 
     Pure range test otherwise -- the wreck itself is never clicked (only the boat's own salvaging
     hook is), so on-screen-projectability doesn't matter here, only world position. ObjectProvider
-    always sets x/y from the object's WorldPoint regardless of whether it's currently on-screen,
-    which is exactly what both the hook-operating-range check and the farther sail-range check
-    need. Chebyshev distance (max(|dx|, |dy|)), matching WorldPoint.distanceTo2D's own convention
-    on the Java side.
+    always sets x/y from the object's WorldPoint regardless of whether it's currently on-screen.
+    Chebyshev distance (max(|dx|, |dy|)), matching WorldPoint.distanceTo2D's own convention on the
+    Java side.
 
     Passes max_dist (plus padding, see WRECK_SEARCH_RADIUS_PADDING) as /objects' radius --
     CONFIRMED live 2026-08-02: an unbounded full-scene walk building screen-projection data for
@@ -266,21 +279,40 @@ def find_nearby_wreck(config: dict, max_dist: float):
     return best
 
 
-def find_wreck_pair_target(config: dict, wreck: dict) -> dict:
+def find_wreck_pair_target(config: dict, wreck: dict):
     """Given a wreck the routine is about to sail to, look for a second matching active wreck
     within PAIR_MAX_TILES of it (same tier names as wreck, same plane, not sunk) and target their
     midpoint instead of the lone wreck -- see PAIR_MAX_TILES's comment for why. Falls back to the
     given wreck's own position if no partner is found nearby (confirmed with the user: a lone
     wreck is still worth sailing to directly, pairing is an optimization, not a requirement).
 
-    Returns a plain {"x", "y", "plane"} dict, the same shape sailing.sail_to already expects as
-    its target -- not a raw ObjectProvider entry, since a midpoint isn't a real game object."""
+    Returns (target, partner): target is a plain {"x", "y", "plane"} dict, the same shape
+    sailing.sail_to already expects (not a raw ObjectProvider entry, since a midpoint isn't a real
+    game object). partner is the raw partner object if one was found, else None -- callers need it
+    (not just target) to verify the boat actually landed within range of BOTH wrecks after
+    sailing, since target alone can't distinguish "real wreck, brake to avoid ramming it" from "a
+    midpoint over open water, no collision risk"."""
     names = {n.lower() for n in config.get("wreckNames", [])}
     wx, wy, wplane = wreck.get("x"), wreck.get("y"), wreck.get("plane")
 
+    # get_objects' radius is centered on the PLAYER, not on wreck (see controller.get_objects) --
+    # BUG confirmed live 2026-08-03 (user report: "it only aims for one wreck instead of the
+    # center of the two"): passing PAIR_MAX_TILES alone left the search box too small whenever
+    # wreck itself was still far from the player (the common case -- this runs against far_wreck,
+    # up to maxSailDistance away, on the routine's initial approach), so a real partner near wreck
+    # sat outside the box and was silently never found. Widen the box by however far the player
+    # already is from wreck, so it reaches PAIR_MAX_TILES past wreck regardless of where the
+    # player currently stands.
+    player = controller.get_player()
+    origin_x = player.get("boatX", player.get("x"))
+    origin_y = player.get("boatY", player.get("y"))
+    dist_to_wreck = 0
+    if origin_x is not None and origin_y is not None:
+        dist_to_wreck = max(abs(wx - origin_x), abs(wy - origin_y))
+
     best_partner = None
     best_dist = None
-    for o in controller.get_objects(radius=int(PAIR_MAX_TILES) + WRECK_SEARCH_RADIUS_PADDING):
+    for o in controller.get_objects(radius=int(dist_to_wreck + PAIR_MAX_TILES) + WRECK_SEARCH_RADIUS_PADDING):
         if (o.get("name") or "").lower() not in names:
             continue
         if o.get("id") in SUNK_SHIPWRECK_IDS:
@@ -301,11 +333,110 @@ def find_wreck_pair_target(config: dict, wreck: dict) -> dict:
             best_partner, best_dist = o, dist
 
     if best_partner is None:
-        return {"x": wx, "y": wy, "plane": wplane}
+        return {"x": wx, "y": wy, "plane": wplane}, None
 
     print(f"[salvage] found a wreck pair {best_dist} tiles apart -- sailing to the midpoint")
-    return {
+    target = {
         "x": (wx + best_partner["x"]) // 2,
         "y": (wy + best_partner["y"]) // 2,
         "plane": wplane,
     }
+    return target, best_partner
+
+
+def _boat_hull_rect(player: dict):
+    """Boat's true-tile hull footprint as (min_x, max_x, min_y, max_y) -- CONFIRMED live
+    2026-08-04 (user report) against the sideloaded Sailing plugin's own TrueTileIndicator overlay
+    (data/decompiled/sailing-plugin's TrueTileIndicator.renderBoatArea), which PlayerProvider's
+    boatWidth/boatHeight fields were already modeled on (RuneLite's own WorldEntityConfig bounds,
+    not a guessed size). None if the boat's position/bounds aren't available (not aboard a
+    WorldEntity)."""
+    origin_x = player.get("boatX", player.get("x"))
+    origin_y = player.get("boatY", player.get("y"))
+    if origin_x is None or origin_y is None:
+        return None
+    half_w = player.get("boatWidth", 0) / 2.0
+    half_h = player.get("boatHeight", 0) / 2.0
+    return origin_x - half_w, origin_x + half_w, origin_y - half_h, origin_y + half_h
+
+
+def _wreck_in_hook_range(player: dict, wreck: dict) -> bool:
+    """Whether the boat's true-tile hull footprint (_boat_hull_rect) overlaps wreck's own
+    WRECK_SQUARE_SIZE square -- i.e. whether the hook could actually engage it from here. Replaces
+    the old single-point maxDistance guess entirely (CONFIRMED live 2026-08-04, see
+    WRECK_SQUARE_SIZE's own comment) with a real rectangle/square overlap test: two axis-aligned
+    boxes overlap exactly when they're within reach of each other on BOTH axes at once."""
+    hull = _boat_hull_rect(player)
+    wx, wy = wreck.get("x"), wreck.get("y")
+    if hull is None or wx is None or wy is None:
+        return False
+    boat_min_x, boat_max_x, boat_min_y, boat_max_y = hull
+    return (
+        boat_min_x <= wx + WRECK_SQUARE_HALF and boat_max_x >= wx - WRECK_SQUARE_HALF
+        and boat_min_y <= wy + WRECK_SQUARE_HALF and boat_max_y >= wy - WRECK_SQUARE_HALF
+    )
+
+
+def find_wreck_in_hook_range(config: dict):
+    """Nearest ACTIVE object matching config["wreckNames"] whose WRECK_SQUARE_SIZE square overlaps
+    the boat's own true-tile hull footprint (_wreck_in_hook_range) -- i.e. whether the hook could
+    engage it without moving. This is the near-wreck counterpart to find_nearby_wreck's farther
+    maxSailDistance search; see find_nearby_wreck's docstring."""
+    names = {n.lower() for n in config.get("wreckNames", [])}
+
+    player = controller.get_player()
+    hull = _boat_hull_rect(player)
+    if hull is None:
+        return None
+    origin_x = player.get("boatX", player.get("x"))
+    origin_y = player.get("boatY", player.get("y"))
+
+    # Bound /objects' radius-limited scene walk the same way find_nearby_wreck does (see its own
+    # comment) -- half the wreck square plus half the boat's own footprint on each axis covers the
+    # farthest a wreck could be from the boat's reference point and still overlap, plus the usual
+    # padding for the player-vs-boat offset.
+    search_radius = int(WRECK_SQUARE_HALF + player.get("boatWidth", 0) + player.get("boatHeight", 0)) + WRECK_SEARCH_RADIUS_PADDING
+
+    best = None
+    best_dist = None
+    for o in controller.get_objects(radius=search_radius):
+        if (o.get("name") or "").lower() not in names:
+            continue
+        if o.get("id") in SUNK_SHIPWRECK_IDS:
+            continue
+        if not _wreck_in_hook_range(player, o):
+            continue
+        wx, wy = o.get("x"), o.get("y")
+        dist = max(abs(wx - origin_x), abs(wy - origin_y))
+        if best_dist is None or dist < best_dist:
+            best, best_dist = o, dist
+
+    return best
+
+
+def sail_to_pair(ctx, config: dict, wreck: dict) -> bool:
+    """Sail to wreck (or, if a nearby partner exists, the pair midpoint -- see
+    find_wreck_pair_target) and verify the boat actually ends up within the hook's real
+    WRECK_SQUARE_SIZE range of BOTH wrecks, instead of just trusting sail_to's own arrival
+    tolerance blind. CONFIRMED live 2026-08-03 (user report): without this check, sail_to's
+    brake-then-drift landing (see sail_to's own brake= docstring) could miss a computed pair
+    midpoint by a wide enough margin to land outside hook range of one or both wrecks, silently
+    defeating the whole point of pairing.
+
+    Checks against _wreck_in_hook_range specifically, not some looser notion of "nearby" --
+    CONFIRMED live 2026-08-04 (user report): an earlier version of this check used a flat
+    maxDistance figure that didn't match the real engage boundary, so it could report "landed
+    fine" even when the hook genuinely couldn't reach either wreck from there.
+
+    brake=False (no ram risk) only when a real partner was found -- a midpoint is open water, but
+    the single-wreck fallback is a real solid object and still needs the wide brake tolerance."""
+    target, partner = find_wreck_pair_target(config, wreck)
+    ok = sailing.sail_to(ctx, target, brake=(partner is None))
+
+    if ok and partner is not None:
+        player = controller.get_player()
+        if not (_wreck_in_hook_range(player, wreck) and _wreck_in_hook_range(player, partner)):
+            print("[salvage] landed outside hook range of one of the paired wrecks -- correcting")
+            ok = sailing.sail_to(ctx, target, brake=False)
+
+    return ok

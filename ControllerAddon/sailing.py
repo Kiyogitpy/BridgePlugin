@@ -54,7 +54,8 @@ STOP_TIMEOUT_S = 15.0
 # stops hopping -- and sail_to calls stop_boat -- once within THIS wider distance instead, letting
 # the already-measured drift close the remaining gap and land the boat short of the target instead
 # of through it. Initial estimate (not yet live-tuned): bigger than the max observed drift (5.0)
-# with margin, small enough that the resulting stop still lands within hook range (maxDistance).
+# with margin, small enough that the resulting stop still lands within hook range (see
+# shipwreck_salvaging.py's WRECK_SQUARE_SIZE for the callers that care about this specifically).
 SAIL_BRAKE_TRIGGER_TILES = 10
 
 STUCK_HOP_LIMIT = 3  # consecutive hops with no meaningful position change before steer_toward
@@ -266,11 +267,20 @@ def deploy_hook(ctx, hook_name: str) -> bool:
     return controller.click_entity(ctx.ser, hook, offset=(0, 0))
 
 
-def sail_to(ctx, target: dict) -> bool:
+def sail_to(ctx, target: dict, brake: bool = True) -> bool:
     """Full reposition: engage the helm, plan an obstacle-aware route (falling back to a direct
     line if no route is needed or none can be found), steer through it leg by leg, take down
     sails at the end. Does not redeploy the hook afterward -- the caller decides when that's
     appropriate.
+
+    brake: whether the final leg uses the wide SAIL_BRAKE_TRIGGER_TILES tolerance (the default).
+    SAIL_BRAKE_TRIGGER_TILES exists specifically to avoid ramming a solid target (see its own
+    comment) -- pass brake=False for a target that isn't a physical object (e.g. a computed
+    midpoint between two wrecks, open water) so the final leg uses the tighter
+    SAIL_ARRIVAL_TOLERANCE instead. CONFIRMED live 2026-08-03: with brake=True, the combination
+    of the 10-tile trigger plus stop_boat's own 2.2-5.0 tile drift left the boat missing a
+    computed pair-midpoint by a wide margin -- appropriate slop for not hitting a wreck, far too
+    much for landing on empty water where precision is what actually matters.
 
     Re-plans from the current position (up to MAX_ROUTE_ATTEMPTS times) if a leg reports getting
     stuck -- CONFIRMED live 2026-08-02: running aground is a hard dead stop needing a real course
@@ -290,7 +300,7 @@ def sail_to(ctx, target: dict) -> bool:
         stuck = False
         for i, leg in enumerate(legs):
             is_final_leg = (i == len(legs) - 1)
-            tolerance = SAIL_BRAKE_TRIGGER_TILES if is_final_leg else SAIL_ARRIVAL_TOLERANCE
+            tolerance = SAIL_BRAKE_TRIGGER_TILES if (is_final_leg and brake) else SAIL_ARRIVAL_TOLERANCE
             if not steer_toward(ctx, leg, arrival_tolerance=tolerance):
                 print(f"[sailing] got stuck heading to a waypoint (attempt {attempt + 1}/{MAX_ROUTE_ATTEMPTS}) -- replanning")
                 stuck = True
