@@ -200,7 +200,11 @@ def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
         print("[sailing] hop point isn't on the minimap, giving up")
         return False
 
-    controller.click_entity(ctx.ser, point, offset=(0, 0))
+    if not controller.click_entity(ctx.ser, point, offset=(0, 0)):
+        # click_entity already printed why (blocked by UI, off-window, ...) -- flag it here too so a
+        # later "stuck -- likely aground" isn't the only signal: the boat may never have gotten a
+        # steering click at all, rather than genuinely running aground.
+        print("[sailing] minimap click didn't land -- boat won't have moved this hop")
 
     waited = 0.0
     while waited < SAIL_HOP_TIMEOUT_S:

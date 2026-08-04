@@ -111,8 +111,15 @@ def tick(ctx):
         if idle and cooldown_elapsed:
             attempt_start = ctx.state.data.setdefault("hook_engage_attempt_at", now)
             if now - attempt_start > HOOK_ENGAGE_TIMEOUT_S:
+                # Sail straight at near_wreck's own point -- NOT sail_to_pair. find_wreck_in_hook_range
+                # already confirmed the boat's hull overlaps THIS wreck's square, so what's needed is
+                # fine positioning on it, not sail_to_pair's pair-midpoint logic (meant for the initial
+                # far-away approach): that can retarget toward a different, farther partner wreck up to
+                # PAIR_MAX_TILES away and send the boat somewhere it was never stuck getting to before --
+                # observed live 2026-08-04 running the boat aground trying to reach that new point right
+                # after sitting fine at near_wreck.
                 print("[salvage] hook isn't engaging after repeated clicks -- repositioning closer")
-                sail_to_pair(ctx, config, near_wreck)
+                sailing.sail_to(ctx, {"x": near_wreck["x"], "y": near_wreck["y"], "plane": near_wreck["plane"]})
                 ctx.state.data.pop("hook_engage_attempt_at", None)
             sailing.deploy_hook(ctx, config.get("hookName", ""))
             ctx.state.data["last_deploy_click_at"] = now
@@ -191,6 +198,37 @@ def drop_salvage(ctx):
 # them apart. One stump id per tier (Small..Merchant), confirmed against the live game cache.
 SUNK_SHIPWRECK_IDS = frozenset({60465, 60467, 60469, 60471, 60473, 60475, 60477, 60479})
 
+# Required boosted Sailing level to actually engage each wreck tier's hook (active-wreck object id
+# -> level) -- from data/decompiled/sailing-plugin's SalvagingHighlight.java SALVAGE_LEVEL_REQ,
+# which the plugin itself checks (`sailingLevel >= SALVAGE_LEVEL_REQ.get(wreck.getId())`) before
+# treating a wreck as "active" rather than "too high level" in its own highlight overlay. A wreck
+# below this threshold isn't really salvageable yet even though it's a live, non-stump object
+# matching wreckNames -- CONFIRMED live 2026-08-04 (user report): find_wreck_pair_target picked a
+# higher-tier wreck as a pairing partner that the player's actual Sailing level couldn't engage,
+# only one of the pair was genuinely salvageable, and the resulting midpoint wasn't a sensible
+# target for either. req is looked up with a None-is-fine default (fail open) so an id missing from
+# this map -- a tier not yet seen live -- doesn't silently exclude an otherwise-valid wreck.
+SALVAGE_LEVEL_REQ = {
+    60464: 15,
+    60466: 26,
+    60468: 35,
+    60470: 53,
+    60472: 64,
+    60474: 73,
+    60476: 80,
+    60478: 87,
+}
+
+
+def _boosted_sailing_level() -> int:
+    return controller.get_skills().get("Sailing", {}).get("boosted", 0)
+
+
+def _wreck_is_salvageable(wreck: dict, sailing_level: int) -> bool:
+    req = SALVAGE_LEVEL_REQ.get(wreck.get("id"))
+    return req is None or sailing_level >= req
+
+
 # Padding added on top of max_dist when bounding /objects' radius-limited scene walk (see
 # find_nearby_wreck below). CONFIRMED live 2026-08-02: ObjectProvider's radius is centered on the
 # PLAYER, but find_nearby_wreck measures from the BOAT's reference position, which can differ from
@@ -224,9 +262,11 @@ PAIR_MAX_TILES = WRECK_SQUARE_SIZE
 
 
 def find_nearby_wreck(config: dict, max_dist: float):
-    """Nearest ACTIVE object matching config["wreckNames"] within max_dist tiles of the BOAT (not
-    the player), or None (sunk wrecks -- see SUNK_SHIPWRECK_IDS -- are filtered out; matching them
-    would let the routine treat a dead wreck as "in range" and never look for a real one).
+    """Nearest ACTIVE, actually-salvageable-at-this-level object matching config["wreckNames"]
+    within max_dist tiles of the BOAT (not the player), or None (sunk wrecks -- see
+    SUNK_SHIPWRECK_IDS -- and wrecks above the player's boosted Sailing level -- see
+    SALVAGE_LEVEL_REQ -- are both filtered out; matching either would let the routine treat a wreck
+    it can't actually work as "in range" and never look for a real one).
 
     Only used for the farther "is this wreck worth sailing to" check (maxSailDistance) now -- the
     near/hook-range case uses find_wreck_in_hook_range's WRECK_SQUARE_SIZE geometry instead (see
@@ -252,6 +292,7 @@ def find_nearby_wreck(config: dict, max_dist: float):
     routine only ever cares about objects within max_dist anyway, so bounding the scan costs
     nothing here."""
     names = {n.lower() for n in config.get("wreckNames", [])}
+    sailing_level = _boosted_sailing_level()
 
     player = controller.get_player()
     origin_x = player.get("boatX", player.get("x"))
@@ -265,6 +306,8 @@ def find_nearby_wreck(config: dict, max_dist: float):
         if (o.get("name") or "").lower() not in names:
             continue
         if o.get("id") in SUNK_SHIPWRECK_IDS:
+            continue
+        if not _wreck_is_salvageable(o, sailing_level):
             continue
         wx, wy = o.get("x"), o.get("y")
         if wx is None or wy is None:
@@ -281,10 +324,18 @@ def find_nearby_wreck(config: dict, max_dist: float):
 
 def find_wreck_pair_target(config: dict, wreck: dict):
     """Given a wreck the routine is about to sail to, look for a second matching active wreck
-    within PAIR_MAX_TILES of it (same tier names as wreck, same plane, not sunk) and target their
-    midpoint instead of the lone wreck -- see PAIR_MAX_TILES's comment for why. Falls back to the
-    given wreck's own position if no partner is found nearby (confirmed with the user: a lone
-    wreck is still worth sailing to directly, pairing is an optimization, not a requirement).
+    within PAIR_MAX_TILES of it (same tier names as wreck, same plane, not sunk, and actually
+    within the player's current Sailing level -- see SALVAGE_LEVEL_REQ) and target their midpoint
+    instead of the lone wreck -- see PAIR_MAX_TILES's comment for why. Falls back to the given
+    wreck's own position if no partner is found nearby (confirmed with the user: a lone wreck is
+    still worth sailing to directly, pairing is an optimization, not a requirement).
+
+    The level check matters specifically here, not just as a general filter -- CONFIRMED live
+    2026-08-04 (user report): aiming for the midpoint is only reasonable when BOTH wrecks are
+    actually salvageable; a nearby wreck that merely matches wreckNames by name but is above the
+    player's level isn't really "active" for them (same distinction the sideloaded Sailing plugin's
+    own highlight overlay draws), and pairing toward it skews the target for no benefit -- the
+    player can't engage that wreck's hook once there anyway.
 
     Returns (target, partner): target is a plain {"x", "y", "plane"} dict, the same shape
     sailing.sail_to already expects (not a raw ObjectProvider entry, since a midpoint isn't a real
@@ -293,6 +344,7 @@ def find_wreck_pair_target(config: dict, wreck: dict):
     sailing, since target alone can't distinguish "real wreck, brake to avoid ramming it" from "a
     midpoint over open water, no collision risk"."""
     names = {n.lower() for n in config.get("wreckNames", [])}
+    sailing_level = _boosted_sailing_level()
     wx, wy, wplane = wreck.get("x"), wreck.get("y"), wreck.get("plane")
 
     # get_objects' radius is centered on the PLAYER, not on wreck (see controller.get_objects) --
@@ -316,6 +368,8 @@ def find_wreck_pair_target(config: dict, wreck: dict):
         if (o.get("name") or "").lower() not in names:
             continue
         if o.get("id") in SUNK_SHIPWRECK_IDS:
+            continue
+        if not _wreck_is_salvageable(o, sailing_level):
             continue
         if o.get("plane") != wplane:
             continue
@@ -378,11 +432,13 @@ def _wreck_in_hook_range(player: dict, wreck: dict) -> bool:
 
 
 def find_wreck_in_hook_range(config: dict):
-    """Nearest ACTIVE object matching config["wreckNames"] whose WRECK_SQUARE_SIZE square overlaps
-    the boat's own true-tile hull footprint (_wreck_in_hook_range) -- i.e. whether the hook could
-    engage it without moving. This is the near-wreck counterpart to find_nearby_wreck's farther
-    maxSailDistance search; see find_nearby_wreck's docstring."""
+    """Nearest ACTIVE, actually-salvageable-at-this-level object matching config["wreckNames"]
+    whose WRECK_SQUARE_SIZE square overlaps the boat's own true-tile hull footprint
+    (_wreck_in_hook_range) -- i.e. whether the hook could engage it without moving. This is the
+    near-wreck counterpart to find_nearby_wreck's farther maxSailDistance search; see
+    find_nearby_wreck's docstring (including for the SALVAGE_LEVEL_REQ filter)."""
     names = {n.lower() for n in config.get("wreckNames", [])}
+    sailing_level = _boosted_sailing_level()
 
     player = controller.get_player()
     hull = _boat_hull_rect(player)
@@ -403,6 +459,8 @@ def find_wreck_in_hook_range(config: dict):
         if (o.get("name") or "").lower() not in names:
             continue
         if o.get("id") in SUNK_SHIPWRECK_IDS:
+            continue
+        if not _wreck_is_salvageable(o, sailing_level):
             continue
         if not _wreck_in_hook_range(player, o):
             continue
