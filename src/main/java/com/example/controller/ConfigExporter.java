@@ -13,14 +13,14 @@ public final class ConfigExporter
 	}
 
 	// General combat mechanics (Prayer, Food & Potions, Breaks, Safety, PvP Safety) come from
-	// ControllerConfig/HttpBridge -- not slayer-task-specific, so shared rather than duplicated
-	// per routine. Everything about which monster to fight, its loot, and banking comes from
-	// SlayerConfig.
-	public static Map<String, Object> export(Client client, ControllerConfig controllerConfig, SlayerConfig config)
+	// the shared sections of ControllerConfig -- not slayer-task-specific, so shared rather
+	// than duplicated per routine. Everything about which monster to fight, its loot, and
+	// banking comes from the Slayer section of the same ControllerConfig.
+	public static Map<String, Object> exportSlayer(Client client, ControllerConfig config)
 	{
 		Map<String, Object> data = new LinkedHashMap<>();
 
-		data.put("enabled", controllerConfig.controllerEnabled());
+		data.put("enabled", config.controllerEnabled());
 		data.put("targets", resolveTargetIds(client, config));
 		data.put("targetNames", parseList(config.targetNpcNames()));
 		data.put("maxTargetDistance", config.maxTargetDistance());
@@ -28,27 +28,27 @@ public final class ConfigExporter
 		data.put("onlyAttackWhenIdle", config.onlyAttackWhenIdle());
 
 		Map<String, Object> prayer = new LinkedHashMap<>();
-		prayer.put("enabled", controllerConfig.usePrayer());
-		prayer.put("defensivePrayer", controllerConfig.defensivePrayer().name());
-		prayer.put("offensivePrayer", controllerConfig.offensivePrayer().name());
-		prayer.put("useQuickPrayers", controllerConfig.useQuickPrayers());
-		prayer.put("restoreAt", controllerConfig.restorePrayerAt());
+		prayer.put("enabled", config.usePrayer());
+		prayer.put("defensivePrayer", config.defensivePrayer().name());
+		prayer.put("offensivePrayer", config.offensivePrayer().name());
+		prayer.put("useQuickPrayers", config.useQuickPrayers());
+		prayer.put("restoreAt", config.restorePrayerAt());
 		data.put("prayer", prayer);
 
-		String foodName = (controllerConfig.useWildernessSupplies() ? controllerConfig.wildernessFood() : controllerConfig.food()).getItemName();
-		String prayerPotionName = (controllerConfig.useWildernessSupplies() ? controllerConfig.wildernessPrayerPotion() : controllerConfig.prayerPotion()).getItemName();
+		String foodName = (config.useWildernessSupplies() ? config.wildernessFood() : config.food()).getItemName();
+		String prayerPotionName = (config.useWildernessSupplies() ? config.wildernessPrayerPotion() : config.prayerPotion()).getItemName();
 
 		Map<String, Object> food = new LinkedHashMap<>();
-		food.put("enabled", controllerConfig.useFood());
+		food.put("enabled", config.useFood());
 		food.put("name", foodName);
-		food.put("eatAt", controllerConfig.eatAtHp());
+		food.put("eatAt", config.eatAtHp());
 		data.put("food", food);
 
 		Map<String, Object> potions = new LinkedHashMap<>();
-		potions.put("prayerEnabled", controllerConfig.usePrayerPotions());
+		potions.put("prayerEnabled", config.usePrayerPotions());
 		potions.put("prayerPotion", prayerPotionName);
-		potions.put("combatEnabled", controllerConfig.useCombatPotions());
-		potions.put("combatPotion", controllerConfig.combatPotion());
+		potions.put("combatEnabled", config.useCombatPotions());
+		potions.put("combatPotion", config.combatPotion());
 		data.put("potions", potions);
 
 		Map<String, Object> loot = new LinkedHashMap<>();
@@ -59,18 +59,18 @@ public final class ConfigExporter
 		data.put("loot", loot);
 
 		Map<String, Object> breaks = new LinkedHashMap<>();
-		breaks.put("enabled", controllerConfig.takeBreaks());
-		breaks.put("everyMinMinutes", controllerConfig.breakEveryMinMinutes());
-		breaks.put("everyMaxMinutes", controllerConfig.breakEveryMaxMinutes());
-		breaks.put("durationMinMinutes", controllerConfig.breakDurationMinMinutes());
-		breaks.put("durationMaxMinutes", controllerConfig.breakDurationMaxMinutes());
-		breaks.put("microBreaks", controllerConfig.microBreaks());
+		breaks.put("enabled", config.takeBreaks());
+		breaks.put("everyMinMinutes", config.breakEveryMinMinutes());
+		breaks.put("everyMaxMinutes", config.breakEveryMaxMinutes());
+		breaks.put("durationMinMinutes", config.breakDurationMinMinutes());
+		breaks.put("durationMaxMinutes", config.breakDurationMaxMinutes());
+		breaks.put("microBreaks", config.microBreaks());
 		data.put("breaks", breaks);
 
 		Map<String, Object> safety = new LinkedHashMap<>();
-		safety.put("stopOnDeath", controllerConfig.stopOnDeath());
-		safety.put("stopOnInventoryFull", controllerConfig.stopOnInventoryFull());
-		safety.put("maxRuntimeHours", controllerConfig.maxRuntimeHours());
+		safety.put("stopOnDeath", config.stopOnDeath());
+		safety.put("stopOnInventoryFull", config.stopOnInventoryFull());
+		safety.put("maxRuntimeHours", config.maxRuntimeHours());
 		data.put("safety", safety);
 
 		Map<String, Object> bank = new LinkedHashMap<>();
@@ -81,22 +81,164 @@ public final class ConfigExporter
 		List<Map<String, Object>> withdraw = new ArrayList<>();
 		addWithdrawEntry(withdraw, foodName, config.bankFoodQuantity());
 		addWithdrawEntry(withdraw, prayerPotionName, config.bankPrayerPotionQuantity());
-		addWithdrawEntry(withdraw, controllerConfig.combatPotion(), config.bankCombatPotionQuantity());
+		addWithdrawEntry(withdraw, config.combatPotion(), config.bankCombatPotionQuantity());
 		bank.put("withdraw", withdraw);
 
 		data.put("bank", bank);
 
 		Map<String, Object> pvpSafety = new LinkedHashMap<>();
-		pvpSafety.put("fleeEnabled", controllerConfig.pvpFleeEnabled());
+		pvpSafety.put("fleeEnabled", config.pvpFleeEnabled());
 		data.put("pvpSafety", pvpSafety);
 
 		data.put("taskLocations", resolveTaskLocations(config));
 
-		data.put("eatAt", controllerConfig.eatAtHp());
-		data.put("restorePrayerAt", controllerConfig.restorePrayerAt());
+		data.put("eatAt", config.eatAtHp());
+		data.put("restorePrayerAt", config.restorePrayerAt());
 		data.put("prayerPotion", prayerPotionName);
 
 		return data;
+	}
+
+	public static Map<String, Object> exportMining(ControllerConfig config)
+	{
+		Map<String, Object> data = new LinkedHashMap<>();
+		data.put("enabled", config.miningEnabled());
+		data.put("rockNames", parseList(config.rockNames()));
+		data.put("maxRockDistance", config.maxRockDistance());
+		data.put("breaks", sharedBreaks(config));
+		data.put("safety", sharedSafetyWithInventoryFull(config));
+		return data;
+	}
+
+	public static Map<String, Object> exportGemstoneCrab(ControllerConfig config)
+	{
+		Map<String, Object> data = new LinkedHashMap<>();
+		data.put("enabled", config.gemstoneCrabEnabled());
+		data.put("crabName", config.crabName());
+		data.put("tunnelName", config.tunnelName());
+		data.put("maxDistance", config.maxDistance());
+		data.put("breaks", sharedBreaks(config));
+		data.put("safety", sharedSafetyWithInventoryFull(config));
+		return data;
+	}
+
+	public static Map<String, Object> exportTormentedDemon(ControllerConfig config)
+	{
+		Map<String, Object> data = new LinkedHashMap<>();
+		data.put("enabled", config.tormentedDemonEnabled());
+		data.put("maxTargetDistance", config.tormentedDemonMaxTargetDistance());
+
+		// Lowercased to match routines/tormented_demon.py's OVERHEAD_ICON_TO_STYLE / loadouts
+		// dict keys ("melee"/"ranged"/"magic") exactly.
+		data.put("combatStyle", config.combatStyle().name().toLowerCase(Locale.ROOT));
+		data.put("autoSwapGear", config.autoSwapGear());
+
+		Map<String, Object> loadouts = new LinkedHashMap<>();
+		loadouts.put("melee", nullIfBlank(config.meleeWeapon()));
+		loadouts.put("ranged", nullIfBlank(config.rangedWeapon()));
+		loadouts.put("magic", nullIfBlank(config.mageWeapon()));
+		data.put("loadouts", loadouts);
+
+		Map<String, Object> food = new LinkedHashMap<>();
+		food.put("enabled", true);
+		food.put("eatAt", config.eatAtHp());
+		data.put("food", food);
+
+		Map<String, Object> prayer = new LinkedHashMap<>();
+		prayer.put("restoreAt", config.restorePrayerAt());
+		data.put("prayer", prayer);
+
+		data.put("breaks", sharedBreaks(config));
+		data.put("safety", sharedSafety(config));
+		return data;
+	}
+
+	public static Map<String, Object> exportFiremaking(ControllerConfig config)
+	{
+		Map<String, Object> data = new LinkedHashMap<>();
+		data.put("enabled", config.firemakingEnabled());
+		data.put("logName", config.logName());
+		data.put("tinderboxName", config.tinderboxName());
+
+		Map<String, Object> bank = new LinkedHashMap<>();
+		bank.put("enabled", config.firemakingBankEnabled());
+		bank.put("teleportFallback", config.firemakingBankTeleportFallback());
+		bank.put("keepItems", Collections.singletonList(config.tinderboxName()));
+
+		List<Map<String, Object>> withdraw = new ArrayList<>();
+		Map<String, Object> entry = new LinkedHashMap<>();
+		entry.put("name", config.logName());
+		entry.put("quantity", config.bankWithdrawQuantity());
+		withdraw.add(entry);
+		bank.put("withdraw", withdraw);
+		data.put("bank", bank);
+
+		data.put("breaks", sharedBreaks(config));
+		data.put("safety", sharedSafety(config));
+		return data;
+	}
+
+	public static Map<String, Object> exportBlastFurnace(ControllerConfig config)
+	{
+		Map<String, Object> data = new LinkedHashMap<>();
+		data.put("enabled", config.blastFurnaceEnabled());
+		// Lowercased to match routines/blast_furnace.py's BAR_TYPES dict keys exactly.
+		data.put("barType", config.barType().name().toLowerCase(Locale.ROOT));
+
+		Map<String, Object> coffer = new LinkedHashMap<>();
+		coffer.put("topUpEnabled", config.cofferTopUpEnabled());
+		coffer.put("topUpAmount", config.cofferTopUpAmount());
+		coffer.put("topUpIntervalMinutes", config.cofferTopUpIntervalMinutes());
+		data.put("coffer", coffer);
+
+		Map<String, Object> bank = new LinkedHashMap<>();
+		bank.put("teleportFallback", config.blastFurnaceBankTeleportFallback());
+		data.put("bank", bank);
+
+		data.put("breaks", sharedBreaks(config));
+		data.put("safety", sharedSafety(config));
+		return data;
+	}
+
+	/** Breaks shape shared by every routine's export -- read from ControllerConfig's shared
+	 * Breaks section rather than a routine-specific duplicate (see this plan's Collision Table). */
+	private static Map<String, Object> sharedBreaks(ControllerConfig config)
+	{
+		Map<String, Object> breaks = new LinkedHashMap<>();
+		breaks.put("enabled", config.takeBreaks());
+		breaks.put("everyMinMinutes", config.breakEveryMinMinutes());
+		breaks.put("everyMaxMinutes", config.breakEveryMaxMinutes());
+		breaks.put("durationMinMinutes", config.breakDurationMinMinutes());
+		breaks.put("durationMaxMinutes", config.breakDurationMaxMinutes());
+		breaks.put("microBreaks", config.microBreaks());
+		return breaks;
+	}
+
+	/** Safety shape (stopOnDeath + maxRuntimeHours only) for routines whose export never
+	 * included stopOnInventoryFull (Tormented Demon, Firemaking, Blast Furnace) -- unchanged
+	 * from before, just reading the shared field instead of a routine-specific one. */
+	private static Map<String, Object> sharedSafety(ControllerConfig config)
+	{
+		Map<String, Object> safety = new LinkedHashMap<>();
+		safety.put("stopOnDeath", config.stopOnDeath());
+		safety.put("maxRuntimeHours", config.maxRuntimeHours());
+		return safety;
+	}
+
+	/** Safety shape including stopOnInventoryFull, for routines whose export already included
+	 * it (Mining, Gemstone Crab) -- unchanged shape, now reading the shared field. */
+	private static Map<String, Object> sharedSafetyWithInventoryFull(ControllerConfig config)
+	{
+		Map<String, Object> safety = new LinkedHashMap<>();
+		safety.put("stopOnDeath", config.stopOnDeath());
+		safety.put("stopOnInventoryFull", config.stopOnInventoryFull());
+		safety.put("maxRuntimeHours", config.maxRuntimeHours());
+		return safety;
+	}
+
+	private static String nullIfBlank(String s)
+	{
+		return s == null || s.trim().isEmpty() ? null : s.trim();
 	}
 
 	private static void addWithdrawEntry(List<Map<String, Object>> withdraw, String name, int quantity)
@@ -118,7 +260,7 @@ public final class ConfigExporter
 	 * Controller Settings sidebar's per-target dropdown for categories with more than one known
 	 * spot, or index 0 (whatever's first/safest) if nothing's been chosen yet.
 	 */
-	public static Map<String, Object> resolveTaskLocations(SlayerConfig config)
+	public static Map<String, Object> resolveTaskLocations(ControllerConfig config)
 	{
 		Map<String, Integer> choices = parseLocationChoices(config.taskLocationChoices());
 		Map<String, Object> result = new LinkedHashMap<>();
@@ -169,7 +311,7 @@ public final class ConfigExporter
 		return choices;
 	}
 
-	public static List<Integer> resolveTargetIds(Client client, SlayerConfig config)
+	public static List<Integer> resolveTargetIds(Client client, ControllerConfig config)
 	{
 		Set<Integer> ids = new LinkedHashSet<>();
 
