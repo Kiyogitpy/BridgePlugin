@@ -15,14 +15,18 @@ import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.PluginManager;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.ImageUtil;
 
 import javax.inject.Inject;
+import java.awt.image.BufferedImage;
 import java.util.HashMap;
 import java.util.Map;
 
 @PluginDescriptor(
 	name = "* HttpBridge",
-	description = "Master enable switch, plus the shared HTTP/UDP bridge every other Controller plugin (Slayer, Mining, Gemstone Crab, Tormented Demon) talks to.",
+	description = "Master enable switch, shared HTTP/UDP bridge, and every routine's settings (Slayer, Mining, Gemstone Crab, Tormented Demon, Firemaking, Blast Furnace) all in one place.",
 	tags = {"controller", "config", "bridge", "http"}
 )
 public class ControllerPlugin extends Plugin
@@ -49,6 +53,14 @@ public class ControllerPlugin extends Plugin
 
 	@Inject
 	private EventBus eventBus;
+
+	@Inject
+	private SettingsPanel panel;
+
+	@Inject
+	private ClientToolbar clientToolbar;
+
+	private NavigationButton navButton;
 
 	private BridgeHttpServer server;
 	private UdpEventSender udpSender;
@@ -88,6 +100,13 @@ public class ControllerPlugin extends Plugin
 		new ConfigProvider(client, clientThread, server, config).register();
 		new ConsumablesProvider(client, clientThread, server, config).register();
 		new LoginProvider(client, clientThread, server).register();
+		new SlayerConfigProvider(client, clientThread, server, config).register();
+
+		server.register("/mining-config", () -> ConfigExporter.exportMining(config));
+		server.register("/gemstone-crab-config", () -> ConfigExporter.exportGemstoneCrab(config));
+		server.register("/tormented-demon-config", () -> ConfigExporter.exportTormentedDemon(config));
+		server.register("/firemaking-config", () -> ConfigExporter.exportFiremaking(config));
+		server.register("/blast-furnace-config", () -> ConfigExporter.exportBlastFurnace(config));
 
 		try
 		{
@@ -97,11 +116,32 @@ public class ControllerPlugin extends Plugin
 		{
 			System.out.println("Shortest Path integration unavailable: " + t);
 		}
+
+		BufferedImage icon;
+		try
+		{
+			icon = ImageUtil.loadImageResource(getClass(), "/controller_icon.png");
+		}
+		catch (IllegalArgumentException e)
+		{
+			icon = createFallbackIcon();
+		}
+
+		navButton = NavigationButton.builder()
+			.tooltip("Controller Settings")
+			.icon(icon)
+			.priority(5)
+			.panel(panel)
+			.build();
+
+		clientToolbar.addNavigation(navButton);
 	}
 
 	@Override
 	protected void shutDown()
 	{
+		clientToolbar.removeNavigation(navButton);
+
 		if (server != null)
 		{
 			server.stop();
@@ -121,27 +161,10 @@ public class ControllerPlugin extends Plugin
 		return configManager.getConfig(ControllerConfig.class);
 	}
 
-	/**
-	 * Lets sibling plugins (declared via @PluginDependency(ControllerPlugin.class), e.g.
-	 * MiningPlugin/GemstoneCrabPlugin/TormentedDemonPlugin) register their own config
-	 * endpoints on this same bridge instead of each standing up a separate HTTP server.
-	 * @PluginDependency guarantees this plugin's startUp() (which creates the server) runs
-	 * before any dependent plugin's startUp() runs, so this is never null by the time a
-	 * dependent needs it.
-	 */
-	public BridgeHttpServer getServer()
-	{
-		return server;
-	}
-
 	@Subscribe
 	public void onMenuOpened(MenuOpened event)
 	{
-		// SlayerConfig isn't @Inject-ed here -- its @Provides binding lives on SlayerPlugin
-		// (needed there for RuneLite to associate it with that plugin's own config screen), and
-		// a dependent plugin's binding isn't visible back to the plugin it depends on. Fetching
-		// it straight from ConfigManager sidesteps needing a Guice binding here at all.
-		MenuPriority.apply(client, config, configManager.getConfig(SlayerConfig.class), event);
+		MenuPriority.apply(client, config, event);
 	}
 
 	@Subscribe
@@ -151,6 +174,11 @@ public class ControllerPlugin extends Plugin
 		{
 			return;
 		}
+
+		// Keeps the sidebar panel's Controller Enabled/target selections live with whatever
+		// just changed -- including edits made from the wrench-icon config screen, which this
+		// panel doesn't otherwise hear about.
+		panel.syncFromConfig();
 
 		if (udpSender != null)
 		{
@@ -283,6 +311,19 @@ public class ControllerPlugin extends Plugin
 		payload.put("message", event.getMessage());
 		payload.put("sender", event.getName());
 		udpSender.send("CHAT_MESSAGE", payload);
+	}
+
+	private static BufferedImage createFallbackIcon()
+	{
+		BufferedImage img = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+		java.awt.Graphics2D g = img.createGraphics();
+		g.setColor(new java.awt.Color(0x4CAF50));
+		g.fillOval(1, 1, 14, 14);
+		g.setColor(java.awt.Color.WHITE);
+		g.fillRect(5, 4, 2, 8);
+		g.fillRect(9, 6, 2, 6);
+		g.dispose();
+		return img;
 	}
 
 	private String targetKey(Actor actor)

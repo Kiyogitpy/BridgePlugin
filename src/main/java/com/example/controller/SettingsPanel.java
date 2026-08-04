@@ -26,7 +26,6 @@ public class SettingsPanel extends PluginPanel
 	private final ClientThread clientThread;
 	private final ConfigManager configManager;
 	private final ControllerConfig config;
-	private final SlayerConfig slayerConfig;
 
 	private final JPanel npcListPanel = new JPanel();
 	private final PluginErrorPanel errorPanel = new PluginErrorPanel();
@@ -55,16 +54,15 @@ public class SettingsPanel extends PluginPanel
 	private final JCheckBox enabledBox = new JCheckBox("Controller Enabled");
 
 	@Inject
-	SettingsPanel(Client client, ClientThread clientThread, ConfigManager configManager, ControllerConfig config, SlayerConfig slayerConfig)
+	SettingsPanel(Client client, ClientThread clientThread, ConfigManager configManager, ControllerConfig config)
 	{
 		this.client = client;
 		this.clientThread = clientThread;
 		this.configManager = configManager;
 		this.config = config;
-		this.slayerConfig = slayerConfig;
 
-		selectedTargets.addAll(ConfigExporter.parseList(slayerConfig.targetNpcNames()));
-		categoryLocationChoice.putAll(ConfigExporter.parseLocationChoices(slayerConfig.taskLocationChoices()));
+		selectedTargets.addAll(ConfigExporter.parseList(config.targetNpcNames()));
+		categoryLocationChoice.putAll(ConfigExporter.parseLocationChoices(config.taskLocationChoices()));
 
 		setLayout(new BorderLayout());
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -494,7 +492,7 @@ public class SettingsPanel extends PluginPanel
 	private void persistSelections()
 	{
 		configManager.setConfiguration(
-			SlayerConfig.GROUP,
+			ControllerConfig.GROUP,
 			"targetNpcNames",
 			String.join(", ", selectedTargets)
 		);
@@ -603,7 +601,7 @@ public class SettingsPanel extends PluginPanel
 			}
 			sb.append(entry.getKey()).append("=").append(entry.getValue());
 		}
-		configManager.setConfiguration(SlayerConfig.GROUP, "taskLocationChoices", sb.toString());
+		configManager.setConfiguration(ControllerConfig.GROUP, "taskLocationChoices", sb.toString());
 	}
 
 	/** Re-syncs every control here from the current config -- called by ControllerPlugin whenever
@@ -617,10 +615,10 @@ public class SettingsPanel extends PluginPanel
 		enabledBox.setSelected(config.controllerEnabled());
 
 		selectedTargets.clear();
-		selectedTargets.addAll(ConfigExporter.parseList(slayerConfig.targetNpcNames()));
+		selectedTargets.addAll(ConfigExporter.parseList(config.targetNpcNames()));
 
 		categoryLocationChoice.clear();
-		categoryLocationChoice.putAll(ConfigExporter.parseLocationChoices(slayerConfig.taskLocationChoices()));
+		categoryLocationChoice.putAll(ConfigExporter.parseLocationChoices(config.taskLocationChoices()));
 
 		for (Map.Entry<String, JCheckBox> entry : npcCheckboxes.entrySet())
 		{

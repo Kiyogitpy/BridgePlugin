@@ -33,7 +33,7 @@ final class MenuPriority
 	{
 	}
 
-	static void apply(Client client, ControllerConfig config, SlayerConfig slayerConfig, MenuOpened event)
+	static void apply(Client client, ControllerConfig config, MenuOpened event)
 	{
 		if (!config.forceClickPriority())
 		{
@@ -47,8 +47,8 @@ final class MenuPriority
 			return;
 		}
 
-		Set<String> targetNpcs = targetNpcsCache.get(slayerConfig.targetNpcNames());
-		Set<String> lootItems = lootItemsCache.get(slayerConfig.lootWhitelist());
+		Set<String> targetNpcs = targetNpcsCache.get(config.targetNpcNames());
+		Set<String> lootItems = lootItemsCache.get(config.lootWhitelist());
 		Set<String> targetObjects = targetObjectsCache.get(config.targetObjectNames());
 		Set<String> forcedActions = forcedActionsCache.get(config.forcedActions());
 
