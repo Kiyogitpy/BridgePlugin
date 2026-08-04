@@ -56,7 +56,21 @@ STOP_TIMEOUT_S = 15.0
 # of through it. Initial estimate (not yet live-tuned): bigger than the max observed drift (5.0)
 # with margin, small enough that the resulting stop still lands within hook range (see
 # shipwreck_salvaging.py's WRECK_SQUARE_SIZE for the callers that care about this specifically).
+#
+# Kept only as the fallback when a live speed reading isn't available (see _dynamic_brake_tiles
+# below) -- SailingProvider.java now measures the boat's actual per-tick speed
+# (WorldEntity.getTargetLocation() deltas, same approach the sideloaded Sailing plugin's own speed
+# readout uses), so the brake trigger no longer has to be one flat guess covering the boat's full-
+# sail top speed regardless of how fast it's actually moving right now.
 SAIL_BRAKE_TRIGGER_TILES = 10
+
+BRAKE_LOOKAHEAD_TICKS = 3  # UNVERIFIED -- initial guess for how many ticks' worth of the boat's
+                            # CURRENT measured speed it keeps coasting for after sails come down.
+                            # stop_boat() now logs the measured speed at the moment of toggling
+                            # right next to its own drift-tiles measurement specifically so this
+                            # can be fitted against real paired data once a few live samples exist
+                            # (drift_tiles ~= speed_tiles_per_tick * actual_coast_ticks), same
+                            # convention as every other unverified constant in this file.
 
 STUCK_HOP_LIMIT = 3  # consecutive hops with no meaningful position change before steer_toward
                        # gives up on the current leg and reports failure (False), letting sail_to
@@ -117,20 +131,26 @@ def use_helm(ctx) -> bool:
     return False
 
 
-def steer_toward(ctx, target: dict, arrival_tolerance: float = SAIL_BRAKE_TRIGGER_TILES) -> bool:
+def steer_toward(ctx, target: dict, arrival_tolerance: float = None) -> bool:
     """Drive the boat to within arrival_tolerance tiles of target ({"x", "y", "plane"}), same
     hop-and-click-minimap loop shape as travel._walk_greedy -- confirmed live that minimap clicks
     steer the boat once the helm is engaged, just with coarser (compass-snapped) heading than foot
     travel.
 
-    Defaults to SAIL_BRAKE_TRIGGER_TILES, not the tighter SAIL_ARRIVAL_TOLERANCE -- CONFIRMED live
+    arrival_tolerance=None (the default) recomputes a braking distance from the boat's CURRENT
+    measured speed on every hop instead of using one fixed number -- see _dynamic_brake_tiles.
+    Recomputed per-hop rather than once up front because speed genuinely changes hop to hop
+    (accelerating away from a stop, cruising at full sail, slowed by an obstacle-avoidance leg,
+    ...), so a single snapshot taken before the loop started could be stale by the time it matters.
+
+    A wide (not the tighter SAIL_ARRIVAL_TOLERANCE) default in general -- CONFIRMED live
     2026-08-02: the boat keeps coasting under full sail for as long as this function keeps
     running, so returning only once already within the tight tolerance left no room to brake
     before ramming the target. sail_to calls stop_boat() immediately after the FINAL leg of a
     route returns, and the already-measured post-toggle drift closes the remaining distance.
-    Intermediate route waypoints (see sail_to) pass the tighter SAIL_ARRIVAL_TOLERANCE instead --
-    they exist specifically to route around an obstacle, so cutting the corner early would defeat
-    the point.
+    Intermediate route waypoints (see sail_to) pass the tighter SAIL_ARRIVAL_TOLERANCE explicitly
+    instead -- they exist specifically to route around an obstacle, so cutting the corner early
+    would defeat the point.
 
     Returns False (instead of exhausting all SAIL_MAX_HOPS) once STUCK_HOP_LIMIT consecutive hops
     show no meaningful position change -- CONFIRMED live 2026-08-02: running aground on an island
@@ -150,7 +170,8 @@ def steer_toward(ctx, target: dict, arrival_tolerance: float = SAIL_BRAKE_TRIGGE
             print("[sailing] target is on a different plane -- can't sail there")
             return False
 
-        if _within_tolerance(px, py, target_x, target_y, arrival_tolerance):
+        current_tolerance = arrival_tolerance if arrival_tolerance is not None else _dynamic_brake_tiles()
+        if _within_tolerance(px, py, target_x, target_y, current_tolerance):
             return True
 
         if last_pos is not None and _within_tolerance(px, py, last_pos[0], last_pos[1], STUCK_MOVEMENT_THRESHOLD_TILES):
@@ -197,6 +218,21 @@ def _within_tolerance(x1: float, y1: float, x2: float, y2: float, tolerance: flo
     return math.hypot(x2 - x1, y2 - y1) <= tolerance
 
 
+def _dynamic_brake_tiles() -> float:
+    """Distance (tiles) steer_toward should stop hopping at, scaled to the boat's CURRENT measured
+    speed (SailingProvider.java's boatSpeed, tiles/tick from WorldEntity.getTargetLocation() deltas
+    -- CONFIRMED live to be the right data source, see its own comment) instead of one flat
+    worst-case guess. Never below SAIL_ARRIVAL_TOLERANCE -- a stopped or barely-moving boat still
+    needs to actually reach the target, not stop short because the speed-scaled distance rounded
+    to near zero. Falls back to the old flat SAIL_BRAKE_TRIGGER_TILES whenever a live speed
+    reading isn't available (older bridge build, or boatSpeed missing for any other reason) --
+    same safety net that constant always was."""
+    speed = controller.get_sailing().get("boatSpeed")
+    if speed is None:
+        return SAIL_BRAKE_TRIGGER_TILES
+    return max(SAIL_ARRIVAL_TOLERANCE, speed * BRAKE_LOOKAHEAD_TICKS)
+
+
 def stop_boat(ctx) -> bool:
     """Open the Sailing Options panel and click the sail toggle to un-set the sails, then wait
     for the boat to actually stop moving. CONFIRMED live 2026-08-02: this isn't two separately
@@ -214,6 +250,7 @@ def stop_boat(ctx) -> bool:
 
     start_player = controller.get_player()
     start_pos = (start_player.get("x"), start_player.get("y"))
+    speed_at_toggle = sailing_state.get("boatSpeed")
 
     print("[sailing] toggling sails")
     controller.click_entity(ctx.ser, button, offset=(0, 0))
@@ -231,9 +268,14 @@ def stop_boat(ctx) -> bool:
             # where steer_toward's SAIL_ARRIVAL_TOLERANCE said "close enough, stop now". Logging
             # the actual distance to see how much to compensate for -- e.g. triggering the stop
             # earlier, or padding the tolerance -- once this has been observed a few times live.
+            #
+            # speed_at_toggle logged alongside it since 2026-08-04 (boatSpeed added to
+            # SailingProvider) -- pairs each drift sample with the actual measured speed that
+            # produced it, giving real data to fit BRAKE_LOOKAHEAD_TICKS against
+            # (drift_tiles ~= speed_at_toggle * actual_coast_ticks) instead of guessing.
             if start_pos[0] is not None and pos[0] is not None:
                 drift = math.hypot(pos[0] - start_pos[0], pos[1] - start_pos[1])
-                print(f"[sailing] stopped -- drifted {drift:.1f} tiles after toggling sails")
+                print(f"[sailing] stopped -- drifted {drift:.1f} tiles after toggling sails (speed at toggle: {speed_at_toggle})")
             return True
         last_pos = pos
 
@@ -273,14 +315,15 @@ def sail_to(ctx, target: dict, brake: bool = True) -> bool:
     sails at the end. Does not redeploy the hook afterward -- the caller decides when that's
     appropriate.
 
-    brake: whether the final leg uses the wide SAIL_BRAKE_TRIGGER_TILES tolerance (the default).
-    SAIL_BRAKE_TRIGGER_TILES exists specifically to avoid ramming a solid target (see its own
-    comment) -- pass brake=False for a target that isn't a physical object (e.g. a computed
-    midpoint between two wrecks, open water) so the final leg uses the tighter
-    SAIL_ARRIVAL_TOLERANCE instead. CONFIRMED live 2026-08-03: with brake=True, the combination
-    of the 10-tile trigger plus stop_boat's own 2.2-5.0 tile drift left the boat missing a
-    computed pair-midpoint by a wide margin -- appropriate slop for not hitting a wreck, far too
-    much for landing on empty water where precision is what actually matters.
+    brake: whether the final leg uses the wide, speed-scaled braking distance (the default) --
+    see steer_toward's arrival_tolerance=None / _dynamic_brake_tiles. That braking distance exists
+    specifically to avoid ramming a solid target -- pass brake=False for a target that isn't a
+    physical object (e.g. a computed midpoint between two wrecks, open water) so the final leg
+    uses the tighter SAIL_ARRIVAL_TOLERANCE instead. CONFIRMED live 2026-08-03: with brake=True
+    (back when the trigger was a flat SAIL_BRAKE_TRIGGER_TILES), the combination of the 10-tile
+    trigger plus stop_boat's own 2.2-5.0 tile drift left the boat missing a computed pair-midpoint
+    by a wide margin -- appropriate slop for not hitting a wreck, far too much for landing on
+    empty water where precision is what actually matters.
 
     Re-plans from the current position (up to MAX_ROUTE_ATTEMPTS times) if a leg reports getting
     stuck -- CONFIRMED live 2026-08-02: running aground is a hard dead stop needing a real course
@@ -300,7 +343,7 @@ def sail_to(ctx, target: dict, brake: bool = True) -> bool:
         stuck = False
         for i, leg in enumerate(legs):
             is_final_leg = (i == len(legs) - 1)
-            tolerance = SAIL_BRAKE_TRIGGER_TILES if (is_final_leg and brake) else SAIL_ARRIVAL_TOLERANCE
+            tolerance = None if (is_final_leg and brake) else SAIL_ARRIVAL_TOLERANCE
             if not steer_toward(ctx, leg, arrival_tolerance=tolerance):
                 print(f"[sailing] got stuck heading to a waypoint (attempt {attempt + 1}/{MAX_ROUTE_ATTEMPTS}) -- replanning")
                 stuck = True

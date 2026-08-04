@@ -4,10 +4,17 @@ import com.example.bridge.BridgeHttpServer;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
 import net.runelite.api.Constants;
+import net.runelite.api.Perspective;
+import net.runelite.api.Player;
+import net.runelite.api.WorldEntity;
 import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.events.GameTick;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
 
 import java.awt.Point;
 import java.awt.Rectangle;
@@ -16,20 +23,72 @@ import java.util.Map;
 
 public class SailingProvider extends BridgeProvider
 {
-	public SailingProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
+	private final EventBus eventBus;
+
+	// Boat speed, sampled once per GameTick rather than on every /sailing GET -- GETs can arrive
+	// several times within a single game tick (polling loop), and the boat's WorldEntity position
+	// only actually changes on tick boundaries, so re-measuring on every GET would either read a
+	// stale delta of 0 between ticks or double-count a single tick's movement across polls.
+	// Modeled directly on the sideloaded Sailing plugin's own speed readout
+	// (data/decompiled/sailing-plugin's NavigationOverlay.onGameTick): measures the boat's
+	// WorldEntity.getTargetLocation() (the boat's own logical position for this tick), not
+	// getLocalLocation() (visually tweened/interpolated between ticks, and so noisy on a per-tick
+	// sample), matching that plugin's own choice for the same reason.
+	private LocalPoint lastBoatTarget;
+	private double lastBoatSpeedTilesPerTick;
+
+	public SailingProvider(Client client, ClientThread clientThread, BridgeHttpServer server, EventBus eventBus)
 	{
 		super(client, clientThread, server);
+		this.eventBus = eventBus;
 	}
 
 	@Override
 	public void register()
 	{
 		server.register("/sailing", () -> onClient(this::getSailing));
+		eventBus.register(this);
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick event)
+	{
+		Player local = client.getLocalPlayer();
+		WorldEntity boat = local != null
+			? RuneLiteUtil.findTopLevelWorldEntityContaining(client, local.getWorldView())
+			: null;
+		if (boat == null)
+		{
+			lastBoatTarget = null;
+			lastBoatSpeedTilesPerTick = 0;
+			return;
+		}
+
+		LocalPoint target = boat.getTargetLocation();
+		if (lastBoatTarget != null && target != null)
+		{
+			double localDist = Math.hypot(target.getX() - lastBoatTarget.getX(), target.getY() - lastBoatTarget.getY());
+			lastBoatSpeedTilesPerTick = localDist / Perspective.LOCAL_TILE_SIZE;
+		}
+		else
+		{
+			lastBoatSpeedTilesPerTick = 0;
+		}
+		lastBoatTarget = target;
 	}
 
 	private Object getSailing()
 	{
 		Map<String, Object> data = new HashMap<>();
+
+		// UNVERIFIED live -- the reference plugin only ever consumes this as a rounded UI display
+		// figure (NavigationOverlay.roundToQuarterTile), never as raw precision, so this exact
+		// tiles-per-tick value hasn't itself been cross-checked against a known live speed. The
+		// underlying getTargetLocation()-delta approach is CONFIRMED as the right data source
+		// (matches that plugin's own choice, see the field comment above); what's unverified is
+		// only whether the raw value here needs further smoothing/rounding for sailing.py's
+		// braking-distance use.
+		data.put("boatSpeed", lastBoatSpeedTilesPerTick);
 
 		// CONFIRMED WRONG live 2026-08-02 (was spec "Still unverified" #7, the single
 		// highest-consequence guess in this whole feature): FossilquestSailing (interface group

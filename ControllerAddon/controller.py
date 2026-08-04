@@ -165,6 +165,7 @@ def get_sailing():
         "navigating": False,
         "facilitiesTabOpen": False,
         "sailToggle": {},
+        "boatSpeed": None,
     }
 
 

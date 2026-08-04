@@ -622,6 +622,39 @@ Not yet live-tested: whether 16-directional movement actually produces a measura
 through a real narrow channel, or whether the difference is negligible in practice given routes are
 already simplified down to corner waypoints.
 
+## Design update: real boat-speed measurement replaces the flat braking-distance guess (2026-08-04)
+
+`SAIL_BRAKE_TRIGGER_TILES` (the distance at which `steer_toward` stops hopping on the final,
+ramming-risk leg) had been one flat number (10) since the 2026-08-02 anti-ramming fix, sized to
+cover the boat's full-sail top speed regardless of how fast it actually happened to be moving at
+that point in a given approach -- a boat that had barely gotten underway (e.g. right after a
+stuck-hop replan) would brake unnecessarily early under the same trigger meant for full cruising
+speed.
+
+**`SailingProvider.java` now measures the boat's real per-tick speed.** Modeled directly on the
+sideloaded Sailing plugin's own speed readout (`data/decompiled/sailing-plugin`'s
+`NavigationOverlay.onGameTick`): subscribes to `GameTick` (a new pattern for this codebase's
+providers -- existing ones are pull-only, computed fresh on each HTTP GET; the reference plugin's
+own choice of `WorldEntity.getTargetLocation()` over the visually-tweened `getLocalLocation()`
+specifically requires sampling once per logical tick, not once per GET, since GETs can arrive
+several times within a single tick) and tracks the boat's `getTargetLocation()` delta between
+ticks, exposed as `boatSpeed` (tiles/tick) on `/sailing`. The data-source choice itself is
+CONFIRMED (matches the reference plugin's own); the raw value's precision for this new
+braking-distance use is UNVERIFIED -- that plugin only ever consumed it as a rounded UI display
+figure, never at this precision.
+
+**`sailing.py`'s braking distance now scales to it.** New `_dynamic_brake_tiles()`: `max(
+SAIL_ARRIVAL_TOLERANCE, boatSpeed * BRAKE_LOOKAHEAD_TICKS)`, falling back to the old flat
+`SAIL_BRAKE_TRIGGER_TILES` whenever a live speed reading isn't available (older bridge build, or
+`boatSpeed` missing for any other reason) -- same safety net that constant always was.
+`steer_toward`'s `arrival_tolerance` parameter now defaults to `None`, meaning "recompute from
+current speed every hop" rather than one value fixed before the loop starts, since speed genuinely
+changes hop to hop (accelerating from a stop, cruising, slowed by an obstacle-avoidance leg).
+`BRAKE_LOOKAHEAD_TICKS` (initial guess: 3) is UNVERIFIED -- `stop_boat()` now logs the measured
+speed at the moment of toggling right next to its own drift-tiles measurement
+(`drift_tiles ~= speed_tiles_per_tick * actual_coast_ticks`), specifically so this can be fitted
+against real paired data once a few live samples exist, rather than guessed blind.
+
 ## Design
 
 ### 1. `SailingProvider.java` (new)
