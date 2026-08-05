@@ -9,6 +9,7 @@
 # Run with:
 #     python controller.py routines/slayer.py
 
+import math
 import random
 import time
 
@@ -269,6 +270,17 @@ SEED_BOX_BYPASS_NAMES = {
 # travel and could still leave the player inside a melee monster's reach).
 SAFESPOT_RETURN_TOLERANCE = 0
 
+# maintain_safespot refuses to attempt a walk-back at all if the marked tile is more than this
+# many tiles away -- CONFIRMED live 2026-08-06: a safespot marked while inside the Blast Furnace
+# minigame (an instanced area) got stored as a raw instance-template coordinate hundreds of tiles
+# from anywhere real (SafespotMarker.java's WorldPoint.fromScene wasn't instance-aware; fixed to
+# use WorldPoint.fromLocalInstance instead), and maintain_safespot blindly tried to walk there --
+# blocking the entire tick() loop (no eating, no prayer, nothing) for minutes while repeatedly
+# re-clicking the same unreachable minimap point. A real safespot return is never this far (it's
+# correcting a few tiles of drift from looting or a pull attack, not crossing the map); a distance
+# this large means the stored tile is stale/wrong, not a legitimate anchor to chase.
+SAFESPOT_MAX_RETURN_DISTANCE = 30
+
 
 def maintain_safespot(ctx):
     """Walks back to the marked safespot tile whenever the player has drifted off of it -- e.g.
@@ -287,7 +299,19 @@ def maintain_safespot(ctx):
 
     tile = {"x": safespot["x"], "y": safespot["y"], "plane": safespot["plane"]}
     if player.get("x") == tile["x"] and player.get("y") == tile["y"] and player.get("plane") == tile["plane"]:
+        ctx.state.data["safespot_too_far_warned"] = False
         return
+
+    dist = math.hypot(tile["x"] - player.get("x"), tile["y"] - player.get("y"))
+    if tile["plane"] != player.get("plane") or dist > SAFESPOT_MAX_RETURN_DISTANCE:
+        if not ctx.state.data.get("safespot_too_far_warned"):
+            debug_log.log("safespot", f"marked safespot ({tile['x']},{tile['y']},{tile['plane']}) is "
+                                       f"{dist:.0f} tiles away or on a different plane -- refusing to "
+                                       f"auto-walk there, this looks like a stale/wrong mark. Re-mark it "
+                                       f"from your current location, or turn off Use Safespot.")
+            ctx.state.data["safespot_too_far_warned"] = True
+        return
+    ctx.state.data["safespot_too_far_warned"] = False
 
     debug_log.log("safespot", f"drifted from safespot (at ({player.get('x')},{player.get('y')}), "
                                f"safespot is ({tile['x']},{tile['y']})) -- returning")
