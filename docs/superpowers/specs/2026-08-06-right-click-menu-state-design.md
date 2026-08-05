@@ -2,16 +2,27 @@
 
 ## Problem
 
-The bot can only ever left-click. Anything that requires reading or choosing from a right-click
-context menu -- e.g. verifying "Mark Safespot" actually appears and works, or any future feature
-needing a specific non-default menu option -- currently needs a human at the keyboard, or the
-existing `MenuPriority`-style trick of force-reordering a menu entry into the left-click slot
-server-side (which only works for options that can be identified and force-prioritized ahead of
-time, not for reading back what's actually on screen right now).
+The real goal is for the agent to be able to live-debug this bot's behavior against a running
+game client on its own -- trigger an action, observe what actually happened, and verify a fix
+worked, without a human relaying screen contents or clicking things by hand. The safespot
+incident this session (a stale marked tile sent the character on an unstoppable walk) is exactly
+the kind of thing that should have been catchable by the agent alone: mark a tile, read back
+whether it landed where expected, and confirm before it's ever relied on live.
 
-This adds the two missing primitives: the ability to right-click, and the ability to read back
-what a currently-open menu actually contains, so the bot itself can trigger and verify menu
-interactions end-to-end.
+Right now that loop is broken at its first step. The bot can only ever left-click, and there's no
+way to read back what a right-click menu actually contains. Anything that requires choosing from
+a context menu -- verifying "Mark Safespot" appears and works, or any future feature needing a
+specific non-default menu option -- currently needs a human at the keyboard, or the existing
+`MenuPriority`-style trick of force-reordering a menu entry into the left-click slot server-side
+(which only works for options identified and force-prioritized ahead of time, not for reading back
+what's actually on screen right now, and can't verify anything -- it just makes a plain click
+resolve differently).
+
+This is the first concrete piece toward that larger goal, not the whole of it: the ability to
+right-click, and the ability to read back what a currently-open menu actually contains, so the
+agent can trigger and verify a menu-driven interaction end-to-end -- close, but not the full
+capability set autonomous live-debugging eventually needs (e.g. visual confirmation of things no
+JSON endpoint captures is a separate, later piece).
 
 ## Right-click primitive
 
@@ -87,3 +98,6 @@ correctly updates config -- without a human or screen vision.
 - Any change to `MenuPriority`'s existing force-left-click-slot behavior -- this is a fully
   separate mechanism (read-and-choose vs. force-reorder-for-a-plain-click) serving a different
   purpose, not a replacement for it.
+- Visual/screenshot-based verification (confirming something on screen a JSON endpoint can't
+  capture, e.g. whether a highlight actually renders) -- a separate, later piece toward the same
+  autonomous-debugging goal, not part of this spec.
