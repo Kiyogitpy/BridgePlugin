@@ -145,6 +145,12 @@ public class ControllerPlugin extends Plugin
 	}
 
 	@Subscribe
+	public void onMenuEntryAdded(MenuEntryAdded event)
+	{
+		SafespotMarker.apply(client, configManager, event);
+	}
+
+	@Subscribe
 	public void onConfigChanged(ConfigChanged event)
 	{
 		if (!ControllerConfig.GROUP.equals(event.getGroup()))

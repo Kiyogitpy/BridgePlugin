@@ -90,6 +90,15 @@ public final class ConfigExporter
 		pvpSafety.put("fleeEnabled", controllerConfig.pvpFleeEnabled());
 		data.put("pvpSafety", pvpSafety);
 
+		Map<String, Object> safespot = new LinkedHashMap<>();
+		boolean safespotMarked = config.safespotEnabled() && (config.safespotX() != 0 || config.safespotY() != 0);
+		safespot.put("enabled", config.safespotEnabled());
+		safespot.put("marked", safespotMarked);
+		safespot.put("x", config.safespotX());
+		safespot.put("y", config.safespotY());
+		safespot.put("plane", config.safespotPlane());
+		data.put("safespot", safespot);
+
 		data.put("taskLocations", resolveTaskLocations(config));
 
 		data.put("eatAt", controllerConfig.eatAtHp());

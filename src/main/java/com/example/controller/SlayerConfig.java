@@ -35,6 +35,9 @@ public interface SlayerConfig extends Config
 	@ConfigSection(name = "Travel", description = "Chosen location for slayer task categories with more than one known spot", position = 10)
 	String travelSection = "travel";
 
+	@ConfigSection(name = "Safespot", description = "Fight from a fixed tile a melee monster can't reach", position = 11)
+	String safespotSection = "safespot";
+
 	// --- Targets ---
 
 	@ConfigItem(
@@ -239,5 +242,58 @@ public interface SlayerConfig extends Config
 	default String taskLocationChoices()
 	{
 		return "";
+	}
+
+	// --- Safespot ---
+
+	@ConfigItem(
+		keyName = "safespotEnabled",
+		name = "Use Safespot",
+		description = "Walk back to the marked safespot tile whenever you drift off it (looting, a monster's " +
+			"pull attack, etc). Only useful for Ranged/Magic tasks -- melee requires standing adjacent to the " +
+			"target, which defeats the point.",
+		section = safespotSection,
+		position = 0
+	)
+	default boolean safespotEnabled()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "safespotX",
+		name = "Safespot X",
+		description = "Managed by right-clicking the ground and choosing \"Mark Safespot\" -- 0 means no tile " +
+			"has been marked yet.",
+		section = safespotSection,
+		position = 1
+	)
+	default int safespotX()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "safespotY",
+		name = "Safespot Y",
+		description = "Managed by right-clicking the ground and choosing \"Mark Safespot\".",
+		section = safespotSection,
+		position = 2
+	)
+	default int safespotY()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "safespotPlane",
+		name = "Safespot Plane",
+		description = "Managed by right-clicking the ground and choosing \"Mark Safespot\".",
+		section = safespotSection,
+		position = 3
+	)
+	default int safespotPlane()
+	{
+		return 0;
 	}
 }
