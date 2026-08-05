@@ -15,6 +15,7 @@ import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.PluginManager;
+import net.runelite.client.ui.overlay.OverlayManager;
 
 import javax.inject.Inject;
 import java.util.HashMap;
@@ -49,6 +50,12 @@ public class ControllerPlugin extends Plugin
 
 	@Inject
 	private EventBus eventBus;
+
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private SafespotOverlay safespotOverlay;
 
 	private BridgeHttpServer server;
 	private UdpEventSender udpSender;
@@ -97,11 +104,15 @@ public class ControllerPlugin extends Plugin
 		{
 			System.out.println("Shortest Path integration unavailable: " + t);
 		}
+
+		overlayManager.add(safespotOverlay);
 	}
 
 	@Override
 	protected void shutDown()
 	{
+		overlayManager.remove(safespotOverlay);
+
 		if (server != null)
 		{
 			server.stop();

@@ -36,7 +36,8 @@ final class SafespotMarker
 
 	static void apply(Client client, ConfigManager configManager, MenuEntryAdded event)
 	{
-		if (event.getMenuEntry().getType() != MenuAction.WALK)
+		MenuAction menuAction = event.getMenuEntry().getType();
+		if (menuAction != MenuAction.WALK && menuAction != MenuAction.SET_HEADING)
 		{
 			return;
 		}
