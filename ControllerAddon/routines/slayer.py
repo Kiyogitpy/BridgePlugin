@@ -14,6 +14,7 @@ import time
 
 import banker
 import controller
+import debug_log
 import settings
 import travel
 
@@ -43,7 +44,7 @@ def tick(ctx):
 
     bank_cfg = config.get("bank", {})
     if bank_cfg.get("enabled") and needs_banking(ctx):
-        print("[bank] inventory full, banking")
+        debug_log.log("bank", "inventory full, banking")
         ctx.state.data["current_target_index"] = None  # don't try to resume a fight through a bank trip
         banker.bank_up(ctx, bank_cfg)
         return
@@ -56,6 +57,7 @@ def tick(ctx):
     if config.get("loot", {}).get("enabled"):
         maybe_loot(ctx)
 
+    maintain_safespot(ctx)
     engage_target(ctx, combat)
 
 
@@ -216,6 +218,81 @@ AUTO_PRAYER_LADDERS = {
 # unable to ever detect "off" again.
 OFFENSIVE_PRAYER_STUCK_ON_TICKS = 3
 
+# maybe_loot gives up on a ground item after this many consecutive pickup attempts on the exact
+# same tile without it disappearing -- CONFIRMED live 2026-08-05: a Grimy ranarr weed dropped in
+# a Gryphon cave room got re-clicked 40+ ticks straight with the player's position/animation never
+# changing at all (not even an attempted walk), never picked up. GroundItemProvider's "clickable"
+# flag is screen-visibility only (onScreen && alive), with no pathfinding/reachability check behind
+# it, so a stuck ground item (e.g. dropped on a tile that isn't actually reachable from here) looks
+# identical to a normal one and gets re-targeted forever with no error to detect otherwise.
+LOOT_STUCK_MAX_ATTEMPTS = 6
+
+# engage_target gives up on a committed target and re-picks/re-clicks after this many
+# consecutive ticks of literally zero player movement while not in combat -- CONFIRMED live
+# 2026-08-05: an engaging click on a distant (dist=7) Gryphon drifted badly during cursor
+# travel (refresh_target re-aiming mid-move at an NPC that itself moved), landing ~143px from
+# the original aim point and missing the NPC entirely. current_target_index gets committed
+# unconditionally once click_entity doesn't abort, with no check that combat actually started,
+# so the routine froze on that target permanently -- it's still "alive" (never hit) and no
+# NPC_DIED ever fires, so the still-alive branch just returns every tick forever. A real
+# engagement always starts moving toward the target or entering combat within a couple ticks,
+# so "not in combat AND hasn't moved at all" for several ticks straight only happens when the
+# engaging click missed -- never during a normal walk-up, which shows position changing tick
+# to tick.
+ENGAGE_STUCK_MAX_TICKS = 5
+
+# maybe_loot ignores minLootValue for these grimy herbs whenever an open herb sack is carried --
+# it auto-stores them for free regardless of GE value, so the value gate only exists to avoid
+# clutter for someone who isn't carrying one. Sourced from the herb sack's own storage list
+# (data/raw/H/Herb sack.txt). Guam, marrentill, tarromin, and harralander are deliberately
+# excluded -- too low-value to bother with even given the free storage.
+HERB_SACK_BYPASS_NAMES = {
+    "grimy ranarr weed", "grimy toadflax", "grimy irit leaf", "grimy avantoe", "grimy kwuarm",
+    "grimy huasca", "grimy snapdragon", "grimy cadantine", "grimy lantadyme", "grimy dwarf weed",
+    "grimy torstol",
+}
+
+# Same reasoning as HERB_SACK_BYPASS_NAMES, for herb and tree seeds whenever an open seed box is
+# carried. Sourced from the wiki's Herb patch/Tree patch seed tables (data/raw/H/Herb
+# patch_Seeds.txt, data/raw/T/Tree patch_Seeds.txt) -- fruit tree seeds are a separate wiki
+# category and deliberately not included here.
+SEED_BOX_BYPASS_NAMES = {
+    "guam seed", "marrentill seed", "tarromin seed", "harralander seed", "ranarr seed",
+    "toadflax seed", "irit seed", "avantoe seed", "kwuarm seed", "huasca seed",
+    "snapdragon seed", "cadantine seed", "lantadyme seed", "dwarf weed seed", "torstol seed",
+    "acorn", "willow seed", "maple seed", "yew seed", "magic seed",
+}
+
+# maintain_safespot walks back to the marked safespot tile once the player is more than this
+# many tiles off of it -- 0 means "must be standing on the exact tile", matching the point of a
+# safespot (travel.walk_to's own default 3-tile WALK_ARRIVAL_TOLERANCE is tuned for bank-trip-scale
+# travel and could still leave the player inside a melee monster's reach).
+SAFESPOT_RETURN_TOLERANCE = 0
+
+
+def maintain_safespot(ctx):
+    """Walks back to the marked safespot tile whenever the player has drifted off of it -- e.g.
+    after stepping out to loot something, or getting dragged by a monster's pull attack. Runs
+    every tick regardless of combat state (not just when picking a fresh target), since that's
+    what actually catches a mid-fight drag rather than just anchoring at the start of each
+    fight."""
+    config = ctx.state.config
+    safespot = config.get("safespot", {})
+    if not safespot.get("enabled") or not safespot.get("marked"):
+        return
+
+    player = controller.get_player()
+    if player.get("x") is None:
+        return
+
+    tile = {"x": safespot["x"], "y": safespot["y"], "plane": safespot["plane"]}
+    if player.get("x") == tile["x"] and player.get("y") == tile["y"] and player.get("plane") == tile["plane"]:
+        return
+
+    debug_log.log("safespot", f"drifted from safespot (at ({player.get('x')},{player.get('y')}), "
+                               f"safespot is ({tile['x']},{tile['y']})) -- returning")
+    travel.walk_to(ctx, tile, tolerance=SAFESPOT_RETURN_TOLERANCE)
+
 
 def resolve_combat_prayer(combat_prayer: str, prayer_level):
     """Resolve a Defensive/Offensive Prayer config value down to a concrete prayer name
@@ -259,15 +336,22 @@ def maintain_defensive_prayer(ctx, combat: dict):
     raw_defensive_prayer = prayer_cfg.get("defensivePrayer", "NONE")
     defensive_prayer = resolve_combat_prayer(raw_defensive_prayer, player.get("prayerReal"))
 
+    # combat.inCombat (Player.getInteracting() != null) can read False for a tick during a
+    # non-combat action like eating/drinking -- CONFIRMED by user report of prayer flicking off
+    # mid-fight right when eating/drinking. Same flakiness engage_target already works around
+    # by preferring "is our tracked target still alive" over this flag -- OR it in here too so
+    # a live tracked target holds prayer on through the same momentary misread.
+    still_fighting = bool(combat.get("inCombat")) or ctx.state.data.get("current_target_index") is not None
+
     if prayer_cfg.get("useQuickPrayers"):
-        want_on = bool(combat.get("inCombat"))
+        want_on = still_fighting
         is_on = prayers.get("quickPrayerEnabled", False)
         if want_on != is_on:
             ox, oy = prayers.get("quickOrbScreenX"), prayers.get("quickOrbScreenY")
             if ox is not None and oy is not None:
                 controller.click_entity(ctx.ser, {"screenX": ox, "screenY": oy}, offset=(0, 0))
     elif defensive_prayer:
-        want_on = bool(combat.get("inCombat"))
+        want_on = still_fighting
         is_on = prayers.get("active", {}).get(defensive_prayer, False)
         if want_on != is_on:
             # Prayer icons only get live screen coords while the Prayer tab is open --
@@ -277,22 +361,22 @@ def maintain_defensive_prayer(ctx, combat: dict):
             controller.open_prayer_tab(ctx.ser)
             icon = controller.get_prayers().get("icons", {}).get(defensive_prayer)
             if icon:
-                print(f"[prayer] {'turning on' if want_on else 'turning off'} {defensive_prayer}")
+                debug_log.log("prayer", f"{'turning on' if want_on else 'turning off'} {defensive_prayer}")
                 controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
     elif raw_defensive_prayer in (None, "", "NONE"):
         if not ctx.state.data.get("warned_no_defensive_prayer"):
-            print("[prayer] usePrayer is on with useQuickPrayers off, but Defensive Prayer is "
-                  "set to None in Controller Settings -- nothing to toggle. Pick a prayer there "
-                  "(e.g. Protect from Melee) or enable Use Quick Prayers instead.")
+            debug_log.log("prayer", "usePrayer is on with useQuickPrayers off, but Defensive Prayer is "
+                                     "set to None in Controller Settings -- nothing to toggle. Pick a prayer there "
+                                     "(e.g. Protect from Melee) or enable Use Quick Prayers instead.")
             ctx.state.data["warned_no_defensive_prayer"] = True
     elif not ctx.state.data.get("warned_defensive_prayer_level_too_low"):
         # Either a manually-picked prayer this account hasn't unlocked, or an Auto ladder
         # with nothing on it affordable yet -- either way, nothing usable right now. Surfaced
         # once rather than resolve_combat_prayer's None silently looking identical to "nothing
         # configured", which would otherwise be confusing to debug from the logs alone.
-        print(f"[prayer] Defensive Prayer is set to {raw_defensive_prayer} in Controller "
-              f"Settings, but nothing in that selection is usable yet at prayer level "
-              f"{player.get('prayerReal')} -- nothing to toggle until it's leveled up.")
+        debug_log.log("prayer", f"Defensive Prayer is set to {raw_defensive_prayer} in Controller "
+                                 f"Settings, but nothing in that selection is usable yet at prayer level "
+                                 f"{player.get('prayerReal')} -- nothing to toggle until it's leveled up.")
         ctx.state.data["warned_defensive_prayer_level_too_low"] = True
 
     potions_cfg = config.get("potions", {})
@@ -325,8 +409,8 @@ def maintain_defensive_prayer(ctx, combat: dict):
             should_drink, mistake = True, True  # wastes a dose we didn't actually need yet
 
         if should_drink and controller.consume_first(ctx.ser, "prayer"):
-            print(f"[prayer] {'(mistake) ' if mistake else ''}drank prayer restore "
-                  f"(prayer={current_prayer}, threshold={threshold:.0f})")
+            debug_log.log("prayer", f"{'(mistake) ' if mistake else ''}drank prayer restore "
+                                     f"(prayer={current_prayer}, threshold={threshold:.0f})")
             ctx.state.data["prayer_drink_threshold"] = None
 
 
@@ -370,7 +454,7 @@ def maintain_offensive_prayer(ctx, combat: dict):
             controller.open_prayer_tab(ctx.ser)
             icon = controller.get_prayers().get("icons", {}).get(offensive_prayer)
             if icon:
-                print(f"[prayer] flicking on {offensive_prayer}")
+                debug_log.log("prayer", f"flicking on {offensive_prayer}")
                 controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
                 ctx.state.data["offensive_prayer_on_since_tick"] = combat.get("tick")
                 ctx.state.data["offensive_prayer_hp_xp_at_flick"] = hp_xp
@@ -390,7 +474,7 @@ def maintain_offensive_prayer(ctx, combat: dict):
         cleared = False
         if icon:
             reason = "hit landed" if hit_landed else ("untracked" if untracked else "attack tick passed")
-            print(f"[prayer] flicking off {offensive_prayer} ({reason})")
+            debug_log.log("prayer", f"flicking off {offensive_prayer} ({reason})")
             controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
             cleared = True
         elif tick_passed and combat.get("tick") - flicked_on_tick >= OFFENSIVE_PRAYER_STUCK_ON_TICKS:
@@ -398,8 +482,8 @@ def maintain_offensive_prayer(ctx, combat: dict):
             # anyway rather than staying permanently unable to ever detect "off" again. The
             # prayer may stay lit in-game a tick or two longer than intended, but that beats
             # draining prayer points forever with nothing able to notice.
-            print(f"[prayer] giving up on flicking off {offensive_prayer} -- icon not found for "
-                  f"{OFFENSIVE_PRAYER_STUCK_ON_TICKS}+ ticks, clearing tracked state anyway")
+            debug_log.log("prayer", f"giving up on flicking off {offensive_prayer} -- icon not found for "
+                                     f"{OFFENSIVE_PRAYER_STUCK_ON_TICKS}+ ticks, clearing tracked state anyway")
             cleared = True
 
         if cleared:
@@ -423,7 +507,7 @@ def maintain_supplies(ctx):
             should_eat, mistake = True, True  # eats a bite we didn't actually need, e.g. right up near full hp
 
         if should_eat and controller.consume_first(ctx.ser, "food"):
-            print(f"[supplies] {'(mistake) ' if mistake else ''}ate food (hp={hp})")
+            debug_log.log("supplies", f"{'(mistake) ' if mistake else ''}ate food (hp={hp})")
             return  # avoid eating and drinking in the same tick
 
     if potions_cfg.get("combatEnabled"):
@@ -440,7 +524,21 @@ def maybe_loot(ctx):
     whitelist = [w.lower() for w in loot_cfg.get("items", [])]
     min_value = loot_cfg.get("minValue", 0)
 
-    for item in controller.get_ground_items():
+    ground_items = controller.get_ground_items()
+    inventory = controller.get_inventory()
+    herb_sack_open = any("open herb sack" in (i.get("name") or "").lower() for i in inventory)
+    seed_box_open = any("open seed box" in (i.get("name") or "").lower() for i in inventory)
+
+    # (id, x, y) identifies a specific dropped item on a specific tile -- if it's no longer
+    # among what's currently on the ground (picked up, despawned, or just out of range now),
+    # drop the stuck-attempt tracking for it rather than let a stale count carry over onto
+    # an unrelated future item that happens to reuse the same key.
+    stuck_key = ctx.state.data.get("loot_stuck_key")
+    if stuck_key is not None and stuck_key not in {(i.get("id"), i.get("x"), i.get("y")) for i in ground_items}:
+        ctx.state.data["loot_stuck_key"] = None
+        ctx.state.data["loot_stuck_attempts"] = 0
+
+    for item in ground_items:
         if not item.get("clickable"):
             continue
 
@@ -448,20 +546,44 @@ def maybe_loot(ctx):
         name_match = bool(whitelist) and any(w in name for w in whitelist)
         # totalValue is GE price * quantity, computed server-side (GroundItemProvider).
         value_match = min_value > 0 and item.get("totalValue", 0) >= min_value
+        herb_bypass = herb_sack_open and name in HERB_SACK_BYPASS_NAMES
+        seed_bypass = seed_box_open and name in SEED_BOX_BYPASS_NAMES
 
-        if name_match or value_match:
-            reason = "whitelist" if name_match else f"worth {item.get('totalValue')}gp"
-            print(f"[loot] picking up {item.get('name')} ({reason})")
+        if name_match or value_match or herb_bypass or seed_bypass:
+            key = (item.get("id"), item.get("x"), item.get("y"))
+            if key == ctx.state.data.get("loot_stuck_key") \
+                    and ctx.state.data.get("loot_stuck_attempts", 0) >= LOOT_STUCK_MAX_ATTEMPTS:
+                # Same tile, still here after repeated attempts -- treat as unreachable and
+                # move on instead of clicking it forever (see LOOT_STUCK_MAX_ATTEMPTS above).
+                continue
+
+            if name_match:
+                reason = "whitelist"
+            elif value_match:
+                reason = f"worth {item.get('totalValue')}gp"
+            elif herb_bypass:
+                reason = "herb sack open"
+            else:
+                reason = "seed box open"
+            debug_log.log("loot", f"picking up {item.get('name')} ({reason})")
             time.sleep(random.uniform(0.2, 0.5))
             controller.click_entity(ctx.ser, item)
+
+            if key == ctx.state.data.get("loot_stuck_key"):
+                ctx.state.data["loot_stuck_attempts"] = ctx.state.data.get("loot_stuck_attempts", 0) + 1
+            else:
+                ctx.state.data["loot_stuck_key"] = key
+                ctx.state.data["loot_stuck_attempts"] = 1
             break
 
     if loot_cfg.get("buryBones"):
         for item in controller.get_inventory():
             name = (item.get("name") or "").lower()
             if "bones" in name:
-                print(f"[loot] burying {item.get('name')}")
-                controller.click_entity(ctx.ser, item)
+                debug_log.log("loot", f"burying {item.get('name')}")
+                # check_ui_blockers=False: inventory-item click, same reasoning as every
+                # other inventory click in this codebase (see banker.py's coal bag notes).
+                controller.click_entity(ctx.ser, item, check_ui_blockers=False)
                 break
 
 
@@ -485,8 +607,30 @@ def engage_target(ctx, combat: dict):
             # False for a tick between attack animations even while the zone
             # still has us locked, so don't use it to decide whether to
             # re-engage; only "is our tracked target still alive" matters.
-            return
+            #
+            # ...unless the engaging click itself missed the NPC (see
+            # ENGAGE_STUCK_MAX_TICKS above) -- give up the commitment once we've gone
+            # several ticks straight with no combat AND no movement at all, since a
+            # real engagement always starts walking toward the target or fighting it
+            # within a couple ticks.
+            player = controller.get_player()
+            pos = (player.get("x"), player.get("y"), player.get("plane"))
+            if bool(combat.get("inCombat")) or pos != ctx.state.data.get("engage_last_pos"):
+                ctx.state.data["engage_last_pos"] = pos
+                ctx.state.data["engage_stuck_ticks"] = 0
+                return
+
+            stuck_ticks = ctx.state.data.get("engage_stuck_ticks", 0) + 1
+            if stuck_ticks < ENGAGE_STUCK_MAX_TICKS:
+                ctx.state.data["engage_stuck_ticks"] = stuck_ticks
+                return
+
+            debug_log.log("combat", f"giving up on target index={current_target_index} -- "
+                                     f"not in combat and hasn't moved for {stuck_ticks} ticks "
+                                     f"straight, engaging click probably missed")
         ctx.state.data["current_target_index"] = None
+        ctx.state.data["engage_last_pos"] = None
+        ctx.state.data["engage_stuck_ticks"] = 0
 
     if config.get("onlyAttackWhenIdle") and not combat.get("isIdle", True):
         return
@@ -495,10 +639,8 @@ def engage_target(ctx, combat: dict):
     if not target:
         return
 
-    print(
-        f"[combat] attacking {target.get('name')} "
-        f"(id={target['id']}, index={target['index']}, dist={target.get('distance')})"
-    )
+    debug_log.log("combat", f"attacking {target.get('name')} "
+                             f"(id={target['id']}, index={target['index']}, dist={target.get('distance')})")
     time.sleep(random.uniform(0.15, 0.6))
     target_index = target["index"]
     if controller.click_entity(
