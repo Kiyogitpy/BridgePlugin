@@ -315,6 +315,16 @@ def maintain_safespot(ctx):
 
     debug_log.log("safespot", f"drifted from safespot (at ({player.get('x')},{player.get('y')}), "
                                f"safespot is ({tile['x']},{tile['y']})) -- returning")
+    # Don't try to resume a fight through a walk this long -- same reasoning as needs_banking's
+    # bank trip. Without this, engage_target sees an old, now-meaningless committed target/position
+    # (recorded before this multi-tick walk started) and just sits there "not in combat, not
+    # moving" for ENGAGE_STUCK_MAX_TICKS before it notices and re-engages on its own -- CONFIRMED
+    # live 2026-08-06 (user report: had to manually re-click the enemy after returning to a
+    # safespot). Clearing this here means engage_target is free to pick/click a fresh target the
+    # very next tick, no artificial delay.
+    ctx.state.data["current_target_index"] = None
+    ctx.state.data["engage_last_pos"] = None
+    ctx.state.data["engage_stuck_ticks"] = 0
     travel.walk_to(ctx, tile, tolerance=SAFESPOT_RETURN_TOLERANCE)
 
 
