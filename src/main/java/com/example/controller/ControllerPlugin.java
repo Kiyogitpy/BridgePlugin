@@ -141,7 +141,7 @@ public class ControllerPlugin extends Plugin
 		// (needed there for RuneLite to associate it with that plugin's own config screen), and
 		// a dependent plugin's binding isn't visible back to the plugin it depends on. Fetching
 		// it straight from ConfigManager sidesteps needing a Guice binding here at all.
-		MenuPriority.apply(client, config, configManager.getConfig(SlayerConfig.class), event);
+		MenuPriority.apply(client, config, configManager.getConfig(SlayerConfig.class), event, itemManager);
 	}
 
 	@Subscribe

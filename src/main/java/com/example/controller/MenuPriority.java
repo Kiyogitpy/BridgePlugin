@@ -3,6 +3,7 @@ package com.example.controller;
 import net.runelite.api.Client;
 import net.runelite.api.MenuEntry;
 import net.runelite.api.events.MenuOpened;
+import net.runelite.client.game.ItemManager;
 import net.runelite.client.util.Text;
 
 import java.util.HashSet;
@@ -33,7 +34,7 @@ final class MenuPriority
 	{
 	}
 
-	static void apply(Client client, ControllerConfig config, SlayerConfig slayerConfig, MenuOpened event)
+	static void apply(Client client, ControllerConfig config, SlayerConfig slayerConfig, MenuOpened event, ItemManager itemManager)
 	{
 		if (!config.forceClickPriority())
 		{
@@ -51,6 +52,7 @@ final class MenuPriority
 		Set<String> lootItems = lootItemsCache.get(slayerConfig.lootWhitelist());
 		Set<String> targetObjects = targetObjectsCache.get(config.targetObjectNames());
 		Set<String> forcedActions = forcedActionsCache.get(config.forcedActions());
+		int minLootValue = slayerConfig.minLootValue();
 
 		for (int i = lastIndex - 1; i >= 0; i--)
 		{
@@ -60,7 +62,7 @@ final class MenuPriority
 
 			boolean wanted =
 				("attack".equals(option) && targetNpcs.contains(target))
-					|| ("take".equals(option) && lootItems.contains(target))
+					|| ("take".equals(option) && (lootItems.contains(target) || meetsLootValue(itemManager, entry, minLootValue)))
 					|| (targetObjects.contains(target) && !"examine".equals(option) && !"cancel".equals(option))
 					|| forcedActions.contains(option);
 
@@ -72,6 +74,26 @@ final class MenuPriority
 				return;
 			}
 		}
+	}
+
+	/** Value-based loot priority, alongside the name-whitelist check above -- covers
+	 * maybe_loot's (slayer.py) totalValue >= minLootValue path, which has no name to match
+	 * against. Uses MenuEntry.getItemId() directly (a real method on the RuneLite API) rather
+	 * than parsing `target`, and checks unit GE price only, not price x quantity -- MenuEntry
+	 * carries no quantity, and ground-item drops are effectively always qty=1 per entry in
+	 * practice, so this is a deliberate simplification, not an oversight. */
+	private static boolean meetsLootValue(ItemManager itemManager, MenuEntry entry, int minLootValue)
+	{
+		if (minLootValue <= 0)
+		{
+			return false;
+		}
+		int itemId = entry.getItemId();
+		if (itemId <= 0)
+		{
+			return false;
+		}
+		return itemManager.getItemPrice(itemId) >= minLootValue;
 	}
 
 	private static Set<String> normalizedSet(String commaSeparated)
