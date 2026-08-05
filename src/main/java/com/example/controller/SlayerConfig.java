@@ -264,9 +264,10 @@ public interface SlayerConfig extends Config
 		keyName = "safespotX",
 		name = "Safespot X",
 		description = "Managed by right-clicking the ground and choosing \"Mark Safespot\" -- 0 means no tile " +
-			"has been marked yet.",
+			"has been marked yet. Hidden: not meant to be hand-typed, only ever set by the marker.",
 		section = safespotSection,
-		position = 1
+		position = 1,
+		hidden = true
 	)
 	default int safespotX()
 	{
@@ -276,9 +277,11 @@ public interface SlayerConfig extends Config
 	@ConfigItem(
 		keyName = "safespotY",
 		name = "Safespot Y",
-		description = "Managed by right-clicking the ground and choosing \"Mark Safespot\".",
+		description = "Managed by right-clicking the ground and choosing \"Mark Safespot\". Hidden: not meant " +
+			"to be hand-typed, only ever set by the marker.",
 		section = safespotSection,
-		position = 2
+		position = 2,
+		hidden = true
 	)
 	default int safespotY()
 	{
@@ -288,9 +291,11 @@ public interface SlayerConfig extends Config
 	@ConfigItem(
 		keyName = "safespotPlane",
 		name = "Safespot Plane",
-		description = "Managed by right-clicking the ground and choosing \"Mark Safespot\".",
+		description = "Managed by right-clicking the ground and choosing \"Mark Safespot\". Hidden: not meant " +
+			"to be hand-typed, only ever set by the marker.",
 		section = safespotSection,
-		position = 3
+		position = 3,
+		hidden = true
 	)
 	default int safespotPlane()
 	{
