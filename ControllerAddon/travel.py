@@ -345,14 +345,27 @@ def _walk_greedy(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE) -
 
 
 def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
-    """Click a minimap point and wait for arrival (or timeout) before
+    """Click the hop point and wait for arrival (or timeout) before
     returning. False only if the point isn't projectable onto the minimap
     at all; a timed-out wait still returns True so the caller just
-    recomputes the next hop from wherever the player actually ended up."""
-    point = controller.get_minimap_walk_point(x, y, plane)
-    if not point.get("onMinimap"):
-        debug_log.log("travel", "hop point isn't on the minimap, giving up")
-        return False
+    recomputes the next hop from wherever the player actually ended up.
+
+    Prefers a viewport click (get_ground_walk_point) over a minimap click
+    whenever the tile is actually rendered on screen -- CONFIRMED live
+    2026-08-06: the minimap is too small/coarse to reliably land on a
+    specific single tile (e.g. maintain_safespot's exact-tile return), while
+    a viewport click aims at the real projected tile position. Minimap
+    clicking is still needed as a fallback for hops beyond render distance,
+    which is the common case for most of a route -- only the tile actually
+    visible right now can use the more precise path."""
+    ground_point = controller.get_ground_walk_point(x, y, plane)
+    if ground_point.get("onScreen"):
+        point = ground_point
+    else:
+        point = controller.get_minimap_walk_point(x, y, plane)
+        if not point.get("onMinimap"):
+            debug_log.log("travel", "hop point isn't on screen or the minimap, giving up")
+            return False
 
     controller.click_entity(ctx.ser, point, offset=(0, 0))
 
