@@ -242,6 +242,13 @@ LOOT_STUCK_MAX_ATTEMPTS = 6
 # to tick.
 ENGAGE_STUCK_MAX_TICKS = 5
 
+# engage_target only runs the ENGAGE_STUCK_MAX_TICKS check within this many seconds of
+# committing to a target -- see the check's own comment in engage_target for why: it exists to
+# catch a missed *initial* engaging click (which always shows up within a few ticks), not to
+# keep re-litigating an already-successful, ongoing fight where a routine mid-fight eat/drink can
+# otherwise be mistaken for a failed engagement.
+ENGAGE_STUCK_WINDOW_S = 10
+
 # maybe_loot ignores minLootValue for these grimy herbs whenever an open herb sack is carried --
 # it auto-stores them for free regardless of GE value, so the value gate only exists to avoid
 # clutter for someone who isn't carrying one. Sourced from the herb sack's own storage list
@@ -437,14 +444,8 @@ def maintain_defensive_prayer(ctx, combat: dict):
             ctx.state.data["prayer_drink_threshold"] = threshold
 
         should_drink = current_prayer <= threshold
-        mistake = False
-        if not should_drink and prayer_max and current_prayer >= prayer_max * settings.MISTAKE_OVERDRINK_MIN_PRAYER_FRACTION \
-                and random.random() < settings.MISTAKE_OVERDRINK_CHANCE:
-            should_drink, mistake = True, True  # wastes a dose we didn't actually need yet
-
         if should_drink and controller.consume_first(ctx.ser, "prayer"):
-            debug_log.log("prayer", f"{'(mistake) ' if mistake else ''}drank prayer restore "
-                                     f"(prayer={current_prayer}, threshold={threshold:.0f})")
+            debug_log.log("prayer", f"drank prayer restore (prayer={current_prayer}, threshold={threshold:.0f})")
             ctx.state.data["prayer_drink_threshold"] = None
 
 
@@ -647,6 +648,21 @@ def engage_target(ctx, combat: dict):
             # several ticks straight with no combat AND no movement at all, since a
             # real engagement always starts walking toward the target or fighting it
             # within a couple ticks.
+            #
+            # Only checked within ENGAGE_STUCK_WINDOW_S of committing to this target --
+            # CONFIRMED live 2026-08-06 (user report: had to manually re-click the target after
+            # eating/drinking mid-fight): combat.inCombat's own flakiness during a non-combat
+            # action (see maintain_defensive_prayer's still_fighting fix for the same root cause)
+            # combined with a stationary safespot fighter never satisfying the "OR moved" half of
+            # this check either, meaning a routine mid-fight sip could accumulate stuck_ticks and
+            # falsely conclude the engagement failed, deep into an already-successful fight. This
+            # detection exists only to catch a missed *initial* click, which always shows up
+            # within a few ticks of committing -- past the window, trust the fight and stop
+            # checking, exactly like the code did before ENGAGE_STUCK_MAX_TICKS existed.
+            committed_at = ctx.state.data.get("engage_committed_at", 0)
+            if time.time() - committed_at >= ENGAGE_STUCK_WINDOW_S:
+                return
+
             player = controller.get_player()
             pos = (player.get("x"), player.get("y"), player.get("plane"))
             if bool(combat.get("inCombat")) or pos != ctx.state.data.get("engage_last_pos"):
@@ -665,6 +681,7 @@ def engage_target(ctx, combat: dict):
         ctx.state.data["current_target_index"] = None
         ctx.state.data["engage_last_pos"] = None
         ctx.state.data["engage_stuck_ticks"] = 0
+        ctx.state.data["engage_committed_at"] = 0
 
     if config.get("onlyAttackWhenIdle") and not combat.get("isIdle", True):
         return
@@ -683,3 +700,4 @@ def engage_target(ctx, combat: dict):
         refresh_target=lambda: controller.get_npc_screen_pos_by_index(target_index),
     ):
         ctx.state.data["current_target_index"] = target_index
+        ctx.state.data["engage_committed_at"] = time.time()
