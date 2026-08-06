@@ -26,13 +26,15 @@ import java.util.Map;
  */
 public class MenuStateProvider extends BridgeProvider
 {
-	// NOT verified against a live client -- Menu only exposes the popup's overall bounding box
-	// (getMenuX/Y/Width/Height), not per-row positions (RuneLite's context menu is a
-	// custom-rendered overlay, not built from widgets with their own queryable bounds), so
-	// per-entry click coordinates have to be computed from an assumed row height instead of read
-	// directly. CONFIRM/CORRECT this against a real right-click menu (see this plan's Task 3)
-	// before relying on it to click a specific entry -- also confirm whether entry index 0
-	// renders at the TOP of the popup (this code's assumption) or the bottom.
+	// CONFIRMED live 2026-08-06 via two independent measurements: a 3-entry ground menu
+	// (Cancel/Mark Safespot/Walk here) measured height=67px, a 4-entry inventory-item menu
+	// (Cancel/Examine/Drop/Use) measured height=82px. Solving header + N*row = height for both
+	// (header + 3*row = 67, header + 4*row = 82) gives row = 15 (the original guess was right)
+	// and header = 22 -- entries don't start at the popup's very top; there's a ~22px header
+	// band above them first (confirmed: a click computed without this offset landed one entry
+	// off, selecting "Cancel" at index 0's old position instead of the intended index-1 entry).
+	// Entry index 0 renders at the TOP of the popup, immediately below the header.
+	private static final int MENU_HEADER_HEIGHT_PX = 22;
 	private static final int MENU_ROW_HEIGHT_PX = 15;
 
 	public MenuStateProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
@@ -76,7 +78,7 @@ public class MenuStateProvider extends BridgeProvider
 			entryData.put("option", Text.removeTags(entry.getOption()));
 			entryData.put("target", Text.removeTags(entry.getTarget()));
 			entryData.put("screenX", menuX + menu.getMenuWidth() / 2);
-			entryData.put("screenY", menuY + (i * MENU_ROW_HEIGHT_PX) + (MENU_ROW_HEIGHT_PX / 2));
+			entryData.put("screenY", menuY + MENU_HEADER_HEIGHT_PX + (i * MENU_ROW_HEIGHT_PX) + (MENU_ROW_HEIGHT_PX / 2));
 			entryList.add(entryData);
 		}
 		data.put("entries", entryList);
