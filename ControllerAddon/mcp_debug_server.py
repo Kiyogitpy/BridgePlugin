@@ -268,6 +268,34 @@ def release_all() -> dict:
     return {"ok": True, "released_buttons": released_buttons, "released_keys": released_keys}
 
 
+@mcp.tool()
+def drag(x1: int, y1: int, x2: int, y2: int, button: str = "left") -> dict:
+    """Press `button` down at (x1, y1), move precisely to (x2, y2), then release -- for
+    drag gestures (e.g. splitting an inventory stack, dragging a map). `button` must be
+    "left" or "right". Rejects either endpoint outside the RuneLite window before touching
+    serial. Always releases the button even if the move between down and up raises, so a
+    failed drag can't leave it stuck down."""
+    if button not in ("left", "right"):
+        return {"ok": False, "error": "button must be 'left' or 'right'"}
+    if (err := _require_within_window(x1, y1)) is not None:
+        return err
+    if (err := _require_within_window(x2, y2)) is not None:
+        return err
+
+    down = controller.mouse_left_down if button == "left" else controller.mouse_right_down
+    up = controller.mouse_left_up if button == "left" else controller.mouse_right_up
+
+    controller.move_to_human(ser, x1, y1, aim_radius=0, overshoot_chance=0)
+    down(ser)
+    _held_buttons.add(button)
+    try:
+        controller.move_to_human(ser, x2, y2, aim_radius=0, overshoot_chance=0)
+    finally:
+        up(ser)
+        _held_buttons.discard(button)
+    return {"ok": True}
+
+
 MENU_POLL_INTERVAL_S = 0.05
 MENU_POLL_TIMEOUT_S = 0.6
 

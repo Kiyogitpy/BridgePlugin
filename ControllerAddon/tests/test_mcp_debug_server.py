@@ -273,3 +273,64 @@ def test_release_all_noop_when_nothing_held():
     s._held_keys.clear()
     result = s.release_all()
     assert result == {"ok": True, "released_buttons": [], "released_keys": []}
+
+
+def test_drag_rejects_invalid_button():
+    result = s.drag(0, 0, 10, 10, button="middle")
+    assert result == {"ok": False, "error": "button must be 'left' or 'right'"}
+
+
+def test_drag_rejects_out_of_window_start(monkeypatch):
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: (x, y) != (-1, -1))
+    move_calls = []
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y, **kwargs: move_calls.append((x, y)))
+    result = s.drag(-1, -1, 10, 10)
+    assert result["ok"] is False
+    assert move_calls == []
+
+
+def test_drag_rejects_out_of_window_end(monkeypatch):
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: (x, y) != (999, 999))
+    move_calls = []
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y, **kwargs: move_calls.append((x, y)))
+    result = s.drag(0, 0, 999, 999)
+    assert result["ok"] is False
+    assert move_calls == []
+
+
+def test_drag_presses_moves_and_releases_left_button(monkeypatch):
+    events = []
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: True)
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y, **kwargs: events.append(("move", x, y)))
+    monkeypatch.setattr(s.controller, "mouse_left_down", lambda ser: events.append(("down",)))
+    monkeypatch.setattr(s.controller, "mouse_left_up", lambda ser: events.append(("up",)))
+    s._held_buttons.clear()
+    result = s.drag(1, 2, 3, 4)
+    assert result == {"ok": True}
+    assert events == [("move", 1, 2), ("down",), ("move", 3, 4), ("up",)]
+    assert "left" not in s._held_buttons
+
+
+def test_drag_releases_button_even_if_move_raises(monkeypatch):
+    events = []
+    move_calls = []
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: True)
+
+    def move_maybe_raise(ser, x, y, **kwargs):
+        move_calls.append((x, y))
+        events.append(("move", x, y))
+        if len(move_calls) == 2:  # the move to (x2, y2)
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(s.controller, "move_to_human", move_maybe_raise)
+    monkeypatch.setattr(s.controller, "mouse_right_down", lambda ser: events.append(("down",)))
+    monkeypatch.setattr(s.controller, "mouse_right_up", lambda ser: events.append(("up",)))
+    s._held_buttons.clear()
+    raised = False
+    try:
+        s.drag(1, 2, 3, 4, button="right")
+    except RuntimeError:
+        raised = True
+    assert raised, "expected RuntimeError to propagate"
+    assert ("up",) in events
+    assert "right" not in s._held_buttons
