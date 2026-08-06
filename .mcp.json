@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "osrs-debug": {
+      "command": "python",
+      "args": ["ControllerAddon/mcp_debug_server.py"]
+    }
+  }
+}

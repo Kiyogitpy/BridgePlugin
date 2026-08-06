@@ -107,3 +107,19 @@ own `main()`, call `controller.set_dpi_aware()` first, before touching the curso
 was mistaken for a third bug during this same session -- without it, Windows silently virtualizes
 the process's screen coordinates to 96 DPI while RuneLite reports/expects real physical pixels,
 so cursor moves land in the wrong place even though the target coordinates themselves are correct.
+
+## Debugging via the MCP server
+
+Everything above (querying bridge state, right-clicking, reading `/menu`, clicking a matched
+entry) is also available as typed MCP tools -- `bridge_get`, `move_mouse`, `left_click`/
+`right_click`, `left_click_at`/`right_click_at`, `key_tap`, `type_text`, `click_menu_entry` --
+via `ControllerAddon/mcp_debug_server.py`, registered in `.mcp.json`. Prefer these tools over
+raw `curl`/`WebFetch` and one-off verification scripts when they're available (i.e. this
+server is registered and reachable) -- same underlying primitives, no risk of forgetting
+`set_dpi_aware()` the way a one-off script can (see the DPI gotcha two paragraphs up).
+
+**`controller.py` must not be running at the same time as this server** -- both need
+exclusive access to the same Arduino serial port. Stop `controller.py` before debugging
+through these tools; restart it afterward for real automation runs.
+
+See `docs/superpowers/specs/2026-08-06-mcp-debug-server-design.md` for the full design.
