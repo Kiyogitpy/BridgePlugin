@@ -1,13 +1,18 @@
 import os
+import queue
 import sys
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# mcp_debug_server opens a real serial port at import time -- stub serial.Serial before
-# importing it, so these pure-logic tests run without any hardware attached.
+# mcp_debug_server opens a real serial port AND a real UDP socket at import time -- stub both
+# before importing it, so these pure-logic tests run without any hardware or network binding.
 import serial
 serial.Serial = MagicMock(return_value=MagicMock())
+
+import controller
+controller.make_udp_listener = MagicMock(return_value=MagicMock())
+controller.poll_udp = MagicMock(return_value=[])
 
 import mcp_debug_server as s  # noqa: E402
 
@@ -334,3 +339,31 @@ def test_drag_releases_button_even_if_move_raises(monkeypatch):
     assert raised, "expected RuntimeError to propagate"
     assert ("up",) in events
     assert "right" not in s._held_buttons
+
+
+def test_poll_events_returns_error_when_listener_unavailable(monkeypatch):
+    monkeypatch.setattr(s, "_udp_socket", None)
+    monkeypatch.setattr(s, "_udp_error", "port already in use")
+    result = s.poll_events()
+    assert result == {"error": "UDP listener not available: port already in use"}
+
+
+def test_poll_events_drains_queued_events(monkeypatch):
+    monkeypatch.setattr(s, "_udp_socket", object())  # any non-None sentinel
+    test_queue = queue.Queue()
+    test_queue.put(("PLAYER_DIED", None))
+    test_queue.put(("HP_CHANGED", {"hp": 10}))
+    monkeypatch.setattr(s, "_event_queue", test_queue)
+    result = s.poll_events()
+    assert result == {"events": [
+        {"type": "PLAYER_DIED", "payload": None},
+        {"type": "HP_CHANGED", "payload": {"hp": 10}},
+    ]}
+    assert test_queue.empty()
+
+
+def test_poll_events_returns_empty_list_when_nothing_queued(monkeypatch):
+    monkeypatch.setattr(s, "_udp_socket", object())
+    monkeypatch.setattr(s, "_event_queue", queue.Queue())
+    result = s.poll_events()
+    assert result == {"events": []}

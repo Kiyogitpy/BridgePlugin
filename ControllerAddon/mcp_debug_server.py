@@ -11,8 +11,10 @@
 # Run directly for a first smoke test: python mcp_debug_server.py
 # Then register in .mcp.json (repo root) for use from Claude Code.
 
+import queue
 import random
 import sys
+import threading
 import time
 
 import serial
@@ -20,7 +22,7 @@ from mcp.server.fastmcp import FastMCP
 
 import controller
 import debug_log
-from settings import SERIAL_PORT, SERIAL_BAUD
+from settings import SERIAL_PORT, SERIAL_BAUD, UDP_PORT
 
 
 def _patch_debug_log_to_stderr() -> None:
@@ -53,6 +55,27 @@ except serial.SerialException as exc:
         file=sys.stderr,
     )
     raise SystemExit(1)
+
+_event_queue: "queue.Queue" = queue.Queue()
+_udp_error: str | None = None
+
+try:
+    _udp_socket = controller.make_udp_listener(UDP_PORT)
+except OSError as exc:
+    _udp_socket = None
+    _udp_error = str(exc)
+    print(f"UDP event listener not available: {exc}", file=sys.stderr)
+
+
+def _event_listener_loop() -> None:
+    while True:
+        for event_type, payload in controller.poll_udp(_udp_socket):
+            _event_queue.put((event_type, payload))
+        time.sleep(0.05)
+
+
+if _udp_socket is not None:
+    threading.Thread(target=_event_listener_loop, daemon=True).start()
 
 mcp = FastMCP("osrs-debug")
 
@@ -366,6 +389,23 @@ def click_menu_entry(x: int, y: int, option: str, target_hint: str | None = None
     controller.move_to_human(ser, match["screenX"], match["screenY"], aim_radius=2)
     controller.click_human(ser)
     return {"ok": True, "matched": match}
+
+
+@mcp.tool()
+def poll_events() -> dict:
+    """Drain and return every bridge UDP event (e.g. "PLAYER_DIED", "NPC_DIED", "LEVEL_UP",
+    "HP_CHANGED") received since the last call to this tool, or since server startup if this
+    is the first call. A background thread continuously drains the UDP socket into an
+    in-memory queue from server startup, so events aren't lost between calls the way reading
+    the OS socket buffer only at call time would risk. Returns {"error": "..."} instead if the
+    UDP listener failed to start (e.g. the port was already in use)."""
+    if _udp_socket is None:
+        return {"error": f"UDP listener not available: {_udp_error}"}
+    events = []
+    while not _event_queue.empty():
+        event_type, payload = _event_queue.get_nowait()
+        events.append({"type": event_type, "payload": payload})
+    return {"events": events}
 
 
 if __name__ == "__main__":

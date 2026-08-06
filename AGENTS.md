@@ -112,12 +112,14 @@ so cursor moves land in the wrong place even though the target coordinates thems
 
 Everything above (querying bridge state, right-clicking, reading `/menu`, clicking a matched
 entry) is also available as typed MCP tools -- `bridge_get`, `get_cursor_position`,
-`move_mouse`, `left_click`/`right_click`, `left_click_at`/`right_click_at`, `key_tap`,
-`type_text`, `click_menu_entry` -- via `ControllerAddon/mcp_debug_server.py`, registered in
-`.mcp.json`. Prefer these tools over raw `curl`/`WebFetch` and one-off verification scripts
-when they're available (i.e. this server is registered and reachable) -- same underlying
-primitives, no risk of forgetting `set_dpi_aware()` the way a one-off script can (see the DPI
-gotcha two paragraphs up).
+`move_mouse`, `left_click`/`right_click`, `left_click_at`/`right_click_at`,
+`left_mouse_down`/`left_mouse_up`, `right_mouse_down`/`right_mouse_up`, `drag`,
+`key_tap`, `key_down`/`key_up`, `type_text`, `release_all`, `click_menu_entry`,
+`poll_events` -- via `ControllerAddon/mcp_debug_server.py`, registered in `.mcp.json`. Prefer
+these tools over raw `curl`/`WebFetch` and one-off verification scripts when they're available
+(i.e. this server is registered and reachable) -- same underlying primitives, no risk of
+forgetting `set_dpi_aware()` the way a one-off script can (see the DPI gotcha two paragraphs
+up).
 
 **`controller.py` must not be running at the same time as this server** -- both need
 exclusive access to the same Arduino serial port. Stop `controller.py` before debugging
@@ -129,3 +131,7 @@ session's entire lifetime, not just while a tool is actively being called. Runni
 server isn't started, not just pausing between tool calls.
 
 See `docs/superpowers/specs/2026-08-06-mcp-debug-server-design.md` for the full design.
+
+Held-input primitives (`left_mouse_down`/`up`, `right_mouse_down`/`up`, `key_down`/`up`,
+`drag`, `release_all`) and the UDP event stream (`poll_events`) are documented in
+`docs/superpowers/specs/2026-08-06-mcp-debug-server-input-events-design.md`.
