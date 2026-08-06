@@ -71,14 +71,27 @@ New package `com.example.tracker`, additive alongside the existing `providers`/`
     Mirrors Salvation's own `onNpcChanged` handling.
   - `onNpcDespawned` -- calls `onDetach()` on each attached tracker for that NPC, then removes it
     from the map.
-  - `onAnimationChanged` -- if the event's actor is a tracked NPC, calls `onAnimationChanged` on
-    every attached tracker that implements `AnimationListener`, then pushes
-    `NPC_TRACKED_ANIMATION_CHANGED` (npc index/id/name + the new animation id) via the existing
-    `UdpEventSender`.
-  - `onHitsplatApplied` -- same shape for `HitsplatListener`, pushing `NPC_TRACKED_HITSPLAT`
-    (npc index/id/name + hitsplat type/amount).
+  - `onClientTick` -- **not** a subscription to the raw `AnimationChanged` RuneLite event.
+    Confirmed against Salvation's actual `NpcTracker` (`data/salvation_plugin
+    examples/plugins/tracker/trackers/NpcTracker.java:193-216`): it doesn't subscribe to
+    `AnimationChanged` for NPCs either, it polls `npc.getAnimation()`/`npc.getAnimationFrame()`
+    on every `ClientTick` (far more frequent than `GameTick`) and diffs against the
+    last-seen value itself, including an `animationFrame < lastAnimationFrame` check to catch
+    the same animation id restarting (e.g. an attack repeating back-to-back). For each NPC with
+    at least one attached `AnimationListener`, the registry does the same: polls, diffs, and
+    only on an actual change calls `onAnimationChanged` on every attached `AnimationListener`
+    for that NPC and pushes `NPC_TRACKED_ANIMATION_CHANGED` (npc index/id/name + the new
+    animation id) via the existing `UdpEventSender`. Trackers still only see `onAnimationChanged`
+    when something actually changed -- the polling/diffing is an internal registry detail, not
+    a new listener type.
+  - `onHitsplatApplied` -- a real, direct RuneLite event subscription (confirmed in
+    `TrackerPlugin.java`'s own handler: `event.getActor()` / `event.getHitsplat()`), unlike
+    animation. If the event's actor is a tracked NPC, calls `onHitsplat` on every attached
+    tracker that implements `HitsplatListener`, then pushes `NPC_TRACKED_HITSPLAT` (npc
+    index/id/name + hitsplat type/amount) via `UdpEventSender`.
   - `onGameTick` -- calls `onTrackerTick` on every attached tracker implementing
-    `TrackerTickListener`.
+    `TrackerTickListener`. Separate cadence from the `ClientTick` animation polling above --
+    once per game tick, for a tracker's own bookkeeping, not detection.
   - `onGameStateChanged(HOPPING)` -- clears the whole map (mirrors Salvation's own cleanup on
     world hop).
 - **`CurrentTargetTracker`** (the proof tracker, registered as one `NpcTrackerFactory`) --
