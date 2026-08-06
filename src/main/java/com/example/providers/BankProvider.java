@@ -1,6 +1,7 @@
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
+import com.example.util.FoodUtil;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
 import net.runelite.api.ItemComposition;
@@ -80,6 +81,14 @@ public class BankProvider extends BridgeProvider
 		data.put("depositInventory", buttonPoint(WidgetInfo.BANK_DEPOSIT_INVENTORY));
 		data.put("depositEquipment", buttonPoint(WidgetInfo.BANK_DEPOSIT_EQUIPMENT));
 
+		// Lets a caller filter a huge bank's item list down to "things ConsumablesProvider would
+		// also call food/a prayer restore" without duplicating FoodUtil's own name list in
+		// Python -- CONFIRMED (user request 2026-08-06): auto-picking whichever food/prayer
+		// restore is actually in the bank (rather than requiring an exact item name configured
+		// in Controller Settings) needs this same classification applied to bank contents too,
+		// not just inventory contents (ConsumablesProvider's existing job).
+		data.put("searchButton", buttonPoint(InterfaceID.Bankmain.SEARCH));
+
 		// Deposits the contents of every gatherer-bag/container in inventory at once (looting
 		// bag, herb sack, seed box, gem bag, coal bag, etc.) -- not in the older WidgetInfo enum,
 		// same as the quantity buttons below, only in the newer InterfaceID constants.
@@ -109,7 +118,11 @@ public class BankProvider extends BridgeProvider
 		ItemComposition comp = client.getItemDefinition(itemWidget.getItemId());
 		if (comp != null)
 		{
-			data.put("name", comp.getName());
+			String name = comp.getName();
+			data.put("name", name);
+			data.put("isFood", FoodUtil.isFood(name));
+			data.put("heal", FoodUtil.getHealAmount(name));
+			data.put("isPrayerPotion", FoodUtil.isPrayerPotion(name));
 		}
 
 		Rectangle bounds = itemWidget.getBounds();

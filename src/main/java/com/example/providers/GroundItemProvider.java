@@ -97,6 +97,14 @@ public class GroundItemProvider extends BridgeProvider
 					data.put("x", wp.getX());
 					data.put("y", wp.getY());
 					data.put("plane", wp.getPlane());
+					// 2 == belongs to another player and isn't takeable by us yet (their private
+					// kill-loot timer hasn't expired) -- same field RuneLite's own bundled Ground
+					// Items plugin reads for its "Takeable" filter (GroundItemsPlugin
+					// .shouldDisplayItem: `ownership != 2`). CONFIRMED live 2026-08-06 (user
+					// report): the bot was attempting to loot other nearby players' drops in this
+					// shared (non-instanced) Slayer cave, which are visible in the client's own
+					// scene data same as ours but aren't actually ours to take.
+					data.put("ownership", item.getOwnership());
 
 					ItemComposition comp = client.getItemDefinition(item.getId());
 					if (comp != null)

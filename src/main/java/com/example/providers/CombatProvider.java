@@ -58,13 +58,25 @@ public class CombatProvider extends BridgeProvider
 		data.put("animation", local.getAnimation());
 		data.put("poseAnimation", local.getPoseAnimation());
 
-		WorldPoint current = local.getWorldLocation();
+		// CONFIRMED live 2026-08-05 (user report -- shipwreck_salvaging.py's hook-management logic
+		// silently stalled indefinitely): while aboard a Sailing boat, local.getWorldLocation() and
+		// WorldPoint.fromLocal(client, dest) each resolve against whichever WorldView their own
+		// LocalPoint names (see RuneLiteUtil.toTopLevelWorldPoint's own doc -- the exact same class
+		// of bug already fixed once for ObjectProvider's distance field reading Integer.MAX_VALUE).
+		// A minimap steering click sets a real getLocalDestinationLocation(), but it and the
+		// player's own boat-relative getWorldLocation() aren't necessarily in the same coordinate
+		// space -- comparing them directly could report "still moving" forever after boat steering,
+		// even with the boat fully stopped (confirmed live: boatSpeed 0.0, navigating false, yet
+		// /combat kept reporting isMoving=true, isIdle=false indefinitely). Resolving both through
+		// the same top-level-world helper used everywhere else this exact mismatch matters fixes it
+		// for boats without changing behavior on foot (RuneLiteUtil's WorldView.TOPLEVEL fast path).
+		WorldPoint current = RuneLiteUtil.getTopLevelWorldLocation(client, local);
 		WorldPoint destination = null;
 
 		net.runelite.api.coords.LocalPoint dest = client.getLocalDestinationLocation();
 		if (dest != null)
 		{
-			destination = WorldPoint.fromLocal(client, dest);
+			destination = RuneLiteUtil.toTopLevelWorldPoint(client, dest);
 		}
 
 		boolean moving = destination != null && !destination.equals(current);

@@ -34,6 +34,7 @@ public final class FoodUtil
 		HEAL_BY_NAME.put("cake", 12);
 		HEAL_BY_NAME.put("pizza", 14);
 		HEAL_BY_NAME.put("cooked karambwan", 18);
+		HEAL_BY_NAME.put("cooked dashing kebbit", 23);
 	}
 
 	private FoodUtil()
@@ -75,6 +76,7 @@ public final class FoodUtil
 			|| lower.contains("super restore")
 			|| lower.contains("blighted super restore")
 			|| lower.contains("sanfew serum")
-			|| lower.contains("moonlight potion");
+			|| lower.contains("moonlight potion")
+			|| lower.contains("moonlight moth mix");
 	}
 }

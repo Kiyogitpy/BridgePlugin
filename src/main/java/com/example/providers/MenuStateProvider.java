@@ -86,7 +86,22 @@ public class MenuStateProvider extends BridgeProvider
 		for (int i = 0; i < entries.length; i++)
 		{
 			MenuEntry entry = entries[i];
-			int canvasEntryY = menuY + MENU_HEADER_HEIGHT_PX + (i * MENU_ROW_HEIGHT_PX) + (MENU_ROW_HEIGHT_PX / 2);
+			// getMenuEntries() is bottom-to-top: index 0 is the menu's LAST/lowest-priority
+			// entry (visually at the BOTTOM -- typically "Cancel"), and the highest index is
+			// the default/top-priority action (visually at the TOP, immediately below the
+			// header). CONFIRMED live 2026-08-06 via a screenshot of a 5-entry "Take Adamant
+			// full helm" menu: visual top-to-bottom order was
+			// [Take, Walk here, Examine, Mark Safespot, Cancel], but getMenuEntries() (and
+			// therefore this endpoint, before this fix) reported index 0 = Cancel .. index 4 =
+			// Take -- the reverse of what row-index-0-is-the-top-row assumed. Every ground-tile
+			// menu logged up to this point is consistent with the same pattern (Cancel always
+			// comes back at index 0). The original live verification of MENU_HEADER_HEIGHT_PX/
+			// MENU_ROW_HEIGHT_PX only ever clicked "Mark Safespot", the *middle* entry of a
+			// 3-entry menu -- the middle row sits at the same offset whether you count top-down
+			// or bottom-up, so that test proved the header/row constants but never actually
+			// exercised, let alone confirmed, direction.
+			int displayRow = entries.length - 1 - i;
+			int canvasEntryY = menuY + MENU_HEADER_HEIGHT_PX + (displayRow * MENU_ROW_HEIGHT_PX) + (MENU_ROW_HEIGHT_PX / 2);
 			Point screen = RuneLiteUtil.canvasToScreen(client, canvasEntryX, canvasEntryY);
 
 			Map<String, Object> entryData = new HashMap<>();

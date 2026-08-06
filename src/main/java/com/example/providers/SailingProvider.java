@@ -34,6 +34,18 @@ public class SailingProvider extends BridgeProvider
 	// WorldEntity.getTargetLocation() (the boat's own logical position for this tick), not
 	// getLocalLocation() (visually tweened/interpolated between ticks, and so noisy on a per-tick
 	// sample), matching that plugin's own choice for the same reason.
+	//
+	// lastBoat tracked alongside lastBoatTarget (CONFIRMED live 2026-08-04, sailing.py-side bug
+	// report: a boatSpeed reading of ~31 tiles/tick showed up in a live log, immediately after
+	// "engaging the helm" with no real movement in between -- physically impossible next to every
+	// other sample in the same run, 0-2.1). findTopLevelWorldEntityContaining can hand back a
+	// different WorldEntity instance across the helm-engage boundary (the boat's steering target
+	// location resets the instant Navigate engages), and the old null-only reset below only
+	// guarded against the boat disappearing entirely, not against silently tracking a *different*
+	// entity than the one lastBoatTarget was captured from -- diffing across that swap produced
+	// one bogus huge one-tick delta instead of 0. Only diff when it's confirmed to be the same
+	// entity as last tick.
+	private WorldEntity lastBoat;
 	private LocalPoint lastBoatTarget;
 	private double lastBoatSpeedTilesPerTick;
 
@@ -59,13 +71,14 @@ public class SailingProvider extends BridgeProvider
 			: null;
 		if (boat == null)
 		{
+			lastBoat = null;
 			lastBoatTarget = null;
 			lastBoatSpeedTilesPerTick = 0;
 			return;
 		}
 
 		LocalPoint target = boat.getTargetLocation();
-		if (lastBoatTarget != null && target != null)
+		if (boat == lastBoat && lastBoatTarget != null && target != null)
 		{
 			double localDist = Math.hypot(target.getX() - lastBoatTarget.getX(), target.getY() - lastBoatTarget.getY());
 			lastBoatSpeedTilesPerTick = localDist / Perspective.LOCAL_TILE_SIZE;
@@ -74,6 +87,7 @@ public class SailingProvider extends BridgeProvider
 		{
 			lastBoatSpeedTilesPerTick = 0;
 		}
+		lastBoat = boat;
 		lastBoatTarget = target;
 	}
 
