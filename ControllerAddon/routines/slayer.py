@@ -300,6 +300,18 @@ def maintain_safespot(ctx):
     if not safespot.get("enabled") or not safespot.get("marked"):
         return
 
+    # Don't override an in-progress loot pickup with a competing walk-back click -- CONFIRMED
+    # live 2026-08-06 (user report: bot abandoned a loot item mid-pickup to walk back to the
+    # safespot). maybe_loot tracks the ground item it's currently attempting via
+    # loot_stuck_key/loot_stuck_attempts; while that's still actively being retried (below
+    # LOOT_STUCK_MAX_ATTEMPTS), let it finish or give up on its own rather than stomping the
+    # click. Once maybe_loot itself has given up on a genuinely unreachable item (attempts hits
+    # the cap), stop deferring -- that key never clears on its own since the item never leaves
+    # the ground, so waiting for it to clear would deadlock maintain_safespot forever.
+    if ctx.state.data.get("loot_stuck_key") is not None \
+            and ctx.state.data.get("loot_stuck_attempts", 0) < LOOT_STUCK_MAX_ATTEMPTS:
+        return
+
     player = controller.get_player()
     if player.get("x") is None:
         return
