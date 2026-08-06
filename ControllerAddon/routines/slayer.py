@@ -643,10 +643,8 @@ def engage_target(ctx, combat: dict):
     # type is alive" can't tell your target apart from its neighbors.
     current_target_index = ctx.state.data.get("current_target_index")
     if current_target_index is not None:
-        still_alive = any(
-            n.get("index") == current_target_index and n.get("hpRatio") != 0
-            for n in npcs
-        )
+        target_npc = next((n for n in npcs if n.get("index") == current_target_index), None)
+        still_alive = target_npc is not None and target_npc.get("hpRatio") != 0
         if still_alive:
             # Committed until this one dies. Some areas enforce strict 1v1
             # combat and reject a second target with "you are already
@@ -677,7 +675,16 @@ def engage_target(ctx, combat: dict):
 
             player = controller.get_player()
             pos = (player.get("x"), player.get("y"), player.get("plane"))
-            if bool(combat.get("inCombat")) or pos != ctx.state.data.get("engage_last_pos"):
+            # CONFIRMED live 2026-08-06 (user report: still had to reclick after eating/drinking
+            # while safespotting, even after the freshness-window fix above) -- combat.inCombat
+            # (Player.getInteracting() != null) apparently isn't the only place this flakiness
+            # shows up; a safespot fighter never moves either, so that alone left no escape hatch
+            # once inCombat misread. target_npc's own interactingPlayer (NPC.getInteracting() ==
+            # local, a completely independent field read off the NPC rather than the player) is
+            # ORed in here too -- both would have to misread on the same tick for this to still
+            # false-positive, which is far less likely than either one alone.
+            if bool(combat.get("inCombat")) or bool(target_npc.get("interactingPlayer")) \
+                    or pos != ctx.state.data.get("engage_last_pos"):
                 ctx.state.data["engage_last_pos"] = pos
                 ctx.state.data["engage_stuck_ticks"] = 0
                 return
