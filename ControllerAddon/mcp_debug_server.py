@@ -54,6 +54,42 @@ except serial.SerialException as exc:
 
 mcp = FastMCP("osrs-debug")
 
+import requests
+import settings
+
+
+def _wrap_bridge_response(response: "requests.Response") -> dict:
+    """Turns a raw requests.Response into either its decoded JSON body or a {"error": ...}
+    dict -- never raises. Used by _bridge_get_impl. Deliberately separate from
+    controller.api_get, which swallows failures for the bot's own tick-to-tick resilience;
+    a debugging tool wants a failed/timed-out request to be visibly an error instead."""
+    if not (200 <= response.status_code < 300):
+        return {"error": f"bridge returned HTTP {response.status_code}"}
+    try:
+        return response.json()
+    except ValueError as exc:
+        return {"error": f"invalid JSON from bridge: {exc}"}
+
+
+def _bridge_get_impl(path: str, params: dict | None, requests_get=requests.get) -> dict:
+    """requests_get is injected so tests can stub the network call without touching the real
+    bridge -- production code always calls this with the default (requests.get)."""
+    try:
+        response = requests_get(f"{settings.API_BASE}{path}", params=params, timeout=2.0)
+    except Exception as exc:
+        return {"error": str(exc)}
+    return _wrap_bridge_response(response)
+
+
+@mcp.tool()
+def bridge_get(path: str, params: dict | None = None) -> dict:
+    """GET an endpoint on the RuneLite HTTP bridge (e.g. "/player", "/menu", "/npcs",
+    "/npc/nearest" with params={"id": 1234}) and return its decoded JSON body. Works for any
+    endpoint registered by src/main/java/com/example/providers/*.java, including ones added
+    after this tool was written. Returns {"error": "..."} instead of raising if the bridge is
+    unreachable, times out, returns a non-2xx status, or returns invalid JSON."""
+    return _bridge_get_impl(path, params)
+
 
 if __name__ == "__main__":
     mcp.run()
