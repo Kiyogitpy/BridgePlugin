@@ -6,6 +6,10 @@
 #
 # REQUIRES: controller.py must NOT be running while this server is running -- both hold
 # the same Arduino serial port exclusively, only one process can have it open at a time.
+# This server also binds UDP_PORT (50555) at import time for its event stream, which
+# controller.py's own main() also binds (before its serial-port open) -- so a port conflict
+# with this server can surface from controller.py as a UDP bind error instead of, or before,
+# the serial-port error.
 #
 # Setup: pip install mcp
 # Run directly for a first smoke test: python mcp_debug_server.py
@@ -68,9 +72,23 @@ except OSError as exc:
 
 
 def _event_listener_loop() -> None:
+    """Runs in a daemon thread from server startup. If controller.poll_udp ever raises (e.g.
+    recvfrom raising ConnectionResetError/OSError after certain network conditions on Windows),
+    the thread must not just die silently -- _udp_socket would stay non-None and poll_events()
+    would keep taking its success branch forever, returning {"events": []} with no signal that
+    the listener actually stopped working. So on any exception: record it in _udp_error, clear
+    _udp_socket (poll_events()'s existing `if _udp_socket is None:` check then catches it), and
+    stop -- there's no point continuing to poll a socket we've given up on."""
+    global _udp_socket, _udp_error
     while True:
-        for event_type, payload in controller.poll_udp(_udp_socket):
-            _event_queue.put((event_type, payload))
+        try:
+            for event_type, payload in controller.poll_udp(_udp_socket):
+                _event_queue.put((event_type, payload))
+        except Exception as exc:
+            _udp_error = f"listener stopped: {exc}"
+            print(f"UDP event listener stopped unexpectedly: {exc}", file=sys.stderr)
+            _udp_socket = None
+            return
         time.sleep(0.05)
 
 
@@ -272,7 +290,13 @@ def key_up(key: str) -> dict:
 def release_all() -> dict:
     """Release every mouse button and key currently tracked as held (via left_mouse_down/
     right_mouse_down/key_down) -- a safety net for a forgotten _up() call or an interrupted
-    debugging session. Safe to call with nothing held; returns what it released."""
+    debugging session. Safe to call with nothing held; returns what it released.
+
+    Tracking only covers the down/up-pair tools (left_mouse_down/up, right_mouse_down/up,
+    key_down/up, drag) -- the base server's combined-gesture tools (left_click, right_click,
+    click_menu_entry, key_tap, type_text, etc.) already send their own down+up internally and
+    never touch _held_buttons/_held_keys, so this can't detect or clean up anything left stuck
+    by those."""
     released_buttons = []
     for button in list(_held_buttons):
         if button == "left":

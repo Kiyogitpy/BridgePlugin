@@ -128,7 +128,17 @@ registers this server project-wide, Claude Code auto-starts it whenever a sessio
 this repo -- so merely having a Claude Code session open here claims the serial port for that
 session's entire lifetime, not just while a tool is actively being called. Running
 `controller.py` therefore requires either closing that session or otherwise ensuring the MCP
-server isn't started, not just pausing between tool calls.
+server isn't started, not just pausing between tool calls. This server also binds `UDP_PORT`
+(50555) at startup for its event stream, and `controller.py`'s own `main()` binds that same
+port before it ever opens the serial port -- so with this server already running, starting
+`controller.py` may surface a UDP bind error first instead of (or before) the serial-port
+error; either symptom means the same thing, this server is already running and needs to be
+stopped first.
+
+If a key or mouse button is left stuck held and the MCP server process itself has died (not
+just a missed `_up()` call `release_all()` could clean up), restarting `controller.py` resets
+the Arduino (see the `time.sleep(2.0)  # Pro Micro reset` in its `main()`), which clears any
+stuck input.
 
 See `docs/superpowers/specs/2026-08-06-mcp-debug-server-design.md` for the full design.
 

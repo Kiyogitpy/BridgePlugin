@@ -12,6 +12,11 @@ serial.Serial = MagicMock(return_value=MagicMock())
 
 import controller
 controller.make_udp_listener = MagicMock(return_value=MagicMock())
+# A real background thread (_event_listener_loop) runs for the whole test session against
+# this stub, polling it every 0.05s. That's harmless only because poll_udp is pinned to
+# always return [] -- if that's ever changed to return real events, the queue-draining
+# assertions in test_poll_events_drains_queued_events could become order-sensitive/flaky
+# against the live thread racing to drain the same queue.
 controller.poll_udp = MagicMock(return_value=[])
 
 import mcp_debug_server as s  # noqa: E402
@@ -367,3 +372,20 @@ def test_poll_events_returns_empty_list_when_nothing_queued(monkeypatch):
     monkeypatch.setattr(s, "_event_queue", queue.Queue())
     result = s.poll_events()
     assert result == {"events": []}
+
+
+def test_event_listener_loop_stops_and_clears_socket_on_exception(monkeypatch):
+    monkeypatch.setattr(s, "_udp_socket", object())  # any non-None sentinel
+
+    def raising_poll_udp(sock):
+        raise OSError("recvfrom failed")
+
+    monkeypatch.setattr(s.controller, "poll_udp", raising_poll_udp)
+
+    # The fix makes _event_listener_loop return after one failed iteration, so it's safe to
+    # call directly (no thread needed) -- it must not loop forever or re-raise.
+    s._event_listener_loop()
+
+    assert s._udp_socket is None
+    result = s.poll_events()
+    assert "error" in result
