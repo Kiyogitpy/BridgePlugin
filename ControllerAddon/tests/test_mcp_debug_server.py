@@ -59,6 +59,19 @@ def test_bridge_get_impl_builds_correct_url_and_returns_json():
     assert calls == [(f"{s.settings.API_BASE}/menu", {"id": 5})]
 
 
+def test_bridge_get_wraps_list_body_in_items(monkeypatch):
+    # _bridge_get_impl's `requests_get` default is bound at import time, so patching
+    # requests.get after the fact wouldn't reach it -- patch _bridge_get_impl itself instead,
+    # which is exactly the seam bridge_get (the tool function under test here) calls through.
+    def fake_bridge_get_impl(path, params):
+        assert path == "/npcs"
+        return [{"id": 1}, {"id": 2}]
+
+    monkeypatch.setattr(s, "_bridge_get_impl", fake_bridge_get_impl)
+    result = s.bridge_get("/npcs")
+    assert result == {"items": [{"id": 1}, {"id": 2}]}
+
+
 def test_require_within_window_returns_none_when_inside(monkeypatch):
     monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: True)
     assert s._require_within_window(100, 100) is None
@@ -73,7 +86,7 @@ def test_require_within_window_returns_error_when_outside(monkeypatch):
 def test_move_mouse_rejects_out_of_window_target(monkeypatch):
     monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: False)
     move_calls = []
-    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y: move_calls.append((x, y)))
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y, **kwargs: move_calls.append((x, y)))
     result = s.move_mouse(50, 50)
     assert result["ok"] is False
     assert move_calls == []  # never attempted the move
@@ -82,7 +95,7 @@ def test_move_mouse_rejects_out_of_window_target(monkeypatch):
 def test_move_mouse_moves_when_inside_window(monkeypatch):
     monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: True)
     move_calls = []
-    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y: move_calls.append((x, y)))
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y, **kwargs: move_calls.append((x, y)))
     result = s.move_mouse(50, 50)
     assert result == {"ok": True}
     assert move_calls == [(50, 50)]
@@ -134,13 +147,13 @@ def test_click_menu_entry_rejects_out_of_window_origin(monkeypatch):
 
 def test_click_menu_entry_reports_available_options_on_no_match(monkeypatch):
     monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: True)
-    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y: None)
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y, **kwargs: None)
     monkeypatch.setattr(s.controller, "right_click_human", lambda ser: None)
     monkeypatch.setattr(s.controller, "click_human", lambda ser: None)
     monkeypatch.setattr(s.controller, "key_tap", lambda ser, key: None)
     monkeypatch.setattr(s.controller, "get_cursor_pos", lambda: (5, 5))
     monkeypatch.setattr(s.controller, "pick_dismiss_point", lambda x, y: (200, 200))
-    monkeypatch.setattr(s.controller, "get_menu", lambda: {
+    monkeypatch.setattr(s, "_bridge_get_impl", lambda path, params: {
         "open": True, "entries": [{"index": 0, "option": "Cancel", "target": "", "screenX": 0, "screenY": 0}],
     })
     result = s.click_menu_entry(x=10, y=10, option="attack")
@@ -149,15 +162,38 @@ def test_click_menu_entry_reports_available_options_on_no_match(monkeypatch):
 
 
 def test_click_menu_entry_clicks_the_match(monkeypatch):
+    moves, clicks = [], []
     monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: True)
-    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y: moves.append((x, y)))
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y, **kwargs: moves.append((x, y)))
     monkeypatch.setattr(s.controller, "right_click_human", lambda ser: None)
     monkeypatch.setattr(s.controller, "click_human", lambda ser: clicks.append(True))
-    monkeypatch.setattr(s.controller, "get_menu", lambda: {
+    monkeypatch.setattr(s, "_bridge_get_impl", lambda path, params: {
         "open": True, "entries": [{"index": 0, "option": "Attack", "target": "Goblin", "screenX": 77, "screenY": 88}],
     })
-    moves, clicks = [], []
     result = s.click_menu_entry(x=10, y=10, option="attack")
     assert result == {"ok": True, "matched": {"index": 0, "option": "Attack", "target": "Goblin", "screenX": 77, "screenY": 88}}
     assert (77, 88) in moves
     assert clicks == [True]
+
+
+def test_click_menu_entry_dismisses_when_menu_never_opened(monkeypatch):
+    dismiss_calls = []
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: True)
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y, **kwargs: None)
+    monkeypatch.setattr(s.controller, "right_click_human", lambda ser: None)
+    monkeypatch.setattr(s.controller, "key_tap", lambda ser, key: dismiss_calls.append(key))
+    monkeypatch.setattr(s.controller, "get_cursor_pos", lambda: (5, 5))
+    monkeypatch.setattr(s.controller, "pick_dismiss_point", lambda x, y: (200, 200))
+    monkeypatch.setattr(s, "_bridge_get_impl", lambda path, params: {"open": False, "entries": []})
+    result = s.click_menu_entry(x=10, y=10, option="attack")
+    assert result == {"ok": False, "error": "menu never opened", "available_options": []}
+    assert dismiss_calls == ["ESC"]
+
+
+def test_click_menu_entry_reports_bridge_error_distinctly(monkeypatch):
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: True)
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y, **kwargs: None)
+    monkeypatch.setattr(s.controller, "right_click_human", lambda ser: None)
+    monkeypatch.setattr(s, "_bridge_get_impl", lambda path, params: {"error": "refused"})
+    result = s.click_menu_entry(x=10, y=10, option="attack")
+    assert result == {"ok": False, "error": "bridge error: refused"}

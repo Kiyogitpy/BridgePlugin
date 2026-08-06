@@ -11,6 +11,7 @@
 # Run directly for a first smoke test: python mcp_debug_server.py
 # Then register in .mcp.json (repo root) for use from Claude Code.
 
+import random
 import sys
 import time
 
@@ -88,8 +89,14 @@ def bridge_get(path: str, params: dict | None = None) -> dict:
     "/npc/nearest" with params={"id": 1234}) and return its decoded JSON body. Works for any
     endpoint registered by src/main/java/com/example/providers/*.java, including ones added
     after this tool was written. Returns {"error": "..."} instead of raising if the bridge is
-    unreachable, times out, returns a non-2xx status, or returns invalid JSON."""
-    return _bridge_get_impl(path, params)
+    unreachable, times out, returns a non-2xx status, or returns invalid JSON.
+
+    Some endpoints (e.g. "/npcs", "/players", "/objects", "/tiles", "/inventory",
+    "/ground-items") return a JSON array rather than an object -- FastMCP would otherwise
+    unpack a returned list into separate content blocks (or none at all for an empty list), so
+    array bodies are wrapped here as {"items": [...]}."""
+    body = _bridge_get_impl(path, params)
+    return body if isinstance(body, dict) else {"items": body}
 
 
 def _require_within_window(x: int, y: int) -> dict | None:
@@ -110,12 +117,13 @@ def get_cursor_position() -> dict:
 
 @mcp.tool()
 def move_mouse(x: int, y: int) -> dict:
-    """Move the cursor to (x, y) with the same human-like Bezier-path movement controller.py's
-    routines use. Rejects targets outside the RuneLite window (returns {"ok": False, "error":
-    ...}) rather than moving there."""
+    """Move the cursor to (x, y) with the same human-like Bezier-path easing/timing
+    controller.py's routines use, but precisely -- no random aim radius or overshoot, so the
+    cursor lands exactly on (x, y). Rejects targets outside the RuneLite window (returns
+    {"ok": False, "error": ...}) rather than moving there."""
     if (err := _require_within_window(x, y)) is not None:
         return err
-    controller.move_to_human(ser, x, y)
+    controller.move_to_human(ser, x, y, aim_radius=0, overshoot_chance=0)
     return {"ok": True}
 
 
@@ -135,22 +143,22 @@ def right_click() -> dict:
 
 @mcp.tool()
 def left_click_at(x: int, y: int) -> dict:
-    """move_mouse(x, y) then left-click, as one call. Same out-of-window rejection as
-    move_mouse."""
+    """move_mouse(x, y) then left-click, as one call. Same out-of-window rejection and
+    precise (no aim jitter/overshoot) move as move_mouse."""
     if (err := _require_within_window(x, y)) is not None:
         return err
-    controller.move_to_human(ser, x, y)
+    controller.move_to_human(ser, x, y, aim_radius=0, overshoot_chance=0)
     controller.click_human(ser)
     return {"ok": True}
 
 
 @mcp.tool()
 def right_click_at(x: int, y: int) -> dict:
-    """move_mouse(x, y) then right-click, as one call. Same out-of-window rejection as
-    move_mouse."""
+    """move_mouse(x, y) then right-click, as one call. Same out-of-window rejection and
+    precise (no aim jitter/overshoot) move as move_mouse."""
     if (err := _require_within_window(x, y)) is not None:
         return err
-    controller.move_to_human(ser, x, y)
+    controller.move_to_human(ser, x, y, aim_radius=0, overshoot_chance=0)
     controller.right_click_human(ser)
     return {"ok": True}
 
@@ -165,12 +173,15 @@ def key_tap(key: str) -> dict:
 
 @mcp.tool()
 def type_text(text: str, press_enter: bool = False) -> dict:
-    """Tap each character of `text` in sequence (spaces mapped to the "SPACE" key name); if
-    press_enter is True, taps "ENTER" afterward too. Covers both controller.py's type_text
-    (press_enter=False, e.g. the bank search box) and type_digits_and_enter (press_enter=True,
-    e.g. an "Enter amount" chatbox prompt) use cases with one tool."""
+    """Tap each character of `text` in sequence (spaces mapped to the "SPACE" key name), with
+    the same inter-keystroke delay controller.py's type_text/type_digits_and_enter use (avoids
+    dropped characters on the Arduino side); if press_enter is True, taps "ENTER" afterward
+    too. Covers both controller.py's type_text (press_enter=False, e.g. the bank search box)
+    and type_digits_and_enter (press_enter=True, e.g. an "Enter amount" chatbox prompt) use
+    cases with one tool."""
     for ch in text:
         controller.key_tap(ser, "SPACE" if ch == " " else ch)
+        time.sleep(random.uniform(0.05, 0.12))
     if press_enter:
         controller.key_tap(ser, "ENTER")
     return {"ok": True}
@@ -194,6 +205,14 @@ def _match_menu_entry(menu: dict, option: str, target_hint: str | None) -> dict 
     )
 
 
+def _dismiss_menu() -> None:
+    """Moves the cursor clear of the menu and taps ESC, so a menu doesn't sit open blocking
+    the next click. Shared by click_menu_entry's never-opened and no-match failure branches."""
+    cx, cy = controller.get_cursor_pos()
+    controller.move_to_human(ser, *controller.pick_dismiss_point(cx, cy))
+    controller.key_tap(ser, "ESC")
+
+
 @mcp.tool()
 def click_menu_entry(x: int, y: int, option: str, target_hint: str | None = None) -> dict:
     """Right-click (x, y), read back the resulting context menu, and left-click whichever entry's
@@ -205,7 +224,8 @@ def click_menu_entry(x: int, y: int, option: str, target_hint: str | None = None
     opened, or nothing matched -- dismisses the menu (moves the cursor clear + ESC, so it
     doesn't sit open blocking the next click) and returns {"ok": False, "error": ...,
     "available_options": [...]} listing what WAS on the menu, so a failed match is diagnosable
-    instead of a bare failure."""
+    instead of a bare failure. A dead bridge is reported distinctly as {"ok": False, "error":
+    "bridge error: ..."} rather than being mistaken for "menu never opened"."""
     if (err := _require_within_window(x, y)) is not None:
         return err
 
@@ -213,23 +233,28 @@ def click_menu_entry(x: int, y: int, option: str, target_hint: str | None = None
     controller.right_click_human(ser)
 
     deadline = time.time() + MENU_POLL_TIMEOUT_S
-    menu = controller.get_menu()
-    while not menu.get("open") and time.time() < deadline:
+    menu = _bridge_get_impl("/menu", None)
+    while "error" not in menu and not menu.get("open") and time.time() < deadline:
         time.sleep(MENU_POLL_INTERVAL_S)
-        menu = controller.get_menu()
+        menu = _bridge_get_impl("/menu", None)
+
+    if "error" in menu:
+        return {"ok": False, "error": f"bridge error: {menu['error']}"}
 
     if not menu.get("open"):
+        _dismiss_menu()
         return {"ok": False, "error": "menu never opened", "available_options": []}
 
     match = _match_menu_entry(menu, option, target_hint)
     if match is None:
         available = [e.get("option") for e in menu.get("entries", [])]
-        cx, cy = controller.get_cursor_pos()
-        controller.move_to_human(ser, *controller.pick_dismiss_point(cx, cy))
-        controller.key_tap(ser, "ESC")
+        _dismiss_menu()
         return {"ok": False, "error": f"no '{option}' entry found", "available_options": available}
 
-    controller.move_to_human(ser, match["screenX"], match["screenY"])
+    if (err := _require_within_window(match["screenX"], match["screenY"])) is not None:
+        return err
+
+    controller.move_to_human(ser, match["screenX"], match["screenY"], aim_radius=2)
     controller.click_human(ser)
     return {"ok": True, "matched": match}
 

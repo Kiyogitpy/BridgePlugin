@@ -111,15 +111,21 @@ so cursor moves land in the wrong place even though the target coordinates thems
 ## Debugging via the MCP server
 
 Everything above (querying bridge state, right-clicking, reading `/menu`, clicking a matched
-entry) is also available as typed MCP tools -- `bridge_get`, `move_mouse`, `left_click`/
-`right_click`, `left_click_at`/`right_click_at`, `key_tap`, `type_text`, `click_menu_entry` --
-via `ControllerAddon/mcp_debug_server.py`, registered in `.mcp.json`. Prefer these tools over
-raw `curl`/`WebFetch` and one-off verification scripts when they're available (i.e. this
-server is registered and reachable) -- same underlying primitives, no risk of forgetting
-`set_dpi_aware()` the way a one-off script can (see the DPI gotcha two paragraphs up).
+entry) is also available as typed MCP tools -- `bridge_get`, `get_cursor_position`,
+`move_mouse`, `left_click`/`right_click`, `left_click_at`/`right_click_at`, `key_tap`,
+`type_text`, `click_menu_entry` -- via `ControllerAddon/mcp_debug_server.py`, registered in
+`.mcp.json`. Prefer these tools over raw `curl`/`WebFetch` and one-off verification scripts
+when they're available (i.e. this server is registered and reachable) -- same underlying
+primitives, no risk of forgetting `set_dpi_aware()` the way a one-off script can (see the DPI
+gotcha two paragraphs up).
 
 **`controller.py` must not be running at the same time as this server** -- both need
 exclusive access to the same Arduino serial port. Stop `controller.py` before debugging
-through these tools; restart it afterward for real automation runs.
+through these tools; restart it afterward for real automation runs. Because `.mcp.json`
+registers this server project-wide, Claude Code auto-starts it whenever a session opens in
+this repo -- so merely having a Claude Code session open here claims the serial port for that
+session's entire lifetime, not just while a tool is actively being called. Running
+`controller.py` therefore requires either closing that session or otherwise ensuring the MCP
+server isn't started, not just pausing between tool calls.
 
 See `docs/superpowers/specs/2026-08-06-mcp-debug-server-design.md` for the full design.
