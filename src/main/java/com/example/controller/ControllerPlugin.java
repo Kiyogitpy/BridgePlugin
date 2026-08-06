@@ -95,6 +95,7 @@ public class ControllerPlugin extends Plugin
 		new ConfigProvider(client, clientThread, server, config).register();
 		new ConsumablesProvider(client, clientThread, server, config).register();
 		new LoginProvider(client, clientThread, server).register();
+		new MenuStateProvider(client, clientThread, server).register();
 
 		try
 		{
