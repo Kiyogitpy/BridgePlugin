@@ -1,11 +1,14 @@
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
+import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
 import net.runelite.api.Menu;
 import net.runelite.api.MenuEntry;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.util.Text;
+
+import java.awt.Point;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -69,16 +72,29 @@ public class MenuStateProvider extends BridgeProvider
 		data.put("width", menu.getMenuWidth());
 		data.put("height", menu.getMenuHeight());
 
+		// Menu.getMenuX()/getMenuY() are canvas-space coordinates (like every other provider's
+		// Perspective/Widget-derived positions), NOT absolute screen coordinates -- CONFIRMED
+		// live 2026-08-06 (user report: computed click landed "miles" off in both x and y) after
+		// the row-height/header fix alone still didn't work. Every other provider in this
+		// codebase converts through RuneLiteUtil.canvasToScreen(...) before returning a
+		// "screenX"/"screenY" field (see GroundItemProvider); this one skipped that step
+		// entirely. canvasToScreen also applies stretched-mode display scaling, not just a fixed
+		// offset, so the miss grows with distance from the canvas origin rather than being a
+		// constant error -- matching what was actually observed.
+		int canvasEntryX = menuX + menu.getMenuWidth() / 2;
 		List<Map<String, Object>> entryList = new ArrayList<>();
 		for (int i = 0; i < entries.length; i++)
 		{
 			MenuEntry entry = entries[i];
+			int canvasEntryY = menuY + MENU_HEADER_HEIGHT_PX + (i * MENU_ROW_HEIGHT_PX) + (MENU_ROW_HEIGHT_PX / 2);
+			Point screen = RuneLiteUtil.canvasToScreen(client, canvasEntryX, canvasEntryY);
+
 			Map<String, Object> entryData = new HashMap<>();
 			entryData.put("index", i);
 			entryData.put("option", Text.removeTags(entry.getOption()));
 			entryData.put("target", Text.removeTags(entry.getTarget()));
-			entryData.put("screenX", menuX + menu.getMenuWidth() / 2);
-			entryData.put("screenY", menuY + MENU_HEADER_HEIGHT_PX + (i * MENU_ROW_HEIGHT_PX) + (MENU_ROW_HEIGHT_PX / 2));
+			entryData.put("screenX", screen.x);
+			entryData.put("screenY", screen.y);
 			entryList.add(entryData);
 		}
 		data.put("entries", entryList);
