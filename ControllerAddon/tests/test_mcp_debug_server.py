@@ -100,3 +100,64 @@ def test_type_text_no_enter_by_default(monkeypatch):
     monkeypatch.setattr(s.controller, "key_tap", lambda ser, key: taps.append(key))
     s.type_text("hi")
     assert taps == ["h", "i"]
+
+
+def test_match_menu_entry_matches_by_option_substring():
+    menu = {"open": True, "entries": [
+        {"index": 0, "option": "Attack", "target": "Goblin", "screenX": 10, "screenY": 20},
+        {"index": 1, "option": "Examine", "target": "Goblin", "screenX": 10, "screenY": 35},
+    ]}
+    match = s._match_menu_entry(menu, "attack", None)
+    assert match == menu["entries"][0]
+
+
+def test_match_menu_entry_matches_by_option_and_target_hint():
+    menu = {"open": True, "entries": [
+        {"index": 0, "option": "Take", "target": "Coins", "screenX": 1, "screenY": 2},
+        {"index": 1, "option": "Take", "target": "Bones", "screenX": 3, "screenY": 4},
+    ]}
+    match = s._match_menu_entry(menu, "take", "bones")
+    assert match == menu["entries"][1]
+
+
+def test_match_menu_entry_returns_none_when_nothing_matches():
+    menu = {"open": True, "entries": [{"index": 0, "option": "Cancel", "target": "", "screenX": 0, "screenY": 0}]}
+    assert s._match_menu_entry(menu, "attack", None) is None
+
+
+def test_click_menu_entry_rejects_out_of_window_origin(monkeypatch):
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: False)
+    result = s.click_menu_entry(x=-1, y=-1, option="attack")
+    assert result["ok"] is False
+    assert "outside the RuneLite window" in result["error"]
+
+
+def test_click_menu_entry_reports_available_options_on_no_match(monkeypatch):
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: True)
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y: None)
+    monkeypatch.setattr(s.controller, "right_click_human", lambda ser: None)
+    monkeypatch.setattr(s.controller, "click_human", lambda ser: None)
+    monkeypatch.setattr(s.controller, "key_tap", lambda ser, key: None)
+    monkeypatch.setattr(s.controller, "get_cursor_pos", lambda: (5, 5))
+    monkeypatch.setattr(s.controller, "pick_dismiss_point", lambda x, y: (200, 200))
+    monkeypatch.setattr(s.controller, "get_menu", lambda: {
+        "open": True, "entries": [{"index": 0, "option": "Cancel", "target": "", "screenX": 0, "screenY": 0}],
+    })
+    result = s.click_menu_entry(x=10, y=10, option="attack")
+    assert result["ok"] is False
+    assert result["available_options"] == ["Cancel"]
+
+
+def test_click_menu_entry_clicks_the_match(monkeypatch):
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: True)
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y: moves.append((x, y)))
+    monkeypatch.setattr(s.controller, "right_click_human", lambda ser: None)
+    monkeypatch.setattr(s.controller, "click_human", lambda ser: clicks.append(True))
+    monkeypatch.setattr(s.controller, "get_menu", lambda: {
+        "open": True, "entries": [{"index": 0, "option": "Attack", "target": "Goblin", "screenX": 77, "screenY": 88}],
+    })
+    moves, clicks = [], []
+    result = s.click_menu_entry(x=10, y=10, option="attack")
+    assert result == {"ok": True, "matched": {"index": 0, "option": "Attack", "target": "Goblin", "screenX": 77, "screenY": 88}}
+    assert (77, 88) in moves
+    assert clicks == [True]

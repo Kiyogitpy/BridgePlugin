@@ -12,6 +12,7 @@
 # Then register in .mcp.json (repo root) for use from Claude Code.
 
 import sys
+import time
 
 import serial
 from mcp.server.fastmcp import FastMCP
@@ -173,6 +174,64 @@ def type_text(text: str, press_enter: bool = False) -> dict:
     if press_enter:
         controller.key_tap(ser, "ENTER")
     return {"ok": True}
+
+
+MENU_POLL_INTERVAL_S = 0.05
+MENU_POLL_TIMEOUT_S = 0.6
+
+
+def _match_menu_entry(menu: dict, option: str, target_hint: str | None) -> dict | None:
+    """Same matching rule as controller.click_menu_action: case-insensitive substring match on
+    `option`, and on `target` too if target_hint is given. Returns the first matching entry
+    dict, or None if nothing matches (including when the menu has no entries)."""
+    option_lower = option.lower()
+    target_lower = target_hint.lower() if target_hint else None
+    return next(
+        (e for e in menu.get("entries", [])
+         if option_lower in (e.get("option") or "").lower()
+         and (target_lower is None or target_lower in (e.get("target") or "").lower())),
+        None,
+    )
+
+
+@mcp.tool()
+def click_menu_entry(x: int, y: int, option: str, target_hint: str | None = None) -> dict:
+    """Right-click (x, y), read back the resulting context menu, and left-click whichever entry's
+    option matches `option` (case-insensitive substring, e.g. "take"). If target_hint is given,
+    it must also substring-match the entry's target text -- narrows to the right entry when
+    multiple things share a click point (e.g. a ground item under an NPC).
+
+    Returns {"ok": True, "matched": {...entry...}} on success. On failure -- the menu never
+    opened, or nothing matched -- dismisses the menu (moves the cursor clear + ESC, so it
+    doesn't sit open blocking the next click) and returns {"ok": False, "error": ...,
+    "available_options": [...]} listing what WAS on the menu, so a failed match is diagnosable
+    instead of a bare failure."""
+    if (err := _require_within_window(x, y)) is not None:
+        return err
+
+    controller.move_to_human(ser, x, y)
+    controller.right_click_human(ser)
+
+    deadline = time.time() + MENU_POLL_TIMEOUT_S
+    menu = controller.get_menu()
+    while not menu.get("open") and time.time() < deadline:
+        time.sleep(MENU_POLL_INTERVAL_S)
+        menu = controller.get_menu()
+
+    if not menu.get("open"):
+        return {"ok": False, "error": "menu never opened", "available_options": []}
+
+    match = _match_menu_entry(menu, option, target_hint)
+    if match is None:
+        available = [e.get("option") for e in menu.get("entries", [])]
+        cx, cy = controller.get_cursor_pos()
+        controller.move_to_human(ser, *controller.pick_dismiss_point(cx, cy))
+        controller.key_tap(ser, "ESC")
+        return {"ok": False, "error": f"no '{option}' entry found", "available_options": available}
+
+    controller.move_to_human(ser, match["screenX"], match["screenY"])
+    controller.click_human(ser)
+    return {"ok": True, "matched": match}
 
 
 if __name__ == "__main__":
