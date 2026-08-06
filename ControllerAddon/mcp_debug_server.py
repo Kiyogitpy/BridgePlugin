@@ -187,6 +187,87 @@ def type_text(text: str, press_enter: bool = False) -> dict:
     return {"ok": True}
 
 
+_held_buttons: set[str] = set()
+_held_keys: set[str] = set()
+
+
+@mcp.tool()
+def left_mouse_down() -> dict:
+    """Press and hold the left mouse button at the cursor's current position, without
+    releasing. Tracked so release_all() can clean it up if the matching left_mouse_up() call
+    never happens."""
+    controller.mouse_left_down(ser)
+    _held_buttons.add("left")
+    return {"ok": True}
+
+
+@mcp.tool()
+def left_mouse_up() -> dict:
+    """Release the left mouse button."""
+    controller.mouse_left_up(ser)
+    _held_buttons.discard("left")
+    return {"ok": True}
+
+
+@mcp.tool()
+def right_mouse_down() -> dict:
+    """Press and hold the right mouse button at the cursor's current position, without
+    releasing. Tracked so release_all() can clean it up if the matching right_mouse_up() call
+    never happens."""
+    controller.mouse_right_down(ser)
+    _held_buttons.add("right")
+    return {"ok": True}
+
+
+@mcp.tool()
+def right_mouse_up() -> dict:
+    """Release the right mouse button."""
+    controller.mouse_right_up(ser)
+    _held_buttons.discard("right")
+    return {"ok": True}
+
+
+@mcp.tool()
+def key_down(key: str) -> dict:
+    """Press and hold a key (e.g. "LEFT", "RIGHT", "SHIFT"), without releasing -- for camera
+    rotation or any other held-key gesture. Tracked so release_all() can clean it up if the
+    matching key_up() call never happens."""
+    controller.key_down(ser, key)
+    _held_keys.add(key)
+    return {"ok": True}
+
+
+@mcp.tool()
+def key_up(key: str) -> dict:
+    """Release a key pressed via key_down()."""
+    controller.key_up(ser, key)
+    _held_keys.discard(key)
+    return {"ok": True}
+
+
+@mcp.tool()
+def release_all() -> dict:
+    """Release every mouse button and key currently tracked as held (via left_mouse_down/
+    right_mouse_down/key_down) -- a safety net for a forgotten _up() call or an interrupted
+    debugging session. Safe to call with nothing held; returns what it released."""
+    released_buttons = []
+    for button in list(_held_buttons):
+        if button == "left":
+            controller.mouse_left_up(ser)
+        else:
+            controller.mouse_right_up(ser)
+        _held_buttons.discard(button)
+        released_buttons.append(button)
+
+    released_keys = []
+    for key in list(_held_keys):
+        controller.key_up(ser, key)
+        _held_keys.discard(key)
+        released_keys.append(key)
+
+    return {"ok": True, "released_buttons": released_buttons, "released_keys": released_keys}
+
+
 MENU_POLL_INTERVAL_S = 0.05
 MENU_POLL_TIMEOUT_S = 0.6
 

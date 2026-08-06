@@ -197,3 +197,79 @@ def test_click_menu_entry_reports_bridge_error_distinctly(monkeypatch):
     monkeypatch.setattr(s, "_bridge_get_impl", lambda path, params: {"error": "refused"})
     result = s.click_menu_entry(x=10, y=10, option="attack")
     assert result == {"ok": False, "error": "bridge error: refused"}
+
+
+def test_left_mouse_down_tracks_held_button(monkeypatch):
+    monkeypatch.setattr(s.controller, "mouse_left_down", lambda ser: None)
+    s._held_buttons.clear()
+    result = s.left_mouse_down()
+    assert result == {"ok": True}
+    assert "left" in s._held_buttons
+
+
+def test_left_mouse_up_clears_held_button(monkeypatch):
+    monkeypatch.setattr(s.controller, "mouse_left_up", lambda ser: None)
+    s._held_buttons.clear()
+    s._held_buttons.add("left")
+    result = s.left_mouse_up()
+    assert result == {"ok": True}
+    assert "left" not in s._held_buttons
+
+
+def test_right_mouse_down_tracks_held_button(monkeypatch):
+    monkeypatch.setattr(s.controller, "mouse_right_down", lambda ser: None)
+    s._held_buttons.clear()
+    result = s.right_mouse_down()
+    assert result == {"ok": True}
+    assert "right" in s._held_buttons
+
+
+def test_right_mouse_up_clears_held_button(monkeypatch):
+    monkeypatch.setattr(s.controller, "mouse_right_up", lambda ser: None)
+    s._held_buttons.clear()
+    s._held_buttons.add("right")
+    result = s.right_mouse_up()
+    assert result == {"ok": True}
+    assert "right" not in s._held_buttons
+
+
+def test_key_down_tracks_held_key(monkeypatch):
+    monkeypatch.setattr(s.controller, "key_down", lambda ser, key: None)
+    s._held_keys.clear()
+    result = s.key_down("LEFT")
+    assert result == {"ok": True}
+    assert "LEFT" in s._held_keys
+
+
+def test_key_up_clears_held_key(monkeypatch):
+    monkeypatch.setattr(s.controller, "key_up", lambda ser, key: None)
+    s._held_keys.clear()
+    s._held_keys.add("LEFT")
+    result = s.key_up("LEFT")
+    assert result == {"ok": True}
+    assert "LEFT" not in s._held_keys
+
+
+def test_release_all_releases_tracked_buttons_and_keys(monkeypatch):
+    released = []
+    monkeypatch.setattr(s.controller, "mouse_left_up", lambda ser: released.append("mouse_left_up"))
+    monkeypatch.setattr(s.controller, "mouse_right_up", lambda ser: released.append("mouse_right_up"))
+    monkeypatch.setattr(s.controller, "key_up", lambda ser, key: released.append(f"key_up:{key}"))
+    s._held_buttons.clear()
+    s._held_buttons.update({"left", "right"})
+    s._held_keys.clear()
+    s._held_keys.update({"LEFT", "SHIFT"})
+    result = s.release_all()
+    assert result["ok"] is True
+    assert set(result["released_buttons"]) == {"left", "right"}
+    assert set(result["released_keys"]) == {"LEFT", "SHIFT"}
+    assert s._held_buttons == set()
+    assert s._held_keys == set()
+    assert set(released) == {"mouse_left_up", "mouse_right_up", "key_up:LEFT", "key_up:SHIFT"}
+
+
+def test_release_all_noop_when_nothing_held():
+    s._held_buttons.clear()
+    s._held_keys.clear()
+    result = s.release_all()
+    assert result == {"ok": True, "released_buttons": [], "released_keys": []}
