@@ -26,6 +26,7 @@ import random
 import time
 
 import controller
+import debug_log
 
 LOGIN_RETRY_INTERVAL_S = 1.0
 
@@ -49,7 +50,7 @@ def attempt_login(ctx) -> bool:
 
     click_to_play = status.get("clickToPlay")
     if click_to_play:
-        print("[login] clicking through the welcome screen")
+        debug_log.log("login", "clicking through the welcome screen")
         controller.click_entity(ctx.ser, click_to_play, offset=(0, 0))
         time.sleep(random.uniform(1.0, 1.5))
         return True
@@ -57,7 +58,7 @@ def attempt_login(ctx) -> bool:
     if status.get("gameState") == "LOGIN_SCREEN":
         tile = status.get("accountTile")
         if tile:
-            print("[login] clicking the saved account tile")
+            debug_log.log("login", "clicking the saved account tile")
             controller.click_entity(ctx.ser, tile, offset=(0, 0))
             time.sleep(random.uniform(2.0, 3.0))
             return True

@@ -10,3 +10,7 @@ nb-configuration.xml
 nbproject/
 data/
 .worktrees/
+ControllerAddon/logs/
+.superpowers/
+.memsearch/
+*.pyc

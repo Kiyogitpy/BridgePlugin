@@ -24,10 +24,12 @@
 #     visibly stopped. No longer tracked explicitly (see #3 above) -- the idle-triggered re-click
 #     covers this the same as every other stop reason.
 
+import math
 import random
 import time
 
 import controller
+import debug_log
 import sailing
 
 DEFAULT_CONFIG = {
@@ -74,10 +76,51 @@ HOOK_ENGAGE_TIMEOUT_S = 12.0  # Kept as a backstop even after switching to the g
                                # was originally added because a flat maxDistance guess (15, then 8)
                                # didn't reliably predict real engagement -- observed live standing
                                # at a wreck that still failed to engage despite passing the
-                               # distance check. If isIdle never goes False for this long despite
-                               # repeated reclicks even though _wreck_in_hook_range said yes,
-                               # reposition closer instead of reclicking forever -- covers any edge
-                               # case the geometric check still misses (e.g. scene/tile lag).
+                               # distance check. If the real salvage channel (SALVAGE_CHANNEL_
+                               # ANIMATIONS) never starts for this long despite repeated reclicks
+                               # even though _wreck_in_hook_range said yes, reposition closer instead
+                               # of reclicking forever -- covers any edge case the geometric check
+                               # still misses (e.g. scene/tile lag).
+
+HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS = 3  # CONFIRMED live 2026-08-05 (user report): with no cap,
+                                           # a wreck where only a sliver of the boat's hull overlaps
+                                           # WRECK_SQUARE_SIZE could pass _wreck_in_hook_range's
+                                           # overlap check without the hook ever actually engaging --
+                                           # each reposition attempt landing at another similarly
+                                           # marginal spot turned this branch into an unbounded loop
+                                           # (toggle sails off, try the hook, toggle sails back on to
+                                           # reposition, repeat forever). Same bounded-retry
+                                           # philosophy as sailing.MAX_ROUTE_ATTEMPTS -- give up on
+                                           # this wreck instead of retrying indefinitely.
+HOOK_ENGAGE_GIVEUP_COOLDOWN_S = 30.0  # how long to leave a given-up-on wreck alone (see above)
+                                        # before it's eligible to be retried -- long enough that a
+                                        # repeated find_wreck_in_hook_range call doesn't just walk
+                                        # straight back into the same loop next tick, short enough
+                                        # that a wreck worth salvaging isn't abandoned for good over
+                                        # one bad approach.
+
+SALVAGE_CHANNEL_ANIMATIONS = frozenset({13576, 13577, 13578})  # CONFIRMED live -- the hook's real
+    # salvaging channel cycles through exactly these three animation ids. Used instead of trusting
+    # /combat's isIdle for "is the hook actually working" -- CONFIRMED live 2026-08-05 (user report,
+    # "seems he's stuck on the helm after clicking the hook once"): isIdle's own formula
+    # (!moving && animation == -1 && target == null) makes ANY non-(-1) animation read as "not
+    # idle", channeling or not. Observed live: animation stuck at 13352 (not one of these three,
+    # cause unconfirmed -- possibly a leftover helm/UI interaction pose) for 100+ seconds after a
+    # single hook click, with isIdle reading False the entire time -- silently blocking every
+    # recovery mechanism below (reclick, reposition-on-timeout, give-up-and-blacklist), since they
+    # were all gated behind isIdle first going True.
+
+FAR_WRECK_GIVEUP_COOLDOWN_S = 60.0  # CONFIRMED live 2026-08-05 (user report): "we just sail around
+                                      # in circles even though we have multiple wreck pairs around
+                                      # us" -- sail_to_pair failing already means sail_to exhausted
+                                      # MAX_ROUTE_ATTEMPTS worth of re-planning (multiple minutes of
+                                      # real time, observed live as one long stretch of ~10s hop
+                                      # timeouts), so find_nearby_wreck just re-picking the exact same
+                                      # nearest-but-unreachable wreck next tick repeated that entire
+                                      # multi-minute journey forever with no way to try a different,
+                                      # reachable pair. Longer than HOOK_ENGAGE_GIVEUP_COOLDOWN_S
+                                      # since a failed full sail attempt is far more expensive than a
+                                      # failed reposition -- not worth retrying as quickly.
 
 
 def tick(ctx):
@@ -88,13 +131,24 @@ def tick(ctx):
         return
 
     near_wreck = find_wreck_in_hook_range(config)
+
+    # A wreck this routine already gave up repositioning for (see HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS
+    # below) is treated as if it weren't in range at all, for HOOK_ENGAGE_GIVEUP_COOLDOWN_S --
+    # keyed by its own tile position, NOT its object id (SALVAGE_LEVEL_REQ/SUNK_SHIPWRECK_IDS
+    # confirm ids are shared per TIER, e.g. every "Small shipwreck" instance uses the same id --
+    # keying by id would blacklist every wreck of that tier, not just this one stuck instance).
     if near_wreck is not None:
-        # isIdle only gates the reclick itself (avoid spam-clicking mid-channel) -- it must NOT
-        # gate this whole branch, or the far-wreck check below never runs. CONFIRMED live
-        # 2026-08-02: salvaging is a continuous multi-tick channel, not brief per-swing bursts
-        # like mining.py -- isIdle can stay False for a wreck's entire lifespan, so gating the
-        # branch on it meant the routine never noticed the near wreck was gone and never looked
-        # for a farther one to sail to.
+        wreck_key = (near_wreck.get("x"), near_wreck.get("y"), near_wreck.get("plane"))
+        if wreck_key == ctx.state.data.get("hook_engage_giveup_key") and time.time() < ctx.state.data.get("hook_engage_giveup_until", 0):
+            near_wreck = None
+
+    if near_wreck is not None:
+        # channeling (SALVAGE_CHANNEL_ANIMATIONS) only gates the reclick itself (avoid
+        # spam-clicking mid-channel) -- it must NOT gate this whole branch, or the far-wreck check
+        # below never runs. CONFIRMED live 2026-08-02: salvaging is a continuous multi-tick
+        # channel, not brief per-swing bursts like mining.py -- the channel can run for a wreck's
+        # entire lifespan, so gating the branch on it meant the routine never noticed the near
+        # wreck was gone and never looked for a farther one to sail to.
         # No "not navigating" gate here (there used to be one) -- CONFIRMED live 2026-08-02:
         # get_sailing()["navigating"] reflects whether the helm/steering interface is still
         # engaged, not whether the boat is physically moving, and it can stay True even after the
@@ -102,41 +156,89 @@ def tick(ctx):
         # it here got the routine permanently stuck ("stuck at the helm... not clicking the
         # hook") once navigating got stuck True. stop_boat() already waits for the boat's actual
         # *position* to stabilize before returning, which is the real "safe to deploy" signal.
-        idle = controller.get_combat().get("isIdle", True)
+        channeling = controller.get_combat().get("animation") in SALVAGE_CHANNEL_ANIMATIONS
         now = time.time()
-        if not idle:
-            # Channel confirmed actually running -- clear the stuck tracker below.
+        if channeling:
+            # Channel confirmed actually running -- clear the stuck trackers below.
             ctx.state.data.pop("hook_engage_attempt_at", None)
+            ctx.state.data.pop("hook_engage_reposition_count", None)
         cooldown_elapsed = now - ctx.state.data.get("last_deploy_click_at", 0) > HOOK_CLICK_COOLDOWN_S
-        if idle and cooldown_elapsed:
+        if not channeling and cooldown_elapsed:
             attempt_start = ctx.state.data.setdefault("hook_engage_attempt_at", now)
             if now - attempt_start > HOOK_ENGAGE_TIMEOUT_S:
-                # Sail straight at near_wreck's own point -- NOT sail_to_pair. find_wreck_in_hook_range
-                # already confirmed the boat's hull overlaps THIS wreck's square, so what's needed is
-                # fine positioning on it, not sail_to_pair's pair-midpoint logic (meant for the initial
-                # far-away approach): that can retarget toward a different, farther partner wreck up to
-                # PAIR_MAX_TILES away and send the boat somewhere it was never stuck getting to before --
-                # observed live 2026-08-04 running the boat aground trying to reach that new point right
-                # after sitting fine at near_wreck.
-                print("[salvage] hook isn't engaging after repeated clicks -- repositioning closer")
-                sailing.sail_to(ctx, {"x": near_wreck["x"], "y": near_wreck["y"], "plane": near_wreck["plane"]})
+                reposition_count = ctx.state.data.get("hook_engage_reposition_count", 0) + 1
+                ctx.state.data["hook_engage_reposition_count"] = reposition_count
+                if reposition_count > HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS:
+                    debug_log.log("salvage", f"giving up on this wreck after {HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS} "
+                                              f"reposition attempts -- letting it cool down and looking elsewhere")
+                    ctx.state.data["hook_engage_giveup_key"] = (near_wreck.get("x"), near_wreck.get("y"), near_wreck.get("plane"))
+                    ctx.state.data["hook_engage_giveup_until"] = now + HOOK_ENGAGE_GIVEUP_COOLDOWN_S
+                    ctx.state.data.pop("hook_engage_attempt_at", None)
+                    ctx.state.data.pop("hook_engage_reposition_count", None)
+                    return
+                # Sail at a point clear of near_wreck's own collision footprint -- NOT sail_to_pair,
+                # and NOT near_wreck's own (x, y) tile either (that tile IS the solid footprint, see
+                # WRECK_COLLISION_SIZE -- aiming straight at it is how the boat kept bonking the
+                # wreck). find_wreck_in_hook_range already confirmed the boat's hull overlaps THIS
+                # wreck's square, so what's needed is fine positioning on it, not sail_to_pair's
+                # pair-midpoint logic (meant for the initial far-away approach): that can retarget
+                # toward a different, farther partner wreck up to PAIR_MAX_TILES away and send the
+                # boat somewhere it was never stuck getting to before -- observed live 2026-08-04
+                # running the boat aground trying to reach that new point right after sitting fine
+                # at near_wreck.
+                player = controller.get_player()
+                origin_x = player.get("boatX", player.get("x"))
+                origin_y = player.get("boatY", player.get("y"))
+                approach_point = None
+                if origin_x is not None and origin_y is not None:
+                    approach_point = _approach_point_clear_of_wreck(origin_x, origin_y, near_wreck, player)
+                if approach_point is not None:
+                    debug_log.log("salvage", "hook isn't engaging after repeated clicks -- repositioning closer "
+                                              f"(attempt {reposition_count}/{HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS})")
+                    sailing.sail_to(ctx, approach_point)
+                else:
+                    # Already within safe clearance of the wreck -- see _approach_point_clear_of_wreck's
+                    # own docstring for why calling sail_to anyway (engaging the helm with nowhere new
+                    # to steer to) is actively harmful, not just a no-op. Nothing left to try but
+                    # reclicking the hook again; the reposition_count above still counts this attempt,
+                    # so a wreck that genuinely never engages still gets given up on eventually.
+                    debug_log.log("salvage", "hook isn't engaging after repeated clicks, but already as close as "
+                                              "it's safe to get -- reclicking instead of repositioning "
+                                              f"(attempt {reposition_count}/{HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS})")
                 ctx.state.data.pop("hook_engage_attempt_at", None)
             sailing.deploy_hook(ctx, config.get("hookName", ""))
             ctx.state.data["last_deploy_click_at"] = now
         return
     ctx.state.data.pop("hook_engage_attempt_at", None)
+    ctx.state.data.pop("hook_engage_reposition_count", None)
 
-    far_wreck = find_nearby_wreck(config, config.get("maxSailDistance", 60))
+    far_giveup_key = ctx.state.data.get("far_wreck_giveup_key")
+    far_giveup_until = ctx.state.data.get("far_wreck_giveup_until", 0)
+    exclude = frozenset({far_giveup_key}) if far_giveup_key and time.time() < far_giveup_until else frozenset()
+
+    far_wreck = find_nearby_wreck(config, config.get("maxSailDistance", 60), exclude=exclude)
     if far_wreck is not None:
         # No "not navigating" gate here either -- see the near-wreck branch's comment above.
         if sail_to_pair(ctx, config, far_wreck):
-            sailing.deploy_hook(ctx, config.get("hookName", ""))
-            ctx.state.data["last_deploy_click_at"] = time.time()
+            ctx.state.data.pop("far_wreck_giveup_key", None)
+            # CONFIRMED live 2026-08-05: sail_to's own arrival pre-check (see sailing.py) means a
+            # far_wreck that's already in range returns here almost instantly every tick instead of
+            # taking the several seconds a real helm-engage-and-steer cycle used to -- without the
+            # same HOOK_CLICK_COOLDOWN_S courtesy the near-wreck branch already has, this spammed a
+            # fresh deploy_hook click on literally every tick (~1s) instead of respecting the cooldown.
+            if time.time() - ctx.state.data.get("last_deploy_click_at", 0) > HOOK_CLICK_COOLDOWN_S:
+                sailing.deploy_hook(ctx, config.get("hookName", ""))
+                ctx.state.data["last_deploy_click_at"] = time.time()
+        else:
+            debug_log.log("salvage", f"couldn't reach the wreck pair near ({far_wreck.get('x')}, {far_wreck.get('y')}) "
+                                      f"-- giving up on it for {FAR_WRECK_GIVEUP_COOLDOWN_S:.0f}s and trying elsewhere")
+            ctx.state.data["far_wreck_giveup_key"] = (far_wreck.get("x"), far_wreck.get("y"), far_wreck.get("plane"))
+            ctx.state.data["far_wreck_giveup_until"] = time.time() + FAR_WRECK_GIVEUP_COOLDOWN_S
         return
 
     now = time.time()
     if now - ctx.state.data.get("last_waiting_message_at", 0) > WAITING_MESSAGE_INTERVAL_S:
-        print("[salvage] no shipwreck in range -- waiting")
+        debug_log.log("salvage", "no shipwreck in range -- waiting")
         ctx.state.data["last_waiting_message_at"] = now
 
 
@@ -179,7 +281,7 @@ def drop_salvage(ctx):
         controller.key_tap(ctx.ser, controller.INVENTORY_TAB_KEY)
         time.sleep(random.uniform(0.2, 0.35))
         if controller.get_sailing().get("facilitiesTabOpen"):
-            print("[salvage] still on the sail menu after 'w' -- dismissing a likely dialogue with Space")
+            debug_log.log("salvage", "still on the sail menu after 'w' -- dismissing a likely dialogue with Space")
             controller.key_tap(ctx.ser, "SPACE")
             time.sleep(random.uniform(0.3, 0.5))
             controller.key_tap(ctx.ser, controller.INVENTORY_TAB_KEY)
@@ -246,6 +348,49 @@ WRECK_SEARCH_RADIUS_PADDING = 10
 WRECK_SQUARE_SIZE = 15
 WRECK_SQUARE_HALF = WRECK_SQUARE_SIZE / 2.0
 
+# The wreck object's own solid collision footprint -- CONFIRMED live 2026-08-04 (user report): a
+# 3x3 square centered on the wreck's tile, well inside its own WRECK_SQUARE_SIZE (15x15)
+# salvage-range square. Sailing straight at the wreck's own (x, y) -- what find_wreck_pair_target's
+# lone-wreck fallback and tick()'s hook-engage-timeout reposition both used to do -- aims the boat
+# directly at this solid footprint: even a perfect, zero-overshoot approach ends with the boat
+# sitting on top of it, and any real overshoot (see sailing.py's stop_boat drift/overshoot
+# logging, live-confirmed to run well past the aim point) sails straight through it -- "bonking"
+# the wreck. Both callers now aim short of it instead, see _approach_point_clear_of_wreck.
+WRECK_COLLISION_SIZE = 3
+WRECK_COLLISION_HALF = WRECK_COLLISION_SIZE / 2.0
+
+
+def _approach_point_clear_of_wreck(origin_x, origin_y, wreck: dict, player: dict):
+    """A point on the straight line between (origin_x, origin_y) and wreck's own tile, offset back
+    from the wreck by WRECK_COLLISION_HALF plus the boat's own hull half-size -- the minimum
+    distance for the boat's hull (not just its reference point) to clear the wreck's solid
+    WRECK_COLLISION_SIZE footprint if this point is reached exactly -- instead of the wreck's own
+    (x, y) tile. Still comfortably inside WRECK_SQUARE_HALF (7.5) for any origin more than a
+    couple tiles from the wreck, so hook range isn't sacrificed for collision clearance.
+
+    Returns None if origin is already at or within that clearance distance (including origin and
+    wreck coinciding exactly) -- CONFIRMED live 2026-08-05 (user report, "we just circling now"):
+    returning origin itself in this case (the previous behavior) meant steer_toward saw itself as
+    already arrived and issued zero hop clicks, but sail_to still unconditionally calls use_helm()
+    first -- which re-engages steering with no fresh minimap click ever telling the boat where to
+    go, letting it resume moving on whatever stale heading the game still had queued. Observed
+    live: a boat sitting still at hook range drifted ~45 tiles away moments after a "reposition"
+    that should have been a no-op. Callers must skip calling sailing.sail_to entirely when this
+    returns None -- there is nothing safe to reposition to, and attempting it is actively harmful."""
+    wx, wy, wplane = wreck["x"], wreck["y"], wreck.get("plane", 0)
+    dx, dy = origin_x - wx, origin_y - wy
+    dist = math.hypot(dx, dy)
+
+    clearance = WRECK_COLLISION_HALF + max(player.get("boatWidth", 0), player.get("boatHeight", 0)) / 2.0
+    if dist <= clearance:
+        return None
+    return {
+        "x": wx + dx / dist * clearance,
+        "y": wy + dy / dist * clearance,
+        "plane": wplane,
+    }
+
+
 # Max distance (tiles, between the two wrecks themselves) for find_wreck_pair_target to treat two
 # active wrecks as a pair worth positioning between. Shipwrecks spawn in close pairs at each
 # hotspot (wiki-confirmed: "a different pair of shipwrecks", "double Salvage spots" -- see
@@ -261,12 +406,20 @@ WRECK_SQUARE_HALF = WRECK_SQUARE_SIZE / 2.0
 PAIR_MAX_TILES = WRECK_SQUARE_SIZE
 
 
-def find_nearby_wreck(config: dict, max_dist: float):
+def find_nearby_wreck(config: dict, max_dist: float, exclude: frozenset = frozenset()):
     """Nearest ACTIVE, actually-salvageable-at-this-level object matching config["wreckNames"]
     within max_dist tiles of the BOAT (not the player), or None (sunk wrecks -- see
     SUNK_SHIPWRECK_IDS -- and wrecks above the player's boosted Sailing level -- see
     SALVAGE_LEVEL_REQ -- are both filtered out; matching either would let the routine treat a wreck
     it can't actually work as "in range" and never look for a real one).
+
+    exclude: a set of (x, y, plane) tuples to skip -- CONFIRMED live 2026-08-05 (user report,
+    "we just sail around in circles even though we have multiple wreck pairs around us"): without
+    this, a wreck sail_to_pair already failed to actually reach (e.g. blocked/aground) is still the
+    single nearest candidate every subsequent tick, so tick() retried the exact same unreachable
+    ~2-minute journey forever instead of trying a different, reachable pair. tick() passes the
+    give-up blacklist here (see HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS's sibling for the near-wreck
+    case) so this picks the next-nearest candidate instead.
 
     Only used for the farther "is this wreck worth sailing to" check (maxSailDistance) now -- the
     near/hook-range case uses find_wreck_in_hook_range's WRECK_SQUARE_SIZE geometry instead (see
@@ -312,6 +465,8 @@ def find_nearby_wreck(config: dict, max_dist: float):
         wx, wy = o.get("x"), o.get("y")
         if wx is None or wy is None:
             continue
+        if (wx, wy, o.get("plane")) in exclude:
+            continue
 
         dist = max(abs(wx - origin_x), abs(wy - origin_y))
         if dist > max_dist:
@@ -326,9 +481,11 @@ def find_wreck_pair_target(config: dict, wreck: dict):
     """Given a wreck the routine is about to sail to, look for a second matching active wreck
     within PAIR_MAX_TILES of it (same tier names as wreck, same plane, not sunk, and actually
     within the player's current Sailing level -- see SALVAGE_LEVEL_REQ) and target their midpoint
-    instead of the lone wreck -- see PAIR_MAX_TILES's comment for why. Falls back to the given
-    wreck's own position if no partner is found nearby (confirmed with the user: a lone wreck is
-    still worth sailing to directly, pairing is an optimization, not a requirement).
+    instead of the lone wreck -- see PAIR_MAX_TILES's comment for why. Falls back to a point clear
+    of the wreck's own solid footprint (_approach_point_clear_of_wreck, see WRECK_COLLISION_SIZE)
+    if no partner is found nearby (confirmed with the user: a lone wreck is still worth sailing to
+    directly, pairing is an optimization, not a requirement) -- not the wreck's own (x, y) tile,
+    which is the collision footprint itself.
 
     The level check matters specifically here, not just as a general filter -- CONFIRMED live
     2026-08-04 (user report): aiming for the midpoint is only reasonable when BOTH wrecks are
@@ -387,9 +544,20 @@ def find_wreck_pair_target(config: dict, wreck: dict):
             best_partner, best_dist = o, dist
 
     if best_partner is None:
-        return {"x": wx, "y": wy, "plane": wplane}, None
+        approach_point = None
+        if origin_x is not None and origin_y is not None:
+            approach_point = _approach_point_clear_of_wreck(origin_x, origin_y, wreck, player)
+        # None means origin is already within safe clearance of the wreck (see
+        # _approach_point_clear_of_wreck's own docstring) -- this is the far-approach path, so
+        # falling back to wreck's own point is fine here: sail_to's normal speed-scaled braking
+        # handles arriving safely, unlike the near-wreck reposition-on-timeout path this same
+        # helper also serves, where a from-already-close no-op target caused real drift (CONFIRMED
+        # live 2026-08-05 -- see tick()'s own handling of this same None case).
+        if approach_point is None:
+            approach_point = {"x": wx, "y": wy, "plane": wplane}
+        return approach_point, None
 
-    print(f"[salvage] found a wreck pair {best_dist} tiles apart -- sailing to the midpoint")
+    debug_log.log("salvage", f"found a wreck pair {best_dist} tiles apart -- sailing to the midpoint")
     target = {
         "x": (wx + best_partner["x"]) // 2,
         "y": (wy + best_partner["y"]) // 2,
@@ -477,24 +645,22 @@ def sail_to_pair(ctx, config: dict, wreck: dict) -> bool:
     find_wreck_pair_target) and verify the boat actually ends up within the hook's real
     WRECK_SQUARE_SIZE range of BOTH wrecks, instead of just trusting sail_to's own arrival
     tolerance blind. CONFIRMED live 2026-08-03 (user report): without this check, sail_to's
-    brake-then-drift landing (see sail_to's own brake= docstring) could miss a computed pair
-    midpoint by a wide enough margin to land outside hook range of one or both wrecks, silently
-    defeating the whole point of pairing.
+    brake-then-drift landing could miss a computed pair midpoint by a wide enough margin to land
+    outside hook range of one or both wrecks, silently defeating the whole point of pairing --
+    sail_to's braking distance is now always speed-scaled (see its own docstring), which was part
+    of that same overshoot (a flat, unscaled tolerance used to apply to this exact midpoint case).
 
     Checks against _wreck_in_hook_range specifically, not some looser notion of "nearby" --
     CONFIRMED live 2026-08-04 (user report): an earlier version of this check used a flat
     maxDistance figure that didn't match the real engage boundary, so it could report "landed
-    fine" even when the hook genuinely couldn't reach either wreck from there.
-
-    brake=False (no ram risk) only when a real partner was found -- a midpoint is open water, but
-    the single-wreck fallback is a real solid object and still needs the wide brake tolerance."""
+    fine" even when the hook genuinely couldn't reach either wreck from there."""
     target, partner = find_wreck_pair_target(config, wreck)
-    ok = sailing.sail_to(ctx, target, brake=(partner is None))
+    ok = sailing.sail_to(ctx, target)
 
     if ok and partner is not None:
         player = controller.get_player()
         if not (_wreck_in_hook_range(player, wreck) and _wreck_in_hook_range(player, partner)):
-            print("[salvage] landed outside hook range of one of the paired wrecks -- correcting")
-            ok = sailing.sail_to(ctx, target, brake=False)
+            debug_log.log("salvage", "landed outside hook range of one of the paired wrecks -- correcting")
+            ok = sailing.sail_to(ctx, target)
 
     return ok

@@ -168,6 +168,10 @@ def get_tiles():
     return api_get("/tiles") or []
 
 
+def get_menu():
+    return api_get("/menu") or {"open": False}
+
+
 def get_consumables():
     return api_get("/consumables") or {"food": [], "prayer": []}
 
@@ -454,6 +458,23 @@ def type_digits_and_enter(ser: serial.Serial, text: str) -> None:
     time.sleep(random.uniform(0.2, 0.4))
 
 
+def type_text(ser: serial.Serial, text: str) -> None:
+    """Type each character of `text` via key_tap -- letters and spaces, no trailing Enter, for
+    a live-filtering text field like the bank's search box (see banker.py's search_bank) rather
+    than type_digits_and_enter's numeric-chatbox-prompt use case.
+
+    ASSUMPTION, NOT YET VERIFIED LIVE: that the Arduino firmware accepts single-letter key names
+    ("a".."z") the same way it accepts the single-digit key names type_digits_and_enter uses
+    (itself still flagged unverified there) and named keys like "SPACE" elsewhere in this file.
+    Verify live (type something into the bank search box, confirm the right characters actually
+    appear) before trusting this for anything unattended."""
+    for ch in text:
+        key = "SPACE" if ch == " " else ch
+        key_tap(ser, key)
+        time.sleep(random.uniform(0.05, 0.12))
+    time.sleep(random.uniform(0.2, 0.4))
+
+
 INVENTORY_TAB_KEY = "w"
 PRAYER_TAB_KEY = "r"
 
@@ -593,6 +614,21 @@ def pick_aim_point(x: int, y: int, radius: int) -> tuple:
     r = radius * math.sqrt(random.random())
     theta = random.uniform(0, 2 * math.pi)
     return int(round(x + r * math.cos(theta))), int(round(y + r * math.sin(theta)))
+
+
+def pick_dismiss_point(x: int, y: int, distance: int = 200) -> tuple:
+    """Pick a point roughly `distance` px from (x, y) in a random direction -- for moving the
+    cursor clear of something (e.g. a stale context menu) rather than jittering near it like
+    pick_aim_point. Tries a few random directions for one that stays inside the RuneLite window;
+    falls back to the canvas center (always safely inside it) if none do."""
+    for _ in range(4):
+        angle = random.uniform(0, 2 * math.pi)
+        candidate = (int(round(x + distance * math.cos(angle))), int(round(y + distance * math.sin(angle))))
+        if is_point_within_window(*candidate):
+            return candidate
+    state = get_state()
+    return (state.get("canvasScreenX", x) + state.get("canvasWidth", 0) // 2,
+            state.get("canvasScreenY", y) + state.get("canvasHeight", 0) // 2)
 
 
 def maybe_overshoot_point(start, aim, *, overshoot_px=DEFAULT_OVERSHOOT_PX, chance=DEFAULT_OVERSHOOT_CHANCE):
@@ -890,6 +926,76 @@ def hover_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
 
     move_to_human(ser, aim_x, aim_y, aim_radius=ENTITY_AIM_RADIUS, refresh_target=refresh_target)
     return not _movement_abort.is_set()
+
+
+MENU_POLL_INTERVAL_S = 0.05
+MENU_POLL_TIMEOUT_S = 0.6
+
+
+def click_menu_action(ser: serial.Serial, entity: dict, option: str, target_hint: str = None,
+                       offset=(-7, 7), check_ui_blockers=True) -> bool:
+    """Right-click `entity`, read back the resulting context menu via GET /menu, and left-click
+    whichever entry's option matches `option` (case-insensitive substring, e.g. "take") -- picks
+    a specific menu action by name instead of trusting whatever left-click's default action
+    resolves to.
+
+    Needed whenever something else can share the same click point and isn't guaranteed to lose
+    the default-action race -- e.g. a ground item on a tile an NPC is currently standing on: a
+    plain click_entity() there can resolve to the NPC's default action (Attack) instead of the
+    item's Take, with no error or misclick logged, just a pickup that silently never happens. See
+    routines/slayer.py's maybe_loot for the original case this was built for. The right-click +
+    menu-read + read-back-and-select primitives this composes were CONFIRMED-working live
+    2026-08-06 (docs/superpowers/plans/2026-08-06-right-click-menu-state.md Task 3).
+
+    `target_hint`, if given, is matched (case-insensitive substring) against the entry's target
+    text too -- narrows to the right entry when a tile has more than one "Take"-able thing on it.
+
+    Returns False -- backing out with ESC rather than leaving the menu open over an unintended
+    entry -- if the menu never opened or nothing matched `option`/`target_hint`, so the caller can
+    retry next tick or fall back instead of assuming a click landed somewhere sensible.
+    """
+    if not click_entity(ser, entity, offset=offset, check_ui_blockers=check_ui_blockers,
+                         simulate_mistakes=False, button="right"):
+        return False
+
+    deadline = time.time() + MENU_POLL_TIMEOUT_S
+    menu = get_menu()
+    while not menu.get("open") and time.time() < deadline:
+        time.sleep(MENU_POLL_INTERVAL_S)
+        menu = get_menu()
+
+    if not menu.get("open"):
+        debug_log.log("!", f"Menu never opened after right-clicking {entity.get('name')}")
+        return False
+
+    option_lower = option.lower()
+    target_lower = target_hint.lower() if target_hint else None
+    match = next(
+        (e for e in menu.get("entries", [])
+         if option_lower in (e.get("option") or "").lower()
+         and (target_lower is None or target_lower in (e.get("target") or "").lower())),
+        None,
+    )
+
+    if match is None:
+        debug_log.log("!", f"No '{option}' entry in menu for {entity.get('name')} "
+                            f"({[e.get('option') for e in menu.get('entries', [])]}) -- closing it")
+        # Move well clear of the menu rather than relying on ESC alone -- CONFIRMED live
+        # 2026-08-06 (user observation, watching the client directly): a menu that isn't
+        # definitively gone keeps rendering on top of the item's screen position, blocking every
+        # subsequent click there (right or left) until it's actually closed. Moving off it is
+        # the same mechanism a human uses to dismiss a context menu without picking an entry.
+        # ESC still goes out too, for belt-and-suspenders -- moving away costs nothing extra to
+        # pair with it.
+        cx, cy = get_cursor_pos()
+        move_to_human(ser, *pick_dismiss_point(cx, cy), aim_radius=10)
+        key_tap(ser, "ESC")
+        return False
+
+    debug_log.log("action", f"menu-select {match.get('option')} {match.get('target')}")
+    move_to_human(ser, match["screenX"], match["screenY"], aim_radius=2)
+    click_human(ser)
+    return True
 
 
 def consume_first(ser: serial.Serial, category: str) -> bool:

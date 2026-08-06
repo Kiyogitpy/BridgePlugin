@@ -47,6 +47,7 @@ import time
 
 import banker
 import controller
+import debug_log
 
 # Firemaking level required to burn each log type -- Firemaking.txt's "List of combustible
 # logs" table. Used only for a one-time-per-activation sanity check run from inside tick()
@@ -158,14 +159,14 @@ def tick(ctx):
     if log is None:
         bank_cfg = config.get("bank", {})
         if bank_cfg.get("enabled"):
-            print("[firemaking] out of logs -- banking")
+            debug_log.log("firemaking", "out of logs -- banking")
             if not banker.bank_up(ctx, bank_cfg):
                 ctx.state.trigger_safety_stop("couldn't reach a bank to restock logs")
         else:
             ctx.state.trigger_safety_stop("out of logs and banking is disabled")
         return
 
-    print(f"[firemaking] lighting {log.get('name')}")
+    debug_log.log("firemaking", f"lighting {log.get('name')}")
     time.sleep(random.uniform(0.15, 0.35))
     controller.click_entity(ctx.ser, tinderbox, check_ui_blockers=False)
     time.sleep(random.uniform(0.1, 0.25))

@@ -52,6 +52,7 @@ import time
 
 import banker
 import controller
+import debug_log
 
 COAL_BAG_CAPACITY = 27
 
@@ -249,11 +250,11 @@ def maybe_top_up_coffer(ctx, config: dict) -> None:
     if current_coins() < amount:
         bank_obj = banker.find_nearby_bank({})
         if bank_obj is None:
-            print("[blast furnace] no bank found for coffer top-up -- will retry shortly")
+            debug_log.log("blast furnace", "no bank found for coffer top-up -- will retry shortly")
             ctx.state.data["bf_coffer_next_topup_at"] = now + 60
             return
         if not banker.open_bank(ctx, bank_obj):
-            print("[blast furnace] couldn't open the bank for coffer top-up -- will retry shortly")
+            debug_log.log("blast furnace", "couldn't open the bank for coffer top-up -- will retry shortly")
             ctx.state.data["bf_coffer_next_topup_at"] = now + 60
             return
         banker.deposit_inventory(ctx, {"keepItems": []})
@@ -261,17 +262,17 @@ def maybe_top_up_coffer(ctx, config: dict) -> None:
         banker.close_bank(ctx)
         time.sleep(random.uniform(0.3, 0.6))  # let the bank-closing transition settle
         if not withdrew or current_coins() < amount:
-            print("[blast furnace] couldn't withdraw enough coins for coffer top-up -- will retry shortly")
+            debug_log.log("blast furnace", "couldn't withdraw enough coins for coffer top-up -- will retry shortly")
             ctx.state.data["bf_coffer_next_topup_at"] = now + 60
             return
 
     coffer = find_object(config, "Coffer")
     if coffer is None:
-        print("[blast furnace] coffer not found nearby -- will retry shortly")
+        debug_log.log("blast furnace", "coffer not found nearby -- will retry shortly")
         ctx.state.data["bf_coffer_next_topup_at"] = now + 60
         return
 
-    print(f"[blast furnace] topping up coffer with {amount} coins")
+    debug_log.log("blast furnace", f"topping up coffer with {amount} coins")
     controller.click_entity(ctx.ser, coffer)
     time.sleep(random.uniform(0.8, 1.2))  # wait for the amount prompt to appear
     controller.type_digits_and_enter(ctx.ser, str(amount))
@@ -433,7 +434,7 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
         if dispenser is None:
             ctx.state.trigger_safety_stop("bar dispenser not found nearby")
             return False
-        print("[blast furnace] collecting bars")
+        debug_log.log("blast furnace", "collecting bars")
         time.sleep(random.uniform(0.2, 0.4))
         controller.click_entity(ctx.ser, dispenser)
         time.sleep(random.uniform(0.6, 1.0))

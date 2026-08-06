@@ -87,7 +87,13 @@ def teleport_to_ferox(ctx) -> bool:
         return False
 
     debug_log.log("travel", "teleporting to Ferox Enclave")
-    if not controller.click_entity(ctx.ser, ring):
+    # check_ui_blockers=False: inventory-item click, same reasoning as every other inventory
+    # click in this codebase (see banker.py's coal bag notes) -- CONFIRMED live 2026-08-06 (user
+    # session: bot stuck at 8hp repeatedly failing this exact click): without it, the ring's own
+    # screen position (always inside the inventory panel) gets flagged as "behind a UI panel",
+    # and rotating the camera to work around it does nothing for a flat 2D panel -- it just
+    # loops forever, rotating and re-blocking, never actually clicking.
+    if not controller.click_entity(ctx.ser, ring, check_ui_blockers=False):
         return False
 
     time.sleep(random.uniform(3.0, 3.6))  # teleport animation + loading transition
@@ -109,7 +115,9 @@ def flee_royal_seed_pod(ctx) -> bool:
         return False
 
     debug_log.log("travel", "PvP threat detected -- using royal seed pod to escape")
-    if not controller.click_entity(ctx.ser, pod):
+    # check_ui_blockers=False -- same inventory-panel UI-blocker loop as teleport_to_ferox's ring
+    # click above; this one's the emergency PvP flee path, so it matters just as much here.
+    if not controller.click_entity(ctx.ser, pod, check_ui_blockers=False):
         return False
 
     time.sleep(random.uniform(3.0, 3.6))  # teleport animation + loading transition
