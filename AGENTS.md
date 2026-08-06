@@ -75,3 +75,35 @@ because the player (registered in a boat's own nested `WorldView`, plane 1, coor
 that view) and top-level-world objects like shipwrecks (plane 0, real Gielinor coordinates) aren't
 in the same coordinate space at all. Querying the live endpoint directly found this in minutes;
 guessing from static code would not have.
+
+## Autonomous live debugging: acting, not just reading
+
+The "query live state" pattern above extends to *acting*: `controller.py` can right-click
+(`controller.right_click_human(ser)` / `click_entity(ser, entity, button="right")`, added
+2026-08-06 -- the Arduino firmware already supported `MRD`/`MRU`/`MRC` identically to the
+existing `MLD`/`MLU`/`MLC`, only the Python-side senders were missing) and read back exactly
+what a currently-open right-click menu contains via `GET /menu`
+(`src/main/java/com/example/providers/MenuStateProvider.java`) -- `{"open": bool, "x", "y",
+"width", "height", "entries": [{"index", "option", "target", "screenX", "screenY"}]}`. This
+closes the loop for verifying anything menu-driven end to end without a human or screen vision:
+right-click -> poll `/menu` -> find the entry by `option`/`target` -> `click_human` at its
+`screenX`/`screenY` -> confirm the effect through an existing state endpoint (config, inventory,
+equipment, etc.).
+
+**Two real bugs only showed up doing this live, not from reading the code:**
+1. Menu entries don't start at the popup's very top -- there's a ~22px header band above them
+   first. Confirmed by measuring two *different* live menus (a 3-entry one at `height=67px`, a
+   4-entry one at `height=82px`) and solving `header + N*row = height` for both simultaneously --
+   both resolved to clean integers (`row=15`, `header=22`), not an approximate fit.
+2. `Menu.getMenuX()`/`getMenuY()` are canvas-space coordinates, not absolute screen coordinates --
+   every other provider in this codebase converts through `RuneLiteUtil.canvasToScreen(...)`
+   (which also applies stretched-mode display scaling, not just a fixed offset) before returning a
+   `screenX`/`screenY` field; the first version of `MenuStateProvider` returned them raw. The
+   symptom was a click landing "miles" off, worse the farther the target was from the canvas
+   origin -- a scaling bug, not a constant-offset one.
+
+**If you write a one-off Python verification script instead of running through `controller.py`'s
+own `main()`, call `controller.set_dpi_aware()` first, before touching the cursor.** Skipping it
+was mistaken for a third bug during this same session -- without it, Windows silently virtualizes
+the process's screen coordinates to 96 DPI while RuneLite reports/expects real physical pixels,
+so cursor moves land in the wrong place even though the target coordinates themselves are correct.
