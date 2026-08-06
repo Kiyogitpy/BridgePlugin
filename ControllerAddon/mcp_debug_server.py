@@ -91,5 +91,89 @@ def bridge_get(path: str, params: dict | None = None) -> dict:
     return _bridge_get_impl(path, params)
 
 
+def _require_within_window(x: int, y: int) -> dict | None:
+    """None if (x, y) is inside the RuneLite window; otherwise an error dict in the same
+    {"ok": False, "error": ...} shape every action tool returns, so callers can
+    `if (err := _require_within_window(x, y)) is not None: return err`."""
+    if controller.is_point_within_window(x, y):
+        return None
+    return {"ok": False, "error": f"({x}, {y}) is outside the RuneLite window"}
+
+
+@mcp.tool()
+def get_cursor_position() -> dict:
+    """Current physical cursor position, e.g. {"x": 512, "y": 340}."""
+    x, y = controller.get_cursor_pos()
+    return {"x": x, "y": y}
+
+
+@mcp.tool()
+def move_mouse(x: int, y: int) -> dict:
+    """Move the cursor to (x, y) with the same human-like Bezier-path movement controller.py's
+    routines use. Rejects targets outside the RuneLite window (returns {"ok": False, "error":
+    ...}) rather than moving there."""
+    if (err := _require_within_window(x, y)) is not None:
+        return err
+    controller.move_to_human(ser, x, y)
+    return {"ok": True}
+
+
+@mcp.tool()
+def left_click() -> dict:
+    """Left-click at the cursor's current position."""
+    controller.click_human(ser)
+    return {"ok": True}
+
+
+@mcp.tool()
+def right_click() -> dict:
+    """Right-click at the cursor's current position."""
+    controller.right_click_human(ser)
+    return {"ok": True}
+
+
+@mcp.tool()
+def left_click_at(x: int, y: int) -> dict:
+    """move_mouse(x, y) then left-click, as one call. Same out-of-window rejection as
+    move_mouse."""
+    if (err := _require_within_window(x, y)) is not None:
+        return err
+    controller.move_to_human(ser, x, y)
+    controller.click_human(ser)
+    return {"ok": True}
+
+
+@mcp.tool()
+def right_click_at(x: int, y: int) -> dict:
+    """move_mouse(x, y) then right-click, as one call. Same out-of-window rejection as
+    move_mouse."""
+    if (err := _require_within_window(x, y)) is not None:
+        return err
+    controller.move_to_human(ser, x, y)
+    controller.right_click_human(ser)
+    return {"ok": True}
+
+
+@mcp.tool()
+def key_tap(key: str) -> dict:
+    """Tap a single key (e.g. "ESC", "SPACE", "w", "1") via the Arduino, same key-name
+    conventions as controller.py's own key_tap."""
+    controller.key_tap(ser, key)
+    return {"ok": True}
+
+
+@mcp.tool()
+def type_text(text: str, press_enter: bool = False) -> dict:
+    """Tap each character of `text` in sequence (spaces mapped to the "SPACE" key name); if
+    press_enter is True, taps "ENTER" afterward too. Covers both controller.py's type_text
+    (press_enter=False, e.g. the bank search box) and type_digits_and_enter (press_enter=True,
+    e.g. an "Enter amount" chatbox prompt) use cases with one tool."""
+    for ch in text:
+        controller.key_tap(ser, "SPACE" if ch == " " else ch)
+    if press_enter:
+        controller.key_tap(ser, "ENTER")
+    return {"ok": True}
+
+
 if __name__ == "__main__":
     mcp.run()

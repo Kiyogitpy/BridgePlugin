@@ -57,3 +57,46 @@ def test_bridge_get_impl_builds_correct_url_and_returns_json():
     result = s._bridge_get_impl("/menu", {"id": 5}, requests_get=fake_get)
     assert result == {"open": True}
     assert calls == [(f"{s.settings.API_BASE}/menu", {"id": 5})]
+
+
+def test_require_within_window_returns_none_when_inside(monkeypatch):
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: True)
+    assert s._require_within_window(100, 100) is None
+
+
+def test_require_within_window_returns_error_when_outside(monkeypatch):
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: False)
+    result = s._require_within_window(9999, 9999)
+    assert result == {"ok": False, "error": "(9999, 9999) is outside the RuneLite window"}
+
+
+def test_move_mouse_rejects_out_of_window_target(monkeypatch):
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: False)
+    move_calls = []
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y: move_calls.append((x, y)))
+    result = s.move_mouse(50, 50)
+    assert result["ok"] is False
+    assert move_calls == []  # never attempted the move
+
+
+def test_move_mouse_moves_when_inside_window(monkeypatch):
+    monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: True)
+    move_calls = []
+    monkeypatch.setattr(s.controller, "move_to_human", lambda ser, x, y: move_calls.append((x, y)))
+    result = s.move_mouse(50, 50)
+    assert result == {"ok": True}
+    assert move_calls == [(50, 50)]
+
+
+def test_type_text_maps_space_and_optional_enter(monkeypatch):
+    taps = []
+    monkeypatch.setattr(s.controller, "key_tap", lambda ser, key: taps.append(key))
+    s.type_text("ab c", press_enter=True)
+    assert taps == ["a", "b", "SPACE", "c", "ENTER"]
+
+
+def test_type_text_no_enter_by_default(monkeypatch):
+    taps = []
+    monkeypatch.setattr(s.controller, "key_tap", lambda ser, key: taps.append(key))
+    s.type_text("hi")
+    assert taps == ["h", "i"]
