@@ -537,13 +537,29 @@ def craft_phase(ctx, config: dict) -> None:
         return
 
     debug_log.log("golem crafting", f"carving plinth (dist={plinth.get('distance')})")
-    for side in range(4):
+    # A real while-loop with its own success counter, NOT `for side in range(4)` with a
+    # `continue` on a failed click -- CONFIRMED during task review (2026-08-07): `continue`
+    # inside a `for` loop advances to the next value from range(4) regardless of whether the
+    # click actually landed, so a single missed/blocked click would silently consume one of the
+    # 4 iterations without a real carve, and the loop would still exit claiming 4 sides done.
+    # Bounded (not an unconditional retry-forever) the same way blast_furnace.py's deposit_items
+    # counts real successes against a requested count rather than assuming success.
+    sides_carved = 0
+    attempts = 0
+    max_attempts = 8  # up to 4 retries total across all sides, on top of the 4 real carves
+    while sides_carved < 4 and attempts < max_attempts:
+        attempts += 1
         controller.open_inventory_tab(ctx.ser)  # no-op if already open; harmless before a world-object click
         if not controller.click_entity(ctx.ser, plinth):
             time.sleep(random.uniform(0.3, 0.6))
-            continue  # missed/blocked click -- retry the same side next loop iteration
-        debug_log.log("golem crafting", f"carved side {side + 1}/4")
+            continue  # missed/blocked click -- retry the same side (sides_carved unchanged)
+        sides_carved += 1
+        debug_log.log("golem crafting", f"carved side {sides_carved}/4")
         time.sleep(random.uniform(*PLINTH_SIDE_WAIT_SECONDS))
+
+    if sides_carved < 4:
+        debug_log.log("golem crafting", f"only carved {sides_carved}/4 sides -- plinth may have gone out of range; retrying next tick")
+        return
 
     controller.open_inventory_tab(ctx.ser)
     core = find_item(SUNSTONE_CORE_NAME)
