@@ -280,4 +280,110 @@ public class NpcTrackerRegistryTest
 
 		org.mockito.Mockito.verify(fine).onHitsplat(org.mockito.Mockito.any());
 	}
+
+	@Test
+	public void clientTickCallsOnAnimationChangedWhenAnimationDiffers()
+	{
+		NPC target = npc(11);
+		when(target.getId()).thenReturn(200);
+		when(target.getName()).thenReturn("Turoth");
+		when(target.getAnimation()).thenReturn(1156);
+		when(target.getAnimationFrame()).thenReturn(0);
+		FullTracker tracker = mock(FullTracker.class);
+		NpcTrackerFactory factory = mock(NpcTrackerFactory.class);
+		when(factory.isValidTrackingTarget(target)).thenReturn(true);
+		when(factory.newInstance(target)).thenReturn(tracker);
+		registry.addFactory(factory);
+		registry.onNpcSpawned(new NpcSpawned(target));
+
+		registry.onClientTick(new net.runelite.api.events.ClientTick());
+
+		org.mockito.Mockito.verify(tracker).onAnimationChanged(1156);
+		org.mockito.ArgumentCaptor<java.util.Map> payloadCaptor = org.mockito.ArgumentCaptor.forClass(java.util.Map.class);
+		org.mockito.Mockito.verify(udpEventSender).send(org.mockito.Mockito.eq("NPC_TRACKED_ANIMATION_CHANGED"), payloadCaptor.capture());
+		java.util.Map<String, Object> payload = payloadCaptor.getValue();
+		assertEquals(11, payload.get("index"));
+		assertEquals(200, payload.get("id"));
+		assertEquals("Turoth", payload.get("name"));
+		assertEquals(1156, payload.get("animationId"));
+	}
+
+	@Test
+	public void clientTickDoesNotFireWhenAnimationUnchanged()
+	{
+		NPC target = npc(12);
+		when(target.getAnimation()).thenReturn(-1);
+		when(target.getAnimationFrame()).thenReturn(0);
+		FullTracker tracker = mock(FullTracker.class);
+		NpcTrackerFactory factory = mock(NpcTrackerFactory.class);
+		when(factory.isValidTrackingTarget(target)).thenReturn(true);
+		when(factory.newInstance(target)).thenReturn(tracker);
+		registry.addFactory(factory);
+		registry.onNpcSpawned(new NpcSpawned(target));
+
+		registry.onClientTick(new net.runelite.api.events.ClientTick()); // first poll: -1 -> -1, no prior state, treated as initial baseline
+		org.mockito.Mockito.clearInvocations(tracker, udpEventSender);
+		registry.onClientTick(new net.runelite.api.events.ClientTick()); // second poll: still -1, genuinely unchanged
+
+		org.mockito.Mockito.verify(tracker, org.mockito.Mockito.never()).onAnimationChanged(org.mockito.Mockito.anyInt());
+		org.mockito.Mockito.verifyNoInteractions(udpEventSender);
+	}
+
+	@Test
+	public void clientTickDetectsSameAnimationIdRestartingViaFrameRegression()
+	{
+		NPC target = npc(13);
+		FullTracker tracker = mock(FullTracker.class);
+		NpcTrackerFactory factory = mock(NpcTrackerFactory.class);
+		when(factory.isValidTrackingTarget(target)).thenReturn(true);
+		when(factory.newInstance(target)).thenReturn(tracker);
+		registry.addFactory(factory);
+		registry.onNpcSpawned(new NpcSpawned(target));
+
+		when(target.getAnimation()).thenReturn(390);
+		when(target.getAnimationFrame()).thenReturn(5);
+		registry.onClientTick(new net.runelite.api.events.ClientTick());
+		org.mockito.Mockito.clearInvocations(tracker);
+
+		// Same animation id, but the frame counter went backwards -- a fresh restart of the
+		// same attack animation, not a continuation of the previous one.
+		when(target.getAnimationFrame()).thenReturn(1);
+		registry.onClientTick(new net.runelite.api.events.ClientTick());
+
+		org.mockito.Mockito.verify(tracker).onAnimationChanged(390);
+	}
+
+	@Test
+	public void clientTickSkipsNpcsWithNoAnimationListenerAttached()
+	{
+		NPC target = npc(14);
+		when(target.getAnimation()).thenReturn(999);
+		NpcTracker plainTracker = mock(NpcTracker.class); // no listener interfaces
+		NpcTrackerFactory factory = mock(NpcTrackerFactory.class);
+		when(factory.isValidTrackingTarget(target)).thenReturn(true);
+		when(factory.newInstance(target)).thenReturn(plainTracker);
+		registry.addFactory(factory);
+		registry.onNpcSpawned(new NpcSpawned(target));
+
+		registry.onClientTick(new net.runelite.api.events.ClientTick()); // must not throw
+
+		org.mockito.Mockito.verifyNoInteractions(udpEventSender);
+	}
+
+	@Test
+	public void gameTickCallsOnTrackerTickWithCurrentTickCount()
+	{
+		when(client.getTickCount()).thenReturn(4242);
+		NPC target = npc(15);
+		FullTracker tracker = mock(FullTracker.class);
+		NpcTrackerFactory factory = mock(NpcTrackerFactory.class);
+		when(factory.isValidTrackingTarget(target)).thenReturn(true);
+		when(factory.newInstance(target)).thenReturn(tracker);
+		registry.addFactory(factory);
+		registry.onNpcSpawned(new NpcSpawned(target));
+
+		registry.onGameTick(new net.runelite.api.events.GameTick());
+
+		org.mockito.Mockito.verify(tracker).onTrackerTick(4242);
+	}
 }

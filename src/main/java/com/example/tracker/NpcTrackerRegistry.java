@@ -32,6 +32,8 @@ public class NpcTrackerRegistry
 	// Keyed by NPC, then by the factory that produced each tracker, enabling per-factory
 	// re-validation instead of aggregate booleans.
 	final Map<NPC, Map<NpcTrackerFactory, NpcTracker>> attached = new HashMap<>();
+	private final Map<NPC, Integer> lastAnimationId = new HashMap<>();
+	private final Map<NPC, Integer> lastAnimationFrame = new HashMap<>();
 
 	public NpcTrackerRegistry(Client client, EventBus eventBus, UdpEventSender udpEventSender)
 	{
@@ -116,6 +118,8 @@ public class NpcTrackerRegistry
 	private void detachAll(NPC npc)
 	{
 		Map<NpcTrackerFactory, NpcTracker> trackersByFactory = attached.remove(npc);
+		lastAnimationId.remove(npc);
+		lastAnimationFrame.remove(npc);
 		if (trackersByFactory == null)
 		{
 			return;
@@ -182,13 +186,62 @@ public class NpcTrackerRegistry
 	@Subscribe
 	public void onGameTick(GameTick event)
 	{
-		// Filled in by Task 4.
+		int tick = client.getTickCount();
+		for (Map<NpcTrackerFactory, NpcTracker> trackers : attached.values())
+		{
+			for (NpcTracker tracker : trackers.values())
+			{
+				if (tracker instanceof TrackerTickListener)
+				{
+					TrackerTickListener listener = (TrackerTickListener) tracker;
+					safely(() -> listener.onTrackerTick(tick));
+				}
+			}
+		}
 	}
 
 	@Subscribe
 	public void onClientTick(ClientTick event)
 	{
-		// Filled in by Task 4.
+		for (Map.Entry<NPC, Map<NpcTrackerFactory, NpcTracker>> entry : attached.entrySet())
+		{
+			NPC npc = entry.getKey();
+			Map<NpcTrackerFactory, NpcTracker> trackers = entry.getValue();
+			boolean anyAnimationListener = trackers.values().stream().anyMatch(t -> t instanceof AnimationListener);
+			if (!anyAnimationListener)
+			{
+				continue;
+			}
+
+			int animation = npc.getAnimation();
+			int animationFrame = npc.getAnimationFrame();
+			Integer previousId = lastAnimationId.put(npc, animation);
+			Integer previousFrame = lastAnimationFrame.put(npc, animationFrame);
+
+			boolean changed = previousId == null
+				|| animation != previousId
+				|| (previousFrame != null && animationFrame < previousFrame);
+			if (!changed)
+			{
+				continue;
+			}
+
+			for (NpcTracker tracker : trackers.values())
+			{
+				if (tracker instanceof AnimationListener)
+				{
+					AnimationListener listener = (AnimationListener) tracker;
+					safely(() -> listener.onAnimationChanged(animation));
+				}
+			}
+
+			Map<String, Object> payload = new HashMap<>();
+			payload.put("index", npc.getIndex());
+			payload.put("id", npc.getId());
+			payload.put("name", npc.getName());
+			payload.put("animationId", animation);
+			udpEventSender.send("NPC_TRACKED_ANIMATION_CHANGED", payload);
+		}
 	}
 
 	private void safely(Runnable action)
