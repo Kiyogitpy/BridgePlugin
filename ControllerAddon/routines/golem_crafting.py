@@ -234,3 +234,91 @@ def chisel_phase(ctx, config: dict) -> None:
     # click makes isMoving true, so without this the very next poll can still read isIdle ==
     # True and fire a duplicate click pair (same reasoning as firemaking.py's own light loop).
     time.sleep(random.uniform(0.6, 1.0))
+
+
+def pick_best_fur_in_inventory() -> str:
+    """Highest-priority (per FUR_PRIORITY) fur type actually present in inventory right now,
+    or None. Exact-name match against each inventory item, same reasoning as find_item."""
+    inv_names = {(i.get("name") or "").lower() for i in controller.get_inventory()}
+    return next((f for f in FUR_PRIORITY if f.lower() in inv_names), None)
+
+
+# ASSUMPTION, NOT YET VERIFIED LIVE -- ~15 game ticks (0.6s each) per plinth side (design
+# section "Key facts": "~15 ticks/side, ~60 ticks total"). Randomized within a band around
+# that, same jitter style every other routine's animation-wait sleeps use.
+PLINTH_SIDE_WAIT_SECONDS = (8.5, 9.5)
+
+
+def craft_phase(ctx, config: dict) -> None:
+    """Craft one golem per call (empty the fur pouch first if this is the first call since
+    entering this phase, carve all 4 sides of an empty plinth, then insert one sunstone core +
+    the best available fur) -- sized like blast_furnace.py's run_trip (one bounded unit of work
+    per call, not a single call looping over every golem this batch), so the engine's between-
+    tick safety/break/PvP checks still run between golems on a long crafting stretch. tick()
+    keeps re-entering this phase (see Task 8) until it sets gc_phase to "bank" itself, once out
+    of cores or fur -- that repetition IS the "repeat until out of cores or fur" the design
+    describes, just spread across multiple tick() calls rather than one internal loop.
+
+    ASSUMPTION, NOT YET VERIFIED LIVE -- PLINTH_NAME ("plinth") is assumed to still substring-
+    match find_object's lookup both before carving starts and after the golem is finished
+    (i.e. the object's display name doesn't change to something without "plinth" in it, e.g.
+    switching to "Golem"/"Finished golem" entirely). If live testing shows otherwise, add the
+    post-carve name as a second candidate substring here.
+    """
+    if not ctx.state.data.get("gc_pouch_emptied_this_craft"):
+        if banker.has_fur_pouch():
+            banker.empty_fur_pouch(ctx)
+        ctx.state.data["gc_pouch_emptied_this_craft"] = True
+
+    core = find_item(SUNSTONE_CORE_NAME)
+    if core is None:
+        debug_log.log("golem crafting", "out of sunstone cores -- moving to bank phase")
+        ctx.state.data["gc_phase"] = "bank"
+        ctx.state.data["gc_pouch_emptied_this_craft"] = False
+        return
+
+    fur_name = pick_best_fur_in_inventory()
+    if fur_name is None:
+        debug_log.log("golem crafting", "out of usable fur -- moving to bank phase")
+        ctx.state.data["gc_phase"] = "bank"
+        ctx.state.data["gc_pouch_emptied_this_craft"] = False
+        return
+
+    plinth = find_object(PLINTH_NAME)
+    if plinth is None:
+        ctx.state.trigger_safety_stop("no empty plinth found nearby")
+        return
+
+    debug_log.log("golem crafting", f"carving plinth (dist={plinth.get('distance')})")
+    for side in range(4):
+        controller.open_inventory_tab(ctx.ser)  # no-op if already open; harmless before a world-object click
+        if not controller.click_entity(ctx.ser, plinth):
+            time.sleep(random.uniform(0.3, 0.6))
+            continue  # missed/blocked click -- retry the same side next loop iteration
+        debug_log.log("golem crafting", f"carved side {side + 1}/4")
+        time.sleep(random.uniform(*PLINTH_SIDE_WAIT_SECONDS))
+
+    controller.open_inventory_tab(ctx.ser)
+    core = find_item(SUNSTONE_CORE_NAME)
+    fur = find_item(fur_name)
+    if core is None or fur is None:
+        # Carving consumed more time than expected and the fur pouch/inventory state moved out
+        # from under us (e.g. a catch routed into the pouch mid-carve) -- bail this golem
+        # rather than clicking with a stale/missing item; next call re-evaluates from scratch.
+        debug_log.log("golem crafting", "core or fur went missing mid-carve -- retrying next tick")
+        return
+
+    debug_log.log("golem crafting", f"inserting core + {fur_name}")
+    controller.click_entity(ctx.ser, core, check_ui_blockers=False)
+    time.sleep(random.uniform(0.15, 0.3))
+    controller.click_entity(ctx.ser, plinth)
+    time.sleep(random.uniform(0.4, 0.7))
+
+    fur = find_item(fur_name)
+    if fur is None:
+        debug_log.log("golem crafting", "fur went missing after inserting the core -- retrying next tick")
+        return
+    controller.click_entity(ctx.ser, fur, check_ui_blockers=False)
+    time.sleep(random.uniform(0.15, 0.3))
+    controller.click_entity(ctx.ser, plinth)
+    time.sleep(random.uniform(0.6, 1.0))
