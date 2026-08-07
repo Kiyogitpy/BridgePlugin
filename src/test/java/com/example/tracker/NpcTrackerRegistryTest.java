@@ -187,4 +187,97 @@ public class NpcTrackerRegistryTest
 		assertEquals(1, registry.attached.get(target).size());
 		assertTrue(registry.attached.get(target).containsValue(trackerB));
 	}
+
+	private static net.runelite.api.Hitsplat hitsplat(int type, int amount)
+	{
+		net.runelite.api.Hitsplat h = mock(net.runelite.api.Hitsplat.class);
+		when(h.getHitsplatType()).thenReturn(type);
+		when(h.getAmount()).thenReturn(amount);
+		return h;
+	}
+
+	private interface FullTracker extends AnimationListener, HitsplatListener, TrackerTickListener
+	{
+	}
+
+	@Test
+	public void hitsplatAppliedCallsAttachedHitsplatListenerAndPushesUdpEvent()
+	{
+		NPC target = npc(8);
+		when(target.getId()).thenReturn(100);
+		when(target.getName()).thenReturn("Cockatrice");
+		FullTracker tracker = mock(FullTracker.class);
+		NpcTrackerFactory factory = mock(NpcTrackerFactory.class);
+		when(factory.isValidTrackingTarget(target)).thenReturn(true);
+		when(factory.newInstance(target)).thenReturn(tracker);
+		registry.addFactory(factory);
+		registry.onNpcSpawned(new NpcSpawned(target));
+
+		net.runelite.api.Hitsplat splat = hitsplat(1, 7);
+		net.runelite.api.events.HitsplatApplied event = new net.runelite.api.events.HitsplatApplied();
+		event.setActor(target);
+		event.setHitsplat(splat);
+		registry.onHitsplatApplied(event);
+
+		org.mockito.Mockito.verify(tracker).onHitsplat(splat);
+		org.mockito.ArgumentCaptor<java.util.Map> payloadCaptor = org.mockito.ArgumentCaptor.forClass(java.util.Map.class);
+		org.mockito.Mockito.verify(udpEventSender).send(org.mockito.Mockito.eq("NPC_TRACKED_HITSPLAT"), payloadCaptor.capture());
+		java.util.Map<String, Object> payload = payloadCaptor.getValue();
+		assertEquals(8, payload.get("index"));
+		assertEquals(100, payload.get("id"));
+		assertEquals("Cockatrice", payload.get("name"));
+		assertEquals(1, payload.get("hitsplatType"));
+		assertEquals(7, payload.get("amount"));
+	}
+
+	@Test
+	public void hitsplatAppliedIgnoresNonNpcActors()
+	{
+		net.runelite.api.Player player = mock(net.runelite.api.Player.class);
+		net.runelite.api.events.HitsplatApplied event = new net.runelite.api.events.HitsplatApplied();
+		event.setActor(player);
+		event.setHitsplat(hitsplat(1, 5));
+
+		registry.onHitsplatApplied(event); // must not throw
+
+		org.mockito.Mockito.verifyNoInteractions(udpEventSender);
+	}
+
+	@Test
+	public void hitsplatAppliedIgnoresUntrackedNpcs()
+	{
+		NPC untracked = npc(9);
+		net.runelite.api.events.HitsplatApplied event = new net.runelite.api.events.HitsplatApplied();
+		event.setActor(untracked);
+		event.setHitsplat(hitsplat(1, 5));
+
+		registry.onHitsplatApplied(event);
+
+		org.mockito.Mockito.verifyNoInteractions(udpEventSender);
+	}
+
+	@Test
+	public void hitsplatListenerExceptionDoesNotStopOtherListeners()
+	{
+		NPC target = npc(10);
+		FullTracker throwing = mock(FullTracker.class);
+		org.mockito.Mockito.doThrow(new RuntimeException("boom")).when(throwing).onHitsplat(org.mockito.Mockito.any());
+		FullTracker fine = mock(FullTracker.class);
+		NpcTrackerFactory factoryA = mock(NpcTrackerFactory.class);
+		when(factoryA.isValidTrackingTarget(target)).thenReturn(true);
+		when(factoryA.newInstance(target)).thenReturn(throwing);
+		NpcTrackerFactory factoryB = mock(NpcTrackerFactory.class);
+		when(factoryB.isValidTrackingTarget(target)).thenReturn(true);
+		when(factoryB.newInstance(target)).thenReturn(fine);
+		registry.addFactory(factoryA);
+		registry.addFactory(factoryB);
+		registry.onNpcSpawned(new NpcSpawned(target));
+
+		net.runelite.api.events.HitsplatApplied event = new net.runelite.api.events.HitsplatApplied();
+		event.setActor(target);
+		event.setHitsplat(hitsplat(1, 5));
+		registry.onHitsplatApplied(event); // must not throw
+
+		org.mockito.Mockito.verify(fine).onHitsplat(org.mockito.Mockito.any());
+	}
 }

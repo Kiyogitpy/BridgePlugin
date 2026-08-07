@@ -2,6 +2,7 @@ package com.example.tracker;
 
 import com.example.util.UdpEventSender;
 import net.runelite.api.Client;
+import net.runelite.api.Hitsplat;
 import net.runelite.api.NPC;
 import net.runelite.api.events.ClientTick;
 import net.runelite.api.events.GameStateChanged;
@@ -141,7 +142,41 @@ public class NpcTrackerRegistry
 	@Subscribe
 	public void onHitsplatApplied(HitsplatApplied event)
 	{
-		// Filled in by Task 3.
+		if (!(event.getActor() instanceof NPC))
+		{
+			return;
+		}
+		NPC npc = (NPC) event.getActor();
+		Map<NpcTrackerFactory, NpcTracker> trackers = attached.get(npc);
+		if (trackers == null)
+		{
+			return;
+		}
+
+		Hitsplat hitsplat = event.getHitsplat();
+		boolean anyListener = false;
+		for (NpcTracker tracker : trackers.values())
+		{
+			if (tracker instanceof HitsplatListener)
+			{
+				anyListener = true;
+				HitsplatListener listener = (HitsplatListener) tracker;
+				safely(() -> listener.onHitsplat(hitsplat));
+			}
+		}
+
+		if (!anyListener)
+		{
+			return;
+		}
+
+		Map<String, Object> payload = new HashMap<>();
+		payload.put("index", npc.getIndex());
+		payload.put("id", npc.getId());
+		payload.put("name", npc.getName());
+		payload.put("hitsplatType", hitsplat.getHitsplatType());
+		payload.put("amount", hitsplat.getAmount());
+		udpEventSender.send("NPC_TRACKED_HITSPLAT", payload);
 	}
 
 	@Subscribe
