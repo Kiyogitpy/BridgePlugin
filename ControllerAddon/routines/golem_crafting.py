@@ -338,3 +338,95 @@ def craft_phase(ctx, config: dict) -> None:
     time.sleep(random.uniform(0.15, 0.3))
     controller.click_entity(ctx.ser, plinth)
     time.sleep(random.uniform(0.6, 1.0))
+
+
+# Never deposited during a golem-crafting bank trip -- the pouch/tools are needed for the next
+# mine/chisel/craft cycle, and a leftover sunstone core (if fur ran out before cores did) needs
+# to survive the trip so the next craft_phase call can still use it.
+BANK_KEEP_ITEMS = [banker.FUR_POUCH_NAME, CHISEL_NAME.lower(), WOODEN_SPIKES_NAME.lower(), SUNSTONE_CORE_NAME.lower()]
+
+# Withdraw budget when no fur pouch is carried -- "a fixed inventory-slot budget (e.g. 14, half
+# an inventory)" per the design's bank-phase bullet. With a pouch, the budget is effectively the
+# pouch's own capacity (small/medium/large all <= 28), so 28 (a full inventory) as the withdraw
+# cap is safe either way -- withdraw_loadout only ever takes min(cap, what's actually in the
+# bank) since it withdraws unit-by-unit off the bank's real stack.
+FUR_WITHDRAW_BUDGET_WITH_POUCH = controller.INVENTORY_SIZE
+FUR_WITHDRAW_BUDGET_NO_POUCH = 14
+
+
+def find_available_fur_in_bank(bank: dict) -> str:
+    """Highest-priority (per FUR_PRIORITY) fur type with qty > 0 in the open bank, or None."""
+    bank_items = {(i.get("name") or "").lower(): i.get("qty", 0) for i in bank.get("items", [])}
+    return next((f for f in FUR_PRIORITY if bank_items.get(f.lower(), 0) > 0), None)
+
+
+def _run_bank_trip(ctx, config: dict) -> None:
+    """The actual deposit/withdraw logic, run once a bank is confirmed open (by either branch
+    of bank_phase below). Deposits everything except BANK_KEEP_ITEMS (uncut gems and any
+    leftover raw sunstone per the design's bank-phase bullet -- anything not explicitly kept),
+    then withdraws the best available fur (filling the pouch if one is carried) or falls
+    through to the hunt phase if the bank has none of FUR_PRIORITY at all."""
+    banker.deposit_inventory(ctx, {"keepItems": BANK_KEEP_ITEMS})
+
+    bank = controller.get_bank()
+    fur_name = find_available_fur_in_bank(bank)
+    if fur_name is None:
+        debug_log.log("golem crafting", "bank has none of the usable fur types -- moving to hunt phase")
+        ctx.state.data["gc_phase"] = "hunt"
+        return
+
+    has_pouch = banker.has_fur_pouch()
+    budget = FUR_WITHDRAW_BUDGET_WITH_POUCH if has_pouch else FUR_WITHDRAW_BUDGET_NO_POUCH
+    slot = next((s for s in bank.get("items", []) if (s.get("name") or "").lower() == fur_name.lower()), None)
+    qty = min(budget, slot.get("qty", 0)) if slot else 0
+
+    if qty > 0:
+        debug_log.log("golem crafting", f"withdrawing {qty}x {fur_name}")
+        banker.withdraw_loadout(ctx, {"withdraw": [{"name": fur_name, "quantity": qty}]})
+
+    if has_pouch:
+        time.sleep(random.uniform(0.3, 0.5))  # let the just-withdrawn fur register in
+                                               # get_inventory() before fill_fur_pouch looks for it
+        banker.fill_fur_pouch(ctx)
+
+    debug_log.log("golem crafting", "banking done -- moving to mine phase")
+    ctx.state.data["gc_phase"] = "mine"
+
+
+def bank_phase(ctx, config: dict) -> None:
+    """Bank near Wyrmscraig if a bank is in walking distance; otherwise teleport to Ferox
+    Enclave via the ring of dueling if Teleport If No Bank Nearby is enabled. Sized like
+    blast_furnace.py's run_trip / banker.bank_up (one full bounded bank visit per call).
+
+    Fur selection needs to inspect the ALREADY-OPEN bank's actual contents (find_available_
+    fur_in_bank), which banker.bank_up's single deposit+withdraw+close call can't do (it needs
+    the withdraw list decided up front). So the local-bank branch below opens the bank itself
+    and calls _run_bank_trip directly, same manual pattern blast_furnace.py's run_trip uses
+    instead of bank_up. The Ferox teleport-fallback branch, though, has to go through
+    banker.bank_up (its private Ferox path isn't meant to be called directly) -- so it can only
+    ever deposit everything and withdraw nothing dynamic, same acknowledged limitation
+    blast_furnace.py's own module header documents for the coal bag ("the Ferox teleport
+    fallback cannot fill the coal bag"). That's not a dead end here, though: Ferox has its own
+    bank chest in walking distance, so the very next bank_phase call (gc_phase is still "bank")
+    finds THAT bank via find_nearby_bank and takes the local-bank branch, which does the real
+    fur scan/withdraw against the same (account-wide) bank contents.
+    """
+    bank_obj = banker.find_nearby_bank({})
+    if bank_obj is not None:
+        if not banker.open_bank(ctx, bank_obj):
+            ctx.state.trigger_safety_stop("failed to open the bank near Wyrmscraig")
+            return
+        _run_bank_trip(ctx, config)
+        banker.close_bank(ctx)
+        time.sleep(random.uniform(0.3, 0.6))
+        return
+
+    if config.get("bank", {}).get("teleportFallback"):
+        if not banker.bank_up(ctx, {"keepItems": BANK_KEEP_ITEMS, "teleportFallback": True}):
+            ctx.state.trigger_safety_stop("couldn't reach a bank near Wyrmscraig, and the Ferox teleport fallback failed")
+        # gc_phase deliberately stays "bank" either way -- see docstring above: a successful
+        # Ferox teleport lands next to Ferox's own bank, and the next call's find_nearby_bank
+        # above will find it and do the real fur withdrawal.
+        return
+
+    ctx.state.trigger_safety_stop("no bank found near Wyrmscraig, and Teleport If No Bank Nearby is off")
