@@ -103,6 +103,8 @@ public class NpcTrackerRegistry
 				if (trackersByFactory.isEmpty())
 				{
 					attached.remove(npc);
+					lastAnimationId.remove(npc);
+					lastAnimationFrame.remove(npc);
 				}
 			}
 			else if (!hasTracker && nowValid)

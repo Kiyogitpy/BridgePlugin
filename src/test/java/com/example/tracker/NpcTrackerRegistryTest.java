@@ -426,4 +426,45 @@ public class NpcTrackerRegistryTest
 		assertEquals(null, registry.attached.get(target));
 		org.mockito.Mockito.verify(tracker).onDetach();
 	}
+
+	@Test
+	public void perFactoryDetachClearsAnimationStateSoReattachStartsFresh()
+	{
+		NPC target = npc(22);
+		FullTracker trackerA = mock(FullTracker.class);
+		NpcTrackerFactory factoryA = mock(NpcTrackerFactory.class);
+		when(factoryA.isValidTrackingTarget(target)).thenReturn(true);
+		when(factoryA.newInstance(target)).thenReturn(trackerA);
+		registry.addFactory(factoryA);
+		registry.onNpcSpawned(new NpcSpawned(target));
+
+		// Populate lastAnimationId/lastAnimationFrame via a ClientTick poll before detaching.
+		when(target.getAnimation()).thenReturn(500);
+		when(target.getAnimationFrame()).thenReturn(10);
+		registry.onClientTick(new net.runelite.api.events.ClientTick());
+		org.mockito.Mockito.verify(trackerA).onAnimationChanged(500);
+
+		// Factory A stops matching -- this goes through the per-factory detach path in
+		// revalidateFactoriesFor (NOT onNpcDespawned/detachAll), which is what Finding 1 covers.
+		when(factoryA.isValidTrackingTarget(target)).thenReturn(false);
+		registry.onNpcChanged(new net.runelite.api.events.NpcChanged(target, null));
+		assertEquals(null, registry.attached.get(target));
+
+		// Re-attach the SAME NPC via a fresh matching factory.
+		FullTracker trackerB = mock(FullTracker.class);
+		NpcTrackerFactory factoryB = mock(NpcTrackerFactory.class);
+		when(factoryB.isValidTrackingTarget(target)).thenReturn(true);
+		when(factoryB.newInstance(target)).thenReturn(trackerB);
+		registry.addFactory(factoryB);
+		registry.onNpcChanged(new net.runelite.api.events.NpcChanged(target, null));
+		assertEquals(1, registry.attached.get(target).size());
+
+		// Animation value is unchanged from before the detach (still 500/10) -- if stale
+		// lastAnimationId/lastAnimationFrame state had survived the detach, this poll would look
+		// like "no change" and onAnimationChanged would NOT fire. It must fire here because
+		// the per-factory detach should have cleared that state, giving a fresh baseline.
+		registry.onClientTick(new net.runelite.api.events.ClientTick());
+
+		org.mockito.Mockito.verify(trackerB).onAnimationChanged(500);
+	}
 }
