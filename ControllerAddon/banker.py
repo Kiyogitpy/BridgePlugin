@@ -216,6 +216,63 @@ def empty_coal_bag(ctx) -> bool:
     return True
 
 
+FUR_POUCH_NAME = "fur pouch"  # substring match -- covers small/medium/large uniformly, same
+                               # idiom as COAL_BAG_NAME above (e.g. "Large fur pouch" still
+                               # matches). See docs/superpowers/specs/2026-08-07-golem-crafting-
+                               # design.md section 1.
+
+
+def has_fur_pouch() -> bool:
+    return any(FUR_POUCH_NAME in (i.get("name") or "").lower() for i in controller.get_inventory())
+
+
+def fill_fur_pouch(ctx) -> bool:
+    """Click the fur pouch at an open bank to fill it with hunter fur. ASSUMPTION, NOT YET
+    VERIFIED LIVE -- which action a plain left-click resolves to here, same uncertainty
+    fill_coal_bag documents above: the OSRS Wiki notes a bank-side click on a non-empty
+    container can resolve to "Empty" instead of "Fill". Verify live which action a plain click
+    actually performs in each state; add the wrong one to Controller Settings -> Clicking ->
+    Forced Actions if needed. check_ui_blockers=False since this is an inventory-item click,
+    same reasoning as every other inventory click in this codebase."""
+    pouch = next(
+        (i for i in controller.get_inventory() if FUR_POUCH_NAME in (i.get("name") or "").lower()),
+        None,
+    )
+    if pouch is None:
+        return False
+
+    print("[bank] filling fur pouch")
+    if not controller.click_entity(ctx.ser, pouch, check_ui_blockers=False):
+        return False
+
+    time.sleep(random.uniform(0.6, 1.0))
+    return True
+
+
+def empty_fur_pouch(ctx) -> bool:
+    """Click Empty on the fur pouch to dump its fur into an open bank (pre-craft: into
+    inventory instead, if no bank is open -- see routines/golem_crafting.py's craft_phase,
+    which calls this before carving a plinth so any fur caught while hunting is available to
+    insert into a golem). Same situation as empty_coal_bag above: "Empty" is not always the
+    item's default option, so add it to Controller Settings -> Clicking -> Forced Actions if a
+    plain click doesn't already resolve to it. check_ui_blockers=False since this is an
+    inventory-item click, used both at a bank and out in the open (at the plinth), where the
+    inventory panel itself is a live UI-blocker rect in resizable layouts."""
+    pouch = next(
+        (i for i in controller.get_inventory() if FUR_POUCH_NAME in (i.get("name") or "").lower()),
+        None,
+    )
+    if pouch is None:
+        return False
+
+    print("[bank] emptying fur pouch")
+    if not controller.click_entity(ctx.ser, pouch, check_ui_blockers=False):
+        return False
+
+    time.sleep(random.uniform(0.6, 1.0))
+    return True
+
+
 def _click_bank_button(ctx, button_key: str) -> bool:
     """Click one of the bank's one-shot deposit-all buttons (depositInventory,
     depositEquipment, depositContainers) if it's currently visible. Standalone
