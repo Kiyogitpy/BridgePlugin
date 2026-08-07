@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "osrs-debug": {
-      "command": "python",
+      "command": "C:\\Users\\Kiyo\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
       "args": ["ControllerAddon/mcp_debug_server.py"]
     }
   }

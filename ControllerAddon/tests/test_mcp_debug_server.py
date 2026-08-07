@@ -5,8 +5,12 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# mcp_debug_server opens a real serial port AND a real UDP socket at import time -- stub both
-# before importing it, so these pure-logic tests run without any hardware or network binding.
+# mcp_debug_server opens a real UDP socket at import time -- stub it before importing, so
+# these pure-logic tests run without any network binding. The Arduino serial port is opened
+# lazily instead (see _get_serial() in the module itself), not at import time, but is still
+# stubbed here since most tests below exercise action tools that need *a* serial handle and
+# don't care which -- individual tests that care about serial-unavailable behavior override
+# `s.ser`/`s.serial.Serial` themselves via monkeypatch.
 import serial
 serial.Serial = MagicMock(return_value=MagicMock())
 
@@ -20,6 +24,16 @@ controller.make_udp_listener = MagicMock(return_value=MagicMock())
 controller.poll_udp = MagicMock(return_value=[])
 
 import mcp_debug_server as s  # noqa: E402
+
+# Pre-open the serial handle once so the ~35 existing action-tool tests below (which don't
+# care about serial specifically) don't each pay _get_serial()'s real 2s Pro Micro reset
+# sleep on whichever of them happens to run first.
+s.ser = MagicMock()
+# Same idea for the UDP listener: mark it already-started so poll_events() tests that set
+# s._udp_socket directly aren't overwritten by a real (if mocked) _ensure_udp_listener() bind
+# attempt. Tests that specifically exercise the lazy-bind path reset this themselves.
+s._udp_listener_started = True
+s._udp_socket = MagicMock()
 
 
 def _fake_response(status_code=200, json_body=None, raise_exc=None):
@@ -372,6 +386,119 @@ def test_poll_events_returns_empty_list_when_nothing_queued(monkeypatch):
     monkeypatch.setattr(s, "_event_queue", queue.Queue())
     result = s.poll_events()
     assert result == {"events": []}
+
+
+def test_get_serial_reuses_already_open_handle(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr(s, "ser", sentinel)
+    open_mock = MagicMock()
+    monkeypatch.setattr(s.serial, "Serial", open_mock)
+    ser_result, err = s._get_serial()
+    assert ser_result is sentinel
+    assert err is None
+    open_mock.assert_not_called()
+
+
+def test_get_serial_opens_and_caches_on_first_success(monkeypatch):
+    monkeypatch.setattr(s, "ser", None)
+    fake_handle = MagicMock()
+    monkeypatch.setattr(s.serial, "Serial", MagicMock(return_value=fake_handle))
+    monkeypatch.setattr(s.time, "sleep", lambda secs: None)
+    ser_result, err = s._get_serial()
+    assert ser_result is fake_handle
+    assert err is None
+    assert s.ser is fake_handle
+
+
+def test_get_serial_returns_error_without_raising_when_port_busy(monkeypatch):
+    monkeypatch.setattr(s, "ser", None)
+    monkeypatch.setattr(
+        s.serial, "Serial",
+        MagicMock(side_effect=s.serial.SerialException("port busy")),
+    )
+    ser_result, err = s._get_serial()
+    assert ser_result is None
+    assert err["ok"] is False
+    assert "port busy" in err["error"]
+
+
+def test_get_serial_retries_after_a_previous_failure(monkeypatch):
+    # A failed open must not be cached -- once controller.py stops holding the port, the very
+    # next action-tool call should succeed without restarting the MCP server.
+    monkeypatch.setattr(s, "ser", None)
+    fake_handle = MagicMock()
+    monkeypatch.setattr(
+        s.serial, "Serial",
+        MagicMock(side_effect=[s.serial.SerialException("port busy"), fake_handle]),
+    )
+    monkeypatch.setattr(s.time, "sleep", lambda secs: None)
+
+    first_ser, first_err = s._get_serial()
+    assert first_ser is None
+    assert first_err is not None
+
+    second_ser, second_err = s._get_serial()
+    assert second_ser is fake_handle
+    assert second_err is None
+
+
+def test_bridge_get_works_when_serial_port_unavailable(monkeypatch):
+    monkeypatch.setattr(s, "ser", None)
+    monkeypatch.setattr(
+        s.serial, "Serial",
+        MagicMock(side_effect=s.serial.SerialException("port busy")),
+    )
+    monkeypatch.setattr(s, "_bridge_get_impl", lambda path, params: {"loggedIn": True})
+    result = s.bridge_get("/state")
+    assert result == {"loggedIn": True}
+
+
+def test_left_click_returns_clear_error_when_serial_port_unavailable(monkeypatch):
+    monkeypatch.setattr(s, "ser", None)
+    monkeypatch.setattr(
+        s.serial, "Serial",
+        MagicMock(side_effect=s.serial.SerialException("port busy")),
+    )
+    result = s.left_click()
+    assert result["ok"] is False
+    assert "port busy" in result["error"]
+
+
+def test_ensure_udp_listener_binds_once_and_caches(monkeypatch):
+    monkeypatch.setattr(s, "_udp_listener_started", False)
+    monkeypatch.setattr(s, "_udp_socket", None)
+    fake_socket = object()
+    bind_mock = MagicMock(return_value=fake_socket)
+    monkeypatch.setattr(s.controller, "make_udp_listener", bind_mock)
+    s._ensure_udp_listener()
+    assert s._udp_socket is fake_socket
+    bind_mock.assert_called_once()
+
+    s._ensure_udp_listener()  # second call must not rebind
+    bind_mock.assert_called_once()
+
+
+def test_ensure_udp_listener_records_error_without_raising_on_bind_failure(monkeypatch):
+    monkeypatch.setattr(s, "_udp_listener_started", False)
+    monkeypatch.setattr(s, "_udp_socket", None)
+    monkeypatch.setattr(
+        s.controller, "make_udp_listener",
+        MagicMock(side_effect=OSError("port already in use")),
+    )
+    s._ensure_udp_listener()
+    assert s._udp_socket is None
+    assert "port already in use" in s._udp_error
+
+
+def test_poll_events_triggers_lazy_bind_on_first_call(monkeypatch):
+    monkeypatch.setattr(s, "_udp_listener_started", False)
+    monkeypatch.setattr(s, "_udp_socket", None)
+    monkeypatch.setattr(s, "_event_queue", queue.Queue())
+    fake_socket = object()
+    monkeypatch.setattr(s.controller, "make_udp_listener", MagicMock(return_value=fake_socket))
+    result = s.poll_events()
+    assert result == {"events": []}
+    assert s._udp_socket is fake_socket
 
 
 def test_event_listener_loop_stops_and_clears_socket_on_exception(monkeypatch):

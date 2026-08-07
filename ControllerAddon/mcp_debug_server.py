@@ -4,12 +4,18 @@
 # mouse/keyboard action primitives as MCP tools -- see
 # docs/superpowers/specs/2026-08-06-mcp-debug-server-design.md for the full design.
 #
-# REQUIRES: controller.py must NOT be running while this server is running -- both hold
-# the same Arduino serial port exclusively, only one process can have it open at a time.
-# This server also binds UDP_PORT (50555) at import time for its event stream, which
-# controller.py's own main() also binds (before its serial-port open) -- so a port conflict
-# with this server can surface from controller.py as a UDP bind error instead of, or before,
-# the serial-port error.
+# The Arduino serial port is opened lazily, on first use by an action tool (move_mouse,
+# left_click, key_tap, drag, click_menu_entry, ...) -- see _get_serial() below -- so the
+# read-only tools (bridge_get, poll_events, get_cursor_position) work fine even while
+# controller.py is running and already holds the port. Only calling an action tool while
+# controller.py holds the port fails, with a clear {"ok": False, "error": ...} rather than
+# raising -- and it's a live retry, not cached, so the very next call succeeds once
+# controller.py stops. UDP_PORT (50555) -- controller.py's own main() also binds this for its
+# event stream, and only one process can hold it -- is bound the same lazy way, on first
+# poll_events() call rather than at import (see _ensure_udp_listener()), so starting this
+# server doesn't preempt controller.py's bind if controller.py hasn't started yet either.
+# Whichever process's bind attempt actually runs first still wins; poll_events() reports the
+# loser's failure as {"error": ...} rather than crashing.
 #
 # Setup: pip install mcp
 # Run directly for a first smoke test: python mcp_debug_server.py
@@ -49,36 +55,73 @@ _patch_debug_log_to_stderr()
 controller.set_dpi_aware()  # must happen before any cursor-position query, same reasoning as
                              # controller.py's own main()
 
-try:
-    ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-except serial.SerialException as exc:
-    print(
-        f"Could not open {SERIAL_PORT}: {exc}\n"
-        f"Is controller.py already running? Stop it before starting the debug MCP server -- "
-        f"only one process can hold the serial port at a time.",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
+# The Arduino serial port is opened lazily (on first action-tool call that actually needs it)
+# rather than at import time, so read-only tools (bridge_get, poll_events,
+# get_cursor_position) work even while controller.py already holds the port -- e.g. debugging
+# a live routine run by watching bridge state/events without having to stop it first. See
+# _get_serial().
+ser = None
+_serial_error: str | None = None
+
+
+def _get_serial():
+    """Returns (ser, None) once the serial port is open, or (None, error_dict) if it can't be
+    opened right now -- never raises, so a caller can `if err: return err` the same way every
+    other action tool already returns {"ok": False, "error": ...}. Successful opens are cached
+    on the module-level `ser` for the rest of the process lifetime (reopening per call would
+    re-trigger the ~2s Pro Micro reset on every single action) -- but a failed attempt is NOT
+    cached, so the next call retries from scratch (e.g. once controller.py has since stopped
+    and freed the port, no server restart needed)."""
+    global ser, _serial_error
+    if ser is not None:
+        return ser, None
+    try:
+        ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+    except serial.SerialException as exc:
+        _serial_error = str(exc)
+        return None, {
+            "ok": False,
+            "error": f"Could not open {SERIAL_PORT}: {exc}. Is controller.py already running? "
+                     f"Stop it first -- only one process can hold the serial port at a time.",
+        }
+    time.sleep(2.0)  # Pro Micro reset, same as controller.py's own main()
+    return ser, None
 
 _event_queue: "queue.Queue" = queue.Queue()
+_udp_socket = None
 _udp_error: str | None = None
+_udp_listener_started = False
 
-try:
-    _udp_socket = controller.make_udp_listener(UDP_PORT)
-except OSError as exc:
-    _udp_socket = None
-    _udp_error = str(exc)
-    print(f"UDP event listener not available: {exc}", file=sys.stderr)
+
+def _ensure_udp_listener() -> None:
+    """Lazily binds UDP_PORT and starts the background drain thread on first poll_events()
+    call, instead of at import time -- same reasoning as _get_serial(): starting this server
+    shouldn't preempt controller.py's own UDP bind (controller.py needs its own listener for
+    real routine logic, not just logging -- see handle_generic_events/routine.on_event in its
+    main loop) if controller.py hasn't grabbed the port yet. A failed bind isn't fatal here
+    either; poll_events() surfaces it as {"error": ...} via _udp_error, same as before."""
+    global _udp_socket, _udp_error, _udp_listener_started
+    if _udp_listener_started:
+        return
+    _udp_listener_started = True
+    try:
+        _udp_socket = controller.make_udp_listener(UDP_PORT)
+    except OSError as exc:
+        _udp_error = str(exc)
+        print(f"UDP event listener not available: {exc}", file=sys.stderr)
+        return
+    threading.Thread(target=_event_listener_loop, daemon=True).start()
 
 
 def _event_listener_loop() -> None:
-    """Runs in a daemon thread from server startup. If controller.poll_udp ever raises (e.g.
-    recvfrom raising ConnectionResetError/OSError after certain network conditions on Windows),
-    the thread must not just die silently -- _udp_socket would stay non-None and poll_events()
-    would keep taking its success branch forever, returning {"events": []} with no signal that
-    the listener actually stopped working. So on any exception: record it in _udp_error, clear
-    _udp_socket (poll_events()'s existing `if _udp_socket is None:` check then catches it), and
-    stop -- there's no point continuing to poll a socket we've given up on."""
+    """Runs in a daemon thread from the first poll_events() call. If controller.poll_udp ever
+    raises (e.g. recvfrom raising ConnectionResetError/OSError after certain network conditions
+    on Windows), the thread must not just die silently -- _udp_socket would stay non-None and
+    poll_events() would keep taking its success branch forever, returning {"events": []} with
+    no signal that the listener actually stopped working. So on any exception: record it in
+    _udp_error, clear _udp_socket (poll_events()'s existing `if _udp_socket is None:` check
+    then catches it), and stop -- there's no point continuing to poll a socket we've given up
+    on."""
     global _udp_socket, _udp_error
     while True:
         try:
@@ -90,10 +133,6 @@ def _event_listener_loop() -> None:
             _udp_socket = None
             return
         time.sleep(0.05)
-
-
-if _udp_socket is not None:
-    threading.Thread(target=_event_listener_loop, daemon=True).start()
 
 mcp = FastMCP("osrs-debug")
 
@@ -164,6 +203,9 @@ def move_mouse(x: int, y: int) -> dict:
     {"ok": False, "error": ...}) rather than moving there."""
     if (err := _require_within_window(x, y)) is not None:
         return err
+    ser, err = _get_serial()
+    if err is not None:
+        return err
     controller.move_to_human(ser, x, y, aim_radius=0, overshoot_chance=0)
     return {"ok": True}
 
@@ -171,6 +213,9 @@ def move_mouse(x: int, y: int) -> dict:
 @mcp.tool()
 def left_click() -> dict:
     """Left-click at the cursor's current position."""
+    ser, err = _get_serial()
+    if err is not None:
+        return err
     controller.click_human(ser)
     return {"ok": True}
 
@@ -178,6 +223,9 @@ def left_click() -> dict:
 @mcp.tool()
 def right_click() -> dict:
     """Right-click at the cursor's current position."""
+    ser, err = _get_serial()
+    if err is not None:
+        return err
     controller.right_click_human(ser)
     return {"ok": True}
 
@@ -187,6 +235,9 @@ def left_click_at(x: int, y: int) -> dict:
     """move_mouse(x, y) then left-click, as one call. Same out-of-window rejection and
     precise (no aim jitter/overshoot) move as move_mouse."""
     if (err := _require_within_window(x, y)) is not None:
+        return err
+    ser, err = _get_serial()
+    if err is not None:
         return err
     controller.move_to_human(ser, x, y, aim_radius=0, overshoot_chance=0)
     controller.click_human(ser)
@@ -199,6 +250,9 @@ def right_click_at(x: int, y: int) -> dict:
     precise (no aim jitter/overshoot) move as move_mouse."""
     if (err := _require_within_window(x, y)) is not None:
         return err
+    ser, err = _get_serial()
+    if err is not None:
+        return err
     controller.move_to_human(ser, x, y, aim_radius=0, overshoot_chance=0)
     controller.right_click_human(ser)
     return {"ok": True}
@@ -208,6 +262,9 @@ def right_click_at(x: int, y: int) -> dict:
 def key_tap(key: str) -> dict:
     """Tap a single key (e.g. "ESC", "SPACE", "w", "1") via the Arduino, same key-name
     conventions as controller.py's own key_tap."""
+    ser, err = _get_serial()
+    if err is not None:
+        return err
     controller.key_tap(ser, key)
     return {"ok": True}
 
@@ -220,6 +277,9 @@ def type_text(text: str, press_enter: bool = False) -> dict:
     too. Covers both controller.py's type_text (press_enter=False, e.g. the bank search box)
     and type_digits_and_enter (press_enter=True, e.g. an "Enter amount" chatbox prompt) use
     cases with one tool."""
+    ser, err = _get_serial()
+    if err is not None:
+        return err
     for ch in text:
         controller.key_tap(ser, "SPACE" if ch == " " else ch)
         time.sleep(random.uniform(0.05, 0.12))
@@ -237,6 +297,9 @@ def left_mouse_down() -> dict:
     """Press and hold the left mouse button at the cursor's current position, without
     releasing. Tracked so release_all() can clean it up if the matching left_mouse_up() call
     never happens."""
+    ser, err = _get_serial()
+    if err is not None:
+        return err
     controller.mouse_left_down(ser)
     _held_buttons.add("left")
     return {"ok": True}
@@ -245,6 +308,9 @@ def left_mouse_down() -> dict:
 @mcp.tool()
 def left_mouse_up() -> dict:
     """Release the left mouse button."""
+    ser, err = _get_serial()
+    if err is not None:
+        return err
     controller.mouse_left_up(ser)
     _held_buttons.discard("left")
     return {"ok": True}
@@ -255,6 +321,9 @@ def right_mouse_down() -> dict:
     """Press and hold the right mouse button at the cursor's current position, without
     releasing. Tracked so release_all() can clean it up if the matching right_mouse_up() call
     never happens."""
+    ser, err = _get_serial()
+    if err is not None:
+        return err
     controller.mouse_right_down(ser)
     _held_buttons.add("right")
     return {"ok": True}
@@ -263,6 +332,9 @@ def right_mouse_down() -> dict:
 @mcp.tool()
 def right_mouse_up() -> dict:
     """Release the right mouse button."""
+    ser, err = _get_serial()
+    if err is not None:
+        return err
     controller.mouse_right_up(ser)
     _held_buttons.discard("right")
     return {"ok": True}
@@ -273,6 +345,9 @@ def key_down(key: str) -> dict:
     """Press and hold a key (e.g. "LEFT", "RIGHT", "SHIFT"), without releasing -- for camera
     rotation or any other held-key gesture. Tracked so release_all() can clean it up if the
     matching key_up() call never happens."""
+    ser, err = _get_serial()
+    if err is not None:
+        return err
     controller.key_down(ser, key)
     _held_keys.add(key)
     return {"ok": True}
@@ -281,6 +356,9 @@ def key_down(key: str) -> dict:
 @mcp.tool()
 def key_up(key: str) -> dict:
     """Release a key pressed via key_down()."""
+    ser, err = _get_serial()
+    if err is not None:
+        return err
     controller.key_up(ser, key)
     _held_keys.discard(key)
     return {"ok": True}
@@ -297,6 +375,13 @@ def release_all() -> dict:
     click_menu_entry, key_tap, type_text, etc.) already send their own down+up internally and
     never touch _held_buttons/_held_keys, so this can't detect or clean up anything left stuck
     by those."""
+    if not _held_buttons and not _held_keys:
+        return {"ok": True, "released_buttons": [], "released_keys": []}
+
+    ser, err = _get_serial()
+    if err is not None:
+        return err
+
     released_buttons = []
     for button in list(_held_buttons):
         if button == "left":
@@ -327,6 +412,9 @@ def drag(x1: int, y1: int, x2: int, y2: int, button: str = "left") -> dict:
     if (err := _require_within_window(x1, y1)) is not None:
         return err
     if (err := _require_within_window(x2, y2)) is not None:
+        return err
+    ser, err = _get_serial()
+    if err is not None:
         return err
 
     down = controller.mouse_left_down if button == "left" else controller.mouse_right_down
@@ -361,7 +449,7 @@ def _match_menu_entry(menu: dict, option: str, target_hint: str | None) -> dict 
     )
 
 
-def _dismiss_menu() -> None:
+def _dismiss_menu(ser) -> None:
     """Moves the cursor clear of the menu and taps ESC, so a menu doesn't sit open blocking
     the next click. Shared by click_menu_entry's never-opened and no-match failure branches."""
     cx, cy = controller.get_cursor_pos()
@@ -384,6 +472,9 @@ def click_menu_entry(x: int, y: int, option: str, target_hint: str | None = None
     "bridge error: ..."} rather than being mistaken for "menu never opened"."""
     if (err := _require_within_window(x, y)) is not None:
         return err
+    ser, err = _get_serial()
+    if err is not None:
+        return err
 
     controller.move_to_human(ser, x, y)
     controller.right_click_human(ser)
@@ -398,13 +489,13 @@ def click_menu_entry(x: int, y: int, option: str, target_hint: str | None = None
         return {"ok": False, "error": f"bridge error: {menu['error']}"}
 
     if not menu.get("open"):
-        _dismiss_menu()
+        _dismiss_menu(ser)
         return {"ok": False, "error": "menu never opened", "available_options": []}
 
     match = _match_menu_entry(menu, option, target_hint)
     if match is None:
         available = [e.get("option") for e in menu.get("entries", [])]
-        _dismiss_menu()
+        _dismiss_menu(ser)
         return {"ok": False, "error": f"no '{option}' entry found", "available_options": available}
 
     if (err := _require_within_window(match["screenX"], match["screenY"])) is not None:
@@ -423,6 +514,7 @@ def poll_events() -> dict:
     in-memory queue from server startup, so events aren't lost between calls the way reading
     the OS socket buffer only at call time would risk. Returns {"error": "..."} instead if the
     UDP listener failed to start (e.g. the port was already in use)."""
+    _ensure_udp_listener()
     if _udp_socket is None:
         return {"error": f"UDP listener not available: {_udp_error}"}
     events = []

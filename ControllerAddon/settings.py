@@ -44,7 +44,7 @@ MOVING_TARGET_MIDFLIGHT_FRACTION = 0.6  # fly this far toward the stale point be
 # check so they show up occasionally, not in clusters. See
 # slayer.maintain_supplies/maintain_defensive_prayer and controller.click_entity's
 # simulate_mistakes/MISTAKE_MISCLICK_CHANCE.
-MISTAKE_OVEREAT_CHANCE = 0.013            # chance/tick to eat before actually hitting eatAt
+MISTAKE_OVEREAT_CHANCE = 0.0013            # chance/tick to eat before actually hitting eatAt
 MISTAKE_OVEREAT_MIN_HP_FRACTION = 0.75    # ...but only once hp is already at least this fraction of real hp
 # Drinking at the exact same prayer point every single time is a tell -- see
 # slayer.maintain_defensive_prayer, which rolls an actual drink threshold somewhere in
