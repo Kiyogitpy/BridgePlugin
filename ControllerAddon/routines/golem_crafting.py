@@ -557,3 +557,30 @@ def hunt_phase(ctx, config: dict) -> None:
     time.sleep(random.uniform(0.2, 0.5))
     controller.click_entity(ctx.ser, target)
     time.sleep(random.uniform(0.6, 1.0))
+
+
+PHASES = {
+    "mine": mine_phase,
+    "chisel": chisel_phase,
+    "craft": craft_phase,
+    "bank": bank_phase,
+    "hunt": hunt_phase,
+}
+
+
+def tick(ctx):
+    config = ctx.state.config
+
+    if not ctx.state.data.get("gc_level_checked"):
+        check_level_requirement(ctx, config)
+        ctx.state.data["gc_level_checked"] = True
+        if ctx.state.safety_stopped:
+            return
+
+    phase = ctx.state.data.get("gc_phase", "mine")
+    handler = PHASES.get(phase)
+    if handler is None:
+        ctx.state.trigger_safety_stop(f"unknown golem crafting phase '{phase}'")
+        return
+
+    handler(ctx, config)
