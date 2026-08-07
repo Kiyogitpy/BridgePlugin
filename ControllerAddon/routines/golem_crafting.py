@@ -446,3 +446,106 @@ def bank_phase(ctx, config: dict) -> None:
         return
 
     ctx.state.trigger_safety_stop("no bank found near Wyrmscraig, and Teleport If No Bank Nearby is off")
+
+
+def _ensure_wooden_spikes(ctx, config: dict) -> bool:
+    """Withdraw wooden spikes from the bank if not already carried. Returns False (with a
+    safety stop already triggered) if neither inventory nor bank has any -- a genuine dead end,
+    same "hard stop, don't spin forever" convention banker.py's out_of_critical_supplies path
+    uses."""
+    if find_item(WOODEN_SPIKES_NAME) is not None:
+        return True
+
+    bank_obj = banker.find_nearby_bank({})
+    if bank_obj is None:
+        ctx.state.trigger_safety_stop("out of wooden spikes and no bank in range to restock")
+        return False
+
+    if not banker.open_bank(ctx, bank_obj):
+        ctx.state.trigger_safety_stop("failed to open the bank while restocking wooden spikes")
+        return False
+
+    banker.withdraw_loadout(ctx, {"withdraw": [{"name": WOODEN_SPIKES_NAME, "quantity": 1}]})
+    banker.close_bank(ctx)
+    time.sleep(random.uniform(0.3, 0.6))
+
+    if find_item(WOODEN_SPIKES_NAME) is None:
+        ctx.state.trigger_safety_stop("no wooden spikes in inventory or bank -- can't line the Goat Pit")
+        return False
+    return True
+
+
+def hunt_phase(ctx, config: dict) -> None:
+    """Entered only when bank_phase finds no usable fur at all. Line the Goat Pit with wooden
+    spikes, open the fur pouch (if owned) so catches route straight in, then lure/harvest
+    goats until none are left nearby (the pit needing to be "fully cleared of goats before it
+    can be re-lured" per the design's Key facts -- approximated here as "no goat NPCs visible
+    near the pit", since the bridge has no dedicated pit-state field to check against). One
+    action (line the pit, lure, or harvest) per call, same isIdle-adjacent single-small-action
+    shape as mine_phase/chisel_phase.
+
+    ASSUMPTION, NOT YET VERIFIED LIVE -- this is the single most uncertain part of this whole
+    routine (see the design doc's Research method: the Goat Pit's exact interaction states
+    weren't deeply covered by the live wiki fetch this design was based on). In particular:
+      - Whether a plain left-click on a wild goat resolves to "Lure" by default, and whether
+        the SAME plain click on an already-trapped goat resolves to "Harvest" -- this function
+        can't currently tell "needs luring" and "ready to harvest" apart from the bridge's NPC
+        data alone, so it clicks whatever goat NPC is nearest and lets the game's own menu
+        resolution sort out which action that click actually performs. Add "Lure"/"Harvest" to
+        Controller Settings -> Clicking -> Forced Actions if a plain click doesn't resolve
+        correctly in one or both states.
+      - Whether "Open" is really the fur pouch's default action while not at a bank (as opposed
+        to Fill/Empty, which is what a bank-side plain click is assumed to resolve to
+        elsewhere in this file) -- same kind of state-dependent-default-action uncertainty
+        banker.py's fill_coal_bag docstring already flags for the coal bag.
+    Correct this function during the Goat Pit stage of this plan's live verification task
+    before trusting the hunt phase unattended.
+    """
+    if not ctx.state.data.get("gc_pit_lined"):
+        if not _ensure_wooden_spikes(ctx, config):
+            return
+
+        pit = find_object(GOAT_PIT_NAME)
+        if pit is None:
+            ctx.state.trigger_safety_stop("Goat Pit not found nearby")
+            return
+
+        spikes = find_item(WOODEN_SPIKES_NAME)
+        debug_log.log("golem crafting", "lining the Goat Pit with wooden spikes")
+        controller.click_entity(ctx.ser, spikes, check_ui_blockers=False)
+        time.sleep(random.uniform(0.15, 0.3))
+        controller.click_entity(ctx.ser, pit)
+        time.sleep(random.uniform(0.6, 1.0))
+        ctx.state.data["gc_pit_lined"] = True
+
+        if banker.has_fur_pouch() and not ctx.state.data.get("gc_pouch_opened_this_hunt"):
+            pouch = find_item(banker.FUR_POUCH_NAME.title()) or next(
+                (i for i in controller.get_inventory() if banker.FUR_POUCH_NAME in (i.get("name") or "").lower()),
+                None,
+            )
+            if pouch is not None:
+                debug_log.log("golem crafting", "opening fur pouch so catches route straight in")
+                controller.click_entity(ctx.ser, pouch, check_ui_blockers=False)
+                time.sleep(random.uniform(0.3, 0.5))
+            ctx.state.data["gc_pouch_opened_this_hunt"] = True
+        return
+
+    goats = [
+        n for n in controller.get_npcs()
+        if GOAT_NAME in (n.get("name") or "").lower()
+        and n.get("visible", True)
+        and 0 <= n.get("distance", 9999) <= MAX_OBJECT_DISTANCE
+    ]
+    if not goats:
+        debug_log.log("golem crafting", "Goat Pit cleared -- moving to bank phase")
+        ctx.state.data["gc_phase"] = "bank"
+        ctx.state.data["gc_pit_lined"] = False
+        ctx.state.data["gc_pouch_opened_this_hunt"] = False
+        return
+
+    goats.sort(key=lambda n: n.get("distance", 9999))
+    target = goats[0]
+    debug_log.log("golem crafting", f"interacting with {target.get('name')} (dist={target.get('distance')})")
+    time.sleep(random.uniform(0.2, 0.5))
+    controller.click_entity(ctx.ser, target)
+    time.sleep(random.uniform(0.6, 1.0))
