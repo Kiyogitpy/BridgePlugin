@@ -512,10 +512,18 @@ def hunt_phase(ctx, config: dict) -> None:
 
         spikes = find_item(WOODEN_SPIKES_NAME)
         debug_log.log("golem crafting", "lining the Goat Pit with wooden spikes")
-        controller.click_entity(ctx.ser, spikes, check_ui_blockers=False)
+        # CORRECTED 2026-08-07 (caught in task review): only commit gc_pit_lined once both
+        # clicks actually landed -- CONFIRMED live click_entity returns False on a blocked/
+        # missed aim point, and the original version here set the flag unconditionally,
+        # matching the same class of bug Task 5's carve loop had (state committed without
+        # checking whether the click that was supposed to produce it actually succeeded).
+        spikes_clicked = controller.click_entity(ctx.ser, spikes, check_ui_blockers=False)
         time.sleep(random.uniform(0.15, 0.3))
-        controller.click_entity(ctx.ser, pit)
+        pit_clicked = controller.click_entity(ctx.ser, pit)
         time.sleep(random.uniform(0.6, 1.0))
+        if not (spikes_clicked and pit_clicked):
+            debug_log.log("golem crafting", "lining click missed/blocked -- retrying next tick")
+            return
         ctx.state.data["gc_pit_lined"] = True
 
         if banker.has_fur_pouch() and not ctx.state.data.get("gc_pouch_opened_this_hunt"):
