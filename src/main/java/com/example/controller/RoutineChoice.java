@@ -15,7 +15,8 @@ public enum RoutineChoice
 	TORMENTED_DEMON("Tormented Demon"),
 	SHIPWRECK_SALVAGING("Shipwreck Salvaging"),
 	FIREMAKING("Firemaking"),
-	BLAST_FURNACE("Blast Furnace");
+	BLAST_FURNACE("Blast Furnace"),
+	GOLEM_CRAFTING("Golem Crafting");
 
 	private final String label;
 

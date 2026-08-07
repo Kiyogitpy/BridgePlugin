@@ -122,6 +122,7 @@ public class ControllerPlugin extends Plugin
 		server.register("/tormented-demon-config", () -> ConfigExporter.exportTormentedDemon(config));
 		server.register("/firemaking-config", () -> ConfigExporter.exportFiremaking(config));
 		server.register("/blast-furnace-config", () -> ConfigExporter.exportBlastFurnace(config));
+		server.register("/golem-crafting-config", () -> ConfigExporter.exportGolemCrafting(config));
 
 		try
 		{

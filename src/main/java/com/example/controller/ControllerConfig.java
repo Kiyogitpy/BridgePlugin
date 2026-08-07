@@ -73,6 +73,9 @@ public interface ControllerConfig extends Config
 	@ConfigSection(name = "Blast Furnace", description = "Blast Furnace routine settings", position = 12)
 	String blastFurnaceSection = "blastFurnace";
 
+	@ConfigSection(name = "Golem Crafting", description = "Golem Crafting routine settings", position = 13)
+	String golemCraftingSection = "golemCrafting";
+
 	// ============================================================
 	// General
 	// ============================================================
@@ -1079,6 +1082,34 @@ public interface ControllerConfig extends Config
 		position = 5
 	)
 	default boolean blastFurnaceBankTeleportFallback()
+	{
+		return false;
+	}
+
+	// ============================================================
+	// Golem Crafting
+	// ============================================================
+
+	@ConfigItem(
+		keyName = "golemCraftingEnabled",
+		name = "Golem Crafting Enabled",
+		description = "Secondary switch on top of launching controller.py with routines/golem_crafting.py.",
+		section = golemCraftingSection,
+		position = 0
+	)
+	default boolean golemCraftingEnabled()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "golemCraftingBankTeleportFallback",
+		name = "Teleport If No Bank Nearby",
+		description = "Use the ring of dueling to Ferox Enclave when no bank is within walking distance of Wyrmscraig.",
+		section = golemCraftingSection,
+		position = 1
+	)
+	default boolean golemCraftingBankTeleportFallback()
 	{
 		return false;
 	}
