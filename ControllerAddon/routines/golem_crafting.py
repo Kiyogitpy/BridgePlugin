@@ -200,3 +200,37 @@ def mine_phase(ctx, config: dict) -> None:
     time.sleep(random.uniform(0.15, 0.5))
     if controller.click_entity(ctx.ser, target):
         ctx.state.data["gc_last_rock_pos"] = (target.get("x"), target.get("y"))
+
+
+def chisel_phase(ctx, config: dict) -> None:
+    """For each raw sunstone in inventory, use the chisel on it to make a sunstone core --
+    item-then-item two-click idiom, same as firemaking.py's tinderbox+log. One chisel action
+    per call, gated on isIdle, so a low-Crafting-level failed attempt (if any -- design section
+    "Key facts" doesn't document a failure chance for this step, unlike Firemaking's, but the
+    isIdle gate costs nothing extra either way) just retries next call the same way
+    firemaking.py's light loop does. -> craft once no raw sunstone is left."""
+    if not controller.get_combat().get("isIdle", True):
+        return
+
+    controller.open_inventory_tab(ctx.ser)
+
+    raw = find_item(RAW_SUNSTONE_NAME)
+    if raw is None:
+        debug_log.log("golem crafting", "no raw sunstone left -- moving to craft phase")
+        ctx.state.data["gc_phase"] = "craft"
+        return
+
+    chisel = find_item(CHISEL_NAME)
+    if chisel is None:
+        ctx.state.trigger_safety_stop("no chisel in inventory")
+        return
+
+    debug_log.log("golem crafting", "chiselling sunstone into a core")
+    time.sleep(random.uniform(0.15, 0.35))
+    controller.click_entity(ctx.ser, chisel, check_ui_blockers=False)
+    time.sleep(random.uniform(0.1, 0.25))
+    controller.click_entity(ctx.ser, raw, check_ui_blockers=False)
+    # Let the action register server-side before the next isIdle poll -- neither inventory
+    # click makes isMoving true, so without this the very next poll can still read isIdle ==
+    # True and fire a duplicate click pair (same reasoning as firemaking.py's own light loop).
+    time.sleep(random.uniform(0.6, 1.0))
