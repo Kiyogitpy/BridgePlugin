@@ -2,7 +2,7 @@ package com.example.controller;
 
 /**
  * Which bar the Blast Furnace routine smelts. .name().toLowerCase() (done by
- * BlastFurnacePlugin's export) must match a key in routines/blast_furnace.py's BAR_TYPES
+ * ConfigExporter's exportBlastFurnace) must match a key in routines/blast_furnace.py's BAR_TYPES
  * dict exactly -- keep both in sync if either changes. Levels are the Smithing requirement
  * to smelt that bar, per Blast Furnace.txt's "Experience rates" table.
  */

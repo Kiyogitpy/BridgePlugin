@@ -605,7 +605,7 @@ public class SettingsPanel extends PluginPanel
 	}
 
 	/** Re-syncs every control here from the current config -- called by ControllerPlugin whenever
-	 * ControllerConfig or SlayerConfig changes from anywhere, so this panel never shows a stale
+	 * ControllerConfig changes from anywhere, so this panel never shows a stale
 	 * value for a setting it shares with the wrench-icon config screens (Controller Enabled,
 	 * target NPCs, and task location choices are all editable from both places). Safe to call
 	 * after a change originating from this panel too: JCheckBox#setSelected doesn't fire its

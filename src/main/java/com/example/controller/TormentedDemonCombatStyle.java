@@ -1,7 +1,7 @@
 package com.example.controller;
 
 /**
- * Wire values (name(), lowercased by TormentedDemonPlugin's export) match
+ * Wire values (name(), lowercased by ConfigExporter's exportTormentedDemon) match
  * routines/tormented_demon.py's OVERHEAD_ICON_TO_STYLE / loadouts dict keys exactly --
  * keep both in sync if either changes.
  */

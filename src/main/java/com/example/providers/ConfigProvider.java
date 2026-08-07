@@ -24,9 +24,9 @@ public class ConfigProvider extends BridgeProvider
 		server.register("/config", () -> onClient(this::getConfig));
 	}
 
-	// Just the master switch and which routine to run -- routine-specific settings moved to
-	// SlayerConfig, exported separately by SlayerPlugin's own /slayer-config endpoint (see
-	// SlayerConfigProvider).
+	// Just the master switch and which routine to run -- routine-specific settings live in
+	// ControllerConfig's own per-routine sections, exported separately by SlayerConfigProvider's
+	// /slayer-config endpoint and ControllerPlugin's other routine endpoints.
 	private Object getConfig()
 	{
 		Map<String, Object> data = new LinkedHashMap<>();
