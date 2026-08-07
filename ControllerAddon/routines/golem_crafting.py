@@ -152,3 +152,51 @@ def find_object(name: str):
 
     candidates.sort(key=lambda o: o.get("distance", 9999))
     return candidates[0]
+
+
+def find_rocks(objects: list) -> list:
+    """Every visible sunstone rock/monolith within MAX_OBJECT_DISTANCE, closest first --
+    plural (unlike find_object above) because mine_phase's momentum re-targeting (see below)
+    needs the whole candidate list, not just the nearest one."""
+    candidates = [
+        o for o in objects
+        if (o.get("name") or "").lower() in ROCK_NAMES
+        and o.get("visible", True)
+        and 0 <= o.get("distance", 9999) <= MAX_OBJECT_DISTANCE
+    ]
+    candidates.sort(key=lambda o: o.get("distance", 9999))
+    return candidates
+
+
+def mine_phase(ctx, config: dict) -> None:
+    """Momentum-click sunstone rocks/the monolith until the inventory is full, then hand off
+    to chisel_phase. One swing (or one re-target) per call, gated on isIdle -- same shape as
+    mining.py's tick(), not a single blocking loop, so the engine's between-tick safety/break/
+    PvP checks still run at their normal cadence throughout a long mining stretch.
+
+    Momentum mechanic (design section "Key facts", "Core loop"): switching rocks between
+    swings raises the success chance and gives a 20% chance of bonus sunstone, so this
+    deliberately targets a DIFFERENT rock each successful click instead of hammering the same
+    one like mining.py does -- tracked via ctx.state.data["gc_last_rock_pos"] (an (x, y) world
+    tile, not an object id: every "Sunstone rocks" instance shares the same object id, so id
+    alone can't distinguish which specific rock was clicked last)."""
+    if not controller.get_combat().get("isIdle", True):
+        return  # still swinging
+
+    if len(controller.get_inventory()) >= controller.INVENTORY_SIZE:
+        debug_log.log("golem crafting", "inventory full -- moving to chisel phase")
+        ctx.state.data["gc_phase"] = "chisel"
+        return
+
+    rocks = find_rocks(controller.get_objects())
+    if not rocks:
+        ctx.state.trigger_safety_stop("no sunstone rocks or monolith found nearby -- wrong location?")
+        return
+
+    last_pos = ctx.state.data.get("gc_last_rock_pos")
+    target = next((r for r in rocks if (r.get("x"), r.get("y")) != last_pos), rocks[0])
+
+    debug_log.log("golem crafting", f"mining {target.get('name')} (dist={target.get('distance')})")
+    time.sleep(random.uniform(0.15, 0.5))
+    if controller.click_entity(ctx.ser, target):
+        ctx.state.data["gc_last_rock_pos"] = (target.get("x"), target.get("y"))
