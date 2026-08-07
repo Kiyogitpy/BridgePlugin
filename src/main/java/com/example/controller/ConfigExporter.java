@@ -158,7 +158,7 @@ public final class ConfigExporter
 		data.put("prayer", prayer);
 
 		data.put("breaks", sharedBreaks(config));
-		data.put("safety", sharedSafety(config));
+		data.put("safety", sharedSafetyWithInventoryFull(config));
 		return data;
 	}
 
@@ -224,8 +224,8 @@ public final class ConfigExporter
 	}
 
 	/** Safety shape (stopOnDeath + maxRuntimeHours only) for routines whose export never
-	 * included stopOnInventoryFull (Tormented Demon, Firemaking, Blast Furnace) -- unchanged
-	 * from before, just reading the shared field instead of a routine-specific one. */
+	 * included stopOnInventoryFull (Firemaking, Blast Furnace) -- unchanged from before, just
+	 * reading the shared field instead of a routine-specific one. */
 	private static Map<String, Object> sharedSafety(ControllerConfig config)
 	{
 		Map<String, Object> safety = new LinkedHashMap<>();
