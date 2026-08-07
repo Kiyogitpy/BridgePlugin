@@ -686,14 +686,23 @@ def bank_phase(ctx, config: dict) -> None:
     fur_in_bank), which banker.bank_up's single deposit+withdraw+close call can't do (it needs
     the withdraw list decided up front). So the local-bank branch below opens the bank itself
     and calls _run_bank_trip directly, same manual pattern blast_furnace.py's run_trip uses
-    instead of bank_up. The Ferox teleport-fallback branch, though, has to go through
-    banker.bank_up (its private Ferox path isn't meant to be called directly) -- so it can only
-    ever deposit everything and withdraw nothing dynamic, same acknowledged limitation
-    blast_furnace.py's own module header documents for the coal bag ("the Ferox teleport
-    fallback cannot fill the coal bag"). That's not a dead end here, though: Ferox has its own
-    bank chest in walking distance, so the very next bank_phase call (gc_phase is still "bank")
-    finds THAT bank via find_nearby_bank and takes the local-bank branch, which does the real
-    fur scan/withdraw against the same (account-wide) bank contents.
+    instead of bank_up.
+
+    CORRECTED 2026-08-07 (caught in task review): the Ferox teleport-fallback branch cannot
+    do that same dynamic fur scan -- it has to go through banker.bank_up (its private Ferox
+    path isn't meant to be called directly), so it can only ever deposit everything and
+    withdraw nothing dynamic, same acknowledged limitation blast_furnace.py's own module
+    header documents for the coal bag ("the Ferox teleport fallback cannot fill the coal
+    bag"). An earlier version of this docstring claimed the very next bank_phase call would
+    then find Ferox's own bank chest nearby and take the local-bank branch instead -- that's
+    wrong: banker._bank_via_ferox walks the player straight back to wherever they started
+    (via travel.walk_to, using the location saved before teleporting) once it's done, not
+    left standing at Ferox, so the next call is back at square one, not next to a bank. Per
+    the design doc, Wyrmscraig has its own bank chest roughly central to the crafting/mining/
+    hunting areas, so the local-bank branch above is expected to be the normal path in
+    practice -- landing in the Ferox branch below at all means that bank genuinely wasn't
+    found nearby. Rather than loop forever depositing-and-walking-back without ever
+    restocking fur, this now stops with a clear message once the Ferox round-trip completes.
     """
     bank_obj = banker.find_nearby_bank({})
     if bank_obj is not None:
@@ -708,9 +717,16 @@ def bank_phase(ctx, config: dict) -> None:
     if config.get("bank", {}).get("teleportFallback"):
         if not banker.bank_up(ctx, {"keepItems": BANK_KEEP_ITEMS, "teleportFallback": True}):
             ctx.state.trigger_safety_stop("couldn't reach a bank near Wyrmscraig, and the Ferox teleport fallback failed")
-        # gc_phase deliberately stays "bank" either way -- see docstring above: a successful
-        # Ferox teleport lands next to Ferox's own bank, and the next call's find_nearby_bank
-        # above will find it and do the real fur withdrawal.
+            return
+        # The Ferox trip above can only deposit, never withdraw fur dynamically (see docstring),
+        # and it walks the player straight back afterward rather than leaving them at a
+        # findable bank -- so there is no useful next state to advance to from here. Stop
+        # rather than silently repeating a deposit-only round trip forever.
+        ctx.state.trigger_safety_stop(
+            "no bank found near Wyrmscraig for golem crafting -- the Ferox teleport fallback can "
+            "only deposit items, not withdraw fur, so it can't recover from this on its own. "
+            "Check you're actually on Wyrmscraig and its bank chest is reachable."
+        )
         return
 
     ctx.state.trigger_safety_stop("no bank found near Wyrmscraig, and Teleport If No Bank Nearby is off")
