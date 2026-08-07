@@ -60,7 +60,18 @@ New package `com.example.tracker`, additive alongside the existing `providers`/`
   plain-constructed in `ControllerPlugin.startUp()` as `new NpcTrackerRegistry(client,
   eventBus).register()`, where `register()` itself calls `eventBus.register(this)` -- not
   Guice `@Inject`, which is how the plugin's own fields (like `config`, `client`) are wired but
-  not how any provider is. Holds `Map<NPC, List<NpcTracker>>`.
+  not how any provider is.
+  - **Update (post-implementation correction):** holds `Map<NPC, Map<NpcTrackerFactory,
+    NpcTracker>>`, not the `Map<NPC, List<NpcTracker>>` originally planned above -- keyed by NPC,
+    then by the factory that produced each tracker, so each factory's attachment can be
+    re-validated independently instead of via one aggregate "is this NPC still valid" boolean.
+    The aggregate-boolean design this replaced was a real bug, not just a style choice: with one
+    `wasTracked`/`stillValid` pair computed across *all* factories, a single `NpcChanged` event
+    where Factory A stopped matching while Factory B started matching in the same tick left both
+    booleans true, so neither the detach nor the attach branch fired -- Factory A's tracker
+    leaked (never got `onDetach()`) and Factory B never attached. Found and fixed during Task 2's
+    implementation (see `npcChangedHandlesSimultaneousFactoryTransitionIndependently` in
+    `NpcTrackerRegistryTest.java`, which proves the fix).
   - `addFactory(NpcTrackerFactory)` -- adds a factory to the registry (named distinctly from the
     no-arg `register()` above, which wires this class itself onto the event bus -- same verb,
     different purpose, kept separate to avoid an overloaded-name mix-up during implementation).
@@ -94,6 +105,25 @@ New package `com.example.tracker`, additive alongside the existing `providers`/`
     once per game tick, for a tracker's own bookkeeping, not detection.
   - `onGameStateChanged(HOPPING)` -- clears the whole map (mirrors Salvation's own cleanup on
     world hop).
+  - **`revalidateCurrentTarget()` (added live during Task 6, not in the original plan above)** --
+    called from `onGameTick`, so it runs on every game tick. Exists because a factory whose
+    validity depends on player state rather than NPC lifecycle events (the canonical example:
+    `CurrentTargetTrackerFactory`, which matches whatever NPC the local player is currently
+    interacting with) has a gap the spawn/change-driven design above never covers: an NPC that
+    already existed in the scene *before* the player targeted it never fires `NpcSpawned` or
+    `NpcChanged` just from being targeted, so it would never get a chance to attach. Live
+    verification against a real fight during Task 6 hit exactly this case -- the target NPC had
+    spawned before the tracker framework's factory was registered, so no per-NPC event ever
+    re-checked it. `revalidateCurrentTarget()` does two things each tick: (1) re-validates every
+    already-attached NPC via the same per-factory `revalidateFactoriesFor` used by `onNpcChanged`
+    above (bounded by however many NPCs are currently tracked, not a scene-wide scan), catching
+    the case where the player switches targets away from an already-tracked NPC; and (2)
+    explicitly re-checks whatever NPC `client.getLocalPlayer().getInteracting()` currently
+    returns, which is what catches the pre-existing-NPC gap. This is currently specific to
+    tracking "the player's current target" and lives directly in the generic registry rather than
+    behind a more general "periodic re-check" hook -- deferred generalization, see the final
+    review's Important #3 finding, left as-is until a second player-state-dependent factory
+    actually needs it.
 - **`CurrentTargetTracker`** (the proof tracker, registered as one `NpcTrackerFactory`) --
   `isValidTrackingTarget` matches whatever NPC is currently interacting with the local player
   (i.e. whatever is being fought right now). Implements all three listener interfaces. Needs no

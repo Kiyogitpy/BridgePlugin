@@ -18,9 +18,9 @@ capabilities of the underlying automation stack were left unreachable:
   things like holding an arrow key to rotate the camera) that the base server never wrapped —
   no held-key camera rotation, no click-and-drag, through MCP.
 - The Java bridge pushes events over UDP (`PLAYER_DIED`, `NPC_DIED`, `LEVEL_UP`,
-  `HP_CHANGED`, etc. — see `controller.py`'s `poll_udp`/`handle_generic_events`) that
-  `controller.py`'s own main loop consumes every tick. Nothing on the MCP side reads this
-  stream at all.
+  `HP_CHANGED`, `NPC_TRACKED_ANIMATION_CHANGED`, `NPC_TRACKED_HITSPLAT`, etc. — see
+  `controller.py`'s `poll_udp`/`handle_generic_events`) that `controller.py`'s own main loop
+  consumes every tick. Nothing on the MCP side reads this stream at all.
 
 ## Non-goals
 
