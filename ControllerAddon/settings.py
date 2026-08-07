@@ -42,12 +42,10 @@ MOVING_TARGET_MIDFLIGHT_FRACTION = 0.6  # fly this far toward the stale point be
 # occasionally eat a bite too early, drink a potion before they needed it,
 # or click empty ground. Kept low-probability and rolled independently per
 # check so they show up occasionally, not in clusters. See
-# slayer.maintain_supplies/maintain_defensive_prayer and
-# controller.maybe_misclick.
-MISTAKE_OVEREAT_CHANCE = 0.04             # chance/tick to eat before actually hitting eatAt
+# slayer.maintain_supplies/maintain_defensive_prayer and controller.click_entity's
+# simulate_mistakes/MISTAKE_MISCLICK_CHANCE.
+MISTAKE_OVEREAT_CHANCE = 0.0013            # chance/tick to eat before actually hitting eatAt
 MISTAKE_OVEREAT_MIN_HP_FRACTION = 0.75    # ...but only once hp is already at least this fraction of real hp
-MISTAKE_OVERDRINK_CHANCE = 0.03           # chance/tick to drink a prayer potion before actually hitting restoreAt
-MISTAKE_OVERDRINK_MIN_PRAYER_FRACTION = 0.75  # ...but only once prayer is already at least this fraction of real prayer
 # Drinking at the exact same prayer point every single time is a tell -- see
 # slayer.maintain_defensive_prayer, which rolls an actual drink threshold somewhere in
 # [restoreAt, restoreAt + PRAYER_RESTORE_SPREAD] each cycle instead of always
@@ -55,12 +53,6 @@ MISTAKE_OVERDRINK_MIN_PRAYER_FRACTION = 0.75  # ...but only once prayer is alrea
 PRAYER_RESTORE_SPREAD = 25
 MISTAKE_MISCLICK_CHANCE = 0.045           # chance per click_entity call to aim beside the target instead of on it
 MISCLICK_OFFSET_PX = (20, 45)             # px; how far off that miss lands -- roughly one tile over, not a wild miss
-MISTAKE_RANDOM_CLICK_CHANCE = 0.004       # chance/tick to click a random viewport point instead of acting --
-                                           # kept low since this fires unconditionally, even mid-combat (no
-                                           # cheap per-tick combat check available before routine.tick's own
-                                           # /combat fetch) -- at 0.02 it read as yanking the click away from
-                                           # the fight roughly every 15s, which is far more scattered than a
-                                           # real player actually is while paying attention to a fight
 
 # ---------------- Idle mouse drift ----------------
 # Every so often, nudge the cursor a short distance from wherever it already

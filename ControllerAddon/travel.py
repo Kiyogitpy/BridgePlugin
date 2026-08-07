@@ -34,6 +34,7 @@ import random
 import time
 
 import controller
+import debug_log
 
 RING_OF_DUELING_NAME = "ring of dueling"
 FOUNTAIN_NAME = "Pool of Refreshment"
@@ -82,11 +83,17 @@ def teleport_to_ferox(ctx) -> bool:
         None,
     )
     if ring is None:
-        print("[travel] no ring of dueling in inventory")
+        debug_log.log("travel", "no ring of dueling in inventory")
         return False
 
-    print("[travel] teleporting to Ferox Enclave")
-    if not controller.click_entity(ctx.ser, ring):
+    debug_log.log("travel", "teleporting to Ferox Enclave")
+    # check_ui_blockers=False: inventory-item click, same reasoning as every other inventory
+    # click in this codebase (see banker.py's coal bag notes) -- CONFIRMED live 2026-08-06 (user
+    # session: bot stuck at 8hp repeatedly failing this exact click): without it, the ring's own
+    # screen position (always inside the inventory panel) gets flagged as "behind a UI panel",
+    # and rotating the camera to work around it does nothing for a flat 2D panel -- it just
+    # loops forever, rotating and re-blocking, never actually clicking.
+    if not controller.click_entity(ctx.ser, ring, check_ui_blockers=False):
         return False
 
     time.sleep(random.uniform(3.0, 3.6))  # teleport animation + loading transition
@@ -104,11 +111,13 @@ def flee_royal_seed_pod(ctx) -> bool:
         None,
     )
     if pod is None:
-        print("[travel] no royal seed pod in inventory -- cannot flee!")
+        debug_log.log("travel", "no royal seed pod in inventory -- cannot flee!")
         return False
 
-    print("[travel] PvP threat detected -- using royal seed pod to escape")
-    if not controller.click_entity(ctx.ser, pod):
+    debug_log.log("travel", "PvP threat detected -- using royal seed pod to escape")
+    # check_ui_blockers=False -- same inventory-panel UI-blocker loop as teleport_to_ferox's ring
+    # click above; this one's the emergency PvP flee path, so it matters just as much here.
+    if not controller.click_entity(ctx.ser, pod, check_ui_blockers=False):
         return False
 
     time.sleep(random.uniform(3.0, 3.6))  # teleport animation + loading transition
@@ -126,10 +135,10 @@ def use_fountain(ctx) -> bool:
         None,
     )
     if fountain is None:
-        print(f"[travel] {FOUNTAIN_NAME} not found nearby")
+        debug_log.log("travel", f"{FOUNTAIN_NAME} not found nearby")
         return False
 
-    print(f"[travel] using {fountain.get('name')}")
+    debug_log.log("travel", f"using {fountain.get('name')}")
     if not controller.click_entity(ctx.ser, fountain):
         return False
 
@@ -137,21 +146,23 @@ def use_fountain(ctx) -> bool:
     return True
 
 
-def walk_to(ctx, target: dict) -> bool:
+def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE) -> bool:
     """Get back to a location from save_location(). Tries a computed route
     from Shortest Path first, falls back to a direct greedy walk if that's
-    unavailable or fails partway. True once within WALK_ARRIVAL_TOLERANCE
-    tiles of the target."""
+    unavailable or fails partway. True once within `tolerance` tiles of the
+    target (defaults to WALK_ARRIVAL_TOLERANCE; callers needing a tighter
+    final arrival -- e.g. safespot anchoring, where 3 tiles of slack could
+    still be inside a melee monster's reach -- can pass a smaller value)."""
     steps = _request_computed_path(target)
     if steps:
-        print(f"[travel] following a {len(steps)}-tile route from Shortest Path")
-        if _walk_along_path(ctx, steps, target):
+        debug_log.log("travel", f"following a {len(steps)}-tile route from Shortest Path")
+        if _walk_along_path(ctx, steps, target, tolerance):
             return True
-        print("[travel] following the computed route failed partway, falling back to a direct walk")
+        debug_log.log("travel", "following the computed route failed partway, falling back to a direct walk")
     else:
-        print("[travel] Shortest Path unavailable -- walking straight toward the target instead")
+        debug_log.log("travel", "Shortest Path unavailable -- walking straight toward the target instead")
 
-    return _walk_greedy(ctx, target)
+    return _walk_greedy(ctx, target, tolerance)
 
 
 def _request_computed_path(target: dict):
@@ -177,7 +188,7 @@ def _request_computed_path(target: dict):
     return None
 
 
-def _walk_along_path(ctx, steps: list, target: dict) -> bool:
+def _walk_along_path(ctx, steps: list, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE) -> bool:
     """Walk a computed route by repeatedly aiming a random number of tiles
     ahead along it (not straight-line toward the final target) and clicking
     via the minimap, same hop-and-click trick as _walk_greedy but following
@@ -198,7 +209,7 @@ def _walk_along_path(ctx, steps: list, target: dict) -> bool:
         if px is None:
             return False
 
-        if _within_tolerance(px, py, target["x"], target["y"]):
+        if _within_tolerance(px, py, target["x"], target["y"], tolerance):
             return True
 
         hop_index = min(index + random.randint(WALK_HOP_MIN_TILES, WALK_HOP_MAX_TILES), len(steps) - 1)
@@ -213,7 +224,7 @@ def _walk_along_path(ctx, steps: list, target: dict) -> bool:
 
             waypoint = steps[transport_index]
             if not _use_transport(ctx, waypoint["transport"], waypoint):
-                print("[travel] couldn't use the transport automatically -- trying to walk through it anyway")
+                debug_log.log("travel", "couldn't use the transport automatically -- trying to walk through it anyway")
                 if not _hop_to(ctx, waypoint["x"], waypoint["y"], waypoint["plane"]):
                     return False
 
@@ -256,17 +267,17 @@ def _use_transport(ctx, transport: dict, waypoint: dict) -> bool:
     name = transport.get("objectName")
     option = transport.get("objectOption")
     if object_id is None or not name:
-        print(f"[travel] transport '{transport.get('displayInfo') or transport.get('type')}' "
-              f"has no object/NPC info -- can't auto-use it yet (item/spell/UI-based transports "
-              f"aren't handled)")
+        debug_log.log("travel", f"transport '{transport.get('displayInfo') or transport.get('type')}' "
+                                 f"has no object/NPC info -- can't auto-use it yet (item/spell/UI-based transports "
+                                 f"aren't handled)")
         return False
 
     entity = _find_transport_object(object_id) or _find_transport_npc(name)
     if entity is None:
-        print(f"[travel] couldn't find '{option} {name}' ({transport.get('type')}) nearby")
+        debug_log.log("travel", f"couldn't find '{option} {name}' ({transport.get('type')}) nearby")
         return False
 
-    print(f"[travel] using transport: {option} {name} ({transport.get('type')})")
+    debug_log.log("travel", f"using transport: {option} {name} ({transport.get('type')})")
     if not controller.click_entity(ctx.ser, entity):
         return False
 
@@ -283,7 +294,7 @@ def _use_transport(ctx, transport: dict, waypoint: dict) -> bool:
         time.sleep(0.6)
         waited += 0.6
 
-    print("[travel] used the transport but didn't arrive where expected -- continuing from wherever we ended up")
+    debug_log.log("travel", "used the transport but didn't arrive where expected -- continuing from wherever we ended up")
     return True
 
 
@@ -310,11 +321,11 @@ def _find_transport_npc(name: str):
     return candidates[0]
 
 
-def _walk_greedy(ctx, target: dict) -> bool:
+def _walk_greedy(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE) -> bool:
     """Straight-line walk toward target with no obstacle awareness -- the
     fallback when Shortest Path isn't available. True once within
-    WALK_ARRIVAL_TOLERANCE tiles, False if it gives up (different plane, hop
-    point off the minimap, or WALK_MAX_HOPS exhausted)."""
+    `tolerance` tiles of the target, False if it gives up (different
+    plane, hop point off the minimap, or WALK_MAX_HOPS exhausted)."""
     target_x, target_y, target_plane = target["x"], target["y"], target["plane"]
 
     for _ in range(WALK_MAX_HOPS):
@@ -324,10 +335,10 @@ def _walk_greedy(ctx, target: dict) -> bool:
             return False
 
         if plane != target_plane:
-            print("[travel] target is on a different plane -- can't walk there yet")
+            debug_log.log("travel", "target is on a different plane -- can't walk there yet")
             return False
 
-        if _within_tolerance(px, py, target_x, target_y):
+        if _within_tolerance(px, py, target_x, target_y, tolerance):
             return True
 
         dist = math.hypot(target_x - px, target_y - py)
@@ -342,14 +353,27 @@ def _walk_greedy(ctx, target: dict) -> bool:
 
 
 def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
-    """Click a minimap point and wait for arrival (or timeout) before
+    """Click the hop point and wait for arrival (or timeout) before
     returning. False only if the point isn't projectable onto the minimap
     at all; a timed-out wait still returns True so the caller just
-    recomputes the next hop from wherever the player actually ended up."""
-    point = controller.get_minimap_walk_point(x, y, plane)
-    if not point.get("onMinimap"):
-        print("[travel] hop point isn't on the minimap, giving up")
-        return False
+    recomputes the next hop from wherever the player actually ended up.
+
+    Prefers a viewport click (get_ground_walk_point) over a minimap click
+    whenever the tile is actually rendered on screen -- CONFIRMED live
+    2026-08-06: the minimap is too small/coarse to reliably land on a
+    specific single tile (e.g. maintain_safespot's exact-tile return), while
+    a viewport click aims at the real projected tile position. Minimap
+    clicking is still needed as a fallback for hops beyond render distance,
+    which is the common case for most of a route -- only the tile actually
+    visible right now can use the more precise path."""
+    ground_point = controller.get_ground_walk_point(x, y, plane)
+    if ground_point.get("onScreen"):
+        point = ground_point
+    else:
+        point = controller.get_minimap_walk_point(x, y, plane)
+        if not point.get("onMinimap"):
+            debug_log.log("travel", "hop point isn't on screen or the minimap, giving up")
+            return False
 
     controller.click_entity(ctx.ser, point, offset=(0, 0))
 
@@ -365,8 +389,8 @@ def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
     return True
 
 
-def _within_tolerance(x1: float, y1: float, x2: float, y2: float) -> bool:
-    return math.hypot(x2 - x1, y2 - y1) <= WALK_ARRIVAL_TOLERANCE
+def _within_tolerance(x1: float, y1: float, x2: float, y2: float, tolerance: float = WALK_ARRIVAL_TOLERANCE) -> bool:
+    return math.hypot(x2 - x1, y2 - y1) <= tolerance
 
 
 def maybe_approach_before_click(ctx, entity: dict, already_engaged: bool = False,
@@ -434,6 +458,6 @@ def maybe_approach_before_click(ctx, entity: dict, already_engaged: bool = False
         if not point.get("onScreen"):
             return False
 
-    print(f"[travel] closing some distance to {entity.get('name')} before the final click")
+    debug_log.log("travel", f"closing some distance to {entity.get('name')} before the final click")
     controller.click_entity(ctx.ser, point, offset=(0, 0))
     return True

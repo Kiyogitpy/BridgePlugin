@@ -2,6 +2,8 @@ package com.example.controller;
 
 import com.example.bridge.BridgeHttpServer;
 import com.example.providers.*;
+import com.example.tracker.CurrentTargetTrackerFactory;
+import com.example.tracker.NpcTrackerRegistry;
 import com.example.util.UdpEventSender;
 import com.google.inject.Provides;
 import net.runelite.api.*;
@@ -17,6 +19,7 @@ import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.PluginManager;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.util.ImageUtil;
 
 import javax.inject.Inject;
@@ -60,10 +63,17 @@ public class ControllerPlugin extends Plugin
 	@Inject
 	private ClientToolbar clientToolbar;
 
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private SafespotOverlay safespotOverlay;
+
 	private NavigationButton navButton;
 
 	private BridgeHttpServer server;
 	private UdpEventSender udpSender;
+	private NpcTrackerRegistry npcTrackerRegistry;
 
 	private int lastHp = -1;
 	private int lastPrayer = -1;
@@ -77,6 +87,10 @@ public class ControllerPlugin extends Plugin
 	{
 		udpSender = new UdpEventSender();
 		udpSender.start();
+
+		npcTrackerRegistry = new NpcTrackerRegistry(client, eventBus, udpSender);
+		npcTrackerRegistry.addFactory(new CurrentTargetTrackerFactory(client));
+		npcTrackerRegistry.register();
 
 		server = new BridgeHttpServer();
 		server.start(HTTP_PORT);
@@ -101,6 +115,7 @@ public class ControllerPlugin extends Plugin
 		new ConsumablesProvider(client, clientThread, server, config).register();
 		new LoginProvider(client, clientThread, server).register();
 		new SlayerConfigProvider(client, clientThread, server, config).register();
+		new MenuStateProvider(client, clientThread, server).register();
 
 		server.register("/mining-config", () -> ConfigExporter.exportMining(config));
 		server.register("/gemstone-crab-config", () -> ConfigExporter.exportGemstoneCrab(config));
@@ -135,12 +150,14 @@ public class ControllerPlugin extends Plugin
 			.build();
 
 		clientToolbar.addNavigation(navButton);
+		overlayManager.add(safespotOverlay);
 	}
 
 	@Override
 	protected void shutDown()
 	{
 		clientToolbar.removeNavigation(navButton);
+		overlayManager.remove(safespotOverlay);
 
 		if (server != null)
 		{
@@ -164,7 +181,13 @@ public class ControllerPlugin extends Plugin
 	@Subscribe
 	public void onMenuOpened(MenuOpened event)
 	{
-		MenuPriority.apply(client, config, event);
+		MenuPriority.apply(client, config, event, itemManager);
+	}
+
+	@Subscribe
+	public void onMenuEntryAdded(MenuEntryAdded event)
+	{
+		SafespotMarker.apply(client, configManager, event);
 	}
 
 	@Subscribe

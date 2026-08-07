@@ -52,6 +52,7 @@ import random
 import time
 
 import controller
+import debug_log
 
 # net.runelite.api.gameval.AnimationID.LUC2_UNDEAD_DEMON_* -- verified against this project's
 # local RuneLite checkout, not just taken on faith from the reference fork.
@@ -159,11 +160,11 @@ def setup(ctx):
         None,
     )
     if item is None:
-        print(f"[td] configured combatStyle is {style} ({weapon_name}) but it isn't in "
-              f"inventory -- fighting with whatever's currently equipped instead")
+        debug_log.log("td", f"configured combatStyle is {style} ({weapon_name}) but it isn't in "
+                            f"inventory -- fighting with whatever's currently equipped instead")
         return
 
-    print(f"[td] equipping starting loadout: {weapon_name} ({style})")
+    debug_log.log("td", f"equipping starting loadout: {weapon_name} ({style})")
     controller.click_entity(ctx.ser, item, check_ui_blockers=False)
     ctx.state.data["current_style"] = style
 
@@ -175,12 +176,12 @@ def tick(ctx):
     hp = player.get("hp")
     if hp is not None and config.get("food", {}).get("enabled") and hp <= config["food"].get("eatAt", 50):
         if controller.consume_first(ctx.ser, "food"):
-            print(f"[td] ate food (hp={hp})")
+            debug_log.log("td", f"ate food (hp={hp})")
             return  # matches slayer.py's convention -- one supply action per tick
 
     npc = find_target(config)
     if npc is None:
-        print("[td] no Tormented Demon in range")
+        debug_log.log("td", "no Tormented Demon in range")
         return
 
     # Fireball dodge takes priority over everything else -- see module header on why this
@@ -240,7 +241,7 @@ def react_to_attack_animation(ctx, npc: dict) -> None:
     controller.open_prayer_tab(ctx.ser)
     icon = controller.get_prayers().get("icons", {}).get(prayer_name)
     if icon:
-        print(f"[td] {npc.get('name')} is attacking -- switching to {prayer_name}")
+        debug_log.log("td", f"{npc.get('name')} is attacking -- switching to {prayer_name}")
         controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
 
 
@@ -259,8 +260,8 @@ def maybe_swap_gear(ctx, npc: dict, config: dict) -> None:
     weapon_name = (config.get("loadouts", {}) or {}).get(style)
     if not weapon_name:
         if not ctx.state.data.get(f"warned_no_{style}_loadout"):
-            print(f"[td] weakness is now {style}, but no loadout weapon is configured for "
-                  f"it in DEFAULT_CONFIG['loadouts']['{style}'] -- staying on current weapon.")
+            debug_log.log("td", f"weakness is now {style}, but no loadout weapon is configured for "
+                                 f"it in DEFAULT_CONFIG['loadouts']['{style}'] -- staying on current weapon.")
             ctx.state.data[f"warned_no_{style}_loadout"] = True
         return
 
@@ -275,10 +276,10 @@ def maybe_swap_gear(ctx, npc: dict, config: dict) -> None:
         None,
     )
     if item is None:
-        print(f"[td] weakness is now {style} ({weapon_name}) but it isn't in inventory")
+        debug_log.log("td", f"weakness is now {style} ({weapon_name}) but it isn't in inventory")
         return
 
-    print(f"[td] weakness is now {style} -- switching to {weapon_name}")
+    debug_log.log("td", f"weakness is now {style} -- switching to {weapon_name}")
     controller.click_entity(ctx.ser, item, check_ui_blockers=False)
     ctx.state.data["current_style"] = style
     time.sleep(random.uniform(0.3, 0.6))
@@ -301,14 +302,14 @@ def maybe_dodge_fireball(ctx, player: dict) -> bool:
     if not on_us:
         return False
 
-    print("[td] fireball incoming on our tile -- moving")
+    debug_log.log("td", "fireball incoming on our tile -- moving")
     for dx, dy in ((2, 0), (-2, 0), (0, 2), (0, -2)):
         point = controller.get_minimap_walk_point(px + dx, py + dy, plane)
         if point.get("onMinimap"):
             controller.click_entity(ctx.ser, point, offset=(0, 0), simulate_mistakes=False)
             return True
 
-    print("[td] couldn't find a dodge tile on the minimap")
+    debug_log.log("td", "couldn't find a dodge tile on the minimap")
     return True
 
 
@@ -322,4 +323,4 @@ def maintain_prayer_potions(ctx, config: dict) -> None:
         return
 
     if controller.consume_first(ctx.ser, "prayer"):
-        print(f"[td] drank prayer restore (prayer={current_prayer})")
+        debug_log.log("td", f"drank prayer restore (prayer={current_prayer})")

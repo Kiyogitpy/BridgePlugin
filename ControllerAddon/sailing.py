@@ -33,6 +33,7 @@ import random
 import time
 
 import controller
+import debug_log
 import ocean_path
 
 HELM_NAME = "helm"  # CONFIRMED live 2026-08-01 -- see module header
@@ -113,10 +114,10 @@ def use_helm(ctx) -> bool:
         None,
     )
     if helm is None:
-        print("[sailing] helm not found nearby")
+        debug_log.log("sailing", "helm not found nearby")
         return False
 
-    print("[sailing] engaging the helm")
+    debug_log.log("sailing", "engaging the helm")
     if not controller.click_entity(ctx.ser, helm):
         return False
 
@@ -127,7 +128,7 @@ def use_helm(ctx) -> bool:
         if controller.get_sailing().get("navigating"):
             return True
 
-    print("[sailing] clicked the helm but never saw navigate mode engage")
+    debug_log.log("sailing", "clicked the helm but never saw navigate mode engage")
     return False
 
 
@@ -167,7 +168,7 @@ def steer_toward(ctx, target: dict, arrival_tolerance: float = None) -> bool:
             return False
 
         if plane != target_plane:
-            print("[sailing] target is on a different plane -- can't sail there")
+            debug_log.log("sailing", "target is on a different plane -- can't sail there")
             return False
 
         current_tolerance = arrival_tolerance if arrival_tolerance is not None else _dynamic_brake_tiles()
@@ -177,7 +178,7 @@ def steer_toward(ctx, target: dict, arrival_tolerance: float = None) -> bool:
         if last_pos is not None and _within_tolerance(px, py, last_pos[0], last_pos[1], STUCK_MOVEMENT_THRESHOLD_TILES):
             stuck_hops += 1
             if stuck_hops >= STUCK_HOP_LIMIT:
-                print("[sailing] stuck -- position hasn't changed across repeated hops, likely aground")
+                debug_log.log("sailing", "stuck -- position hasn't changed across repeated hops, likely aground")
                 return False
         else:
             stuck_hops = 0
@@ -197,14 +198,14 @@ def steer_toward(ctx, target: dict, arrival_tolerance: float = None) -> bool:
 def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
     point = controller.get_minimap_walk_point(x, y, plane)
     if not point.get("onMinimap"):
-        print("[sailing] hop point isn't on the minimap, giving up")
+        debug_log.log("sailing", "hop point isn't on the minimap, giving up")
         return False
 
     if not controller.click_entity(ctx.ser, point, offset=(0, 0)):
         # click_entity already printed why (blocked by UI, off-window, ...) -- flag it here too so a
         # later "stuck -- likely aground" isn't the only signal: the boat may never have gotten a
         # steering click at all, rather than genuinely running aground.
-        print("[sailing] minimap click didn't land -- boat won't have moved this hop")
+        debug_log.log("sailing", "minimap click didn't land -- boat won't have moved this hop")
 
     waited = 0.0
     while waited < SAIL_HOP_TIMEOUT_S:
@@ -237,26 +238,33 @@ def _dynamic_brake_tiles() -> float:
     return max(SAIL_ARRIVAL_TOLERANCE, speed * BRAKE_LOOKAHEAD_TICKS)
 
 
-def stop_boat(ctx) -> bool:
+def stop_boat(ctx, target: dict = None) -> bool:
     """Open the Sailing Options panel and click the sail toggle to un-set the sails, then wait
     for the boat to actually stop moving. CONFIRMED live 2026-08-02: this isn't two separately
     labeled buttons ("Take down sails"/"Set sail", the original guess) -- it's a single toggle
     icon (no text of its own) whose menu action just flips between "Set sails" and "Un-set sails"
     depending on current state, so clicking it here always resolves to whichever one is actually
-    valid right now (matching the confirmed-safe re-click precedent for the salvaging hook)."""
+    valid right now (matching the confirmed-safe re-click precedent for the salvaging hook).
+
+    target: the point steer_toward was actually trying to land on (sail_to passes its own target
+    through), logged alongside the drift measurement below as the real overshoot-from-target --
+    the more direct number for fitting BRAKE_LOOKAHEAD_TICKS against than drift-from-toggle-point
+    alone, since that only measures how far the boat coasted, not whether it landed short of or
+    past where it was actually aiming. None (e.g. no caller-supplied target) just skips that part
+    of the log line."""
     open_sailing_options_tab(ctx)
 
     sailing_state = controller.get_sailing()
     button = sailing_state.get("sailToggle") or {}
     if button.get("screenX") is None:
-        print("[sailing] sail toggle not found")
+        debug_log.log("sailing", "sail toggle not found")
         return False
 
     start_player = controller.get_player()
     start_pos = (start_player.get("x"), start_player.get("y"))
     speed_at_toggle = sailing_state.get("boatSpeed")
 
-    print("[sailing] toggling sails")
+    debug_log.log("sailing", "toggling sails")
     controller.click_entity(ctx.ser, button, offset=(0, 0))
 
     waited = 0.0
@@ -277,13 +285,23 @@ def stop_boat(ctx) -> bool:
             # SailingProvider) -- pairs each drift sample with the actual measured speed that
             # produced it, giving real data to fit BRAKE_LOOKAHEAD_TICKS against
             # (drift_tiles ~= speed_at_toggle * actual_coast_ticks) instead of guessing.
+            #
+            # overshoot (added 2026-08-04, boat-upgrade speed increase): distance from where the
+            # boat actually settled to the target it was aiming for. drift alone can't tell
+            # whether BRAKE_LOOKAHEAD_TICKS's linear speed*ticks model still holds now that the
+            # boat is faster -- overshoot is the direct "how far past/short of center did we land"
+            # number needed to refit it.
             if start_pos[0] is not None and pos[0] is not None:
                 drift = math.hypot(pos[0] - start_pos[0], pos[1] - start_pos[1])
-                print(f"[sailing] stopped -- drifted {drift:.1f} tiles after toggling sails (speed at toggle: {speed_at_toggle})")
+                msg = f"stopped -- drifted {drift:.1f} tiles after toggling sails (speed at toggle: {speed_at_toggle})"
+                if target is not None and target.get("x") is not None:
+                    overshoot = math.hypot(pos[0] - target["x"], pos[1] - target["y"])
+                    msg += f" -- {overshoot:.1f} tiles from target"
+                debug_log.log("sailing", msg)
             return True
         last_pos = pos
 
-    print("[sailing] never saw the boat settle -- continuing anyway")
+    debug_log.log("sailing", "never saw the boat settle -- continuing anyway")
     return True
 
 
@@ -306,32 +324,53 @@ def deploy_hook(ctx, hook_name: str) -> bool:
         None,
     )
     if hook is None:
-        print(f"[sailing] {hook_name} not found nearby")
+        debug_log.log("sailing", f"{hook_name} not found nearby")
         return False
 
-    print(f"[sailing] deploying {hook.get('name')}")
+    debug_log.log("sailing", f"deploying {hook.get('name')}")
     return controller.click_entity(ctx.ser, hook, offset=(0, 0))
 
 
-def sail_to(ctx, target: dict, brake: bool = True) -> bool:
+def sail_to(ctx, target: dict) -> bool:
     """Full reposition: engage the helm, plan an obstacle-aware route (falling back to a direct
     line if no route is needed or none can be found), steer through it leg by leg, take down
     sails at the end. Does not redeploy the hook afterward -- the caller decides when that's
     appropriate.
 
-    brake: whether the final leg uses the wide, speed-scaled braking distance (the default) --
-    see steer_toward's arrival_tolerance=None / _dynamic_brake_tiles. That braking distance exists
-    specifically to avoid ramming a solid target -- pass brake=False for a target that isn't a
-    physical object (e.g. a computed midpoint between two wrecks, open water) so the final leg
-    uses the tighter SAIL_ARRIVAL_TOLERANCE instead. CONFIRMED live 2026-08-03: with brake=True
-    (back when the trigger was a flat SAIL_BRAKE_TRIGGER_TILES), the combination of the 10-tile
-    trigger plus stop_boat's own 2.2-5.0 tile drift left the boat missing a computed pair-midpoint
-    by a wide margin -- appropriate slop for not hitting a wreck, far too much for landing on
-    empty water where precision is what actually matters.
+    The final leg always uses the speed-scaled braking distance (steer_toward's
+    arrival_tolerance=None / _dynamic_brake_tiles), regardless of whether target is a solid
+    object or open water (e.g. a computed midpoint between two wrecks) -- stop_boat's post-toggle
+    coast happens either way and scales with current speed either way, so a flat, unscaled
+    tolerance for the "no ram risk" case just meant the boat kept overshooting the target by
+    however much the flat number under-covered the real drift. There used to be a `brake` flag
+    that skipped the speed-scaled distance for open-water targets in favor of a flat
+    SAIL_ARRIVAL_TOLERANCE, reasoning that precision mattered more than collision margin there --
+    CONFIRMED live 2026-08-04 (user report, after a boat speed upgrade): that flat tolerance
+    doesn't account for the boat now coasting farther post-toggle, so it was landing well past a
+    computed pair-midpoint instead of near it. Removed -- there's no case where the flat,
+    speed-blind distance is more correct than the measured one. (Intermediate route waypoints
+    still pass the tighter SAIL_ARRIVAL_TOLERANCE explicitly -- they exist specifically to route
+    around an obstacle, not to land precisely, so cutting the corner early would defeat the
+    point.)
 
     Re-plans from the current position (up to MAX_ROUTE_ATTEMPTS times) if a leg reports getting
     stuck -- CONFIRMED live 2026-08-02: running aground is a hard dead stop needing a real course
-    change to recover from, not something retrying the exact same heading resolves on its own."""
+    change to recover from, not something retrying the exact same heading resolves on its own.
+
+    Does nothing at all -- not even engaging the helm -- if the boat is already within arrival
+    distance of target. CONFIRMED live 2026-08-05 (user report, "overshot again"): a caller can
+    pass a target the boat is already sitting on or very near (e.g. shipwreck_salvaging.py asking
+    to reposition slightly when it's already about as close as it should safely get), and
+    steer_toward would then see itself as already arrived and issue zero hop clicks -- but
+    use_helm() had already unconditionally re-engaged steering before that check ever ran, with no
+    fresh minimap click ever telling the boat where to go, letting it resume moving on whatever
+    stale heading the game still had queued and drift tens of tiles in the wrong direction. Only a
+    target requiring an actual new hop should ever touch the helm at all."""
+    player = controller.get_player()
+    px, py, plane = player.get("x"), player.get("y"), player.get("plane")
+    if px is not None and plane == target.get("plane") and _within_tolerance(px, py, target["x"], target["y"], _dynamic_brake_tiles()):
+        return True
+
     if not use_helm(ctx):
         return False
 
@@ -347,14 +386,14 @@ def sail_to(ctx, target: dict, brake: bool = True) -> bool:
         stuck = False
         for i, leg in enumerate(legs):
             is_final_leg = (i == len(legs) - 1)
-            tolerance = None if (is_final_leg and brake) else SAIL_ARRIVAL_TOLERANCE
+            tolerance = None if is_final_leg else SAIL_ARRIVAL_TOLERANCE
             if not steer_toward(ctx, leg, arrival_tolerance=tolerance):
-                print(f"[sailing] got stuck heading to a waypoint (attempt {attempt + 1}/{MAX_ROUTE_ATTEMPTS}) -- replanning")
+                debug_log.log("sailing", f"got stuck heading to a waypoint (attempt {attempt + 1}/{MAX_ROUTE_ATTEMPTS}) -- replanning")
                 stuck = True
                 break
 
         if not stuck:
-            return stop_boat(ctx)
+            return stop_boat(ctx, target)
 
-    print("[sailing] couldn't find a working route after repeated attempts -- giving up")
+    debug_log.log("sailing", "couldn't find a working route after repeated attempts -- giving up")
     return False

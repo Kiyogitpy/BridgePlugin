@@ -77,6 +77,7 @@ import requests
 import serial
 import win32gui
 
+import debug_log
 from settings import *  # noqa: F401,F403 -- all tunables collected in settings.py
 
 
@@ -97,12 +98,35 @@ def start_panic_listener():
 
 
 # ---------------- bridge HTTP helpers ----------------
+_bridge_failing = False
+_bridge_fail_count = 0
+
+
 def api_get(path, params=None, timeout=0.3):
+    global _bridge_failing, _bridge_fail_count
     try:
         resp = requests.get(f"{API_BASE}{path}", params=params, timeout=timeout)
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+        if _bridge_failing:
+            # Recovery is edge-triggered too, not logged on every successful request -- api_get()
+            # is called many times per tick (every get_*() wrapper), so without this a bridge
+            # restart would print a burst of "recovered" lines instead of exactly one.
+            debug_log.log("routine", f"bridge recovered after {_bridge_fail_count} failed requests")
+            _bridge_failing = False
+            _bridge_fail_count = 0
+        return result
     except Exception:
+        # Bridge failures currently look identical to "the routine is stuck" from the console
+        # alone -- api_get() swallows every request exception silently, so if the Java plugin
+        # restarts or the RuneLite client closes mid-run, every get_*() wrapper quietly starts
+        # returning empty/default values with no signal that anything changed. Edge-triggered
+        # (only on the OK -> failing transition) so a bad connection doesn't spam one line per
+        # failed request -- every get_*() wrapper calls this, several times per tick.
+        _bridge_fail_count += 1
+        if not _bridge_failing:
+            _bridge_failing = True
+            debug_log.log("!", f"bridge unreachable: GET {path} failing since tick={debug_log.current_tick()}")
         return None
 
 
@@ -142,6 +166,10 @@ def get_objects(radius=None):
 
 def get_tiles():
     return api_get("/tiles") or []
+
+
+def get_menu():
+    return api_get("/menu") or {"open": False}
 
 
 def get_consumables():
@@ -371,13 +399,35 @@ def mouse_left_click(ser: serial.Serial) -> None:
 
 
 def click_human(ser: serial.Serial) -> None:
+    debug_log.log("action", f"click_human at {get_cursor_pos()}")
     mouse_left_down(ser)
     time.sleep(random.uniform(0.045, 0.11))
     mouse_left_up(ser)
     time.sleep(random.uniform(0.03, 0.09))
 
 
+def mouse_right_down(ser: serial.Serial) -> None:
+    send_line(ser, "MRD")
+
+
+def mouse_right_up(ser: serial.Serial) -> None:
+    send_line(ser, "MRU")
+
+
+def mouse_right_click(ser: serial.Serial) -> None:
+    send_line(ser, "MRC")
+
+
+def right_click_human(ser: serial.Serial) -> None:
+    debug_log.log("action", f"right_click_human at {get_cursor_pos()}")
+    mouse_right_down(ser)
+    time.sleep(random.uniform(0.045, 0.11))
+    mouse_right_up(ser)
+    time.sleep(random.uniform(0.03, 0.09))
+
+
 def key_tap(ser: serial.Serial, key: str) -> None:
+    debug_log.log("action", f"key_tap {key}")
     send_line(ser, f"KT {key}")
 
 
@@ -405,6 +455,23 @@ def type_digits_and_enter(ser: serial.Serial, text: str) -> None:
         key_tap(ser, ch)
         time.sleep(random.uniform(0.05, 0.12))
     key_tap(ser, "ENTER")
+    time.sleep(random.uniform(0.2, 0.4))
+
+
+def type_text(ser: serial.Serial, text: str) -> None:
+    """Type each character of `text` via key_tap -- letters and spaces, no trailing Enter, for
+    a live-filtering text field like the bank's search box (see banker.py's search_bank) rather
+    than type_digits_and_enter's numeric-chatbox-prompt use case.
+
+    ASSUMPTION, NOT YET VERIFIED LIVE: that the Arduino firmware accepts single-letter key names
+    ("a".."z") the same way it accepts the single-digit key names type_digits_and_enter uses
+    (itself still flagged unverified there) and named keys like "SPACE" elsewhere in this file.
+    Verify live (type something into the bank search box, confirm the right characters actually
+    appear) before trusting this for anything unattended."""
+    for ch in text:
+        key = "SPACE" if ch == " " else ch
+        key_tap(ser, key)
+        time.sleep(random.uniform(0.05, 0.12))
     time.sleep(random.uniform(0.2, 0.4))
 
 
@@ -547,6 +614,21 @@ def pick_aim_point(x: int, y: int, radius: int) -> tuple:
     r = radius * math.sqrt(random.random())
     theta = random.uniform(0, 2 * math.pi)
     return int(round(x + r * math.cos(theta))), int(round(y + r * math.sin(theta)))
+
+
+def pick_dismiss_point(x: int, y: int, distance: int = 200) -> tuple:
+    """Pick a point roughly `distance` px from (x, y) in a random direction -- for moving the
+    cursor clear of something (e.g. a stale context menu) rather than jittering near it like
+    pick_aim_point. Tries a few random directions for one that stays inside the RuneLite window;
+    falls back to the canvas center (always safely inside it) if none do."""
+    for _ in range(4):
+        angle = random.uniform(0, 2 * math.pi)
+        candidate = (int(round(x + distance * math.cos(angle))), int(round(y + distance * math.sin(angle))))
+        if is_point_within_window(*candidate):
+            return candidate
+    state = get_state()
+    return (state.get("canvasScreenX", x) + state.get("canvasWidth", 0) // 2,
+            state.get("canvasScreenY", y) + state.get("canvasHeight", 0) // 2)
 
 
 def maybe_overshoot_point(start, aim, *, overshoot_px=DEFAULT_OVERSHOOT_PX, chance=DEFAULT_OVERSHOOT_CHANCE):
@@ -753,7 +835,7 @@ def rotate_camera_away_from_ui(ser: serial.Serial, blocker: dict) -> None:
     blocker_center_x = blocker.get("x", 0) + blocker.get("width", 0) / 2
     key = "LEFT" if blocker_center_x >= canvas_center_x else "RIGHT"
 
-    print(f"[!] Aim point is behind a UI panel -- rotating camera ({key}) to work around it")
+    debug_log.log("!", f"Aim point is behind a UI panel -- rotating camera ({key}) to work around it")
     nudge_camera_yaw(ser, key)
 
 
@@ -768,7 +850,7 @@ def rotate_camera_to_reveal(ser: serial.Serial, x) -> None:
     canvas_center_x = state.get("canvasScreenX", 0) + state.get("canvasWidth", 0) / 2
     key = "RIGHT" if x < canvas_center_x else "LEFT"
 
-    print(f"[!] Target is off-screen -- rotating camera ({key}) to bring it into view")
+    debug_log.log("!", f"Target is off-screen -- rotating camera ({key}) to bring it into view")
     nudge_camera_yaw(ser, key)
 
 
@@ -777,7 +859,7 @@ def rotate_camera_to_reveal(ser: serial.Serial, x) -> None:
 # *absolute* screen coordinates (canvas offset baked in server-side) -- do
 # not add the canvas offset again here.
 def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_target=None,
-                  check_ui_blockers=True, simulate_mistakes=True) -> bool:
+                  check_ui_blockers=True, simulate_mistakes=True, button: str = "left") -> bool:
     x, y = entity.get("screenX"), entity.get("screenY")
     if x is None or y is None:
         return False
@@ -795,10 +877,10 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
         miss_dist = random.uniform(*MISCLICK_OFFSET_PX)
         aim_x += int(round(miss_dist * math.cos(angle)))
         aim_y += int(round(miss_dist * math.sin(angle)))
-        print(f"[!] Misclick -- aimed beside {entity.get('name')} instead of on it")
+        debug_log.log("!", f"Misclick -- aimed beside {entity.get('name')} instead of on it")
 
     if not is_point_within_window(aim_x, aim_y):
-        print(f"[!] Skipping click on {entity.get('name')} -- aim point is outside the RuneLite window")
+        debug_log.log("!", f"Skipping click on {entity.get('name')} -- aim point is outside the RuneLite window")
         return False
 
     if check_ui_blockers:
@@ -807,6 +889,7 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
             rotate_camera_away_from_ui(ser, blocker)
             return False
 
+    debug_log.log("action", f"click_entity target={entity.get('name')}(id={entity.get('id')}) at ({aim_x},{aim_y})")
     move_to_human(
         ser,
         aim_x,
@@ -816,7 +899,10 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
     )
     if _movement_abort.is_set():
         return False
-    click_human(ser)
+    if button == "right":
+        right_click_human(ser)
+    else:
+        click_human(ser)
     return True
 
 
@@ -842,6 +928,76 @@ def hover_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
     return not _movement_abort.is_set()
 
 
+MENU_POLL_INTERVAL_S = 0.05
+MENU_POLL_TIMEOUT_S = 0.6
+
+
+def click_menu_action(ser: serial.Serial, entity: dict, option: str, target_hint: str = None,
+                       offset=(-7, 7), check_ui_blockers=True) -> bool:
+    """Right-click `entity`, read back the resulting context menu via GET /menu, and left-click
+    whichever entry's option matches `option` (case-insensitive substring, e.g. "take") -- picks
+    a specific menu action by name instead of trusting whatever left-click's default action
+    resolves to.
+
+    Needed whenever something else can share the same click point and isn't guaranteed to lose
+    the default-action race -- e.g. a ground item on a tile an NPC is currently standing on: a
+    plain click_entity() there can resolve to the NPC's default action (Attack) instead of the
+    item's Take, with no error or misclick logged, just a pickup that silently never happens. See
+    routines/slayer.py's maybe_loot for the original case this was built for. The right-click +
+    menu-read + read-back-and-select primitives this composes were CONFIRMED-working live
+    2026-08-06 (docs/superpowers/plans/2026-08-06-right-click-menu-state.md Task 3).
+
+    `target_hint`, if given, is matched (case-insensitive substring) against the entry's target
+    text too -- narrows to the right entry when a tile has more than one "Take"-able thing on it.
+
+    Returns False -- backing out with ESC rather than leaving the menu open over an unintended
+    entry -- if the menu never opened or nothing matched `option`/`target_hint`, so the caller can
+    retry next tick or fall back instead of assuming a click landed somewhere sensible.
+    """
+    if not click_entity(ser, entity, offset=offset, check_ui_blockers=check_ui_blockers,
+                         simulate_mistakes=False, button="right"):
+        return False
+
+    deadline = time.time() + MENU_POLL_TIMEOUT_S
+    menu = get_menu()
+    while not menu.get("open") and time.time() < deadline:
+        time.sleep(MENU_POLL_INTERVAL_S)
+        menu = get_menu()
+
+    if not menu.get("open"):
+        debug_log.log("!", f"Menu never opened after right-clicking {entity.get('name')}")
+        return False
+
+    option_lower = option.lower()
+    target_lower = target_hint.lower() if target_hint else None
+    match = next(
+        (e for e in menu.get("entries", [])
+         if option_lower in (e.get("option") or "").lower()
+         and (target_lower is None or target_lower in (e.get("target") or "").lower())),
+        None,
+    )
+
+    if match is None:
+        debug_log.log("!", f"No '{option}' entry in menu for {entity.get('name')} "
+                            f"({[e.get('option') for e in menu.get('entries', [])]}) -- closing it")
+        # Move well clear of the menu rather than relying on ESC alone -- CONFIRMED live
+        # 2026-08-06 (user observation, watching the client directly): a menu that isn't
+        # definitively gone keeps rendering on top of the item's screen position, blocking every
+        # subsequent click there (right or left) until it's actually closed. Moving off it is
+        # the same mechanism a human uses to dismiss a context menu without picking an entry.
+        # ESC still goes out too, for belt-and-suspenders -- moving away costs nothing extra to
+        # pair with it.
+        cx, cy = get_cursor_pos()
+        move_to_human(ser, *pick_dismiss_point(cx, cy), aim_radius=10)
+        key_tap(ser, "ESC")
+        return False
+
+    debug_log.log("action", f"menu-select {match.get('option')} {match.get('target')}")
+    move_to_human(ser, match["screenX"], match["screenY"], aim_radius=2)
+    click_human(ser)
+    return True
+
+
 def consume_first(ser: serial.Serial, category: str) -> bool:
     """Click the first inventory item ConsumablesProvider tags as `category` (e.g. "food",
     "prayer"). Only resolves item screen coords while the Inventory tab is open, so switch
@@ -855,95 +1011,10 @@ def consume_first(ser: serial.Serial, category: str) -> bool:
     items = get_consumables().get(category, [])
     if not items:
         return False
-    return click_entity(ser, items[0])
-
-
-def random_viewport_point():
-    """A random absolute screen point somewhere inside the 3D game viewport
-    (not the minimap, inventory, or any other UI chrome), or None if the
-    viewport isn't known yet (e.g. still loading)."""
-    state = get_state()
-    canvas_x, canvas_y = state.get("canvasScreenX"), state.get("canvasScreenY")
-    vp_x_off, vp_y_off = state.get("viewportXOffset"), state.get("viewportYOffset")
-    vp_w, vp_h = state.get("viewportWidth"), state.get("viewportHeight")
-    if None in (canvas_x, canvas_y, vp_x_off, vp_y_off, vp_w, vp_h) or vp_w <= 0 or vp_h <= 0:
-        return None
-    x = canvas_x + vp_x_off + random.randint(0, vp_w - 1)
-    y = canvas_y + vp_y_off + random.randint(0, vp_h - 1)
-    return x, y
-
-
-ADJACENT_TILE_OFFSETS = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if (dx, dy) != (0, 0)]
-
-
-def _misclick_target_point():
-    """A screen point one tile off from whatever's actually nearest -- the
-    nearest visible NPC or object, not restricted to either -- or None if
-    nothing nearby has an on-screen adjacent tile to aim at. Tries the 8
-    surrounding tiles in random order, since not all of them are necessarily
-    reachable/on-screen (e.g. a target against a wall)."""
-    candidates = [
-        e for e in (get_npcs() + get_objects())
-        if e.get("visible", True) and e.get("x") is not None and e.get("distance") is not None
-    ]
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda e: e.get("distance", 9999))
-    target = candidates[0]
-    tx, ty, plane = target["x"], target["y"], target.get("plane", 0)
-
-    offsets = list(ADJACENT_TILE_OFFSETS)
-    random.shuffle(offsets)
-    for dx, dy in offsets:
-        point = get_ground_walk_point(tx + dx, ty + dy, plane)
-        if point.get("onScreen"):
-            return point["screenX"], point["screenY"]
-
-    return None
-
-
-def maybe_misclick(ctx, chance: float = MISTAKE_RANDOM_CLICK_CHANCE) -> bool:
-    """With `chance` probability, click a tile adjacent to whatever's nearest
-    instead of doing anything purposeful this tick -- a stray misclick (aimed
-    near what you were looking at and missed the tile) rather than every
-    click in a session being deliberate. Falls back to a genuinely random
-    viewport point if nothing's nearby to aim beside. Engine-level like
-    check_stray_dialog, so every routine gets it for free.
-
-    Never fires while actively in combat -- a real player doesn't throw in a
-    stray click mid-fight, and for a routine tracking a specific target (e.g.
-    gemstone_crab's crab-then-tunnel sequence) a stray click elsewhere is
-    indistinguishable from actually clicking away from what it's doing. Same
-    reasoning for Sailing's helm/steering mode (get_sailing().navigating) --
-    CONFIRMED live 2026-08-02: a stray click while engaged with the helm was
-    "making so many problems" (e.g. clicking away from a deployed salvaging
-    hook retrieves it, confirmed separately -- a misclick mid-navigation is
-    exactly that kind of unwanted "clicked away").
-
-    Returns True if it fired (caller should skip its real action this tick
-    and let the next tick carry on normally), False otherwise.
-    """
-    if random.random() > chance:
-        return False
-
-    if get_combat().get("inCombat"):
-        return False
-
-    if get_sailing().get("navigating"):
-        return False
-
-    point = _misclick_target_point() or random_viewport_point()
-    if point is None:
-        return False
-
-    x, y = point
-    if is_point_blocked_by_ui(x, y):
-        return False
-
-    print("[!] Misclick -- clicked a tile beside the nearest target instead of acting")
-    click_entity(ctx.ser, {"screenX": x, "screenY": y, "name": "(random point)"}, offset=(0, 0))
-    return True
+    # check_ui_blockers=False: an inventory item's own screen position is naturally inside
+    # the floating inventory panel that uiBlockers flags -- same fix as every other
+    # inventory-item click in this codebase (see shipwreck_salvaging.py's drop_salvage).
+    return click_entity(ser, items[0], check_ui_blockers=False)
 
 
 def maybe_idle_mouse_move(ctx, state: "ControllerState") -> None:
@@ -953,8 +1024,7 @@ def maybe_idle_mouse_move(ctx, state: "ControllerState") -> None:
     normal click speed) reads as a resting hand shifting slightly, not a
     purposeful move -- the whole point of this being "idle". Purely cosmetic
     movement -- it always runs before the caller's real action for this
-    tick, never instead of it (unlike maybe_misclick, which deliberately
-    eats a tick), so it never delays or replaces an actual click.
+    tick and never replaces it.
     """
     now = time.time()
     if state.next_idle_move_at is None:
@@ -986,6 +1056,8 @@ class ControllerState:
         self._bridge_config_fetched_at = 0.0
         self.config = None
         self.data = {}
+        self.active_routine_path = None  # set by main() on routine switch -- read by
+                                           # debug_log.tick()'s per-tick snapshot line
 
         self.start_time = time.time()
         self.safety_stopped = False
@@ -1012,12 +1084,12 @@ class ControllerState:
         self.safety_stopped = True
         self.safety_reason = reason
         request_movement_abort()
-        print(f"[!] Safety stop: {reason}. Automation paused -- fix the issue and restart.")
+        debug_log.log("!", f"Safety stop: {reason}. Automation paused -- fix the issue and restart.")
 
     def print_safety_reminder(self):
         now = time.time()
         if now - self._safety_reminder_at > 30:
-            print(f"[!] Still stopped: {self.safety_reason}")
+            debug_log.log("!", f"Still stopped: {self.safety_reason}")
             self._safety_reminder_at = now
 
     def maybe_toggle_break(self, breaks_cfg: dict):
@@ -1044,7 +1116,7 @@ class ControllerState:
                 breaks_cfg.get("durationMaxMinutes", 12),
             )
             self.break_until = now + duration_min * 60
-            print(f"[break] taking a {duration_min:.1f}-minute break")
+            debug_log.log("break", f"taking a {duration_min:.1f}-minute break")
 
     def _schedule_next_break(self, breaks_cfg: dict, now: float):
         wait_min = random.uniform(
@@ -1109,7 +1181,7 @@ def check_pvp_threat(ctx, state: ControllerState, config: dict):
         if other_combat is None:
             continue
         if abs(other_combat - my_combat) <= wilderness_level:
-            print(f"[!] PvP threat: {other.get('name')} (combat {other_combat}) is within attack range")
+            debug_log.log("!", f"PvP threat: {other.get('name')} (combat {other_combat}) is within attack range")
             travel.flee_royal_seed_pod(ctx)
             state.trigger_safety_stop(f"fled from {other.get('name')} in the wilderness")
             return
@@ -1126,7 +1198,7 @@ def check_stray_dialog(ctx):
     blind would mean guessing a choice.
     """
     if get_state().get("dialogOpen"):
-        print("[!] Dismissing a stray dialogue box (Space)")
+        debug_log.log("!", "Dismissing a stray dialogue box (Space)")
         key_tap(ctx.ser, "SPACE")
         time.sleep(random.uniform(0.3, 0.6))
 
@@ -1199,7 +1271,18 @@ def main():
             "the routine live from the RuneLite HttpBridge plugin's Routine setting instead."
         ),
     )
+    parser.add_argument(
+        "--debug-log",
+        action="store_true",
+        help=(
+            "Persist a structured debug log to logs/debug_<timestamp>.log (per-tick snapshots, "
+            "state-diffs, stall detection, full exception tracebacks) on top of today's console "
+            "output -- see docs/superpowers/specs/2026-08-02-controller-debug-logger-design.md. "
+            "Equivalent to setting the DEBUG_LOG=1 environment variable."
+        ),
+    )
     args = parser.parse_args()
+    debug_log.init(args.debug_log or os.environ.get("DEBUG_LOG") == "1")
 
     set_dpi_aware()  # must happen before any cursor/window coordinate queries below,
                       # otherwise Windows silently virtualizes them to 96 DPI while
@@ -1217,11 +1300,17 @@ def main():
         last_warned_routine = "__unset__"
 
         while True:
+            debug_log.tick(ctx)
+
             events = poll_udp(udp)
             handle_generic_events(state, events)
             if routine is not None and hasattr(routine, "on_event"):
                 for event_type, payload in events:
-                    routine.on_event(ctx, event_type, payload)
+                    try:
+                        routine.on_event(ctx, event_type, payload)
+                    except Exception as exc:
+                        debug_log.log_exception("on_event", exc)
+                        raise
 
             bridge_config = state.refresh_bridge_config()
 
@@ -1232,8 +1321,8 @@ def main():
                 desired_path = ROUTINE_FILES.get(routine_key) if routine_key else None
                 if desired_path is None and routine_key != last_warned_routine:
                     if routine_key is not None and routine_key != "NONE":
-                        print(f"[!] No routine registered for '{routine_key}' "
-                              f"-- add it to ROUTINE_FILES in controller.py.")
+                        debug_log.log("!", f"No routine registered for '{routine_key}' "
+                                            f"-- add it to ROUTINE_FILES in controller.py.")
                     last_warned_routine = routine_key
 
             if desired_path is None:
@@ -1243,10 +1332,15 @@ def main():
             if desired_path != active_path:
                 routine = load_routine(routine_full_path(desired_path))
                 active_path = desired_path
+                state.active_routine_path = desired_path
                 state.data = {}
-                print(f"[routine] running {desired_path}")
+                debug_log.log("routine", f"running {desired_path}")
                 if hasattr(routine, "setup"):
-                    routine.setup(ctx)
+                    try:
+                        routine.setup(ctx)
+                    except Exception as exc:
+                        debug_log.log_exception("setup", exc)
+                        raise
 
             config = resolve_config(routine, bridge_config)
             if config is None:
@@ -1282,8 +1376,11 @@ def main():
 
             check_stray_dialog(ctx)
             maybe_idle_mouse_move(ctx, state)
-            if not maybe_misclick(ctx):
+            try:
                 routine.tick(ctx)
+            except Exception as exc:
+                debug_log.log_exception("tick", exc)
+                raise
 
             if config.get("breaks", {}).get("microBreaks") and random.random() < 0.15:
                 time.sleep(random.uniform(0.3, 1.2))

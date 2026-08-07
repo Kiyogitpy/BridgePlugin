@@ -75,3 +75,73 @@ because the player (registered in a boat's own nested `WorldView`, plane 1, coor
 that view) and top-level-world objects like shipwrecks (plane 0, real Gielinor coordinates) aren't
 in the same coordinate space at all. Querying the live endpoint directly found this in minutes;
 guessing from static code would not have.
+
+## Autonomous live debugging: acting, not just reading
+
+The "query live state" pattern above extends to *acting*: `controller.py` can right-click
+(`controller.right_click_human(ser)` / `click_entity(ser, entity, button="right")`, added
+2026-08-06 -- the Arduino firmware already supported `MRD`/`MRU`/`MRC` identically to the
+existing `MLD`/`MLU`/`MLC`, only the Python-side senders were missing) and read back exactly
+what a currently-open right-click menu contains via `GET /menu`
+(`src/main/java/com/example/providers/MenuStateProvider.java`) -- `{"open": bool, "x", "y",
+"width", "height", "entries": [{"index", "option", "target", "screenX", "screenY"}]}`. This
+closes the loop for verifying anything menu-driven end to end without a human or screen vision:
+right-click -> poll `/menu` -> find the entry by `option`/`target` -> `click_human` at its
+`screenX`/`screenY` -> confirm the effect through an existing state endpoint (config, inventory,
+equipment, etc.).
+
+**Two real bugs only showed up doing this live, not from reading the code:**
+1. Menu entries don't start at the popup's very top -- there's a ~22px header band above them
+   first. Confirmed by measuring two *different* live menus (a 3-entry one at `height=67px`, a
+   4-entry one at `height=82px`) and solving `header + N*row = height` for both simultaneously --
+   both resolved to clean integers (`row=15`, `header=22`), not an approximate fit.
+2. `Menu.getMenuX()`/`getMenuY()` are canvas-space coordinates, not absolute screen coordinates --
+   every other provider in this codebase converts through `RuneLiteUtil.canvasToScreen(...)`
+   (which also applies stretched-mode display scaling, not just a fixed offset) before returning a
+   `screenX`/`screenY` field; the first version of `MenuStateProvider` returned them raw. The
+   symptom was a click landing "miles" off, worse the farther the target was from the canvas
+   origin -- a scaling bug, not a constant-offset one.
+
+**If you write a one-off Python verification script instead of running through `controller.py`'s
+own `main()`, call `controller.set_dpi_aware()` first, before touching the cursor.** Skipping it
+was mistaken for a third bug during this same session -- without it, Windows silently virtualizes
+the process's screen coordinates to 96 DPI while RuneLite reports/expects real physical pixels,
+so cursor moves land in the wrong place even though the target coordinates themselves are correct.
+
+## Debugging via the MCP server
+
+Everything above (querying bridge state, right-clicking, reading `/menu`, clicking a matched
+entry) is also available as typed MCP tools -- `bridge_get`, `get_cursor_position`,
+`move_mouse`, `left_click`/`right_click`, `left_click_at`/`right_click_at`,
+`left_mouse_down`/`left_mouse_up`, `right_mouse_down`/`right_mouse_up`, `drag`,
+`key_tap`, `key_down`/`key_up`, `type_text`, `release_all`, `click_menu_entry`,
+`poll_events` -- via `ControllerAddon/mcp_debug_server.py`, registered in `.mcp.json`. Prefer
+these tools over raw `curl`/`WebFetch` and one-off verification scripts when they're available
+(i.e. this server is registered and reachable) -- same underlying primitives, no risk of
+forgetting `set_dpi_aware()` the way a one-off script can (see the DPI gotcha two paragraphs
+up).
+
+**`controller.py` must not be running at the same time as this server** -- both need
+exclusive access to the same Arduino serial port. Stop `controller.py` before debugging
+through these tools; restart it afterward for real automation runs. Because `.mcp.json`
+registers this server project-wide, Claude Code auto-starts it whenever a session opens in
+this repo -- so merely having a Claude Code session open here claims the serial port for that
+session's entire lifetime, not just while a tool is actively being called. Running
+`controller.py` therefore requires either closing that session or otherwise ensuring the MCP
+server isn't started, not just pausing between tool calls. This server also binds `UDP_PORT`
+(50555) at startup for its event stream, and `controller.py`'s own `main()` binds that same
+port before it ever opens the serial port -- so with this server already running, starting
+`controller.py` may surface a UDP bind error first instead of (or before) the serial-port
+error; either symptom means the same thing, this server is already running and needs to be
+stopped first.
+
+If a key or mouse button is left stuck held and the MCP server process itself has died (not
+just a missed `_up()` call `release_all()` could clean up), restarting `controller.py` resets
+the Arduino (see the `time.sleep(2.0)  # Pro Micro reset` in its `main()`), which clears any
+stuck input.
+
+See `docs/superpowers/specs/2026-08-06-mcp-debug-server-design.md` for the full design.
+
+Held-input primitives (`left_mouse_down`/`up`, `right_mouse_down`/`up`, `key_down`/`up`,
+`drag`, `release_all`) and the UDP event stream (`poll_events`) are documented in
+`docs/superpowers/specs/2026-08-06-mcp-debug-server-input-events-design.md`.

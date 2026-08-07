@@ -23,6 +23,7 @@ import random
 import time
 
 import controller
+import debug_log
 import travel
 
 DEFAULT_CONFIG = {
@@ -54,10 +55,8 @@ def get_config(bridge_config):
 
 def setup(ctx):
     tunnel_name = DEFAULT_CONFIG["tunnelName"]
-    print(
-        f"[crab] reminder: add \"{tunnel_name}\" to Controller Settings -> Clicking -> "
-        f"Priority Objects, so a click near it can't resolve to a nearby tree/rock instead."
-    )
+    debug_log.log("crab", f"reminder: add \"{tunnel_name}\" to Controller Settings -> Clicking -> "
+                           f"Priority Objects, so a click near it can't resolve to a nearby tree/rock instead.")
 
 
 # After clicking the tunnel to follow the crab across, it takes a while to resurface on the
@@ -90,7 +89,7 @@ def tick(ctx):
                                                via_minimap=False):
             ctx.state.data["tunnel_retry_at"] = None
             return
-        print(f"[crab] attacking (dist={crab.get('distance')})")
+        debug_log.log("crab", f"attacking (dist={crab.get('distance')})")
         time.sleep(random.uniform(0.15, 0.4))
         controller.click_entity(ctx.ser, crab)
         ctx.state.data["tunnel_retry_at"] = None
@@ -101,21 +100,21 @@ def tick(ctx):
     if retry_at is not None:
         if time.time() < retry_at:
             return  # already followed the crab across -- give it time to resurface, don't touch the tunnel again
-        print("[crab] crab still hasn't shown up since crossing -- trying the tunnel again")
+        debug_log.log("crab", "crab still hasn't shown up since crossing -- trying the tunnel again")
         ctx.state.data["tunnel_retry_at"] = None
 
     tunnel = find_nearby(controller.get_objects(), config, "tunnelName")
     if tunnel:
         if travel.maybe_approach_before_click(ctx, tunnel, already_engaged=combat.get("inCombat", False)):
             return
-        print("[crab] not found -- following it into the tunnel")
+        debug_log.log("crab", "not found -- following it into the tunnel")
         time.sleep(random.uniform(0.2, 0.5))
         controller.click_entity(ctx.ser, tunnel)
         time.sleep(random.uniform(1.0, 1.5))  # entering transition
         ctx.state.data["tunnel_retry_at"] = time.time() + TUNNEL_RETRY_TIMEOUT_SECONDS
         return
 
-    print("[crab] neither the crab nor the tunnel is visible nearby")
+    debug_log.log("crab", "neither the crab nor the tunnel is visible nearby")
 
 
 def maybe_hover_next_step(ctx, config: dict) -> None:

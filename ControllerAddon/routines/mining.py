@@ -13,6 +13,7 @@ import random
 import time
 
 import controller
+import debug_log
 
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -52,7 +53,7 @@ def tick(ctx):
     if not rock:
         return
 
-    print(f"[mining] swinging at {rock.get('name')} (dist={rock.get('distance')})")
+    debug_log.log("mining", f"swinging at {rock.get('name')} (dist={rock.get('distance')})")
     time.sleep(random.uniform(0.15, 0.5))
     controller.click_entity(ctx.ser, rock)
 
