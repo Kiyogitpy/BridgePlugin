@@ -4,6 +4,7 @@ import com.example.util.UdpEventSender;
 import net.runelite.api.Client;
 import net.runelite.api.Hitsplat;
 import net.runelite.api.NPC;
+import net.runelite.api.Player;
 import net.runelite.api.events.ClientTick;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
@@ -80,7 +81,11 @@ public class NpcTrackerRegistry
 	@Subscribe
 	public void onNpcChanged(NpcChanged event)
 	{
-		NPC npc = event.getNpc();
+		revalidateFactoriesFor(event.getNpc());
+	}
+
+	private void revalidateFactoriesFor(NPC npc)
+	{
 		Map<NpcTrackerFactory, NpcTracker> trackersByFactory = attached.get(npc);
 
 		// Re-validate each factory independently
@@ -186,6 +191,8 @@ public class NpcTrackerRegistry
 	@Subscribe
 	public void onGameTick(GameTick event)
 	{
+		revalidateCurrentTarget();
+
 		int tick = client.getTickCount();
 		for (Map<NpcTrackerFactory, NpcTracker> trackers : attached.values())
 		{
@@ -197,6 +204,25 @@ public class NpcTrackerRegistry
 					safely(() -> listener.onTrackerTick(tick));
 				}
 			}
+		}
+	}
+
+	private void revalidateCurrentTarget()
+	{
+		// Already-tracked NPCs might have stopped matching (e.g. the player switched targets) --
+		// bounded by however many NPCs are currently tracked, not a scene-wide scan.
+		for (NPC npc : new ArrayList<>(attached.keySet()))
+		{
+			revalidateFactoriesFor(npc);
+		}
+
+		// The player's current target might have no attached trackers at all yet -- e.g. it already
+		// existed in the scene before the player started interacting with it, so it never got a
+		// chance to match via onNpcSpawned/onNpcChanged. Check it explicitly.
+		Player localPlayer = client.getLocalPlayer();
+		if (localPlayer != null && localPlayer.getInteracting() instanceof NPC)
+		{
+			revalidateFactoriesFor((NPC) localPlayer.getInteracting());
 		}
 	}
 

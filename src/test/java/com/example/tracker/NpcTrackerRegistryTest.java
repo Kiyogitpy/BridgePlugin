@@ -386,4 +386,44 @@ public class NpcTrackerRegistryTest
 
 		org.mockito.Mockito.verify(tracker).onTrackerTick(4242);
 	}
+
+	@Test
+	public void gameTickAttachesFactoryForNpcAlreadyInteractingWithLocalPlayer()
+	{
+		NPC target = npc(20); // already "existing" -- never spawned through the registry
+		NpcTracker tracker = mock(NpcTracker.class);
+		NpcTrackerFactory factory = mock(NpcTrackerFactory.class);
+		when(factory.isValidTrackingTarget(target)).thenReturn(true);
+		when(factory.newInstance(target)).thenReturn(tracker);
+		registry.addFactory(factory);
+
+		net.runelite.api.Player player = mock(net.runelite.api.Player.class);
+		when(player.getInteracting()).thenReturn(target);
+		when(client.getLocalPlayer()).thenReturn(player);
+
+		registry.onGameTick(new net.runelite.api.events.GameTick());
+
+		assertEquals(1, registry.attached.get(target).size());
+		assertTrue(registry.attached.get(target).containsValue(tracker));
+	}
+
+	@Test
+	public void gameTickDetachesTrackerWhenAttachedNpcNoLongerMatchesAnyFactory()
+	{
+		NPC target = npc(21);
+		NpcTracker tracker = mock(NpcTracker.class);
+		NpcTrackerFactory factory = mock(NpcTrackerFactory.class);
+		when(factory.isValidTrackingTarget(target)).thenReturn(true);
+		when(factory.newInstance(target)).thenReturn(tracker);
+		registry.addFactory(factory);
+		registry.onNpcSpawned(new NpcSpawned(target));
+
+		when(factory.isValidTrackingTarget(target)).thenReturn(false);
+		when(client.getLocalPlayer()).thenReturn(null); // nobody interacting with anything
+
+		registry.onGameTick(new net.runelite.api.events.GameTick());
+
+		assertEquals(null, registry.attached.get(target));
+		org.mockito.Mockito.verify(tracker).onDetach();
+	}
 }
