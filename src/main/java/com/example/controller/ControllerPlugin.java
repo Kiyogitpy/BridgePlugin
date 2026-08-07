@@ -2,6 +2,8 @@ package com.example.controller;
 
 import com.example.bridge.BridgeHttpServer;
 import com.example.providers.*;
+import com.example.tracker.CurrentTargetTrackerFactory;
+import com.example.tracker.NpcTrackerRegistry;
 import com.example.util.UdpEventSender;
 import com.google.inject.Provides;
 import net.runelite.api.*;
@@ -59,6 +61,7 @@ public class ControllerPlugin extends Plugin
 
 	private BridgeHttpServer server;
 	private UdpEventSender udpSender;
+	private NpcTrackerRegistry npcTrackerRegistry;
 
 	private int lastHp = -1;
 	private int lastPrayer = -1;
@@ -72,6 +75,10 @@ public class ControllerPlugin extends Plugin
 	{
 		udpSender = new UdpEventSender();
 		udpSender.start();
+
+		npcTrackerRegistry = new NpcTrackerRegistry(client, eventBus, udpSender);
+		npcTrackerRegistry.addFactory(new CurrentTargetTrackerFactory(client));
+		npcTrackerRegistry.register();
 
 		server = new BridgeHttpServer();
 		server.start(HTTP_PORT);
