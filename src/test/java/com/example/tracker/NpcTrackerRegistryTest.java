@@ -49,7 +49,7 @@ public class NpcTrackerRegistryTest
 		registry.onNpcSpawned(new NpcSpawned(target));
 
 		assertEquals(1, registry.attached.get(target).size());
-		assertTrue(registry.attached.get(target).contains(tracker));
+		assertTrue(registry.attached.get(target).containsValue(tracker));
 	}
 
 	@Test
@@ -153,5 +153,38 @@ public class NpcTrackerRegistryTest
 
 		assertEquals(null, registry.attached.get(target));
 		org.mockito.Mockito.verify(tracker).onDetach();
+	}
+
+	@Test
+	public void npcChangedHandlesSimultaneousFactoryTransitionIndependently()
+	{
+		NPC target = npc(8);
+		NpcTracker trackerA = mock(NpcTracker.class);
+		NpcTracker trackerB = mock(NpcTracker.class);
+		NpcTrackerFactory factoryA = mock(NpcTrackerFactory.class);
+		NpcTrackerFactory factoryB = mock(NpcTrackerFactory.class);
+
+		// Factory A initially matches, Factory B doesn't
+		when(factoryA.isValidTrackingTarget(target)).thenReturn(true);
+		when(factoryA.newInstance(target)).thenReturn(trackerA);
+		when(factoryB.isValidTrackingTarget(target)).thenReturn(false);
+		registry.addFactory(factoryA);
+		registry.addFactory(factoryB);
+		registry.onNpcSpawned(new NpcSpawned(target));
+
+		// Verify A is attached, B is not
+		assertEquals(1, registry.attached.get(target).size());
+		assertTrue(registry.attached.get(target).containsValue(trackerA));
+
+		// Now flip: Factory A no longer matches, Factory B starts matching
+		when(factoryA.isValidTrackingTarget(target)).thenReturn(false);
+		when(factoryB.isValidTrackingTarget(target)).thenReturn(true);
+		when(factoryB.newInstance(target)).thenReturn(trackerB);
+		registry.onNpcChanged(new net.runelite.api.events.NpcChanged(target, null));
+
+		// Verify A is detached (onDetach called) and B is now attached
+		org.mockito.Mockito.verify(trackerA).onDetach();
+		assertEquals(1, registry.attached.get(target).size());
+		assertTrue(registry.attached.get(target).containsValue(trackerB));
 	}
 }

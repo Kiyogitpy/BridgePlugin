@@ -28,7 +28,9 @@ public class NpcTrackerRegistry
 
 	// Package-private (not private) so this task's same-package tests can assert on attachment
 	// state directly, instead of needing a getter whose only caller would be a test.
-	final Map<NPC, List<NpcTracker>> attached = new HashMap<>();
+	// Keyed by NPC, then by the factory that produced each tracker, enabling per-factory
+	// re-validation instead of aggregate booleans.
+	final Map<NPC, Map<NpcTrackerFactory, NpcTracker>> attached = new HashMap<>();
 
 	public NpcTrackerRegistry(Client client, EventBus eventBus, UdpEventSender udpEventSender)
 	{
@@ -62,7 +64,12 @@ public class NpcTrackerRegistry
 		{
 			if (factory.isValidTrackingTarget(npc))
 			{
-				attached.computeIfAbsent(npc, n -> new ArrayList<>()).add(factory.newInstance(npc));
+				Map<NpcTrackerFactory, NpcTracker> trackersByFactory = attached.computeIfAbsent(npc, n -> new HashMap<>());
+				// Only create tracker if this factory hasn't already produced one for this NPC
+				if (!trackersByFactory.containsKey(factory))
+				{
+					trackersByFactory.put(factory, factory.newInstance(npc));
+				}
 			}
 		}
 	}
@@ -71,17 +78,31 @@ public class NpcTrackerRegistry
 	public void onNpcChanged(NpcChanged event)
 	{
 		NPC npc = event.getNpc();
-		List<NpcTracker> current = attached.get(npc);
-		boolean wasTracked = current != null && !current.isEmpty();
-		boolean stillValid = factories.stream().anyMatch(f -> f.isValidTrackingTarget(npc));
+		Map<NpcTrackerFactory, NpcTracker> trackersByFactory = attached.get(npc);
 
-		if (wasTracked && !stillValid)
+		// Re-validate each factory independently
+		for (NpcTrackerFactory factory : factories)
 		{
-			detachAll(npc);
-		}
-		else if (!wasTracked && stillValid)
-		{
-			attachMatchingFactories(npc);
+			boolean hasTracker = trackersByFactory != null && trackersByFactory.containsKey(factory);
+			boolean nowValid = factory.isValidTrackingTarget(npc);
+
+			if (hasTracker && !nowValid)
+			{
+				// Detach this one tracker
+				NpcTracker tracker = trackersByFactory.remove(factory);
+				safely(tracker::onDetach);
+				// Clean up if inner map is now empty
+				if (trackersByFactory.isEmpty())
+				{
+					attached.remove(npc);
+				}
+			}
+			else if (!hasTracker && nowValid)
+			{
+				// Attach this factory's tracker
+				NpcTracker tracker = factory.newInstance(npc);
+				attached.computeIfAbsent(npc, n -> new HashMap<>()).put(factory, tracker);
+			}
 		}
 	}
 
@@ -93,12 +114,12 @@ public class NpcTrackerRegistry
 
 	private void detachAll(NPC npc)
 	{
-		List<NpcTracker> trackers = attached.remove(npc);
-		if (trackers == null)
+		Map<NpcTrackerFactory, NpcTracker> trackersByFactory = attached.remove(npc);
+		if (trackersByFactory == null)
 		{
 			return;
 		}
-		for (NpcTracker tracker : trackers)
+		for (NpcTracker tracker : trackersByFactory.values())
 		{
 			safely(tracker::onDetach);
 		}
