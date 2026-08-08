@@ -39,6 +39,7 @@ public class ObjectProvider extends BridgeProvider
 	public void register()
 	{
 		server.registerQuery("/objects", query -> onClient(() -> getObjects(query)));
+		server.registerQuery("/debug-objects-all-planes", query -> onClient(() -> getObjectsAllPlanes(query)));
 	}
 
 	private Object getObjects(Map<String, String> query)
@@ -65,6 +66,127 @@ public class ObjectProvider extends BridgeProvider
 			cachedRadius = radiusKey;
 		}
 		return cachedObjects;
+	}
+
+	// ADDED 2026-08-08 (user investigation): debug-only, uncached, deliberately not the normal
+	// get_objects() path -- walkScene (used by computeObjects above) only ever walks
+	// client.getPlane(), the player's own current plane, same as every other caller in this
+	// codebase assumes. A golem-crafting "carved side" ground effect that isn't any TileObject
+	// type, GroundItem, NPC, GraphicsObject, or Projectile (all already checked live) could still
+	// be a real TileObject if it happens to sit on a DIFFERENT plane at the same (x, y) -- a known
+	// trick for certain overlay-style ground effects. This scans every plane of the top-level
+	// scene at an explicit (x, y), not just the player's current one, to test that specifically.
+	// Skips buildObjectData's screen-projection/clickbox work entirely (meaningless for a plane
+	// the client isn't currently rendering) and reports the plane it was actually found on
+	// directly from the loop variable, not from buildObjectData's own "plane" field -- that field
+	// comes from WorldPoint.fromLocal(client, local), which itself assumes client.getPlane(), so
+	// it would silently mislabel anything found on another plane as being on the current one.
+	private Object getObjectsAllPlanes(Map<String, String> query)
+	{
+		Integer x = parseIntParam(query.get("x"));
+		Integer y = parseIntParam(query.get("y"));
+		Integer radius = parseIntParam(query.get("radius"));
+		int r = radius != null ? radius : 2;
+
+		List<Map<String, Object>> list = new ArrayList<>();
+		if (x == null || y == null)
+		{
+			return list;
+		}
+
+		Scene scene = client.getScene();
+		Tile[][][] tiles = scene != null ? scene.getTiles() : null;
+		if (tiles == null)
+		{
+			return list;
+		}
+
+		int px = x - scene.getBaseX();
+		int py = y - scene.getBaseY();
+
+		for (int plane = 0; plane < tiles.length; plane++)
+		{
+			if (tiles[plane] == null)
+			{
+				continue;
+			}
+			int width = tiles[plane].length;
+			int height = width > 0 ? tiles[plane][0].length : 0;
+			int xStart = Math.max(0, px - r);
+			int xEnd = Math.min(width, px + r + 1);
+			int yStart = Math.max(0, py - r);
+			int yEnd = Math.min(height, py + r + 1);
+
+			for (int sx = xStart; sx < xEnd; sx++)
+			{
+				for (int sy = yStart; sy < yEnd; sy++)
+				{
+					Tile tile = tiles[plane][sx][sy];
+					if (tile == null)
+					{
+						continue;
+					}
+
+					for (GameObject obj : tile.getGameObjects())
+					{
+						if (obj != null)
+						{
+							list.add(buildDebugObjectData(obj, "GameObject", plane));
+						}
+					}
+					WallObject wallObj = tile.getWallObject();
+					if (wallObj != null)
+					{
+						list.add(buildDebugObjectData(wallObj, "WallObject", plane));
+					}
+					GroundObject groundObj = tile.getGroundObject();
+					if (groundObj != null)
+					{
+						list.add(buildDebugObjectData(groundObj, "GroundObject", plane));
+					}
+					DecorativeObject decorativeObj = tile.getDecorativeObject();
+					if (decorativeObj != null)
+					{
+						list.add(buildDebugObjectData(decorativeObj, "DecorativeObject", plane));
+					}
+				}
+			}
+		}
+		return list;
+	}
+
+	private Map<String, Object> buildDebugObjectData(TileObject obj, String objectType, int plane)
+	{
+		Map<String, Object> data = new HashMap<>();
+		data.put("id", obj.getId());
+		data.put("objectType", objectType);
+		data.put("plane", plane);
+		ObjectComposition comp = client.getObjectDefinition(obj.getId());
+		if (comp != null && comp.getImpostorIds() != null)
+		{
+			comp = comp.getImpostor();
+		}
+		data.put("name", comp != null ? comp.getName() : "Unknown");
+		LocalPoint local = obj.getLocalLocation();
+		data.put("sceneX", local.getSceneX());
+		data.put("sceneY", local.getSceneY());
+		return data;
+	}
+
+	private Integer parseIntParam(String s)
+	{
+		if (s == null || s.isEmpty())
+		{
+			return null;
+		}
+		try
+		{
+			return Integer.parseInt(s);
+		}
+		catch (NumberFormatException e)
+		{
+			return null;
+		}
 	}
 
 	// Recursion guard for walkWorldViewRecursively -- WorldEntity/WorldView nesting is expected to

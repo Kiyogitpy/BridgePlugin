@@ -95,6 +95,42 @@ public class TileProvider extends BridgeProvider
 				data.put("reachable", walkable && local != null
 					&& GeometryUtil.distanceToPlayer(client, wp) <= 20);
 
+				// ADDED 2026-08-08 (user investigation): a ground effect that isn't any TileObject
+				// (GameObject/WallObject/GroundObject/DecorativeObject -- see ObjectProvider),
+				// GroundItem, NPC, GraphicsObject, or Projectile has to be something else -- the
+				// remaining possibility is the tile's own paint/model recolor (SceneTilePaint for a
+				// flat tile, SceneTileModel for a sloped/shaped one), which isn't an entity at all
+				// and so wouldn't show up under any of those categories. Exposed here, not on
+				// ObjectProvider, since this is a property of the Tile itself, not a TileObject on
+				// it. Only the flat-paint case's 4 corner colors + texture are surfaced (the common
+				// case for a plain ground tile); a shaped/sloped tile's SceneTileModel data isn't
+				// pulled in yet since nothing has needed it -- add getModelOverlay()/
+				// getTriangleColorA/B/C() etc. here the same way if a future comparison needs it.
+				SceneTilePaint paint = tile.getSceneTilePaint();
+				if (paint != null)
+				{
+					data.put("paintTexture", paint.getTexture());
+					data.put("paintSwColor", paint.getSwColor());
+					data.put("paintSeColor", paint.getSeColor());
+					data.put("paintNwColor", paint.getNwColor());
+					data.put("paintNeColor", paint.getNeColor());
+				}
+
+				// CONFIRMED live 2026-08-08 (user session): the golem-crafting "completed side"
+				// tile has no SceneTilePaint at all (a normal flat ground tile does) -- meaning it's
+				// a SceneTileModel instead, a genuinely different (sloped/shaped) tile mesh, not
+				// just a recolor. modelOverlay/modelUnderlay identify which ground textures the
+				// shape blends between; shape itself is the actual geometry variant id -- both are
+				// enough to tell a completed side's tile apart from a plain flat one without needing
+				// the full vertex/triangle arrays.
+				SceneTileModel model = tile.getSceneTileModel();
+				if (model != null)
+				{
+					data.put("modelShape", model.getShape());
+					data.put("modelOverlay", model.getModelOverlay());
+					data.put("modelUnderlay", model.getModelUnderlay());
+				}
+
 				list.add(data);
 			}
 		}
