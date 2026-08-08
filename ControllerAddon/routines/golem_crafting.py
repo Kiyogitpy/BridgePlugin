@@ -794,16 +794,21 @@ def on_event(ctx, event_type, payload) -> None:
 GOLEM_ACTION_TIMEOUT_S = 15.0
 
 
-def walk_to_golem_side(ctx, x: int, y: int, plane: int) -> bool:
-    """Walk to the exact world tile (x, y) -- one of the golem's 4 adjacent sides -- and wait
-    until standing exactly on it. Deliberately NOT travel.py's walk_to/_hop_to: those consider
-    landing within WALK_ARRIVAL_TOLERANCE (3 tiles) of the target "arrived", which is useless
-    here -- the golem's 4 adjacent sides are only 1-2 tiles apart from each other, so a
-    3-tile-tolerant arrival could leave the player on the WRONG side while still reporting
-    success. Returns False only if the tile can't be projected onto the screen at all (out of
-    render range -- shouldn't happen for a tile adjacent to an already-visible golem); a
-    timed-out wait still returns True, since the caller re-checks the golem/player position
-    fresh afterward either way."""
+def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
+    """Walk to the exact world tile (x, y) and wait until standing exactly on it. Deliberately
+    NOT travel.py's walk_to/_hop_to: those consider landing within WALK_ARRIVAL_TOLERANCE
+    (3 tiles) of the target "arrived", which is useless for either of this function's two
+    callers -- craft_phase's golem sides are only 1-2 tiles apart from each other (a 3-tile-
+    tolerant arrival could leave the player on the WRONG side while still reporting success),
+    and hunt_phase's fixed north-of-the-pit standing tile needs to be exact for its own
+    north-side-exclusion geometry (is_valid_grab_target) to mean anything. Returns False only
+    if the tile can't be projected onto the screen at all (out of render range -- shouldn't
+    happen for a tile adjacent to an already-visible golem/pit); a timed-out wait still returns
+    True, since callers re-check position fresh afterward either way.
+
+    RENAMED 2026-08-08 from walk_to_golem_side -- originally craft_phase-specific, generalized
+    (no logic change) once hunt_phase needed the exact same exact-arrival behavior for its own
+    fixed standing tile rather than duplicating this polling loop."""
     point = controller.get_ground_walk_point(x, y, plane)
     if not point.get("onScreen"):
         return False
@@ -1027,7 +1032,7 @@ def craft_phase(ctx, config: dict) -> None:
             # the 4 tiles that happens to be. CONFIRMED live across all 3 golems this session:
             # the chat response to this very first click was always GOLEM_CHAT_SIDE_ALREADY_DONE
             # ("you've already crafted this side"), never GOLEM_CHAT_SIDE_DONE -- meaning the
-            # walk_to_golem_side call below (to GOLEM_ADJACENT_OFFSETS[0] specifically, since
+            # walk_to_exact_tile call below (to GOLEM_ADJACENT_OFFSETS[0] specifically, since
             # sides_done is still empty here) was carving a side that was going to be free no
             # matter where it was clicked from. Skipping the walk entirely and clicking
             # Start-golem from wherever the routine already is saves a full walk+confirm round
@@ -1038,7 +1043,7 @@ def craft_phase(ctx, config: dict) -> None:
             if not controller.click_menu_action(ctx.ser, golem, "golem"):
                 # CORRECTED 2026-08-08 (live session, user report: "stuck now, probably a
                 # misclick we don't correct for"): CONFIRMED live this looped forever -- unlike
-                # shaping/inserting (which always walk_to_golem_side first, landing adjacent and
+                # shaping/inserting (which always walk_to_exact_tile first, landing adjacent and
                 # on-screen), this fast-path deliberately clicks from wherever the routine
                 # already is (see the comment above) with no positioning step at all, so a golem
                 # that resets off-screen after the routine arrives from somewhere else (e.g.
@@ -1102,7 +1107,7 @@ def craft_phase(ctx, config: dict) -> None:
             # further attempt also nudge the camera.
             if attempts >= GOLEM_EXTRA_SIDE_MISSES_BEFORE_ROTATE:
                 controller.nudge_camera_yaw(ctx.ser, "LEFT" if attempts % 2 else "RIGHT")
-        if not walk_to_golem_side(ctx, golem["x"] + offset[0], golem["y"] + offset[1], golem.get("plane", 0)):
+        if not walk_to_exact_tile(ctx, golem["x"] + offset[0], golem["y"] + offset[1], golem.get("plane", 0)):
             debug_log.log("golem crafting", f"couldn't walk to golem side offset {offset} -- retrying next tick")
             return
 
@@ -1159,7 +1164,7 @@ def craft_phase(ctx, config: dict) -> None:
         ctx.state.data["gc_phase"] = "bank"
         return
 
-    if not walk_to_golem_side(ctx, golem["x"] + offset[0], golem["y"] + offset[1], golem.get("plane", 0)):
+    if not walk_to_exact_tile(ctx, golem["x"] + offset[0], golem["y"] + offset[1], golem.get("plane", 0)):
         debug_log.log("golem crafting", f"couldn't walk to insert-core side offset {offset} -- retrying next tick")
         return
 
