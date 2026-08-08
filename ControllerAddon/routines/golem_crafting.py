@@ -1461,8 +1461,12 @@ def _ensure_wooden_spikes(ctx, config: dict) -> bool:
     ctx.state.data["gc_spikes_misses"] = 0
     ctx.state.data["gc_spikes_walks"] = 0
 
-    debug_log.log("golem crafting", "taking wooden spikes from the Spikes supply")
-    controller.click_entity(ctx.ser, supply)
+    # CORRECTED 2026-08-09 (user request): "Take-5" instead of a plain click -- a plain click's
+    # default action only ever gave 1 spike at a time (CONFIRMED live: hunt_phase's own relining
+    # consumes 1 per cycle, so a 1-at-a-time take meant a Spikes supply round trip every single
+    # cycle). Taking 5 at once covers 5 relining cycles per visit instead of 1.
+    debug_log.log("golem crafting", "taking 5 wooden spikes from the Spikes supply")
+    controller.click_menu_action(ctx.ser, supply, "take-5")
     time.sleep(random.uniform(0.4, 0.7))
     return find_item(WOODEN_SPIKES_NAME) is not None
 
@@ -1541,17 +1545,29 @@ def hunt_phase(ctx, config: dict) -> None:
             debug_log.log("golem crafting", "couldn't walk to the hunt standing tile -- retrying next tick")
             return
         ctx.state.data["gc_hunt_standing"] = True
+        # CORRECTED 2026-08-09 (user report: "didn't press the pit to line it"): `pit` was
+        # captured BEFORE the walk above, so its screenX/screenY were stale by the time the
+        # lining click below used them -- walk_to_exact_tile's own polling loop takes real time
+        # and can pan the camera, so a click against the pre-walk position landed nowhere near
+        # the pit's actual on-screen spot post-walk. Re-fetching fresh here, same "always
+        # re-check before a critical click" pattern craft_phase already uses after its own
+        # walk_to_exact_tile calls.
+        pit = find_object(GOAT_PIT_NAME)
+        if pit is None:
+            debug_log.log("golem crafting", "pit no longer found after walking to the standing tile -- retrying next tick")
+            return
 
     if not ctx.state.data.get("gc_pit_lined"):
-        spikes = find_item(WOODEN_SPIKES_NAME)
-        debug_log.log("golem crafting", "lining the Goat Pit with wooden spikes")
-        spikes_clicked = controller.click_entity(ctx.ser, spikes, check_ui_blockers=False)
-        time.sleep(random.uniform(0.15, 0.3))
-        pit_clicked = controller.click_entity(ctx.ser, pit)
-        time.sleep(random.uniform(0.6, 1.0))
-        if not (spikes_clicked and pit_clicked):
+        # CORRECTED 2026-08-09 (user correction): lining doesn't need "use spikes on pit" --
+        # merely carrying wooden spikes (already guaranteed by _ensure_wooden_spikes above) is
+        # enough; a plain click on the Goat Pit itself does the lining. The previous click-
+        # spikes-then-click-pit sequence was never actually needed and, combined with the stale
+        # `pit` reference above, was why the pit click wasn't visibly landing.
+        debug_log.log("golem crafting", "lining the Goat Pit")
+        if not controller.click_entity(ctx.ser, pit):
             debug_log.log("golem crafting", "lining click missed/blocked -- retrying next tick")
             return
+        time.sleep(random.uniform(0.6, 1.0))
         ctx.state.data["gc_pit_lined"] = True
         ctx.state.data["gc_pit_filled"] = False
 
