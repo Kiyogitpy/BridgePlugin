@@ -1,26 +1,54 @@
-# routines/golem_crafting.py
+﻿# routines/golem_crafting.py
 #
-# Golem Crafting routine: mine sunstone -> chisel it into cores -> carve an empty plinth and
-# insert a core + hunter fur to finish a golem (Crafting XP + an uncut gem) -> bank, with an
-# automatic fallback to hunting goats at the Goat Pit when the bank has no usable fur left.
+# Golem Crafting routine, overall loop (CORRECTED 2026-08-08, live session, user-specified):
+#   bank (stock fur, pouched) -> mine a batch of sunstone -> chisel PART of it into cores ->
+#   craft up to one golem per core (auto-consumes fur too) -> bank again only once the tracked
+#   fur stock actually runs low, otherwise straight back to mining -- with a detour to the Goat
+#   Pit if the bank itself has no usable fur left at all.
+#
+# Fur is withdrawn in FULL and kept compacted in the fur pouch for the mine/chisel legs (so it
+# never competes with raw sunstone for inventory slots -- CONFIRMED live this was a real
+# problem: carrying 14+ loose fur while mining left too few slots to reach a full batch),
+# unpacked only once per crafting batch, right before the first golem needs it, and re-packed
+# before heading back out. See _run_bank_trip's docstring for the full reasoning, and
+# craft_phase's for exactly where the pack/unpack points are.
 #
 # Full design and research notes: docs/superpowers/specs/2026-08-07-golem-crafting-design.md.
-# Golem Crafting is a member-only Crafting method on Wyrmscraig, released 2026-07-29 -- 9 days
-# before that design doc. The bundled OSRS Wiki mirror (osrs-wiki-data-master/) still tags
-# Wyrmscraig.txt and Fallen From Grace.txt {{Future Content}} with no mechanical detail, so
-# EVERY object name, menu-option string, and click sequence below comes from a live wiki fetch,
-# not the local mirror, and has NOT been cross-checked against the running game the way this
-# codebase's other routines verify object/menu names before relying on them. Each such
-# assumption below carries its own "ASSUMPTION, NOT YET VERIFIED LIVE" comment, same convention
-# as blast_furnace.py's -- correct these during the staged live verification this design's
-# Testing section lays out before trusting this routine unattended.
+# Golem Crafting is a member-only Crafting method on Wyrmscraig, released 2026-07-29.
+#
+# CORRECTED 2026-08-08 (MCP live debug session, full end-to-end verification): the plinth/carve
+# mechanic this file originally implemented was reverse-engineered from a live wiki fetch and
+# turned out to be substantially wrong in several ways once actually tested in-game:
+#   - The right-click option is "Start-golem" (first side) / "Shape-golem" (remaining sides),
+#     never "Carve" -- and the object's own name changes as it progresses: "Empty plinth" ->
+#     "Unfinished golem" (after the first side) -> "Unpowered golem" (after all 4 sides) -> back
+#     to "Empty plinth" once a golem is completed and ready for the next one.
+#   - Each of the 4 sides must be carved from a DIFFERENT adjacent tile around the object --
+#     repeating the same tile/screen position (this file's original 4x-identical-click loop)
+#     gets "You've already crafted this side of the golem." with no progress and no error
+#     signal available synchronously (the confirmation chat message can arrive many ticks after
+#     the click, since it's server-side action-queue-delayed -- see on_event below).
+#   - Material cost is front-loaded, not per-side and not core/fur-based: the FIRST side
+#     ("Start-golem") consumes exactly 1 raw Sunstone (not a core!) if available, or fails with
+#     "You don't have enough sunstone to assemble a golem." otherwise; the remaining 3 sides
+#     ("Shape-golem") consume nothing further (confirmed once, n=1 -- if a future live run ever
+#     sees a second side also consume sunstone, that assumption needs revisiting).
+#   - The finishing move is "Insert-core" (not two separate core-then-fur clicks) -- CONFIRMED
+#     live it auto-consumes both 1 Sunstone core AND the best available fur in inventory in one
+#     click, dropping an uncut gem gift on the ground and awarding Crafting XP. It also only
+#     works from a specific side ("You can't insert a sunstone core from this side of the
+#     golem." from the wrong one) -- confirmed working from the same tile "Start-golem" was
+#     used from; not confirmed whether that's coincidental or the actual rule, so craft_phase
+#     below retries every untried side for Insert-core rather than assuming it's always the
+#     start tile.
+# See GOLEM_ADJACENT_OFFSETS/GOLEM_STATE_NAMES/on_event below for how this is now modeled.
 #
 # Requirements assumed already met (out of scope for this routine, see the design's Scope):
 # Crafting 60, "Fallen From Grace" quest complete, already own a fur pouch (any size).
 #
 # Deliberately NOT implemented: the XP-drop tick-timing speed-up trick for plinth carving
-# (always uses the safe, un-optimized ~15-ticks-per-side cadence); acquiring a fur pouch;
-# sourcing fur from anywhere but the bank or the Goat Pit.
+# (always uses the safe, un-optimized cadence); acquiring a fur pouch; sourcing fur from
+# anywhere but the bank or the Goat Pit.
 #
 # Run with:
 #     python controller.py routines/golem_crafting.py
@@ -63,22 +91,80 @@ MAX_CONSECUTIVE_MISSES = 5
 
 CRAFTING_LEVEL_REQUIRED = 60
 
-# ASSUMPTION, NOT YET VERIFIED LIVE -- exact object names for the 22 rock spots + 1 monolith
-# (design section "Key facts", "Core loop").
-ROCK_NAMES = ("sunstone rocks", "sunstone monolith")
+# CORRECTED 2026-08-08 (live session, user request): mine_phase used to target the ~22
+# "Sunstone rocks" spots scattered around the monolith, deliberately switching between whichever
+# ones were nearest each swing (a "momentum" mechanic). CONFIRMED live this constantly sent the
+# character running between rocks several tiles apart, re-targeting yet another rock before the
+# current walk/swing had even resolved (get_combat's isIdle races) -- "running to a node it just
+# clicked another node". This was first fixed by dropping to the monolith alone (id 62216, single
+# fixed-position instance -- see the "mining" anchor comment above), which sidesteps the bug
+# entirely rather than patching the race, at the cost of being the only mineable spot.
+#
+# CORRECTED 2026-08-08 (live session, user report): the monolith alone mines noticeably slower --
+# CONFIRMED live-observed -- so this switched to "Sunstone rocks" instead (see
+# find_mining_target below), WITHOUT reviving the momentum-switching that caused the original
+# bug: mine_phase always targets whichever single rock is closest and just keeps re-clicking it,
+# the same one-target-at-a-time idiom mining.py itself uses. It only ever moves on to a different
+# rock once the current one is no longer the closest match returned (i.e. genuinely depleted or
+# out of range), never proactively mid-approach -- the switching itself was the bug, not the
+# existence of multiple rock spots.
+MINING_TARGET_NAMES = ("sunstone rocks",)
 
-# ASSUMPTION, NOT YET VERIFIED LIVE -- exact inventory item names for the raw ore, the finished
-# core, and the tool used to turn one into the other.
+# CONFIRMED LIVE 2026-08-08 (MCP debug session): exact inventory item names for the raw ore, the
+# chiselled core, and the tool used to turn one into the other.
 RAW_SUNSTONE_NAME = "Sunstone"
 SUNSTONE_CORE_NAME = "Sunstone core"
 CHISEL_NAME = "Chisel"
 
-# ASSUMPTION, NOT YET VERIFIED LIVE -- exact object name for the crafting station. Assumed to
-# stay findable by this same substring both before and after carving starts (see craft_phase's
-# docstring in a later task for how this assumption is used).
-PLINTH_NAME = "plinth"
+# CONFIRMED LIVE 2026-08-08 (MCP debug session): the crafting station's own displayed name
+# changes as a golem progresses -- "Empty plinth" (nothing started) -> "Unfinished golem" (1-3
+# sides carved) -> "Unpowered golem" (all 4 sides carved, needs Insert-core) -> back to "Empty
+# plinth" once a golem is completed. find_golem_object() below matches any of these, replacing
+# the original single-substring PLINTH_NAME (which stopped matching the moment carving started,
+# since none of the later names contain "plinth" at all).
+GOLEM_STATE_NAMES = ("Empty plinth", "Unfinished golem", "Unpowered golem")
 
-# ASSUMPTION, NOT YET VERIFIED LIVE -- exact item/object names for the Goat Pit hunting loop.
+# CONFIRMED LIVE 2026-08-08 (MCP debug session): the 4 world-tile offsets (dx, dy) around the
+# plinth/golem that were actually walked to and successfully carved from, one side each, in this
+# order. OSRS world y increases northward. There is no confirmed requirement that sides must be
+# carved in this specific order or that these are the ONLY 4 valid tiles -- just that 4 distinct
+# adjacent tiles are needed and repeating one gets rejected (see craft_phase). If a future live
+# run finds one of these tiles blocked/unreachable at a different plinth instance, this may need
+# to become a live-computed "any of the object's walkable adjacent tiles" list instead of a fixed
+# offset table.
+GOLEM_ADJACENT_OFFSETS = ((0, 1), (1, 0), (0, -1), (-1, 0))  # N, E, S, W
+
+# CONFIRMED live 2026-08-08 (user report): which of the 4 sides Insert-core actually accepts is
+# fixed per plinth instance (each is independently oriented), not a single universal answer --
+# the northern plinth (id 62351, see the "plinth" location anchor's own comment) takes it from
+# its south side; the southern one (id 62352) takes it from its north side. Keyed by id (not
+# position -- see find_golem_object's own docstring for why id is the stable identity here)
+# so craft_phase's insert step can go straight to the right side instead of the original blind
+# GOLEM_CHAT_WRONG_INSERT_SIDE trial-and-error across all 4. Any plinth id not in this table
+# still falls back to that trial-and-error (see the insert-offset lookup below).
+GOLEM_INSERT_OFFSET_BY_ID = {
+    62351: (0, -1),  # northern plinth -> insert from the south
+    62352: (0, 1),   # southern plinth -> insert from the north
+}
+
+# ADDED 2026-08-08 (live session, user report: "stuck in a loop"): a hard cap on how many extra
+# Shape-golem attempts craft_phase will make beyond the normal 4 once every tracked offset is
+# already marked done but the golem's own name still isn't "Unpowered golem" (see that fallback's
+# own comment). Without this a genuinely stuck/corrupted plinth state (CONFIRMED live possible --
+# this exact plinth had been interrupted mid-progress by many earlier test runs today) retried
+# forever with no safety-stop.
+GOLEM_EXTRA_SIDE_ATTEMPTS_CAP = 8
+
+# CONFIRMED LIVE 2026-08-08 (MCP debug session): a "Spikes supply" GameObject stands right next
+# to Geoff at the Goat Pit -- a plain click resolves to "Take" (confirmed via /menu:
+# Take/Take-5/Take-10/Take-X, with "Take" as the default/top entry), handing over one wooden
+# spike per click. This replaces the original design's bank-withdrawal path for spikes (see
+# _ensure_wooden_spikes below) -- there's no reason to walk all the way back to the bank for
+# something sitting right at the pit.
+SPIKES_SUPPLY_NAME = "Spikes supply"
+
+# ASSUMPTION, NOT YET VERIFIED LIVE -- exact item/object names for the Goat Pit hunting loop
+# (the inventory item name spikes actually show up as, the pit object itself, and goat NPCs).
 WOODEN_SPIKES_NAME = "Wooden spikes"
 GOAT_PIT_NAME = "Goat pit"
 GOAT_NAME = "goat"
@@ -97,17 +183,29 @@ DEFAULT_CONFIG = {
     "bank": {"teleportFallback": False},
 
     # World-tile anchors ({"x", "y", "plane"}, same shape as travel.save_location()'s output)
-    # near each area, or None if unset -- see handle_missing_target below. ADDED 2026-08-08
-    # (final whole-branch review): the design doc itself says exact walking distances between
-    # Wyrmscraig's mining/crafting/hunting areas and its bank are unconfirmed, so this routine
-    # can't hardcode real coordinates yet. Left None by default (no navigation attempted, same
-    # behavior as before this was added, modulo the miss-tolerance fix) until Task 10's live
-    # verification fills these in -- at that point, setting any of these requires no further
-    # code changes, just a config edit.
+    # near each area -- this is what lets handle_missing_target (see below) walk the player back
+    # to an area on its own whenever the relevant object isn't found nearby, e.g. after banking,
+    # instead of just retrying a few times and safety-stopping. CONFIRMED LIVE 2026-08-08 (MCP
+    # debug session) -- real Wyrmscraig coordinates, not guesses:
+    #   mining: the sunstone monolith (id 62216) -- a single fixed-position instance, unlike the
+    #     many "Sunstone rocks" spots, so it's a stable anchor regardless of which rocks happen
+    #     to be depleted/others-in-use when the routine arrives.
+    #   plinth: one of Wyrmscraig's two Empty plinths (id 62352); the other (id 62351, ~4 tiles
+    #     away at 2596,2257) works just as well -- picked arbitrarily.
+    #   goatPit / spikesSupply: the Goat Pit itself and the Spikes supply object beside Geoff,
+    #     ~60 tiles south of the mining/plinth cluster -- travel.walk_to covers this in multiple
+    #     hops (WALK_HOP_MIN/MAX_TILES), same as any other multi-hop route in this codebase.
+    #   bank: the Bank chest (id 62390) near the mining/plinth cluster -- ADDED because the
+    #     Goat Pit sits ~65 tiles from it, well outside banker.find_nearby_bank's default
+    #     40-tile radius, so a hunt trip needed an anchor to actually get back to it. Safe to
+    #     hardcode: Wyrmscraig has exactly one bank (per the design doc's own "Key facts" --
+    #     unlike Ferox/most other banking spots, there's no ambiguity about which one this is).
     "locations": {
-        "mining": None,
-        "plinth": None,
-        "goatPit": None,
+        "mining": {"x": 2599, "y": 2248, "plane": 0},
+        "plinth": {"x": 2595, "y": 2253, "plane": 0},
+        "goatPit": {"x": 2572, "y": 2195, "plane": 0},
+        "spikesSupply": {"x": 2578, "y": 2202, "plane": 0},
+        "bank": {"x": 2587, "y": 2260, "plane": 0},
     },
 
     "breaks": {
@@ -173,10 +271,22 @@ def find_item(name: str):
 def find_object(name: str):
     """Closest visible object whose name contains `name`, within MAX_OBJECT_DISTANCE -- same
     filter shape as blast_furnace.py's find_object/mining.py's pick_rock/banker.py's
-    find_nearby_bank, kept local per this codebase's established convention."""
+    find_nearby_bank, kept local per this codebase's established convention.
+
+    CORRECTED 2026-08-08 (MCP live debug session): passes radius=MAX_OBJECT_DISTANCE to
+    controller.get_objects() -- CONFIRMED live this file's object lookups were doing a full,
+    unbounded scene walk (ObjectProvider.java's own module comment already documents this as a
+    measurable source of client stutter, which is exactly why the radius param exists) on every
+    single call, several times a tick, and the resulting slowness was enough to blow api_get's
+    default 0.3s timeout on /objects every tick -- every phase using find_object/find_golem_
+    object/find_rocks was silently retrying past this on every call, never actually finding
+    anything, "wrong location?" safety-stops firing even while standing right next to the target.
+    Every caller here already filters by this same distance bound afterward, so passing it
+    through changes nothing about the result, only how much of the scene has to be walked to
+    produce it."""
     name_lower = name.lower()
     candidates = [
-        o for o in controller.get_objects()
+        o for o in controller.get_objects(radius=MAX_OBJECT_DISTANCE)
         if name_lower in (o.get("name") or "").lower()
         and o.get("visible", True)
         and 0 <= o.get("distance", 9999) <= MAX_OBJECT_DISTANCE
@@ -188,12 +298,103 @@ def find_object(name: str):
     return candidates[0]
 
 
+def find_golem_object(committed_id=None):
+    """A single visible plinth/golem object in any of GOLEM_STATE_NAMES, within
+    MAX_OBJECT_DISTANCE -- see that constant's docstring for why an exact-name-set match
+    replaced the original single-substring find_object(PLINTH_NAME) call.
+
+    Sticky, same idea as find_mining_target's own committed_pos, but keyed on the object's `id`
+    rather than its (x, y) -- CONFIRMED live 2026-08-08 (live session, user report) an (x, y)-
+    keyed version of this still lost track of an in-progress golem: Wyrmscraig has two plinths
+    ~4 tiles apart, and the SAME physical plinth's own reported (x, y) can shift by a tile
+    between its "Empty plinth"/"Unfinished golem"/"Unpowered golem" states (multi-tile object
+    anchor quirk), so a position-keyed match failed to re-find it the very next tick after its
+    first "Start-golem" click, read that as "a different plinth now", and started fresh progress
+    on the OTHER plinth instead -- discarding the first one's pending confirmation entirely. `id`
+    (CONFIRMED live stable across all 3 of a plinth's states, unlike (x, y)) doesn't have that
+    problem. If given and still among the visible candidates, that id's object is returned
+    regardless of whether something else is now nearer -- see this function's docstring history
+    for why "closer to the other plinth this tick" must never be a reason to switch mid-golem."""
+    candidates = [
+        o for o in controller.get_objects(radius=MAX_OBJECT_DISTANCE)
+        if (o.get("name") or "") in GOLEM_STATE_NAMES
+        and o.get("visible", True)
+        and 0 <= o.get("distance", 9999) <= MAX_OBJECT_DISTANCE
+    ]
+    if not candidates:
+        return None
+
+    if committed_id is not None:
+        current = next((o for o in candidates if o.get("id") == committed_id), None)
+        if current is not None:
+            return current
+
+    candidates.sort(key=lambda o: o.get("distance", 9999))
+    return candidates[0]
+
+
+def find_mining_target(committed_pos=None):
+    """A single object in MINING_TARGET_NAMES ("Sunstone rocks") to click -- sticky, not just
+    "whichever is closest right now": if `committed_pos` (an (x, y) world tile) is given and
+    still among the visible candidates, THAT one is returned regardless of whether something
+    else is now nearer, only falling back to the closest candidate otherwise. Returns None if
+    nothing is in range at all.
+
+    CORRECTED 2026-08-08 (live session, user report, second pass): the first version of this
+    always returned the plain closest match, re-derived fresh on every call -- CONFIRMED live
+    this reintroduced the exact "running to a node it just clicked another node" bug the
+    monolith-only detour existed to sidestep in the first place: while still walking toward a
+    rock several tiles away, the player's own movement changes which OTHER rock is nearest from
+    tick to tick, and since nothing tracked which one was already committed to, mine_phase would
+    happily redirect toward whichever became closest, abandoning the walk in progress every time.
+    Sticking to `committed_pos` until it's actually gone (mined out, or no longer in range) means
+    a walk in progress is never abandoned just because something else happened to become
+    nearer -- mine_phase only moves on once the rock it was already going for is confirmed gone."""
+    candidates = [
+        o for o in controller.get_objects(radius=MAX_OBJECT_DISTANCE)
+        if (o.get("name") or "").lower() in MINING_TARGET_NAMES
+        and o.get("visible", True)
+        and 0 <= o.get("distance", 9999) <= MAX_OBJECT_DISTANCE
+    ]
+    if not candidates:
+        return None
+
+    if committed_pos is not None:
+        current = next((o for o in candidates if (o.get("x"), o.get("y")) == committed_pos), None)
+        if current is not None:
+            return current
+
+    candidates.sort(key=lambda o: o.get("distance", 9999))
+    return candidates[0]
+
+
 # A location anchor is a best-effort hint, not a guarantee the target is actually there once
-# arrived (e.g. one of ROCK_NAMES/PLINTH_NAME/GOAT_PIT_NAME turning out to be a wrong guess, or
-# the anchor coordinates themselves being off) -- give up after this many walk attempts rather
-# than walking-and-retrying forever. ADDED 2026-08-08 (final whole-branch review, second pass):
-# the first version of handle_missing_target below had no cap on this path at all.
-MAX_WALK_ATTEMPTS = 3
+# arrived (e.g. one of MINING_TARGET_NAMES/GOLEM_STATE_NAMES/GOAT_PIT_NAME turning out to be a wrong
+# guess, or the anchor coordinates themselves being off) -- give up after this many walk attempts
+# rather than walking-and-retrying forever. ADDED 2026-08-08 (final whole-branch review, second
+# pass): the first version of handle_missing_target below had no cap on this path at all.
+#
+# CORRECTED 2026-08-08 (live session): bumped from 3 -- CONFIRMED live walking to the bank
+# anchor from ~65 tiles away, travel.walk_to's own Shortest Path route occasionally declares
+# "arrived" (within WALK_ARRIVAL_TOLERANCE) a bit short of where find_nearby_bank can actually
+# detect the bank object, and a retried Shortest Path request right after can get rejected
+# ("Shortest Path unavailable") if the plugin still considers the previous one active -- either
+# way costs one wasted attempt with no real progress. 3 wasn't always enough headroom to still
+# land a couple of genuinely-progressing walks after an unlucky one; this is a blunt mitigation,
+# not a fix for travel.py's own walking algorithm (out of this routine's scope).
+MAX_WALK_ATTEMPTS = 6
+
+# ADDED 2026-08-08 (user request): a bank found by find_nearby_bank within its 40-tile radius
+# but too far off-screen to click directly (see open_bank's caller in bank_phase) gets a few
+# direct minimap-click hops straight at its own real position first, same trick travel.py's
+# own _hop_to uses for a route hop beyond render distance -- CONFIRMED that idiom already works
+# for cross-country travel, and it's a cheaper, more targeted fix here than immediately handing
+# off to handle_missing_target's full Shortest-Path walk toward the (possibly-approximate)
+# "bank" anchor tile: clicking the bank object's actual coordinates walks straight at the real
+# thing. Capped, same reasoning as MAX_WALK_ATTEMPTS above -- a bank that never gets closer after
+# a few hops (e.g. genuinely unreachable, or the click isn't landing) should fall through to the
+# anchor-walk fallback instead of hopping at the same spot forever.
+MAX_BANK_MINIMAP_HOPS = 3
 
 
 def handle_missing_target(ctx, config: dict, location_key: str, miss_counter_key: str, walk_counter_key: str) -> bool:
@@ -203,111 +404,246 @@ def handle_missing_target(ctx, config: dict, location_key: str, miss_counter_key
     message (this function never calls trigger_safety_stop directly).
 
     ADDED 2026-08-08 (final whole-branch review). Two layers, tried in order:
-      1. If a location anchor is configured for `location_key` (DEFAULT_CONFIG["locations"]),
-         walk toward it via travel.walk_to and retry, up to MAX_WALK_ATTEMPTS times -- resets
-         the miss counter each time so a target that's still missing after arriving gets its
-         own fresh run of misses, not one inherited from before the walk. Once MAX_WALK_ATTEMPTS
-         is exhausted, gives up (returns False) rather than walking forever -- CORRECTED
-         2026-08-08 (final whole-branch review, second pass): this path originally had no exit
-         at all, so a configured anchor whose target genuinely isn't there (e.g. a wrong object
-         name, or the anchor coordinates being off) walked-and-retried indefinitely with no
-         safety-stop.
-      2. Otherwise (no anchor configured, or walk attempts exhausted), tolerate up to
-         MAX_CONSECUTIVE_MISSES consecutive empty polls before giving up -- a single empty poll
-         can just mean a transient bridge timeout (see this module's MAX_CONSECUTIVE_MISSES
-         comment), not "genuinely not there".
+      1. Tolerate up to MAX_CONSECUTIVE_MISSES consecutive empty polls before doing anything else
+         -- a single empty poll can just mean a transient bridge timeout, or (CONFIRMED live
+         2026-08-08, live session, user-observed) a brief real gap in the scene right after an
+         object changes state (e.g. craft_phase's own Start-golem click: the "Empty plinth"
+         despawning and the new "Unfinished golem" spawning aren't guaranteed atomic from the
+         bridge's point of view, so a poll landing in between can briefly see neither). Either
+         way it's not "genuinely not there", and CORRECTED 2026-08-08 (live session, user report:
+         two live safety-stops in a row from exactly this) -- walking immediately on the very
+         first miss, as this used to for any location with a configured anchor, actively made it
+         worse here: the player was already standing right at the plinth, so travel.walk_to's own
+         hop/camera movement while "recovering" from a gap that would have closed on its own
+         within a poll or two instead kept the object out of view for the whole 6-attempt budget.
+      2. Once that tolerance is exhausted, if a location anchor is configured for `location_key`
+         (DEFAULT_CONFIG["locations"]), walk toward it via travel.walk_to and retry, up to
+         MAX_WALK_ATTEMPTS times -- resets the miss counter each time so a target that's still
+         missing after arriving gets its own fresh run of misses, not one inherited from before
+         the walk. Once MAX_WALK_ATTEMPTS is exhausted, gives up (returns False) rather than
+         walking forever -- CORRECTED 2026-08-08 (final whole-branch review, second pass): this
+         path originally had no exit at all, so a configured anchor whose target genuinely isn't
+         there (e.g. a wrong object name, or the anchor coordinates being off) walked-and-retried
+         indefinitely with no safety-stop. With no anchor configured at all, exhausting the poll
+         tolerance above is the end of the line -- straight to False.
 
     Callers are responsible for resetting both `ctx.state.data[miss_counter_key]` and
     `ctx.state.data[walk_counter_key]` to 0 once the target IS found again, so a later,
     unrelated miss doesn't inherit a stale near-threshold count from an earlier search."""
-    target = (config.get("locations") or {}).get(location_key)
-    if target is not None:
-        walks = ctx.state.data.get(walk_counter_key, 0) + 1
-        ctx.state.data[walk_counter_key] = walks
-        if walks <= MAX_WALK_ATTEMPTS:
-            debug_log.log("golem crafting", f"{location_key} not found nearby -- walking toward the configured location (attempt {walks}/{MAX_WALK_ATTEMPTS})")
-            travel.walk_to(ctx, target)
-            ctx.state.data[miss_counter_key] = 0
-            return True
-        debug_log.log("golem crafting", f"{location_key} still not found after {MAX_WALK_ATTEMPTS} walk attempts toward the configured location")
-        return False
-
     misses = ctx.state.data.get(miss_counter_key, 0) + 1
     ctx.state.data[miss_counter_key] = misses
     if misses < MAX_CONSECUTIVE_MISSES:
         debug_log.log("golem crafting", f"{location_key} not found (miss {misses}/{MAX_CONSECUTIVE_MISSES}) -- retrying")
         return True
 
+    target = (config.get("locations") or {}).get(location_key)
+    if target is None:
+        return False
+
+    walks = ctx.state.data.get(walk_counter_key, 0) + 1
+    ctx.state.data[walk_counter_key] = walks
+    if walks <= MAX_WALK_ATTEMPTS:
+        debug_log.log("golem crafting", f"{location_key} not found nearby -- walking toward the configured location (attempt {walks}/{MAX_WALK_ATTEMPTS})")
+        travel.walk_to(ctx, target)
+        ctx.state.data[miss_counter_key] = 0
+        return True
+    debug_log.log("golem crafting", f"{location_key} still not found after {MAX_WALK_ATTEMPTS} walk attempts toward the configured location")
     return False
 
 
-def find_rocks(objects: list) -> list:
-    """Every visible sunstone rock/monolith within MAX_OBJECT_DISTANCE, closest first --
-    plural (unlike find_object above) because mine_phase's momentum re-targeting (see below)
-    needs the whole candidate list, not just the nearest one."""
-    candidates = [
-        o for o in objects
-        if (o.get("name") or "").lower() in ROCK_NAMES
-        and o.get("visible", True)
-        and 0 <= o.get("distance", 9999) <= MAX_OBJECT_DISTANCE
-    ]
-    candidates.sort(key=lambda o: o.get("distance", 9999))
-    return candidates
+# How much raw+chiselled sunstone to hold per trip, and how many of those become cores --
+# CORRECTED 2026-08-08 (live session, user-specified batch shape): mine 20, chisel 4 of them into
+# cores, leaving 16 raw sunstone (enough for 4 golems' "Start-golem" cost with plenty of reserve).
+# This is a budget on raw_count + cores_have TOGETHER, not on raw sunstone alone -- see
+# mine_phase's docstring for why that distinction is what fixes the overmining bug.
+SUNSTONE_PER_TRIP = 20
+
+# How long mine_phase will wait for raw_count to rise after a click before giving up on it and
+# clicking again -- see mine_phase's own comment on its inventory-change gate for why a bound is
+# needed at all (a click that lands nowhere useful, e.g. click_entity's own simulated near-miss,
+# would otherwise wait for an inventory change that's never coming). Long enough to cover a
+# genuine walk-and-swing to a distant rock (MAX_OBJECT_DISTANCE tiles away) without mistaking
+# that for a stalled click.
+MINE_RECLICK_TIMEOUT_S = 8.0
+
+
+def _hop_toward_point(ctx, x: int, y: int, plane: int) -> bool:
+    """One single hop toward a world tile -- same viewport-then-minimap idiom as travel.py's own
+    _hop_to, but fire-and-forget (no wait for arrival). Shared by _step_toward_plinth (see below)
+    and mine_phase's own off-screen fallback (see mine_phase's docstring for why a found-but-
+    too-far-to-click monolith needs this same trick the bank fallback in bank_phase already
+    uses). Returns False (does nothing) if the tile isn't projectable onto either the viewport or
+    the minimap right now."""
+    point = controller.get_ground_walk_point(x, y, plane)
+    if not point.get("onScreen"):
+        point = controller.get_minimap_walk_point(x, y, plane)
+        if not point.get("onMinimap"):
+            return False
+
+    controller.click_entity(ctx.ser, point, offset=(0, 0))
+    return True
+
+
+def _step_toward_plinth(ctx, config: dict) -> None:
+    """One single hop toward the "plinth" location anchor -- fire-and-forget (no wait for
+    arrival): this only exists to interrupt an in-progress mining swing the instant mine_phase's
+    budget is hit (see that function's own docstring), not to actually get there -- craft_phase's
+    own find_golem_object lookup handles the rest of the approach once chisel_phase is done.
+    Does nothing if the plinth isn't a configured anchor."""
+    target = (config.get("locations") or {}).get("plinth")
+    if target is None:
+        return
+    _hop_toward_point(ctx, target["x"], target["y"], target.get("plane", 0))
 
 
 def mine_phase(ctx, config: dict) -> None:
-    """Momentum-click sunstone rocks/the monolith until the inventory is full, then hand off
-    to chisel_phase. One swing (or one re-target) per call, gated on isIdle -- same shape as
-    mining.py's tick(), not a single blocking loop, so the engine's between-tick safety/break/
-    PvP checks still run at their normal cadence throughout a long mining stretch.
+    """Click the sunstone monolith until raw_count + cores_have reaches SUNSTONE_PER_TRIP (or the
+    inventory fills up first, as a safety cap), then hand off to chisel_phase. One swing per call,
+    gated on raw_count actually rising since the last click (see below) -- same shape as
+    mining.py's own single-rock loop, not a single blocking loop, so the engine's between-tick
+    safety/break/PvP checks still run at their normal cadence throughout a long mining stretch.
 
-    Momentum mechanic (design section "Key facts", "Core loop"): switching rocks between
-    swings raises the success chance and gives a 20% chance of bonus sunstone, so this
-    deliberately targets a DIFFERENT rock each successful click instead of hammering the same
-    one like mining.py does -- tracked via ctx.state.data["gc_last_rock_pos"] (an (x, y) world
-    tile, not an object id: every "Sunstone rocks" instance shares the same object id, so id
-    alone can't distinguish which specific rock was clicked last)."""
-    if not controller.get_combat().get("isIdle", True):
-        return  # still swinging
+    CORRECTED 2026-08-08 (live session, user request): used to also target the ~22 "Sunstone
+    rocks" spots around the monolith, deliberately switching targets between swings (a "momentum"
+    mechanic per the design doc) -- CONFIRMED live this sent the character running between rocks
+    several tiles apart and re-targeted yet another one before the current walk/swing had even
+    resolved. The monolith alone is a single fixed-position object, so this now just re-clicks
+    it in place -- no target list, no switching, no walking, and the whole class of bug is gone
+    rather than patched.
 
-    if len(controller.get_inventory()) >= controller.INVENTORY_SIZE:
-        debug_log.log("golem crafting", "inventory full -- moving to chisel phase")
+    CORRECTED 2026-08-08 (live session, user report): the stopping check used to be raw_count
+    alone (>= SUNSTONE_PER_TRIP) -- CONFIRMED live this overmined whenever a previous trip ended
+    with cores still unspent (e.g. craft_phase bailing out early on "out of usable fur" before
+    using any of them): raw_count had dropped well below 20 but raw_count + cores_have (the real
+    sunstone budget -- chiselling converts one to the other 1-for-1, it never changes that sum)
+    was already at or near it, so mine_phase kept mining more on top, overflowing the inventory
+    and leaving no room to empty the fur pouch afterward. Checking the combined count instead
+    means a trip that resumes with leftover cores mines only enough raw to top the budget back
+    up, not a fresh 20 regardless of what's already there.
+
+    CORRECTED 2026-08-08 (live session, user report, second pass): the budget check used to sit
+    AFTER the isIdle gate below -- CONFIRMED live the sunstone monolith (unlike a depleting
+    "Sunstone rocks" spot) keeps the mining animation going for a long, uninterrupted stretch
+    with no natural idle gap in between, so isIdle stayed False for minutes on end and the budget
+    was never even checked until whatever eventually broke the streak -- 24 sunstone banked
+    before it noticed, 4 over target. Checking the budget FIRST, every single call regardless of
+    isIdle, means gc_phase flips to "chisel" on the very next tick() after crossing it.
+
+    CORRECTED 2026-08-08 (live session, user request): moving the check earlier still isn't
+    enough on its own -- the character is still mid-swing right up until something actually
+    interrupts it, and chisel_phase has no reason to be at the mining spot at all. So the moment
+    the budget is hit, this clicks a step toward the plinth (see _step_toward_plinth) instead of
+    just flipping gc_phase and hoping for the best: the movement itself breaks the mining
+    animation immediately, same as a player manually walking off would, and it's a step in a
+    direction the routine needs to cover anyway before craft_phase can do anything."""
+    raw_count = _count_named(RAW_SUNSTONE_NAME)
+    cores_have = _count_named(SUNSTONE_CORE_NAME)
+    if raw_count + cores_have >= SUNSTONE_PER_TRIP or len(controller.get_inventory()) >= controller.INVENTORY_SIZE:
+        debug_log.log("golem crafting", f"have {raw_count} sunstone + {cores_have} cores -- moving to chisel phase")
+        _step_toward_plinth(ctx, config)
         ctx.state.data["gc_phase"] = "chisel"
+        ctx.state.data["gc_mine_target_pos"] = None
+        ctx.state.data["gc_mine_last_raw_count"] = None
+        ctx.state.data["gc_mine_last_click_time"] = 0.0
         return
 
-    rocks = find_rocks(controller.get_objects())
-    if not rocks:
+    # CORRECTED 2026-08-08 (live session, user report: "still reclicks when already clicked a
+    # node" -- user's own fix, replacing an isIdle-based settle-poll tried first): isIdle isn't a
+    # reliable "is the last click still in flight" signal here -- it's raced this whole session
+    # (see this function's own CORRECTED-history above), and a settle-poll on it just moved the
+    # race around rather than closing it. Whether raw_count has actually gone up since the last
+    # click is ground truth instead: if it hasn't, the last swing hasn't resolved yet (still
+    # walking there, still mid-swing, or it whiffed and the game's own auto-repeat is about to
+    # try again on its own) -- either way, clicking again right now is redundant "click all over"
+    # noise, not progress. Once it rises, the previous click is spent and it's fine to evaluate
+    # a new one.
+    #
+    # CORRECTED 2026-08-08 (live session, user follow-up: "if misclick was true for last click
+    # reclick"): click_entity's own simulate_mistakes feature (a deliberate, randomized near-miss
+    # aimed beside the target -- see its own comment, this is intentional human-mimicry, not a
+    # bug) means a "click" here can execute cleanly yet land nowhere useful, and raw_count then
+    # never rises no matter how long this waits -- an unconditional wait-for-inventory-change
+    # gate would just trade "clicks too often" for "freezes forever" the first time that happens.
+    # MINE_RECLICK_TIMEOUT_S bounds the wait: long enough to cover a genuine walk-and-swing to a
+    # distant rock, short enough that a wasted click (misclick, missed swing, whatever) gets
+    # retried instead of stalling the whole trip.
+    last_raw = ctx.state.data.get("gc_mine_last_raw_count")
+    last_click_time = ctx.state.data.get("gc_mine_last_click_time", 0.0)
+    if last_raw is not None and raw_count <= last_raw and time.time() - last_click_time < MINE_RECLICK_TIMEOUT_S:
+        return
+
+    committed_pos = ctx.state.data.get("gc_mine_target_pos")
+    rock = find_mining_target(committed_pos)
+    if rock is None:
+        ctx.state.data["gc_mine_target_pos"] = None
         if handle_missing_target(ctx, config, "mining", "gc_mine_misses", "gc_mine_walks"):
             return
-        ctx.state.trigger_safety_stop("no sunstone rocks or monolith found nearby -- wrong location?")
+        ctx.state.trigger_safety_stop("no sunstone rocks found nearby -- wrong location?")
         return
     ctx.state.data["gc_mine_misses"] = 0
     ctx.state.data["gc_mine_walks"] = 0
+    ctx.state.data["gc_mine_target_pos"] = (rock.get("x"), rock.get("y"))
 
-    last_pos = ctx.state.data.get("gc_last_rock_pos")
-    target = next((r for r in rocks if (r.get("x"), r.get("y")) != last_pos), rocks[0])
-
-    debug_log.log("golem crafting", f"mining {target.get('name')} (dist={target.get('distance')})")
+    debug_log.log("golem crafting", f"mining {rock.get('name')} (dist={rock.get('distance')})")
     time.sleep(random.uniform(0.15, 0.5))
-    if controller.click_entity(ctx.ser, target):
-        ctx.state.data["gc_last_rock_pos"] = (target.get("x"), target.get("y"))
+    if not controller.click_entity(ctx.ser, rock):
+        # ADDED 2026-08-08 (live session): find_mining_target's MAX_OBJECT_DISTANCE radius can
+        # report a rock as "found" while it's still off the actual rendered viewport -- CONFIRMED
+        # live for this same problem with the monolith right after a fresh bank trip, before
+        # anything had moved the player closer. Same fix as bank_phase's own minimap-hop
+        # fallback for the exact same class of problem.
+        _hop_toward_point(ctx, rock["x"], rock["y"], rock.get("plane", 0))
+        return
+
+    ctx.state.data["gc_mine_last_raw_count"] = raw_count
+    ctx.state.data["gc_mine_last_click_time"] = time.time()
+
+
+# How many sunstone cores to chisel per mining trip (== golems per trip, one core each) --
+# CORRECTED 2026-08-08 (live session, user request): chisel_phase used to convert EVERY raw
+# sunstone into a core, which left nothing raw to ever start a NEW golem with ("Start-golem"
+# consumes 1 raw sunstone specifically, not a core -- see this module's header comment).
+# User-specified batch shape: mine SUNSTONE_PER_TRIP (20) sunstone, chisel 4 into cores (leaving
+# 16 raw), craft 4 golems (1 raw + 1 core each, 4 of the 16 raw used, 12 carried into the next
+# trip), then mine a fresh batch and repeat.
+CORES_PER_TRIP = 4
+
+# How long to wait, after a chisel click, for the specific conversion to actually be reflected
+# in the bridge's inventory snapshot -- ADDED 2026-08-08 (live session, user report): a flat
+# fixed sleep here ("let the action register server-side before the next isIdle poll") wasn't
+# reliably long enough on every attempt -- CONFIRMED live: chisel_phase occasionally re-issued
+# a chisel-then-item click pair against an item that had already converted to a core by the
+# time the click fired (the previous call's `find_item(RAW_SUNSTONE_NAME)` result had gone
+# stale between being fetched and the bridge's next per-tick-cached snapshot reflecting the
+# conversion), landing a pointless chisel-on-core click. Polling for the actual core count to
+# increase before returning closes this instead of hoping a fixed delay was long enough.
+CHISEL_CONFIRM_TIMEOUT_S = 3.0
+
+
+def _count_named(name: str) -> int:
+    name_lower = name.lower()
+    return sum(1 for i in controller.get_inventory() if (i.get("name") or "").lower() == name_lower)
 
 
 def chisel_phase(ctx, config: dict) -> None:
-    """For each raw sunstone in inventory, use the chisel on it to make a sunstone core --
-    item-then-item two-click idiom, same as firemaking.py's tinderbox+log. One chisel action
-    per call, gated on isIdle, so a low-Crafting-level failed attempt (if any -- design section
-    "Key facts" doesn't document a failure chance for this step, unlike Firemaking's, but the
-    isIdle gate costs nothing extra either way) just retries next call the same way
-    firemaking.py's light loop does. -> craft once no raw sunstone is left."""
+    """Chisel raw sunstone into cores, up to CORES_PER_TRIP total (not "until none are left" --
+    see that constant's docstring for why some must stay raw), item-then-item two-click idiom
+    same as firemaking.py's tinderbox+log. One chisel action per call, gated on isIdle -- craft
+    once CORES_PER_TRIP is reached or raw sunstone runs out first."""
     if not controller.get_combat().get("isIdle", True):
         return
 
     controller.open_inventory_tab(ctx.ser)
 
+    cores_have = _count_named(SUNSTONE_CORE_NAME)
+    if cores_have >= CORES_PER_TRIP:
+        debug_log.log("golem crafting", f"chiselled {cores_have} cores -- moving to craft phase")
+        ctx.state.data["gc_phase"] = "craft"
+        return
+
     raw = find_item(RAW_SUNSTONE_NAME)
     if raw is None:
-        debug_log.log("golem crafting", "no raw sunstone left -- moving to craft phase")
+        debug_log.log("golem crafting", f"no raw sunstone left ({cores_have}/{CORES_PER_TRIP} cores chiselled) -- moving to craft phase")
         ctx.state.data["gc_phase"] = "craft"
         return
 
@@ -316,158 +652,446 @@ def chisel_phase(ctx, config: dict) -> None:
         ctx.state.trigger_safety_stop("no chisel in inventory")
         return
 
-    debug_log.log("golem crafting", "chiselling sunstone into a core")
+    debug_log.log("golem crafting", f"chiselling sunstone into a core ({cores_have}/{CORES_PER_TRIP})")
     time.sleep(random.uniform(0.15, 0.35))
     controller.click_entity(ctx.ser, chisel, check_ui_blockers=False)
     time.sleep(random.uniform(0.1, 0.25))
     controller.click_entity(ctx.ser, raw, check_ui_blockers=False)
-    # Let the action register server-side before the next isIdle poll -- neither inventory
-    # click makes isMoving true, so without this the very next poll can still read isIdle ==
-    # True and fire a duplicate click pair (same reasoning as firemaking.py's own light loop).
-    time.sleep(random.uniform(0.6, 1.0))
+
+    deadline = time.time() + CHISEL_CONFIRM_TIMEOUT_S
+    while time.time() < deadline:
+        time.sleep(0.2)
+        if _count_named(SUNSTONE_CORE_NAME) > cores_have:
+            return
+    debug_log.log("golem crafting", "chisel click didn't register within timeout -- retrying next tick")
 
 
-def pick_best_fur_in_inventory() -> str:
-    """Highest-priority (per FUR_PRIORITY) fur type actually present in inventory right now,
-    or None. Exact-name match against each inventory item, same reasoning as find_item."""
-    inv_names = {(i.get("name") or "").lower() for i in controller.get_inventory()}
-    return next((f for f in FUR_PRIORITY if f.lower() in inv_names), None)
+# CHAT_MESSAGE substrings (lowercased) this routine reacts to -- see on_event below for why a
+# chat-driven signal is needed at all (the game confirms/rejects a golem action on its own
+# server-queued schedule, several ticks after the click, not synchronously). Every one of these
+# was CONFIRMED live 2026-08-08 (MCP debug session) as the exact text the game sent back.
+GOLEM_CHAT_SIDE_DONE = "you finish crafting the golem from this angle."
+GOLEM_CHAT_SIDE_ALREADY_DONE = "you've already crafted this side of the golem."
+GOLEM_CHAT_NOT_ENOUGH_SUNSTONE = "you don't have enough sunstone to assemble a golem."
+GOLEM_CHAT_WRONG_INSERT_SIDE = "you can't insert a sunstone core from this side of the golem."
+GOLEM_CHAT_COMPLETE = "you have crafted"  # "...N golem(s) on Wyrmscraig." -- prefix match
 
 
-# ASSUMPTION, NOT YET VERIFIED LIVE -- ~15 game ticks (0.6s each) per plinth side (design
-# section "Key facts": "~15 ticks/side, ~60 ticks total"). Randomized within a band around
-# that, same jitter style every other routine's animation-wait sleeps use.
-PLINTH_SIDE_WAIT_SECONDS = (8.5, 9.5)
+def on_event(ctx, event_type, payload) -> None:
+    """Captures the golem-crafting confirmation/rejection chat messages into
+    ctx.state.data["gc_last_chat"]/["gc_last_chat_seq"] as they arrive -- controller.py's main
+    loop drains UDP events and calls this before every tick() (see controller.py's main()), so
+    a message that arrives between two tick() calls is caught here and available to craft_phase
+    on its next call. gc_last_chat_seq is a monotonic counter, not just the text, so craft_phase
+    can tell "no new message since I started waiting" apart from "a new message arrived that
+    happens to repeat old text" -- comparing the text alone couldn't distinguish those. Ignores
+    every other chat message (this routine has no other use for chat) so unrelated game/spam
+    messages can't overwrite a still-unconsumed golem-crafting one."""
+    if event_type != "CHAT_MESSAGE" or not payload:
+        return
+    message = (payload.get("message") or "").lower()
+    if not any(known in message for known in (
+        GOLEM_CHAT_SIDE_DONE, GOLEM_CHAT_SIDE_ALREADY_DONE, GOLEM_CHAT_NOT_ENOUGH_SUNSTONE,
+        GOLEM_CHAT_WRONG_INSERT_SIDE, GOLEM_CHAT_COMPLETE,
+    )):
+        return
+    ctx.state.data["gc_last_chat"] = message
+    ctx.state.data["gc_last_chat_seq"] = ctx.state.data.get("gc_last_chat_seq", 0) + 1
+
+
+# How long craft_phase waits for a chat confirmation before giving up on one attempt and
+# retrying -- CONFIRMED live 2026-08-08: real confirmations arrived within a few seconds of
+# the click every time observed; generous margin for a slower tick under load.
+GOLEM_ACTION_TIMEOUT_S = 15.0
+
+
+def walk_to_golem_side(ctx, x: int, y: int, plane: int) -> bool:
+    """Walk to the exact world tile (x, y) -- one of the golem's 4 adjacent sides -- and wait
+    until standing exactly on it. Deliberately NOT travel.py's walk_to/_hop_to: those consider
+    landing within WALK_ARRIVAL_TOLERANCE (3 tiles) of the target "arrived", which is useless
+    here -- the golem's 4 adjacent sides are only 1-2 tiles apart from each other, so a
+    3-tile-tolerant arrival could leave the player on the WRONG side while still reporting
+    success. Returns False only if the tile can't be projected onto the screen at all (out of
+    render range -- shouldn't happen for a tile adjacent to an already-visible golem); a
+    timed-out wait still returns True, since the caller re-checks the golem/player position
+    fresh afterward either way."""
+    point = controller.get_ground_walk_point(x, y, plane)
+    if not point.get("onScreen"):
+        return False
+    controller.click_entity(ctx.ser, point, offset=(0, 0))
+    waited = 0.0
+    while waited < 8.0:
+        time.sleep(0.6)
+        waited += 0.6
+        player = controller.get_player()
+        if player.get("x") == x and player.get("y") == y:
+            return True
+    return True
 
 
 def craft_phase(ctx, config: dict) -> None:
-    """Craft one golem per call (carve all 4 sides of an empty plinth, then insert one
-    sunstone core + the best available fur) -- sized like blast_furnace.py's run_trip (one
-    bounded unit of work per call, not a single call looping over every golem this batch), so
-    the engine's between-tick safety/break/PvP checks still run between golems on a long
-    crafting stretch. tick() keeps re-entering this phase (see Task 8) until it sets gc_phase
-    to "bank" itself, once out of cores or fur -- that repetition IS the "repeat until out of
-    cores or fur" the design describes, just spread across multiple tick() calls rather than
-    one internal loop.
+    """Craft one golem per call to gc_phase="craft" overall (carve all 4 sides of a plinth from
+    4 distinct adjacent tiles, then insert-core) -- sized like blast_furnace.py's run_trip (one
+    bounded unit of work per call), so the engine's between-tick safety/break/PvP checks still
+    run on a long crafting stretch. tick() keeps re-entering this phase until it sets gc_phase
+    to "bank" itself once materials run out.
 
-    CORRECTED 2026-08-08 (final whole-branch review): this used to also empty the fur pouch
-    here, on first entry to this phase. That's what caused a deterministic deadlock: with a
-    pouch carried, the fur withdrawn at the bank stayed compact in the pouch (1 slot) while
-    mine_phase filled the OTHER 27 slots with sunstone before craft_phase ever ran, so by the
-    time this tried to empty the pouch there was no free inventory slot left for the fur to go
-    into -- pick_best_fur_in_inventory() would find nothing, every golem attempt would bail out
-    to "out of usable fur", and the bank trip after that would just refill the pouch the same
-    way, forever. The pouch is now emptied back into loose inventory slots right after the bank
-    trip closes (see bank_phase), before mine_phase ever runs, and the bank withdrawal is
-    capped low enough (see FUR_WITHDRAW_BUDGET) that mining always still has room left. This
-    phase no longer touches the pouch at all.
+    CORRECTED 2026-08-08 (MCP live debug session, full end-to-end verification): replaces this
+    function's original model, which was wrong in every particular once actually tested -- see
+    this module's header comment for the full list of what was wrong and what's confirmed
+    correct instead. In short: 4 distinct adjacent tiles (not 4 identical clicks), a chat-message-
+    driven confirmation loop (not a synchronous click-and-assume-success loop, since the game
+    confirms/rejects several ticks after the click -- see on_event), 1 raw Sunstone consumed
+    once up front (not cores/fur consumed per side), and a single Insert-core click that
+    auto-consumes both the core and the best fur together (not two separate insert clicks).
 
-    ASSUMPTION, NOT YET VERIFIED LIVE -- PLINTH_NAME ("plinth") is assumed to still substring-
-    match find_object's lookup both before carving starts and after the golem is finished
-    (i.e. the object's display name doesn't change to something without "plinth" in it, e.g.
-    switching to "Golem"/"Finished golem" entirely). If live testing shows otherwise, add the
-    post-carve name as a second candidate substring here. The plinth is re-looked-up (not
-    cached) before every click below rather than reused from one find_object call at the top of
-    this function -- CORRECTED 2026-08-08 (final whole-branch review): a cached reference was
-    still being clicked after a UI-blocked click triggers a camera rotation (see
-    controller.click_entity), so a "retry" against the stale cached screen position could land
-    on empty ground and still return True, incrementing the carve counter for a carve that
-    never actually happened -- the same class of bug the carve-loop fix (below) already closed
-    through a different door. Re-fetching fresh each time closes it for good.
+    This phase is a small state machine tracked in ctx.state.data, all keyed off
+    "gc_craft_golem_id" (the plinth/golem object's own `id` -- CONFIRMED live stable across its
+    whole Empty plinth -> Unfinished golem -> Unpowered golem progression, unlike its (x, y),
+    which can shift by a tile between those states -- see find_golem_object's own docstring for
+    why that distinction is what fixes a real live bug -- so this is how a fresh start is told
+    apart from a resumed one):
+      gc_craft_sides_done: list of (dx, dy) offsets already confirmed carved for this golem.
+      gc_craft_insert_tried: list of (dx, dy) offsets Insert-core has already been rejected
+        from (see GOLEM_CHAT_WRONG_INSERT_SIDE -- confirmed live it's side-dependent, but not
+        confirmed which specific side is always correct, so every untried side gets a turn).
+      gc_craft_awaiting: {"kind": "side"|"insert", "offset": (dx,dy), "since_seq", "started_at"}
+        while a click's chat confirmation hasn't arrived yet, else None.
     """
-    core = find_item(SUNSTONE_CORE_NAME)
-    if core is None:
-        debug_log.log("golem crafting", "out of sunstone cores -- moving to bank phase")
-        ctx.state.data["gc_phase"] = "bank"
-        return
-
-    fur_name = pick_best_fur_in_inventory()
-    if fur_name is None:
-        debug_log.log("golem crafting", "out of usable fur -- moving to bank phase")
-        ctx.state.data["gc_phase"] = "bank"
-        return
-
-    plinth = find_object(PLINTH_NAME)
-    if plinth is None:
+    golem = find_golem_object(ctx.state.data.get("gc_craft_golem_id"))
+    if golem is None:
         if handle_missing_target(ctx, config, "plinth", "gc_plinth_misses", "gc_plinth_walks"):
             return
-        ctx.state.trigger_safety_stop("no empty plinth found nearby")
+        ctx.state.trigger_safety_stop("no plinth/golem found nearby")
         return
     ctx.state.data["gc_plinth_misses"] = 0
     ctx.state.data["gc_plinth_walks"] = 0
 
-    debug_log.log("golem crafting", f"carving plinth (dist={plinth.get('distance')})")
-    # A real while-loop with its own success counter, NOT `for side in range(4)` with a
-    # `continue` on a failed click -- CONFIRMED during task review (2026-08-07): `continue`
-    # inside a `for` loop advances to the next value from range(4) regardless of whether the
-    # click actually landed, so a single missed/blocked click would silently consume one of the
-    # 4 iterations without a real carve, and the loop would still exit claiming 4 sides done.
-    # Bounded (not an unconditional retry-forever) the same way blast_furnace.py's deposit_items
-    # counts real successes against a requested count rather than assuming success.
-    sides_carved = 0
-    attempts = 0
-    max_attempts = 8  # up to 4 retries total across all sides, on top of the 4 real carves
-    while sides_carved < 4 and attempts < max_attempts:
-        attempts += 1
-        plinth = find_object(PLINTH_NAME)  # fresh lookup every attempt -- see docstring above
-        if plinth is None:
-            debug_log.log("golem crafting", "plinth no longer found mid-carve -- retrying next tick")
+    if ctx.state.data.get("gc_craft_golem_id") != golem.get("id"):
+        # A different plinth instance, or this one just reset to "Empty plinth" after a
+        # previous golem completed -- start fresh tracking for it.
+        ctx.state.data["gc_craft_golem_id"] = golem.get("id")
+        ctx.state.data["gc_craft_sides_done"] = []
+        ctx.state.data["gc_craft_insert_tried"] = []
+        ctx.state.data["gc_craft_awaiting"] = None
+        ctx.state.data["gc_craft_extra_side_attempts"] = 0
+
+    awaiting = ctx.state.data.get("gc_craft_awaiting")
+    if awaiting is not None:
+        seen_seq = ctx.state.data.get("gc_last_chat_seq", 0)
+        if seen_seq <= awaiting["since_seq"]:
+            if time.time() - awaiting["started_at"] > GOLEM_ACTION_TIMEOUT_S:
+                debug_log.log("golem crafting", f"no confirmation after {GOLEM_ACTION_TIMEOUT_S}s -- retrying")
+                ctx.state.data["gc_craft_awaiting"] = None
+            return  # still waiting on a chat confirmation -- nothing else to do this call
+
+        message = ctx.state.data.get("gc_last_chat", "")
+        offset = awaiting["offset"]
+        ctx.state.data["gc_craft_awaiting"] = None
+
+        if awaiting["kind"] == "side":
+            if GOLEM_CHAT_SIDE_DONE in message or GOLEM_CHAT_SIDE_ALREADY_DONE in message:
+                # Either a real success, or confirmation this side was already done (e.g. after
+                # a process restart lost our in-memory tracking) -- either way it's spent now.
+                sides = ctx.state.data.get("gc_craft_sides_done", [])
+                if offset not in sides:
+                    sides.append(offset)
+                ctx.state.data["gc_craft_sides_done"] = sides
+                debug_log.log("golem crafting", f"side confirmed ({len(sides)}/4): {message.strip()}")
+            elif GOLEM_CHAT_NOT_ENOUGH_SUNSTONE in message:
+                debug_log.log("golem crafting", "not enough raw sunstone to start a golem -- moving to mine phase")
+                ctx.state.data["gc_phase"] = "mine"
+            else:
+                debug_log.log("golem crafting", f"unexpected response to golem side click: {message.strip()}")
+        else:  # kind == "insert"
+            if GOLEM_CHAT_WRONG_INSERT_SIDE in message:
+                tried = ctx.state.data.get("gc_craft_insert_tried", [])
+                tried.append(offset)
+                ctx.state.data["gc_craft_insert_tried"] = tried
+                debug_log.log("golem crafting", f"can't insert-core from this side -- trying another (tried {len(tried)}/4)")
+            elif GOLEM_CHAT_COMPLETE in message:
+                debug_log.log("golem crafting", "golem finished -- ready for the next one")
+                # ADDED 2026-08-08 (live session, user report): the plinth stays unresponsive for
+                # about 2 seconds after a golem finishes before it resets to "Empty plinth" and
+                # can start a new one -- CONFIRMED live. Rather than spend that unavoidable dead
+                # time uselessly hammering find_golem_object every tick against a plinth that
+                # isn't ready yet, use it to pick up whatever the golem dropped right where it
+                # stood, then a short settle sleep -- same "Take" idiom as slayer.py's own
+                # ground-item pickup (right-click + explicit menu selection, not a plain
+                # click_entity, since a plain click's default action isn't reliably "Take").
+                drops = [
+                    i for i in controller.get_ground_items()
+                    if abs(i.get("x", 9999) - golem.get("x", 0)) <= 1
+                    and abs(i.get("y", 9999) - golem.get("y", 0)) <= 1
+                ]
+                for drop in drops:
+                    drop_key = (drop.get("id"), drop.get("x"), drop.get("y"))
+                    debug_log.log("golem crafting", f"picking up {drop.get('name')}")
+                    # CORRECTED 2026-08-08 (live session, user report: "it missed looting its
+                    # gem, we want always the loot"): a single click_menu_action attempt isn't
+                    # reliable enough on its own -- CONFIRMED live one attempt landed on the bare
+                    # tile's own menu (Cancel/Mark Safespot/Walk here) instead of the item's
+                    # (Take/Examine/Cancel), same class of race slayer.py's own maybe_loot
+                    # documents (the camera/model rendering trails the logical tile position by
+                    # about a tick right after a state change -- here, the golem just finished).
+                    # Retries a few times, re-fetching the item's position fresh each attempt
+                    # (not reusing the same possibly-stale drop dict) and stopping as soon as it's
+                    # actually gone from the ground -- confirmed picked up, not just clicked at.
+                    for _ in range(3):
+                        fresh = next(
+                            (i for i in controller.get_ground_items()
+                             if (i.get("id"), i.get("x"), i.get("y")) == drop_key),
+                            None,
+                        )
+                        if fresh is None:
+                            break  # gone -- picked up (or despawned/looted by something else)
+                        controller.click_menu_action(ctx.ser, fresh, "take", target_hint=fresh.get("name"), offset=(0, 0))
+                        time.sleep(random.uniform(0.4, 0.6))
+                # CORRECTED 2026-08-08 (live session, user report): 1.0s here still weighed in
+                # too early against the plinth's own ~2s reset delay -- CONFIRMED live. Bumped to
+                # 2.0s (on top of whatever the loot loop above already spent).
+                time.sleep(2.0)
+
+                ctx.state.data["gc_craft_sides_done"] = []
+                ctx.state.data["gc_craft_insert_tried"] = []
+                ctx.state.data["gc_craft_golem_id"] = None  # force a fresh-start detection next call
+                # One fur consumed per golem -- see _run_bank_trip's docstring for why this
+                # tracked count (not a live inventory/pouch read) drives the end-of-batch
+                # bank-or-mine decision below.
+                ctx.state.data["gc_fur_stock"] = max(0, ctx.state.data.get("gc_fur_stock", 0) - 1)
+            else:
+                debug_log.log("golem crafting", f"unexpected response to insert-core: {message.strip()}")
+        return
+
+    sides_done = ctx.state.data.get("gc_craft_sides_done", [])
+
+    # CORRECTED 2026-08-08 (live session, user report: "we are stuck in a loop"): this gate used
+    # to be `len(sides_done) < 4` -- our OWN click-confirmation count -- rather than the golem
+    # object's own reported name. CONFIRMED live these can desync: a plinth left mid-progress
+    # from an earlier interrupted run/process restart still has its real carved-side state
+    # server-side, but ctx.state.data resets to sides_done=[] on every restart, so this session's
+    # 4 tracked offsets don't necessarily correspond to the 4 real remaining sides -- one real
+    # side can get (correctly) reported "already crafted" more than once while another genuinely
+    # untried side never gets attempted at all. The result: sides_done reached 4 while the golem
+    # was still actually "Unfinished golem", and every subsequent Insert-core attempt failed with
+    # "no 'insert-core' entry in menu" forever (that option only exists on "Unpowered golem").
+    # Gating on the object's own name instead is self-correcting -- it only ever proceeds to
+    # Insert-core once the game itself says the golem is actually ready.
+    if golem.get("name") != "Unpowered golem":
+        if not sides_done:
+            # Only checked before the FIRST side -- confirmed live the material cost is
+            # front-loaded (1 raw sunstone on "Start-golem", nothing further per side), so
+            # there's no need to re-check core/fur availability between sides; only that we
+            # won't strand a half-carved golem without enough to ever finish it.
+            #
+            # CORRECTED 2026-08-08 (live session, user request): a raw-sunstone/core shortage
+            # means this whole mining trip's batch is done -- decide bank vs. mine from the
+            # tracked fur stock, not from bank_phase's original uniform "always go to mine"
+            # default. Routes to "mine" for the shortage itself regardless (bank_phase has no
+            # way to restock sunstone -- Wyrmscraig's bank only ever holds fur), same as before.
+            if find_item(RAW_SUNSTONE_NAME) is None or find_item(SUNSTONE_CORE_NAME) is None:
+                fur_stock = ctx.state.data.get("gc_fur_stock", 0)
+                if fur_stock < CORES_PER_TRIP:
+                    debug_log.log("golem crafting", f"batch done, fur stock low ({fur_stock}) -- moving to bank phase")
+                    ctx.state.data["gc_phase"] = "bank"
+                else:
+                    debug_log.log("golem crafting", f"batch done, fur stock still sufficient ({fur_stock}) -- moving to mine phase")
+                    ctx.state.data["gc_phase"] = "mine"
+                return
+
+            # CORRECTED 2026-08-08 (live session, live-testing discovery: "we don't actually have
+            # to empty the furs, we can use them from within the fur pouch"): Insert-core auto-
+            # consumes the best available fur straight out of the pouch, same as it would from
+            # loose inventory -- CONFIRMED live across three full golems this session with the
+            # pouch never once emptied. The unpack-once-per-batch step (banker.empty_fur_pouch)
+            # this replaced existed only because that wasn't known yet; removing it means there's
+            # never any loose fur to lose track of or re-pouch, so gc_fur_stock (already tracked
+            # for the batch-end bank-or-mine decision above) is now also the sole source of truth
+            # for "is there fur to use", in place of a live pick_best_fur_in_inventory() scan that
+            # only ever found anything after that now-removed unpack step.
+            if ctx.state.data.get("gc_fur_stock", 0) <= 0:
+                debug_log.log("golem crafting", "out of usable fur for a new golem -- moving to bank phase")
+                ctx.state.data["gc_phase"] = "bank"
+                return
+
+            # ADDED 2026-08-08 (live session, live-testing discovery): "Start-golem" on an Empty
+            # plinth -- unlike every later "Shape-golem" click -- auto-completes whichever side
+            # it's clicked from as a side effect of starting the golem, regardless of which of
+            # the 4 tiles that happens to be. CONFIRMED live across all 3 golems this session:
+            # the chat response to this very first click was always GOLEM_CHAT_SIDE_ALREADY_DONE
+            # ("you've already crafted this side"), never GOLEM_CHAT_SIDE_DONE -- meaning the
+            # walk_to_golem_side call below (to GOLEM_ADJACENT_OFFSETS[0] specifically, since
+            # sides_done is still empty here) was carving a side that was going to be free no
+            # matter where it was clicked from. Skipping the walk entirely and clicking
+            # Start-golem from wherever the routine already is saves a full walk+confirm round
+            # trip on every golem for no loss -- GOLEM_ADJACENT_OFFSETS[0] is still recorded
+            # below purely as bookkeeping (which of the 4 offsets is "spent"), not because the
+            # routine actually stood there.
+            debug_log.log("golem crafting", "starting golem (0/4 done)")
+            if not controller.click_menu_action(ctx.ser, golem, "golem"):
+                # CORRECTED 2026-08-08 (live session, user report: "stuck now, probably a
+                # misclick we don't correct for"): CONFIRMED live this looped forever -- unlike
+                # shaping/inserting (which always walk_to_golem_side first, landing adjacent and
+                # on-screen), this fast-path deliberately clicks from wherever the routine
+                # already is (see the comment above) with no positioning step at all, so a golem
+                # that resets off-screen after the routine arrives from somewhere else (e.g.
+                # straight from chisel_phase) hit "aim point is outside the RuneLite window"
+                # every single tick with nothing ever correcting the position. Hopping toward the
+                # golem's own tile -- the same off-screen fallback mine_phase/bank_phase already
+                # use -- fixes it instead of retrying the identical failing click indefinitely.
+                debug_log.log("golem crafting", "Start-golem click missed/no matching menu entry -- hopping closer and retrying next tick")
+                _hop_toward_point(ctx, golem["x"], golem["y"], golem.get("plane", 0))
+                return
+
+            ctx.state.data["gc_craft_awaiting"] = {
+                "kind": "side", "offset": GOLEM_ADJACENT_OFFSETS[0],
+                "since_seq": ctx.state.data.get("gc_last_chat_seq", 0),
+                "started_at": time.time(),
+            }
             return
-        controller.open_inventory_tab(ctx.ser)  # no-op if already open; harmless before a world-object click
-        if not controller.click_entity(ctx.ser, plinth):
-            time.sleep(random.uniform(0.3, 0.6))
-            continue  # missed/blocked click -- retry the same side (sides_carved unchanged)
-        sides_carved += 1
-        debug_log.log("golem crafting", f"carved side {sides_carved}/4")
-        time.sleep(random.uniform(*PLINTH_SIDE_WAIT_SECONDS))
 
-    if sides_carved < 4:
-        debug_log.log("golem crafting", f"only carved {sides_carved}/4 sides -- plinth may have gone out of range; retrying next tick")
+        offset = next((o for o in GOLEM_ADJACENT_OFFSETS if o not in sides_done), None)
+        if offset is None:
+            # All 4 tracked offsets are already marked done, yet the golem's own name says
+            # otherwise (see the gate comment above) -- this session's offset<->real-side mapping
+            # has desynced from the game's actual state. Cycle back through them again rather
+            # than crashing (next() on an empty generator) or getting stuck: each retry still
+            # goes through the normal chat-confirmation path below, so a genuinely-untried real
+            # side eventually gets hit and reported as a real completion, not another "already
+            # done".
+            #
+            # CORRECTED 2026-08-08 (live session, user report: "stuck in a loop"): indexing by
+            # `len(sides_done)` here was itself the bug, not just this branch's existence --
+            # CONFIRMED live sides_done stays fixed at exactly 4 forever once every offset is in
+            # it (the "already done" handler only appends an offset the FIRST time it sees it),
+            # so `len(sides_done) % 4` always computed the same index -- this retried the SAME
+            # offset every single time, forever, rather than actually cycling. A dedicated
+            # counter that increments every retry (capped, see GOLEM_EXTRA_SIDE_ATTEMPTS_CAP)
+            # fixes both the infinite loop and the "never actually tries a different offset" bug
+            # in one move.
+            attempts = ctx.state.data.get("gc_craft_extra_side_attempts", 0) + 1
+            ctx.state.data["gc_craft_extra_side_attempts"] = attempts
+            if attempts > GOLEM_EXTRA_SIDE_ATTEMPTS_CAP:
+                ctx.state.trigger_safety_stop(
+                    f"golem at plinth id={golem.get('id')} never reached Unpowered golem after "
+                    f"{GOLEM_EXTRA_SIDE_ATTEMPTS_CAP} extra Shape-golem attempts beyond the "
+                    "normal 4 -- likely a stuck/corrupted plinth state, needs a manual look"
+                )
+                return
+            offset = GOLEM_ADJACENT_OFFSETS[attempts % len(GOLEM_ADJACENT_OFFSETS)]
+            debug_log.log("golem crafting", f"golem still not ready for Insert-core after 4 tracked sides -- retrying offset {offset} (extra attempt {attempts}/{GOLEM_EXTRA_SIDE_ATTEMPTS_CAP})")
+        if not walk_to_golem_side(ctx, golem["x"] + offset[0], golem["y"] + offset[1], golem.get("plane", 0)):
+            debug_log.log("golem crafting", f"couldn't walk to golem side offset {offset} -- retrying next tick")
+            return
+
+        golem = find_golem_object(ctx.state.data.get("gc_craft_golem_id"))  # fresh lookup -- screen position changed after walking
+        if golem is None:
+            debug_log.log("golem crafting", "golem no longer found after walking to a side -- retrying next tick")
+            return
+
+        debug_log.log("golem crafting", f"shaping golem from offset {offset} ({len(sides_done)}/4 done)")
+        if not controller.click_menu_action(ctx.ser, golem, "golem"):
+            debug_log.log("golem crafting", "Shape-golem click missed/no matching menu entry -- retrying next tick")
+            return
+
+        ctx.state.data["gc_craft_awaiting"] = {
+            "kind": "side", "offset": offset,
+            "since_seq": ctx.state.data.get("gc_last_chat_seq", 0),
+            "started_at": time.time(),
+        }
         return
 
-    controller.open_inventory_tab(ctx.ser)
+    tried = ctx.state.data.get("gc_craft_insert_tried", [])
+    # Go straight to the known-correct side for this plinth (see GOLEM_INSERT_OFFSET_BY_ID) if it
+    # hasn't already been rejected -- only falls back to trying the other 3 blind if that lookup
+    # is somehow wrong for this instance, or the plinth id isn't one of the two known ones.
+    known_offset = GOLEM_INSERT_OFFSET_BY_ID.get(golem.get("id"))
+    if known_offset is not None and known_offset not in tried:
+        offset = known_offset
+    else:
+        offset = next((o for o in GOLEM_ADJACENT_OFFSETS if o not in tried), None)
+    if offset is None:
+        ctx.state.trigger_safety_stop("Insert-core was rejected from all 4 sides of the golem")
+        return
+
     core = find_item(SUNSTONE_CORE_NAME)
-    fur = find_item(fur_name)
-    plinth = find_object(PLINTH_NAME)  # fresh lookup -- see docstring above
-    if core is None or fur is None or plinth is None:
-        # Carving consumed more time than expected and the fur pouch/inventory state (or the
-        # plinth itself) moved out from under us -- bail this golem rather than clicking with a
-        # stale/missing reference; next call re-evaluates from scratch.
-        debug_log.log("golem crafting", "core, fur, or plinth went missing mid-carve -- retrying next tick")
+    if core is None:
+        debug_log.log("golem crafting", "sunstone core went missing before inserting -- moving to mine phase")
+        ctx.state.data["gc_phase"] = "mine"
+        return
+    # CORRECTED 2026-08-08 (live session, live-testing discovery): fur is consumed straight from
+    # the pouch (see the batch-loop comment above), so gc_fur_stock is the only availability
+    # signal there is here -- there's no loose fur item left to look up a name from.
+    if ctx.state.data.get("gc_fur_stock", 0) <= 0:
+        debug_log.log("golem crafting", "fur ran out before inserting -- moving to bank phase")
+        ctx.state.data["gc_phase"] = "bank"
         return
 
-    debug_log.log("golem crafting", f"inserting core + {fur_name}")
-    controller.click_entity(ctx.ser, core, check_ui_blockers=False)
-    time.sleep(random.uniform(0.15, 0.3))
-    controller.click_entity(ctx.ser, plinth)
-    time.sleep(random.uniform(0.4, 0.7))
-
-    fur = find_item(fur_name)
-    plinth = find_object(PLINTH_NAME)  # fresh lookup -- see docstring above
-    if fur is None or plinth is None:
-        debug_log.log("golem crafting", "fur or plinth went missing after inserting the core -- retrying next tick")
+    if not walk_to_golem_side(ctx, golem["x"] + offset[0], golem["y"] + offset[1], golem.get("plane", 0)):
+        debug_log.log("golem crafting", f"couldn't walk to insert-core side offset {offset} -- retrying next tick")
         return
-    controller.click_entity(ctx.ser, fur, check_ui_blockers=False)
-    time.sleep(random.uniform(0.15, 0.3))
-    controller.click_entity(ctx.ser, plinth)
-    time.sleep(random.uniform(0.6, 1.0))
+
+    golem = find_golem_object(ctx.state.data.get("gc_craft_golem_id"))  # fresh lookup -- screen position changed after walking
+    if golem is None:
+        debug_log.log("golem crafting", "golem no longer found before inserting core -- retrying next tick")
+        return
+
+    debug_log.log("golem crafting", f"inserting core + fur from offset {offset}")
+    if not controller.click_menu_action(ctx.ser, golem, "insert-core"):
+        debug_log.log("golem crafting", "Insert-core click missed/no matching menu entry -- retrying next tick")
+        return
+
+    ctx.state.data["gc_craft_awaiting"] = {
+        "kind": "insert", "offset": offset,
+        "since_seq": ctx.state.data.get("gc_last_chat_seq", 0),
+        "started_at": time.time(),
+    }
 
 
 # Never deposited during a golem-crafting bank trip -- the pouch/tools are needed for the next
-# mine/chisel/craft cycle, and a leftover sunstone core (if fur ran out before cores did) needs
-# to survive the trip so the next craft_phase call can still use it.
-BANK_KEEP_ITEMS = [banker.FUR_POUCH_NAME, CHISEL_NAME.lower(), WOODEN_SPIKES_NAME.lower(), SUNSTONE_CORE_NAME.lower()]
+# mine/chisel/craft cycle, and leftover raw sunstone/cores (if fur ran out before either did)
+# need to survive the trip so the next craft_phase call can still use them. Wooden spikes
+# specifically CONFIRMED LIVE 2026-08-08 (MCP debug session): the bank won't even accept a
+# deposit of them at all (not just "we'd rather keep them") -- consistent with spikes now being
+# sourced from the Spikes supply object next to Geoff (see SPIKES_SUPPLY_NAME) rather than the
+# bank, since a bank-unstorable item was never going to be a bankable supply to begin with.
+#
+# CORRECTED 2026-08-08 (live session, user report): the Hammer and the open gem bag were
+# getting deposited every bank trip along with the raw sunstone -- CONFIRMED live, both are
+# meant to stay in inventory permanently (the gem bag auto-catches every uncut gem a finished
+# golem drops, same as fur pouch/coal bag's own "keep it, don't bank it" treatment elsewhere in
+# this codebase; the hammer is part of the player's fixed loadout). "fur" (a substring of every
+# FUR_PRIORITY name) is also kept defensively -- craft_phase consumes fur straight from the
+# pouch now (see that function's own comment) so there normally shouldn't be any loose fur at
+# deposit time at all, but this is a cheap backstop against losing any that ends up loose anyway
+# (e.g. caught while hunting before the pouch is opened).
+#
+# CORRECTED 2026-08-08 (live session, user report): raw sunstone itself wasn't on this list --
+# harmless as long as bank_phase was ONLY ever reached once craft_phase's own end-of-batch check
+# had already confirmed raw sunstone (or cores) was gone (its original, only intended path), but
+# CONFIRMED live that's no longer the only path: a fur shortage alone (find_available_fur_in_bank
+# finding nothing usable, or the fur pouch's fill/empty step silently not landing) also routes to
+# "bank" via that same end-of-batch branch, and can do so with raw sunstone and cores still very
+# much unused -- depositing them there would strand a half-supplied batch and force mining a
+# fresh 20 from scratch next trip for no reason. Kept unconditionally now, the same as cores.
+BANK_KEEP_ITEMS = [
+    banker.FUR_POUCH_NAME, CHISEL_NAME.lower(), WOODEN_SPIKES_NAME.lower(),
+    RAW_SUNSTONE_NAME.lower(), SUNSTONE_CORE_NAME.lower(),
+    "hammer", "gem bag", "fur",
+]
 
-# How much fur to withdraw per bank trip -- "a fixed inventory-slot budget (e.g. 14, half an
-# inventory)" per the design's bank-phase bullet. CORRECTED 2026-08-08 (final whole-branch
-# review): this used to be a full 28 (INVENTORY_SIZE) when a fur pouch was carried, on the
-# reasoning that the pouch's own capacity was the real limit. That was the root cause of a
-# deterministic deadlock (see craft_phase's docstring) -- with the pouch emptied back into loose
-# inventory slots right after the bank trip (see bank_phase), the real binding constraint is
-# always free inventory slots for mining, not bank stock or pouch capacity, regardless of
-# whether a pouch is carried. A single budget, used either way, guarantees mine_phase always has
-# at least INVENTORY_SIZE - FUR_WITHDRAW_BUDGET slots free for raw sunstone.
-FUR_WITHDRAW_BUDGET = 14
+# CORRECTED 2026-08-08 (live session, user request): fur is withdrawn in FULL (Withdraw-All,
+# not a capped budget) and immediately compacted into the fur pouch (large: 28 capacity, so no
+# overflow risk taking the whole stack) rather than carried loose. This replaces the original
+# design's "a fixed inventory-slot budget (e.g. 14, half an inventory)" -- that budget existed
+# specifically because loose fur was competing with raw sunstone for inventory slots during
+# mining; pouching removes that competition entirely (fur costs exactly 1 slot -- the pouch
+# itself -- regardless of how much is stocked), so there's no longer a reason to under-withdraw.
+# Unpacked once per crafting batch (craft_phase, right before the first golem needs it) and
+# re-packed once the batch ends (also craft_phase, before heading back to mine or bank) -- see
+# that function's own comments for the full mine -> chisel -> craft -> (mine | bank) loop this
+# enables: only detour to the bank when the tracked "gc_fur_stock" count actually runs low
+# (< CORES_PER_TRIP), not every single batch the way an always-empty-after-banking design would.
 
 
 def find_available_fur_in_bank(bank: dict) -> str:
@@ -476,41 +1100,93 @@ def find_available_fur_in_bank(bank: dict) -> str:
     return next((f for f in FUR_PRIORITY if bank_items.get(f.lower(), 0) > 0), None)
 
 
+# How long to wait, after the withdraw-all click, for the fur to actually show up in inventory
+# before deciding the click didn't land -- same idea as CHISEL_CONFIRM_TIMEOUT_S, see this
+# function's own comment on the withdrawal for what this closes.
+WITHDRAW_CONFIRM_TIMEOUT_S = 3.0
+
+
 def _run_bank_trip(ctx, config: dict) -> None:
     """The actual deposit/withdraw logic, run once a bank is confirmed open (by either branch
     of bank_phase below). Deposits everything except BANK_KEEP_ITEMS (uncut gems and any
     leftover raw sunstone per the design's bank-phase bullet -- anything not explicitly kept),
-    then withdraws the best available fur straight into loose inventory slots, or falls through
-    to the hunt phase if the bank has none of FUR_PRIORITY at all.
+    then withdraws the entire stack of the best available fur type, straight into loose
+    inventory slots -- bank_phase itself compacts it into the fur pouch right after this
+    function returns and the bank closes (see that function's own comment for why the pouch
+    fill has to happen there and not here: CONFIRMED live the pouch's right-click menu doesn't
+    even offer "Fill" while a bank interface is open -- it shows Deposit-1/5/10/X/All instead --
+    so this has to leave the fur loose and let bank_phase's post-close step handle compacting
+    it), or falls through to the hunt phase if the bank has none of FUR_PRIORITY at all.
 
-    CORRECTED 2026-08-08 (final whole-branch review, second pass): this used to also fill the
-    fur pouch (if one was carried) right after withdrawing, only for bank_phase to immediately
-    empty it straight back out again once the bank closed (see bank_phase). Since
-    FUR_WITHDRAW_BUDGET is the same 14 regardless of pouch ownership, that fill+empty pair
-    bought nothing -- it was two extra clicks whose menu-resolution banker.py's fill_coal_bag
-    docstring already flags as unverified ("a bank-side click on a non-empty container can
-    resolve to 'Empty' instead of 'Fill'"), which if it ever resolved the wrong way would send
-    the withdrawn fur straight back into the open bank instead of into inventory. Withdrawing
-    straight to loose inventory slots avoids that risk entirely and needs no pouch interaction
-    here at all -- bank_phase's post-close empty_fur_pouch call still runs regardless (that one
-    is for fur caught while HUNTING and routed into the pouch, a real, separate reason to
-    empty it, unrelated to this withdrawal)."""
+    CORRECTED 2026-08-08 (live session, user request): withdraws the FULL stack (Withdraw-All)
+    rather than a capped budget -- pouching (once compacted, post-close) removes the old
+    loose-fur-vs-sunstone inventory-slot competition entirely, so there's no reason to
+    under-withdraw. gc_fur_stock is set to the amount withdrawn here (not added to whatever
+    was left, since bank_phase is only ever entered once that's already run low -- see
+    craft_phase's own end-of-batch check) so it stays a reasonably accurate count of how much
+    fur is actually stocked for craft_phase's bank-or-mine decision after each batch.
+
+    CORRECTED 2026-08-08 (MCP live debug session): searches the bank for "fur" ONCE instead of
+    scanning the whole unfiltered bank to pick a fur type and then searching AGAIN for that
+    specific name -- CONFIRMED live on this account's real (large, unsorted) bank: a bare
+    unfiltered bank read reports far off-screen screenX/screenY for anything not on the first
+    visible page (e.g. "Sunlight antelope fur" at screenY=5271), which the original version's
+    withdraw call (banker.withdraw_loadout, clicking that raw off-screen position with no
+    search step) silently failed against every time -- craft_phase would then find no fur,
+    bounce back here, and repeat the same doomed click forever, no error, no safety-stop.
+    Searching "fur" (a substring of every FUR_PRIORITY name) surfaces every fur type actually
+    in the bank at once, laid out from slot 0 (see search_bank's docstring) -- so
+    find_available_fur_in_bank can pick the best one AND get a guaranteed-on-screen position
+    for it from that single filtered read, with no second per-item search needed (unlike
+    banker.search_and_withdraw, which is built for a single already-chosen item name and
+    searches for it fresh -- not needed here since "fur" already surfaces all of them)."""
     banker.deposit_inventory(ctx, {"keepItems": BANK_KEEP_ITEMS})
+
+    if not banker.search_bank(ctx, "fur"):
+        debug_log.log("golem crafting", "bank search for fur failed -- moving to mine phase")
+        ctx.state.data["gc_phase"] = "mine"
+        return
 
     bank = controller.get_bank()
     fur_name = find_available_fur_in_bank(bank)
     if fur_name is None:
+        banker.clear_bank_search(ctx)
         debug_log.log("golem crafting", "bank has none of the usable fur types -- moving to hunt phase")
         ctx.state.data["gc_phase"] = "hunt"
         return
 
     slot = next((s for s in bank.get("items", []) if (s.get("name") or "").lower() == fur_name.lower()), None)
-    qty = min(FUR_WITHDRAW_BUDGET, slot.get("qty", 0)) if slot else 0
+    qty = slot.get("qty", 0) if slot else 0
 
     if qty > 0:
-        debug_log.log("golem crafting", f"withdrawing {qty}x {fur_name}")
-        banker.withdraw_loadout(ctx, {"withdraw": [{"name": fur_name, "quantity": qty}]})
+        debug_log.log("golem crafting", f"withdrawing all {qty}x {fur_name}")
+        banker.set_quantity_mode(ctx, "all")
+        controller.click_entity(ctx.ser, slot)
+        # ADDED 2026-08-08 (live session, user report): used to trust click_entity's return value
+        # alone and set gc_fur_stock = qty unconditionally -- CONFIRMED live this isn't reliable
+        # enough on its own here: click_entity reported a clean landing (no misclick) with the
+        # quantity-mode button click immediately before it, yet the fur never actually appeared
+        # in inventory (the mode click may have landed on the wrong button after its own
+        # recovery-retry, silently withdrawing something other than the full stack, or nothing at
+        # all pending an "X" prompt that was never answered). gc_fur_stock then read as fully
+        # stocked all the way through an entire mine/chisel batch with zero real fur behind it,
+        # surfacing only as "no 'empty' entry in menu" once craft_phase finally tried to use it --
+        # several minutes and a wasted mining trip later. Polling inventory for the fur to
+        # actually show up closes that gap at the source instead.
+        deadline = time.time() + WITHDRAW_CONFIRM_TIMEOUT_S
+        landed = False
+        while time.time() < deadline:
+            if any((i.get("name") or "").lower() == fur_name.lower() for i in controller.get_inventory()):
+                landed = True
+                break
+            time.sleep(0.2)
+        if landed:
+            ctx.state.data["gc_fur_stock"] = qty
+        else:
+            debug_log.log("golem crafting", f"withdraw-all on {fur_name} didn't land in inventory -- will retry next bank trip")
+            ctx.state.data["gc_fur_stock"] = 0
 
+    banker.clear_bank_search(ctx)
     debug_log.log("golem crafting", "banking done -- moving to mine phase")
     ctx.state.data["gc_phase"] = "mine"
 
@@ -526,16 +1202,12 @@ def bank_phase(ctx, config: dict) -> None:
     and calls _run_bank_trip directly, same manual pattern blast_furnace.py's run_trip uses
     instead of bank_up.
 
-    CORRECTED 2026-08-08 (final whole-branch review): the local-bank branch now also empties
-    the fur pouch (if one is carried) right after the bank closes -- NOT while it's still open,
-    which would dump the pouch's contents back INTO the bank instead of into inventory (see
-    banker.empty_fur_pouch's docstring: "dump its contents into an open bank"). This isn't for
-    fur _run_bank_trip just withdrew -- that now goes straight to loose inventory slots, no
-    pouch involved (see _run_bank_trip's own docstring, second pass) -- it's for fur caught
-    while HUNTING, which routes into an open pouch (see hunt_phase). Doing this here, after
-    close_bank and before mine_phase ever runs, means hunted fur becomes visible to
-    pick_best_fur_in_inventory() the same cycle it's caught, rather than sitting trapped in the
-    pouch.
+    CORRECTED 2026-08-08 (live session, user request): no longer empties the fur pouch after
+    closing the bank -- _run_bank_trip now deliberately fills it (see that function's own
+    docstring for the pouched-fur design), and unpacking it here would immediately undo that.
+    craft_phase owns unpacking now, once per crafting batch, right before the first golem needs
+    it -- including fur caught while HUNTING, which routes into the pouch the same way (see
+    hunt_phase) and stays there, compacted, until that same craft_phase unpack point.
 
     CORRECTED 2026-08-07 (caught in task review): the Ferox teleport-fallback branch cannot
     do that same dynamic fur scan -- it has to go through banker.bank_up (its private Ferox
@@ -552,17 +1224,58 @@ def bank_phase(ctx, config: dict) -> None:
     practice -- landing in the Ferox branch below at all means that bank genuinely wasn't
     found nearby. Rather than loop forever depositing-and-walking-back without ever
     restocking fur, this now stops with a clear message once the Ferox round-trip completes.
+
+    CORRECTED 2026-08-08 (MCP live debug session): walks toward the "bank" location anchor
+    (via handle_missing_target, same as mine_phase/craft_phase/hunt_phase's own lookups) before
+    falling through to the Ferox teleport fallback -- CONFIRMED live the Goat Pit sits ~65
+    tiles from the bank, well past banker.find_nearby_bank's default 40-tile search radius, so
+    without this a hunt trip's own bank_phase call would either wrongly teleport off Wyrmscraig
+    entirely (if teleportFallback is enabled) or safety-stop (if not), even with the bank
+    genuinely reachable on foot.
     """
     bank_obj = banker.find_nearby_bank({})
-    if bank_obj is not None:
-        if not banker.open_bank(ctx, bank_obj):
-            ctx.state.trigger_safety_stop("failed to open the bank near Wyrmscraig")
+    if bank_obj is None:
+        if handle_missing_target(ctx, config, "bank", "gc_bank_misses", "gc_bank_walks"):
             return
+        # Walk attempts toward the configured anchor exhausted -- fall through to the Ferox
+        # teleport fallback below, same as this phase's original behavior before the anchor
+        # existed (bank_obj stays None, so neither this branch's early-return nor the
+        # gc_bank_misses/gc_bank_walks reset below run).
+    else:
+        if not banker.open_bank(ctx, bank_obj):
+            # CORRECTED 2026-08-08 (live session): find_nearby_bank's 40-tile radius can return
+            # an object that isn't actually on-screen/render-visible yet (too far to click),
+            # which open_bank's click then fails against ("aim point is outside the RuneLite
+            # window") -- CONFIRMED live right after a fresh routine start ~25 tiles from the
+            # bank. Try a direct minimap-click hop straight at the bank object's own position
+            # first (see MAX_BANK_MINIMAP_HOPS's docstring) before falling back to the anchor
+            # walk and, failing that, the safety stop.
+            hops = ctx.state.data.get("gc_bank_minimap_hops", 0)
+            if hops < MAX_BANK_MINIMAP_HOPS:
+                point = controller.get_minimap_walk_point(bank_obj.get("x"), bank_obj.get("y"), bank_obj.get("plane"))
+                if point.get("onMinimap"):
+                    ctx.state.data["gc_bank_minimap_hops"] = hops + 1
+                    debug_log.log("golem crafting", f"bank found but off-screen -- minimap-clicking toward it (hop {hops + 1}/{MAX_BANK_MINIMAP_HOPS})")
+                    controller.click_entity(ctx.ser, point, offset=(0, 0))
+                    time.sleep(random.uniform(0.6, 1.0))
+                    return
+            if handle_missing_target(ctx, config, "bank", "gc_bank_misses", "gc_bank_walks"):
+                return
+            ctx.state.trigger_safety_stop("failed to open the bank near Wyrmscraig even after walking toward it")
+            return
+        ctx.state.data["gc_bank_misses"] = 0
+        ctx.state.data["gc_bank_walks"] = 0
+        ctx.state.data["gc_bank_minimap_hops"] = 0
         _run_bank_trip(ctx, config)
         banker.close_bank(ctx)
         time.sleep(random.uniform(0.3, 0.6))
+        # CORRECTED 2026-08-08 (live session, user correction): the fur pouch can only be
+        # filled AFTER the bank closes -- CONFIRMED live its right-click menu offers no "Fill"
+        # entry at all while a bank interface is open (Deposit-1/5/10/X/All instead). Compacts
+        # whatever _run_bank_trip just withdrew (loose, by necessity -- see that function's own
+        # docstring) into the pouch for the walk back out to mining.
         if banker.has_fur_pouch():
-            banker.empty_fur_pouch(ctx)
+            banker.fill_fur_pouch(ctx)
         return
 
     if config.get("bank", {}).get("teleportFallback"):
@@ -584,30 +1297,37 @@ def bank_phase(ctx, config: dict) -> None:
 
 
 def _ensure_wooden_spikes(ctx, config: dict) -> bool:
-    """Withdraw wooden spikes from the bank if not already carried. Returns False (with a
-    safety stop already triggered) if neither inventory nor bank has any -- a genuine dead end,
-    same "hard stop, don't spin forever" convention banker.py's out_of_critical_supplies path
-    uses."""
+    """Take wooden spikes from the Spikes supply object next to Geoff if not already carried.
+    CORRECTED 2026-08-08 (MCP live debug session): the original design assumed spikes had to be
+    withdrawn from the bank, same as any other supply -- live testing found a "Spikes supply"
+    object standing right next to Geoff at the Goat Pit itself, whose default left-click
+    resolves to "Take" (see SPIKES_SUPPLY_NAME's comment). Walking back to the bank for
+    something sitting right at the pit made no sense once that was confirmed, so this now takes
+    directly from the supply instead.
+
+    Same handle_missing_target retry/walk pattern as mine_phase/craft_phase/hunt_phase's own
+    object lookups (not a bespoke bank-or-bust check like the old version), since hunt_phase can
+    call this before the player has actually reached the pit area. Returns True once wooden
+    spikes are confirmed in inventory; returns False either to tell the caller to just retry
+    next tick, or because handle_missing_target gave up and this already called
+    trigger_safety_stop -- callers don't need to distinguish the two, same as every other
+    handle_missing_target call site in this module."""
     if find_item(WOODEN_SPIKES_NAME) is not None:
         return True
 
-    bank_obj = banker.find_nearby_bank({})
-    if bank_obj is None:
-        ctx.state.trigger_safety_stop("out of wooden spikes and no bank in range to restock")
+    supply = find_object(SPIKES_SUPPLY_NAME)
+    if supply is None:
+        if handle_missing_target(ctx, config, "spikesSupply", "gc_spikes_misses", "gc_spikes_walks"):
+            return False
+        ctx.state.trigger_safety_stop("out of wooden spikes and no Spikes supply found nearby")
         return False
+    ctx.state.data["gc_spikes_misses"] = 0
+    ctx.state.data["gc_spikes_walks"] = 0
 
-    if not banker.open_bank(ctx, bank_obj):
-        ctx.state.trigger_safety_stop("failed to open the bank while restocking wooden spikes")
-        return False
-
-    banker.withdraw_loadout(ctx, {"withdraw": [{"name": WOODEN_SPIKES_NAME, "quantity": 1}]})
-    banker.close_bank(ctx)
-    time.sleep(random.uniform(0.3, 0.6))
-
-    if find_item(WOODEN_SPIKES_NAME) is None:
-        ctx.state.trigger_safety_stop("no wooden spikes in inventory or bank -- can't line the Goat Pit")
-        return False
-    return True
+    debug_log.log("golem crafting", "taking wooden spikes from the Spikes supply")
+    controller.click_entity(ctx.ser, supply)
+    time.sleep(random.uniform(0.4, 0.7))
+    return find_item(WOODEN_SPIKES_NAME) is not None
 
 
 # Consecutive empty-goat polls required before treating the pit as genuinely cleared -- guards
@@ -755,7 +1475,11 @@ def tick(ctx):
         if ctx.state.safety_stopped:
             return
 
-    phase = ctx.state.data.get("gc_phase", "mine")
+    # CORRECTED 2026-08-08 (live session, user request): starts at "bank" rather than "mine" --
+    # a fresh activation should stock fur FIRST (withdrawn in full and pouched, see
+    # _run_bank_trip's docstring), so mine_phase never has to compete with loose fur for
+    # inventory slots even on the very first mining trip of a session.
+    phase = ctx.state.data.get("gc_phase", "bank")
     handler = PHASES.get(phase)
     if handler is None:
         ctx.state.trigger_safety_stop(f"unknown golem crafting phase '{phase}'")

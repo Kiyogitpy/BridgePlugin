@@ -162,6 +162,30 @@ def test_match_menu_entry_returns_none_when_nothing_matches():
     assert s._match_menu_entry(menu, "attack", None) is None
 
 
+def test_match_menu_entry_prefers_exact_option_over_substring():
+    # CONFIRMED live 2026-08-08 (MCP debug session): "examine" contains "mine" as a substring,
+    # so a naive substring-only search for "Mine" silently matched "Examine" instead whenever
+    # both were present in the same menu (i.e. basically always, since every object has an
+    # Examine entry) -- resolving to the wrong action with no error at all.
+    menu = {"open": True, "entries": [
+        {"index": 0, "option": "Examine", "target": "Sunstone rocks", "screenX": 10, "screenY": 20},
+        {"index": 1, "option": "Mine", "target": "Sunstone rocks", "screenX": 10, "screenY": 35},
+    ]}
+    match = s._match_menu_entry(menu, "mine", None)
+    assert match == menu["entries"][1]
+
+
+def test_match_menu_entry_falls_back_to_substring_when_no_exact_match():
+    # The substring fallback is still needed for cases like "take" matching "Take-5"/"Take-10"/
+    # "Take-X" when there's no bare "Take" entry -- this must keep working.
+    menu = {"open": True, "entries": [
+        {"index": 0, "option": "Cancel", "target": "", "screenX": 0, "screenY": 0},
+        {"index": 1, "option": "Take-5", "target": "Coins", "screenX": 5, "screenY": 6},
+    ]}
+    match = s._match_menu_entry(menu, "take", None)
+    assert match == menu["entries"][1]
+
+
 def test_click_menu_entry_rejects_out_of_window_origin(monkeypatch):
     monkeypatch.setattr(s.controller, "is_point_within_window", lambda x, y: False)
     result = s.click_menu_entry(x=-1, y=-1, option="attack")

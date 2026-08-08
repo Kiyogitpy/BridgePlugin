@@ -107,7 +107,7 @@ def api_get(path, params=None, timeout=0.3):
     try:
         resp = requests.get(f"{API_BASE}{path}", params=params, timeout=timeout)
         resp.raise_for_status()
-        result = resp.json()
+        result = _scale_screen_coords(resp.json(), get_dpi_scale())
         if _bridge_failing:
             # Recovery is edge-triggered too, not logged on every successful request -- api_get()
             # is called many times per tick (every get_*() wrapper), so without this a bridge
@@ -366,6 +366,82 @@ def set_dpi_aware():
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+_dpi_scale_cache = None
+
+
+def get_dpi_scale() -> float:
+    """Ratio between this (DPI-aware, see set_dpi_aware) process's real physical pixels and the
+    RuneLite/Java client's own reported screen coordinates -- CONFIRMED live 2026-08-08 (MCP
+    debug session): the Java client (launched via `./gradlew.bat run`, a bare java.exe with no
+    DPI-aware manifest) reports AWT screen coordinates (Component.getLocationOnScreen,
+    MouseInfo, Toolkit.getScreenSize) in its own device-independent "user space" -- this is a
+    fixed property of the JDK 9+ HiDPI model, NOT a fixable "DPI-unaware app" bug: neither a JVM
+    system property (-Dsun.java2d.dpiaware=true), an explicit native
+    SetProcessDpiAwarenessContext/SetProcessDPIAware call from Java (via JNA, in
+    ExamplePluginTest.main, before any window is created), nor an OS-level per-executable
+    HIGHDPIAWARE compatibility override changed the ratio at all -- it stayed exactly the
+    display's scale factor (confirmed 1.25 on a 125%-scaled display: moving the real OS cursor
+    to physical (600, 500) had RuneLite's own /state report the mouse at (480, 400), every
+    single time, regardless of which of those three fixes was in effect). So every screenX/
+    screenY (and window/canvas/mouse screen-position field) the bridge returns is in that
+    "user space" and must be scaled up by this ratio before it's a real physical-pixel target
+    for the Arduino-driven cursor -- applied centrally in api_get() via _scale_screen_coords,
+    not at each of click_entity/hover_entity/click_menu_action's call sites.
+
+    Cached for the process lifetime -- the display's DPI doesn't change mid-session, and this
+    would otherwise cost a GetDC/GetDeviceCaps/ReleaseDC round trip on every single api_get()
+    call.
+    """
+    global _dpi_scale_cache
+    if _dpi_scale_cache is None:
+        try:
+            hdc = user32.GetDC(None)
+            dpi_x = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+            user32.ReleaseDC(None, hdc)
+            _dpi_scale_cache = dpi_x / 96.0 if dpi_x else 1.0
+        except Exception:
+            _dpi_scale_cache = 1.0
+    return _dpi_scale_cache
+
+
+# Field names that are unambiguously screen-pixel positions/sizes wherever they appear in a
+# bridge response, at any nesting depth -- safe to scale by exact key match. Deliberately NOT
+# a blind "x"/"y" match: those bare names are also used throughout the bridge for WORLD tile
+# coordinates (e.g. /player, /objects' own "x"/"y"), which must never be scaled.
+_SCREEN_COORD_KEYS = {
+    "screenX", "screenY",
+    "windowX", "windowY", "windowWidth", "windowHeight",
+    "canvasScreenX", "canvasScreenY", "canvasWidth", "canvasHeight",
+    "mouseScreenX", "mouseScreenY",
+}
+
+
+def _scale_screen_coords(obj, scale: float):
+    """Recursively multiplies every _SCREEN_COORD_KEYS field (and each uiBlockers entry's own
+    x/y/width/height -- ambiguously named like world coordinates, but a fixed, known shape from
+    GameStateProvider, so safe to special-case) by `scale` in place. See get_dpi_scale's
+    docstring for why this needs to exist at all. Mutates and returns `obj` so api_get can just
+    do `result = _scale_screen_coords(result, get_dpi_scale())`."""
+    if scale == 1.0:
+        return obj
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in _SCREEN_COORD_KEYS and isinstance(value, (int, float)):
+                obj[key] = int(round(value * scale))
+            elif key == "uiBlockers" and isinstance(value, list):
+                for blocker in value:
+                    if isinstance(blocker, dict):
+                        for bk in ("x", "y", "width", "height"):
+                            if isinstance(blocker.get(bk), (int, float)):
+                                blocker[bk] = int(round(blocker[bk] * scale))
+            else:
+                _scale_screen_coords(value, scale)
+    elif isinstance(obj, list):
+        for item in obj:
+            _scale_screen_coords(item, scale)
+    return obj
 
 
 def get_cursor_pos() -> tuple:
@@ -972,14 +1048,27 @@ def click_menu_action(ser: serial.Serial, entity: dict, option: str, target_hint
         debug_log.log("!", f"Menu never opened after right-clicking {entity.get('name')}")
         return False
 
+    # Exact match on `option` preferred over substring -- CONFIRMED live 2026-08-08 (MCP debug
+    # session): a plain substring search for "Mine" silently matched "Examine" instead (every
+    # object's menu has an Examine entry, and "examine" contains "mine"), resolving to the wrong
+    # action with no error. Falls back to substring only if no exact match exists, which is still
+    # needed for e.g. "take" matching "Take-5"/"Take-10"/"Take-X" when there's no bare "Take".
     option_lower = option.lower()
     target_lower = target_hint.lower() if target_hint else None
+
+    def _target_ok(entry: dict) -> bool:
+        return target_lower is None or target_lower in (entry.get("target") or "").lower()
+
+    entries = menu.get("entries", [])
     match = next(
-        (e for e in menu.get("entries", [])
-         if option_lower in (e.get("option") or "").lower()
-         and (target_lower is None or target_lower in (e.get("target") or "").lower())),
+        (e for e in entries if option_lower == (e.get("option") or "").lower() and _target_ok(e)),
         None,
     )
+    if match is None:
+        match = next(
+            (e for e in entries if option_lower in (e.get("option") or "").lower() and _target_ok(e)),
+            None,
+        )
 
     if match is None:
         debug_log.log("!", f"No '{option}' entry in menu for {entity.get('name')} "

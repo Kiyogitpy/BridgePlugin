@@ -144,11 +144,20 @@ def _wrap_bridge_response(response: "requests.Response") -> dict:
     """Turns a raw requests.Response into either its decoded JSON body or a {"error": ...}
     dict -- never raises. Used by _bridge_get_impl. Deliberately separate from
     controller.api_get, which swallows failures for the bot's own tick-to-tick resilience;
-    a debugging tool wants a failed/timed-out request to be visibly an error instead."""
+    a debugging tool wants a failed/timed-out request to be visibly an error instead.
+
+    Runs the same controller._scale_screen_coords pass controller.api_get applies -- CONFIRMED
+    live 2026-08-08 (MCP debug session): every screenX/screenY (and window/canvas/mouse
+    screen-position field) the bridge returns is in the RuneLite/Java client's own "user space",
+    not this (DPI-aware) process's real physical pixels -- see controller.get_dpi_scale's
+    docstring for the full story. Without this, bridge_get/click_menu_entry's own /menu polling
+    (this module's own independent HTTP path, bypassing controller.api_get entirely) would keep
+    returning coordinates that miss their real on-screen target by the display's DPI scale
+    factor, exactly like every click_entity call did before controller.api_get got this fix."""
     if not (200 <= response.status_code < 300):
         return {"error": f"bridge returned HTTP {response.status_code}"}
     try:
-        return response.json()
+        return controller._scale_screen_coords(response.json(), controller.get_dpi_scale())
     except ValueError as exc:
         return {"error": f"invalid JSON from bridge: {exc}"}
 
@@ -436,15 +445,30 @@ MENU_POLL_TIMEOUT_S = 0.6
 
 
 def _match_menu_entry(menu: dict, option: str, target_hint: str | None) -> dict | None:
-    """Same matching rule as controller.click_menu_action: case-insensitive substring match on
-    `option`, and on `target` too if target_hint is given. Returns the first matching entry
+    """Same matching rule as controller.click_menu_action: case-insensitive, preferring an exact
+    match on `option` and only falling back to substring if no exact match exists -- CONFIRMED
+    live 2026-08-08 (MCP debug session): a plain substring search for "Mine" silently matched
+    "Examine" instead (every object's menu has an Examine entry, and "examine" contains "mine"),
+    returning {"ok": True} for the wrong action with no error at all. Exact-match-first fixes
+    that case while still allowing the substring fallback's original purpose (e.g. "take"
+    matching "Take-5"/"Take-10"/"Take-X" when there's no bare "Take" entry). Matches `target_hint`
+    (if given) the same way, independently, against `target`. Returns the first matching entry
     dict, or None if nothing matches (including when the menu has no entries)."""
     option_lower = option.lower()
     target_lower = target_hint.lower() if target_hint else None
+
+    def target_ok(entry: dict) -> bool:
+        return target_lower is None or target_lower in (entry.get("target") or "").lower()
+
+    entries = menu.get("entries", [])
+    exact = next(
+        (e for e in entries if option_lower == (e.get("option") or "").lower() and target_ok(e)),
+        None,
+    )
+    if exact is not None:
+        return exact
     return next(
-        (e for e in menu.get("entries", [])
-         if option_lower in (e.get("option") or "").lower()
-         and (target_lower is None or target_lower in (e.get("target") or "").lower())),
+        (e for e in entries if option_lower in (e.get("option") or "").lower() and target_ok(e)),
         None,
     )
 

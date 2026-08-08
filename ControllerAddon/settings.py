@@ -17,7 +17,7 @@ API_BASE = "http://localhost:8080"
 UDP_PORT = 50555
 
 # ---------------- Arduino serial connection ----------------
-SERIAL_PORT = os.environ.get("BRIDGE_SERIAL_PORT", "COM6")
+SERIAL_PORT = os.environ.get("BRIDGE_SERIAL_PORT", "COM3")
 SERIAL_BAUD = 115200
 
 # ---------------- Main loop pacing ----------------

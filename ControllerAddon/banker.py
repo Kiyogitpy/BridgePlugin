@@ -227,13 +227,19 @@ def has_fur_pouch() -> bool:
 
 
 def fill_fur_pouch(ctx) -> bool:
-    """Click the fur pouch at an open bank to fill it with hunter fur. ASSUMPTION, NOT YET
-    VERIFIED LIVE -- which action a plain left-click resolves to here, same uncertainty
-    fill_coal_bag documents above: the OSRS Wiki notes a bank-side click on a non-empty
-    container can resolve to "Empty" instead of "Fill". Verify live which action a plain click
-    actually performs in each state; add the wrong one to Controller Settings -> Clicking ->
-    Forced Actions if needed. check_ui_blockers=False since this is an inventory-item click,
-    same reasoning as every other inventory click in this codebase."""
+    """Click the fur pouch to fill it with loose fur -- plain click_entity, NOT explicit menu
+    selection. CORRECTED 2026-08-08 (live session): first tried the same explicit-menu fix as
+    empty_fur_pouch below, on the assumption the same click-ambiguity risk applied -- CONFIRMED
+    live it does not, and the explicit-menu version actively breaks the primary use case: while
+    a bank interface is open, the pouch's own right-click menu doesn't offer "Fill" at all (it
+    shows Deposit-1/5/10/X/All/Empty-to-bank instead -- bank-context actions replace the item's
+    normal one), so click_menu_action(..., "fill", ...) always failed there with "No 'fill'
+    entry in menu". A plain click resolves to Fill correctly in that exact context (this is
+    the intended, designed-for use of a gathering pouch at a bank), which is the only place
+    this function is actually called from (_run_bank_trip, bank interface open) -- unlike
+    empty_fur_pouch, called AWAY from a bank, where the ambiguity between Close/Use/Check/
+    Fill/Empty was real and confirmed. check_ui_blockers=False: inventory-item click, same
+    reasoning as every other inventory click in this codebase."""
     pouch = next(
         (i for i in controller.get_inventory() if FUR_POUCH_NAME in (i.get("name") or "").lower()),
         None,
@@ -250,14 +256,24 @@ def fill_fur_pouch(ctx) -> bool:
 
 
 def empty_fur_pouch(ctx) -> bool:
-    """Click Empty on the fur pouch to dump its fur into an open bank (pre-craft: into
-    inventory instead, if no bank is open -- see routines/golem_crafting.py's bank_phase,
-    which calls this right after closing the bank so any fur caught while hunting is available
-    to insert into a golem). Same situation as empty_coal_bag above: "Empty" is not always the
-    item's default option, so add it to Controller Settings -> Clicking -> Forced Actions if a
-    plain click doesn't already resolve to it. check_ui_blockers=False since this is an
-    inventory-item click, used both at a bank and out in the open (at the plinth), where the
-    inventory panel itself is a live UI-blocker rect in resizable layouts."""
+    """Explicitly select "Empty" on the fur pouch's right-click menu to dump its fur into an
+    open bank (pre-craft: into inventory instead, if no bank is open -- see
+    routines/golem_crafting.py's bank_phase, which calls this right after closing the bank so
+    any fur caught while hunting is available to insert into a golem).
+
+    CORRECTED 2026-08-08 (live session, user report): this used to be a plain click_entity
+    (whatever the pouch's current default action resolves to), which the function's own
+    docstring already flagged as unverified -- CONFIRMED live it was the wrong guess: an
+    "(open)" pouch's default click resolved to something other than "Empty" (its own menu also
+    lists Close/Use/Check/Fill alongside Empty, all plausible defaults depending on state),
+    silently pulling fur that had JUST been withdrawn from the bank back INTO the pouch instead
+    of leaving it loose in inventory -- pick_best_fur_in_inventory() only scans top-level
+    inventory item names, so fur trapped inside the pouch became invisible to craft_phase,
+    which then reported "out of usable fur" and bounced back to bank_phase in an unproductive
+    loop, on every single automated run. Explicit menu selection (via click_menu_action, same
+    idiom slayer.py's maybe_loot uses for ground-item Take) removes the ambiguity entirely.
+    offset=(0, 0): the pouch's inventory icon is small, same reasoning maybe_loot's own Take
+    click uses for ground items rather than click_entity's NPC-sized default offset."""
     pouch = next(
         (i for i in controller.get_inventory() if FUR_POUCH_NAME in (i.get("name") or "").lower()),
         None,
@@ -266,7 +282,7 @@ def empty_fur_pouch(ctx) -> bool:
         return False
 
     print("[bank] emptying fur pouch")
-    if not controller.click_entity(ctx.ser, pouch, check_ui_blockers=False):
+    if not controller.click_menu_action(ctx.ser, pouch, "empty", offset=(0, 0), check_ui_blockers=False):
         return False
 
     time.sleep(random.uniform(0.6, 1.0))
@@ -455,13 +471,29 @@ def _dose(name: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def _search_and_withdraw(ctx, item_name: str, quantity: int) -> bool:
-    # Search by the base name, without any trailing (N) dose/charge suffix -- CONFIRMED live
-    # 2026-08-06: searching the item's full exact name (e.g. "Sanfew serum(4)") failed every
-    # time, because key_tap has no way to send a shifted character like "(" or ")" -- there's no
-    # such single key on a real keyboard, it's Shift+9/Shift+0. The base name alone is still
-    # specific enough to filter down to just that item's dose variants (rarely more than a
-    # handful), and the exact-name match below still picks the one dose we actually chose.
+def search_and_withdraw(ctx, item_name: str, quantity: int) -> bool:
+    """Search-then-click withdraw for exactly one named item, guaranteeing it's scrolled onto
+    an on-screen, clickable position first (see search_bank's docstring for why that matters).
+    Originally private (used only by withdraw_best_food/withdraw_best_prayer_restore below) --
+    made public 2026-08-08 for routines/golem_crafting.py's fur withdrawal, which hit the exact
+    same bug: banker.withdraw_loadout clicks a bank slot's raw screenX/screenY with no
+    search/visibility step, which silently fails (is_point_within_window rejects the far
+    off-screen point, click_entity just returns False) for anything not on the bank's first
+    visible page -- CONFIRMED live 2026-08-08, this account's real (large, unsorted) bank
+    reports "Sunlight antelope fur" at screenY=5271 against a display nowhere near that tall.
+    Deliberately NOT folded into withdraw_loadout itself -- that function's substring-matching
+    lookup and blast_furnace.py's run_trip rely on specific call-ordering/sleep timing around it
+    (see run_trip's own docstring, the "Coal" vs "Coal bag" collision) that a rewrite risks
+    silently breaking for an already-working routine; this is a separate, additive entry point
+    for callers (so far golem_crafting.py) that want the extra visibility guarantee explicitly.
+
+    Search by the base name, without any trailing (N) dose/charge suffix -- CONFIRMED live
+    2026-08-06: searching the item's full exact name (e.g. "Sanfew serum(4)") failed every
+    time, because key_tap has no way to send a shifted character like "(" or ")" -- there's no
+    such single key on a real keyboard, it's Shift+9/Shift+0. The base name alone is still
+    specific enough to filter down to just that item's dose variants (rarely more than a
+    handful), and the exact-name match below still picks the one dose we actually chose.
+    """
     search_query = _DOSE_RE.sub("", item_name).strip()
     if not search_bank(ctx, search_query):
         return False
@@ -511,7 +543,7 @@ def withdraw_best_food(ctx, quantity: int = 1) -> bool:
     candidates.sort(key=lambda i: i.get("heal", 0), reverse=True)
     best = candidates[0]
     print(f"[bank] auto-picked food: {best.get('name')} (heals {best.get('heal')})")
-    return _search_and_withdraw(ctx, best.get("name"), quantity)
+    return search_and_withdraw(ctx, best.get("name"), quantity)
 
 
 def withdraw_best_prayer_restore(ctx, quantity: int = 1) -> bool:
@@ -526,7 +558,7 @@ def withdraw_best_prayer_restore(ctx, quantity: int = 1) -> bool:
     candidates.sort(key=lambda i: _dose(i.get("name")), reverse=True)
     best = candidates[0]
     print(f"[bank] auto-picked prayer restore: {best.get('name')}")
-    return _search_and_withdraw(ctx, best.get("name"), quantity)
+    return search_and_withdraw(ctx, best.get("name"), quantity)
 
 
 def bank_up(ctx, config: dict) -> bool:
