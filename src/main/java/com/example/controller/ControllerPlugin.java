@@ -116,6 +116,7 @@ public class ControllerPlugin extends Plugin
 		new LoginProvider(client, clientThread, server).register();
 		new SlayerConfigProvider(client, clientThread, server, config).register();
 		new MenuStateProvider(client, clientThread, server).register();
+		new SpellbookProvider(client, clientThread, server).register();
 
 		server.register("/mining-config", () -> ConfigExporter.exportMining(config));
 		server.register("/gemstone-crab-config", () -> ConfigExporter.exportGemstoneCrab(config));
