@@ -370,6 +370,23 @@ def find_golem_object(committed_id=None):
     return candidates[0]
 
 
+def is_valid_grab_target(pit: dict, goat: dict) -> bool:
+    """South, east, or west of the pit only -- north is the player's own fixed standing side
+    (CONFIRMED live, account owner), so a goat there can never be a valid Grab target no matter
+    how close it is."""
+    return goat.get("y", 0) <= pit.get("y", 0)
+
+
+def goat_in_grab_range(player: dict, goat: dict) -> bool:
+    """Telekinetic Grab's cast range is 10 tiles (CONFIRMED live, account owner) -- a target
+    beyond that makes the character auto-walk toward it instead of just casting in place, which
+    would pull the player off the fixed north tile hunt_phase depends on for is_valid_grab_
+    target's own north-side exclusion to keep meaning anything."""
+    dx = abs(goat.get("x", 0) - player.get("x", 0))
+    dy = abs(goat.get("y", 0) - player.get("y", 0))
+    return max(dx, dy) <= GRAB_RANGE_TILES
+
+
 def find_mining_target(committed_pos=None):
     """A single object in MINING_TARGET_NAMES ("Sunstone rocks") to click -- sticky, not just
     "whichever is closest right now": if `committed_pos` (an (x, y) world tile) is given and
@@ -720,6 +737,21 @@ GOLEM_CHAT_COMPLETE = "you have crafted"  # "...N golem(s) on Wyrmscraig." -- pr
 # it needs to be recognized at all, not just handled once seen.
 GOLEM_CHAT_NOT_ENOUGH_FUR = "you need to dress the golem in furs from hunted creatures."
 
+# CONFIRMED live (user session) -- Goat Pit hunting mechanic, replacing the original wrong
+# plain-click-lures/harvests assumption. See docs/superpowers/specs/2026-08-08-goat-pit-
+# telekinetic-grab-design.md for the full mechanic writeup.
+GOAT_CHAT_PIT_FULL = "the pit is now filled with goats."
+# Rune name varies (law/air), so this matches on the stable surrounding text rather than a
+# single fixed string -- both substrings must be present.
+GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS = ("you do not have enough", "to cast this spell")
+GOAT_HORN_NAME = "Goat horn"  # always drops per trapped goat, never useful -- dropped on harvest
+FUR_POUCH_CAPACITY = 28  # large fur pouch's capacity -- once hit, further fur spills into loose
+                         # inventory instead of the pouch, which is exactly the signal used below
+                         # to know the pouch is full without any dedicated capacity-check action
+GRAB_RANGE_TILES = 10  # Telekinetic Grab's cast range -- a farther target makes the character
+                       # auto-walk toward it, pulling the player off the fixed standing tile the
+                       # whole north-side-only geometry below depends on
+
 
 def on_event(ctx, event_type, payload) -> None:
     """Captures the golem-crafting confirmation/rejection chat messages into
@@ -730,17 +762,30 @@ def on_event(ctx, event_type, payload) -> None:
     can tell "no new message since I started waiting" apart from "a new message arrived that
     happens to repeat old text" -- comparing the text alone couldn't distinguish those. Ignores
     every other chat message (this routine has no other use for chat) so unrelated game/spam
-    messages can't overwrite a still-unconsumed golem-crafting one."""
+    messages can't overwrite a still-unconsumed golem-crafting one.
+
+    ADDED 2026-08-08 (Goat Pit hunting redesign): also captures hunt_phase's own two chat
+    signals (pit-full, rune-shortage) into a SEPARATE gc_last_hunt_chat/_seq pair, not the
+    golem-crafting one above -- controller.py only ever calls one on_event per routine module
+    (see its own dispatch, `hasattr(routine, "on_event")`), so both concerns have to live in
+    this one function, but craft_phase and hunt_phase are mutually exclusive via gc_phase and
+    keeping their chat state in separate keys avoids any future ambiguity if that ever changes."""
     if event_type != "CHAT_MESSAGE" or not payload:
         return
     message = (payload.get("message") or "").lower()
-    if not any(known in message for known in (
+
+    if any(known in message for known in (
         GOLEM_CHAT_SIDE_DONE, GOLEM_CHAT_SIDE_ALREADY_DONE, GOLEM_CHAT_NOT_ENOUGH_SUNSTONE,
         GOLEM_CHAT_WRONG_INSERT_SIDE, GOLEM_CHAT_COMPLETE, GOLEM_CHAT_NOT_ENOUGH_FUR,
     )):
-        return
-    ctx.state.data["gc_last_chat"] = message
-    ctx.state.data["gc_last_chat_seq"] = ctx.state.data.get("gc_last_chat_seq", 0) + 1
+        ctx.state.data["gc_last_chat"] = message
+        ctx.state.data["gc_last_chat_seq"] = ctx.state.data.get("gc_last_chat_seq", 0) + 1
+
+    is_pit_full = GOAT_CHAT_PIT_FULL in message
+    is_rune_short = all(part in message for part in GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS)
+    if is_pit_full or is_rune_short:
+        ctx.state.data["gc_last_hunt_chat"] = message
+        ctx.state.data["gc_last_hunt_chat_seq"] = ctx.state.data.get("gc_last_hunt_chat_seq", 0) + 1
 
 
 # How long craft_phase waits for a chat confirmation before giving up on one attempt and
