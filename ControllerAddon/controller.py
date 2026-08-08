@@ -943,7 +943,15 @@ def cast_telekinetic_grab(ser: serial.Serial, target: dict) -> bool:
     if not click_entity(ser, spell, offset=(0, 0), check_ui_blockers=False):
         return False
     time.sleep(random.uniform(0.15, 0.3))
-    return click_entity(ser, target)
+    # ADDED 2026-08-09 (user report: "the data is too slow because the goats move around a lot,
+    # we click the ground 70% of the time"): target's screenX/screenY are a snapshot from
+    # whenever the caller fetched the NPC list, already stale by the time this click actually
+    # executes for a fast-moving goat. refresh_target re-queries this SPECIFIC NPC's live
+    # position by index mid-flight (same mechanism slayer.py's engage_target already uses for
+    # moving combat targets) rather than trusting the one snapshot for the whole click.
+    npc_index = target.get("index")
+    refresh = (lambda: get_npc_screen_pos_by_index(npc_index)) if npc_index is not None else None
+    return click_entity(ser, target, refresh_target=refresh)
 
 
 def rotate_camera_away_from_ui(ser: serial.Serial, blocker: dict) -> None:
