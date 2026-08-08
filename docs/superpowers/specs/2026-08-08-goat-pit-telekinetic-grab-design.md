@@ -60,15 +60,18 @@ else in `golem_crafting.py`'s design changes.
 - **User-verified live play** (this session) for every mechanic above --
   the wrong original assumption was also user-caught live, so this
   supersedes it entirely.
-- **RuneLite API inspection** (`runelite-api-1.12.33.jar`, via `javap`) for
-  `Widget`/`WidgetID`/`SceneTilePaint`/`SceneTileModel` -- confirmed
-  `WidgetID.SPELLBOOK_GROUP_ID` exists and `Widget.getName()`/`getBounds()`
-  are available for building `SpellbookProvider`, but no live capture of
-  the spellbook widget tree has been done yet -- **treat "Telekinetic
-  Grab" being findable via `Widget.getName()` under that group as an
-  ASSUMPTION, NOT YET VERIFIED LIVE**, same convention as this file's other
-  flagged uncertainties. Verify by opening the spellbook and hitting
-  `GET /spellbook` before trusting this unattended.
+- **RuneLite API inspection** (`runelite-api-1.12.33.jar`, via `javap`) --
+  found `InterfaceID.MagicSpellbook.TELEGRAB`, a direct generated
+  packed-widget-id constant for Telekinetic Grab specifically (same
+  `InterfaceID.<Group>.<CONSTANT>` idiom `BankProvider.java` already uses
+  for e.g. `InterfaceID.Bankmain.SEARCH`). This replaces the original plan
+  of walking the spellbook's dynamic children and matching by
+  `Widget.getName()` -- no name-matching or iteration needed, just
+  `client.getWidget(InterfaceID.MagicSpellbook.TELEGRAB)` directly. Still
+  **NOT YET VERIFIED LIVE** that this constant resolves to a real, visible
+  widget once the Magic tab is actually open in this game (only confirmed
+  to exist in the API jar) -- verify via `GET /spellbook` before trusting
+  this unattended.
 - Exact chat message wording for the rune-shortage rejection ("You do not
   have enough &lt;rune&gt; to cast this spell.") was given directly by the
   user, not independently captured live -- match on the stable substrings
@@ -290,6 +293,12 @@ def hunt_phase(ctx, config):
     ctx.state.data["gc_pit_filled"] = False
     if spilled_fur:
         debug_log.log("golem crafting", "fur pouch full -- skipping bank, heading to mine phase")
+        # Leftover wooden spikes are only useful at the pit -- no reason to carry them into
+        # mine/craft phases once hunting is done for this trip (per the account owner).
+        for spikes in [i for i in controller.get_inventory()
+                       if WOODEN_SPIKES_NAME.lower() in (i.get("name") or "").lower()]:
+            controller.click_entity(ctx.ser, spikes, check_ui_blockers=False)  # "Drop"
+            time.sleep(random.uniform(0.2, 0.4))
         ctx.state.data["gc_fur_stock"] = FUR_POUCH_CAPACITY
         ctx.state.data["gc_hunt_standing"] = False
         ctx.state.data["gc_phase"] = "mine"
@@ -315,5 +324,11 @@ mechanics (see the original golem-crafting design's own ASSUMPTION flags):
    capitalization differences, but confirm the substrings themselves).
 4. Confirm a plain click on a full pit resolves to "Harvest" by default
    (not "Examine" or something else needing a Forced Action).
-5. Confirm dropping "Goat horn" via plain click resolves to "Drop" (Forced
-   Actions setting, same caveat `drop_salvage` already documents).
+5. ~~Confirm dropping "Goat horn" via plain click resolves to "Drop"~~ --
+   CONFIRMED live (user session): "Drop" is set as the left-click Forced
+   Action for Goat horn, so a plain `click_entity` resolves correctly.
+6. Confirm "Wooden spikes" also has "Drop" set as its left-click Forced
+   Action (Controller Settings -> Clicking -> Forced Actions) -- this is a
+   separate per-item-name setting from Goat horn's, not automatically
+   covered by item 5's confirmation, and the leftover-spikes drop (end of
+   a hunt trip once the pouch is full) relies on it the same way.
