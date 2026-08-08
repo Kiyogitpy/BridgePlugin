@@ -1473,67 +1473,78 @@ def _ensure_wooden_spikes(ctx, config: dict) -> bool:
 # review).
 GOAT_NO_GOAT_CLEAR_STREAK = 3
 
-# Hard cap on lure/harvest clicks per hunt-phase activation -- guards the opposite failure: if a
-# plain click never actually resolves to Lure/Harvest (see this function's own flagged
-# uncertainty below), goats would never stop appearing and this phase would click forever with
-# no progress. ADDED 2026-08-08 (final whole-branch review).
+# Hard cap on hunt-phase actions (originally lure/harvest clicks; now Telekinetic Grab casts --
+# see hunt_phase's own docstring for the 2026-08-08 rewrite) per activation -- guards the
+# opposite failure: if a cast/click never actually resolves as expected, this phase would
+# repeat forever with no progress. ADDED 2026-08-08 (final whole-branch review).
 MAX_HUNT_ACTIONS = 60
 
 
 def hunt_phase(ctx, config: dict) -> None:
-    """Entered only when bank_phase finds no usable fur at all. Line the Goat Pit with wooden
-    spikes, open the fur pouch (if owned) so catches route straight in, then lure/harvest
-    goats until none are left nearby (the pit needing to be "fully cleared of goats before it
-    can be re-lured" per the design's Key facts -- approximated here as "no goat NPCs visible
-    near the pit", since the bridge has no dedicated pit-state field to check against). One
-    action (line the pit, lure, or harvest) per call, same isIdle-adjacent single-small-action
-    shape as mine_phase/chisel_phase.
+    """Entered only when bank_phase finds no usable fur at all. Traps Wyrmscraig goats by
+    casting Telekinetic Grab on them (not by clicking them directly -- see this function's own
+    history below for the wrong assumption this replaces), harvests the pit once full, and
+    repeats (relining every single cycle) until either no valid goats remain nearby or the fur
+    pouch hits capacity. One bounded action per call, same shape as mine_phase/chisel_phase.
 
-    CORRECTED 2026-08-08 (final whole-branch review): "no goats visible" now has to hold for
-    GOAT_NO_GOAT_CLEAR_STREAK consecutive polls before the pit is treated as cleared, not just
-    once -- a single miss right after lining (before any goat has spawned/registered yet) used
-    to immediately declare "cleared" and bounce straight back to bank_phase, which would just
-    re-enter hunt_phase and re-line, burning wooden spikes in a bank<->hunt ping-pong. There's
-    also now a bounded MAX_HUNT_ACTIONS cap on lure/harvest clicks, so a stuck click resolution
-    (see the ASSUMPTION below) safety-stops instead of clicking forever with no progress.
+    CORRECTED 2026-08-08 (user session, live-verified): replaces this function's entire
+    original model. The original assumed a plain left-click on a wild goat resolves to "Lure"
+    (and the same click on a trapped goat resolves to "Harvest") -- CONFIRMED WRONG live. The
+    real mechanic (see docs/superpowers/specs/2026-08-08-goat-pit-telekinetic-grab-design.md
+    for the full writeup):
+      1. Line the pit with wooden spikes (unchanged mechanically, now happens after walking to
+         the fixed standing tile rather than before, so lining always happens from the same
+         spot the whole cycle depends on).
+      2. Stand on the tile 2 tiles north of the pit -- the player's own fixed side. Only goats
+         to the south, east, or west (is_valid_grab_target) within 10 tiles
+         (goat_in_grab_range) are ever valid Grab targets; a farther target would make the
+         character auto-walk toward it, abandoning the fixed tile.
+      3. Cast Telekinetic Grab (controller.cast_telekinetic_grab) on the nearest valid goat,
+         repeatedly, until the chat message "The pit is now filled with goats." arrives
+         (captured by on_event into gc_last_hunt_chat/_seq, same chat-driven-confirmation
+         idiom craft_phase already uses for golem-crafting messages).
+      4. Click the pit to harvest (not individual goats) -- always yields a Goat horn (useless,
+         dropped) and a 1/4-per-trapped-goat chance of Wyrmscraig goat fur (routed into the
+         already-open fur pouch, same as before).
+      5. Relines every single cycle (not once per hunt visit) before repeating from step 3.
+      6. If the fur pouch is at capacity (28), any further fur spills into loose inventory
+         instead of the pouch -- CONFIRMED live this is the signal used to know it's full,
+         rather than any dedicated capacity-check action. Once seen, drops any leftover wooden
+         spikes (no longer needed this trip) and skips bank_phase entirely, going straight to
+         mine_phase (fully re-stocked already -- nothing to deposit or withdraw for fur).
 
-    ASSUMPTION, NOT YET VERIFIED LIVE -- this is the single most uncertain part of this whole
-    routine (see the design doc's Research method: the Goat Pit's exact interaction states
-    weren't deeply covered by the live wiki fetch this design was based on). In particular:
-      - Whether a plain left-click on a wild goat resolves to "Lure" by default, and whether
-        the SAME plain click on an already-trapped goat resolves to "Harvest" -- this function
-        can't currently tell "needs luring" and "ready to harvest" apart from the bridge's NPC
-        data alone, so it clicks whatever goat NPC is nearest and lets the game's own menu
-        resolution sort out which action that click actually performs. Add "Lure"/"Harvest" to
-        Controller Settings -> Clicking -> Forced Actions if a plain click doesn't resolve
-        correctly in one or both states.
-      - Whether "Open" is really the fur pouch's default action while not at a bank (as opposed
-        to Fill/Empty, which is what a bank-side plain click is assumed to resolve to
-        elsewhere in this file) -- same kind of state-dependent-default-action uncertainty
-        banker.py's fill_coal_bag docstring already flags for the coal bag.
-    Correct this function during the Goat Pit stage of this plan's live verification task
-    before trusting the hunt phase unattended.
+    Rune handling: no pre-check of the rune pouch's contents (it isn't inventory-visible the
+    way find_item can see loose runes -- see the spec's Research method section for why).
+    Instead, casting is attempted and the "you do not have enough ... to cast this spell"
+    rejection (GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS) safety-stops immediately, same pattern as the
+    fur/sunstone shortage handling in craft_phase.
+
+    Still bounded by MAX_HUNT_ACTIONS/gc_hunt_actions, same safety net the original click-based
+    version had -- a Grab cast that never actually resolves is the same "clicks forever with no
+    progress" risk class a bad click resolution always was, so the cap carries over unchanged.
     """
+    if not _ensure_wooden_spikes(ctx, config):
+        return
+
+    pit = find_object(GOAT_PIT_NAME)
+    if pit is None:
+        if handle_missing_target(ctx, config, "goatPit", "gc_pit_misses", "gc_pit_walks"):
+            return
+        ctx.state.trigger_safety_stop("Goat Pit not found nearby")
+        return
+    ctx.state.data["gc_pit_misses"] = 0
+    ctx.state.data["gc_pit_walks"] = 0
+
+    if not ctx.state.data.get("gc_hunt_standing"):
+        target = {"x": pit["x"], "y": pit["y"] + 2, "plane": pit.get("plane", 0)}
+        if not walk_to_exact_tile(ctx, target["x"], target["y"], target["plane"]):
+            debug_log.log("golem crafting", "couldn't walk to the hunt standing tile -- retrying next tick")
+            return
+        ctx.state.data["gc_hunt_standing"] = True
+
     if not ctx.state.data.get("gc_pit_lined"):
-        if not _ensure_wooden_spikes(ctx, config):
-            return
-
-        pit = find_object(GOAT_PIT_NAME)
-        if pit is None:
-            if handle_missing_target(ctx, config, "goatPit", "gc_pit_misses", "gc_pit_walks"):
-                return
-            ctx.state.trigger_safety_stop("Goat Pit not found nearby")
-            return
-        ctx.state.data["gc_pit_misses"] = 0
-        ctx.state.data["gc_pit_walks"] = 0
-
         spikes = find_item(WOODEN_SPIKES_NAME)
         debug_log.log("golem crafting", "lining the Goat Pit with wooden spikes")
-        # CORRECTED 2026-08-07 (caught in task review): only commit gc_pit_lined once both
-        # clicks actually landed -- CONFIRMED live click_entity returns False on a blocked/
-        # missed aim point, and the original version here set the flag unconditionally,
-        # matching the same class of bug Task 5's carve loop had (state committed without
-        # checking whether the click that was supposed to produce it actually succeeded).
         spikes_clicked = controller.click_entity(ctx.ser, spikes, check_ui_blockers=False)
         time.sleep(random.uniform(0.15, 0.3))
         pit_clicked = controller.click_entity(ctx.ser, pit)
@@ -1542,6 +1553,7 @@ def hunt_phase(ctx, config: dict) -> None:
             debug_log.log("golem crafting", "lining click missed/blocked -- retrying next tick")
             return
         ctx.state.data["gc_pit_lined"] = True
+        ctx.state.data["gc_pit_filled"] = False
 
         if banker.has_fur_pouch() and not ctx.state.data.get("gc_pouch_opened_this_hunt"):
             pouch = find_item(banker.FUR_POUCH_NAME.title()) or next(
@@ -1555,43 +1567,98 @@ def hunt_phase(ctx, config: dict) -> None:
             ctx.state.data["gc_pouch_opened_this_hunt"] = True
         return
 
-    goats = [
-        n for n in controller.get_npcs()
-        if GOAT_NAME in (n.get("name") or "").lower()
-        and n.get("visible", True)
-        and 0 <= n.get("distance", 9999) <= MAX_OBJECT_DISTANCE
-    ]
-    if not goats:
-        streak = ctx.state.data.get("gc_hunt_no_goat_streak", 0) + 1
-        ctx.state.data["gc_hunt_no_goat_streak"] = streak
-        if streak < GOAT_NO_GOAT_CLEAR_STREAK:
-            debug_log.log("golem crafting", f"no goats visible ({streak}/{GOAT_NO_GOAT_CLEAR_STREAK}) -- confirming the pit is actually cleared")
+    if not ctx.state.data.get("gc_pit_filled"):
+        player = controller.get_player()
+        goats = [
+            n for n in controller.get_npcs()
+            if GOAT_NAME in (n.get("name") or "").lower()
+            and n.get("visible", True)
+            and is_valid_grab_target(pit, n)
+            and goat_in_grab_range(player, n)
+        ]
+        if not goats:
+            streak = ctx.state.data.get("gc_hunt_no_goat_streak", 0) + 1
+            ctx.state.data["gc_hunt_no_goat_streak"] = streak
+            if streak < GOAT_NO_GOAT_CLEAR_STREAK:
+                debug_log.log("golem crafting", f"no valid goats visible ({streak}/{GOAT_NO_GOAT_CLEAR_STREAK}) -- confirming the area is actually cleared")
+                return
+            debug_log.log("golem crafting", "no valid goats left nearby -- moving to bank phase")
+            ctx.state.data["gc_phase"] = "bank"
+            ctx.state.data["gc_pit_lined"] = False
+            ctx.state.data["gc_pit_filled"] = False
+            ctx.state.data["gc_hunt_standing"] = False
+            ctx.state.data["gc_pouch_opened_this_hunt"] = False
+            ctx.state.data["gc_hunt_no_goat_streak"] = 0
+            ctx.state.data["gc_hunt_actions"] = 0
             return
-        debug_log.log("golem crafting", "Goat Pit cleared -- moving to bank phase")
-        ctx.state.data["gc_phase"] = "bank"
-        ctx.state.data["gc_pit_lined"] = False
-        ctx.state.data["gc_pouch_opened_this_hunt"] = False
         ctx.state.data["gc_hunt_no_goat_streak"] = 0
-        ctx.state.data["gc_hunt_actions"] = 0
+
+        # Same safety net the original click-based version had (MAX_HUNT_ACTIONS/gc_hunt_actions
+        # existed to guard "a click that never actually resolves clicks forever with no
+        # progress") -- a Grab cast that never actually lands (spellbook not opening, wrong
+        # widget, etc.) is the exact same risk class for this mechanic, so the cap carries over
+        # unchanged rather than being dropped along with the click-based approach it originally
+        # guarded.
+        actions = ctx.state.data.get("gc_hunt_actions", 0) + 1
+        ctx.state.data["gc_hunt_actions"] = actions
+        if actions > MAX_HUNT_ACTIONS:
+            ctx.state.trigger_safety_stop(
+                f"hunt phase exceeded {MAX_HUNT_ACTIONS} Grab-cast attempts without the pit "
+                "filling -- Telekinetic Grab may not be resolving as expected (see hunt_phase's "
+                "docstring)"
+            )
+            return
+
+        goats.sort(key=lambda n: n.get("distance", 9999))
+        target = goats[0]
+        debug_log.log("golem crafting", f"casting Telekinetic Grab on {target.get('name')} (dist={target.get('distance')})")
+        controller.cast_telekinetic_grab(ctx.ser, target)
+        time.sleep(random.uniform(0.6, 1.0))
+
+        seq = ctx.state.data.get("gc_last_hunt_chat_seq", 0)
+        if seq > ctx.state.data.get("gc_hunt_chat_seen_seq", 0):
+            ctx.state.data["gc_hunt_chat_seen_seq"] = seq
+            message = ctx.state.data.get("gc_last_hunt_chat", "")
+            if all(part in message for part in GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS):
+                ctx.state.trigger_safety_stop("out of law/air runes for Telekinetic Grab")
+                return
+            if GOAT_CHAT_PIT_FULL in message:
+                debug_log.log("golem crafting", "pit is now filled with goats -- harvesting")
+                ctx.state.data["gc_pit_filled"] = True
+                ctx.state.data["gc_hunt_actions"] = 0
         return
 
-    ctx.state.data["gc_hunt_no_goat_streak"] = 0
-    actions = ctx.state.data.get("gc_hunt_actions", 0) + 1
-    ctx.state.data["gc_hunt_actions"] = actions
-    if actions > MAX_HUNT_ACTIONS:
-        ctx.state.trigger_safety_stop(
-            f"hunt phase exceeded {MAX_HUNT_ACTIONS} lure/harvest actions without the Goat Pit "
-            "clearing -- a plain click may not be resolving to Lure/Harvest as assumed (see "
-            "hunt_phase's docstring)"
-        )
+    # Pit is full -- harvest.
+    pit = find_object(GOAT_PIT_NAME)  # fresh lookup, same idiom as craft_phase's re-checks
+    if pit is None:
+        debug_log.log("golem crafting", "pit no longer found before harvesting -- retrying next tick")
         return
-
-    goats.sort(key=lambda n: n.get("distance", 9999))
-    target = goats[0]
-    debug_log.log("golem crafting", f"interacting with {target.get('name')} (dist={target.get('distance')})")
-    time.sleep(random.uniform(0.2, 0.5))
-    controller.click_entity(ctx.ser, target)
+    controller.click_entity(ctx.ser, pit)
     time.sleep(random.uniform(0.6, 1.0))
+
+    for horn in [i for i in controller.get_inventory()
+                 if GOAT_HORN_NAME.lower() in (i.get("name") or "").lower()]:
+        controller.click_entity(ctx.ser, horn, check_ui_blockers=False)  # "Drop" (confirmed
+                                                                          # live Forced Action)
+        time.sleep(random.uniform(0.2, 0.4))
+
+    spilled_fur = any(
+        (i.get("name") or "").lower() in {f.lower() for f in FUR_PRIORITY}
+        for i in controller.get_inventory()
+    )
+    ctx.state.data["gc_pit_lined"] = False
+    ctx.state.data["gc_pit_filled"] = False
+    if spilled_fur:
+        debug_log.log("golem crafting", "fur pouch full -- skipping bank, heading to mine phase")
+        for spikes in [i for i in controller.get_inventory()
+                       if WOODEN_SPIKES_NAME.lower() in (i.get("name") or "").lower()]:
+            controller.click_entity(ctx.ser, spikes, check_ui_blockers=False)  # "Drop"
+            time.sleep(random.uniform(0.2, 0.4))
+        ctx.state.data["gc_fur_stock"] = FUR_POUCH_CAPACITY
+        ctx.state.data["gc_hunt_standing"] = False
+        ctx.state.data["gc_pouch_opened_this_hunt"] = False
+        ctx.state.data["gc_hunt_actions"] = 0
+        ctx.state.data["gc_phase"] = "mine"
 
 
 PHASES = {
