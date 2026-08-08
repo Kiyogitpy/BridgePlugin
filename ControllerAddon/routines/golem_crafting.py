@@ -31,6 +31,7 @@ import time
 import banker
 import controller
 import debug_log
+import travel
 
 # Highest fur-quality first (routines/golem_crafting.py-design.md's "Fur table"). A pure module
 # constant, not read from bridge config -- ConfigExporter.exportGolemCrafting deliberately
@@ -51,6 +52,14 @@ FUR_PRIORITY = [
 # rather than config.get("maxObjectDistance", ...), which would silently fall back to this same
 # value anyway whenever the live bridge config is in effect.
 MAX_OBJECT_DISTANCE = 15
+
+# A single empty get_objects()/get_npcs() poll can just mean a transient bridge timeout (see
+# banker.py's find_nearby_bank docstring for the documented live incident this guards against),
+# not "genuinely not there" -- tolerate a few consecutive misses before handle_missing_target
+# below gives up and lets the caller safety-stop. CORRECTED 2026-08-08 (final whole-branch
+# review): mine_phase/craft_phase/hunt_phase used to hard safety-stop on the very first empty
+# poll, which could end a whole session on one slow /objects or /npcs call.
+MAX_CONSECUTIVE_MISSES = 5
 
 CRAFTING_LEVEL_REQUIRED = 60
 
@@ -86,6 +95,20 @@ DEFAULT_CONFIG = {
     "maxObjectDistance": MAX_OBJECT_DISTANCE,
 
     "bank": {"teleportFallback": False},
+
+    # World-tile anchors ({"x", "y", "plane"}, same shape as travel.save_location()'s output)
+    # near each area, or None if unset -- see handle_missing_target below. ADDED 2026-08-08
+    # (final whole-branch review): the design doc itself says exact walking distances between
+    # Wyrmscraig's mining/crafting/hunting areas and its bank are unconfirmed, so this routine
+    # can't hardcode real coordinates yet. Left None by default (no navigation attempted, same
+    # behavior as before this was added, modulo the miss-tolerance fix) until Task 10's live
+    # verification fills these in -- at that point, setting any of these requires no further
+    # code changes, just a config edit.
+    "locations": {
+        "mining": None,
+        "plinth": None,
+        "goatPit": None,
+    },
 
     "breaks": {
         "enabled": True,
@@ -154,6 +177,40 @@ def find_object(name: str):
     return candidates[0]
 
 
+def handle_missing_target(ctx, config: dict, location_key: str, miss_counter_key: str) -> bool:
+    """Shared not-found handling for mine_phase/craft_phase/hunt_phase's object lookups. Returns
+    True if the caller should just return this tick and let the next tick retry; False once
+    genuinely exhausted, meaning the caller should safety-stop itself with its own specific
+    message (this function never calls trigger_safety_stop directly).
+
+    ADDED 2026-08-08 (final whole-branch review). Two layers, tried in order:
+      1. If a location anchor is configured for `location_key` (DEFAULT_CONFIG["locations"]),
+         walk toward it via travel.walk_to and retry -- resets the miss counter so a target
+         that's still missing after arriving gets its own fresh run of misses, not one
+         inherited from before the walk.
+      2. Otherwise, tolerate up to MAX_CONSECUTIVE_MISSES consecutive empty polls before giving
+         up -- a single empty poll can just mean a transient bridge timeout (see this module's
+         MAX_CONSECUTIVE_MISSES comment), not "genuinely not there".
+
+    Callers are responsible for resetting `ctx.state.data[miss_counter_key]` to 0 once the
+    target IS found again, so a later, unrelated miss doesn't inherit a stale near-threshold
+    count."""
+    target = (config.get("locations") or {}).get(location_key)
+    if target is not None:
+        debug_log.log("golem crafting", f"{location_key} not found nearby -- walking toward the configured location")
+        travel.walk_to(ctx, target)
+        ctx.state.data[miss_counter_key] = 0
+        return True
+
+    misses = ctx.state.data.get(miss_counter_key, 0) + 1
+    ctx.state.data[miss_counter_key] = misses
+    if misses < MAX_CONSECUTIVE_MISSES:
+        debug_log.log("golem crafting", f"{location_key} not found (miss {misses}/{MAX_CONSECUTIVE_MISSES}) -- retrying")
+        return True
+
+    return False
+
+
 def find_rocks(objects: list) -> list:
     """Every visible sunstone rock/monolith within MAX_OBJECT_DISTANCE, closest first --
     plural (unlike find_object above) because mine_phase's momentum re-targeting (see below)
@@ -190,8 +247,11 @@ def mine_phase(ctx, config: dict) -> None:
 
     rocks = find_rocks(controller.get_objects())
     if not rocks:
+        if handle_missing_target(ctx, config, "mining", "gc_mine_misses"):
+            return
         ctx.state.trigger_safety_stop("no sunstone rocks or monolith found nearby -- wrong location?")
         return
+    ctx.state.data["gc_mine_misses"] = 0
 
     last_pos = ctx.state.data.get("gc_last_rock_pos")
     target = next((r for r in rocks if (r.get("x"), r.get("y")) != last_pos), rocks[0])
@@ -250,44 +310,59 @@ PLINTH_SIDE_WAIT_SECONDS = (8.5, 9.5)
 
 
 def craft_phase(ctx, config: dict) -> None:
-    """Craft one golem per call (empty the fur pouch first if this is the first call since
-    entering this phase, carve all 4 sides of an empty plinth, then insert one sunstone core +
-    the best available fur) -- sized like blast_furnace.py's run_trip (one bounded unit of work
-    per call, not a single call looping over every golem this batch), so the engine's between-
-    tick safety/break/PvP checks still run between golems on a long crafting stretch. tick()
-    keeps re-entering this phase (see Task 8) until it sets gc_phase to "bank" itself, once out
-    of cores or fur -- that repetition IS the "repeat until out of cores or fur" the design
-    describes, just spread across multiple tick() calls rather than one internal loop.
+    """Craft one golem per call (carve all 4 sides of an empty plinth, then insert one
+    sunstone core + the best available fur) -- sized like blast_furnace.py's run_trip (one
+    bounded unit of work per call, not a single call looping over every golem this batch), so
+    the engine's between-tick safety/break/PvP checks still run between golems on a long
+    crafting stretch. tick() keeps re-entering this phase (see Task 8) until it sets gc_phase
+    to "bank" itself, once out of cores or fur -- that repetition IS the "repeat until out of
+    cores or fur" the design describes, just spread across multiple tick() calls rather than
+    one internal loop.
+
+    CORRECTED 2026-08-08 (final whole-branch review): this used to also empty the fur pouch
+    here, on first entry to this phase. That's what caused a deterministic deadlock: with a
+    pouch carried, the fur withdrawn at the bank stayed compact in the pouch (1 slot) while
+    mine_phase filled the OTHER 27 slots with sunstone before craft_phase ever ran, so by the
+    time this tried to empty the pouch there was no free inventory slot left for the fur to go
+    into -- pick_best_fur_in_inventory() would find nothing, every golem attempt would bail out
+    to "out of usable fur", and the bank trip after that would just refill the pouch the same
+    way, forever. The pouch is now emptied back into loose inventory slots right after the bank
+    trip closes (see bank_phase), before mine_phase ever runs, and the bank withdrawal is
+    capped low enough (see FUR_WITHDRAW_BUDGET) that mining always still has room left. This
+    phase no longer touches the pouch at all.
 
     ASSUMPTION, NOT YET VERIFIED LIVE -- PLINTH_NAME ("plinth") is assumed to still substring-
     match find_object's lookup both before carving starts and after the golem is finished
     (i.e. the object's display name doesn't change to something without "plinth" in it, e.g.
     switching to "Golem"/"Finished golem" entirely). If live testing shows otherwise, add the
-    post-carve name as a second candidate substring here.
+    post-carve name as a second candidate substring here. The plinth is re-looked-up (not
+    cached) before every click below rather than reused from one find_object call at the top of
+    this function -- CORRECTED 2026-08-08 (final whole-branch review): a cached reference was
+    still being clicked after a UI-blocked click triggers a camera rotation (see
+    controller.click_entity), so a "retry" against the stale cached screen position could land
+    on empty ground and still return True, incrementing the carve counter for a carve that
+    never actually happened -- the same class of bug the carve-loop fix (below) already closed
+    through a different door. Re-fetching fresh each time closes it for good.
     """
-    if not ctx.state.data.get("gc_pouch_emptied_this_craft"):
-        if banker.has_fur_pouch():
-            banker.empty_fur_pouch(ctx)
-        ctx.state.data["gc_pouch_emptied_this_craft"] = True
-
     core = find_item(SUNSTONE_CORE_NAME)
     if core is None:
         debug_log.log("golem crafting", "out of sunstone cores -- moving to bank phase")
         ctx.state.data["gc_phase"] = "bank"
-        ctx.state.data["gc_pouch_emptied_this_craft"] = False
         return
 
     fur_name = pick_best_fur_in_inventory()
     if fur_name is None:
         debug_log.log("golem crafting", "out of usable fur -- moving to bank phase")
         ctx.state.data["gc_phase"] = "bank"
-        ctx.state.data["gc_pouch_emptied_this_craft"] = False
         return
 
     plinth = find_object(PLINTH_NAME)
     if plinth is None:
+        if handle_missing_target(ctx, config, "plinth", "gc_plinth_misses"):
+            return
         ctx.state.trigger_safety_stop("no empty plinth found nearby")
         return
+    ctx.state.data["gc_plinth_misses"] = 0
 
     debug_log.log("golem crafting", f"carving plinth (dist={plinth.get('distance')})")
     # A real while-loop with its own success counter, NOT `for side in range(4)` with a
@@ -302,6 +377,10 @@ def craft_phase(ctx, config: dict) -> None:
     max_attempts = 8  # up to 4 retries total across all sides, on top of the 4 real carves
     while sides_carved < 4 and attempts < max_attempts:
         attempts += 1
+        plinth = find_object(PLINTH_NAME)  # fresh lookup every attempt -- see docstring above
+        if plinth is None:
+            debug_log.log("golem crafting", "plinth no longer found mid-carve -- retrying next tick")
+            return
         controller.open_inventory_tab(ctx.ser)  # no-op if already open; harmless before a world-object click
         if not controller.click_entity(ctx.ser, plinth):
             time.sleep(random.uniform(0.3, 0.6))
@@ -317,11 +396,12 @@ def craft_phase(ctx, config: dict) -> None:
     controller.open_inventory_tab(ctx.ser)
     core = find_item(SUNSTONE_CORE_NAME)
     fur = find_item(fur_name)
-    if core is None or fur is None:
-        # Carving consumed more time than expected and the fur pouch/inventory state moved out
-        # from under us (e.g. a catch routed into the pouch mid-carve) -- bail this golem
-        # rather than clicking with a stale/missing item; next call re-evaluates from scratch.
-        debug_log.log("golem crafting", "core or fur went missing mid-carve -- retrying next tick")
+    plinth = find_object(PLINTH_NAME)  # fresh lookup -- see docstring above
+    if core is None or fur is None or plinth is None:
+        # Carving consumed more time than expected and the fur pouch/inventory state (or the
+        # plinth itself) moved out from under us -- bail this golem rather than clicking with a
+        # stale/missing reference; next call re-evaluates from scratch.
+        debug_log.log("golem crafting", "core, fur, or plinth went missing mid-carve -- retrying next tick")
         return
 
     debug_log.log("golem crafting", f"inserting core + {fur_name}")
@@ -331,8 +411,9 @@ def craft_phase(ctx, config: dict) -> None:
     time.sleep(random.uniform(0.4, 0.7))
 
     fur = find_item(fur_name)
-    if fur is None:
-        debug_log.log("golem crafting", "fur went missing after inserting the core -- retrying next tick")
+    plinth = find_object(PLINTH_NAME)  # fresh lookup -- see docstring above
+    if fur is None or plinth is None:
+        debug_log.log("golem crafting", "fur or plinth went missing after inserting the core -- retrying next tick")
         return
     controller.click_entity(ctx.ser, fur, check_ui_blockers=False)
     time.sleep(random.uniform(0.15, 0.3))
@@ -345,13 +426,16 @@ def craft_phase(ctx, config: dict) -> None:
 # to survive the trip so the next craft_phase call can still use it.
 BANK_KEEP_ITEMS = [banker.FUR_POUCH_NAME, CHISEL_NAME.lower(), WOODEN_SPIKES_NAME.lower(), SUNSTONE_CORE_NAME.lower()]
 
-# Withdraw budget when no fur pouch is carried -- "a fixed inventory-slot budget (e.g. 14, half
-# an inventory)" per the design's bank-phase bullet. With a pouch, the budget is effectively the
-# pouch's own capacity (small/medium/large all <= 28), so 28 (a full inventory) as the withdraw
-# cap is safe either way -- withdraw_loadout only ever takes min(cap, what's actually in the
-# bank) since it withdraws unit-by-unit off the bank's real stack.
-FUR_WITHDRAW_BUDGET_WITH_POUCH = controller.INVENTORY_SIZE
-FUR_WITHDRAW_BUDGET_NO_POUCH = 14
+# How much fur to withdraw per bank trip -- "a fixed inventory-slot budget (e.g. 14, half an
+# inventory)" per the design's bank-phase bullet. CORRECTED 2026-08-08 (final whole-branch
+# review): this used to be a full 28 (INVENTORY_SIZE) when a fur pouch was carried, on the
+# reasoning that the pouch's own capacity was the real limit. That was the root cause of a
+# deterministic deadlock (see craft_phase's docstring) -- with the pouch emptied back into loose
+# inventory slots right after the bank trip (see bank_phase), the real binding constraint is
+# always free inventory slots for mining, not bank stock or pouch capacity, regardless of
+# whether a pouch is carried. A single budget, used either way, guarantees mine_phase always has
+# at least INVENTORY_SIZE - FUR_WITHDRAW_BUDGET slots free for raw sunstone.
+FUR_WITHDRAW_BUDGET = 14
 
 
 def find_available_fur_in_bank(bank: dict) -> str:
@@ -365,7 +449,10 @@ def _run_bank_trip(ctx, config: dict) -> None:
     of bank_phase below). Deposits everything except BANK_KEEP_ITEMS (uncut gems and any
     leftover raw sunstone per the design's bank-phase bullet -- anything not explicitly kept),
     then withdraws the best available fur (filling the pouch if one is carried) or falls
-    through to the hunt phase if the bank has none of FUR_PRIORITY at all."""
+    through to the hunt phase if the bank has none of FUR_PRIORITY at all. The pouch, if
+    filled, is emptied back into loose inventory slots by bank_phase AFTER this trip closes the
+    bank (see bank_phase's docstring for why it can't happen here, while the bank is still
+    open)."""
     banker.deposit_inventory(ctx, {"keepItems": BANK_KEEP_ITEMS})
 
     bank = controller.get_bank()
@@ -376,9 +463,8 @@ def _run_bank_trip(ctx, config: dict) -> None:
         return
 
     has_pouch = banker.has_fur_pouch()
-    budget = FUR_WITHDRAW_BUDGET_WITH_POUCH if has_pouch else FUR_WITHDRAW_BUDGET_NO_POUCH
     slot = next((s for s in bank.get("items", []) if (s.get("name") or "").lower() == fur_name.lower()), None)
-    qty = min(budget, slot.get("qty", 0)) if slot else 0
+    qty = min(FUR_WITHDRAW_BUDGET, slot.get("qty", 0)) if slot else 0
 
     if qty > 0:
         debug_log.log("golem crafting", f"withdrawing {qty}x {fur_name}")
@@ -404,6 +490,14 @@ def bank_phase(ctx, config: dict) -> None:
     and calls _run_bank_trip directly, same manual pattern blast_furnace.py's run_trip uses
     instead of bank_up.
 
+    CORRECTED 2026-08-08 (final whole-branch review): the local-bank branch now also empties
+    the fur pouch (if one is carried) right after the bank closes -- NOT while it's still open,
+    which would dump the fur back INTO the bank instead of into inventory (see
+    banker.empty_fur_pouch's docstring: "dump its contents into an open bank"), undoing the
+    withdrawal entirely. Doing this here, after close_bank and before mine_phase ever runs, is
+    what makes FUR_WITHDRAW_BUDGET's inventory-slot accounting actually hold -- see
+    craft_phase's docstring for the deadlock this fixes.
+
     CORRECTED 2026-08-07 (caught in task review): the Ferox teleport-fallback branch cannot
     do that same dynamic fur scan -- it has to go through banker.bank_up (its private Ferox
     path isn't meant to be called directly), so it can only ever deposit everything and
@@ -428,6 +522,8 @@ def bank_phase(ctx, config: dict) -> None:
         _run_bank_trip(ctx, config)
         banker.close_bank(ctx)
         time.sleep(random.uniform(0.3, 0.6))
+        if banker.has_fur_pouch():
+            banker.empty_fur_pouch(ctx)
         return
 
     if config.get("bank", {}).get("teleportFallback"):
@@ -475,6 +571,19 @@ def _ensure_wooden_spikes(ctx, config: dict) -> bool:
     return True
 
 
+# Consecutive empty-goat polls required before treating the pit as genuinely cleared -- guards
+# against declaring "cleared" off a single early poll taken right after lining, before any wild
+# goat has registered in the bridge's NPC list yet. ADDED 2026-08-08 (final whole-branch
+# review).
+GOAT_NO_GOAT_CLEAR_STREAK = 3
+
+# Hard cap on lure/harvest clicks per hunt-phase activation -- guards the opposite failure: if a
+# plain click never actually resolves to Lure/Harvest (see this function's own flagged
+# uncertainty below), goats would never stop appearing and this phase would click forever with
+# no progress. ADDED 2026-08-08 (final whole-branch review).
+MAX_HUNT_ACTIONS = 60
+
+
 def hunt_phase(ctx, config: dict) -> None:
     """Entered only when bank_phase finds no usable fur at all. Line the Goat Pit with wooden
     spikes, open the fur pouch (if owned) so catches route straight in, then lure/harvest
@@ -483,6 +592,14 @@ def hunt_phase(ctx, config: dict) -> None:
     near the pit", since the bridge has no dedicated pit-state field to check against). One
     action (line the pit, lure, or harvest) per call, same isIdle-adjacent single-small-action
     shape as mine_phase/chisel_phase.
+
+    CORRECTED 2026-08-08 (final whole-branch review): "no goats visible" now has to hold for
+    GOAT_NO_GOAT_CLEAR_STREAK consecutive polls before the pit is treated as cleared, not just
+    once -- a single miss right after lining (before any goat has spawned/registered yet) used
+    to immediately declare "cleared" and bounce straight back to bank_phase, which would just
+    re-enter hunt_phase and re-line, burning wooden spikes in a bank<->hunt ping-pong. There's
+    also now a bounded MAX_HUNT_ACTIONS cap on lure/harvest clicks, so a stuck click resolution
+    (see the ASSUMPTION below) safety-stops instead of clicking forever with no progress.
 
     ASSUMPTION, NOT YET VERIFIED LIVE -- this is the single most uncertain part of this whole
     routine (see the design doc's Research method: the Goat Pit's exact interaction states
@@ -507,8 +624,11 @@ def hunt_phase(ctx, config: dict) -> None:
 
         pit = find_object(GOAT_PIT_NAME)
         if pit is None:
+            if handle_missing_target(ctx, config, "goatPit", "gc_pit_misses"):
+                return
             ctx.state.trigger_safety_stop("Goat Pit not found nearby")
             return
+        ctx.state.data["gc_pit_misses"] = 0
 
         spikes = find_item(WOODEN_SPIKES_NAME)
         debug_log.log("golem crafting", "lining the Goat Pit with wooden spikes")
@@ -545,10 +665,28 @@ def hunt_phase(ctx, config: dict) -> None:
         and 0 <= n.get("distance", 9999) <= MAX_OBJECT_DISTANCE
     ]
     if not goats:
+        streak = ctx.state.data.get("gc_hunt_no_goat_streak", 0) + 1
+        ctx.state.data["gc_hunt_no_goat_streak"] = streak
+        if streak < GOAT_NO_GOAT_CLEAR_STREAK:
+            debug_log.log("golem crafting", f"no goats visible ({streak}/{GOAT_NO_GOAT_CLEAR_STREAK}) -- confirming the pit is actually cleared")
+            return
         debug_log.log("golem crafting", "Goat Pit cleared -- moving to bank phase")
         ctx.state.data["gc_phase"] = "bank"
         ctx.state.data["gc_pit_lined"] = False
         ctx.state.data["gc_pouch_opened_this_hunt"] = False
+        ctx.state.data["gc_hunt_no_goat_streak"] = 0
+        ctx.state.data["gc_hunt_actions"] = 0
+        return
+
+    ctx.state.data["gc_hunt_no_goat_streak"] = 0
+    actions = ctx.state.data.get("gc_hunt_actions", 0) + 1
+    ctx.state.data["gc_hunt_actions"] = actions
+    if actions > MAX_HUNT_ACTIONS:
+        ctx.state.trigger_safety_stop(
+            f"hunt phase exceeded {MAX_HUNT_ACTIONS} lure/harvest actions without the Goat Pit "
+            "clearing -- a plain click may not be resolving to Lure/Harvest as assumed (see "
+            "hunt_phase's docstring)"
+        )
         return
 
     goats.sort(key=lambda n: n.get("distance", 9999))
