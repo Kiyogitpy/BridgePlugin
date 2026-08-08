@@ -751,6 +751,11 @@ FUR_POUCH_CAPACITY = 28  # large fur pouch's capacity -- once hit, further fur s
 GRAB_RANGE_TILES = 10  # Telekinetic Grab's cast range -- a farther target makes the character
                        # auto-walk toward it, pulling the player off the fixed standing tile the
                        # whole north-side-only geometry below depends on
+# ADDED 2026-08-09 (user request): a goat that was just cast on keeps traveling toward the pit
+# for a few seconds, not vanishing instantly -- without a cooldown it stayed the closest
+# candidate and got re-targeted over and over instead of spreading casts across the several
+# goats that can be en route to the pit at once. 4s (middle of the requested 3-5s) per goat.
+GOAT_GRAB_COOLDOWN_S = 4.0
 
 
 def on_event(ctx, event_type, payload) -> None:
@@ -1471,6 +1476,35 @@ def _ensure_wooden_spikes(ctx, config: dict) -> bool:
     return find_item(WOODEN_SPIKES_NAME) is not None
 
 
+# How long to wait for the Goat Pit's menu to switch from "Clear" to "Line" before giving up and
+# proceeding anyway -- ADDED 2026-08-09 (user request). Generous margin: the collection animation
+# was observed to "take a while", and proceeding too early is exactly the bug this guards against,
+# so this errs toward patience over a tight bound.
+PIT_CLEAR_TIMEOUT_S = 20.0
+
+
+def _pit_ready_to_reline(ctx, pit: dict) -> bool:
+    """Right-click the Goat Pit and check whether its menu currently offers "Line" (collection
+    finished) rather than "Clear" (still processing) -- CONFIRMED live (user observation) this
+    is the pit's own authoritative done-collecting signal. Peeks only: never selects an entry,
+    dismissing the menu the same move-away-then-ESC way controller.click_menu_action does when
+    nothing matches, so checking never risks accidentally triggering whatever IS on the menu."""
+    if not controller.click_entity(ctx.ser, pit, simulate_mistakes=False, button="right"):
+        return False
+    deadline = time.time() + controller.MENU_POLL_TIMEOUT_S
+    menu = controller.get_menu()
+    while not menu.get("open") and time.time() < deadline:
+        time.sleep(controller.MENU_POLL_INTERVAL_S)
+        menu = controller.get_menu()
+    if not menu.get("open"):
+        return False
+    ready = any("line" == (e.get("option") or "").lower() for e in menu.get("entries", []))
+    cx, cy = controller.get_cursor_pos()
+    controller.move_to_human(ctx.ser, *controller.pick_dismiss_point(cx, cy), aim_radius=10)
+    controller.key_tap(ctx.ser, "ESC")
+    return ready
+
+
 # Consecutive empty-goat polls required before treating the pit as genuinely cleared -- guards
 # against declaring "cleared" off a single early poll taken right after lining, before any wild
 # goat has registered in the bridge's NPC list yet. ADDED 2026-08-08 (final whole-branch
@@ -1585,14 +1619,30 @@ def hunt_phase(ctx, config: dict) -> None:
 
     if not ctx.state.data.get("gc_pit_filled"):
         player = controller.get_player()
-        goats = [
+        # ADDED 2026-08-09 (user request): a goat that was just Grab-cast on doesn't vanish or
+        # move out of range instantly -- it's still the closest candidate for a few seconds while
+        # it travels toward the pit, so without this the very next cast re-targeted the SAME goat
+        # over and over instead of spreading casts across the several goats that can be traveling
+        # toward the pit at once (CONFIRMED live: id=16298 targeted repeatedly in a row).
+        # Short-lived cooldown by NPC index, not identity/position (a goat's own position changes
+        # every tick while it's being pulled in, so anything position-keyed would never actually
+        # match the same goat twice).
+        cooldowns = ctx.state.data.get("gc_hunt_grab_cooldowns", {})
+        now = time.time()
+        cooldowns = {idx: expiry for idx, expiry in cooldowns.items() if expiry > now}
+        ctx.state.data["gc_hunt_grab_cooldowns"] = cooldowns
+        valid_goats = [
             n for n in controller.get_npcs()
             if GOAT_NAME in (n.get("name") or "").lower()
             and n.get("visible", True)
             and is_valid_grab_target(pit, n)
             and goat_in_grab_range(player, n)
         ]
-        if not goats:
+        # "Area genuinely cleared" is judged against valid_goats (ignores cooldown) -- a goat
+        # that's merely on cooldown while it travels toward the pit is still there, not cleared,
+        # and must never count toward this streak (it would otherwise falsely trigger "no valid
+        # goats left -- moving to bank phase" every time several goats got Grab-cast in a row).
+        if not valid_goats:
             streak = ctx.state.data.get("gc_hunt_no_goat_streak", 0) + 1
             ctx.state.data["gc_hunt_no_goat_streak"] = streak
             if streak < GOAT_NO_GOAT_CLEAR_STREAK:
@@ -1606,8 +1656,16 @@ def hunt_phase(ctx, config: dict) -> None:
             ctx.state.data["gc_pouch_opened_this_hunt"] = False
             ctx.state.data["gc_hunt_no_goat_streak"] = 0
             ctx.state.data["gc_hunt_actions"] = 0
+            ctx.state.data["gc_hunt_grab_cooldowns"] = {}
             return
         ctx.state.data["gc_hunt_no_goat_streak"] = 0
+
+        goats = [n for n in valid_goats if n.get("index") not in cooldowns]
+        if not goats:
+            # Every currently-valid goat is on cooldown (all recently cast on, still traveling
+            # toward the pit) -- not "cleared", just nothing new to cast on yet this tick.
+            debug_log.log("golem crafting", "all nearby goats on cooldown -- waiting for one to become castable again")
+            return
 
         # Same safety net the original click-based version had (MAX_HUNT_ACTIONS/gc_hunt_actions
         # existed to guard "a click that never actually resolves clicks forever with no
@@ -1629,6 +1687,8 @@ def hunt_phase(ctx, config: dict) -> None:
         target = goats[0]
         debug_log.log("golem crafting", f"casting Telekinetic Grab on {target.get('name')} (dist={target.get('distance')})")
         controller.cast_telekinetic_grab(ctx.ser, target)
+        if target.get("index") is not None:
+            cooldowns[target["index"]] = now + GOAT_GRAB_COOLDOWN_S
         time.sleep(random.uniform(0.6, 1.0))
 
         seq = ctx.state.data.get("gc_last_hunt_chat_seq", 0)
@@ -1652,6 +1712,23 @@ def hunt_phase(ctx, config: dict) -> None:
     controller.click_entity(ctx.ser, pit)
     time.sleep(random.uniform(0.6, 1.0))
 
+    # ADDED 2026-08-09 (user report: "we still try to catch goats while the animation is going"):
+    # collecting the trapped goats isn't instant -- CONFIRMED live the pit's own right-click menu
+    # still offers "Clear" while that's in progress, only switching to "Line" once it's actually
+    # done, which is the authoritative "finished collecting" signal (more reliable than a fixed
+    # guess at how long the animation takes). Blocks here -- nothing else in hunt_phase runs
+    # again until this returns, so no further Grab casts or inventory handling can overlap with
+    # the collection animation.
+    debug_log.log("golem crafting", "waiting for the pit to finish collecting")
+    deadline = time.time() + PIT_CLEAR_TIMEOUT_S
+    while time.time() < deadline and not _pit_ready_to_reline(ctx, pit):
+        time.sleep(1.0)
+
+    controller.key_tap(ctx.ser, "w")  # switch to Inventory -- CONFIRMED live (same idiom
+                                       # chisel_phase already uses) needed before clicking
+                                       # inventory items; a still-open Magic tab from Grab-
+                                       # casting would otherwise leave Goat horns unclickable.
+    time.sleep(random.uniform(0.2, 0.4))
     for horn in [i for i in controller.get_inventory()
                  if GOAT_HORN_NAME.lower() in (i.get("name") or "").lower()]:
         controller.click_entity(ctx.ser, horn, check_ui_blockers=False)  # "Drop" (confirmed
