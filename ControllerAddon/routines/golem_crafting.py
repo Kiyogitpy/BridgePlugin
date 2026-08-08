@@ -1628,6 +1628,23 @@ def hunt_phase(ctx, config: dict) -> None:
 
     if not ctx.state.data.get("gc_pit_filled"):
         player = controller.get_player()
+        # ADDED 2026-08-09 (user report: "sent a spell on a goat behind a tree and ran away from
+        # our designated tile... creates an endless loop"): a goat blocked by scenery (a tree,
+        # here) apparently isn't a valid Grab target even within range -- CONFIRMED live the
+        # character auto-walked toward it instead of casting in place, the same failure mode
+        # goat_in_grab_range's own docstring already flags for an out-of-range target, just
+        # triggered by line-of-sight instead of distance. Once off the standing tile, every
+        # subsequent goat looked "closest" from the wrong spot and casting kept silently failing
+        # there forever. Re-asserting position here, every single call (not just once via
+        # gc_hunt_standing), makes getting back the top priority over casting anything -- this
+        # check runs before goat selection, so a drifted player never even attempts a cast from
+        # the wrong tile.
+        expected_x, expected_y = pit["x"], pit["y"] + 2
+        if player.get("x") != expected_x or player.get("y") != expected_y:
+            debug_log.log("golem crafting", "drifted off the hunt standing tile -- walking back before casting again")
+            walk_to_exact_tile(ctx, expected_x, expected_y, pit.get("plane", 0))
+            return
+
         # ADDED 2026-08-09 (user request): a goat that was just Grab-cast on doesn't vanish or
         # move out of range instantly -- it's still the closest candidate for a few seconds while
         # it travels toward the pit, so without this the very next cast re-targeted the SAME goat
