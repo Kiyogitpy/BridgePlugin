@@ -115,6 +115,12 @@ MINING_TARGET_NAMES = ("sunstone rocks",)
 RAW_SUNSTONE_NAME = "Sunstone"
 SUNSTONE_CORE_NAME = "Sunstone core"
 CHISEL_NAME = "Chisel"
+# ADDED 2026-08-08 (user report): a better chisel -- CONFIRMED live preferred over the plain
+# Chisel whenever both are owned, falling back to CHISEL_NAME only if this one isn't carried.
+# BANK_KEEP_ITEMS below already protects it without needing its own entry there -- deposit_
+# inventory's keepItems match is substring-based (see banker.deposit_inventory's own comment),
+# and "chisel" (CHISEL_NAME.lower(), already in that list) is itself a substring of this name.
+JEWELLERS_CHISEL_NAME = "Jeweller's chisel"
 
 # CONFIRMED LIVE 2026-08-08 (MCP debug session): the crafting station's own displayed name
 # changes as a golem progresses -- "Empty plinth" (nothing started) -> "Unfinished golem" (1-3
@@ -678,7 +684,7 @@ def chisel_phase(ctx, config: dict) -> None:
         ctx.state.data["gc_phase"] = "craft"
         return
 
-    chisel = find_item(CHISEL_NAME)
+    chisel = find_item(JEWELLERS_CHISEL_NAME) or find_item(CHISEL_NAME)
     if chisel is None:
         ctx.state.trigger_safety_stop("no chisel in inventory")
         return
