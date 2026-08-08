@@ -17,7 +17,7 @@ API_BASE = "http://localhost:8080"
 UDP_PORT = 50555
 
 # ---------------- Arduino serial connection ----------------
-SERIAL_PORT = os.environ.get("BRIDGE_SERIAL_PORT", "COM3")
+SERIAL_PORT = os.environ.get("BRIDGE_SERIAL_PORT", "COM6")
 SERIAL_BAUD = 115200
 
 # ---------------- Main loop pacing ----------------
@@ -51,7 +51,7 @@ MISTAKE_OVEREAT_MIN_HP_FRACTION = 0.75    # ...but only once hp is already at le
 # [restoreAt, restoreAt + PRAYER_RESTORE_SPREAD] each cycle instead of always
 # waiting for exactly the configured restoreAt floor.
 PRAYER_RESTORE_SPREAD = 25
-MISTAKE_MISCLICK_CHANCE = 0.045           # chance per click_entity call to aim beside the target instead of on it
+MISTAKE_MISCLICK_CHANCE = 0.025           # chance per click_entity call to aim beside the target instead of on it
 MISCLICK_OFFSET_PX = (20, 45)             # px; how far off that miss lands -- roughly one tile over, not a wild miss
 
 # ---------------- Idle mouse drift ----------------
