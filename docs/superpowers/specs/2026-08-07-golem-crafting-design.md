@@ -162,17 +162,30 @@ its own work is done for now:
 - **`chisel`**: for each raw sunstone in inventory, use the chisel on it to
   make a sunstone core (item-then-item two-click idiom, same as
   `firemaking.py`'s tinderbox+log). -> `craft`.
-- **`craft`**: `empty_fur_pouch` first if one is carried, then find an empty
-  plinth and carve all 4 sides (click, wait ~15 ticks, repeat x4 -- no
-  XP-drop timing per Scope), then insert one sunstone core + the
-  highest-priority fur present in inventory into the finished golem. Repeat
-  until out of cores or fur. -> `bank`.
+- **`craft`**: find an empty plinth and carve all 4 sides (click, wait ~15
+  ticks, repeat x4 -- no XP-drop timing per Scope), then insert one
+  sunstone core + the highest-priority fur present in inventory into the
+  finished golem. Repeat until out of cores or fur. -> `bank`. **AMENDED
+  2026-08-08** (implementation-time final review): this phase does NOT
+  empty the fur pouch, contrary to this bullet's original text -- doing so
+  here, after `mine` had already filled the inventory, was a deterministic
+  deadlock (no free slot for the emptied fur to occupy). See `bank`'s own
+  amendment below for where pouch handling actually lives now.
 - **`bank`**: open the bank, deposit uncut gems and any leftover raw
   sunstone, withdraw the first `furPriority` type actually present in the
-  bank -- enough to fill the fur pouch if one is owned
-  (`fill_fur_pouch` after withdrawing), or a fixed inventory-slot budget
-  (e.g. 14, half an inventory) if not. If **none** of `furPriority`'s fur
-  types are in the bank at all -> `hunt`. Otherwise -> `mine`.
+  bank -- a fixed inventory-slot budget (`FUR_WITHDRAW_BUDGET = 14`)
+  regardless of whether a fur pouch is owned. **AMENDED 2026-08-08**: the
+  original "enough to fill the fur pouch if one is owned" design withdrew
+  up to a full inventory's worth when a pouch was carried, compacted it
+  into the pouch, and left emptying it to `craft`; that combination is what
+  produced the `craft`-phase deadlock above. Withdrawn fur now goes
+  straight to loose inventory slots (no pouch fill/empty round-trip at
+  all -- that pair bought nothing once the budget stopped depending on
+  pouch ownership). The pouch is still emptied once, right after the bank
+  closes, but only for fur caught while *hunting* (see `hunt` below),
+  which routes into an open pouch -- unrelated to this withdrawal. If
+  **none** of `furPriority`'s fur types are in the bank at all -> `hunt`.
+  Otherwise -> `mine`.
 - **`hunt`**: entered only when the bank is out of every usable fur type.
   Verify/withdraw wooden spikes (safety-stop if the bank has none either),
   line the Goat Pit, open the fur pouch (if owned) so catches auto-route

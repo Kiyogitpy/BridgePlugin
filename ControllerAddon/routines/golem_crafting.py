@@ -127,7 +127,18 @@ DEFAULT_CONFIG = {
 
 def get_config(bridge_config):
     config = controller.get_golem_crafting_config()
-    return config if config is not None else DEFAULT_CONFIG
+    if config is None:
+        return DEFAULT_CONFIG
+
+    # locations isn't part of ConfigExporter.exportGolemCrafting's output (see the "locations"
+    # comment in DEFAULT_CONFIG above) -- CORRECTED 2026-08-08 (final whole-branch review): the
+    # live bridge config used to be returned as-is, silently dropping this key whenever the
+    # Controller plugin is running, which made handle_missing_target's location-anchor walking
+    # permanently unreachable in the actual deployed configuration. Same fix shape as
+    # tormented_demon.py's get_config re-injecting DEFAULT_NPC_IDS.
+    config = dict(config)
+    config["locations"] = DEFAULT_CONFIG["locations"]
+    return config
 
 
 def check_level_requirement(ctx, config: dict) -> None:
@@ -177,7 +188,15 @@ def find_object(name: str):
     return candidates[0]
 
 
-def handle_missing_target(ctx, config: dict, location_key: str, miss_counter_key: str) -> bool:
+# A location anchor is a best-effort hint, not a guarantee the target is actually there once
+# arrived (e.g. one of ROCK_NAMES/PLINTH_NAME/GOAT_PIT_NAME turning out to be a wrong guess, or
+# the anchor coordinates themselves being off) -- give up after this many walk attempts rather
+# than walking-and-retrying forever. ADDED 2026-08-08 (final whole-branch review, second pass):
+# the first version of handle_missing_target below had no cap on this path at all.
+MAX_WALK_ATTEMPTS = 3
+
+
+def handle_missing_target(ctx, config: dict, location_key: str, miss_counter_key: str, walk_counter_key: str) -> bool:
     """Shared not-found handling for mine_phase/craft_phase/hunt_phase's object lookups. Returns
     True if the caller should just return this tick and let the next tick retry; False once
     genuinely exhausted, meaning the caller should safety-stop itself with its own specific
@@ -185,22 +204,33 @@ def handle_missing_target(ctx, config: dict, location_key: str, miss_counter_key
 
     ADDED 2026-08-08 (final whole-branch review). Two layers, tried in order:
       1. If a location anchor is configured for `location_key` (DEFAULT_CONFIG["locations"]),
-         walk toward it via travel.walk_to and retry -- resets the miss counter so a target
-         that's still missing after arriving gets its own fresh run of misses, not one
-         inherited from before the walk.
-      2. Otherwise, tolerate up to MAX_CONSECUTIVE_MISSES consecutive empty polls before giving
-         up -- a single empty poll can just mean a transient bridge timeout (see this module's
-         MAX_CONSECUTIVE_MISSES comment), not "genuinely not there".
+         walk toward it via travel.walk_to and retry, up to MAX_WALK_ATTEMPTS times -- resets
+         the miss counter each time so a target that's still missing after arriving gets its
+         own fresh run of misses, not one inherited from before the walk. Once MAX_WALK_ATTEMPTS
+         is exhausted, gives up (returns False) rather than walking forever -- CORRECTED
+         2026-08-08 (final whole-branch review, second pass): this path originally had no exit
+         at all, so a configured anchor whose target genuinely isn't there (e.g. a wrong object
+         name, or the anchor coordinates being off) walked-and-retried indefinitely with no
+         safety-stop.
+      2. Otherwise (no anchor configured, or walk attempts exhausted), tolerate up to
+         MAX_CONSECUTIVE_MISSES consecutive empty polls before giving up -- a single empty poll
+         can just mean a transient bridge timeout (see this module's MAX_CONSECUTIVE_MISSES
+         comment), not "genuinely not there".
 
-    Callers are responsible for resetting `ctx.state.data[miss_counter_key]` to 0 once the
-    target IS found again, so a later, unrelated miss doesn't inherit a stale near-threshold
-    count."""
+    Callers are responsible for resetting both `ctx.state.data[miss_counter_key]` and
+    `ctx.state.data[walk_counter_key]` to 0 once the target IS found again, so a later,
+    unrelated miss doesn't inherit a stale near-threshold count from an earlier search."""
     target = (config.get("locations") or {}).get(location_key)
     if target is not None:
-        debug_log.log("golem crafting", f"{location_key} not found nearby -- walking toward the configured location")
-        travel.walk_to(ctx, target)
-        ctx.state.data[miss_counter_key] = 0
-        return True
+        walks = ctx.state.data.get(walk_counter_key, 0) + 1
+        ctx.state.data[walk_counter_key] = walks
+        if walks <= MAX_WALK_ATTEMPTS:
+            debug_log.log("golem crafting", f"{location_key} not found nearby -- walking toward the configured location (attempt {walks}/{MAX_WALK_ATTEMPTS})")
+            travel.walk_to(ctx, target)
+            ctx.state.data[miss_counter_key] = 0
+            return True
+        debug_log.log("golem crafting", f"{location_key} still not found after {MAX_WALK_ATTEMPTS} walk attempts toward the configured location")
+        return False
 
     misses = ctx.state.data.get(miss_counter_key, 0) + 1
     ctx.state.data[miss_counter_key] = misses
@@ -247,11 +277,12 @@ def mine_phase(ctx, config: dict) -> None:
 
     rocks = find_rocks(controller.get_objects())
     if not rocks:
-        if handle_missing_target(ctx, config, "mining", "gc_mine_misses"):
+        if handle_missing_target(ctx, config, "mining", "gc_mine_misses", "gc_mine_walks"):
             return
         ctx.state.trigger_safety_stop("no sunstone rocks or monolith found nearby -- wrong location?")
         return
     ctx.state.data["gc_mine_misses"] = 0
+    ctx.state.data["gc_mine_walks"] = 0
 
     last_pos = ctx.state.data.get("gc_last_rock_pos")
     target = next((r for r in rocks if (r.get("x"), r.get("y")) != last_pos), rocks[0])
@@ -358,11 +389,12 @@ def craft_phase(ctx, config: dict) -> None:
 
     plinth = find_object(PLINTH_NAME)
     if plinth is None:
-        if handle_missing_target(ctx, config, "plinth", "gc_plinth_misses"):
+        if handle_missing_target(ctx, config, "plinth", "gc_plinth_misses", "gc_plinth_walks"):
             return
         ctx.state.trigger_safety_stop("no empty plinth found nearby")
         return
     ctx.state.data["gc_plinth_misses"] = 0
+    ctx.state.data["gc_plinth_walks"] = 0
 
     debug_log.log("golem crafting", f"carving plinth (dist={plinth.get('distance')})")
     # A real while-loop with its own success counter, NOT `for side in range(4)` with a
@@ -448,11 +480,21 @@ def _run_bank_trip(ctx, config: dict) -> None:
     """The actual deposit/withdraw logic, run once a bank is confirmed open (by either branch
     of bank_phase below). Deposits everything except BANK_KEEP_ITEMS (uncut gems and any
     leftover raw sunstone per the design's bank-phase bullet -- anything not explicitly kept),
-    then withdraws the best available fur (filling the pouch if one is carried) or falls
-    through to the hunt phase if the bank has none of FUR_PRIORITY at all. The pouch, if
-    filled, is emptied back into loose inventory slots by bank_phase AFTER this trip closes the
-    bank (see bank_phase's docstring for why it can't happen here, while the bank is still
-    open)."""
+    then withdraws the best available fur straight into loose inventory slots, or falls through
+    to the hunt phase if the bank has none of FUR_PRIORITY at all.
+
+    CORRECTED 2026-08-08 (final whole-branch review, second pass): this used to also fill the
+    fur pouch (if one was carried) right after withdrawing, only for bank_phase to immediately
+    empty it straight back out again once the bank closed (see bank_phase). Since
+    FUR_WITHDRAW_BUDGET is the same 14 regardless of pouch ownership, that fill+empty pair
+    bought nothing -- it was two extra clicks whose menu-resolution banker.py's fill_coal_bag
+    docstring already flags as unverified ("a bank-side click on a non-empty container can
+    resolve to 'Empty' instead of 'Fill'"), which if it ever resolved the wrong way would send
+    the withdrawn fur straight back into the open bank instead of into inventory. Withdrawing
+    straight to loose inventory slots avoids that risk entirely and needs no pouch interaction
+    here at all -- bank_phase's post-close empty_fur_pouch call still runs regardless (that one
+    is for fur caught while HUNTING and routed into the pouch, a real, separate reason to
+    empty it, unrelated to this withdrawal)."""
     banker.deposit_inventory(ctx, {"keepItems": BANK_KEEP_ITEMS})
 
     bank = controller.get_bank()
@@ -462,18 +504,12 @@ def _run_bank_trip(ctx, config: dict) -> None:
         ctx.state.data["gc_phase"] = "hunt"
         return
 
-    has_pouch = banker.has_fur_pouch()
     slot = next((s for s in bank.get("items", []) if (s.get("name") or "").lower() == fur_name.lower()), None)
     qty = min(FUR_WITHDRAW_BUDGET, slot.get("qty", 0)) if slot else 0
 
     if qty > 0:
         debug_log.log("golem crafting", f"withdrawing {qty}x {fur_name}")
         banker.withdraw_loadout(ctx, {"withdraw": [{"name": fur_name, "quantity": qty}]})
-
-    if has_pouch:
-        time.sleep(random.uniform(0.3, 0.5))  # let the just-withdrawn fur register in
-                                               # get_inventory() before fill_fur_pouch looks for it
-        banker.fill_fur_pouch(ctx)
 
     debug_log.log("golem crafting", "banking done -- moving to mine phase")
     ctx.state.data["gc_phase"] = "mine"
@@ -492,11 +528,14 @@ def bank_phase(ctx, config: dict) -> None:
 
     CORRECTED 2026-08-08 (final whole-branch review): the local-bank branch now also empties
     the fur pouch (if one is carried) right after the bank closes -- NOT while it's still open,
-    which would dump the fur back INTO the bank instead of into inventory (see
-    banker.empty_fur_pouch's docstring: "dump its contents into an open bank"), undoing the
-    withdrawal entirely. Doing this here, after close_bank and before mine_phase ever runs, is
-    what makes FUR_WITHDRAW_BUDGET's inventory-slot accounting actually hold -- see
-    craft_phase's docstring for the deadlock this fixes.
+    which would dump the pouch's contents back INTO the bank instead of into inventory (see
+    banker.empty_fur_pouch's docstring: "dump its contents into an open bank"). This isn't for
+    fur _run_bank_trip just withdrew -- that now goes straight to loose inventory slots, no
+    pouch involved (see _run_bank_trip's own docstring, second pass) -- it's for fur caught
+    while HUNTING, which routes into an open pouch (see hunt_phase). Doing this here, after
+    close_bank and before mine_phase ever runs, means hunted fur becomes visible to
+    pick_best_fur_in_inventory() the same cycle it's caught, rather than sitting trapped in the
+    pouch.
 
     CORRECTED 2026-08-07 (caught in task review): the Ferox teleport-fallback branch cannot
     do that same dynamic fur scan -- it has to go through banker.bank_up (its private Ferox
@@ -624,11 +663,12 @@ def hunt_phase(ctx, config: dict) -> None:
 
         pit = find_object(GOAT_PIT_NAME)
         if pit is None:
-            if handle_missing_target(ctx, config, "goatPit", "gc_pit_misses"):
+            if handle_missing_target(ctx, config, "goatPit", "gc_pit_misses", "gc_pit_walks"):
                 return
             ctx.state.trigger_safety_stop("Goat Pit not found nearby")
             return
         ctx.state.data["gc_pit_misses"] = 0
+        ctx.state.data["gc_pit_walks"] = 0
 
         spikes = find_item(WOODEN_SPIKES_NAME)
         debug_log.log("golem crafting", "lining the Goat Pit with wooden spikes")

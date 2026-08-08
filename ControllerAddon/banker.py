@@ -251,9 +251,9 @@ def fill_fur_pouch(ctx) -> bool:
 
 def empty_fur_pouch(ctx) -> bool:
     """Click Empty on the fur pouch to dump its fur into an open bank (pre-craft: into
-    inventory instead, if no bank is open -- see routines/golem_crafting.py's craft_phase,
-    which calls this before carving a plinth so any fur caught while hunting is available to
-    insert into a golem). Same situation as empty_coal_bag above: "Empty" is not always the
+    inventory instead, if no bank is open -- see routines/golem_crafting.py's bank_phase,
+    which calls this right after closing the bank so any fur caught while hunting is available
+    to insert into a golem). Same situation as empty_coal_bag above: "Empty" is not always the
     item's default option, so add it to Controller Settings -> Clicking -> Forced Actions if a
     plain click doesn't already resolve to it. check_ui_blockers=False since this is an
     inventory-item click, used both at a bank and out in the open (at the plinth), where the
