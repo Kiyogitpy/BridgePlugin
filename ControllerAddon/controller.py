@@ -160,8 +160,19 @@ def get_objects(radius=None):
     # object in the entire scene, every game tick, regardless of whether any caller actually cares
     # about it, was a real source of client stutter. Every caller here already filters results by
     # its own distance check afterward, so passing that same bound through costs nothing.
+    #
+    # timeout=1.0, not api_get's default 0.3 -- CONFIRMED live 2026-08-08: even a radius-bounded
+    # /objects call still builds clickbox/screen-projection data for every object in range, and an
+    # object-dense area (Wyrmscraig: ~2900 objects within a 40-tile radius) measured 390-420ms for
+    # this specific endpoint while every other endpoint (e.g. /state) measured under 20ms. Sharing
+    # the same 300ms budget as those cheap endpoints meant /objects timed out on every single tick
+    # here, and a timed-out call fails-safe to an empty list indistinguishable from "genuinely
+    # nothing nearby" -- golem_crafting's bank_phase read that as no bank at all and safety-stopped
+    # even standing right next to one. 1.0s comfortably covers the measured worst case with
+    # headroom, without the caller having to wait meaningfully longer than that if the bridge is
+    # genuinely down.
     params = {"radius": radius} if radius is not None else None
-    return api_get("/objects", params=params) or []
+    return api_get("/objects", params=params, timeout=1.0) or []
 
 
 def get_tiles():
