@@ -1293,7 +1293,16 @@ def _run_bank_trip(ctx, config: dict) -> None:
     fur_name = find_available_fur_in_bank(bank)
     if fur_name is None:
         banker.clear_bank_search(ctx)
-        debug_log.log("golem crafting", "bank has none of the usable fur types -- moving to hunt phase")
+        # ADDED 2026-08-09 (user request): raw sunstone/cores are normally kept through a bank
+        # trip (see BANK_KEEP_ITEMS's own comment -- protects a half-supplied mining batch), but
+        # that protection stops being worth the inventory space once there's genuinely no fur
+        # anywhere and a hunt trip is starting: hunt_phase needs room for Goat horns, and we're
+        # already standing at the open bank right now, so banking them (not dropping -- still
+        # fully recoverable next mine_phase visit) costs nothing extra.
+        debug_log.log("golem crafting", "bank has none of the usable fur types -- banking spare sunstone/cores before hunting")
+        hunt_keep_items = [k for k in BANK_KEEP_ITEMS
+                            if k not in (RAW_SUNSTONE_NAME.lower(), SUNSTONE_CORE_NAME.lower())]
+        banker.deposit_inventory(ctx, {"keepItems": hunt_keep_items})
         ctx.state.data["gc_phase"] = "hunt"
         return
 
