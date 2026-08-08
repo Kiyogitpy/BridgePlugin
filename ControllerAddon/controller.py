@@ -179,6 +179,10 @@ def get_tiles():
     return api_get("/tiles") or []
 
 
+def get_spellbook():
+    return api_get("/spellbook") or {"visible": False}
+
+
 def get_menu():
     return api_get("/menu") or {"open": False}
 
@@ -912,6 +916,34 @@ def nudge_camera_yaw(ser: serial.Serial, key: str) -> None:
     time.sleep(random.uniform(0.15, 0.35))
     key_up(ser, key)
     time.sleep(random.uniform(0.1, 0.2))
+
+
+def open_spellbook_if_needed(ser: serial.Serial) -> None:
+    """Idempotent -- taps T (this game's Magic-tab keybind) only if Telekinetic Grab isn't
+    already visible, so a hunt_phase call that finds the tab already open doesn't needlessly
+    re-tap it every single cast."""
+    if get_spellbook().get("visible"):
+        return
+    key_tap(ser, "T")
+    time.sleep(random.uniform(0.3, 0.5))
+
+
+def cast_telekinetic_grab(ser: serial.Serial, target: dict) -> bool:
+    """Click Telekinetic Grab, then click the target -- same two-click 'use X on Y' shape as
+    any item-on-entity interaction elsewhere in this codebase. Returns False if the spell
+    isn't visible (spellbook not open/wrong spellbook active) or either click misses; True
+    only means both clicks landed, not that the cast actually resolved -- the caller (hunt_
+    phase) still has to watch chat for the real confirmation/rejection, same reasoning
+    golem_crafting.py's craft_phase already documents for why a click landing isn't the same
+    as the game having accepted it."""
+    open_spellbook_if_needed(ser)
+    spell = get_spellbook()
+    if not spell.get("visible"):
+        return False
+    if not click_entity(ser, spell, offset=(0, 0), check_ui_blockers=False):
+        return False
+    time.sleep(random.uniform(0.15, 0.3))
+    return click_entity(ser, target)
 
 
 def rotate_camera_away_from_ui(ser: serial.Serial, blocker: dict) -> None:
