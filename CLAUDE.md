@@ -1,20 +1,100 @@
-# BridgePlugin — live-debugging workflow
+# BridgePlugin
 
-When debugging a `ControllerAddon/routines/*.py` routine live against the running RuneLite
-client, use this loop by default. It was confirmed to work well over an hours-long session that
-took `golem_crafting.py` from broken to reliably running unattended.
+## What this is
 
-## The loop
+A RuneLite (Old School RuneScape) automation plugin ("Controller") paired with a Python
+controller that drives a physical Arduino-connected mouse/keyboard over serial — not
+software-injected input, to avoid detection. The Java plugin exposes an HTTP + UDP bridge
+reporting live game state; the Python side reads that state and decides what to click.
 
-1. **Check for a serial-port conflict first.** `controller.py` and the MCP debug server
-   (`mcp_debug_server.py`) both need exclusive use of the Arduino's COM port — only one can hold
-   it at a time. Before launching either, confirm no stray process still has it:
+## Architecture
+
+```
+RuneLite client (Java plugin, src/main/java/com/example/)
+  └─ HTTP bridge on localhost:8080 (BridgeHttpServer.java, providers/*Provider.java)
+  └─ UDP event stream on port 50555 (PLAYER_DIED, NPC_DIED, LEVEL_UP, HP_CHANGED, CHAT_MESSAGE, ...)
+        ↕
+Python controller (ControllerAddon/)
+  └─ controller.py     — engine: bridge polling, Arduino serial driving, panic key,
+                          safety stops, human-movement realism (see settings.py)
+  └─ routines/*.py     — one file per activity (slayer, mining, golem_crafting, ...);
+                          controller.py loads whichever is passed on the command line
+  └─ banker.py         — shared banking helpers (deposit, withdraw, pouches/bags)
+  └─ travel.py         — shared walking helpers (Shortest Path plugin integration,
+                          minimap/viewport hop-clicking)
+  └─ login.py          — auto-login if the bridge reports logged out
+  └─ debug_log.py      — the `[category] message` log lines seen in routine output
+  └─ mcp_debug_server.py — exposes bridge/controller primitives as MCP tools (see .mcp.json),
+                            for live interactive debugging outside a running routine
+```
+
+The Java side's `providers/` classes are the only thing that knows about RuneLite's internal
+API; everything they expose becomes a JSON field on some bridge endpoint (`GET /player`,
+`/objects`, `/inventory`, `/bank`, `/npcs`, `/combat`, `/ground-items`, `/menu`, ...). The Python
+side never touches RuneLite internals directly — only these HTTP endpoints.
+
+## Running things
+
+- **RuneLite client**: `./gradlew.bat run` (from repo root). Launches via
+  `ExamplePluginTest.main`, which loads the Controller plugin and starts the bridge.
+- **A routine**: `python -u controller.py routines/<name>.py` (from `ControllerAddon/`). Runs
+  until the panic key (F1) is pressed, a safety stop triggers, or the process is killed.
+- **MCP debug server** (`osrs-debug` in `.mcp.json`): read-only bridge queries plus
+  `move_mouse`/`click_entity`/`click_menu_entry` for live interactive debugging *without* a
+  routine running — but it needs the same Arduino serial port `controller.py` does, so only one
+  of the two can be running at a time (see the workflow below).
+- **Tests**: `python -m pytest tests/` from `ControllerAddon/`.
+
+## The routine contract
+
+Every file in `routines/` is a plain Python module `controller.py` loads dynamically. It may
+define (see `controller.py`'s own header comment for the authoritative version):
+
+- `DEFAULT_CONFIG = {...}` — optional fallback config if the routine doesn't read from the
+  bridge's `GET /config`.
+- `get_config(bridge_config: dict | None) -> dict` — optional; resolves the config to use.
+- `setup(ctx) -> None` — optional; runs once after the serial connection opens.
+- `tick(ctx) -> None` — **required**; runs once per loop iteration, only while logged in,
+  focused, no safety stop active, and not on a break.
+- `on_event(ctx, event_type: str, payload: dict | None) -> None` — optional; runs for every UDP
+  event regardless of whether `tick` is currently running.
+
+`ctx.state.data` is a plain dict for a routine's own bookkeeping (current target, phase, etc.) —
+**it resets to `{}`** whenever the routine file changes or the process restarts. It is NOT
+persisted across restarts; a routine's own in-game progress (mid-craft state, partially-filled
+inventory, etc.) very much is, so the two can desync after a restart — see the golem_crafting.py
+notes below for a real example of this causing a bug.
+
+## Known environment gotchas
+
+- **Windows HiDPI scaling**: RuneLite's own AWT windows report `screenX`/`screenY` at 96 DPI
+  under a bare `java.exe` launch (no DPI-aware manifest), regardless of the display's actual
+  scaling. `controller.py` compensates by scaling every bridge response through
+  `get_dpi_scale()`/`_scale_screen_coords()`. If clicks are consistently off by a fixed ratio,
+  suspect this before anything else.
+- **Simulated human "mistakes" are intentional, not bugs.** `controller.click_entity` has a
+  `MISTAKE_MISCLICK_CHANCE` (~4.5%, see `settings.py`) chance of deliberately aiming beside the
+  target instead of on it, logged as `[!] Misclick -- aimed beside X instead of on it`. This is
+  anti-detection humanization, not a targeting bug — code that reacts to a click's outcome must
+  handle this (see golem_crafting.py's mining reclick gate for an example of a bug this caused:
+  waiting forever for an inventory change that a misclick will never produce).
+- **Arduino / MCP server / controller.py serial port conflict**: only one process can hold the
+  COM port at a time. Read-only bridge HTTP queries don't need it and work regardless.
+- **`ctx.state.data` reset on restart** (see above) can desync from real in-game state that
+  persists — always consider whether a routine needs to reconcile against a live bridge read
+  (e.g. an object's actual name) rather than trusting its own resumed bookkeeping.
+
+## Live-debugging workflow
+
+Use this loop by default when debugging a routine live against the running RuneLite client — it
+was confirmed to work well over an hours-long session that took `golem_crafting.py` from broken
+to reliably running unattended.
+
+1. **Check for a serial-port conflict first.** Confirm no stray process still holds the Arduino:
    `Get-CimInstance Win32_Process -Filter "Name = 'python.exe'"`.
 2. **Launch the routine in the background, unbuffered, logged to a file:**
-   `python -u controller.py routines/<name>.py *> <logfile> 2>&1`. Read-only bridge queries
-   (`GET http://localhost:8080/...`) don't need the serial port, so they work for live
-   cross-checking even while `controller.py` holds it.
-3. **Poll the log with `Read`, not tight loops.** 20–90s gaps between checks are fine — this is a
+   `python -u controller.py routines/<name>.py *> <logfile> 2>&1`.
+3. **Poll the log with `Read`, not tight loops.** 20-90s gaps between checks are fine — this is a
    live session, not a race.
 4. **Trust the user's live observations over your own read of the log.** If the log looks clean
    to you but the user reports something wrong, keep digging for the actual mechanism rather than
@@ -27,19 +107,22 @@ took `golem_crafting.py` from broken to reliably running unattended.
 7. **Iterate in small, targeted fixes**, one reported symptom at a time, rather than large
    rewrites.
 
-## Before any live click/mouse debugging
-
-Verify all three (see memory `feedback-mcp-debug-preconditions` for the full incident this came
-from):
-- RuneLite window is focused (`GET /state` → `windowFocused`).
-- Windows mouse acceleration ("Enhance pointer precision") is off.
-- The process calling into `controller.py` is DPI-aware (`set_dpi_aware()` — already handled by
-  `mcp_debug_server.py` at import time).
-
-## Hardware vs. code
-
-If `controller.py` crashes with a `serial.SerialException`, check whether the Arduino has
-actually dropped off the USB bus before assuming it's a logic bug:
+**Distinguish infra/hardware failures from code bugs**: a `serial.SerialException` crash mid-run
+can mean the Arduino has dropped off the USB bus entirely, not a code bug. Check
 `[System.IO.Ports.SerialPort]::getportnames()` (empty = gone) and `Get-PnpDevice -Class Ports`
-(look for "Status: Unknown" on the Arduino Leonardo). A reseat/power-cycle fixes this — no amount
-of code changes will.
+(look for "Status: Unknown" on the Arduino Leonardo) before assuming it's a logic bug. A
+reseat/power-cycle fixes this — no amount of code changes will.
+
+**Before any live click/mouse debugging**, verify: RuneLite window is focused (`GET /state` →
+`windowFocused`), Windows mouse acceleration ("Enhance pointer precision") is off, and the
+process is DPI-aware (already handled by `mcp_debug_server.py`/`controller.py` at import time).
+
+## Current state of routines/golem_crafting.py
+
+As of the last session, this routine was extensively live-debugged and left in a working state:
+mines Sunstone rocks to a budget, chisels cores, crafts golems on either of Wyrmscraig's two
+plinths (tracked by object id, not position — see that file's own comments for why), inserts
+cores/fur, loots gems, and cycles bank ↔ mine ↔ craft on its own. Several other routines
+(`slayer.py`, `mining.py`, `blast_furnace.py`, etc.) exist and were not touched this session —
+don't assume they share golem_crafting.py's specific fixes (sticky targeting, inventory-change
+reclick gates, etc.) unless verified.
