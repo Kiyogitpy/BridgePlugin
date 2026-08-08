@@ -122,7 +122,17 @@ CHISEL_NAME = "Chisel"
 # plinth" once a golem is completed. find_golem_object() below matches any of these, replacing
 # the original single-substring PLINTH_NAME (which stopped matching the moment carving started,
 # since none of the later names contain "plinth" at all).
-GOLEM_STATE_NAMES = ("Empty plinth", "Unfinished golem", "Unpowered golem")
+#
+# CORRECTED 2026-08-08 (user report: "the plinth got crafted into a base in a previous loop and
+# is now stuck"): a plinth doesn't actually reset to "Empty plinth" once it's been used at least
+# once -- CONFIRMED live it instead reads "Golem base" from then on (same id, same tile,
+# functionally identical to "Empty plinth" -- Start-golem works on it the same way). Missing
+# this name entirely made find_golem_object's candidate filter (below) exclude the plinth
+# outright once it reached this state -- not a transient miss handle_missing_target's retry
+# budget could ever recover from, since the object was never going to reappear under a name
+# this tuple recognized. Both of Wyrmscraig's plinths were observed in this state simultaneously
+# after enough golems had been crafted at each, so this isn't a one-off fluke tied to one plinth.
+GOLEM_STATE_NAMES = ("Empty plinth", "Golem base", "Unfinished golem", "Unpowered golem")
 
 # CONFIRMED LIVE 2026-08-08 (MCP debug session): the 4 world-tile offsets (dx, dy) around the
 # plinth/golem that were actually walked to and successfully carved from, one side each, in this
