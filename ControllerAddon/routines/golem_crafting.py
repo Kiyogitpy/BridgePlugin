@@ -813,11 +813,20 @@ def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
 
     RENAMED 2026-08-08 from walk_to_golem_side -- originally craft_phase-specific, generalized
     (no logic change) once hunt_phase needed the exact same exact-arrival behavior for its own
-    fixed standing tile rather than duplicating this polling loop."""
+    fixed standing tile rather than duplicating this polling loop.
+
+    CORRECTED 2026-08-09 (user report: "accidentally clicked the pit and started emptying it"
+    while walking back near it): a plain click at a ground point close to an interactive object
+    (the Goat Pit is only 2 tiles from hunt_phase's standing tile) can resolve to the OBJECT's
+    own action instead of walking there, if their clickable areas overlap on screen -- CONFIRMED
+    live this cleared the pit (removing its lining) mid walk-back. Explicit "Walk here" menu
+    selection guarantees the intended action regardless of what's nearby, same reasoning
+    controller.click_menu_action already documents for any click point something else can share."""
     point = controller.get_ground_walk_point(x, y, plane)
     if not point.get("onScreen"):
         return False
-    controller.click_entity(ctx.ser, point, offset=(0, 0))
+    if not controller.click_menu_action(ctx.ser, point, "walk", offset=(0, 0)):
+        return False
     waited = 0.0
     while waited < 8.0:
         time.sleep(0.6)
