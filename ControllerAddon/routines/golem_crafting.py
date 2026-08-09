@@ -1107,7 +1107,10 @@ def craft_phase(ctx, config: dict) -> None:
             # below purely as bookkeeping (which of the 4 offsets is "spent"), not because the
             # routine actually stood there.
             debug_log.log("golem crafting", "starting golem (0/4 done)")
-            if not controller.click_menu_action(ctx.ser, golem, "golem"):
+            # CORRECTED 2026-08-09 (user report): a plain left-click's default action already
+            # resolves to Start-golem/Shape-golem/Insert-core in every phase -- no need for
+            # click_menu_action's right-click+menu-read+select round trip.
+            if not controller.click_entity(ctx.ser, golem):
                 # CORRECTED 2026-08-08 (live session, user report: "stuck now, probably a
                 # misclick we don't correct for"): CONFIRMED live this looped forever -- unlike
                 # shaping/inserting (which always walk_to_exact_tile first, landing adjacent and
@@ -1118,7 +1121,7 @@ def craft_phase(ctx, config: dict) -> None:
                 # every single tick with nothing ever correcting the position. Hopping toward the
                 # golem's own tile -- the same off-screen fallback mine_phase/bank_phase already
                 # use -- fixes it instead of retrying the identical failing click indefinitely.
-                debug_log.log("golem crafting", "Start-golem click missed/no matching menu entry -- hopping closer and retrying next tick")
+                debug_log.log("golem crafting", "Start-golem click missed -- hopping closer and retrying next tick")
                 _hop_toward_point(ctx, golem["x"], golem["y"], golem.get("plane", 0))
                 return
 
@@ -1184,8 +1187,10 @@ def craft_phase(ctx, config: dict) -> None:
             return
 
         debug_log.log("golem crafting", f"shaping golem from offset {offset} ({len(sides_done)}/4 done)")
-        if not controller.click_menu_action(ctx.ser, golem, "golem"):
-            debug_log.log("golem crafting", "Shape-golem click missed/no matching menu entry -- retrying next tick")
+        # CORRECTED 2026-08-09 (user report): plain left-click's default action already resolves
+        # to Shape-golem here -- no need for click_menu_action's right-click+menu-read+select.
+        if not controller.click_entity(ctx.ser, golem):
+            debug_log.log("golem crafting", "Shape-golem click missed -- retrying next tick")
             return
 
         # ADDED 2026-08-08 (user report: "when we misclick we don't count it as a try?"): only
@@ -1241,8 +1246,10 @@ def craft_phase(ctx, config: dict) -> None:
         return
 
     debug_log.log("golem crafting", f"inserting core + fur from offset {offset}")
-    if not controller.click_menu_action(ctx.ser, golem, "insert-core"):
-        debug_log.log("golem crafting", "Insert-core click missed/no matching menu entry -- retrying next tick")
+    # CORRECTED 2026-08-09 (user report): plain left-click's default action already resolves to
+    # Insert-core here too -- no need for click_menu_action's right-click+menu-read+select.
+    if not controller.click_entity(ctx.ser, golem):
+        debug_log.log("golem crafting", "Insert-core click missed -- retrying next tick")
         return
 
     ctx.state.data["gc_craft_awaiting"] = {
