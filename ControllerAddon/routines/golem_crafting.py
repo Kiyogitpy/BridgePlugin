@@ -826,6 +826,15 @@ def on_event(ctx, event_type, payload) -> None:
         return
     message = (payload.get("message") or "").lower()
 
+    # TEMP DIAGNOSTIC 2026-08-09 (autonomous session): hunt_phase hit its 60-cast safety-stop
+    # twice in a row (hunt_test15.log, hunt_test16.log) with zero pit fills even after fixing the
+    # goat click offset -- logging every chat line while hunting, unfiltered, to see what the
+    # game actually says after each cast (a real "nothing interesting happens"/cast-failure
+    # message would confirm the click lands but the cast itself is rejected; total silence would
+    # point at the click never registering as a spell-cast at all). MUST REVERT once root-caused.
+    if ctx.state.data.get("gc_phase") == "hunt":
+        debug_log.log("hunt-diag", f"chat: {payload.get('message')!r}")
+
     if any(known in message for known in (
         GOLEM_CHAT_SIDE_DONE, GOLEM_CHAT_SIDE_ALREADY_DONE, GOLEM_CHAT_NOT_ENOUGH_SUNSTONE,
         GOLEM_CHAT_WRONG_INSERT_SIDE, GOLEM_CHAT_COMPLETE, GOLEM_CHAT_NOT_ENOUGH_FUR,
@@ -1800,7 +1809,12 @@ def hunt_phase(ctx, config: dict) -> None:
         goats.sort(key=lambda n: n.get("distance", 9999))
         target = goats[0]
         debug_log.log("golem crafting", f"casting Telekinetic Grab on {target.get('name')} (dist={target.get('distance')})")
-        controller.cast_telekinetic_grab(ctx.ser, target)
+        # TEMP DIAGNOSTIC 2026-08-09 (autonomous session, see on_event's matching note): logging
+        # cast_telekinetic_grab's own return value -- False here means the spell-icon click or
+        # the goat click itself was rejected (off-window, spellbook not visible), which the
+        # un-checked call previously discarded silently. MUST REVERT once root-caused.
+        cast_ok = controller.cast_telekinetic_grab(ctx.ser, target)
+        debug_log.log("hunt-diag", f"cast_telekinetic_grab returned {cast_ok} for index={target.get('index')}")
         if target.get("index") is not None:
             cooldowns[target["index"]] = now + GOAT_GRAB_COOLDOWN_S
         time.sleep(random.uniform(0.6, 1.0))
