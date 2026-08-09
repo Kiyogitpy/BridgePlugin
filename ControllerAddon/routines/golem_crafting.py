@@ -53,7 +53,6 @@
 # Run with:
 #     python controller.py routines/golem_crafting.py
 
-import os
 import random
 import time
 
@@ -1871,14 +1870,7 @@ def tick(ctx):
     # a fresh activation should stock fur FIRST (withdrawn in full and pouched, see
     # _run_bank_trip's docstring), so mine_phase never has to compete with loose fur for
     # inventory slots even on the very first mining trip of a session.
-    #
-    # ADDED 2026-08-09 (user request, testing convenience): GC_START_PHASE overrides the
-    # starting phase on a fresh process start (only takes effect once, same as the default --
-    # gc_phase is set into ctx.state.data below either way, so subsequent phase transitions
-    # aren't affected). Lets hunt_phase be tested directly without waiting through a full mine/
-    # chisel/craft/bank cycle first every time. Unset in normal use -- has zero effect then.
-    default_phase = os.environ.get("GC_START_PHASE", "bank")
-    phase = ctx.state.data.get("gc_phase", default_phase)
+    phase = ctx.state.data.get("gc_phase", "bank")
     handler = PHASES.get(phase)
     if handler is None:
         ctx.state.trigger_safety_stop(f"unknown golem crafting phase '{phase}'")
