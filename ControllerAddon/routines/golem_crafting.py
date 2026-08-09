@@ -754,8 +754,10 @@ GRAB_RANGE_TILES = 10  # Telekinetic Grab's cast range -- a farther target makes
 # ADDED 2026-08-09 (user request): a goat that was just cast on keeps traveling toward the pit
 # for a few seconds, not vanishing instantly -- without a cooldown it stayed the closest
 # candidate and got re-targeted over and over instead of spreading casts across the several
-# goats that can be en route to the pit at once. 4s (middle of the requested 3-5s) per goat.
-GOAT_GRAB_COOLDOWN_S = 4.0
+# goats that can be en route to the pit at once.
+# CORRECTED 2026-08-09 (user report, live): 4s still let some goats get re-clicked before
+# actually reaching the pit -- bumped by the requested extra 3-5s.
+GOAT_GRAB_COOLDOWN_S = 8.0
 
 
 def on_event(ctx, event_type, payload) -> None:
