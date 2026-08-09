@@ -1733,7 +1733,13 @@ def hunt_phase(ctx, config: dict) -> None:
             ctx.state.data["gc_hunt_chat_seen_seq"] = seq
             message = ctx.state.data.get("gc_last_hunt_chat", "")
             if all(part in message for part in GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS):
-                ctx.state.trigger_safety_stop("out of law/air runes for Telekinetic Grab")
+                # CORRECTED 2026-08-09 (user report): this fired once over "not enough Earth
+                # runes" -- traced to a misclick on the spell icon landing on a different spell
+                # entirely (now fixed, see cast_telekinetic_grab's simulate_mistakes=False). The
+                # rune actually named in the game's own message is included here rather than
+                # assumed to be law/air, so a repeat of this (or any other unexpected cause)
+                # says exactly what the game said instead of a guess that could be wrong again.
+                ctx.state.trigger_safety_stop(f"can't cast Telekinetic Grab: {message.strip()}")
                 return
             if GOAT_CHAT_PIT_FULL in message:
                 debug_log.log("golem crafting", "pit is now filled with goats -- harvesting")

@@ -940,7 +940,14 @@ def cast_telekinetic_grab(ser: serial.Serial, target: dict) -> bool:
     spell = get_spellbook()
     if not spell.get("visible"):
         return False
-    if not click_entity(ser, spell, offset=(0, 0), check_ui_blockers=False):
+    # CORRECTED 2026-08-09 (user report: safety-stopped over "out of Earth runes" instead of
+    # law/air): simulate_mistakes' humanized aim-beside-target miss (~20-45px, see
+    # MISCLICK_OFFSET_PX) is fine for a world object -- a miss there just lands on empty ground,
+    # harmless. Spell icons in the spellbook are packed close together, so that same miss can
+    # land squarely on an ADJACENT spell instead, silently casting something else entirely with
+    # different rune costs. Disabled here, same reasoning click_menu_action's own right-click
+    # already disables it for menu-sensitive clicks.
+    if not click_entity(ser, spell, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False):
         return False
     time.sleep(random.uniform(0.15, 0.3))
     # ADDED 2026-08-09 (user report: "the data is too slow because the goats move around a lot,
