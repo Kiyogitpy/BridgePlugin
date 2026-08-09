@@ -451,6 +451,43 @@ MAX_WALK_ATTEMPTS = 6
 # anchor-walk fallback instead of hopping at the same spot forever.
 MAX_BANK_MINIMAP_HOPS = 3
 
+# How far to search for a genuinely walkable substitute tile when a configured location anchor
+# turns out to sit on a blocked tile (inside/on an object) -- ADDED 2026-08-09 (user request,
+# live report: a walk toward the "mining" anchor got stuck retrying a route to an unwalkable
+# tile for 2.5+ minutes). 8 tiles comfortably covers an anchor that's just slightly off (e.g.
+# centered on the object it's meant to stand next to) without wandering far enough to end up
+# somewhere no longer useful for whatever the anchor was for.
+WALKABLE_ANCHOR_SEARCH_RADIUS = 8
+
+
+def _nearest_walkable_tile(target: dict) -> dict:
+    """Return `target` unchanged if it's already walkable, otherwise the closest walkable tile
+    within WALKABLE_ANCHOR_SEARCH_RADIUS tiles on the same plane -- or `target` itself if no
+    walkable tile was found nearby (the caller's walk just fails the same way it already could
+    have, no worse off than before this existed). CONFIRMED live the "mining" anchor
+    (2599, 2248) sits directly on a blocked tile; travel.walk_to has no way to know that on its
+    own and will retry a route to an unreachable tile forever, which is exactly the failure
+    mode this exists to route around at the source instead of inside travel.py (shared
+    infrastructure well outside this routine's scope)."""
+    tx, ty, plane = target["x"], target["y"], target.get("plane", 0)
+    tiles = controller.get_tiles()
+    exact = next((t for t in tiles if t.get("x") == tx and t.get("y") == ty and t.get("plane") == plane), None)
+    if exact is not None and exact.get("walkable"):
+        return target
+
+    candidates = [
+        t for t in tiles
+        if t.get("plane") == plane and t.get("walkable")
+        and abs(t.get("x", 0) - tx) <= WALKABLE_ANCHOR_SEARCH_RADIUS
+        and abs(t.get("y", 0) - ty) <= WALKABLE_ANCHOR_SEARCH_RADIUS
+    ]
+    if not candidates:
+        return target
+
+    candidates.sort(key=lambda t: (t["x"] - tx) ** 2 + (t["y"] - ty) ** 2)
+    nearest = candidates[0]
+    return {"x": nearest["x"], "y": nearest["y"], "plane": plane}
+
 
 def handle_missing_target(ctx, config: dict, location_key: str, miss_counter_key: str, walk_counter_key: str) -> bool:
     """Shared not-found handling for mine_phase/craft_phase/hunt_phase's object lookups. Returns
@@ -499,7 +536,14 @@ def handle_missing_target(ctx, config: dict, location_key: str, miss_counter_key
     ctx.state.data[walk_counter_key] = walks
     if walks <= MAX_WALK_ATTEMPTS:
         debug_log.log("golem crafting", f"{location_key} not found nearby -- walking toward the configured location (attempt {walks}/{MAX_WALK_ATTEMPTS})")
-        travel.walk_to(ctx, target)
+        # ADDED 2026-08-09 (user report: a walk toward "mining" got stuck for 2.5+ minutes,
+        # repeated identical clicks with zero movement): CONFIRMED live the configured (2599,
+        # 2248) anchor tile itself is blocked/unwalkable (sits inside/on an object) -- travel.
+        # walk_to has no way to know that and just kept retrying a route to a tile that can
+        # never actually be reached. Substituting the closest genuinely walkable tile within
+        # WALKABLE_ANCHOR_SEARCH_RADIUS fixes the anchor itself rather than special-casing the
+        # walk logic (travel.py is shared infrastructure well outside this routine's scope).
+        travel.walk_to(ctx, _nearest_walkable_tile(target))
         ctx.state.data[miss_counter_key] = 0
         return True
     debug_log.log("golem crafting", f"{location_key} still not found after {MAX_WALK_ATTEMPTS} walk attempts toward the configured location")
