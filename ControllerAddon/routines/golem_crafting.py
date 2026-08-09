@@ -1154,11 +1154,30 @@ def craft_phase(ctx, config: dict) -> None:
             # in one move.
             attempts = ctx.state.data.get("gc_craft_extra_side_attempts", 0)
             if attempts >= GOLEM_EXTRA_SIDE_ATTEMPTS_CAP:
-                ctx.state.trigger_safety_stop(
+                # CORRECTED 2026-08-09 (live session, autonomous recovery): CONFIRMED live this
+                # cap can still be exhausted even with the camera-nudge phase (attempts 9-16) --
+                # all 16 attempts came back "already crafted this side", never a real completion,
+                # for the SAME plinth id across a full extra cycle. Rather than a terminal
+                # safety-stop (the original design here, before autonomous operation was in
+                # scope), abandon this golem's tracked state and let the routine re-discover it
+                # fresh next call: find_golem_object has no memory of a committed id once this is
+                # cleared, so it re-evaluates from the object's OWN reported name (the actual
+                # source of truth this file's own docstrings already establish as more reliable
+                # than local bookkeeping) rather than the stale sides_done/offset mapping that
+                # desynced in the first place. Bounded the same way as before -- if the SAME
+                # plinth is picked again and genuinely can't progress, this safety net triggers
+                # again rather than looping forever.
+                debug_log.log(
+                    "golem crafting",
                     f"golem at plinth id={golem.get('id')} never reached Unpowered golem after "
-                    f"{GOLEM_EXTRA_SIDE_ATTEMPTS_CAP} extra Shape-golem attempts beyond the "
-                    "normal 4 -- likely a stuck/corrupted plinth state, needs a manual look"
+                    f"{GOLEM_EXTRA_SIDE_ATTEMPTS_CAP} extra Shape-golem attempts -- abandoning "
+                    "this golem's tracked state and retrying fresh instead of stopping"
                 )
+                ctx.state.data["gc_craft_golem_id"] = None
+                ctx.state.data["gc_craft_sides_done"] = []
+                ctx.state.data["gc_craft_insert_tried"] = []
+                ctx.state.data["gc_craft_awaiting"] = None
+                ctx.state.data["gc_craft_extra_side_attempts"] = 0
                 return
             offset = GOLEM_ADJACENT_OFFSETS[attempts % len(GOLEM_ADJACENT_OFFSETS)]
             debug_log.log("golem crafting", f"golem still not ready for Insert-core after 4 tracked sides -- retrying offset {offset} (extra attempt {attempts + 1}/{GOLEM_EXTRA_SIDE_ATTEMPTS_CAP})")
