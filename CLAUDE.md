@@ -83,6 +83,15 @@ notes below for a real example of this causing a bug.
 - **`ctx.state.data` reset on restart** (see above) can desync from real in-game state that
   persists — always consider whether a routine needs to reconcile against a live bridge read
   (e.g. an object's actual name) rather than trusting its own resumed bookkeeping.
+- **Always shift+click (`key_down`/`key_up` "SHIFT" around the click) when walking to a plain
+  ground tile, never a bare click.** A ground point close to any interactive object can resolve
+  to that OBJECT's own action instead of walking there if their clickable areas overlap on
+  screen — CONFIRMED live (golem_crafting.py's hunt_phase, 2026-08-09): a plain click near the
+  Goat Pit while walking back to a standing tile cleared/unlined it instead of just walking.
+  Shift+click is OSRS's own standard force-walk shortcut (forces "Walk here" regardless of
+  what's under the cursor) and looks like any other single click, so there's no reason not to
+  use it for every walk-to-a-tile click, not just ones near a known-risky object. See
+  `golem_crafting.py`'s `walk_to_exact_tile` for the reference implementation.
 
 ## Live-debugging workflow
 

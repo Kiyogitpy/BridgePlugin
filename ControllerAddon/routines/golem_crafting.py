@@ -863,18 +863,24 @@ def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
     (no logic change) once hunt_phase needed the exact same exact-arrival behavior for its own
     fixed standing tile rather than duplicating this polling loop.
 
-    CORRECTED 2026-08-09 (user report: "accidentally clicked the pit and started emptying it"
-    while walking back near it): a plain click at a ground point close to an interactive object
-    (the Goat Pit is only 2 tiles from hunt_phase's standing tile) can resolve to the OBJECT's
-    own action instead of walking there, if their clickable areas overlap on screen -- CONFIRMED
-    live this cleared the pit (removing its lining) mid walk-back. Explicit "Walk here" menu
-    selection guarantees the intended action regardless of what's nearby, same reasoning
-    controller.click_menu_action already documents for any click point something else can share."""
+    Holds Shift during the click -- ADDED 2026-08-09 (user report: "accidentally clicked the
+    pit and started emptying it" while walking back near it): a plain click at a ground point
+    close to an interactive object (the Goat Pit is only 2 tiles from hunt_phase's standing
+    tile) can resolve to the OBJECT's own action instead of walking there, if their clickable
+    areas overlap on screen -- CONFIRMED live this cleared the pit (removing its lining) mid
+    walk-back. First tried an explicit right-click "Walk here" menu selection instead, but per
+    user feedback that looked visually different/out of place on craft_phase's own frequent
+    golem-side walks, which have no such overlap risk to guard against in the first place.
+    Shift+click is OSRS's own standard force-walk shortcut (same mechanic a human player already
+    uses for exactly this situation) -- forces the "Walk here" action regardless of what's under
+    the cursor, in a single click that looks the same as any other, so it's safe to use
+    unconditionally for both callers instead of needing a per-caller opt-in."""
     point = controller.get_ground_walk_point(x, y, plane)
     if not point.get("onScreen"):
         return False
-    if not controller.click_menu_action(ctx.ser, point, "walk", offset=(0, 0)):
-        return False
+    controller.key_down(ctx.ser, "SHIFT")
+    controller.click_entity(ctx.ser, point, offset=(0, 0))
+    controller.key_up(ctx.ser, "SHIFT")
     waited = 0.0
     while waited < 8.0:
         time.sleep(0.6)
