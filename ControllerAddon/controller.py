@@ -958,7 +958,19 @@ def cast_telekinetic_grab(ser: serial.Serial, target: dict) -> bool:
     # moving combat targets) rather than trusting the one snapshot for the whole click.
     npc_index = target.get("index")
     refresh = (lambda: get_npc_screen_pos_by_index(npc_index)) if npc_index is not None else None
-    return click_entity(ser, target, refresh_target=refresh)
+    # CORRECTED 2026-08-09 (autonomous session, root-caused from hunt_test15.log: 60 straight
+    # Grab-cast attempts, zero pit fills, with "drifted off the hunt standing tile" recurring
+    # throughout -- the signature of casts resolving as ground-walks instead of landing on the
+    # goat). click_entity's default offset=(-7, 7) is deliberately sized to land somewhere on a
+    # "largeish" NPC sprite (see slayer.py's engage_target comment) -- fine for the Gryphons/
+    # combat targets it was tuned against, but a Wyrmscraig goat's sprite is much smaller and its
+    # screenX/screenY is the same ground-tile anchor point every provider uses (confirmed in
+    # NPCProvider/RuneLiteUtil.screenCoords, no model-height adjustment), so that offset was very
+    # plausibly landing off the goat's clickable area onto bare ground behind/beside it -- with
+    # the spell already selected, a ground click just cancels the selection and walks there,
+    # which matches the observed drift exactly. offset=(0, 0) here, same fix already applied to
+    # ground items for the same "default offset assumes a bigger sprite" reason.
+    return click_entity(ser, target, offset=(0, 0), refresh_target=refresh)
 
 
 def rotate_camera_away_from_ui(ser: serial.Serial, blocker: dict) -> None:
