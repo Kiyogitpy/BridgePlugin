@@ -788,6 +788,15 @@ GOAT_CHAT_PIT_FULL = "the pit is now filled with goats."
 # Rune name varies (law/air), so this matches on the stable surrounding text rather than a
 # single fixed string -- both substrings must be present.
 GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS = ("you do not have enough", "to cast this spell")
+# ROOT-CAUSED 2026-08-09 (autonomous session, hunt_test17.log diagnostic logging): the lining
+# applied once at the start of a hunt visit wears out well before the pit fills -- every Grab
+# cast after the first couple came back with this exact chat line, CONFIRMED live as the actual
+# reason hunt_phase's 60-cast cap kept getting exhausted with zero fills (cast_telekinetic_grab
+# itself was returning True the whole time; the click lands, the game just rejects the catch).
+# The plan's original edge-case question ("if we don't get 28 furs within those 5 spikes, do we
+# recognize this and grab new spikes to line with?") was never actually wired to a mid-cycle
+# reline -- only the pre-hunt and post-harvest relining paths existed.
+GOAT_CHAT_NEED_NEW_SPIKES = "you need to replace the spikes in the pit."
 GOAT_HORN_NAME = "Goat horn"  # always drops per trapped goat, never useful -- dropped on harvest
 FUR_POUCH_CAPACITY = 28  # large fur pouch's capacity -- once hit, further fur spills into loose
                          # inventory instead of the pouch, which is exactly the signal used below
@@ -826,15 +835,6 @@ def on_event(ctx, event_type, payload) -> None:
         return
     message = (payload.get("message") or "").lower()
 
-    # TEMP DIAGNOSTIC 2026-08-09 (autonomous session): hunt_phase hit its 60-cast safety-stop
-    # twice in a row (hunt_test15.log, hunt_test16.log) with zero pit fills even after fixing the
-    # goat click offset -- logging every chat line while hunting, unfiltered, to see what the
-    # game actually says after each cast (a real "nothing interesting happens"/cast-failure
-    # message would confirm the click lands but the cast itself is rejected; total silence would
-    # point at the click never registering as a spell-cast at all). MUST REVERT once root-caused.
-    if ctx.state.data.get("gc_phase") == "hunt":
-        debug_log.log("hunt-diag", f"chat: {payload.get('message')!r}")
-
     if any(known in message for known in (
         GOLEM_CHAT_SIDE_DONE, GOLEM_CHAT_SIDE_ALREADY_DONE, GOLEM_CHAT_NOT_ENOUGH_SUNSTONE,
         GOLEM_CHAT_WRONG_INSERT_SIDE, GOLEM_CHAT_COMPLETE, GOLEM_CHAT_NOT_ENOUGH_FUR,
@@ -844,7 +844,8 @@ def on_event(ctx, event_type, payload) -> None:
 
     is_pit_full = GOAT_CHAT_PIT_FULL in message
     is_rune_short = all(part in message for part in GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS)
-    if is_pit_full or is_rune_short:
+    is_spikes_worn = GOAT_CHAT_NEED_NEW_SPIKES in message
+    if is_pit_full or is_rune_short or is_spikes_worn:
         ctx.state.data["gc_last_hunt_chat"] = message
         ctx.state.data["gc_last_hunt_chat_seq"] = ctx.state.data.get("gc_last_hunt_chat_seq", 0) + 1
 
@@ -1651,6 +1652,12 @@ def hunt_phase(ctx, config: dict) -> None:
          dropped) and a 1/4-per-trapped-goat chance of Wyrmscraig goat fur (routed into the
          already-open fur pouch, same as before).
       5. Relines every single cycle (not once per hunt visit) before repeating from step 3.
+         ROOT-CAUSED 2026-08-09 (autonomous session): a single lining also wears out mid-visit,
+         well before the pit fills -- "You need to replace the spikes in the pit." (chat, caught
+         via GOAT_CHAT_NEED_NEW_SPIKES) means every subsequent cast lands but is rejected by the
+         game, not that the cast itself is broken. This clears gc_pit_lined so the very next call
+         re-lines from the same standing tile (no re-walk) before resuming casts -- this, not the
+         click mechanics, was the real reason MAX_HUNT_ACTIONS kept exhausting with zero fills.
       6. If the fur pouch is at capacity (28), any further fur spills into loose inventory
          instead of the pouch -- CONFIRMED live this is the signal used to know it's full,
          rather than any dedicated capacity-check action. Once seen, drops any leftover wooden
@@ -1809,12 +1816,7 @@ def hunt_phase(ctx, config: dict) -> None:
         goats.sort(key=lambda n: n.get("distance", 9999))
         target = goats[0]
         debug_log.log("golem crafting", f"casting Telekinetic Grab on {target.get('name')} (dist={target.get('distance')})")
-        # TEMP DIAGNOSTIC 2026-08-09 (autonomous session, see on_event's matching note): logging
-        # cast_telekinetic_grab's own return value -- False here means the spell-icon click or
-        # the goat click itself was rejected (off-window, spellbook not visible), which the
-        # un-checked call previously discarded silently. MUST REVERT once root-caused.
-        cast_ok = controller.cast_telekinetic_grab(ctx.ser, target)
-        debug_log.log("hunt-diag", f"cast_telekinetic_grab returned {cast_ok} for index={target.get('index')}")
+        controller.cast_telekinetic_grab(ctx.ser, target)
         if target.get("index") is not None:
             cooldowns[target["index"]] = now + GOAT_GRAB_COOLDOWN_S
         time.sleep(random.uniform(0.6, 1.0))
@@ -1836,6 +1838,17 @@ def hunt_phase(ctx, config: dict) -> None:
                 debug_log.log("golem crafting", "pit is now filled with goats -- harvesting")
                 ctx.state.data["gc_pit_filled"] = True
                 ctx.state.data["gc_hunt_actions"] = 0
+            elif GOAT_CHAT_NEED_NEW_SPIKES in message:
+                # ROOT-CAUSED 2026-08-09 (autonomous session, hunt_test17.log): a single lining
+                # only lasts a handful of catches before wearing out mid-visit -- CONFIRMED live
+                # this was the actual reason hunt_phase kept exhausting MAX_HUNT_ACTIONS with zero
+                # pit fills (every cast after the first couple landed fine but was rejected by the
+                # game with this exact message). Clearing gc_pit_lined re-enters the lining branch
+                # above on the very next call -- no re-walk needed, gc_hunt_standing stays True and
+                # the player is still on the fixed tile, so this only re-clicks the pit (guarded by
+                # _ensure_wooden_spikes at the top of hunt_phase already keeping spikes stocked).
+                debug_log.log("golem crafting", "pit's spikes wore out mid-hunt -- relining before casting again")
+                ctx.state.data["gc_pit_lined"] = False
         return
 
     # Pit is full -- harvest.
