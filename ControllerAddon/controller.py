@@ -248,6 +248,22 @@ def get_ground_walk_point(x: int, y: int, plane: int):
     return api_get("/ground/walk", params={"x": x, "y": y, "plane": plane}) or {"onScreen": False}
 
 
+def get_ground_walk_screen_pos(x: int, y: int, plane: int):
+    """refresh_target callable for a stationary world tile -- same shape as
+    get_npc_screen_pos_by_index, but for a fixed (x, y, plane) instead of a moving NPC. The tile
+    itself never moves, but its *screen* projection depends on the camera, which can shift
+    (auto-follow scroll, momentum from a prior nudge_camera_yaw) during move_to_human's travel
+    time -- this lets the final approach re-aim at the tile's current screen position instead of
+    trusting a snapshot taken before the camera moved."""
+    data = get_ground_walk_point(x, y, plane)
+    if not data.get("onScreen"):
+        return None
+    x, y = data.get("screenX"), data.get("screenY")
+    if x is None or y is None:
+        return None
+    return int(x), int(y)
+
+
 def request_shortest_path(x: int, y: int, plane: int):
     """Ask the (separately installed) Shortest Path plugin to compute a
     route to (x, y, plane). requested=False if that plugin isn't
@@ -1016,6 +1032,7 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
 
     aim_x, aim_y = int(x) + offset[0], int(y) + offset[1]
 
+    missed = False
     if simulate_mistakes and random.random() < MISTAKE_MISCLICK_CHANCE:
         # Simulate a near-miss -- aimed at the ground/tile beside the target instead of on
         # it (e.g. clicked next to the crab instead of the crab itself), rather than a wild
@@ -1027,6 +1044,7 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
         miss_dist = random.uniform(*MISCLICK_OFFSET_PX)
         aim_x += int(round(miss_dist * math.cos(angle)))
         aim_y += int(round(miss_dist * math.sin(angle)))
+        missed = True
         debug_log.log("!", f"Misclick -- aimed beside {entity.get('name')} instead of on it")
 
     if not is_point_within_window(aim_x, aim_y):
@@ -1053,7 +1071,53 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
         right_click_human(ser)
     else:
         click_human(ser)
+
+    if missed:
+        _reclick_after_misclick(ser, entity, offset, refresh_target, check_ui_blockers, button)
+
     return True
+
+
+def _reclick_after_misclick(ser: serial.Serial, entity: dict, offset, refresh_target,
+                             check_ui_blockers: bool, button: str) -> None:
+    """Corrective follow-up after click_entity's own simulated near-miss: a human who clicks
+    empty ground beside a target notices nothing happened and clicks again almost immediately,
+    they don't just give up and stand there. Without this, every caller that cares about the
+    click's actual effect has to build its own detect-and-retry logic around the fact that a
+    miss executes cleanly but produces nothing -- golem_crafting.py alone has three separate
+    workarounds for exactly this (MINE_RECLICK_TIMEOUT_S's inventory-change gate, the golem
+    fast-path's "misclick we don't correct for" fix, the fur-stock trust bug). Centralizing the
+    correction here means those keep working as safety nets but rarely actually need to trigger.
+
+    Never itself rolls another simulated miss -- a human's corrective second click is the one
+    they're actually paying attention to. Re-resolves the target's live position via
+    refresh_target when given, same staleness handling as any other re-aim (see
+    walk_to_exact_tile's get_ground_walk_screen_pos for why a snapshot from before this function's
+    own reaction-delay sleep can't be trusted as-is)."""
+    time.sleep(random.uniform(*MISCLICK_RECLICK_DELAY_S))
+
+    x, y = entity.get("screenX"), entity.get("screenY")
+    if refresh_target is not None:
+        updated = refresh_target()
+        if updated is not None:
+            x, y = updated
+    if x is None or y is None:
+        return
+
+    aim_x, aim_y = int(x) + offset[0], int(y) + offset[1]
+    if not is_point_within_window(aim_x, aim_y):
+        return
+    if check_ui_blockers and is_point_blocked_by_ui(aim_x, aim_y) is not None:
+        return
+
+    debug_log.log("action", f"Reclick -- correcting misclick on {entity.get('name')} at ({aim_x},{aim_y})")
+    move_to_human(ser, aim_x, aim_y, aim_radius=ENTITY_AIM_RADIUS, refresh_target=refresh_target)
+    if _movement_abort.is_set():
+        return
+    if button == "right":
+        right_click_human(ser)
+    else:
+        click_human(ser)
 
 
 def hover_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_target=None) -> bool:

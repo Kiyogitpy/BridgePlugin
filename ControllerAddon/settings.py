@@ -53,6 +53,9 @@ MISTAKE_OVEREAT_MIN_HP_FRACTION = 0.75    # ...but only once hp is already at le
 PRAYER_RESTORE_SPREAD = 25
 MISTAKE_MISCLICK_CHANCE = 0.025           # chance per click_entity call to aim beside the target instead of on it
 MISCLICK_OFFSET_PX = (20, 45)             # px; how far off that miss lands -- roughly one tile over, not a wild miss
+# A human who clicks empty ground beside a target notices nothing happened and clicks again
+# almost immediately -- see click_entity's post-miss corrective reclick.
+MISCLICK_RECLICK_DELAY_S = (0.25, 0.55)
 
 # ---------------- Idle mouse drift ----------------
 # Every so often, nudge the cursor a short distance from wherever it already

@@ -883,12 +883,19 @@ def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
     Shift+click is OSRS's own standard force-walk shortcut (same mechanic a human player already
     uses for exactly this situation) -- forces the "Walk here" action regardless of what's under
     the cursor, in a single click that looks the same as any other, so it's safe to use
-    unconditionally for both callers instead of needing a per-caller opt-in."""
+    unconditionally for both callers instead of needing a per-caller opt-in.
+
+    ADDED 2026-08-10 (user report: camera-vs-true-tile discrepancy causing misclicks): passes
+    refresh_target so move_to_human's mid-flight re-aim re-queries this tile's live screen
+    position instead of trusting the single snapshot taken before the click started -- same
+    staleness fix already proven live for cast_telekinetic_grab's moving-NPC targets, applied
+    here for camera movement instead of target movement (see get_ground_walk_screen_pos)."""
     point = controller.get_ground_walk_point(x, y, plane)
     if not point.get("onScreen"):
         return False
+    refresh = lambda: controller.get_ground_walk_screen_pos(x, y, plane)
     controller.key_down(ctx.ser, "SHIFT")
-    controller.click_entity(ctx.ser, point, offset=(0, 0))
+    controller.click_entity(ctx.ser, point, offset=(0, 0), refresh_target=refresh)
     controller.key_up(ctx.ser, "SHIFT")
     waited = 0.0
     while waited < 8.0:
