@@ -35,6 +35,7 @@ import re
 import time
 
 import controller
+import debug_log
 import travel
 
 DEFAULT_BANK_NAMES = ("bank booth", "bank chest", "bank counter", "grand exchange booth")
@@ -145,7 +146,7 @@ def empty_looting_bag(ctx) -> bool:
     if bag is None:
         return False
 
-    print("[bank] emptying looting bag")
+    debug_log.log("bank", "emptying looting bag")
     if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False):
         return False
 
@@ -181,7 +182,7 @@ def fill_coal_bag(ctx) -> bool:
     if bag is None:
         return False
 
-    print("[bank] filling coal bag")
+    debug_log.log("bank", "filling coal bag")
     if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False):
         return False
 
@@ -208,7 +209,7 @@ def empty_coal_bag(ctx) -> bool:
     if bag is None:
         return False
 
-    print("[bank] emptying coal bag")
+    debug_log.log("bank", "emptying coal bag")
     if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False):
         return False
 
@@ -247,7 +248,7 @@ def fill_fur_pouch(ctx) -> bool:
     if pouch is None:
         return False
 
-    print("[bank] filling fur pouch")
+    debug_log.log("bank", "filling fur pouch")
     if not controller.click_entity(ctx.ser, pouch, check_ui_blockers=False):
         return False
 
@@ -281,7 +282,7 @@ def empty_fur_pouch(ctx) -> bool:
     if pouch is None:
         return False
 
-    print("[bank] emptying fur pouch")
+    debug_log.log("bank", "emptying fur pouch")
     if not controller.click_menu_action(ctx.ser, pouch, "empty", offset=(0, 0), check_ui_blockers=False):
         return False
 
@@ -367,7 +368,7 @@ def set_quantity_mode(ctx, mode: str) -> bool:
     bank = controller.get_bank()
     button = bank.get("quantityButtons", {}).get(mode) or {}
     if button.get("screenX") is None:
-        print(f"[bank] quantity mode button '{mode}' not found (bank open?)")
+        debug_log.log("bank", f"quantity mode button '{mode}' not found (bank open?)")
         return False
 
     controller.click_entity(ctx.ser, button, offset=(0, 0))
@@ -391,10 +392,10 @@ def withdraw_loadout(ctx, config: dict) -> None:
             None,
         )
         if slot is None:
-            print(f"[bank] {entry.get('name')} not found in bank, skipping")
+            debug_log.log("bank", f"{entry.get('name')} not found in bank, skipping")
             continue
 
-        print(f"[bank] withdrawing {quantity}x {slot.get('name')}")
+        debug_log.log("bank", f"withdrawing {quantity}x {slot.get('name')}")
         for _ in range(quantity):
             controller.click_entity(ctx.ser, slot)
             time.sleep(random.uniform(0.15, 0.3))
@@ -430,7 +431,7 @@ def search_bank(ctx, query: str) -> bool:
     bank = controller.get_bank()
     button = bank.get("searchButton") or {}
     if button.get("screenX") is None:
-        print("[bank] search button not found (bank open?)")
+        debug_log.log("bank", "search button not found (bank open?)")
         return False
 
     controller.click_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False)
@@ -504,11 +505,11 @@ def search_and_withdraw(ctx, item_name: str, quantity: int) -> bool:
         None,
     )
     if slot is None:
-        print(f"[bank] {item_name} not found after searching '{search_query}' -- search may not have worked")
+        debug_log.log("bank", f"{item_name} not found after searching '{search_query}' -- search may not have worked")
         return False
 
     set_quantity_mode(ctx, "one")
-    print(f"[bank] withdrawing {quantity}x {slot.get('name')}")
+    debug_log.log("bank", f"withdrawing {quantity}x {slot.get('name')}")
     # Track whether the clicks actually landed instead of assuming success -- CONFIRMED live
     # 2026-08-06: a concurrent human interaction moved the mouse mid-sequence and every withdraw
     # click failed ("aim point is outside the RuneLite window"), but this still unconditionally
@@ -520,10 +521,10 @@ def search_and_withdraw(ctx, item_name: str, quantity: int) -> bool:
         time.sleep(random.uniform(0.15, 0.3))
     clear_bank_search(ctx)
     if landed == 0:
-        print(f"[bank] withdrawing {slot.get('name')} failed -- no click landed")
+        debug_log.log("bank", f"withdrawing {slot.get('name')} failed -- no click landed")
         return False
     if landed < quantity:
-        print(f"[bank] only {landed}/{quantity} withdraw clicks on {slot.get('name')} landed")
+        debug_log.log("bank", f"only {landed}/{quantity} withdraw clicks on {slot.get('name')} landed")
     return True
 
 
@@ -537,12 +538,12 @@ def withdraw_best_food(ctx, quantity: int = 1) -> bool:
     bank = controller.get_bank()
     candidates = [i for i in bank.get("items", []) if i.get("isFood")]
     if not candidates:
-        print("[bank] no food found in bank")
+        debug_log.log("bank", "no food found in bank")
         return False
 
     candidates.sort(key=lambda i: i.get("heal", 0), reverse=True)
     best = candidates[0]
-    print(f"[bank] auto-picked food: {best.get('name')} (heals {best.get('heal')})")
+    debug_log.log("bank", f"auto-picked food: {best.get('name')} (heals {best.get('heal')})")
     return search_and_withdraw(ctx, best.get("name"), quantity)
 
 
@@ -552,12 +553,12 @@ def withdraw_best_prayer_restore(ctx, quantity: int = 1) -> bool:
     bank = controller.get_bank()
     candidates = [i for i in bank.get("items", []) if i.get("isPrayerPotion")]
     if not candidates:
-        print("[bank] no prayer restore found in bank")
+        debug_log.log("bank", "no prayer restore found in bank")
         return False
 
     candidates.sort(key=lambda i: _dose(i.get("name")), reverse=True)
     best = candidates[0]
-    print(f"[bank] auto-picked prayer restore: {best.get('name')}")
+    debug_log.log("bank", f"auto-picked prayer restore: {best.get('name')}")
     return search_and_withdraw(ctx, best.get("name"), quantity)
 
 
@@ -576,9 +577,9 @@ def bank_up(ctx, config: dict) -> bool:
     # below even when a real bank is right there).
     bank_obj = _find_nearby_bank_retrying(config)
     if bank_obj is not None:
-        print(f"[bank] walking to {bank_obj.get('name')} (dist={bank_obj.get('distance')})")
+        debug_log.log("bank", f"walking to {bank_obj.get('name')} (dist={bank_obj.get('distance')})")
         if not open_bank(ctx, bank_obj):
-            print("[bank] failed to open bank")
+            debug_log.log("bank", "failed to open bank")
             return False
 
         deposit_inventory(ctx, config)
@@ -620,7 +621,7 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
         if "bank_ferox_return_location" not in ctx.state.data:
             saved_location = travel.save_location()
             if saved_location is None:
-                print("[bank] couldn't record current location, aborting teleport bank trip")
+                debug_log.log("bank", "couldn't record current location, aborting teleport bank trip")
                 return False
             ctx.state.data["bank_ferox_return_location"] = saved_location
 
@@ -640,11 +641,11 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
 
         bank_obj = _find_nearby_bank_retrying(ferox_search_config)
         if bank_obj is None:
-            print("[bank] no bank found at Ferox Enclave -- did the teleport actually land?")
+            debug_log.log("bank", "no bank found at Ferox Enclave -- did the teleport actually land?")
             return False
 
     if not open_bank(ctx, bank_obj):
-        print("[bank] failed to open the Ferox Enclave bank")
+        debug_log.log("bank", "failed to open the Ferox Enclave bank")
         return False
 
     # Never deposit the ring or seed pod themselves, or every trip after this
@@ -662,8 +663,8 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
 
     saved_location = ctx.state.data.pop("bank_ferox_return_location", None)
     if saved_location is not None:
-        print("[bank] walking back to the previous location")
+        debug_log.log("bank", "walking back to the previous location")
         if not travel.walk_to(ctx, saved_location):
-            print("[bank] couldn't walk all the way back -- continuing from here")
+            debug_log.log("bank", "couldn't walk all the way back -- continuing from here")
 
     return True
