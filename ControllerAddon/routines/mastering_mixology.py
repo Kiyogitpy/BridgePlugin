@@ -59,37 +59,6 @@ def get_config(bridge_config):
     return config if config is not None else DEFAULT_CONFIG
 
 
-PHASES = {
-    "bank_herbs": bank_herbs_phase,
-    "orders": orders_phase,
-    "mix": mix_phase,
-    "process": process_phase,
-    "deposit": deposit_phase,
-}
-
-
-def setup(ctx) -> None:
-    ctx.state.data.setdefault("mm_phase", "bank_herbs")
-
-
-def tick(ctx) -> None:
-    config = ctx.state.config
-    if not ctx.state.data.get("mm_level_checked"):
-        check_level_requirement(ctx, config)
-        ctx.state.data["mm_level_checked"] = True
-        if ctx.state.safety_stopped:
-            return
-
-    maybe_collect_digweed(ctx, config)
-
-    phase = ctx.state.data.get("mm_phase", "bank_herbs")
-    handler = PHASES.get(phase)
-    if handler is None:
-        ctx.state.trigger_safety_stop(f"unknown mastering_mixology phase '{phase}'")
-        return
-    handler(ctx, config)
-
-
 def find_item(name: str):
     """First inventory item whose name matches `name` exactly (case-insensitive) -- same
     exact-match idiom as golem_crafting.py's find_item."""
@@ -496,3 +465,34 @@ def maybe_collect_digweed(ctx, config: dict) -> None:
     time.sleep(random.uniform(0.5, 0.8))
     if find_item("Digweed") is not None:
         ctx.state.data["mm_have_digweed"] = True
+
+
+PHASES = {
+    "bank_herbs": bank_herbs_phase,
+    "orders": orders_phase,
+    "mix": mix_phase,
+    "process": process_phase,
+    "deposit": deposit_phase,
+}
+
+
+def setup(ctx) -> None:
+    ctx.state.data.setdefault("mm_phase", "bank_herbs")
+
+
+def tick(ctx) -> None:
+    config = ctx.state.config
+    if not ctx.state.data.get("mm_level_checked"):
+        check_level_requirement(ctx, config)
+        ctx.state.data["mm_level_checked"] = True
+        if ctx.state.safety_stopped:
+            return
+
+    maybe_collect_digweed(ctx, config)
+
+    phase = ctx.state.data.get("mm_phase", "bank_herbs")
+    handler = PHASES.get(phase)
+    if handler is None:
+        ctx.state.trigger_safety_stop(f"unknown mastering_mixology phase '{phase}'")
+        return
+    handler(ctx, config)
