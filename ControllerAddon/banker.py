@@ -98,21 +98,92 @@ def is_open() -> bool:
     return controller.get_bank().get("open", False)
 
 
-def open_bank(ctx, bank_obj, timeout_s: float = 10.0) -> bool:
-    """Walk to and open a bank object. Returns once the interface is up."""
+def _refresh_bank_object(bank_obj: dict) -> dict:
+    """Re-find `bank_obj` (matched by id) among currently visible objects, so a retry click
+    aims at its actual current screen position instead of a position captured once and now
+    stale -- see open_bank's docstring for why this matters. Falls back to the original
+    `bank_obj` unchanged if a matching id isn't found (e.g. a transient read miss); a stale
+    position is still better than no click attempt at all."""
+    target_id = bank_obj.get("id")
+    for obj in controller.get_objects(radius=15):
+        if obj.get("id") == target_id and obj.get("visible", True):
+            return obj
+    return bank_obj
+
+
+def open_bank(ctx, bank_obj, timeout_s: float = 20.0) -> bool:
+    """Walk to and open a bank object. Returns once the interface is up.
+
+    CONFIRMED live 2026-08-12 (Mastering Mixology live session): a single click here can
+    silently fail to open the bank -- the click itself "lands" (click_entity returns True) but
+    the interface never comes up. Two distinct causes identified live, both needing the same
+    shape of fix:
+
+    1. The player wasn't standing right at the bank (having just walked off toward the
+       refiner/hopper), so OSRS walks there first, then opens the bank -- a too-short reclick
+       interval doesn't give that walk time to finish and instead re-issues a fresh
+       walk-to-then-interact command mid-transit, redirecting the walk instead of letting the
+       original click resolve.
+    2. The bank's aim point can be behind a UI panel -- click_entity's own
+       rotate_camera_away_from_ui already handles this by nudging the camera and returning
+       False, with its docstring explicitly saying the CALLER should "re-resolve the target's
+       (now-shifted) screen position on its next attempt." The original version of this
+       function didn't honor that contract at all: its very first click
+       (`if not click_entity(...): return False`) returned a hard failure immediately on a
+       UI-panel block, never reaching any retry loop, and even after a retry loop was added it
+       kept re-clicking the SAME stale `bank_obj` screen position captured before any camera
+       rotation -- which can never land once the camera has actually moved.
+
+    CORRECTED twice more the same session (user reports + insight): a fixed reclick interval
+    was still just a guess, and the follow-up fix (gating on camera yaw/pitch settling) turned
+    out not to be the right signal either -- this minigame's camera retargets almost every tick
+    as the player turns to face its next interaction, so yaw==yawTarget held on nearly every
+    poll even while the net on-screen position kept drifting (user report: "still clicks like
+    crazy even when camera moving"). Per explicit user direction, this now gates on the
+    player's own activity state instead (see controller.wait_until_player_idle: animation +
+    pose + position all stable across consecutive reads) -- the direct signal for "is my
+    character still busy or still walking", not a screen/camera-derived proxy for it.
+
+    Fixed by waiting for the player to be idle before every click, including the first, then
+    re-resolving the bank object's current position (see _refresh_bank_object) right before
+    clicking -- so a UI-panel nudge's "try again next attempt" and an in-progress walk's
+    changing position are both naturally covered by the loop itself."""
     if is_open():
         return True
 
-    if not controller.click_entity(ctx.ser, bank_obj):
-        return False
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        controller.wait_until_player_idle(timeout_s=max(1.0, deadline - time.time()))
+        fresh = _refresh_bank_object(bank_obj)
 
-    waited = 0.0
-    while waited < timeout_s:
-        time.sleep(0.5)
-        waited += 0.5
-        if is_open():
-            return True
-    return False
+        # CONFIRMED live 2026-08-12 (user report: "not doing anything" -> safety-stopped on
+        # "failed to open the bank"): the object's own `visible` flag can read True while
+        # `onScreen` reads False (game-state-visible vs. actually-in-viewport are different
+        # things) -- clicking it then aims at a screenX/Y outside the RuneLite window every
+        # time, which click_entity correctly refuses, so the loop just burned its whole timeout
+        # reclicking the same unreachable spot. Per user's own suggested fix: click the minimap
+        # toward the bank's world position first so the camera/player turns it into view, then
+        # let the loop's next iteration re-resolve and click it normally.
+        if not fresh.get("onScreen", True):
+            x, y, plane = fresh.get("x"), fresh.get("y"), fresh.get("plane", 0)
+            if x is not None and y is not None:
+                point = controller.get_minimap_walk_point(x, y, plane)
+                if point.get("onMinimap"):
+                    debug_log.log("bank", "bank object off-screen -- minimap-walking toward it first")
+                    controller.click_entity(ctx.ser, point, offset=(0, 0))
+                    controller.wait_until_player_idle(timeout_s=max(1.0, deadline - time.time()))
+            continue
+
+        controller.click_entity(ctx.ser, fresh)
+
+        # Give the click a few seconds to resolve (open animation/server round trip) without
+        # reclicking yet -- reclicking here would just interrupt a click that's about to work.
+        click_deadline = min(deadline, time.time() + 3.0)
+        while time.time() < click_deadline:
+            if is_open():
+                return True
+            time.sleep(0.3)
+    return is_open()
 
 
 def close_bank(ctx) -> None:
@@ -376,6 +447,23 @@ def set_quantity_mode(ctx, mode: str) -> bool:
     return True
 
 
+def switch_bank_tab(ctx, index: int) -> bool:
+    """Click bank tab `index` (0 = "view all", 1-9 = the player's own numbered tabs) --
+    ADDED 2026-08-12 (user request): an alternative to search_bank for a player who's
+    organized specific items (e.g. herbs) into a dedicated tab. See BankProvider.java's own
+    "tabs" field docstring for the same not-yet-verified-live caveat on which widget-children
+    call actually populates it."""
+    bank = controller.get_bank()
+    tab = next((t for t in bank.get("tabs", []) if t.get("index") == index), None)
+    if tab is None or tab.get("screenX") is None:
+        debug_log.log("bank", f"tab {index} button not found (bank open?)")
+        return False
+
+    controller.click_entity(ctx.ser, tab, offset=(0, 0), check_ui_blockers=False)
+    time.sleep(random.uniform(0.3, 0.5))
+    return True
+
+
 def wait_until_bank_item_gone(ctx, name_substring: str, timeout_s: float = 1.5, poll_interval_s: float = 0.15) -> bool:
     """Polls /bank with fresh=True until no item name contains name_substring (case-insensitive),
     or timeout_s elapses. fresh=True only guarantees the bridge's own cache isn't stale -- it does
@@ -464,7 +552,13 @@ def search_bank(ctx, query: str) -> bool:
     controller.click_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False)
     time.sleep(random.uniform(0.2, 0.4))
     controller.type_text(ctx.ser, query)
-    time.sleep(random.uniform(0.3, 0.5))
+    # CONFIRMED live 2026-08-12 (Mastering Mixology live session): a 0.3-0.5s settle here --
+    # shorter than one full game tick (0.6s), with no margin -- reproduced a real bug twice in a
+    # row on the THIRD back-to-back search within one bank session: /bank's own read already
+    # reflected the new query (the caller's item-lookup found the right name/id), but the actual
+    # on-screen click still landed on the PREVIOUS search's result instead, silently withdrawing
+    # the wrong item. Bumped to comfortably clear a full tick with margin.
+    time.sleep(random.uniform(0.7, 0.9))
     return True
 
 
@@ -527,12 +621,19 @@ def search_and_withdraw(ctx, item_name: str, quantity: int) -> bool:
         return False
 
     bank = controller.get_bank()
+    # CONFIRMED live 2026-08-12: a bank search can surface a zero-stock "placeholder" slot whose
+    # name exactly matches item_name (e.g. searching "Ranarr weed" on an account with none in
+    # stock still returned a qty=0 "Ranarr weed" placeholder alongside qty=0 "Grimy ranarr
+    # weed") -- clicking it is a no-op at best; observed live to instead silently interact with
+    # whatever the PREVIOUS search's result slot still rendered at that screen position,
+    # withdrawing the wrong item. Requiring qty > 0 makes this a clean "not found" instead.
     slot = next(
-        (s for s in bank.get("items", []) if (s.get("name") or "").lower() == item_name.lower()),
+        (s for s in bank.get("items", [])
+         if (s.get("name") or "").lower() == item_name.lower() and s.get("qty", 0) > 0),
         None,
     )
     if slot is None:
-        debug_log.log("bank", f"{item_name} not found after searching '{search_query}' -- search may not have worked")
+        debug_log.log("bank", f"{item_name} not found (or out of stock) after searching '{search_query}'")
         return False
 
     set_quantity_mode(ctx, "one")
