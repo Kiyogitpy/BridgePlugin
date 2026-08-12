@@ -1,9 +1,12 @@
 """routines/mastering_mixology.py
 
-Automates Mastering Mixology under the max-total-points-per-paste strategy (see
-docs/superpowers/specs/2026-08-12-mastering-mixology-design.md): bank herbs -> refine -> hopper
--> read the 3 active orders -> mix -> process -> deposit, skipping single-paste orders (AAA/MMM/
-LLL) unless an MAL order is present in the same set of 3.
+Automates Mastering Mixology (see docs/superpowers/specs/2026-08-12-mastering-mixology-design.md
+for the original plan): bank herbs -> refine -> hopper -> read the 3 active orders -> mix ->
+process -> deposit. Always makes and deposits all 3 current orders together every cycle (see
+_choose_orders) rather than the original plan's max-points-per-paste selection, which skipped
+single-paste orders (AAA/MMM/LLL) without an MAL order present -- changed 2026-08-12 per explicit
+user direction, to always capture the wiki-confirmed resin bonus for depositing multiple orders
+at once (+20% for 2, +40% for 3).
 """
 
 import random
@@ -30,7 +33,6 @@ RECIPE_TABLE = {
     "Anti-leech lotion": {"mox": 0, "aga": 1, "lye": 2},
     "Mixalot": {"mox": 1, "aga": 1, "lye": 1},
 }
-SINGLE_PASTE_BASES = {"Alco-augmentator", "Mammoth-might mix", "Liplack liquor"}
 MAL_BASE = "Mixalot"
 
 # ItemID.MM_POTION_*_UNFINISHED / _FINISHED (net.runelite.api.gameval.ItemID,
@@ -387,24 +389,18 @@ def _refine_and_hopper_inventory(ctx) -> None:
 
 
 def _choose_orders(orders: list) -> list:
-    """Max-points-per-paste selection: make every non-single-paste order, plus every
-    single-paste order too if an MAL order is present in this same set of 3. If ALL 3 are
-    single-paste, make only the one whose paste type currently has the lowest hopper stock
-    (spends down whichever is SCARCEST, to keep the three roughly balanced over time, since
-    single-paste orders are the only lever this routine has for correcting an imbalance;
-    skipping the other two loses no points since single-paste orders are net-negative on their
-    own per the wiki's reward-ratio table)."""
-    has_mal = any(o.get("name") == MAL_BASE for o in orders)
-    if has_mal:
-        return list(orders)
+    """Always make and deposit all 3 current orders together.
 
-    non_single = [o for o in orders if o.get("name") not in SINGLE_PASTE_BASES]
-    if non_single:
-        return non_single
-
-    # All 3 are single-paste -- caller (orders_phase) picks which one via hopper stock, since
-    # that needs a live hopper read this pure function shouldn't fetch itself.
-    return orders
+    CHANGED 2026-08-12 (explicit user direction: "we need to do all 3 orders at once"): the
+    wiki (data/raw/M/Mastering Mixology.txt:472,474) confirms the conveyor belt deposits up to
+    three potions in a single click, fulfilling as many current orders as possible and
+    refreshing all three together -- and fulfilling 2 at once gives 20% more resin per potion,
+    3 at once gives 40% more. The original plan's max-points-per-paste strategy deliberately
+    skipped single-paste orders (AAA/MMM/LLL) without an MAL order present, reasoning they're
+    net-negative in isolation per the wiki's reward-ratio table -- correct in isolation, but it
+    meant most cycles only ever chose 1-2 orders, never capturing the simultaneous-deposit
+    bonus at all. User's call: always take all 3, unconditionally."""
+    return list(orders)
 
 
 def orders_phase(ctx, config: dict) -> None:
@@ -418,8 +414,6 @@ def orders_phase(ctx, config: dict) -> None:
         return
 
     chosen = _choose_orders(orders)
-    if chosen and all(o.get("name") in SINGLE_PASTE_BASES for o in chosen):
-        chosen = [min(chosen, key=lambda o: hopper.get(_paste_type_of(o), 0))]
 
     needed = {"mox": 0, "aga": 0, "lye": 0}
     for order in chosen:
@@ -435,12 +429,6 @@ def orders_phase(ctx, config: dict) -> None:
     ctx.state.data["mm_chosen_orders"] = chosen
     debug_log.log("mixology", f"chosen orders this cycle: {[o.get('name') for o in chosen]}")
     ctx.state.data["mm_phase"] = "mix"
-
-
-def _paste_type_of(order: dict) -> str:
-    """The single paste type a single-paste order (AAA/MMM/LLL) needs -- whichever of
-    mox/aga/lye is non-zero on that order dict."""
-    return next(p for p in ("mox", "aga", "lye") if order.get(p, 0) > 0)
 
 
 # Mixing vessel object ids by content, confirmed via direct ObjectID/ObjectID1 jar lookup (see
