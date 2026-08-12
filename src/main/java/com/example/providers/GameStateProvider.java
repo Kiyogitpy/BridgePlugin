@@ -96,6 +96,20 @@ public class GameStateProvider extends BridgeProvider
 			data.put("minimapHeight", (int) Math.round(bounds.height * scale[1]));
 		}
 
+		// ADDED 2026-08-12 (user insight): the player's own world position settling after a walk
+		// does NOT mean the camera has finished following -- the camera visibly "catches up" for
+		// a bit afterward, and every screen-space click position this bridge reports depends on
+		// the camera's CURRENT angle, not the player's tile position. getCameraYaw()/Pitch() are
+		// the camera's current angle; getCameraYawTarget()/PitchTarget() are where it's smoothly
+		// interpolating toward. Equal means genuinely settled -- the real, direct signal for
+		// "is it safe to trust a screen position right now," instead of inferring it indirectly
+		// from player movement (CONFIRMED unreliable for this: the camera can still be catching
+		// up after the player's tile position has already stopped changing).
+		data.put("cameraYaw", client.getCameraYaw());
+		data.put("cameraYawTarget", client.getCameraYawTarget());
+		data.put("cameraPitch", client.getCameraPitch());
+		data.put("cameraPitchTarget", client.getCameraPitchTarget());
+
 		data.put("viewportWidth", client.getViewportWidth());
 		data.put("viewportHeight", client.getViewportHeight());
 		data.put("viewportXOffset", client.getViewportXOffset());
