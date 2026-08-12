@@ -100,12 +100,17 @@ def start_panic_listener():
 # ---------------- bridge HTTP helpers ----------------
 _bridge_failing = False
 _bridge_fail_count = 0
+# Reused for the process lifetime instead of requests.get()'s implicit one-off connection --
+# CONFIRMED this endpoint is polled many times a second (see ObjectProvider.java's own comment
+# on /objects/ /tiles/ /ground-items), so a shared Session's TCP connection reuse meaningfully
+# cuts per-call overhead to the local bridge.
+_session = requests.Session()
 
 
 def api_get(path, params=None, timeout=0.3):
     global _bridge_failing, _bridge_fail_count
     try:
-        resp = requests.get(f"{API_BASE}{path}", params=params, timeout=timeout)
+        resp = _session.get(f"{API_BASE}{path}", params=params, timeout=timeout)
         resp.raise_for_status()
         result = _scale_screen_coords(resp.json(), get_dpi_scale())
         if _bridge_failing:
@@ -146,15 +151,16 @@ def get_prayers():
     return api_get("/prayers") or {}
 
 
-def get_npcs():
-    return api_get("/npcs") or []
+def get_npcs(fresh=False):
+    params = {"fresh": "true"} if fresh else None
+    return api_get("/npcs", params=params) or []
 
 
 def get_players():
     return api_get("/players") or []
 
 
-def get_objects(radius=None):
+def get_objects(radius=None, fresh=False):
     # radius (tiles, optional): bounds the scene walk to a box around the player instead of the
     # whole loaded scene. CONFIRMED live 2026-08-02 -- building screen-projection data for every
     # object in the entire scene, every game tick, regardless of whether any caller actually cares
@@ -171,12 +177,20 @@ def get_objects(radius=None):
     # even standing right next to one. 1.0s comfortably covers the measured worst case with
     # headroom, without the caller having to wait meaningfully longer than that if the bridge is
     # genuinely down.
-    params = {"radius": radius} if radius is not None else None
-    return api_get("/objects", params=params, timeout=1.0) or []
+    #
+    # fresh=True bypasses the bridge's per-tick cache for this one call -- see get_bank's fresh
+    # kwarg for the motivating case.
+    params = {}
+    if radius is not None:
+        params["radius"] = radius
+    if fresh:
+        params["fresh"] = "true"
+    return api_get("/objects", params=params or None, timeout=1.0) or []
 
 
-def get_tiles():
-    return api_get("/tiles") or []
+def get_tiles(fresh=False):
+    params = {"fresh": "true"} if fresh else None
+    return api_get("/tiles", params=params) or []
 
 
 def get_spellbook():
@@ -191,16 +205,22 @@ def get_consumables():
     return api_get("/consumables") or {"food": [], "prayer": []}
 
 
-def get_ground_items():
-    return api_get("/ground-items") or []
+def get_ground_items(fresh=False):
+    params = {"fresh": "true"} if fresh else None
+    return api_get("/ground-items", params=params) or []
 
 
 def get_inventory():
     return api_get("/inventory") or []
 
 
-def get_bank():
-    return api_get("/bank") or {"open": False}
+def get_bank(fresh=False):
+    # fresh=True bypasses the bridge's per-tick cache for this one call -- pass it right after an
+    # action that just changed bank state (a withdrawal/deposit) instead of waiting out a full
+    # game tick for BankProvider's cache to naturally reflect it. See banker.withdraw_loadout's
+    # own fresh parameter for the motivating call site.
+    params = {"fresh": "true"} if fresh else None
+    return api_get("/bank", params=params) or {"open": False}
 
 
 def get_sailing():
@@ -216,8 +236,9 @@ def get_equipment():
     return api_get("/equipment") or {}
 
 
-def get_graphics_objects():
-    return api_get("/graphics-objects") or []
+def get_graphics_objects(fresh=False):
+    params = {"fresh": "true"} if fresh else None
+    return api_get("/graphics-objects", params=params) or []
 
 
 def get_tormented_demon_config():
