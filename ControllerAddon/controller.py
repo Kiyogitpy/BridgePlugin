@@ -261,6 +261,10 @@ def get_golem_crafting_config():
     return api_get("/golem-crafting-config")
 
 
+def get_mastering_mixology_config():
+    return api_get("/mastering-mixology-config")
+
+
 def get_mixology_state():
     return api_get("/mixology-state") or {
         "inLab": False, "orders": [], "hopper": {"mox": 0, "aga": 0, "lye": 0},
@@ -1501,6 +1505,7 @@ ROUTINE_FILES = {
     "FIREMAKING": "routines/firemaking.py",
     "BLAST_FURNACE": "routines/blast_furnace.py",
     "GOLEM_CRAFTING": "routines/golem_crafting.py",
+    "MASTERING_MIXOLOGY": "routines/mastering_mixology.py",
 }
 
 

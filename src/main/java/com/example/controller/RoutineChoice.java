@@ -16,7 +16,8 @@ public enum RoutineChoice
 	SHIPWRECK_SALVAGING("Shipwreck Salvaging"),
 	FIREMAKING("Firemaking"),
 	BLAST_FURNACE("Blast Furnace"),
-	GOLEM_CRAFTING("Golem Crafting");
+	GOLEM_CRAFTING("Golem Crafting"),
+	MASTERING_MIXOLOGY("Mastering Mixology");
 
 	private final String label;
 

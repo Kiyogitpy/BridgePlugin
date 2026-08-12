@@ -76,6 +76,9 @@ public interface ControllerConfig extends Config
 	@ConfigSection(name = "Golem Crafting", description = "Golem Crafting routine settings", position = 13)
 	String golemCraftingSection = "golemCrafting";
 
+	@ConfigSection(name = "Mastering Mixology", description = "Mastering Mixology routine settings", position = 14)
+	String masteringMixologySection = "masteringMixology";
+
 	// ============================================================
 	// General
 	// ============================================================
@@ -1112,5 +1115,57 @@ public interface ControllerConfig extends Config
 	default boolean golemCraftingBankTeleportFallback()
 	{
 		return false;
+	}
+
+	// ============================================================
+	// Mastering Mixology
+	// ============================================================
+
+	@ConfigItem(
+		keyName = "masteringMixologyEnabled",
+		name = "Mastering Mixology Enabled",
+		description = "Secondary switch on top of launching controller.py with routines/mastering_mixology.py.",
+		section = masteringMixologySection,
+		position = 0
+	)
+	default boolean masteringMixologyEnabled()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "masteringMixologyBankTeleportFallback",
+		name = "Teleport If No Bank Nearby",
+		description = "Use the configured teleport fallback if no bank is within walking distance of the lab.",
+		section = masteringMixologySection,
+		position = 1
+	)
+	default boolean masteringMixologyBankTeleportFallback()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "masteringMixologyDigweedEnabled",
+		name = "Collect Digweed",
+		description = "Collect and use digweed spawns when they appear.",
+		section = masteringMixologySection,
+		position = 2
+	)
+	default boolean masteringMixologyDigweedEnabled()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "masteringMixologySpeedupsEnabled",
+		name = "Processing Speedups",
+		description = "Perform the timing-based speedup clicks at each processing station.",
+		section = masteringMixologySection,
+		position = 3
+	)
+	default boolean masteringMixologySpeedupsEnabled()
+	{
+		return true;
 	}
 }
