@@ -8,6 +8,12 @@ import java.util.function.Supplier;
  * supplied key changes, or the caller explicitly asks for a fresh value. Replaces the identical
  * cachedTick/cached&lt;Thing&gt; field pairs six providers used to hand-roll independently
  * (Bank, NPC, Tile, GroundItem, GraphicsObject, Object).
+ *
+ * A {@code null} compute result is returned for that call but never cached: for every real
+ * caller in this codebase a {@code null} only happens when the underlying compute (e.g. a
+ * client-thread dispatch) failed or was interrupted, never as a legitimate "empty" answer (those
+ * are always an empty List/Map), so caching it would pin a transient failure as the confident
+ * answer for the rest of the tick instead of retrying on the next call.
  */
 public class TickCache<T>
 {
@@ -30,10 +36,27 @@ public class TickCache<T>
 	{
 		if (forceFresh || !hasValue || currentTick != cachedTick || !Objects.equals(key, cachedKey))
 		{
-			cached = compute.get();
-			cachedTick = currentTick;
-			cachedKey = key;
-			hasValue = true;
+			T result = compute.get();
+			if (result != null)
+			{
+				cached = result;
+				cachedTick = currentTick;
+				cachedKey = key;
+				hasValue = true;
+			}
+			else
+			{
+				// A null result is never a legitimate "empty" answer from any of this class's real
+				// callers (they all return an empty List/Map, never null, for the empty case) -- it
+				// only happens when the underlying compute (e.g. a client-thread dispatch) failed or
+				// was interrupted. Don't cache it: the next call should retry immediately instead of
+				// serving a full tick's worth of confidently-wrong empty answers. CONFIRMED (final
+				// branch review): RuneLiteUtil.runOnClientThread returns null on a swallowed
+				// exception/interrupt, and before this class existed, each provider's own
+				// cachedX == null check had this same self-healing retry-on-null behavior.
+				cached = null;
+				hasValue = false;
+			}
 		}
 		return cached;
 	}

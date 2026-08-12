@@ -376,6 +376,28 @@ def set_quantity_mode(ctx, mode: str) -> bool:
     return True
 
 
+def wait_until_bank_item_gone(ctx, name_substring: str, timeout_s: float = 1.5, poll_interval_s: float = 0.15) -> bool:
+    """Polls /bank with fresh=True until no item name contains name_substring (case-insensitive),
+    or timeout_s elapses. fresh=True only guarantees the bridge's own cache isn't stale -- it does
+    NOT guarantee a just-clicked withdrawal has actually landed server-side yet (that still
+    resolves on a real game-tick boundary), so a single fresh read taken immediately after a
+    withdrawal click can still observe the pre-withdrawal state. Polling with a short interval
+    catches the withdrawal as soon as it actually lands, instead of trusting either a single fresh
+    read or a fixed blind sleep. Returns True if the item was confirmed gone, False if the timeout
+    was hit first (logged; the caller isn't required to treat that as a hard failure -- the old
+    sleep-based code didn't guarantee success here either, e.g. against a simulated misclick)."""
+    name_substring = name_substring.lower()
+    deadline = time.monotonic() + timeout_s
+    while True:
+        bank = controller.get_bank(fresh=True)
+        if not any(name_substring in (i.get("name") or "").lower() for i in bank.get("items", [])):
+            return True
+        if time.monotonic() >= deadline:
+            debug_log.log("bank", f"'{name_substring}' still shows in the bank after {timeout_s}s -- withdrawal may not have landed yet")
+            return False
+        time.sleep(poll_interval_s)
+
+
 def withdraw_loadout(ctx, config: dict, fresh: bool = False) -> None:
     """fresh: forces this call's /bank reads to bypass the bridge's per-tick cache -- pass True
     when the bank state may have just changed from something outside this call (e.g. a separate

@@ -71,16 +71,16 @@ public class TickCacheTest
 	}
 
 	@Test
-	public void nullResultStillCachesInsteadOfRecomputingEveryCall()
+	public void nullResultIsNotCachedSoItRetriesNextCall()
 	{
 		TickCache<String> cache = new TickCache<>();
 		int[] calls = {0};
 
 		String first = cache.get(1, false, null, countingSupplier(calls, null));
-		String second = cache.get(1, false, null, countingSupplier(calls, "should not run"));
+		String second = cache.get(1, false, null, countingSupplier(calls, "a"));
 
 		assertNull(first);
-		assertNull(second);
-		assertEquals(1, calls[0]);
+		assertEquals("a", second);
+		assertEquals(2, calls[0]);
 	}
 }

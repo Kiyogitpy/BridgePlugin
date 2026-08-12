@@ -323,10 +323,15 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
     same-tick re-fetch between two entries in a single withdraw_loadout call can still return
     a stale, pre-withdrawal snapshot -- putting the bag first in the SAME call (as an earlier
     version of this function tried) doesn't reliably avoid banker.withdraw_loadout's
-    substring-matching "Coal" search resolving to a still-cached "Coal bag" slot. Passing
-    `fresh=True` to the materials withdrawal's own `withdraw_loadout` call (only when the bag
-    was actually just withdrawn) is what actually guarantees its `/bank` read reflects the bag
-    being gone, without waiting out a full tick for it. Loose coal is deposited before the bag is
+    substring-matching "Coal" search resolving to a still-cached "Coal bag" slot. Confirming the
+    bag is actually gone from `/bank` is now done via `banker.wait_until_bank_item_gone`'s poll
+    loop right after the bag withdrawal, since a single `fresh=True` read taken immediately after
+    the withdrawal click can still race the server -- `fresh=True` only bypasses the bridge's own
+    cache, it doesn't guarantee the withdrawal has actually been processed server-side yet (that
+    still resolves on a real game-tick boundary). The follow-up `fresh=True` passed to the
+    materials withdrawal's own `withdraw_loadout` call is now just cheap extra insurance in case a
+    tick boundary passed between the two calls, not the thing that actually guarantees the state.
+    Loose coal is deposited before the bag is
     emptied, since the bag can only be emptied into slots that are actually free (see module
     header). Coffer coins are handled entirely separately by maybe_top_up_coffer's own
     dedicated bank visit, so this function never carries coins itself."""
@@ -353,6 +358,13 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
         banker.deposit_inventory(ctx, bank_cfg)
         if need_bag_withdraw:
             banker.withdraw_loadout(ctx, {"withdraw": [{"name": "coal bag", "quantity": 1}]})
+            # A single fresh=True read isn't enough here -- CONFIRMED (final branch review): it
+            # guarantees the bridge's cache isn't stale, but not that this withdrawal has actually
+            # been processed server-side yet (that still resolves on a real game-tick boundary), so
+            # a fresh read taken immediately after the click can still race the server and observe
+            # the coal bag as still present. Poll until it's actually gone instead of trusting a
+            # single read or a fixed sleep.
+            banker.wait_until_bank_item_gone(ctx, "coal bag")
         # fresh=True (only actually needed when the bag was just withdrawn above) forces this
         # call's /bank reads to bypass the bridge's per-tick cache instead of waiting out a full
         # game tick for it to naturally reflect the bag being gone -- see the docstring above and
