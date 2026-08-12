@@ -318,24 +318,42 @@ STATION_STATE_KEY = {"Alembic": "alembic", "Retort": "retort", "Agitator": "agit
 
 
 def process_phase(ctx, config: dict) -> None:
-    unprocessed = [i for i in controller.get_inventory() if i.get("name") in RECIPE_TABLE]
-    if not unprocessed:
+    chosen = ctx.state.data.get("mm_chosen_orders", [])
+
+    # Check if we have any unprocessed bases at all
+    current_inventory = controller.get_inventory()
+    unprocessed_any = any(i.get("name") in RECIPE_TABLE for i in current_inventory)
+    if not unprocessed_any:
         ctx.state.data["mm_phase"] = "deposit"
         return
 
-    # Which station a base needs is per-order, not fixed per potion name (see Global
-    # Constraints/design doc) -- read from the order that's still in ctx.state.data rather than
-    # guessing, since mm_chosen_orders already carries each chosen order's "station" field.
-    chosen = ctx.state.data.get("mm_chosen_orders", [])
-    station_for_name = {o.get("name"): o.get("station") for o in chosen}
+    # Process each chosen order in sequence, finding one unprocessed potion per order
+    # (not pre-grouped by name, so duplicate-named orders with different stations don't collide)
+    for order in chosen:
+        order_name = order.get("name")
+        station_name = order.get("station")
 
-    for station_name in STATION_ORDER:
+        # Find an unprocessed potion matching this order's name
+        current_inventory = controller.get_inventory()
+        potion = next(
+            (i for i in current_inventory if i.get("name") == order_name and i.get("name") in RECIPE_TABLE),
+            None,
+        )
+
+        if potion is None:
+            continue
+
         station = find_object(station_name)
         if station is None:
             continue
-        due = [i for i in unprocessed if station_for_name.get(i.get("name")) == station_name]
-        for potion in due:
-            _process_one(ctx, config, station_name, station, potion)
+
+        _process_one(ctx, config, station_name, station, potion)
+
+    # Check if anything unprocessed remains -- if so, retry next tick instead of transitioning
+    remaining = [i for i in controller.get_inventory() if i.get("name") in RECIPE_TABLE]
+    if remaining:
+        debug_log.log("mixology", f"still unprocessed: {[i.get('name') for i in remaining]} -- retrying")
+        return
 
     ctx.state.data["mm_phase"] = "deposit"
 
