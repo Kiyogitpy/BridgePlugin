@@ -114,10 +114,10 @@ def bank_herbs_phase(ctx, config: dict) -> None:
 
     herb_priority = config.get("herbPriority", DEFAULT_CONFIG["herbPriority"])
     needed_types = [p for p in ("mox", "aga", "lye") if hopper.get(p, 0) < target]
-    per_type_qty = min(14, 28 // len(needed_types))
     if not needed_types:
         ctx.state.data["mm_phase"] = "orders"
         return
+    per_type_qty = min(14, 28 // len(needed_types))
 
     bank_cfg = {"teleportFallback": config.get("bank", {}).get("teleportFallback", False)}
     bank_obj = banker.find_nearby_bank(bank_cfg)
