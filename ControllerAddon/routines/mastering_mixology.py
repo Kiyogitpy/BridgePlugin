@@ -181,3 +181,60 @@ def _refine_and_hopper_inventory(ctx) -> None:
         return
     controller.click_entity(ctx.ser, hopper_obj, check_ui_blockers=False)
     time.sleep(random.uniform(0.4, 0.7))
+
+
+def _choose_orders(orders: list) -> list:
+    """Max-points-per-paste selection: make every non-single-paste order, plus every
+    single-paste order too if an MAL order is present in this same set of 3. If ALL 3 are
+    single-paste, make only the one whose paste type currently has the lowest hopper stock
+    (spends down whichever is SCARCEST, to keep the three roughly balanced over time, since
+    single-paste orders are the only lever this routine has for correcting an imbalance;
+    skipping the other two loses no points since single-paste orders are net-negative on their
+    own per the wiki's reward-ratio table)."""
+    has_mal = any(o.get("name") == MAL_BASE for o in orders)
+    if has_mal:
+        return list(orders)
+
+    non_single = [o for o in orders if o.get("name") not in SINGLE_PASTE_BASES]
+    if non_single:
+        return non_single
+
+    # All 3 are single-paste -- caller (orders_phase) picks which one via hopper stock, since
+    # that needs a live hopper read this pure function shouldn't fetch itself.
+    return orders
+
+
+def orders_phase(ctx, config: dict) -> None:
+    data = controller.get_mixology_state()
+    orders = data.get("orders", [])
+    hopper = data.get("hopper", {})
+
+    if len(orders) < 3:
+        # Bridge read came back short (e.g. not actually in the lab, or a fresh spawn not yet
+        # populated) -- don't act on a partial order set.
+        return
+
+    chosen = _choose_orders(orders)
+    if chosen and all(o.get("name") in SINGLE_PASTE_BASES for o in chosen):
+        chosen = [min(chosen, key=lambda o: hopper.get(_paste_type_of(o), 0))]
+
+    needed = {"mox": 0, "aga": 0, "lye": 0}
+    for order in chosen:
+        for paste in ("mox", "aga", "lye"):
+            needed[paste] += order.get(paste, 0) * 10  # each lever pull uses 10 paste
+
+    low_water = config.get("hopperLowWater", 150)
+    if any(hopper.get(p, 0) - needed[p] < low_water for p in ("mox", "aga", "lye")):
+        debug_log.log("mixology", f"hopper would drop below low-water fulfilling {[o.get('name') for o in chosen]} -- rebanking")
+        ctx.state.data["mm_phase"] = "bank_herbs"
+        return
+
+    ctx.state.data["mm_chosen_orders"] = chosen
+    debug_log.log("mixology", f"chosen orders this cycle: {[o.get('name') for o in chosen]}")
+    ctx.state.data["mm_phase"] = "mix"
+
+
+def _paste_type_of(order: dict) -> str:
+    """The single paste type a single-paste order (AAA/MMM/LLL) needs -- whichever of
+    mox/aga/lye is non-zero on that order dict."""
+    return next(p for p in ("mox", "aga", "lye") if order.get(p, 0) > 0)
