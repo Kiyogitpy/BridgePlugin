@@ -2,13 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
-> **Tasks 1 and 2 are live/interactive, not background-dispatchable.** They require a running
-> RuneLite client with the player's own account standing in the Mastering Mixology lab
-> (Aldarin), with an active order, so their widget/graphics content actually has real data to
-> inspect. Do not dispatch these to an autonomous background subagent — drive them the same way
-> `CLAUDE.md`'s live-debugging workflow and the bridge-tick-cache-freshness plan's Task 6 handled
-> live/account-touching verification: interactively, with the human partner present. Every other
-> task is a normal, self-contained code task.
+> **Task 10 (Live verification) is live/interactive, not background-dispatchable.** It requires a
+> running RuneLite client with the player's own account standing in the Mastering Mixology lab
+> (Aldarin), with an active order. Do not dispatch it to an autonomous background subagent — drive
+> it the same way `CLAUDE.md`'s live-debugging workflow and the bridge-tick-cache-freshness plan's
+> Task 6 handled live/account-touching verification: interactively, with the human partner
+> present. Every other task is a normal, self-contained code task — this plan's earlier draft had
+> two live-investigation tasks up front, but both were resolved during research (see the design
+> doc's "Superseded research" section) using RuneLite's own generated `VarbitID`/`ObjectID`/
+> `SpotanimID` constants, cross-checked directly against this project's cached RuneLite jar. What
+> remains live is *confirming* known values against the real game, not discovering them.
 
 **Goal:** Build `routines/mastering_mixology.py`, automating Mastering Mixology under the
 max-points-per-paste strategy (bank herbs → refine → hopper → read orders → mix → process →
@@ -16,11 +19,12 @@ deposit), plus the one new Java provider it needs.
 
 **Architecture:** A phase state machine in `ctx.state.data["mm_phase"]`, the same shape as
 `golem_crafting.py`'s. Six physical stations (refiner, 3 levers, hopper, mixing vessel, 3
-processing stations, conveyor belt) are all directly clickable objects with known IDs from the
-wiki — no new research needed there. The 3 active orders and hopper paste totals live in a HUD
-widget with no existing RuneLite mapping; a new `MixologyProvider` exposes them once their real
-IDs are found live (Task 1). Processing-station speedup timing cues are similarly undiscovered
-(Task 2).
+processing stations, conveyor belt) are directly clickable multiloc objects, found by name via
+the existing `find_object` convention. `MixologyProvider` exposes active orders, hopper paste
+totals, station potion/progress, and digweed corner state via direct `client.getVarbitValue(...)`
+reads — no widget scraping, no new client-side detection infrastructure. Processing-station
+speedup cues are detected via the already-existing `/graphics-objects` endpoint, filtered to two
+specific, confirmed graphics-object ids.
 
 **Tech Stack:** Java (RuneLite plugin), Python (`ControllerAddon/`).
 
@@ -30,29 +34,48 @@ IDs are found live (Task 1). Processing-station speedup timing cues are similarl
   strategy" section) — no other strategy is built this pass.
 - The game itself only ever offers orders the player has the Herblore level for (confirmed via
   the 2024-09-27 hotfix changelog in `data/raw/M/Mastering Mixology.txt`) — the routine does
-  **not** implement its own order-level filtering; it trusts whatever `/mixology-orders` returns.
-- **Always re-read hopper totals, vessel content, and active orders from the bridge rather than
-  tracking them locally** — see the design doc's Error handling section for why (the vessel's
-  "4th lever overrides the oldest paste" mechanic plus this codebase's simulated-misclick
-  humanization make locally-tracked state actively dangerous here, not just imprecise).
-- Known object IDs (from `data/raw/`, unverified live — confirm during Task 12's walkthrough,
-  but click by **name**, not by these numeric IDs, matching every other routine's convention —
-  the IDs below are for *reading which content variant is present*, e.g. the mixing vessel's
-  current mix, not for clicking):
-  - Refiner `54904` ("Operate"), Mox lever `54868` / Aga lever `54867` / Lye lever `54869`
-    ("Operate"), Hopper `54903` ("Deposit"), Conveyor belt `54917` ("Fulfil-order").
-  - Mixing vessel ("Take-from"): `54918` empty, `54919` Mammoth-might mix, `54920` Mystic mana
-    amalgam, `54921` Marley's moonlight, `54922` Alco-augmentator, `54923` Aqualux amalgam,
-    `54924` Azure aura mix, `54925` Liplack liquor, `54926` Anti-leech lotion, `54927` Megalite
-    liquid, `54928` Mixalot.
-  - Retort ("Concentrate-potion"): `54870`-`54880`, same 11-way content order as the vessel.
-  - Agitator ("Homogenise-potion"): `54881`-`54891`, same order.
-  - Alembic ("Crystalise-potion"): `54892`-`54902`, same order.
-- Recipe table (paste combination per base, all mox/aga/lye counts sum to 3):
-  AAA={mox:0,aga:3,lye:0}, MMM={mox:3,aga:0,lye:0}, LLL={mox:0,aga:0,lye:3},
-  MMA={mox:2,aga:1,lye:0}, MML={mox:2,aga:0,lye:1}, AAM={mox:1,aga:2,lye:0},
-  ALA={mox:0,aga:2,lye:1}, MLL={mox:1,aga:0,lye:2}, ALL={mox:0,aga:1,lye:2},
-  MAL={mox:1,aga:1,lye:1}.
+  **not** implement its own order-level filtering; it trusts whatever `/mixology-state` returns.
+- **Always re-read hopper totals, vessel content, station state, and active orders from the
+  bridge rather than tracking them locally** — see the design doc's Error handling section.
+- Confirmed varbit IDs (`net.runelite.api.gameval.VarbitID`, verified present in
+  `runelite-api-1.12.35.jar`): `MM_LAB_ORDER_{1,2,3}_TYPE`/`_MODIFIER` (`11315`-`11320`,
+  1-indexed), `MM_LAB_{AGITATOR,RETORT,ALEMBIC}_POTION` (`11340`-`11342`, 1-indexed),
+  `MM_{AGITATOR,RETORT,ALEMBIC}_PROGRESS` (`11327`-`11329`), `MM_HERB_READY_{1,2,3,4}`
+  (`11330`-`11333`), `MM_LAB_HIT_SKILLSHOT_{AGITATOR,ALEMBIC}` (`11337`-`11338`).
+  `MM_AVAILABLE_{MOX,AGA,LYE}` (`11431`-`11433`) exist but are lower-confidence (inferred from
+  naming, not confirmed by any consuming code) — confirm live per Task 10.
+- Confirmed graphics-object ids (`net.runelite.api.gameval.SpotanimID`):
+  `VFX_MACHINERY_ALCHEMY01_AGITATOR01` = `2954`, `VFX_MACHINERY_ALCHEMY01_ALEMBIC01` = `2955`.
+- Confirmed object ids (`net.runelite.api.gameval.ObjectID`/`ObjectID1`), click by **name** per
+  this codebase's convention, not by these ids — they're for reading which content variant is
+  present, not for clicking:
+  - Refiner `54904`, Mox lever `54868`, Aga lever `54867`, Lye lever `54869`, Hopper `54903`,
+    Conveyor belt `54917`.
+  - Mixing vessel content variants (from `Mixing vessel.txt`'s own `id1`-`id11` infobox fields —
+    **this ordering is NOT the same as the varbit type index below**, it differs at two
+    positions; see the note after this list): `54918` empty, `54919` Mammoth-might mix, `54920`
+    Mystic mana amalgam, `54921` Marley's moonlight, `54922` Alco-augmentator, `54923` Aqualux
+    amalgam, `54924` Azure aura mix, `54925` Liplack liquor, `54926` Anti-leech lotion, `54927`
+    Megalite liquid, `54928` Mixalot.
+  - Retort content variants `54870` empty through `54880`, Agitator `54881` empty through
+    `54891`, Alembic `54892` empty through `54902` — same order as the vessel's above in each
+    case (confirmed independently from each object's own wiki infobox).
+
+  **This physical-object-id order genuinely differs from the varbit type-index order below**, at
+  two positions: Aqualux amalgam/Azure aura mix are swapped, and Anti-leech lotion/Megalite
+  liquid are swapped. These are two unrelated numbering systems (scenery-object content variants
+  vs. varbit-encoded type indices) that don't have to agree, and here they don't — use the table
+  immediately above for anything reading an object's `id` (Task 5's vessel-content check), and
+  the table below for anything reading a varbit value (Task 1's provider, orders, station
+  potions).
+- Recipe table (paste combination per base, matching the varbit type index):
+  0=Mammoth-might mix{mox:3,aga:0,lye:0}, 1=Mystic mana amalgam{mox:2,aga:1,lye:0},
+  2=Marley's moonlight{mox:2,aga:0,lye:1}, 3=Alco-augmentator{mox:0,aga:3,lye:0},
+  4=Azure aura mix{mox:1,aga:2,lye:0}, 5=Aqualux amalgam{mox:0,aga:2,lye:1},
+  6=Liplack liquor{mox:0,aga:0,lye:3}, 7=Megalite liquid{mox:1,aga:0,lye:2},
+  8=Anti-leech lotion{mox:0,aga:1,lye:2}, 9=Mixalot{mox:1,aga:1,lye:1}.
+  Modifier index (matching the varbit modifier index): 0=Homogenised(Agitator),
+  1=Concentrated(Retort), 2=Crystalised(Alembic).
 - Windows environment: Gradle via `gradlew.bat`, not `./gradlew`.
 
 ## File Structure
@@ -62,63 +85,32 @@ IDs are found live (Task 1). Processing-station speedup timing cues are similarl
 - Modify: `src/main/java/com/example/controller/RoutineChoice.java` (new enum entry)
 - Modify: `src/main/java/com/example/controller/ControllerConfig.java` (new config section)
 - Modify: `src/main/java/com/example/controller/ConfigExporter.java` (new export function)
-- Modify: `ControllerAddon/controller.py` (`ROUTINE_FILES` entry, config wrapper)
+- Modify: `ControllerAddon/controller.py` (`ROUTINE_FILES` entry, config/state wrappers)
 - Create: `ControllerAddon/routines/mastering_mixology.py`
 
 ---
 
-### Task 1 (LIVE): `MixologyProvider` — orders, hopper totals, digweed identifiers
+### Task 1: `MixologyProvider`
 
 **Files:**
 - Create: `src/main/java/com/example/providers/MixologyProvider.java`
 
 **Interfaces:**
-- Produces: `GET /mixology-orders` → `{"orders": [{"name": str, "mox": int, "aga": int, "lye":
-  int, "points": int}, ...], "hopper": {"mox": int, "aga": int, "lye": int}}` — consumed by
-  Task 5 (`orders` phase). Also produces: the digweed object's real name (for Task 9's
-  `find_object` lookup) and the exact chat message text announcing its spawn (for Task 9's
-  `on_event` matcher).
+- Produces: `GET /mixology-state` → `{"inLab": bool, "orders": [{"name": str, "mox": int, "aga":
+  int, "lye": int, "station": str}, ...], "hopper": {"mox": int, "aga": int, "lye": int},
+  "stations": {"retort"/"agitator"/"alembic": {"potionName": str|null, "progress": int}},
+  "digweed": {"northEast"/"southEast"/"southWest"/"northWest": bool}}` — consumed by every later
+  task in this file.
 
-- [ ] **Step 1: Get into position**
-
-Launch the client (`gradlew.bat run` from the repo root, per `CLAUDE.md`'s live-debugging
-workflow). With the player standing in the Mastering Mixology lab and at least one active order
-showing on the HUD, enable RuneLite's built-in Developer Tools plugin (Configuration → search
-"Developer Tools" → enable; it's off by default) and open its Widget Inspector.
-
-- [ ] **Step 2: Find the order-HUD widget IDs**
-
-Hover each of the 3 order slots in the Widget Inspector overlay. Record, for each: the widget
-group ID, the child ID(s) that hold the order's name/combination/points text, and the exact text
-format (e.g. is the combination shown as icons, as a "2x Mox paste" string, or as the 3-letter
-mnemonic like "MMA"?). Note whether the 3 slots are separate top-level widgets or children of one
-container widget.
-
-- [ ] **Step 3: Find the hopper-totals widget IDs**
-
-Same tool, hovering the hopper paste counters in the HUD. Record the group/child ID for each of
-the 3 paste types' current count.
-
-- [ ] **Step 4: Find digweed's real object name and spawn message**
-
-Wait for (or otherwise trigger, if there's an in-game way to check current digweed state) a
-digweed spawn. Record the exact chatbox message text (case-sensitive) and the object's real name
-as reported by `GET /objects` while it's present (`curl http://localhost:8080/objects?radius=15`
-filtered to something plant-shaped in a room corner).
-
-- [ ] **Step 5: Implement `MixologyProvider.java`**
-
-Using the IDs found in Steps 2-3, write the provider following this codebase's established
-shape (plain `Map`/`List` JSON via `BridgeProvider`, always-live — no `TickCache`, this data
-changes on player action, not a fixed tick cadence, matching `PlayerProvider`'s pattern, not the
-six providers `TickCache` covers):
+- [ ] **Step 1: Write `MixologyProvider.java`**
 
 ```java
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
 import net.runelite.api.Client;
-import net.runelite.api.widgets.Widget;
+import net.runelite.api.Player;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.client.callback.ClientThread;
 
 import java.util.ArrayList;
@@ -126,8 +118,39 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Reads Mastering Mixology's live state directly from RuneLite's own generated VarbitID
+ * constants -- confirmed present in this project's runelite-api jar via direct javap inspection,
+ * and cross-referenced against the hex-agon/mastering-mixology reference plugin's usage of the
+ * same constants (see docs/superpowers/specs/2026-08-12-mastering-mixology-design.md's Research
+ * method section). No widget reading, no dependency on that plugin at runtime -- this file
+ * reimplements the handful of lookup tables it needs directly.
+ */
 public class MixologyProvider extends BridgeProvider
 {
+	private static final int LABS_REGION_ID = 5521;
+	private static final int LABS_REGION_PLANE = 0;
+
+	// Declared order matches PotionType's order in the reference plugin, which is also the
+	// 0-indexed value the MM_LAB_ORDER_*_TYPE / MM_LAB_*_POTION varbits encode (real varbit
+	// values are 1-indexed; index = varbit value - 1).
+	private static final String[] POTION_NAMES = {
+		"Mammoth-might mix", "Mystic mana amalgam", "Marley's moonlight", "Alco-augmentator",
+		"Azure aura mix", "Aqualux amalgam", "Liplack liquor", "Megalite liquid",
+		"Anti-leech lotion", "Mixalot",
+	};
+
+	// {mox, aga, lye} per POTION_NAMES entry, from the wiki's recipe table.
+	private static final int[][] POTION_RECIPES = {
+		{3, 0, 0}, {2, 1, 0}, {2, 0, 1}, {0, 3, 0}, {1, 2, 0},
+		{0, 2, 1}, {0, 0, 3}, {1, 0, 2}, {0, 1, 2}, {1, 1, 1},
+	};
+
+	// Declared order matches PotionModifier's order in the reference plugin: 0=Homogenised
+	// (Agitator), 1=Concentrated (Retort), 2=Crystalised (Alembic). Same 1-indexed varbit
+	// convention as the potion-type varbits above.
+	private static final String[] MODIFIER_STATIONS = {"Agitator", "Retort", "Alembic"};
+
 	public MixologyProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
 	{
 		super(client, clientThread, server);
@@ -136,112 +159,121 @@ public class MixologyProvider extends BridgeProvider
 	@Override
 	public void register()
 	{
-		server.register("/mixology-orders", () -> onClient(this::getOrders));
+		server.register("/mixology-state", () -> onClient(this::getState));
 	}
 
-	private Object getOrders()
+	private Object getState()
 	{
 		Map<String, Object> data = new HashMap<>();
+		data.put("inLab", isInLab());
 		data.put("orders", computeOrders());
 		data.put("hopper", computeHopper());
+		data.put("stations", computeStations());
+		data.put("digweed", computeDigweed());
 		return data;
 	}
 
-	// TODO(Task 1 live investigation): replace with the real group/child widget IDs found in
-	// Steps 2-3, and parse each order slot's actual text format (icons vs. "2x Mox paste" vs.
-	// mnemonic) into {name, mox, aga, lye, points} using the RECIPE_TABLE constant this file
-	// should define locally (same combination table as this plan's Global Constraints section).
-	private List<Map<String, Object>> computeOrders()
+	private boolean isInLab()
 	{
-		throw new UnsupportedOperationException("widget IDs not yet found -- see Task 1");
+		Player local = client.getLocalPlayer();
+		if (local == null)
+		{
+			return false;
+		}
+		return local.getWorldLocation().getRegionID() == LABS_REGION_ID
+			&& local.getWorldLocation().getPlane() == LABS_REGION_PLANE;
 	}
 
-	// TODO(Task 1 live investigation): replace with the real group/child widget IDs found in
-	// Step 3.
+	private List<Map<String, Object>> computeOrders()
+	{
+		List<Map<String, Object>> orders = new ArrayList<>();
+		addOrderIfPresent(orders, VarbitID.MM_LAB_ORDER_1_TYPE, VarbitID.MM_LAB_ORDER_1_MODIFIER);
+		addOrderIfPresent(orders, VarbitID.MM_LAB_ORDER_2_TYPE, VarbitID.MM_LAB_ORDER_2_MODIFIER);
+		addOrderIfPresent(orders, VarbitID.MM_LAB_ORDER_3_TYPE, VarbitID.MM_LAB_ORDER_3_MODIFIER);
+		return orders;
+	}
+
+	private void addOrderIfPresent(List<Map<String, Object>> orders, int typeVarbit, int modifierVarbit)
+	{
+		int typeIdx = client.getVarbitValue(typeVarbit) - 1;
+		int modifierIdx = client.getVarbitValue(modifierVarbit) - 1;
+		if (typeIdx < 0 || typeIdx >= POTION_NAMES.length || modifierIdx < 0 || modifierIdx >= MODIFIER_STATIONS.length)
+		{
+			return;
+		}
+
+		Map<String, Object> order = new HashMap<>();
+		order.put("name", POTION_NAMES[typeIdx]);
+		order.put("mox", POTION_RECIPES[typeIdx][0]);
+		order.put("aga", POTION_RECIPES[typeIdx][1]);
+		order.put("lye", POTION_RECIPES[typeIdx][2]);
+		order.put("station", MODIFIER_STATIONS[modifierIdx]);
+		orders.add(order);
+	}
+
 	private Map<String, Object> computeHopper()
 	{
-		throw new UnsupportedOperationException("widget IDs not yet found -- see Task 1");
+		Map<String, Object> hopper = new HashMap<>();
+		hopper.put("mox", client.getVarbitValue(VarbitID.MM_AVAILABLE_MOX));
+		hopper.put("aga", client.getVarbitValue(VarbitID.MM_AVAILABLE_AGA));
+		hopper.put("lye", client.getVarbitValue(VarbitID.MM_AVAILABLE_LYE));
+		return hopper;
+	}
+
+	private Map<String, Object> computeStations()
+	{
+		Map<String, Object> stations = new HashMap<>();
+		stations.put("retort", buildStation(VarbitID.MM_LAB_RETORT_POTION, VarbitID.MM_RETORT_PROGRESS));
+		stations.put("agitator", buildStation(VarbitID.MM_LAB_AGITATOR_POTION, VarbitID.MM_AGITATOR_PROGRESS));
+		stations.put("alembic", buildStation(VarbitID.MM_LAB_ALEMBIC_POTION, VarbitID.MM_ALEMBIC_PROGRESS));
+		return stations;
+	}
+
+	private Map<String, Object> buildStation(int potionVarbit, int progressVarbit)
+	{
+		Map<String, Object> station = new HashMap<>();
+		int typeIdx = client.getVarbitValue(potionVarbit) - 1;
+		station.put("potionName", (typeIdx >= 0 && typeIdx < POTION_NAMES.length) ? POTION_NAMES[typeIdx] : null);
+		station.put("progress", client.getVarbitValue(progressVarbit));
+		return station;
+	}
+
+	private Map<String, Object> computeDigweed()
+	{
+		Map<String, Object> digweed = new HashMap<>();
+		digweed.put("northEast", client.getVarbitValue(VarbitID.MM_HERB_READY_1) != 0);
+		digweed.put("southEast", client.getVarbitValue(VarbitID.MM_HERB_READY_2) != 0);
+		digweed.put("southWest", client.getVarbitValue(VarbitID.MM_HERB_READY_3) != 0);
+		digweed.put("northWest", client.getVarbitValue(VarbitID.MM_HERB_READY_4) != 0);
+		return digweed;
 	}
 }
 ```
 
-Replace both `TODO`/`throw` bodies with real `client.getWidget(groupId, childId)` reads and text
-parsing once Steps 2-3's findings are in hand — this step is not complete until both methods
-return real data, confirmed by querying `/mixology-orders` live against an active order and
-checking the JSON matches what's actually on screen.
+- [ ] **Step 2: Compile clean**
 
-- [ ] **Step 6: Confirm live**
+Run: `gradlew.bat compileJava`
+Expected: BUILD SUCCESSFUL, no errors. This confirms every `VarbitID.MM_*` constant referenced
+above actually exists in the project's dependency jar (already checked via `javap` during
+research, but the compiler is the authoritative check).
 
-`curl http://localhost:8080/mixology-orders` (or `Invoke-RestMethod` in PowerShell) while
-standing at the minigame with active orders. Confirm the returned `orders` array's 3 entries
-match what's actually shown on the HUD (name, combination, points), and `hopper` matches the
-displayed paste counts.
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add src/main/java/com/example/providers/MixologyProvider.java
-git commit -m "Add MixologyProvider: active orders and hopper paste totals"
+git commit -m "Add MixologyProvider: orders, hopper totals, station state, digweed via varbits"
 ```
 
 ---
 
-### Task 2 (LIVE): Processing-station speedup cue detection
-
-**Files:**
-- No file is mandated up front — this task's deliverable is a documented, live-confirmed
-  detection method, consumed by Task 7 (`process` phase). If the method needs bridge support
-  beyond what already exists (`/graphics-objects`, `/player`, a station's "Check" menu option's
-  resulting chat message), extend the relevant existing provider rather than building a new one
-  — `GraphicsObjectProvider`/`PlayerProvider` are both already general enough to cover an
-  animation-id or graphics-object-id-based signal without any code change, only a new constant
-  in the Python routine once the ID is known.
-
-**Interfaces:**
-- Produces: for each of the 3 stations, either (a) a specific `graphicsObjectId` to watch for via
-  `GET /graphics-objects` at the station's tile, or (b) a specific animation ID to watch for via
-  `GET /player`, or (c) confirmation that the "Check" menu option's resulting chat message is a
-  reliable enough progress signal to poll instead. Consumed by Task 7.
-
-- [ ] **Step 1: Alembic — find the 4th-pump signal**
-
-Start crystallising a potion at the Alembic. While it pumps, poll `GET /graphics-objects`
-(filtered to the Alembic's tile) and `GET /player` (watching `animationId`) once per tick,
-logging every change. Identify what changes specifically on the 4th pump (a new graphics object
-id appearing, an animation id change, or neither — in which case, test whether "Check"'s message
-text includes a pump count).
-
-- [ ] **Step 2: Agitator — find the fireworks cue**
-
-Same method, homogenising a potion at the Agitator, watching for whatever signals the
-sound/visual "fireworks" cue the wiki describes (graphics object appearing is the most likely
-candidate, matching `GraphicsObjectProvider`'s own stated design intent for "a boss's telegraphed
-AoE attack landing on a tile" — this is architecturally the same kind of transient tile-anchored
-effect).
-
-- [ ] **Step 3: Retort — confirm the every-tick click has no cue at all**
-
-Per the wiki, the Retort's speedup is unconditional (click every tick while processing, no
-timing window) — confirm live that `GET /player`'s `isIdle`/animation state (or the Retort
-object's own id/still-being-`Concentrate-potion`-clickable state) is enough to know "processing
-is still in progress, keep clicking," with no cue to detect at all.
-
-- [ ] **Step 4: Document findings**
-
-Record, in a comment block at the top of Task 7's `process_phase` function (written in Task 7,
-not here) or in this plan's own progress ledger, the exact detection method for each station —
-whichever constant/id/message-substring each needs.
-
----
-
-### Task 3: `routines/mastering_mixology.py` scaffolding
+### Task 2: `routines/mastering_mixology.py` scaffolding
 
 **Files:**
 - Create: `ControllerAddon/routines/mastering_mixology.py`
 
 **Interfaces:**
 - Produces: `DEFAULT_CONFIG`, `get_config(bridge_config)`, `find_item(name)`, `find_object(name)`,
-  `check_level_requirement(ctx, config)`, `setup(ctx)` — consumed by every later task in this file.
+  `check_level_requirement(ctx, config)` — consumed by every later task in this file.
 
 - [ ] **Step 1: Write the scaffolding**
 
@@ -257,34 +289,29 @@ LLL) unless an MAL order is present in the same set of 3.
 import random
 import time
 
+import banker
 import controller
 import debug_log
 
 MAX_OBJECT_DISTANCE = 15
 HERBLORE_LEVEL_REQUIRED = 60
 
-# name -> {mox, aga, lye, points} -- see this plan's Global Constraints for the full table.
+# name -> {mox, aga, lye} -- matches the varbit type-index order MixologyProvider reports (see
+# this plan's Global Constraints), NOT alphabetical or wiki-page order.
 RECIPE_TABLE = {
-    "Alco-augmentator": {"mox": 0, "aga": 3, "lye": 0},
     "Mammoth-might mix": {"mox": 3, "aga": 0, "lye": 0},
-    "Liplack liquor": {"mox": 0, "aga": 0, "lye": 3},
     "Mystic mana amalgam": {"mox": 2, "aga": 1, "lye": 0},
     "Marley's moonlight": {"mox": 2, "aga": 0, "lye": 1},
+    "Alco-augmentator": {"mox": 0, "aga": 3, "lye": 0},
     "Azure aura mix": {"mox": 1, "aga": 2, "lye": 0},
     "Aqualux amalgam": {"mox": 0, "aga": 2, "lye": 1},
+    "Liplack liquor": {"mox": 0, "aga": 0, "lye": 3},
     "Megalite liquid": {"mox": 1, "aga": 0, "lye": 2},
     "Anti-leech lotion": {"mox": 0, "aga": 1, "lye": 2},
     "Mixalot": {"mox": 1, "aga": 1, "lye": 1},
 }
 SINGLE_PASTE_BASES = {"Alco-augmentator", "Mammoth-might mix", "Liplack liquor"}
 MAL_BASE = "Mixalot"
-
-# Which processing station each base needs -- see the design doc's "Recipe reference"; every
-# base is either Alembic (crystalise), Retort (concentrate), or Agitator (homogenise) at
-# different points in the minigame's own randomized assignment, NOT a fixed 1:1 per base name.
-# ASSUMPTION, NOT YET VERIFIED LIVE: this needs confirming against /mixology-orders' actual
-# fields once Task 1 lands -- if the process type is part of that endpoint's response, use it
-# directly instead of a static table.
 
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -314,8 +341,7 @@ def get_config(bridge_config):
 
 def find_item(name: str):
     """First inventory item whose name matches `name` exactly (case-insensitive) -- same
-    exact-match idiom as golem_crafting.py's find_item (a substring match here would risk
-    e.g. "Mox paste" matching an unrelated item with "paste" in its name)."""
+    exact-match idiom as golem_crafting.py's find_item."""
     name_lower = name.lower()
     return next(
         (i for i in controller.get_inventory() if (i.get("name") or "").lower() == name_lower),
@@ -325,9 +351,10 @@ def find_item(name: str):
 
 def find_object(name: str):
     """Closest visible object whose name contains `name`, within MAX_OBJECT_DISTANCE -- same
-    shape as golem_crafting.py's find_object, including its radius fix (see that function's own
-    docstring for why an unbounded /objects call is a measurable source of client stutter and
-    api_get timeouts)."""
+    shape (including the radius fix) as golem_crafting.py's find_object. Every Mastering
+    Mixology fixture is a multiloc/impostor object, so this resolves correctly regardless of
+    which content variant (empty, or holding a specific potion) is currently active -- see the
+    design doc's "Physical objects are multiloc" note."""
     name_lower = name.lower()
     candidates = [
         o for o in controller.get_objects(radius=MAX_OBJECT_DISTANCE)
@@ -343,8 +370,7 @@ def find_object(name: str):
 
 def check_level_requirement(ctx, config: dict) -> None:
     """One-time-per-activation under-level sanity check -- same shape and same setup()-vs-tick()
-    reasoning as golem_crafting.py's check_level_requirement (querying /skills from setup()
-    would run pre-login and false-trigger a permanent safety stop)."""
+    reasoning as golem_crafting.py's check_level_requirement."""
     herblore = controller.get_skills().get("Herblore") or {}
     level = herblore.get("level")
     if level is not None and level < HERBLORE_LEVEL_REQUIRED:
@@ -367,25 +393,28 @@ git commit -m "Add mastering_mixology.py scaffolding: config, recipe table, shar
 
 ---
 
-### Task 4: `bank_herbs` phase
+### Task 3: `bank_herbs` phase
 
 **Files:**
 - Modify: `ControllerAddon/routines/mastering_mixology.py`
+- Modify: `ControllerAddon/controller.py`
 
 **Interfaces:**
-- Consumes: `find_object` (Task 3), `banker.bank_up(ctx, config)` (existing, unmodified —
-  `ControllerAddon/banker.py:592`), `controller.get_mixology_orders()` (new Python wrapper this
-  step adds, calling Task 1's `/mixology-orders`).
+- Consumes: `find_object` (Task 2), `banker.find_nearby_bank`/`open_bank`/`deposit_inventory`/
+  `withdraw_loadout`/`close_bank` (existing, unmodified).
 - Produces: `bank_herbs_phase(ctx, config)`, setting `ctx.state.data["mm_phase"]` to `"orders"`
-  on completion.
+  on completion. Adds `controller.get_mixology_state()`, consumed by every later task.
 
-- [ ] **Step 1: Add the `get_mixology_orders` wrapper to `controller.py`**
+- [ ] **Step 1: Add the `get_mixology_state` wrapper to `controller.py`**
 
 In `ControllerAddon/controller.py`, alongside the other `get_*` wrappers:
 
 ```python
-def get_mixology_orders():
-    return api_get("/mixology-orders") or {"orders": [], "hopper": {"mox": 0, "aga": 0, "lye": 0}}
+def get_mixology_state():
+    return api_get("/mixology-state") or {
+        "inLab": False, "orders": [], "hopper": {"mox": 0, "aga": 0, "lye": 0},
+        "stations": {}, "digweed": {},
+    }
 ```
 
 - [ ] **Step 2: Write `bank_herbs_phase`**
@@ -404,9 +433,9 @@ def bank_herbs_phase(ctx, config: dict) -> None:
     """Withdraw herbs per herbPriority (first candidate actually in the bank, per paste type),
     refine them, deposit the resulting paste into the hopper. Repeats (the phase re-enters
     itself on the next tick if the hopper target isn't reached yet) until every paste type in
-    /mixology-orders' hopper totals reaches hopperTarget, or safety-stops if the bank has none
+    /mixology-state's hopper totals reaches hopperTarget, or safety-stops if the bank has none
     of a paste type's configured herb candidates left at all."""
-    hopper = controller.get_mixology_orders().get("hopper", {})
+    hopper = controller.get_mixology_state().get("hopper", {})
     target = config.get("hopperTarget", 1000)
     if all(hopper.get(paste, 0) >= target for paste in ("mox", "aga", "lye")):
         debug_log.log("mixology", f"hopper stocked ({hopper}) -- moving to orders phase")
@@ -483,18 +512,12 @@ def _refine_and_hopper_inventory(ctx) -> None:
     time.sleep(random.uniform(0.4, 0.7))
 ```
 
-- [ ] **Step 3: Add the `import banker` this phase needs**
-
-Add `import banker` near the top of `mastering_mixology.py` (alongside the existing `import
-controller`) — Step 2 uses `banker.find_nearby_bank`/`open_bank`/`deposit_inventory`/
-`withdraw_loadout`/`close_bank`.
-
-- [ ] **Step 4: Byte-compile**
+- [ ] **Step 3: Byte-compile**
 
 Run (from `ControllerAddon/`): `python -m py_compile routines/mastering_mixology.py controller.py`
 Expected: no output, exit code 0.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add ControllerAddon/routines/mastering_mixology.py ControllerAddon/controller.py
@@ -503,27 +526,25 @@ git commit -m "Add bank_herbs phase: withdraw/refine/hopper herbs to a configure
 
 ---
 
-### Task 5: `orders` phase
+### Task 4: `orders` phase
 
 **Files:**
 - Modify: `ControllerAddon/routines/mastering_mixology.py`
 
 **Interfaces:**
-- Consumes: `controller.get_mixology_orders()` (Task 4), `RECIPE_TABLE`/`SINGLE_PASTE_BASES`/
-  `MAL_BASE` (Task 3).
+- Consumes: `controller.get_mixology_state()` (Task 3), `RECIPE_TABLE`/`SINGLE_PASTE_BASES`/
+  `MAL_BASE` (Task 2).
 - Produces: `orders_phase(ctx, config)`, writing `ctx.state.data["mm_chosen_orders"]` (a list of
   the order dicts to actually make this cycle) and setting `mm_phase` to `"mix"` — consumed by
-  Task 6.
+  Task 5.
 
-- [ ] **Step 1: Write the failing-order-selection unit-style check (manual, no test framework)**
+- [ ] **Step 1: Sanity-check the selection rule by hand before wiring it in**
 
 This codebase has no unit-test framework for routine logic (per `golem_crafting-design.md`'s
-Testing section — verification here is live). Before wiring this into the phase machine, sanity
-check the selection rule against the wiki's own worked cases by hand:
-- 3 orders, none MAL, one AAA present → make only the two non-single-paste orders, skip AAA.
-- 3 orders, one is MAL → make all 3, including any single-paste orders present.
-- All 3 orders are single-paste → make only the most-wanted single-paste type (see Step 2 for
-  what "most wanted" means here).
+Testing section — verification here is live). Check the rule against the wiki's own worked
+cases: (a) 3 orders, none MAL, one single-paste present → make only the two non-single-paste
+orders. (b) 3 orders, one is MAL → make all 3, including any single-paste orders present. (c)
+All 3 orders single-paste → make only the one whose paste type the hopper has the least of.
 
 - [ ] **Step 2: Write `orders_phase`**
 
@@ -532,10 +553,10 @@ def _choose_orders(orders: list) -> list:
     """Max-points-per-paste selection: make every non-single-paste order, plus every
     single-paste order too if an MAL order is present in this same set of 3. If ALL 3 are
     single-paste, make only the one whose paste type currently has the lowest hopper stock
-    (spends down whichever paste is most abundant... no -- spends down whichever is SCARCEST,
-    to keep the three roughly balanced over time, since single-paste orders are the only lever
-    this routine has for correcting an imbalance; skipping the other two loses no points since
-    single-paste orders are net-negative on their own per the wiki's reward-ratio table)."""
+    (spends down whichever is SCARCEST, to keep the three roughly balanced over time, since
+    single-paste orders are the only lever this routine has for correcting an imbalance;
+    skipping the other two loses no points since single-paste orders are net-negative on their
+    own per the wiki's reward-ratio table)."""
     has_mal = any(o.get("name") == MAL_BASE for o in orders)
     if has_mal:
         return list(orders)
@@ -550,18 +571,17 @@ def _choose_orders(orders: list) -> list:
 
 
 def orders_phase(ctx, config: dict) -> None:
-    data = controller.get_mixology_orders()
+    data = controller.get_mixology_state()
     orders = data.get("orders", [])
     hopper = data.get("hopper", {})
 
     if len(orders) < 3:
-        # Bridge/widget read came back short -- don't act on a partial order set.
+        # Bridge read came back short (e.g. not actually in the lab, or a fresh spawn not yet
+        # populated) -- don't act on a partial order set.
         return
 
     chosen = _choose_orders(orders)
     if chosen and all(o.get("name") in SINGLE_PASTE_BASES for o in chosen):
-        # All single-paste: keep only the one whose paste type the hopper has the LEAST of, per
-        # _choose_orders' docstring.
         chosen = [min(chosen, key=lambda o: hopper.get(_paste_type_of(o), 0))]
 
     needed = {"mox": 0, "aga": 0, "lye": 0}
@@ -600,29 +620,32 @@ git commit -m "Add orders phase: max-points-per-paste order selection"
 
 ---
 
-### Task 6: `mix` phase
+### Task 5: `mix` phase
 
 **Files:**
 - Modify: `ControllerAddon/routines/mastering_mixology.py`
 
 **Interfaces:**
-- Consumes: `ctx.state.data["mm_chosen_orders"]` (Task 5), `find_object` (Task 3).
+- Consumes: `ctx.state.data["mm_chosen_orders"]` (Task 4), `find_object` (Task 2).
 - Produces: `mix_phase(ctx, config)`, setting `mm_phase` to `"process"` once every chosen order's
   base has been taken from the vessel into inventory.
 
 - [ ] **Step 1: Write `mix_phase`**
 
 ```python
-# Mixing vessel object ids by content -- see this plan's Global Constraints for the full table.
-# Used to confirm the vessel's actual content after pulling levers, rather than trusting the
-# pull count alone (see Global Constraints' "always re-read... rather than tracking locally").
+# Mixing vessel object ids by content, confirmed via direct ObjectID/ObjectID1 jar lookup (see
+# this plan's Global Constraints) -- used to confirm the vessel's actual content after pulling
+# levers, rather than trusting the pull count alone (see Global Constraints' "always re-read...
+# rather than tracking locally").
 VESSEL_ID_TO_BASE = {
+    # This is the wiki-infobox object-id order, NOT the varbit type-index order RECIPE_TABLE
+    # uses -- they genuinely differ (Aqualux amalgam/Azure aura mix and Anti-leech lotion/
+    # Megalite liquid are swapped between the two). See this plan's Global Constraints.
     54919: "Mammoth-might mix", 54920: "Mystic mana amalgam", 54921: "Marley's moonlight",
     54922: "Alco-augmentator", 54923: "Aqualux amalgam", 54924: "Azure aura mix",
     54925: "Liplack liquor", 54926: "Anti-leech lotion", 54927: "Megalite liquid",
     54928: "Mixalot",
 }
-VESSEL_EMPTY_ID = 54918
 
 LEVER_NAMES = {"mox": "Mox lever", "aga": "Aga lever", "lye": "Lye lever"}
 
@@ -666,7 +689,24 @@ def mix_phase(ctx, config: dict) -> None:
     controller.click_entity(ctx.ser, vessel, check_ui_blockers=False)
     time.sleep(random.uniform(0.4, 0.6))
     ctx.state.data["mm_made_bases"] = made + [target_order.get("name")]
+
+    if ctx.state.data.get("mm_have_digweed") and target_order.get("name") == MAL_BASE:
+        digweed_item = find_item("Digweed")
+        base_item = find_item(MAL_BASE)
+        if digweed_item is not None and base_item is not None:
+            controller.click_entity(ctx.ser, digweed_item, check_ui_blockers=False)
+            time.sleep(random.uniform(0.15, 0.3))
+            controller.click_entity(ctx.ser, base_item, check_ui_blockers=False)
+            time.sleep(random.uniform(0.3, 0.5))
+            ctx.state.data["mm_have_digweed"] = False
 ```
+
+(The digweed-into-MAL step at the end is written here, not deferred to a later task, because it
+needs to run at the exact moment a MAL base is taken from the vessel — see Task 7 for how
+`mm_have_digweed` gets set to `True` in the first place. `find_item("Digweed")` uses a substring
+match, consistent with `find_item`'s general convention — the collected item's exact display
+name (e.g. plain "Digweed" vs. something more specific) should be confirmed during Task 10's
+live walkthrough; substring matching means a slightly-off guess still likely resolves correctly.)
 
 - [ ] **Step 2: Byte-compile**
 
@@ -677,33 +717,32 @@ Expected: no output, exit code 0.
 
 ```bash
 git add ControllerAddon/routines/mastering_mixology.py
-git commit -m "Add mix phase: lever pulls with vessel-content reconciliation"
+git commit -m "Add mix phase: lever pulls with vessel-content reconciliation and digweed use"
 ```
 
 ---
 
-### Task 7: `process` phase
+### Task 6: `process` phase
 
 **Files:**
 - Modify: `ControllerAddon/routines/mastering_mixology.py`
 
 **Interfaces:**
-- Consumes: Task 2's live-confirmed speedup detection method (fill in the `TODO`s below with
-  its findings — this task cannot be finished until Task 2 is), `find_item`/`find_object`
-  (Task 3).
+- Consumes: `controller.get_mixology_state()` (Task 3), `controller.get_graphics_objects()`
+  (existing), `find_object`/`find_item` (Task 2).
 - Produces: `process_phase(ctx, config)`, setting `mm_phase` to `"deposit"` once every unprocessed
   base currently held has been processed.
 
 - [ ] **Step 1: Write `process_phase`**
 
 ```python
-# Which station each base is processed at is part of a given order's own randomized assignment
-# per the wiki (a base isn't fixed to one station across all orders), so this reads it from
-# whatever /mixology-orders reports for the order that produced each held base, rather than a
-# static base->station table. ASSUMPTION, NOT YET VERIFIED LIVE: confirm during Task 12 that
-# /mixology-orders' order entries actually carry a process-type field (Alembic/Retort/
-# Agitator) -- if not, Task 1 needs a follow-up to add one, since nothing else exposes it.
+# Confirmed graphics-object ids for each station's speedup click-now cue (see this plan's
+# Global Constraints) -- read via the existing /graphics-objects endpoint, no new Java needed.
+AGITATOR_CUE_GRAPHICS_ID = 2954
+ALEMBIC_CUE_GRAPHICS_ID = 2955
+
 STATION_ORDER = ["Alembic", "Retort", "Agitator"]  # wiki's own recommended pathing order
+STATION_STATE_KEY = {"Alembic": "alembic", "Retort": "retort", "Agitator": "agitator"}
 
 
 def process_phase(ctx, config: dict) -> None:
@@ -712,22 +751,21 @@ def process_phase(ctx, config: dict) -> None:
         ctx.state.data["mm_phase"] = "deposit"
         return
 
+    # Which station a base needs is per-order, not fixed per potion name (see Global
+    # Constraints/design doc) -- read from the order that's still in ctx.state.data rather than
+    # guessing, since mm_chosen_orders already carries each chosen order's "station" field.
+    chosen = ctx.state.data.get("mm_chosen_orders", [])
+    station_for_name = {o.get("name"): o.get("station") for o in chosen}
+
     for station_name in STATION_ORDER:
         station = find_object(station_name)
         if station is None:
             continue
-        due = [i for i in unprocessed if _station_for(i.get("name")) == station_name]
+        due = [i for i in unprocessed if station_for_name.get(i.get("name")) == station_name]
         for potion in due:
             _process_one(ctx, config, station_name, station, potion)
 
     ctx.state.data["mm_phase"] = "deposit"
-
-
-def _station_for(base_name: str) -> str:
-    """TODO(Task 7, blocked on Task 1): look up the process type from /mixology-orders' own
-    order entry for this base once that field exists, rather than guessing. Placeholder returns
-    Alembic for everything so this compiles; MUST be replaced before this phase is trusted live."""
-    return "Alembic"
 
 
 def _process_one(ctx, config: dict, station_name: str, station: dict, potion: dict) -> None:
@@ -753,53 +791,80 @@ def _process_one(ctx, config: dict, station_name: str, station: dict, potion: di
 
 
 def _process_retort_speedup(ctx, station: dict) -> None:
-    """TODO(Task 2 finding): click every tick while the Retort is processing -- no timing
-    window per the wiki, confirm live whether some readable state (isIdle, the station's own
-    still-clickable Concentrate-potion option) tells us to stop clicking, or whether a fixed
-    tick-count loop matching this potion's known processing time is simpler."""
-    raise NotImplementedError("fill in from Task 2's live findings")
+    """No timing window (confirmed: the reference plugin tracks no varbit/graphics cue for the
+    Retort at all, consistent with the wiki's "click every tick" description) -- click every
+    tick while /mixology-state still reports a potion loaded in the Retort."""
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
+        state = controller.get_mixology_state()
+        if not state.get("stations", {}).get("retort", {}).get("potionName"):
+            return
+        controller.click_entity(ctx.ser, station, check_ui_blockers=False)
+        time.sleep(random.uniform(0.55, 0.75))  # one game tick
 
 
 def _process_agitator_speedup(ctx, station: dict) -> None:
-    """TODO(Task 2 finding): click once, then click again on whatever signal Task 2 found for
-    the "fireworks" cue (graphics object id at the station's tile, most likely -- see Task 2)."""
-    raise NotImplementedError("fill in from Task 2's live findings")
+    """Click again when graphics-object id 2954 (VFX_MACHINERY_ALCHEMY01_AGITATOR01) appears at
+    the Agitator's tile -- the visual "fireworks" cue. Bounded wait: per the wiki, a
+    consistently-missed window is worse than not attempting the speedup, so this gives up
+    cleanly rather than risking a late click against a closed window."""
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        graphics = controller.get_graphics_objects()
+        cue = next(
+            (g for g in graphics
+             if g.get("id") == AGITATOR_CUE_GRAPHICS_ID
+             and g.get("x") == station.get("x") and g.get("y") == station.get("y")),
+            None,
+        )
+        if cue is not None:
+            controller.click_entity(ctx.ser, station, check_ui_blockers=False)
+            return
+        time.sleep(0.15)
 
 
 def _process_alembic_speedup(ctx, station: dict) -> None:
-    """TODO(Task 2 finding): click once, then click again on the 4th pump per whatever signal
-    Task 2 found (graphics object id, animation id, or a pump counter parsed from "Check")."""
-    raise NotImplementedError("fill in from Task 2's live findings")
+    """Same shape as the Agitator's speedup -- click again when graphics-object id 2955
+    (VFX_MACHINERY_ALCHEMY01_ALEMBIC01) appears at the Alembic's tile."""
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        graphics = controller.get_graphics_objects()
+        cue = next(
+            (g for g in graphics
+             if g.get("id") == ALEMBIC_CUE_GRAPHICS_ID
+             and g.get("x") == station.get("x") and g.get("y") == station.get("y")),
+            None,
+        )
+        if cue is not None:
+            controller.click_entity(ctx.ser, station, check_ui_blockers=False)
+            return
+        time.sleep(0.15)
 ```
 
-- [ ] **Step 2: Replace every `TODO`/`NotImplementedError` with Task 2's live findings**
-
-This step is not optional scaffolding — the task is not done while any of `_station_for`,
-`_process_retort_speedup`, `_process_agitator_speedup`, `_process_alembic_speedup` still contain
-a placeholder. Use Task 2's documented detection method for each.
-
-- [ ] **Step 3: Byte-compile**
+- [ ] **Step 2: Byte-compile**
 
 Run (from `ControllerAddon/`): `python -m py_compile routines/mastering_mixology.py`
 Expected: no output, exit code 0.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add ControllerAddon/routines/mastering_mixology.py
-git commit -m "Add process phase: station routing with configurable speedup clicks"
+git commit -m "Add process phase: station routing with graphics-cue-based speedup clicks"
 ```
 
 ---
 
-### Task 8: `deposit` phase
+### Task 7: `deposit` phase and digweed collection
 
 **Files:**
 - Modify: `ControllerAddon/routines/mastering_mixology.py`
 
 **Interfaces:**
-- Consumes: `find_object` (Task 3).
-- Produces: `deposit_phase(ctx, config)`, setting `mm_phase` to `"orders"`.
+- Consumes: `find_object` (Task 2), `controller.get_mixology_state()` (Task 3).
+- Produces: `deposit_phase(ctx, config)` (sets `mm_phase` to `"orders"`),
+  `maybe_collect_digweed(ctx, config)` (sets `ctx.state.data["mm_have_digweed"]`, consumed by
+  Task 5's `mix_phase`).
 
 - [ ] **Step 1: Write `deposit_phase`**
 
@@ -815,101 +880,60 @@ def deposit_phase(ctx, config: dict) -> None:
     ctx.state.data["mm_phase"] = "orders"
 ```
 
-- [ ] **Step 2: Byte-compile**
+- [ ] **Step 2: Write `maybe_collect_digweed`**
 
-Run (from `ControllerAddon/`): `python -m py_compile routines/mastering_mixology.py`
-Expected: no output, exit code 0.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add ControllerAddon/routines/mastering_mixology.py
-git commit -m "Add deposit phase: fulfil orders via the conveyor belt"
-```
-
----
-
-### Task 9: Digweed `on_event` handler
-
-**Files:**
-- Modify: `ControllerAddon/routines/mastering_mixology.py`
-
-**Interfaces:**
-- Consumes: Task 1's live-confirmed digweed object name and spawn-message text.
-- Produces: `on_event(ctx, event_type, payload)`, the routine contract's optional UDP-event hook.
-
-- [ ] **Step 1: Write the handler**
+Polled every tick regardless of phase (wired into `tick` in Task 8), rather than tied to one
+specific phase — a digweed corner can go ready at any point in the cycle, and `/mixology-state`'s
+`digweed` field is cheap enough to check unconditionally:
 
 ```python
-# TODO(Task 1 live finding): replace with the exact chat message text and object name found
-# during Task 1 Step 4.
-DIGWEED_SPAWN_MESSAGE_SUBSTRING = "REPLACE ME"
-DIGWEED_OBJECT_NAME = "REPLACE ME"
+DIGWEED_CORNERS = ["northEast", "southEast", "southWest", "northWest"]  # /mixology-state's
+                                                                          # digweed dict keys
 
 
-def on_event(ctx, event_type: str, payload: dict) -> None:
-    if event_type != "CHAT_MESSAGE":
-        return
-    config = ctx.state.config or DEFAULT_CONFIG
+def maybe_collect_digweed(ctx, config: dict) -> None:
+    if ctx.state.data.get("mm_have_digweed"):
+        return  # already holding one -- per the wiki, holding it suppresses new spawns anyway
     if not config.get("digweed", {}).get("enabled", True):
         return
 
-    message = (payload or {}).get("message", "")
-    if DIGWEED_SPAWN_MESSAGE_SUBSTRING.lower() not in message.lower():
+    state = controller.get_mixology_state()
+    digweed = state.get("digweed", {})
+    if not any(digweed.get(corner) for corner in DIGWEED_CORNERS):
         return
 
-    plant = find_object(DIGWEED_OBJECT_NAME)
+    plant = find_object("Digweed")
     if plant is None:
-        return  # already gone/withered before we could path to it -- not an error
+        return  # ready per the varbit but not yet visible/already collected by the time we look
 
     controller.click_entity(ctx.ser, plant, check_ui_blockers=False)
     time.sleep(random.uniform(0.5, 0.8))
-    ctx.state.data["mm_have_digweed"] = True
+    if find_item("Digweed") is not None:
+        ctx.state.data["mm_have_digweed"] = True
 ```
 
-- [ ] **Step 2: Wire digweed into `mix_phase`**
-
-In Task 6's `mix_phase`, right after a base is successfully taken from the vessel (the
-`ctx.state.data["mm_made_bases"] = made + [...]` line), add:
-
-```python
-    if ctx.state.data.get("mm_have_digweed") and target_order.get("name") == MAL_BASE:
-        digweed = find_item(DIGWEED_OBJECT_NAME)
-        base_item = find_item(MAL_BASE)
-        if digweed is not None and base_item is not None:
-            controller.click_entity(ctx.ser, digweed, check_ui_blockers=False)
-            time.sleep(random.uniform(0.15, 0.3))
-            controller.click_entity(ctx.ser, base_item, check_ui_blockers=False)
-            time.sleep(random.uniform(0.3, 0.5))
-            ctx.state.data["mm_have_digweed"] = False
-```
-
-- [ ] **Step 3: Replace the `REPLACE ME` placeholders with Task 1's findings**
-
-This task is not done while `DIGWEED_SPAWN_MESSAGE_SUBSTRING`/`DIGWEED_OBJECT_NAME` still read
-`"REPLACE ME"`.
-
-- [ ] **Step 4: Byte-compile**
+- [ ] **Step 3: Byte-compile**
 
 Run (from `ControllerAddon/`): `python -m py_compile routines/mastering_mixology.py`
 Expected: no output, exit code 0.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add ControllerAddon/routines/mastering_mixology.py
-git commit -m "Add digweed CHAT_MESSAGE interrupt: collect and save for the next MAL base"
+git commit -m "Add deposit phase and digweed collection (varbit-polled, not chat-message-driven)"
 ```
 
 ---
 
-### Task 10: Phase dispatcher (`tick`)
+### Task 8: Phase dispatcher (`tick`)
 
 **Files:**
 - Modify: `ControllerAddon/routines/mastering_mixology.py`
 
 **Interfaces:**
-- Consumes: every phase function from Tasks 4-8, `check_level_requirement` (Task 3).
+- Consumes: every phase function from Tasks 3, 4, 5, 6, 7, `check_level_requirement` (Task 2),
+  `maybe_collect_digweed` (Task 7).
 - Produces: `tick(ctx)`, `setup(ctx)` — the routine contract's two required/optional entry points
   `controller.py` calls directly.
 
@@ -937,6 +961,8 @@ def tick(ctx) -> None:
         if ctx.state.safety_stopped:
             return
 
+    maybe_collect_digweed(ctx, config)
+
     phase = ctx.state.data.get("mm_phase", "bank_herbs")
     handler = PHASES.get(phase)
     if handler is None:
@@ -959,7 +985,7 @@ git commit -m "Add mastering_mixology.py phase dispatcher (tick/setup)"
 
 ---
 
-### Task 11: Controller/RuneLite wiring
+### Task 9: Controller/RuneLite wiring
 
 **Files:**
 - Modify: `src/main/java/com/example/controller/ControllerPlugin.java`
@@ -1152,44 +1178,57 @@ git commit -m "Wire Mastering Mixology into ControllerPlugin, RoutineChoice, and
 
 ---
 
-### Task 12 (LIVE): Verification
+### Task 10 (LIVE): Verification
 
-Same staged-verification convention as the design doc's Testing section and
-`golem_crafting.py`'s own precedent — this has more unverified surface than a typical routine.
+Every value this plan uses is a confirmed constant (direct jar lookup, cross-referenced against
+a real published plugin's usage), so this is a much smaller live pass than a typical new-routine
+plan in this codebase — confirming *behavior*, not discovering unknowns.
 
 **Files:** none (verification only).
 
-- [ ] **Step 1: Confirm the `_station_for` assumption**
+- [ ] **Step 1: Confirm `/mixology-state` against what's on screen**
 
-Before anything else, confirm live whether `/mixology-orders`' order entries actually need a
-process-type field (per Task 7's flagged assumption). If they don't carry one, this blocks
-`process_phase` from working correctly and needs a follow-up to `MixologyProvider` before
-continuing.
+Launch the client (`gradlew.bat run`), stand in the lab with active orders, and compare
+`GET /mixology-state`'s `orders`/`hopper`/`stations`/`digweed` fields against what's actually
+displayed. This is the one step that can invalidate downstream assumptions if it's wrong — in
+particular, confirm `hopper` (`MM_AVAILABLE_MOX`/`_AGA`/`_LYE`, this plan's lowest-confidence
+constants) reads a sane number matching the displayed hopper amount.
 
-- [ ] **Step 2: One manual cycle**
+- [ ] **Step 2: Confirm the speedup cue detection**
+
+Trigger the Agitator's and Alembic's processing, and watch `/graphics-objects` for id
+`2954`/`2955` appearing at the right moment (cross-reference against the in-game visual/sound
+cue). Confirm `_process_retort_speedup`'s `/mixology-state` polling correctly detects when the
+Retort's potion clears.
+
+- [ ] **Step 3: One manual cycle**
 
 Walk through bank → refine → hopper → read one order set → mix → process → deposit by hand,
-confirming every object name/menu option in this plan resolves as expected (per this plan's
-Global Constraints table).
+confirming every object name/menu option in this plan resolves as expected. Specifically confirm
+`VESSEL_ID_TO_BASE`'s ordering (Task 5): mix at least an Aqualux amalgam or Azure aura mix, and
+an Anti-leech lotion or Megalite liquid, checking `/objects`' reported id against the table —
+these are the two positions where the wiki-infobox order and the varbit type-index order
+diverge, so they're the ones actually worth confirming rather than assuming the wiki got it
+right.
 
-- [ ] **Step 3: Short live run**
+- [ ] **Step 4: Short live run**
 
 Launch per `CLAUDE.md`'s live-debugging workflow (`python -u controller.py
 routines/mastering_mixology.py`, logged to a file, polled with `Read`). Watch phase transitions
 in the debug log through several full `orders → mix → process → deposit` cycles.
 
-- [ ] **Step 4: Confirm the max-points selection rule live**
+- [ ] **Step 5: Confirm the max-points selection rule live**
 
 Watch at least one cycle with a single-paste order present (confirm it's skipped when no MAL is
 present) and, if one appears during the session, one cycle with an MAL order present (confirm
 all 3, including any single-paste orders, get made).
 
-- [ ] **Step 5: Confirm digweed end-to-end**
+- [ ] **Step 6: Confirm digweed end-to-end**
 
-Let a digweed spawn occur naturally during the run (or wait for one deliberately). Confirm the
-`CHAT_MESSAGE` interrupt fires, the plant is collected, and it gets mixed into the next MAL base
-made.
+Let a digweed spawn occur naturally during the run (or wait for one deliberately). Confirm
+`maybe_collect_digweed` fires, the plant is collected (confirm `find_item("Digweed")`'s
+substring match resolves to the item's real name), and it gets mixed into the next MAL base made.
 
-- [ ] **Step 6: Longer unattended soak run**
+- [ ] **Step 7: Longer unattended soak run**
 
-Only after Steps 1-5 all pass clean.
+Only after Steps 1-6 all pass clean.
