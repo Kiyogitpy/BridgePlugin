@@ -1,6 +1,7 @@
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
+import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
 import net.runelite.api.Player;
 import net.runelite.api.gameval.VarbitID;
@@ -73,8 +74,10 @@ public class MixologyProvider extends BridgeProvider
 		{
 			return false;
 		}
-		return local.getWorldLocation().getRegionID() == LABS_REGION_ID
-			&& local.getWorldLocation().getPlane() == LABS_REGION_PLANE;
+		// Use getTopLevelWorldLocation() to handle nested WorldViews (e.g. Sailing) correctly.
+		// Raw getWorldLocation() returns WorldView-local coordinates which are meaningless outside that view.
+		return RuneLiteUtil.getTopLevelWorldLocation(client, local).getRegionID() == LABS_REGION_ID
+			&& RuneLiteUtil.getTopLevelWorldLocation(client, local).getPlane() == LABS_REGION_PLANE;
 	}
 
 	private List<Map<String, Object>> computeOrders()
@@ -107,6 +110,8 @@ public class MixologyProvider extends BridgeProvider
 	private Map<String, Object> computeHopper()
 	{
 		Map<String, Object> hopper = new HashMap<>();
+		// MM_AVAILABLE_{MOX,AGA,LYE} are lower-confidence varbits per the design doc's Global Constraints.
+		// Live verification needed during implementation.
 		hopper.put("mox", client.getVarbitValue(VarbitID.MM_AVAILABLE_MOX));
 		hopper.put("aga", client.getVarbitValue(VarbitID.MM_AVAILABLE_AGA));
 		hopper.put("lye", client.getVarbitValue(VarbitID.MM_AVAILABLE_LYE));
