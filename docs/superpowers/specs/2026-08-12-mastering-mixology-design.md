@@ -133,14 +133,30 @@ section is kept only so a future reader doesn't waste time re-deriving what chan
     rather than wasting it, per the wiki).
   - Hopper: `MM_LAB_HOPPER` (`54903`), option "Deposit" (max 3,000 per paste type).
   - Mixing vessel: `MM_LAB_VESSEL` (`55395`, base/impostor id), option "Take-from". Content
-    variants (`/objects`' returned `id`): `54918` empty, then `54919`-`54928` in the same order
-    as the Recipe/points table below (`54919`=Mammoth-might mix ... `54928`=Mixalot).
+    variants (`/objects`' returned `id`, from `Mixing vessel.txt`'s own `id1`-`id11` infobox
+    fields — **this ordering is NOT the same as the Recipe/points table below**, see the note
+    immediately after this list): `54918` empty, `54919` Mammoth-might mix, `54920` Mystic mana
+    amalgam, `54921` Marley's moonlight, `54922` Alco-augmentator, `54923` Aqualux amalgam,
+    `54924` Azure aura mix, `54925` Liplack liquor, `54926` Anti-leech lotion, `54927` Megalite
+    liquid, `54928` Mixalot.
   - Retort (Concentrate): `MM_LAB_MACHINE_RETORT` (`55389`, base/impostor id), option
-    "Concentrate-potion" (+"Check"). Content variants `54870`-`54880`, same order.
+    "Concentrate-potion" (+"Check"). Content variants `54870` empty through `54880`, same order
+    as the vessel's above (confirmed independently from `Retort.txt`'s own infobox).
   - Agitator (Homogenise): `MM_LAB_MACHINE_AGITATOR` (`55390`), option "Homogenise-potion"
-    (+"Check"). Content variants `54881`-`54891`, same order.
+    (+"Check"). Content variants `54881` empty through `54891`, same order.
   - Alembic (Crystalise): `MM_LAB_MACHINE_ALEMBIC` (`55391`), option "Crystalise-potion"
-    (+"Check"). Content variants `54892`-`54902`, same order.
+    (+"Check"). Content variants `54892` empty through `54902`, same order.
+
+  **Important:** this physical-object-id ordering is a genuinely different sequence from the
+  Recipe/points table below, at two positions — Aqualux amalgam/Azure aura mix are swapped, and
+  Anti-leech lotion/Megalite liquid are swapped, relative to `PotionType.java`'s enum order.
+  These are two unrelated numbering systems (one for scenery-object content variants, one for
+  varbit-encoded type indices) that don't have to agree, and here they don't. Trust each source
+  for the specific question it actually answers: the wiki's per-object infobox (`id1`-`id11`,
+  cross-checked consistent across the vessel, Retort, Agitator, and Alembic articles
+  independently) for "what does this physical object id look like," and `PotionType.java`'s
+  declared order (confirmed by the reference plugin's own working `fromIdx` code) for "what does
+  this varbit value mean." Conflating them was a mistake in an earlier pass of this design.
   - Conveyor belt: `MM_LAB_CONVEYOR` (`54917`), option "Fulfil-order" (deposits up to 3 potions
     at once, fulfilling as many current orders as possible; refreshes all 3 orders regardless of
     match).
@@ -369,7 +385,9 @@ confirmation still matters (a verified *constant* is not the same as verified *b
 1. Manual one-cycle walkthrough (bank herbs → refine → hopper → read one order set → mix →
    process → deposit) confirming `/mixology-state` reports real data matching what's on screen,
    and every object name/menu-option string above resolves as expected, before any unattended
-   run.
+   run. Specifically confirm the vessel/station content-variant id ordering: mix a couple of
+   known combinations and check the reported `/objects` id against the wiki-infobox-sourced
+   table above, not just that *some* id changes.
 2. Confirm the Agitator/Alembic speedup detection live: trigger each station's cue and watch
    `/graphics-objects` for id `2954`/`2955` appearing at the right moment, and cross-check
    against `MM_LAB_HIT_SKILLSHOT_AGITATOR`/`_ALEMBIC` pulsing on a successful click.
