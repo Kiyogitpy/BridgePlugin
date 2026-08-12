@@ -376,7 +376,12 @@ def set_quantity_mode(ctx, mode: str) -> bool:
     return True
 
 
-def withdraw_loadout(ctx, config: dict) -> None:
+def withdraw_loadout(ctx, config: dict, fresh: bool = False) -> None:
+    """fresh: forces this call's /bank reads to bypass the bridge's per-tick cache -- pass True
+    when the bank state may have just changed from something outside this call (e.g. a separate
+    withdraw_loadout call for a different item immediately before this one) and waiting out a
+    full game tick for the cache to reflect it isn't acceptable. See controller.get_bank's own
+    fresh kwarg."""
     entries = [e for e in config.get("withdraw", []) if e.get("name") and e.get("quantity", 1) > 0]
 
     if entries:
@@ -386,7 +391,7 @@ def withdraw_loadout(ctx, config: dict) -> None:
         name = entry["name"].lower()
         quantity = entry["quantity"]
 
-        bank = controller.get_bank()
+        bank = controller.get_bank(fresh=fresh)
         slot = next(
             (s for s in bank.get("items", []) if name in (s.get("name") or "").lower()),
             None,

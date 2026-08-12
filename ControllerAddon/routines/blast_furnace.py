@@ -323,9 +323,10 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
     same-tick re-fetch between two entries in a single withdraw_loadout call can still return
     a stale, pre-withdrawal snapshot -- putting the bag first in the SAME call (as an earlier
     version of this function tried) doesn't reliably avoid banker.withdraw_loadout's
-    substring-matching "Coal" search resolving to a still-cached "Coal bag" slot. A full-tick
-    settle sleep after the bag's own withdrawal call is what actually guarantees the next
-    /bank read reflects the bag being gone. Loose coal is deposited before the bag is
+    substring-matching "Coal" search resolving to a still-cached "Coal bag" slot. Passing
+    `fresh=True` to the materials withdrawal's own `withdraw_loadout` call (only when the bag
+    was actually just withdrawn) is what actually guarantees its `/bank` read reflects the bag
+    being gone, without waiting out a full tick for it. Loose coal is deposited before the bag is
     emptied, since the bag can only be emptied into slots that are actually free (see module
     header). Coffer coins are handled entirely separately by maybe_top_up_coffer's own
     dedicated bank visit, so this function never carries coins itself."""
@@ -352,11 +353,11 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
         banker.deposit_inventory(ctx, bank_cfg)
         if need_bag_withdraw:
             banker.withdraw_loadout(ctx, {"withdraw": [{"name": "coal bag", "quantity": 1}]})
-            # Let a full game tick pass so the bridge's per-tick-cached /bank read reflects
-            # the bag actually being gone before the materials withdrawal below searches it
-            # for "Coal" -- see the docstring above.
-            time.sleep(random.uniform(0.9, 1.3))
-        banker.withdraw_loadout(ctx, bank_cfg)
+        # fresh=True (only actually needed when the bag was just withdrawn above) forces this
+        # call's /bank reads to bypass the bridge's per-tick cache instead of waiting out a full
+        # game tick for it to naturally reflect the bag being gone -- see the docstring above and
+        # withdraw_loadout's own fresh parameter.
+        banker.withdraw_loadout(ctx, bank_cfg, fresh=need_bag_withdraw)
         if need_bag_fill:
             time.sleep(random.uniform(0.3, 0.5))  # let a just-withdrawn bag register in
                                                     # get_inventory() before fill_coal_bag
