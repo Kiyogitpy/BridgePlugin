@@ -429,3 +429,39 @@ def _process_alembic_speedup(ctx, station: dict) -> None:
             controller.click_entity(ctx.ser, station, check_ui_blockers=False)
             return
         time.sleep(0.15)
+
+
+def deposit_phase(ctx, config: dict) -> None:
+    belt = find_object("Conveyor belt")
+    if belt is None:
+        ctx.state.trigger_safety_stop("no conveyor belt found near the player")
+        return
+
+    controller.click_entity(ctx.ser, belt, check_ui_blockers=False)
+    time.sleep(random.uniform(0.5, 0.8))
+    ctx.state.data["mm_phase"] = "orders"
+
+
+DIGWEED_CORNERS = ["northEast", "southEast", "southWest", "northWest"]  # /mixology-state's
+                                                                          # digweed dict keys
+
+
+def maybe_collect_digweed(ctx, config: dict) -> None:
+    if ctx.state.data.get("mm_have_digweed"):
+        return  # already holding one -- per the wiki, holding it suppresses new spawns anyway
+    if not config.get("digweed", {}).get("enabled", True):
+        return
+
+    state = controller.get_mixology_state()
+    digweed = state.get("digweed", {})
+    if not any(digweed.get(corner) for corner in DIGWEED_CORNERS):
+        return
+
+    plant = find_object("Digweed")
+    if plant is None:
+        return  # ready per the varbit but not yet visible/already collected by the time we look
+
+    controller.click_entity(ctx.ser, plant, check_ui_blockers=False)
+    time.sleep(random.uniform(0.5, 0.8))
+    if find_item("Digweed") is not None:
+        ctx.state.data["mm_have_digweed"] = True
