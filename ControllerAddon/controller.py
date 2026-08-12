@@ -261,6 +261,13 @@ def get_golem_crafting_config():
     return api_get("/golem-crafting-config")
 
 
+def get_mixology_state():
+    return api_get("/mixology-state") or {
+        "inLab": False, "orders": [], "hopper": {"mox": 0, "aga": 0, "lye": 0},
+        "stations": {}, "digweed": {},
+    }
+
+
 def get_minimap_walk_point(x: int, y: int, plane: int):
     return api_get("/minimap/walk", params={"x": x, "y": y, "plane": plane}) or {"onMinimap": False}
 
