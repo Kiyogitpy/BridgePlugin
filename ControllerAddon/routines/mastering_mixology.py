@@ -114,6 +114,7 @@ def bank_herbs_phase(ctx, config: dict) -> None:
 
     herb_priority = config.get("herbPriority", DEFAULT_CONFIG["herbPriority"])
     needed_types = [p for p in ("mox", "aga", "lye") if hopper.get(p, 0) < target]
+    per_type_qty = min(14, 28 // len(needed_types))
     if not needed_types:
         ctx.state.data["mm_phase"] = "orders"
         return
@@ -147,7 +148,7 @@ def bank_herbs_phase(ctx, config: dict) -> None:
                 f"none of the configured {paste_type} herbs ({candidates}) are in the bank"
             )
             return
-        withdraw.append({"name": chosen, "quantity": 14})
+        withdraw.append({"name": chosen, "quantity": per_type_qty})
 
     banker.withdraw_loadout(ctx, {"withdraw": withdraw})
     banker.close_bank(ctx)
