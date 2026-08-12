@@ -13,34 +13,26 @@ import java.util.Map;
 
 public class TileProvider extends BridgeProvider
 {
-	// See ObjectProvider's identical cache for why -- walking the whole tile grid is real work,
-	// and a caller polling faster than the game state changes (confirmed: something was hitting
-	// /tiles, /objects, and /ground-items multiple times a second) turns that into repeated full
-	// walks and was a real, measurable source of client stutter. Tiles only change once per game
-	// tick regardless of poll rate, so caching by tick count adds no real staleness.
-	private int cachedTick = -1;
-	private List<Map<String, Object>> cachedTiles;
+	// See BankProvider's identical comment for why this is cached, and TickCache/TickClock for
+	// how.
+	private final TickClock tickClock;
+	private final TickCache<List<Map<String, Object>>> cache = new TickCache<>();
 
-	public TileProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
+	public TileProvider(Client client, ClientThread clientThread, BridgeHttpServer server, TickClock tickClock)
 	{
 		super(client, clientThread, server);
+		this.tickClock = tickClock;
 	}
 
 	@Override
 	public void register()
 	{
-		server.register("/tiles", () -> onClient(this::getTiles));
+		server.registerQuery("/tiles", query -> getTiles(isFresh(query)));
 	}
 
-	private Object getTiles()
+	private Object getTiles(boolean fresh)
 	{
-		int tick = client.getTickCount();
-		if (cachedTiles == null || tick != cachedTick)
-		{
-			cachedTiles = computeTiles();
-			cachedTick = tick;
-		}
-		return cachedTiles;
+		return cache.get(tickClock.get(), fresh, null, () -> (List<Map<String, Object>>) onClient(this::computeTiles));
 	}
 
 	private List<Map<String, Object>> computeTiles()

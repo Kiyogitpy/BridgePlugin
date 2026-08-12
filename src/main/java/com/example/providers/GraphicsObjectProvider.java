@@ -20,34 +20,26 @@ import java.util.Map;
  */
 public class GraphicsObjectProvider extends BridgeProvider
 {
-	// Same reasoning as ObjectProvider/NPCProvider/GroundItemProvider/TileProvider: a caller
-	// polling faster than the game state actually changes turns repeated per-object WorldPoint/
-	// distance work into a real source of client stutter, worst exactly when it matters most --
-	// a busy fight with many active effects onscreen. Caching by tick count adds no staleness
-	// since these only move/spawn/finish on game tick boundaries anyway.
-	private int cachedTick = -1;
-	private List<Map<String, Object>> cachedGraphicsObjects;
+	// See BankProvider's identical comment for why this is cached, and TickCache/TickClock for
+	// how.
+	private final TickClock tickClock;
+	private final TickCache<List<Map<String, Object>>> cache = new TickCache<>();
 
-	public GraphicsObjectProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
+	public GraphicsObjectProvider(Client client, ClientThread clientThread, BridgeHttpServer server, TickClock tickClock)
 	{
 		super(client, clientThread, server);
+		this.tickClock = tickClock;
 	}
 
 	@Override
 	public void register()
 	{
-		server.register("/graphics-objects", () -> onClient(this::getGraphicsObjects));
+		server.registerQuery("/graphics-objects", query -> getGraphicsObjects(isFresh(query)));
 	}
 
-	private Object getGraphicsObjects()
+	private Object getGraphicsObjects(boolean fresh)
 	{
-		int tick = client.getTickCount();
-		if (cachedGraphicsObjects == null || tick != cachedTick)
-		{
-			cachedGraphicsObjects = computeGraphicsObjects();
-			cachedTick = tick;
-		}
-		return cachedGraphicsObjects;
+		return cache.get(tickClock.get(), fresh, null, () -> (List<Map<String, Object>>) onClient(this::computeGraphicsObjects));
 	}
 
 	private List<Map<String, Object>> computeGraphicsObjects()

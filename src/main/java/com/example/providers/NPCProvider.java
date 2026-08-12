@@ -13,38 +13,29 @@ import java.util.stream.Collectors;
 
 public class NPCProvider extends BridgeProvider
 {
-	// Same reasoning as ObjectProvider/GroundItemProvider/TileProvider: building screen-coord/
-	// distance/health data for every NPC on screen is real work on the client thread, and a
-	// caller polling this faster than the game state actually changes (confirmed: /npcs gets
-	// polled multiple times a second) turns into repeated full-list rebuilds -- a real, measurable
-	// source of client stutter. NPCs only change once per game tick regardless of poll rate, so
-	// caching by tick count adds no staleness while capping the work to once per tick.
-	private int cachedTick = -1;
-	private List<Map<String, Object>> cachedNpcs;
+	// See BankProvider's identical comment for why this is cached, and TickCache/TickClock for
+	// how.
+	private final TickClock tickClock;
+	private final TickCache<List<Map<String, Object>>> cache = new TickCache<>();
 
-	public NPCProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
+	public NPCProvider(Client client, ClientThread clientThread, BridgeHttpServer server, TickClock tickClock)
 	{
 		super(client, clientThread, server);
+		this.tickClock = tickClock;
 	}
 
 	@Override
 	public void register()
 	{
-		server.register("/npcs", () -> onClient(this::getNPCs));
+		server.registerQuery("/npcs", query -> getNPCs(isFresh(query)));
 		server.registerQuery("/npc/nearest", query -> onClient(() -> getNearestNpc(query)));
 		server.registerQuery("/npc/by-index", query -> onClient(() -> getNpcByIndex(query)));
 		server.register("/npc-types", () -> onClient(this::getNpcTypes));
 	}
 
-	private Object getNPCs()
+	private Object getNPCs(boolean fresh)
 	{
-		int tick = client.getTickCount();
-		if (cachedNpcs == null || tick != cachedTick)
-		{
-			cachedNpcs = computeNpcs();
-			cachedTick = tick;
-		}
-		return cachedNpcs;
+		return cache.get(tickClock.get(), fresh, null, () -> (List<Map<String, Object>>) onClient(this::computeNpcs));
 	}
 
 	private List<Map<String, Object>> computeNpcs()
