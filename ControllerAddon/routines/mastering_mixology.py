@@ -58,7 +58,9 @@ DEFAULT_CONFIG = {
     "herbPriority": {
         "mox": ["Guam leaf", "Marrentill", "Tarromin", "Harralander"],
         "aga": ["Huasca", "Irit leaf", "Cadantine", "Lantadyme", "Dwarf weed", "Torstol"],
-        "lye": ["Ranarr weed", "Toadflax", "Avantoe", "Kwuarm", "Snapdragon"],
+        # Ranarr weed and Snapdragon deliberately excluded (user request 2026-08-12): reserved
+        # for other uses, never to be consumed by this routine even if in stock.
+        "lye": ["Toadflax", "Avantoe", "Kwuarm"],
     },
     "hopperTarget": 1000,
     "hopperLowWater": 150,
@@ -102,16 +104,25 @@ def find_item(name: str):
     )
 
 
-def find_object(name: str):
-    """Closest visible object whose name contains `name`, within MAX_OBJECT_DISTANCE -- same
-    shape (including the radius fix) as golem_crafting.py's find_object. Every Mastering
-    Mixology fixture is a multiloc/impostor object, so this resolves correctly regardless of
-    which content variant (empty, or holding a specific potion) is currently active -- see the
-    design doc's "Physical objects are multiloc" note."""
+def find_object(name: str, exclude: str = None):
+    """Closest visible object whose name contains `name` (and does NOT contain `exclude`, if
+    given), within MAX_OBJECT_DISTANCE -- same shape (including the radius fix) as
+    golem_crafting.py's find_object. Every Mastering Mixology fixture is a multiloc/impostor
+    object, so this resolves correctly regardless of which content variant (empty, or holding a
+    specific potion) is currently active -- see the design doc's "Physical objects are
+    multiloc" note.
+
+    `exclude` exists for Digweed: CONFIRMED live 2026-08-12 (user report: "digweed spawned and
+    we clicked the wrong one, should have been name=Mature not young") -- the wiki confirms
+    digweed grows through a young stage before it matures and blooms into the collectible
+    plant, and the young stage's object name apparently also contains "digweed", so a plain
+    substring match can grab the wrong growth stage."""
     name_lower = name.lower()
+    exclude_lower = exclude.lower() if exclude else None
     candidates = [
         o for o in controller.get_objects(radius=MAX_OBJECT_DISTANCE)
         if name_lower in (o.get("name") or "").lower()
+        and (exclude_lower is None or exclude_lower not in (o.get("name") or "").lower())
         and o.get("visible", True)
         and 0 <= o.get("distance", 9999) <= MAX_OBJECT_DISTANCE
     ]
@@ -121,15 +132,55 @@ def find_object(name: str):
     return candidates[0]
 
 
-def check_level_requirement(ctx, config: dict) -> None:
+def _click_world_object(ctx, name: str, exclude: str = None, timeout_s: float = 5.0, **kwargs):
+    """Wait for the player to be genuinely idle (see controller.wait_until_player_idle), THEN
+    resolve the closest visible object named `name`, THEN click it -- in that order.
+
+    CONFIRMED live 2026-08-12, three rounds before this one: round 1 gated several call sites
+    but handed the click a position the CALLER had already resolved before waiting for the
+    camera. Round 2 fixed that ordering but gated on camera yaw/pitch settling, which this
+    minigame's camera defeats by retargeting almost every tick as the player character turns to
+    face its next interaction target -- yaw==yawTarget held on nearly every poll even while the
+    net on-screen position kept drifting. Round 3 replaced the camera proxy with polling the
+    object's own screen position directly until stable, which was closer but still missed a
+    real, DIFFERENT mechanism live reads turned up during that same investigation: the player's
+    own x/y genuinely shifts a few tiles between lever pulls (the Mox/Aga/Lye levers aren't all
+    reachable from one standing tile), which a screen-position poll starting fresh each call
+    can't see coming. Per explicit user direction 2026-08-12 ("lets scrap the camera bullshit
+    ... We go with animation instead"), this now gates on the player's own activity state
+    (animation + pose + position, see wait_until_player_idle) instead of anything screen/camera
+    derived -- directly answering "is my character still busy or still moving" rather than
+    inferring it from a proxy. Returns the freshly-resolved object (or None if not found/no
+    click attempted) so callers that need its other fields (impostorId, world tile x/y, etc.)
+    don't need a second lookup."""
+    controller.wait_until_player_idle(timeout_s=timeout_s)
+    entity = find_object(name, exclude=exclude)
+    if entity is None:
+        return None
+    controller.click_entity(ctx.ser, entity, **kwargs)
+    return entity
+
+
+def check_level_requirement(ctx, config: dict) -> bool:
     """One-time-per-activation under-level sanity check -- same shape and same setup()-vs-tick()
-    reasoning as golem_crafting.py's check_level_requirement."""
+    reasoning as golem_crafting.py's check_level_requirement.
+
+    Returns False (without performing the check) if Herblore's reported level is 0 -- CONFIRMED
+    live 2026-08-12: every real OSRS skill's minimum level is 1, so a 0 reading is never a real
+    under-level account, it's /skills responding in the brief window right after
+    login.is_fully_logged_in() first reports True but before RuneLite's own skill-data event has
+    actually landed. Trusting it blindly permanently safety-stopped a perfectly fine level-90+
+    account during this exact live session. Caller should retry next tick rather than mark the
+    check done when this returns False."""
     herblore = controller.get_skills().get("Herblore") or {}
     level = herblore.get("level")
+    if level == 0:
+        return False
     if level is not None and level < HERBLORE_LEVEL_REQUIRED:
         ctx.state.trigger_safety_stop(
             f"Herblore level {level} is below the {HERBLORE_LEVEL_REQUIRED} required for Mastering Mixology"
         )
+    return True
 
 
 def bank_herbs_phase(ctx, config: dict) -> None:
@@ -163,16 +214,35 @@ def bank_herbs_phase(ctx, config: dict) -> None:
 
     banker.deposit_inventory(ctx, {"keepItems": []})
 
-    # fresh=True not strictly needed here (the bank was just opened this same call), but matches
-    # this plan's Global Constraints convention of never trusting a possibly-stale read for a
-    # decision that's about to drive a withdrawal.
+    # CONFIRMED live 2026-08-12 (user report): searching each configured herb name one at a
+    # time -- resolving "which candidate is in stock" from one bank read, then re-searching and
+    # clicking from a SEPARATE later read inside search_and_withdraw -- raced against reality:
+    # a candidate that looked in-stock at selection time could be genuinely out of stock by the
+    # time the click-specific read ran, and the mismatch was only logged, never escalated. The
+    # phase then looped open/closed on the bank forever, making no progress. Switching to tab 8
+    # (user's own dedicated herb-storage tab, per user request) once surfaces every herb in one
+    # view, so candidate selection below and the actual withdrawal both read from the same live
+    # state -- no more two-read race.
+    if not banker.switch_bank_tab(ctx, 8):
+        banker.close_bank(ctx)
+        ctx.state.trigger_safety_stop("could not switch to the herb bank tab")
+        return
+
     bank_contents = controller.get_bank(fresh=True).get("items", [])
-    withdraw = []
+    chosen_names = {}
     for paste_type in needed_types:
         candidates = herb_priority.get(paste_type, [])
+        # Substring match (not exact) -- herbPriority's candidates are clean names ("Avantoe"),
+        # but the account can hold the grimy/uncleaned form ("Grimy avantoe") instead, or as
+        # well; CORRECTED same session (this exact bug, caught live within minutes of writing
+        # it): an exact match here missed real, in-stock Kwuarm/Avantoe entirely because their
+        # actual bank names carry the "Grimy" prefix. Requiring qty > 0 alongside the substring
+        # match is what actually matters for the zero-stock-placeholder problem (see the fix
+        # earlier this session).
         chosen = next(
             (name for name in candidates
-             if any(name.lower() in (i.get("name") or "").lower() for i in bank_contents)),
+             if any(name.lower() in (i.get("name") or "").lower() and i.get("qty", 0) > 0
+                    for i in bank_contents)),
             None,
         )
         if chosen is None:
@@ -181,39 +251,139 @@ def bank_herbs_phase(ctx, config: dict) -> None:
                 f"none of the configured {paste_type} herbs ({candidates}) are in the bank"
             )
             return
-        withdraw.append({"name": chosen, "quantity": per_type_qty})
+        chosen_names[paste_type] = chosen
 
-    banker.withdraw_loadout(ctx, {"withdraw": withdraw})
+    # CONFIRMED (user report): withdrawing one unit at a time (quantity mode "one", one click
+    # per unit) is needlessly slow and click-heavy. CORRECTED same session (user report):
+    # "X" means the per-item right-click "Withdraw-X" menu option, not the persistent global
+    # quantity-mode button -- each herb needs its own right-click + Withdraw-X + typed amount.
+    for paste_type, name in chosen_names.items():
+        # Re-resolve fresh right before each click rather than reusing a position captured
+        # earlier in this same loop -- an earlier withdrawal in this loop can shift the tab's
+        # item grid (e.g. a herb that just hit 0 stock drops out, reflowing whatever came after
+        # it) -- same "always re-read, never trust a captured position" principle as this file's
+        # other click loops.
+        current = controller.get_bank(fresh=True).get("items", [])
+        # CONFIRMED live 2026-08-12: exact-name match here was inconsistent with the substring
+        # match used for candidate selection just above -- this account's real stock sat in the
+        # grimy form ("Grimy toadflax", qty 20) while the clean-named placeholder ("Toadflax",
+        # qty 0) matched the exact-equality test and lost every time to the qty>0 filter, so the
+        # herb was always reported "no longer available" even though real stock existed.
+        slot = next(
+            (i for i in current if name.lower() in (i.get("name") or "").lower() and i.get("qty", 0) > 0),
+            None,
+        )
+        if slot is None:
+            debug_log.log("mixology", f"{name} no longer available when it came time to withdraw it -- skipping this cycle, will re-evaluate next tick")
+            continue
+        if not controller.click_menu_action(ctx.ser, slot, "Withdraw-X", check_ui_blockers=False):
+            debug_log.log("mixology", f"Withdraw-X menu entry not found for {name} -- skipping this cycle")
+            continue
+        # CONFIRMED live 2026-08-12: click_menu_action returns immediately after its click lands
+        # (no settle wait built in -- other callers don't need one, since they don't chain a
+        # keyboard prompt after it), but the "Enter amount" chatbox needs a moment to actually
+        # render and take keyboard focus. Typing immediately dropped the digits silently (menu
+        # click logged fine, digits logged fine, but nothing was ever actually withdrawn).
+        time.sleep(random.uniform(0.4, 0.6))
+        controller.type_digits_and_enter(ctx.ser, str(per_type_qty))
+        time.sleep(random.uniform(0.3, 0.5))
+
     banker.close_bank(ctx)
 
     _refine_and_hopper_inventory(ctx)
 
 
-def _refine_and_hopper_inventory(ctx) -> None:
-    """Deposit every clean herb / unfinished potion currently held into the refiner (clicking
-    every tick to double refine speed, per the wiki), then deposit the resulting paste into the
-    hopper. Loops until nothing refinable is left in the inventory."""
-    refiner = find_object("Refiner")
-    if refiner is None:
-        ctx.state.trigger_safety_stop("no refiner found near the player")
-        return
+def _clean_grimy_herbs(ctx) -> None:
+    """Left-click each 'Grimy X' herb currently held to clean it into its usable form --
+    CONFIRMED live 2026-08-12 (user report, and data/raw/M/Mastering Mixology.txt:73: "Grimy
+    herbs are typically cheaper... but cannot be used in mixology until cleaned"): the Refiner
+    only accepts clean herbs, never grimy ones directly. Cleaning is one click per herb, not a
+    batch action (herbs aren't stackable), so this loops one at a time until nothing grimy
+    remains in inventory or a bounded deadline is hit."""
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        grimy = next(
+            (i for i in controller.get_inventory() if (i.get("name") or "").lower().startswith("grimy ")),
+            None,
+        )
+        if grimy is None:
+            return
+        controller.click_entity(ctx.ser, grimy, check_ui_blockers=False)
+        time.sleep(random.uniform(0.55, 0.75))  # one game tick
+    debug_log.log("mixology", "grimy herb cleaning didn't finish within the time budget")
 
+
+def _refine_and_hopper_inventory(ctx) -> None:
+    """Clean any grimy herbs held, then deposit every clean herb / unfinished potion currently
+    held into the refiner (clicking every tick to double refine speed, per the wiki), then
+    deposit the resulting paste into the hopper. Loops until nothing refinable is left in the
+    inventory."""
+    _clean_grimy_herbs(ctx)
+
+    # CONFIRMED live 2026-08-12: the refiner's on-screen position was fetched ONCE before this
+    # loop and reused for the entire ~60s clicking window -- user directly observed clicks
+    # landing off-target ("in thin air") partway through a long refine run. Screen coordinates
+    # depend on the camera, which can drift continuously (not tick-quantized) over that window,
+    # so a position cached at loop start goes stale the longer the loop runs. Re-fetching fresh
+    # every iteration (this is a bridge read, not a serial action, so it's cheap) keeps every
+    # click aimed at the refiner's actual current position.
     all_herb_names = {name for names in DEFAULT_CONFIG["herbPriority"].values() for name in names}
+    # CONFIRMED live 2026-08-12: this account's real stock can be the grimy/uncleaned form
+    # ("Grimy toadflax"), but exact-set membership only recognized the clean configured names
+    # ("Toadflax") -- held was always empty for anything grimy, so this function silently
+    # no-opped (never clicked the Refiner, never deposited to the Hopper) every time
+    # bank_herbs_phase withdrew a grimy herb, and the very next cycle just deposited it straight
+    # back into the bank. Substring match (same fix already applied to the withdrawal-candidate
+    # matching above) makes "Grimy toadflax" correctly recognized as a Toadflax-family herb.
+    # _click_world_object's player-idle gate covers arriving here via a walk from the bank, but
+    # once actually standing at the Refiner clicking it repeatedly, the player never moves again
+    # until this loop ends -- per user direction 2026-08-12 ("we can just spam click them until
+    # we are finished, no need to do it every tick... no need to move between clicks either"),
+    # only the FIRST click needs the idle-wait + fresh resolve; every click after that reuses
+    # the same position directly, skipping the wait entirely (this was adding real, needless
+    # latency to a loop that could otherwise run at its full tick-paced cadence).
+    refiner_pos = None
     deadline = time.time() + 60.0  # a full inventory of herbs refines in well under this at 1/tick
     while time.time() < deadline:
-        held = [i for i in controller.get_inventory() if (i.get("name") or "") in all_herb_names]
+        held = [
+            i for i in controller.get_inventory()
+            if any(name.lower() in (i.get("name") or "").lower() for name in all_herb_names)
+        ]
         if not held:
             break
-        controller.click_entity(ctx.ser, refiner, check_ui_blockers=False)
+        if refiner_pos is None:
+            refiner_pos = _click_world_object(ctx, "Refiner", check_ui_blockers=False)
+            if refiner_pos is None:
+                ctx.state.trigger_safety_stop("no refiner found near the player")
+                return
+        else:
+            controller.click_entity(ctx.ser, refiner_pos, check_ui_blockers=False)
         time.sleep(random.uniform(0.55, 0.75))  # one game tick, matches the refiner's own
                                                   # per-tick processing cadence when clicked
 
-    hopper_obj = find_object("Hopper")
-    if hopper_obj is None:
-        ctx.state.trigger_safety_stop("no hopper found near the player")
-        return
-    controller.click_entity(ctx.ser, hopper_obj, check_ui_blockers=False)
-    time.sleep(random.uniform(0.4, 0.7))
+    # Same re-verify idiom as the fixes above: confirm the paste actually landed in the hopper
+    # (via /mixology-state) rather than assuming one click succeeded, and retry a bounded number
+    # of times against a freshly-refetched Hopper object if it didn't.
+    held_paste = [i for i in controller.get_inventory() if i.get("name", "").endswith(" paste")]
+    if not held_paste:
+        return  # nothing left to deposit -- refining already consumed everything held
+
+    # CORRECTED twice more same session: a fixed per-attempt poll window was still just a guess,
+    # and a follow-up camera-yaw-based settle check turned out not to be the right signal either
+    # (see _click_world_object's docstring). _click_world_object now gates each Hopper click on
+    # controller.wait_until_player_idle (animation/pose/position) before resolving position.
+    for _ in range(3):
+        hopper_obj = _click_world_object(ctx, "Hopper", check_ui_blockers=False)
+        if hopper_obj is None:
+            ctx.state.trigger_safety_stop("no hopper found near the player")
+            return
+        # Give the click a few seconds to resolve without reclicking yet.
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            time.sleep(0.3)
+            if not any(i.get("name", "").endswith(" paste") for i in controller.get_inventory()):
+                return
+    debug_log.log("mixology", "hopper deposit click may not have landed -- paste still held after retries")
 
 
 def _choose_orders(orders: list) -> list:
@@ -305,11 +475,10 @@ def mix_phase(ctx, config: dict) -> None:
         pulls.extend([paste] * target_order.get(paste, 0))
 
     for paste in pulls:
-        lever = find_object(LEVER_NAMES[paste])
+        lever = _click_world_object(ctx, LEVER_NAMES[paste], check_ui_blockers=False)
         if lever is None:
             ctx.state.trigger_safety_stop(f"no {LEVER_NAMES[paste]} found near the player")
             return
-        controller.click_entity(ctx.ser, lever, check_ui_blockers=False)
         time.sleep(random.uniform(0.5, 0.7))  # one game tick -- levers resolve per-tick
 
     vessel = find_object("Mixing vessel")
@@ -317,7 +486,12 @@ def mix_phase(ctx, config: dict) -> None:
         ctx.state.trigger_safety_stop("no mixing vessel found near the player")
         return
 
-    actual_base = VESSEL_ID_TO_BASE.get(vessel.get("id"))
+    # CONFIRMED live 2026-08-12: the vessel's plain "id" field always reports the multiloc's own
+    # base/impostor definition id (55395), never the content-variant ids (54918-54928)
+    # VESSEL_ID_TO_BASE is keyed by -- ObjectProvider.java resolves the impostor for the object's
+    # *name* but historically left "id" as the raw base id. "impostorId" (added alongside this
+    # fix) is the impostor-resolved id and is what actually reflects current vessel content.
+    actual_base = VESSEL_ID_TO_BASE.get(vessel.get("impostorId"))
     if actual_base != target_order.get("name"):
         # Vessel content doesn't match what this phase just tried to build -- a misclick on one
         # of the lever pulls above is the likely cause (see Global Constraints). Don't take a
@@ -334,7 +508,12 @@ def mix_phase(ctx, config: dict) -> None:
     target_id = next(
         (k for k, v in UNFINISHED_IDS.items() if v == target_order.get("name")), None
     )
-    controller.click_entity(ctx.ser, vessel, check_ui_blockers=False)
+    # `vessel` above was only fetched to check content (impostorId) -- re-resolve fresh for
+    # the actual click, same stale-position reasoning as _click_world_object's own docstring.
+    clicked_vessel = _click_world_object(ctx, "Mixing vessel", check_ui_blockers=False)
+    if clicked_vessel is None:
+        ctx.state.trigger_safety_stop("no mixing vessel found near the player")
+        return
     took = False
     deadline = time.time() + 3.0
     while time.time() < deadline:
@@ -407,6 +586,20 @@ def process_phase(ctx, config: dict) -> None:
         if potion is None:
             continue
 
+        # CONFIRMED live 2026-08-12 (user report: "tried to start a new potion while we still
+        # working on one"): with two orders routed to the same station (the duplicate-name
+        # scenario Fix 8's per-order iteration is meant to handle), _process_one's completion
+        # poll can time out at its 20s deadline without ever detecting the FIRST potion actually
+        # finishing, and returns anyway (success and timeout aren't distinguished) -- letting
+        # this loop move on and click the station again while it's still actively processing the
+        # first potion. /mixology-state's own stations.{name}.progress/potionName (already
+        # exposed, no new bridge work needed) is ground truth for whether the station is free;
+        # check it before clicking, and skip this order for now if not -- process_phase's own
+        # "still unprocessed -- retrying" gate (below) picks it back up next tick once free.
+        station_state = controller.get_mixology_state().get("stations", {}).get(station_name.lower(), {})
+        if station_state.get("potionName"):
+            continue
+
         station = find_object(station_name)
         if station is None:
             continue
@@ -424,14 +617,13 @@ def process_phase(ctx, config: dict) -> None:
 
 
 def _process_one(ctx, config: dict, station_name: str, station: dict, potion: dict) -> None:
-    # Fix 7 (final whole-branch review): the wiki (data/raw/M/Mastering Mixology.txt:425)
-    # confirms left-clicking the machine alone inputs the FIRST unprocessed potion in the
-    # inventory, regardless of which order it fulfills -- click the specific potion item first,
-    # same two-click item-on-target idiom mix_phase already uses for combining digweed into a
-    # base, so the right potion (not just whichever happens to be first) goes into this station.
-    controller.click_entity(ctx.ser, potion, check_ui_blockers=False)
-    time.sleep(random.uniform(0.2, 0.35))
-    controller.click_entity(ctx.ser, station, check_ui_blockers=False)
+    # The wiki (data/raw/M/Mastering Mixology.txt:425) warns that left-clicking the machine
+    # alone inputs the FIRST unprocessed potion in inventory regardless of which order it
+    # fulfills, which is why this used to click the specific potion item first. CONFIRMED live
+    # 2026-08-12 (user tested in-game): clicking the station alone is fine as long as orders are
+    # processed in a consistent sequence -- which process_phase's own STATION_ORDER sort already
+    # guarantees -- so the extra potion-selection click (and its own settle delay) is unneeded.
+    _click_world_object(ctx, station_name, check_ui_blockers=False)
     time.sleep(random.uniform(0.4, 0.6))
 
     speedups = config.get("speedups", DEFAULT_CONFIG["speedups"])
@@ -458,13 +650,22 @@ def _process_one(ctx, config: dict, station_name: str, station: dict, potion: di
 def _process_retort_speedup(ctx, station: dict) -> None:
     """No timing window (confirmed: the reference plugin tracks no varbit/graphics cue for the
     Retort at all, consistent with the wiki's "click every tick" description) -- click every
-    tick while /mixology-state still reports a potion loaded in the Retort."""
+    tick while /mixology-state still reports a potion loaded in the Retort.
+
+    Same first-click-only idle-wait optimization as _refine_and_hopper_inventory's Refiner loop
+    (user direction 2026-08-12): the player is standing at the Retort for this entire loop and
+    never moves again once engaged, so only the first click needs to wait/resolve -- every
+    click after that reuses the same position directly."""
+    retort_pos = None
     deadline = time.time() + 20.0
     while time.time() < deadline:
         state = controller.get_mixology_state()
         if not state.get("stations", {}).get("retort", {}).get("potionName"):
             return
-        controller.click_entity(ctx.ser, station, check_ui_blockers=False)
+        if retort_pos is None:
+            retort_pos = _click_world_object(ctx, "Retort", check_ui_blockers=False)
+        else:
+            controller.click_entity(ctx.ser, retort_pos, check_ui_blockers=False)
         time.sleep(random.uniform(0.55, 0.75))  # one game tick
 
 
@@ -472,7 +673,13 @@ def _process_agitator_speedup(ctx, station: dict) -> None:
     """Click again when graphics-object id 2954 (VFX_MACHINERY_ALCHEMY01_AGITATOR01) appears at
     the Agitator's tile -- the visual "fireworks" cue. Bounded wait: per the wiki, a
     consistently-missed window is worse than not attempting the speedup, so this gives up
-    cleanly rather than risking a late click against a closed window."""
+    cleanly rather than risking a late click against a closed window.
+
+    CONFIRMED live 2026-08-12 (user report on the Alembic's identical logic): the passed-in
+    `station` is used only to compare against the graphics cue's tile (world coordinates, stable
+    across the wait) -- the actual CLICK re-fetches the station fresh right before it fires,
+    since up to 15s can pass before the cue appears and the station's screen position can drift
+    in that window."""
     deadline = time.time() + 15.0
     while time.time() < deadline:
         graphics = controller.get_graphics_objects()
@@ -483,14 +690,18 @@ def _process_agitator_speedup(ctx, station: dict) -> None:
             None,
         )
         if cue is not None:
-            controller.click_entity(ctx.ser, station, check_ui_blockers=False)
+            _click_world_object(ctx, "Agitator", check_ui_blockers=False)
             return
         time.sleep(0.15)
 
 
 def _process_alembic_speedup(ctx, station: dict) -> None:
     """Same shape as the Agitator's speedup -- click again when graphics-object id 2955
-    (VFX_MACHINERY_ALCHEMY01_ALEMBIC01) appears at the Alembic's tile."""
+    (VFX_MACHINERY_ALCHEMY01_ALEMBIC01) appears at the Alembic's tile.
+
+    CONFIRMED live 2026-08-12 (user report: "crystalise potion is bugged, clicking away from
+    the table"): the click re-fetches the station fresh right before firing, for the same
+    stale-position reason as the Agitator/Retort speedups above."""
     deadline = time.time() + 15.0
     while time.time() < deadline:
         graphics = controller.get_graphics_objects()
@@ -501,18 +712,27 @@ def _process_alembic_speedup(ctx, station: dict) -> None:
             None,
         )
         if cue is not None:
-            controller.click_entity(ctx.ser, station, check_ui_blockers=False)
+            _click_world_object(ctx, "Alembic", check_ui_blockers=False)
             return
         time.sleep(0.15)
 
 
 def deposit_phase(ctx, config: dict) -> None:
-    belt = find_object("Conveyor belt")
+    # CONFIRMED live 2026-08-12 (user report: "it reclicks the conveyor belt even when the item
+    # is already gone from our inventory"): this used to click the belt unconditionally every
+    # single call, only checking AFTER the click whether anything was actually left to deposit.
+    # If this phase gets re-entered with nothing finished held (e.g. deposit already succeeded
+    # but the phase transition below hadn't taken effect yet on a stale read), it fired a real,
+    # pointless click every time. Check first and skip straight to orders if there's nothing to
+    # turn in.
+    if not any(i.get("id") in FINISHED_IDS for i in controller.get_inventory()):
+        ctx.state.data["mm_phase"] = "orders"
+        return
+
+    belt = _click_world_object(ctx, "Conveyor belt", check_ui_blockers=False)
     if belt is None:
         ctx.state.trigger_safety_stop("no conveyor belt found near the player")
         return
-
-    controller.click_entity(ctx.ser, belt, check_ui_blockers=False)
     time.sleep(random.uniform(0.5, 0.8))
 
     # Fix 4 (final whole-branch review): don't transition unconditionally -- confirm the click
@@ -551,11 +771,9 @@ def maybe_collect_digweed(ctx, config: dict) -> None:
     if not any(digweed.get(corner) for corner in DIGWEED_CORNERS):
         return
 
-    plant = find_object("Digweed")
+    plant = _click_world_object(ctx, "Digweed", exclude="young", check_ui_blockers=False)
     if plant is None:
         return  # ready per the varbit but not yet visible/already collected by the time we look
-
-    controller.click_entity(ctx.ser, plant, check_ui_blockers=False)
     time.sleep(random.uniform(0.5, 0.8))
 
 
@@ -575,7 +793,8 @@ def setup(ctx) -> None:
 def tick(ctx) -> None:
     config = ctx.state.config
     if not ctx.state.data.get("mm_level_checked"):
-        check_level_requirement(ctx, config)
+        if not check_level_requirement(ctx, config):
+            return  # skills not synced yet post-login -- retry next tick, don't mark done
         ctx.state.data["mm_level_checked"] = True
         if ctx.state.safety_stopped:
             return
