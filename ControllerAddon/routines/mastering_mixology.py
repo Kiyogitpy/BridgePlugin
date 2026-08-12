@@ -33,6 +33,26 @@ RECIPE_TABLE = {
 SINGLE_PASTE_BASES = {"Alco-augmentator", "Mammoth-might mix", "Liplack liquor"}
 MAL_BASE = "Mixalot"
 
+# ItemID.MM_POTION_*_UNFINISHED / _FINISHED (net.runelite.api.gameval.ItemID,
+# runelite-api-1.12.35.jar) -- processing transforms a base potion in place and the display
+# NAME is identical before and after (confirmed: Mammoth-might mix has id1=30011 (Unfinished)
+# and id2=30021 (Processed) sharing one `name` field in the wiki infobox), so name matching
+# cannot distinguish unprocessed from processed. This ordering matches VESSEL_ID_TO_BASE's
+# object-id order (NOT RECIPE_TABLE's varbit order) -- see this plan's Global Constraints.
+UNFINISHED_IDS = {
+    30011: "Mammoth-might mix", 30012: "Mystic mana amalgam", 30013: "Marley's moonlight",
+    30014: "Alco-augmentator", 30015: "Aqualux amalgam",      30016: "Azure aura mix",
+    30017: "Liplack liquor",   30018: "Anti-leech lotion",    30019: "Megalite liquid",
+    30020: "Mixalot",
+}
+FINISHED_IDS = {k + 10: v for k, v in UNFINISHED_IDS.items()}
+
+# ItemID.MM_LAB_SPECIAL_HERB -- Digweed. Used instead of a sticky ctx.state.data flag (see Fix 5
+# in the final whole-branch review) because the plant withers out of inventory if the player
+# leaves the minigame area, and find_item()'s exact-match semantics made a flag-based confirm
+# unreliable if the in-game name isn't precisely "Digweed".
+MM_LAB_SPECIAL_HERB_ID = 30031
+
 DEFAULT_CONFIG = {
     "enabled": True,
     "herbPriority": {
@@ -56,7 +76,20 @@ DEFAULT_CONFIG = {
 
 def get_config(bridge_config):
     config = controller.get_mastering_mixology_config()
-    return config if config is not None else DEFAULT_CONFIG
+    if config is None:
+        return DEFAULT_CONFIG
+
+    # ConfigExporter.exportMasteringMixology only emits enabled/bank/digweed/speedups/breaks/
+    # safety -- herbPriority/hopperTarget/hopperLowWater/maxObjectDistance silently vanish
+    # whenever the Controller plugin is actually running (i.e. always, in real deployment) if the
+    # live bridge config were returned as-is, even though every phase function still reads them
+    # via config.get(key, DEFAULT_CONFIG[key]) and so never crashes -- it just silently ignores
+    # any user customization of those keys. Same bug golem_crafting.py's get_config hit and fixed
+    # for its own "locations" key -- same fix shape here.
+    config = dict(config)
+    for key in ("herbPriority", "hopperTarget", "hopperLowWater", "maxObjectDistance"):
+        config.setdefault(key, DEFAULT_CONFIG[key])
+    return config
 
 
 def find_item(name: str):
@@ -293,19 +326,45 @@ def mix_phase(ctx, config: dict) -> None:
         debug_log.log("mixology", f"vessel shows '{actual_base}', expected '{target_order.get('name')}' -- retrying")
         return
 
+    # Fix 3 (final whole-branch review): the wiki confirms the game can refuse the take
+    # (insufficient paste, insufficient Herblore level), and click_entity's own
+    # MISTAKE_MISCLICK_CHANCE can also cause a miss -- don't advance mm_made_bases until the
+    # base actually lands in inventory, matching golem_crafting.py's reclick-gate idiom for the
+    # same class of "click looked fine but didn't land" problem.
+    target_id = next(
+        (k for k, v in UNFINISHED_IDS.items() if v == target_order.get("name")), None
+    )
     controller.click_entity(ctx.ser, vessel, check_ui_blockers=False)
-    time.sleep(random.uniform(0.4, 0.6))
+    took = False
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if target_id is not None and any(i.get("id") == target_id for i in controller.get_inventory()):
+            took = True
+            break
+        time.sleep(0.3)
+    if not took:
+        debug_log.log(
+            "mixology",
+            f"vessel take for '{target_order.get('name')}' didn't land in inventory -- retrying",
+        )
+        return
     ctx.state.data["mm_made_bases"] = made + [target_order.get("name")]
 
-    if ctx.state.data.get("mm_have_digweed") and target_order.get("name") == MAL_BASE:
-        digweed_item = find_item("Digweed")
+    # Fix 5 (final whole-branch review): live inventory check instead of the old sticky
+    # ctx.state.data["mm_have_digweed"] flag -- digweed withers out of inventory if the player
+    # leaves the minigame area (e.g. a bank trip), which would otherwise leave the flag stuck
+    # True forever; and find_item() is an exact-name match, which made the old flag-set fragile
+    # if the plant's real in-game name isn't precisely "Digweed".
+    digweed_item = next(
+        (i for i in controller.get_inventory() if i.get("id") == MM_LAB_SPECIAL_HERB_ID), None
+    )
+    if digweed_item is not None and target_order.get("name") == MAL_BASE:
         base_item = find_item(MAL_BASE)
-        if digweed_item is not None and base_item is not None:
+        if base_item is not None:
             controller.click_entity(ctx.ser, digweed_item, check_ui_blockers=False)
             time.sleep(random.uniform(0.15, 0.3))
             controller.click_entity(ctx.ser, base_item, check_ui_blockers=False)
             time.sleep(random.uniform(0.3, 0.5))
-            ctx.state.data["mm_have_digweed"] = False
 
 
 # Confirmed graphics-object ids for each station's speedup click-now cue (see this plan's
@@ -314,29 +373,34 @@ AGITATOR_CUE_GRAPHICS_ID = 2954
 ALEMBIC_CUE_GRAPHICS_ID = 2955
 
 STATION_ORDER = ["Alembic", "Retort", "Agitator"]  # wiki's own recommended pathing order
-STATION_STATE_KEY = {"Alembic": "alembic", "Retort": "retort", "Agitator": "agitator"}
 
 
 def process_phase(ctx, config: dict) -> None:
     chosen = ctx.state.data.get("mm_chosen_orders", [])
 
-    # Check if we have any unprocessed bases at all
+    # Check if we have any unprocessed bases at all -- id-based (Fix 1, final whole-branch
+    # review): processing transforms a base potion in place while keeping its display `name`
+    # identical, so a name-in-RECIPE_TABLE test can never distinguish unprocessed from processed
+    # and this check could never observe completion. See UNFINISHED_IDS/FINISHED_IDS above.
     current_inventory = controller.get_inventory()
-    unprocessed_any = any(i.get("name") in RECIPE_TABLE for i in current_inventory)
+    unprocessed_any = any(i.get("id") in UNFINISHED_IDS for i in current_inventory)
     if not unprocessed_any:
         ctx.state.data["mm_phase"] = "deposit"
         return
 
     # Process each chosen order in sequence, finding one unprocessed potion per order
-    # (not pre-grouped by name, so duplicate-named orders with different stations don't collide)
-    for order in chosen:
+    # (not pre-grouped by name, so duplicate-named orders with different stations don't collide).
+    # Fix 8 (final whole-branch review): sort by station (STATION_ORDER's wiki-recommended
+    # Alembic -> Retort -> Agitator pathing) while still iterating per-order, so the collision
+    # fix Task 6 already made doesn't cost the station-grouped pathing optimization too.
+    for order in sorted(chosen, key=lambda o: STATION_ORDER.index(o.get("station"))):
         order_name = order.get("name")
         station_name = order.get("station")
 
-        # Find an unprocessed potion matching this order's name
+        # Find an unprocessed potion matching this order's name -- id-based (Fix 1).
         current_inventory = controller.get_inventory()
         potion = next(
-            (i for i in current_inventory if i.get("name") == order_name and i.get("name") in RECIPE_TABLE),
+            (i for i in current_inventory if i.get("name") == order_name and i.get("id") in UNFINISHED_IDS),
             None,
         )
 
@@ -349,8 +413,9 @@ def process_phase(ctx, config: dict) -> None:
 
         _process_one(ctx, config, station_name, station, potion)
 
-    # Check if anything unprocessed remains -- if so, retry next tick instead of transitioning
-    remaining = [i for i in controller.get_inventory() if i.get("name") in RECIPE_TABLE]
+    # Check if anything unprocessed remains -- if so, retry next tick instead of transitioning.
+    # Id-based (Fix 1).
+    remaining = [i for i in controller.get_inventory() if i.get("id") in UNFINISHED_IDS]
     if remaining:
         debug_log.log("mixology", f"still unprocessed: {[i.get('name') for i in remaining]} -- retrying")
         return
@@ -359,6 +424,13 @@ def process_phase(ctx, config: dict) -> None:
 
 
 def _process_one(ctx, config: dict, station_name: str, station: dict, potion: dict) -> None:
+    # Fix 7 (final whole-branch review): the wiki (data/raw/M/Mastering Mixology.txt:425)
+    # confirms left-clicking the machine alone inputs the FIRST unprocessed potion in the
+    # inventory, regardless of which order it fulfills -- click the specific potion item first,
+    # same two-click item-on-target idiom mix_phase already uses for combining digweed into a
+    # base, so the right potion (not just whichever happens to be first) goes into this station.
+    controller.click_entity(ctx.ser, potion, check_ui_blockers=False)
+    time.sleep(random.uniform(0.2, 0.35))
     controller.click_entity(ctx.ser, station, check_ui_blockers=False)
     time.sleep(random.uniform(0.4, 0.6))
 
@@ -370,13 +442,16 @@ def _process_one(ctx, config: dict, station_name: str, station: dict, potion: di
     elif station_name == "Alembic" and speedups.get("alembic"):
         _process_alembic_speedup(ctx, station)
 
-    # Wait for the station to finish and the processed potion to land back in inventory --
-    # polled via inventory count, same confirmation idiom as golem_crafting.py's chisel_phase.
+    # Fix 2 (final whole-branch review): processing transforms the item in place -- inventory
+    # LENGTH never changes (only the item's id changes), so the old "wait for inventory count to
+    # change" gate always burned its full timeout. Poll for this specific potion's id
+    # transitioning from its UNFINISHED_IDS id to the corresponding FINISHED_IDS id (+10) instead.
+    potion_id = potion.get("id")
+    finished_id = potion_id + 10 if potion_id is not None else None
     deadline = time.time() + 20.0
-    starting_count = len(controller.get_inventory())
     while time.time() < deadline:
         time.sleep(0.3)
-        if len(controller.get_inventory()) != starting_count:
+        if finished_id is not None and any(i.get("id") == finished_id for i in controller.get_inventory()):
             return
 
 
@@ -439,6 +514,18 @@ def deposit_phase(ctx, config: dict) -> None:
 
     controller.click_entity(ctx.ser, belt, check_ui_blockers=False)
     time.sleep(random.uniform(0.5, 0.8))
+
+    # Fix 4 (final whole-branch review): don't transition unconditionally -- confirm the click
+    # actually landed by re-reading inventory, same retry-next-tick idiom process_phase's own
+    # fix round established.
+    remaining = [i for i in controller.get_inventory() if i.get("id") in FINISHED_IDS]
+    if remaining:
+        debug_log.log(
+            "mixology",
+            f"still have finished potions after conveyor belt click: {[i.get('name') for i in remaining]} -- retrying",
+        )
+        return
+
     ctx.state.data["mm_phase"] = "orders"
 
 
@@ -447,7 +534,14 @@ DIGWEED_CORNERS = ["northEast", "southEast", "southWest", "northWest"]  # /mixol
 
 
 def maybe_collect_digweed(ctx, config: dict) -> None:
-    if ctx.state.data.get("mm_have_digweed"):
+    # Fix 5 (final whole-branch review): live inventory check instead of a sticky
+    # ctx.state.data flag -- the wiki confirms digweed withers out of inventory if the player
+    # exits the minigame area (e.g. an orders -> bank_herbs low-water trip), which would leave a
+    # sticky flag stuck True and digweed collection permanently disabled; and find_item() is an
+    # exact-name match, not substring, so a stale flag-set based on it was also fragile. This
+    # also brings the file in line with the plan's own Global Constraint of always re-reading
+    # live state rather than tracking it locally.
+    if any(i.get("id") == MM_LAB_SPECIAL_HERB_ID for i in controller.get_inventory()):
         return  # already holding one -- per the wiki, holding it suppresses new spawns anyway
     if not config.get("digweed", {}).get("enabled", True):
         return
@@ -463,8 +557,6 @@ def maybe_collect_digweed(ctx, config: dict) -> None:
 
     controller.click_entity(ctx.ser, plant, check_ui_blockers=False)
     time.sleep(random.uniform(0.5, 0.8))
-    if find_item("Digweed") is not None:
-        ctx.state.data["mm_have_digweed"] = True
 
 
 PHASES = {
