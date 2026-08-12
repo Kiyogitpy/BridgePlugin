@@ -101,6 +101,39 @@ public class BankProvider extends BridgeProvider
 		quantity.put("all", buttonPoint(InterfaceID.Bankmain.QUANTITYALL));
 		data.put("quantityButtons", quantity);
 
+		// ADDED 2026-08-12 (user request): bank tab buttons, so a caller can switch to a
+		// specific tab (e.g. a dedicated herb-storage tab) instead of using the search box.
+		// index 0 is the "view all" tab; 1-9 are the player's actual numbered tabs. NOT YET
+		// VERIFIED LIVE which of getChildren()/getDynamicChildren() TABS actually populates --
+		// tries the (more likely, for a fixed-count UI element) static getChildren() first, same
+		// epistemic-honesty convention as this project's other live-verification-needed
+		// assumptions (see controller.py's type_digits_and_enter).
+		List<Map<String, Object>> tabs = new ArrayList<>();
+		Widget tabsContainer = client.getWidget(InterfaceID.Bankmain.TABS);
+		Widget[] tabChildren = tabsContainer != null ? tabsContainer.getChildren() : null;
+		if (tabChildren == null && tabsContainer != null)
+		{
+			tabChildren = tabsContainer.getDynamicChildren();
+		}
+		if (tabChildren != null)
+		{
+			for (int i = 0; i < tabChildren.length; i++)
+			{
+				Widget child = tabChildren[i];
+				if (child == null || child.isHidden())
+				{
+					continue;
+				}
+				Map<String, Object> point = boundsPoint(child);
+				if (point.containsKey("screenX"))
+				{
+					point.put("index", i);
+					tabs.add(point);
+				}
+			}
+		}
+		data.put("tabs", tabs);
+
 		return data;
 	}
 

@@ -39,10 +39,11 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   `ExamplePluginTest.main`, which loads the Controller plugin and starts the bridge.
 - **A routine**: `python -u controller.py routines/<name>.py` (from `ControllerAddon/`). Runs
   until the panic key (F1) is pressed, a safety stop triggers, or the process is killed.
-- **MCP debug server** (`osrs-debug` in `.mcp.json`): read-only bridge queries plus
-  `move_mouse`/`click_entity`/`click_menu_entry` for live interactive debugging *without* a
-  routine running — but it needs the same Arduino serial port `controller.py` does, so only one
-  of the two can be running at a time (see the workflow below).
+- **MCP debug server** (`osrs-debug` in `.mcp.json`): read-only bridge queries
+  (`bridge_get`/`get_cursor_position`/`poll_events`) only — no mouse/keyboard action tools, so it
+  never touches the Arduino serial port and can stay connected for the whole session, including
+  while `controller.py` is running. (Action tools were removed 2026-08-12; if live click/mouse
+  debugging is needed again, drive it through `controller.py` itself.)
 - **Tests**: `python -m pytest tests/` from `ControllerAddon/`.
 
 ## The routine contract
@@ -78,8 +79,9 @@ notes below for a real example of this causing a bug.
   anti-detection humanization, not a targeting bug — code that reacts to a click's outcome must
   handle this (see golem_crafting.py's mining reclick gate for an example of a bug this caused:
   waiting forever for an inventory change that a misclick will never produce).
-- **Arduino / MCP server / controller.py serial port conflict**: only one process can hold the
-  COM port at a time. Read-only bridge HTTP queries don't need it and work regardless.
+- **Arduino serial port**: only one process can hold the COM port at a time. The MCP debug
+  server no longer touches it at all (read-only bridge queries only, see above) — the only real
+  contender is a stray/leftover `controller.py` process.
 - **`ctx.state.data` reset on restart** (see above) can desync from real in-game state that
   persists — always consider whether a routine needs to reconcile against a live bridge read
   (e.g. an object's actual name) rather than trusting its own resumed bookkeeping.

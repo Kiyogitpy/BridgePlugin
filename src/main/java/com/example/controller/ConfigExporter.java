@@ -223,6 +223,31 @@ public final class ConfigExporter
 		return data;
 	}
 
+	public static Map<String, Object> exportMasteringMixology(ControllerConfig config)
+	{
+		Map<String, Object> data = new LinkedHashMap<>();
+		data.put("enabled", config.masteringMixologyEnabled());
+
+		Map<String, Object> bank = new LinkedHashMap<>();
+		bank.put("teleportFallback", config.masteringMixologyBankTeleportFallback());
+		data.put("bank", bank);
+
+		Map<String, Object> digweed = new LinkedHashMap<>();
+		digweed.put("enabled", config.masteringMixologyDigweedEnabled());
+		data.put("digweed", digweed);
+
+		Map<String, Object> speedups = new LinkedHashMap<>();
+		boolean speedupsEnabled = config.masteringMixologySpeedupsEnabled();
+		speedups.put("retort", speedupsEnabled);
+		speedups.put("agitator", speedupsEnabled);
+		speedups.put("alembic", speedupsEnabled);
+		data.put("speedups", speedups);
+
+		data.put("breaks", sharedBreaks(config));
+		data.put("safety", sharedSafety(config));
+		return data;
+	}
+
 	/** Breaks shape shared by every routine's export -- read from ControllerConfig's shared
 	 * Breaks section rather than a routine-specific duplicate (see this plan's Collision Table). */
 	private static Map<String, Object> sharedBreaks(ControllerConfig config)

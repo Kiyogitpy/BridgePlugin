@@ -120,6 +120,8 @@ public class ControllerPlugin extends Plugin
 		new SlayerConfigProvider(client, clientThread, server, config).register();
 		new MenuStateProvider(client, clientThread, server).register();
 		new SpellbookProvider(client, clientThread, server).register();
+		new MixologyProvider(client, clientThread, server).register();
+		new LastActionProvider(client, clientThread, server, eventBus).register();
 
 		server.register("/mining-config", () -> ConfigExporter.exportMining(config));
 		server.register("/gemstone-crab-config", () -> ConfigExporter.exportGemstoneCrab(config));
@@ -127,6 +129,7 @@ public class ControllerPlugin extends Plugin
 		server.register("/firemaking-config", () -> ConfigExporter.exportFiremaking(config));
 		server.register("/blast-furnace-config", () -> ConfigExporter.exportBlastFurnace(config));
 		server.register("/golem-crafting-config", () -> ConfigExporter.exportGolemCrafting(config));
+		server.register("/mastering-mixology-config", () -> ConfigExporter.exportMasteringMixology(config));
 
 		try
 		{

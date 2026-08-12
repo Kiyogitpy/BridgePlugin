@@ -143,6 +143,50 @@ def get_player():
     return api_get("/player") or {}
 
 
+def _player_activity_snapshot():
+    """(animation, poseAnimation, x, y) -- the fields that actually change while the player is
+    either mid-action (animation) or physically walking (x/y; poseAnimation also flips between
+    stand/walk/run poses). Two consecutive identical snapshots is the direct signal that the
+    player is genuinely idle right now."""
+    p = get_player()
+    return (p.get("animation"), p.get("poseAnimation"), p.get("x"), p.get("y"))
+
+
+def wait_until_player_idle(timeout_s: float = 5.0, stable_reads: int = 2,
+                            poll_interval_s: float = 0.15) -> bool:
+    """Polls until the player's activity snapshot (see _player_activity_snapshot) holds
+    unchanged across `stable_reads` consecutive polls, or timeout_s elapses. Returns True once
+    idle, False if still busy/moving when the timeout hits.
+
+    REPLACES an earlier camera-yaw/pitch-based settle check (wait_until_camera_settled/
+    is_camera_settled, removed 2026-08-12) that turned out NOT to be the right signal --
+    CONFIRMED live: this minigame's camera retargets almost every tick as the player character
+    turns to face whatever it's about to interact with next, so cameraYaw==cameraYawTarget held
+    on nearly every poll even while the net on-screen position kept drifting tick over tick
+    (user report: "bunch of wild clicks still camera thing seems not solved" even after gating
+    every world-object click on that signal). Direct live reads during that same investigation
+    also showed the player's own x/y genuinely shifting a few tiles between lever pulls
+    (levers aren't all reachable from one standing tile), which a camera-only signal can't see
+    at all. animation/poseAnimation/x/y together cover both dimensions this needs: "is an action
+    still playing" and "is the player still physically moving" -- CONFIRMED via user directive
+    2026-08-12 ("lets scrap the camera bullshit ... We go with animation instead") to replace
+    the camera signal with this one. Callers about to trust a screen position should wait for
+    this before resolving/clicking a world object, the same way the old camera check was used."""
+    deadline = time.time() + timeout_s
+    last, stable = None, 0
+    while time.time() < deadline:
+        snap = _player_activity_snapshot()
+        if snap == last:
+            stable += 1
+            if stable >= stable_reads:
+                return True
+        else:
+            stable = 0
+        last = snap
+        time.sleep(poll_interval_s)
+    return False
+
+
 def get_combat():
     return api_get("/combat") or {}
 
@@ -259,6 +303,17 @@ def get_blast_furnace_config():
 
 def get_golem_crafting_config():
     return api_get("/golem-crafting-config")
+
+
+def get_mastering_mixology_config():
+    return api_get("/mastering-mixology-config")
+
+
+def get_mixology_state():
+    return api_get("/mixology-state") or {
+        "inLab": False, "orders": [], "hopper": {"mox": 0, "aga": 0, "lye": 0},
+        "stations": {}, "digweed": {},
+    }
 
 
 def get_minimap_walk_point(x: int, y: int, plane: int):
@@ -1494,6 +1549,7 @@ ROUTINE_FILES = {
     "FIREMAKING": "routines/firemaking.py",
     "BLAST_FURNACE": "routines/blast_furnace.py",
     "GOLEM_CRAFTING": "routines/golem_crafting.py",
+    "MASTERING_MIXOLOGY": "routines/mastering_mixology.py",
 }
 
 

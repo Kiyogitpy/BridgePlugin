@@ -359,6 +359,17 @@ public class ObjectProvider extends BridgeProvider
 			comp = comp.getImpostor();
 		}
 		data.put("name", comp != null ? comp.getName() : "Unknown");
+		// ADDED 2026-08-12 (Mastering Mixology live verification): "id" above is deliberately left
+		// as the object's raw base/impostor-table id -- unchanged, since other routines (e.g.
+		// golem_crafting.py's plinth tracking) rely on it staying stable as an identity key across
+		// a multiloc object's own state changes. But some routines need the OPPOSITE: which content
+		// variant is currently showing (e.g. Mastering Mixology's mixing vessel/retort/agitator/
+		// alembic, whose "id" always reports 55395/55389/55390/55391 -- the multiloc's own base
+		// definition id -- regardless of what potion, if any, is actually in it; CONFIRMED live
+		// 2026-08-12: the vessel showed id=55395 name="Mixing vessel (Empty)", never the
+		// content-variant ids 54918-54928 the plan's VESSEL_ID_TO_BASE table expects). This field
+		// is the impostor-resolved id (same as "id" for a non-multiloc object) for exactly that use.
+		data.put("impostorId", comp != null ? comp.getId() : obj.getId());
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
 		data.put("plane", wp.getPlane());
