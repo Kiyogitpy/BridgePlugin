@@ -15,30 +15,24 @@ import java.util.Map;
 
 public class ObjectProvider extends BridgeProvider
 {
-	// Walking the whole scene's tile grid (and building screen-projection/composition data for
-	// every object in it) is real, non-trivial work on the client thread -- cheap for one call,
-	// but a caller hitting this endpoint faster than the game state actually changes (confirmed:
-	// something was polling /objects, /tiles, and /ground-items multiple times a second) turns
-	// into repeated full scene walks and was a real, measurable source of client stutter. The
-	// scene only changes once per game tick regardless of how often this is polled, so caching by
-	// tick count adds no real staleness while capping the expensive work to once per tick no
-	// matter how many times something calls in.
-	private int cachedTick = -1;
-	// -1 means "no radius filter" (the old full-scene behavior) -- distinct from any real radius
-	// value so a radius-bounded call and an unbounded call in the same tick don't share a stale
-	// cache entry for the wrong scope.
-	private int cachedRadius = -1;
-	private List<Map<String, Object>> cachedObjects;
+	// See BankProvider's identical comment for why this is cached, and TickCache/TickClock for
+	// how. radius is passed as TickCache's extra key (see ObjectProvider's own historical note
+	// on why a radius-bounded call and an unbounded one must not share a cache entry) -- unlike
+	// the old cachedRadius field, TickCache's Objects.equals-based key comparison handles a null
+	// radius as its own distinct key with no sentinel value needed.
+	private final TickClock tickClock;
+	private final TickCache<List<Map<String, Object>>> cache = new TickCache<>();
 
-	public ObjectProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
+	public ObjectProvider(Client client, ClientThread clientThread, BridgeHttpServer server, TickClock tickClock)
 	{
 		super(client, clientThread, server);
+		this.tickClock = tickClock;
 	}
 
 	@Override
 	public void register()
 	{
-		server.registerQuery("/objects", query -> onClient(() -> getObjects(query)));
+		server.registerQuery("/objects", this::getObjects);
 		server.registerQuery("/debug-objects-all-planes", query -> onClient(() -> getObjectsAllPlanes(query)));
 	}
 
@@ -56,16 +50,9 @@ public class ObjectProvider extends BridgeProvider
 			{
 			}
 		}
-		int radiusKey = radius == null ? -1 : radius;
+		Integer finalRadius = radius;
 
-		int tick = client.getTickCount();
-		if (cachedObjects == null || tick != cachedTick || radiusKey != cachedRadius)
-		{
-			cachedObjects = computeObjects(radius);
-			cachedTick = tick;
-			cachedRadius = radiusKey;
-		}
-		return cachedObjects;
+		return cache.get(tickClock.get(), isFresh(query), radius, () -> (List<Map<String, Object>>) onClient(() -> computeObjects(finalRadius)));
 	}
 
 	// ADDED 2026-08-08 (user investigation): debug-only, uncached, deliberately not the normal

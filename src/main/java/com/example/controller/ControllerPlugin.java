@@ -2,6 +2,7 @@ package com.example.controller;
 
 import com.example.bridge.BridgeHttpServer;
 import com.example.providers.*;
+import com.example.providers.TickClock;
 import com.example.tracker.CurrentTargetTrackerFactory;
 import com.example.tracker.NpcTrackerRegistry;
 import com.example.util.UdpEventSender;
@@ -95,6 +96,9 @@ public class ControllerPlugin extends Plugin
 		server = new BridgeHttpServer();
 		server.start(HTTP_PORT);
 
+		TickClock tickClock = new TickClock();
+		tickClock.register(eventBus);
+
 		new GameStateProvider(client, clientThread, server).register();
 		new PlayerProvider(client, clientThread, server).register();
 		new PvpProvider(client, clientThread, server).register();
@@ -104,13 +108,13 @@ public class ControllerPlugin extends Plugin
 		new CameraProvider(client, clientThread, server).register();
 		new EquipmentProvider(client, clientThread, server).register();
 		new InventoryProvider(client, clientThread, server).register();
-		new BankProvider(client, clientThread, server).register();
+		new BankProvider(client, clientThread, server, tickClock).register();
 		new SailingProvider(client, clientThread, server, eventBus).register();
-		new NPCProvider(client, clientThread, server).register();
-		new ObjectProvider(client, clientThread, server).register();
-		new GroundItemProvider(client, clientThread, server, itemManager).register();
-		new GraphicsObjectProvider(client, clientThread, server).register();
-		new TileProvider(client, clientThread, server).register();
+		new NPCProvider(client, clientThread, server, tickClock).register();
+		new ObjectProvider(client, clientThread, server, tickClock).register();
+		new GroundItemProvider(client, clientThread, server, itemManager, tickClock).register();
+		new GraphicsObjectProvider(client, clientThread, server, tickClock).register();
+		new TileProvider(client, clientThread, server, tickClock).register();
 		new ConfigProvider(client, clientThread, server, config).register();
 		new ConsumablesProvider(client, clientThread, server, config).register();
 		new LoginProvider(client, clientThread, server).register();

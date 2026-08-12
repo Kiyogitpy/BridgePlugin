@@ -19,33 +19,29 @@ import java.util.Map;
 
 public class BankProvider extends BridgeProvider
 {
-	// Same reasoning as ObjectProvider/NPCProvider/GroundItemProvider/TileProvider -- a bank can
-	// hold hundreds of slots, each needing a widget-bounds/composition lookup, and banker.py
-	// polls this repeatedly for the whole duration of a banking trip. Caching by tick count caps
-	// that walk to once per tick no matter how many times something calls in.
-	private int cachedTick = -1;
-	private Map<String, Object> cachedBank;
+	// Cached per game tick via TickCache -- banker.py polls this repeatedly for the whole
+	// duration of a banking trip, and a bank can hold hundreds of slots each needing a
+	// widget-bounds/composition lookup, so capping that work to once per tick (unless fresh=true
+	// is passed, see BridgeProvider.isFresh) matters the same way it did before this moved into
+	// a shared cache.
+	private final TickClock tickClock;
+	private final TickCache<Map<String, Object>> cache = new TickCache<>();
 
-	public BankProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
+	public BankProvider(Client client, ClientThread clientThread, BridgeHttpServer server, TickClock tickClock)
 	{
 		super(client, clientThread, server);
+		this.tickClock = tickClock;
 	}
 
 	@Override
 	public void register()
 	{
-		server.register("/bank", () -> onClient(this::getBank));
+		server.registerQuery("/bank", query -> getBank(isFresh(query)));
 	}
 
-	private Object getBank()
+	private Object getBank(boolean fresh)
 	{
-		int tick = client.getTickCount();
-		if (cachedBank == null || tick != cachedTick)
-		{
-			cachedBank = computeBank();
-			cachedTick = tick;
-		}
-		return cachedBank;
+		return cache.get(tickClock.get(), fresh, null, () -> (Map<String, Object>) onClient(this::computeBank));
 	}
 
 	private Map<String, Object> computeBank()

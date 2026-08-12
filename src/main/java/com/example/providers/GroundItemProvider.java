@@ -17,35 +17,27 @@ public class GroundItemProvider extends BridgeProvider
 {
 	private final ItemManager itemManager;
 
-	// See ObjectProvider's identical cache for why -- walking the whole tile grid is real work,
-	// and a caller polling faster than the game state changes (confirmed: something was hitting
-	// /ground-items, /objects, and /tiles multiple times a second) turns that into repeated full
-	// walks and was a real, measurable source of client stutter. Ground items only change once
-	// per game tick regardless of poll rate, so caching by tick count adds no real staleness.
-	private int cachedTick = -1;
-	private List<Map<String, Object>> cachedGroundItems;
+	// See BankProvider's identical comment for why this is cached, and TickCache/TickClock for
+	// how.
+	private final TickClock tickClock;
+	private final TickCache<List<Map<String, Object>>> cache = new TickCache<>();
 
-	public GroundItemProvider(Client client, ClientThread clientThread, BridgeHttpServer server, ItemManager itemManager)
+	public GroundItemProvider(Client client, ClientThread clientThread, BridgeHttpServer server, ItemManager itemManager, TickClock tickClock)
 	{
 		super(client, clientThread, server);
 		this.itemManager = itemManager;
+		this.tickClock = tickClock;
 	}
 
 	@Override
 	public void register()
 	{
-		server.register("/ground-items", () -> onClient(this::getGroundItems));
+		server.registerQuery("/ground-items", query -> getGroundItems(isFresh(query)));
 	}
 
-	private Object getGroundItems()
+	private Object getGroundItems(boolean fresh)
 	{
-		int tick = client.getTickCount();
-		if (cachedGroundItems == null || tick != cachedTick)
-		{
-			cachedGroundItems = computeGroundItems();
-			cachedTick = tick;
-		}
-		return cachedGroundItems;
+		return cache.get(tickClock.get(), fresh, null, () -> (List<Map<String, Object>>) onClient(this::computeGroundItems));
 	}
 
 	private List<Map<String, Object>> computeGroundItems()
