@@ -306,3 +306,108 @@ def mix_phase(ctx, config: dict) -> None:
             controller.click_entity(ctx.ser, base_item, check_ui_blockers=False)
             time.sleep(random.uniform(0.3, 0.5))
             ctx.state.data["mm_have_digweed"] = False
+
+
+# Confirmed graphics-object ids for each station's speedup click-now cue (see this plan's
+# Global Constraints) -- read via the existing /graphics-objects endpoint, no new Java needed.
+AGITATOR_CUE_GRAPHICS_ID = 2954
+ALEMBIC_CUE_GRAPHICS_ID = 2955
+
+STATION_ORDER = ["Alembic", "Retort", "Agitator"]  # wiki's own recommended pathing order
+STATION_STATE_KEY = {"Alembic": "alembic", "Retort": "retort", "Agitator": "agitator"}
+
+
+def process_phase(ctx, config: dict) -> None:
+    unprocessed = [i for i in controller.get_inventory() if i.get("name") in RECIPE_TABLE]
+    if not unprocessed:
+        ctx.state.data["mm_phase"] = "deposit"
+        return
+
+    # Which station a base needs is per-order, not fixed per potion name (see Global
+    # Constraints/design doc) -- read from the order that's still in ctx.state.data rather than
+    # guessing, since mm_chosen_orders already carries each chosen order's "station" field.
+    chosen = ctx.state.data.get("mm_chosen_orders", [])
+    station_for_name = {o.get("name"): o.get("station") for o in chosen}
+
+    for station_name in STATION_ORDER:
+        station = find_object(station_name)
+        if station is None:
+            continue
+        due = [i for i in unprocessed if station_for_name.get(i.get("name")) == station_name]
+        for potion in due:
+            _process_one(ctx, config, station_name, station, potion)
+
+    ctx.state.data["mm_phase"] = "deposit"
+
+
+def _process_one(ctx, config: dict, station_name: str, station: dict, potion: dict) -> None:
+    controller.click_entity(ctx.ser, station, check_ui_blockers=False)
+    time.sleep(random.uniform(0.4, 0.6))
+
+    speedups = config.get("speedups", DEFAULT_CONFIG["speedups"])
+    if station_name == "Retort" and speedups.get("retort"):
+        _process_retort_speedup(ctx, station)
+    elif station_name == "Agitator" and speedups.get("agitator"):
+        _process_agitator_speedup(ctx, station)
+    elif station_name == "Alembic" and speedups.get("alembic"):
+        _process_alembic_speedup(ctx, station)
+
+    # Wait for the station to finish and the processed potion to land back in inventory --
+    # polled via inventory count, same confirmation idiom as golem_crafting.py's chisel_phase.
+    deadline = time.time() + 20.0
+    starting_count = len(controller.get_inventory())
+    while time.time() < deadline:
+        time.sleep(0.3)
+        if len(controller.get_inventory()) != starting_count:
+            return
+
+
+def _process_retort_speedup(ctx, station: dict) -> None:
+    """No timing window (confirmed: the reference plugin tracks no varbit/graphics cue for the
+    Retort at all, consistent with the wiki's "click every tick" description) -- click every
+    tick while /mixology-state still reports a potion loaded in the Retort."""
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
+        state = controller.get_mixology_state()
+        if not state.get("stations", {}).get("retort", {}).get("potionName"):
+            return
+        controller.click_entity(ctx.ser, station, check_ui_blockers=False)
+        time.sleep(random.uniform(0.55, 0.75))  # one game tick
+
+
+def _process_agitator_speedup(ctx, station: dict) -> None:
+    """Click again when graphics-object id 2954 (VFX_MACHINERY_ALCHEMY01_AGITATOR01) appears at
+    the Agitator's tile -- the visual "fireworks" cue. Bounded wait: per the wiki, a
+    consistently-missed window is worse than not attempting the speedup, so this gives up
+    cleanly rather than risking a late click against a closed window."""
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        graphics = controller.get_graphics_objects()
+        cue = next(
+            (g for g in graphics
+             if g.get("id") == AGITATOR_CUE_GRAPHICS_ID
+             and g.get("x") == station.get("x") and g.get("y") == station.get("y")),
+            None,
+        )
+        if cue is not None:
+            controller.click_entity(ctx.ser, station, check_ui_blockers=False)
+            return
+        time.sleep(0.15)
+
+
+def _process_alembic_speedup(ctx, station: dict) -> None:
+    """Same shape as the Agitator's speedup -- click again when graphics-object id 2955
+    (VFX_MACHINERY_ALCHEMY01_ALEMBIC01) appears at the Alembic's tile."""
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        graphics = controller.get_graphics_objects()
+        cue = next(
+            (g for g in graphics
+             if g.get("id") == ALEMBIC_CUE_GRAPHICS_ID
+             and g.get("x") == station.get("x") and g.get("y") == station.get("y")),
+            None,
+        )
+        if cue is not None:
+            controller.click_entity(ctx.ser, station, check_ui_blockers=False)
+            return
+        time.sleep(0.15)
