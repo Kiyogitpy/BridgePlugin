@@ -23,7 +23,10 @@ public class TickCache<T>
 	 *                    radius); pass null for providers with no extra key
 	 * @param compute     produces a fresh value; only invoked on an actual cache miss
 	 */
-	public T get(int currentTick, boolean forceFresh, Object key, Supplier<T> compute)
+	// synchronized -- callers now run on arbitrary HTTP worker threads (see BridgeHttpServer's
+	// thread pool), not RuneLite's client thread, so concurrent requests to the same cache
+	// instance need this to avoid racing on cachedTick/cachedKey/cached/hasValue.
+	public synchronized T get(int currentTick, boolean forceFresh, Object key, Supplier<T> compute)
 	{
 		if (forceFresh || !hasValue || currentTick != cachedTick || !Objects.equals(key, cachedKey))
 		{
