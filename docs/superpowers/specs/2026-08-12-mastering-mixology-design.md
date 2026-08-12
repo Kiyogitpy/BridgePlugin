@@ -24,9 +24,9 @@ and it eliminates the live-investigation blocker an earlier version of this desi
    orders → mix → process → deposit), optimizing for maximum total points per paste (see
    "Optimization strategy" below), with digweed collection and processing-station speedup clicks.
 2. A new Java provider, `MixologyProvider`, exposing the 3 active orders, hopper paste totals,
-   mixing vessel slot contents, each processing station's current potion + progress, and digweed
-   corner state — all via direct varbit reads (see Design). Fully specifiable now; no live
-   session is needed to write it, only to confirm it against the real game (Testing).
+   each processing station's current potion + progress, and digweed corner state — all via
+   direct varbit reads (see Design). Fully specifiable now; no live session is needed to write
+   it, only to confirm it against the real game (Testing).
 3. Wiring: `ROUTINE_FILES` in `controller.py`, a new `MASTERING_MIXOLOGY` entry in
    `RoutineChoice.java`, a new config section in `ControllerConfig.java`, and
    `ConfigExporter.exportMasteringMixology()`.
@@ -115,30 +115,32 @@ section is kept only so a future reader doesn't waste time re-deriving what chan
 - **Location**: Aldarin, members. A bank chest exists in the lab itself. Region id `5521`, plane
   `0`, is the lab region (`isInLabRegion` in the reference plugin) — a cheap "is the player even
   in the right area" check independent of any specific object being visible.
-- **Physical objects are multiloc (impostor) objects**, not the 11-separate-static-ids model this
-  design's first draft assumed. `ObjectID1` has both a "base" id per station (e.g.
-  `MM_LAB_MACHINE_RETORT = 55389`) and the 11 content-variant ids (`MM_LAB_MACHINE_RETORT_EMPTY`
-  through `..._MAL`) the game swaps the base id's *impostor* to, driven by the same varbits below
-  — the same pattern `ObjectProvider.java` already resolves generically via
-  `ObjectComposition.getImpostor()`. This means **`find_object("Retort")`-by-name (this
-  codebase's existing convention, per `golem_crafting.py`) already works correctly today**,
-  without needing any of the 11 variant ids — they're listed below only because
-  `MixologyProvider` reads current content from varbits directly, which is simpler and more
-  precise than inferring it from whichever id the object happens to resolve to.
+- **Physical objects are multiloc (impostor) objects**: `ObjectID`/`ObjectID1` has both a "base"
+  id per station (e.g. `MM_LAB_MACHINE_RETORT = 55389`) and 11 content-variant ids
+  (`MM_LAB_MACHINE_RETORT_EMPTY` through `..._MAL`) the game swaps the base id's *impostor* to —
+  the same pattern `ObjectProvider.java` already resolves generically via
+  `ObjectComposition.getImpostor()`. This confirms two things at once: `find_object("Retort")`-
+  by-name (this codebase's existing convention, per `golem_crafting.py`) already works correctly
+  today, **and** the 11 variant ids are directly usable as an authoritative "what does this
+  station/the vessel currently hold" signal via the existing `/objects` endpoint's returned `id`
+  — no varbit or new provider field needed for this specific question, since (unlike the hopper
+  totals or the unused mixer-slot varbits above) these ids are fully confirmed by direct jar
+  lookup, not inferred from a name.
   - Refiner: `MM_LAB_MILL` (`54904`), option "Operate".
   - Levers: Mox `MM_LAB_SWITCH_MOX` (`54868`), Aga `MM_LAB_SWITCH_AGA` (`54867`), Lye
     `MM_LAB_SWITCH_LYE` (`54869`), option "Operate" (10 paste per pull from the hopper; a 4th
     pull on a full vessel overrides the *oldest* selected paste, returning it to the hopper
-    rather than wasting it — confirmed both by the wiki and by the plugin's own vessel-slot
-    varbit model, see below).
+    rather than wasting it, per the wiki).
   - Hopper: `MM_LAB_HOPPER` (`54903`), option "Deposit" (max 3,000 per paste type).
-  - Mixing vessel: `MM_LAB_VESSEL` (`55395`, base/impostor id), option "Take-from".
+  - Mixing vessel: `MM_LAB_VESSEL` (`55395`, base/impostor id), option "Take-from". Content
+    variants (`/objects`' returned `id`): `54918` empty, then `54919`-`54928` in the same order
+    as the Recipe/points table below (`54919`=Mammoth-might mix ... `54928`=Mixalot).
   - Retort (Concentrate): `MM_LAB_MACHINE_RETORT` (`55389`, base/impostor id), option
-    "Concentrate-potion" (+"Check").
+    "Concentrate-potion" (+"Check"). Content variants `54870`-`54880`, same order.
   - Agitator (Homogenise): `MM_LAB_MACHINE_AGITATOR` (`55390`), option "Homogenise-potion"
-    (+"Check").
+    (+"Check"). Content variants `54881`-`54891`, same order.
   - Alembic (Crystalise): `MM_LAB_MACHINE_ALEMBIC` (`55391`), option "Crystalise-potion"
-    (+"Check").
+    (+"Check"). Content variants `54892`-`54902`, same order.
   - Conveyor belt: `MM_LAB_CONVEYOR` (`54917`), option "Fulfil-order" (deposits up to 3 potions
     at once, fulfilling as many current orders as possible; refreshes all 3 orders regardless of
     match).
@@ -151,15 +153,21 @@ section is kept only so a future reader doesn't waste time re-deriving what chan
     `MM_LAB_ORDER_3_TYPE` / `_MODIFIER` (ids `11315`-`11320`) — each order's potion-type index
     and processing-modifier index, both **1-indexed** (0 = no order yet / slot empty; real values
     are `client.getVarbitValue(id) - 1`, indexing into the tables below).
-  - `MM_AVAILABLE_MOX` / `_AGA` / `_LYE` (ids `11431`-`11433`) — current hopper paste totals.
-    Notably **not** read by the reference plugin at all (its own overlay doesn't display them),
-    found instead by scanning the full `VarbitID` class for the `MM_*` prefix rather than only
-    following the plugin's own usages — worth remembering as a research technique: a reference
-    implementation shows what its author needed, not everything that exists.
-  - `MM_LAB_MIXER_SLOT_0` / `_1` / `_2` (ids `11324`-`11326`) — the mixing vessel's 3 currently
-    loaded paste slots, in pull order. More precise than inferring content from the vessel
-    object's resolved impostor id (this design's first draft), since it exposes state mid-fill,
-    not just once all 3 are loaded.
+  - `MM_AVAILABLE_MOX` / `_AGA` / `_LYE` (ids `11431`-`11433`) — presumed current hopper paste
+    totals, based on naming alone. **Lower confidence than everything else in this list**: the
+    reference plugin never reads these (its own overlay doesn't display hopper totals), so unlike
+    every other varbit here, no consuming code confirms their value is a plain integer count.
+    Still the best lead found for the one piece of state this design never had another source
+    for — worth a quick live check (read it, compare against the displayed hopper count) rather
+    than trusting it outright, but that's a narrow one-field confirmation, not the "discover an
+    entire unmapped system" task this used to be.
+  - `MM_LAB_MIXER_SLOT_0` / `_1` / `_2` (ids `11324`-`11326`) exist and are presumably the
+    vessel's 3 loading slots, but — same caveat as above — nothing in the reference plugin reads
+    them, so their value encoding (which integer means which paste) is unconfirmed. **Not used by
+    this design**: the vessel's own resolved object id (see the physical-objects list above,
+    fully confirmed via both the wiki and the `ObjectID`/`ObjectID1` jar dump) already gives an
+    authoritative "what does the vessel currently hold" answer once a base is complete, via the
+    existing `/objects` endpoint — no new provider field needed for this one.
   - `MM_LAB_AGITATOR_POTION`, `MM_LAB_RETORT_POTION`, `MM_LAB_ALEMBIC_POTION` (ids `11340`-
     `11342`) — each station's currently-loaded potion type index (same 1-indexed convention as
     the order varbits; 0 = station empty).
@@ -172,9 +180,9 @@ section is kept only so a future reader doesn't waste time re-deriving what chan
     which persists across its visual duration rather than a single tick.
   - `MM_HERB_READY_1` / `_2` / `_3` / `_4` (ids `11330`-`11333`) — 1 when that corner's digweed is
     collectible, matching the `AlchemyObject` corner order above (NE/SE/SW/NW).
-  - `MM_LAB_VESSEL_READY` (id `11339`) — mirrors whether the vessel currently holds a
-    take-able finished base (referenced by the plugin but not otherwise needed here, since the
-    3 mixer-slot varbits already give strictly more detail).
+  - `MM_LAB_VESSEL_READY` (id `11339`) exists (referenced by the plugin) but isn't used by this
+    design — the vessel's own resolved object id already answers "what does it currently hold,"
+    including the empty case, via the confirmed content-variant ids above.
 - **Speedup graphics cues** (`net.runelite.api.gameval.SpotanimID`, confirmed present):
   `VFX_MACHINERY_ALCHEMY01_AGITATOR01` (`2954`) and `VFX_MACHINERY_ALCHEMY01_ALEMBIC01` (`2955`)
   — these are the exact graphics-object ids `GraphicsObjectProvider.java` (already built, generic,
@@ -190,18 +198,18 @@ section is kept only so a future reader doesn't waste time re-deriving what chan
   Mixology.txt`'s rewards table); XP values are the reference plugin's own constants, cross-
   checked against the wiki and consistent:
 
-  | idx | Name | mox/aga/lye | Modifier idx → station | Points | XP |
-  |---|---|---|---|---|---|
-  | 0 | Mammoth-might mix | 3/0/0 | | 20 | 190 |
-  | 1 | Mystic mana amalgam | 2/1/0 | | 30 | 215 |
-  | 2 | Marley's moonlight | 2/0/1 | | 30 | 240 |
-  | 3 | Alco-augmentator | 0/3/0 | | 20 | 190 |
-  | 4 | Azure aura mix | 1/2/0 | | 30 | 265 |
-  | 5 | Aqualux amalgam | 0/2/1 | | 30 | 290 |
-  | 6 | Liplack liquor | 0/0/3 | | 20 | 190 |
-  | 7 | Megalite liquid | 1/0/2 | | 30 | 315 |
-  | 8 | Anti-leech lotion | 0/1/2 | | 30 | 340 |
-  | 9 | Mixalot | 1/1/1 | | 60 | 365 |
+  | idx | Name | mox/aga/lye | Points | XP |
+  |---|---|---|---|---|
+  | 0 | Mammoth-might mix | 3/0/0 | 20 | 190 |
+  | 1 | Mystic mana amalgam | 2/1/0 | 30 | 215 |
+  | 2 | Marley's moonlight | 2/0/1 | 30 | 240 |
+  | 3 | Alco-augmentator | 0/3/0 | 20 | 190 |
+  | 4 | Azure aura mix | 1/2/0 | 30 | 265 |
+  | 5 | Aqualux amalgam | 0/2/1 | 30 | 290 |
+  | 6 | Liplack liquor | 0/0/3 | 20 | 190 |
+  | 7 | Megalite liquid | 1/0/2 | 30 | 315 |
+  | 8 | Anti-leech lotion | 0/1/2 | 30 | 340 |
+  | 9 | Mixalot | 1/1/1 | 60 | 365 |
 
   Modifier idx 0 = Homogenised (Agitator), 1 = Concentrated (Retort), 2 = Crystalised (Alembic) —
   **which station a given order uses is per-order, not fixed per potion name** (the same base can
@@ -231,7 +239,6 @@ GET /mixology-state
     ...
   ],
   "hopper": {"mox": 850, "aga": 1000, "lye": 620},
-  "vesselSlots": ["mox", "aga", null],
   "stations": {
     "retort": {"potionName": "Mammoth-might mix", "progress": 12},
     "agitator": {"potionName": null, "progress": 0},
@@ -293,9 +300,9 @@ dispatched from `tick(ctx)`:
   apply the max-points rule (see "Optimization strategy") to the 3 returned orders, recording the
   chosen subset in `ctx.state.data`. → `mix`.
 - **`mix`**: for each chosen order, pull the 3 levers matching its combination, then take from
-  the mixing vessel — **reading `vesselSlots` after each pull to confirm the actual contents
-  match what was intended**, not just trusting the pull count (see Error handling). Repeat per
-  chosen order. → `process`.
+  the mixing vessel — **reading the vessel's own resolved object id afterward to confirm its
+  actual content matches what was intended** (via the confirmed content-variant ids above), not
+  just trusting the pull count (see Error handling). Repeat per chosen order. → `process`.
 - **`process`**: walk Alembic → Retort → Agitator (per the wiki's efficient-pathing order),
   processing every unprocessed potion of the matching type currently held, applying the
   configured speedup clicks per station — Retort clicks every tick while
@@ -335,7 +342,7 @@ One-shot Herblore 60 / Children of the Sun pre-flight check, same shape as `blas
 - Hard safety-stops: `/mixology-state`'s `inLab` false or none of the known fixtures found
   nearby (wrong location), no configured herb candidates left in the bank for a paste type the
   current strategy needs, sub-60 Herblore or incomplete Children of the Sun (pre-flight check).
-- **Always re-read hopper totals, vessel slot contents, station state, and active orders from the
+- **Always re-read hopper totals, vessel content, station state, and active orders from the
   bridge rather than tracking them locally.** This is the same class of bug this codebase just
   spent a full project fixing in the HTTP bridge's own caching (see
   `docs/superpowers/specs/2026-08-12-bridge-tick-cache-freshness-design.md`): trusting a locally
@@ -345,8 +352,8 @@ One-shot Herblore 60 / Children of the Sun pre-flight check, same shape as `blas
   — especially after a simulated misclick (`CLAUDE.md`'s documented anti-detection humanization,
   `MISTAKE_MISCLICK_CHANCE`). `golem_crafting.py`'s hunt-phase reclick-gate bug (waiting forever
   for an inventory change a misclick will never produce) is the concrete precedent for what
-  happens when this isn't handled — reconcile against `vesselSlots` after every lever pull, don't
-  assume.
+  happens when this isn't handled — reconcile against the vessel's actual resolved object id
+  after every lever pull, don't assume.
 - Speedup timing: per the wiki, a consistently-missed cue costs more than not attempting the
   speedup at all. `speedups.{retort,agitator,alembic}` are independently toggleable so a station
   whose cue proves unreliable to hit in practice (Arduino/physical-click latency against a
