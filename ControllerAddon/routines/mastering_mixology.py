@@ -238,3 +238,71 @@ def _paste_type_of(order: dict) -> str:
     """The single paste type a single-paste order (AAA/MMM/LLL) needs -- whichever of
     mox/aga/lye is non-zero on that order dict."""
     return next(p for p in ("mox", "aga", "lye") if order.get(p, 0) > 0)
+
+
+# Mixing vessel object ids by content, confirmed via direct ObjectID/ObjectID1 jar lookup (see
+# this plan's Global Constraints) -- used to confirm the vessel's actual content after pulling
+# levers, rather than trusting the pull count alone (see Global Constraints' "always re-read...
+# rather than tracking locally").
+VESSEL_ID_TO_BASE = {
+    # This is the wiki-infobox object-id order, NOT the varbit type-index order RECIPE_TABLE
+    # uses -- they genuinely differ (Aqualux amalgam/Azure aura mix and Anti-leech lotion/
+    # Megalite liquid are swapped between the two). See this plan's Global Constraints.
+    54919: "Mammoth-might mix", 54920: "Mystic mana amalgam", 54921: "Marley's moonlight",
+    54922: "Alco-augmentator", 54923: "Aqualux amalgam", 54924: "Azure aura mix",
+    54925: "Liplack liquor", 54926: "Anti-leech lotion", 54927: "Megalite liquid",
+    54928: "Mixalot",
+}
+
+LEVER_NAMES = {"mox": "Mox lever", "aga": "Aga lever", "lye": "Lye lever"}
+
+
+def mix_phase(ctx, config: dict) -> None:
+    chosen = ctx.state.data.get("mm_chosen_orders", [])
+    made = ctx.state.data.get("mm_made_bases", [])
+
+    if len(made) >= len(chosen):
+        ctx.state.data["mm_made_bases"] = []
+        ctx.state.data["mm_phase"] = "process"
+        return
+
+    target_order = chosen[len(made)]
+    pulls = []
+    for paste in ("mox", "aga", "lye"):
+        pulls.extend([paste] * target_order.get(paste, 0))
+
+    for paste in pulls:
+        lever = find_object(LEVER_NAMES[paste])
+        if lever is None:
+            ctx.state.trigger_safety_stop(f"no {LEVER_NAMES[paste]} found near the player")
+            return
+        controller.click_entity(ctx.ser, lever, check_ui_blockers=False)
+        time.sleep(random.uniform(0.5, 0.7))  # one game tick -- levers resolve per-tick
+
+    vessel = find_object("Mixing vessel")
+    if vessel is None:
+        ctx.state.trigger_safety_stop("no mixing vessel found near the player")
+        return
+
+    actual_base = VESSEL_ID_TO_BASE.get(vessel.get("id"))
+    if actual_base != target_order.get("name"):
+        # Vessel content doesn't match what this phase just tried to build -- a misclick on one
+        # of the lever pulls above is the likely cause (see Global Constraints). Don't take a
+        # wrong potion; log and retry the same target_order next tick with the vessel as it
+        # actually is now, not what pulls we think we made.
+        debug_log.log("mixology", f"vessel shows '{actual_base}', expected '{target_order.get('name')}' -- retrying")
+        return
+
+    controller.click_entity(ctx.ser, vessel, check_ui_blockers=False)
+    time.sleep(random.uniform(0.4, 0.6))
+    ctx.state.data["mm_made_bases"] = made + [target_order.get("name")]
+
+    if ctx.state.data.get("mm_have_digweed") and target_order.get("name") == MAL_BASE:
+        digweed_item = find_item("Digweed")
+        base_item = find_item(MAL_BASE)
+        if digweed_item is not None and base_item is not None:
+            controller.click_entity(ctx.ser, digweed_item, check_ui_blockers=False)
+            time.sleep(random.uniform(0.15, 0.3))
+            controller.click_entity(ctx.ser, base_item, check_ui_blockers=False)
+            time.sleep(random.uniform(0.3, 0.5))
+            ctx.state.data["mm_have_digweed"] = False
