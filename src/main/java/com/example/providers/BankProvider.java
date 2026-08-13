@@ -6,6 +6,7 @@ import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetInfo;
 import net.runelite.client.callback.ClientThread;
@@ -133,6 +134,14 @@ public class BankProvider extends BridgeProvider
 			}
 		}
 		data.put("tabs", tabs);
+
+		// ADDED 2026-08-13 (user directive: check before switching tabs instead of always
+		// re-clicking one that might already be active) -- VarbitID.BANK_CURRENTTAB tracks the
+		// currently viewed numbered tab, same 0="view all"/1-9 indexing as the `tabs` list
+		// above. Confirmed present via direct VarbitID inspection (same javap-on-runelite-api
+		// method as this project's other varbit usages, see MixologyProvider.java's own
+		// comment) -- NOT YET VERIFIED LIVE against actual tab-switch behavior.
+		data.put("currentTab", client.getVarbitValue(VarbitID.BANK_CURRENTTAB));
 
 		return data;
 	}

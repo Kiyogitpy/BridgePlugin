@@ -122,6 +122,7 @@ public class ControllerPlugin extends Plugin
 		new SpellbookProvider(client, clientThread, server).register();
 		new MixologyProvider(client, clientThread, server).register();
 		new LastActionProvider(client, clientThread, server, eventBus).register();
+		new LastChatMessageProvider(client, clientThread, server, eventBus).register();
 
 		server.register("/mining-config", () -> ConfigExporter.exportMining(config));
 		server.register("/gemstone-crab-config", () -> ConfigExporter.exportGemstoneCrab(config));

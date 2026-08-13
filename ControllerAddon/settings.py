@@ -14,7 +14,16 @@ import os
 
 # ---------------- Bridge connection ----------------
 API_BASE = "http://localhost:8080"
-UDP_PORT = 50555
+UDP_PORT = 50555          # controller.py's own event stream -- routine on_event dispatch depends
+                           # on this one, only controller.py should ever bind it.
+DEBUG_UDP_PORT = 50556    # mcp_debug_server.py's poll_events -- a SEPARATE port the Java plugin
+                           # fans the same events out to (see UdpEventSender.java), added
+                           # 2026-08-13 after the two ports being the same one caused a real bind
+                           # race: a poll_events() call during a live debugging session bound
+                           # UDP_PORT in the debug server process, and controller.py's own launch
+                           # right after lost the race for that port and crashed
+                           # (OSError [WinError 10048]). Two ports means neither process's own
+                           # bind can ever block the other's.
 
 # ---------------- Arduino serial connection ----------------
 SERIAL_PORT = os.environ.get("BRIDGE_SERIAL_PORT", "COM6")

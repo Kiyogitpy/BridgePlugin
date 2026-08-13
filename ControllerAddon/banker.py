@@ -140,9 +140,10 @@ def open_bank(ctx, bank_obj, timeout_s: float = 20.0) -> bool:
     as the player turns to face its next interaction, so yaw==yawTarget held on nearly every
     poll even while the net on-screen position kept drifting (user report: "still clicks like
     crazy even when camera moving"). Per explicit user direction, this now gates on the
-    player's own activity state instead (see controller.wait_until_player_idle: animation +
-    pose + position all stable across consecutive reads) -- the direct signal for "is my
-    character still busy or still walking", not a screen/camera-derived proxy for it.
+    player's own activity state instead (see controller.wait_until_player_idle: local position
+    stable across consecutive reads, narrowed 2026-08-13 from an earlier animation+pose+position
+    snapshot -- see that function's docstring) -- the direct signal for "is a screen position
+    still safe to click", not a screen/camera-derived proxy for it.
 
     Fixed by waiting for the player to be idle before every click, including the first, then
     re-resolving the bank object's current position (see _refresh_bank_object) right before
@@ -452,8 +453,17 @@ def switch_bank_tab(ctx, index: int) -> bool:
     ADDED 2026-08-12 (user request): an alternative to search_bank for a player who's
     organized specific items (e.g. herbs) into a dedicated tab. See BankProvider.java's own
     "tabs" field docstring for the same not-yet-verified-live caveat on which widget-children
-    call actually populates it."""
+    call actually populates it.
+
+    ADDED 2026-08-13 (user directive: check before switching instead of always re-clicking):
+    skips the click entirely if `currentTab` (BankProvider.java, VarbitID.BANK_CURRENTTAB)
+    already reports `index` -- a human wouldn't click a tab they're already viewing. Returns
+    True in that case the same as an actual successful switch, since the caller's postcondition
+    (now viewing that tab) already holds either way."""
     bank = controller.get_bank()
+    if bank.get("currentTab") == index:
+        return True
+
     tab = next((t for t in bank.get("tabs", []) if t.get("index") == index), None)
     if tab is None or tab.get("screenX") is None:
         debug_log.log("bank", f"tab {index} button not found (bank open?)")

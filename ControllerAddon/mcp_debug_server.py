@@ -12,12 +12,16 @@
 # manage. If live click/mouse debugging is needed again, drive it through controller.py itself
 # or reintroduce action tools in a separate, deliberately serial-holding process.
 #
-# UDP_PORT (50555) -- controller.py's own main() also binds this for its event stream, and only
-# one process can hold it -- is still bound lazily, on first poll_events() call rather than at
-# import (see _ensure_udp_listener()), so starting this server doesn't preempt controller.py's
-# bind if controller.py hasn't started yet either. Whichever process's bind attempt actually
-# runs first still wins; poll_events() reports the loser's failure as {"error": ...} rather than
-# crashing.
+# DEBUG_UDP_PORT (50556) -- a port dedicated to this server, separate from controller.py's own
+# UDP_PORT (50555). Originally this bound UDP_PORT itself, on the reasoning that only one of
+# controller.py/this server would ever be actively polling it at a time -- CONFIRMED live
+# 2026-08-13 that assumption was wrong: a poll_events() call here during a live debugging session
+# bound UDP_PORT in THIS process, and controller.py's own launch right after lost the race for
+# that same port and crashed outright (OSError [WinError 10048], not a graceful
+# {"error": ...} the way a losing bind here would have been). UdpEventSender.java now sends every
+# event to both ports unconditionally, so this server has its own dedicated port that
+# controller.py never touches -- no more race, in either direction. Still bound lazily, on first
+# poll_events() call rather than at import, since nothing here needs the socket before that.
 #
 # Setup: pip install mcp
 # Run directly for a first smoke test: python mcp_debug_server.py
@@ -31,7 +35,7 @@ import time
 from mcp.server.fastmcp import FastMCP
 
 import controller
-from settings import UDP_PORT
+from settings import DEBUG_UDP_PORT
 
 controller.set_dpi_aware()  # must happen before any cursor-position query, same reasoning as
                              # controller.py's own main()
@@ -43,18 +47,16 @@ _udp_listener_started = False
 
 
 def _ensure_udp_listener() -> None:
-    """Lazily binds UDP_PORT and starts the background drain thread on first poll_events()
-    call, instead of at import time -- starting this server shouldn't preempt controller.py's
-    own UDP bind (controller.py needs its own listener for real routine logic, not just logging
-    -- see handle_generic_events/routine.on_event in its main loop) if controller.py hasn't
-    grabbed the port yet. A failed bind isn't fatal here either; poll_events() surfaces it as
+    """Lazily binds DEBUG_UDP_PORT and starts the background drain thread on first poll_events()
+    call, instead of at import time -- nothing here needs the socket before a caller actually
+    asks for events. A failed bind isn't fatal here either; poll_events() surfaces it as
     {"error": ...} via _udp_error, same as before."""
     global _udp_socket, _udp_error, _udp_listener_started
     if _udp_listener_started:
         return
     _udp_listener_started = True
     try:
-        _udp_socket = controller.make_udp_listener(UDP_PORT)
+        _udp_socket = controller.make_udp_listener(DEBUG_UDP_PORT)
     except OSError as exc:
         _udp_error = str(exc)
         print(f"UDP event listener not available: {exc}", file=sys.stderr)

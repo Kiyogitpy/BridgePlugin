@@ -144,12 +144,19 @@ def get_player():
 
 
 def _player_activity_snapshot():
-    """(animation, poseAnimation, x, y) -- the fields that actually change while the player is
-    either mid-action (animation) or physically walking (x/y; poseAnimation also flips between
-    stand/walk/run poses). Two consecutive identical snapshots is the direct signal that the
-    player is genuinely idle right now."""
+    """(localX, localY) -- the player's own local position, sampled multiple times a tick while
+    walking (RuneLite interpolates it smoothly, not just once per game tick) and held exactly
+    constant the instant the player is truly stationary. Two consecutive identical snapshots is
+    the direct signal that it's safe to trust a screen position for a click right now.
+
+    REPLACES an animation+poseAnimation+x/y snapshot (removed 2026-08-13) -- CONFIRMED via user
+    directive 2026-08-13 ("replace it with my method, it checks local X and Y ... a better
+    standing still check") that the animation/pose fields made this check unnecessarily slow:
+    they gate on whether an *action* is still playing, not on whether the click target's screen
+    position is stale, which is the only thing callers here actually care about (see
+    wait_until_player_idle's own docstring)."""
     p = get_player()
-    return (p.get("animation"), p.get("poseAnimation"), p.get("x"), p.get("y"))
+    return (p.get("localX"), p.get("localY"))
 
 
 def wait_until_player_idle(timeout_s: float = 5.0, stable_reads: int = 2,
@@ -158,20 +165,31 @@ def wait_until_player_idle(timeout_s: float = 5.0, stable_reads: int = 2,
     unchanged across `stable_reads` consecutive polls, or timeout_s elapses. Returns True once
     idle, False if still busy/moving when the timeout hits.
 
+    The point of this check is purely "is a screen position we resolved going to still be valid
+    by the time the click lands" -- a moving player invalidates screen coordinates continuously,
+    so callers about to trust one (resolving/clicking a world object) should wait for this first.
+    It is NOT a check for "is an action's animation still playing"; an action performed from a
+    fixed standing tile (a lever pull, mixing a potion, etc.) never moves localX/localY, so this
+    returns True immediately even mid-animation -- that's intentional, see the 2026-08-13 change
+    below.
+
     REPLACES an earlier camera-yaw/pitch-based settle check (wait_until_camera_settled/
     is_camera_settled, removed 2026-08-12) that turned out NOT to be the right signal --
     CONFIRMED live: this minigame's camera retargets almost every tick as the player character
     turns to face whatever it's about to interact with next, so cameraYaw==cameraYawTarget held
     on nearly every poll even while the net on-screen position kept drifting tick over tick
     (user report: "bunch of wild clicks still camera thing seems not solved" even after gating
-    every world-object click on that signal). Direct live reads during that same investigation
-    also showed the player's own x/y genuinely shifting a few tiles between lever pulls
-    (levers aren't all reachable from one standing tile), which a camera-only signal can't see
-    at all. animation/poseAnimation/x/y together cover both dimensions this needs: "is an action
-    still playing" and "is the player still physically moving" -- CONFIRMED via user directive
-    2026-08-12 ("lets scrap the camera bullshit ... We go with animation instead") to replace
-    the camera signal with this one. Callers about to trust a screen position should wait for
-    this before resolving/clicking a world object, the same way the old camera check was used."""
+    every world-object click on that signal). That was replaced 2026-08-12 with an
+    animation+poseAnimation+x/y snapshot ("lets scrap the camera bullshit ... We go with
+    animation instead"), which was in turn replaced 2026-08-13 with local-position-only (see
+    _player_activity_snapshot) -- CONFIRMED via user directive: the animation/pose fields made
+    every wait pay for an action's full animation length even when the player's on-screen
+    position (the only thing a caller here is protecting) hadn't moved at all."""
+    debug_log.log(
+        "movement",
+        f"wait_until_player_idle started: timeout={timeout_s}s, "
+        f"stable_reads={stable_reads}, poll_interval={poll_interval_s}s",
+    )
     deadline = time.time() + timeout_s
     last, stable = None, 0
     while time.time() < deadline:
@@ -179,12 +197,60 @@ def wait_until_player_idle(timeout_s: float = 5.0, stable_reads: int = 2,
         if snap == last:
             stable += 1
             if stable >= stable_reads:
+                debug_log.log("movement", f"player IDLE: local={snap}")
                 return True
         else:
+            if last is not None:
+                debug_log.log("movement", f"player MOVED: {last} -> {snap}")
             stable = 0
         last = snap
         time.sleep(poll_interval_s)
+    debug_log.log("movement", f"wait_until_player_idle TIMED OUT: last local={last}")
     return False
+
+
+def get_last_action():
+    """GET /last-action (see LastActionProvider.java) -- the most recent MenuOptionClicked the
+    client actually processed: {tick, option, target, id, menuAction, param0, param1, itemId}.
+    Added to the bridge 2026-08-12 for Mastering Mixology but never actually wired to a Python
+    caller until this wrapper (2026-08-13) -- confirms WHAT a click resolved to (the right
+    option on the right target) immediately, from the game's own event, rather than inferring it
+    after the fact from a side effect. Deliberately not a "wait for" helper like
+    wait_for_chat_message -- this reports an ACTION being recognized, not one completing; pair it
+    with wait_for_chat_message (or an inventory/state poll) for that."""
+    return api_get("/last-action") or {}
+
+
+def get_last_chat_message():
+    return api_get("/last-chat-message") or {}
+
+
+def wait_for_chat_message(predicate, since_tick=None, timeout_s=5.0, poll_interval_s=0.15):
+    """Poll /last-chat-message (see LastChatMessageProvider.java) until a message newer than
+    since_tick satisfies predicate(message_dict), or timeout_s elapses. Returns the matching
+    message dict, or None on timeout.
+
+    Added 2026-08-13 (Mastering Mixology, user directive): the game itself announces exactly
+    when an action completes ("You finish concentrating the X.", "You collect some X from the
+    mixing vessel.") -- this lets a caller confirm that directly from the game's own text
+    instead of inferring completion from a side effect (an item id appearing in inventory) that
+    could just as easily be caused by something else. `since_tick` should be the caller's own
+    pre-action baseline (a get_last_chat_message() read taken right before acting) so a stale
+    message left over from before the action can't false-positive."""
+    debug_log.log(
+        "mixology",
+        f"wait_for_chat_message started: since_tick={since_tick}, timeout={timeout_s}s",
+    )
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        msg = get_last_chat_message()
+        tick = msg.get("tick")
+        if tick is not None and (since_tick is None or tick > since_tick) and predicate(msg):
+            debug_log.log("mixology", f"wait_for_chat_message matched: {msg}")
+            return msg
+        time.sleep(poll_interval_s)
+    debug_log.log("mixology", "wait_for_chat_message TIMED OUT")
+    return None
 
 
 def get_combat():
@@ -411,7 +477,6 @@ def get_ammo_count():
     if "weaponQty" in player:
         return player["weaponQty"]
     return None
-
 
 # ---------------- UDP event stream ----------------
 def make_udp_listener(port: int = UDP_PORT) -> socket.socket:
@@ -972,6 +1037,75 @@ def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140, 
         time.sleep(0.004)
 
 
+def sweep_and_click(ser: serial.Serial, x: int, y: int, *, click_rate_hz=(5.0, 7.0),
+                     fps: int = 140, duration_scale: float = 1.0, min_clicks: int = 0) -> None:
+    """Glide toward (x, y) the same eased/bezier/jittered way _move_to_human_exact does, but
+    fire left-clicks throughout the glide at a randomized click_rate_hz cadence instead of
+    waiting until the destination is reached before clicking at all.
+
+    Added 2026-08-13 (user directive, mastering_mixology.py's grimy-herb cleaning): a human
+    sweeping their mouse across a dense run of targets (e.g. a row of inventory items) spam-
+    clicks WHILE moving, they don't move-then-click-then-move-again for each one. move_to_human
+    and click_human are each already built on the same low-level primitives this needs
+    (move_rel_arduino for movement, mouse_left_down/up for a click) -- this just interleaves
+    both within one loop instead of calling them as two separate, fully-sequential blocking
+    calls. Not a threading concern: movement and click commands are just separate serial
+    messages: nothing stops one Python loop from sending both.
+
+    CORRECTED 2026-08-13 (user report: "we arent clicking fast enough"): duration used to be
+    purely estimate_duration_ms(dist), which is realistic mouse-TRAVEL time for the distance
+    involved -- but a 4-slot inventory row only spans ~260px, which estimate_duration_ms puts at
+    ~250-300ms total. Even at the fast end of click_rate_hz (7/sec, ~140ms between clicks), that
+    barely fits 2 clicks before the glide's already over -- the click rate was never the
+    bottleneck, the glide was just ending before it could fire more. min_clicks, when given,
+    floors the duration at whatever it takes to fit that many clicks at the SLOW end of
+    click_rate_hz (a real spam-click burst, not truncated by a short travel distance)."""
+    debug_log.log("action", f"sweep_and_click toward ({x},{y}) from {get_cursor_pos()}")
+
+    sx, sy = get_cursor_pos()
+    dist = math.hypot(x - sx, y - sy)
+    bez = build_bezier_path((sx, sy), (x, y)) if dist >= 2 else None
+
+    min_click_burst_ms = (min_clicks / click_rate_hz[0]) * 1000.0 if min_clicks > 0 else 0.0
+    duration_ms = max(estimate_duration_ms(dist), 250, min_click_burst_ms) * duration_scale
+    steps = max(18, int((duration_ms / 1000.0) * fps))
+    t0 = time.perf_counter()
+    next_click_at = t0 + random.uniform(1.0 / click_rate_hz[1], 1.0 / click_rate_hz[0])
+
+    for i in range(1, steps + 1):
+        if _movement_abort.is_set():
+            return
+
+        t = i / steps
+        te = ease_in_out(t)
+
+        if bez is not None:
+            tx, ty = bez.point(te)
+            jitter = clamp(dist / 900.0, 0.3, 1.2)
+            if t > 0.75:
+                jitter *= 0.55
+            tx += random.uniform(-jitter, jitter)
+            ty += random.uniform(-jitter, jitter)
+
+            cx, cy = get_cursor_pos()
+            dx = max(-80, min(80, int(round(tx)) - cx))
+            dy = max(-80, min(80, int(round(ty)) - cy))
+            if dx or dy:
+                move_rel_arduino(ser, dx, dy, max_step=18)
+
+        now = time.perf_counter()
+        if now >= next_click_at:
+            mouse_left_down(ser)
+            time.sleep(random.uniform(0.02, 0.05))
+            mouse_left_up(ser)
+            next_click_at = time.perf_counter() + random.uniform(1.0 / click_rate_hz[1], 1.0 / click_rate_hz[0])
+
+        target_time = t0 + (t * (duration_ms / 1000.0))
+        sleep_s = target_time - time.perf_counter()
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+
+
 # ---------------- clicking bridge entities ----------------
 def is_point_within_window(x: int, y: int) -> bool:
     """False if (x, y) falls outside the actual RuneLite window. A provider's
@@ -1196,22 +1330,33 @@ def _reclick_after_misclick(ser: serial.Serial, entity: dict, offset, refresh_ta
         click_human(ser)
 
 
-def hover_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_target=None) -> bool:
+def hover_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_target=None,
+                  check_ui_blockers=True) -> bool:
     """Move the cursor onto `entity` (same aim jitter as click_entity) without
     clicking -- for anticipatory hovering over something a routine already
     knows it'll need next, while it's otherwise idle-waiting on the current
     action to resolve (e.g. drifting toward the tunnel while a crab is still
-    being fought). Unlike click_entity this is just a courtesy move, not a
+    being fought), OR for resting the mouse on a time-critical click target
+    ahead of time so only a click (not a move-then-click) has to fire the
+    instant it's actually needed (see mastering_mixology.py's speedup
+    functions). Unlike click_entity this is just a courtesy move, not a
     real interaction attempt: it silently no-ops (no camera nudge, no log)
     if the point isn't safely reachable right now, rather than trying to
     work around it.
+
+    check_ui_blockers matches click_entity's own flag (added 2026-08-13) --
+    some UIs (e.g. Mastering Mixology's own panels) legitimately overlap
+    world objects this needs to hover, the same reason click_entity call
+    sites there already pass check_ui_blockers=False.
     """
     x, y = entity.get("screenX"), entity.get("screenY")
     if x is None or y is None:
         return False
 
     aim_x, aim_y = int(x) + offset[0], int(y) + offset[1]
-    if not is_point_within_window(aim_x, aim_y) or is_point_blocked_by_ui(aim_x, aim_y) is not None:
+    if not is_point_within_window(aim_x, aim_y):
+        return False
+    if check_ui_blockers and is_point_blocked_by_ui(aim_x, aim_y) is not None:
         return False
 
     move_to_human(ser, aim_x, aim_y, aim_radius=ENTITY_AIM_RADIUS, refresh_target=refresh_target)

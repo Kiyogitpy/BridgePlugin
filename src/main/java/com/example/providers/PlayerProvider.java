@@ -48,6 +48,13 @@ public class PlayerProvider extends BridgeProvider
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
 
+		LocalPoint local = p.getLocalLocation();
+		if (local != null)
+		{
+			data.put("localX", local.getX());
+			data.put("localY", local.getY());
+		}
+
 		// The boat's own reference position, separate from the player's own foot position above --
 		// confirmed live 2026-08-02: standing at one end of a Sailing boat (its own WorldView is
 		// only ~8 tiles per side) can be several tiles from the opposite end, which matters for a
