@@ -722,7 +722,7 @@ def move_rel_arduino(ser: serial.Serial, dx: int, dy: int, *, max_step: int = 20
         send_line(ser, f"M {sx} {sy}")
         dx -= sx
         dy -= sy
-        time.sleep(random.uniform(0.0005, 0.0015))  # small random jitter
+        human_delay(0.0005, 0.0015)  # small random jitter
 
 
 def mouse_left_down(ser: serial.Serial) -> None:
@@ -740,9 +740,9 @@ def mouse_left_click(ser: serial.Serial) -> None:
 def click_human(ser: serial.Serial) -> None:
     debug_log.log("action", f"click_human at {get_cursor_pos()}")
     mouse_left_down(ser)
-    time.sleep(random.uniform(0.045, 0.11))
+    human_delay(0.045, 0.11)
     mouse_left_up(ser)
-    time.sleep(random.uniform(0.03, 0.09))
+    human_delay(0.03, 0.09)
 
 
 def mouse_right_down(ser: serial.Serial) -> None:
@@ -760,9 +760,9 @@ def mouse_right_click(ser: serial.Serial) -> None:
 def right_click_human(ser: serial.Serial) -> None:
     debug_log.log("action", f"right_click_human at {get_cursor_pos()}")
     mouse_right_down(ser)
-    time.sleep(random.uniform(0.045, 0.11))
+    human_delay(0.045, 0.11)
     mouse_right_up(ser)
-    time.sleep(random.uniform(0.03, 0.09))
+    human_delay(0.03, 0.09)
 
 
 def key_tap(ser: serial.Serial, key: str) -> None:
@@ -792,9 +792,9 @@ def type_digits_and_enter(ser: serial.Serial, text: str) -> None:
     notes, tormented_demon.py's reflection caveats)."""
     for ch in text:
         key_tap(ser, ch)
-        time.sleep(random.uniform(0.05, 0.12))
+        human_delay(0.05, 0.12)
     key_tap(ser, "ENTER")
-    time.sleep(random.uniform(0.2, 0.4))
+    human_delay(0.2, 0.4)
 
 
 def type_text(ser: serial.Serial, text: str) -> None:
@@ -810,8 +810,8 @@ def type_text(ser: serial.Serial, text: str) -> None:
     for ch in text:
         key = "SPACE" if ch == " " else ch
         key_tap(ser, key)
-        time.sleep(random.uniform(0.05, 0.12))
-    time.sleep(random.uniform(0.2, 0.4))
+        human_delay(0.05, 0.12)
+    human_delay(0.2, 0.4)
 
 
 INVENTORY_TAB_KEY = "w"
@@ -822,7 +822,7 @@ def open_inventory_tab(ser: serial.Serial) -> None:
     if get_state().get("inventoryTabOpen"):
         return
     key_tap(ser, INVENTORY_TAB_KEY)
-    time.sleep(random.uniform(0.2, 0.35))
+    human_delay(0.2, 0.35)
 
 
 def open_prayer_tab(ser: serial.Serial) -> None:
@@ -831,7 +831,7 @@ def open_prayer_tab(ser: serial.Serial) -> None:
     if get_prayers().get("tabOpen"):
         return
     key_tap(ser, PRAYER_TAB_KEY)
-    time.sleep(random.uniform(0.2, 0.35))
+    human_delay(0.2, 0.35)
 
 
 # ---------------- Human-like trajectory generation ----------------
@@ -1129,7 +1129,7 @@ def move_to_human(
         _move_to_human_exact(ser, over[0], over[1], fps=fps, duration_scale=duration_scale)
         if _movement_abort.is_set():
             return
-        time.sleep(random.uniform(0.01, 0.05))
+        human_delay(0.01, 0.05)
         aim = _reaim(aim, refresh_target, aim_radius)
         _move_to_human_exact(ser, aim[0], aim[1], fps=max(90, fps - 25), duration_scale=duration_scale)
         return
@@ -1211,7 +1211,7 @@ def _move_to_human_tracking(ser: serial.Serial, start: tuple, x: int, y: int, *,
             return
 
         if leg > 0:
-            time.sleep(random.uniform(0.01, 0.05))
+            human_delay(0.01, 0.05)
             cursor_x, cursor_y = get_cursor_pos()
             if not target_lost and refresh_target is not None:
                 updated = refresh_target()
@@ -1284,7 +1284,7 @@ def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140, 
             move_rel_arduino(ser, dx, dy, max_step=max_step)
 
         if i == pause_step:
-            time.sleep(random.uniform(0.03, 0.10))
+            human_delay(0.03, 0.10)
 
         target_time = t0 + (t * (duration_ms / 1000.0))
         sleep_s = target_time - time.perf_counter()
@@ -1365,7 +1365,7 @@ def sweep_and_click(ser: serial.Serial, x: int, y: int, *, click_rate_hz=(5.0, 7
         now = time.perf_counter()
         if now >= next_click_at:
             mouse_left_down(ser)
-            time.sleep(random.uniform(0.02, 0.05))
+            human_delay(0.02, 0.05)
             mouse_left_up(ser)
             next_click_at = time.perf_counter() + random.uniform(1.0 / click_rate_hz[1], 1.0 / click_rate_hz[0])
 
@@ -1408,9 +1408,9 @@ def nudge_camera_yaw(ser: serial.Serial, key: str) -> None:
     """Hold the given arrow key just long enough for a small camera turn,
     then release -- shared by both camera-nudge use cases below."""
     key_down(ser, key)
-    time.sleep(random.uniform(0.15, 0.35))
+    human_delay(0.15, 0.35)
     key_up(ser, key)
-    time.sleep(random.uniform(0.1, 0.2))
+    human_delay(0.1, 0.2)
 
 
 def open_spellbook_if_needed(ser: serial.Serial) -> None:
@@ -1420,7 +1420,7 @@ def open_spellbook_if_needed(ser: serial.Serial) -> None:
     if get_spellbook().get("visible"):
         return
     key_tap(ser, "T")
-    time.sleep(random.uniform(0.3, 0.5))
+    human_delay(0.3, 0.5)
 
 
 def cast_telekinetic_grab(ser: serial.Serial, target: dict) -> bool:
@@ -1444,7 +1444,7 @@ def cast_telekinetic_grab(ser: serial.Serial, target: dict) -> bool:
     # already disables it for menu-sensitive clicks.
     if not click_entity(ser, spell, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False):
         return False
-    time.sleep(random.uniform(0.15, 0.3))
+    human_delay(0.15, 0.3)
     # ADDED 2026-08-09 (user report: "the data is too slow because the goats move around a lot,
     # we click the ground 70% of the time"): target's screenX/screenY are a snapshot from
     # whenever the caller fetched the NPC list, already stale by the time this click actually
@@ -1575,7 +1575,7 @@ def _reclick_after_misclick(ser: serial.Serial, entity: dict, offset, refresh_ta
     refresh_target when given, same staleness handling as any other re-aim (see
     walk_to_exact_tile's get_ground_walk_screen_pos for why a snapshot from before this function's
     own reaction-delay sleep can't be trusted as-is)."""
-    time.sleep(random.uniform(*MISCLICK_RECLICK_DELAY_S))
+    human_delay(*MISCLICK_RECLICK_DELAY_S)
 
     x, y = entity.get("screenX"), entity.get("screenY")
     if refresh_target is not None:
@@ -1931,7 +1931,7 @@ def check_stray_dialog(ctx):
     if get_state().get("dialogOpen"):
         debug_log.log("!", "Dismissing a stray dialogue box (Space)")
         key_tap(ctx.ser, "SPACE")
-        time.sleep(random.uniform(0.3, 0.6))
+        human_delay(0.3, 0.6)
 
 
 def handle_generic_events(state: ControllerState, events: list):
@@ -2118,7 +2118,7 @@ def main():
                 raise
 
             if config.get("breaks", {}).get("microBreaks") and random.random() < 0.15:
-                time.sleep(random.uniform(0.3, 1.2))
+                human_delay(0.3, 1.2)
 
             time.sleep(STATE_POLL_INTERVAL)
 
