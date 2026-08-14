@@ -1058,3 +1058,89 @@ considering this task (and the whole plan) done.
 
 Stop the routine (panic key or process kill, per how the session was ended), and note the result
 in project memory if anything unexpected came up during live verification.
+
+---
+
+### Task 14: Clean up dead imports left by migration
+
+Added during execution (2026-08-14): Task 8's reviewer flagged that migrating
+`time.sleep(random.uniform(a, b))` to `human_delay(a, b)` leaves `import random` dead in any file
+where `random.uniform` was that file's only use of the `random` module — already confirmed true
+for `banker.py`, `routines/golem_crafting.py`, and `routines/blast_furnace.py` (Tasks 6-8), and
+possibly true for some of Tasks 9-12's files too. The plan's migration scripts deliberately only
+touch call sites, not imports, so this was out of scope for Tasks 5-12 individually. Human
+decision (asked mid-execution): defer to a single cleanup pass here rather than fixing per-task
+or leaving it for the final whole-branch review to flag.
+
+**Files:**
+- Modify (conditionally, only where dead): `ControllerAddon/banker.py`,
+  `ControllerAddon/routines/golem_crafting.py`, `ControllerAddon/routines/blast_furnace.py`, and
+  any other file touched by Tasks 5-12 where the same pattern turns out to apply.
+
+**Interfaces:**
+- Consumes: the final state of all files touched by Tasks 5-12.
+- Produces: no interface change — import cleanup only.
+
+- [ ] **Step 1: Identify every file with a now-dead `import random`**
+
+Run (from `ControllerAddon/`):
+```bash
+python -c "
+import re
+files = [
+    'controller.py', 'banker.py', 'travel.py', 'login.py', 'sailing.py',
+    'routines/tormented_demon.py', 'routines/slayer.py', 'routines/shipwreck_salvaging.py',
+    'routines/pest_control.py', 'routines/gemstone_crab.py', 'routines/mining.py',
+    'routines/firemaking.py', 'routines/mastering_mixology.py', 'routines/golem_crafting.py',
+    'routines/blast_furnace.py',
+]
+for path in files:
+    with open(path, encoding='utf-8') as f:
+        content = f.read()
+    if not re.search(r'^import random$', content, re.MULTILINE):
+        continue
+    # Every use of `random.` outside the import line itself.
+    uses = re.findall(r'(?<!import )\brandom\.\w+', content)
+    if not uses:
+        print('DEAD:', path)
+    else:
+        print('LIVE:', path, '-', len(uses), 'use(s)')
+"
+```
+
+Note: `controller.py` itself is expected to print `LIVE` — it still uses `random.gauss`,
+`random.uniform`, `random.choice`, `random.lognormvariate` etc. directly inside
+`pick_aim_point`/`build_bezier_path`/`sample_human_delay`/misclick jitter, none of which this
+plan's migration touched.
+
+- [ ] **Step 2: Remove the dead `import random` line from each file printed as `DEAD`**
+
+For each such file, delete the `import random` line. Use the Edit tool (or equivalent) rather
+than a blanket script here — the exact surrounding import block formatting differs per file and
+this is a small enough number of files (expected: `banker.py`, `routines/golem_crafting.py`,
+`routines/blast_furnace.py`, plus whichever of Tasks 9-12's files also print `DEAD`) to do by
+hand safely.
+
+- [ ] **Step 3: `py_compile` every file touched in Step 2**
+
+Run: `cd ControllerAddon && python -m py_compile <each touched file>`
+Expected: all compile cleanly (removing an unused import cannot introduce a syntax error, but
+this catches a mistaken over-deletion).
+
+- [ ] **Step 4: Full test suite**
+
+Run: `cd ControllerAddon && python -m pytest tests/ -v`
+Expected: all 32 tests still pass — this task touches no runtime behavior.
+
+- [ ] **Step 5: Re-run Step 1's detection script to confirm zero remaining `DEAD` files**
+
+Expected output: every file that printed `DEAD` in Step 1 either no longer appears in the
+scan (import removed) — confirm by re-running the Step 1 script and checking no `DEAD:` lines
+remain.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add <each file touched in Step 2>
+git commit -m "Remove import random left dead by the human_delay migration (Tasks 5-12)"
+```
