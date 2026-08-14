@@ -882,7 +882,13 @@ def build_bezier_path(start: tuple, end: tuple) -> Bezier:
         perp_x = -dy / dist
         perp_y = dx / dist
 
-    curve_mag = clamp(dist * random.uniform(0.15, 0.35), 8.0, 300.0)
+    # User directive 2026-08-14: reduced from (0.15-0.35 fraction, 300.0 cap) -- raw mouse
+    # movement/path is never transmitted to OSRS's servers (packet-based protocol, only
+    # discrete action results and their timing are), so the curve's exact bow has no bearing on
+    # server-side detection; what actually matters there (click timing via estimate_duration_ms,
+    # aim-point variance via pick_aim_point/misclicks) is untouched by this change. Kept
+    # deliberately nonzero rather than a straight line, for screen-recording/visual plausibility.
+    curve_mag = clamp(dist * random.uniform(0.08, 0.20), 8.0, 150.0)
     curve_sign = random.choice([-1.0, 1.0])
     # Real aim-trainer recordings show ~2/3 of moves cross back over the
     # straight line at least once -- about half here, since c2 is only one
@@ -947,12 +953,27 @@ def clear_movement_abort():
 def pick_aim_point(x: int, y: int, radius: int) -> tuple:
     if radius <= 0:
         return x, y
-    # Uniform over the disc (sqrt of a uniform draw), not the bounding square --
-    # a square jitter can land up to radius*sqrt(2) away, which can miss a
-    # small clickbox even though it looks "within radius".
-    r = radius * math.sqrt(random.random())
-    theta = random.uniform(0, 2 * math.pi)
-    return int(round(x + r * math.cos(theta))), int(round(y + r * math.sin(theta)))
+    # 2D Gaussian jitter, not a uniform disc -- user directive 2026-08-14: the previous
+    # sqrt(random())-based approach was uniform *density* over the disc, but still had a hard
+    # mathematical edge (nothing ever landed even 1px beyond `radius`), which is itself a more
+    # artificial, more distinctive signature than real human aim error -- a human's error
+    # doesn't have a cliff, it has a tail that thins out smoothly and indefinitely. sigma is
+    # tuned so most draws land within roughly the old radius (similar practical click
+    # precision to before), with the tail extending smoothly past it instead of stopping dead.
+    # Magnitude soft-clamped at 2.5x radius purely as a numerical safety net against a truly
+    # pathological outlier missing the target's clickable area entirely -- far enough out that
+    # a normal draw essentially never reaches it, not a perceptible boundary the way the old
+    # hard cutoff was.
+    sigma = radius / 1.5
+    dx = random.gauss(0, sigma)
+    dy = random.gauss(0, sigma)
+    mag = math.hypot(dx, dy)
+    max_mag = radius * 2.5
+    if mag > max_mag:
+        scale = max_mag / mag
+        dx *= scale
+        dy *= scale
+    return int(round(x + dx)), int(round(y + dy))
 
 
 def pick_dismiss_point(x: int, y: int, distance: int = 200) -> tuple:
