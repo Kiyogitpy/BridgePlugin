@@ -279,19 +279,19 @@ def drop_salvage(ctx):
     confirmed to have failed."""
     if controller.get_sailing().get("facilitiesTabOpen"):
         controller.key_tap(ctx.ser, controller.INVENTORY_TAB_KEY)
-        time.sleep(random.uniform(0.2, 0.35))
+        controller.human_delay(0.2, 0.35)
         if controller.get_sailing().get("facilitiesTabOpen"):
             debug_log.log("salvage", "still on the sail menu after 'w' -- dismissing a likely dialogue with Space")
             controller.key_tap(ctx.ser, "SPACE")
-            time.sleep(random.uniform(0.3, 0.5))
+            controller.human_delay(0.3, 0.5)
             controller.key_tap(ctx.ser, controller.INVENTORY_TAB_KEY)
-            time.sleep(random.uniform(0.2, 0.35))
+            controller.human_delay(0.2, 0.35)
     controller.open_inventory_tab(ctx.ser)
     for item in controller.get_inventory():
         name = (item.get("name") or "").lower()
         if name.endswith("salvage"):
             controller.click_entity(ctx.ser, item, check_ui_blockers=False)
-            time.sleep(random.uniform(0.06, 0.12))  # 40% faster still, on top of the earlier 2x (original 0.2-0.4s)
+            controller.human_delay(0.06, 0.12)  # 40% faster still, on top of the earlier 2x (original 0.2-0.4s)
 
 
 # Sinking swaps a wreck's object out entirely for a "stump" variant that keeps the exact same

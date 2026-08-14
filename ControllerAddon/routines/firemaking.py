@@ -167,14 +167,14 @@ def tick(ctx):
         return
 
     debug_log.log("firemaking", f"lighting {log.get('name')}")
-    time.sleep(random.uniform(0.15, 0.35))
+    controller.human_delay(0.15, 0.35)
     controller.click_entity(ctx.ser, tinderbox, check_ui_blockers=False)
-    time.sleep(random.uniform(0.1, 0.25))
+    controller.human_delay(0.1, 0.25)
     controller.click_entity(ctx.ser, log, check_ui_blockers=False)
     # Let the light register server-side before the next isIdle poll -- neither inventory
     # click makes isMoving true the way clicking a distant object would, so without this the
     # very next ~0.3s poll can still read isIdle == True and fire a duplicate click pair.
-    time.sleep(random.uniform(0.6, 1.0))
+    controller.human_delay(0.6, 1.0)
 
 
 def find_item(name: str):

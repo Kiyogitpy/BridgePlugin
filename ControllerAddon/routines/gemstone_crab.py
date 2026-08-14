@@ -90,7 +90,7 @@ def tick(ctx):
             ctx.state.data["tunnel_retry_at"] = None
             return
         debug_log.log("crab", f"attacking (dist={crab.get('distance')})")
-        time.sleep(random.uniform(0.15, 0.4))
+        controller.human_delay(0.15, 0.4)
         controller.click_entity(ctx.ser, crab)
         ctx.state.data["tunnel_retry_at"] = None
         ctx.state.data["hovered_next_step"] = False  # fresh fight -- allow one more anticipatory hover
@@ -108,9 +108,9 @@ def tick(ctx):
         if travel.maybe_approach_before_click(ctx, tunnel, already_engaged=combat.get("inCombat", False)):
             return
         debug_log.log("crab", "not found -- following it into the tunnel")
-        time.sleep(random.uniform(0.2, 0.5))
+        controller.human_delay(0.2, 0.5)
         controller.click_entity(ctx.ser, tunnel)
-        time.sleep(random.uniform(1.0, 1.5))  # entering transition
+        controller.human_delay(1.0, 1.5)  # entering transition
         ctx.state.data["tunnel_retry_at"] = time.time() + TUNNEL_RETRY_TIMEOUT_SECONDS
         return
 
