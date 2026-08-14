@@ -298,6 +298,32 @@ def get_objects(radius=None, fresh=False):
     return api_get("/objects", params=params or None, timeout=1.0) or []
 
 
+def get_object_at(x: int, y: int, plane: int, obj_id: int, radius=None):
+    """Exact lookup by tile position + object id (uncached, unlike get_objects) -- the object
+    equivalent of get_npc_by_index, for re-checking/re-aiming at a specific object already
+    committed to mid-approach (e.g. while the player is still moving toward it). Matches by
+    position+id rather than a live coordinate-to-LocalPoint conversion -- see
+    ObjectProvider.java's getObjectAt for why. Same generous timeout as get_objects -- this
+    walks the same scene."""
+    params = {"x": x, "y": y, "plane": plane, "id": obj_id}
+    if radius is not None:
+        params["radius"] = radius
+    data = api_get("/object/at", params=params, timeout=1.0)
+    if not data or not data.get("found"):
+        return None
+    return data
+
+
+def get_object_screen_pos_at(x: int, y: int, plane: int, obj_id: int, radius=None):
+    data = get_object_at(x, y, plane, obj_id, radius=radius)
+    if data is None:
+        return None
+    sx, sy = data.get("screenX"), data.get("screenY")
+    if sx is None or sy is None:
+        return None
+    return int(sx), int(sy)
+
+
 def get_tiles(fresh=False):
     params = {"fresh": "true"} if fresh else None
     return api_get("/tiles", params=params) or []
@@ -318,6 +344,27 @@ def get_consumables():
 def get_ground_items(fresh=False):
     params = {"fresh": "true"} if fresh else None
     return api_get("/ground-items", params=params) or []
+
+
+def get_ground_item_at(x: int, y: int, plane: int, item_id: int):
+    """Exact lookup by tile position + item id (uncached, unlike get_ground_items) -- the
+    ground-item equivalent of get_object_at/get_npc_by_index, for re-checking/re-aiming at a
+    specific item already committed to looting mid-approach (e.g. while the player is still
+    moving toward it). See GroundItemProvider.java's getGroundItemAt for the matching logic."""
+    data = api_get("/ground-item/at", params={"x": x, "y": y, "plane": plane, "id": item_id})
+    if not data or not data.get("found"):
+        return None
+    return data
+
+
+def get_ground_item_screen_pos_at(x: int, y: int, plane: int, item_id: int):
+    data = get_ground_item_at(x, y, plane, item_id)
+    if data is None:
+        return None
+    sx, sy = data.get("screenX"), data.get("screenY")
+    if sx is None or sy is None:
+        return None
+    return int(sx), int(sy)
 
 
 def get_inventory():
@@ -480,6 +527,26 @@ def ground_tile_refresh_target(x: int, y: int, plane: int):
     through a click's flight -- the tile itself never moves, but its screen position shifts
     with the camera (see get_ground_walk_screen_pos)."""
     return lambda: get_ground_walk_screen_pos(x, y, plane)
+
+
+def object_refresh_target(x: int, y: int, plane: int, obj_id: int, radius=None):
+    """refresh_target factory for tracking a specific world object's current screen projection
+    through a click's flight -- added 2026-08-14 alongside /object/at (ObjectProvider.java) so a
+    routine clicking an object (a bank booth, a tree, a plinth, ...) can be moving at the same
+    time, the same way npc_index_refresh_target already covers NPCs. Objects don't move, but
+    their screen position shifts with the camera exactly like a ground tile's does, and a
+    multiloc object's clickbox/name can change between the click's decision and the moment the
+    cursor actually arrives (see buildObjectData's own comment on impostor variants)."""
+    return lambda: get_object_screen_pos_at(x, y, plane, obj_id, radius=radius)
+
+
+def ground_item_refresh_target(x: int, y: int, plane: int, item_id: int):
+    """refresh_target factory for tracking a specific ground item's current screen projection
+    through a click's flight -- added 2026-08-14 alongside /ground-item/at
+    (GroundItemProvider.java), same role object_refresh_target plays for objects. Items don't
+    move, but their screen position shifts with the camera exactly like an object's or ground
+    tile's does."""
+    return lambda: get_ground_item_screen_pos_at(x, y, plane, item_id)
 
 
 def is_logged_in():

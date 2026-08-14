@@ -86,6 +86,27 @@ steps above.
 
 ## Known environment gotchas
 
+- **Instanced areas break forward world-coordinate conversion — check for this first in any new
+  provider that reads or writes a `WorldPoint`/`LocalPoint`.** Hit four separate times so far
+  (`PlayerProvider`, `NPCProvider`, `ObjectProvider`, `GroundItemProvider`, all fixed 2026-08-14):
+  reading a position *out* of the client (`LocalPoint` → real-world `WorldPoint`) needs
+  `WorldPoint.fromLocalInstance()`, not `RuneLiteUtil.toTopLevelWorldPoint`/
+  `getTopLevelWorldLocation`/a bare `tile.getWorldLocation()` alone (none of those handle classic
+  instance-template chunk remapping, only (at best) a nested-WorldView case like a Sailing boat)
+  — CONFIRMED live via Pest Control (an instanced arena) reporting every x/y in the ~13000s
+  instead of the real ~2600s map coordinates. Going the *other* direction (a known real-world
+  tile → a clickable screen position, e.g. `CombatProvider`'s `/minimap/walk`/`/ground/walk`,
+  both built on `LocalPoint.fromWorld()`) is **not fixed and not easily fixable the same way** —
+  CONFIRMED live these fail to resolve even the player's own current tile while inside an
+  instance. `pest_control.py` works around this entirely by never doing forward world-coordinate
+  resolution inside an instanced arena: it clicks a hardcoded absolute screen pixel on the
+  minimap instead (see that routine's own header comment), and `/object/at`'s and
+  `/ground-item/at`'s designs both deliberately filter the already-corrected bulk `/objects`/
+  `/ground-items` lists rather than attempting a fresh forward lookup (see their own doc
+  comments). If a future routine needs to click a known world tile while inside an instance and
+  neither of those patterns fits, that forward-direction fix is still an open problem, not a
+  solved one. `/players` (`PvpProvider`) hasn't been checked for this bug yet — assume it has the
+  same gap until verified, same as every other provider not in the four already fixed.
 - **Windows HiDPI scaling**: RuneLite's own AWT windows report `screenX`/`screenY` at 96 DPI
   under a bare `java.exe` launch (no DPI-aware manifest), regardless of the display's actual
   scaling. `controller.py` compensates by scaling every bridge response through
@@ -129,8 +150,9 @@ On the bridge side, only 6 providers (`NPCProvider`, `ObjectProvider`, `TileProv
 `GroundItemProvider`, `GraphicsObjectProvider`, `BankProvider`) are gated by `TickCache` — a
 deliberate perf optimization for the bulk list endpoints (`/npcs`, `/objects`, ...), not a
 platform limitation, and it already has a `?fresh=true` bypass. Single-entity lookups
-(`/npc/by-index`, `/npc/nearest`, `/player`, `/combat`) were never cached at all — every poll
-already reads the client's current interpolated position fresh, however often you ask.
+(`/npc/by-index`, `/npc/nearest`, `/object/at`, `/player`, `/combat`) were never cached at all —
+every poll already reads the client's current interpolated position fresh, however often you
+ask.
 
 This is why routines gate clicks behind `wait_until_player_idle()` (wait for the player to fully
 stop before trusting a resolved screen position) rather than clicking while moving: most click
@@ -149,8 +171,12 @@ snapshot before ever re-aiming, and per-leg jitter was being redrawn instead of 
 real wasted motion even for a stationary target) — see `_move_to_human_tracking`'s own docstring
 for the full account. Covered by unit tests in `tests/test_controller.py`, but **not yet
 exercised against a live client**, and no routine has adopted it yet as of this note. See
-`npc_index_refresh_target`/`ground_tile_refresh_target` for ready-made `refresh_target` factories
-instead of hand-writing the lambda at each call site.
+`npc_index_refresh_target`/`ground_tile_refresh_target`/`object_refresh_target`/
+`ground_item_refresh_target` (the last two added 2026-08-14 alongside `/object/at` and
+`/ground-item/at`, the object/ground-item equivalents of `/npc/by-index` — see "Instanced areas
+break forward world-coordinate conversion" above for why both are implemented by filtering the
+already-corrected bulk `/objects`/`/ground-items` lists rather than a fresh forward lookup) for
+ready-made `refresh_target` factories instead of hand-writing the lambda at each call site.
 
 ## Live-debugging workflow
 

@@ -29,11 +29,64 @@ public class ObjectProvider extends BridgeProvider
 		this.tickClock = tickClock;
 	}
 
+	// Default search radius (tiles, around the player) for /object/at -- generous since a caller
+	// looking this up already has an approximate world position for something it's about to
+	// click, which is necessarily within normal interaction range already.
+	private static final int OBJECT_AT_DEFAULT_RADIUS = 30;
+
 	@Override
 	public void register()
 	{
 		server.registerQuery("/objects", this::getObjects);
+		server.registerQuery("/object/at", query -> onClient(() -> getObjectAt(query)));
 		server.registerQuery("/debug-objects-all-planes", query -> onClient(() -> getObjectsAllPlanes(query)));
+	}
+
+	/**
+	 * Exact lookup by tile position + object id (uncached, unlike the bulk /objects) -- the
+	 * object equivalent of NPCProvider's getNpcByIndex, for re-checking/re-aiming at a specific
+	 * object already committed to mid-approach (e.g. a moving player about to click one). Static
+	 * objects have no NPC-like per-instance index; position + id (stable across a multiloc
+	 * object's own appearance changes -- see buildObjectData's own comment) is the closest
+	 * equivalent identity.
+	 *
+	 * Deliberately reuses computeObjects' own scene walk (same instance-corrected world
+	 * coordinates, same clickbox resolution) and filters the result, rather than converting the
+	 * caller's (x, y, plane) back into a LocalPoint via LocalPoint.fromWorld and indexing the
+	 * tile array directly -- CONFIRMED live 2026-08-14 (see PlayerProvider/NPCProvider/this
+	 * class's own regionId/coordinate fixes) that the forward real-world-to-local conversion is
+	 * NOT reliably instance-aware in this codebase, the same class of bug already found for
+	 * CombatProvider's /minimap/walk and /ground/walk. Filtering the already-correctly-resolved
+	 * bulk list sidesteps that entirely instead of introducing a second, separately-fragile
+	 * conversion path.
+	 */
+	private Object getObjectAt(Map<String, String> query)
+	{
+		Map<String, Object> notFound = new HashMap<>();
+		notFound.put("found", false);
+
+		Integer x = parseIntParam(query.get("x"));
+		Integer y = parseIntParam(query.get("y"));
+		Integer plane = parseIntParam(query.get("plane"));
+		Integer id = parseIntParam(query.get("id"));
+		if (x == null || y == null || plane == null || id == null)
+		{
+			return notFound;
+		}
+
+		Integer radius = parseIntParam(query.get("radius"));
+		List<Map<String, Object>> objects = computeObjects(radius != null ? radius : OBJECT_AT_DEFAULT_RADIUS);
+		for (Map<String, Object> obj : objects)
+		{
+			if (id.equals(obj.get("id")) && x.equals(obj.get("x")) && y.equals(obj.get("y"))
+				&& plane.equals(obj.get("plane")))
+			{
+				Map<String, Object> found = new HashMap<>(obj);
+				found.put("found", true);
+				return found;
+			}
+		}
+		return notFound;
 	}
 
 	private Object getObjects(Map<String, String> query)
@@ -344,6 +397,19 @@ public class ObjectProvider extends BridgeProvider
 		// object that lives in a boat's own nested WorldView), so every object this endpoint
 		// returns is comparable on equal terms -- see RuneLiteUtil.toTopLevelWorldPoint.
 		WorldPoint wp = RuneLiteUtil.toTopLevelWorldPoint(client, local);
+
+		// Instance-template correction -- CONFIRMED live 2026-08-14 for PlayerProvider/
+		// NPCProvider (same bug class, see their own comments), found here by inspection while
+		// adding /object/at rather than by a live symptom: toTopLevelWorldPoint above only
+		// handles the nested-WorldView case (a boat's own fixtures), not classic instance-
+		// template chunk remapping, so every object's x/y/plane -- and hence "distance" -- would
+		// be a raw, meaningless instance-template coordinate inside any instanced area (a
+		// minigame, a dungeon, a boss room). WorldPoint.fromLocalInstance() does that correction;
+		// only applied for the common non-nested-WorldView case, same guard as PlayerProvider's.
+		if (local.getWorldView() <= WorldView.TOPLEVEL)
+		{
+			wp = WorldPoint.fromLocalInstance(client, local);
+		}
 
 		data.put("id", obj.getId());
 		data.put("objectType", objectType);
