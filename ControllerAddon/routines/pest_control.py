@@ -150,7 +150,7 @@ def dock_tick(ctx, config, player):
         return
 
     debug_log.log("pest_control", "boarding the boat")
-    time.sleep(random.uniform(0.2, 10.0))
+    controller.human_delay(0.2, 10.0)
     click_without_rotating(ctx, gangplank)
     ctx.state.data["gangplank_clicked_at"] = time.time()
 
@@ -232,7 +232,7 @@ def in_game_tick(ctx, config):
 
     debug_log.log("pest_control", f"attacking {target.get('name')} (dist to Void Knight="
                                    f"{distance(target, anchor):.1f})")
-    time.sleep(random.uniform(0.15, 0.4))
+    controller.human_delay(0.15, 0.4)
     since_tick = controller.get_last_action().get("tick")
     if not click_without_rotating(ctx, target):
         return  # nulled (UI-blocked) or otherwise failed -- next tick re-resolves and retries
@@ -345,7 +345,7 @@ def step_forward_blind(ctx, config):
         debug_log.log("pest_control", "already close enough after settling -- skipping this step")
         return
 
-    time.sleep(random.uniform(1.0, 5.0))
+    controller.human_delay(1.0, 5.0)
     point = {"screenX": ABS_MINIMAP_CLICK_X, "screenY": ABS_MINIMAP_CLICK_Y, "name": "minimap landmark"}
     click_without_rotating(ctx, point, offset=(0, 0))
 

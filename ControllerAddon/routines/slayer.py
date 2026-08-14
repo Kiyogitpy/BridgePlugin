@@ -748,7 +748,7 @@ def maybe_loot(ctx):
                 if target_npc is not None and target_npc.get("hpRatio") != 0:
                     debug_log.log("combat", f"re-engaging {target_npc.get('name')} "
                                              f"(index={current_target_index}) after loot pickup")
-                    time.sleep(random.uniform(0.15, 0.6))
+                    controller.human_delay(0.15, 0.6)
                     if controller.click_entity(
                         ctx.ser,
                         target_npc,
@@ -820,7 +820,7 @@ def maybe_loot(ctx):
                 else:
                     reason = "seed box open"
                 debug_log.log("loot", f"picking up {item.get('name')} ({reason})")
-                time.sleep(random.uniform(0.2, 0.5))
+                controller.human_delay(0.2, 0.5)
                 # Re-fetch this item's screen position AFTER the delay above, not before --
                 # CONFIRMED (user insight 2026-08-06, the well-known OSRS "true tile" quirk):
                 # the player's logical world tile (what GroundItemProvider's screen-position
@@ -997,7 +997,7 @@ def engage_target(ctx, combat: dict):
 
     debug_log.log("combat", f"attacking {target.get('name')} "
                              f"(id={target['id']}, index={target['index']}, dist={target.get('distance')})")
-    time.sleep(random.uniform(0.15, 0.6))
+    controller.human_delay(0.15, 0.6)
     target_index = target["index"]
     if controller.click_entity(
         ctx.ser,

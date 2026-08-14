@@ -52,7 +52,7 @@ def attempt_login(ctx) -> bool:
     if click_to_play:
         debug_log.log("login", "clicking through the welcome screen")
         controller.click_entity(ctx.ser, click_to_play, offset=(0, 0))
-        time.sleep(random.uniform(1.0, 1.5))
+        controller.human_delay(1.0, 1.5)
         return True
 
     if status.get("gameState") == "LOGIN_SCREEN":
@@ -60,7 +60,7 @@ def attempt_login(ctx) -> bool:
         if tile:
             debug_log.log("login", "clicking the saved account tile")
             controller.click_entity(ctx.ser, tile, offset=(0, 0))
-            time.sleep(random.uniform(2.0, 3.0))
+            controller.human_delay(2.0, 3.0)
             return True
 
     return False
