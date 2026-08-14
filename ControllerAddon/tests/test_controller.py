@@ -1,4 +1,5 @@
 import dataclasses
+import math
 import os
 import sys
 
@@ -236,3 +237,33 @@ def test_human_delay_sleeps_for_the_sampled_duration(monkeypatch):
     controller.human_delay(1.0, 2.0)
 
     assert slept == [1.23]
+
+
+def test_pick_aim_point_jitter_spread_follows_profile_aim_sigma_factor(monkeypatch):
+    def make_profile(factor):
+        return controller.HumanProfile(
+            aim_sigma_factor=factor, curve_mag_low=0.08, curve_mag_high=0.20,
+            delay_skew=0.5, rerolled_at=0.0, reroll_after_s=1e9,
+        )
+
+    def variance(samples):
+        mean = sum(samples) / len(samples)
+        return sum((s - mean) ** 2 for s in samples) / len(samples)
+
+    controller.random.seed(1)
+    monkeypatch.setattr(controller, "get_human_profile", lambda: make_profile(1.8))
+    tight = [
+        math.hypot(*controller.pick_aim_point(0, 0, 10)) for _ in range(5000)
+    ]
+
+    controller.random.seed(1)
+    monkeypatch.setattr(controller, "get_human_profile", lambda: make_profile(1.3))
+    wide = [
+        math.hypot(*controller.pick_aim_point(0, 0, 10)) for _ in range(5000)
+    ]
+
+    # Same seed sequence, only the profile's sigma factor differs -- a smaller
+    # factor means a larger sigma (radius / factor) and should measurably widen
+    # the spread of magnitudes (confirmed empirically: ~1.9x variance ratio
+    # between factor=1.3 and factor=1.8 at radius=10).
+    assert variance(wide) > variance(tight) * 1.3

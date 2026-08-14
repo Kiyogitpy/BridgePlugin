@@ -1018,7 +1018,8 @@ def pick_aim_point(x: int, y: int, radius: int) -> tuple:
     # pathological outlier missing the target's clickable area entirely -- far enough out that
     # a normal draw essentially never reaches it, not a perceptible boundary the way the old
     # hard cutoff was.
-    sigma = radius / 1.5
+    profile = get_human_profile()
+    sigma = radius / profile.aim_sigma_factor
     dx = random.gauss(0, sigma)
     dy = random.gauss(0, sigma)
     mag = math.hypot(dx, dy)
