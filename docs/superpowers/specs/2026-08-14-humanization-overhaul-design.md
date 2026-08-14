@@ -60,9 +60,18 @@ class HumanProfile:
 `time.monotonic() - rerolled_at` exceeds a randomized interval drawn fresh each reroll (e.g.
 `Uniform(10, 20)` minutes — the reroll cadence itself isn't a fixed period, so it doesn't just
 relocate the fixed-formula problem one level up). Each knob re-rolls independently, within a
-tuned range centered on today's existing constants (`aim_sigma_factor` around 1.5, `curve_mag`
-range around 0.08–0.20) — narrow enough that any single draw feels like current behavior, wide
-enough that the *aggregate* distribution across a long session isn't one fixed formula.
+tuned range centered on today's existing constants — narrow enough that any single draw feels
+like current behavior, wide enough that the *aggregate* distribution across a long session isn't
+one fixed formula:
+
+- `aim_sigma_factor`: `Uniform(1.3, 1.8)` (today's fixed value is 1.5)
+- `curve_mag_low`: `Uniform(0.06, 0.10)` (today's fixed value is 0.08)
+- `curve_mag_high`: `Uniform(0.16, 0.24)` (today's fixed value is 0.20)
+- `delay_skew`: `Uniform(0.0, 1.0)` (feeds `human_delay`'s sigma calculation directly, no
+  existing constant to anchor to)
+
+These are starting ranges, not final tuning — the implementation plan may adjust them after the
+Monte Carlo tests (below) show the resulting aggregate spread.
 
 `pick_aim_point`, `build_bezier_path`, and the new `human_delay` all pull their working
 parameters from `get_human_profile()` instead of hardcoded constants. Their internal shapes
