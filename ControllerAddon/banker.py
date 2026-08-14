@@ -222,7 +222,7 @@ def empty_looting_bag(ctx) -> bool:
     if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False):
         return False
 
-    time.sleep(random.uniform(0.6, 1.0))
+    controller.human_delay(0.6, 1.0)
     return True
 
 
@@ -258,7 +258,7 @@ def fill_coal_bag(ctx) -> bool:
     if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False):
         return False
 
-    time.sleep(random.uniform(0.6, 1.0))
+    controller.human_delay(0.6, 1.0)
     return True
 
 
@@ -285,7 +285,7 @@ def empty_coal_bag(ctx) -> bool:
     if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False):
         return False
 
-    time.sleep(random.uniform(0.6, 1.0))
+    controller.human_delay(0.6, 1.0)
     return True
 
 
@@ -324,7 +324,7 @@ def fill_fur_pouch(ctx) -> bool:
     if not controller.click_entity(ctx.ser, pouch, check_ui_blockers=False):
         return False
 
-    time.sleep(random.uniform(0.6, 1.0))
+    controller.human_delay(0.6, 1.0)
     return True
 
 
@@ -358,7 +358,7 @@ def empty_fur_pouch(ctx) -> bool:
     if not controller.click_menu_action(ctx.ser, pouch, "empty", offset=(0, 0), check_ui_blockers=False):
         return False
 
-    time.sleep(random.uniform(0.6, 1.0))
+    controller.human_delay(0.6, 1.0)
     return True
 
 
@@ -377,7 +377,7 @@ def _click_bank_button(ctx, button_key: str) -> bool:
         return False
 
     controller.click_entity(ctx.ser, button, offset=(0, 0))
-    time.sleep(random.uniform(0.3, 0.6))
+    controller.human_delay(0.3, 0.6)
     return True
 
 
@@ -420,7 +420,7 @@ def deposit_inventory(ctx, config: dict) -> None:
         deposit_all = bank.get("depositInventory") or {}
         if deposit_all.get("screenX") is not None:
             controller.click_entity(ctx.ser, deposit_all, offset=(0, 0))
-            time.sleep(random.uniform(0.3, 0.6))
+            controller.human_delay(0.3, 0.6)
         return
 
     # Keeping specific items -- deposit one stack at a time instead of
@@ -430,7 +430,7 @@ def deposit_inventory(ctx, config: dict) -> None:
         if any(k in name for k in keep):
             continue
         controller.click_entity(ctx.ser, item)
-        time.sleep(random.uniform(0.2, 0.4))
+        controller.human_delay(0.2, 0.4)
 
 
 def set_quantity_mode(ctx, mode: str) -> bool:
@@ -444,7 +444,7 @@ def set_quantity_mode(ctx, mode: str) -> bool:
         return False
 
     controller.click_entity(ctx.ser, button, offset=(0, 0))
-    time.sleep(random.uniform(0.2, 0.4))
+    controller.human_delay(0.2, 0.4)
     return True
 
 
@@ -470,7 +470,7 @@ def switch_bank_tab(ctx, index: int) -> bool:
         return False
 
     controller.click_entity(ctx.ser, tab, offset=(0, 0), check_ui_blockers=False)
-    time.sleep(random.uniform(0.3, 0.5))
+    controller.human_delay(0.3, 0.5)
     return True
 
 
@@ -523,7 +523,7 @@ def withdraw_loadout(ctx, config: dict, fresh: bool = False) -> None:
         debug_log.log("bank", f"withdrawing {quantity}x {slot.get('name')}")
         for _ in range(quantity):
             controller.click_entity(ctx.ser, slot)
-            time.sleep(random.uniform(0.15, 0.3))
+            controller.human_delay(0.15, 0.3)
 
     # Auto-pick fallback, independent of the explicit list above -- CONFIRMED (user request
     # 2026-08-06): "just let it pick any prayer restore/food, prioritising the one with the
@@ -560,7 +560,7 @@ def search_bank(ctx, query: str) -> bool:
         return False
 
     controller.click_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False)
-    time.sleep(random.uniform(0.2, 0.4))
+    controller.human_delay(0.2, 0.4)
     controller.type_text(ctx.ser, query)
     # CONFIRMED live 2026-08-12 (Mastering Mixology live session): a 0.3-0.5s settle here --
     # shorter than one full game tick (0.6s), with no margin -- reproduced a real bug twice in a
@@ -568,7 +568,7 @@ def search_bank(ctx, query: str) -> bool:
     # reflected the new query (the caller's item-lookup found the right name/id), but the actual
     # on-screen click still landed on the PREVIOUS search's result instead, silently withdrawing
     # the wrong item. Bumped to comfortably clear a full tick with margin.
-    time.sleep(random.uniform(0.7, 0.9))
+    controller.human_delay(0.7, 0.9)
     return True
 
 
@@ -588,7 +588,7 @@ def clear_bank_search(ctx) -> bool:
         return False
 
     controller.click_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False)
-    time.sleep(random.uniform(0.2, 0.4))
+    controller.human_delay(0.2, 0.4)
     return True
 
 
@@ -656,7 +656,7 @@ def search_and_withdraw(ctx, item_name: str, quantity: int) -> bool:
     for _ in range(quantity):
         if controller.click_entity(ctx.ser, slot):
             landed += 1
-        time.sleep(random.uniform(0.15, 0.3))
+        controller.human_delay(0.15, 0.3)
     clear_bank_search(ctx)
     if landed == 0:
         debug_log.log("bank", f"withdrawing {slot.get('name')} failed -- no click landed")
