@@ -59,6 +59,12 @@ define (see `controller.py`'s own header comment for the authoritative version):
   focused, no safety stop active, and not on a break.
 - `on_event(ctx, event_type: str, payload: dict | None) -> None` — optional; runs for every UDP
   event regardless of whether `tick` is currently running.
+- `SKIP_STRAY_DIALOG_CHECK = True` — optional module-level flag; opts out of the engine-level
+  `check_stray_dialog` (dismisses a "click here to continue" dialogue via Space before every
+  tick). Added 2026-08-14 for `routines/pest_control.py`: that check only presses Space once per
+  tick, so a multi-stage dialogue only advances one stage per call instead of clearing in one
+  shot — fine for a routine whose own state detection tolerates a lingering dialogue, not useful
+  otherwise. Off (check runs) by default for every other routine.
 
 `ctx.state.data` is a plain dict for a routine's own bookkeeping (current target, phase, etc.) —
 **it resets to `{}`** whenever the routine file changes or the process restarts. It is NOT

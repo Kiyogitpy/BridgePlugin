@@ -39,6 +39,13 @@ import controller
 import debug_log
 import travel
 
+# User directive 2026-08-14: controller.py's engine-level check_stray_dialog only presses Space
+# once per tick, so a multi-stage dialogue (several consecutive "click to continue" pages) only
+# advances one stage per call instead of clearing in one shot -- not wrong, just not useful here,
+# since this routine's own region-based phase detection doesn't depend on a dialogue being fully
+# dismissed to keep working (it already tolerates "unrecognized region" ticks while one lingers).
+SKIP_STRAY_DIALOG_CHECK = True
+
 DEFAULT_CONFIG = {
     "enabled": True,
 
@@ -143,7 +150,7 @@ def dock_tick(ctx, config, player):
         return
 
     debug_log.log("pest_control", "boarding the boat")
-    time.sleep(random.uniform(0.2, 0.5))
+    time.sleep(random.uniform(0.2, 10.0))
     click_without_rotating(ctx, gangplank)
     ctx.state.data["gangplank_clicked_at"] = time.time()
 
@@ -326,7 +333,10 @@ def step_forward_blind(ctx, config):
     even though the first click may have already closed the gap. Since every click represents
     the same fixed direction+distance, an unnecessary second click compounds straight past the
     tile instead of correcting toward it. Skip the click entirely if we're already close enough
-    by the time the wait actually finishes."""
+    by the time the wait actually finishes.
+
+    Random 1-5s pause right before the click itself (user directive 2026-08-14) -- purely
+    humanization, on top of (not instead of) the idle-wait above."""
     if not controller.wait_until_player_idle(timeout_s=10.0):
         return
 
@@ -335,6 +345,7 @@ def step_forward_blind(ctx, config):
         debug_log.log("pest_control", "already close enough after settling -- skipping this step")
         return
 
+    time.sleep(random.uniform(1.0, 5.0))
     point = {"screenX": ABS_MINIMAP_CLICK_X, "screenY": ABS_MINIMAP_CLICK_Y, "name": "minimap landmark"}
     click_without_rotating(ctx, point, offset=(0, 0))
 

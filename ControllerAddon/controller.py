@@ -1840,6 +1840,16 @@ def check_stray_dialog(ctx):
     notices. Deliberately does not touch a multiple-choice dialogue (GET
     /state's "dialogOpen" already excludes DIALOG_OPTION) -- continuing that
     blind would mean guessing a choice.
+
+    Only presses Space once per call, so a genuinely multi-stage dialogue
+    (several consecutive "click to continue" pages) only advances one stage per
+    tick rather than being fully cleared in one shot -- user report 2026-08-14,
+    Pest Control: not wrong, but not useful there either, since that routine's
+    own region-based phase detection doesn't depend on a dialogue being fully
+    dismissed to keep working. A routine can opt out entirely by setting
+    SKIP_STRAY_DIALOG_CHECK = True at module level (see the main loop above,
+    and routines/pest_control.py for the reference case) rather than this
+    function trying to guess how many stages to clear.
     """
     if get_state().get("dialogOpen"):
         debug_log.log("!", "Dismissing a stray dialogue box (Space)")
@@ -2021,7 +2031,8 @@ def main():
                 time.sleep(1.0)
                 continue
 
-            check_stray_dialog(ctx)
+            if not getattr(routine, "SKIP_STRAY_DIALOG_CHECK", False):
+                check_stray_dialog(ctx)
             maybe_idle_mouse_move(ctx, state)
             try:
                 routine.tick(ctx)
