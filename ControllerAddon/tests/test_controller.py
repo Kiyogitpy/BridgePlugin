@@ -267,3 +267,37 @@ def test_pick_aim_point_jitter_spread_follows_profile_aim_sigma_factor(monkeypat
     # the spread of magnitudes (confirmed empirically: ~1.9x variance ratio
     # between factor=1.3 and factor=1.8 at radius=10).
     assert variance(wide) > variance(tight) * 1.3
+
+
+def test_build_bezier_path_curve_magnitude_follows_profile_range(monkeypatch):
+    def make_profile(low, high):
+        return controller.HumanProfile(
+            aim_sigma_factor=1.5, curve_mag_low=low, curve_mag_high=high,
+            delay_skew=0.5, rerolled_at=0.0, reroll_after_s=1e9,
+        )
+
+    def mean_c1_offset(samples):
+        return sum(samples) / len(samples)
+
+    start, end = (0, 0), (400, 0)
+
+    controller.random.seed(2)
+    monkeypatch.setattr(controller, "get_human_profile", lambda: make_profile(0.08, 0.08))
+    low_offsets = []
+    for _ in range(2000):
+        bez = controller.build_bezier_path(start, end)
+        # c1 sits at c1_t along the straight line, plus a perpendicular offset --
+        # isolate that offset by comparing against the line's own y at that x.
+        low_offsets.append(abs(bez.p1[1]))
+
+    controller.random.seed(2)
+    monkeypatch.setattr(controller, "get_human_profile", lambda: make_profile(0.20, 0.20))
+    high_offsets = []
+    for _ in range(2000):
+        bez = controller.build_bezier_path(start, end)
+        high_offsets.append(abs(bez.p1[1]))
+
+    # Same seed sequence, only the profile's curve_mag range differs -- pinning
+    # it to 0.20 instead of 0.08 should produce a visibly larger average
+    # perpendicular offset (confirmed empirically: ~2.5x on a 400px move).
+    assert mean_c1_offset(high_offsets) > mean_c1_offset(low_offsets) * 1.5

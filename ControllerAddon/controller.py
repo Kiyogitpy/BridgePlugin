@@ -888,7 +888,8 @@ def build_bezier_path(start: tuple, end: tuple) -> Bezier:
     # server-side detection; what actually matters there (click timing via estimate_duration_ms,
     # aim-point variance via pick_aim_point/misclicks) is untouched by this change. Kept
     # deliberately nonzero rather than a straight line, for screen-recording/visual plausibility.
-    curve_mag = clamp(dist * random.uniform(0.08, 0.20), 8.0, 150.0)
+    profile = get_human_profile()
+    curve_mag = clamp(dist * random.uniform(profile.curve_mag_low, profile.curve_mag_high), 8.0, 150.0)
     curve_sign = random.choice([-1.0, 1.0])
     # Real aim-trainer recordings show ~2/3 of moves cross back over the
     # straight line at least once -- about half here, since c2 is only one
