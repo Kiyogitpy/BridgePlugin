@@ -197,3 +197,42 @@ def test_get_human_profile_rerolls_after_interval_elapses(monkeypatch):
 
     assert second is not stale
     assert second.rerolled_at > stale.rerolled_at
+
+
+def test_sample_human_delay_median_tracks_midpoint_with_soft_floor():
+    controller.random.seed(1234)
+    samples = sorted(controller.sample_human_delay(1.0, 2.0) for _ in range(10000))
+
+    median = samples[len(samples) // 2]
+    assert 1.3 < median < 1.7  # tracks (1.0+2.0)/2 == 1.5
+
+    assert min(samples) >= 1.0 * 0.6 - 1e-9  # soft floor, not min_s itself
+
+
+def test_sample_human_delay_has_no_hard_ceiling_unlike_uniform():
+    controller.random.seed(5678)
+    samples = [controller.sample_human_delay(1.0, 2.0) for _ in range(10000)]
+
+    over_ceiling = sum(1 for s in samples if s > 2.0)
+    assert over_ceiling > 1000  # meaningfully non-zero; uniform(1,2) would give exactly 0
+
+
+def test_sample_human_delay_is_not_uniformly_distributed():
+    controller.random.seed(9012)
+    samples = [controller.sample_human_delay(1.0, 2.0) for _ in range(10000)]
+
+    mean = sum(samples) / len(samples)
+    variance = sum((s - mean) ** 2 for s in samples) / len(samples)
+    # uniform(1, 2)'s variance is (2-1)**2/12 ~= 0.083; the fat-tailed shape
+    # should sit well above that regardless of the current delay_skew draw.
+    assert variance > 0.15
+
+
+def test_human_delay_sleeps_for_the_sampled_duration(monkeypatch):
+    slept = []
+    monkeypatch.setattr(controller.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(controller, "sample_human_delay", lambda a, b: 1.23)
+
+    controller.human_delay(1.0, 2.0)
+
+    assert slept == [1.23]

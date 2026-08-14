@@ -984,6 +984,26 @@ def get_human_profile() -> "HumanProfile":
     return _human_profile
 
 
+def sample_human_delay(min_s: float, max_s: float) -> float:
+    # Fat right tail instead of random.uniform's hard ceiling -- a real human occasionally
+    # pauses much longer than usual (distraction, re-reading a dialog). Median still tracks
+    # (min_s, max_s) so existing call sites don't need bound retuning; only the shape changes.
+    # See docs/superpowers/specs/2026-08-14-humanization-overhaul-design.md.
+    mid = (min_s + max_s) / 2.0
+    profile = get_human_profile()
+    sigma = 0.35 + 0.15 * profile.delay_skew
+    mu = math.log(max(mid, 1e-3))
+    draw = random.lognormvariate(mu, sigma)
+    # Soft floor -- real reaction time has a hard physiological minimum -- but no hard ceiling.
+    return max(draw, min_s * 0.6)
+
+
+def human_delay(min_s: float, max_s: float) -> None:
+    """Drop-in replacement for time.sleep(random.uniform(min_s, max_s)) -- same call shape,
+    fat-tailed instead of uniform. See sample_human_delay for the distribution."""
+    time.sleep(sample_human_delay(min_s, max_s))
+
+
 def pick_aim_point(x: int, y: int, radius: int) -> tuple:
     if radius <= 0:
         return x, y
