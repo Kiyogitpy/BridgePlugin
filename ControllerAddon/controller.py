@@ -462,6 +462,26 @@ def get_npc_screen_pos_by_index(npc_index: int):
     return int(x), int(y)
 
 
+# ---------------- refresh_target factories ----------------
+# Added 2026-08-14. move_to_human/click_entity's refresh_target parameter has existed for a
+# while, but every caller that used it (slayer.py, tormented_demon.py, golem_crafting.py) hand-
+# rolled its own zero-arg lambda wrapping one of the two functions above -- these just give that
+# lambda a name so future routines reuse it instead of re-deriving it. Purely additive: existing
+# inline lambdas keep working exactly as before, nothing here changes their behavior.
+def npc_index_refresh_target(npc_index: int):
+    """refresh_target factory for tracking a specific committed-to NPC instance through a
+    click's flight -- by index, so it can never resolve to a different individual of the same
+    species (see get_npc_by_index)."""
+    return lambda: get_npc_screen_pos_by_index(npc_index)
+
+
+def ground_tile_refresh_target(x: int, y: int, plane: int):
+    """refresh_target factory for tracking a fixed world tile's current screen projection
+    through a click's flight -- the tile itself never moves, but its screen position shifts
+    with the camera (see get_ground_walk_screen_pos)."""
+    return lambda: get_ground_walk_screen_pos(x, y, plane)
+
+
 def is_logged_in():
     return get_state().get("loggedIn", False)
 
@@ -918,6 +938,7 @@ def move_to_human(
     overshoot_chance: float = DEFAULT_OVERSHOOT_CHANCE,
     duration_scale: float = 1.0,
     refresh_target=None,
+    refresh_legs: int = None,
 ) -> None:
     """
     refresh_target, if given, is a zero-arg callable returning the target's current
@@ -930,8 +951,33 @@ def move_to_human(
     otherwise pick for the distance involved -- 1.0 (the default) is normal
     click-speed movement; pass something higher (e.g. from
     maybe_idle_mouse_move) for a deliberately slower, more idle-looking drift.
+
+    refresh_legs, if given together with refresh_target (and the flight is at least
+    MOVING_TARGET_MIN_DIST), splits the flight into that many legs toward interpolated
+    waypoints instead of the single mid-flight checkpoint above, re-aiming before each one
+    after the first (see _move_to_human_tracking for exactly how the waypoints are computed
+    and why) -- added 2026-08-14 for clicking without first waiting on wait_until_player_idle:
+    a single checkpoint narrows the staleness window from "whole flight" to "the last stretch
+    since that one checkpoint", which is enough for a target that's merely walking, but not
+    necessarily enough to track the PLAYER's own continued movement all the way to physical
+    arrival. None (default, or <=1) is a no-op -- every existing caller's behavior is completely
+    unchanged unless it opts in by passing this explicitly. See
+    npc_index_refresh_target/ground_tile_refresh_target for ready-made refresh_target factories
+    instead of hand-writing the lambda each time. Implemented and reviewed (including an
+    independent second pass) but not yet exercised against a live client as of 2026-08-14.
     """
     start = get_cursor_pos()
+
+    if refresh_target is not None and refresh_legs is not None and refresh_legs > 1:
+        # Same distance floor as the single-checkpoint branch below (MOVING_TARGET_MIN_DIST) --
+        # a short flight finishes too fast for multiple checkpoints to be worth the extra bridge
+        # round-trips, so it falls through to the normal path instead.
+        if math.hypot(x - start[0], y - start[1]) >= MOVING_TARGET_MIN_DIST:
+            _move_to_human_tracking(ser, start, x, y, fps=fps, aim_radius=aim_radius,
+                                     duration_scale=duration_scale, refresh_target=refresh_target,
+                                     legs=refresh_legs)
+            return
+
     aim = pick_aim_point(x, y, aim_radius)
 
     over = maybe_overshoot_point(start, aim, overshoot_px=overshoot_px, chance=overshoot_chance)
@@ -965,6 +1011,85 @@ def _reaim(fallback_aim: tuple, refresh_target, aim_radius: int) -> tuple:
     if updated is None:
         return fallback_aim
     return pick_aim_point(updated[0], updated[1], aim_radius)
+
+
+def _move_to_human_tracking(ser: serial.Serial, start: tuple, x: int, y: int, *, fps: int,
+                             aim_radius: int, duration_scale: float, refresh_target, legs: int) -> None:
+    """Generalizes move_to_human's existing single-midflight-checkpoint re-aim (see
+    MOVING_TARGET_MIDFLIGHT_FRACTION) into `legs` sequential hops toward interpolated waypoints,
+    re-aiming via refresh_target before each hop after the first. Added 2026-08-14 specifically
+    for clicking without waiting on wait_until_player_idle first: a single checkpoint is enough
+    for a merely-walking target, but tracking the PLAYER's own continued movement all the way to
+    physical arrival benefits from more frequent correction. Each leg re-queries the target's
+    actual current screen position (via whatever refresh_target resolves -- an NPC index, a
+    world tile, etc.), which is itself a function of wherever the player/camera currently are,
+    so this corrects for our own movement exactly the same way it corrects for the target's.
+
+    Each of the first `legs - 1` hops targets a waypoint interpolated between the cursor's
+    current position and the freshly-resolved aim (cursor + (aim - cursor) / legs_remaining) --
+    NOT the full distance -- so a stale snapshot only ever costs one leg's worth of travel
+    before the next re-aim corrects course; only the final leg lands exactly on the target.
+    Flying the full distance on every leg and only correcting afterward (an earlier version of
+    this function did exactly that, caught in review before ever running live) defeats the
+    entire point: it means "arrive, then twitch-correct in place," not "track en route."
+
+    The aim-radius jitter offset is drawn ONCE, before the loop, and re-applied to every
+    refreshed (x, y) rather than redrawn per leg (pick_aim_point draws uniformly over the disc
+    on every call) -- redrawing would add real, wasted motion even for a perfectly stationary
+    target (two independent draws inside a radius-3 disc average ~2.7px apart, and
+    _move_to_human_exact's duration estimate floors at 200ms even for a 2-3px correction),
+    directly working against clicking sooner, this function's whole purpose.
+
+    Once refresh_target() returns None (target no longer resolvable), stops calling it again for
+    the remaining legs -- rather than spending a bridge round-trip on every one likely to fail
+    the same way -- and finishes the flight toward the last position that was actually resolved.
+
+    Deliberately NOT a change to _move_to_human_exact's own per-step loop (which runs a single
+    pre-computed Bezier curve toward a fixed endpoint, no bridge polling inside it) -- that would
+    mean a bridge round-trip on every one of its ~18+ per-click steps. Chaining whole
+    _move_to_human_exact hops toward interpolated waypoints instead reuses the exact same proven
+    building block move_to_human already calls, just more times in sequence, at whatever
+    granularity `legs` asks for.
+
+    Doesn't combine with maybe_overshoot_point's humanized overshoot-and-correct -- that's a
+    separate, orthogonal randomization the other two branches use; move_to_human's caller falls
+    through to this function before overshoot is ever considered. Not yet exercised against a
+    live client as of 2026-08-14 -- reviewed via static analysis and an independent second pass,
+    not yet confirmed live."""
+    target_x, target_y = x, y
+    jitter_x, jitter_y = pick_aim_point(x, y, aim_radius)
+    jitter_dx, jitter_dy = jitter_x - x, jitter_y - y
+
+    cursor_x, cursor_y = start
+    target_lost = False
+    for leg in range(legs):
+        if _movement_abort.is_set():
+            return
+
+        if leg > 0:
+            time.sleep(random.uniform(0.01, 0.05))
+            cursor_x, cursor_y = get_cursor_pos()
+            if not target_lost and refresh_target is not None:
+                updated = refresh_target()
+                if updated is None:
+                    target_lost = True
+                else:
+                    target_x, target_y = updated
+
+        aim_x, aim_y = target_x + jitter_dx, target_y + jitter_dy
+        legs_remaining = legs - leg
+        if legs_remaining <= 1:
+            waypoint = (int(round(aim_x)), int(round(aim_y)))
+        else:
+            waypoint = (
+                int(round(cursor_x + (aim_x - cursor_x) / legs_remaining)),
+                int(round(cursor_y + (aim_y - cursor_y) / legs_remaining)),
+            )
+
+        # Matches the single-checkpoint MOVING_TARGET branch's own final-approach fps (this
+        # function generalizes that branch, not the separate overshoot branch's fps value).
+        leg_fps = fps if leg < legs - 1 else max(110, fps - 15)
+        _move_to_human_exact(ser, waypoint[0], waypoint[1], fps=leg_fps, duration_scale=duration_scale)
 
 
 def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140, duration_scale: float = 1.0) -> None:
@@ -1235,7 +1360,8 @@ def rotate_camera_to_reveal(ser: serial.Serial, x) -> None:
 # *absolute* screen coordinates (canvas offset baked in server-side) -- do
 # not add the canvas offset again here.
 def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_target=None,
-                  check_ui_blockers=True, simulate_mistakes=True, button: str = "left") -> bool:
+                  check_ui_blockers=True, simulate_mistakes=True, button: str = "left",
+                  refresh_legs: int = None) -> bool:
     x, y = entity.get("screenX"), entity.get("screenY")
     if x is None or y is None:
         return False
@@ -1274,6 +1400,7 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
         aim_y,
         aim_radius=ENTITY_AIM_RADIUS,
         refresh_target=refresh_target,
+        refresh_legs=refresh_legs,
     )
     if _movement_abort.is_set():
         return False
@@ -1283,13 +1410,13 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
         click_human(ser)
 
     if missed:
-        _reclick_after_misclick(ser, entity, offset, refresh_target, check_ui_blockers, button)
+        _reclick_after_misclick(ser, entity, offset, refresh_target, check_ui_blockers, button, refresh_legs)
 
     return True
 
 
 def _reclick_after_misclick(ser: serial.Serial, entity: dict, offset, refresh_target,
-                             check_ui_blockers: bool, button: str) -> None:
+                             check_ui_blockers: bool, button: str, refresh_legs: int = None) -> None:
     """Corrective follow-up after click_entity's own simulated near-miss: a human who clicks
     empty ground beside a target notices nothing happened and clicks again almost immediately,
     they don't just give up and stand there. Without this, every caller that cares about the
@@ -1321,7 +1448,8 @@ def _reclick_after_misclick(ser: serial.Serial, entity: dict, offset, refresh_ta
         return
 
     debug_log.log("action", f"Reclick -- correcting misclick on {entity.get('name')} at ({aim_x},{aim_y})")
-    move_to_human(ser, aim_x, aim_y, aim_radius=ENTITY_AIM_RADIUS, refresh_target=refresh_target)
+    move_to_human(ser, aim_x, aim_y, aim_radius=ENTITY_AIM_RADIUS, refresh_target=refresh_target,
+                  refresh_legs=refresh_legs)
     if _movement_abort.is_set():
         return
     if button == "right":
@@ -1331,7 +1459,7 @@ def _reclick_after_misclick(ser: serial.Serial, entity: dict, offset, refresh_ta
 
 
 def hover_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_target=None,
-                  check_ui_blockers=True) -> bool:
+                  check_ui_blockers=True, refresh_legs: int = None) -> bool:
     """Move the cursor onto `entity` (same aim jitter as click_entity) without
     clicking -- for anticipatory hovering over something a routine already
     knows it'll need next, while it's otherwise idle-waiting on the current
@@ -1359,7 +1487,8 @@ def hover_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
     if check_ui_blockers and is_point_blocked_by_ui(aim_x, aim_y) is not None:
         return False
 
-    move_to_human(ser, aim_x, aim_y, aim_radius=ENTITY_AIM_RADIUS, refresh_target=refresh_target)
+    move_to_human(ser, aim_x, aim_y, aim_radius=ENTITY_AIM_RADIUS, refresh_target=refresh_target,
+                  refresh_legs=refresh_legs)
     return not _movement_abort.is_set()
 
 
@@ -1695,6 +1824,7 @@ ROUTINE_FILES = {
     "BLAST_FURNACE": "routines/blast_furnace.py",
     "GOLEM_CRAFTING": "routines/golem_crafting.py",
     "MASTERING_MIXOLOGY": "routines/mastering_mixology.py",
+    "PEST_CONTROL": "routines/pest_control.py",
 }
 
 

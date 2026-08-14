@@ -66,6 +66,24 @@ persisted across restarts; a routine's own in-game progress (mid-craft state, pa
 inventory, etc.) very much is, so the two can desync after a restart — see the golem_crafting.py
 notes below for a real example of this causing a bug.
 
+**Wiring a new routine into the GUI is a required step, not optional polish.** A routine file
+alone is only launchable via `python controller.py routines/<name>.py --routine <NAME>` from the
+command line — CONFIRMED live 2026-08-14 (`pest_control.py` shipped without this and could only
+be started that way). To make it selectable from the RuneLite plugin's own Controller Settings
+panel (so `controllerEnabled` + picking it from the Routine dropdown is enough, no command line
+needed), both of these are required, and need a client restart (Java-side change) to take effect:
+1. Add an entry to the `RoutineChoice` enum
+   (`src/main/java/com/example/controller/RoutineChoice.java`).
+2. Add a matching key to `ROUTINE_FILES` in `controller.py` (the enum name, e.g. `PEST_CONTROL`,
+   mapping to `"routines/pest_control.py"`).
+
+Only add a dedicated `ControllerConfig.java` toggle/section on top of this (see the "Secondary
+switch on top of launching controller.py with routines/X.py" entries for `golem_crafting.py`,
+`gemstone_crab.py`, etc.) if the routine actually reads its config from the bridge's `GET
+/config` — a routine using a plain `DEFAULT_CONFIG`/`get_config` that ignores `bridge_config`
+(same pattern as `gemstone_crab.py`, `mining.py`, `pest_control.py`) needs nothing beyond the two
+steps above.
+
 ## Known environment gotchas
 
 - **Windows HiDPI scaling**: RuneLite's own AWT windows report `screenX`/`screenY` at 96 DPI
@@ -94,6 +112,45 @@ notes below for a real example of this causing a bug.
   what's under the cursor) and looks like any other single click, so there's no reason not to
   use it for every walk-to-a-tile click, not just ones near a known-risky object. See
   `golem_crafting.py`'s `walk_to_exact_tile` for the reference implementation.
+
+## Sub-tick data and clicking while moving
+
+Most game state is genuinely capped at OSRS's own 0.6s server tick — HP, true tile position,
+target switches, which animation is playing — no client-side trick gets around that; the
+information doesn't exist any faster server-side no matter how it's read. But on-screen
+*position* data is not tick-capped: a moving actor's `LocalPoint` is smoothly interpolated by
+the client every render frame, and RuneLite's `ClientTick` event (fires once per frame, not once
+per game tick) is the general mechanism for reading that. This codebase's only current use of it
+is `NpcTrackerRegistry.onClientTick`'s animation-*frame* diffing (catches a repeating attack
+animation restarting even when the animation *id* itself never changes between reps — a
+`GameTick`-only check would structurally miss this, not just see it late).
+
+On the bridge side, only 6 providers (`NPCProvider`, `ObjectProvider`, `TileProvider`,
+`GroundItemProvider`, `GraphicsObjectProvider`, `BankProvider`) are gated by `TickCache` — a
+deliberate perf optimization for the bulk list endpoints (`/npcs`, `/objects`, ...), not a
+platform limitation, and it already has a `?fresh=true` bypass. Single-entity lookups
+(`/npc/by-index`, `/npc/nearest`, `/player`, `/combat`) were never cached at all — every poll
+already reads the client's current interpolated position fresh, however often you ask.
+
+This is why routines gate clicks behind `wait_until_player_idle()` (wait for the player to fully
+stop before trusting a resolved screen position) rather than clicking while moving: most click
+call sites resolve a screen position once and never re-check it, not because the position data
+itself is too slow to get. `move_to_human`/`click_entity` already had a `refresh_target`
+parameter for this (a zero-arg callable re-resolving a target's current screen position — used
+by `slayer.py`/`tormented_demon.py`/`golem_crafting.py`, each hand-writing its own lambda) but it
+only re-aimed once, partway through a flight. `refresh_legs` (added 2026-08-14, purely additive —
+`None`/default reproduces every existing caller's exact prior behavior bit-for-bit) generalizes
+this into multiple re-aim checkpoints toward interpolated waypoints (only the final leg lands
+exactly on the target; earlier legs travel a fraction of the remaining distance, so a re-aim
+mid-flight can still correct the approach), specifically so a routine could eventually click
+without waiting for full stillness first. Reviewed via an independent second pass that caught
+and fixed two real bugs in the first draft (leg 0 was flying the *entire* distance to a stale
+snapshot before ever re-aiming, and per-leg jitter was being redrawn instead of fixed, adding
+real wasted motion even for a stationary target) — see `_move_to_human_tracking`'s own docstring
+for the full account. Covered by unit tests in `tests/test_controller.py`, but **not yet
+exercised against a live client**, and no routine has adopted it yet as of this note. See
+`npc_index_refresh_target`/`ground_tile_refresh_target` for ready-made `refresh_target` factories
+instead of hand-writing the lambda at each call site.
 
 ## Live-debugging workflow
 

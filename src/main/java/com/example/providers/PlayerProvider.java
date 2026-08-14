@@ -41,14 +41,35 @@ public class PlayerProvider extends BridgeProvider
 		// boat's own nested WorldView). This resolves to the true top-level-world position either
 		// way, matching what ObjectProvider/NPCProvider's coordinates already are.
 		WorldPoint wp = RuneLiteUtil.getTopLevelWorldLocation(client, p);
+
+		LocalPoint local = p.getLocalLocation();
+
+		// Instance-template correction -- CONFIRMED live 2026-08-14 (Pest Control routine
+		// live-debugging): inside any instanced area (a minigame, a dungeon, a boss room), wp
+		// above is still a raw instance-template coordinate (observed x~13600, regionId~54000
+		// aboard a Pest Control boat), not the real reachable map location a routine's own
+		// hardcoded tiles/region ids are written against -- the exact same bug class already
+		// fixed once for SafespotMarker.java (Blast Furnace, see its own comment) but left
+		// unaddressed here (flagged, not fixed, in slayer.py's SAFESPOT_MAX_RETURN_DISTANCE
+		// comment). WorldPoint.fromLocalInstance() does the same chunk-remapping SafespotMarker
+		// now uses, degrading to a plain WorldPoint.fromLocal() when not actually inside an
+		// instance -- safe to apply unconditionally. Only applied for the common
+		// non-nested-WorldView case; a player aboard a Sailing boat's own WorldView isn't
+		// expected to also be inside an instance, so getTopLevelWorldLocation's boat handling
+		// above takes priority there instead.
+		if (local != null && local.getWorldView() <= WorldView.TOPLEVEL)
+		{
+			wp = WorldPoint.fromLocalInstance(client, local);
+		}
+
 		Map<String, Object> data = new HashMap<>();
 
 		data.put("name", p.getName());
 		data.put("combatLevel", p.getCombatLevel());
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
+		data.put("regionId", wp.getRegionID());
 
-		LocalPoint local = p.getLocalLocation();
 		if (local != null)
 		{
 			data.put("localX", local.getX());

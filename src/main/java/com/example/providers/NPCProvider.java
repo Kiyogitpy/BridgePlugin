@@ -5,6 +5,7 @@ import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
 import net.runelite.api.NPC;
 import net.runelite.api.Player;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
 
@@ -186,7 +187,16 @@ public class NPCProvider extends BridgeProvider
 	private Map<String, Object> buildNpcData(NPC npc, Player local)
 	{
 		Map<String, Object> data = new HashMap<>();
-		WorldPoint wp = npc.getWorldLocation();
+
+		// npc.getWorldLocation() alone is NOT instance-aware -- inside any instanced area (a
+		// minigame, a dungeon, a boss room) it's a raw instance-template coordinate, not the real
+		// reachable map location a routine's own hardcoded tiles/distance math is written
+		// against. Same bug, same fix as PlayerProvider's regionId addition (see its own
+		// comment, CONFIRMED live 2026-08-14 via a Pest Control routine reporting every NPC's x/y
+		// in the ~13000s instead of the real ~2600s map coordinates once /player itself was
+		// fixed but this wasn't yet).
+		LocalPoint npcLocal = npc.getLocalLocation();
+		WorldPoint wp = npcLocal != null ? WorldPoint.fromLocalInstance(client, npcLocal) : npc.getWorldLocation();
 		int plane = client.getPlane();
 		boolean alive = !RuneLiteUtil.isNpcDead(npc);
 
@@ -203,6 +213,9 @@ public class NPCProvider extends BridgeProvider
 		data.put("interactingPlayer", local != null && npc.getInteracting() == local);
 		data.put("inCombat", npc.getInteracting() != null);
 		data.put("attackable", RuneLiteUtil.isNpcAttackable(npc));
+		// Additive, doesn't replace "attackable" (existing routines already filter on that) --
+		// see RuneLiteUtil.hasAttackOption's own doc for why this is a more direct signal.
+		data.put("hasAttackOption", RuneLiteUtil.hasAttackOption(npc));
 		data.putAll(RuneLiteUtil.visibility(client, npc.getLocalLocation(), plane, alive));
 		return data;
 	}

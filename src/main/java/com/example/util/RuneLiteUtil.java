@@ -192,6 +192,40 @@ public final class RuneLiteUtil
 		return npc != null && npc.getHealthRatio() == 0;
 	}
 
+	/**
+	 * Whether the NPC's own composition actually defines an "Attack" menu option -- a more
+	 * semantically direct attackability signal than {@link #isNpcAttackable}'s combatLevel/health
+	 * heuristic, which can't distinguish "attackable" from "just has a nonzero combat level for
+	 * flavor" (or miss an attackable NPC with combatLevel 0). Ported from the sideloaded "Target
+	 * True Tile" plugin's own {@code isNpcAttackable} (decompiled to
+	 * data/decompiled/target-true-tile/, 2026-08-14) -- that plugin checks only
+	 * {@code actions[1] != null} (a fixed-slot convention); this generalizes to a case-insensitive
+	 * scan of every action slot instead of assuming "Attack" is always at index 1, since that
+	 * position isn't guaranteed for every NPC composition.
+	 */
+	public static boolean hasAttackOption(NPC npc)
+	{
+		if (npc == null || npc.getComposition() == null)
+		{
+			return false;
+		}
+
+		String[] actions = npc.getComposition().getActions();
+		if (actions == null)
+		{
+			return false;
+		}
+
+		for (String action : actions)
+		{
+			if (action != null && action.equalsIgnoreCase("Attack"))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	public static int distanceToPlayer(Client client, WorldPoint wp)
 	{
 		return GeometryUtil.distanceToPlayer(client, wp);

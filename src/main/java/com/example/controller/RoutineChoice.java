@@ -17,7 +17,8 @@ public enum RoutineChoice
 	FIREMAKING("Firemaking"),
 	BLAST_FURNACE("Blast Furnace"),
 	GOLEM_CRAFTING("Golem Crafting"),
-	MASTERING_MIXOLOGY("Mastering Mixology");
+	MASTERING_MIXOLOGY("Mastering Mixology"),
+	PEST_CONTROL("Pest Control");
 
 	private final String label;
 
