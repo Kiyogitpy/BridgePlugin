@@ -215,9 +215,9 @@ def withdraw_coins_via_x(ctx, amount: int) -> bool:
         return False
     if not controller.click_entity(ctx.ser, slot):
         return False
-    time.sleep(random.uniform(0.4, 0.7))  # wait for the amount prompt to appear
+    controller.human_delay(0.4, 0.7)  # wait for the amount prompt to appear
     controller.type_digits_and_enter(ctx.ser, str(amount))
-    time.sleep(random.uniform(0.3, 0.5))
+    controller.human_delay(0.3, 0.5)
     return True
 
 
@@ -260,7 +260,7 @@ def maybe_top_up_coffer(ctx, config: dict) -> None:
         banker.deposit_inventory(ctx, {"keepItems": []})
         withdrew = withdraw_coins_via_x(ctx, amount)
         banker.close_bank(ctx)
-        time.sleep(random.uniform(0.3, 0.6))  # let the bank-closing transition settle
+        controller.human_delay(0.3, 0.6)  # let the bank-closing transition settle
         if not withdrew or current_coins() < amount:
             debug_log.log("blast furnace", "couldn't withdraw enough coins for coffer top-up -- will retry shortly")
             ctx.state.data["bf_coffer_next_topup_at"] = now + 60
@@ -274,9 +274,9 @@ def maybe_top_up_coffer(ctx, config: dict) -> None:
 
     debug_log.log("blast furnace", f"topping up coffer with {amount} coins")
     controller.click_entity(ctx.ser, coffer)
-    time.sleep(random.uniform(0.8, 1.2))  # wait for the amount prompt to appear
+    controller.human_delay(0.8, 1.2)  # wait for the amount prompt to appear
     controller.type_digits_and_enter(ctx.ser, str(amount))
-    time.sleep(random.uniform(0.4, 0.8))
+    controller.human_delay(0.4, 0.8)
     ctx.state.data["bf_coffer_next_topup_at"] = now + interval_s
 
 
@@ -371,7 +371,7 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
         # withdraw_loadout's own fresh parameter.
         banker.withdraw_loadout(ctx, bank_cfg, fresh=need_bag_withdraw)
         if need_bag_fill:
-            time.sleep(random.uniform(0.3, 0.5))  # let a just-withdrawn bag register in
+            controller.human_delay(0.3, 0.5)  # let a just-withdrawn bag register in
                                                     # get_inventory() before fill_coal_bag
                                                     # looks for it
             if not banker.fill_coal_bag(ctx):
@@ -379,7 +379,7 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
                 ctx.state.trigger_safety_stop("no coal bag in inventory or bank -- this bar type needs one")
                 return False
         banker.close_bank(ctx)
-        time.sleep(random.uniform(0.3, 0.6))  # let the bank-closing transition settle
+        controller.human_delay(0.3, 0.6)  # let the bank-closing transition settle
     elif config.get("bank", {}).get("teleportFallback"):
         if need_bag_fill:
             ctx.state.trigger_safety_stop(
@@ -434,7 +434,7 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
         if not banker.empty_coal_bag(ctx):
             ctx.state.trigger_safety_stop("couldn't empty the coal bag at the conveyor belt")
             return False
-        time.sleep(random.uniform(0.3, 0.6))
+        controller.human_delay(0.3, 0.6)
         deposited = deposit_items(ctx, "Coal", bag_coal, conveyor)
         if deposited < bag_coal:
             ctx.state.trigger_safety_stop(
@@ -448,9 +448,9 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
             ctx.state.trigger_safety_stop("bar dispenser not found nearby")
             return False
         debug_log.log("blast furnace", "collecting bars")
-        time.sleep(random.uniform(0.2, 0.4))
+        controller.human_delay(0.2, 0.4)
         controller.click_entity(ctx.ser, dispenser)
-        time.sleep(random.uniform(0.6, 1.0))
+        controller.human_delay(0.6, 1.0)
 
     return True
 
@@ -478,13 +478,13 @@ def deposit_items(ctx, name: str, quantity: int, target: dict) -> int:
         if item is None:
             break
         if not controller.click_entity(ctx.ser, item, check_ui_blockers=False):
-            time.sleep(random.uniform(0.2, 0.4))
+            controller.human_delay(0.2, 0.4)
             continue
-        time.sleep(random.uniform(0.15, 0.3))
+        controller.human_delay(0.15, 0.3)
         if not controller.click_entity(ctx.ser, target):
-            time.sleep(random.uniform(0.2, 0.4))
+            controller.human_delay(0.2, 0.4)
             continue
-        time.sleep(random.uniform(0.3, 0.5))
+        controller.human_delay(0.3, 0.5)
         deposited += 1
     return deposited
 
