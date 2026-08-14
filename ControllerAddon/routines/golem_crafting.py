@@ -683,7 +683,7 @@ def mine_phase(ctx, config: dict) -> None:
     ctx.state.data["gc_mine_target_pos"] = (rock.get("x"), rock.get("y"))
 
     debug_log.log("golem crafting", f"mining {rock.get('name')} (dist={rock.get('distance')})")
-    time.sleep(random.uniform(0.15, 0.5))
+    controller.human_delay(0.15, 0.5)
     if not controller.click_entity(ctx.ser, rock):
         # ADDED 2026-08-08 (live session): find_mining_target's MAX_OBJECT_DISTANCE radius can
         # report a rock as "found" while it's still off the actual rendered viewport -- CONFIRMED
@@ -751,9 +751,9 @@ def chisel_phase(ctx, config: dict) -> None:
         return
 
     debug_log.log("golem crafting", f"chiselling sunstone into a core ({cores_have}/{CORES_PER_TRIP})")
-    time.sleep(random.uniform(0.15, 0.35))
+    controller.human_delay(0.15, 0.35)
     controller.click_entity(ctx.ser, chisel, check_ui_blockers=False)
-    time.sleep(random.uniform(0.1, 0.25))
+    controller.human_delay(0.1, 0.25)
     controller.click_entity(ctx.ser, raw, check_ui_blockers=False)
 
     deadline = time.time() + CHISEL_CONFIRM_TIMEOUT_S
@@ -1042,7 +1042,7 @@ def craft_phase(ctx, config: dict) -> None:
                         # still see the item sitting there, and fire a second take on top of it.
                         # Matches the same click-then-wait-a-tick-before-rechecking idiom already
                         # used elsewhere in this file (e.g. the minimap-hop retry above).
-                        time.sleep(random.uniform(0.6, 1.0))
+                        controller.human_delay(0.6, 1.0)
                 # CORRECTED 2026-08-08 (live session, user report): 1.0s here still weighed in
                 # too early against the plinth's own ~2s reset delay -- CONFIRMED live. Bumped to
                 # 2.0s (on top of whatever the loot loop above already spent).
@@ -1513,7 +1513,7 @@ def bank_phase(ctx, config: dict) -> None:
                     ctx.state.data["gc_bank_minimap_hops"] = hops + 1
                     debug_log.log("golem crafting", f"bank found but off-screen -- minimap-clicking toward it (hop {hops + 1}/{MAX_BANK_MINIMAP_HOPS})")
                     controller.click_entity(ctx.ser, point, offset=(0, 0))
-                    time.sleep(random.uniform(0.6, 1.0))
+                    controller.human_delay(0.6, 1.0)
                     return
             if handle_missing_target(ctx, config, "bank", "gc_bank_misses", "gc_bank_walks"):
                 return
@@ -1524,7 +1524,7 @@ def bank_phase(ctx, config: dict) -> None:
         ctx.state.data["gc_bank_minimap_hops"] = 0
         _run_bank_trip(ctx, config)
         banker.close_bank(ctx)
-        time.sleep(random.uniform(0.3, 0.6))
+        controller.human_delay(0.3, 0.6)
         # CORRECTED 2026-08-08 (live session, user correction): the fur pouch can only be
         # filled AFTER the bank closes -- CONFIRMED live its right-click menu offers no "Fill"
         # entry at all while a bank interface is open (Deposit-1/5/10/X/All instead). Compacts
@@ -1586,7 +1586,7 @@ def _ensure_wooden_spikes(ctx, config: dict) -> bool:
     # cycle). Taking 5 at once covers 5 relining cycles per visit instead of 1.
     debug_log.log("golem crafting", "taking 5 wooden spikes from the Spikes supply")
     controller.click_menu_action(ctx.ser, supply, "take-5")
-    time.sleep(random.uniform(0.4, 0.7))
+    controller.human_delay(0.4, 0.7)
     return find_item(WOODEN_SPIKES_NAME) is not None
 
 
@@ -1721,7 +1721,7 @@ def hunt_phase(ctx, config: dict) -> None:
         if not controller.click_entity(ctx.ser, pit):
             debug_log.log("golem crafting", "lining click missed/blocked -- retrying next tick")
             return
-        time.sleep(random.uniform(0.6, 1.0))
+        controller.human_delay(0.6, 1.0)
         ctx.state.data["gc_pit_lined"] = True
         ctx.state.data["gc_pit_filled"] = False
 
@@ -1733,7 +1733,7 @@ def hunt_phase(ctx, config: dict) -> None:
             if pouch is not None:
                 debug_log.log("golem crafting", "opening fur pouch so catches route straight in")
                 controller.click_entity(ctx.ser, pouch, check_ui_blockers=False)
-                time.sleep(random.uniform(0.3, 0.5))
+                controller.human_delay(0.3, 0.5)
             ctx.state.data["gc_pouch_opened_this_hunt"] = True
         return
 
@@ -1826,7 +1826,7 @@ def hunt_phase(ctx, config: dict) -> None:
         controller.cast_telekinetic_grab(ctx.ser, target)
         if target.get("index") is not None:
             cooldowns[target["index"]] = now + GOAT_GRAB_COOLDOWN_S
-        time.sleep(random.uniform(0.6, 1.0))
+        controller.human_delay(0.6, 1.0)
 
         seq = ctx.state.data.get("gc_last_hunt_chat_seq", 0)
         if seq > ctx.state.data.get("gc_hunt_chat_seen_seq", 0):
@@ -1864,7 +1864,7 @@ def hunt_phase(ctx, config: dict) -> None:
         debug_log.log("golem crafting", "pit no longer found before harvesting -- retrying next tick")
         return
     controller.click_entity(ctx.ser, pit)
-    time.sleep(random.uniform(0.6, 1.0))
+    controller.human_delay(0.6, 1.0)
 
     # ADDED 2026-08-09 (user report: "we still try to catch goats while the animation is going"):
     # collecting the trapped goats isn't instant -- CONFIRMED live the pit's own right-click menu
@@ -1882,12 +1882,12 @@ def hunt_phase(ctx, config: dict) -> None:
                                        # chisel_phase already uses) needed before clicking
                                        # inventory items; a still-open Magic tab from Grab-
                                        # casting would otherwise leave Goat horns unclickable.
-    time.sleep(random.uniform(0.2, 0.4))
+    controller.human_delay(0.2, 0.4)
     for horn in [i for i in controller.get_inventory()
                  if GOAT_HORN_NAME.lower() in (i.get("name") or "").lower()]:
         controller.click_entity(ctx.ser, horn, check_ui_blockers=False)  # "Drop" (confirmed
                                                                           # live Forced Action)
-        time.sleep(random.uniform(0.2, 0.4))
+        controller.human_delay(0.2, 0.4)
 
     spilled_fur = any(
         (i.get("name") or "").lower() in {f.lower() for f in FUR_PRIORITY}
@@ -1900,7 +1900,7 @@ def hunt_phase(ctx, config: dict) -> None:
         for spikes in [i for i in controller.get_inventory()
                        if WOODEN_SPIKES_NAME.lower() in (i.get("name") or "").lower()]:
             controller.click_entity(ctx.ser, spikes, check_ui_blockers=False)  # "Drop"
-            time.sleep(random.uniform(0.2, 0.4))
+            controller.human_delay(0.2, 0.4)
         ctx.state.data["gc_fur_stock"] = FUR_POUCH_CAPACITY
         ctx.state.data["gc_hunt_standing"] = False
         ctx.state.data["gc_pouch_opened_this_hunt"] = False
