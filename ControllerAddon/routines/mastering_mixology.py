@@ -247,13 +247,13 @@ def bank_herbs_phase(ctx, config: dict) -> None:
         for name in known_container_names
     ):
         banker.deposit_all_containers(ctx)
-        time.sleep(random.uniform(0.3, 0.5))
+        controller.human_delay(0.3, 0.5)
 
     if inventory:
         deposit_all = controller.get_bank().get("depositInventory") or {}
         if deposit_all.get("screenX") is not None:
             controller.click_entity(ctx.ser, deposit_all, offset=(0, 0), check_ui_blockers=False)
-            time.sleep(random.uniform(0.3, 0.6))
+            controller.human_delay(0.3, 0.6)
 
     # CONFIRMED live 2026-08-12 (user report): searching each configured herb name one at a
     # time -- resolving "which candidate is in stock" from one bank read, then re-searching and
@@ -372,9 +372,9 @@ def bank_herbs_phase(ctx, config: dict) -> None:
         # keyboard prompt after it), but the "Enter amount" chatbox needs a moment to actually
         # render and take keyboard focus. Typing immediately dropped the digits silently (menu
         # click logged fine, digits logged fine, but nothing was ever actually withdrawn).
-        time.sleep(random.uniform(0.4, 0.6))
+        controller.human_delay(0.4, 0.6)
         controller.type_digits_and_enter(ctx.ser, str(per_type_qty))
-        time.sleep(random.uniform(0.3, 0.5))
+        controller.human_delay(0.3, 0.5)
 
     banker.close_bank(ctx)
 
@@ -430,7 +430,7 @@ def _clean_grimy_herbs(ctx) -> None:
             # too short to justify.
             controller.sweep_and_click(ctx.ser, end_x, y, click_rate_hz=(5.0, 7.0), min_clicks=len(row_items))
 
-        time.sleep(random.uniform(0.2, 0.4))  # let this pass of clicks actually resolve
+        controller.human_delay(0.2, 0.4)  # let this pass of clicks actually resolve
     debug_log.log("mixology", "grimy herb cleaning didn't finish within the time budget")
 
 
@@ -488,7 +488,7 @@ def _refine_and_hopper_inventory(ctx) -> None:
         if not held:
             break
         controller.click_human(ctx.ser)
-        time.sleep(random.uniform(0.06, 0.25))
+        controller.human_delay(0.06, 0.25)
 
     # Same re-verify idiom as the fixes above: confirm the paste actually landed in the hopper
     # (via /mixology-state) rather than assuming one click succeeded, and retry a bounded number
@@ -632,7 +632,7 @@ def _pull_lever_confirmed(ctx, paste: str) -> bool:
         lever = _click_world_object(ctx, lever_name, check_ui_blockers=False)
         if lever is None:
             return False  # object not found near the player -- retrying won't help
-        time.sleep(random.uniform(0.5, 0.7))  # one game tick -- levers resolve per-tick
+        controller.human_delay(0.5, 0.7)  # one game tick -- levers resolve per-tick
 
         action = controller.get_last_action()
         target = (action.get("target") or "").lower()
@@ -825,7 +825,7 @@ def _process_one(ctx, config: dict, station_name: str, station: dict, order_name
     # process_phase's own comment: the station auto-processes the leftmost unprocessed potion,
     # and a select click first only risked misclicking an adjacent, already-finished item).
     _click_world_object(ctx, station_name, check_ui_blockers=False)
-    time.sleep(random.uniform(0.4, 0.6))
+    controller.human_delay(0.4, 0.6)
 
     speedups = config.get("speedups", DEFAULT_CONFIG["speedups"])
     if station_name == "Retort" and speedups.get("retort"):
@@ -963,7 +963,7 @@ def _process_retort_speedup(ctx, station: dict, baseline_tick, order_name: str) 
             last_progress = progress
         # else: progress hasn't advanced since we last saw it -- skip clicking this iteration
         # (see docstring) and just re-poll next loop instead.
-        time.sleep(random.uniform(0.55, 0.75))  # one game tick
+        controller.human_delay(0.55, 0.75)  # one game tick
 
     current_potion = controller.get_mixology_state().get("stations", {}).get("retort", {}).get("potionName")
     if current_potion and current_potion != order_name:
@@ -1195,9 +1195,9 @@ def _apply_digweed_if_held(ctx) -> bool:
 
     debug_log.log("mixology", f"applying held digweed to '{best.get('name')}'")
     controller.click_entity(ctx.ser, digweed_item, check_ui_blockers=False)
-    time.sleep(random.uniform(0.15, 0.3))
+    controller.human_delay(0.15, 0.3)
     controller.click_entity(ctx.ser, best, check_ui_blockers=False)
-    time.sleep(random.uniform(0.3, 0.5))
+    controller.human_delay(0.3, 0.5)
 
     # CONFIRMED live 2026-08-13 (user report: ended up with two Liplack liquors in inventory
     # after a digweed application): this used to return True right after firing the clicks,
@@ -1240,7 +1240,7 @@ def maybe_collect_digweed(ctx, config: dict) -> None:
     plant = _click_world_object(ctx, "Digweed", exclude="young", check_ui_blockers=False)
     if plant is None:
         return  # ready per the varbit but not yet visible/already collected by the time we look
-    time.sleep(random.uniform(0.5, 0.8))
+    controller.human_delay(0.5, 0.8)
 
 
 PHASES = {
