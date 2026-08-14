@@ -30,7 +30,6 @@
 # quantityButtons the bridge exposes) before withdrawing, so it no longer
 # matters what mode you last left the bank in.
 
-import random
 import re
 import time
 

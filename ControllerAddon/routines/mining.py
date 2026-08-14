@@ -9,7 +9,6 @@
 # Run with:
 #     python controller.py routines/mining.py
 
-import random
 import time
 
 import controller

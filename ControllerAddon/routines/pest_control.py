@@ -32,7 +32,6 @@
 # walk-to-Void-Knight step needed.
 
 import math
-import random
 import time
 
 import controller

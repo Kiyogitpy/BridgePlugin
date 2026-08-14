@@ -47,7 +47,6 @@
 # Run with:
 #     python controller.py routines/blast_furnace.py
 
-import random
 import time
 
 import banker

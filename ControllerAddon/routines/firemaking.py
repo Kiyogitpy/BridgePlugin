@@ -42,7 +42,6 @@
 # Run with:
 #     python controller.py routines/firemaking.py
 
-import random
 import time
 
 import banker

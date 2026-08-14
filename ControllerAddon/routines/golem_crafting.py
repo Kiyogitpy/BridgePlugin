@@ -53,7 +53,6 @@
 # Run with:
 #     python controller.py routines/golem_crafting.py
 
-import random
 import time
 
 import banker

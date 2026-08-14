@@ -25,7 +25,6 @@
 #     covers this the same as every other stop reason.
 
 import math
-import random
 import time
 
 import controller

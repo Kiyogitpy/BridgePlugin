@@ -48,7 +48,6 @@
 # Run with:
 #     python controller.py routines/tormented_demon.py
 
-import random
 import time
 
 import controller
