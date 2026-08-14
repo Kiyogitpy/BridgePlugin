@@ -1,3 +1,4 @@
+import dataclasses
 import os
 import sys
 
@@ -172,3 +173,27 @@ def test_move_to_human_tracking_stops_repolling_after_target_lost(monkeypatch):
                                         duration_scale=1.0, refresh_target=fake_refresh, legs=4)
 
     assert len(refresh_calls) == 1  # tried once (leg 1), not again for legs 2/3
+
+
+def test_get_human_profile_returns_same_profile_until_interval_elapses(monkeypatch):
+    monkeypatch.setattr(controller, "_human_profile", None)
+
+    first = controller.get_human_profile()
+    again = controller.get_human_profile()
+
+    assert again is first
+
+
+def test_get_human_profile_rerolls_after_interval_elapses(monkeypatch):
+    monkeypatch.setattr(controller, "_human_profile", None)
+    first = controller.get_human_profile()
+
+    stale = dataclasses.replace(
+        first, rerolled_at=first.rerolled_at - (first.reroll_after_s + 1.0)
+    )
+    monkeypatch.setattr(controller, "_human_profile", stale)
+
+    second = controller.get_human_profile()
+
+    assert second is not stale
+    assert second.rerolled_at > stale.rerolled_at

@@ -45,6 +45,20 @@ DEFAULT_OVERSHOOT_CHANCE = 0.42  # probability a given move overshoots before co
 MOVING_TARGET_MIN_DIST = 60             # px; shorter moves finish too fast to bother re-aiming
 MOVING_TARGET_MIDFLIGHT_FRACTION = 0.6  # fly this far toward the stale point before re-aiming
 
+# ---------------- Humanization profile drift ----------------
+# HumanProfile (controller.py) holds the parameters that drive pick_aim_point,
+# build_bezier_path, and human_delay. It re-rolls on a randomized interval during a session so
+# no single fixed formula produces every sample -- a fixed formula run for an entire session is
+# itself a statistical signature over enough samples, independent of how well-shaped any single
+# draw is. See docs/superpowers/specs/2026-08-14-humanization-overhaul-design.md. Ranges are
+# centered on the constants they replace (noted per line) so default/typical behavior doesn't
+# shift enough to break existing tuning.
+PROFILE_REROLL_MINUTES_RANGE = (10.0, 20.0)  # how long a profile lasts before re-rolling
+AIM_SIGMA_FACTOR_RANGE = (1.3, 1.8)          # pick_aim_point: sigma = radius / this (was fixed 1.5)
+CURVE_MAG_LOW_RANGE = (0.06, 0.10)           # build_bezier_path: low end of curve_mag fraction (was fixed 0.08)
+CURVE_MAG_HIGH_RANGE = (0.16, 0.24)          # build_bezier_path: high end of curve_mag fraction (was fixed 0.20)
+DELAY_SKEW_RANGE = (0.0, 1.0)                # human_delay: feeds its lognormal sigma directly
+
 # ---------------- Human mistake simulation ----------------
 # Small, deliberately-imperfect behaviors so supply/prayer upkeep and
 # clicking don't look like a flawless state machine -- real players

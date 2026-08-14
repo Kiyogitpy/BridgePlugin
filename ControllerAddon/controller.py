@@ -950,6 +950,40 @@ def clear_movement_abort():
     _movement_abort.clear()
 
 
+# ---------------- Humanization profile (session-level parameter drift) ----------------
+@dataclass
+class HumanProfile:
+    aim_sigma_factor: float
+    curve_mag_low: float
+    curve_mag_high: float
+    delay_skew: float
+    rerolled_at: float
+    reroll_after_s: float
+
+
+def _roll_human_profile() -> "HumanProfile":
+    return HumanProfile(
+        aim_sigma_factor=random.uniform(*AIM_SIGMA_FACTOR_RANGE),
+        curve_mag_low=random.uniform(*CURVE_MAG_LOW_RANGE),
+        curve_mag_high=random.uniform(*CURVE_MAG_HIGH_RANGE),
+        delay_skew=random.uniform(*DELAY_SKEW_RANGE),
+        rerolled_at=time.monotonic(),
+        reroll_after_s=random.uniform(*PROFILE_REROLL_MINUTES_RANGE) * 60.0,
+    )
+
+
+_human_profile: "HumanProfile | None" = None
+
+
+def get_human_profile() -> "HumanProfile":
+    global _human_profile
+    if _human_profile is None or (
+        time.monotonic() - _human_profile.rerolled_at >= _human_profile.reroll_after_s
+    ):
+        _human_profile = _roll_human_profile()
+    return _human_profile
+
+
 def pick_aim_point(x: int, y: int, radius: int) -> tuple:
     if radius <= 0:
         return x, y
