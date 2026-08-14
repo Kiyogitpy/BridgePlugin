@@ -54,7 +54,7 @@ def tick(ctx):
         return
 
     debug_log.log("mining", f"swinging at {rock.get('name')} (dist={rock.get('distance')})")
-    time.sleep(random.uniform(0.15, 0.5))
+    controller.human_delay(0.15, 0.5)
     controller.click_entity(ctx.ser, rock)
 
 

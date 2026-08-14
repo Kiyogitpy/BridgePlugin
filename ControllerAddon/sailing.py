@@ -100,7 +100,7 @@ def open_sailing_options_tab(ctx) -> None:
     if controller.get_sailing().get("facilitiesTabOpen"):
         return
     controller.key_tap(ctx.ser, SAILING_OPTIONS_TAB_KEY)
-    time.sleep(random.uniform(0.3, 0.6))
+    controller.human_delay(0.3, 0.6)
 
 
 def use_helm(ctx) -> bool:

@@ -282,7 +282,7 @@ def maybe_swap_gear(ctx, npc: dict, config: dict) -> None:
     debug_log.log("td", f"weakness is now {style} -- switching to {weapon_name}")
     controller.click_entity(ctx.ser, item, check_ui_blockers=False)
     ctx.state.data["current_style"] = style
-    time.sleep(random.uniform(0.3, 0.6))
+    controller.human_delay(0.3, 0.6)
 
 
 def maybe_dodge_fireball(ctx, player: dict) -> bool:

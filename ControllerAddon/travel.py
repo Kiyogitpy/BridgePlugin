@@ -96,7 +96,7 @@ def teleport_to_ferox(ctx) -> bool:
     if not controller.click_entity(ctx.ser, ring, check_ui_blockers=False):
         return False
 
-    time.sleep(random.uniform(3.0, 3.6))  # teleport animation + loading transition
+    controller.human_delay(3.0, 3.6)  # teleport animation + loading transition
     return True
 
 
@@ -120,7 +120,7 @@ def flee_royal_seed_pod(ctx) -> bool:
     if not controller.click_entity(ctx.ser, pod, check_ui_blockers=False):
         return False
 
-    time.sleep(random.uniform(3.0, 3.6))  # teleport animation + loading transition
+    controller.human_delay(3.0, 3.6)  # teleport animation + loading transition
     return True
 
 
@@ -142,7 +142,7 @@ def use_fountain(ctx) -> bool:
     if not controller.click_entity(ctx.ser, fountain):
         return False
 
-    time.sleep(random.uniform(1.0, 1.5))
+    controller.human_delay(1.0, 1.5)
     return True
 
 
