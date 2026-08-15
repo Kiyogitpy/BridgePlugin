@@ -48,8 +48,6 @@
 # Run with:
 #     python controller.py routines/tormented_demon.py
 
-import time
-
 import controller
 import debug_log
 

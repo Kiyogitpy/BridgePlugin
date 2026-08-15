@@ -42,8 +42,6 @@
 # Run with:
 #     python controller.py routines/firemaking.py
 
-import time
-
 import banker
 import controller
 import debug_log

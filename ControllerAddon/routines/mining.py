@@ -9,8 +9,6 @@
 # Run with:
 #     python controller.py routines/mining.py
 
-import time
-
 import controller
 import debug_log
 

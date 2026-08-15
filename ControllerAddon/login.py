@@ -22,7 +22,6 @@
 #      widget, so its bounds are read fresh every call and aren't fragile
 #      the way the tile click is.
 
-import time
 
 import controller
 import debug_log
