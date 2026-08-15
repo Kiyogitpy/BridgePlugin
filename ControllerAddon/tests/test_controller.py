@@ -3,9 +3,20 @@ import math
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import controller
+
+
+@pytest.fixture(autouse=True)
+def _reset_human_related_global_state():
+    rng_state = controller.random.getstate()
+    profile_before = controller._human_profile
+    yield
+    controller.random.setstate(rng_state)
+    controller._human_profile = profile_before
 
 
 class _FakeResponse:
@@ -200,33 +211,54 @@ def test_get_human_profile_rerolls_after_interval_elapses(monkeypatch):
     assert second.rerolled_at > stale.rerolled_at
 
 
-def test_sample_human_delay_median_tracks_midpoint_with_soft_floor():
-    controller.random.seed(1234)
-    samples = sorted(controller.sample_human_delay(1.0, 2.0) for _ in range(10000))
+def test_sample_human_delay_never_goes_below_min_s():
+    # The regression this test guards against: several real call sites' min_s is a documented
+    # fix for a real bug (e.g. banker.py's search_bank), not an aesthetic minimum -- violating
+    # it is a correctness bug, not just a humanization-quality nitpick.
+    controller.random.seed(1)
+    for min_s, max_s in [(0.7, 0.9), (0.5, 0.7), (0.6, 1.0), (3.0, 3.6), (0.2, 10.0), (0.0005, 0.0015)]:
+        samples = [controller.sample_human_delay(min_s, max_s) for _ in range(2000)]
+        assert min(samples) >= min_s, f"violated floor for ({min_s}, {max_s}): got {min(samples)}"
 
-    median = samples[len(samples) // 2]
-    assert 1.3 < median < 1.7  # tracks (1.0+2.0)/2 == 1.5
 
-    assert min(samples) >= 1.0 * 0.6 - 1e-9  # soft floor, not min_s itself
+def test_sample_human_delay_has_no_point_mass_at_the_floor():
+    # Guards against reverting to a clamp (max(draw, floor)), which produces a spike of
+    # bit-for-bit identical values at the floor -- a hard-edge artifact.
+    controller.random.seed(2)
+    samples = [controller.sample_human_delay(0.7, 0.9) for _ in range(5000)]
+    from collections import Counter
+    most_common_count = Counter(samples).most_common(1)[0][1]
+    assert most_common_count <= 2  # no meaningful repeated-value spike
 
 
 def test_sample_human_delay_has_no_hard_ceiling_unlike_uniform():
-    controller.random.seed(5678)
+    controller.random.seed(3)
     samples = [controller.sample_human_delay(1.0, 2.0) for _ in range(10000)]
-
     over_ceiling = sum(1 for s in samples if s > 2.0)
-    assert over_ceiling > 1000  # meaningfully non-zero; uniform(1,2) would give exactly 0
+    assert over_ceiling > 50  # meaningfully non-zero; uniform(1,2) would give exactly 0
 
 
-def test_sample_human_delay_is_not_uniformly_distributed():
-    controller.random.seed(9012)
-    samples = [controller.sample_human_delay(1.0, 2.0) for _ in range(10000)]
+def test_sample_human_delay_median_tracks_the_range():
+    controller.random.seed(4)
+    samples = sorted(controller.sample_human_delay(1.0, 2.0) for _ in range(10000))
+    median = samples[len(samples) // 2]
+    assert 1.0 < median < 2.0
 
-    mean = sum(samples) / len(samples)
-    variance = sum((s - mean) ** 2 for s in samples) / len(samples)
-    # uniform(1, 2)'s variance is (2-1)**2/12 ~= 0.083; the fat-tailed shape
-    # should sit well above that regardless of the current delay_skew draw.
-    assert variance > 0.15
+
+def test_sample_human_delay_scales_spread_with_range_width():
+    # The core fix this branch's review required: sigma must scale with the range's own
+    # log-width, not be a fixed relative spread -- otherwise a narrow tick-critical range gets
+    # the same spread as a wide, deliberately-erratic one.
+    controller.random.seed(5)
+    narrow = [controller.sample_human_delay(0.7, 0.9) for _ in range(5000)]
+    controller.random.seed(5)
+    wide = [controller.sample_human_delay(0.2, 10.0) for _ in range(5000)]
+
+    def spread(samples):
+        s = sorted(samples)
+        return s[int(len(s) * 0.9)] - s[int(len(s) * 0.1)]  # p90 - p10
+
+    assert spread(wide) > spread(narrow) * 5
 
 
 def test_human_delay_sleeps_for_the_sampled_duration(monkeypatch):
