@@ -2000,6 +2000,7 @@ ROUTINE_FILES = {
     "GOLEM_CRAFTING": "routines/golem_crafting.py",
     "MASTERING_MIXOLOGY": "routines/mastering_mixology.py",
     "PEST_CONTROL": "routines/pest_control.py",
+    "PYRAMID_PLUNDER": "routines/pyramid_plunder.py",
 }
 
 
