@@ -27,16 +27,69 @@ import debug_log
 PYRAMID_REGION_ID = 7749
 
 SPEAR_TRAP_ID = 21280
-GRAND_GOLD_CHEST_CLOSED_ID = 20946
-GRAND_GOLD_CHEST_OPENED_ID = 26616
-SARCOPHAGUS_CLOSED_ID = 21255
-SARCOPHAGUS_OPENED_ID = 26626
-TOMB_DOOR_CLOSED_ID = 20948
-TOMB_DOOR_WALL_IDS = {26618, 26619, 26620, 26621}
+
+# BASE ids vs IMPOSTOR ids -- this distinction is load-bearing for every stateful object below,
+# and getting it backwards silently breaks the whole routine (it did, in this file's first
+# draft). ObjectProvider.java puts GameObject.getId() -- the multiloc BASE id, which never
+# changes as the object is opened/searched/picked -- in each object's "id" field, and the
+# varbit-resolved state variant in a SEPARATE "impostorId" field. So: match on "id" to find the
+# object at all, then branch on "impostorId" to know what state it's in.
+#
+# Base ids 26616 (chest) / 26626 (sarcophagus) / 26618-26621 (the 4 tomb-door wall objects) and
+# closed impostors 20946 / 21255 / 20948 are lifted straight from the official RuneLite plugin
+# (data/decompiled/client-1.12.33/net/runelite/client/plugins/pyramidplunder/), whose overlay
+# does exactly this two-step (`26616 == object.getId()` then
+# `20946 != getObjectDefinition(object.getId()).getImpostor().getId()`). The remaining
+# impostor ids come from the wiki infoboxes' id1/id2/id3 version lists in data/raw/.
+GRAND_GOLD_CHEST_ID = 26616                     # base object id
+GRAND_GOLD_CHEST_CLOSED_IMPOSTOR_ID = 20946     # version "Closed", option "Search"
+GRAND_GOLD_CHEST_SEARCHED_IMPOSTOR_ID = 20947   # version "Opened", no options -- already looted
+
+SARCOPHAGUS_ID = 26626                          # base object id
+SARCOPHAGUS_CLOSED_IMPOSTOR_ID = 21255          # version "Closed", option "Open"
+SARCOPHAGUS_OPENING_IMPOSTOR_ID = 21257         # version "Opening", NO options -- mid-animation
+SARCOPHAGUS_OPENED_IMPOSTOR_ID = 21256          # version "Opened", option "Search"
+
+TOMB_DOOR_WALL_IDS = {26618, 26619, 26620, 26621}   # base ids of the 4 physical wall objects
+TOMB_DOOR_CLOSED_ID = 20948                     # impostor, option "Pick-lock"
+TOMB_DOOR_OPENED_ID = 20949                     # impostor, option "Enter"
+
+# NEEDS LIVE VERIFICATION: unlike everything above, this id has no decompiled-plugin
+# cross-check -- it's the wiki infobox's id1 for "Tomb Door (exit)" only, and that infobox lists
+# a single "In game" version carrying BOTH "Leave Tomb" and "Quick-leave" (id2=20932 is the
+# lobby-side door), so it may be a plain single-state object where base id == impostor id, or it
+# may be an impostor id like every other id1 on this page. quick_leave() therefore matches it
+# against BOTH "id" and "impostorId" and falls back to a name lookup if neither hits.
 EXIT_DOOR_ID = 20931
+EXIT_DOOR_NAME = "tomb door"
 
 GUARDIAN_MUMMY_NAME = "guardian mummy"
 ANONYMOUS_DOOR_NAME = "anonymous looking door"
+
+# GET /npcs returns every NPC in the loaded scene with no radius or line-of-sight filter, and
+# the mummy's lobby sits only ~2-14 tiles from the outer anonymous doors -- close enough that
+# it's in the list (through a wall) while the player is still standing outside. Without this
+# bound the LOBBY branch wins from the very first tick and the routine can never actually enter
+# the pyramid. The design spec's wording is "mummy reachable", not "mummy present".
+#
+# Kept deliberately tight; tick() backs it up with an unbounded match for the case where the 4
+# outer anonymous doors are NOT visible (i.e. we can't possibly be standing outside), so an
+# over-tight bound degrades to "takes an extra tick to notice the lobby" rather than
+# deadlocking outside_tick against a lobby it can't act on.
+MUMMY_MAX_DISTANCE = 5
+
+# An outer anonymous-door entry attempt can fail its Thieving roll (stun + 1-4 dmg) on the
+# CORRECT door too, so one failure is not evidence the cached door is wrong. Only invalidate the
+# cache after this many CONSECUTIVE failures on the same cached index.
+OUTSIDE_DOOR_FAIL_TOLERANCE = 2
+
+# Hard safety-stop backstop (design spec section 4: "Hard safety-stop ... if no anonymous door /
+# Guardian mummy / chest / tomb door can be found at all within a reasonable number of
+# attempts"). One shared counter, incremented on any tick that resolved nothing and changed
+# nothing, reset by note_progress() the moment anything real happens. Deliberately far larger
+# than slayer.py's per-target ENGAGE_STUCK_MAX_TICKS=5 style counters -- this is a
+# whole-routine last resort, not a per-action retry budget.
+NO_PROGRESS_MAX_TICKS = 80
 
 ROOM_STEP_TRAP = "trap"
 ROOM_STEP_CHEST = "chest"
@@ -70,6 +123,9 @@ def get_config(bridge_config):
 
 
 def find_object_by_id(objects: list, object_id: int):
+    """Nearest visible object whose BASE id (GET /objects' "id") matches. Callers that care
+    about a multiloc object's current state must branch on the returned object's "impostorId"
+    themselves -- see the base-id/impostor-id note at the top of this file."""
     candidates = [o for o in objects if o.get("id") == object_id and o.get("visible", True)]
     if not candidates:
         return None
@@ -83,13 +139,42 @@ def find_objects_by_name(objects: list, name_substring: str) -> list:
             if name_substring in (o.get("name") or "").lower() and o.get("visible", True)]
 
 
-def find_npc_by_name(npcs: list, name: str):
+def find_npc_by_name(npcs: list, name: str, max_distance: float = None):
+    """Nearest NPC with this exact (case-insensitive) name. max_distance bounds the match to
+    NPCs within that many tiles -- GET /npcs is scene-wide with no visibility/reachability
+    filter, so an unbounded lookup happily "finds" an NPC through a wall (see
+    MUMMY_MAX_DISTANCE). Default None keeps the original unbounded behavior."""
     name = name.lower()
     candidates = [n for n in npcs if (n.get("name") or "").lower() == name]
+    if max_distance is not None:
+        candidates = [n for n in candidates if n.get("distance", 9999) <= max_distance]
     if not candidates:
         return None
     candidates.sort(key=lambda n: n.get("distance", 9999))
     return candidates[0]
+
+
+def find_outer_doors():
+    return find_objects_by_name(controller.get_objects(radius=30), ANONYMOUS_DOOR_NAME)
+
+
+def resolve_mummy(npcs: list = None, doors: list = None):
+    """The routine's single "are we in the mummy's lobby" test. Primary rule: the mummy within
+    MUMMY_MAX_DISTANCE tiles (see that constant for why an unbounded /npcs match is wrong).
+    Relaxation: if the bounded match misses AND the 4 outer anonymous doors are not visible, we
+    demonstrably aren't standing outside, so an unbounded match is accepted -- that keeps an
+    over-tight bound from stranding the routine in a lobby outside_tick can't act on. Returns
+    the mummy dict, or None for "we're outside"."""
+    if npcs is None:
+        npcs = controller.get_npcs()
+    mummy = find_npc_by_name(npcs, GUARDIAN_MUMMY_NAME, max_distance=MUMMY_MAX_DISTANCE)
+    if mummy is not None:
+        return mummy
+    if doors is None:
+        doors = find_outer_doors()
+    if len(doors) != 4:
+        return find_npc_by_name(npcs, GUARDIAN_MUMMY_NAME)
+    return None
 
 
 def order_doors_clockwise(doors: list) -> list:
@@ -101,6 +186,48 @@ def order_doors_clockwise(doors: list) -> list:
     cx = sum(d.get("x", 0) for d in doors) / len(doors)
     cy = sum(d.get("y", 0) for d in doors) / len(doors)
     return sorted(doors, key=lambda d: math.atan2(d.get("y", 0) - cy, d.get("x", 0) - cx))
+
+
+def note_progress(ctx) -> None:
+    """Something real happened this tick -- a phase change, a step change, a room-number
+    change, or simply resolving the object/NPC this step is waiting on. Resets the shared
+    no-progress safety counter (see NO_PROGRESS_MAX_TICKS / check_no_progress)."""
+    ctx.state.data["progress_this_tick"] = True
+    ctx.state.data["no_progress_ticks"] = 0
+
+
+def check_no_progress(ctx) -> None:
+    """Called once at the end of every tick. Nothing resolved and nothing changed for
+    NO_PROGRESS_MAX_TICKS consecutive ticks means the routine is genuinely lost (stuck in an
+    abandoned room whose door won't resolve, standing somewhere with no pyramid in sight, ...),
+    not mid-multi-tick-action -- hard-stop rather than clicking at nothing forever."""
+    if ctx.state.data.pop("progress_this_tick", False):
+        ctx.state.data["no_progress_ticks"] = 0
+        return
+    stalled = ctx.state.data.get("no_progress_ticks", 0) + 1
+    ctx.state.data["no_progress_ticks"] = stalled
+    if stalled >= NO_PROGRESS_MAX_TICKS:
+        ctx.state.data["no_progress_ticks"] = 0
+        ctx.state.trigger_safety_stop(
+            f"Pyramid Plunder: no progress for {stalled} ticks -- couldn't resolve an anonymous "
+            f"door, the Guardian mummy, the chest, the sarcophagus or a tomb door")
+
+
+def note_phase(ctx, phase: str) -> None:
+    if ctx.state.data.get("phase") != phase:
+        ctx.state.data["phase"] = phase
+        note_progress(ctx)
+
+
+def reset_run_state(ctx) -> None:
+    """No run is active -- clear every piece of mid-run bookkeeping so the next run starts from
+    room 1 step "trap". Without this, a run that ended abnormally (501-tick timer expiry, a
+    sceptre auto-eject, death) leaves room_step/door_attempt at whatever they were, and the next
+    run skips room 1's trap/chest/sarcophagus entirely. Idempotent -- cheap to run every
+    OUTSIDE/LOBBY tick rather than trying to catch each abnormal ending individually."""
+    ctx.state.data["room_step"] = ROOM_STEP_TRAP
+    ctx.state.data["door_attempt"] = 0
+    ctx.state.data["dead_end_doors"] = []
 
 
 def maybe_eat_food(ctx, config) -> None:
@@ -115,24 +242,36 @@ def maybe_eat_food(ctx, config) -> None:
             debug_log.log("pyramid_plunder", f"ate food (hp={hp})")
 
 
-def outside_tick(ctx, config) -> None:
+def outside_tick(ctx, config, doors: list = None) -> None:
     """Not near the Guardian mummy yet -- find and enter the correct one of the 4 static
     anonymous-door objects. Caches the winning index in ctx.state.data["correct_door_index"]
     (see order_doors_clockwise) so almost every entry after the first is a single direct
     click, not a fresh 4-door search -- expected to keep working for the life of the ~25-minute
     door rotation.
 
+    A single failed attempt is NOT treated as "wrong door": per the wiki, entering the correct
+    door is a Thieving roll that can fail (stun + 1-4 dmg) just like a wrong one. The cached
+    index is only invalidated after OUTSIDE_DOOR_FAIL_TOLERANCE consecutive failures on that
+    same index, which tolerates a bad roll without re-searching all 4 doors, while still
+    recovering when the ~25-minute rotation genuinely moves the correct door.
+
     NEEDS LIVE VERIFICATION: the exact signal that a door was wrong (led to an "abandoned
     room" rather than the Guardian mummy's lobby) and how to leave that room back outside.
-    Best-effort assumption implemented below: re-click the same door we just walked through
-    (anonymous doors are described as ordinary bidirectional entry points in the wiki) to step
-    back outside, then try the next door index next tick. Correct if wrong, per this
-    codebase's "ASSUMPTION, NOT YET VERIFIED LIVE" convention (see blast_furnace.py)."""
-    doors = find_objects_by_name(controller.get_objects(radius=30), ANONYMOUS_DOOR_NAME)
-    if len(doors) < 4:
-        debug_log.log("pyramid_plunder", f"only found {len(doors)} anonymous doors -- waiting")
+    Best-effort assumption implemented below: re-click the anonymous door we can see from
+    wherever we ended up (anonymous doors are described as ordinary bidirectional entry points
+    in the wiki) to step back outside, then try the next door index next tick. Correct if
+    wrong, per this codebase's "ASSUMPTION, NOT YET VERIFIED LIVE" convention (see
+    blast_furnace.py)."""
+    if doors is None:
+        doors = find_outer_doors()
+    if len(doors) != 4:
+        # != rather than < : a larger match set means the name substring caught something this
+        # code's clockwise indexing was never designed for, and proceeding would cache an index
+        # that points at a different physical door every call.
+        debug_log.log("pyramid_plunder", f"found {len(doors)} anonymous doors (expected 4) -- waiting")
         return
     ordered = order_doors_clockwise(doors)
+    note_progress(ctx)
 
     cached_index = ctx.state.data.get("correct_door_index")
     attempt_index = ctx.state.data.get("door_attempt_index", 0) % len(ordered)
@@ -147,22 +286,67 @@ def outside_tick(ctx, config) -> None:
     # checking whether it worked.
     controller.human_delay(1.5, 3.0)
 
-    mummy = find_npc_by_name(controller.get_npcs(), GUARDIAN_MUMMY_NAME)
-    if mummy is not None:
+    if resolve_mummy() is not None:
         debug_log.log("pyramid_plunder", f"reached the Guardian mummy via door index {index_to_try}")
         ctx.state.data["correct_door_index"] = index_to_try
+        ctx.state.data["cached_door_fails"] = 0
+        ctx.state.data["cached_door_fail_index"] = None
         return
 
     debug_log.log("pyramid_plunder", f"door index {index_to_try} didn't reach the mummy -- "
-                                      f"stepping back through it and trying the next one")
-    controller.wait_until_player_idle(timeout_s=5.0)
-    controller.click_entity(ctx.ser, door, check_ui_blockers=False)
-    controller.human_delay(1.0, 2.0)
+                                     f"stepping back out and trying again")
+    step_back_outside(ctx)
 
-    if cached_index is not None:
-        ctx.state.data["correct_door_index"] = None
-    else:
+    if cached_index is None:
         ctx.state.data["door_attempt_index"] = attempt_index + 1
+        return
+
+    # Consecutive-failure accounting for the cached index only (see the docstring above).
+    if ctx.state.data.get("cached_door_fail_index") != index_to_try:
+        ctx.state.data["cached_door_fail_index"] = index_to_try
+        fails = 0
+    else:
+        fails = ctx.state.data.get("cached_door_fails", 0)
+    fails += 1
+    ctx.state.data["cached_door_fails"] = fails
+    if fails >= OUTSIDE_DOOR_FAIL_TOLERANCE:
+        debug_log.log("pyramid_plunder", f"cached door index {index_to_try} failed {fails} times "
+                                         f"in a row -- dropping the cache and re-searching")
+        ctx.state.data["correct_door_index"] = None
+        ctx.state.data["cached_door_fails"] = 0
+        ctx.state.data["cached_door_fail_index"] = None
+        ctx.state.data["door_attempt_index"] = (index_to_try + 1) % len(ordered)
+
+
+def step_back_outside(ctx) -> None:
+    """Wrong-door recovery: click back through whichever anonymous door is actually resolvable
+    from where we ended up.
+
+    Deliberately re-fetches /objects instead of reusing outside_tick's pre-click snapshot --
+    that snapshot's screenX/screenY were resolved on the other side of an area transition and
+    can easily point at nothing useful now, and a recovery click that doesn't land leaves the
+    player in an abandoned room indefinitely.
+
+    Two of the three possible fresh results are "don't click anything": all 4 outer doors still
+    visible means the entry attempt just failed its Thieving roll and we never left (nothing to
+    step back out of -- clicking the nearest door here would be an unrelated extra entry
+    attempt on a door we didn't choose); nothing resolvable at all is exactly the case the
+    shared no-progress counter (check_no_progress) exists to catch, so no hand-rolled escape
+    here either."""
+    controller.wait_until_player_idle(timeout_s=5.0)
+    fresh = find_outer_doors()
+    if len(fresh) >= 4:
+        debug_log.log("pyramid_plunder", "still outside (all 4 doors visible) -- the entry "
+                                         "attempt just failed its roll, nothing to step back out of")
+        return
+    if not fresh:
+        debug_log.log("pyramid_plunder", "no anonymous door resolvable for the step-back-out "
+                                         "click -- waiting for a fresh poll")
+        return
+    fresh.sort(key=lambda o: o.get("distance", 9999))
+    note_progress(ctx)
+    controller.click_entity(ctx.ser, fresh[0], check_ui_blockers=False)
+    controller.human_delay(1.0, 2.0)
 
 
 def lobby_tick(ctx, config, mummy: dict) -> None:
@@ -171,27 +355,54 @@ def lobby_tick(ctx, config, mummy: dict) -> None:
         return
     if controller.click_menu_action(ctx.ser, mummy, "Start-minigame", check_ui_blockers=False):
         debug_log.log("pyramid_plunder", "started a new run")
+        note_progress(ctx)
         controller.human_delay(0.8, 1.5)
 
 
 def setup(ctx):
     ctx.state.data.setdefault("room_step", ROOM_STEP_TRAP)
+    ctx.state.data.setdefault("door_attempt", 0)
+    ctx.state.data.setdefault("dead_end_doors", [])
+    ctx.state.data.setdefault("no_progress_ticks", 0)
 
 
 def tick(ctx):
     config = ctx.state.config
+    ctx.state.data["progress_this_tick"] = False
     maybe_eat_food(ctx, config)
 
     pp = controller.get_pyramid_plunder()
+
+    room = pp.get("roomNumber", 0)
+    if room != ctx.state.data.get("last_room_number"):
+        ctx.state.data["last_room_number"] = room
+        note_progress(ctx)
+
     if pp.get("inRun"):
+        note_phase(ctx, "in_room")
         in_room_tick(ctx, config, pp)
+        check_no_progress(ctx)
         return
 
-    mummy = find_npc_by_name(controller.get_npcs(), GUARDIAN_MUMMY_NAME)
+    # Not in a run: whatever ended the last one (Quick-leave, the 501-tick timer, a sceptre
+    # auto-eject, death) leaves mid-run bookkeeping behind -- clear it before the next run.
+    reset_run_state(ctx)
+    # Leftover artefacts survive the run's end too, so keep draining them out here as well and
+    # not only from in_room_tick.
+    drop_loot(ctx, config)
+
+    npcs = controller.get_npcs()
+    doors = find_outer_doors()
+    mummy = resolve_mummy(npcs, doors)
+
     if mummy is not None:
+        note_phase(ctx, "lobby")
         lobby_tick(ctx, config, mummy)
     else:
-        outside_tick(ctx, config)
+        note_phase(ctx, "outside")
+        outside_tick(ctx, config, doors)
+
+    check_no_progress(ctx)
 
 
 def in_room_tick(ctx, config, pp: dict) -> None:
@@ -205,6 +416,9 @@ def in_room_tick(ctx, config, pp: dict) -> None:
         sarco_step(ctx, config, pp)
     elif step == ROOM_STEP_DOOR:
         door_step(ctx, config, pp)
+
+    if ctx.state.data.get("room_step", ROOM_STEP_TRAP) != step:
+        note_progress(ctx)
 
     drop_loot(ctx, config)
 
@@ -228,6 +442,7 @@ def trap_step(ctx, config, pp: dict) -> None:
         debug_log.log("pyramid_plunder", "trapActive but no spear trap object visible -- skipping")
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         return
+    note_progress(ctx)
 
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
@@ -248,13 +463,26 @@ def trap_step(ctx, config, pp: dict) -> None:
 
 def chest_step(ctx, config, pp: dict) -> None:
     """Grand Gold Chest always opens instantly on a single search (per the wiki -- no
-    fail-and-retry loop needed here, unlike the trap/sarcophagus/doors)."""
+    fail-and-retry loop needed here, unlike the trap/sarcophagus/doors).
+
+    Three distinct outcomes, not two -- "not in this poll's object list" is a camera/distance
+    problem, NOT evidence the chest is already looted, so it retries next tick instead of
+    silently advancing past an unlooted chest."""
     next_step = ROOM_STEP_SARCO if pp.get("roomNumber", 0) >= config["sarcophagusStartRoom"] else ROOM_STEP_DOOR
 
-    chest = find_object_by_id(controller.get_objects(radius=15), GRAND_GOLD_CHEST_CLOSED_ID)
+    chest = find_object_by_id(controller.get_objects(radius=15), GRAND_GOLD_CHEST_ID)
     if chest is None:
-        # Already searched (now shows the opened id) or not resolved this poll -- either way
-        # there's nothing left to click here.
+        debug_log.log("pyramid_plunder", "no Grand Gold Chest resolved this poll -- retrying")
+        return
+    note_progress(ctx)
+
+    impostor = chest.get("impostorId")
+    if impostor == GRAND_GOLD_CHEST_SEARCHED_IMPOSTOR_ID:
+        ctx.state.data["room_step"] = next_step
+        return
+    if impostor != GRAND_GOLD_CHEST_CLOSED_IMPOSTOR_ID:
+        debug_log.log("pyramid_plunder", f"Grand Gold Chest in unexpected state (impostorId="
+                                         f"{impostor}) -- treating it as done")
         ctx.state.data["room_step"] = next_step
         return
 
@@ -266,34 +494,64 @@ def chest_step(ctx, config, pp: dict) -> None:
 
 
 def sarco_step(ctx, config, pp: dict) -> None:
-    """Two-stage: click "Open" on the closed sarcophagus, wait for it to become searchable
-    (id flips from SARCOPHAGUS_CLOSED_ID to SARCOPHAGUS_OPENED_ID), then click it again to
-    Search. No mummy-specific handling beyond the routine's normal food-eat safety net --
-    per the design doc, prayer management was explicitly rejected in favor of that.
+    """Two-stage, driven entirely off the single base-id object's impostorId (the three wiki
+    versions of the same object, in order): 21255 "Closed"/Open -> 21257 "Opening"/no options
+    at all while the animation plays -> 21256 "Opened"/Search. No mummy-specific handling
+    beyond the routine's normal food-eat safety net -- per the design doc, prayer management
+    was explicitly rejected in favor of that.
 
-    NEEDS LIVE VERIFICATION: how long the opening animation actually takes before the id flip
-    happens -- the 2.0-4.0s wait below is a first-cut guess, not a measured value."""
-    objs = controller.get_objects(radius=15)
-    opened = find_object_by_id(objs, SARCOPHAGUS_OPENED_ID)
-    if opened is not None:
+    The 21257 state is exactly what an "wait for the opening animation" delay was ever really
+    waiting out, so it's polled rather than guessed: stay on this step, click nothing (there is
+    no clickable option in that state), re-poll next tick."""
+    sarco = find_object_by_id(controller.get_objects(radius=15), SARCOPHAGUS_ID)
+    if sarco is None:
+        debug_log.log("pyramid_plunder", "no sarcophagus resolved this poll -- retrying")
+        return
+    note_progress(ctx)
+
+    impostor = sarco.get("impostorId")
+
+    if impostor == SARCOPHAGUS_OPENING_IMPOSTOR_ID:
+        # Mid-animation, no menu option exists -- just let it finish.
+        controller.human_delay(0.6, 1.2)
+        return
+
+    if impostor == SARCOPHAGUS_OPENED_IMPOSTOR_ID:
         if not controller.wait_until_player_idle(timeout_s=5.0):
             return
-        controller.click_entity(ctx.ser, opened, check_ui_blockers=False)
+        controller.click_entity(ctx.ser, sarco, check_ui_blockers=False)   # "Search"
         controller.human_delay(1.0, 2.0)
         ctx.state.data["room_step"] = ROOM_STEP_DOOR
         return
 
-    closed = find_object_by_id(objs, SARCOPHAGUS_CLOSED_ID)
-    if closed is not None:
+    if impostor == SARCOPHAGUS_CLOSED_IMPOSTOR_ID:
         if not controller.wait_until_player_idle(timeout_s=5.0):
             return
-        controller.click_entity(ctx.ser, closed, check_ui_blockers=False)
-        controller.human_delay(2.0, 4.0)
-        return  # re-poll next tick; stays on "sarco" until `opened` is found above
+        controller.click_entity(ctx.ser, sarco, check_ui_blockers=False)   # "Open"
+        controller.human_delay(1.0, 2.0)
+        return  # re-poll next tick; opening (21257) then opened (21256) are handled above
 
-    # Neither id present -- already looted (or genuinely missing this poll). Move on either way
-    # rather than getting stuck waiting on something that isn't there.
+    debug_log.log("pyramid_plunder", f"sarcophagus in unexpected state (impostorId={impostor}) "
+                                     f"-- moving on to the doors")
     ctx.state.data["room_step"] = ROOM_STEP_DOOR
+
+
+def find_exit_doors(objs: list) -> list:
+    """Candidate in-room exit doors, nearest first: by id first, by name second. EXIT_DOOR_ID is
+    the one id in this file with no decompiled-plugin cross-check (see its own comment), so it's
+    matched against BOTH "id" (in case it's a plain single-state object) and "impostorId" (in
+    case it's really an impostor id, like every other wiki id1 on these pages), and a name lookup
+    backs both up -- a wrong id degrades to a less targeted lookup instead of silently never
+    finding the door at all. The name fallback excludes the 4 pick-lock progression doors, which
+    share the "Tomb Door" name but never offer Quick-leave."""
+    candidates = [o for o in objs
+                  if (o.get("id") == EXIT_DOOR_ID or o.get("impostorId") == EXIT_DOOR_ID)
+                  and o.get("visible", True)]
+    if not candidates:
+        candidates = [o for o in find_objects_by_name(objs, EXIT_DOOR_NAME)
+                      if o.get("id") not in TOMB_DOOR_WALL_IDS]
+    candidates.sort(key=lambda o: o.get("distance", 9999))
+    return candidates
 
 
 def quick_leave(ctx, config) -> None:
@@ -301,16 +559,26 @@ def quick_leave(ctx, config) -> None:
     exit door's Quick-leave option rather than walking back out through 6 tomb doors. The next
     tick's phase dispatch (OUTSIDE vs LOBBY) picks up wherever the game actually drops the
     player, so no explicit "where did we land" handling is needed here."""
-    exit_door = find_object_by_id(controller.get_objects(radius=15), EXIT_DOOR_ID)
-    if exit_door is None:
+    exit_doors = find_exit_doors(controller.get_objects(radius=15))
+    if not exit_doors:
         debug_log.log("pyramid_plunder", "no exit door found in the final room -- waiting")
         return
+    note_progress(ctx)
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
-    if controller.click_menu_action(ctx.ser, exit_door, "Quick-leave", check_ui_blockers=False):
-        debug_log.log("pyramid_plunder", f"quick-left room {config['lastRoomToLoot']} -- run complete, restarting")
-        ctx.state.data["room_step"] = ROOM_STEP_TRAP
-        ctx.state.data["door_attempt"] = 0
+    # click_menu_action, not click_entity: the door's default left-click action is "Leave Tomb",
+    # and only "Quick-leave" ends the run instantly from inside the room. It returns False when
+    # the option isn't on that object's menu at all, which is also how a wrong name-fallback
+    # candidate gets rejected -- so walk the candidates until one actually offers Quick-leave.
+    for exit_door in exit_doors[:3]:
+        if controller.click_menu_action(ctx.ser, exit_door, "Quick-leave", check_ui_blockers=False):
+            debug_log.log("pyramid_plunder", f"quick-left room {config['lastRoomToLoot']} -- run complete, restarting")
+            reset_run_state(ctx)
+            return
+
+
+def door_key(door: dict):
+    return (door.get("x"), door.get("y"), door.get("plane"))
 
 
 def door_step(ctx, config, pp: dict) -> None:
@@ -331,25 +599,44 @@ def door_step(ctx, config, pp: dict) -> None:
     objects (26618-26621) -- the game's own "3 wrong -> 4th always works" rule bounds the
     worst case.
 
-    NEEDS LIVE VERIFICATION: whether Pick-lock and Enter are actually one click or two -- this
-    implementation assumes one click resolves both (closed tomb doors have a single default
-    action per the wiki infobox)."""
+    NEEDS LIVE VERIFICATION: whether Pick-lock and Enter are actually one click or two. The
+    wiki infobox lists them as the two SEPARATE version states of the same object (impostor
+    20948 "Closed"/Pick-lock -> 20949 "Opened"/Enter), so this treats them as two clicks and
+    accepts either state as a candidate: a door that flipped to 20949 was successfully picked
+    and still needs entering, and is preferred over starting a fresh pick attempt elsewhere. If
+    it turns out one click does both, the 20949 branch simply never has anything to click and
+    this still behaves exactly like a one-click implementation.
+
+    Doors confirmed dead ends this room are remembered by tile (dead_end_doors) and excluded --
+    without that, an already-picked dead end sitting at 20949 would win the "prefer opened"
+    preference forever."""
     room = pp.get("roomNumber", 0)
     if room >= config["lastRoomToLoot"]:
         quick_leave(ctx, config)
         return
 
     objs = controller.get_objects(radius=15)
+    dead_ends = {tuple(k) for k in ctx.state.data.get("dead_end_doors", [])}
     doors = [o for o in objs
-             if o.get("id") in TOMB_DOOR_WALL_IDS and o.get("impostorId") == TOMB_DOOR_CLOSED_ID
-             and o.get("visible", True)]
+             if o.get("id") in TOMB_DOOR_WALL_IDS
+             and o.get("impostorId") in (TOMB_DOOR_CLOSED_ID, TOMB_DOOR_OPENED_ID)
+             and o.get("visible", True)
+             and door_key(o) not in dead_ends]
     if not doors:
-        debug_log.log("pyramid_plunder", "no closed tomb doors found -- waiting")
+        debug_log.log("pyramid_plunder", "no untried tomb doors found -- waiting")
         return
-    doors.sort(key=lambda o: o.get("distance", 9999))
+    note_progress(ctx)
 
+    # Prefer a door that's already been picked open (just needs "Enter") over starting a new
+    # pick-lock attempt -- entering an unlocked door is strictly more progress.
+    opened = sorted((o for o in doors if o.get("impostorId") == TOMB_DOOR_OPENED_ID),
+                    key=lambda o: o.get("distance", 9999))
     attempt = ctx.state.data.get("door_attempt", 0)
-    door = doors[attempt % len(doors)]
+    if opened:
+        door = opened[0]
+    else:
+        doors.sort(key=lambda o: o.get("distance", 9999))
+        door = doors[attempt % len(doors)]
 
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
@@ -365,6 +652,9 @@ def door_step(ctx, config, pp: dict) -> None:
     )
     if dead_end is not None:
         debug_log.log("pyramid_plunder", f"door attempt {attempt} is a dead end -- trying the next one")
+        remembered = list(ctx.state.data.get("dead_end_doors", []))
+        remembered.append(list(door_key(door)))
+        ctx.state.data["dead_end_doors"] = remembered
         ctx.state.data["door_attempt"] = attempt + 1
         return
 
@@ -373,9 +663,12 @@ def door_step(ctx, config, pp: dict) -> None:
         debug_log.log("pyramid_plunder", f"advanced to room {fresh_pp.get('roomNumber')}")
         ctx.state.data["room_step"] = ROOM_STEP_TRAP
         ctx.state.data["door_attempt"] = 0
+        ctx.state.data["dead_end_doors"] = []
         return
 
-    # Neither signal fired yet (still picking the lock) -- stay on this door and retry next tick.
+    # Neither signal fired yet (lock still being picked, or the door was picked open and now
+    # needs the separate "Enter" click) -- re-poll next tick; the 20949 preference above picks
+    # up an opened-but-not-entered door on its own.
 
 
 def drop_loot(ctx, config) -> None:
@@ -390,12 +683,27 @@ def drop_loot(ctx, config) -> None:
     artefactNames) -- the game's own auto-eject on finding it is what actually ends the run;
     this routine does nothing special beyond logging it."""
     names = {n.lower() for n in config.get("artefactNames", [])}
-    for item in controller.get_inventory():
-        item_name = (item.get("name") or "").lower()
-        if item_name in names:
+    # InventoryProvider resolves item screen coords from the inventory Widget, which only exists
+    # while the Inventory tab is actually showing (see consume_first/open_inventory_tab's own
+    # notes) -- clicking off a stale/hidden slot position otherwise. Idempotent and cheap: it
+    # no-ops when the tab is already open.
+    controller.open_inventory_tab(ctx.ser)
+    inventory = controller.get_inventory()
+
+    # startswith, not ==: the minigame drops the uncharged variant, named "Pharaoh's sceptre
+    # (uncharged)". Drop-safety is unaffected either way (no sceptre name is in artefactNames),
+    # this only decides whether the find gets logged. The flag clears itself once the sceptre is
+    # gone from the inventory, so a second sceptre later in the same process still logs.
+    has_sceptre = any((i.get("name") or "").lower().startswith("pharaoh's sceptre")
+                      for i in inventory)
+    if not has_sceptre:
+        ctx.state.data["sceptre_logged"] = False
+    elif not ctx.state.data.get("sceptre_logged"):
+        debug_log.log("pyramid_plunder", "PHARAOH'S SCEPTRE FOUND -- letting the game's own auto-eject take over")
+        ctx.state.data["sceptre_logged"] = True
+
+    for item in inventory:
+        if (item.get("name") or "").lower() in names:
             controller.click_entity(ctx.ser, item, check_ui_blockers=False)
             controller.human_delay(0.2, 0.5)
             return
-        if item_name == "pharaoh's sceptre" and not ctx.state.data.get("sceptre_logged"):
-            debug_log.log("pyramid_plunder", "PHARAOH'S SCEPTRE FOUND -- letting the game's own auto-eject take over")
-            ctx.state.data["sceptre_logged"] = True
