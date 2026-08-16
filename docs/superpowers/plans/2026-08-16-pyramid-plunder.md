@@ -18,6 +18,7 @@ These are copied verbatim from the spec and apply to every task below:
 - Varbits (`net.runelite.api.gameval.VarbitID`): `NTK_ROOM_NUMBER` (2377, room 1-8), `NTK_PLAYER_TIMER_COUNT` (2375, ticks elapsed this run; `0` = not in a run), `NTK_TRAP_ACTIVE` (2365, `1` = current room's spear trap still armed).
 - Object ids (decompiled-client-confirmed, take priority over the wiki infobox where they differ): spear trap `21280`; Grand Gold Chest closed `20946` / searched `26616`; Sarcophagus closed `21255` / opened-searchable `26626`; Tomb Door closed appearance `20948`, the 4 physical wall-object instances `26618`-`26621`; Tomb Door (exit) `20931` with a **"Quick-leave"** menu option.
 - Wrong-tomb-door chat text (user-confirmed, case-insensitive substring match): `"this door leads to a dead end."`
+- Failed-spear-trap chat text (user-confirmed, case-insensitive substring match): `"fail to deactivate the trap"`
 - Loot policy: only Grand Gold Chest + Sarcophagus are looted (never urns); sarcophagi are skipped in rooms 1-3 and looted rooms 4-6; the run is deliberately abandoned via Quick-leave after room 6 and restarted, never pushed to rooms 7-8; every artefact from a fixed name list is dropped, **except** "Pharaoh's sceptre" which is never dropped.
 - No banking, no prayer management (rejected explicitly in the spec) — only a generic `hp <= eatAt` food-eat safety net, same as `slayer.py`.
 - No `ControllerConfig.java` panel/section — this routine never reads `GET /config`.
@@ -422,7 +423,11 @@ def in_room_tick(ctx, config, pp: dict) -> None:
 
 ```python
 def trap_step(ctx, config, pp: dict) -> None:
-    """Disarm the spear trap if the bridge reports it still armed.
+    """Disarm the spear trap if the bridge reports it still armed. A failed attempt is
+    confirmed via the chat message "You fail to deactivate the trap." (user-confirmed, see
+    Global Constraints) -- logged for visibility, but the actual retry is driven by re-polling
+    pp["trapActive"] next tick either way (stays on "trap" until the bridge confirms it's
+    actually disarmed), so a missed/late chat message can't cause a stuck loop.
 
     NEEDS LIVE VERIFICATION: whether this is actually mandatory to reach the chest/
     sarcophagus/doors at all, or just an optional bonus-XP obstacle -- see design doc. Either
@@ -439,10 +444,19 @@ def trap_step(ctx, config, pp: dict) -> None:
 
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
+    since_tick = controller.get_last_chat_message().get("tick")
     controller.click_entity(ctx.ser, trap, check_ui_blockers=False)
     controller.human_delay(0.6, 1.2)
-    # Re-polled next tick via pp["trapActive"] -- stays on "trap" until the bridge confirms it's
-    # actually disarmed, so a failed attempt naturally retries instead of advancing early.
+
+    failed = controller.wait_for_chat_message(
+        lambda m: "fail to deactivate the trap" in (m.get("message") or "").lower(),
+        since_tick=since_tick, timeout_s=2.0,
+    )
+    if failed is not None:
+        debug_log.log("pyramid_plunder", "failed to disarm the spear trap -- retrying")
+    # Re-polled next tick via pp["trapActive"] either way -- stays on "trap" until the bridge
+    # confirms it's actually disarmed, so a failed attempt (logged above or not) naturally
+    # retries instead of advancing early.
 
 
 def chest_step(ctx, config, pp: dict) -> None:
