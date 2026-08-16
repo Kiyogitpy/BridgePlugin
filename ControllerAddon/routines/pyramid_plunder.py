@@ -696,7 +696,12 @@ def door_step(ctx, config, pp: dict) -> None:
 
     Doors confirmed dead ends this room are remembered by tile (dead_end_doors) and excluded --
     without that, an already-picked dead end sitting at 20949 would win the "prefer opened"
-    preference forever."""
+    preference forever. A tile also gets excluded (door_enter_attempts, DOOR_ENTER_ATTEMPT_LIMIT)
+    without an explicit dead-end message if its clicks keep producing no signal at all -- covers
+    both a click that misses the object entirely (CONFIRMED live: resolves to a plain "Walk
+    here" instead, see click_missed below -- open at long range, see TOMB_DOOR_AIM_OFFSET's own
+    note) and a silent dead end on an already-opened door (Entering it produces no chat message,
+    unlike the initial Pick-lock attempt on a closed one)."""
     room = pp.get("roomNumber", 0)
     if room >= config["lastRoomToLoot"]:
         quick_leave(ctx, config)
@@ -712,7 +717,6 @@ def door_step(ctx, config, pp: dict) -> None:
     if not doors:
         debug_log.log("pyramid_plunder", "no untried tomb doors found -- waiting")
         return
-    note_progress(ctx)
 
     # Prefer a door that's already been picked open (just needs "Enter") over starting a new
     # pick-lock attempt -- entering an unlocked door is strictly more progress.
@@ -728,15 +732,25 @@ def door_step(ctx, config, pp: dict) -> None:
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
 
-    was_opened = door.get("impostorId") == TOMB_DOOR_OPENED_ID
     since_tick = controller.get_last_chat_message().get("tick")
+    action_before = controller.get_last_action().get("tick")
     if not controller.click_entity(ctx.ser, door, offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False):
         return
     controller.human_delay(0.8, 1.6)
 
+    # CONFIRMED live 2026-08-17: a long-range Tomb Door click can silently resolve to a plain
+    # "Walk here" instead of Pick-lock/Enter (GET /last-action: menuAction=WALK) -- a genuine
+    # aim miss, not a skill-roll failure. Without this check, note_progress() below would fire
+    # on the mere presence of a resolvable candidate object regardless of whether the click
+    # actually did anything, permanently defeating NO_PROGRESS_MAX_TICKS for exactly the case
+    # it exists to catch.
+    action = controller.get_last_action()
+    click_missed = (action.get("tick") == action_before
+                     or (action.get("menuAction") or "").upper() == "WALK")
+
     dead_end = controller.wait_for_chat_message(
         lambda m: "leads to a dead end" in (m.get("message") or "").lower(),
-        since_tick=since_tick, timeout_s=3.0,
+        since_tick=since_tick, timeout_s=0.5 if click_missed else 3.0,
     )
     if dead_end is not None:
         debug_log.log("pyramid_plunder", f"door attempt {attempt} is a dead end -- trying the next one")
@@ -755,27 +769,34 @@ def door_step(ctx, config, pp: dict) -> None:
         ctx.state.data["door_enter_attempts"] = {}
         return
 
-    # Neither signal fired -- for a still-CLOSED door this is a normal, expected silent
-    # Pick-lock failure roll (per the wiki) and just needs retrying. For an already-OPENED door
-    # (see DOOR_ENTER_ATTEMPT_LIMIT above) it means we just Entered a silent dead end -- count
-    # these and give up on this tile once the limit's hit, since Entering an unlocked door has
-    # no skill-roll retry mechanic to wait out.
-    if was_opened:
-        key = door_key(door)
-        enter_attempts = dict(ctx.state.data.get("door_enter_attempts", {}))
-        count = enter_attempts.get(key, 0) + 1
-        if count >= DOOR_ENTER_ATTEMPT_LIMIT:
-            debug_log.log("pyramid_plunder", f"door attempt {attempt} entered {count}x with no "
-                                             f"signal either way -- treating as a silent dead end")
-            remembered = list(ctx.state.data.get("dead_end_doors", []))
-            remembered.append(list(key))
-            ctx.state.data["dead_end_doors"] = remembered
-            ctx.state.data["door_attempt"] = attempt + 1
-            enter_attempts.pop(key, None)
-            ctx.state.data["door_enter_attempts"] = enter_attempts
-            return
-        enter_attempts[key] = count
-        ctx.state.data["door_enter_attempts"] = enter_attempts
+    # Neither signal fired. A genuinely-registered click on a still-closed door is a normal,
+    # expected silent Pick-lock failure roll (per the wiki) and just needs retrying -- that's
+    # real progress (the attempt actually happened), so note_progress() fires. A click that
+    # missed (click_missed) or one that registered on an already-OPENED door (silently entered
+    # a dead end -- Entering an unlocked door has no skill-roll retry mechanic to wait out) is
+    # NOT progress -- count these per tile and give up on it once DOOR_ENTER_ATTEMPT_LIMIT is
+    # hit, so a tile this routine simply can't reliably click doesn't stall it forever.
+    was_opened = door.get("impostorId") == TOMB_DOOR_OPENED_ID
+    if not click_missed and not was_opened:
+        note_progress(ctx)
+        return
+
+    key = door_key(door)
+    stalled_attempts = dict(ctx.state.data.get("door_enter_attempts", {}))
+    count = stalled_attempts.get(key, 0) + 1
+    if count >= DOOR_ENTER_ATTEMPT_LIMIT:
+        reason = "the click keeps missing" if click_missed else "entered with no signal either way"
+        debug_log.log("pyramid_plunder", f"door attempt {attempt}: {reason} {count}x -- "
+                                         f"treating as unreachable, trying the next one")
+        remembered = list(ctx.state.data.get("dead_end_doors", []))
+        remembered.append(list(key))
+        ctx.state.data["dead_end_doors"] = remembered
+        ctx.state.data["door_attempt"] = attempt + 1
+        stalled_attempts.pop(key, None)
+        ctx.state.data["door_enter_attempts"] = stalled_attempts
+        return
+    stalled_attempts[key] = count
+    ctx.state.data["door_enter_attempts"] = stalled_attempts
 
 
 def drop_loot(ctx, config) -> None:
