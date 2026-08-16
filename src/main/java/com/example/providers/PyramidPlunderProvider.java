@@ -38,6 +38,13 @@ public class PyramidPlunderProvider extends BridgeProvider
 		Map<String, Object> data = new HashMap<>();
 
 		Player local = client.getLocalPlayer();
+		// Deliberately plain getWorldLocation(), NOT the instance-safe
+		// WorldPoint.fromLocalInstance()/getTopLevelWorldLocation() this codebase standardizes on
+		// elsewhere (see CLAUDE.md's "Instanced areas break forward world-coordinate conversion"):
+		// this reproduces the official RuneLite PyramidPlunderPlugin.isInPyramidPlunder() exactly,
+		// and the Jalsavrah Pyramid's rooms are a real, shared, NON-instanced region (7749) -- the
+		// instance-template chunk remapping that gotcha is about simply doesn't happen here, so
+		// there is no wrong region id to correct for.
 		boolean inRegion = local != null && local.getWorldLocation().getRegionID() == PYRAMID_PLUNDER_REGION;
 		int timerTicks = client.getVarbitValue(VarbitID.NTK_PLAYER_TIMER_COUNT);
 

@@ -100,18 +100,46 @@ routine at all.
     requirement (21/31/.../91) -- not needed by this design's logic (room
     number alone drives every branch) but cheap to expose alongside the
     others for debug-log purposes.
-- **Object ids** (from the decompiled plugin, take priority over the wiki
-  infobox's ids where they differ -- e.g. the wiki lists the opened
-  sarcophagus as `21256`, the live client plugin uses `26626`):
-  - Spear trap: `21280`.
-  - Grand Gold Chest: closed `20946` -> searched `26616`.
-  - Sarcophagus: closed `21255` -> opened `26626` (searchable).
+- **Object ids** -- CORRECTED 2026-08-16 (this bullet list previously framed
+  these as "closed X -> searched Y" single-id state flips, and claimed the
+  decompiled plugin's ids and the wiki infobox's ids *contradicted* each
+  other. Both were wrong, and the routine's first implementation was broken
+  by it. The two sources don't conflict; they list **different kinds of id**,
+  and the objects here need BOTH):
+  - **Base id vs impostor id.** These are multiloc (varbit-conditional)
+    objects. `GameObject.getId()` returns the *base* id, which never changes
+    as the object is opened/searched/picked; the *impostor* id
+    (`getObjectDefinition(baseId).getImpostor().getId()`) is the current
+    state variant, and is what actually flips. `ObjectProvider.java` exposes
+    both: `"id"` = base id, `"impostorId"` = resolved state variant. So a
+    routine matches on `id` to find the object, then branches on
+    `impostorId` to know its state -- exactly what the official plugin's own
+    overlay does (`26616 == object.getId()` **and then** `20946 !=
+    imposter.getId()`). The decompiled plugin's `GRAND_GOLD_CHEST_ID`/
+    `SARCOPHAGUS_ID` are base ids; its `*_CLOSED_ID`s and every `id1`/`id2`/
+    `id3` in a wiki Infobox Scenery version list are impostor ids.
+  - Spear trap: `21280` (single-state, no impostor pair).
+  - Grand Gold Chest: base `26616`; impostors `20946` = Closed (option
+    "Search") -> `20947` = Opened (no options, already looted).
+  - Sarcophagus: base `26626`; impostors `21255` = Closed (option "Open") ->
+    `21257` = Opening (**no options at all** -- this is the state the
+    opening animation occupies, and polling for it is what an "wait for the
+    animation" delay was really approximating) -> `21256` = Opened (option
+    "Search").
   - Tomb Door (the 4 per-room progression doors, all identical in
-    appearance): closed `20948`; the 4 physical wall-object instances are
-    ids `26618`-`26621`.
+    appearance): base ids `26618`-`26621` (the 4 physical wall objects);
+    impostors `20948` = Closed (option "Pick-lock") -> `20949` = Opened
+    (option "Enter"). Two separate states implies two separate clicks --
+    still on the NEEDS LIVE VERIFICATION list, but the routine now accepts
+    both states as candidates so it works either way.
   - Tomb Door (exit): `20931`, options "Leave Tomb" / **"Quick-leave"** --
     this is what ends a run instantly from inside any room, no need to walk
-    back through previously-opened doors.
+    back through previously-opened doors. NOT cross-checkable against the
+    decompiled plugin (it doesn't reference this object at all), and the
+    wiki lists it as a single "In game" version (`id1=20931`; `id2=20932` is
+    the separate lobby-side door), so whether `20931` is a base id or an
+    impostor id is unverified -- the routine matches it against both fields
+    and falls back to a name lookup.
 - **Loot mechanics**: Grand Gold Chest and Sarcophagus each independently
   roll for the Pharaoh's sceptre on every search/open attempt (regardless of
   success/failure since the 2023-08-30 rework); sceptre odds improve in
@@ -224,17 +252,20 @@ the right phase on its own):
      retrying on the 1-4 dmg failure roll. -> `chest`.
      **NEEDS LIVE VERIFICATION**: whether this is actually mandatory to
      reach the chest/sarcophagus/doors, or just an optional obstacle.
-  2. **`chest`**: search the Grand Gold Chest (`20946` -> `26616`). ->
-     `sarco` if `roomNumber >= sarcophagusStartRoom`, else -> `door`.
-  3. **`sarco`**: click "Open" on the Sarcophagus (`21255`), wait for it to
-     become searchable (`26626`), click "Search". No mummy-specific
+  2. **`chest`**: search the Grand Gold Chest (base `26616`, impostor
+     `20946` closed -> `20947` searched). -> `sarco` if
+     `roomNumber >= sarcophagusStartRoom`, else -> `door`.
+  3. **`sarco`**: click "Open" on the Sarcophagus (base `26626`, impostor
+     `21255`), wait out the option-less "Opening" state (`21257`) for it to
+     become searchable (`21256`), click "Search". No mummy-specific
      handling beyond the routine's normal food-eat safety net. -> `door`.
   4. **`door`**:
      - If `roomNumber >= lastRoomToLoot`: this room's looting is done --
        click the exit door's **Quick-leave** option (`20931`) and reset
        `room_step` for next run. Dispatch naturally lands back on
        `OUTSIDE`/`LOBBY` next tick, whichever the game actually did.
-     - Else: work through the 4 Tomb Doors (`20948`) one at a time --
+     - Else: work through the 4 Tomb Doors (base `26618`-`26621`, impostor
+       `20948` closed -> `20949` opened) one at a time --
        pick-lock (using a lockpick if `useLockpick` and one is carried),
        then Enter. `on_event` watches for the `CHAT_MESSAGE` substring
        `"this door leads to a dead end."`: if seen, this door is confirmed
