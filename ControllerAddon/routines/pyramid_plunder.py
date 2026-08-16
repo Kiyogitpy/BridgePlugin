@@ -63,6 +63,17 @@ TOMB_DOOR_OPENED_ID = 20949                     # impostor, option "Enter"
 EXIT_DOOR_ID = 20931
 EXIT_DOOR_NAME = "tomb door"
 
+# CONFIRMED live 2026-08-17: a wrong outer anonymous door places the player in an "abandoned
+# room" that shares Pyramid Plunder's own region (7749) but reports roomNumber=0/inRun=false via
+# /pyramid-plunder -- i.e. it looks like a real room to a naive region check, but isn't one. No
+# Guardian mummy is present. The room contains a "Tomb Door" object at id=20932 (the wiki
+# infobox's "Lobby" variant, option "Leave Tomb" only, no "Quick-leave") right next to the
+# player's landing tile -- clicking it is the actual escape. NOT matched by EXIT_DOOR_NAME's
+# generic "tomb door" substring search alone in step_back_outside, because that name collides
+# with the room-progression Tomb Doors (20948/20949) once back in a real room; matched by id
+# here specifically to stay unambiguous.
+ABANDONED_ROOM_EXIT_ID = 20932
+
 GUARDIAN_MUMMY_NAME = "guardian mummy"
 ANONYMOUS_DOOR_NAME = "anonymous looking door"
 
@@ -82,6 +93,38 @@ MUMMY_MAX_DISTANCE = 5
 # CORRECT door too, so one failure is not evidence the cached door is wrong. Only invalidate the
 # cache after this many CONSECUTIVE failures on the same cached index.
 OUTSIDE_DOOR_FAIL_TOLERANCE = 2
+
+# CONFIRMED live 2026-08-17: entering an already-opened (impostorId TOMB_DOOR_OPENED_ID) tomb
+# door that turns out to be a dead end produces NO chat message at all -- unlike the initial
+# Pick-lock attempt on a still-closed door, which does say "leads to a dead end" -- and of
+# course no room advance either. Silent on both signals door_step otherwise relies on, so an
+# already-open wrong door would be re-Entered forever without this fallback. Small on purpose:
+# entering an unlocked door has no skill-roll retry mechanic (unlike Pick-lock), so a handful of
+# identical silent attempts is already conclusive, not a normal gameplay variance to wait out.
+DOOR_ENTER_ATTEMPT_LIMIT = 3
+
+# CONFIRMED live 2026-08-17: click_entity's default aim offset (-7, +7) -- tuned for wide
+# floor-standing GameObjects like the chest/sarcophagus/spear trap, which all clicked fine with
+# it -- systematically missed a distant (15-tile) Tomb Door WallObject every single time,
+# resolving to a plain "Walk here" instead of the door's own action (confirmed via
+# GET /last-action: {"menuAction": "WALK", "option": "Walk here"}), even though the object's own
+# reported screenX/screenY were otherwise accurate. WallObjects render as a thin strip, not a
+# wide clickable area, and don't tolerate a fixed diagonal pixel bias the way a chest does --
+# aim dead-center instead for every object in the Tomb Door family (room-progression doors and
+# both exit-door variants).
+TOMB_DOOR_AIM_OFFSET = (0, 0)
+
+# NEEDS LIVE VERIFICATION: even with TOMB_DOOR_AIM_OFFSET, a Tomb Door candidate at long range
+# (observed failing at 14-15 tiles, across the room) still resolved every click to a plain
+# "Walk here" (GET /last-action: menuAction=WALK) instead of the door's own action. A shift-click
+# force-walk toward the door's own (x, y) was tried as a fix and reverted (2026-08-17): the
+# player never actually moved across ~20 consecutive attempts, most likely because a wall
+# object's own tile isn't a valid walk destination the way an open floor tile is -- OSRS's
+# "walk near an unwalkable tile" fallback behavior needs to be understood before a real fix can
+# be written here, not guessed at again blind. Left unhandled for now: the existing
+# NO_PROGRESS_MAX_TICKS safety-stop is the backstop for this case (the routine restarts and the
+# door layout may differ next time), same as any other genuinely open live-verification gap in
+# this file.
 
 # Hard safety-stop backstop (design spec section 4: "Hard safety-stop ... if no anonymous door /
 # Guardian mummy / chest / tomb door can be found at all within a reasonable number of
@@ -105,7 +148,13 @@ DEFAULT_CONFIG = {
         "stone scarab", "stone statuette", "gold seal", "golden scarab",    # sceptre are never at
         "golden statuette",                                                 # risk of being dropped
     ],
-    "food": {"enabled": True, "eatAt": 5},   # same shape as slayer.py's food_cfg
+    # CONFIRMED live 2026-08-17: eatAt=5 (the original value) let a scarab-swarm-inflicted
+    # poison drain the player from 81 hp down to 4 hp before the safety net ever triggered --
+    # poison ticks on the game's own damage schedule, not gated behind this routine's tick loop,
+    # so multiple ticks can land between two consecutive checks. 40 leaves real margin against
+    # that without materially increasing food consumption (this routine still only eats when
+    # actually needed, just meaningfully earlier).
+    "food": {"enabled": True, "eatAt": 40},   # same shape as slayer.py's food_cfg
     "breaks": {
         "enabled": True,
         "everyMinMinutes": 45, "everyMaxMinutes": 75,
@@ -134,9 +183,22 @@ def find_object_by_id(objects: list, object_id: int):
 
 
 def find_objects_by_name(objects: list, name_substring: str) -> list:
+    """Matches are deduplicated by (x, y) tile -- CONFIRMED live 2026-08-17: the 4 anonymous
+    doors each come back as 4 exactly-identical entries (same id/impostorId/screen position)
+    within radius 30, presumably multiple wall-object layers on the same tile all resolving to
+    the same display name. Without dedup, outside_tick's own `!= 4` sanity check ("found 16
+    anonymous doors, expected 4") correctly refused to proceed rather than misordering
+    order_doors_clockwise on the raw list -- but it also meant the routine could never actually
+    enter the pyramid. One physical tile is one clickable target regardless of how many
+    same-named object layers RuneLite reports there, so dedup is the correct fix, not a
+    workaround."""
     name_substring = name_substring.lower()
-    return [o for o in objects
-            if name_substring in (o.get("name") or "").lower() and o.get("visible", True)]
+    matches = [o for o in objects
+               if name_substring in (o.get("name") or "").lower() and o.get("visible", True)]
+    deduped = {}
+    for o in matches:
+        deduped.setdefault((o.get("x"), o.get("y")), o)
+    return list(deduped.values())
 
 
 def find_npc_by_name(npcs: list, name: str, max_distance: float = None):
@@ -228,6 +290,7 @@ def reset_run_state(ctx) -> None:
     ctx.state.data["room_step"] = ROOM_STEP_TRAP
     ctx.state.data["door_attempt"] = 0
     ctx.state.data["dead_end_doors"] = []
+    ctx.state.data["door_enter_attempts"] = {}
 
 
 def maybe_eat_food(ctx, config) -> None:
@@ -268,7 +331,17 @@ def outside_tick(ctx, config, doors: list = None) -> None:
         # != rather than < : a larger match set means the name substring caught something this
         # code's clockwise indexing was never designed for, and proceeding would cache an index
         # that points at a different physical door every call.
-        debug_log.log("pyramid_plunder", f"found {len(doors)} anonymous doors (expected 4) -- waiting")
+        #
+        # CONFIRMED live 2026-08-17 (bug, now fixed): this used to just log-and-wait here, which
+        # meant step_back_outside (below) was only ever reachable as a same-tick follow-up right
+        # after THIS function's own door click -- a fresh tick that starts already inside an
+        # abandoned room (e.g. right after a routine restart) hit this early return every single
+        # tick forever, since doors-not-visible-from-inside never becomes 4 on its own. Routing
+        # through step_back_outside here too means every tick gets a real chance at recovery
+        # (all 4 visible / abandoned-room exit found / genuinely nothing -> defers to the
+        # no-progress safety net), not just the one that happened to just click a door.
+        debug_log.log("pyramid_plunder", f"found {len(doors)} anonymous doors (expected 4) -- checking for recovery")
+        step_back_outside(ctx)
         return
     ordered = order_doors_clockwise(doors)
     note_progress(ctx)
@@ -319,29 +392,41 @@ def outside_tick(ctx, config, doors: list = None) -> None:
 
 
 def step_back_outside(ctx) -> None:
-    """Wrong-door recovery: click back through whichever anonymous door is actually resolvable
-    from where we ended up.
+    """Wrong-door recovery. Three possible fresh states, checked in order:
 
-    Deliberately re-fetches /objects instead of reusing outside_tick's pre-click snapshot --
+    1. All 4 outer doors still visible -- the entry attempt just failed its Thieving roll and
+       we never left (nothing to step back out of -- clicking a door here would be an unrelated
+       extra entry attempt on one we didn't choose).
+    2. CONFIRMED live 2026-08-17: a wrong door lands in an "abandoned room" (still region 7749,
+       but roomNumber=0/inRun=false and no Guardian mummy) containing its own exit object,
+       ABANDONED_ROOM_EXIT_ID -- click that to leave. This is the actual escape; a plain
+       re-search for anonymous doors from inside this room always finds zero, since anonymous
+       doors don't exist in there at all.
+    3. Nothing resolvable (neither the outer doors nor the room's own exit) -- exactly the case
+       the shared no-progress counter (check_no_progress) exists to catch, so no further
+       hand-rolled escape here.
+
+    Deliberately re-fetches /objects rather than reusing outside_tick's pre-click snapshot --
     that snapshot's screenX/screenY were resolved on the other side of an area transition and
-    can easily point at nothing useful now, and a recovery click that doesn't land leaves the
-    player in an abandoned room indefinitely.
-
-    Two of the three possible fresh results are "don't click anything": all 4 outer doors still
-    visible means the entry attempt just failed its Thieving roll and we never left (nothing to
-    step back out of -- clicking the nearest door here would be an unrelated extra entry
-    attempt on a door we didn't choose); nothing resolvable at all is exactly the case the
-    shared no-progress counter (check_no_progress) exists to catch, so no hand-rolled escape
-    here either."""
+    can easily point at nothing useful now."""
     controller.wait_until_player_idle(timeout_s=5.0)
     fresh = find_outer_doors()
     if len(fresh) >= 4:
         debug_log.log("pyramid_plunder", "still outside (all 4 doors visible) -- the entry "
                                          "attempt just failed its roll, nothing to step back out of")
         return
+
+    exit_obj = find_object_by_id(controller.get_objects(radius=15), ABANDONED_ROOM_EXIT_ID)
+    if exit_obj is not None:
+        debug_log.log("pyramid_plunder", "in an abandoned room -- leaving via its exit door")
+        note_progress(ctx)
+        controller.click_entity(ctx.ser, exit_obj, offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False)
+        controller.human_delay(1.0, 2.0)
+        return
+
     if not fresh:
-        debug_log.log("pyramid_plunder", "no anonymous door resolvable for the step-back-out "
-                                         "click -- waiting for a fresh poll")
+        debug_log.log("pyramid_plunder", "no anonymous door or abandoned-room exit resolvable "
+                                         "-- waiting for a fresh poll")
         return
     fresh.sort(key=lambda o: o.get("distance", 9999))
     note_progress(ctx)
@@ -363,6 +448,7 @@ def setup(ctx):
     ctx.state.data.setdefault("room_step", ROOM_STEP_TRAP)
     ctx.state.data.setdefault("door_attempt", 0)
     ctx.state.data.setdefault("dead_end_doors", [])
+    ctx.state.data.setdefault("door_enter_attempts", {})
     ctx.state.data.setdefault("no_progress_ticks", 0)
 
 
@@ -571,7 +657,8 @@ def quick_leave(ctx, config) -> None:
     # the option isn't on that object's menu at all, which is also how a wrong name-fallback
     # candidate gets rejected -- so walk the candidates until one actually offers Quick-leave.
     for exit_door in exit_doors[:3]:
-        if controller.click_menu_action(ctx.ser, exit_door, "Quick-leave", check_ui_blockers=False):
+        if controller.click_menu_action(ctx.ser, exit_door, "Quick-leave",
+                                         offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False):
             debug_log.log("pyramid_plunder", f"quick-left room {config['lastRoomToLoot']} -- run complete, restarting")
             reset_run_state(ctx)
             return
@@ -641,8 +728,9 @@ def door_step(ctx, config, pp: dict) -> None:
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
 
+    was_opened = door.get("impostorId") == TOMB_DOOR_OPENED_ID
     since_tick = controller.get_last_chat_message().get("tick")
-    if not controller.click_entity(ctx.ser, door, check_ui_blockers=False):
+    if not controller.click_entity(ctx.ser, door, offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False):
         return
     controller.human_delay(0.8, 1.6)
 
@@ -664,11 +752,30 @@ def door_step(ctx, config, pp: dict) -> None:
         ctx.state.data["room_step"] = ROOM_STEP_TRAP
         ctx.state.data["door_attempt"] = 0
         ctx.state.data["dead_end_doors"] = []
+        ctx.state.data["door_enter_attempts"] = {}
         return
 
-    # Neither signal fired yet (lock still being picked, or the door was picked open and now
-    # needs the separate "Enter" click) -- re-poll next tick; the 20949 preference above picks
-    # up an opened-but-not-entered door on its own.
+    # Neither signal fired -- for a still-CLOSED door this is a normal, expected silent
+    # Pick-lock failure roll (per the wiki) and just needs retrying. For an already-OPENED door
+    # (see DOOR_ENTER_ATTEMPT_LIMIT above) it means we just Entered a silent dead end -- count
+    # these and give up on this tile once the limit's hit, since Entering an unlocked door has
+    # no skill-roll retry mechanic to wait out.
+    if was_opened:
+        key = door_key(door)
+        enter_attempts = dict(ctx.state.data.get("door_enter_attempts", {}))
+        count = enter_attempts.get(key, 0) + 1
+        if count >= DOOR_ENTER_ATTEMPT_LIMIT:
+            debug_log.log("pyramid_plunder", f"door attempt {attempt} entered {count}x with no "
+                                             f"signal either way -- treating as a silent dead end")
+            remembered = list(ctx.state.data.get("dead_end_doors", []))
+            remembered.append(list(key))
+            ctx.state.data["dead_end_doors"] = remembered
+            ctx.state.data["door_attempt"] = attempt + 1
+            enter_attempts.pop(key, None)
+            ctx.state.data["door_enter_attempts"] = enter_attempts
+            return
+        enter_attempts[key] = count
+        ctx.state.data["door_enter_attempts"] = enter_attempts
 
 
 def drop_loot(ctx, config) -> None:
