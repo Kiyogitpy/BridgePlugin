@@ -121,6 +121,7 @@ public class ControllerPlugin extends Plugin
 		new MenuStateProvider(client, clientThread, server).register();
 		new SpellbookProvider(client, clientThread, server).register();
 		new MixologyProvider(client, clientThread, server).register();
+		new PyramidPlunderProvider(client, clientThread, server).register();
 		new LastActionProvider(client, clientThread, server, eventBus).register();
 		new LastChatMessageProvider(client, clientThread, server, eventBus).register();
 

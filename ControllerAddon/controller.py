@@ -389,6 +389,10 @@ def get_sailing():
     }
 
 
+def get_pyramid_plunder():
+    return api_get("/pyramid-plunder") or {"inRun": False, "roomNumber": 0, "timerTicks": 0, "trapActive": False}
+
+
 def get_equipment():
     return api_get("/equipment") or {}
 
