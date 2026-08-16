@@ -195,5 +195,207 @@ def tick(ctx):
 
 
 def in_room_tick(ctx, config, pp: dict) -> None:
-    # Filled in by Task 3.
-    pass
+    step = ctx.state.data.get("room_step", ROOM_STEP_TRAP)
+
+    if step == ROOM_STEP_TRAP:
+        trap_step(ctx, config, pp)
+    elif step == ROOM_STEP_CHEST:
+        chest_step(ctx, config, pp)
+    elif step == ROOM_STEP_SARCO:
+        sarco_step(ctx, config, pp)
+    elif step == ROOM_STEP_DOOR:
+        door_step(ctx, config, pp)
+
+    drop_loot(ctx, config)
+
+
+def trap_step(ctx, config, pp: dict) -> None:
+    """Disarm the spear trap if the bridge reports it still armed. A failed attempt is
+    confirmed via the chat message "You fail to deactivate the trap." (user-confirmed, see
+    Global Constraints) -- logged for visibility, but the actual retry is driven by re-polling
+    pp["trapActive"] next tick either way (stays on "trap" until the bridge confirms it's
+    actually disarmed), so a missed/late chat message can't cause a stuck loop.
+
+    NEEDS LIVE VERIFICATION: whether this is actually mandatory to reach the chest/
+    sarcophagus/doors at all, or just an optional bonus-XP obstacle -- see design doc. Either
+    way, disarming it first is a safe default (10 xp, minor 1-4 dmg risk on a failed attempt)."""
+    if not pp.get("trapActive"):
+        ctx.state.data["room_step"] = ROOM_STEP_CHEST
+        return
+
+    trap = find_object_by_id(controller.get_objects(radius=15), SPEAR_TRAP_ID)
+    if trap is None:
+        debug_log.log("pyramid_plunder", "trapActive but no spear trap object visible -- skipping")
+        ctx.state.data["room_step"] = ROOM_STEP_CHEST
+        return
+
+    if not controller.wait_until_player_idle(timeout_s=5.0):
+        return
+    since_tick = controller.get_last_chat_message().get("tick")
+    controller.click_entity(ctx.ser, trap, check_ui_blockers=False)
+    controller.human_delay(0.6, 1.2)
+
+    failed = controller.wait_for_chat_message(
+        lambda m: "fail to deactivate the trap" in (m.get("message") or "").lower(),
+        since_tick=since_tick, timeout_s=2.0,
+    )
+    if failed is not None:
+        debug_log.log("pyramid_plunder", "failed to disarm the spear trap -- retrying")
+    # Re-polled next tick via pp["trapActive"] either way -- stays on "trap" until the bridge
+    # confirms it's actually disarmed, so a failed attempt (logged above or not) naturally
+    # retries instead of advancing early.
+
+
+def chest_step(ctx, config, pp: dict) -> None:
+    """Grand Gold Chest always opens instantly on a single search (per the wiki -- no
+    fail-and-retry loop needed here, unlike the trap/sarcophagus/doors)."""
+    next_step = ROOM_STEP_SARCO if pp.get("roomNumber", 0) >= config["sarcophagusStartRoom"] else ROOM_STEP_DOOR
+
+    chest = find_object_by_id(controller.get_objects(radius=15), GRAND_GOLD_CHEST_CLOSED_ID)
+    if chest is None:
+        # Already searched (now shows the opened id) or not resolved this poll -- either way
+        # there's nothing left to click here.
+        ctx.state.data["room_step"] = next_step
+        return
+
+    if not controller.wait_until_player_idle(timeout_s=5.0):
+        return
+    controller.click_entity(ctx.ser, chest, check_ui_blockers=False)
+    controller.human_delay(0.6, 1.5)
+    ctx.state.data["room_step"] = next_step
+
+
+def sarco_step(ctx, config, pp: dict) -> None:
+    """Two-stage: click "Open" on the closed sarcophagus, wait for it to become searchable
+    (id flips from SARCOPHAGUS_CLOSED_ID to SARCOPHAGUS_OPENED_ID), then click it again to
+    Search. No mummy-specific handling beyond the routine's normal food-eat safety net --
+    per the design doc, prayer management was explicitly rejected in favor of that.
+
+    NEEDS LIVE VERIFICATION: how long the opening animation actually takes before the id flip
+    happens -- the 2.0-4.0s wait below is a first-cut guess, not a measured value."""
+    objs = controller.get_objects(radius=15)
+    opened = find_object_by_id(objs, SARCOPHAGUS_OPENED_ID)
+    if opened is not None:
+        if not controller.wait_until_player_idle(timeout_s=5.0):
+            return
+        controller.click_entity(ctx.ser, opened, check_ui_blockers=False)
+        controller.human_delay(1.0, 2.0)
+        ctx.state.data["room_step"] = ROOM_STEP_DOOR
+        return
+
+    closed = find_object_by_id(objs, SARCOPHAGUS_CLOSED_ID)
+    if closed is not None:
+        if not controller.wait_until_player_idle(timeout_s=5.0):
+            return
+        controller.click_entity(ctx.ser, closed, check_ui_blockers=False)
+        controller.human_delay(2.0, 4.0)
+        return  # re-poll next tick; stays on "sarco" until `opened` is found above
+
+    # Neither id present -- already looted (or genuinely missing this poll). Move on either way
+    # rather than getting stuck waiting on something that isn't there.
+    ctx.state.data["room_step"] = ROOM_STEP_DOOR
+
+
+def quick_leave(ctx, config) -> None:
+    """Room 6 (or configured lastRoomToLoot) is fully looted -- end the run via the in-room
+    exit door's Quick-leave option rather than walking back out through 6 tomb doors. The next
+    tick's phase dispatch (OUTSIDE vs LOBBY) picks up wherever the game actually drops the
+    player, so no explicit "where did we land" handling is needed here."""
+    exit_door = find_object_by_id(controller.get_objects(radius=15), EXIT_DOOR_ID)
+    if exit_door is None:
+        debug_log.log("pyramid_plunder", "no exit door found in the final room -- waiting")
+        return
+    if not controller.wait_until_player_idle(timeout_s=5.0):
+        return
+    if controller.click_menu_action(ctx.ser, exit_door, "Quick-leave", check_ui_blockers=False):
+        debug_log.log("pyramid_plunder", f"quick-left room {config['lastRoomToLoot']} -- run complete, restarting")
+        ctx.state.data["room_step"] = ROOM_STEP_TRAP
+        ctx.state.data["door_attempt"] = 0
+
+
+def door_step(ctx, config, pp: dict) -> None:
+    """Rooms before lastRoomToLoot: find the correct one of the 4 Tomb Doors. Rooms at or past
+    lastRoomToLoot: Quick-leave instead (this room's looting is already done by the time
+    in_room_tick reaches "door").
+
+    A lockpick in inventory is assumed to passively boost the pick-lock success chance (per the
+    wiki: "Having a lockpick will increase the chance") rather than needing a separate
+    use-item-on-door click -- NEEDS LIVE VERIFICATION: if that assumption is wrong and an
+    explicit "use lockpick on door" step is actually required, this is the function to add it
+    to; not dropping the lockpick (it's absent from artefactNames) means it stays available
+    either way.
+
+    Outcome detection: wait_for_chat_message for the confirmed dead-end text (Global
+    Constraints) means a wrong door; roomNumber incrementing with no dead-end message means the
+    right one. Capped implicitly at 4 attempts per room by cycling through the 4 physical wall
+    objects (26618-26621) -- the game's own "3 wrong -> 4th always works" rule bounds the
+    worst case.
+
+    NEEDS LIVE VERIFICATION: whether Pick-lock and Enter are actually one click or two -- this
+    implementation assumes one click resolves both (closed tomb doors have a single default
+    action per the wiki infobox)."""
+    room = pp.get("roomNumber", 0)
+    if room >= config["lastRoomToLoot"]:
+        quick_leave(ctx, config)
+        return
+
+    objs = controller.get_objects(radius=15)
+    doors = [o for o in objs
+             if o.get("id") in TOMB_DOOR_WALL_IDS and o.get("impostorId") == TOMB_DOOR_CLOSED_ID
+             and o.get("visible", True)]
+    if not doors:
+        debug_log.log("pyramid_plunder", "no closed tomb doors found -- waiting")
+        return
+    doors.sort(key=lambda o: o.get("distance", 9999))
+
+    attempt = ctx.state.data.get("door_attempt", 0)
+    door = doors[attempt % len(doors)]
+
+    if not controller.wait_until_player_idle(timeout_s=5.0):
+        return
+
+    since_tick = controller.get_last_chat_message().get("tick")
+    if not controller.click_entity(ctx.ser, door, check_ui_blockers=False):
+        return
+    controller.human_delay(0.8, 1.6)
+
+    dead_end = controller.wait_for_chat_message(
+        lambda m: "leads to a dead end" in (m.get("message") or "").lower(),
+        since_tick=since_tick, timeout_s=3.0,
+    )
+    if dead_end is not None:
+        debug_log.log("pyramid_plunder", f"door attempt {attempt} is a dead end -- trying the next one")
+        ctx.state.data["door_attempt"] = attempt + 1
+        return
+
+    fresh_pp = controller.get_pyramid_plunder()
+    if fresh_pp.get("roomNumber", room) > room:
+        debug_log.log("pyramid_plunder", f"advanced to room {fresh_pp.get('roomNumber')}")
+        ctx.state.data["room_step"] = ROOM_STEP_TRAP
+        ctx.state.data["door_attempt"] = 0
+        return
+
+    # Neither signal fired yet (still picking the lock) -- stay on this door and retry next tick.
+
+
+def drop_loot(ctx, config) -> None:
+    """Drop every inventory item whose name is in the fixed artefactNames list -- never a
+    substring match, so food/lockpick are never at risk. One drop per tick (not a burst) --
+    next tick re-scans and picks up whatever's left, same pacing idiom as this codebase's
+    other per-tick inventory actions. Left-click-to-drop resolves via controller.py's
+    click_menu_action underneath click_entity's own UI-blocker-free inventory path, same as
+    shipwreck_salvaging.py's drop_salvage.
+
+    Finding the Pharaoh's sceptre is logged, never dropped (it's deliberately absent from
+    artefactNames) -- the game's own auto-eject on finding it is what actually ends the run;
+    this routine does nothing special beyond logging it."""
+    names = {n.lower() for n in config.get("artefactNames", [])}
+    for item in controller.get_inventory():
+        item_name = (item.get("name") or "").lower()
+        if item_name in names:
+            controller.click_entity(ctx.ser, item, check_ui_blockers=False)
+            controller.human_delay(0.2, 0.5)
+            return
+        if item_name == "pharaoh's sceptre" and not ctx.state.data.get("sceptre_logged"):
+            debug_log.log("pyramid_plunder", "PHARAOH'S SCEPTRE FOUND -- letting the game's own auto-eject take over")
+            ctx.state.data["sceptre_logged"] = True
