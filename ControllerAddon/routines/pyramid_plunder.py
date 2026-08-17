@@ -481,9 +481,23 @@ def tick(ctx):
 
     pp = controller.get_pyramid_plunder()
 
+    # CONFIRMED live 2026-08-17 (user directive): this is the routine's one reliable,
+    # timing-independent signal that a new room has actually started -- door_step's own
+    # post-click "did roomNumber just increase" check can race the varbit update and miss a
+    # genuine advance. When that happens, room_step used to stay stuck on "door" into the new
+    # room: the next door_step call would run against a stale door_attempt/dead_end_doors state
+    # from the OLD room, with the physical geometry now belonging to a DIFFERENT room -- live-
+    # confirmed this landed a click on the new room's own exit door by accident, ending the run
+    # early. Resetting here, unconditionally, whenever the room number itself changes (by
+    # whatever means) is the fix: it can never miss a transition door_step's own narrower check
+    # might.
     room = pp.get("roomNumber", 0)
     if room != ctx.state.data.get("last_room_number"):
         ctx.state.data["last_room_number"] = room
+        ctx.state.data["room_step"] = ROOM_STEP_TRAP
+        ctx.state.data["door_attempt"] = 0
+        ctx.state.data["dead_end_doors"] = []
+        ctx.state.data["door_enter_attempts"] = {}
         note_progress(ctx)
 
     if pp.get("inRun"):
