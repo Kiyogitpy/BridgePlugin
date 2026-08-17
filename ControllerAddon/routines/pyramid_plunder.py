@@ -781,12 +781,20 @@ def sarco_step(ctx, config, pp: dict) -> None:
         # change (whichever comes first: 21257 "Opening" mid-animation, or straight to 21256
         # "Opened" if that transition is fast) instead of blindly returning to re-poll on a
         # fixed short delay regardless of whether the click actually landed on a real attempt.
-        deadline = time.time() + 5.0
+        #
+        # REGRESSION, FIXED 2026-08-17 (user-flagged: "still a bunch of wasted time"): the
+        # original 5.0s deadline meant every FAILED Strength roll (a real, normal, and fairly
+        # common outcome per the wiki -- not an edge case) paid out the full 5s before this
+        # function would even try again, on top of whatever the next external tick's own
+        # scheduling adds. A genuine success flips the object's state almost immediately (well
+        # under a second in every live observation so far), so there's no reason a failed roll
+        # needs anywhere near 5s to be conclusively "still closed" -- 1.5s is already generous.
+        deadline = time.time() + 1.5
         while time.time() < deadline:
             refreshed = controller.get_object_at(sarco.get("x"), sarco.get("y"), sarco.get("plane"), sarco.get("id"))
             if refreshed is not None and refreshed.get("impostorId") != SARCOPHAGUS_CLOSED_IMPOSTOR_ID:
                 break
-            time.sleep(0.3)
+            time.sleep(0.2)
         return  # re-poll next tick regardless; opening (21257) then opened (21256) are handled above
 
     debug_log.log("pyramid_plunder", f"sarcophagus in unexpected state (impostorId={impostor}) "
