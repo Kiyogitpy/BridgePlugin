@@ -112,13 +112,12 @@ MUMMY_MAX_DISTANCE = 5
 # cache after this many CONSECUTIVE failures on the same cached index.
 OUTSIDE_DOOR_FAIL_TOLERANCE = 2
 
-# CONFIRMED live 2026-08-17: entering an already-opened (impostorId TOMB_DOOR_OPENED_ID) tomb
-# door that turns out to be a dead end produces NO chat message at all -- unlike the initial
-# Pick-lock attempt on a still-closed door, which does say "leads to a dead end" -- and of
-# course no room advance either. Silent on both signals door_step otherwise relies on, so an
-# already-open wrong door would be re-Entered forever without this fallback. Small on purpose:
-# entering an unlocked door has no skill-roll retry mechanic (unlike Pick-lock), so a handful of
-# identical silent attempts is already conclusive, not a normal gameplay variance to wait out.
+# REPURPOSED 2026-08-17 (door_step's full rework -- see attempt_door_click's own docstring):
+# used to cover two silent-failure cases (a click that misses the object entirely, and
+# re-Entering an already-open wrong door with no chat message). The Enter-click case no longer
+# exists in the reworked flow -- this now only counts a click that resolved to "missed" (aimed
+# at nothing, e.g. a long-range "Walk here"), so a tile this routine can't reliably click still
+# gets blacklisted instead of stalling the room forever.
 DOOR_ENTER_ATTEMPT_LIMIT = 3
 
 # CONFIRMED live 2026-08-17: click_entity's default aim offset (-7, +7) -- tuned for wide
@@ -131,15 +130,6 @@ DOOR_ENTER_ATTEMPT_LIMIT = 3
 # aim dead-center instead for every object in the Tomb Door family (room-progression doors and
 # both exit-door variants).
 TOMB_DOOR_AIM_OFFSET = (0, 0)
-
-# CONFIRMED live 2026-08-17 (user directive): local units, RuneLite's own LOCAL_TILE_SIZE=128
-# per tile -- roughly 3.5 tiles' worth of displacement between two consecutive ~0.1s polls. A
-# room-transfer teleport clears this in a single frame-to-frame step; ordinary walking, even at
-# run speed, moves nowhere near this far in one render frame (the earlier regression was from
-# comparing against a single fixed baseline, letting cumulative walking distance over several
-# seconds trip it -- see attempt_door_click's own note; comparing consecutive polls instead
-# means only a genuine single-frame discontinuity can trigger this).
-POSITION_JUMP_THRESHOLD = 450
 
 # NEEDS LIVE VERIFICATION: even with TOMB_DOOR_AIM_OFFSET, a Tomb Door candidate at long range
 # (observed failing at 14-15 tiles, across the room) still resolved every click to a plain
@@ -983,183 +973,60 @@ def find_room_doors(dead_ends: set) -> list:
             and distance_fn(o) <= ROOM_DOOR_SEARCH_RADIUS]
 
 
-def attempt_door_click(ctx, door: dict, room: int):
-    """Click one Tomb Door candidate and interpret what happened. Returns (outcome, door):
+def attempt_door_click(ctx, door: dict) -> str:
+    """REWRITTEN 2026-08-17 (user directive, full rework): "lets not worry about transfer to
+    another place i fixed it in another way. so now the idea with tomb doors is exactly: Click
+    tomb door - wait for xp - xp drop - delay 0.3-0.5 sec - blacklist this door - click next
+    door. if we dont get xp we poll chat for that we failed the lockpick." Drops the entire
+    Enter-click chain, the position-jump/roomNumber advance detection, and the "leads to a dead
+    end" chat check that used to live here -- whether a picked door happens to be the correct
+    one and transfers the player is no longer this function's concern at all; tick()'s own
+    top-level room-number-change reset is the sole thing that notices and resets the room's
+    bookkeeping when that happens. This function now only ever answers one question: did this
+    Pick-lock attempt succeed (grant Thieving XP)?
 
-    - "dead_end": the confirmed chat message arrived.
-    - "advanced": roomNumber actually increased -- resets the room bookkeeping itself (needed
-      for the immediate same-call chain below; tick()'s own top-level room-number check is the
-      general backstop for any race this misses).
-    - "flipped_open": a still-closed door's impostorId flipped to OPENED within this same call.
-      CONFIRMED live 2026-08-17 (user directive): the Pick-lock roll's outcome is knowable
-      instantly via a direct re-lookup of this exact door (get_object_at), not just by waiting
-      for the next external tick's own fresh /objects scan to notice it. The returned `door` is
-      the refreshed object, ready to feed straight back into this function for the Enter click.
-      Detected two ways: a Thieving XP gain (see below, the fast path) or, as a fallback, a
-      direct re-lookup once the poll loop's deadline is reached.
-    - "missed": the click resolved to a plain "Walk here" instead of a real door interaction
-      (see TOMB_DOOR_AIM_OFFSET's own note).
-    - "registered": a genuine Pick-lock/Enter attempt happened but produced no other signal --
-      a normal, expected silent failure roll on a still-closed door, per the wiki.
-
-    user directive 2026-08-17: a successful Pick-lock is confirmable without waiting on the
-    0.6s-tick-capped roomNumber/impostorId state at all -- per the wiki (data/raw/T/Tomb
-    Door.txt: "They can be picked, which gives Thieving experience"), every successful pick
-    grants Thieving XP, and PlayerProvider's thievingXp field (client.getSkillExperience,
-    same idiom as the existing hitpointsXp field) reflects that the moment the client's own
-    StatChanged event fires -- the same signal the game's own XP Drop plugin uses
-    (data/decompiled/.../xpdrop/XpDropPlugin.java#onStatChanged), sub-tick and not gated by
-    TickCache like the bulk /objects scan. Only meaningful on a Pick-lock attempt (a still-closed
-    door); Entering an already-open door grants no further Thieving XP, so this check is skipped
-    entirely for that case."""
+    Returns "picked" (XP confirmed -- caller should blacklist this door and move on), "failed"
+    (no XP; a normal, expected, silent roll failure per the wiki -- caller should just retry the
+    same door), or "missed" (click resolved to a plain "Walk here", not a real Pick-lock
+    attempt -- see TOMB_DOOR_AIM_OFFSET's own note)."""
     since_tick = controller.get_last_chat_message().get("tick")
     action_before = controller.get_last_action().get("tick")
-    before_impostor = door.get("impostorId")
-    xp_before = (controller.get_player().get("thievingXp")
-                 if before_impostor == TOMB_DOOR_CLOSED_ID else None)
+    xp_before = controller.get_player().get("thievingXp")
     if not controller.click_entity(ctx.ser, door, offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False):
-        return "missed", door
-    # user-flagged 2026-08-17: a longer settle delay right after the Pick-lock/Enter click,
-    # before any of the polling below starts -- avoids the click resolution and the very next
-    # poll iteration landing close enough together to look like a weirdly-fast double click.
+        return "missed"
     controller.human_delay(0.6, 1.0)
 
     # CONFIRMED live 2026-08-17: a long-range Tomb Door click can silently resolve to a plain
-    # "Walk here" instead of Pick-lock/Enter (GET /last-action: menuAction=WALK) -- a genuine
-    # aim miss, not a skill-roll failure.
+    # "Walk here" instead of Pick-lock (GET /last-action: menuAction=WALK) -- a genuine aim
+    # miss, not a skill-roll failure.
     action = controller.get_last_action()
-    click_missed = (action.get("tick") == action_before
-                     or (action.get("menuAction") or "").upper() == "WALK")
+    if action.get("tick") == action_before or (action.get("menuAction") or "").upper() == "WALK":
+        return "missed"
 
-    # CONFIRMED live 2026-08-17 (user directive): roomNumber only updates once per 0.6s game
-    # tick, but a real room transfer teleports the player instantly. localX/localY are
-    # interpolated every render frame regardless (see CLAUDE.md's "Sub-tick data" section), so
-    # comparing CONSECUTIVE polls -- not a single fixed baseline taken before the click -- lets
-    # a genuine transfer's single-frame discontinuity be caught far sooner than the tick-capped
-    # bridge state, without misreading ordinary multi-tile walking as a transfer.
-    #
-    # REGRESSION, FIXED 2026-08-17: a first attempt at this compared every poll against one
-    # snapshot taken right before the click. Live-confirmed that falsely fired on perfectly
-    # normal walking (e.g. approaching the next door candidate): the CUMULATIVE distance from
-    # that fixed baseline crossed the threshold well before any teleport happened, since walking
-    # steadily for the ~2.5s poll window covers real ground too. Comparing frame-to-frame
-    # instead means only an actual single-step discontinuity can trip it -- normal walking's
-    # per-frame increments stay far below POSITION_JUMP_THRESHOLD even over several seconds.
-    #
-    # SHORTENED 3.0 -> 1.2 2026-08-17 (user-flagged, speed): per the wiki
-    # (data/raw/T/Tomb Door.txt, data/raw/P/Pyramid Plunder.txt#Gameplay), a Pick-lock failure
-    # on ANY of the 4 candidates -- correct or fake -- is silent: "no consequences will occur if
-    # they fail", no message, no state change, resolved within the single game tick the click
-    # landed on. The human_delay(0.6, 1.0) above already covers that tick's worth of settle
-    # time, so this loop was spending up to ~2.4s doing nothing on the overwhelmingly common
-    # "registered" (silent-fail) outcome, every single retry. 1.2s keeps roughly one full extra
-    # tick of margin past the settle delay for a genuine dead-end message or room transfer to
-    # still land -- both are the same near-instant, same-tick signals the position-jump fix
-    # above already showed resolve well inside a couple hundred ms, not seconds.
-    deadline = time.time() + (0.5 if click_missed else 1.2)
-    prev_pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
-    jumped = dead_end = xp_gained = False
+    # Fast path: Thieving XP lands the moment the client's own StatChanged event fires (see
+    # CLAUDE.md's "XP gain is another sub-tick, general-purpose signal" note) -- sub-tick and
+    # not gated by the 0.6s server tick the way roomNumber/impostorId state is.
+    deadline = time.time() + 2.0
     while time.time() < deadline:
+        xp = controller.get_player().get("thievingXp")
+        if xp is not None and xp_before is not None and xp > xp_before:
+            controller.human_delay(0.3, 0.5)
+            return "picked"
         time.sleep(0.1)
-        if xp_before is not None:
-            xp = controller.get_player().get("thievingXp")
-            if xp is not None and xp > xp_before:
-                xp_gained = True
-                break
-        pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
-        if None not in pos and None not in prev_pos \
-                and math.hypot(pos[0] - prev_pos[0], pos[1] - prev_pos[1]) > POSITION_JUMP_THRESHOLD:
-            jumped = True
-            break
-        prev_pos = pos
-        msg = controller.get_last_chat_message()
-        msg_tick = msg.get("tick")
-        if (msg_tick is not None and since_tick is not None and msg_tick > since_tick
-                and "leads to a dead end" in (msg.get("message") or "").lower()):
-            dead_end = True
-            break
 
-    if xp_gained:
-        # user-flagged 2026-08-17, direct correction after live-observing their own account:
-        # "you think we need to press enter after we pick? thats not necessary it does it
-        # automaticly if it was the right door." Only a WRONG door needs a manual Enter click
-        # after Pick-lock succeeds (to walk through and reveal the dead-end message) -- the
-        # CORRECT door auto-transfers the player the instant the pick succeeds, no second click
-        # at all. Blindly chaining into an Enter click on every flipped_open (the old behavior)
-        # could fire that click against a door that no longer exists because the room had
-        # already changed out from under it -- this is the exact mechanism behind a stray
-        # dialogue box + silent full ejection back outside the pyramid CONFIRMED live in the
-        # debug log (a "picked open" immediately followed by dialogOpen=True, then the very next
-        # tick already back at the outer anonymous doors with no dead_end/advanced message ever
-        # logged for that attempt).
-        #
-        # xp_gained fires the instant XP lands, which can be a beat before a genuine auto-
-        # transfer actually completes -- so give it a short extra window (position-jump first,
-        # same frame-to-frame idiom as below; roomNumber/inRun as a fallback) to resolve as
-        # "advanced" before ever treating this as "flipped_open" and clicking Enter.
-        #
-        # RAISED 1.0 -> 3.0 2026-08-17 (user-flagged live: still clicking Enter on tomb doors).
-        # CONFIRMED live via the debug log: a "picked open" at 07:22:03.983 fell through this
-        # window unconfirmed, clicked Enter at 07:22:04.000, and the position-jump only actually
-        # registered at 07:22:06.135 -- ~2.15s after the pick succeeded, well past the old 1.0s
-        # allowance. 3.0s covers that with real margin.
-        transfer_deadline = time.time() + 3.0
-        while time.time() < transfer_deadline:
-            time.sleep(0.1)
-            pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
-            if None not in pos and None not in prev_pos \
-                    and math.hypot(pos[0] - prev_pos[0], pos[1] - prev_pos[1]) > POSITION_JUMP_THRESHOLD:
-                debug_log.log("pyramid_plunder", "auto-transferred after a successful pick -- no Enter needed")
-                ctx.state.data["room_step"] = ROOM_STEP_TRAP
-                ctx.state.data["door_attempt"] = 0
-                ctx.state.data["dead_end_doors"] = []
-                ctx.state.data["door_enter_attempts"] = {}
-                return "advanced", door
-            prev_pos = pos
-        fresh_pp = controller.get_pyramid_plunder()
-        if fresh_pp.get("inRun") and fresh_pp.get("roomNumber", room) > room:
-            debug_log.log("pyramid_plunder", f"auto-transferred to room {fresh_pp.get('roomNumber')} after a successful pick -- no Enter needed")
-            ctx.state.data["room_step"] = ROOM_STEP_TRAP
-            ctx.state.data["door_attempt"] = 0
-            ctx.state.data["dead_end_doors"] = []
-            ctx.state.data["door_enter_attempts"] = {}
-            return "advanced", door
-        refreshed = controller.get_object_at(door.get("x"), door.get("y"), door.get("plane"), door.get("id"))
-        return "flipped_open", (refreshed if refreshed is not None else door)
-
-    if dead_end:
-        return "dead_end", door
-
-    if jumped:
-        debug_log.log("pyramid_plunder", "position jumped between two consecutive polls -- treating as an instant room transfer")
-        ctx.state.data["room_step"] = ROOM_STEP_TRAP
-        ctx.state.data["door_attempt"] = 0
-        ctx.state.data["dead_end_doors"] = []
-        ctx.state.data["door_enter_attempts"] = {}
-        return "advanced", door
-
-    fresh_pp = controller.get_pyramid_plunder()
-    # Fallback for a transfer the fast position-jump check above somehow missed. roomNumber
-    # alone is not fully reliable either -- it can still read a stale leftover value for a
-    # moment even after a run has actually ended -- but inRun must also be true, or this isn't a
-    # real advance.
-    if fresh_pp.get("inRun") and fresh_pp.get("roomNumber", room) > room:
-        debug_log.log("pyramid_plunder", f"advanced to room {fresh_pp.get('roomNumber')}")
-        ctx.state.data["room_step"] = ROOM_STEP_TRAP
-        ctx.state.data["door_attempt"] = 0
-        ctx.state.data["dead_end_doors"] = []
-        ctx.state.data["door_enter_attempts"] = {}
-        return "advanced", door
-
-    if click_missed:
-        return "missed", door
-
-    if before_impostor == TOMB_DOOR_CLOSED_ID:
-        refreshed = controller.get_object_at(door.get("x"), door.get("y"), door.get("plane"), door.get("id"))
-        if refreshed is not None and refreshed.get("impostorId") == TOMB_DOOR_OPENED_ID:
-            return "flipped_open", refreshed
-
-    return "registered", door
+    # No XP within the window -- per the wiki this is a normal, silent, expected failure roll,
+    # but poll chat briefly anyway to confirm it really was a failed pick-lock (not something
+    # else) and to surface the game's own wording for this in the log.
+    msg = controller.wait_for_chat_message(
+        lambda m: "lock" in (m.get("message") or "").lower()
+                  and "fail" in (m.get("message") or "").lower(),
+        since_tick=since_tick, timeout_s=1.0,
+    )
+    if msg is not None:
+        debug_log.log("pyramid_plunder", f"failed the lockpick: {msg.get('message')}")
+    else:
+        debug_log.log("pyramid_plunder", "no XP and no confirming chat message -- treating as a failed lockpick anyway")
+    return "failed"
 
 
 def door_step(ctx, config, pp: dict) -> None:
@@ -1174,28 +1041,21 @@ def door_step(ctx, config, pp: dict) -> None:
     to; not dropping the lockpick (it's absent from artefactNames) means it stays available
     either way.
 
-    Outcome detection: wait_for_chat_message for the confirmed dead-end text (Global
-    Constraints) means a wrong door; roomNumber incrementing with no dead-end message means the
-    right one. Capped implicitly at 4 attempts per room by cycling through the 4 physical wall
-    objects (26618-26621) -- the game's own "3 wrong -> 4th always works" rule bounds the
-    worst case.
+    REWRITTEN 2026-08-17 (user directive, full rework -- see attempt_door_click's own docstring
+    for the "why"): every successfully-picked door gets blacklisted (dead_end_doors) immediately,
+    whether or not it turns out to have been the correct one -- if it was correct, the room has
+    already changed out from under this bookkeeping by the time anything here would read it
+    again, and tick()'s own top-level room-number-change reset clears dead_end_doors for the new
+    room anyway. This makes the old "prefer an already-opened door" selection, the Enter-click
+    chain, and the door_enter_attempts silent-dead-end tracking all unnecessary -- doors here are
+    never anything but Closed candidates, so selection is a plain distance sort. Capped
+    implicitly at 4 attempts per room by cycling through the 4 physical wall objects
+    (26618-26621) -- the game's own "3 wrong -> 4th always works" rule bounds the worst case.
 
-    NEEDS LIVE VERIFICATION: whether Pick-lock and Enter are actually one click or two. The
-    wiki infobox lists them as the two SEPARATE version states of the same object (impostor
-    20948 "Closed"/Pick-lock -> 20949 "Opened"/Enter), so this treats them as two clicks and
-    accepts either state as a candidate: a door that flipped to 20949 was successfully picked
-    and still needs entering, and is preferred over starting a fresh pick attempt elsewhere. If
-    it turns out one click does both, the 20949 branch simply never has anything to click and
-    this still behaves exactly like a one-click implementation.
-
-    Doors confirmed dead ends this room are remembered by tile (dead_end_doors) and excluded --
-    without that, an already-picked dead end sitting at 20949 would win the "prefer opened"
-    preference forever. A tile also gets excluded (door_enter_attempts, DOOR_ENTER_ATTEMPT_LIMIT)
-    without an explicit dead-end message if its clicks keep producing no signal at all -- covers
-    both a click that misses the object entirely (CONFIRMED live: resolves to a plain "Walk
-    here" instead, see click_missed below -- open at long range, see TOMB_DOOR_AIM_OFFSET's own
-    note) and a silent dead end on an already-opened door (Entering it produces no chat message,
-    unlike the initial Pick-lock attempt on a closed one)."""
+    door_enter_attempts (the state key, name kept for continuity) now only counts a click that
+    resolved to "missed" (aimed at nothing, e.g. a long-range "Walk here") -- a tile this routine
+    simply can't reliably click gets blacklisted after DOOR_ENTER_ATTEMPT_LIMIT misses rather
+    than stalling the room forever."""
     room = pp.get("roomNumber", 0)
     if room >= config["lastRoomToLoot"]:
         quick_leave(ctx, config)
@@ -1207,70 +1067,35 @@ def door_step(ctx, config, pp: dict) -> None:
         debug_log.log("pyramid_plunder", "no untried tomb doors found -- waiting")
         return
 
-    # Prefer a door that's already been picked open (just needs "Enter") over starting a new
-    # pick-lock attempt -- entering an unlocked door is strictly more progress.
-    opened = sorted((o for o in doors if o.get("impostorId") == TOMB_DOOR_OPENED_ID),
-                    key=lambda o: o.get("distance", 9999))
+    doors.sort(key=lambda o: o.get("distance", 9999))
     attempt = ctx.state.data.get("door_attempt", 0)
-    if opened:
-        door = opened[0]
-    else:
-        doors.sort(key=lambda o: o.get("distance", 9999))
-        door = doors[attempt % len(doors)]
+    door = doors[attempt % len(doors)]
 
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
 
-    outcome, door = attempt_door_click(ctx, door, room)
+    outcome = attempt_door_click(ctx, door)
 
-    if outcome == "dead_end":
-        debug_log.log("pyramid_plunder", f"door attempt {attempt} is a dead end -- trying the next one")
+    if outcome == "picked":
+        debug_log.log("pyramid_plunder", f"door attempt {attempt} picked -- blacklisting and trying the next one")
         remembered = list(ctx.state.data.get("dead_end_doors", []))
         remembered.append(list(door_key(door)))
         ctx.state.data["dead_end_doors"] = remembered
         ctx.state.data["door_attempt"] = attempt + 1
-        return
-
-    if outcome == "advanced":
-        return  # room-number-change reset (tick()'s own check) already reset every bit of this
-
-    # user-flagged 2026-08-17: once a Pick-lock succeeds (impostorId flips CLOSED -> OPENED),
-    # we know it INSTANTLY via a direct re-lookup of that exact door -- no need to wait a full
-    # external tick before acting on it. Chain straight into the Enter click right here instead
-    # of returning and letting the next tick's "prefer opened" branch pick it up later.
-    if outcome == "flipped_open":
-        debug_log.log("pyramid_plunder", f"door attempt {attempt} picked open -- entering immediately")
-        outcome, door = attempt_door_click(ctx, door, room)
-        if outcome == "dead_end":
-            debug_log.log("pyramid_plunder", f"door attempt {attempt} is a dead end -- trying the next one")
-            remembered = list(ctx.state.data.get("dead_end_doors", []))
-            remembered.append(list(door_key(door)))
-            ctx.state.data["dead_end_doors"] = remembered
-            ctx.state.data["door_attempt"] = attempt + 1
-            return
-        if outcome == "advanced":
-            return
-
-    click_missed = outcome == "missed"
-
-    # A genuinely-registered click on a still-closed door is a normal, expected silent
-    # Pick-lock failure roll (per the wiki) and just needs retrying -- that's real progress
-    # (the attempt actually happened), so note_progress() fires. A click that missed
-    # (click_missed) or one that registered on an already-OPENED door (silently entered a dead
-    # end -- Entering an unlocked door has no skill-roll retry mechanic to wait out) is NOT
-    # progress -- count these per tile and give up on it once DOOR_ENTER_ATTEMPT_LIMIT is hit,
-    # so a tile this routine simply can't reliably click doesn't stall it forever.
-    was_opened = door.get("impostorId") == TOMB_DOOR_OPENED_ID
-    if not click_missed and not was_opened:
         note_progress(ctx)
         return
 
+    if outcome == "failed":
+        note_progress(ctx)  # a real attempt happened -- normal, expected, just retry this door
+        return
+
+    # outcome == "missed": count per tile, blacklist once DOOR_ENTER_ATTEMPT_LIMIT is hit so an
+    # unreachable door doesn't stall the room forever.
     key = door_key(door)
     stalled_attempts = dict(ctx.state.data.get("door_enter_attempts", {}))
     count = stalled_attempts.get(key, 0) + 1
     if count >= DOOR_ENTER_ATTEMPT_LIMIT:
-        reason = "the click keeps missing" if click_missed else "entered with no signal either way"
-        debug_log.log("pyramid_plunder", f"door attempt {attempt}: {reason} {count}x -- "
+        debug_log.log("pyramid_plunder", f"door attempt {attempt}: the click keeps missing {count}x -- "
                                          f"treating as unreachable, trying the next one")
         remembered = list(ctx.state.data.get("dead_end_doors", []))
         remembered.append(list(key))
@@ -1281,7 +1106,6 @@ def door_step(ctx, config, pp: dict) -> None:
         return
     stalled_attempts[key] = count
     ctx.state.data["door_enter_attempts"] = stalled_attempts
-
 
 INVENTORY_FULL_THRESHOLD = 28  # OSRS's own inventory size
 
