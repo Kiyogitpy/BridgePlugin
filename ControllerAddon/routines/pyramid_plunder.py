@@ -731,8 +731,21 @@ def sarco_step(ctx, config, pp: dict) -> None:
     of their own account over the wiki-derived Closed/Opening/Opened state model.
 
     Click once, confirm it registered via /last-action (same idiom as every other confirmed
-    click in this file), short delay, move straight to the doors -- nothing waits on or
-    re-checks the object's state afterward."""
+    click in this file), short delay, move straight to the doors -- nothing waits on the
+    object's state to reach a specific value.
+
+    BUG, FIXED 2026-08-17 (user-flagged: "we skipped 2 sarcos"): the version of this that only
+    checked /last-action registration -- and not whether the Open attempt actually SUCCEEDED --
+    advanced to the doors even on a normal failed Strength roll (silent, no message, object
+    stays Closed, per the wiki: "Failing has no downside, other than needing to wait a few
+    ticks... you will automatically keep attempting to open it until successful"). CONFIRMED
+    live via the debug log: a room's sarcophagus click registered, room_step advanced to DOOR,
+    door_step's own >=lastRoomToLoot branch quick-left, and only the quick-leave's own eager
+    reset_run_state (see quick_leave's docstring) sent the routine back through trap/chest/sarco
+    a second time -- during which the retry click landed on a still-CLOSED object, proving the
+    first attempt's roll had failed and the loot was never actually collected. "The click
+    resolves" (registers) and "the roll succeeds" are different things; only the latter means
+    done."""
     sarco = find_object_by_id(controller.get_objects(radius=15), SARCOPHAGUS_ID)
     if sarco is None:
         debug_log.log("pyramid_plunder", "no sarcophagus resolved this poll -- retrying")
@@ -763,6 +776,11 @@ def sarco_step(ctx, config, pp: dict) -> None:
         debug_log.log("pyramid_plunder", "sarcophagus Open click didn't register -- retrying")
         return
     controller.human_delay(0.4, 0.8)
+
+    refreshed = controller.get_object_at(sarco.get("x"), sarco.get("y"), sarco.get("plane"), sarco.get("id"))
+    if refreshed is not None and refreshed.get("impostorId") == SARCOPHAGUS_CLOSED_IMPOSTOR_ID:
+        debug_log.log("pyramid_plunder", "sarcophagus Open roll failed -- retrying")
+        return
     ctx.state.data["room_step"] = ROOM_STEP_DOOR
 
 
@@ -788,7 +806,18 @@ def quick_leave(ctx, config) -> None:
     """Room 6 (or configured lastRoomToLoot) is fully looted -- end the run via the in-room
     exit door's Quick-leave option rather than walking back out through 6 tomb doors. The next
     tick's phase dispatch (OUTSIDE vs LOBBY) picks up wherever the game actually drops the
-    player, so no explicit "where did we land" handling is needed here."""
+    player, so no explicit "where did we land" handling is needed here.
+
+    BUG, FIXED 2026-08-17: click_menu_action returning True only means the "Quick-leave" menu
+    entry was found and clicked -- not that the leave has actually taken effect yet. CONFIRMED
+    live via the debug log: reset_run_state() used to fire the instant that click registered,
+    which -- while the leave was still processing -- sent the routine straight back through
+    trap/chest/sarco a second time inside the SAME still-current room (roomNumber/inRun hadn't
+    changed yet), redundantly re-clicking an already-searched chest and already-open sarcophagus.
+    Harmless once the sarco success-check above is fixed (both no-op correctly on a second pass),
+    but still wasted real time every single final room. Poll briefly for inRun to actually flip
+    false before resetting -- same "confirm the state change, don't assume the click == the
+    outcome" idiom as attempt_door_click's flipped_open check."""
     exit_doors = find_exit_doors(controller.get_objects(radius=15))
     if not exit_doors:
         debug_log.log("pyramid_plunder", "no exit door found in the final room -- waiting")
@@ -803,6 +832,11 @@ def quick_leave(ctx, config) -> None:
     for exit_door in exit_doors[:3]:
         if controller.click_menu_action(ctx.ser, exit_door, "Quick-leave",
                                          offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False):
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if not controller.get_pyramid_plunder().get("inRun", True):
+                    break
+                time.sleep(0.15)
             debug_log.log("pyramid_plunder", f"quick-left room {config['lastRoomToLoot']} -- run complete, restarting")
             reset_run_state(ctx)
             return
@@ -852,13 +886,28 @@ def attempt_door_click(ctx, door: dict, room: int):
       instantly via a direct re-lookup of this exact door (get_object_at), not just by waiting
       for the next external tick's own fresh /objects scan to notice it. The returned `door` is
       the refreshed object, ready to feed straight back into this function for the Enter click.
+      Detected two ways: a Thieving XP gain (see below, the fast path) or, as a fallback, a
+      direct re-lookup once the poll loop's deadline is reached.
     - "missed": the click resolved to a plain "Walk here" instead of a real door interaction
       (see TOMB_DOOR_AIM_OFFSET's own note).
     - "registered": a genuine Pick-lock/Enter attempt happened but produced no other signal --
-      a normal, expected silent failure roll on a still-closed door, per the wiki."""
+      a normal, expected silent failure roll on a still-closed door, per the wiki.
+
+    user directive 2026-08-17: a successful Pick-lock is confirmable without waiting on the
+    0.6s-tick-capped roomNumber/impostorId state at all -- per the wiki (data/raw/T/Tomb
+    Door.txt: "They can be picked, which gives Thieving experience"), every successful pick
+    grants Thieving XP, and PlayerProvider's thievingXp field (client.getSkillExperience,
+    same idiom as the existing hitpointsXp field) reflects that the moment the client's own
+    StatChanged event fires -- the same signal the game's own XP Drop plugin uses
+    (data/decompiled/.../xpdrop/XpDropPlugin.java#onStatChanged), sub-tick and not gated by
+    TickCache like the bulk /objects scan. Only meaningful on a Pick-lock attempt (a still-closed
+    door); Entering an already-open door grants no further Thieving XP, so this check is skipped
+    entirely for that case."""
     since_tick = controller.get_last_chat_message().get("tick")
     action_before = controller.get_last_action().get("tick")
     before_impostor = door.get("impostorId")
+    xp_before = (controller.get_player().get("thievingXp")
+                 if before_impostor == TOMB_DOOR_CLOSED_ID else None)
     if not controller.click_entity(ctx.ser, door, offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False):
         return "missed", door
     # user-flagged 2026-08-17: a longer settle delay right after the Pick-lock/Enter click,
@@ -900,9 +949,14 @@ def attempt_door_click(ctx, door: dict, room: int):
     # above already showed resolve well inside a couple hundred ms, not seconds.
     deadline = time.time() + (0.5 if click_missed else 1.2)
     prev_pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
-    jumped = dead_end = False
+    jumped = dead_end = xp_gained = False
     while time.time() < deadline:
         time.sleep(0.1)
+        if xp_before is not None:
+            xp = controller.get_player().get("thievingXp")
+            if xp is not None and xp > xp_before:
+                xp_gained = True
+                break
         pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
         if None not in pos and None not in prev_pos \
                 and math.hypot(pos[0] - prev_pos[0], pos[1] - prev_pos[1]) > POSITION_JUMP_THRESHOLD:
@@ -915,6 +969,10 @@ def attempt_door_click(ctx, door: dict, room: int):
                 and "leads to a dead end" in (msg.get("message") or "").lower()):
             dead_end = True
             break
+
+    if xp_gained:
+        refreshed = controller.get_object_at(door.get("x"), door.get("y"), door.get("plane"), door.get("id"))
+        return "flipped_open", (refreshed if refreshed is not None else door)
 
     if dead_end:
         return "dead_end", door
