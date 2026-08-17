@@ -199,6 +199,16 @@ def find_object_by_id(objects: list, object_id: int):
     return candidates[0]
 
 
+def find_objects_by_id(objects: list, object_id: int) -> list:
+    """All visible objects whose BASE id matches, nearest first -- same filter as
+    find_object_by_id but returns every candidate instead of just the closest. Added 2026-08-17
+    for trap_step's swap-after-repeated-failure logic (some rooms genuinely have more than one
+    spear trap tile blocking the path to the chest)."""
+    candidates = [o for o in objects if o.get("id") == object_id and o.get("visible", True)]
+    candidates.sort(key=lambda o: o.get("distance", 9999))
+    return candidates
+
+
 def find_objects_by_name(objects: list, name_substring: str) -> list:
     """Matches are deduplicated by (x, y) tile -- CONFIRMED live 2026-08-17: the 4 anonymous
     doors each come back as 4 exactly-identical entries (same id/impostorId/screen position)
@@ -337,6 +347,7 @@ def reset_run_state(ctx) -> None:
     ctx.state.data["door_attempt"] = 0
     ctx.state.data["dead_end_doors"] = []
     ctx.state.data["door_enter_attempts"] = {}
+    ctx.state.data["trap_fail_tiles"] = {}
 
 
 def maybe_eat_food(ctx, config) -> None:
@@ -609,6 +620,7 @@ def tick(ctx):
         ctx.state.data["door_attempt"] = 0
         ctx.state.data["dead_end_doors"] = []
         ctx.state.data["door_enter_attempts"] = {}
+        ctx.state.data["trap_fail_tiles"] = {}
         note_progress(ctx)
 
     if pp.get("inRun"):
@@ -656,6 +668,15 @@ def in_room_tick(ctx, config, pp: dict) -> None:
     drop_loot(ctx, config)
 
 
+def trap_key(trap: dict):
+    return (trap.get("x"), trap.get("y"), trap.get("plane"))
+
+
+TRAP_SWAP_FAIL_LIMIT = 2  # user directive 2026-08-17: swap to a different trap candidate after
+                          # this many CONSECUTIVE fails (missed click or a confirmed failed
+                          # disarm roll) on the same physical tile.
+
+
 def trap_step(ctx, config, pp: dict) -> None:
     """Disarm the spear trap if the bridge reports it still armed. A failed attempt is
     confirmed via the chat message "You fail to deactivate the trap." (user-confirmed, see
@@ -665,13 +686,26 @@ def trap_step(ctx, config, pp: dict) -> None:
 
     NEEDS LIVE VERIFICATION: whether this is actually mandatory to reach the chest/
     sarcophagus/doors at all, or just an optional bonus-XP obstacle -- see design doc. Either
-    way, disarming it first is a safe default (10 xp, minor 1-4 dmg risk on a failed attempt)."""
+    way, disarming it first is a safe default (10 xp, minor 1-4 dmg risk on a failed attempt).
+
+    BUG, FIXED 2026-08-17 (user-flagged live): "we succesfully deactivated it and went past but
+    then deactivated it on the other side and went back again meaning we are stuck in a loop
+    trying to run to the gold chest but take dmg from the trap over and over" -- some rooms
+    genuinely have more than one spear trap tile blocking the path (CONFIRMED live: the debug
+    log shows exactly two real, non-miss trap resolutions per room in the overwhelming common
+    case). Always re-picking the single CLOSEST candidate every attempt, with no memory of
+    which tile keeps failing, could get stuck alternating between two candidates that both keep
+    failing (or one whose approach path requires stepping onto the OTHER trap first, taking
+    incidental damage) with no way to break the cycle. TRAP_SWAP_FAIL_LIMIT tracks consecutive
+    fails per tile (ctx.state.data["trap_fail_tiles"]) and temporarily deprioritizes a tile once
+    it's failed twice in a row, falling back to trying every candidate again if all of them are
+    currently deprioritized (never gets permanently stuck)."""
     if not pp.get("trapActive"):
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         return
 
-    trap = find_object_by_id(controller.get_objects(radius=15), SPEAR_TRAP_ID)
-    if trap is None:
+    candidates = find_objects_by_id(controller.get_objects(radius=15), SPEAR_TRAP_ID)
+    if not candidates:
         debug_log.log("pyramid_plunder", "trapActive but no spear trap object visible -- skipping")
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         return
@@ -681,11 +715,13 @@ def trap_step(ctx, config, pp: dict) -> None:
         return
     # user-flagged 2026-08-17 (screenshot): standing near the trap and clicking a copy resolved
     # before this wait kept walking the player INTO the trap tile instead of disarming it --
-    # the `trap` object picked at the top of this function can be stale by the time we actually
-    # click (wait_until_player_idle can block up to 5s), and re-checking for whichever spear
-    # trap is genuinely closest right now, immediately before the click, is the fix -- not a
-    # one-time pick at function entry.
-    trap = find_object_by_id(controller.get_objects(radius=15), SPEAR_TRAP_ID) or trap
+    # the candidates picked at the top of this function can be stale by the time we actually
+    # click (wait_until_player_idle can block up to 5s), so re-resolve fresh immediately before
+    # picking -- not a one-time pick at function entry.
+    candidates = find_objects_by_id(controller.get_objects(radius=15), SPEAR_TRAP_ID) or candidates
+    trap_fail_tiles = dict(ctx.state.data.get("trap_fail_tiles", {}))
+    usable = [t for t in candidates if trap_fail_tiles.get(trap_key(t), 0) < TRAP_SWAP_FAIL_LIMIT]
+    trap = (usable or candidates)[0]  # closest usable candidate; if all are deprioritized, try everything again
     since_tick = controller.get_last_chat_message().get("tick")
     action_before = controller.get_last_action().get("tick")
     before_pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
@@ -707,7 +743,11 @@ def trap_step(ctx, config, pp: dict) -> None:
     click_missed = (action.get("tick") == action_before
                      or (action.get("menuAction") or "").upper() == "WALK")
     if click_missed:
-        debug_log.log("pyramid_plunder", "spear trap click missed (resolved to Walk here) -- retrying")
+        key = trap_key(trap)
+        trap_fail_tiles[key] = trap_fail_tiles.get(key, 0) + 1
+        ctx.state.data["trap_fail_tiles"] = trap_fail_tiles
+        debug_log.log("pyramid_plunder", f"spear trap click missed (resolved to Walk here) "
+                                         f"{trap_fail_tiles[key]}x -- retrying")
         controller.wait_until_player_idle(timeout_s=2.0)
         return
 
@@ -743,6 +783,8 @@ def trap_step(ctx, config, pp: dict) -> None:
             break
         time.sleep(0.15)
 
+    key = trap_key(trap)
+
     if xp_gained:
         # user directive 2026-08-17: "the moment we get xp we can click gold chest" -- chain
         # straight into chest_step's own click right here instead of just setting room_step and
@@ -750,19 +792,27 @@ def trap_step(ctx, config, pp: dict) -> None:
         # disarm (bridge-state-gated, tick-capped). chest_step does its own fresh object lookup,
         # state check, click, and room_step advance -- calling it directly here is exactly
         # equivalent to how the next tick would have handled it, just without the wait.
+        trap_fail_tiles.pop(key, None)
+        ctx.state.data["trap_fail_tiles"] = trap_fail_tiles
         debug_log.log("pyramid_plunder", "trap disarmed (XP confirmed) -- clicking the chest immediately")
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         chest_step(ctx, config, pp)
         return
 
     if moved:
+        trap_fail_tiles.pop(key, None)
+        ctx.state.data["trap_fail_tiles"] = trap_fail_tiles
         debug_log.log("pyramid_plunder", "trap disarm resolved via movement (click confirmed real, not a miss)")
         controller.wait_until_player_idle(timeout_s=3.0)
     elif failed:
-        debug_log.log("pyramid_plunder", "failed to disarm the spear trap -- retrying")
+        trap_fail_tiles[key] = trap_fail_tiles.get(key, 0) + 1
+        ctx.state.data["trap_fail_tiles"] = trap_fail_tiles
+        debug_log.log("pyramid_plunder", f"failed to disarm the spear trap {trap_fail_tiles[key]}x -- retrying")
     # Re-polled next tick via pp["trapActive"] either way -- stays on "trap" until the bridge
     # confirms it's actually disarmed, so an ambiguous/failed attempt (logged above or not)
-    # naturally retries instead of advancing early.
+    # naturally retries instead of advancing early. A tile that hits TRAP_SWAP_FAIL_LIMIT gets
+    # deprioritized (not excluded outright) by the candidate selection above, so a genuinely
+    # single-trap room still eventually retries it once every other candidate is exhausted.
 
 
 def chest_step(ctx, config, pp: dict) -> None:
@@ -1123,7 +1173,16 @@ def door_step(ctx, config, pp: dict) -> None:
     dead_ends = {tuple(k) for k in ctx.state.data.get("dead_end_doors", [])}
     doors = find_room_doors(dead_ends)
     if not doors:
-        debug_log.log("pyramid_plunder", "no untried tomb doors found -- waiting")
+        # user directive 2026-08-17: safety net for the room getting stuck with every candidate
+        # blacklisted (CONFIRMED live: "no untried tomb doors found -- waiting" repeating for
+        # many ticks straight) -- rather than staying stuck forever waiting on a bookkeeping
+        # state that can't self-correct, just reset the blacklist and let the room re-resolve
+        # from scratch next tick. Cheap: at worst this repeats a genuinely-confirmed dead end
+        # once more before re-excluding it.
+        debug_log.log("pyramid_plunder", "no untried tomb doors found -- resetting the blacklist and retrying")
+        ctx.state.data["dead_end_doors"] = []
+        ctx.state.data["door_attempt"] = 0
+        ctx.state.data["door_enter_attempts"] = {}
         return
 
     doors.sort(key=lambda o: o.get("distance", 9999))
