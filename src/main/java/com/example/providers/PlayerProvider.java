@@ -125,6 +125,11 @@ public class PlayerProvider extends BridgeProvider
 		}
 		data.put("plane", wp.getPlane());
 		data.put("inWilderness", client.getVarbitValue(Varbits.IN_WILDERNESS) != 0);
+		// Varbit 3956 -- matches the official RuneLite Nightmare Zone plugin's own
+		// checkAbsorption() (client.getVarbitValue(3956)); no named Varbits constant exists for
+		// it even in that plugin, so match it exactly with the same raw id. Read unconditionally
+		// (cheap, harmless outside NMZ) rather than gating on region, same as inWilderness above.
+		data.put("nmzAbsorptionPoints", client.getVarbitValue(3956));
 
 		Widget wildernessLevelWidget = client.getWidget(WidgetInfo.PVP_WILDERNESS_LEVEL);
 		if (wildernessLevelWidget != null && !wildernessLevelWidget.isHidden())
