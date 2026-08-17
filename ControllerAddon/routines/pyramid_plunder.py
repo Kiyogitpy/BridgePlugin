@@ -795,6 +795,15 @@ def sarco_step(ctx, config, pp: dict) -> None:
     if sarco.get("impostorId") != SARCOPHAGUS_CLOSED_IMPOSTOR_ID:
         # Already opened/mid-animation (e.g. resumed mid-sarco after a routine restart) --
         # per the user directive above, never issue a Search click. Nothing left to do here.
+        #
+        # user-flagged 2026-08-17: this is the tick right after the busy-wait animation gate
+        # above first sees impostorId flip away from Closed -- the discrete object state updates
+        # slightly before the sarcophagus's own opening animation visually finishes on screen.
+        # We don't need to wait it out (clicking through it wouldn't cancel it), but moving
+        # straight to a tomb door click here can visibly overlap the tail of that animation.
+        # Small fixed settle delay, not the usual human_delay range -- this isn't approximating
+        # human reaction time, just giving the animation a moment to finish.
+        controller.human_delay(0.3, 0.4)
         ctx.state.data["room_step"] = ROOM_STEP_DOOR
         return
 
@@ -852,6 +861,7 @@ def sarco_step(ctx, config, pp: dict) -> None:
         debug_log.log("pyramid_plunder", "sarcophagus Open roll failed -- the game keeps "
                                          "attempting on its own")
         return
+    controller.human_delay(0.3, 0.4)  # same settle-time note as the branch above
     ctx.state.data["room_step"] = ROOM_STEP_DOOR
 
 
