@@ -751,6 +751,91 @@ def door_key(door: dict):
     return (door.get("x"), door.get("y"), door.get("plane"))
 
 
+ROOM_DOOR_SEARCH_RADIUS = 10  # tiles from the room's own chest, not the player -- see docstring
+
+
+def find_room_doors(dead_ends: set) -> list:
+    """Tomb Door candidates for the CURRENT room only, anchored on the Grand Gold Chest's
+    position rather than the player's -- user-flagged 2026-08-17: a player-anchored radius still
+    let the previous room's doors bleed in whenever the player happened to be standing near a
+    room's edge (their distance-to-player varies with where they stand; the chest, the fixed
+    center of every room per the wiki, doesn't). Falls back to a player-anchored radius if the
+    chest itself isn't resolvable this particular poll (e.g. mid-transition) -- degraded, not
+    broken."""
+    objs = controller.get_objects(radius=15)
+    chest = find_object_by_id(objs, GRAND_GOLD_CHEST_ID)
+
+    if chest is not None:
+        cx, cy = chest.get("x", 0), chest.get("y", 0)
+        distance_fn = lambda o: math.hypot(o.get("x", 0) - cx, o.get("y", 0) - cy)
+    else:
+        distance_fn = lambda o: o.get("distance", 9999)
+
+    return [o for o in objs
+            if o.get("id") in TOMB_DOOR_WALL_IDS
+            and o.get("impostorId") in (TOMB_DOOR_CLOSED_ID, TOMB_DOOR_OPENED_ID)
+            and o.get("visible", True)
+            and door_key(o) not in dead_ends
+            and distance_fn(o) <= ROOM_DOOR_SEARCH_RADIUS]
+
+
+def attempt_door_click(ctx, door: dict, room: int):
+    """Click one Tomb Door candidate and interpret what happened. Returns (outcome, door):
+
+    - "dead_end": the confirmed chat message arrived.
+    - "advanced": roomNumber actually increased -- resets the room bookkeeping itself (needed
+      for the immediate same-call chain below; tick()'s own top-level room-number check is the
+      general backstop for any race this misses).
+    - "flipped_open": a still-closed door's impostorId flipped to OPENED within this same call.
+      CONFIRMED live 2026-08-17 (user directive): the Pick-lock roll's outcome is knowable
+      instantly via a direct re-lookup of this exact door (get_object_at), not just by waiting
+      for the next external tick's own fresh /objects scan to notice it. The returned `door` is
+      the refreshed object, ready to feed straight back into this function for the Enter click.
+    - "missed": the click resolved to a plain "Walk here" instead of a real door interaction
+      (see TOMB_DOOR_AIM_OFFSET's own note).
+    - "registered": a genuine Pick-lock/Enter attempt happened but produced no other signal --
+      a normal, expected silent failure roll on a still-closed door, per the wiki."""
+    since_tick = controller.get_last_chat_message().get("tick")
+    action_before = controller.get_last_action().get("tick")
+    before_impostor = door.get("impostorId")
+    if not controller.click_entity(ctx.ser, door, offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False):
+        return "missed", door
+    controller.human_delay(0.8, 1.6)
+
+    # CONFIRMED live 2026-08-17: a long-range Tomb Door click can silently resolve to a plain
+    # "Walk here" instead of Pick-lock/Enter (GET /last-action: menuAction=WALK) -- a genuine
+    # aim miss, not a skill-roll failure.
+    action = controller.get_last_action()
+    click_missed = (action.get("tick") == action_before
+                     or (action.get("menuAction") or "").upper() == "WALK")
+
+    dead_end = controller.wait_for_chat_message(
+        lambda m: "leads to a dead end" in (m.get("message") or "").lower(),
+        since_tick=since_tick, timeout_s=0.5 if click_missed else 3.0,
+    )
+    if dead_end is not None:
+        return "dead_end", door
+
+    fresh_pp = controller.get_pyramid_plunder()
+    if fresh_pp.get("roomNumber", room) > room:
+        debug_log.log("pyramid_plunder", f"advanced to room {fresh_pp.get('roomNumber')}")
+        ctx.state.data["room_step"] = ROOM_STEP_TRAP
+        ctx.state.data["door_attempt"] = 0
+        ctx.state.data["dead_end_doors"] = []
+        ctx.state.data["door_enter_attempts"] = {}
+        return "advanced", door
+
+    if click_missed:
+        return "missed", door
+
+    if before_impostor == TOMB_DOOR_CLOSED_ID:
+        refreshed = controller.get_object_at(door.get("x"), door.get("y"), door.get("plane"), door.get("id"))
+        if refreshed is not None and refreshed.get("impostorId") == TOMB_DOOR_OPENED_ID:
+            return "flipped_open", refreshed
+
+    return "registered", door
+
+
 def door_step(ctx, config, pp: dict) -> None:
     """Rooms before lastRoomToLoot: find the correct one of the 4 Tomb Doors. Rooms at or past
     lastRoomToLoot: Quick-leave instead (this room's looting is already done by the time
@@ -790,20 +875,8 @@ def door_step(ctx, config, pp: dict) -> None:
         quick_leave(ctx, config)
         return
 
-    # radius=10, not door_step's usual 15 -- user-flagged 2026-08-17 (and confirmed live: an
-    # /objects(radius=15) query returned 8 distinct Tomb Door tiles in one room, not 4, since
-    # the previous (already-passed) room's doors are close enough to still be in range). The
-    # real room's own 4 doors were all within 9 tiles; the previous room's were all >=12 --
-    # 10 is a first-cut cut line with margin on the one instance actually measured, not a
-    # guaranteed-correct room boundary. Object ids alone can't disambiguate this (TOMB_DOOR_
-    # WALL_IDS are shared across every room), so distance is the only signal available.
-    objs = controller.get_objects(radius=10)
     dead_ends = {tuple(k) for k in ctx.state.data.get("dead_end_doors", [])}
-    doors = [o for o in objs
-             if o.get("id") in TOMB_DOOR_WALL_IDS
-             and o.get("impostorId") in (TOMB_DOOR_CLOSED_ID, TOMB_DOOR_OPENED_ID)
-             and o.get("visible", True)
-             and door_key(o) not in dead_ends]
+    doors = find_room_doors(dead_ends)
     if not doors:
         debug_log.log("pyramid_plunder", "no untried tomb doors found -- waiting")
         return
@@ -822,27 +895,9 @@ def door_step(ctx, config, pp: dict) -> None:
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
 
-    since_tick = controller.get_last_chat_message().get("tick")
-    action_before = controller.get_last_action().get("tick")
-    if not controller.click_entity(ctx.ser, door, offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False):
-        return
-    controller.human_delay(0.8, 1.6)
+    outcome, door = attempt_door_click(ctx, door, room)
 
-    # CONFIRMED live 2026-08-17: a long-range Tomb Door click can silently resolve to a plain
-    # "Walk here" instead of Pick-lock/Enter (GET /last-action: menuAction=WALK) -- a genuine
-    # aim miss, not a skill-roll failure. Without this check, note_progress() below would fire
-    # on the mere presence of a resolvable candidate object regardless of whether the click
-    # actually did anything, permanently defeating NO_PROGRESS_MAX_TICKS for exactly the case
-    # it exists to catch.
-    action = controller.get_last_action()
-    click_missed = (action.get("tick") == action_before
-                     or (action.get("menuAction") or "").upper() == "WALK")
-
-    dead_end = controller.wait_for_chat_message(
-        lambda m: "leads to a dead end" in (m.get("message") or "").lower(),
-        since_tick=since_tick, timeout_s=0.5 if click_missed else 3.0,
-    )
-    if dead_end is not None:
+    if outcome == "dead_end":
         debug_log.log("pyramid_plunder", f"door attempt {attempt} is a dead end -- trying the next one")
         remembered = list(ctx.state.data.get("dead_end_doors", []))
         remembered.append(list(door_key(door)))
@@ -850,22 +905,35 @@ def door_step(ctx, config, pp: dict) -> None:
         ctx.state.data["door_attempt"] = attempt + 1
         return
 
-    fresh_pp = controller.get_pyramid_plunder()
-    if fresh_pp.get("roomNumber", room) > room:
-        debug_log.log("pyramid_plunder", f"advanced to room {fresh_pp.get('roomNumber')}")
-        ctx.state.data["room_step"] = ROOM_STEP_TRAP
-        ctx.state.data["door_attempt"] = 0
-        ctx.state.data["dead_end_doors"] = []
-        ctx.state.data["door_enter_attempts"] = {}
-        return
+    if outcome == "advanced":
+        return  # room-number-change reset (tick()'s own check) already reset every bit of this
 
-    # Neither signal fired. A genuinely-registered click on a still-closed door is a normal,
-    # expected silent Pick-lock failure roll (per the wiki) and just needs retrying -- that's
-    # real progress (the attempt actually happened), so note_progress() fires. A click that
-    # missed (click_missed) or one that registered on an already-OPENED door (silently entered
-    # a dead end -- Entering an unlocked door has no skill-roll retry mechanic to wait out) is
-    # NOT progress -- count these per tile and give up on it once DOOR_ENTER_ATTEMPT_LIMIT is
-    # hit, so a tile this routine simply can't reliably click doesn't stall it forever.
+    # user-flagged 2026-08-17: once a Pick-lock succeeds (impostorId flips CLOSED -> OPENED),
+    # we know it INSTANTLY via a direct re-lookup of that exact door -- no need to wait a full
+    # external tick before acting on it. Chain straight into the Enter click right here instead
+    # of returning and letting the next tick's "prefer opened" branch pick it up later.
+    if outcome == "flipped_open":
+        debug_log.log("pyramid_plunder", f"door attempt {attempt} picked open -- entering immediately")
+        outcome, door = attempt_door_click(ctx, door, room)
+        if outcome == "dead_end":
+            debug_log.log("pyramid_plunder", f"door attempt {attempt} is a dead end -- trying the next one")
+            remembered = list(ctx.state.data.get("dead_end_doors", []))
+            remembered.append(list(door_key(door)))
+            ctx.state.data["dead_end_doors"] = remembered
+            ctx.state.data["door_attempt"] = attempt + 1
+            return
+        if outcome == "advanced":
+            return
+
+    click_missed = outcome == "missed"
+
+    # A genuinely-registered click on a still-closed door is a normal, expected silent
+    # Pick-lock failure roll (per the wiki) and just needs retrying -- that's real progress
+    # (the attempt actually happened), so note_progress() fires. A click that missed
+    # (click_missed) or one that registered on an already-OPENED door (silently entered a dead
+    # end -- Entering an unlocked door has no skill-roll retry mechanic to wait out) is NOT
+    # progress -- count these per tile and give up on it once DOOR_ENTER_ATTEMPT_LIMIT is hit,
+    # so a tile this routine simply can't reliably click doesn't stall it forever.
     was_opened = door.get("impostorId") == TOMB_DOOR_OPENED_ID
     if not click_missed and not was_opened:
         note_progress(ctx)
@@ -889,13 +957,18 @@ def door_step(ctx, config, pp: dict) -> None:
     ctx.state.data["door_enter_attempts"] = stalled_attempts
 
 
+INVENTORY_FULL_THRESHOLD = 28  # OSRS's own inventory size
+
+
 def drop_loot(ctx, config) -> None:
     """Drop every inventory item whose name is in the fixed artefactNames list -- never a
-    substring match, so food/lockpick are never at risk. One drop per tick (not a burst) --
-    next tick re-scans and picks up whatever's left, same pacing idiom as this codebase's
-    other per-tick inventory actions. Left-click-to-drop resolves via controller.py's
-    click_menu_action underneath click_entity's own UI-blocker-free inventory path, same as
-    shipwreck_salvaging.py's drop_salvage.
+    substring match, so food/lockpick are never at risk. Only fires once the inventory is
+    actually full, then bursts through every matching item in one go rather than one drop per
+    tick -- user directive 2026-08-17: dropping on every single tick that happens to be holding
+    an artefact interrupts far too often and wastes real time across a whole run; there's no
+    need to keep inventory empty moment-to-moment when nothing else is competing for the space.
+    Left-click-to-drop resolves via controller.py's click_menu_action underneath click_entity's
+    own UI-blocker-free inventory path, same as shipwreck_salvaging.py's drop_salvage.
 
     Finding the Pharaoh's sceptre is logged, never dropped (it's deliberately absent from
     artefactNames) -- the game's own auto-eject on finding it is what actually ends the run;
@@ -920,8 +993,12 @@ def drop_loot(ctx, config) -> None:
         debug_log.log("pyramid_plunder", "PHARAOH'S SCEPTRE FOUND -- letting the game's own auto-eject take over")
         ctx.state.data["sceptre_logged"] = True
 
+    if len(inventory) < INVENTORY_FULL_THRESHOLD:
+        return
+
+    debug_log.log("pyramid_plunder", f"inventory full ({len(inventory)}/{INVENTORY_FULL_THRESHOLD}) "
+                                     f"-- dropping all loot")
     for item in inventory:
         if (item.get("name") or "").lower() in names:
             controller.click_entity(ctx.ser, item, check_ui_blockers=False)
             controller.human_delay(0.2, 0.5)
-            return
