@@ -748,6 +748,17 @@ def trap_step(ctx, config, pp: dict) -> None:
         return
 
     if not pp.get("trapActive"):
+        # BUG, FIXED 2026-08-17 (user-flagged live, room 4: "we went and disarmed the trap on
+        # the other side and got into a loop"). This fallback fires whenever our own faster
+        # XP/chat confirmation never caught the disarm at all (CONFIRMED live: room 4 transitioned
+        # straight from "trap" to "chest" with NO "trap disarmed" log line anywhere -- the bridge
+        # eventually reported trapActive=false on its own, tick-capped, without this function's
+        # own detection ever firing). The success branch below sets trap_disarmed_this_room, but
+        # this one didn't -- leaving the latch never actually engaged, so a later tick that saw
+        # trapActive flip true again (the far side's own separate traps) walked straight back
+        # into trap-clicking. trapActive=false is just as much a genuine "done with traps this
+        # room" signal as our own confirmation, so it latches the same way.
+        ctx.state.data["trap_disarmed_this_room"] = True
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         return
 
