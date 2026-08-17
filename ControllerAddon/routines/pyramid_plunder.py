@@ -379,6 +379,7 @@ def outside_tick(ctx, config, doors: list = None) -> None:
     index_to_try = cached_index if cached_index is not None else attempt_index
     door = ordered[index_to_try]
 
+    since_tick = controller.get_last_chat_message().get("tick")
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
     if not controller.click_entity(ctx.ser, door, check_ui_blockers=False):
@@ -394,6 +395,26 @@ def outside_tick(ctx, config, doors: list = None) -> None:
         ctx.state.data["correct_door_index"] = index_to_try
         ctx.state.data["cached_door_fails"] = 0
         ctx.state.data["cached_door_fail_index"] = None
+        return
+
+    # CONFIRMED live 2026-08-17 (user directive, matches the wiki): the "shoved back" punch --
+    # "A mysterious bandaged hand punches you away from the door." -- only happens when
+    # attempting the CORRECT door and failing its Thieving roll; a wrong door leads silently
+    # into the abandoned room with no punch at all. So this message alone definitively proves
+    # which door is correct even on a failed attempt -- cache it immediately and don't count
+    # this toward OUTSIDE_DOOR_FAIL_TOLERANCE, unlike an ordinary "didn't reach the mummy" that
+    # could just as easily mean a wrong door.
+    punched = controller.wait_for_chat_message(
+        lambda m: "bandaged hand punches you away" in (m.get("message") or "").lower(),
+        since_tick=since_tick, timeout_s=0.5,
+    )
+    if punched is not None:
+        debug_log.log("pyramid_plunder", f"door index {index_to_try} punched us back -- "
+                                         f"confirmed correct, just an unlucky roll")
+        ctx.state.data["correct_door_index"] = index_to_try
+        ctx.state.data["cached_door_fails"] = 0
+        ctx.state.data["cached_door_fail_index"] = None
+        step_back_outside(ctx)
         return
 
     debug_log.log("pyramid_plunder", f"door index {index_to_try} didn't reach the mummy -- "
