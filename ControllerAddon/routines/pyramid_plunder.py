@@ -348,6 +348,7 @@ def reset_run_state(ctx) -> None:
     ctx.state.data["dead_end_doors"] = []
     ctx.state.data["door_enter_attempts"] = {}
     ctx.state.data["trap_fail_tiles"] = {}
+    ctx.state.data["trap_disarmed_this_room"] = False
 
 
 def maybe_eat_food(ctx, config) -> None:
@@ -621,6 +622,7 @@ def tick(ctx):
         ctx.state.data["dead_end_doors"] = []
         ctx.state.data["door_enter_attempts"] = {}
         ctx.state.data["trap_fail_tiles"] = {}
+        ctx.state.data["trap_disarmed_this_room"] = False
         note_progress(ctx)
 
     if pp.get("inRun"):
@@ -728,7 +730,23 @@ def trap_step(ctx, config, pp: dict) -> None:
     the cycle. TRAP_SWAP_FAIL_LIMIT tracks consecutive fails per tile
     (ctx.state.data["trap_fail_tiles"]) and temporarily deprioritizes a tile once it's failed
     twice in a row, falling back to trying every candidate again if all of them are currently
-    deprioritized (never gets permanently stuck)."""
+    deprioritized (never gets permanently stuck).
+
+    BUG, FIXED 2026-08-17 (user directive, the actual final fix for the oscillation bug): "i
+    think we just once we see the message you deactivate the trap we never again touch a trap
+    until next room." Live investigation (chat log check + user confirming the character stayed
+    in the same spot, not a cross-room walk) ruled out the TRAP_SEARCH_RADIUS cross-side theory
+    above -- the real issue was that pp["trapActive"] apparently doesn't reliably reflect "has
+    THIS player already disarmed what they need to," so trusting it at the top of every call
+    could send the routine back into trap-clicking after a confirmed success. Once this
+    function's own XP/chat confirmation fires even once, ctx.state.data["trap_disarmed_this_room"]
+    is set and checked FIRST, before ever consulting trapActive again -- reset alongside the
+    other per-room bookkeeping (dead_end_doors, trap_fail_tiles, ...) whenever the room actually
+    changes."""
+    if ctx.state.data.get("trap_disarmed_this_room"):
+        ctx.state.data["room_step"] = ROOM_STEP_CHEST
+        return
+
     if not pp.get("trapActive"):
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         return
@@ -832,6 +850,7 @@ def trap_step(ctx, config, pp: dict) -> None:
         # equivalent to how the next tick would have handled it, just without the wait.
         trap_fail_tiles.pop(key, None)
         ctx.state.data["trap_fail_tiles"] = trap_fail_tiles
+        ctx.state.data["trap_disarmed_this_room"] = True
         reason = "XP" if xp_gained else "chat message"
         debug_log.log("pyramid_plunder", f"trap disarmed ({reason} confirmed) -- clicking the chest immediately")
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
