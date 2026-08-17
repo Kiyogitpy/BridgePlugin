@@ -687,9 +687,29 @@ def trap_step(ctx, config, pp: dict) -> None:
     # one-time pick at function entry.
     trap = find_object_by_id(controller.get_objects(radius=15), SPEAR_TRAP_ID) or trap
     since_tick = controller.get_last_chat_message().get("tick")
+    action_before = controller.get_last_action().get("tick")
     before_pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
     xp_before = controller.get_player().get("thievingXp")
     controller.click_entity(ctx.ser, trap, check_ui_blockers=False)
+
+    # BUG, FIXED 2026-08-17 (user-flagged live: "still doesnt seem like we click the closest
+    # speartrap?"). Diagnostic logging on the "moved" branch below (added earlier this session
+    # to find out why xp_gained never fires) proved the real issue: xp_before/xp_now came back
+    # IDENTICAL across 8+ consecutive "successful" (moved) resolutions in the same room --
+    # thievingXp was never actually changing. That means "moved" was a false-positive success
+    # signal the whole time: CONFIRMED live via the same class of bug already documented for
+    # tomb doors (see attempt_door_click) and the chest -- a click on `trap` can silently
+    # resolve to a plain "Walk here" instead of the trap's own Disarm/whatever action, and a
+    # walk-here miss ALSO produces player movement, which the old code treated as "disarm
+    # succeeded, queued movement resumed." Checking /last-action's menuAction rules this out
+    # before ever trusting "moved" as evidence of anything.
+    action = controller.get_last_action()
+    click_missed = (action.get("tick") == action_before
+                     or (action.get("menuAction") or "").upper() == "WALK")
+    if click_missed:
+        debug_log.log("pyramid_plunder", "spear trap click missed (resolved to Walk here) -- retrying")
+        controller.wait_until_player_idle(timeout_s=2.0)
+        return
 
     # user directive 2026-08-17: disarming grants 10 Thieving XP (per the wiki), and that XP
     # lands the moment the client's own StatChanged event fires -- same sub-tick idiom as the
@@ -702,7 +722,8 @@ def trap_step(ctx, config, pp: dict) -> None:
     # queued movement resume immediately (they start walking past the trap); a failed attempt
     # leaves them standing still. Kept as a fallback alongside XP, and the confirmed fail message
     # as a third -- whichever resolves first, instead of always blocking out the full
-    # fail-message timeout even on the success path, where no such message is ever coming.
+    # fail-message timeout even on the success path, where no such message is ever coming. Only
+    # trustworthy now that click_missed has already ruled out a Walk-here resolution above.
     deadline = time.time() + 2.5
     xp_gained = moved = failed = False
     while time.time() < deadline:
@@ -735,14 +756,7 @@ def trap_step(ctx, config, pp: dict) -> None:
         return
 
     if moved:
-        # DIAGNOSTIC 2026-08-17 (user-flagged live: trap->chest still slow, XP path never
-        # firing): log the exact XP values seen so the next live run shows WHY xp_gained never
-        # triggered here -- e.g. thievingXp genuinely unchanged (disarm doesn't grant Thieving
-        # XP after all, contrary to the wiki) vs. it changed but this poll simply never sampled
-        # the moment it did.
-        xp_now = controller.get_player().get("thievingXp")
-        debug_log.log("pyramid_plunder", f"trap disarm resolved via movement, not XP -- "
-                                         f"xp_before={xp_before} xp_now={xp_now}")
+        debug_log.log("pyramid_plunder", "trap disarm resolved via movement (click confirmed real, not a miss)")
         controller.wait_until_player_idle(timeout_s=3.0)
     elif failed:
         debug_log.log("pyramid_plunder", "failed to disarm the spear trap -- retrying")
