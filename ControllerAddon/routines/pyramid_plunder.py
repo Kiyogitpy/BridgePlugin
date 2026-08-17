@@ -55,9 +55,8 @@ GRAND_GOLD_CHEST_CLOSED_IMPOSTOR_ID = 20946     # version "Closed", option "Sear
 GRAND_GOLD_CHEST_SEARCHED_IMPOSTOR_ID = 20947   # version "Opened", no options -- already looted
 
 SARCOPHAGUS_ID = 26626                          # base object id
-SARCOPHAGUS_CLOSED_IMPOSTOR_ID = 21255          # version "Closed", option "Open"
-SARCOPHAGUS_OPENING_IMPOSTOR_ID = 21257         # version "Opening", NO options -- mid-animation
-SARCOPHAGUS_OPENED_IMPOSTOR_ID = 21256          # version "Opened", option "Search"
+SARCOPHAGUS_CLOSED_IMPOSTOR_ID = 21255          # version "Closed", option "Open" -- the only
+                                                 # state this routine ever clicks (see sarco_step)
 
 TOMB_DOOR_WALL_IDS = {26618, 26619, 26620, 26621}   # base ids of the 4 physical wall objects
 TOMB_DOOR_CLOSED_ID = 20948                     # impostor, option "Pick-lock"
@@ -724,94 +723,46 @@ def chest_step(ctx, config, pp: dict) -> None:
 
 
 def sarco_step(ctx, config, pp: dict) -> None:
-    """Two-stage, driven entirely off the single base-id object's impostorId (the three wiki
-    versions of the same object, in order): 21255 "Closed"/Open -> 21257 "Opening"/no options
-    at all while the animation plays -> 21256 "Opened"/Search. No mummy-specific handling
-    beyond the routine's normal food-eat safety net -- per the design doc, prayer management
-    was explicitly rejected in favor of that.
+    """REWRITTEN 2026-08-17 (user directive, live-observed on the real account, overriding the
+    wiki-infobox-derived two-stage Open->Search design this used to have): "it clicked search
+    and it should never search. as long as the click resolves it will loot the item." A single
+    Open click resolving is the complete interaction -- no separate Search click, no waiting on
+    the object's impostorId to reach OPENED first. Trusting the user's direct live observation
+    of their own account over the wiki-derived Closed/Opening/Opened state model.
 
-    The 21257 state is exactly what an "wait for the opening animation" delay was ever really
-    waiting out, so it's polled rather than guessed: stay on this step, click nothing (there is
-    no clickable option in that state), re-poll next tick."""
+    Click once, confirm it registered via /last-action (same idiom as every other confirmed
+    click in this file), short delay, move straight to the doors -- nothing waits on or
+    re-checks the object's state afterward."""
     sarco = find_object_by_id(controller.get_objects(radius=15), SARCOPHAGUS_ID)
     if sarco is None:
         debug_log.log("pyramid_plunder", "no sarcophagus resolved this poll -- retrying")
         return
     note_progress(ctx)
 
-    impostor = sarco.get("impostorId")
-
-    if impostor == SARCOPHAGUS_OPENING_IMPOSTOR_ID:
-        # Mid-animation, no menu option exists -- just let it finish.
-        controller.human_delay(0.6, 1.2)
-        return
-
-    if impostor == SARCOPHAGUS_OPENED_IMPOSTOR_ID:
-        if not controller.wait_until_player_idle(timeout_s=5.0):
-            return
-        # Confirm the click actually registered via /last-action before considering this step
-        # done -- same "confirm via the game's own signal, not a fixed guess" idiom as
-        # trap_step's movement/fail-message poll above.
-        #
-        # REGRESSION, FIXED 2026-08-17 (user directive): an earlier version of this also waited
-        # up to 6s for an inventory COUNT change as proof the loot landed. Live-confirmed that
-        # was an unreliable signal -- looting genuinely succeeded every time (per the user
-        # watching directly) but the count-change almost never registered, most likely because
-        # the received artefact stacked onto one already in inventory rather than taking a new
-        # slot. That false negative cost a full wasted 6s wait on nearly every single
-        # sarcophagus, every room. Action registration alone is the real completion signal;
-        # loot presence isn't ours to verify here.
-        action_before = controller.get_last_action().get("tick")
-        controller.click_entity(ctx.ser, sarco, check_ui_blockers=False)   # "Search"
-
-        deadline = time.time() + 2.0
-        registered = False
-        while time.time() < deadline:
-            action = controller.get_last_action()
-            if action.get("tick") != action_before:
-                registered = True
-                break
-            time.sleep(0.15)
-
-        if not registered:
-            debug_log.log("pyramid_plunder", "sarcophagus Search click didn't register -- retrying")
-            return
-        controller.human_delay(0.4, 0.8)
+    if sarco.get("impostorId") != SARCOPHAGUS_CLOSED_IMPOSTOR_ID:
+        # Already opened/mid-animation (e.g. resumed mid-sarco after a routine restart) --
+        # per the user directive above, never issue a Search click. Nothing left to do here.
         ctx.state.data["room_step"] = ROOM_STEP_DOOR
         return
 
-    if impostor == SARCOPHAGUS_CLOSED_IMPOSTOR_ID:
-        if not controller.wait_until_player_idle(timeout_s=5.0):
-            return
-        # REWRITTEN 2026-08-17 (user directive: "click it once check last action that it
-        # resolved wait a bit then do the next task"): dropped the impostorId-polling loop this
-        # used to have -- same last-action-registration idiom as the Search branch above, and
-        # nothing else is needed. Re-clicking "Open" while a successful attempt's animation is
-        # still playing would reset it, but that can't happen here: this function only ever gets
-        # called again on the NEXT external tick, and by then a successful Open has already
-        # flipped impostorId to OPENING, which is handled above by a branch that clicks nothing
-        # at all while it waits. A failed Strength roll leaves impostor CLOSED, so the next tick
-        # just retries this same click -- also correct, no special-casing required.
-        action_before = controller.get_last_action().get("tick")
-        controller.click_entity(ctx.ser, sarco, check_ui_blockers=False)   # "Open"
+    if not controller.wait_until_player_idle(timeout_s=5.0):
+        return
+    action_before = controller.get_last_action().get("tick")
+    controller.click_entity(ctx.ser, sarco, check_ui_blockers=False)   # "Open"
 
-        deadline = time.time() + 2.0
-        registered = False
-        while time.time() < deadline:
-            action = controller.get_last_action()
-            if action.get("tick") != action_before:
-                registered = True
-                break
-            time.sleep(0.15)
+    deadline = time.time() + 2.0
+    registered = False
+    while time.time() < deadline:
+        action = controller.get_last_action()
+        if action.get("tick") != action_before:
+            registered = True
+            break
+        time.sleep(0.15)
 
-        if not registered:
-            debug_log.log("pyramid_plunder", "sarcophagus Open click didn't register -- retrying")
-            return
-        controller.human_delay(0.4, 0.8)
-        return  # re-poll next tick regardless; opening (21257) then opened (21256) are handled above
-
-    debug_log.log("pyramid_plunder", f"sarcophagus in unexpected state (impostorId={impostor}) "
-                                     f"-- moving on to the doors")
+    if not registered:
+        debug_log.log("pyramid_plunder", "sarcophagus Open click didn't register -- retrying")
+        return
+    controller.human_delay(0.4, 0.8)
     ctx.state.data["room_step"] = ROOM_STEP_DOOR
 
 
