@@ -342,6 +342,39 @@ def maybe_eat_food(ctx, config) -> None:
             debug_log.log("pyramid_plunder", f"ate food (hp={hp})")
 
 
+POISON_CURE_COOLDOWN_S = 5.0  # user-flagged 2026-08-17: antipoisons/antidotes are expensive --
+                               # don't drink again every single tick while `poisoned` is still
+                               # true waiting for the dose already taken to register.
+
+
+def maybe_cure_poison(ctx, config) -> None:
+    """user-flagged 2026-08-17, after a scarab-swarm poison drained the player to 4/90 hp
+    earlier this session (see food.eatAt's own note): sip an antipoison/antidote the moment
+    /player reports poisoned, rather than just relying on food to out-heal the ongoing drain.
+    ConsumablesProvider only classifies "food"/"prayer" (no antipoison category exists in the
+    bridge), so this matches by name directly instead of going through consume_first -- same
+    idiom as drop_loot's own name-based inventory scan. open_inventory_tab first for the same
+    reason consume_first/drop_loot both do: item screen coords only resolve while that tab is
+    actually showing.
+
+    Cooldown-gated (POISON_CURE_COOLDOWN_S): these are real, expensive consumables, not a
+    disposable resource like food -- one dose per poisoning event, not one per tick for however
+    many ticks `poisoned` stays true while the dose already taken is still registering."""
+    if not controller.get_player().get("poisoned"):
+        return
+    last_drunk = ctx.state.data.get("poison_cure_drunk_at", 0.0)
+    if time.time() - last_drunk < POISON_CURE_COOLDOWN_S:
+        return
+    controller.open_inventory_tab(ctx.ser)
+    for item in controller.get_inventory():
+        name = (item.get("name") or "").lower()
+        if "antipoison" in name or "antidote" in name:
+            controller.click_entity(ctx.ser, item, check_ui_blockers=False)
+            ctx.state.data["poison_cure_drunk_at"] = time.time()
+            debug_log.log("pyramid_plunder", f"poisoned -- drank {item.get('name')}")
+            return
+
+
 def outside_tick(ctx, config, doors: list = None) -> None:
     """Not near the Guardian mummy yet -- find and enter the correct one of the 4 static
     anonymous-door objects. Caches the winning index in ctx.state.data["correct_door_index"]
@@ -516,6 +549,7 @@ def tick(ctx):
     config = ctx.state.config
     ctx.state.data["progress_this_tick"] = False
     maybe_eat_food(ctx, config)
+    maybe_cure_poison(ctx, config)
 
     pp = controller.get_pyramid_plunder()
 
