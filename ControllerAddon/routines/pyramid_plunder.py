@@ -1097,7 +1097,13 @@ def attempt_door_click(ctx, door: dict, room: int):
         # transfer actually completes -- so give it a short extra window (position-jump first,
         # same frame-to-frame idiom as below; roomNumber/inRun as a fallback) to resolve as
         # "advanced" before ever treating this as "flipped_open" and clicking Enter.
-        transfer_deadline = time.time() + 1.0
+        #
+        # RAISED 1.0 -> 3.0 2026-08-17 (user-flagged live: still clicking Enter on tomb doors).
+        # CONFIRMED live via the debug log: a "picked open" at 07:22:03.983 fell through this
+        # window unconfirmed, clicked Enter at 07:22:04.000, and the position-jump only actually
+        # registered at 07:22:06.135 -- ~2.15s after the pick succeeded, well past the old 1.0s
+        # allowance. 3.0s covers that with real margin.
+        transfer_deadline = time.time() + 3.0
         while time.time() < transfer_deadline:
             time.sleep(0.1)
             pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
