@@ -555,18 +555,37 @@ def trap_step(ctx, config, pp: dict) -> None:
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
     since_tick = controller.get_last_chat_message().get("tick")
+    before_pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
     controller.click_entity(ctx.ser, trap, check_ui_blockers=False)
-    controller.human_delay(0.6, 1.2)
 
-    failed = controller.wait_for_chat_message(
-        lambda m: "fail to deactivate the trap" in (m.get("message") or "").lower(),
-        since_tick=since_tick, timeout_s=2.0,
-    )
-    if failed is not None:
+    # CONFIRMED live 2026-08-17 (user directive): a successful disarm lets the player's own
+    # queued movement resume immediately (they start walking past the trap); a failed attempt
+    # leaves them standing still. Poll for whichever resolves first -- movement starting (a
+    # fast, positive success signal) or the confirmed fail message -- instead of always
+    # blocking out the full fail-message timeout even on the success path, where no such
+    # message is ever coming.
+    deadline = time.time() + 2.5
+    moved = failed = False
+    while time.time() < deadline:
+        pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
+        if None not in pos and pos != before_pos:
+            moved = True
+            break
+        msg = controller.get_last_chat_message()
+        msg_tick = msg.get("tick")
+        if (msg_tick is not None and since_tick is not None and msg_tick > since_tick
+                and "fail to deactivate the trap" in (msg.get("message") or "").lower()):
+            failed = True
+            break
+        time.sleep(0.15)
+
+    if moved:
+        controller.wait_until_player_idle(timeout_s=3.0)
+    elif failed:
         debug_log.log("pyramid_plunder", "failed to disarm the spear trap -- retrying")
     # Re-polled next tick via pp["trapActive"] either way -- stays on "trap" until the bridge
-    # confirms it's actually disarmed, so a failed attempt (logged above or not) naturally
-    # retries instead of advancing early.
+    # confirms it's actually disarmed, so an ambiguous/failed attempt (logged above or not)
+    # naturally retries instead of advancing early.
 
 
 def chest_step(ctx, config, pp: dict) -> None:
@@ -627,8 +646,36 @@ def sarco_step(ctx, config, pp: dict) -> None:
     if impostor == SARCOPHAGUS_OPENED_IMPOSTOR_ID:
         if not controller.wait_until_player_idle(timeout_s=5.0):
             return
+        # CONFIRMED live 2026-08-17 (user directive): Search has a long completion animation,
+        # and advancing unconditionally right after the click (the old behavior) let a
+        # still-animating room get re-polled and re-clicked before it actually finished,
+        # observed live producing a real "You have already looted this Sarcophagus." message
+        # from a redundant second Search. Confirm the click actually registered via
+        # /last-action, then wait for the loot to actually land (an inventory count change)
+        # before considering this step done -- same "confirm via the game's own signal, not a
+        # fixed guess" idiom as trap_step's movement/fail-message poll above.
+        before_count = len(controller.get_inventory())
+        action_before = controller.get_last_action().get("tick")
         controller.click_entity(ctx.ser, sarco, check_ui_blockers=False)   # "Search"
-        controller.human_delay(1.0, 2.0)
+
+        deadline = time.time() + 6.0
+        registered = looted = False
+        while time.time() < deadline:
+            if not registered:
+                action = controller.get_last_action()
+                if action.get("tick") != action_before:
+                    registered = True
+            if len(controller.get_inventory()) != before_count:
+                looted = True
+                break
+            time.sleep(0.2)
+
+        if not registered:
+            debug_log.log("pyramid_plunder", "sarcophagus Search click didn't register -- retrying")
+            return
+        if not looted:
+            debug_log.log("pyramid_plunder", "sarcophagus Search registered but no loot landed "
+                                             "within the timeout -- moving on anyway")
         ctx.state.data["room_step"] = ROOM_STEP_DOOR
         return
 
