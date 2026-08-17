@@ -735,6 +735,14 @@ def trap_step(ctx, config, pp: dict) -> None:
         return
 
     if moved:
+        # DIAGNOSTIC 2026-08-17 (user-flagged live: trap->chest still slow, XP path never
+        # firing): log the exact XP values seen so the next live run shows WHY xp_gained never
+        # triggered here -- e.g. thievingXp genuinely unchanged (disarm doesn't grant Thieving
+        # XP after all, contrary to the wiki) vs. it changed but this poll simply never sampled
+        # the moment it did.
+        xp_now = controller.get_player().get("thievingXp")
+        debug_log.log("pyramid_plunder", f"trap disarm resolved via movement, not XP -- "
+                                         f"xp_before={xp_before} xp_now={xp_now}")
         controller.wait_until_player_idle(timeout_s=3.0)
     elif failed:
         debug_log.log("pyramid_plunder", "failed to disarm the spear trap -- retrying")
@@ -1009,10 +1017,11 @@ def attempt_door_click(ctx, door: dict) -> str:
     bookkeeping when that happens. This function now only ever answers one question: did this
     Pick-lock attempt succeed (grant Thieving XP)?
 
-    Returns "picked" (XP confirmed -- caller should blacklist this door and move on), "failed"
-    (no XP; a normal, expected, silent roll failure per the wiki -- caller should just retry the
-    same door), or "missed" (click resolved to a plain "Walk here", not a real Pick-lock
-    attempt -- see TOMB_DOOR_AIM_OFFSET's own note)."""
+    Returns "picked" (XP confirmed, OR the game's chat confirms this door was already open --
+    see the safety-net note below; caller should blacklist this door and move on), "failed" (no
+    XP and no "already open" message; a normal, expected, silent roll failure per the wiki --
+    caller should just retry the same door), or "missed" (click resolved to a plain "Walk
+    here", not a real Pick-lock attempt -- see TOMB_DOOR_AIM_OFFSET's own note)."""
     since_tick = controller.get_last_chat_message().get("tick")
     action_before = controller.get_last_action().get("tick")
     xp_before = controller.get_player().get("thievingXp")
@@ -1039,17 +1048,29 @@ def attempt_door_click(ctx, door: dict) -> str:
         time.sleep(0.1)
 
     # No XP within the window -- per the wiki this is a normal, silent, expected failure roll,
-    # but poll chat briefly anyway to confirm it really was a failed pick-lock (not something
-    # else) and to surface the game's own wording for this in the log.
-    msg = controller.wait_for_chat_message(
-        lambda m: "lock" in (m.get("message") or "").lower()
-                  and "fail" in (m.get("message") or "").lower(),
-        since_tick=since_tick, timeout_s=1.0,
-    )
-    if msg is not None:
-        debug_log.log("pyramid_plunder", f"failed the lockpick: {msg.get('message')}")
-    else:
+    # but poll chat briefly anyway to confirm it (one combined poll covers two possibilities:
+    # a normal failed pick-lock, or the safety-net case below).
+    #
+    # user-flagged 2026-08-17: safety net for find_room_doors' own dead_ends filter somehow
+    # missing this door (e.g. a coordinate-key mismatch) and letting an already-blacklisted,
+    # already-picked door get reclicked -- if the game itself confirms via chat that this door
+    # is already open, treat that exactly like a fresh "picked" outcome (blacklist and move on)
+    # rather than retrying it forever as if it were a normal failed roll.
+    def _outcome_message(m):
+        text = (m.get("message") or "").lower()
+        return ("already" in text and "open" in text) or ("lock" in text and "fail" in text)
+
+    msg = controller.wait_for_chat_message(_outcome_message, since_tick=since_tick, timeout_s=1.0)
+    if msg is None:
         debug_log.log("pyramid_plunder", "no XP and no confirming chat message -- treating as a failed lockpick anyway")
+        return "failed"
+
+    text = (msg.get("message") or "").lower()
+    if "already" in text and "open" in text:
+        debug_log.log("pyramid_plunder", f"door was already open (blacklist safety net): {msg.get('message')}")
+        return "picked"
+
+    debug_log.log("pyramid_plunder", f"failed the lockpick: {msg.get('message')}")
     return "failed"
 
 
