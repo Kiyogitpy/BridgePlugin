@@ -764,6 +764,15 @@ def trap_step(ctx, config, pp: dict) -> None:
     # as a third -- whichever resolves first, instead of always blocking out the full
     # fail-message timeout even on the success path, where no such message is ever coming. Only
     # trustworthy now that click_missed has already ruled out a Walk-here resolution above.
+    #
+    # BUG, FIXED 2026-08-17 (user-flagged live, the oscillation bug recurred even after the
+    # click_missed fix above): "if we see in chat ouch! that means we still need to pass the
+    # trap." A failed disarm can ALSO produce player movement in the same window (e.g. a knock-
+    # back, or the player continuing to walk despite taking damage) -- "moved" alone is still not
+    # sufficient proof of success. Damage/fail signals are now checked FIRST in each poll
+    # iteration, before the position check, so a genuine fail can never lose a race to a
+    # same-snapshot "moved" reading; "Ouch!" is the generic OSRS damage-taken chat message and
+    # catches this even on ticks where the specific "fail to deactivate the trap" text doesn't.
     deadline = time.time() + 2.5
     xp_gained = moved = failed = False
     while time.time() < deadline:
@@ -771,15 +780,16 @@ def trap_step(ctx, config, pp: dict) -> None:
         if xp is not None and xp_before is not None and xp > xp_before:
             xp_gained = True
             break
+        msg = controller.get_last_chat_message()
+        msg_tick = msg.get("tick")
+        if msg_tick is not None and since_tick is not None and msg_tick > since_tick:
+            text = (msg.get("message") or "").lower()
+            if "fail to deactivate the trap" in text or "ouch" in text:
+                failed = True
+                break
         pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
         if None not in pos and pos != before_pos:
             moved = True
-            break
-        msg = controller.get_last_chat_message()
-        msg_tick = msg.get("tick")
-        if (msg_tick is not None and since_tick is not None and msg_tick > since_tick
-                and "fail to deactivate the trap" in (msg.get("message") or "").lower()):
-            failed = True
             break
         time.sleep(0.15)
 
