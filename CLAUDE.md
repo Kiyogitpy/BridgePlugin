@@ -184,6 +184,29 @@ break forward world-coordinate conversion" above for why both are implemented by
 already-corrected bulk `/objects`/`/ground-items` lists rather than a fresh forward lookup) for
 ready-made `refresh_target` factories instead of hand-writing the lambda at each call site.
 
+**XP gain is another sub-tick, general-purpose signal — not specific to any one routine.** Added
+2026-08-17 (user directive, generalized from `pyramid_plunder.py`'s tomb-door confirmation):
+`client.getSkillExperience(Skill.X)` reflects the moment the client's own `StatChanged` event
+fires — this is the exact signal the game's own XP Drop plugin uses
+(`data/decompiled/.../xpdrop/XpDropPlugin.java#onStatChanged`) — and is not gated by `TickCache`
+or the 0.6s server tick the way bulk `/objects`/`/npcs` scans or `roomNumber`-style state are.
+Any skilling action that grants XP on success (thieving, mining, fishing, crafting, ...) can use
+this as a fast, definitive "did that attempt actually succeed" check instead of polling chat
+messages, waiting out a fixed delay, or re-reading tick-capped object/state fields.
+
+`PlayerProvider` exposes each skill's cumulative XP the same way (`hitpointsXp` was the existing
+precedent; `thievingXp` was added alongside this note) — add more `data.put("<skill>Xp",
+client.getSkillExperience(Skill.<SKILL>))` lines there for whichever skill a routine needs, same
+pattern. **Requires a RuneLite client rebuild + restart** (`./gradlew.bat run`) before a newly
+added skill's XP field shows up on `GET /player` — it's compiled into the Java plugin, not
+something the Python side can pick up on its own.
+
+Python-side usage pattern (see `pyramid_plunder.py`'s `attempt_door_click`): snapshot
+`controller.get_player().get("<skill>Xp")` immediately before the click, then poll for an
+increase inside the same short wait loop already used for other post-click signals (position
+jump, confirmation chat message, ...) — an XP increase is proof the underlying skill check
+succeeded, sub-tick and often faster than any other available signal.
+
 ## Live-debugging workflow
 
 Use this loop by default when debugging a routine live against the running RuneLite client — it
