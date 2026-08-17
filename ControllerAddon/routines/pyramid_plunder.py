@@ -783,28 +783,31 @@ def sarco_step(ctx, config, pp: dict) -> None:
     if impostor == SARCOPHAGUS_CLOSED_IMPOSTOR_ID:
         if not controller.wait_until_player_idle(timeout_s=5.0):
             return
+        # REWRITTEN 2026-08-17 (user directive: "click it once check last action that it
+        # resolved wait a bit then do the next task"): dropped the impostorId-polling loop this
+        # used to have -- same last-action-registration idiom as the Search branch above, and
+        # nothing else is needed. Re-clicking "Open" while a successful attempt's animation is
+        # still playing would reset it, but that can't happen here: this function only ever gets
+        # called again on the NEXT external tick, and by then a successful Open has already
+        # flipped impostorId to OPENING, which is handled above by a branch that clicks nothing
+        # at all while it waits. A failed Strength roll leaves impostor CLOSED, so the next tick
+        # just retries this same click -- also correct, no special-casing required.
+        action_before = controller.get_last_action().get("tick")
         controller.click_entity(ctx.ser, sarco, check_ui_blockers=False)   # "Open"
 
-        # user-flagged 2026-08-17: re-clicking "Open" while a successful attempt's animation is
-        # still playing RESETS it, wasting real time -- same lesson as the Search-click
-        # confirmation above, applied here too. Poll for the object's own impostorId to actually
-        # change (whichever comes first: 21257 "Opening" mid-animation, or straight to 21256
-        # "Opened" if that transition is fast) instead of blindly returning to re-poll on a
-        # fixed short delay regardless of whether the click actually landed on a real attempt.
-        #
-        # REGRESSION, FIXED 2026-08-17 (user-flagged: "still a bunch of wasted time"): the
-        # original 5.0s deadline meant every FAILED Strength roll (a real, normal, and fairly
-        # common outcome per the wiki -- not an edge case) paid out the full 5s before this
-        # function would even try again, on top of whatever the next external tick's own
-        # scheduling adds. A genuine success flips the object's state almost immediately (well
-        # under a second in every live observation so far), so there's no reason a failed roll
-        # needs anywhere near 5s to be conclusively "still closed" -- 1.5s is already generous.
-        deadline = time.time() + 1.5
+        deadline = time.time() + 2.0
+        registered = False
         while time.time() < deadline:
-            refreshed = controller.get_object_at(sarco.get("x"), sarco.get("y"), sarco.get("plane"), sarco.get("id"))
-            if refreshed is not None and refreshed.get("impostorId") != SARCOPHAGUS_CLOSED_IMPOSTOR_ID:
+            action = controller.get_last_action()
+            if action.get("tick") != action_before:
+                registered = True
                 break
-            time.sleep(0.2)
+            time.sleep(0.15)
+
+        if not registered:
+            debug_log.log("pyramid_plunder", "sarcophagus Open click didn't register -- retrying")
+            return
+        controller.human_delay(0.4, 0.8)
         return  # re-poll next tick regardless; opening (21257) then opened (21256) are handled above
 
     debug_log.log("pyramid_plunder", f"sarcophagus in unexpected state (impostorId={impostor}) "
@@ -933,7 +936,18 @@ def attempt_door_click(ctx, door: dict, room: int):
     # steadily for the ~2.5s poll window covers real ground too. Comparing frame-to-frame
     # instead means only an actual single-step discontinuity can trip it -- normal walking's
     # per-frame increments stay far below POSITION_JUMP_THRESHOLD even over several seconds.
-    deadline = time.time() + (0.5 if click_missed else 3.0)
+    #
+    # SHORTENED 3.0 -> 1.2 2026-08-17 (user-flagged, speed): per the wiki
+    # (data/raw/T/Tomb Door.txt, data/raw/P/Pyramid Plunder.txt#Gameplay), a Pick-lock failure
+    # on ANY of the 4 candidates -- correct or fake -- is silent: "no consequences will occur if
+    # they fail", no message, no state change, resolved within the single game tick the click
+    # landed on. The human_delay(0.6, 1.0) above already covers that tick's worth of settle
+    # time, so this loop was spending up to ~2.4s doing nothing on the overwhelmingly common
+    # "registered" (silent-fail) outcome, every single retry. 1.2s keeps roughly one full extra
+    # tick of margin past the settle delay for a genuine dead-end message or room transfer to
+    # still land -- both are the same near-instant, same-tick signals the position-jump fix
+    # above already showed resolve well inside a couple hundred ms, not seconds.
+    deadline = time.time() + (0.5 if click_missed else 1.2)
     prev_pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
     jumped = dead_end = False
     while time.time() < deadline:
