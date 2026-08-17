@@ -839,7 +839,18 @@ def chest_step(ctx, config, pp: dict) -> None:
 
     Three distinct outcomes, not two -- "not in this poll's object list" is a camera/distance
     problem, NOT evidence the chest is already looted, so it retries next tick instead of
-    silently advancing past an unlooted chest."""
+    silently advancing past an unlooted chest.
+
+    BUG, FIXED 2026-08-17 (user-flagged live: "we missclick the golden chest now because of the
+    movement, or rather the chest position once we drag our mouse over is using stale data").
+    Same class of bug already fixed for trap_step's own trap pick (see that function's own
+    comment): the chest object fetched here for the state check can be resolved WHILE the
+    player is still walking -- especially now that trap_step can chain straight into this
+    function the instant a trap disarm is confirmed, well before the player has finished
+    crossing the room. Its screenX/screenY reflect wherever the camera/player were at that
+    fetch, not wherever they end up once wait_until_player_idle below actually returns. Re-
+    fetching fresh immediately before the click (not a one-time pick at function entry) is the
+    fix, same idiom as trap_step/attempt_door_click/sarco_step."""
     next_step = ROOM_STEP_SARCO if pp.get("roomNumber", 0) >= config["sarcophagusStartRoom"] else ROOM_STEP_DOOR
 
     chest = find_object_by_id(controller.get_objects(radius=15), GRAND_GOLD_CHEST_ID)
@@ -860,6 +871,7 @@ def chest_step(ctx, config, pp: dict) -> None:
 
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
+    chest = find_object_by_id(controller.get_objects(radius=15), GRAND_GOLD_CHEST_ID) or chest
     controller.click_entity(ctx.ser, chest, check_ui_blockers=False)
     controller.human_delay(0.6, 1.5)
     ctx.state.data["room_step"] = next_step
