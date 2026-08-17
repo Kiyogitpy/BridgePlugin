@@ -20,6 +20,7 @@
 #     python controller.py routines/pyramid_plunder.py
 
 import math
+import time
 
 import controller
 import debug_log
@@ -239,6 +240,25 @@ def resolve_mummy(npcs: list = None, doors: list = None):
     return None
 
 
+def wait_for_mummy(timeout_s: float = 8.0, poll_interval_s: float = 0.5):
+    """Polls resolve_mummy() instead of a single fixed-delay-then-check -- user-flagged
+    2026-08-17: a correct door was repeatedly misjudged as wrong, and this codebase has already
+    hit the underlying cause once before (pest_control.py's own note on NPC-streaming delay --
+    a newly-loaded area's NPCs, including the Guardian mummy, can take a few seconds to appear
+    in GET /npcs at all after the scene transition). A single check after a fixed 1.5-3.0s
+    delay could fire before the mummy had streamed in, reporting a correct door as a failure --
+    which then discarded real progress (dropped the door cache / walked into recovery logic)
+    for no reason. Returns as soon as the mummy is found, same early-exit shape as
+    wait_until_player_idle/wait_for_chat_message elsewhere in this codebase."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        mummy = resolve_mummy()
+        if mummy is not None:
+            return mummy
+        time.sleep(poll_interval_s)
+    return None
+
+
 def order_doors_clockwise(doors: list) -> list:
     """Stable ordering of the 4 static anonymous-door objects by angle around their own
     centroid, so the same physical door always resolves to the same index (0-3) across every
@@ -356,10 +376,12 @@ def outside_tick(ctx, config, doors: list = None) -> None:
     if not controller.click_entity(ctx.ser, door, check_ui_blockers=False):
         return
     # Let the search-the-door attempt (and possible 1-4 dmg stun on failure) resolve before
-    # checking whether it worked.
-    controller.human_delay(1.5, 3.0)
+    # polling for the mummy -- wait_for_mummy itself keeps checking for up to 8s rather than a
+    # single check, since a correct door's mummy can take a few seconds to stream into GET
+    # /npcs after the scene transition (see wait_for_mummy's own docstring).
+    controller.human_delay(1.0, 1.8)
 
-    if resolve_mummy() is not None:
+    if wait_for_mummy() is not None:
         debug_log.log("pyramid_plunder", f"reached the Guardian mummy via door index {index_to_try}")
         ctx.state.data["correct_door_index"] = index_to_try
         ctx.state.data["cached_door_fails"] = 0
@@ -707,7 +729,14 @@ def door_step(ctx, config, pp: dict) -> None:
         quick_leave(ctx, config)
         return
 
-    objs = controller.get_objects(radius=15)
+    # radius=10, not door_step's usual 15 -- user-flagged 2026-08-17 (and confirmed live: an
+    # /objects(radius=15) query returned 8 distinct Tomb Door tiles in one room, not 4, since
+    # the previous (already-passed) room's doors are close enough to still be in range). The
+    # real room's own 4 doors were all within 9 tiles; the previous room's were all >=12 --
+    # 10 is a first-cut cut line with margin on the one instance actually measured, not a
+    # guaranteed-correct room boundary. Object ids alone can't disambiguate this (TOMB_DOOR_
+    # WALL_IDS are shared across every room), so distance is the only signal available.
+    objs = controller.get_objects(radius=10)
     dead_ends = {tuple(k) for k in ctx.state.data.get("dead_end_doors", [])}
     doors = [o for o in objs
              if o.get("id") in TOMB_DOOR_WALL_IDS
