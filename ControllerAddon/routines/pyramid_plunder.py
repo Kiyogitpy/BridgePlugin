@@ -784,11 +784,23 @@ def trap_step(ctx, config, pp: dict) -> None:
         msg = controller.get_last_chat_message()
         msg_tick = msg.get("tick")
         if msg_tick is not None and since_tick is not None and msg_tick > since_tick:
+            # BUG, FIXED 2026-08-17 (user-flagged live, then user-diagnosed: "most likely our
+            # string matching isnt strict"). The old success check ("deactivate the trap" in
+            # text) is a loose fragment that's ALSO contained inside the failure message's own
+            # text -- if the real failure wording didn't precisely match the old strict
+            # "fail to deactivate the trap" phrase (e.g. any variation this file's own comments
+            # haven't seen confirmed live), it fell through to the looser success check and got
+            # misread as a disarm, which is exactly what let the routine walk straight back into
+            # a still-armed trap believing it was already past it. Now: ANY message containing
+            # the single, unambiguous keyword "fail" is treated as a failure -- robust against
+            # exact wording -- and success requires the full specific phrase "you deactivate the
+            # trap" (mutually exclusive with "fail" in the overwhelming likely case), not just a
+            # fragment shared with the failure text.
             text = (msg.get("message") or "").lower()
-            if "fail to deactivate the trap" in text or "ouch" in text:
+            if "fail" in text or "ouch" in text:
                 failed = True
                 break
-            if "deactivate the trap" in text:
+            if "you deactivate the trap" in text:
                 disarmed = True
                 break
         time.sleep(0.15)
