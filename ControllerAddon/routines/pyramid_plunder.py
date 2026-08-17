@@ -676,6 +676,22 @@ TRAP_SWAP_FAIL_LIMIT = 2  # user directive 2026-08-17: swap to a different trap 
                           # this many CONSECUTIVE fails (missed click or a confirmed failed
                           # disarm roll) on the same physical tile.
 
+# WORKING HYPOTHESIS, NOT YET LIVE-CONFIRMED, 2026-08-17: user-flagged live that the room-
+# spanning oscillation bug (see trap_step's own docstring) recurred even after dropping the
+# unreliable "moved" success signal -- the room genuinely has 4 spear traps total, 2 on the
+# entry side and 2 on the chest side (user-clarified), and TRAP_SWAP_FAIL_LIMIT's swap logic has
+# no concept of "which side" a candidate is on, only raw distance. If the entry side's own trap
+# racks up 2 consecutive "no confirming signal" results (not necessarily a REAL failed roll --
+# just this routine not catching XP/the exact chat phrase in time), the swap could pick the
+# next-closest candidate by pure distance, which -- if the far side's traps are within the same
+# general radius=15 search used everywhere else in this file -- might be a chest-side trap
+# instead of another entry-side one, sending the player straight into the exact loop being
+# fixed. Scoped tighter than the general radius (matching MUMMY_MAX_DISTANCE=5's own precedent
+# for "genuinely adjacent, not just somewhere in the room") specifically for trap CANDIDATE
+# SELECTION, so a far-side trap can never even enter consideration until the player has
+# actually walked over there on their own.
+TRAP_SEARCH_RADIUS = 6
+
 
 def trap_step(ctx, config, pp: dict) -> None:
     """Disarm the spear trap if the bridge reports it still armed. A failed attempt is
@@ -717,7 +733,7 @@ def trap_step(ctx, config, pp: dict) -> None:
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         return
 
-    candidates = find_objects_by_id(controller.get_objects(radius=15), SPEAR_TRAP_ID)
+    candidates = find_objects_by_id(controller.get_objects(radius=TRAP_SEARCH_RADIUS), SPEAR_TRAP_ID)
     if not candidates:
         debug_log.log("pyramid_plunder", "trapActive but no spear trap object visible -- skipping")
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
@@ -731,7 +747,7 @@ def trap_step(ctx, config, pp: dict) -> None:
     # the candidates picked at the top of this function can be stale by the time we actually
     # click (wait_until_player_idle can block up to 5s), so re-resolve fresh immediately before
     # picking -- not a one-time pick at function entry.
-    candidates = find_objects_by_id(controller.get_objects(radius=15), SPEAR_TRAP_ID) or candidates
+    candidates = find_objects_by_id(controller.get_objects(radius=TRAP_SEARCH_RADIUS), SPEAR_TRAP_ID) or candidates
     trap_fail_tiles = dict(ctx.state.data.get("trap_fail_tiles", {}))
     usable = [t for t in candidates if trap_fail_tiles.get(trap_key(t), 0) < TRAP_SWAP_FAIL_LIMIT]
     trap = (usable or candidates)[0]  # closest usable candidate; if all are deprioritized, try everything again
