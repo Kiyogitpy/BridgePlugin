@@ -19,7 +19,8 @@ public enum RoutineChoice
 	GOLEM_CRAFTING("Golem Crafting"),
 	MASTERING_MIXOLOGY("Mastering Mixology"),
 	PEST_CONTROL("Pest Control"),
-	NMZ("Nightmare Zone");
+	NMZ("Nightmare Zone"),
+	PYRAMID_PLUNDER("Pyramid Plunder");
 
 	private final String label;
 

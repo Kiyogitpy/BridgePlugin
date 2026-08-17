@@ -389,6 +389,10 @@ def get_sailing():
     }
 
 
+def get_pyramid_plunder():
+    return api_get("/pyramid-plunder") or {"inRun": False, "roomNumber": 0, "timerTicks": 0, "trapActive": False}
+
+
 def get_equipment():
     return api_get("/equipment") or {}
 
@@ -1997,6 +2001,7 @@ ROUTINE_FILES = {
     "MASTERING_MIXOLOGY": "routines/mastering_mixology.py",
     "PEST_CONTROL": "routines/pest_control.py",
     "NMZ": "routines/nmz.py",
+    "PYRAMID_PLUNDER": "routines/pyramid_plunder.py",
 }
 
 

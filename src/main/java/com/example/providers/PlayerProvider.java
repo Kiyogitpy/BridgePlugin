@@ -153,6 +153,7 @@ public class PlayerProvider extends BridgeProvider
 		data.put("prayer", client.getBoostedSkillLevel(Skill.PRAYER));
 		data.put("prayerReal", client.getRealSkillLevel(Skill.PRAYER));
 		data.put("hitpointsXp", client.getSkillExperience(Skill.HITPOINTS));
+		data.put("thievingXp", client.getSkillExperience(Skill.THIEVING));
 
 		data.put("runEnergy", client.getEnergy() / 100);
 		data.put("specialAttackPercent", client.getVarpValue(VarPlayer.SPECIAL_ATTACK_PERCENT) / 10);
