@@ -817,7 +817,13 @@ def attempt_door_click(ctx, door: dict, room: int):
         return "dead_end", door
 
     fresh_pp = controller.get_pyramid_plunder()
-    if fresh_pp.get("roomNumber", room) > room:
+    # CONFIRMED live 2026-08-17: roomNumber alone is not a reliable "we're in a new room"
+    # signal -- it can still read a stale leftover value (e.g. "2") for a moment even after the
+    # run has actually ended, misreported here as a real advance while the very next position
+    # read showed the player standing outside the pyramid entirely (most likely an accidental
+    # misclick landing on the room's own exit door, which produces no distinctive chat message
+    # this function was watching for). inRun must also be true, or this isn't a real advance.
+    if fresh_pp.get("inRun") and fresh_pp.get("roomNumber", room) > room:
         debug_log.log("pyramid_plunder", f"advanced to room {fresh_pp.get('roomNumber')}")
         ctx.state.data["room_step"] = ROOM_STEP_TRAP
         ctx.state.data["door_attempt"] = 0
