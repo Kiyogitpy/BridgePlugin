@@ -688,33 +688,31 @@ def trap_step(ctx, config, pp: dict) -> None:
     sarcophagus/doors at all, or just an optional bonus-XP obstacle -- see design doc. Either
     way, disarming it first is a safe default (10 xp, minor 1-4 dmg risk on a failed attempt).
 
-    BUG, FIXED 2026-08-17 (user-flagged live, multiple rounds): "we succesfully deactivated it
-    and went past but then deactivated it on the other side and went back again meaning we are
-    stuck in a loop trying to run to the gold chest but take dmg from the trap over and over."
-    User clarified the actual room layout: 4 spear traps total, 2 on the entry side and 2 on the
-    chest side. Disarming the 2 entry-side traps auto-walks the player across to the chest side
-    -- but pp["trapActive"] apparently still reads true there (reflecting the chest side's own,
-    separate, never-actually-blocking traps), so this function kept trying to disarm THOSE too,
-    and disarming a trap on that side auto-walks back across to the entry side, repeating
-    forever. trapActive alone isn't sufficient evidence that a trap still needs disarming --
-    reaching the chest side (the chest itself becomes visible) is the real completion signal,
-    checked first and unconditionally, before ever consulting trapActive.
+    BUG, FIXED 2026-08-17 (user-flagged live, multiple rounds -- final root cause): "the way we
+    can see if we crossed the traps sucessfully is either the thieving 10 experience we get for
+    disabling it OR the message that says 'You deactivate the trap!'" User clarified the actual
+    room layout: 4 spear traps total, 2 on the entry side and 2 on the chest side (the chest
+    itself is ALWAYS interactable/visible regardless of which side the player is on, so an
+    earlier attempt at this fix that checked chest visibility as a "have we crossed" signal was
+    wrong and has been reverted -- it would have skipped straight past every trap in every room).
+    The real, previously-unfixed root cause: "moved" (the player's queued movement resuming) was
+    never a reliable success signal at all, on either side of the room -- a failed attempt can
+    ALSO produce movement (a knockback, or continuing to walk despite taking damage), so
+    "moved"-as-success caused the routine to wrongly believe a trap was disarmed and immediately
+    try the (still-armed) NEXT one, over and over, taking repeated damage. Dropped "moved"
+    entirely; XP and the exact success chat message are the only two things this function ever
+    trusts as confirmation.
 
-    Earlier fix, still in place beneath this one: some rooms genuinely have more than one spear
-    trap tile blocking a single side's path (CONFIRMED live: the debug log shows exactly two
-    real, non-miss trap resolutions per room in the overwhelming common case). Always re-picking
-    the single CLOSEST candidate every attempt, with no memory of which tile keeps failing, could
-    get stuck alternating between two candidates that both keep failing (or one whose approach
-    path requires stepping onto the OTHER trap first, taking incidental damage) with no way to
-    break the cycle. TRAP_SWAP_FAIL_LIMIT tracks consecutive fails per tile
+    Earlier fix, still in place: some rooms genuinely have more than one spear trap tile
+    blocking a single side's path (CONFIRMED live: the debug log shows exactly two real
+    resolutions per room in the overwhelming common case). Always re-picking the single CLOSEST
+    candidate every attempt, with no memory of which tile keeps failing, could get stuck
+    alternating between two candidates that both keep failing (or one whose approach path
+    requires stepping onto the OTHER trap first, taking incidental damage) with no way to break
+    the cycle. TRAP_SWAP_FAIL_LIMIT tracks consecutive fails per tile
     (ctx.state.data["trap_fail_tiles"]) and temporarily deprioritizes a tile once it's failed
     twice in a row, falling back to trying every candidate again if all of them are currently
     deprioritized (never gets permanently stuck)."""
-    if find_object_by_id(controller.get_objects(radius=15), GRAND_GOLD_CHEST_ID) is not None:
-        debug_log.log("pyramid_plunder", "chest already visible -- already past the traps, skipping straight to it")
-        ctx.state.data["room_step"] = ROOM_STEP_CHEST
-        return
-
     if not pp.get("trapActive"):
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         return
@@ -766,30 +764,18 @@ def trap_step(ctx, config, pp: dict) -> None:
         controller.wait_until_player_idle(timeout_s=2.0)
         return
 
-    # user directive 2026-08-17: disarming grants 10 Thieving XP (per the wiki), and that XP
-    # lands the moment the client's own StatChanged event fires -- same sub-tick idiom as the
-    # tomb-door Pick-lock confirmation (see CLAUDE.md's "XP gain is another sub-tick,
-    # general-purpose signal" note), faster and more definitive than waiting on movement to
-    # resume or pp["trapActive"] to catch up on a later external tick. Checked first in the
-    # loop below since it's the fastest, most reliable signal available.
-    #
-    # CONFIRMED live 2026-08-17 (user directive): a successful disarm ALSO lets the player's own
-    # queued movement resume immediately (they start walking past the trap); a failed attempt
-    # leaves them standing still. Kept as a fallback alongside XP, and the confirmed fail message
-    # as a third -- whichever resolves first, instead of always blocking out the full
-    # fail-message timeout even on the success path, where no such message is ever coming. Only
-    # trustworthy now that click_missed has already ruled out a Walk-here resolution above.
-    #
-    # BUG, FIXED 2026-08-17 (user-flagged live, the oscillation bug recurred even after the
-    # click_missed fix above): "if we see in chat ouch! that means we still need to pass the
-    # trap." A failed disarm can ALSO produce player movement in the same window (e.g. a knock-
-    # back, or the player continuing to walk despite taking damage) -- "moved" alone is still not
-    # sufficient proof of success. Damage/fail signals are now checked FIRST in each poll
-    # iteration, before the position check, so a genuine fail can never lose a race to a
-    # same-snapshot "moved" reading; "Ouch!" is the generic OSRS damage-taken chat message and
-    # catches this even on ticks where the specific "fail to deactivate the trap" text doesn't.
+    # user directive 2026-08-17 (final root-cause fix): only two signals are ever trusted as
+    # confirmation -- Thieving XP (lands the moment the client's own StatChanged event fires,
+    # same sub-tick idiom as the tomb-door Pick-lock confirmation) and the exact chat message
+    # "You deactivate the trap!" (user-specified). "moved" is no longer checked at all: a failed
+    # attempt can ALSO produce player movement (a knockback, or continuing to walk despite
+    # taking damage), which is exactly what caused the oscillation bug across multiple earlier
+    # fix attempts this session. The confirmed-fail message and "Ouch!" (the generic OSRS
+    # damage-taken message) are still checked, purely for fail-count bookkeeping (the swap
+    # mechanic) and logging -- neither one is required for correctness, since simply not seeing
+    # a success signal is already enough to keep retrying.
     deadline = time.time() + 2.5
-    xp_gained = moved = failed = False
+    xp_gained = disarmed = failed = False
     while time.time() < deadline:
         xp = controller.get_player().get("thievingXp")
         if xp is not None and xp_before is not None and xp > xp_before:
@@ -802,15 +788,14 @@ def trap_step(ctx, config, pp: dict) -> None:
             if "fail to deactivate the trap" in text or "ouch" in text:
                 failed = True
                 break
-        pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
-        if None not in pos and pos != before_pos:
-            moved = True
-            break
+            if "deactivate the trap" in text:
+                disarmed = True
+                break
         time.sleep(0.15)
 
     key = trap_key(trap)
 
-    if xp_gained:
+    if xp_gained or disarmed:
         # user directive 2026-08-17: "the moment we get xp we can click gold chest" -- chain
         # straight into chest_step's own click right here instead of just setting room_step and
         # waiting for the next external tick's own pp["trapActive"] re-check to notice the
@@ -819,25 +804,21 @@ def trap_step(ctx, config, pp: dict) -> None:
         # equivalent to how the next tick would have handled it, just without the wait.
         trap_fail_tiles.pop(key, None)
         ctx.state.data["trap_fail_tiles"] = trap_fail_tiles
-        debug_log.log("pyramid_plunder", "trap disarmed (XP confirmed) -- clicking the chest immediately")
+        reason = "XP" if xp_gained else "chat message"
+        debug_log.log("pyramid_plunder", f"trap disarmed ({reason} confirmed) -- clicking the chest immediately")
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         chest_step(ctx, config, pp)
         return
 
-    if moved:
-        trap_fail_tiles.pop(key, None)
-        ctx.state.data["trap_fail_tiles"] = trap_fail_tiles
-        debug_log.log("pyramid_plunder", "trap disarm resolved via movement (click confirmed real, not a miss)")
-        controller.wait_until_player_idle(timeout_s=3.0)
-    elif failed:
-        trap_fail_tiles[key] = trap_fail_tiles.get(key, 0) + 1
-        ctx.state.data["trap_fail_tiles"] = trap_fail_tiles
-        debug_log.log("pyramid_plunder", f"failed to disarm the spear trap {trap_fail_tiles[key]}x -- retrying")
+    trap_fail_tiles[key] = trap_fail_tiles.get(key, 0) + 1
+    ctx.state.data["trap_fail_tiles"] = trap_fail_tiles
+    reason = "failed the roll" if failed else "no confirming signal within the window"
+    debug_log.log("pyramid_plunder", f"spear trap attempt {reason} ({trap_fail_tiles[key]}x) -- retrying")
     # Re-polled next tick via pp["trapActive"] either way -- stays on "trap" until the bridge
-    # confirms it's actually disarmed, so an ambiguous/failed attempt (logged above or not)
-    # naturally retries instead of advancing early. A tile that hits TRAP_SWAP_FAIL_LIMIT gets
-    # deprioritized (not excluded outright) by the candidate selection above, so a genuinely
-    # single-trap room still eventually retries it once every other candidate is exhausted.
+    # confirms it's actually disarmed, so a failed/ambiguous attempt naturally retries instead
+    # of advancing early. A tile that hits TRAP_SWAP_FAIL_LIMIT gets deprioritized (not excluded
+    # outright) by the candidate selection above, so a genuinely single-trap room still
+    # eventually retries it once every other candidate is exhausted.
 
 
 def chest_step(ctx, config, pp: dict) -> None:
