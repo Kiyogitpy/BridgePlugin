@@ -705,36 +705,34 @@ def sarco_step(ctx, config, pp: dict) -> None:
     if impostor == SARCOPHAGUS_OPENED_IMPOSTOR_ID:
         if not controller.wait_until_player_idle(timeout_s=5.0):
             return
-        # CONFIRMED live 2026-08-17 (user directive): Search has a long completion animation,
-        # and advancing unconditionally right after the click (the old behavior) let a
-        # still-animating room get re-polled and re-clicked before it actually finished,
-        # observed live producing a real "You have already looted this Sarcophagus." message
-        # from a redundant second Search. Confirm the click actually registered via
-        # /last-action, then wait for the loot to actually land (an inventory count change)
-        # before considering this step done -- same "confirm via the game's own signal, not a
-        # fixed guess" idiom as trap_step's movement/fail-message poll above.
-        before_count = len(controller.get_inventory())
+        # Confirm the click actually registered via /last-action before considering this step
+        # done -- same "confirm via the game's own signal, not a fixed guess" idiom as
+        # trap_step's movement/fail-message poll above.
+        #
+        # REGRESSION, FIXED 2026-08-17 (user directive): an earlier version of this also waited
+        # up to 6s for an inventory COUNT change as proof the loot landed. Live-confirmed that
+        # was an unreliable signal -- looting genuinely succeeded every time (per the user
+        # watching directly) but the count-change almost never registered, most likely because
+        # the received artefact stacked onto one already in inventory rather than taking a new
+        # slot. That false negative cost a full wasted 6s wait on nearly every single
+        # sarcophagus, every room. Action registration alone is the real completion signal;
+        # loot presence isn't ours to verify here.
         action_before = controller.get_last_action().get("tick")
         controller.click_entity(ctx.ser, sarco, check_ui_blockers=False)   # "Search"
 
-        deadline = time.time() + 6.0
-        registered = looted = False
+        deadline = time.time() + 2.0
+        registered = False
         while time.time() < deadline:
-            if not registered:
-                action = controller.get_last_action()
-                if action.get("tick") != action_before:
-                    registered = True
-            if len(controller.get_inventory()) != before_count:
-                looted = True
+            action = controller.get_last_action()
+            if action.get("tick") != action_before:
+                registered = True
                 break
-            time.sleep(0.2)
+            time.sleep(0.15)
 
         if not registered:
             debug_log.log("pyramid_plunder", "sarcophagus Search click didn't register -- retrying")
             return
-        if not looted:
-            debug_log.log("pyramid_plunder", "sarcophagus Search registered but no loot landed "
-                                             "within the timeout -- moving on anyway")
+        controller.human_delay(0.4, 0.8)
         ctx.state.data["room_step"] = ROOM_STEP_DOOR
         return
 
