@@ -803,8 +803,8 @@ def sarco_step(ctx, config, pp: dict) -> None:
         # straight to a tomb door click here can visibly overlap the tail of that animation.
         # Small fixed settle delay, not the usual human_delay range -- this isn't approximating
         # human reaction time, just giving the animation a moment to finish. Raised 0.3-0.4 ->
-        # 0.5-0.7 2026-08-17 (user-flagged live: still not enough).
-        controller.human_delay(0.5, 0.7)
+        # 0.5-0.7 -> 0.7-0.9 2026-08-17 (user-flagged live twice: still not enough).
+        controller.human_delay(0.7, 0.9)
         ctx.state.data["room_step"] = ROOM_STEP_DOOR
         return
 
@@ -862,7 +862,7 @@ def sarco_step(ctx, config, pp: dict) -> None:
         debug_log.log("pyramid_plunder", "sarcophagus Open roll failed -- the game keeps "
                                          "attempting on its own")
         return
-    controller.human_delay(0.5, 0.7)  # same settle-time note as the branch above
+    controller.human_delay(0.7, 0.9)  # same settle-time note as the branch above
     ctx.state.data["room_step"] = ROOM_STEP_DOOR
 
 
