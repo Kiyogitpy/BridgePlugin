@@ -115,6 +115,15 @@ DOOR_ENTER_ATTEMPT_LIMIT = 3
 # both exit-door variants).
 TOMB_DOOR_AIM_OFFSET = (0, 0)
 
+# CONFIRMED live 2026-08-17 (user directive): local units, RuneLite's own LOCAL_TILE_SIZE=128
+# per tile -- roughly 3.5 tiles' worth of displacement between two consecutive ~0.1s polls. A
+# room-transfer teleport clears this in a single frame-to-frame step; ordinary walking, even at
+# run speed, moves nowhere near this far in one render frame (the earlier regression was from
+# comparing against a single fixed baseline, letting cumulative walking distance over several
+# seconds trip it -- see attempt_door_click's own note; comparing consecutive polls instead
+# means only a genuine single-frame discontinuity can trigger this).
+POSITION_JUMP_THRESHOLD = 450
+
 # NEEDS LIVE VERIFICATION: even with TOMB_DOOR_AIM_OFFSET, a Tomb Door candidate at long range
 # (observed failing at 14-15 tiles, across the room) still resolved every click to a plain
 # "Walk here" (GET /last-action: menuAction=WALK) instead of the door's own action. A shift-click
@@ -821,7 +830,10 @@ def attempt_door_click(ctx, door: dict, room: int):
     before_impostor = door.get("impostorId")
     if not controller.click_entity(ctx.ser, door, offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False):
         return "missed", door
-    controller.human_delay(0.8, 1.6)
+    # user-flagged 2026-08-17: a longer settle delay right after the Pick-lock/Enter click,
+    # before any of the polling below starts -- avoids the click resolution and the very next
+    # poll iteration landing close enough together to look like a weirdly-fast double click.
+    controller.human_delay(0.6, 1.0)
 
     # CONFIRMED live 2026-08-17: a long-range Tomb Door click can silently resolve to a plain
     # "Walk here" instead of Pick-lock/Enter (GET /last-action: menuAction=WALK) -- a genuine
@@ -830,20 +842,54 @@ def attempt_door_click(ctx, door: dict, room: int):
     click_missed = (action.get("tick") == action_before
                      or (action.get("menuAction") or "").upper() == "WALK")
 
-    dead_end = controller.wait_for_chat_message(
-        lambda m: "leads to a dead end" in (m.get("message") or "").lower(),
-        since_tick=since_tick, timeout_s=0.5 if click_missed else 3.0,
-    )
-    if dead_end is not None:
+    # CONFIRMED live 2026-08-17 (user directive): roomNumber only updates once per 0.6s game
+    # tick, but a real room transfer teleports the player instantly. localX/localY are
+    # interpolated every render frame regardless (see CLAUDE.md's "Sub-tick data" section), so
+    # comparing CONSECUTIVE polls -- not a single fixed baseline taken before the click -- lets
+    # a genuine transfer's single-frame discontinuity be caught far sooner than the tick-capped
+    # bridge state, without misreading ordinary multi-tile walking as a transfer.
+    #
+    # REGRESSION, FIXED 2026-08-17: a first attempt at this compared every poll against one
+    # snapshot taken right before the click. Live-confirmed that falsely fired on perfectly
+    # normal walking (e.g. approaching the next door candidate): the CUMULATIVE distance from
+    # that fixed baseline crossed the threshold well before any teleport happened, since walking
+    # steadily for the ~2.5s poll window covers real ground too. Comparing frame-to-frame
+    # instead means only an actual single-step discontinuity can trip it -- normal walking's
+    # per-frame increments stay far below POSITION_JUMP_THRESHOLD even over several seconds.
+    deadline = time.time() + (0.5 if click_missed else 3.0)
+    prev_pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
+    jumped = dead_end = False
+    while time.time() < deadline:
+        time.sleep(0.1)
+        pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
+        if None not in pos and None not in prev_pos \
+                and math.hypot(pos[0] - prev_pos[0], pos[1] - prev_pos[1]) > POSITION_JUMP_THRESHOLD:
+            jumped = True
+            break
+        prev_pos = pos
+        msg = controller.get_last_chat_message()
+        msg_tick = msg.get("tick")
+        if (msg_tick is not None and since_tick is not None and msg_tick > since_tick
+                and "leads to a dead end" in (msg.get("message") or "").lower()):
+            dead_end = True
+            break
+
+    if dead_end:
         return "dead_end", door
 
+    if jumped:
+        debug_log.log("pyramid_plunder", "position jumped between two consecutive polls -- treating as an instant room transfer")
+        ctx.state.data["room_step"] = ROOM_STEP_TRAP
+        ctx.state.data["door_attempt"] = 0
+        ctx.state.data["dead_end_doors"] = []
+        ctx.state.data["door_enter_attempts"] = {}
+        return "advanced", door
+
     fresh_pp = controller.get_pyramid_plunder()
-    # CONFIRMED live 2026-08-17: roomNumber alone is not a reliable "we're in a new room"
-    # signal -- it can still read a stale leftover value (e.g. "2") for a moment even after the
-    # run has actually ended, misreported here as a real advance while the very next position
-    # read showed the player standing outside the pyramid entirely (most likely an accidental
-    # misclick landing on the room's own exit door, which produces no distinctive chat message
-    # this function was watching for). inRun must also be true, or this isn't a real advance.
+    # Fallback for a transfer the fast position-jump check above somehow missed. roomNumber
+    # alone is not fully reliable either -- it can still read a stale leftover value for a
+    # moment even after a run has actually ended -- but inRun must also be true, or this isn't a
+    # real advance.
     if fresh_pp.get("inRun") and fresh_pp.get("roomNumber", room) > room:
         debug_log.log("pyramid_plunder", f"advanced to room {fresh_pp.get('roomNumber')}")
         ctx.state.data["room_step"] = ROOM_STEP_TRAP
