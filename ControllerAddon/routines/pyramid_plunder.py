@@ -257,7 +257,7 @@ def resolve_mummy(npcs: list = None, doors: list = None):
     return None
 
 
-def wait_for_mummy(timeout_s: float = 8.0, poll_interval_s: float = 0.5):
+def wait_for_mummy(timeout_s: float = 12.0, poll_interval_s: float = 0.5):
     """Polls resolve_mummy() instead of a single fixed-delay-then-check -- user-flagged
     2026-08-17: a correct door was repeatedly misjudged as wrong, and this codebase has already
     hit the underlying cause once before (pest_control.py's own note on NPC-streaming delay --
@@ -266,7 +266,17 @@ def wait_for_mummy(timeout_s: float = 8.0, poll_interval_s: float = 0.5):
     delay could fire before the mummy had streamed in, reporting a correct door as a failure --
     which then discarded real progress (dropped the door cache / walked into recovery logic)
     for no reason. Returns as soon as the mummy is found, same early-exit shape as
-    wait_until_player_idle/wait_for_chat_message elsewhere in this codebase."""
+    wait_until_player_idle/wait_for_chat_message elsewhere in this codebase.
+
+    Raised 8.0 -> 12.0 2026-08-17 (user-flagged live, second occurrence of the same class of
+    bug): CONFIRMED via debug log -- door index 1 timed out at ~8s on one entry (misjudged as
+    wrong, sent through the abandoned-room recovery path) and then reached the mummy in ~6s on
+    the very next attempt at the SAME cached index, with no code path in between that could have
+    changed which physical door index 1 points at. The only explanation consistent with that is
+    the mummy occasionally taking longer than 8s to stream in even on a correct door. Cost of
+    the extra margin is cheap (a few more seconds spent per wrong door, of which there are ~3 on
+    average per outer-door search); cost of a false negative is much higher (a correct door
+    gets treated as wrong, discarding the cached index and forcing a full 4-door re-search)."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         mummy = resolve_mummy()
@@ -427,7 +437,7 @@ def outside_tick(ctx, config, doors: list = None) -> None:
     if not controller.click_entity(ctx.ser, door, check_ui_blockers=False):
         return
     # Let the search-the-door attempt (and possible 1-4 dmg stun on failure) resolve before
-    # polling for the mummy -- wait_for_mummy itself keeps checking for up to 8s rather than a
+    # polling for the mummy -- wait_for_mummy itself keeps checking for up to 12s rather than a
     # single check, since a correct door's mummy can take a few seconds to stream into GET
     # /npcs after the scene transition (see wait_for_mummy's own docstring).
     controller.human_delay(1.0, 1.8)
