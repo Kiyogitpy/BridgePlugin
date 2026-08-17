@@ -58,6 +58,16 @@ SARCOPHAGUS_ID = 26626                          # base object id
 SARCOPHAGUS_CLOSED_IMPOSTOR_ID = 21255          # version "Closed", option "Open" -- the only
                                                  # state this routine ever clicks (see sarco_step)
 
+# CONFIRMED live 2026-08-17 via the debug log's own per-tick snapshots: across a full session
+# these two player animation ids appear 17 times and ONLY ever inside a sarcophagus step -- 4344
+# while an Open attempt is being repeated, 4345 on the tick the sarcophagus actually opens (every
+# single "room_step: sarco -> door" transition in that log is immediately preceded by an
+# anim=4345 snapshot). Used purely as a "the game's own auto-repeat loop is already running,
+# don't click again" gate in sarco_step, backed by SARCOPHAGUS_BUSY_MAX_WAIT_S so a wrong id
+# degrades to a slightly delayed re-click rather than a deadlock.
+SARCOPHAGUS_OPEN_ANIM_IDS = {4344, 4345}
+SARCOPHAGUS_BUSY_MAX_WAIT_S = 20.0
+
 TOMB_DOOR_WALL_IDS = {26618, 26619, 26620, 26621}   # base ids of the 4 physical wall objects
 TOMB_DOOR_CLOSED_ID = 20948                     # impostor, option "Pick-lock"
 TOMB_DOOR_OPENED_ID = 20949                     # impostor, option "Enter"
@@ -536,14 +546,44 @@ def step_back_outside(ctx) -> None:
     controller.human_delay(1.0, 2.0)
 
 
+RUN_START_CONFIRM_TIMEOUT_S = 5.0
+
+
 def lobby_tick(ctx, config, mummy: dict) -> None:
-    """Guardian mummy reachable, no run active -- right-click Start-minigame."""
+    """Guardian mummy reachable, no run active -- right-click Start-minigame.
+
+    BUG, FIXED 2026-08-17 (user-flagged live: "still clicks"; exact same class as quick_leave's
+    own fixed bug below): click_menu_action returning True only means the "Start-minigame" entry
+    was found and clicked -- inRun does not flip for another ~1.5-4s while the game teleports the
+    player into room 1. This used to log "started a new run" and return straight away, so the
+    NEXT tick still read inRun=false, dispatched to the lobby again, and right-clicked the mummy
+    a SECOND time. CONFIRMED live via the debug log on every single run start, e.g.:
+        [06:58:37.332 tick=216] menu-select Start-minigame Guardian mummy
+        [06:58:37.669 tick=216] started a new run
+        [06:58:38.910 tick=217] snapshot ... inCombat=True target=Guardian mummy(100%)
+        [06:58:39.790 tick=217] click_entity target=Guardian mummy(id=1779) at (1007,718)
+        [06:58:40.190 tick=217] [!] No 'Start-minigame' entry in menu for Guardian mummy
+                                    (['Cancel', 'Mark Safespot', 'Walk here']) -- closing it
+        [06:58:40.477 tick=217] key_tap ESC
+    -- i.e. a wasted right-click + menu open + ESC against a mummy the player was already
+    mid-interaction with (identical pair at ticks 83/84 earlier in the same log). Poll for the
+    confirmation in-call instead, same shape as quick_leave's own inRun poll."""
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
-    if controller.click_menu_action(ctx.ser, mummy, "Start-minigame", check_ui_blockers=False):
-        debug_log.log("pyramid_plunder", "started a new run")
-        note_progress(ctx)
-        controller.human_delay(0.8, 1.5)
+    if not controller.click_menu_action(ctx.ser, mummy, "Start-minigame", check_ui_blockers=False):
+        return
+    note_progress(ctx)
+    deadline = time.time() + RUN_START_CONFIRM_TIMEOUT_S
+    while time.time() < deadline:
+        if controller.get_pyramid_plunder().get("inRun"):
+            debug_log.log("pyramid_plunder", "started a new run")
+            return
+        time.sleep(0.15)
+    # Unconfirmed: leave it to the next tick's own dispatch rather than claiming success. If the
+    # run really did start, that tick reads inRun=true and never comes back here at all; if the
+    # click genuinely didn't take, retrying it is the correct thing to do.
+    debug_log.log("pyramid_plunder", "Start-minigame click registered but inRun hasn't set yet "
+                                     "-- waiting")
 
 
 def setup(ctx):
@@ -758,6 +798,36 @@ def sarco_step(ctx, config, pp: dict) -> None:
         ctx.state.data["room_step"] = ROOM_STEP_DOOR
         return
 
+    # BUG, FIXED 2026-08-17 (user-flagged live: "still clicks"). Per the wiki
+    # (data/raw/S/"Sarcophagus (Pyramid Plunder).txt": "Failing has no downside, other than
+    # needing to wait a few ticks until you can attempt again - you will automatically keep
+    # attempting to open it until successful"), ONE Open click starts an auto-repeating attempt
+    # loop the player drives entirely on their own. There is nothing to re-click while that loop
+    # is running -- but nothing here noticed it was running: wait_until_player_idle is
+    # deliberately position-only and returns True instantly mid-animation (see its own
+    # docstring), so every tick sailed straight through it and fired another identical click at
+    # the same pixel. CONFIRMED live via the debug log, room 4: three consecutive ticks each
+    # clicking Sarcophagus at exactly (1285,801) -- 06:56:09.980 / 06:56:11.720 / 06:56:13.681 --
+    # with each of those ticks' own snapshots already reporting anim=4344 BEFORE the click. Same
+    # pattern in every other room's sarco step in that log (5 clicks where 1-2 were real).
+    #
+    # This is the same root cause as quick_leave's and lobby_tick's own fixed bugs: re-issuing an
+    # action whose previous attempt has registered but whose effect hasn't landed yet.
+    if controller.get_player().get("animation") in SARCOPHAGUS_OPEN_ANIM_IDS:
+        waiting_since = ctx.state.data.get("sarco_busy_since")
+        if waiting_since is None:
+            waiting_since = time.time()
+            ctx.state.data["sarco_busy_since"] = waiting_since
+        if time.time() - waiting_since < SARCOPHAGUS_BUSY_MAX_WAIT_S:
+            debug_log.log("pyramid_plunder", "already attempting to open the sarcophagus -- "
+                                             "letting the game's own auto-retry run")
+            return
+        # Held the animation implausibly long: either the auto-repeat loop was interrupted
+        # without the animation clearing, or these ids don't mean what the live log implied.
+        # Fall through and re-click rather than waiting on it forever.
+        debug_log.log("pyramid_plunder", "sarcophagus open animation stuck -- re-clicking anyway")
+    ctx.state.data["sarco_busy_since"] = None
+
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
     action_before = controller.get_last_action().get("tick")
@@ -779,7 +849,8 @@ def sarco_step(ctx, config, pp: dict) -> None:
 
     refreshed = controller.get_object_at(sarco.get("x"), sarco.get("y"), sarco.get("plane"), sarco.get("id"))
     if refreshed is not None and refreshed.get("impostorId") == SARCOPHAGUS_CLOSED_IMPOSTOR_ID:
-        debug_log.log("pyramid_plunder", "sarcophagus Open roll failed -- retrying")
+        debug_log.log("pyramid_plunder", "sarcophagus Open roll failed -- the game keeps "
+                                         "attempting on its own")
         return
     ctx.state.data["room_step"] = ROOM_STEP_DOOR
 
@@ -800,6 +871,18 @@ def find_exit_doors(objs: list) -> list:
                       if o.get("id") not in TOMB_DOOR_WALL_IDS]
     candidates.sort(key=lambda o: o.get("distance", 9999))
     return candidates
+
+
+# RAISED 2.0 -> 5.0 2026-08-17. CONFIRMED live via the debug log: the 2.0s window never once
+# confirmed -- all three quick-leaves in that session (ticks 12, 80, 214) hit the timeout and
+# logged "inRun hasn't cleared yet" even though the leave had in fact gone through, landing the
+# player outside within the next tick or two (e.g. click at 06:53:35.255, timeout at
+# 06:53:37.491, already outside the pyramid by 06:53:38.991). So the success branch below --
+# including its reset_run_state() -- was structurally dead code, the log line was actively
+# misleading, and one of the three (tick 12 -> 13) did re-click Quick-leave a second time before
+# the first had registered. inRun is observed flipping ~2.2-4.2s after the click; 5.0s covers
+# that with real margin while still returning immediately on confirmation.
+QUICK_LEAVE_CONFIRM_TIMEOUT_S = 5.0
 
 
 def quick_leave(ctx, config) -> None:
@@ -841,7 +924,7 @@ def quick_leave(ctx, config) -> None:
     for exit_door in exit_doors[:3]:
         if controller.click_menu_action(ctx.ser, exit_door, "Quick-leave",
                                          offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False):
-            deadline = time.time() + 2.0
+            deadline = time.time() + QUICK_LEAVE_CONFIRM_TIMEOUT_S
             left = False
             while time.time() < deadline:
                 if not controller.get_pyramid_plunder().get("inRun", True):
