@@ -688,18 +688,33 @@ def trap_step(ctx, config, pp: dict) -> None:
     sarcophagus/doors at all, or just an optional bonus-XP obstacle -- see design doc. Either
     way, disarming it first is a safe default (10 xp, minor 1-4 dmg risk on a failed attempt).
 
-    BUG, FIXED 2026-08-17 (user-flagged live): "we succesfully deactivated it and went past but
-    then deactivated it on the other side and went back again meaning we are stuck in a loop
-    trying to run to the gold chest but take dmg from the trap over and over" -- some rooms
-    genuinely have more than one spear trap tile blocking the path (CONFIRMED live: the debug
-    log shows exactly two real, non-miss trap resolutions per room in the overwhelming common
-    case). Always re-picking the single CLOSEST candidate every attempt, with no memory of
-    which tile keeps failing, could get stuck alternating between two candidates that both keep
-    failing (or one whose approach path requires stepping onto the OTHER trap first, taking
-    incidental damage) with no way to break the cycle. TRAP_SWAP_FAIL_LIMIT tracks consecutive
-    fails per tile (ctx.state.data["trap_fail_tiles"]) and temporarily deprioritizes a tile once
-    it's failed twice in a row, falling back to trying every candidate again if all of them are
-    currently deprioritized (never gets permanently stuck)."""
+    BUG, FIXED 2026-08-17 (user-flagged live, multiple rounds): "we succesfully deactivated it
+    and went past but then deactivated it on the other side and went back again meaning we are
+    stuck in a loop trying to run to the gold chest but take dmg from the trap over and over."
+    User clarified the actual room layout: 4 spear traps total, 2 on the entry side and 2 on the
+    chest side. Disarming the 2 entry-side traps auto-walks the player across to the chest side
+    -- but pp["trapActive"] apparently still reads true there (reflecting the chest side's own,
+    separate, never-actually-blocking traps), so this function kept trying to disarm THOSE too,
+    and disarming a trap on that side auto-walks back across to the entry side, repeating
+    forever. trapActive alone isn't sufficient evidence that a trap still needs disarming --
+    reaching the chest side (the chest itself becomes visible) is the real completion signal,
+    checked first and unconditionally, before ever consulting trapActive.
+
+    Earlier fix, still in place beneath this one: some rooms genuinely have more than one spear
+    trap tile blocking a single side's path (CONFIRMED live: the debug log shows exactly two
+    real, non-miss trap resolutions per room in the overwhelming common case). Always re-picking
+    the single CLOSEST candidate every attempt, with no memory of which tile keeps failing, could
+    get stuck alternating between two candidates that both keep failing (or one whose approach
+    path requires stepping onto the OTHER trap first, taking incidental damage) with no way to
+    break the cycle. TRAP_SWAP_FAIL_LIMIT tracks consecutive fails per tile
+    (ctx.state.data["trap_fail_tiles"]) and temporarily deprioritizes a tile once it's failed
+    twice in a row, falling back to trying every candidate again if all of them are currently
+    deprioritized (never gets permanently stuck)."""
+    if find_object_by_id(controller.get_objects(radius=15), GRAND_GOLD_CHEST_ID) is not None:
+        debug_log.log("pyramid_plunder", "chest already visible -- already past the traps, skipping straight to it")
+        ctx.state.data["room_step"] = ROOM_STEP_CHEST
+        return
+
     if not pp.get("trapActive"):
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         return
