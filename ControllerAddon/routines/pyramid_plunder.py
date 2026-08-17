@@ -727,8 +727,20 @@ def sarco_step(ctx, config, pp: dict) -> None:
         if not controller.wait_until_player_idle(timeout_s=5.0):
             return
         controller.click_entity(ctx.ser, sarco, check_ui_blockers=False)   # "Open"
-        controller.human_delay(1.0, 2.0)
-        return  # re-poll next tick; opening (21257) then opened (21256) are handled above
+
+        # user-flagged 2026-08-17: re-clicking "Open" while a successful attempt's animation is
+        # still playing RESETS it, wasting real time -- same lesson as the Search-click
+        # confirmation above, applied here too. Poll for the object's own impostorId to actually
+        # change (whichever comes first: 21257 "Opening" mid-animation, or straight to 21256
+        # "Opened" if that transition is fast) instead of blindly returning to re-poll on a
+        # fixed short delay regardless of whether the click actually landed on a real attempt.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            refreshed = controller.get_object_at(sarco.get("x"), sarco.get("y"), sarco.get("plane"), sarco.get("id"))
+            if refreshed is not None and refreshed.get("impostorId") != SARCOPHAGUS_CLOSED_IMPOSTOR_ID:
+                break
+            time.sleep(0.3)
+        return  # re-poll next tick regardless; opening (21257) then opened (21256) are handled above
 
     debug_log.log("pyramid_plunder", f"sarcophagus in unexpected state (impostorId={impostor}) "
                                      f"-- moving on to the doors")
