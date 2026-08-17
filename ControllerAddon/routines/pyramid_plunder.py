@@ -802,8 +802,9 @@ def sarco_step(ctx, config, pp: dict) -> None:
         # We don't need to wait it out (clicking through it wouldn't cancel it), but moving
         # straight to a tomb door click here can visibly overlap the tail of that animation.
         # Small fixed settle delay, not the usual human_delay range -- this isn't approximating
-        # human reaction time, just giving the animation a moment to finish.
-        controller.human_delay(0.3, 0.4)
+        # human reaction time, just giving the animation a moment to finish. Raised 0.3-0.4 ->
+        # 0.5-0.7 2026-08-17 (user-flagged live: still not enough).
+        controller.human_delay(0.5, 0.7)
         ctx.state.data["room_step"] = ROOM_STEP_DOOR
         return
 
@@ -861,7 +862,7 @@ def sarco_step(ctx, config, pp: dict) -> None:
         debug_log.log("pyramid_plunder", "sarcophagus Open roll failed -- the game keeps "
                                          "attempting on its own")
         return
-    controller.human_delay(0.3, 0.4)  # same settle-time note as the branch above
+    controller.human_delay(0.5, 0.7)  # same settle-time note as the branch above
     ctx.state.data["room_step"] = ROOM_STEP_DOOR
 
 
@@ -1079,6 +1080,44 @@ def attempt_door_click(ctx, door: dict, room: int):
             break
 
     if xp_gained:
+        # user-flagged 2026-08-17, direct correction after live-observing their own account:
+        # "you think we need to press enter after we pick? thats not necessary it does it
+        # automaticly if it was the right door." Only a WRONG door needs a manual Enter click
+        # after Pick-lock succeeds (to walk through and reveal the dead-end message) -- the
+        # CORRECT door auto-transfers the player the instant the pick succeeds, no second click
+        # at all. Blindly chaining into an Enter click on every flipped_open (the old behavior)
+        # could fire that click against a door that no longer exists because the room had
+        # already changed out from under it -- this is the exact mechanism behind a stray
+        # dialogue box + silent full ejection back outside the pyramid CONFIRMED live in the
+        # debug log (a "picked open" immediately followed by dialogOpen=True, then the very next
+        # tick already back at the outer anonymous doors with no dead_end/advanced message ever
+        # logged for that attempt).
+        #
+        # xp_gained fires the instant XP lands, which can be a beat before a genuine auto-
+        # transfer actually completes -- so give it a short extra window (position-jump first,
+        # same frame-to-frame idiom as below; roomNumber/inRun as a fallback) to resolve as
+        # "advanced" before ever treating this as "flipped_open" and clicking Enter.
+        transfer_deadline = time.time() + 1.0
+        while time.time() < transfer_deadline:
+            time.sleep(0.1)
+            pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
+            if None not in pos and None not in prev_pos \
+                    and math.hypot(pos[0] - prev_pos[0], pos[1] - prev_pos[1]) > POSITION_JUMP_THRESHOLD:
+                debug_log.log("pyramid_plunder", "auto-transferred after a successful pick -- no Enter needed")
+                ctx.state.data["room_step"] = ROOM_STEP_TRAP
+                ctx.state.data["door_attempt"] = 0
+                ctx.state.data["dead_end_doors"] = []
+                ctx.state.data["door_enter_attempts"] = {}
+                return "advanced", door
+            prev_pos = pos
+        fresh_pp = controller.get_pyramid_plunder()
+        if fresh_pp.get("inRun") and fresh_pp.get("roomNumber", room) > room:
+            debug_log.log("pyramid_plunder", f"auto-transferred to room {fresh_pp.get('roomNumber')} after a successful pick -- no Enter needed")
+            ctx.state.data["room_step"] = ROOM_STEP_TRAP
+            ctx.state.data["door_attempt"] = 0
+            ctx.state.data["dead_end_doors"] = []
+            ctx.state.data["door_enter_attempts"] = {}
+            return "advanced", door
         refreshed = controller.get_object_at(door.get("x"), door.get("y"), door.get("plane"), door.get("id"))
         return "flipped_open", (refreshed if refreshed is not None else door)
 
