@@ -29,6 +29,44 @@ PYRAMID_REGION_ID = 7749
 
 SPEAR_TRAP_ID = 21280
 
+# THE SPEAR TRAP IS A GATE YOU *PASS THROUGH*, NOT SOMETHING YOU DISARM IN PLACE. This is the
+# single most load-bearing fact in this file and every earlier fix attempt at the "oscillation
+# bug" got it wrong, which is why the bug kept coming back.
+#
+# CONFIRMED 2026-08-17 from data/raw/S/Speartrap.txt (wiki infobox, id 21280):
+#     |options = Pass
+#     "A speartrap can be found at the beginning of every room ... When one clicks the trap,
+#      they will try to pass it. Successfully passing the trap will give 10 Thieving experience."
+# and its |map= pin list, which gives the exact tile layout of all 8 gates (one per room):
+#     1925/1927 x 4427/4428    1926/1928 x 4472/4473    1930/1931 x 4451/4453
+#     1943/1945 x 4424/4425    1953/1955 x 4473/4474    1961/1962 x 4443/4445
+#     1973/1975 x 4423/4424    1975/1977 x 4465/4466
+# i.e. every room has exactly ONE gate made of FOUR Speartrap objects: two flanking each side of
+# a one-tile-wide passage, two tiles deep. That is precisely the user's "there is 4 traps in
+# total, 2 on one side you enter and 2 on the other" -- not two separate gates at opposite ends
+# of the room, and not four independently-disarmable traps.
+#
+# Consequences, all of which the pre-2026-08-17 code got wrong:
+#   * The click is a TRAVERSAL. Success moves the player to the OTHER SIDE of the gate. Clicking
+#     a speartrap again afterwards walks them straight back through it -- which is the entire
+#     "we went past then went back again" loop the user kept reporting. CONFIRMED live in
+#     logs/debug_2026-08-17_09-42-58.log, room 4 (gate at x=1930/1931):
+#         09:46:52.945 click Speartrap  -> player walks 1927 -> 1929
+#         09:46:55.818 "no confirming signal within the window (1x) -- retrying"
+#         09:46:59.626 click Speartrap  -> player crosses east to 1932
+#         09:47:02.776 "no confirming signal within the window (1x) -- retrying"
+#         09:47:04.424 pos=(1930,4452)  -- back INSIDE the gate, heading west again
+#   * The old 2.5s confirmation window measured from the click was far too short: the click
+#     usually has to walk the player several tiles to the gate FIRST (observed 3-6s of walking in
+#     the logs above before the Pass even begins), so a genuine success was routinely logged as
+#     "no confirming signal", the trap_disarmed_this_room latch never engaged, and the next tick
+#     re-clicked -- passing the player back the other way. See TRAP_CONFIRM_MAX_WAIT_S.
+#   * The authoritative "this room's gate is done" signal is the game's own NTK_TRAP_ACTIVE
+#     varbit, exposed as /pyramid-plunder's "trapActive" (PyramidPlunderProvider.java).
+#     /pyramid-plunder is NOT behind TickCache, so polling it is a fresh varbit read every time --
+#     it is both faster and far more reliable than the XP/chat heuristics, and it is now the
+#     primary confirmation (XP and chat are kept only as redundant early-outs).
+
 # CONFIRMED live 2026-08-17 (user-reported, screenshot): click_entity's default aim offset
 # (-7, +7) -- already known to systematically miss thin WallObjects like tomb doors, see
 # TOMB_DOOR_AIM_OFFSET's own note -- also misses the spear trap at close range (observed
@@ -694,55 +732,57 @@ TRAP_SWAP_FAIL_LIMIT = 2  # user directive 2026-08-17: swap to a different trap 
 # actually walked over there on their own.
 TRAP_SEARCH_RADIUS = 6
 
+# Post-click confirmation window for a Pass attempt. See the big SPEAR_TRAP_ID note at the top of
+# this file for why the old flat 2.5s-from-the-click window was the actual root cause of the
+# oscillation bug: a trap click routinely has to walk the player several tiles to the gate before
+# the Pass itself is even attempted (3-6s of walking observed live), so the window has to cover
+# the walk, not just the roll.
+#
+# The window therefore runs on a settle timer rather than a fixed deadline: every poll that sees
+# the player's position change pushes the settle deadline out by TRAP_CONFIRM_SETTLE_S, so the
+# window stays open for as long as the player is still travelling and closes ~2.5s after they
+# come to rest. TRAP_CONFIRM_MAX_WAIT_S is the hard cap on the whole thing. A genuine failed roll
+# still returns fast (the failure chat message breaks out immediately, and a failed roll doesn't
+# move the player anyway).
+TRAP_CONFIRM_MAX_WAIT_S = 12.0
+TRAP_CONFIRM_SETTLE_S = 2.5
+
 
 def trap_step(ctx, config, pp: dict) -> None:
-    """Disarm the spear trap if the bridge reports it still armed. A failed attempt is
-    confirmed via the chat message "You fail to deactivate the trap." (user-confirmed, see
-    Global Constraints) -- logged for visibility, but the actual retry is driven by re-polling
-    pp["trapActive"] next tick either way (stays on "trap" until the bridge confirms it's
-    actually disarmed), so a missed/late chat message can't cause a stuck loop.
+    """Get through this room's spear-trap gate. READ THE SPEAR_TRAP_ID NOTE AT THE TOP OF THIS
+    FILE FIRST -- the trap is a one-tile-wide gate you PASS THROUGH (the object's only option is
+    literally "Pass"), not something you disarm from a distance and then walk past freely. Every
+    click is a traversal; clicking again after a successful pass walks the player back to the
+    side they came from. That single fact is the whole of the "we went past the traps, then went
+    back over them again" oscillation bug the user reported five separate times, and every
+    earlier fix in this session missed it because the code (and these comments) modelled the
+    interaction as a stationary "disarm".
 
-    NEEDS LIVE VERIFICATION: whether this is actually mandatory to reach the chest/
-    sarcophagus/doors at all, or just an optional bonus-XP obstacle -- see design doc. Either
-    way, disarming it first is a safe default (10 xp, minor 1-4 dmg risk on a failed attempt).
+    Order of business, and why each piece exists:
 
-    BUG, FIXED 2026-08-17 (user-flagged live, multiple rounds -- final root cause): "the way we
-    can see if we crossed the traps sucessfully is either the thieving 10 experience we get for
-    disabling it OR the message that says 'You deactivate the trap!'" User clarified the actual
-    room layout: 4 spear traps total, 2 on the entry side and 2 on the chest side (the chest
-    itself is ALWAYS interactable/visible regardless of which side the player is on, so an
-    earlier attempt at this fix that checked chest visibility as a "have we crossed" signal was
-    wrong and has been reverted -- it would have skipped straight past every trap in every room).
-    The real, previously-unfixed root cause: "moved" (the player's queued movement resuming) was
-    never a reliable success signal at all, on either side of the room -- a failed attempt can
-    ALSO produce movement (a knockback, or continuing to walk despite taking damage), so
-    "moved"-as-success caused the routine to wrongly believe a trap was disarmed and immediately
-    try the (still-armed) NEXT one, over and over, taking repeated damage. Dropped "moved"
-    entirely; XP and the exact success chat message are the only two things this function ever
-    trusts as confirmation.
+    1. ctx.state.data["trap_disarmed_this_room"] is checked FIRST, before anything else. Once
+       this room's gate is behind us we never touch a speartrap again until the room number
+       changes -- because doing so would physically walk the player back through it. Reset only
+       alongside the rest of the per-room bookkeeping in tick()'s room-number-change block and in
+       reset_run_state; nothing else in this file writes it (verified 2026-08-17).
 
-    Earlier fix, still in place: some rooms genuinely have more than one spear trap tile
-    blocking a single side's path (CONFIRMED live: the debug log shows exactly two real
-    resolutions per room in the overwhelming common case). Always re-picking the single CLOSEST
-    candidate every attempt, with no memory of which tile keeps failing, could get stuck
-    alternating between two candidates that both keep failing (or one whose approach path
-    requires stepping onto the OTHER trap first, taking incidental damage) with no way to break
-    the cycle. TRAP_SWAP_FAIL_LIMIT tracks consecutive fails per tile
-    (ctx.state.data["trap_fail_tiles"]) and temporarily deprioritizes a tile once it's failed
-    twice in a row, falling back to trying every candidate again if all of them are currently
-    deprioritized (never gets permanently stuck).
+    2. pp["trapActive"] (NTK_TRAP_ACTIVE) is the game's own authoritative "this room's gate is
+       still armed" flag. False at entry, or false at any point during the post-click poll below,
+       latches (1) and moves on. This is now the PRIMARY success signal, not a slow fallback.
 
-    BUG, FIXED 2026-08-17 (user directive, the actual final fix for the oscillation bug): "i
-    think we just once we see the message you deactivate the trap we never again touch a trap
-    until next room." Live investigation (chat log check + user confirming the character stayed
-    in the same spot, not a cross-room walk) ruled out the TRAP_SEARCH_RADIUS cross-side theory
-    above -- the real issue was that pp["trapActive"] apparently doesn't reliably reflect "has
-    THIS player already disarmed what they need to," so trusting it at the top of every call
-    could send the routine back into trap-clicking after a confirmed success. Once this
-    function's own XP/chat confirmation fires even once, ctx.state.data["trap_disarmed_this_room"]
-    is set and checked FIRST, before ever consulting trapActive again -- reset alongside the
-    other per-room bookkeeping (dead_end_doors, trap_fail_tiles, ...) whenever the room actually
-    changes."""
+    3. Only if the gate is genuinely still armed do we click, and the post-click confirmation
+       window is sized to cover the WALK to the gate, not just the roll -- see
+       TRAP_CONFIRM_MAX_WAIT_S. Under-sizing that window was the mechanism by which a genuine
+       success got recorded as "no confirming signal", leaving (1) unlatched and letting the next
+       tick re-cross the gate. CONFIRMED live, logs/debug_2026-08-17_09-42-58.log room 4 and
+       logs/debug_2026-08-17_09-52-23.log room 3.
+
+    TRAP_SWAP_FAIL_LIMIT / ctx.state.data["trap_fail_tiles"] remain as a stuck-breaker: the gate
+    is four separate objects and a particular one can be awkward to click from where the player
+    happens to be standing, so a tile that fails twice in a row is deprioritized (never excluded
+    outright -- if every candidate is deprioritized they all become eligible again). With
+    trapActive now confirming successes properly this should rarely fire at all; it used to fire
+    constantly, on successes being misread as failures."""
     if ctx.state.data.get("trap_disarmed_this_room"):
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         return
@@ -758,6 +798,9 @@ def trap_step(ctx, config, pp: dict) -> None:
         # trapActive flip true again (the far side's own separate traps) walked straight back
         # into trap-clicking. trapActive=false is just as much a genuine "done with traps this
         # room" signal as our own confirmation, so it latches the same way.
+        if not ctx.state.data.get("trap_disarmed_this_room"):
+            debug_log.log("pyramid_plunder", "trapActive is already clear for this room -- "
+                                             "latching and moving on to the chest")
         ctx.state.data["trap_disarmed_this_room"] = True
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         return
@@ -777,6 +820,20 @@ def trap_step(ctx, config, pp: dict) -> None:
     # click (wait_until_player_idle can block up to 5s), so re-resolve fresh immediately before
     # picking -- not a one-time pick at function entry.
     candidates = find_objects_by_id(controller.get_objects(radius=TRAP_SEARCH_RADIUS), SPEAR_TRAP_ID) or candidates
+
+    # Last-moment re-check of the authoritative flag. wait_until_player_idle above can block for
+    # up to 5s, and `pp` was read at the very top of tick() -- so the gate can already have been
+    # cleared (by the previous tick's own click finally resolving) by the time we get here.
+    # Clicking a speartrap at that point does not "re-disarm" anything, it PASSES THE PLAYER BACK
+    # THROUGH THE GATE (see the SPEAR_TRAP_ID note). This closes the last window in which that
+    # could still happen.
+    if not controller.get_pyramid_plunder().get("trapActive", True):
+        debug_log.log("pyramid_plunder", "trapActive cleared while we were waiting to click -- "
+                                         "latching instead of passing back through the gate")
+        ctx.state.data["trap_disarmed_this_room"] = True
+        ctx.state.data["room_step"] = ROOM_STEP_CHEST
+        return
+
     trap_fail_tiles = dict(ctx.state.data.get("trap_fail_tiles", {}))
     usable = [t for t in candidates if trap_fail_tiles.get(trap_key(t), 0) < TRAP_SWAP_FAIL_LIMIT]
     trap = (usable or candidates)[0]  # closest usable candidate; if all are deprioritized, try everything again
@@ -784,7 +841,14 @@ def trap_step(ctx, config, pp: dict) -> None:
     action_before = controller.get_last_action().get("tick")
     before_pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
     xp_before = controller.get_player().get("thievingXp")
-    controller.click_entity(ctx.ser, trap, check_ui_blockers=False)
+    # BUG, FIXED 2026-08-17: SPEAR_TRAP_AIM_OFFSET has existed (with a "CONFIRMED live" note
+    # explaining that click_entity's default (-7, +7) bias makes a close-range speartrap click
+    # resolve to a plain "Walk here" -- i.e. the player walks INTO the trap tile instead of
+    # passing it) but was never actually passed to click_entity: this call used the default the
+    # whole time. That is a second, independent contributor to the same visible symptom -- a
+    # Walk-here misresolution walks the player onto/through the gate with no Pass attempt and no
+    # confirming signal, which is exactly what the "click missed" branch below then has to mop up.
+    controller.click_entity(ctx.ser, trap, offset=SPEAR_TRAP_AIM_OFFSET, check_ui_blockers=False)
 
     # BUG, FIXED 2026-08-17 (user-flagged live: "still doesnt seem like we click the closest
     # speartrap?"). Diagnostic logging on the "moved" branch below (added earlier this session
@@ -809,19 +873,36 @@ def trap_step(ctx, config, pp: dict) -> None:
         controller.wait_until_player_idle(timeout_s=2.0)
         return
 
-    # user directive 2026-08-17 (final root-cause fix): only two signals are ever trusted as
-    # confirmation -- Thieving XP (lands the moment the client's own StatChanged event fires,
-    # same sub-tick idiom as the tomb-door Pick-lock confirmation) and the exact chat message
-    # "You deactivate the trap!" (user-specified). "moved" is no longer checked at all: a failed
-    # attempt can ALSO produce player movement (a knockback, or continuing to walk despite
-    # taking damage), which is exactly what caused the oscillation bug across multiple earlier
-    # fix attempts this session. The confirmed-fail message and "Ouch!" (the generic OSRS
-    # damage-taken message) are still checked, purely for fail-count bookkeeping (the swap
-    # mechanic) and logging -- neither one is required for correctness, since simply not seeing
-    # a success signal is already enough to keep retrying.
-    deadline = time.time() + 2.5
-    xp_gained = disarmed = failed = False
-    while time.time() < deadline:
+    # ROOT-CAUSE FIX 2026-08-17 (see the big SPEAR_TRAP_ID note at the top of this file for the
+    # full account and the live log lines). Two changes, both essential:
+    #
+    # 1. pp["trapActive"] (the game's own NTK_TRAP_ACTIVE varbit) is now the PRIMARY confirmation,
+    #    polled in-loop rather than only re-read on some later tick. It is authoritative -- it is
+    #    the game's own "this room's gate is still armed" flag -- and /pyramid-plunder is not
+    #    behind TickCache, so each poll is a fresh varbit read. XP and the "you deactivate the
+    #    trap" chat message are kept as redundant early-outs, not as the only evidence.
+    #
+    # 2. The window is no longer a flat 2.5s from the click. A trap click usually has to walk the
+    #    player several tiles to the gate before the Pass is even attempted (3-6s of walking
+    #    observed live), so the old window expired mid-walk and reported genuine successes as "no
+    #    confirming signal" -- which left trap_disarmed_this_room unlatched and let the very next
+    #    tick click the gate again, passing the player straight back to the side they came from.
+    #    The settle timer below keeps the window open while the player is still travelling and
+    #    closes it ~TRAP_CONFIRM_SETTLE_S after they come to rest, capped by
+    #    TRAP_CONFIRM_MAX_WAIT_S. A real failed roll still exits immediately on its chat message
+    #    (and doesn't move the player anyway, so the settle timer closes fast regardless).
+    #
+    # "moved" is still never treated as success on its own: a failed attempt can also produce
+    # movement, and -- now that the mechanic is understood -- so can a Pass in the WRONG
+    # direction. Movement only ever extends the observation window here, it never confirms.
+    hard_deadline = time.time() + TRAP_CONFIRM_MAX_WAIT_S
+    settle_deadline = time.time() + TRAP_CONFIRM_SETTLE_S
+    last_pos = before_pos
+    xp_gained = disarmed = failed = trap_cleared = False
+    while time.time() < hard_deadline:
+        if not controller.get_pyramid_plunder().get("trapActive", True):
+            trap_cleared = True
+            break
         xp = controller.get_player().get("thievingXp")
         if xp is not None and xp_before is not None and xp > xp_before:
             xp_gained = True
@@ -848,11 +929,20 @@ def trap_step(ctx, config, pp: dict) -> None:
             if "you deactivate the trap" in text:
                 disarmed = True
                 break
+        # Still walking to the gate -> keep the window open. Stopped and stayed stopped for
+        # TRAP_CONFIRM_SETTLE_S -> the attempt has fully resolved one way or the other, stop
+        # waiting (rather than burning the full hard cap on every genuine failure).
+        pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
+        if pos != last_pos:
+            last_pos = pos
+            settle_deadline = time.time() + TRAP_CONFIRM_SETTLE_S
+        elif time.time() >= settle_deadline:
+            break
         time.sleep(0.15)
 
     key = trap_key(trap)
 
-    if xp_gained or disarmed:
+    if xp_gained or disarmed or trap_cleared:
         # user directive 2026-08-17: "the moment we get xp we can click gold chest" -- chain
         # straight into chest_step's own click right here instead of just setting room_step and
         # waiting for the next external tick's own pp["trapActive"] re-check to notice the
@@ -862,8 +952,10 @@ def trap_step(ctx, config, pp: dict) -> None:
         trap_fail_tiles.pop(key, None)
         ctx.state.data["trap_fail_tiles"] = trap_fail_tiles
         ctx.state.data["trap_disarmed_this_room"] = True
-        reason = "XP" if xp_gained else "chat message"
-        debug_log.log("pyramid_plunder", f"trap disarmed ({reason} confirmed) -- clicking the chest immediately")
+        reason = ("trapActive cleared" if trap_cleared
+                  else "XP" if xp_gained else "chat message")
+        debug_log.log("pyramid_plunder", f"trap passed ({reason} confirmed) -- latching "
+                                         f"trap_disarmed_this_room and clicking the chest immediately")
         ctx.state.data["room_step"] = ROOM_STEP_CHEST
         chest_step(ctx, config, pp)
         return
@@ -872,11 +964,13 @@ def trap_step(ctx, config, pp: dict) -> None:
     ctx.state.data["trap_fail_tiles"] = trap_fail_tiles
     reason = "failed the roll" if failed else "no confirming signal within the window"
     debug_log.log("pyramid_plunder", f"spear trap attempt {reason} ({trap_fail_tiles[key]}x) -- retrying")
-    # Re-polled next tick via pp["trapActive"] either way -- stays on "trap" until the bridge
-    # confirms it's actually disarmed, so a failed/ambiguous attempt naturally retries instead
-    # of advancing early. A tile that hits TRAP_SWAP_FAIL_LIMIT gets deprioritized (not excluded
-    # outright) by the candidate selection above, so a genuinely single-trap room still
-    # eventually retries it once every other candidate is exhausted.
+    # Reaching here now genuinely means the gate is still armed and the player is still on the
+    # near side: the loop above only exits without a success flag after re-reading trapActive
+    # (authoritative) on its final iteration, so an unnoticed success can no longer leak through
+    # to a retry that would pass the player back across the gate. A tile that hits
+    # TRAP_SWAP_FAIL_LIMIT gets deprioritized (not excluded outright) by the candidate selection
+    # above, so a genuinely stubborn single tile still eventually gets retried once every other
+    # candidate is exhausted.
 
 
 def chest_step(ctx, config, pp: dict) -> None:
