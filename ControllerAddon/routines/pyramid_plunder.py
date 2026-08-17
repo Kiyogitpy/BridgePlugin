@@ -688,17 +688,28 @@ def trap_step(ctx, config, pp: dict) -> None:
     trap = find_object_by_id(controller.get_objects(radius=15), SPEAR_TRAP_ID) or trap
     since_tick = controller.get_last_chat_message().get("tick")
     before_pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
+    xp_before = controller.get_player().get("thievingXp")
     controller.click_entity(ctx.ser, trap, check_ui_blockers=False)
 
-    # CONFIRMED live 2026-08-17 (user directive): a successful disarm lets the player's own
+    # user directive 2026-08-17: disarming grants 10 Thieving XP (per the wiki), and that XP
+    # lands the moment the client's own StatChanged event fires -- same sub-tick idiom as the
+    # tomb-door Pick-lock confirmation (see CLAUDE.md's "XP gain is another sub-tick,
+    # general-purpose signal" note), faster and more definitive than waiting on movement to
+    # resume or pp["trapActive"] to catch up on a later external tick. Checked first in the
+    # loop below since it's the fastest, most reliable signal available.
+    #
+    # CONFIRMED live 2026-08-17 (user directive): a successful disarm ALSO lets the player's own
     # queued movement resume immediately (they start walking past the trap); a failed attempt
-    # leaves them standing still. Poll for whichever resolves first -- movement starting (a
-    # fast, positive success signal) or the confirmed fail message -- instead of always
-    # blocking out the full fail-message timeout even on the success path, where no such
-    # message is ever coming.
+    # leaves them standing still. Kept as a fallback alongside XP, and the confirmed fail message
+    # as a third -- whichever resolves first, instead of always blocking out the full
+    # fail-message timeout even on the success path, where no such message is ever coming.
     deadline = time.time() + 2.5
-    moved = failed = False
+    xp_gained = moved = failed = False
     while time.time() < deadline:
+        xp = controller.get_player().get("thievingXp")
+        if xp is not None and xp_before is not None and xp > xp_before:
+            xp_gained = True
+            break
         pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
         if None not in pos and pos != before_pos:
             moved = True
@@ -710,6 +721,18 @@ def trap_step(ctx, config, pp: dict) -> None:
             failed = True
             break
         time.sleep(0.15)
+
+    if xp_gained:
+        # user directive 2026-08-17: "the moment we get xp we can click gold chest" -- chain
+        # straight into chest_step's own click right here instead of just setting room_step and
+        # waiting for the next external tick's own pp["trapActive"] re-check to notice the
+        # disarm (bridge-state-gated, tick-capped). chest_step does its own fresh object lookup,
+        # state check, click, and room_step advance -- calling it directly here is exactly
+        # equivalent to how the next tick would have handled it, just without the wait.
+        debug_log.log("pyramid_plunder", "trap disarmed (XP confirmed) -- clicking the chest immediately")
+        ctx.state.data["room_step"] = ROOM_STEP_CHEST
+        chest_step(ctx, config, pp)
+        return
 
     if moved:
         controller.wait_until_player_idle(timeout_s=3.0)
@@ -793,8 +816,9 @@ def sarco_step(ctx, config, pp: dict) -> None:
         # straight to a tomb door click here can visibly overlap the tail of that animation.
         # Small fixed settle delay, not the usual human_delay range -- this isn't approximating
         # human reaction time, just giving the animation a moment to finish. Raised 0.3-0.4 ->
-        # 0.5-0.7 -> 0.7-0.9 2026-08-17 (user-flagged live twice: still not enough).
-        controller.human_delay(0.7, 0.9)
+        # 0.5-0.7 -> 0.7-0.9 -> 1.2-1.4 2026-08-17 (user-flagged live three times: still not
+        # enough).
+        controller.human_delay(1.2, 1.4)
         ctx.state.data["room_step"] = ROOM_STEP_DOOR
         return
 
@@ -852,7 +876,7 @@ def sarco_step(ctx, config, pp: dict) -> None:
         debug_log.log("pyramid_plunder", "sarcophagus Open roll failed -- the game keeps "
                                          "attempting on its own")
         return
-    controller.human_delay(0.7, 0.9)  # same settle-time note as the branch above
+    controller.human_delay(1.2, 1.4)  # same settle-time note as the branch above
     ctx.state.data["room_step"] = ROOM_STEP_DOOR
 
 
