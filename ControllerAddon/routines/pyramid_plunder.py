@@ -815,9 +815,18 @@ def quick_leave(ctx, config) -> None:
     trap/chest/sarco a second time inside the SAME still-current room (roomNumber/inRun hadn't
     changed yet), redundantly re-clicking an already-searched chest and already-open sarcophagus.
     Harmless once the sarco success-check above is fixed (both no-op correctly on a second pass),
-    but still wasted real time every single final room. Poll briefly for inRun to actually flip
-    false before resetting -- same "confirm the state change, don't assume the click == the
-    outcome" idiom as attempt_door_click's flipped_open check."""
+    but still wasted real time every single final room.
+
+    REGRESSION, FIXED 2026-08-17: the first attempt at "poll briefly for inRun to actually flip
+    false" added the poll but never gated on its result -- reset_run_state() ran unconditionally
+    after the loop regardless of whether it broke early (confirmed) or simply timed out
+    (unconfirmed), so a slow-to-process leave still reset immediately, reproducing the exact bug
+    the poll was meant to fix. CONFIRMED live via the debug log: two consecutive
+    "quick-left ... restarting" messages 4 ticks apart, room_step visibly cycling
+    door->trap->chest->sarco->door twice in the same still-current room. Now only resets (and
+    logs success) on a CONFIRMED inRun==false; a timeout logs and returns instead, leaving
+    room_step untouched so the next tick's door_step naturally retries quick_leave from
+    scratch -- no redundant reset, no re-walking the room's own steps."""
     exit_doors = find_exit_doors(controller.get_objects(radius=15))
     if not exit_doors:
         debug_log.log("pyramid_plunder", "no exit door found in the final room -- waiting")
@@ -833,10 +842,16 @@ def quick_leave(ctx, config) -> None:
         if controller.click_menu_action(ctx.ser, exit_door, "Quick-leave",
                                          offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False):
             deadline = time.time() + 2.0
+            left = False
             while time.time() < deadline:
                 if not controller.get_pyramid_plunder().get("inRun", True):
+                    left = True
                     break
                 time.sleep(0.15)
+            if not left:
+                debug_log.log("pyramid_plunder", "quick-leave click registered but inRun hasn't "
+                                                  "cleared yet -- retrying")
+                return
             debug_log.log("pyramid_plunder", f"quick-left room {config['lastRoomToLoot']} -- run complete, restarting")
             reset_run_state(ctx)
             return
