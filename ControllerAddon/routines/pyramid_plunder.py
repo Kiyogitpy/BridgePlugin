@@ -29,6 +29,14 @@ PYRAMID_REGION_ID = 7749
 
 SPEAR_TRAP_ID = 21280
 
+# CONFIRMED live 2026-08-17 (user-reported, screenshot): click_entity's default aim offset
+# (-7, +7) -- already known to systematically miss thin WallObjects like tomb doors, see
+# TOMB_DOOR_AIM_OFFSET's own note -- also misses the spear trap at close range (observed
+# standing 1 tile away): the click kept resolving to "Walk here" onto the trap's own tile
+# instead of Disarm, so the player just walked into it repeatedly with no progress. Aim
+# dead-center instead, same fix as the tomb doors.
+SPEAR_TRAP_AIM_OFFSET = (0, 0)
+
 # BASE ids vs IMPOSTOR ids -- this distinction is load-bearing for every stateful object below,
 # and getting it backwards silently breaks the whole routine (it did, in this file's first
 # draft). ObjectProvider.java puts GameObject.getId() -- the multiloc BASE id, which never
@@ -598,6 +606,13 @@ def trap_step(ctx, config, pp: dict) -> None:
 
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
+    # user-flagged 2026-08-17 (screenshot): standing near the trap and clicking a copy resolved
+    # before this wait kept walking the player INTO the trap tile instead of disarming it --
+    # the `trap` object picked at the top of this function can be stale by the time we actually
+    # click (wait_until_player_idle can block up to 5s), and re-checking for whichever spear
+    # trap is genuinely closest right now, immediately before the click, is the fix -- not a
+    # one-time pick at function entry.
+    trap = find_object_by_id(controller.get_objects(radius=15), SPEAR_TRAP_ID) or trap
     since_tick = controller.get_last_chat_message().get("tick")
     before_pos = (controller.get_player().get("localX"), controller.get_player().get("localY"))
     controller.click_entity(ctx.ser, trap, check_ui_blockers=False)
