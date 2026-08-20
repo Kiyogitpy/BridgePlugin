@@ -293,6 +293,100 @@ def find_item(name: str):
     )
 
 
+# The four sides in clockwise order. Index arithmetic below depends on this ordering.
+SIDES = ("north", "east", "south", "west")
+
+# CONFIRMED by the user 2026-08-20: "Start-golem" deducts 4 raw sunstone on that first click,
+# not 1 -- this module's header comment previously claimed 1 (self-flagged there as n=1) and was
+# wrong. Matches the reference plugin's own hasGolemMaterials() gate (sunstoneCount < 4 blocks a
+# start). Each golem also needs 1 core, itself 1 raw sunstone chiselled 1-for-1, so a golem
+# costs 5 sunstone-equivalents and SUNSTONE_PER_TRIP=20 / CORES_PER_TRIP=4 balances exactly.
+SUNSTONE_PER_GOLEM = 4
+CORES_PER_GOLEM = 1
+
+
+def side_order(start: str, insert_side: str) -> list:
+    """All four sides from `start`, rotating in whichever direction reaches `insert_side` last.
+
+    Direction rule is the reference plugin's isClockwise: clockwise when the clockwise distance
+    to the insert side is at least the counter-clockwise one. Note this returns all four sides
+    regardless of whether they are carved -- carve_plan does the filtering."""
+    start_index = SIDES.index(start)
+    insert_index = SIDES.index(insert_side)
+    clockwise = (insert_index - start_index) % 4
+    counter = (start_index - insert_index) % 4
+    step = 1 if clockwise >= counter else 3
+    return [SIDES[(start_index + i * step) % 4] for i in range(4)]
+
+
+def can_end_on_insert(start: str, insert_side: str) -> bool:
+    """True iff a full four-side rotation from `start` finishes on `insert_side`.
+
+    Four steps from `start` land on `start + 3` (clockwise) or `start + 1` (counter-clockwise),
+    so this holds only when `start` is one of `insert_side`'s two neighbours -- starting ON the
+    insert side, or opposite it, makes ending there impossible. Both plinths insert from a
+    north/south side, so east and west are the only valid starts for either. That is exactly why
+    the reference plugin's StartDirection enum contains only EAST and WEST; the restriction reads
+    as arbitrary until this is derived."""
+    return side_order(start, insert_side)[-1] == insert_side
+
+
+def choose_start_side(station: dict, player_x: int, player_y: int) -> str:
+    """Whichever valid start side (east/west, see can_end_on_insert) is nearer to the player.
+
+    Both produce a correct four-side order, so the choice is free -- making it adaptive is what
+    keeps plinth alternation cheap: arriving from the other plinth, carving begins on the near
+    side instead of walking around the golem first."""
+    candidates = [s for s in SIDES if can_end_on_insert(s, station["insertSide"])]
+    return min(
+        candidates,
+        key=lambda s: max(
+            abs(station["sides"][s]["x"] - player_x),
+            abs(station["sides"][s]["y"] - player_y),
+        ),
+    )
+
+
+def carve_plan(station: dict, player_x: int, player_y: int) -> list:
+    """The sides still needing carving, in the order to carve them.
+
+    Reading `done` from the varbits is what makes a resumed run correct for free: whatever the
+    game says is uncarved is what gets carved, with no dependence on ctx.state.data surviving a
+    restart. On a resumed golem whose insert side is already carved the plan will NOT end on the
+    insert side -- that is legal, and craft_phase walks there afterwards. Ending on the insert
+    side is a best-effort saving on fresh golems, never a correctness requirement."""
+    order = side_order(choose_start_side(station, player_x, player_y), station["insertSide"])
+    return [side for side in order if not station["sides"][side]["done"]]
+
+
+def choose_station(stations: list, last_station, player_x: int, player_y: int):
+    """Which plinth to work on next, or None if `stations` is empty.
+
+    Finishing an in-progress golem takes priority, and the more advanced of two in-progress ones
+    goes first -- its 4 sunstone are already spent and unrecoverable, so the shorter the window
+    before it completes, the less a crash can strand. When neither is in progress, alternate away
+    from the just-completed plinth (see the routine's alternation note) rather than waiting out
+    its reset. `last_station` being None -- a fresh start or a restart -- needs no reconciliation:
+    either plinth is correct, so fall through to whichever is nearer."""
+    if not stations:
+        return None
+    in_progress = [s for s in stations if s.get("progress", 0) > 0]
+    if in_progress:
+        return max(in_progress, key=lambda s: s.get("progress", 0))
+    if last_station is not None:
+        others = [s for s in stations if s.get("name") != last_station]
+        if others:
+            return others[0]
+    return min(stations, key=lambda s: max(abs(s["x"] - player_x), abs(s["y"] - player_y)))
+
+
+def has_start_materials(raw_sunstone: int, cores: int) -> bool:
+    """Whether a NEW golem can be started. Counts, not mere existence -- see SUNSTONE_PER_GOLEM:
+    holding 1-3 raw sunstone passed the old existence check, fired a doomed "Start-golem" and
+    burned a full confirmation cycle before the rejection routed to mine."""
+    return raw_sunstone >= SUNSTONE_PER_GOLEM and cores >= CORES_PER_GOLEM
+
+
 def find_object(name: str):
     """Closest visible object whose name contains `name`, within MAX_OBJECT_DISTANCE -- same
     filter shape as blast_furnace.py's find_object/mining.py's pick_rock/banker.py's
