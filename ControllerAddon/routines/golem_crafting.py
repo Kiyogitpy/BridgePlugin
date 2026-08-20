@@ -6,12 +6,13 @@
 #   fur stock actually runs low, otherwise straight back to mining -- with a detour to the Goat
 #   Pit if the bank itself has no usable fur left at all.
 #
-# Fur is withdrawn in FULL and kept compacted in the fur pouch for the mine/chisel legs (so it
-# never competes with raw sunstone for inventory slots -- CONFIRMED live this was a real
-# problem: carrying 14+ loose fur while mining left too few slots to reach a full batch),
-# unpacked only once per crafting batch, right before the first golem needs it, and re-packed
-# before heading back out. See _run_bank_trip's docstring for the full reasoning, and
-# craft_phase's for exactly where the pack/unpack points are.
+# Fur is withdrawn in FULL and kept compacted in the fur pouch throughout -- mining, chiselling,
+# AND crafting -- so it never competes with raw sunstone for inventory slots (CONFIRMED live this
+# was a real problem: carrying 14+ loose fur while mining left too few slots to reach a full
+# batch). REWRITTEN 2026-08-20: it is never unpacked at all -- Insert-core consumes its 1 fur
+# straight from the pouch in the same click that consumes the core (see craft_phase's own
+# docstring and this file's header note on Insert-core below). See _run_bank_trip's docstring for
+# why it's withdrawn loose and compacted only after the bank closes.
 #
 # Full design and research notes: docs/superpowers/specs/2026-08-07-golem-crafting-design.md.
 # Golem Crafting is a member-only Crafting method on Wyrmscraig, released 2026-07-29.
@@ -28,19 +29,23 @@
 #     gets "You've already crafted this side of the golem." with no progress and no error
 #     signal available synchronously (the confirmation chat message can arrive many ticks after
 #     the click, since it's server-side action-queue-delayed -- see on_event below).
-#   - Material cost is front-loaded, not per-side and not core/fur-based: the FIRST side
-#     ("Start-golem") consumes exactly 1 raw Sunstone (not a core!) if available, or fails with
-#     "You don't have enough sunstone to assemble a golem." otherwise; the remaining 3 sides
-#     ("Shape-golem") consume nothing further (confirmed once, n=1 -- if a future live run ever
-#     sees a second side also consume sunstone, that assumption needs revisiting).
-#   - The finishing move is "Insert-core" (not two separate core-then-fur clicks) -- CONFIRMED
-#     live it auto-consumes both 1 Sunstone core AND the best available fur in inventory in one
-#     click, dropping an uncut gem gift on the ground and awarding Crafting XP. It also only
-#     works from a specific side ("You can't insert a sunstone core from this side of the
-#     golem." from the wrong one) -- confirmed working from the same tile "Start-golem" was
-#     used from; not confirmed whether that's coincidental or the actual rule, so craft_phase
-#     below retries every untried side for Insert-core rather than assuming it's always the
-#     start tile.
+#   - Material cost is front-loaded: the FIRST side ("Start-golem") consumes 4 raw Sunstone, all
+#     deducted on that one click -- CONFIRMED by the user 2026-08-20, correcting this comment's
+#     earlier claim of 1 (which was self-flagged as n=1 and was wrong). The remaining 3 sides
+#     ("Shape-golem") consume nothing further. A golem therefore costs 4 raw sunstone + 1 core,
+#     and since a core is 1 raw sunstone chiselled 1-for-1, 5 sunstone-equivalents in total --
+#     which is why SUNSTONE_PER_TRIP (20) and CORES_PER_TRIP (4) balance to exactly 4 golems.
+#     Note this means abandoning a half-carved golem destroys 4 sunstone.
+#   - The finishing move is "Insert-core", which auto-consumes both 1 Sunstone core AND the best
+#     available fur (straight from the fur pouch) in one click, and awards Crafting XP. It is
+#     accepted from exactly ONE side per plinth, fixed: the northern plinth (object 62351) takes
+#     it from its south side, the southern one (62352) from its north. This is no longer
+#     discovered by trial and error -- GolemProvider reports it as `insertSide` on GET /golem.
+#   - Which sides are already carved is read from per-side game state variables via GET /golem,
+#     NOT tracked locally. See
+#     docs/superpowers/specs/2026-08-20-golem-crafting-varbit-overhaul-design.md.
+#   - The gem a finished golem awards goes straight into the gem bag; nothing is left on the
+#     ground unless the bag is full (see GOLEM_LOOT_GROUND_MARKER).
 # REWRITTEN 2026-08-20 to read GET /golem's own state variables directly instead of modeling any
 # of this by hand -- see craft_phase's own docstring and docs/superpowers/specs/2026-08-20-golem-
 # crafting-varbit-overhaul-design.md for the current mechanic.
@@ -340,9 +345,11 @@ def find_object(name: str):
     unbounded scene walk (ObjectProvider.java's own module comment already documents this as a
     measurable source of client stutter, which is exactly why the radius param exists) on every
     single call, several times a tick, and the resulting slowness was enough to blow api_get's
-    default 0.3s timeout on /objects every tick -- every phase using find_object/find_golem_
-    object/find_rocks was silently retrying past this on every call, never actually finding
-    anything, "wrong location?" safety-stops firing even while standing right next to the target.
+    default 0.3s timeout on /objects every tick -- every phase's object lookup (find_object,
+    find_mining_target, and a golem-station lookup since replaced by GET /golem -- see this
+    module's header comment) was silently retrying past this on every call, never actually
+    finding anything, "wrong location?" safety-stops firing even while standing right next to
+    the target.
     Every caller here already filters by this same distance bound afterward, so passing it
     through changes nothing about the result, only how much of the scene has to be walked to
     produce it."""
@@ -541,9 +548,13 @@ def handle_missing_target(ctx, config: dict, location_key: str, miss_counter_key
 
 # How much raw+chiselled sunstone to hold per trip, and how many of those become cores --
 # CORRECTED 2026-08-08 (live session, user-specified batch shape): mine 20, chisel 4 of them into
-# cores, leaving 16 raw sunstone (enough for 4 golems' "Start-golem" cost with plenty of reserve).
-# This is a budget on raw_count + cores_have TOGETHER, not on raw sunstone alone -- see
-# mine_phase's docstring for why that distinction is what fixes the overmining bug.
+# cores, leaving 16 raw sunstone. CORRECTED 2026-08-20: at the confirmed cost of 4 raw sunstone
+# per "Start-golem" (see SUNSTONE_PER_GOLEM above), 16 raw covers exactly 4 golems with ZERO
+# reserve, not "plenty" as this comment previously (and wrongly) claimed -- 4 golems x 4 raw each
+# x 4 cores = 20 sunstone-equivalents in, 20 out, no slack either way. This is exact, not
+# generous, which is worth recording so these two constants aren't "fixed" later on the mistaken
+# belief they're padded. This is a budget on raw_count + cores_have TOGETHER, not on raw sunstone
+# alone -- see mine_phase's docstring for why that distinction is what fixes the overmining bug.
 SUNSTONE_PER_TRIP = 20
 
 # How long mine_phase will wait for raw_count to rise after a click before giving up on it and
@@ -690,10 +701,13 @@ def mine_phase(ctx, config: dict) -> None:
 # How many sunstone cores to chisel per mining trip (== golems per trip, one core each) --
 # CORRECTED 2026-08-08 (live session, user request): chisel_phase used to convert EVERY raw
 # sunstone into a core, which left nothing raw to ever start a NEW golem with ("Start-golem"
-# consumes 1 raw sunstone specifically, not a core -- see this module's header comment).
+# consumes raw sunstone specifically, not a core -- see this module's header comment).
 # User-specified batch shape: mine SUNSTONE_PER_TRIP (20) sunstone, chisel 4 into cores (leaving
-# 16 raw), craft 4 golems (1 raw + 1 core each, 4 of the 16 raw used, 12 carried into the next
-# trip), then mine a fresh batch and repeat.
+# 16 raw), craft 4 golems. CORRECTED 2026-08-20: at the confirmed cost of 4 raw per golem (see
+# SUNSTONE_PER_GOLEM above), that's 4 golems x 4 raw = all 16 remaining raw sunstone used, 0
+# carried into the next trip -- not "1 raw + 1 core each" / partial carry-over as this comment
+# previously (and wrongly) claimed. The batch is exact: 20 sunstone-equivalents mined, 20 spent
+# (16 raw on Start-golem + 4 cores), then mine a fresh batch and repeat.
 CORES_PER_TRIP = 4
 
 # How long to wait, after a chisel click, for the specific conversion to actually be reflected
@@ -1389,10 +1403,9 @@ BANK_KEEP_ITEMS = [
 # specifically because loose fur was competing with raw sunstone for inventory slots during
 # mining; pouching removes that competition entirely (fur costs exactly 1 slot -- the pouch
 # itself -- regardless of how much is stocked), so there's no longer a reason to under-withdraw.
-# Unpacked once per crafting batch (craft_phase, right before the first golem needs it) and
-# re-packed once the batch ends (also craft_phase, before heading back to mine or bank) -- see
-# that function's own comments for the full mine -> chisel -> craft -> (mine | bank) loop this
-# enables: only detour to the bank when the tracked "gc_fur_stock" count actually runs low
+# REWRITTEN 2026-08-20: never unpacked at all -- Insert-core (see craft_phase) consumes its 1 fur
+# straight from the still-packed pouch in the same click that consumes the core. This enables:
+# only detour to the bank when the tracked "gc_fur_stock" count actually runs low
 # (< CORES_PER_TRIP), not every single batch the way an always-empty-after-banking design would.
 
 
@@ -1515,10 +1528,10 @@ def bank_phase(ctx, config: dict) -> None:
 
     CORRECTED 2026-08-08 (live session, user request): no longer empties the fur pouch after
     closing the bank -- _run_bank_trip now deliberately fills it (see that function's own
-    docstring for the pouched-fur design), and unpacking it here would immediately undo that.
-    craft_phase owns unpacking now, once per crafting batch, right before the first golem needs
-    it -- including fur caught while HUNTING, which routes into the pouch the same way (see
-    hunt_phase) and stays there, compacted, until that same craft_phase unpack point.
+    docstring for the pouched-fur design). REWRITTEN 2026-08-20: it is never unpacked again after
+    this, by anything -- Insert-core (see craft_phase) consumes its 1 fur straight from the
+    still-packed pouch. This includes fur caught while HUNTING, which routes into the pouch the
+    same way (see hunt_phase) and stays there, compacted, indefinitely.
 
     CORRECTED 2026-08-07 (caught in task review): the Ferox teleport-fallback branch cannot
     do that same dynamic fur scan -- it has to go through banker.bank_up (its private Ferox
