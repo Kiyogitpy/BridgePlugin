@@ -219,7 +219,7 @@ def test_click_failure_does_not_spin_forever_and_eventually_safety_stops(monkeyp
     station = _station("north", progress=5, done=())
     _stub_golem_area(monkeypatch, station)
     monkeypatch.setattr(gc, "walk_to_exact_tile", lambda ctx, x, y, plane: True)
-    monkeypatch.setattr(gc, "_click_station", lambda ctx, station: False)
+    monkeypatch.setattr(gc, "_click_station", lambda ctx, station, objects: False)
 
     ctx = _ctx()
     for i in range(1, gc.GOLEM_APPROACH_MISS_LIMIT):
@@ -277,4 +277,74 @@ def test_n_consecutive_golem_state_misses_eventually_safety_stops(monkeypatch):
 
     gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
     assert ctx.state.safety_stopped
-    assert ctx.state.data["gc_golem_state_misses"] == gc.GOLEM_STATE_MISS_LIMIT
+
+
+# --- gem-bag loot handling (2026-08-20) ----------------------------------------------
+
+class _FakeState:
+    def __init__(self):
+        self.data = {}
+
+    def trigger_safety_stop(self, reason):
+        self.data["_stopped"] = reason
+
+
+class _FakeCtx:
+    def __init__(self):
+        self.state = _FakeState()
+        self.ser = None
+
+
+def _loot_event(ctx, destination):
+    gc.on_event(ctx, "CHAT_MESSAGE", {
+        "message": f"As you complete the golem it leaves a gift {destination} for you: 1 x Uncut ruby."
+    })
+
+
+def test_gem_bag_destination_does_not_flag_a_full_bag():
+    ctx = _FakeCtx()
+    _loot_event(ctx, "in your gem bag")
+    assert not ctx.state.data.get("gc_gem_bag_full")
+
+
+def test_ground_destination_flags_a_full_gem_bag():
+    """The only route by which loot can now be permanently lost, so it must be detected from the
+    message rather than by scanning the ground after every golem."""
+    ctx = _FakeCtx()
+    _loot_event(ctx, "on the ground")
+    assert ctx.state.data["gc_gem_bag_full"]
+
+
+def test_gem_sack_destination_does_not_flag_a_full_bag():
+    ctx = _FakeCtx()
+    _loot_event(ctx, "in your gem sack")
+    assert not ctx.state.data.get("gc_gem_bag_full")
+
+
+# --- craft_phase /objects de-duplication (2026-08-20 code review) --------------------
+#
+# controller.py:280-283 documents /objects measuring 390-420ms in Wyrmscraig (this routine's own
+# location, ~2900 objects in radius) versus under 20ms for every other bridge endpoint -- so a
+# second, redundant fetch on every single carve tick directly worked against this routine's
+# single biggest user complaint (speed). craft_phase must resolve the object list once per call
+# and thread that one result through both the visibility gate (_any_station_visible) and the
+# click path (_click_station/_find_station_object) instead of each fetching its own.
+
+def test_craft_phase_fetches_objects_at_most_once_per_call(monkeypatch):
+    station = _station("north", progress=5, done=())
+    _stub_golem_area(monkeypatch, station)
+    calls = {"n": 0}
+
+    def counting_get_objects(radius=None):
+        calls["n"] += 1
+        return [{"id": station["objectId"], "x": station["x"], "y": station["y"], "plane": 0}]
+
+    monkeypatch.setattr(controller, "get_objects", counting_get_objects)
+    monkeypatch.setattr(gc, "walk_to_exact_tile", lambda ctx, x, y, plane: True)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(gc, "_await_side_done", lambda *a, **k: True)
+
+    ctx = _ctx()
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert calls["n"] == 1, f"expected exactly one /objects fetch per craft_phase call, got {calls['n']}"

@@ -766,6 +766,13 @@ def chisel_phase(ctx, config: dict) -> None:
 # and craft_phase's use of the "gc_fur_exhausted" flag it sets.
 GOLEM_CHAT_NOT_ENOUGH_FUR = "you need to dress the golem in furs from hunted creatures."
 
+# CONFIRMED by the user 2026-08-20: the gift a finished golem awards goes straight into the gem
+# bag -- there is nothing on the ground to pick up, so the old three-attempt ground-item retry
+# loop (and its 2.0s settle) is gone. The game's own message names the destination, though, and
+# a FULL gem bag drops the gift to the ground instead. Detecting that from the message costs
+# nothing on the common path, where scanning the ground every golem cost ~2s and up to 3 clicks.
+GOLEM_LOOT_GROUND_MARKER = "leaves a gift on the ground"
+
 # CONFIRMED live (user session) -- Goat Pit hunting mechanic, replacing the original wrong
 # plain-click-lures/harvests assumption. See docs/superpowers/specs/2026-08-08-goat-pit-
 # telekinetic-grab-design.md for the full mechanic writeup.
@@ -832,6 +839,10 @@ def on_event(ctx, event_type, payload) -> None:
         # game's own authoritative answer. See craft_phase's own use of this flag for why it's
         # checked both before attempting an insert and right after one fails to confirm.
         ctx.state.data["gc_fur_exhausted"] = True
+
+    if GOLEM_LOOT_GROUND_MARKER in message:
+        # Gem bag is full -- the gift fell on the ground. craft_phase picks it up once and banks.
+        ctx.state.data["gc_gem_bag_full"] = True
 
     is_pit_full = GOAT_CHAT_PIT_FULL in message
     is_rune_short = all(part in message for part in GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS)
@@ -938,38 +949,44 @@ def _station_by_name(state: dict, name: str):
     return next((s for s in state.get("stations", []) if s.get("name") == name), None)
 
 
-def _find_station_object(station: dict):
-    """The plinth GameObject for `station`, matched by object id.
+def _find_station_object(station: dict, objects: list):
+    """The plinth GameObject for `station`, matched by object id, out of an already-fetched
+    `objects` list.
 
     Matched by id rather than by name: the object's name changes as the golem progresses (Empty
     plinth -> Unfinished golem -> Unpowered golem) while its id does not, so an id match needs no
-    state-name table and cannot be confused by a state transition mid-lookup."""
+    state-name table and cannot be confused by a state transition mid-lookup.
+
+    Takes `objects` rather than fetching its own -- see craft_phase's own comment on why /objects
+    is resolved exactly once per call and threaded through here and _any_station_visible instead
+    of each independently paying for it."""
     return next(
-        (o for o in controller.get_objects(radius=MAX_OBJECT_DISTANCE)
-         if o.get("id") == station["objectId"]),
+        (o for o in objects if o.get("id") == station["objectId"]),
         None,
     )
 
 
-def _any_station_visible(stations: list) -> bool:
+def _any_station_visible(stations: list, objects: list) -> bool:
     """Whether at least one of `stations`' plinth GameObjects is currently within
-    MAX_OBJECT_DISTANCE. Needed because GolemProvider reports both stations unconditionally
-    regardless of whether the player is actually in the golem-crafting area or anywhere near
-    either plinth (CONFIRMED by code review) -- craft_phase's `stations` list can never be empty,
-    so this is the check that actually detects "in the area, but nothing to click right now",
-    the state `not stations` was originally meant to (and never could) catch."""
-    visible_ids = {o.get("id") for o in controller.get_objects(radius=MAX_OBJECT_DISTANCE)}
+    MAX_OBJECT_DISTANCE, per an already-fetched `objects` list (see craft_phase). Needed because
+    GolemProvider reports both stations unconditionally regardless of whether the player is
+    actually in the golem-crafting area or anywhere near either plinth (CONFIRMED by code
+    review) -- craft_phase's `stations` list can never be empty, so this is the check that
+    actually detects "in the area, but nothing to click right now", the state `not stations` was
+    originally meant to (and never could) catch."""
+    visible_ids = {o.get("id") for o in objects}
     return any(s.get("objectId") in visible_ids for s in stations)
 
 
-def _click_station(ctx, station) -> bool:
-    """Click the plinth, hopping closer first if it isn't on screen. Returns False if the click
-    did not go out, in which case the caller should retry next tick.
+def _click_station(ctx, station, objects: list) -> bool:
+    """Click the plinth (resolved out of the already-fetched `objects` list), hopping closer
+    first if it isn't on screen. Returns False if the click did not go out, in which case the
+    caller should retry next tick.
 
     A plain left-click is enough -- its default action already resolves to Start-golem /
     Shape-golem / Insert-core in each respective state, so there's no need for
     click_menu_action's right-click + menu-read + select round trip."""
-    obj = _find_station_object(station)
+    obj = _find_station_object(station, objects)
     if obj is None:
         _hop_toward_point(ctx, station["x"], station["y"], station.get("plane", 0))
         return False
@@ -983,12 +1000,12 @@ def _click_station(ctx, station) -> bool:
     return True
 
 
-def _click_station_tracked(ctx, station, miss_key: str) -> bool:
+def _click_station_tracked(ctx, station, miss_key: str, objects: list) -> bool:
     """_click_station with a bounded miss counter -- see GOLEM_APPROACH_MISS_LIMIT's own comment
     for why an uncounted click failure is exactly the same unbounded-loop shape as an uncounted
     walk failure. _click_station already hops toward the station on a miss; this adds the
     counting and the eventual safety-stop escalation once hopping alone hasn't fixed it."""
-    if _click_station(ctx, station):
+    if _click_station(ctx, station, objects):
         ctx.state.data[miss_key] = 0
         return True
     misses = ctx.state.data.get(miss_key, 0) + 1
@@ -1132,7 +1149,16 @@ def craft_phase(ctx, config: dict) -> None:
     # currently projects onto the viewport" -- the exact condition that used to fall through to a
     # byte-identical no-op return every tick, forever. `not stations` is kept as a defensive extra
     # condition in case that provider guarantee ever changes, not as the real gate.
-    if not stations or not state.get("inArea", True) or not _any_station_visible(stations):
+    #
+    # PERFORMANCE FIX 2026-08-20 (code review): /objects is resolved exactly once here and
+    # threaded through both this gate (_any_station_visible) and the click path below
+    # (_click_station_tracked -> _click_station/_find_station_object), rather than each fetching
+    # its own -- controller.py's own comment documents /objects measuring 390-420ms in Wyrmscraig
+    # (this routine's own location, ~2900 objects in radius) versus under 20ms for every other
+    # bridge endpoint, so paying for it twice per tick directly worked against this routine's
+    # single biggest complaint (speed).
+    objects = controller.get_objects(radius=MAX_OBJECT_DISTANCE)
+    if not stations or not state.get("inArea", True) or not _any_station_visible(stations, objects):
         if handle_missing_target(ctx, config, "plinth", "gc_plinth_misses", "gc_plinth_walks"):
             return
         ctx.state.trigger_safety_stop("golem crafting area/plinths not found nearby")
@@ -1172,7 +1198,7 @@ def craft_phase(ctx, config: dict) -> None:
             return
         verb = "starting golem" if fresh_golem else "shaping golem"
         debug_log.log("golem crafting", f"{verb} from {side} side of {station['name']} plinth ({4 - len(plan)}/4 done)")
-        if not _click_station_tracked(ctx, station, "gc_side_click_misses"):
+        if not _click_station_tracked(ctx, station, "gc_side_click_misses", objects):
             return
         if not _await_side_done(station["name"], side, GOLEM_SIDE_TIMEOUT_S):
             debug_log.log("golem crafting", f"{side} side didn't register within {GOLEM_SIDE_TIMEOUT_S}s -- retrying next tick")
@@ -1217,7 +1243,7 @@ def craft_phase(ctx, config: dict) -> None:
         return
 
     debug_log.log("golem crafting", f"inserting core + fur from {insert_side} side of {station['name']} plinth")
-    if not _click_station_tracked(ctx, station, "gc_insert_click_misses"):
+    if not _click_station_tracked(ctx, station, "gc_insert_click_misses", objects):
         return
     if not _await_golem_complete(station["name"], GOLEM_INSERT_TIMEOUT_S):
         if ctx.state.data.get("gc_fur_exhausted"):
@@ -1249,6 +1275,17 @@ def craft_phase(ctx, config: dict) -> None:
     # Alternate: record which plinth just finished so choose_station picks the other one next
     # call, rather than waiting out this one's reset.
     ctx.state.data["gc_last_station"] = station["name"]
+    if ctx.state.data.get("gc_gem_bag_full"):
+        debug_log.log("golem crafting", "gem bag full -- collecting the dropped gift and banking")
+        for drop in [
+            i for i in controller.get_ground_items()
+            if abs(i.get("x", 9999) - station["x"]) <= 1 and abs(i.get("y", 9999) - station["y"]) <= 1
+        ]:
+            controller.click_menu_action(ctx.ser, drop, "take", target_hint=drop.get("name"), offset=(0, 0))
+            controller.human_delay(0.6, 1.0)
+        ctx.state.data["gc_gem_bag_full"] = False
+        ctx.state.data["gc_phase"] = "bank"
+        return
     ctx.state.data["gc_fur_stock"] = max(0, ctx.state.data.get("gc_fur_stock", 0) - 1)
     ctx.state.data["gc_insert_misses"] = 0
 
