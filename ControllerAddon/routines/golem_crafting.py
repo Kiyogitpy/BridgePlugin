@@ -1275,6 +1275,15 @@ def craft_phase(ctx, config: dict) -> None:
     # Alternate: record which plinth just finished so choose_station picks the other one next
     # call, rather than waiting out this one's reset.
     ctx.state.data["gc_last_station"] = station["name"]
+    # FIX 2026-08-20 (code review): the fur decrement and insert-miss reset below must run BEFORE
+    # the gem-bag-full check, not after -- the golem is confirmed complete by this point, so it
+    # consumed its fur regardless of where the gift ended up (gem bag or ground). gc_fur_stock has
+    # no game-state fallback to self-correct a skipped decrement against (that's exactly why
+    # gc_fur_exhausted exists as a backstop), and gc_insert_misses carrying over would drift
+    # toward a false safety-stop on the next golem. Both used to sit after the gem-bag-full
+    # branch's own early return, silently skipping them on that path only.
+    ctx.state.data["gc_fur_stock"] = max(0, ctx.state.data.get("gc_fur_stock", 0) - 1)
+    ctx.state.data["gc_insert_misses"] = 0
     if ctx.state.data.get("gc_gem_bag_full"):
         debug_log.log("golem crafting", "gem bag full -- collecting the dropped gift and banking")
         for drop in [
@@ -1286,8 +1295,6 @@ def craft_phase(ctx, config: dict) -> None:
         ctx.state.data["gc_gem_bag_full"] = False
         ctx.state.data["gc_phase"] = "bank"
         return
-    ctx.state.data["gc_fur_stock"] = max(0, ctx.state.data.get("gc_fur_stock", 0) - 1)
-    ctx.state.data["gc_insert_misses"] = 0
 
 
 # Never deposited during a golem-crafting bank trip -- the pouch/tools are needed for the next

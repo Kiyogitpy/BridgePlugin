@@ -321,6 +321,34 @@ def test_gem_sack_destination_does_not_flag_a_full_bag():
     assert not ctx.state.data.get("gc_gem_bag_full")
 
 
+def test_gem_bag_full_path_still_runs_end_of_golem_bookkeeping(monkeypatch):
+    """Regression for a defect caught in review: the gem-bag-full branch's early `return` must
+    not skip the fur decrement / insert-miss reset that every other golem-completion exit path
+    runs. A completed golem consumes one fur whether or not its gem fit in the bag -- gc_fur_stock
+    is a blind local estimate with no game-state fallback (that's exactly why gc_fur_exhausted
+    exists), so a skipped decrement never self-corrects and eventually causes an Insert-core
+    attempt with no fur left. gc_insert_misses carrying over would likewise drift toward a false
+    safety-stop on the next golem."""
+    station = _station("north", progress=5, done=gc.SIDES)  # all four sides done -> insert path
+    _stub_golem_area(monkeypatch, station)
+    monkeypatch.setattr(gc, "walk_to_exact_tile", lambda ctx, x, y, plane: True)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(gc, "_await_golem_complete", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Sunstone core"}])
+    monkeypatch.setattr(controller, "get_ground_items", lambda: [])
+
+    ctx = _ctx()
+    ctx.state.data["gc_fur_stock"] = 5
+    ctx.state.data["gc_gem_bag_full"] = True
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert ctx.state.data["gc_fur_stock"] == 4, "a completed golem must still consume one fur even when its gem overflowed to the ground"
+    assert ctx.state.data["gc_insert_misses"] == 0, "insert-miss count must still reset on a confirmed completion"
+    assert ctx.state.data["gc_gem_bag_full"] is False
+    assert ctx.state.data["gc_phase"] == "bank"
+
+
 # --- craft_phase /objects de-duplication (2026-08-20 code review) --------------------
 #
 # controller.py:280-283 documents /objects measuring 390-420ms in Wyrmscraig (this routine's own
