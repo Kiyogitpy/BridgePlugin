@@ -433,6 +433,17 @@ def get_mixology_state():
     }
 
 
+def get_golem():
+    """Live golem-crafting state from GolemProvider, or None if the endpoint is unavailable.
+
+    Deliberately returns None rather than an empty default (unlike get_mixology_state above):
+    routines/golem_crafting.py treats a missing /golem as a hard stop with a "rebuild the client"
+    message, because the alternative -- falling back to the old blind guess-and-check path --
+    would mean two divergent code paths for the same phase, which is exactly what produced the
+    desync bug this endpoint exists to fix."""
+    return api_get("/golem")
+
+
 def get_minimap_walk_point(x: int, y: int, plane: int):
     return api_get("/minimap/walk", params={"x": x, "y": y, "plane": plane}) or {"onMinimap": False}
 

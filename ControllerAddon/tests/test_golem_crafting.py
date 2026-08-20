@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "routines"))
 
 import golem_crafting as gc
+import controller
 
 
 def _station(name="north", x=2596, y=2257, insert_side="south", progress=0, done=()):
@@ -138,3 +139,18 @@ def test_start_materials_needs_four_sunstone_not_merely_one():
 def test_start_materials_needs_a_core():
     assert not gc.has_start_materials(20, 0)
     assert gc.has_start_materials(20, 1)
+
+
+# --- controller.get_golem ------------------------------------------------------------
+
+def test_get_golem_returns_none_when_the_endpoint_is_missing(monkeypatch):
+    """A 404 (client not rebuilt with GolemProvider) must surface as None, not an empty dict --
+    craft_phase safety-stops on None rather than silently degrading to a blind path."""
+    monkeypatch.setattr(controller, "api_get", lambda path, **kw: None)
+    assert controller.get_golem() is None
+
+
+def test_get_golem_passes_through_the_payload(monkeypatch):
+    payload = {"inArea": True, "stations": []}
+    monkeypatch.setattr(controller, "api_get", lambda path, **kw: payload)
+    assert controller.get_golem() == payload

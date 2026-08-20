@@ -41,7 +41,9 @@
 #     used from; not confirmed whether that's coincidental or the actual rule, so craft_phase
 #     below retries every untried side for Insert-core rather than assuming it's always the
 #     start tile.
-# See GOLEM_ADJACENT_OFFSETS/GOLEM_STATE_NAMES/on_event below for how this is now modeled.
+# REWRITTEN 2026-08-20 to read GET /golem's own state variables directly instead of modeling any
+# of this by hand -- see craft_phase's own docstring and docs/superpowers/specs/2026-08-20-golem-
+# crafting-varbit-overhaul-design.md for the current mechanic.
 #
 # Requirements assumed already met (out of scope for this routine, see the design's Scope):
 # Crafting 60, "Fallen From Grace" quest complete, already own a fur pouch (any size).
@@ -120,65 +122,6 @@ CHISEL_NAME = "Chisel"
 # inventory's keepItems match is substring-based (see banker.deposit_inventory's own comment),
 # and "chisel" (CHISEL_NAME.lower(), already in that list) is itself a substring of this name.
 JEWELLERS_CHISEL_NAME = "Jeweller's chisel"
-
-# CONFIRMED LIVE 2026-08-08 (MCP debug session): the crafting station's own displayed name
-# changes as a golem progresses -- "Empty plinth" (nothing started) -> "Unfinished golem" (1-3
-# sides carved) -> "Unpowered golem" (all 4 sides carved, needs Insert-core) -> back to "Empty
-# plinth" once a golem is completed. find_golem_object() below matches any of these, replacing
-# the original single-substring PLINTH_NAME (which stopped matching the moment carving started,
-# since none of the later names contain "plinth" at all).
-#
-# CORRECTED 2026-08-08 (user report: "the plinth got crafted into a base in a previous loop and
-# is now stuck"): a plinth doesn't actually reset to "Empty plinth" once it's been used at least
-# once -- CONFIRMED live it instead reads "Golem base" from then on (same id, same tile,
-# functionally identical to "Empty plinth" -- Start-golem works on it the same way). Missing
-# this name entirely made find_golem_object's candidate filter (below) exclude the plinth
-# outright once it reached this state -- not a transient miss handle_missing_target's retry
-# budget could ever recover from, since the object was never going to reappear under a name
-# this tuple recognized. Both of Wyrmscraig's plinths were observed in this state simultaneously
-# after enough golems had been crafted at each, so this isn't a one-off fluke tied to one plinth.
-GOLEM_STATE_NAMES = ("Empty plinth", "Golem base", "Unfinished golem", "Unpowered golem")
-
-# CONFIRMED LIVE 2026-08-08 (MCP debug session): the 4 world-tile offsets (dx, dy) around the
-# plinth/golem that were actually walked to and successfully carved from, one side each, in this
-# order. OSRS world y increases northward. There is no confirmed requirement that sides must be
-# carved in this specific order or that these are the ONLY 4 valid tiles -- just that 4 distinct
-# adjacent tiles are needed and repeating one gets rejected (see craft_phase). If a future live
-# run finds one of these tiles blocked/unreachable at a different plinth instance, this may need
-# to become a live-computed "any of the object's walkable adjacent tiles" list instead of a fixed
-# offset table.
-GOLEM_ADJACENT_OFFSETS = ((0, 1), (1, 0), (0, -1), (-1, 0))  # N, E, S, W
-
-# CONFIRMED live 2026-08-08 (user report): which of the 4 sides Insert-core actually accepts is
-# fixed per plinth instance (each is independently oriented), not a single universal answer --
-# the northern plinth (id 62351, see the "plinth" location anchor's own comment) takes it from
-# its south side; the southern one (id 62352) takes it from its north side. Keyed by id (not
-# position -- see find_golem_object's own docstring for why id is the stable identity here)
-# so craft_phase's insert step can go straight to the right side instead of the original blind
-# GOLEM_CHAT_WRONG_INSERT_SIDE trial-and-error across all 4. Any plinth id not in this table
-# still falls back to that trial-and-error (see the insert-offset lookup below).
-GOLEM_INSERT_OFFSET_BY_ID = {
-    62351: (0, -1),  # northern plinth -> insert from the south
-    62352: (0, 1),   # southern plinth -> insert from the north
-}
-
-# ADDED 2026-08-08 (live session, user report: "stuck in a loop"): a hard cap on how many extra
-# Shape-golem attempts craft_phase will make beyond the normal 4 once every tracked offset is
-# already marked done but the golem's own name still isn't "Unpowered golem" (see that fallback's
-# own comment). Without this a genuinely stuck/corrupted plinth state (CONFIRMED live possible --
-# this exact plinth had been interrupted mid-progress by many earlier test runs today) retried
-# forever with no safety-stop.
-#
-# CORRECTED 2026-08-08 (user request): doubled from 8 -- the first GOLEM_EXTRA_SIDE_MISSES_BEFORE_
-# ROTATE attempts are plain retries (give the chat-message-desync theory, see this cap's own
-# use below, a fair unperturbed shot), and only the remaining attempts nudge the camera as a
-# different approach. Bumping the cap to 16 rather than keeping it at 8 gives that rotated phase
-# its own real run of attempts instead of just one last toss before giving up.
-GOLEM_EXTRA_SIDE_ATTEMPTS_CAP = 16
-
-# How many extra attempts to let run plain (no camera nudge) before switching to nudging the
-# camera each attempt -- see GOLEM_EXTRA_SIDE_ATTEMPTS_CAP's own comment.
-GOLEM_EXTRA_SIDE_MISSES_BEFORE_ROTATE = 8
 
 # CONFIRMED LIVE 2026-08-08 (MCP debug session): a "Spikes supply" GameObject stands right next
 # to Geoff at the Goat Pit -- a plain click resolves to "Take" (confirmed via /menu:
@@ -417,52 +360,6 @@ def find_object(name: str):
     return candidates[0]
 
 
-def find_golem_object(committed_id=None):
-    """A single visible plinth/golem object in any of GOLEM_STATE_NAMES, within
-    MAX_OBJECT_DISTANCE -- see that constant's docstring for why an exact-name-set match
-    replaced the original single-substring find_object(PLINTH_NAME) call.
-
-    Sticky, same idea as find_mining_target's own committed_pos, but keyed on the object's `id`
-    rather than its (x, y) -- CONFIRMED live 2026-08-08 (live session, user report) an (x, y)-
-    keyed version of this still lost track of an in-progress golem: Wyrmscraig has two plinths
-    ~4 tiles apart, and the SAME physical plinth's own reported (x, y) can shift by a tile
-    between its "Empty plinth"/"Unfinished golem"/"Unpowered golem" states (multi-tile object
-    anchor quirk), so a position-keyed match failed to re-find it the very next tick after its
-    first "Start-golem" click, read that as "a different plinth now", and started fresh progress
-    on the OTHER plinth instead -- discarding the first one's pending confirmation entirely. `id`
-    (CONFIRMED live stable across all 3 of a plinth's states, unlike (x, y)) doesn't have that
-    problem. If given and still among the visible candidates, that id's object is returned
-    regardless of whether something else is now nearer -- see this function's docstring history
-    for why "closer to the other plinth this tick" must never be a reason to switch mid-golem.
-
-    CORRECTED 2026-08-08 (user report: "wants to swap to the other plinth while still in
-    crafting animation"): a committed golem can drop out of `candidates` for a tick or two
-    entirely -- not just have something else become nearer -- if the crafting animation right
-    after Start-golem transiently reports a name outside GOLEM_STATE_NAMES or leaves it briefly
-    not `visible` (same class of gap as the Empty-plinth-despawning/Unfinished-golem-spawning
-    race handle_missing_target's own docstring already documents). CONFIRMED live this used to
-    fall through to `candidates[0]` in that case -- the closest OTHER candidate, i.e. the second
-    plinth -- and craft_phase read the id mismatch as "a different plinth now" and abandoned the
-    committed one mid-animation. Returning None instead when a commitment was given but not
-    found lets the caller's existing transient-miss tolerance (handle_missing_target's
-    MAX_CONSECUTIVE_MISSES, same as every other lookup in this file) absorb a brief animation
-    blip, rather than silently substituting a different object with a different id."""
-    candidates = [
-        o for o in controller.get_objects(radius=MAX_OBJECT_DISTANCE)
-        if (o.get("name") or "") in GOLEM_STATE_NAMES
-        and o.get("visible", True)
-        and 0 <= o.get("distance", 9999) <= MAX_OBJECT_DISTANCE
-    ]
-    if not candidates:
-        return None
-
-    if committed_id is not None:
-        return next((o for o in candidates if o.get("id") == committed_id), None)
-
-    candidates.sort(key=lambda o: o.get("distance", 9999))
-    return candidates[0]
-
-
 def is_valid_grab_target(pit: dict, goat: dict) -> bool:
     """South, east, or west of the pit only -- north is the player's own fixed standing side
     (CONFIRMED live, account owner), so a goat there can never be a valid Grab target no matter
@@ -516,7 +413,7 @@ def find_mining_target(committed_pos=None):
 
 
 # A location anchor is a best-effort hint, not a guarantee the target is actually there once
-# arrived (e.g. one of MINING_TARGET_NAMES/GOLEM_STATE_NAMES/GOAT_PIT_NAME turning out to be a wrong
+# arrived (e.g. one of MINING_TARGET_NAMES/GOAT_PIT_NAME turning out to be a wrong
 # guess, or the anchor coordinates themselves being off) -- give up after this many walk attempts
 # rather than walking-and-retrying forever. ADDED 2026-08-08 (final whole-branch review, second
 # pass): the first version of handle_missing_target below had no cap on this path at all.
@@ -679,7 +576,7 @@ def _step_toward_plinth(ctx, config: dict) -> None:
     """One single hop toward the "plinth" location anchor -- fire-and-forget (no wait for
     arrival): this only exists to interrupt an in-progress mining swing the instant mine_phase's
     budget is hit (see that function's own docstring), not to actually get there -- craft_phase's
-    own find_golem_object lookup handles the rest of the approach once chisel_phase is done.
+    own station lookup handles the rest of the approach once chisel_phase is done.
     Does nothing if the plinth isn't a configured anchor."""
     target = (config.get("locations") or {}).get("plinth")
     if target is None:
@@ -857,21 +754,16 @@ def chisel_phase(ctx, config: dict) -> None:
     debug_log.log("golem crafting", "chisel click didn't register within timeout -- retrying next tick")
 
 
-# CHAT_MESSAGE substrings (lowercased) this routine reacts to -- see on_event below for why a
-# chat-driven signal is needed at all (the game confirms/rejects a golem action on its own
-# server-queued schedule, several ticks after the click, not synchronously). Every one of these
-# was CONFIRMED live 2026-08-08 (MCP debug session) as the exact text the game sent back.
-GOLEM_CHAT_SIDE_DONE = "you finish crafting the golem from this angle."
-GOLEM_CHAT_SIDE_ALREADY_DONE = "you've already crafted this side of the golem."
-GOLEM_CHAT_NOT_ENOUGH_SUNSTONE = "you don't have enough sunstone to assemble a golem."
-GOLEM_CHAT_WRONG_INSERT_SIDE = "you can't insert a sunstone core from this side of the golem."
-GOLEM_CHAT_COMPLETE = "you have crafted"  # "...N golem(s) on Wyrmscraig." -- prefix match
-# ADDED 2026-08-08 (user report): the real rejection when Insert-core is clicked with no usable
-# fur left in the pouch -- gc_fur_stock is only ever a locally-tracked estimate (set from a bank
-# withdrawal's qty, decremented by 1 per completed golem), never corrected against what hunt_phase
-# actually catches, so it can read >0 while the pouch is genuinely empty. This message is the
-# game's own authoritative answer; see its handling in craft_phase's "insert" branch below for why
-# it needs to be recognized at all, not just handled once seen.
+# CHAT_MESSAGE substring (lowercased) this routine still reacts to. REWRITTEN 2026-08-20: every
+# other golem-crafting chat message this used to watch for (side-done, side-already-done,
+# not-enough-sunstone, wrong-insert-side, overall-complete) is superseded by a /golem varbit read
+# -- see craft_phase/on_event below. Fur is the one exception: fur count is NOT one of the game's
+# exposed state variables, so this rejection message (CONFIRMED live 2026-08-08, MCP debug
+# session, as the exact text the game sent back) remains the only authoritative fur signal there
+# is. gc_fur_stock is only ever a locally-tracked estimate (set from a bank withdrawal's qty,
+# decremented by 1 per completed golem), never corrected against what hunt_phase actually catches,
+# so it can read >0 while the pouch is genuinely empty -- see on_event's handling of this message
+# and craft_phase's use of the "gc_fur_exhausted" flag it sets.
 GOLEM_CHAT_NOT_ENOUGH_FUR = "you need to dress the golem in furs from hunted creatures."
 
 # CONFIRMED live (user session) -- Goat Pit hunting mechanic, replacing the original wrong
@@ -908,19 +800,24 @@ GOAT_GRAB_COOLDOWN_S = 10.0
 
 
 def on_event(ctx, event_type, payload) -> None:
-    """Captures the golem-crafting confirmation/rejection chat messages into
-    ctx.state.data["gc_last_chat"]/["gc_last_chat_seq"] as they arrive -- controller.py's main
-    loop drains UDP events and calls this before every tick() (see controller.py's main()), so
-    a message that arrives between two tick() calls is caught here and available to craft_phase
-    on its next call. gc_last_chat_seq is a monotonic counter, not just the text, so craft_phase
-    can tell "no new message since I started waiting" apart from "a new message arrived that
-    happens to repeat old text" -- comparing the text alone couldn't distinguish those. Ignores
-    every other chat message (this routine has no other use for chat) so unrelated game/spam
-    messages can't overwrite a still-unconsumed golem-crafting one.
+    """Reacts to the one golem-crafting chat signal that isn't available from /golem's varbits,
+    and separately captures hunt_phase's own two chat signals -- controller.py's main loop drains
+    UDP events and calls this before every tick() (see controller.py's main()), so a message that
+    arrives between two tick() calls is caught here and available on craft_phase's next call.
+
+    REWRITTEN 2026-08-20 (see docs/superpowers/specs/2026-08-20-golem-crafting-varbit-overhaul-
+    design.md): craft_phase's side/insert confirmation now polls /golem's own varbits directly
+    (see _await_side_done/_await_golem_complete below) instead of waiting on a chat message, so
+    the gc_last_chat/gc_last_chat_seq generic capture-and-compare machinery this docstring used
+    to describe is gone. Fur count is the one exception -- it is NOT exposed by any golem state
+    variable, so GOLEM_CHAT_NOT_ENOUGH_FUR (the game's own rejection message) remains the only
+    authoritative fur signal there is. Set directly into a "gc_fur_exhausted" flag craft_phase
+    checks itself, rather than a generic chat channel with nothing left to read it now that every
+    other golem-crafting chat message this used to watch for is superseded by a varbit read.
 
     ADDED 2026-08-08 (Goat Pit hunting redesign): also captures hunt_phase's own two chat
     signals (pit-full, rune-shortage) into a SEPARATE gc_last_hunt_chat/_seq pair, not the
-    golem-crafting one above -- controller.py only ever calls one on_event per routine module
+    golem-crafting fur flag above -- controller.py only ever calls one on_event per routine module
     (see its own dispatch, `hasattr(routine, "on_event")`), so both concerns have to live in
     this one function, but craft_phase and hunt_phase are mutually exclusive via gc_phase and
     keeping their chat state in separate keys avoids any future ambiguity if that ever changes."""
@@ -928,12 +825,13 @@ def on_event(ctx, event_type, payload) -> None:
         return
     message = (payload.get("message") or "").lower()
 
-    if any(known in message for known in (
-        GOLEM_CHAT_SIDE_DONE, GOLEM_CHAT_SIDE_ALREADY_DONE, GOLEM_CHAT_NOT_ENOUGH_SUNSTONE,
-        GOLEM_CHAT_WRONG_INSERT_SIDE, GOLEM_CHAT_COMPLETE, GOLEM_CHAT_NOT_ENOUGH_FUR,
-    )):
-        ctx.state.data["gc_last_chat"] = message
-        ctx.state.data["gc_last_chat_seq"] = ctx.state.data.get("gc_last_chat_seq", 0) + 1
+    if GOLEM_CHAT_NOT_ENOUGH_FUR in message:
+        # gc_fur_stock is only ever a locally-tracked estimate (set from a bank withdrawal's qty,
+        # decremented by 1 per completed golem), never corrected against what hunt_phase actually
+        # catches, so it can read >0 while the pouch is genuinely empty -- this message is the
+        # game's own authoritative answer. See craft_phase's own use of this flag for why it's
+        # checked both before attempting an insert and right after one fails to confirm.
+        ctx.state.data["gc_fur_exhausted"] = True
 
     is_pit_full = GOAT_CHAT_PIT_FULL in message
     is_rune_short = all(part in message for part in GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS)
@@ -943,10 +841,27 @@ def on_event(ctx, event_type, payload) -> None:
         ctx.state.data["gc_last_hunt_chat_seq"] = ctx.state.data.get("gc_last_hunt_chat_seq", 0) + 1
 
 
-# How long craft_phase waits for a chat confirmation before giving up on one attempt and
-# retrying -- CONFIRMED live 2026-08-08: real confirmations arrived within a few seconds of
-# the click every time observed; generous margin for a slower tick under load.
-GOLEM_ACTION_TIMEOUT_S = 15.0
+# How long to wait for a side's `done` varbit to flip after a Shape-golem click. Far shorter than
+# the 15s chat-message timeout this replaces: the varbit moves on the tick the server processes
+# the action, so anything beyond a couple of seconds means the click genuinely didn't land.
+GOLEM_SIDE_TIMEOUT_S = 4.0
+
+# Insert-core gets a little longer -- it consumes a core and a fur and plays a longer animation
+# before the station's progress varbit resets.
+GOLEM_INSERT_TIMEOUT_S = 6.0
+
+# How often to re-read /golem while awaiting a confirmation. Well under the 0.6s game tick, since
+# the endpoint is deliberately not TickCache-gated (see GolemProvider's own comment).
+GOLEM_CONFIRM_POLL_S = 0.2
+
+# Consecutive failures at the SAME side before treating it as a real anomaly. With ground truth
+# available a stuck side is genuinely abnormal, not the routine desync the old 16-attempt budget
+# existed to absorb, so this is an assertion rather than a retry allowance.
+GOLEM_SIDE_MISS_LIMIT = 5
+
+# Same reasoning as GOLEM_SIDE_MISS_LIMIT, for the Insert-core step -- an unbounded retry here
+# would hang the routine silently, which is the exact bug class this overhaul exists to remove.
+GOLEM_INSERT_MISS_LIMIT = 5
 
 
 def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
@@ -1000,392 +915,223 @@ def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
     return True
 
 
+def _station_by_name(state: dict, name: str):
+    return next((s for s in state.get("stations", []) if s.get("name") == name), None)
+
+
+def _find_station_object(station: dict):
+    """The plinth GameObject for `station`, matched by object id.
+
+    Matched by id rather than by name: the object's name changes as the golem progresses (Empty
+    plinth -> Unfinished golem -> Unpowered golem) while its id does not, so an id match needs no
+    state-name table and cannot be confused by a state transition mid-lookup."""
+    return next(
+        (o for o in controller.get_objects(radius=MAX_OBJECT_DISTANCE)
+         if o.get("id") == station["objectId"]),
+        None,
+    )
+
+
+def _click_station(ctx, station) -> bool:
+    """Click the plinth, hopping closer first if it isn't on screen. Returns False if the click
+    did not go out, in which case the caller should retry next tick.
+
+    A plain left-click is enough -- its default action already resolves to Start-golem /
+    Shape-golem / Insert-core in each respective state, so there's no need for
+    click_menu_action's right-click + menu-read + select round trip."""
+    obj = _find_station_object(station)
+    if obj is None:
+        _hop_toward_point(ctx, station["x"], station["y"], station.get("plane", 0))
+        return False
+    refresh = controller.object_refresh_target(
+        obj.get("x"), obj.get("y"), obj.get("plane", 0), station["objectId"],
+        radius=MAX_OBJECT_DISTANCE,
+    )
+    if not controller.click_entity(ctx.ser, obj, refresh_target=refresh):
+        _hop_toward_point(ctx, station["x"], station["y"], station.get("plane", 0))
+        return False
+    return True
+
+
+def _await_side_done(station_name: str, side: str, timeout_s: float) -> bool:
+    """Poll /golem until `side` reads done, or timeout. True if it flipped.
+
+    This replaces the old 15s chat-message wait. The varbit flips on the tick the server
+    processes the action, so a real success is seen almost immediately and a timeout genuinely
+    means the click did not land -- most often a deliberate MISTAKE_MISCLICK_CHANCE near-miss,
+    which produces no game action at all (see CLAUDE.md). Retrying is safe precisely because the
+    varbit says unambiguously whether the previous click counted."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(GOLEM_CONFIRM_POLL_S)
+        state = controller.get_golem()
+        if state is None:
+            return False
+        station = _station_by_name(state, station_name)
+        if station and station["sides"][side]["done"]:
+            return True
+    return False
+
+
+def _await_golem_complete(station_name: str, timeout_s: float) -> bool:
+    """Poll /golem until the station's overall progress returns to 0 (golem finished)."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(GOLEM_CONFIRM_POLL_S)
+        state = controller.get_golem()
+        if state is None:
+            return False
+        station = _station_by_name(state, station_name)
+        if station and station.get("progress", 0) == 0:
+            return True
+    return False
+
+
 def craft_phase(ctx, config: dict) -> None:
-    """Craft one golem per call to gc_phase="craft" overall (carve all 4 sides of a plinth from
-    4 distinct adjacent tiles, then insert-core) -- sized like blast_furnace.py's run_trip (one
-    bounded unit of work per call), so the engine's between-tick safety/break/PvP checks still
-    run on a long crafting stretch. tick() keeps re-entering this phase until it sets gc_phase
-    to "bank" itself once materials run out.
+    """Carve and complete one golem per call, driven entirely by /golem's varbits.
 
-    CORRECTED 2026-08-08 (MCP live debug session, full end-to-end verification): replaces this
-    function's original model, which was wrong in every particular once actually tested -- see
-    this module's header comment for the full list of what was wrong and what's confirmed
-    correct instead. In short: 4 distinct adjacent tiles (not 4 identical clicks), a chat-message-
-    driven confirmation loop (not a synchronous click-and-assume-success loop, since the game
-    confirms/rejects several ticks after the click -- see on_event), 1 raw Sunstone consumed
-    once up front (not cores/fur consumed per side), and a single Insert-core click that
-    auto-consumes both the core and the best fur together (not two separate insert clicks).
+    REWRITTEN 2026-08-20 (see docs/superpowers/specs/2026-08-20-golem-crafting-varbit-overhaul-
+    design.md). The previous implementation tracked carved sides in ctx.state.data, which resets
+    on every process restart and every edit to this file while the plinth's real progress
+    persists server-side. That desync was absorbed by a 16-attempt retry budget, camera nudges
+    and eventually abandoning the golem -- and since Start-golem's 4 sunstone are spent up front,
+    each abandonment destroyed a full golem's worth of material. Reading each side's `done`
+    varbit removes the desync outright, so none of that machinery is needed.
 
-    This phase is a small state machine tracked in ctx.state.data, all keyed off
-    "gc_craft_golem_id" (the plinth/golem object's own `id` -- CONFIRMED live stable across its
-    whole Empty plinth -> Unfinished golem -> Unpowered golem progression, unlike its (x, y),
-    which can shift by a tile between those states -- see find_golem_object's own docstring for
-    why that distinction is what fixes a real live bug -- so this is how a fresh start is told
-    apart from a resumed one):
-      gc_craft_sides_done: list of (dx, dy) offsets already confirmed carved for this golem.
-      gc_craft_insert_tried: list of (dx, dy) offsets Insert-core has already been rejected
-        from (see GOLEM_CHAT_WRONG_INSERT_SIDE -- confirmed live it's side-dependent, but not
-        confirmed which specific side is always correct, so every untried side gets a turn).
-      gc_craft_awaiting: {"kind": "side"|"insert", "offset": (dx,dy), "since_seq", "started_at"}
-        while a click's chat confirmation hasn't arrived yet, else None.
-    """
-    golem = find_golem_object(ctx.state.data.get("gc_craft_golem_id"))
-    if golem is None:
+    Three savings per golem come with it: the carve order ends on the insert side (no extra walk
+    before Insert-core), confirmation is a varbit poll rather than a 15s chat timeout, and a
+    completed plinth is left immediately for the other one rather than waited on (its gem goes
+    straight to the gem bag, so there is nothing to pick up -- see the gem-bag handling).
+
+    Fur is the one exception -- it is NOT one of /golem's exposed state variables, so
+    GOLEM_CHAT_NOT_ENOUGH_FUR (captured by on_event into the "gc_fur_exhausted" flag) remains the
+    only authoritative signal that an Insert-core attempt was rejected for lack of fur, checked
+    both before attempting an insert and right after one fails to confirm (see below)."""
+    state = controller.get_golem()
+    if state is None:
+        ctx.state.trigger_safety_stop(
+            "GET /golem unavailable -- rebuild and restart the RuneLite client "
+            "(./gradlew.bat run) so GolemProvider is loaded"
+        )
+        return
+
+    stations = state.get("stations", [])
+    if not stations:
         if handle_missing_target(ctx, config, "plinth", "gc_plinth_misses", "gc_plinth_walks"):
             return
-        ctx.state.trigger_safety_stop("no plinth/golem found nearby")
+        ctx.state.trigger_safety_stop("no golem stations reported by /golem")
         return
     ctx.state.data["gc_plinth_misses"] = 0
     ctx.state.data["gc_plinth_walks"] = 0
 
-    if ctx.state.data.get("gc_craft_golem_id") != golem.get("id"):
-        # A different plinth instance, or this one just reset to "Empty plinth" after a
-        # previous golem completed -- start fresh tracking for it.
-        ctx.state.data["gc_craft_golem_id"] = golem.get("id")
-        ctx.state.data["gc_craft_sides_done"] = []
-        ctx.state.data["gc_craft_insert_tried"] = []
-        ctx.state.data["gc_craft_awaiting"] = None
-        ctx.state.data["gc_craft_extra_side_attempts"] = 0
+    player = controller.get_player()
+    player_x, player_y = player.get("x", 0), player.get("y", 0)
+    station = choose_station(
+        stations, ctx.state.data.get("gc_last_station"), player_x, player_y
+    )
+    fresh_golem = station.get("progress", 0) == 0
 
-    awaiting = ctx.state.data.get("gc_craft_awaiting")
-    if awaiting is not None:
-        seen_seq = ctx.state.data.get("gc_last_chat_seq", 0)
-        if seen_seq <= awaiting["since_seq"]:
-            if time.time() - awaiting["started_at"] > GOLEM_ACTION_TIMEOUT_S:
-                debug_log.log("golem crafting", f"no confirmation after {GOLEM_ACTION_TIMEOUT_S}s -- retrying")
-                ctx.state.data["gc_craft_awaiting"] = None
-            return  # still waiting on a chat confirmation -- nothing else to do this call
-
-        message = ctx.state.data.get("gc_last_chat", "")
-        offset = awaiting["offset"]
-        ctx.state.data["gc_craft_awaiting"] = None
-
-        if awaiting["kind"] == "side":
-            if GOLEM_CHAT_SIDE_DONE in message or GOLEM_CHAT_SIDE_ALREADY_DONE in message:
-                # Either a real success, or confirmation this side was already done (e.g. after
-                # a process restart lost our in-memory tracking) -- either way it's spent now.
-                sides = ctx.state.data.get("gc_craft_sides_done", [])
-                if offset not in sides:
-                    sides.append(offset)
-                ctx.state.data["gc_craft_sides_done"] = sides
-                debug_log.log("golem crafting", f"side confirmed ({len(sides)}/4): {message.strip()}")
-            elif GOLEM_CHAT_NOT_ENOUGH_SUNSTONE in message:
-                debug_log.log("golem crafting", "not enough raw sunstone to start a golem -- moving to mine phase")
+    if fresh_golem:
+        raw = _count_named(RAW_SUNSTONE_NAME)
+        cores = _count_named(SUNSTONE_CORE_NAME)
+        if not has_start_materials(raw, cores):
+            fur_stock = ctx.state.data.get("gc_fur_stock", 0)
+            if fur_stock < CORES_PER_TRIP:
+                debug_log.log("golem crafting", f"batch done ({raw} sunstone, {cores} cores), fur low ({fur_stock}) -- banking")
+                ctx.state.data["gc_phase"] = "bank"
+            else:
+                debug_log.log("golem crafting", f"batch done ({raw} sunstone, {cores} cores), fur ok ({fur_stock}) -- mining")
                 ctx.state.data["gc_phase"] = "mine"
-            else:
-                debug_log.log("golem crafting", f"unexpected response to golem side click: {message.strip()}")
-        else:  # kind == "insert"
-            if GOLEM_CHAT_WRONG_INSERT_SIDE in message:
-                tried = ctx.state.data.get("gc_craft_insert_tried", [])
-                tried.append(offset)
-                ctx.state.data["gc_craft_insert_tried"] = tried
-                debug_log.log("golem crafting", f"can't insert-core from this side -- trying another (tried {len(tried)}/4)")
-            elif GOLEM_CHAT_NOT_ENOUGH_FUR in message:
-                # The game's own answer overrides our locally-tracked gc_fur_stock estimate --
-                # see that field's docstring and GOLEM_CHAT_NOT_ENOUGH_FUR's own comment for why
-                # the tracked count can read >0 while the pouch is actually empty. Zeroing it here
-                # (rather than leaving it for the next batch-end check) means the very next
-                # craft_phase call routes to bank via the existing gc_fur_stock<=0 gate instead of
-                # retrying the identical doomed Insert-core click.
-                debug_log.log("golem crafting", "out of fur (game rejected insert-core) -- correcting tracked fur stock to 0")
-                ctx.state.data["gc_fur_stock"] = 0
-                ctx.state.data["gc_phase"] = "bank"
-                return
-            elif GOLEM_CHAT_COMPLETE in message:
-                debug_log.log("golem crafting", "golem finished -- ready for the next one")
-                # ADDED 2026-08-08 (live session, user report): the plinth stays unresponsive for
-                # about 2 seconds after a golem finishes before it resets to "Empty plinth" and
-                # can start a new one -- CONFIRMED live. Rather than spend that unavoidable dead
-                # time uselessly hammering find_golem_object every tick against a plinth that
-                # isn't ready yet, use it to pick up whatever the golem dropped right where it
-                # stood, then a short settle sleep -- same "Take" idiom as slayer.py's own
-                # ground-item pickup (right-click + explicit menu selection, not a plain
-                # click_entity, since a plain click's default action isn't reliably "Take").
-                drops = [
-                    i for i in controller.get_ground_items()
-                    if abs(i.get("x", 9999) - golem.get("x", 0)) <= 1
-                    and abs(i.get("y", 9999) - golem.get("y", 0)) <= 1
-                ]
-                for drop in drops:
-                    drop_key = (drop.get("id"), drop.get("x"), drop.get("y"))
-                    debug_log.log("golem crafting", f"picking up {drop.get('name')}")
-                    # CORRECTED 2026-08-08 (live session, user report: "it missed looting its
-                    # gem, we want always the loot"): a single click_menu_action attempt isn't
-                    # reliable enough on its own -- CONFIRMED live one attempt landed on the bare
-                    # tile's own menu (Cancel/Mark Safespot/Walk here) instead of the item's
-                    # (Take/Examine/Cancel), same class of race slayer.py's own maybe_loot
-                    # documents (the camera/model rendering trails the logical tile position by
-                    # about a tick right after a state change -- here, the golem just finished).
-                    # Retries a few times, re-fetching the item's position fresh each attempt
-                    # (not reusing the same possibly-stale drop dict) and stopping as soon as it's
-                    # actually gone from the ground -- confirmed picked up, not just clicked at.
-                    for _ in range(3):
-                        fresh = next(
-                            (i for i in controller.get_ground_items()
-                             if (i.get("id"), i.get("x"), i.get("y")) == drop_key),
-                            None,
-                        )
-                        if fresh is None:
-                            break  # gone -- picked up (or despawned/looted by something else)
-                        controller.click_menu_action(ctx.ser, fresh, "take", target_hint=fresh.get("name"), offset=(0, 0))
-                        # 0.6-1.0s, not the 0.4-0.6s this used to be -- CONFIRMED live 2026-08-08
-                        # (user report: a successful take still got re-clicked) 0.4s can be shorter
-                        # than a single game tick (0.6s), so the very next iteration's fresh-lookup
-                        # could poll before the game had processed the click that just succeeded,
-                        # still see the item sitting there, and fire a second take on top of it.
-                        # Matches the same click-then-wait-a-tick-before-rechecking idiom already
-                        # used elsewhere in this file (e.g. the minimap-hop retry above).
-                        controller.human_delay(0.6, 1.0)
-                # CORRECTED 2026-08-08 (live session, user report): 1.0s here still weighed in
-                # too early against the plinth's own ~2s reset delay -- CONFIRMED live. Bumped to
-                # 2.0s (on top of whatever the loot loop above already spent).
-                time.sleep(2.0)
-
-                ctx.state.data["gc_craft_sides_done"] = []
-                ctx.state.data["gc_craft_insert_tried"] = []
-                ctx.state.data["gc_craft_golem_id"] = None  # force a fresh-start detection next call
-                # One fur consumed per golem -- see _run_bank_trip's docstring for why this
-                # tracked count (not a live inventory/pouch read) drives the end-of-batch
-                # bank-or-mine decision below.
-                ctx.state.data["gc_fur_stock"] = max(0, ctx.state.data.get("gc_fur_stock", 0) - 1)
-            else:
-                debug_log.log("golem crafting", f"unexpected response to insert-core: {message.strip()}")
-        return
-
-    sides_done = ctx.state.data.get("gc_craft_sides_done", [])
-
-    # CORRECTED 2026-08-08 (live session, user report: "we are stuck in a loop"): this gate used
-    # to be `len(sides_done) < 4` -- our OWN click-confirmation count -- rather than the golem
-    # object's own reported name. CONFIRMED live these can desync: a plinth left mid-progress
-    # from an earlier interrupted run/process restart still has its real carved-side state
-    # server-side, but ctx.state.data resets to sides_done=[] on every restart, so this session's
-    # 4 tracked offsets don't necessarily correspond to the 4 real remaining sides -- one real
-    # side can get (correctly) reported "already crafted" more than once while another genuinely
-    # untried side never gets attempted at all. The result: sides_done reached 4 while the golem
-    # was still actually "Unfinished golem", and every subsequent Insert-core attempt failed with
-    # "no 'insert-core' entry in menu" forever (that option only exists on "Unpowered golem").
-    # Gating on the object's own name instead is self-correcting -- it only ever proceeds to
-    # Insert-core once the game itself says the golem is actually ready.
-    if golem.get("name") != "Unpowered golem":
-        if not sides_done:
-            # Only checked before the FIRST side -- confirmed live the material cost is
-            # front-loaded (1 raw sunstone on "Start-golem", nothing further per side), so
-            # there's no need to re-check core/fur availability between sides; only that we
-            # won't strand a half-carved golem without enough to ever finish it.
-            #
-            # CORRECTED 2026-08-08 (live session, user request): a raw-sunstone/core shortage
-            # means this whole mining trip's batch is done -- decide bank vs. mine from the
-            # tracked fur stock, not from bank_phase's original uniform "always go to mine"
-            # default. Routes to "mine" for the shortage itself regardless (bank_phase has no
-            # way to restock sunstone -- Wyrmscraig's bank only ever holds fur), same as before.
-            if find_item(RAW_SUNSTONE_NAME) is None or find_item(SUNSTONE_CORE_NAME) is None:
-                fur_stock = ctx.state.data.get("gc_fur_stock", 0)
-                if fur_stock < CORES_PER_TRIP:
-                    debug_log.log("golem crafting", f"batch done, fur stock low ({fur_stock}) -- moving to bank phase")
-                    ctx.state.data["gc_phase"] = "bank"
-                else:
-                    debug_log.log("golem crafting", f"batch done, fur stock still sufficient ({fur_stock}) -- moving to mine phase")
-                    ctx.state.data["gc_phase"] = "mine"
-                return
-
-            # CORRECTED 2026-08-08 (live session, live-testing discovery: "we don't actually have
-            # to empty the furs, we can use them from within the fur pouch"): Insert-core auto-
-            # consumes the best available fur straight out of the pouch, same as it would from
-            # loose inventory -- CONFIRMED live across three full golems this session with the
-            # pouch never once emptied. The unpack-once-per-batch step (banker.empty_fur_pouch)
-            # this replaced existed only because that wasn't known yet; removing it means there's
-            # never any loose fur to lose track of or re-pouch, so gc_fur_stock (already tracked
-            # for the batch-end bank-or-mine decision above) is now also the sole source of truth
-            # for "is there fur to use", in place of a live pick_best_fur_in_inventory() scan that
-            # only ever found anything after that now-removed unpack step.
-            if ctx.state.data.get("gc_fur_stock", 0) <= 0:
-                debug_log.log("golem crafting", "out of usable fur for a new golem -- moving to bank phase")
-                ctx.state.data["gc_phase"] = "bank"
-                return
-
-            # ADDED 2026-08-08 (live session, live-testing discovery): "Start-golem" on an Empty
-            # plinth -- unlike every later "Shape-golem" click -- auto-completes whichever side
-            # it's clicked from as a side effect of starting the golem, regardless of which of
-            # the 4 tiles that happens to be. CONFIRMED live across all 3 golems this session:
-            # the chat response to this very first click was always GOLEM_CHAT_SIDE_ALREADY_DONE
-            # ("you've already crafted this side"), never GOLEM_CHAT_SIDE_DONE -- meaning the
-            # walk_to_exact_tile call below (to GOLEM_ADJACENT_OFFSETS[0] specifically, since
-            # sides_done is still empty here) was carving a side that was going to be free no
-            # matter where it was clicked from. Skipping the walk entirely and clicking
-            # Start-golem from wherever the routine already is saves a full walk+confirm round
-            # trip on every golem for no loss -- GOLEM_ADJACENT_OFFSETS[0] is still recorded
-            # below purely as bookkeeping (which of the 4 offsets is "spent"), not because the
-            # routine actually stood there.
-            debug_log.log("golem crafting", "starting golem (0/4 done)")
-            # CORRECTED 2026-08-09 (user report): a plain left-click's default action already
-            # resolves to Start-golem/Shape-golem/Insert-core in every phase -- no need for
-            # click_menu_action's right-click+menu-read+select round trip.
-            if not controller.click_entity(ctx.ser, golem):
-                # CORRECTED 2026-08-08 (live session, user report: "stuck now, probably a
-                # misclick we don't correct for"): CONFIRMED live this looped forever -- unlike
-                # shaping/inserting (which always walk_to_exact_tile first, landing adjacent and
-                # on-screen), this fast-path deliberately clicks from wherever the routine
-                # already is (see the comment above) with no positioning step at all, so a golem
-                # that resets off-screen after the routine arrives from somewhere else (e.g.
-                # straight from chisel_phase) hit "aim point is outside the RuneLite window"
-                # every single tick with nothing ever correcting the position. Hopping toward the
-                # golem's own tile -- the same off-screen fallback mine_phase/bank_phase already
-                # use -- fixes it instead of retrying the identical failing click indefinitely.
-                debug_log.log("golem crafting", "Start-golem click missed -- hopping closer and retrying next tick")
-                _hop_toward_point(ctx, golem["x"], golem["y"], golem.get("plane", 0))
-                return
-
-            ctx.state.data["gc_craft_awaiting"] = {
-                "kind": "side", "offset": GOLEM_ADJACENT_OFFSETS[0],
-                "since_seq": ctx.state.data.get("gc_last_chat_seq", 0),
-                "started_at": time.time(),
-            }
+            return
+        if ctx.state.data.get("gc_fur_stock", 0) <= 0:
+            debug_log.log("golem crafting", "out of usable fur for a new golem -- moving to bank phase")
+            ctx.state.data["gc_phase"] = "bank"
             return
 
-        offset = next((o for o in GOLEM_ADJACENT_OFFSETS if o not in sides_done), None)
-        is_extra_attempt = offset is None
-        if is_extra_attempt:
-            # All 4 tracked offsets are already marked done, yet the golem's own name says
-            # otherwise (see the gate comment above) -- this session's offset<->real-side mapping
-            # has desynced from the game's actual state. Cycle back through them again rather
-            # than crashing (next() on an empty generator) or getting stuck: each retry still
-            # goes through the normal chat-confirmation path below, so a genuinely-untried real
-            # side eventually gets hit and reported as a real completion, not another "already
-            # done".
-            #
-            # CORRECTED 2026-08-08 (live session, user report: "stuck in a loop"): indexing by
-            # `len(sides_done)` here was itself the bug, not just this branch's existence --
-            # CONFIRMED live sides_done stays fixed at exactly 4 forever once every offset is in
-            # it (the "already done" handler only appends an offset the FIRST time it sees it),
-            # so `len(sides_done) % 4` always computed the same index -- this retried the SAME
-            # offset every single time, forever, rather than actually cycling. A dedicated
-            # counter that increments every retry (capped, see GOLEM_EXTRA_SIDE_ATTEMPTS_CAP)
-            # fixes both the infinite loop and the "never actually tries a different offset" bug
-            # in one move.
-            attempts = ctx.state.data.get("gc_craft_extra_side_attempts", 0)
-            if attempts >= GOLEM_EXTRA_SIDE_ATTEMPTS_CAP:
-                # CORRECTED 2026-08-09 (live session, autonomous recovery): CONFIRMED live this
-                # cap can still be exhausted even with the camera-nudge phase (attempts 9-16) --
-                # all 16 attempts came back "already crafted this side", never a real completion,
-                # for the SAME plinth id across a full extra cycle. Rather than a terminal
-                # safety-stop (the original design here, before autonomous operation was in
-                # scope), abandon this golem's tracked state and let the routine re-discover it
-                # fresh next call: find_golem_object has no memory of a committed id once this is
-                # cleared, so it re-evaluates from the object's OWN reported name (the actual
-                # source of truth this file's own docstrings already establish as more reliable
-                # than local bookkeeping) rather than the stale sides_done/offset mapping that
-                # desynced in the first place. Bounded the same way as before -- if the SAME
-                # plinth is picked again and genuinely can't progress, this safety net triggers
-                # again rather than looping forever.
-                debug_log.log(
-                    "golem crafting",
-                    f"golem at plinth id={golem.get('id')} never reached Unpowered golem after "
-                    f"{GOLEM_EXTRA_SIDE_ATTEMPTS_CAP} extra Shape-golem attempts -- abandoning "
-                    "this golem's tracked state and retrying fresh instead of stopping"
+    plan = carve_plan(station, player_x, player_y)
+    if plan:
+        side = plan[0]
+        tile = station["sides"][side]
+        if not walk_to_exact_tile(ctx, tile["x"], tile["y"], tile.get("plane", 0)):
+            debug_log.log("golem crafting", f"couldn't walk to {side} side -- retrying next tick")
+            return
+        verb = "starting golem" if fresh_golem else "shaping golem"
+        debug_log.log("golem crafting", f"{verb} from {side} side of {station['name']} plinth ({4 - len(plan)}/4 done)")
+        if not _click_station(ctx, station):
+            return
+        if not _await_side_done(station["name"], side, GOLEM_SIDE_TIMEOUT_S):
+            debug_log.log("golem crafting", f"{side} side didn't register within {GOLEM_SIDE_TIMEOUT_S}s -- retrying next tick")
+            ctx.state.data["gc_side_misses"] = ctx.state.data.get("gc_side_misses", 0) + 1
+            if ctx.state.data["gc_side_misses"] >= GOLEM_SIDE_MISS_LIMIT:
+                ctx.state.trigger_safety_stop(
+                    f"{station['name']} plinth's {side} side never registered after "
+                    f"{GOLEM_SIDE_MISS_LIMIT} attempts; station state: {station}"
                 )
-                ctx.state.data["gc_craft_golem_id"] = None
-                ctx.state.data["gc_craft_sides_done"] = []
-                ctx.state.data["gc_craft_insert_tried"] = []
-                ctx.state.data["gc_craft_awaiting"] = None
-                ctx.state.data["gc_craft_extra_side_attempts"] = 0
-                return
-            offset = GOLEM_ADJACENT_OFFSETS[attempts % len(GOLEM_ADJACENT_OFFSETS)]
-            debug_log.log("golem crafting", f"golem still not ready for Insert-core after 4 tracked sides -- retrying offset {offset} (extra attempt {attempts + 1}/{GOLEM_EXTRA_SIDE_ATTEMPTS_CAP})")
-            # ADDED 2026-08-08 (user report: a run that hit the safety-stop below turned out to be
-            # a genuine misclick earlier in this golem's session, not a truly stuck plinth -- the
-            # offset<->real-side mapping had desynced, and re-walking to the same 4 fixed tiles
-            # under the SAME camera angle every cycle reproduced the identical "already crafted"
-            # menu resolution 8 times in a row, never a real completion. Nudging the camera changes
-            # what's actually under the click -- a genuinely different attempt instead of a
-            # mechanical repeat of one that already isn't working.
-            #
-            # CORRECTED 2026-08-08 (user request): only once misses reach
-            # GOLEM_EXTRA_SIDE_MISSES_BEFORE_ROTATE, not every extra attempt from the start -- the
-            # first batch of plain retries give the chat-message-desync theory (this branch's own
-            # docstring) a fair, unperturbed shot; only once those alone haven't worked does every
-            # further attempt also nudge the camera.
-            if attempts >= GOLEM_EXTRA_SIDE_MISSES_BEFORE_ROTATE:
-                controller.nudge_camera_yaw(ctx.ser, "LEFT" if attempts % 2 else "RIGHT")
-        if not walk_to_exact_tile(ctx, golem["x"] + offset[0], golem["y"] + offset[1], golem.get("plane", 0)):
-            debug_log.log("golem crafting", f"couldn't walk to golem side offset {offset} -- retrying next tick")
             return
-
-        golem = find_golem_object(ctx.state.data.get("gc_craft_golem_id"))  # fresh lookup -- screen position changed after walking
-        if golem is None:
-            debug_log.log("golem crafting", "golem no longer found after walking to a side -- retrying next tick")
-            return
-
-        debug_log.log("golem crafting", f"shaping golem from offset {offset} ({len(sides_done)}/4 done)")
-        # CORRECTED 2026-08-09 (user report): plain left-click's default action already resolves
-        # to Shape-golem here -- no need for click_menu_action's right-click+menu-read+select.
-        if not controller.click_entity(ctx.ser, golem):
-            debug_log.log("golem crafting", "Shape-golem click missed -- retrying next tick")
-            return
-
-        # ADDED 2026-08-08 (user report: "when we misclick we don't count it as a try?"): only
-        # burns an extra attempt now that a click has genuinely landed (a real menu selection
-        # happened and a real chat response is coming) -- previously this incremented the instant
-        # the routine entered the extra-attempt branch above, so a failed walk, a golem that went
-        # missing after walking, or a plain missed click (no matching menu entry -- nothing
-        # happened in-game at all) each silently burned budget identical to a real "already
-        # crafted" rejection, shrinking the CAP's actual headroom for genuine attempts.
-        if is_extra_attempt:
-            ctx.state.data["gc_craft_extra_side_attempts"] = ctx.state.data.get("gc_craft_extra_side_attempts", 0) + 1
-
-        ctx.state.data["gc_craft_awaiting"] = {
-            "kind": "side", "offset": offset,
-            "since_seq": ctx.state.data.get("gc_last_chat_seq", 0),
-            "started_at": time.time(),
-        }
+        ctx.state.data["gc_side_misses"] = 0
         return
 
-    tried = ctx.state.data.get("gc_craft_insert_tried", [])
-    # Go straight to the known-correct side for this plinth (see GOLEM_INSERT_OFFSET_BY_ID) if it
-    # hasn't already been rejected -- only falls back to trying the other 3 blind if that lookup
-    # is somehow wrong for this instance, or the plinth id isn't one of the two known ones.
-    known_offset = GOLEM_INSERT_OFFSET_BY_ID.get(golem.get("id"))
-    if known_offset is not None and known_offset not in tried:
-        offset = known_offset
-    else:
-        offset = next((o for o in GOLEM_ADJACENT_OFFSETS if o not in tried), None)
-    if offset is None:
-        ctx.state.trigger_safety_stop("Insert-core was rejected from all 4 sides of the golem")
+    # All four sides carved -- insert the core. The carve order ended here on a fresh golem, so
+    # this walk is normally a no-op; it only actually moves on a resumed golem whose insert side
+    # was already carved before this session started.
+    insert_side = station["insertSide"]
+    tile = station["sides"][insert_side]
+    if not walk_to_exact_tile(ctx, tile["x"], tile["y"], tile.get("plane", 0)):
+        debug_log.log("golem crafting", f"couldn't walk to {insert_side} insert side -- retrying next tick")
         return
 
-    core = find_item(SUNSTONE_CORE_NAME)
-    if core is None:
+    if find_item(SUNSTONE_CORE_NAME) is None:
         debug_log.log("golem crafting", "sunstone core went missing before inserting -- moving to mine phase")
         ctx.state.data["gc_phase"] = "mine"
         return
-    # CORRECTED 2026-08-08 (live session, live-testing discovery): fur is consumed straight from
-    # the pouch (see the batch-loop comment above), so gc_fur_stock is the only availability
-    # signal there is here -- there's no loose fur item left to look up a name from.
     if ctx.state.data.get("gc_fur_stock", 0) <= 0:
         debug_log.log("golem crafting", "fur ran out before inserting -- moving to bank phase")
         ctx.state.data["gc_phase"] = "bank"
         return
-
-    if not walk_to_exact_tile(ctx, golem["x"] + offset[0], golem["y"] + offset[1], golem.get("plane", 0)):
-        debug_log.log("golem crafting", f"couldn't walk to insert-core side offset {offset} -- retrying next tick")
+    if ctx.state.data.get("gc_fur_exhausted"):
+        # Checked before every insert attempt, not just after one fails -- see this function's
+        # own docstring and on_event's handling of GOLEM_CHAT_NOT_ENOUGH_FUR for why this flag,
+        # not gc_fur_stock, is the authoritative signal. Without this check a stale-positive
+        # gc_fur_stock (never corrected against what hunt_phase actually catches) would make
+        # every Insert-core attempt fail and retry forever, the exact unbounded-loop bug class
+        # this overhaul exists to remove.
+        debug_log.log("golem crafting", "game already rejected insert-core for lack of fur -- moving to bank phase")
+        ctx.state.data["gc_fur_stock"] = 0
+        ctx.state.data["gc_fur_exhausted"] = False
+        ctx.state.data["gc_phase"] = "bank"
         return
 
-    golem = find_golem_object(ctx.state.data.get("gc_craft_golem_id"))  # fresh lookup -- screen position changed after walking
-    if golem is None:
-        debug_log.log("golem crafting", "golem no longer found before inserting core -- retrying next tick")
+    debug_log.log("golem crafting", f"inserting core + fur from {insert_side} side of {station['name']} plinth")
+    if not _click_station(ctx, station):
+        return
+    if not _await_golem_complete(station["name"], GOLEM_INSERT_TIMEOUT_S):
+        if ctx.state.data.get("gc_fur_exhausted"):
+            # The varbit poll times out identically whether the click never landed or the game
+            # rejected it for lack of fur -- the GOLEM_CHAT_NOT_ENOUGH_FUR chat on_event caught
+            # while _await_golem_complete was polling disambiguates it as the latter, which the
+            # varbit alone can never tell us.
+            debug_log.log("golem crafting", "insert-core rejected -- out of fur, moving to bank phase")
+            ctx.state.data["gc_fur_stock"] = 0
+            ctx.state.data["gc_fur_exhausted"] = False
+            ctx.state.data["gc_phase"] = "bank"
+            return
+        debug_log.log("golem crafting", f"golem didn't complete within {GOLEM_INSERT_TIMEOUT_S}s -- retrying next tick")
+        # Same reasoning as gc_side_misses above -- bounded rather than unbounded, since with
+        # ground truth available a stuck insert is a genuine anomaly, not desync to absorb.
+        ctx.state.data["gc_insert_misses"] = ctx.state.data.get("gc_insert_misses", 0) + 1
+        if ctx.state.data["gc_insert_misses"] >= GOLEM_INSERT_MISS_LIMIT:
+            ctx.state.trigger_safety_stop(
+                f"Insert-core on {station['name']} plinth never completed after "
+                f"{GOLEM_INSERT_MISS_LIMIT} attempts; station state: {station}"
+            )
         return
 
-    debug_log.log("golem crafting", f"inserting core + fur from offset {offset}")
-    # CORRECTED 2026-08-09 (user report): plain left-click's default action already resolves to
-    # Insert-core here too -- no need for click_menu_action's right-click+menu-read+select.
-    if not controller.click_entity(ctx.ser, golem):
-        debug_log.log("golem crafting", "Insert-core click missed -- retrying next tick")
-        return
-
-    ctx.state.data["gc_craft_awaiting"] = {
-        "kind": "insert", "offset": offset,
-        "since_seq": ctx.state.data.get("gc_last_chat_seq", 0),
-        "started_at": time.time(),
-    }
+    debug_log.log("golem crafting", f"golem finished on {station['name']} plinth")
+    # Alternate: record which plinth just finished so choose_station picks the other one next
+    # call, rather than waiting out this one's reset.
+    ctx.state.data["gc_last_station"] = station["name"]
+    ctx.state.data["gc_fur_stock"] = max(0, ctx.state.data.get("gc_fur_stock", 0) - 1)
+    ctx.state.data["gc_insert_misses"] = 0
 
 
 # Never deposited during a golem-crafting bank trip -- the pouch/tools are needed for the next
