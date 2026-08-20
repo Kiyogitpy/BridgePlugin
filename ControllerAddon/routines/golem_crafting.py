@@ -841,8 +841,23 @@ def on_event(ctx, event_type, payload) -> None:
         ctx.state.data["gc_fur_exhausted"] = True
 
     if GOLEM_LOOT_GROUND_MARKER in message:
-        # Gem bag is full -- the gift fell on the ground. craft_phase picks it up once and banks.
+        # Gem bag is full -- the gift fell on the ground. craft_phase picks it up once and banks
+        # -- see its own CRITICAL FIX 2026-08-20 comment for why that pickup runs on the NEXT
+        # craft_phase call, against gc_last_station, rather than in the same call this flag is
+        # read (on_event can't drain this message until the next main-loop iteration either way).
         ctx.state.data["gc_gem_bag_full"] = True
+        # Parsed out of "... for you: <qty> x <item name>." (the game's own message format --
+        # see docs/superpowers/specs/2026-08-20-golem-crafting-varbit-overhaul-design.md) so the
+        # pickup below can filter by name instead of taking any ground item merely near the
+        # right tile. rfind rather than a regex: this codebase has no other chat-parsing regex
+        # to match the idiom of, and " x " is not expected to appear anywhere in the three fixed
+        # destination phrases (see GOLEM_LOOT_GROUND_MARKER's siblings), only right before the
+        # item name.
+        item_name = None
+        marker_idx = message.rfind(" x ")
+        if marker_idx != -1:
+            item_name = message[marker_idx + 3:].rstrip(".").strip()
+        ctx.state.data["gc_gem_bag_full_item"] = item_name
 
     is_pit_full = GOAT_CHAT_PIT_FULL in message
     is_rune_short = all(part in message for part in GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS)
@@ -1139,6 +1154,56 @@ def craft_phase(ctx, config: dict) -> None:
         return
     ctx.state.data["gc_golem_state_misses"] = 0
 
+    # CRITICAL FIX 2026-08-20 (code review): must run here, at the very top -- not at the end of
+    # the completion that sets the flag, where the original version of this block lived. on_event
+    # only drains queued UDP events once per main-loop iteration, strictly BEFORE tick() runs (see
+    # controller.py's poll_udp/main()), and _await_golem_complete blocks *inside this same
+    # function* on a plain time.sleep poll that never drains UDP. So the "leaves a gift on the
+    # ground" message announcing a golem's completion cannot reach on_event -- and therefore
+    # cannot set gc_gem_bag_full -- until the NEXT craft_phase call, one iteration after the
+    # completion that set gc_last_station. By the time this flag is finally visible, `station`
+    # local to a same-call check would already be whatever choose_station picks next -- which, by
+    # design, alternates to the OTHER plinth -- so searching around a freshly-chosen `station`
+    # instead of gc_last_station would look at the wrong tile, find nothing, clear the flag, and
+    # bank with the real gem still sitting uncollected at the plinth that actually dropped it.
+    # That is exactly the permanent loot loss this whole mechanism exists to prevent.
+    #
+    # Checked here, before choose_station or any walk runs, the player is still standing exactly
+    # where the completing call left them (that call's only remaining actions after completion
+    # are bookkeeping and a return -- nothing moves), so gc_last_station's own coordinates are
+    # still the correct place to search, and on_event has always already drained the message by
+    # the time this call starts. gc_last_station can be absent on a fresh start or a process
+    # restart that lost ctx.state.data after the flag was set server-side-adjacent; in that case
+    # there is nothing to search against, so the flag is cleared without attempting a pickup
+    # rather than crashing on a None station.
+    if ctx.state.data.get("gc_gem_bag_full"):
+        last_station = _station_by_name(state, ctx.state.data.get("gc_last_station"))
+        item_name = ctx.state.data.get("gc_gem_bag_full_item")
+        if last_station is None:
+            debug_log.log(
+                "golem crafting",
+                "gem bag full but no gc_last_station to search (fresh start/restart) -- "
+                "clearing without a pickup",
+            )
+        else:
+            debug_log.log("golem crafting", "gem bag full -- collecting the dropped gift and banking")
+            # Filtered by name (parsed by on_event from the loot message itself), not just
+            # position -- CODE REVIEW: the original version of this block took ANY ground item
+            # within 1 tile of the station, which could just as easily pick up something
+            # unrelated sitting nearby.
+            for drop in [
+                i for i in controller.get_ground_items()
+                if abs(i.get("x", 9999) - last_station["x"]) <= 1
+                and abs(i.get("y", 9999) - last_station["y"]) <= 1
+                and (item_name is None or (i.get("name") or "").lower() == item_name)
+            ]:
+                controller.click_menu_action(ctx.ser, drop, "take", target_hint=drop.get("name"), offset=(0, 0))
+                controller.human_delay(0.6, 1.0)
+        ctx.state.data["gc_gem_bag_full"] = False
+        ctx.state.data["gc_gem_bag_full_item"] = None
+        ctx.state.data["gc_phase"] = "bank"
+        return
+
     stations = state.get("stations", [])
     # CRITICAL FIX 2026-08-21 (code review): GolemProvider reports both stations unconditionally,
     # regardless of whether the player is actually in the golem-crafting area or anywhere near
@@ -1275,26 +1340,14 @@ def craft_phase(ctx, config: dict) -> None:
     # Alternate: record which plinth just finished so choose_station picks the other one next
     # call, rather than waiting out this one's reset.
     ctx.state.data["gc_last_station"] = station["name"]
-    # FIX 2026-08-20 (code review): the fur decrement and insert-miss reset below must run BEFORE
-    # the gem-bag-full check, not after -- the golem is confirmed complete by this point, so it
-    # consumed its fur regardless of where the gift ended up (gem bag or ground). gc_fur_stock has
-    # no game-state fallback to self-correct a skipped decrement against (that's exactly why
+    # This bookkeeping runs unconditionally, regardless of where the gift landed -- the golem is
+    # confirmed complete by this point, so it consumed its fur either way. gc_fur_stock has no
+    # game-state fallback to self-correct a skipped decrement against (that's exactly why
     # gc_fur_exhausted exists as a backstop), and gc_insert_misses carrying over would drift
-    # toward a false safety-stop on the next golem. Both used to sit after the gem-bag-full
-    # branch's own early return, silently skipping them on that path only.
+    # toward a false safety-stop on the next golem. See the gem-bag-full check near the top of
+    # this function (CRITICAL FIX 2026-08-20) for why that check can no longer live here.
     ctx.state.data["gc_fur_stock"] = max(0, ctx.state.data.get("gc_fur_stock", 0) - 1)
     ctx.state.data["gc_insert_misses"] = 0
-    if ctx.state.data.get("gc_gem_bag_full"):
-        debug_log.log("golem crafting", "gem bag full -- collecting the dropped gift and banking")
-        for drop in [
-            i for i in controller.get_ground_items()
-            if abs(i.get("x", 9999) - station["x"]) <= 1 and abs(i.get("y", 9999) - station["y"]) <= 1
-        ]:
-            controller.click_menu_action(ctx.ser, drop, "take", target_hint=drop.get("name"), offset=(0, 0))
-            controller.human_delay(0.6, 1.0)
-        ctx.state.data["gc_gem_bag_full"] = False
-        ctx.state.data["gc_phase"] = "bank"
-        return
 
 
 # Never deposited during a golem-crafting bank trip -- the pouch/tools are needed for the next

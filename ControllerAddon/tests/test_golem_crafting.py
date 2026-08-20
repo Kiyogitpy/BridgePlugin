@@ -277,6 +277,7 @@ def test_n_consecutive_golem_state_misses_eventually_safety_stops(monkeypatch):
 
     gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
     assert ctx.state.safety_stopped
+    assert ctx.state.data["gc_golem_state_misses"] == gc.GOLEM_STATE_MISS_LIMIT
 
 
 # --- gem-bag loot handling (2026-08-20) ----------------------------------------------
@@ -315,36 +316,189 @@ def test_ground_destination_flags_a_full_gem_bag():
     assert ctx.state.data["gc_gem_bag_full"]
 
 
+def test_ground_destination_parses_the_item_name_for_the_later_pickup_filter():
+    """craft_phase's pickup (run one call later -- see below) filters by name as well as
+    position; on_event is the only place that ever sees the raw chat message, so it must parse
+    the item name out of it here rather than the pickup guessing at a hardcoded gem list."""
+    ctx = _FakeCtx()
+    _loot_event(ctx, "on the ground")
+    assert ctx.state.data["gc_gem_bag_full_item"] == "uncut ruby"
+
+
 def test_gem_sack_destination_does_not_flag_a_full_bag():
     ctx = _FakeCtx()
     _loot_event(ctx, "in your gem sack")
     assert not ctx.state.data.get("gc_gem_bag_full")
 
 
-def test_gem_bag_full_path_still_runs_end_of_golem_bookkeeping(monkeypatch):
-    """Regression for a defect caught in review: the gem-bag-full branch's early `return` must
-    not skip the fur decrement / insert-miss reset that every other golem-completion exit path
-    runs. A completed golem consumes one fur whether or not its gem fit in the bag -- gc_fur_stock
-    is a blind local estimate with no game-state fallback (that's exactly why gc_fur_exhausted
-    exists), so a skipped decrement never self-corrects and eventually causes an Insert-core
-    attempt with no fur left. gc_insert_misses carrying over would likewise drift toward a false
-    safety-stop on the next golem."""
-    station = _station("north", progress=5, done=gc.SIDES)  # all four sides done -> insert path
-    _stub_golem_area(monkeypatch, station)
+# --- craft_phase gem-bag pickup timing (2026-08-20 code review round 2) --------------
+#
+# CRITICAL, established as fact by the reviewer (controller.py:2070-2080): on_event only drains
+# queued UDP events once per main-loop iteration, strictly BEFORE tick() runs, and
+# _await_golem_complete blocks *inside craft_phase itself* on a plain time.sleep poll that never
+# drains UDP. So the "leaves a gift on the ground" message announcing a golem's own completion
+# cannot reach on_event -- and therefore cannot set gc_gem_bag_full -- until the NEXT craft_phase
+# call, one iteration after the completion that set gc_last_station. By then choose_station has
+# already alternated away from the plinth that actually completed, so the pickup must search
+# gc_last_station's coordinates, not whatever station a same-call read would have used. These
+# tests model that real two-call sequence directly instead of (incorrectly) presetting the flag
+# before a call that also completes a golem, which cannot happen in practice.
+
+def _two_station_golem(monkeypatch, north, south, ground_items, click_calls):
+    """Stubs get_golem/get_player/get_objects to always report both plinths (as GolemProvider
+    really does, unconditionally -- see _any_station_visible's own docstring), and records every
+    click_menu_action call (rather than a bare True/False stub) so a test can assert exactly
+    which ground item, at which position, was actually targeted."""
+    monkeypatch.setattr(
+        controller, "get_golem",
+        lambda: {"inArea": True, "stations": [north, south]},
+    )
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": north["x"], "y": north["y"]})
+    monkeypatch.setattr(
+        controller, "get_objects",
+        lambda radius=None: [
+            {"id": north["objectId"], "x": north["x"], "y": north["y"], "plane": 0},
+            {"id": south["objectId"], "x": south["x"], "y": south["y"], "plane": 0},
+        ],
+    )
+    monkeypatch.setattr(controller, "get_ground_items", lambda: ground_items)
+    monkeypatch.setattr(
+        controller, "click_menu_action",
+        lambda ser, entity, option, target_hint=None, offset=(0, 0): click_calls.append(entity),
+    )
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+
+
+def _complete_golem_at(monkeypatch, ctx, station, other_station):
+    """Drives craft_phase through a single-call Insert-core completion on `station`, the same
+    setup test_gem_bag_full_path_still_runs_end_of_golem_bookkeeping (round 1) used -- this
+    leaves ctx.state.data["gc_last_station"] set to `station`, matching what a real completed
+    golem does before on_event has had any chance to drain the loot message."""
+    monkeypatch.setattr(
+        controller, "get_golem",
+        lambda: {"inArea": True, "stations": [station, other_station]},
+    )
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": station["x"], "y": station["y"]})
+    monkeypatch.setattr(
+        controller, "get_objects",
+        lambda radius=None: [{"id": station["objectId"], "x": station["x"], "y": station["y"], "plane": 0}],
+    )
     monkeypatch.setattr(gc, "walk_to_exact_tile", lambda ctx, x, y, plane: True)
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
     monkeypatch.setattr(gc, "_await_golem_complete", lambda *a, **k: True)
     monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Sunstone core"}])
-    monkeypatch.setattr(controller, "get_ground_items", lambda: [])
-
-    ctx = _ctx()
     ctx.state.data["gc_fur_stock"] = 5
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+    assert ctx.state.data["gc_last_station"] == station["name"]
+    assert not ctx.state.data.get("gc_gem_bag_full"), "flag can't be set within the completing call itself"
+
+
+def test_gem_bag_full_path_still_runs_end_of_golem_bookkeeping(monkeypatch):
+    """Regression for a defect caught in round 1's review: the gem-bag-full branch's early
+    `return` used to skip the fur decrement / insert-miss reset that every other
+    golem-completion exit path runs. A completed golem consumes one fur whether or not its gem
+    fit in the bag -- gc_fur_stock is a blind local estimate with no game-state fallback (that's
+    exactly why gc_fur_exhausted exists), so a skipped decrement never self-corrects and
+    eventually causes an Insert-core attempt with no fur left. gc_insert_misses carrying over
+    would likewise drift toward a false safety-stop on the next golem.
+
+    REWORKED for round 2's fix (the gem-bag check moved to the top of craft_phase): modeled now
+    as the real two-call sequence -- call one completes the golem and sets gc_last_station (this
+    is where the fur/insert-miss bookkeeping under test actually runs); the loot message then
+    arrives via on_event, exactly as it would between main-loop iterations; call two observes
+    the now-set flag. The original single-call version (preset the flag, then call craft_phase
+    once) can no longer happen in practice, since the flag can never become true within the same
+    call that completes a golem -- see this section's own header comment."""
+    north = _station("north", 2596, 2257, "south", progress=5, done=gc.SIDES)
+    south = _station("south", 2595, 2253, "north", progress=0)
+    ctx = _ctx()
+
+    _complete_golem_at(monkeypatch, ctx, north, south)
+    assert ctx.state.data["gc_fur_stock"] == 4, "a completed golem must still consume one fur even when its gem overflowed to the ground"
+    assert ctx.state.data["gc_insert_misses"] == 0, "insert-miss count must still reset on a confirmed completion"
+
+    gc.on_event(ctx, "CHAT_MESSAGE", {
+        "message": "As you complete the golem it leaves a gift on the ground for you: 1 x Uncut ruby.",
+    })
+    assert ctx.state.data["gc_gem_bag_full"]
+
+    click_calls = []
+    _two_station_golem(monkeypatch, north, south, ground_items=[], click_calls=click_calls)
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert ctx.state.data["gc_gem_bag_full"] is False
+    assert ctx.state.data["gc_phase"] == "bank"
+    # The bookkeeping from call one must still stand -- the second call's gem-bag branch must not
+    # have touched gc_fur_stock/gc_insert_misses again.
+    assert ctx.state.data["gc_fur_stock"] == 4
+    assert ctx.state.data["gc_insert_misses"] == 0
+
+
+def test_gem_bag_pickup_targets_gc_last_station_not_the_freshly_chosen_one(monkeypatch):
+    """Pins the actual CRITICAL fix: with the flag set (as on_event would have left it, one call
+    after completion), the pickup must search around gc_last_station (north, where the gem
+    actually fell) even though choose_station would pick south next. A decoy item of the exact
+    same name sits at south to prove this is a position check, not merely a name match."""
+    north = _station("north", 2596, 2257, "south", progress=0)
+    south = _station("south", 2595, 2253, "north", progress=0)
+    ctx = _ctx()
+    ctx.state.data["gc_last_station"] = "north"
     ctx.state.data["gc_gem_bag_full"] = True
+    ctx.state.data["gc_gem_bag_full_item"] = "uncut ruby"
+
+    real_gem = {"id": 1, "name": "Uncut ruby", "x": north["x"], "y": north["y"]}
+    decoy = {"id": 2, "name": "Uncut ruby", "x": south["x"], "y": south["y"]}
+    click_calls = []
+    _two_station_golem(monkeypatch, north, south, ground_items=[real_gem, decoy], click_calls=click_calls)
 
     gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
 
-    assert ctx.state.data["gc_fur_stock"] == 4, "a completed golem must still consume one fur even when its gem overflowed to the ground"
-    assert ctx.state.data["gc_insert_misses"] == 0, "insert-miss count must still reset on a confirmed completion"
+    assert click_calls == [real_gem], "must pick up the item at gc_last_station (north), not the newly-chosen station (south)"
+    assert ctx.state.data["gc_gem_bag_full"] is False
+    assert ctx.state.data["gc_gem_bag_full_item"] is None
+    assert ctx.state.data["gc_phase"] == "bank"
+
+
+def test_gem_bag_pickup_never_searches_the_freshly_chosen_station(monkeypatch):
+    """The other half of the same fix, isolated: an item sitting ONLY near the station
+    choose_station would pick next (south) -- not gc_last_station (north) -- must never be
+    picked up, even though it's the only candidate on the ground. Confirms the wrong-plinth
+    search genuinely cannot happen, rather than merely being deprioritized."""
+    north = _station("north", 2596, 2257, "south", progress=0)
+    south = _station("south", 2595, 2253, "north", progress=0)
+    ctx = _ctx()
+    ctx.state.data["gc_last_station"] = "north"
+    ctx.state.data["gc_gem_bag_full"] = True
+    ctx.state.data["gc_gem_bag_full_item"] = "uncut ruby"
+
+    decoy_only = {"id": 2, "name": "Uncut ruby", "x": south["x"], "y": south["y"]}
+    click_calls = []
+    _two_station_golem(monkeypatch, north, south, ground_items=[decoy_only], click_calls=click_calls)
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert click_calls == [], "an item near the freshly-chosen station must never be picked up as a substitute"
+    assert ctx.state.data["gc_gem_bag_full"] is False
+    assert ctx.state.data["gc_phase"] == "bank"
+
+
+def test_gem_bag_full_without_a_last_station_clears_the_flag_without_a_pickup(monkeypatch):
+    """gc_last_station can be absent (a fresh start, or a process restart that lost
+    ctx.state.data after the flag was effectively set server-side) -- must clear the flag and
+    still route to bank rather than crash on a None station or spin forever unable to search."""
+    north = _station("north", 2596, 2257, "south", progress=0)
+    south = _station("south", 2595, 2253, "north", progress=0)
+    ctx = _ctx()
+    ctx.state.data["gc_gem_bag_full"] = True
+    ctx.state.data["gc_gem_bag_full_item"] = "uncut ruby"
+    # Deliberately no gc_last_station.
+
+    click_calls = []
+    _two_station_golem(monkeypatch, north, south, ground_items=[], click_calls=click_calls)
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert click_calls == []
     assert ctx.state.data["gc_gem_bag_full"] is False
     assert ctx.state.data["gc_phase"] == "bank"
 
@@ -358,7 +512,7 @@ def test_gem_bag_full_path_still_runs_end_of_golem_bookkeeping(monkeypatch):
 # and thread that one result through both the visibility gate (_any_station_visible) and the
 # click path (_click_station/_find_station_object) instead of each fetching its own.
 
-def test_craft_phase_fetches_objects_at_most_once_per_call(monkeypatch):
+def test_craft_phase_fetches_objects_exactly_once_per_call(monkeypatch):
     station = _station("north", progress=5, done=())
     _stub_golem_area(monkeypatch, station)
     calls = {"n": 0}
