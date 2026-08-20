@@ -863,6 +863,25 @@ GOLEM_SIDE_MISS_LIMIT = 5
 # would hang the routine silently, which is the exact bug class this overhaul exists to remove.
 GOLEM_INSERT_MISS_LIMIT = 5
 
+# CRITICAL FIX 2026-08-21 (code review of the varbit-overhaul rewrite): craft_phase's walk-to-tile
+# and click-the-plinth steps used to return on failure with no counter incremented at all -- a
+# byte-identical retry every following tick, forever, with nothing to make progress or escalate.
+# Reachable in normal play: craft_phase is entered from chisel_phase at the mining anchor, ~10
+# tiles from any station tile, and whether a station tile projects onto the viewport from there
+# depends on camera yaw, which nothing on that path changes. _walk_to_station_tile/
+# _click_station_tracked below bound those two failure modes the same way GOLEM_SIDE_MISS_LIMIT/
+# GOLEM_INSERT_MISS_LIMIT already bound the confirmation-side ones.
+GOLEM_APPROACH_MISS_LIMIT = 5
+
+# IMPORTANT FIX (same review): get_golem() can return None on nothing worse than api_get's own
+# 0.3s timeout -- CLAUDE.md documents this exact routine blowing that timeout under load -- so a
+# single miss must not immediately safety-stop asserting "rebuild the client", which is very
+# likely the wrong diagnosis for what's usually a transient bridge hiccup. Same
+# MAX_CONSECUTIVE_MISSES-style tolerance as handle_missing_target's own poll-tolerance layer
+# (see that function's docstring), kept as its own constant since this gates a hard safety-stop
+# rather than a location-anchor walk.
+GOLEM_STATE_MISS_LIMIT = 5
+
 
 def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
     """Walk to the exact world tile (x, y) and wait until standing exactly on it. Deliberately
@@ -932,6 +951,17 @@ def _find_station_object(station: dict):
     )
 
 
+def _any_station_visible(stations: list) -> bool:
+    """Whether at least one of `stations`' plinth GameObjects is currently within
+    MAX_OBJECT_DISTANCE. Needed because GolemProvider reports both stations unconditionally
+    regardless of whether the player is actually in the golem-crafting area or anywhere near
+    either plinth (CONFIRMED by code review) -- craft_phase's `stations` list can never be empty,
+    so this is the check that actually detects "in the area, but nothing to click right now",
+    the state `not stations` was originally meant to (and never could) catch."""
+    visible_ids = {o.get("id") for o in controller.get_objects(radius=MAX_OBJECT_DISTANCE)}
+    return any(s.get("objectId") in visible_ids for s in stations)
+
+
 def _click_station(ctx, station) -> bool:
     """Click the plinth, hopping closer first if it isn't on screen. Returns False if the click
     did not go out, in which case the caller should retry next tick.
@@ -953,6 +983,57 @@ def _click_station(ctx, station) -> bool:
     return True
 
 
+def _click_station_tracked(ctx, station, miss_key: str) -> bool:
+    """_click_station with a bounded miss counter -- see GOLEM_APPROACH_MISS_LIMIT's own comment
+    for why an uncounted click failure is exactly the same unbounded-loop shape as an uncounted
+    walk failure. _click_station already hops toward the station on a miss; this adds the
+    counting and the eventual safety-stop escalation once hopping alone hasn't fixed it."""
+    if _click_station(ctx, station):
+        ctx.state.data[miss_key] = 0
+        return True
+    misses = ctx.state.data.get(miss_key, 0) + 1
+    ctx.state.data[miss_key] = misses
+    debug_log.log(
+        "golem crafting",
+        f"click on {station['name']} plinth missed (miss {misses}/{GOLEM_APPROACH_MISS_LIMIT})",
+    )
+    if misses >= GOLEM_APPROACH_MISS_LIMIT:
+        ctx.state.trigger_safety_stop(
+            f"clicking {station['name']} plinth failed {GOLEM_APPROACH_MISS_LIMIT} times in a "
+            f"row; station state: {station}"
+        )
+    return False
+
+
+def _walk_to_station_tile(ctx, station, tile: dict, miss_key: str) -> bool:
+    """walk_to_exact_tile toward `tile`, with a bounded miss counter (`miss_key`) and a
+    _hop_toward_point fallback toward the station's own tile on failure -- see
+    GOLEM_APPROACH_MISS_LIMIT's own comment for why an uncounted failure here is exactly the
+    no-progress spin this overhaul exists to remove. walk_to_exact_tile only returns False when
+    the target tile can't be projected onto the viewport at all (see its own docstring), meaning
+    the camera/position genuinely needs to change before the next attempt can possibly succeed --
+    which is exactly what the hop provides."""
+    if walk_to_exact_tile(ctx, tile["x"], tile["y"], tile.get("plane", 0)):
+        ctx.state.data[miss_key] = 0
+        return True
+    misses = ctx.state.data.get(miss_key, 0) + 1
+    ctx.state.data[miss_key] = misses
+    debug_log.log(
+        "golem crafting",
+        f"couldn't walk to ({tile['x']}, {tile['y']}) near {station['name']} plinth "
+        f"(miss {misses}/{GOLEM_APPROACH_MISS_LIMIT}) -- hopping closer",
+    )
+    if misses >= GOLEM_APPROACH_MISS_LIMIT:
+        ctx.state.trigger_safety_stop(
+            f"couldn't reach a tile near {station['name']} plinth after "
+            f"{GOLEM_APPROACH_MISS_LIMIT} attempts; target ({tile['x']}, {tile['y']}, "
+            f"plane {tile.get('plane', 0)})"
+        )
+        return False
+    _hop_toward_point(ctx, station["x"], station["y"], station.get("plane", 0))
+    return False
+
+
 def _await_side_done(station_name: str, side: str, timeout_s: float) -> bool:
     """Poll /golem until `side` reads done, or timeout. True if it flipped.
 
@@ -960,13 +1041,19 @@ def _await_side_done(station_name: str, side: str, timeout_s: float) -> bool:
     processes the action, so a real success is seen almost immediately and a timeout genuinely
     means the click did not land -- most often a deliberate MISTAKE_MISCLICK_CHANCE near-miss,
     which produces no game action at all (see CLAUDE.md). Retrying is safe precisely because the
-    varbit says unambiguously whether the previous click counted."""
+    varbit says unambiguously whether the previous click counted.
+
+    IMPORTANT FIX 2026-08-21 (code review): a None from get_golem() mid-poll now `continue`s
+    rather than returning False -- a single dropped request (the same transient timeout
+    GOLEM_STATE_MISS_LIMIT tolerates in craft_phase) used to abandon the poll early and score it
+    as a genuine miss, which could charge a spurious gc_side_misses tick against an action that
+    actually succeeded."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         time.sleep(GOLEM_CONFIRM_POLL_S)
         state = controller.get_golem()
         if state is None:
-            return False
+            continue
         station = _station_by_name(state, station_name)
         if station and station["sides"][side]["done"]:
             return True
@@ -974,13 +1061,16 @@ def _await_side_done(station_name: str, side: str, timeout_s: float) -> bool:
 
 
 def _await_golem_complete(station_name: str, timeout_s: float) -> bool:
-    """Poll /golem until the station's overall progress returns to 0 (golem finished)."""
+    """Poll /golem until the station's overall progress returns to 0 (golem finished).
+
+    See _await_side_done's docstring for why a None from get_golem() mid-poll continues polling
+    (IMPORTANT FIX 2026-08-21) rather than returning False immediately."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         time.sleep(GOLEM_CONFIRM_POLL_S)
         state = controller.get_golem()
         if state is None:
-            return False
+            continue
         station = _station_by_name(state, station_name)
         if station and station.get("progress", 0) == 0:
             return True
@@ -1006,20 +1096,46 @@ def craft_phase(ctx, config: dict) -> None:
     Fur is the one exception -- it is NOT one of /golem's exposed state variables, so
     GOLEM_CHAT_NOT_ENOUGH_FUR (captured by on_event into the "gc_fur_exhausted" flag) remains the
     only authoritative signal that an Insert-core attempt was rejected for lack of fur, checked
-    both before attempting an insert and right after one fails to confirm (see below)."""
+    both before attempting an insert and right after one fails to confirm (see below).
+
+    IMPORTANT FIX 2026-08-21 (code review): a None from get_golem() -- api_get returns None on
+    ANY exception, including its own 0.3s timeout, which CLAUDE.md documents this exact routine
+    blowing under load -- now tolerates GOLEM_STATE_MISS_LIMIT consecutive misses before
+    safety-stopping, the same tolerance handle_missing_target's own poll layer gives every other
+    lookup in this file, rather than asserting "rebuild the client" off a single transient blip."""
     state = controller.get_golem()
     if state is None:
+        misses = ctx.state.data.get("gc_golem_state_misses", 0) + 1
+        ctx.state.data["gc_golem_state_misses"] = misses
+        if misses < GOLEM_STATE_MISS_LIMIT:
+            debug_log.log(
+                "golem crafting",
+                f"/golem unavailable (miss {misses}/{GOLEM_STATE_MISS_LIMIT}) -- retrying, "
+                "likely a transient bridge timeout",
+            )
+            return
         ctx.state.trigger_safety_stop(
-            "GET /golem unavailable -- rebuild and restart the RuneLite client "
-            "(./gradlew.bat run) so GolemProvider is loaded"
+            f"GET /golem unavailable for {GOLEM_STATE_MISS_LIMIT} consecutive attempts -- "
+            "either a transient bridge issue that never cleared, or the client needs "
+            "rebuilding/restarting (./gradlew.bat run) so GolemProvider is loaded"
         )
         return
+    ctx.state.data["gc_golem_state_misses"] = 0
 
     stations = state.get("stations", [])
-    if not stations:
+    # CRITICAL FIX 2026-08-21 (code review): GolemProvider reports both stations unconditionally,
+    # regardless of whether the player is actually in the golem-crafting area or anywhere near
+    # either plinth (confirmed by review) -- `not stations` can therefore never be true on its
+    # own, and used to make handle_missing_target's fallback below permanently dead code. Gate on
+    # state that actually varies instead: `inArea` (exposed by GolemProvider, unused until now)
+    # catches "not even in the area", and _any_station_visible catches "in the area, but nothing
+    # currently projects onto the viewport" -- the exact condition that used to fall through to a
+    # byte-identical no-op return every tick, forever. `not stations` is kept as a defensive extra
+    # condition in case that provider guarantee ever changes, not as the real gate.
+    if not stations or not state.get("inArea", True) or not _any_station_visible(stations):
         if handle_missing_target(ctx, config, "plinth", "gc_plinth_misses", "gc_plinth_walks"):
             return
-        ctx.state.trigger_safety_stop("no golem stations reported by /golem")
+        ctx.state.trigger_safety_stop("golem crafting area/plinths not found nearby")
         return
     ctx.state.data["gc_plinth_misses"] = 0
     ctx.state.data["gc_plinth_walks"] = 0
@@ -1052,12 +1168,11 @@ def craft_phase(ctx, config: dict) -> None:
     if plan:
         side = plan[0]
         tile = station["sides"][side]
-        if not walk_to_exact_tile(ctx, tile["x"], tile["y"], tile.get("plane", 0)):
-            debug_log.log("golem crafting", f"couldn't walk to {side} side -- retrying next tick")
+        if not _walk_to_station_tile(ctx, station, tile, "gc_side_walk_misses"):
             return
         verb = "starting golem" if fresh_golem else "shaping golem"
         debug_log.log("golem crafting", f"{verb} from {side} side of {station['name']} plinth ({4 - len(plan)}/4 done)")
-        if not _click_station(ctx, station):
+        if not _click_station_tracked(ctx, station, "gc_side_click_misses"):
             return
         if not _await_side_done(station["name"], side, GOLEM_SIDE_TIMEOUT_S):
             debug_log.log("golem crafting", f"{side} side didn't register within {GOLEM_SIDE_TIMEOUT_S}s -- retrying next tick")
@@ -1076,8 +1191,7 @@ def craft_phase(ctx, config: dict) -> None:
     # was already carved before this session started.
     insert_side = station["insertSide"]
     tile = station["sides"][insert_side]
-    if not walk_to_exact_tile(ctx, tile["x"], tile["y"], tile.get("plane", 0)):
-        debug_log.log("golem crafting", f"couldn't walk to {insert_side} insert side -- retrying next tick")
+    if not _walk_to_station_tile(ctx, station, tile, "gc_insert_walk_misses"):
         return
 
     if find_item(SUNSTONE_CORE_NAME) is None:
@@ -1098,21 +1212,26 @@ def craft_phase(ctx, config: dict) -> None:
         debug_log.log("golem crafting", "game already rejected insert-core for lack of fur -- moving to bank phase")
         ctx.state.data["gc_fur_stock"] = 0
         ctx.state.data["gc_fur_exhausted"] = False
+        ctx.state.data["gc_insert_misses"] = 0
         ctx.state.data["gc_phase"] = "bank"
         return
 
     debug_log.log("golem crafting", f"inserting core + fur from {insert_side} side of {station['name']} plinth")
-    if not _click_station(ctx, station):
+    if not _click_station_tracked(ctx, station, "gc_insert_click_misses"):
         return
     if not _await_golem_complete(station["name"], GOLEM_INSERT_TIMEOUT_S):
         if ctx.state.data.get("gc_fur_exhausted"):
-            # The varbit poll times out identically whether the click never landed or the game
-            # rejected it for lack of fur -- the GOLEM_CHAT_NOT_ENOUGH_FUR chat on_event caught
-            # while _await_golem_complete was polling disambiguates it as the latter, which the
-            # varbit alone can never tell us.
+            # IMPORTANT FIX 2026-08-21 (code review): this branch cannot actually fire under the
+            # current single-threaded event dispatch -- on_event only runs from the main loop
+            # between ticks, never while craft_phase is blocked inside _await_golem_complete's own
+            # sleep loop, and the pre-insert check above already consumes the flag first on the
+            # very next call. Kept anyway as cheap defence per Ruling 1 (both checks were asked
+            # for) in case that dispatch assumption ever changes, not because it's expected to
+            # trigger today.
             debug_log.log("golem crafting", "insert-core rejected -- out of fur, moving to bank phase")
             ctx.state.data["gc_fur_stock"] = 0
             ctx.state.data["gc_fur_exhausted"] = False
+            ctx.state.data["gc_insert_misses"] = 0
             ctx.state.data["gc_phase"] = "bank"
             return
         debug_log.log("golem crafting", f"golem didn't complete within {GOLEM_INSERT_TIMEOUT_S}s -- retrying next tick")

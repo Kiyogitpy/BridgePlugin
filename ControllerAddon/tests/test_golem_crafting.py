@@ -154,3 +154,127 @@ def test_get_golem_passes_through_the_payload(monkeypatch):
     payload = {"inArea": True, "stations": []}
     monkeypatch.setattr(controller, "api_get", lambda path, **kw: payload)
     assert controller.get_golem() == payload
+
+
+# --- craft_phase regressions (2026-08-21 code review round 1) -----------------------
+#
+# These stub controller.get_golem/get_player/get_objects (and, per test, walk_to_exact_tile or
+# _click_station) rather than hitting a real bridge -- craft_phase itself is an integration
+# function, but the specific bug class under test (a failure path that returns with no counter
+# incremented and nothing else changed) is entirely deterministic given those stubs, so a real
+# bridge/client isn't needed to reproduce or prove the fix.
+
+def _ctx():
+    return controller.Context(ser=None, state=controller.ControllerState())
+
+
+def _stub_golem_area(monkeypatch, station):
+    """Stubs get_golem/get_player/get_objects so craft_phase clears the "in area, station
+    visible" gate and reaches the carve-plan step for `station` (a single in-progress station,
+    progress > 0, so the fresh-golem material checks are skipped entirely)."""
+    monkeypatch.setattr(controller, "get_golem", lambda: {"inArea": True, "stations": [station]})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": station["x"], "y": station["y"]})
+    monkeypatch.setattr(
+        controller, "get_objects",
+        lambda radius=None: [
+            {"id": station["objectId"], "x": station["x"], "y": station["y"], "plane": 0}
+        ],
+    )
+
+
+def test_unprojectable_tile_does_not_spin_forever_and_eventually_safety_stops(monkeypatch):
+    """Regression for CRITICAL 1 (2026-08-21 review): walk_to_exact_tile returning False (the
+    target tile can't be projected onto the viewport at all) used to make craft_phase return
+    having done NOTHING -- no counter, no hop, no phase change, no safety stop -- so the very next
+    tick was byte-identical, forever. Drives craft_phase with a permanently-unprojectable side
+    tile for GOLEM_APPROACH_MISS_LIMIT calls and asserts every one of them makes observable
+    progress (a hop attempt, an incremented miss counter) short of the limit, then safety-stops
+    on the limit-th call instead of continuing to spin."""
+    station = _station("north", progress=5, done=())  # in-progress -- skips the material gates
+    _stub_golem_area(monkeypatch, station)
+    monkeypatch.setattr(gc, "walk_to_exact_tile", lambda ctx, x, y, plane: False)
+    hops = []
+    monkeypatch.setattr(
+        gc, "_hop_toward_point",
+        lambda ctx, x, y, plane: hops.append((x, y, plane)) or False,
+    )
+
+    ctx = _ctx()
+    for i in range(1, gc.GOLEM_APPROACH_MISS_LIMIT):
+        gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+        assert not ctx.state.safety_stopped, f"safety-stopped too early on attempt {i}"
+        assert ctx.state.data.get("gc_side_walk_misses") == i, "miss counter must advance every attempt"
+        assert len(hops) == i, "each failed walk must attempt a hop, never a silent no-op"
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+    assert ctx.state.safety_stopped, "unbounded walk failures must eventually safety-stop, not spin forever"
+    assert ctx.state.data["gc_side_walk_misses"] == gc.GOLEM_APPROACH_MISS_LIMIT
+
+
+def test_click_failure_does_not_spin_forever_and_eventually_safety_stops(monkeypatch):
+    """Regression for IMPORTANT 2: _click_station failing was the same unbounded shape as
+    CRITICAL 1's walk failure -- both call sites returned with no counter incremented. Walk
+    succeeds here so the click step is actually reached; _click_station itself is stubbed to fail
+    every time, and _click_station_tracked must bound that the same way the walk step is bounded."""
+    station = _station("north", progress=5, done=())
+    _stub_golem_area(monkeypatch, station)
+    monkeypatch.setattr(gc, "walk_to_exact_tile", lambda ctx, x, y, plane: True)
+    monkeypatch.setattr(gc, "_click_station", lambda ctx, station: False)
+
+    ctx = _ctx()
+    for i in range(1, gc.GOLEM_APPROACH_MISS_LIMIT):
+        gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+        assert not ctx.state.safety_stopped, f"safety-stopped too early on attempt {i}"
+        assert ctx.state.data.get("gc_side_click_misses") == i
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+    assert ctx.state.safety_stopped, "unbounded click failures must eventually safety-stop, not spin forever"
+
+
+def test_single_golem_state_miss_is_tolerated_not_stopped(monkeypatch):
+    """Regression for IMPORTANT 3: api_get (and therefore get_golem) returns None on ANY
+    exception, including its own 0.3s timeout -- CLAUDE.md documents this exact routine blowing
+    that timeout under load. A single None must be tolerated as a likely transient blip, not
+    immediately safety-stopped as "rebuild the client"."""
+    ctx = _ctx()
+    monkeypatch.setattr(controller, "get_golem", lambda: None)
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert not ctx.state.safety_stopped
+    assert ctx.state.data["gc_golem_state_misses"] == 1
+
+
+def test_golem_state_miss_counter_resets_on_a_later_success(monkeypatch):
+    """A transient miss followed by a real response must not leave a stale near-threshold count
+    sitting around to combine with a later, unrelated gap."""
+    ctx = _ctx()
+    calls = {"n": 0}
+
+    def fake_get_golem():
+        calls["n"] += 1
+        return None if calls["n"] == 1 else {"inArea": True, "stations": []}
+
+    monkeypatch.setattr(controller, "get_golem", fake_get_golem)
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)  # miss 1
+    assert ctx.state.data["gc_golem_state_misses"] == 1
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)  # a real response this time
+    assert ctx.state.data["gc_golem_state_misses"] == 0
+    assert not ctx.state.safety_stopped
+
+
+def test_n_consecutive_golem_state_misses_eventually_safety_stops(monkeypatch):
+    """The other half of IMPORTANT 3's fix: tolerance must still have a ceiling --
+    GOLEM_STATE_MISS_LIMIT consecutive Nones must safety-stop rather than retry forever."""
+    ctx = _ctx()
+    monkeypatch.setattr(controller, "get_golem", lambda: None)
+
+    for i in range(1, gc.GOLEM_STATE_MISS_LIMIT):
+        gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+        assert not ctx.state.safety_stopped, f"safety-stopped too early on miss {i}"
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+    assert ctx.state.safety_stopped
+    assert ctx.state.data["gc_golem_state_misses"] == gc.GOLEM_STATE_MISS_LIMIT
