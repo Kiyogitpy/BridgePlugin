@@ -30,6 +30,14 @@ Three consequences follow from that single design choice:
 3. **Walking is unplanned.** Sides are carved in fixed `N, E, S, W` order, then the routine walks
    *again* to the insert side. That extra walk happens on every single golem.
 
+Two further inefficiencies are independent of the desync but sit in the same code path, and are
+fixed here because the rewrite touches exactly those lines:
+
+4. **The routine waits out each plinth's reset.** After a golem completes it sleeps 2.0s for the
+   plinth to become available again, when the *other* plinth is free immediately (see 3b).
+5. **It scans the ground for loot that is never there.** The gift goes straight into the gem bag;
+   the three-attempt pickup loop guards a case that does not normally occur (see 3a).
+
 The user additionally reports problems in the mining, banking/fur, and hunting phases. Those are
 scoped out of this document — see Decomposition.
 
@@ -169,25 +177,41 @@ can see them.
 The phase becomes a deterministic function of live state. New helper `controller.get_golem()`
 alongside the existing bridge getters.
 
-**Station selection.** Pick the station whose `progress > 0` (a golem is in progress there). If
-neither is in progress, pick the nearer one and start a golem on it. This replaces
-`find_golem_object`'s object-name scan and the `gc_craft_golem_id` commitment tracking — the
-varbit *is* the identity, and it cannot desync across a restart.
+**Station selection.** Prefer a station with `progress > 0` (a golem already in progress). If
+both are in progress, take the one with the higher `progress` — finishing the more advanced golem
+first minimises the window in which a crash could strand its already-spent 4 sunstone. If neither
+is in progress, take the station that is **not** the one just completed (see Alternating plinths
+below), falling back to the nearer one. This replaces `find_golem_object`'s object-name scan and
+the `gc_craft_golem_id` commitment tracking — the varbit *is* the identity, and it cannot desync
+across a restart.
 
 **Side ordering.** Compute the carve order so the last side carved is `insertSide`, leaving the
 player already standing on the correct tile for Insert-core:
 
-- Order the four sides rotationally (`N, E, S, W`) starting from a start side. This is a module
-  constant `GOLEM_START_SIDE = "east"` (matching the reference plugin's
-  `southGolemStartDirection=EAST`), **not** a bridge-config field: it is not a player-facing
-  choice, and adding it to `ControllerConfig.java` would mean a Java rebuild to tune a constant.
-  Same reasoning as `FUR_PRIORITY` already being a module constant rather than exported config
-  ([golem_crafting.py:63-70](../../../ControllerAddon/routines/golem_crafting.py#L63-L70)).
-- Choose rotation direction (clockwise or counter-clockwise) such that `insertSide` is reached
-  last, using the reference plugin's `isClockwise` rule: clockwise if
+- Order the four sides rotationally (`N, E, S, W`) from a start side, stepping clockwise or
+  counter-clockwise such that `insertSide` is reached last. Direction follows the reference
+  plugin's `isClockwise` rule: clockwise if
   `(finalIdx - startIdx) mod 4 >= (startIdx - finalIdx) mod 4`.
+- **The start side must be adjacent to `insertSide`.** Rotating four steps from `start` ends on
+  `start + 3` (clockwise) or `start + 1` (counter-clockwise), so a full four-side carve can only
+  finish on `insertSide` if `start` is one of its two neighbours. Starting on `insertSide` itself,
+  or on the side opposite it, makes ending there impossible. Both plinths insert from a
+  north/south side, so **east and west are the only valid start sides for either** — which is
+  exactly why the reference plugin's `StartDirection` enum contains only `EAST` and `WEST`, a
+  constraint that reads as an arbitrary limitation until this is derived. Verified exhaustively
+  over all four starts × both insert sides.
+- Given only two valid starts, pick **whichever of east/west is nearer to the player's current
+  position**, rather than fixing one as a constant. Both produce a correct four-side order, so
+  the choice is free, and making it adaptive is what keeps plinth alternation cheap: arriving
+  from the other plinth, the routine begins on the near side instead of walking around first.
 - Skip any side whose `done` varbit is already set. This is what makes a resumed mid-golem run
   correct for free: the routine simply carves whatever is genuinely left.
+
+  Note the interaction: on a *resumed* golem the remaining sides may not include a valid
+  east/west start, and the surviving order may not end on `insertSide`. That is fine and must not
+  be treated as an error — the routine carves what remains in rotational order and walks to
+  `insertSide` afterwards if it is not already there. The end-on-insert optimisation is a
+  best-effort saving on fresh golems, never a correctness requirement.
 
 **Per-side loop.** For the next not-`done` side: `walk_to_exact_tile` to `sides[side].x/y`, then
 click the station. Confirm by polling `/golem` until that side's `done` flips true.
@@ -205,36 +229,119 @@ Click, then confirm on `station.progress` returning to 0 (golem complete) or `to
 incrementing. The blind four-side trial-and-error and its
 `"Insert-core was rejected from all 4 sides"` safety stop are both deleted.
 
+### 3a. Loot goes to the gem bag — no ground pickup
+
+**CONFIRMED by the user 2026-08-20:** the gem the finished golem awards goes **straight into the
+gem bag**; there is nothing to pick up off the ground. The reference plugin's loot message regex
+corroborates this by distinguishing all three destinations:
+
+```
+As you complete the golem it leaves a gift (on the ground|in your gem sack|in your gem bag)
+for you: (\d+) x (.*)\.
+```
+
+The entire post-completion pickup block is therefore **deleted**, not kept
+([golem_crafting.py:1010-1044](../../../ControllerAddon/routines/golem_crafting.py#L1010-L1044)):
+the ground-item scan, the three-attempt `click_menu_action` retry with fresh position re-lookup,
+its 0.6–1.0s per-attempt settle, and the trailing 2.0s plinth-reset sleep. On the common path
+that removes roughly 2 seconds and up to three clicks from **every golem**, and it is what makes
+plinth alternation worth doing — with no pickup to perform, there is no reason to remain at a
+plinth that has just entered its reset.
+
+**The one case that still needs handling** is a full gem bag, where the gift falls to the ground
+instead. Rather than pay for a ground scan every golem to catch a rare case, detect it from the
+message itself: `on_event` matches the loot line and flags `gc_gem_bag_full` when capture group 1
+is `"on the ground"`. When that flag is set, `craft_phase` picks the item up once and routes to
+`bank` to empty the bag. Costs nothing in the common case and cannot silently drop loot — which
+was the original concern behind the retry loop being written in the first place ("it missed
+looting its gem, we want always the loot").
+
+This requires `on_event` to keep a golem-crafting chat branch after all, contrary to what the
+deletion list below would otherwise say — but a much narrower one: the loot line only, not the
+side/insert confirmation messages that the varbits now supersede.
+
+### 3b. Alternating plinths
+
+**User-directed 2026-08-20.** Rather than waiting out a completed plinth's reset, immediately
+begin the next golem on the *other* plinth. Wyrmscraig has two, and their geometry makes this
+nearly free — the two insert tiles are **2 tiles apart**:
+
+| Station | Object | Golem tile | Insert side | Insert tile |
+|---|---|---|---|---|
+| north | 62351 | 2596, 2257 | south | 2596, 2256 |
+| south | 62352 | 2595, 2253 | north | 2595, 2254 |
+
+So the player finishes a golem standing on one insert tile and is already within two tiles of the
+other plinth's. Combined with the adaptive east/west start side above, the routine arrives and
+begins carving on the near side without walking around first.
+
+The cycle becomes: complete on A → walk to B → carve and complete on B → walk back to A, which
+reset long ago. Only ever **one golem in progress at a time** — this is about never waiting on a
+reset, not about running two golems concurrently. Two concurrent golems would double the
+sunstone at risk (8 rather than 4 committed and unrecoverable on a crash) for no throughput gain,
+since the player can only act on one plinth at a time.
+
+Implementation is small, given station selection above already prefers a station with
+`progress > 0`: record the just-completed station in `ctx.state.data["gc_last_station"]`, and
+when neither plinth is in progress prefer the other one. If that key is missing — a fresh start
+or a restart — either plinth is correct, so no reconciliation is needed. The existing
+`GOLEM_STATE_NAMES`-based waiting for a plinth to read `Empty plinth` again disappears entirely;
+the `progress` varbit answers it directly and the routine is elsewhere while it resets.
+
 **What is deliberately kept** from the current implementation, unchanged:
 
-- The post-completion loot pickup with its three-attempt retry and fresh position re-lookup
-  ([golem_crafting.py:1010-1044](../../../ControllerAddon/routines/golem_crafting.py#L1010-L1044)),
-  including the 2.0s plinth-reset settle.
 - `walk_to_exact_tile`'s shift+click force-walk and `refresh_target` re-aim.
 - The `_hop_toward_point` off-screen fallback.
 - `handle_missing_target`'s walk-back-and-retry ladder.
 
 **What is deleted:** `gc_craft_sides_done`, `gc_craft_insert_tried`, `gc_craft_awaiting`,
 `gc_craft_extra_side_attempts`, `GOLEM_EXTRA_SIDE_ATTEMPTS_CAP`,
-`GOLEM_EXTRA_SIDE_MISSES_BEFORE_ROTATE`, the camera-nudge escalation, and the golem-side branches
-of `on_event`'s chat capture. `on_event` keeps its hunt-phase chat handling.
+`GOLEM_EXTRA_SIDE_MISSES_BEFORE_ROTATE`, the camera-nudge escalation, the post-completion loot
+pickup and its 2.0s settle (see 3a), and `on_event`'s side/insert confirmation branches.
+`on_event` keeps its hunt-phase chat handling and gains the narrow loot-line branch from 3a.
 
-### 4. Open question to resolve live, first thing
+### 4. Material cost: 4 sunstone per golem (resolved)
 
-The reference plugin's `hasGolemMaterials()` requires `sunstoneCount >= 4` to start a golem. This
-routine's header comment claims `Start-golem` consumes exactly **1** raw sunstone, with the
-material cost front-loaded and the remaining three sides free — explicitly flagged there as
-`confirmed once, n=1`
-([golem_crafting.py:31-35](../../../ControllerAddon/routines/golem_crafting.py#L31-L35)).
+**CONFIRMED by the user 2026-08-20:** `Start-golem` consumes **4 raw sunstone**, all deducted on
+that first click. This matches the reference plugin's `hasGolemMaterials()` gate
+(`sunstoneCount < 4` → cannot start) and **contradicts this routine's header comment**, which
+claims 1 raw sunstone with the remaining three sides free — a claim explicitly self-flagged there
+as `confirmed once, n=1`
+([golem_crafting.py:31-35](../../../ControllerAddon/routines/golem_crafting.py#L31-L35)). That
+comment is wrong and must be corrected as part of this work.
 
-If the real cost is 1 per side, the current per-trip budget (`SUNSTONE_PER_TRIP = 20`,
-`CORES_PER_TRIP = 4` → 16 raw for 4 golems) is consumed exactly, with zero slack, which would
-explain runs bailing to `mine` unexpectedly.
+**The per-trip budget is already correct, by coincidence.** Each golem costs 4 raw sunstone plus
+1 core, and a core is itself 1 raw sunstone chiselled 1-for-1 — so 5 sunstone-equivalents per
+golem. The existing constants happen to balance exactly:
 
-**Resolution:** before implementing the side loop, snapshot the raw-sunstone count immediately
-before and after a single `Start-golem`, and again after one `Shape-golem`. This is a
-two-minute check against the running client and it determines whether `SUNSTONE_PER_TRIP` needs
-to change. Do not implement budget changes on the assumption; measure first.
+```
+SUNSTONE_PER_TRIP = 20  mined
+  - CORES_PER_TRIP = 4  chiselled into cores   ->  16 raw + 4 cores
+  4 golems x (4 raw + 1 core)                  =   16 raw + 4 cores   (exact, zero slack)
+```
+
+`SUNSTONE_PER_TRIP` and `CORES_PER_TRIP` therefore stay as they are. `mine_phase`'s budget check
+(`raw_count + cores_have >= SUNSTONE_PER_TRIP`) is also still correct, since chiselling preserves
+that sum.
+
+**What is wrong is the gating.** Two changes follow:
+
+- `craft_phase`'s pre-`Start-golem` check tests only that raw sunstone and a core *exist*
+  ([golem_crafting.py:1087](../../../ControllerAddon/routines/golem_crafting.py#L1087)). With a
+  cost of 4, holding 1–3 raw sunstone passes that check, fires a doomed `Start-golem`, and burns
+  a full click plus confirmation wait before the rejection routes it to `mine`. Replace with a
+  count check: `raw >= 4 and cores >= 1`.
+- Because the cost is charged entirely on the first click, **abandoning a half-carved golem
+  destroys 4 sunstone** — a full golem's worth of mining. The current implementation's
+  `GOLEM_EXTRA_SIDE_ATTEMPTS_CAP` path does exactly that whenever side-tracking desyncs
+  ([golem_crafting.py:1186-1197](../../../ControllerAddon/routines/golem_crafting.py#L1186-L1197)).
+  With zero slack in the budget, one abandonment costs the trip its fourth golem outright. This
+  makes the varbit rewrite a throughput fix, not only a reliability one — reading `done` from
+  varbits removes the desync that triggers abandonment in the first place.
+
+Zero slack is acceptable *given* that the abandonment path is gone; it is not worth padding
+`SUNSTONE_PER_TRIP` to absorb a failure mode this work eliminates. If live runs still show the
+fourth golem stranded, revisit then with the real cause in hand rather than pre-emptively.
 
 ## Error handling and safety
 
@@ -255,16 +362,35 @@ to change. Do not implement budget changes on the assumption; measure first.
   pure and table-testable. Cover, for both stations and both start directions: full four-side
   order ends on `insertSide`; already-`done` sides are skipped; a single remaining side that *is*
   the insert side; all four done → no sides to carve. No bridge or serial access.
+- **Unit**: that only east/west starts can end on `insertSide`, asserted directly rather than
+  left implicit — all four starts × both insert sides, exactly the exhaustive check that derived
+  the constraint. This is what stops a later "why is the start side restricted?" simplification
+  from silently reintroducing the extra walk.
+- **Unit**: the `Start-golem` material gate, at the 4-sunstone boundary specifically — 3 raw
+  must not attempt a start, 4 raw with 1 core must. This is the check whose off-by-existence
+  version is being replaced (see section 4), so the boundary is the whole point of the test.
+- **Unit**: station selection — prefers a station with `progress > 0`; prefers the higher
+  `progress` when both are in progress; alternates away from `gc_last_station` when neither is;
+  and tolerates `gc_last_station` being absent (fresh start or restart).
 - **Java**: no unit tests — this codebase's providers have none, and the value is entirely in
   the live read.
 - **Live verification**, per CLAUDE.md's live-debugging workflow: `py_compile` every touched
   file, run `python -m pytest tests/`, then `./gradlew.bat run` for the Java changes. Confirm
   `GET /golem` reports plausible values against a plinth in a known state before running the
-  routine. Then watch a full golem carve end-to-end — specifically confirming the player does
-  **not** walk after the final side before Insert-core.
+  routine. Then watch a full golem carve end-to-end, confirming three things specifically:
+  the player does **not** walk after the final side before Insert-core; the player does **not**
+  linger at the completed plinth (no ground scan, no 2s settle) and instead heads for the other
+  one; and the gem arrives in the bag with nothing left on the ground.
+- **Two golems back to back** is the alternation test: watch A complete, B start immediately, and
+  A be reused on the third — confirming the reset never actually gets waited on.
 - **The resumed-run case is the one that matters most** and must be tested explicitly: kill the
   routine mid-golem, restart it, and confirm it carves only the genuinely remaining sides. That
-  is the exact scenario the current implementation cannot handle.
+  is the exact scenario the current implementation cannot handle. Include a resume where the
+  remaining sides do *not* admit an east/west start, confirming the routine still finishes and
+  simply walks to `insertSide` rather than treating it as an error.
+- **Gem bag full** should be provoked at least once if practical (or the flag forced by hand),
+  confirming the `"on the ground"` path picks the gift up and routes to `bank`. This is the only
+  route by which loot can now be permanently lost, so it should not ship purely reasoned-about.
 
 ## Decomposition
 
