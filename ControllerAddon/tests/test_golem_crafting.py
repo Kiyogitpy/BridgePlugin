@@ -156,7 +156,7 @@ def test_get_golem_passes_through_the_payload(monkeypatch):
     assert controller.get_golem() == payload
 
 
-# --- craft_phase regressions (2026-08-21 code review round 1) -----------------------
+# --- craft_phase regressions (2026-08-20 code review round 1) -----------------------
 #
 # These stub controller.get_golem/get_player/get_objects (and, per test, walk_to_exact_tile or
 # _click_station) rather than hitting a real bridge -- craft_phase itself is an integration
@@ -183,7 +183,7 @@ def _stub_golem_area(monkeypatch, station):
 
 
 def test_unprojectable_tile_does_not_spin_forever_and_eventually_safety_stops(monkeypatch):
-    """Regression for CRITICAL 1 (2026-08-21 review): walk_to_exact_tile returning False (the
+    """Regression for CRITICAL 1 (2026-08-20 review): walk_to_exact_tile returning False (the
     target tile can't be projected onto the viewport at all) used to make craft_phase return
     having done NOTHING -- no counter, no hop, no phase change, no safety stop -- so the very next
     tick was byte-identical, forever. Drives craft_phase with a permanently-unprojectable side

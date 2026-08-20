@@ -903,7 +903,7 @@ GOLEM_SIDE_MISS_LIMIT = 5
 # would hang the routine silently, which is the exact bug class this overhaul exists to remove.
 GOLEM_INSERT_MISS_LIMIT = 5
 
-# CRITICAL FIX 2026-08-21 (code review of the varbit-overhaul rewrite): craft_phase's walk-to-tile
+# CRITICAL FIX 2026-08-20 (code review of the varbit-overhaul rewrite): craft_phase's walk-to-tile
 # and click-the-plinth steps used to return on failure with no counter incremented at all -- a
 # byte-identical retry every following tick, forever, with nothing to make progress or escalate.
 # Reachable in normal play: craft_phase is entered from chisel_phase at the mining anchor, ~10
@@ -1089,7 +1089,7 @@ def _await_side_done(station_name: str, side: str, timeout_s: float) -> bool:
     which produces no game action at all (see CLAUDE.md). Retrying is safe precisely because the
     varbit says unambiguously whether the previous click counted.
 
-    IMPORTANT FIX 2026-08-21 (code review): a None from get_golem() mid-poll now `continue`s
+    IMPORTANT FIX 2026-08-20 (code review): a None from get_golem() mid-poll now `continue`s
     rather than returning False -- a single dropped request (the same transient timeout
     GOLEM_STATE_MISS_LIMIT tolerates in craft_phase) used to abandon the poll early and score it
     as a genuine miss, which could charge a spurious gc_side_misses tick against an action that
@@ -1110,7 +1110,7 @@ def _await_golem_complete(station_name: str, timeout_s: float) -> bool:
     """Poll /golem until the station's overall progress returns to 0 (golem finished).
 
     See _await_side_done's docstring for why a None from get_golem() mid-poll continues polling
-    (IMPORTANT FIX 2026-08-21) rather than returning False immediately."""
+    (IMPORTANT FIX 2026-08-20) rather than returning False immediately."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         time.sleep(GOLEM_CONFIRM_POLL_S)
@@ -1144,7 +1144,7 @@ def craft_phase(ctx, config: dict) -> None:
     only authoritative signal that an Insert-core attempt was rejected for lack of fur, checked
     both before attempting an insert and right after one fails to confirm (see below).
 
-    IMPORTANT FIX 2026-08-21 (code review): a None from get_golem() -- api_get returns None on
+    IMPORTANT FIX 2026-08-20 (code review): a None from get_golem() -- api_get returns None on
     ANY exception, including its own 0.3s timeout, which CLAUDE.md documents this exact routine
     blowing under load -- now tolerates GOLEM_STATE_MISS_LIMIT consecutive misses before
     safety-stopping, the same tolerance handle_missing_target's own poll layer gives every other
@@ -1219,7 +1219,7 @@ def craft_phase(ctx, config: dict) -> None:
         return
 
     stations = state.get("stations", [])
-    # CRITICAL FIX 2026-08-21 (code review): GolemProvider reports both stations unconditionally,
+    # CRITICAL FIX 2026-08-20 (code review): GolemProvider reports both stations unconditionally,
     # regardless of whether the player is actually in the golem-crafting area or anywhere near
     # either plinth (confirmed by review) -- `not stations` can therefore never be true on its
     # own, and used to make handle_missing_target's fallback below permanently dead code. Gate on
@@ -1326,7 +1326,7 @@ def craft_phase(ctx, config: dict) -> None:
         return
     if not _await_golem_complete(station["name"], GOLEM_INSERT_TIMEOUT_S):
         if ctx.state.data.get("gc_fur_exhausted"):
-            # IMPORTANT FIX 2026-08-21 (code review): this branch cannot actually fire under the
+            # IMPORTANT FIX 2026-08-20 (code review): this branch cannot actually fire under the
             # current single-threaded event dispatch -- on_event only runs from the main loop
             # between ticks, never while craft_phase is blocked inside _await_golem_complete's own
             # sleep loop, and the pre-insert check above already consumes the flag first on the
