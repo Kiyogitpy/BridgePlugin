@@ -48,8 +48,15 @@ def test_only_east_and_west_are_valid_starts_for_either_plinth():
         assert sorted(valid) == ["east", "west"]
 
 
-def test_side_order_covers_all_four_sides_exactly_once():
-    assert sorted(gc.side_order("east", "south")) == sorted(gc.SIDES)
+@pytest.mark.parametrize("start", gc.SIDES)
+@pytest.mark.parametrize("insert_side", gc.SIDES)
+def test_side_order_covers_all_four_sides_exactly_once(start, insert_side):
+    """PARAMETRIZED 2026-08-20 (FINDING F, whole-branch review): previously checked only the
+    single (east, south) combination -- widened across every (start, insert_side) pair, same
+    @pytest.mark.parametrize style already used above for the east/west-start tests, so a future
+    regression specific to some other combination (e.g. a start side equal to insert_side) can't
+    slip through unnoticed."""
+    assert sorted(gc.side_order(start, insert_side)) == sorted(gc.SIDES)
 
 
 # --- choose_start_side --------------------------------------------------------------
@@ -60,10 +67,23 @@ def test_choose_start_side_picks_the_nearer_of_east_and_west():
     assert gc.choose_start_side(station, 2590, 2257) == "west"
 
 
-def test_choose_start_side_never_returns_a_north_south_side():
-    station = _station()
-    for py in (2270, 2240):
-        assert gc.choose_start_side(station, 2596, py) in ("east", "west")
+def test_choose_start_side_picks_the_nearer_side_even_when_the_player_is_north_or_south():
+    """REWRITTEN 2026-08-20 (FINDING F, whole-branch review): the deleted version of this test
+    (test_choose_start_side_never_returns_a_north_south_side) was structurally vacuous -- the
+    candidate set inside choose_start_side is already filtered to east/west (see
+    can_end_on_insert) before any distance comparison runs, so "the result is in (east, west)"
+    holds for ANY distance function, including a broken one that e.g. always returns "east". This
+    version asserts the SPECIFIC side actually chosen: with the player due north or south of the
+    golem tile (equidistant in x from both east and west, see _station's geometry), max(|dx|,
+    |dy|) is dominated by |dy| for both candidates, so both distances tie and min() falls through
+    to picking whichever candidate sorts/iterates first -- east, per SIDES' ordering. Moving the
+    player noticeably closer to the west tile's x instead breaks that tie in west's favor,
+    pinning that the distance comparison itself is doing real work rather than accepting whatever
+    order can_end_on_insert happens to build."""
+    station = _station()  # golem tile (2596, 2257); east (2597, 2257), west (2595, 2257)
+    assert gc.choose_start_side(station, 2596, 2270) == "east"
+    assert gc.choose_start_side(station, 2596, 2240) == "east"
+    assert gc.choose_start_side(station, 2593, 2257) == "west"
 
 
 # --- carve_plan ---------------------------------------------------------------------
@@ -348,7 +368,14 @@ def _two_station_golem(monkeypatch, north, south, ground_items, click_calls):
     """Stubs get_golem/get_player/get_objects to always report both plinths (as GolemProvider
     really does, unconditionally -- see _any_station_visible's own docstring), and records every
     click_menu_action call (rather than a bare True/False stub) so a test can assert exactly
-    which ground item, at which position, was actually targeted."""
+    which ground item, at which position, was actually targeted.
+
+    UPDATED 2026-08-20 (FINDING C fix): get_ground_items is now a live view over a mutable copy
+    of `ground_items`, and click_menu_action's stub removes the clicked entity from it -- the same
+    "the click actually landed and picked it up" simulation a real bridge would report on the next
+    fresh re-read. This is what lets _collect_golem_gift's retry-until-gone loop exit after a
+    single successful click in tests, the same as it would live, rather than retrying
+    GOLEM_GEM_PICKUP_ATTEMPTS times against a ground list a stub never actually changes."""
     monkeypatch.setattr(
         controller, "get_golem",
         lambda: {"inArea": True, "stations": [north, south]},
@@ -361,11 +388,16 @@ def _two_station_golem(monkeypatch, north, south, ground_items, click_calls):
             {"id": south["objectId"], "x": south["x"], "y": south["y"], "plane": 0},
         ],
     )
-    monkeypatch.setattr(controller, "get_ground_items", lambda: ground_items)
-    monkeypatch.setattr(
-        controller, "click_menu_action",
-        lambda ser, entity, option, target_hint=None, offset=(0, 0): click_calls.append(entity),
-    )
+    ground_state = list(ground_items)
+    monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: list(ground_state))
+
+    def _fake_click_menu_action(ser, entity, option, target_hint=None, offset=(0, 0)):
+        click_calls.append(entity)
+        if entity in ground_state:
+            ground_state.remove(entity)
+        return True
+
+    monkeypatch.setattr(controller, "click_menu_action", _fake_click_menu_action)
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
 
 
@@ -530,3 +562,336 @@ def test_craft_phase_fetches_objects_exactly_once_per_call(monkeypatch):
     gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
 
     assert calls["n"] == 1, f"expected exactly one /objects fetch per craft_phase call, got {calls['n']}"
+
+
+# --- _await_side_done / _await_golem_complete (2026-08-20 whole-branch review) -------
+#
+# These two confirmation helpers had zero direct tests despite being repeatedly patched -- every
+# existing craft_phase test above simply stubs them out wholesale. They're pure given a stubbed
+# controller.get_golem, so tested directly here rather than only indirectly through craft_phase.
+# `fake_clock` monkeypatches gc.time.time/sleep so a deadline/extension test doesn't cost real
+# wall-clock seconds (GOLEM_SIDE_MAX_WAIT_S alone is 15s) -- each fake sleep(s) just advances a
+# counter that gc.time.time() reads back, so the polling loops run to completion near-instantly
+# while the deadline math inside them is exercised exactly as it would be live.
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    state = {"t": 1_000_000.0}
+    monkeypatch.setattr(gc.time, "time", lambda: state["t"])
+    monkeypatch.setattr(gc.time, "sleep", lambda s: state.__setitem__("t", state["t"] + s))
+    return state
+
+
+def test_await_side_done_succeeds_on_a_genuine_transition(monkeypatch, fake_clock):
+    calls = {"n": 0}
+
+    def fake_get_golem():
+        calls["n"] += 1
+        flipped = calls["n"] >= 2
+        return {"stations": [_station("north", done=("east",) if flipped else ())]}
+
+    monkeypatch.setattr(controller, "get_golem", fake_get_golem)
+    assert gc._await_side_done("north", "east", gc.GOLEM_SIDE_TIMEOUT_S, already_done=False) is True
+
+
+def test_await_side_done_pre_click_already_done_is_not_evidence_of_success(monkeypatch, fake_clock):
+    """FINDING A: if the side already reads done BEFORE the click (already_done=True, the
+    caller's own pre-click snapshot), a post-click poll matching that same reading is not
+    evidence the click did anything -- must not return True merely by observing an already-true
+    state it never actually caused."""
+    monkeypatch.setattr(controller, "get_golem", lambda: {"stations": [_station("north", done=("east",))]})
+    assert gc._await_side_done("north", "east", gc.GOLEM_SIDE_TIMEOUT_S, already_done=True) is False
+
+
+def test_await_side_done_tolerates_a_none_mid_poll(monkeypatch, fake_clock):
+    calls = {"n": 0}
+
+    def fake_get_golem():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return {"stations": [_station("north", done=("east",))]}
+
+    monkeypatch.setattr(controller, "get_golem", fake_get_golem)
+    assert gc._await_side_done("north", "east", gc.GOLEM_SIDE_TIMEOUT_S, already_done=False) is True
+
+
+def test_await_side_done_times_out_when_the_side_never_flips(monkeypatch, fake_clock):
+    monkeypatch.setattr(controller, "get_golem", lambda: {"stations": [_station("north", done=())]})
+    assert gc._await_side_done("north", "east", gc.GOLEM_SIDE_TIMEOUT_S, already_done=False) is False
+
+
+def test_await_side_done_extends_the_deadline_while_progress_is_climbing(monkeypatch, fake_clock):
+    """FINDING D: a side genuinely mid-carve keeps its own `progress` climbing every poll -- this
+    must not be declared a miss just because elapsed time exceeds the short GOLEM_SIDE_TIMEOUT_S
+    (4.0s), as long as it's still making progress, up to the GOLEM_SIDE_MAX_WAIT_S cap (15s).
+    Progress here climbs by 1 every 3 polls (0.6s), reaching 10/done at poll 30 (~6.0s elapsed) --
+    past the original 4.0s timeout, comfortably under the 15s hard cap, and only reachable at all
+    if the extension logic is actually firing."""
+    calls = {"n": 0}
+
+    def fake_get_golem():
+        calls["n"] += 1
+        progress = min(calls["n"] // 3, 10)
+        done = progress >= 10
+        station = _station("north", done=("east",) if done else ())
+        station["sides"]["east"]["progress"] = progress
+        return {"stations": [station]}
+
+    monkeypatch.setattr(controller, "get_golem", fake_get_golem)
+    result = gc._await_side_done("north", "east", gc.GOLEM_SIDE_TIMEOUT_S, already_done=False)
+    assert result is True
+    assert fake_clock["t"] - 1_000_000.0 > gc.GOLEM_SIDE_TIMEOUT_S, \
+        "test is only meaningful if it actually ran past the un-extended timeout"
+
+
+def test_await_side_done_declares_a_miss_when_progress_stalls(monkeypatch, fake_clock):
+    """The other half of FINDING D: progress that stops changing (genuinely stuck, not mid-carve)
+    must still time out at the original GOLEM_SIDE_TIMEOUT_S, not be extended forever."""
+    station = _station("north", done=())
+    station["sides"]["east"]["progress"] = 3
+    monkeypatch.setattr(controller, "get_golem", lambda: {"stations": [station]})
+    result = gc._await_side_done("north", "east", gc.GOLEM_SIDE_TIMEOUT_S, already_done=False)
+    assert result is False
+    elapsed = fake_clock["t"] - 1_000_000.0
+    assert elapsed < gc.GOLEM_SIDE_MAX_WAIT_S, "a stalled (non-climbing) side must not get the extension at all"
+
+
+def test_await_side_done_caps_extension_at_the_max_wait(monkeypatch, fake_clock):
+    """Progress keeps climbing forever but `done` never flips -- extension must still terminate at
+    GOLEM_SIDE_MAX_WAIT_S rather than waiting indefinitely on a side that's genuinely stuck (not
+    slow)."""
+    calls = {"n": 0}
+
+    def fake_get_golem():
+        calls["n"] += 1
+        station = _station("north", done=())
+        station["sides"]["east"]["progress"] = calls["n"]  # always climbing, never done
+        return {"stations": [station]}
+
+    monkeypatch.setattr(controller, "get_golem", fake_get_golem)
+    result = gc._await_side_done("north", "east", gc.GOLEM_SIDE_TIMEOUT_S, already_done=False)
+    assert result is False
+    elapsed = fake_clock["t"] - 1_000_000.0
+    assert elapsed <= gc.GOLEM_SIDE_MAX_WAIT_S + gc.GOLEM_CONFIRM_POLL_S, \
+        "must be bounded by GOLEM_SIDE_MAX_WAIT_S, not infinite"
+
+
+def test_await_golem_complete_succeeds_when_total_crafted_increments(monkeypatch, fake_clock):
+    monkeypatch.setattr(
+        controller, "get_golem",
+        lambda: {"totalCrafted": 6, "stations": [_station("north", progress=4)]},
+    )
+    assert gc._await_golem_complete("north", 6.0, before_total_crafted=5, before_progress=4) is True
+
+
+def test_await_golem_complete_succeeds_when_progress_returns_to_zero(monkeypatch, fake_clock):
+    monkeypatch.setattr(
+        controller, "get_golem",
+        lambda: {"totalCrafted": 5, "stations": [_station("north", progress=0)]},
+    )
+    assert gc._await_golem_complete("north", 6.0, before_total_crafted=5, before_progress=4) is True
+
+
+def test_await_golem_complete_pre_click_absolute_state_is_not_evidence(monkeypatch, fake_clock):
+    """FINDING A -- the exact bug: _await_golem_complete's first poll can still observe pre-click
+    state. If before_progress was already 0 (nothing to transition FROM) and totalCrafted never
+    increments, a station reading progress==0 must NOT count as a completion just because it
+    matches the absolute target state."""
+    monkeypatch.setattr(
+        controller, "get_golem",
+        lambda: {"totalCrafted": 5, "stations": [_station("north", progress=0)]},
+    )
+    assert gc._await_golem_complete("north", 0.5, before_total_crafted=5, before_progress=0) is False
+
+
+def test_await_golem_complete_tolerates_a_none_mid_poll(monkeypatch, fake_clock):
+    calls = {"n": 0}
+
+    def fake_get_golem():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return {"totalCrafted": 6, "stations": [_station("north", progress=0)]}
+
+    monkeypatch.setattr(controller, "get_golem", fake_get_golem)
+    assert gc._await_golem_complete("north", 6.0, before_total_crafted=5, before_progress=4) is True
+
+
+def test_await_golem_complete_times_out_when_nothing_changes(monkeypatch, fake_clock):
+    monkeypatch.setattr(
+        controller, "get_golem",
+        lambda: {"totalCrafted": 5, "stations": [_station("north", progress=4)]},
+    )
+    assert gc._await_golem_complete("north", 1.0, before_total_crafted=5, before_progress=4) is False
+
+
+# --- FINDING B: fresh_golem + empty plan is a contradiction --------------------------
+
+def test_fresh_golem_with_empty_plan_safety_stops_without_a_click(monkeypatch):
+    """FINDING B: fresh_golem (progress == 0) and an empty carve plan (every side already reads
+    done) are mutually exclusive by design -- if this contradictory combination is ever observed,
+    craft_phase must safety-stop with a diagnosable record rather than falling through to a click
+    that would resolve to Start-golem in this state, silently spending 4 raw sunstone on a
+    phantom action."""
+    station = _station("north", progress=0, done=gc.SIDES)  # contradictory: fresh, but all done
+    _stub_golem_area(monkeypatch, station)
+    click_calls = []
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: click_calls.append(a) or True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [
+        {"name": "Sunstone"}, {"name": "Sunstone"}, {"name": "Sunstone"}, {"name": "Sunstone"},
+        {"name": "Sunstone core"},
+    ])
+    ctx = _ctx()
+    ctx.state.data["gc_fur_stock"] = 5  # clear the fur gate so the contradiction is actually reached
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert ctx.state.safety_stopped
+    assert click_calls == [], "must not click the plinth in this contradictory state"
+
+
+# --- FINDING C: gem-bag pickup must not silently lose loot ---------------------------
+
+def test_gem_bag_pickup_falls_back_to_position_when_name_filter_matches_nothing(monkeypatch):
+    """FINDING C: the parsed item name can legitimately mismatch the ground item's actual name
+    (e.g. the golem's message says "2 x Uncut rubies", the ground item is "Uncut ruby" singular)
+    -- a name filter yielding zero candidates must not just leave the loop body empty and
+    silently bank with the gem still sitting there. Confirms the position-only fallback still
+    picks it up."""
+    north = _station("north", 2596, 2257, "south", progress=0)
+    south = _station("south", 2595, 2253, "north", progress=0)
+    ctx = _ctx()
+    ctx.state.data["gc_last_station"] = "north"
+    ctx.state.data["gc_gem_bag_full"] = True
+    ctx.state.data["gc_gem_bag_full_item"] = "uncut rubies"  # parsed plural -- won't exact-match
+
+    gem = {"id": 1, "name": "Uncut ruby", "x": north["x"], "y": north["y"]}  # actual name: singular
+    click_calls = []
+    _two_station_golem(monkeypatch, north, south, ground_items=[gem], click_calls=click_calls)
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert click_calls == [gem], "a name-filter miss must fall back to a position-only match, not silently drop the pickup"
+    assert ctx.state.data["gc_gem_bag_full"] is False
+    assert ctx.state.data["gc_phase"] == "bank"
+
+
+def test_gem_bag_pickup_gives_up_after_max_attempts_but_still_clears_the_flag(monkeypatch):
+    """A click that never actually lands (e.g. the ~4.5% MISTAKE_MISCLICK_CHANCE near-miss -- see
+    CLAUDE.md) must not hang the routine forever retrying the same pickup. After
+    GOLEM_GEM_PICKUP_ATTEMPTS genuinely-failed attempts it gives up (logged loudly) and still
+    clears the flag / routes to bank, rather than spinning on a lost cause."""
+    north = _station("north", 2596, 2257, "south", progress=0)
+    south = _station("south", 2595, 2253, "north", progress=0)
+    ctx = _ctx()
+    ctx.state.data["gc_last_station"] = "north"
+    ctx.state.data["gc_gem_bag_full"] = True
+    ctx.state.data["gc_gem_bag_full_item"] = "uncut ruby"
+
+    gem = {"id": 1, "name": "Uncut ruby", "x": north["x"], "y": north["y"]}
+    click_calls = []
+    monkeypatch.setattr(
+        controller, "get_golem",
+        lambda: {"inArea": True, "stations": [north, south]},
+    )
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": north["x"], "y": north["y"]})
+    monkeypatch.setattr(
+        controller, "get_objects",
+        lambda radius=None: [
+            {"id": north["objectId"], "x": north["x"], "y": north["y"], "plane": 0},
+            {"id": south["objectId"], "x": south["x"], "y": south["y"], "plane": 0},
+        ],
+    )
+    # Deliberately never removes the item -- every click "misses", the same as a real
+    # MISTAKE_MISCLICK_CHANCE near-miss that lands nowhere useful.
+    monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [gem])
+    monkeypatch.setattr(
+        controller, "click_menu_action",
+        lambda ser, entity, option, target_hint=None, offset=(0, 0): click_calls.append(entity) or True,
+    )
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert len(click_calls) == gc.GOLEM_GEM_PICKUP_ATTEMPTS, "must retry up to the attempt cap, not give up after one click"
+    assert ctx.state.data["gc_gem_bag_full"] is False, "must still clear the flag once retries are exhausted, to avoid spinning forever on a lost cause"
+    assert ctx.state.data["gc_phase"] == "bank"
+
+
+# --- FINDING E: walk_to_exact_tile early-out / the branch's headline saving ----------
+
+def test_walk_to_exact_tile_early_outs_when_already_standing_there(monkeypatch):
+    """FINDING E, core fix: if the player already reports exactly (x, y, plane), walk_to_exact_
+    tile must return True immediately without clicking anything or touching Shift."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2596, "y": 2257, "plane": 0})
+    calls = []
+    monkeypatch.setattr(controller, "get_ground_walk_point", lambda x, y, plane: calls.append("walk_point") or {"onScreen": True})
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: calls.append("click") or True)
+    monkeypatch.setattr(controller, "key_down", lambda ser, key: calls.append("key_down"))
+    monkeypatch.setattr(controller, "key_up", lambda ser, key: calls.append("key_up"))
+
+    ctx = _ctx()
+    assert gc.walk_to_exact_tile(ctx, 2596, 2257, 0) is True
+    assert calls == [], "already standing on the exact tile must short-circuit before any click machinery runs"
+
+
+def test_walk_to_exact_tile_still_walks_when_not_already_there(monkeypatch):
+    """The other half: the early-out must not swallow a genuine walk -- different (x, y) still
+    goes through the normal click path."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2590, "y": 2250, "plane": 0})
+    monkeypatch.setattr(controller, "get_ground_walk_point", lambda x, y, plane: {"onScreen": True, "screenX": 100, "screenY": 100})
+    monkeypatch.setattr(controller, "get_ground_walk_screen_pos", lambda x, y, plane: (100, 100))
+    click_calls = []
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: click_calls.append(a) or True)
+    monkeypatch.setattr(controller, "key_down", lambda ser, key: None)
+    monkeypatch.setattr(controller, "key_up", lambda ser, key: None)
+    monkeypatch.setattr(gc.time, "sleep", lambda s: None)
+
+    ctx = _ctx()
+    assert gc.walk_to_exact_tile(ctx, 2596, 2257, 0) is True
+    assert len(click_calls) == 1, "a genuine walk to a different tile must still click"
+
+
+def test_insert_side_walk_is_a_no_op_after_the_full_carve(monkeypatch):
+    """Pins the branch's headline saving (see craft_phase's own docstring: "the carve order ends
+    on the insert side -- no extra walk before Insert-core"). Unlike every other craft_phase test
+    in this file, walk_to_exact_tile is NOT replaced with a constant -- it's wrapped so its calls
+    are both recorded AND actually executed, so this proves the insert-side walk is a genuine
+    no-op (FINDING E: no click emitted) rather than merely a walk call nothing ever inspected."""
+    station = _station("north", 2596, 2257, "south", progress=4, done=gc.SIDES)  # fully carved
+    insert_tile = station["sides"]["south"]
+    player_pos = {"x": insert_tile["x"], "y": insert_tile["y"], "plane": insert_tile["plane"]}
+
+    _stub_golem_area(monkeypatch, station)
+    monkeypatch.setattr(controller, "get_player", lambda: dict(player_pos))
+
+    walk_calls = []
+    real_walk = gc.walk_to_exact_tile
+
+    def spy_walk(ctx, x, y, plane):
+        walk_calls.append((x, y, plane))
+        return real_walk(ctx, x, y, plane)
+
+    monkeypatch.setattr(gc, "walk_to_exact_tile", spy_walk)
+
+    click_entity_calls = []
+    monkeypatch.setattr(
+        controller, "click_entity",
+        lambda ser, entity, **kw: click_entity_calls.append(entity) or True,
+    )
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Sunstone core"}])
+    monkeypatch.setattr(gc, "_await_golem_complete", lambda *a, **k: True)
+
+    ctx = _ctx()
+    ctx.state.data["gc_fur_stock"] = 5
+
+    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert walk_calls == [(insert_tile["x"], insert_tile["y"], insert_tile["plane"])], \
+        "the insert step must still call walk_to_exact_tile once, to confirm/no-op the position"
+    ground_point_clicks = [c for c in click_entity_calls if "id" not in c]
+    assert ground_point_clicks == [], \
+        "FINDING E: no click may be emitted for the insert-side walk once the player is already standing there"
+    station_clicks = [c for c in click_entity_calls if c.get("id") == station["objectId"]]
+    assert len(station_clicks) == 1, "the Insert-core click itself must still happen"

@@ -787,6 +787,16 @@ GOLEM_CHAT_NOT_ENOUGH_FUR = "you need to dress the golem in furs from hunted cre
 # nothing on the common path, where scanning the ground every golem cost ~2s and up to 3 clicks.
 GOLEM_LOOT_GROUND_MARKER = "leaves a gift on the ground"
 
+# FINDING C (2026-08-20 whole-branch review): the "nothing on the ground to pick up" comment
+# above is only true on the common path -- a full gem bag still drops the gift to the ground, and
+# the pickup that follows can miss it (a name-filter mismatch between the chat message's parsed
+# item name and the ground item's actual name, e.g. "uncut rubies" vs "Uncut ruby"; or the
+# deliberate ~4.5% MISTAKE_MISCLICK_CHANCE near-miss, see CLAUDE.md) with no way to tell that
+# apart from success. This restores a bounded retry (same count, 3, as the three-attempt loop
+# this file's REWRITTEN 2026-08-20 header note says was deleted) around a fresh ground re-check
+# each attempt, rather than firing a single click and trusting it landed.
+GOLEM_GEM_PICKUP_ATTEMPTS = 3
+
 # CONFIRMED live (user session) -- Goat Pit hunting mechanic, replacing the original wrong
 # plain-click-lures/harvests assumption. See docs/superpowers/specs/2026-08-08-goat-pit-
 # telekinetic-grab-design.md for the full mechanic writeup.
@@ -881,10 +891,24 @@ def on_event(ctx, event_type, payload) -> None:
         ctx.state.data["gc_last_hunt_chat_seq"] = ctx.state.data.get("gc_last_hunt_chat_seq", 0) + 1
 
 
-# How long to wait for a side's `done` varbit to flip after a Shape-golem click. Far shorter than
-# the 15s chat-message timeout this replaces: the varbit moves on the tick the server processes
-# the action, so anything beyond a couple of seconds means the click genuinely didn't land.
+# How long to wait for a side's `done` varbit to flip after a Shape-golem click, PROVIDED the
+# side isn't still visibly climbing (see GOLEM_SIDE_MAX_WAIT_S below). Far shorter than the 15s
+# chat-message timeout this replaces: the varbit moves on the tick the server processes the
+# action, so a click that genuinely landed and is just still animating shows the per-side
+# `progress` field rising, and only a truly stalled value past this deadline means the click
+# didn't land.
 GOLEM_SIDE_TIMEOUT_S = 4.0
+
+# FINDING D (2026-08-20 whole-branch review): GOLEM_SIDE_TIMEOUT_S was picked without live
+# confirmation of how long a single side carve actually takes -- in-repo evidence on this is
+# contradictory, and if a real carve runs longer than 4.0s, EVERY side would time out, charge a
+# spurious gc_side_misses tick, and re-walk/re-click mid-carve, turning this branch's headline
+# "fast confirmation" saving into extra clicks. _await_side_done extends its deadline for as long
+# as the side's own `progress` value keeps climbing between polls (genuine evidence the carve is
+# underway), rather than guessing the right fixed constant. This is the hard cap on that
+# extension, so a side that is climbing but never actually finishes (a genuine anomaly, not a slow
+# carve) still terminates instead of waiting forever.
+GOLEM_SIDE_MAX_WAIT_S = 15.0
 
 # Insert-core gets a little longer -- it consumes a core and a fur and plays a longer animation
 # before the station's progress varbit resets.
@@ -894,9 +918,13 @@ GOLEM_INSERT_TIMEOUT_S = 6.0
 # the endpoint is deliberately not TickCache-gated (see GolemProvider's own comment).
 GOLEM_CONFIRM_POLL_S = 0.2
 
-# Consecutive failures at the SAME side before treating it as a real anomaly. With ground truth
-# available a stuck side is genuinely abnormal, not the routine desync the old 16-attempt budget
-# existed to absorb, so this is an assertion rather than a retry allowance.
+# Consecutive carve-side failures overall before treating it as a real anomaly. CORRECTED
+# 2026-08-20 (whole-branch review, comment-only fix -- FINDING F): this used to say "at the SAME
+# side", which is wrong -- gc_side_misses is a single un-keyed counter, not reset or tracked per
+# side, so 5 failures spread across up to 4 different sides trip this identically to 5 failures on
+# one side. Behavior is fine as-is; only the comment was wrong. With ground truth available a
+# stuck side is genuinely abnormal, not the routine desync the old 16-attempt budget existed to
+# absorb, so this is an assertion rather than a retry allowance.
 GOLEM_SIDE_MISS_LIMIT = 5
 
 # Same reasoning as GOLEM_SIDE_MISS_LIMIT, for the Insert-core step -- an unbounded retry here
@@ -956,7 +984,19 @@ def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
     refresh_target so move_to_human's mid-flight re-aim re-queries this tile's live screen
     position instead of trusting the single snapshot taken before the click started -- same
     staleness fix already proven live for cast_telekinetic_grab's moving-NPC targets, applied
-    here for camera movement instead of target movement (see get_ground_walk_screen_pos)."""
+    here for camera movement instead of target movement (see get_ground_walk_screen_pos).
+
+    FINDING E (2026-08-20 whole-branch review): early-outs with no click at all if the player is
+    already standing exactly on (x, y, plane) -- craft_phase's insert-side walk is NORMALLY a
+    no-op by design (the carve order ends on the insert side, see carve_plan's docstring), but
+    without this check every golem still paid for a full human-paced shift+click flight plus this
+    function's own 0.6s first poll for a walk that was never needed. Safe for hunt_phase's fixed
+    standing-tile walk too -- reporting True immediately when already there is exactly what that
+    caller wants as well, just skipping straight to it instead of clicking and then discovering
+    the same thing a poll later."""
+    player = controller.get_player()
+    if player.get("x") == x and player.get("y") == y and player.get("plane", 0) == plane:
+        return True
     point = controller.get_ground_walk_point(x, y, plane)
     if not point.get("onScreen"):
         return False
@@ -1080,8 +1120,9 @@ def _walk_to_station_tile(ctx, station, tile: dict, miss_key: str) -> bool:
     return False
 
 
-def _await_side_done(station_name: str, side: str, timeout_s: float) -> bool:
-    """Poll /golem until `side` reads done, or timeout. True if it flipped.
+def _await_side_done(station_name: str, side: str, timeout_s: float, already_done: bool = False) -> bool:
+    """Poll /golem until `side` shows a genuine False -> True TRANSITION on its `done` varbit, or
+    timeout. True only on that transition.
 
     This replaces the old 15s chat-message wait. The varbit flips on the tick the server
     processes the action, so a real success is seen almost immediately and a timeout genuinely
@@ -1089,25 +1130,72 @@ def _await_side_done(station_name: str, side: str, timeout_s: float) -> bool:
     which produces no game action at all (see CLAUDE.md). Retrying is safe precisely because the
     varbit says unambiguously whether the previous click counted.
 
-    IMPORTANT FIX 2026-08-20 (code review): a None from get_golem() mid-poll now `continue`s
-    rather than returning False -- a single dropped request (the same transient timeout
+    `already_done` is the caller's own pre-click snapshot of this exact same field (craft_phase
+    passes `station["sides"][side]["done"]` as read BEFORE the click went out). FINDING A
+    (2026-08-20 whole-branch review): an ABSOLUTE-state read of "done == True" is not evidence a
+    click did anything if that was already true beforehand -- the same reasoning
+    _await_golem_complete applies to `progress`/`totalCrafted` below, generalized here. In
+    practice craft_phase's own carve_plan filtering means the one real call site never actually
+    passes already_done=True (plan only ever contains sides that already read not-done), so this
+    is a defensive assertion against a future call site or a stale/desynced pre-click read, not a
+    behavior change on the current path: if it ever does fire, no post-click reading can prove
+    anything and this correctly always reports failure instead of a false positive.
+
+    FINDING D (2026-08-20 whole-branch review): also extends its own deadline, up to the
+    GOLEM_SIDE_MAX_WAIT_S hard cap, for as long as `side`'s own `progress` value keeps climbing
+    between polls -- see GOLEM_SIDE_TIMEOUT_S's own comment for why a fixed short timeout alone
+    risks charging a miss against a carve that is simply still animating. Only a stalled,
+    unchanged progress value past the (possibly-extended) deadline is treated as a real miss.
+
+    IMPORTANT FIX 2026-08-20 (code review): a None from get_golem() mid-poll `continue`s rather
+    than returning False -- a single dropped request (the same transient timeout
     GOLEM_STATE_MISS_LIMIT tolerates in craft_phase) used to abandon the poll early and score it
     as a genuine miss, which could charge a spurious gc_side_misses tick against an action that
     actually succeeded."""
-    deadline = time.time() + timeout_s
+    if already_done:
+        return False
+    hard_deadline = time.time() + GOLEM_SIDE_MAX_WAIT_S
+    deadline = min(time.time() + timeout_s, hard_deadline)
+    last_progress = None
     while time.time() < deadline:
         time.sleep(GOLEM_CONFIRM_POLL_S)
         state = controller.get_golem()
         if state is None:
             continue
         station = _station_by_name(state, station_name)
-        if station and station["sides"][side]["done"]:
+        if station is None:
+            continue
+        side_state = station["sides"][side]
+        if side_state.get("done"):
             return True
+        progress = side_state.get("progress", 0)
+        if last_progress is not None and progress > last_progress:
+            # Genuinely still carving -- push the deadline back out instead of letting a slow but
+            # real carve get charged as a miss, capped by hard_deadline so a side that climbs
+            # forever without ever finishing still terminates.
+            deadline = min(time.time() + timeout_s, hard_deadline)
+        last_progress = progress
     return False
 
 
-def _await_golem_complete(station_name: str, timeout_s: float) -> bool:
-    """Poll /golem until the station's overall progress returns to 0 (golem finished).
+def _await_golem_complete(
+    station_name: str, timeout_s: float, before_total_crafted: int, before_progress: int
+) -> bool:
+    """Poll /golem until a genuine completion TRANSITION is observed -- `totalCrafted`
+    incrementing past `before_total_crafted`, or the station's own `progress` going from
+    `before_progress` (expected non-zero -- see craft_phase's own pre-click snapshot) back to 0.
+    True only on one of those two transitions; a reading that merely matches the pre-click
+    baseline never counts, no matter how many polls repeat it.
+
+    FINDING A (2026-08-20 whole-branch review): the previous version tested ABSOLUTE state
+    (`progress == 0`) rather than a transition. That is unsafe on its own: this function's first
+    poll fires GOLEM_CONFIRM_POLL_S after the click, which can easily still be BEFORE the server
+    has processed the click at all, so it can observe the very same pre-click reading and report a
+    golem complete that never was. Snapshotting both `totalCrafted` and the station's `progress`
+    immediately before the Insert-core click (craft_phase does this) and requiring an actual
+    change from either baseline -- the design spec's own two clauses, see
+    docs/superpowers/specs/2026-08-07-golem-crafting-design.md -- closes this: a poll that merely
+    matches the pre-click reading can never satisfy either condition.
 
     See _await_side_done's docstring for why a None from get_golem() mid-poll continues polling
     (IMPORTANT FIX 2026-08-20) rather than returning False immediately."""
@@ -1117,10 +1205,79 @@ def _await_golem_complete(station_name: str, timeout_s: float) -> bool:
         state = controller.get_golem()
         if state is None:
             continue
+        if state.get("totalCrafted", before_total_crafted) > before_total_crafted:
+            return True
         station = _station_by_name(state, station_name)
-        if station and station.get("progress", 0) == 0:
+        if station and before_progress != 0 and station.get("progress", 0) == 0:
             return True
     return False
+
+
+def _near_station_tile(item: dict, station: dict) -> bool:
+    return (
+        abs(item.get("x", 9999) - station["x"]) <= 1
+        and abs(item.get("y", 9999) - station["y"]) <= 1
+    )
+
+
+def _collect_golem_gift(ctx, last_station: dict, item_name) -> bool:
+    """Pick up the gift a gem-bag-full completion dropped near `last_station`, retrying up to
+    GOLEM_GEM_PICKUP_ATTEMPTS times with a FRESH `/ground-items` re-check each attempt. Returns
+    True once the item is confirmed gone from the ground (a genuine pickup, or it was already
+    gone before this ever ran), False if it's still there after every attempt is exhausted.
+
+    FINDING C (2026-08-20 whole-branch review): replaces a single click whose return value was
+    discarded and whose candidates were filtered by an EXACT lowercased name match against
+    on_event's own chat-parsed string. Two ways that silently lost loot: the parsed name can
+    legitimately mismatch the ground item's real name (a golem awarding "2 x Uncut rubies" parses
+    to "uncut rubies", but the ground item is "Uncut ruby" -- zero candidates, loop body never
+    runs), or the single click can hit the deliberate ~4.5% MISTAKE_MISCLICK_CHANCE near-miss (see
+    CLAUDE.md -- intentional humanisation, not a bug, but code reacting to a click's outcome must
+    tolerate it). Either way the caller used to clear the flag and bank unconditionally, leaving
+    the gem to despawn. This is the ONLY path by which loot can be permanently lost, and the
+    code it replaced retried three times with a fresh ground re-check for exactly this reason --
+    see GOLEM_GEM_PICKUP_ATTEMPTS's own comment.
+
+    A name-filter miss (candidates by name empty, but something IS sitting on the station tile)
+    falls back to a position-only match rather than giving up -- logged loudly so a real name
+    mismatch is visible in the log, but still recoverable instead of silently abandoning the item.
+    """
+    name_lower = item_name.lower() if item_name else None
+    for attempt in range(1, GOLEM_GEM_PICKUP_ATTEMPTS + 1):
+        near = [i for i in controller.get_ground_items(fresh=True) if _near_station_tile(i, last_station)]
+        if not near:
+            # Nothing left near the plinth -- either this attempt's predecessor already picked it
+            # up, or (on the very first attempt) there was never anything to collect.
+            return True
+
+        candidates = [i for i in near if name_lower is None or (i.get("name") or "").lower() == name_lower]
+        if not candidates:
+            debug_log.log(
+                "golem crafting",
+                f"gem-bag-full pickup: no ground item named {item_name!r} near "
+                f"{last_station['name']} plinth (found {[i.get('name') for i in near]}) -- "
+                "falling back to a position-only match",
+            )
+            candidates = near
+
+        target = candidates[0]
+        debug_log.log(
+            "golem crafting",
+            f"gem-bag-full pickup attempt {attempt}/{GOLEM_GEM_PICKUP_ATTEMPTS}: {target.get('name')}",
+        )
+        controller.click_menu_action(ctx.ser, target, "take", target_hint=target.get("name"), offset=(0, 0))
+        controller.human_delay(0.6, 1.0)
+
+    still_there = any(
+        _near_station_tile(i, last_station) for i in controller.get_ground_items(fresh=True)
+    )
+    if still_there:
+        debug_log.log(
+            "golem crafting",
+            f"gem-bag-full pickup: gave up after {GOLEM_GEM_PICKUP_ATTEMPTS} attempts -- item "
+            f"likely lost near {last_station['name']} plinth",
+        )
+    return not still_there
 
 
 def craft_phase(ctx, config: dict) -> None:
@@ -1201,18 +1358,7 @@ def craft_phase(ctx, config: dict) -> None:
             )
         else:
             debug_log.log("golem crafting", "gem bag full -- collecting the dropped gift and banking")
-            # Filtered by name (parsed by on_event from the loot message itself), not just
-            # position -- CODE REVIEW: the original version of this block took ANY ground item
-            # within 1 tile of the station, which could just as easily pick up something
-            # unrelated sitting nearby.
-            for drop in [
-                i for i in controller.get_ground_items()
-                if abs(i.get("x", 9999) - last_station["x"]) <= 1
-                and abs(i.get("y", 9999) - last_station["y"]) <= 1
-                and (item_name is None or (i.get("name") or "").lower() == item_name)
-            ]:
-                controller.click_menu_action(ctx.ser, drop, "take", target_hint=drop.get("name"), offset=(0, 0))
-                controller.human_delay(0.6, 1.0)
+            _collect_golem_gift(ctx, last_station, item_name)
         ctx.state.data["gc_gem_bag_full"] = False
         ctx.state.data["gc_gem_bag_full_item"] = None
         ctx.state.data["gc_phase"] = "bank"
@@ -1270,6 +1416,27 @@ def craft_phase(ctx, config: dict) -> None:
             return
 
     plan = carve_plan(station, player_x, player_y)
+
+    # FINDING B (2026-08-20 whole-branch review): fresh_golem (progress == 0, i.e. no golem in
+    # progress on this plinth) and an EMPTY carve plan (every side's own `done` reads True) are
+    # mutually exclusive by design -- a golem that hasn't started can't already have any side
+    # carved. Nobody has verified live whether the per-side varbits actually get cleared when a
+    # golem completes; if they don't, this exact contradictory combination is how that would
+    # first show up. Left unguarded, this falls straight through to the Insert-core block below
+    # and left-clicks a plinth whose default action in a truly fresh state is Start-golem, not
+    # Insert-core -- silently spending 4 raw sunstone on a phantom "insert" that (with FINDING A
+    # unfixed) also used to report a phantom completion and loop forever, burning 4 more sunstone
+    # every lap with zero slack in the trip budget to absorb it. Treat it as the impossible state
+    # it is: stop with the full station dict on record rather than guessing.
+    if fresh_golem and not plan:
+        ctx.state.trigger_safety_stop(
+            f"golem crafting: {station['name']} plinth reads progress == 0 (fresh golem) but "
+            "every side's `done` varbit already reads True -- contradictory state that should "
+            "be impossible; if this fires live it most likely means the per-side varbits are "
+            f"NOT cleared when a golem completes. station state: {station}"
+        )
+        return
+
     if plan:
         side = plan[0]
         tile = station["sides"][side]
@@ -1279,7 +1446,7 @@ def craft_phase(ctx, config: dict) -> None:
         debug_log.log("golem crafting", f"{verb} from {side} side of {station['name']} plinth ({4 - len(plan)}/4 done)")
         if not _click_station_tracked(ctx, station, "gc_side_click_misses", objects):
             return
-        if not _await_side_done(station["name"], side, GOLEM_SIDE_TIMEOUT_S):
+        if not _await_side_done(station["name"], side, GOLEM_SIDE_TIMEOUT_S, already_done=station["sides"][side]["done"]):
             debug_log.log("golem crafting", f"{side} side didn't register within {GOLEM_SIDE_TIMEOUT_S}s -- retrying next tick")
             ctx.state.data["gc_side_misses"] = ctx.state.data.get("gc_side_misses", 0) + 1
             if ctx.state.data["gc_side_misses"] >= GOLEM_SIDE_MISS_LIMIT:
@@ -1322,9 +1489,17 @@ def craft_phase(ctx, config: dict) -> None:
         return
 
     debug_log.log("golem crafting", f"inserting core + fur from {insert_side} side of {station['name']} plinth")
+    # FINDING A (2026-08-20 whole-branch review): snapshotted immediately BEFORE the click, not
+    # after -- _await_golem_complete needs the genuine pre-click baseline to tell a real
+    # completion apart from a poll that just happens to observe the same state the click started
+    # from. See that function's own docstring.
+    before_total_crafted = state.get("totalCrafted", 0)
+    before_progress = station.get("progress", 0)
     if not _click_station_tracked(ctx, station, "gc_insert_click_misses", objects):
         return
-    if not _await_golem_complete(station["name"], GOLEM_INSERT_TIMEOUT_S):
+    if not _await_golem_complete(
+        station["name"], GOLEM_INSERT_TIMEOUT_S, before_total_crafted, before_progress
+    ):
         if ctx.state.data.get("gc_fur_exhausted"):
             # IMPORTANT FIX 2026-08-20 (code review): this branch cannot actually fire under the
             # current single-threaded event dispatch -- on_event only runs from the main loop
