@@ -442,38 +442,37 @@ public class ControllerPlugin extends Plugin
 		return true;
 	}
 
+	// Handles both LEVEL_UP and XP_GAINED off the single StatChanged event -- NOT split into two
+	// @Subscribe methods. RuneLite's EventBus.register() hard-requires a subscriber's method name
+	// to equal "on" + the parameter type's simple name (verified against client-1.12.36.jar, the
+	// version `latest.release` resolves to); for a StatChanged parameter that name is literally
+	// "onStatChanged". A differently-named second subscriber (e.g. onXpGained) throws
+	// IllegalArgumentException inside register()'s method loop, before subscribers = builder.build()
+	// runs -- which kills registration for every subscriber in this class, not just the new one, so
+	// the whole plugin comes up dead. Two methods both named onStatChanged are impossible in Java
+	// anyway, so both jobs have to live in the one handler.
 	@Subscribe
 	public void onStatChanged(StatChanged event)
 	{
 		Skill skill = event.getSkill();
-		int realLevel = client.getRealSkillLevel(skill);
-		Integer previous = lastRealLevels.put(skill, realLevel);
 
-		if (previous == null || realLevel <= previous)
+		int realLevel = client.getRealSkillLevel(skill);
+		Integer previousLevel = lastRealLevels.put(skill, realLevel);
+		if (previousLevel != null && realLevel > previousLevel)
 		{
-			return;
+			Map<String, Object> payload = new HashMap<>();
+			payload.put("skill", skill.getName());
+			payload.put("level", realLevel);
+			payload.put("previousLevel", previousLevel);
+			payload.put("xp", client.getSkillExperience(skill));
+			udpSender.send("LEVEL_UP", payload);
 		}
 
-		Map<String, Object> payload = new HashMap<>();
-		payload.put("skill", skill.getName());
-		payload.put("level", realLevel);
-		payload.put("previousLevel", previous);
-		payload.put("xp", client.getSkillExperience(skill));
-		udpSender.send("LEVEL_UP", payload);
-	}
-
-	// Separate @Subscribe method (not folded into onStatChanged above) because it tracks raw XP
-	// via its own lastXp map, not level via lastRealLevels -- most XP gains don't cross a level
-	// boundary, so LEVEL_UP alone would miss almost every individual gain a routine cares about.
-	@Subscribe
-	public void onXpGained(StatChanged event)
-	{
-		Skill skill = event.getSkill();
 		int xp = event.getXp();
-		Integer previous = lastXp.put(skill, xp);
-		if (previous == null || xp <= previous)
+		Integer previousXp = lastXp.put(skill, xp);
+		if (previousXp == null || xp <= previousXp)
 		{
-			// previous == null is the first StatChanged for this skill since login/plugin
+			// previousXp == null is the first StatChanged for this skill since login/plugin
 			// start, which carries the account's entire XP total, not a gain -- reporting it
 			// as a "delta" would mean e.g. an account with ~1.5M Hunter XP emitting a single
 			// 1,500,000 XP_GAINED the moment tracking begins.
@@ -482,7 +481,7 @@ public class ControllerPlugin extends Plugin
 		Map<String, Object> payload = new HashMap<>();
 		payload.put("skill", skill.getName());
 		payload.put("xp", xp);
-		payload.put("delta", xp - previous);
+		payload.put("delta", xp - previousXp);
 		payload.put("tick", tickClock.get());
 		udpSender.send("XP_GAINED", payload);
 	}
