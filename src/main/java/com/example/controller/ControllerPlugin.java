@@ -7,6 +7,7 @@ import com.example.tracker.NpcTrackerRegistry;
 import com.example.util.UdpEventSender;
 import com.google.inject.Provides;
 import net.runelite.api.*;
+import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.*;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
@@ -304,6 +305,83 @@ public class ControllerPlugin extends Plugin
 		{
 			udpSender.send("PLAYER_DIED");
 		}
+	}
+
+	@Subscribe
+	public void onGameObjectSpawned(GameObjectSpawned event)
+	{
+		sendObjectEvent("OBJECT_SPAWNED", event.getGameObject());
+	}
+
+	@Subscribe
+	public void onGameObjectDespawned(GameObjectDespawned event)
+	{
+		sendObjectEvent("OBJECT_DESPAWNED", event.getGameObject());
+	}
+
+	@Subscribe
+	public void onItemSpawned(ItemSpawned event)
+	{
+		sendGroundItemEvent("GROUND_ITEM_SPAWNED", event.getTile(), event.getItem());
+	}
+
+	@Subscribe
+	public void onItemDespawned(ItemDespawned event)
+	{
+		sendGroundItemEvent("GROUND_ITEM_DESPAWNED", event.getTile(), event.getItem());
+	}
+
+	private void sendObjectEvent(String type, GameObject obj)
+	{
+		// A region load spawns thousands of objects at once (client not yet LOGGED_IN) -- skip
+		// those rather than flooding the UDP socket; only steady-state spawns/despawns are worth
+		// pushing.
+		if (client.getGameState() != GameState.LOGGED_IN)
+		{
+			return;
+		}
+		if (obj == null)
+		{
+			return;
+		}
+		WorldPoint wp = WorldPoint.fromLocalInstance(client, obj.getLocalLocation());
+		if (wp == null)
+		{
+			return;
+		}
+		Map<String, Object> payload = new HashMap<>();
+		payload.put("id", obj.getId());
+		payload.put("x", wp.getX());
+		payload.put("y", wp.getY());
+		payload.put("plane", wp.getPlane());
+		payload.put("tick", tickClock.get());
+		udpSender.send(type, payload);
+	}
+
+	private void sendGroundItemEvent(String type, Tile tile, TileItem item)
+	{
+		// Same volume guard as sendObjectEvent -- a region load also dumps ground items in bulk.
+		if (client.getGameState() != GameState.LOGGED_IN)
+		{
+			return;
+		}
+		if (tile == null || item == null)
+		{
+			return;
+		}
+		WorldPoint wp = WorldPoint.fromLocalInstance(client, tile.getLocalLocation());
+		if (wp == null)
+		{
+			return;
+		}
+		Map<String, Object> payload = new HashMap<>();
+		payload.put("id", item.getId());
+		payload.put("qty", item.getQuantity());
+		payload.put("x", wp.getX());
+		payload.put("y", wp.getY());
+		payload.put("plane", wp.getPlane());
+		payload.put("tick", tickClock.get());
+		udpSender.send(type, payload);
 	}
 
 	@Subscribe
