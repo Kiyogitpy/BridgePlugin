@@ -70,6 +70,15 @@ define (see `controller.py`'s own header comment for the authoritative version):
   focused, no safety stop active, and not on a break.
 - `on_event(ctx, event_type: str, payload: dict | None) -> None` — optional; runs for every UDP
   event regardless of whether `tick` is currently running.
+- `before_break(ctx) -> None` — optional; runs once on the tick a break first comes due, **before
+  the break starts**, under the same gates `tick` runs under. Added 2026-08-20 (user requirement
+  for `routines/chinchompa_hunting.py`: "make it so it picks up the trap before the break
+  function") because breaks are toggled *before* `tick` and `tick` is skipped for the whole
+  break, so a routine otherwise physically cannot clean up after one begins — four laid box traps
+  would sit out a 3-12 minute break unattended. The break starts once this returns, so a slow
+  teardown just delays it. Backed by the side-effect-free predicate `ControllerState.break_due()`;
+  routines without the hook are unaffected. There is **no** equivalent hook for a safety stop or
+  for process exit (the panic key is a hard `os._exit` by design) — only breaks are covered.
 - `SKIP_STRAY_DIALOG_CHECK = True` — optional module-level flag; opts out of the engine-level
   `check_stray_dialog` (dismisses a "click here to continue" dialogue via Space before every
   tick). Added 2026-08-14 for `routines/pest_control.py`: that check only presses Space once per
@@ -175,6 +184,42 @@ steps above.
   what's under the cursor) and looks like any other single click, so there's no reason not to
   use it for every walk-to-a-tile click, not just ones near a known-risky object. See
   `golem_crafting.py`'s `walk_to_exact_tile` for the reference implementation.
+- **A Shortest Path route is only useful if we can follow it — never inherit that plugin's own
+  panel settings.** `_use_transport` can do exactly one thing: click a single menu option on an
+  object or NPC. Every teleport, and every transport that opens a destination picker (canoes,
+  charter ships, minecarts), produces an edge with no `objectId` to click — and before 2026-08-21
+  travel.py reacted to that by trying to *walk* to the tile on the far side. CONFIRMED live that
+  day: a `walk_to` from Civitas illa Fortis returned a route whose first edge was a
+  `QUETZAL_WHISTLE` to (1697, 3140), i.e. a minimap click at a tile **454 tiles away**, purely
+  because the user's own Shortest Path panel had quetzals enabled. `travel.TRANSPORT_POLICY` is
+  now sent in full with every request and disables everything we can't execute; the same target
+  went from a 90-step route with an undriveable teleport to a 526-step walkable one whose only
+  two transports were an ordinary boat and a door. Add a key to that policy — don't loosen it —
+  when new execution code lands, and see `_transport_is_executable` for the second line of
+  defence.
+- **Shortest Path's config override is sticky AND session-global.** The `config` map on its
+  `("shortestpath", "path")` PluginMessage is copied into a *static* field that the plugin only
+  ever replaces (when a non-empty map arrives) and never clears. Two consequences: a partial
+  override from one request silently stays in force for every later one — which is why
+  `travel.transport_config()` sends the whole policy every time rather than just the keys it
+  wants changed — and the override also shadows the human's own manual use of the plugin for the
+  rest of the client session. Restarting the client is currently the only way to clear it. If
+  that ever needs fixing, the shape would be having the bridge snapshot the real config values
+  through `ConfigManager` once and restore them; nothing does that today.
+- **A finished path is not necessarily *your* path, and `walk_to` doesn't always ask for one.**
+  Shortest Path swaps its `Pathfinder` in asynchronously after the message, so a poll landing in
+  between reads the *previous* walk's finished route — complete, `done`, and to somewhere else
+  entirely. `/shortest-path/result` therefore echoes the running pathfinder's own `start` and
+  `targets`, and `_request_computed_path` only accepts a result whose targets match what it asked
+  for (a build too old to report them degrades to the old done-is-enough behaviour). It also
+  returns `reached`/`terminationReason` (`TARGET_REACHED` / `SEARCH_EXHAUSTED` / `CUTOFF_REACHED`
+  / `CANCELLED`), because the plugin hands back its best *partial* route when it can't arrive and
+  that is otherwise indistinguishable on the wire from one that does. Separately, `walk_to` skips
+  the pathfinder entirely for same-plane targets within `SHORT_HOP_TILES` (25) and goes straight
+  to `_walk_greedy` — so "it never called Shortest Path" is expected for a short hop, not a bug.
+  Pass `min_path_tiles=0` to force a computed route anyway. Deliberately not a large threshold:
+  `_walk_greedy` is obstacle-blind and every extra tile of gate is another chance to wedge
+  against a wall it can't route around.
 
 ## Sub-tick data and clicking while moving
 
@@ -285,3 +330,88 @@ cores/fur, loots gems, and cycles bank ↔ mine ↔ craft on its own. Several ot
 (`slayer.py`, `mining.py`, `blast_furnace.py`, etc.) exist and were not touched this session —
 don't assume they share golem_crafting.py's specific fixes (sticky targeting, inventory-change
 reclick gates, etc.) unless verified.
+
+## Current state of routines/chinchompa_hunting.py
+
+Written 2026-08-20 (design: `docs/superpowers/specs/2026-08-20-chinchompa-hunting-design.md`).
+Box-traps Carnivorous chinchompas with 4 traps and picks every trap back up via the new
+`before_break` hook. First run live 2026-08-21 in the Red chinchompa hunting ground (an
+underground cave, and **not** instanced — forward world→screen conversion works there, so
+`walk_to_exact_tile` is safe; verified before the first run). That session replaced most of the
+guesswork in this routine with measurements:
+
+- **Interacting with a trap is a plain left-click, not a menu selection.** The user swapped the
+  client-side menu entries so the left-click action is correct in every trap state, so
+  `click_menu_action`/`target_hint`/`TRAP_STATE_ACTIONS` are gone. The old `target_hint` guess was
+  wrong anyway: a trap's **displayed name depends on its state** — a full one is a `Shaking box`,
+  a set or collapsed one is a `Box trap` — so it missed on every single retrieval and only worked
+  via the option-name-only fallback. Nothing matches on the name any more; identity is by object
+  id (`classify_trap`).
+- **A trap object appears in `/objects` ~1.9s AFTER the trap leaves the inventory** (≈3 game
+  ticks, the setup animation), measured over three consecutive lays. Confirming a lay on the pack
+  decrement alone — which is what `_await_trap_laid` used to do — hands control back inside that
+  window, the next tick reads the tile as still empty, and the routine lays a *second* trap on it.
+  See `_await_trap_laid`; it now waits for the object and nothing else.
+- **Checking a full trap is TWO animations with a deceptive ~0.66s idle gap between them:** 5212
+  (check / pick up) then 5208 (the game re-laying it automatically), ~6s end to end. `animation
+  == -1` is therefore NOT a valid "action finished" signal on its own — only *sustained* idle is
+  (`_await_action_finished`, `ACTION_SETTLE_S`). Returning during that gap let the next tick
+  interrupt the re-lay, so the trap stayed in the pack and the tile stayed bare; over a few
+  catches every trap ended up in the inventory with nothing on the ground.
+- **A left-click keeps a *set* trap** (picks it up, no re-lay) but *re-lays* a full or collapsed
+  one. That asymmetry is why `retrieve_trap` confirms on "the tile no longer holds the state we
+  clicked on" rather than on the trap reaching the inventory — only one of the two outcomes
+  involves the inventory at all — and it is what lets `before_break` still clear the ground.
+- **An unreachable plan tile used to be retried forever, and it was the single biggest throughput
+  drain found.** `block_tile` keys off the game's refusal chat message, which never arrives when
+  the player cannot physically get onto the tile to attempt the lay — so `lay_trap` just logged
+  "didn't reach" and gave up, every tick, at ~10s an action. CONFIRMED live 2026-08-21: two plan
+  tiles were walls, burning ~200 actions an hour and holding the catch rate at roughly half
+  baseline. `lay_trap` now counts consecutive failed walks per tile and blocks after
+  `UNREACHABLE_BLOCK_THRESHOLD` (4), and the plan rebuilds onto a spare offset; catch gaps went
+  from 28-96s back to ~10s immediately. The threshold is deliberately not 1 — a chinchompa
+  standing on a tile blocks the walk transiently — and arriving clears the streak. Root cause of
+  the bad geometry: repeated restarts let the plan adopt scattered leftover traps until the
+  anchor drifted somewhere with walls for neighbours, so a **clean start from a deliberate anchor
+  is worth doing** after a run of restarts.
+- **Known, deliberately unfixed: collapsed traps sometimes time out before they are reset.**
+  `work_queue` ranks `failed` last, so a collapsed trap waits behind catches, dropped-trap
+  recoveries and empty slots; some wait long enough to time out and drop as an item, which then
+  costs two actions (recover + re-lay) instead of one (reset). MEASURED 2026-08-21 over 115
+  consecutive actions: 65 catches, 33 resets, 9 lays, 8 recoveries — so the waste is ~7%.
+  Promoting `failed` above `empty` would recover most of it, **but** `full` + `failed` already
+  account for 98 of those 115 actions, which is exactly the condition that starved the empty slot
+  before (12 catches on 3 traps of a 4-trap plan). Left alone on purpose: a 7% loss is not worth
+  re-risking a whole trap slot, and both previous reorderings made on reasoning rather than
+  measurement regressed throughput 45-85%. Measure over a long run before touching this.
+- **Do not try to reclaim the animation tail — it was measured and is strictly worse.** The
+  obvious speed idea is that once the re-laid trap object is back on the ground (~1.3s before the
+  animation ends) it has already left the pack, so the re-lay is committed and the next action
+  can start. Tried 2026-08-21: the catch cycle went from ~9.7s to a **median of 18s**, with 6
+  dropped retrieve clicks and 7 lay timeouts where the full wait had none. The trap being placed
+  is not the same as the player being free — a click issued while the player is still animating
+  is dropped by the game, and the retries cost far more than the wait saves. Throughput here is
+  bound by the game's own ~6s two-part animation, and the routine is already saturated (~0.5s
+  idle between actions), so there is very little left to win.
+- **Traps left on the ground time out and despawn**, dropping as a `Box trap` *ground item*
+  (`/ground-items`, not `/objects`) — MEASURED as a steady leak of ~1-2 traps an hour, since a
+  set trap that never catches anything is never touched and so eventually times out. Recovered by
+  `dropped_traps_by_tile`/`recover_dropped_trap`, which pick the item back up rather than paving
+  the tile with a fresh trap from the pack. That pickup goes through the right-click menu (`Take
+  Box trap`) and **must not** be "simplified" to a bare left-click: that was tried first and
+  failed on its first live attempt (the item despawned instead), because these items lie on tiles
+  the chinchompas wander across and a click on a shared pixel resolves to Attack. Note the
+  asymmetry with `retrieve_trap`, which *does* use a bare click — the menu entries are swapped
+  client-side for trap OBJECTS, but a ground ITEM still has an ordinary Take option.
+- This is also why `block_tile` now
+  refuses to blacklist a tile one of our own traps is standing on: striking such a tile off the
+  plan means never returning for that trap, and it despawns. A run lost two traps exactly that
+  way before the double-lay driving those refusals was fixed.
+
+Two things it does differently from the other routines, on purpose:
+- **Trap identity is a tile, not a remembered trap.** It re-reads `/objects` every tick and
+  classifies whatever box trap is standing on each of its own planned tiles — which also settles
+  ownership (a trap on any other tile belongs to someone else) and survives the `ctx.state.data`
+  reset, since a plan built from scratch adopts traps already laid near the anchor.
+- **No banking phase at all.** Box traps and red chinchompas both stack, so the inventory
+  genuinely cannot fill — there is nothing to bank, and adding a bank cycle would be dead code.

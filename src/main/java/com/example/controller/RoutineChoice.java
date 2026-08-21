@@ -20,7 +20,8 @@ public enum RoutineChoice
 	MASTERING_MIXOLOGY("Mastering Mixology"),
 	PEST_CONTROL("Pest Control"),
 	NMZ("Nightmare Zone"),
-	PYRAMID_PLUNDER("Pyramid Plunder");
+	PYRAMID_PLUNDER("Pyramid Plunder"),
+	CHINCHOMPA_HUNTING("Chinchompa Hunting");
 
 	private final String label;
 

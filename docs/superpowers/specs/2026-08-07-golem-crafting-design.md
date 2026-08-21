@@ -40,7 +40,7 @@ inline "ASSUMPTION, NOT YET VERIFIED LIVE" comments).
      drop appears to cut the next plinth side from 4 ticks to 3). Always use
      the safe, un-optimized cadence.
    - Acquiring the fur pouch itself -- the routine assumes the player
-     already owns one (any size).
+     already owns one (any size).push
    - Any fur types not obtainable at all (this routine only ever sources
      fur from the bank or the Goat Pit -- it never buys from a shop or trains
      other Hunter methods elsewhere on the map).
@@ -182,7 +182,7 @@ its own work is done for now:
   straight to loose inventory slots (no pouch fill/empty round-trip at
   all -- that pair bought nothing once the budget stopped depending on
   pouch ownership). The pouch is still emptied once, right after the bank
-  closes, but only for fur caught while *hunting* (see `hunt` below),
+  closes, but only for fur caught while _hunting_ (see `hunt` below),
   which routes into an open pouch -- unrelated to this withdrawal. If
   **none** of `furPriority`'s fur types are in the bank at all -> `hunt`.
   Otherwise -> `mine`.

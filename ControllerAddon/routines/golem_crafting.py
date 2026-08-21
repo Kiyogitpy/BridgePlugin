@@ -994,24 +994,13 @@ def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
     standing-tile walk too -- reporting True immediately when already there is exactly what that
     caller wants as well, just skipping straight to it instead of clicking and then discovering
     the same thing a poll later."""
-    player = controller.get_player()
-    if player.get("x") == x and player.get("y") == y and player.get("plane", 0) == plane:
-        return True
-    point = controller.get_ground_walk_point(x, y, plane)
-    if not point.get("onScreen"):
-        return False
-    refresh = lambda: controller.get_ground_walk_screen_pos(x, y, plane)
-    controller.key_down(ctx.ser, "SHIFT")
-    controller.click_entity(ctx.ser, point, offset=(0, 0), refresh_target=refresh)
-    controller.key_up(ctx.ser, "SHIFT")
-    waited = 0.0
-    while waited < 8.0:
-        time.sleep(0.6)
-        waited += 0.6
-        player = controller.get_player()
-        if player.get("x") == x and player.get("y") == y:
-            return True
-    return True
+    # MOVED 2026-08-20 to travel.walk_to_exact_tile, verbatim, once routines/chinchompa_hunting.py
+    # needed the identical exact-arrival walk (it has to stand on the precise tile it lays a box
+    # trap on). Kept as a delegating wrapper rather than replacing this module's ~15 call sites:
+    # the docstring above is this behaviour's whole provenance record, and test_golem_crafting.py
+    # patches `gc.walk_to_exact_tile` by name in several craft_phase tests, so the name has to
+    # stay a real attribute of this module either way.
+    return travel.walk_to_exact_tile(ctx, x, y, plane)
 
 
 def _station_by_name(state: dict, name: str):

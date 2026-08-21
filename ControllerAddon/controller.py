@@ -45,6 +45,16 @@
 #       "PLAYER_DIED", "NPC_DIED", "LEVEL_UP", "HP_CHANGED"), regardless of
 #       whether the routine is currently ticking.
 #
+#   def before_break(ctx: Context) -> None:
+#       Optional. Called once, immediately before a break starts -- i.e. on the
+#       tick where ControllerState.break_due() first goes true, under the same
+#       gates tick() runs under (logged in, focused, not safety-stopped). For
+#       leaving the world in a state that survives being unattended for the
+#       break's 3-12 minutes: routines/chinchompa_hunting.py picks its four box
+#       traps back up here rather than leaving them laid. The break starts after
+#       this returns, so a slow teardown just delays the break by that much.
+#       Never called while already on a break, and never more than once per break.
+#
 # ctx (a Context instance) is what routines use to act:
 #
 #   ctx.ser         -- open serial.Serial connection; pass to click_entity,
@@ -468,11 +478,30 @@ def get_ground_walk_screen_pos(x: int, y: int, plane: int):
     return int(x), int(y)
 
 
-def request_shortest_path(x: int, y: int, plane: int):
+def request_shortest_path(x: int, y: int, plane: int, config: dict | None = None):
     """Ask the (separately installed) Shortest Path plugin to compute a
     route to (x, y, plane). requested=False if that plugin isn't
-    installed/running -- see get_shortest_path_result to poll for it."""
-    return api_get("/shortest-path/request", params={"x": x, "y": y, "plane": plane}) or {"requested": False}
+    installed/running -- see get_shortest_path_result to poll for it.
+
+    `config` is a per-request override of that plugin's own settings, keyed by
+    its ShortestPathConfig option names (useFairyRings, useTeleportationItems,
+    avoidWilderness, calculationCutoff, ...) -- see travel.TRANSPORT_POLICY,
+    which is where the values actually come from. Sent as cfg.-prefixed query
+    params so a config key can never collide with x/y/plane."""
+    params = {"x": x, "y": y, "plane": plane}
+    for key, value in (config or {}).items():
+        params[f"cfg.{key}"] = _config_param_value(value)
+    return api_get("/shortest-path/request", params=params) or {"requested": False}
+
+
+def _config_param_value(value):
+    """Shortest Path's own override map only reads Boolean/Integer/String values, and the bridge
+    re-derives which of those a param is from its text -- so booleans have to go out lowercase
+    ("true"), not Python's str(True) == "True", which would parse as a plain string and be
+    silently ignored by a boolean config getter."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def get_shortest_path_result():
@@ -1672,8 +1701,9 @@ MENU_POLL_INTERVAL_S = 0.05
 MENU_POLL_TIMEOUT_S = 0.6
 
 
-def click_menu_action(ser: serial.Serial, entity: dict, option: str, target_hint: str = None,
+def click_menu_action(ser: serial.Serial, entity: dict, option, target_hint: str = None,
                        offset=(-7, 7), check_ui_blockers=True) -> bool:
+    # option: str | Sequence[str] -- see the docstring's own note on the sequence form.
     """Right-click `entity`, read back the resulting context menu via GET /menu, and left-click
     whichever entry's option matches `option` (case-insensitive substring, e.g. "take") -- picks
     a specific menu action by name instead of trusting whatever left-click's default action
@@ -1693,6 +1723,19 @@ def click_menu_action(ser: serial.Serial, entity: dict, option: str, target_hint
     Returns False -- backing out with ESC rather than leaving the menu open over an unintended
     entry -- if the menu never opened or nothing matched `option`/`target_hint`, so the caller can
     retry next tick or fall back instead of assuming a click landed somewhere sensible.
+
+    `option` may also be a SEQUENCE of option names (2026-08-20, for
+    routines/chinchompa_hunting.py), tried in priority order against the one menu this already
+    reads back -- no extra right-click. That routine needs it because the correct retrieval
+    action differs per box-trap state ("Check" a full one, "Dismantle" an empty/collapsed one)
+    and, for the collapsed case, is not something this codebase can confirm without a live
+    client: giving the exact action first and plausible siblings after it means a wrong guess
+    degrades into "picked the right entry anyway" instead of a routine that no-ops forever. A
+    plain str behaves exactly as before.
+
+    A `target_hint` that matches nothing is likewise retried WITHOUT the hint before giving up
+    (same menu, no extra click) -- an over-narrow hint should cost precision, not the whole
+    interaction.
     """
     if not click_entity(ser, entity, offset=offset, check_ui_blockers=check_ui_blockers,
                          simulate_mistakes=False, button="right"):
@@ -1713,25 +1756,40 @@ def click_menu_action(ser: serial.Serial, entity: dict, option: str, target_hint
     # object's menu has an Examine entry, and "examine" contains "mine"), resolving to the wrong
     # action with no error. Falls back to substring only if no exact match exists, which is still
     # needed for e.g. "take" matching "Take-5"/"Take-10"/"Take-X" when there's no bare "Take".
-    option_lower = option.lower()
+    options = [option] if isinstance(option, str) else list(option)
+    options_lower = [o.lower() for o in options]
     target_lower = target_hint.lower() if target_hint else None
 
-    def _target_ok(entry: dict) -> bool:
-        return target_lower is None or target_lower in (entry.get("target") or "").lower()
-
     entries = menu.get("entries", [])
-    match = next(
-        (e for e in entries if option_lower == (e.get("option") or "").lower() and _target_ok(e)),
-        None,
-    )
-    if match is None:
-        match = next(
-            (e for e in entries if option_lower in (e.get("option") or "").lower() and _target_ok(e)),
-            None,
-        )
+
+    def _find(use_hint: bool, exact: bool):
+        """First entry matching any of `options_lower`, scanning options in priority order
+        (option 0 exhausts the whole menu before option 1 is considered) so a caller's stated
+        preference wins over menu ordering."""
+        for opt in options_lower:
+            for entry in entries:
+                entry_option = (entry.get("option") or "").lower()
+                if exact:
+                    if entry_option != opt:
+                        continue
+                elif opt not in entry_option:
+                    continue
+                if use_hint and target_lower is not None \
+                        and target_lower not in (entry.get("target") or "").lower():
+                    continue
+                return entry
+        return None
+
+    match = _find(use_hint=True, exact=True) or _find(use_hint=True, exact=False)
+    if match is None and target_lower is not None:
+        match = _find(use_hint=False, exact=True) or _find(use_hint=False, exact=False)
+        if match is not None:
+            debug_log.log("!", f"target_hint '{target_hint}' matched nothing for "
+                                f"{entity.get('name')} -- falling back to '{match.get('option')} "
+                                f"{match.get('target')}' on option name alone")
 
     if match is None:
-        debug_log.log("!", f"No '{option}' entry in menu for {entity.get('name')} "
+        debug_log.log("!", f"No '{'/'.join(options)}' entry in menu for {entity.get('name')} "
                             f"({[e.get('option') for e in menu.get('entries', [])]}) -- closing it")
         # Move well clear of the menu rather than relying on ESC alone -- CONFIRMED live
         # 2026-08-06 (user observation, watching the client directly): a menu that isn't
@@ -1844,6 +1902,26 @@ class ControllerState:
         if now - self._safety_reminder_at > 30:
             debug_log.log("!", f"Still stopped: {self.safety_reason}")
             self._safety_reminder_at = now
+
+    def break_due(self, breaks_cfg: dict) -> bool:
+        """True exactly when the next maybe_toggle_break() call would START a break (as opposed
+        to being mid-break, or still counting down toward one). Deliberately side-effect free --
+        it never schedules, never starts and never ends a break -- so main() can ask "is a break
+        about to begin?" and give the routine a chance to tidy up first, without changing when
+        the break itself actually happens.
+
+        ADDED 2026-08-20 for routines/chinchompa_hunting.py (user requirement: "make it so it
+        picks up the trap before the break function"). Breaks are toggled BEFORE routine.tick()
+        in the main loop, and tick() is skipped for the whole break, so without this a routine
+        physically cannot clean up after a break has started -- four laid box traps would sit
+        out a 3-12 minute break unattended. See main()'s before_break dispatch."""
+        if not breaks_cfg.get("enabled"):
+            return False
+        if self.break_until is not None:
+            return False  # already on one (or one just ended -- maybe_toggle_break reschedules)
+        if self.next_break_at is None:
+            return False  # first call for this config; maybe_toggle_break only schedules
+        return time.time() >= self.next_break_at
 
     def maybe_toggle_break(self, breaks_cfg: dict):
         if not breaks_cfg.get("enabled"):
@@ -2013,6 +2091,7 @@ ROUTINE_FILES = {
     "PEST_CONTROL": "routines/pest_control.py",
     "NMZ": "routines/nmz.py",
     "PYRAMID_PLUNDER": "routines/pyramid_plunder.py",
+    "CHINCHOMPA_HUNTING": "routines/chinchompa_hunting.py",
 }
 
 
@@ -2137,7 +2216,22 @@ def main():
                 time.sleep(0.5)
                 continue
 
-            state.maybe_toggle_break(config.get("breaks", {}))
+            breaks_cfg = config.get("breaks", {})
+            # Last chance for the routine to put the world back in a state it's happy to leave
+            # unattended for the next 3-12 minutes -- runs BEFORE the break is toggled, so
+            # whatever it does still happens with the routine fully live (logged in, focused, no
+            # safety stop -- every gate above has already passed at this point). The break then
+            # starts however long the teardown took. Routines that don't define before_break are
+            # completely unaffected. See ControllerState.break_due and
+            # routines/chinchompa_hunting.py's own before_break (picking its box traps back up).
+            if hasattr(routine, "before_break") and state.break_due(breaks_cfg):
+                try:
+                    routine.before_break(ctx)
+                except Exception as exc:
+                    debug_log.log_exception("before_break", exc)
+                    raise
+
+            state.maybe_toggle_break(breaks_cfg)
             if state.on_break():
                 time.sleep(1.0)
                 continue

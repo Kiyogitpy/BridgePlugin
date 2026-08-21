@@ -10,6 +10,8 @@
 #   teleport_to_ferox()  -- ring of dueling -> Ferox Enclave
 #   use_fountain()       -- click Ferox's free HP/prayer/special fountain
 #   walk_to(target)      -- get back to a saved location
+#   walk_to_exact_tile() -- shift+click force-walk onto ONE specific tile and
+#                           wait until standing exactly on it (no tolerance)
 #
 # walk_to routes through the (separately installed) Shortest Path hub
 # plugin: it posts a PluginMessage asking it to compute an obstacle-aware
@@ -54,6 +56,104 @@ WALK_MAX_HOPS = 60           # hard cap so a bad target can't loop forever
 
 PATH_REQUEST_TIMEOUT_S = 6.0   # give up waiting for Shortest Path to finish computing
 PATH_POLL_INTERVAL_S = 0.3
+
+# Below this many tiles (Chebyshev, same plane only) walk_to doesn't bother asking Shortest Path
+# at all and goes straight to _walk_greedy: the request plus up to PATH_REQUEST_TIMEOUT_S of
+# polling costs more than the walk itself over a short hop. Deliberately NOT a large number --
+# _walk_greedy is obstacle-blind, so every tile of gate raises the odds of wedging against a wall
+# it can't route around. 25 covers the "already basically there" case (a safespot return, a
+# re-approach after a bank trip) without gambling on open terrain.
+SHORT_HOP_TILES = 25
+
+# Every ShortestPathConfig option the plugin recognises, so a typo in an override can be caught
+# here instead of being silently dropped (the plugin ignores unknown keys, which would leave the
+# baseline quietly in force while the caller believed it had opted in). Taken from
+# ShortestPathConfig's own method names in the installed jar.
+SHORTEST_PATH_CONFIG_KEYS = frozenset({
+    "avoidWilderness", "useAgilityShortcuts", "useGrappleShortcuts", "useBoats", "useCanoes",
+    "useCharterShips", "useShips", "useFairyRings", "useGnomeGliders", "useHotAirBalloons",
+    "useMagicCarpets", "useMagicMushtrees", "useMinecarts", "useQuetzals", "useSpiritTrees",
+    "useTeleportationItems", "useTeleportationLevers", "useTeleportationPortals",
+    "useTeleportationSpells", "useTeleportationSpellsHome", "useTeleportationMinigames",
+    "useWildernessObelisks", "useSeasonalTransports", "includeBankPath", "currencyThreshold",
+    "cancelInstead", "recalculateDistance", "reachedDistance", "unreachableTargetDistance",
+    "calculationCutoff", "usePoh", "usePohFairyRing", "usePohSpiritTree",
+    "useTeleportationPortalsPoh", "pohJewelleryBoxTier", "usePohMountedItems",
+    "costAgilityShortcuts", "costBoats", "costCanoes", "costCharterShips", "costFairyRings",
+    "costGnomeGliders", "costGrappleShortcuts", "costHotAirBalloons", "costMagicCarpets",
+    "costMagicMushtrees", "costMinecarts", "costNonConsumableTeleportationItems",
+    "costQuetzalWhistle", "costQuetzals", "costSeasonalTransports", "costShips",
+    "costSpiritTrees", "costTeleportationBoxes", "costTeleportationLevers",
+    "costTeleportationMinigames", "costTeleportationPortals", "costTeleportationSpells",
+    "costTeleportationSpellsHome", "costWildernessObelisks",
+})
+
+# The transport policy sent with EVERY path request, in full.
+#
+# Two reasons it's explicit rather than "let the plugin use whatever the user ticked in its own
+# panel". First, a route is only useful if we can actually follow it, and _use_transport can only
+# do one thing: click a single menu option on an object or NPC. Every teleport and every
+# destination-picker transport produces an edge we'd have to walk across instead, which for a
+# teleport means minimap-clicking a tile on the far side of the map -- so inheriting a panel with
+# teleports enabled silently breaks routes. Second, the plugin's override map is STICKY: it only
+# replaces the map when a non-empty one arrives and never clears it, so a partial override from
+# one walk would leak into every later walk in the session. Sending the whole map every time is
+# what makes each request independent of the last.
+#
+# On = what _use_transport can execute today (ordinary doors/gates/ladders/stairs need no key at
+# all -- TransportType.TRANSPORT has no toggle and is always on). Off = everything else, until
+# there's code that can actually drive it. Routines opt individual keys back on per call via
+# walk_to(..., transports={...}).
+TRANSPORT_POLICY = {
+    # Single-click object/NPC transports -- executable.
+    "useAgilityShortcuts": True,
+    "useGrappleShortcuts": True,
+    "useBoats": True,
+    "useShips": True,
+
+    # Clickable, but each opens a destination picker _use_transport can't drive.
+    "useCanoes": False,
+    "useCharterShips": False,
+    "useMinecarts": False,
+
+    # Teleports: no object to click at all, or a code/menu UI on top of one.
+    "useTeleportationItems": "None",
+    "useTeleportationSpells": False,
+    "useTeleportationSpellsHome": False,
+    "useTeleportationLevers": False,
+    "useTeleportationPortals": False,
+    "useTeleportationMinigames": False,
+    "useFairyRings": False,
+    "useSpiritTrees": False,
+    "useGnomeGliders": False,
+    "useHotAirBalloons": False,
+    "useMagicCarpets": False,
+    "useMagicMushtrees": False,
+    "useQuetzals": False,
+    "useWildernessObelisks": False,
+
+    # Player-owned house routing -- needs a house teleport plus in-house navigation.
+    "usePoh": False,
+    "usePohFairyRing": False,
+    "usePohSpiritTree": False,
+    "usePohMountedItems": False,
+    "useTeleportationPortalsPoh": False,
+
+    # Leagues/seasonal-only transports, which don't exist on a main.
+    "useSeasonalTransports": False,
+}
+
+
+def transport_config(overrides: dict | None = None) -> dict:
+    """TRANSPORT_POLICY with `overrides` applied, as a fresh dict. Raises ValueError on a key
+    Shortest Path wouldn't recognise -- it ignores unknown keys silently, so a typo would leave
+    the baseline in force while the caller believed it had opted into something."""
+    unknown = set(overrides or {}) - SHORTEST_PATH_CONFIG_KEYS
+    if unknown:
+        raise ValueError(f"not a Shortest Path config key: {', '.join(sorted(unknown))}")
+    config = dict(TRANSPORT_POLICY)
+    config.update(overrides or {})
+    return config
 
 
 def save_location():
@@ -146,15 +246,32 @@ def use_fountain(ctx) -> bool:
     return True
 
 
-def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE) -> bool:
+def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
+            transports: dict | None = None, min_path_tiles: float | None = None) -> bool:
     """Get back to a location from save_location(). Tries a computed route
     from Shortest Path first, falls back to a direct greedy walk if that's
     unavailable or fails partway. True once within `tolerance` tiles of the
     target (defaults to WALK_ARRIVAL_TOLERANCE; callers needing a tighter
     final arrival -- e.g. safespot anchoring, where 3 tiles of slack could
-    still be inside a melee monster's reach -- can pass a smaller value)."""
-    steps = _request_computed_path(target)
+    still be inside a melee monster's reach -- can pass a smaller value).
+
+    `transports` overrides individual TRANSPORT_POLICY keys for this one walk
+    (e.g. {"avoidWilderness": True}); `min_path_tiles` overrides SHORT_HOP_TILES,
+    the distance below which the pathfinder isn't worth asking at all -- pass 0
+    to force a computed route even for a short hop."""
+    if _is_short_hop(target, min_path_tiles):
+        debug_log.log("travel", "target is close enough to walk straight to -- skipping Shortest Path")
+        return _walk_greedy(ctx, target, tolerance)
+
+    steps, reached, reason = _request_computed_path(target, transport_config(transports))
     if steps:
+        if not reached:
+            # The route is the best Shortest Path could do, not one that arrives -- follow it
+            # anyway (getting closer beats standing still, and _walk_greedy picks up the
+            # remainder) but say so, because the alternative is a walk that silently stops short
+            # and a caller that can't tell why.
+            debug_log.log("travel", f"Shortest Path couldn't reach the target ({reason}) -- "
+                                    f"following its best partial route, then walking the rest")
         debug_log.log("travel", f"following a {len(steps)}-tile route from Shortest Path")
         if _walk_along_path(ctx, steps, target, tolerance):
             return True
@@ -165,13 +282,34 @@ def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE) -> boo
     return _walk_greedy(ctx, target, tolerance)
 
 
-def _request_computed_path(target: dict):
+def _is_short_hop(target: dict, min_path_tiles: float | None = None) -> bool:
+    """True when the target is near enough (and on this plane) that a computed route isn't worth
+    the round trip. Plane is a hard gate, not a distance term: a staircase's two ends are a
+    couple of tiles apart horizontally but only the route knows about the staircase."""
+    threshold = SHORT_HOP_TILES if min_path_tiles is None else min_path_tiles
+    player = controller.get_player()
+    px, py = player.get("x"), player.get("y")
+    if px is None or player.get("plane") != target["plane"]:
+        return False
+    return max(abs(target["x"] - px), abs(target["y"] - py)) <= threshold
+
+
+def _request_computed_path(target: dict, config: dict):
     """Ask Shortest Path for a route to target and poll for the result.
-    Returns a list of {"x", "y", "plane"} waypoints in travel order, or None
-    if the plugin isn't available or didn't finish in time."""
-    ack = controller.request_shortest_path(target["x"], target["y"], target["plane"])
+
+    Returns (steps, reached, termination_reason): a list of {"x", "y", "plane"} waypoints in
+    travel order, whether the plugin's own pathfinder actually got to the target, and its
+    PathTerminationReason (TARGET_REACHED / SEARCH_EXHAUSTED / CUTOFF_REACHED / CANCELLED).
+    steps is None if the plugin isn't available or didn't finish in time.
+
+    The result is matched against the target we asked for before it's accepted. Shortest Path
+    replaces its Pathfinder asynchronously, so an early poll can still be reading the PREVIOUS
+    walk's finished path -- and before this check, that path was followed as if it were ours,
+    sending the player off toward wherever the last routine was going. A build too old to report
+    its targets degrades to the old done-is-enough behaviour rather than refusing to path."""
+    ack = controller.request_shortest_path(target["x"], target["y"], target["plane"], config=config)
     if not ack.get("requested"):
-        return None
+        return None, False, None
 
     waited = 0.0
     while waited < PATH_REQUEST_TIMEOUT_S:
@@ -180,12 +318,26 @@ def _request_computed_path(target: dict):
 
         result = controller.get_shortest_path_result()
         if not result.get("active"):
-            return None
-        if result.get("done"):
-            steps = result.get("steps") or []
-            return steps if steps else None
+            return None, False, None
+        if not result.get("done") or not _result_is_for(result, target):
+            continue
 
-    return None
+        steps = result.get("steps") or []
+        return steps or None, bool(result.get("reached", True)), result.get("terminationReason")
+
+    return None, False, None
+
+
+def _result_is_for(result: dict, target: dict) -> bool:
+    """Whether a finished path is the one we asked for. True when the result carries no target
+    info at all -- see _request_computed_path on the older-build fallback."""
+    targets = result.get("targets")
+    if targets is None:
+        return True
+    return any(
+        t.get("x") == target["x"] and t.get("y") == target["y"] and t.get("plane") == target["plane"]
+        for t in targets
+    )
 
 
 def _walk_along_path(ctx, steps: list, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE) -> bool:
@@ -223,7 +375,20 @@ def _walk_along_path(ctx, steps: list, target: dict, tolerance: float = WALK_ARR
                     return False
 
             waypoint = steps[transport_index]
-            if not _use_transport(ctx, waypoint["transport"], waypoint):
+            transport = waypoint["transport"]
+
+            if not _transport_is_executable(transport):
+                # Walking through an unusable transport is only sane when there's something
+                # physically there to walk into. For a teleport (or any edge with no object at
+                # all) the far side is somewhere else entirely, so the "walk through it anyway"
+                # fallback below would minimap-click a tile across the map. Give up on the route
+                # instead and let walk_to fall back to a direct walk.
+                debug_log.log("travel", f"route needs a transport we can't drive "
+                                        f"({transport.get('type')}: {transport.get('displayInfo')}) "
+                                        f"-- abandoning the computed route")
+                return False
+
+            if not _use_transport(ctx, transport, waypoint):
                 debug_log.log("travel", "couldn't use the transport automatically -- trying to walk through it anyway")
                 if not _hop_to(ctx, waypoint["x"], waypoint["y"], waypoint["plane"]):
                     return False
@@ -246,6 +411,14 @@ def _find_next_transport_index(steps: list, from_index: int):
         if steps[i].get("transport"):
             return i
     return None
+
+
+def _transport_is_executable(transport: dict) -> bool:
+    """Whether _use_transport can actually drive this edge: it clicks one menu option on one
+    object or NPC, so it needs both an id and a name to find. Deliberately keyed on that rather
+    than on the transport's type or its isTeleport flag -- a teleport lever IS a clickable
+    object, and a boat that somehow arrives without object info is NOT, whatever its type says."""
+    return transport.get("objectId") is not None and bool(transport.get("objectName"))
 
 
 TRANSPORT_INTERACT_TIMEOUT_S = 8.0
@@ -391,6 +564,59 @@ def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
 
 def _within_tolerance(x1: float, y1: float, x2: float, y2: float, tolerance: float = WALK_ARRIVAL_TOLERANCE) -> bool:
     return math.hypot(x2 - x1, y2 - y1) <= tolerance
+
+
+EXACT_TILE_POLL_INTERVAL_S = 0.6   # one game tick -- the soonest the player's own tile can change
+EXACT_TILE_TIMEOUT_S = 8.0         # generous for the short, in-render-range hops this is for
+
+
+def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
+    """Walk to the EXACT world tile (x, y, plane) and wait until standing exactly on it.
+
+    Deliberately not walk_to/_hop_to above: those treat landing within WALK_ARRIVAL_TOLERANCE
+    (3 tiles) as arrival, which is useless whenever a tile's identity is the whole point --
+    golem_crafting.py's golem sides are 1-2 tiles apart (a 3-tile-tolerant arrival can report
+    success while standing on the WRONG side), and chinchompa_hunting.py has to be standing on
+    the precise tile it means to lay a box trap on, since "Lay" always targets the player's own
+    tile and nothing else.
+
+    Returns False only if the tile can't be projected onto the screen at all (out of render
+    range); a timed-out wait still returns True, since callers re-check position fresh afterward
+    either way.
+
+    EXTRACTED 2026-08-20 from routines/golem_crafting.py, unchanged, once a second routine needed
+    the identical behaviour -- see that file's own walk_to_exact_tile (now a delegating wrapper)
+    for the full provenance of each piece below. In short:
+      - Early-out with no click at all when already standing there (2026-08-20 review finding E):
+        the common case for both callers is a walk that turns out to be a no-op, and paying for a
+        full human-paced flight plus a poll to discover that is pure waste.
+      - Shift held around the click (2026-08-09 user report, CONFIRMED live): a plain click at a
+        ground point near an interactive object can resolve to that OBJECT's action instead of
+        walking -- it cleared the Goat Pit's lining mid walk-back. Shift+click is OSRS's own
+        force-walk shortcut, looks like any other click, so it's used unconditionally. This is
+        the codebase rule for every walk-to-a-tile click (see CLAUDE.md), not a per-caller opt-in.
+      - refresh_target (2026-08-10 user report): the tile doesn't move but its screen projection
+        does (camera auto-follow/momentum) during move_to_human's flight time, so the final
+        approach re-aims at the tile's live position instead of a pre-click snapshot.
+    """
+    player = controller.get_player()
+    if player.get("x") == x and player.get("y") == y and player.get("plane", 0) == plane:
+        return True
+    point = controller.get_ground_walk_point(x, y, plane)
+    if not point.get("onScreen"):
+        return False
+    refresh = lambda: controller.get_ground_walk_screen_pos(x, y, plane)
+    controller.key_down(ctx.ser, "SHIFT")
+    controller.click_entity(ctx.ser, point, offset=(0, 0), refresh_target=refresh)
+    controller.key_up(ctx.ser, "SHIFT")
+    waited = 0.0
+    while waited < EXACT_TILE_TIMEOUT_S:
+        time.sleep(EXACT_TILE_POLL_INTERVAL_S)
+        waited += EXACT_TILE_POLL_INTERVAL_S
+        player = controller.get_player()
+        if player.get("x") == x and player.get("y") == y:
+            return True
+    return True
 
 
 def maybe_approach_before_click(ctx, entity: dict, already_engaged: bool = False,

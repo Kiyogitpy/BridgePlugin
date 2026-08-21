@@ -333,3 +333,138 @@ def test_build_bezier_path_curve_magnitude_follows_profile_range(monkeypatch):
     # it to 0.20 instead of 0.08 should produce a visibly larger average
     # perpendicular offset (confirmed empirically: ~2.5x on a 400px move).
     assert mean_c1_offset(high_offsets) > mean_c1_offset(low_offsets) * 1.5
+
+
+# ---- ControllerState.break_due / the before_break hook, 2026-08-20 ----
+
+BREAKS_ON = {"enabled": True, "everyMinMinutes": 45, "everyMaxMinutes": 75}
+
+
+def test_break_due_is_false_before_the_first_break_is_even_scheduled():
+    """maybe_toggle_break's first call only SCHEDULES -- asking before that must not report a
+    break as due, or a routine would tear down its work on the very first tick."""
+    state = controller.ControllerState()
+    assert state.break_due(BREAKS_ON) is False
+
+
+def test_break_due_is_false_while_still_counting_down():
+    state = controller.ControllerState()
+    state.maybe_toggle_break(BREAKS_ON)   # schedules next_break_at some 45-75 minutes out
+    assert state.next_break_at is not None
+    assert state.break_due(BREAKS_ON) is False
+
+
+def test_break_due_goes_true_exactly_when_the_break_would_start():
+    state = controller.ControllerState()
+    state.maybe_toggle_break(BREAKS_ON)
+    state.next_break_at = controller.time.time() - 1
+    assert state.break_due(BREAKS_ON) is True
+
+
+def test_break_due_never_reports_due_while_already_on_a_break():
+    """before_break must fire once per break, not repeatedly for its whole duration."""
+    state = controller.ControllerState()
+    state.maybe_toggle_break(BREAKS_ON)
+    state.next_break_at = controller.time.time() - 1
+    state.maybe_toggle_break(BREAKS_ON)   # actually starts it
+    assert state.on_break() is True
+    assert state.break_due(BREAKS_ON) is False
+
+
+def test_break_due_is_false_when_breaks_are_disabled():
+    state = controller.ControllerState()
+    state.next_break_at = controller.time.time() - 1
+    assert state.break_due({"enabled": False}) is False
+
+
+def test_break_due_has_no_side_effects():
+    """It is a predicate main() asks BEFORE maybe_toggle_break -- if it scheduled, started or
+    cleared anything, asking the question would change the answer."""
+    state = controller.ControllerState()
+    state.maybe_toggle_break(BREAKS_ON)
+    before = (state.next_break_at, state.break_until)
+    for _ in range(5):
+        state.break_due(BREAKS_ON)
+    assert (state.next_break_at, state.break_until) == before
+
+
+# ---- click_menu_action's option-list form, 2026-08-20 ----
+
+def _menu(*options):
+    return {"open": True, "entries": [
+        {"option": option, "target": "Box trap", "screenX": 10, "screenY": 20 + i}
+        for i, option in enumerate(options)
+    ]}
+
+
+def _stub_menu(monkeypatch, menu, picked):
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_menu", lambda: menu)
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **k: picked.append((x, y)))
+    monkeypatch.setattr(controller, "click_human", lambda ser: None)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (0, 0))
+
+
+def test_click_menu_action_still_takes_a_plain_string(monkeypatch):
+    picked = []
+    _stub_menu(monkeypatch, _menu("Examine", "Check"), picked)
+    assert controller.click_menu_action(None, {"screenX": 1, "screenY": 1}, "Check") is True
+    assert picked == [(10, 21)]
+
+
+def test_click_menu_action_takes_options_in_priority_order(monkeypatch):
+    """First option wins even though the menu lists the second one first -- the caller's stated
+    preference, not menu order, decides (a full box trap must be Checked, never Dismantled)."""
+    picked = []
+    _stub_menu(monkeypatch, _menu("Dismantle", "Check"), picked)
+    assert controller.click_menu_action(None, {"screenX": 1, "screenY": 1},
+                                         ("Check", "Dismantle")) is True
+    assert picked == [(10, 21)], "should have picked Check, the second entry"
+
+
+def test_click_menu_action_falls_through_to_a_later_option(monkeypatch):
+    picked = []
+    _stub_menu(monkeypatch, _menu("Examine", "Dismantle"), picked)
+    assert controller.click_menu_action(None, {"screenX": 1, "screenY": 1},
+                                         ("Check", "Dismantle")) is True
+    assert picked == [(10, 21)]
+
+
+def test_click_menu_action_returns_false_when_no_option_matches(monkeypatch):
+    picked = []
+    _stub_menu(monkeypatch, _menu("Examine", "Walk here"), picked)
+    assert controller.click_menu_action(None, {"screenX": 1, "screenY": 1},
+                                         ("Check", "Dismantle")) is False
+
+
+def test_an_over_narrow_target_hint_degrades_instead_of_failing(monkeypatch):
+    """A wrong target_hint should cost precision, not the whole interaction -- the box trap
+    object's displayed name is one of the things this codebase could not confirm offline."""
+    picked = []
+    _stub_menu(monkeypatch, _menu("Check"), picked)
+    assert controller.click_menu_action(None, {"screenX": 1, "screenY": 1}, "Check",
+                                         target_hint="Cage trap") is True
+    assert picked == [(10, 20)]
+
+
+def test_a_matching_target_hint_still_narrows_the_choice(monkeypatch):
+    picked = []
+    menu = {"open": True, "entries": [
+        {"option": "Take", "target": "Bones", "screenX": 10, "screenY": 20},
+        {"option": "Take", "target": "Box trap", "screenX": 10, "screenY": 30},
+    ]}
+    _stub_menu(monkeypatch, menu, picked)
+    assert controller.click_menu_action(None, {"screenX": 1, "screenY": 1}, "Take",
+                                         target_hint="box trap") is True
+    assert picked == [(10, 30)]
+
+
+def test_an_exact_option_still_beats_a_substring_one(monkeypatch):
+    """The documented "Examine" contains "mine" trap -- pinned again now that matching runs
+    through the multi-option scanner."""
+    picked = []
+    _stub_menu(monkeypatch, _menu("Examine", "Mine"), picked)
+    assert controller.click_menu_action(None, {"screenX": 1, "screenY": 1}, "Mine") is True
+    assert picked == [(10, 21)], "must land on Mine, not on Examine"
