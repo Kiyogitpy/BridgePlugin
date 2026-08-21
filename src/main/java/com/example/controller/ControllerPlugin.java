@@ -78,6 +78,7 @@ public class ControllerPlugin extends Plugin
 	private BridgeHttpServer server;
 	private UdpEventSender udpSender;
 	private NpcTrackerRegistry npcTrackerRegistry;
+	private TickClock tickClock;
 
 	private int lastHp = -1;
 	private int lastPrayer = -1;
@@ -99,8 +100,7 @@ public class ControllerPlugin extends Plugin
 		server = new BridgeHttpServer();
 		server.start(HTTP_PORT);
 
-		TickClock tickClock = new TickClock();
-		tickClock.register(eventBus);
+		tickClock = new TickClock();
 
 		new GameStateProvider(client, clientThread, server).register();
 		new PlayerProvider(client, clientThread, server).register();
@@ -229,7 +229,14 @@ public class ControllerPlugin extends Plugin
 	@Subscribe
 	public void onGameTick(GameTick event)
 	{
-		udpSender.send("TICK");
+		// TickClock isn't a self-registered subscriber (RuneLite doesn't guarantee subscriber
+		// ordering, so a second GameTick handler here could race this one) -- bump it explicitly
+		// so the TICK payload always reflects the tick this handler is currently on.
+		tickClock.bump();
+		Map<String, Object> tickPayload = new HashMap<>();
+		tickPayload.put("tick", tickClock.get());
+		tickPayload.put("atMillis", tickClock.lastTickMillis());
+		udpSender.send("TICK", tickPayload);
 
 		int hp = client.getBoostedSkillLevel(Skill.HITPOINTS);
 		if (lastHp >= 0 && hp != lastHp)
