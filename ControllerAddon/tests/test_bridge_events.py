@@ -134,3 +134,18 @@ def test_the_age_prune_does_not_drop_payload_less_or_untagged_events(monkeypatch
     s.pump(now=1000.0)
     types = [t for t, _ in s._recent]
     assert "PLAYER_DIED" in types
+
+
+def test_ctx_exposes_the_event_stream():
+    """Routines reach the mirror through ctx, the same way they reach ctx.state and ctx.ser."""
+    import controller
+    ctx = controller.Context(ser=None, state=None, events="sentinel")
+    assert ctx.events == "sentinel"
+
+
+def test_ctx_still_constructs_without_an_event_stream():
+    """Purely additive: every existing caller passes two positional args and must keep working,
+    and a routine running without a stream must see None rather than an AttributeError."""
+    import controller
+    ctx = controller.Context(None, None)
+    assert ctx.events is None

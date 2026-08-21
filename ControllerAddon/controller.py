@@ -1963,9 +1963,13 @@ class ControllerState:
 class Context:
     """Everything a routine needs that isn't a bare module-level function."""
 
-    def __init__(self, ser: serial.Serial, state: ControllerState):
+    def __init__(self, ser: serial.Serial, state: ControllerState, events=None):
         self.ser = ser
         self.state = state
+        # Live view of the bridge's UDP stream (bridge_events.EventStream), or None when the
+        # engine did not start one. Routines MUST tolerate None -- it is an accelerator, and
+        # every path that uses it needs a working fallback without it.
+        self.events = events
 
 
 def check_safety(state: ControllerState, config: dict):
@@ -2105,6 +2109,7 @@ def resolve_config(routine, bridge_config):
 
 def main():
     import login  # local import: login.py imports controller back, deferred to avoid circularity
+    import bridge_events  # local import: bridge_events imports controller back, same reason
 
     parser = argparse.ArgumentParser(description="Generic RuneLite bridge controller")
     parser.add_argument(
@@ -2136,12 +2141,13 @@ def main():
                       # RuneLite's Java window reports/receives real physical pixels
     start_panic_listener()
     udp = make_udp_listener(UDP_PORT)
+    event_stream = bridge_events.EventStream(udp)
     state = ControllerState()
 
     with serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1) as ser:
         time.sleep(2.0)  # Pro Micro reset
 
-        ctx = Context(ser, state)
+        ctx = Context(ser, state, events=event_stream)
         routine = None
         active_path = None
         last_warned_routine = "__unset__"
@@ -2149,7 +2155,7 @@ def main():
         while True:
             debug_log.tick(ctx)
 
-            events = poll_udp(udp)
+            events = event_stream.pump()
             handle_generic_events(state, events)
             if routine is not None and hasattr(routine, "on_event"):
                 for event_type, payload in events:
