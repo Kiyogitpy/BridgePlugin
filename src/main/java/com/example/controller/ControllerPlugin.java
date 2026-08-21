@@ -26,6 +26,7 @@ import net.runelite.client.util.ImageUtil;
 
 import javax.inject.Inject;
 import java.awt.image.BufferedImage;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -91,6 +92,10 @@ public class ControllerPlugin extends Plugin
 	private int lastAnimation = -1;
 	private String lastTargetKey = "";
 	private final Map<Skill, Integer> lastRealLevels = new HashMap<>();
+	// Tracks raw XP per skill (not level) so XP_GAINED can report every gain, including ones
+	// too small to bump a level -- CLAUDE.md's "sub-tick data" note identifies StatChanged's XP
+	// as the definitive, non-tick-capped proof a skilling action's server-side check succeeded.
+	private final Map<Skill, Integer> lastXp = new EnumMap<>(Skill.class);
 	private int spawnEventBudgetTick = -1;
 	private int spawnEventBudgetCount = 0;
 
@@ -273,6 +278,12 @@ public class ControllerPlugin extends Plugin
 			{
 				Map<String, Object> payload = new HashMap<>();
 				payload.put("animation", anim);
+				// "from" is the animation being left, not the new one -- the whole point is
+				// telling a mid-sequence pause (e.g. 5212 -> -1, trap check ending, re-lay still
+				// to come) apart from a finished action (5208 -> -1), which "animation" alone
+				// can't do. Read lastAnimation here, before it's overwritten below.
+				payload.put("from", lastAnimation);
+				payload.put("tick", tickClock.get());
 				udpSender.send("ANIMATION_CHANGED", payload);
 			}
 			lastAnimation = anim;
@@ -449,6 +460,31 @@ public class ControllerPlugin extends Plugin
 		payload.put("previousLevel", previous);
 		payload.put("xp", client.getSkillExperience(skill));
 		udpSender.send("LEVEL_UP", payload);
+	}
+
+	// Separate @Subscribe method (not folded into onStatChanged above) because it tracks raw XP
+	// via its own lastXp map, not level via lastRealLevels -- most XP gains don't cross a level
+	// boundary, so LEVEL_UP alone would miss almost every individual gain a routine cares about.
+	@Subscribe
+	public void onXpGained(StatChanged event)
+	{
+		Skill skill = event.getSkill();
+		int xp = event.getXp();
+		Integer previous = lastXp.put(skill, xp);
+		if (previous == null || xp <= previous)
+		{
+			// previous == null is the first StatChanged for this skill since login/plugin
+			// start, which carries the account's entire XP total, not a gain -- reporting it
+			// as a "delta" would mean e.g. an account with ~1.5M Hunter XP emitting a single
+			// 1,500,000 XP_GAINED the moment tracking begins.
+			return;
+		}
+		Map<String, Object> payload = new HashMap<>();
+		payload.put("skill", skill.getName());
+		payload.put("xp", xp);
+		payload.put("delta", xp - previous);
+		payload.put("tick", tickClock.get());
+		udpSender.send("XP_GAINED", payload);
 	}
 
 	@Subscribe
