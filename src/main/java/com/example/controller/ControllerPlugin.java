@@ -38,6 +38,10 @@ public class ControllerPlugin extends Plugin
 {
 	private static final int HTTP_PORT = 8080;
 
+	// Shared per-tick budget for OBJECT_*/GROUND_ITEM_* events (see sendObjectEvent's comment for
+	// why this exists and why 40 is deliberately a cap, not a warning threshold).
+	private static final int SPAWN_EVENT_CAP_PER_TICK = 40;
+
 	@Inject
 	private Client client;
 
@@ -87,6 +91,8 @@ public class ControllerPlugin extends Plugin
 	private int lastAnimation = -1;
 	private String lastTargetKey = "";
 	private final Map<Skill, Integer> lastRealLevels = new HashMap<>();
+	private int spawnEventBudgetTick = -1;
+	private int spawnEventBudgetCount = 0;
 
 	@Override
 	protected void startUp()
@@ -333,14 +339,21 @@ public class ControllerPlugin extends Plugin
 
 	private void sendObjectEvent(String type, GameObject obj)
 	{
-		// A region load spawns thousands of objects at once (client not yet LOGGED_IN) -- skip
-		// those rather than flooding the UDP socket; only steady-state spawns/despawns are worth
-		// pushing.
+		// Cheap first filter -- excludes the logged-out case -- but NOT sufficient alone to guard
+		// against a scene-load flood: LoginProvider.java:28-31 records, live-confirmed, that
+		// GameState is already LOGGED_IN at the "CLICK HERE TO PLAY" screen, before the world has
+		// loaded, and an ordinary walk-triggered scene swap never transitions GameState at all --
+		// it stays LOGGED_IN for the whole session while routines here travel constantly. See the
+		// shared per-tick budget below for what actually bounds a scene-load burst.
 		if (client.getGameState() != GameState.LOGGED_IN)
 		{
 			return;
 		}
 		if (obj == null)
+		{
+			return;
+		}
+		if (!spawnEventBudgetAvailable())
 		{
 			return;
 		}
@@ -360,12 +373,17 @@ public class ControllerPlugin extends Plugin
 
 	private void sendGroundItemEvent(String type, Tile tile, TileItem item)
 	{
-		// Same volume guard as sendObjectEvent -- a region load also dumps ground items in bulk.
+		// Same cheap-but-insufficient GameState filter as sendObjectEvent -- see that method's
+		// comment for why a scene-load burst needs the per-tick budget below, not just this check.
 		if (client.getGameState() != GameState.LOGGED_IN)
 		{
 			return;
 		}
 		if (tile == null || item == null)
+		{
+			return;
+		}
+		if (!spawnEventBudgetAvailable())
 		{
 			return;
 		}
@@ -382,6 +400,35 @@ public class ControllerPlugin extends Plugin
 		payload.put("plane", wp.getPlane());
 		payload.put("tick", tickClock.get());
 		udpSender.send(type, payload);
+	}
+
+	/**
+	 * Shared per-tick emission budget for OBJECT_-prefixed and GROUND_ITEM_-prefixed events,
+	 * checked before either helper above does its own UdpEventSender.send(). UdpEventSender.send()
+	 * makes two synchronous, blocking DatagramSocket.send() calls (UdpEventSender.java:47-56) fired
+	 * straight from this @Subscribe handler on the client thread -- an ordinary scene swap from
+	 * walking (GameObjectSpawned/Despawned fire in bulk with no GameState transition to filter on,
+	 * see the comment above) would otherwise turn into hundreds of blocking socket writes on
+	 * RuneLite's render thread. One shared counter for both event categories, because the harm is
+	 * total blocking writes per tick, not per category. Dropping events past the cap is intended
+	 * and correct, not a bug to "fix" later: the Python-side mirror this feeds is an accelerator
+	 * with an HTTP (/objects, /ground-items) fallback, so a dropped spawn costs latency, never
+	 * correctness.
+	 */
+	private boolean spawnEventBudgetAvailable()
+	{
+		int tick = tickClock.get();
+		if (tick != spawnEventBudgetTick)
+		{
+			spawnEventBudgetTick = tick;
+			spawnEventBudgetCount = 0;
+		}
+		if (spawnEventBudgetCount >= SPAWN_EVENT_CAP_PER_TICK)
+		{
+			return false;
+		}
+		spawnEventBudgetCount++;
+		return true;
 	}
 
 	@Subscribe
