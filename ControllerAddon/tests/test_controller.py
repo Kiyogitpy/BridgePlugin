@@ -1,6 +1,7 @@
 import dataclasses
 import math
 import os
+import socket
 import sys
 
 import pytest
@@ -8,6 +9,13 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import controller
+
+# Captured immediately, before pytest's collection phase can import test_mcp_debug_server.py --
+# that module replaces controller.make_udp_listener with a MagicMock at its own import time (to
+# avoid a real socket bind for its whole test session) and never restores it, since it isn't
+# wrapped in monkeypatch. Python import order in this directory is alphabetical, so this line
+# runs first and this reference stays the real implementation regardless of collection order.
+_REAL_MAKE_UDP_LISTENER = controller.make_udp_listener
 
 
 @pytest.fixture(autouse=True)
@@ -468,3 +476,17 @@ def test_an_exact_option_still_beats_a_substring_one(monkeypatch):
     _stub_menu(monkeypatch, _menu("Examine", "Mine"), picked)
     assert controller.click_menu_action(None, {"screenX": 1, "screenY": 1}, "Mine") is True
     assert picked == [(10, 21)], "must land on Mine, not on Examine"
+
+
+def test_make_udp_listener_bumps_the_receive_buffer_past_the_windows_default():
+    """I5: this branch's spawn-event budget (ControllerPlugin.SPAWN_EVENT_CAP_PER_TICK) can put
+    up to 40 OBJECT_/GROUND_ITEM_ packets on the socket per tick, and routines that never opted
+    into ctx.events -- or that block for seconds between pump() calls -- only drain it once per
+    main-loop iteration. Windows' 64KB default can overflow and the kernel drops silently, and a
+    dropped packet is not necessarily a harmless spawn: PLAYER_DIED shares the same socket."""
+    s = _REAL_MAKE_UDP_LISTENER(port=0)   # port 0 -- OS picks a free one, no live conflict
+    try:
+        actual = s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        assert actual >= (1 << 20)
+    finally:
+        s.close()

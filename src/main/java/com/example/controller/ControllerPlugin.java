@@ -373,6 +373,14 @@ public class ControllerPlugin extends Plugin
 		{
 			return;
 		}
+		// shutDown() nulls udpSender and RuneLite only unregisters this plugin's subscribers
+		// AFTER shutDown() returns (M5, whole-branch review, 2026-08-21) -- onConfigChanged
+		// already guards the same race; these two spawn helpers didn't, and an
+		// ObjectSpawned/ItemSpawned event landing in that gap NPE'd.
+		if (udpSender == null)
+		{
+			return;
+		}
 		Map<String, Object> payload = new HashMap<>();
 		payload.put("id", obj.getId());
 		payload.put("x", wp.getX());
@@ -400,6 +408,12 @@ public class ControllerPlugin extends Plugin
 		}
 		WorldPoint wp = WorldPoint.fromLocalInstance(client, tile.getLocalLocation());
 		if (wp == null)
+		{
+			return;
+		}
+		// Same shutDown()-vs-unregister race as sendObjectEvent above -- see that method's
+		// comment (M5, whole-branch review, 2026-08-21).
+		if (udpSender == null)
 		{
 			return;
 		}

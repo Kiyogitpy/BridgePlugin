@@ -256,15 +256,22 @@ def test_await_placement_settled_gives_up_when_the_trap_was_taken_not_re_laid(mo
 
 def test_placement_uses_the_event_stream_when_available(monkeypatch):
     """The GROUND_ITEM_SPAWNED event is the instant the trap hits the floor -- the same moment
-    HunterPlugin logs "Trap placed". Polling for it costs up to a poll interval on top."""
+    HunterPlugin logs "Trap placed". Polling for it costs up to a poll interval on top.
+
+    (I4, 2026-08-21) The event path must set chin_free_at via deadline_after_ticks, exactly like
+    the polling path below -- NOT sleep the window out inline via wait_ticks. An inline sleep
+    reintroduces the pessimisation _wait_until_free/chin_free_at was written to remove: it pushes
+    the caller's own HTTP setup and mouse flight for the NEXT action entirely after the window
+    instead of overlapping it, which is what took the cycle from 7.44s back up from the measured
+    6.16s."""
     class _Events:
-        def __init__(self):
-            self.asked = []
         def wait_for_event(self, types, match=None, timeout_s=1.0):
-            self.asked.append(types)
             return {"id": 10008, "x": 2512, "y": 9300, "plane": 0}
         def wait_ticks(self, n):
-            self.ticks = n
+            raise AssertionError("must not sleep the window inline -- record a deadline instead")
+        def deadline_after_ticks(self, n):
+            self.deadline_ticks = n
+            return 4242.0
 
     ctx = _Ctx()
     ctx.events = _Events()
@@ -273,7 +280,8 @@ def test_placement_uses_the_event_stream_when_available(monkeypatch):
                             AssertionError("must not poll when the event stream is available")))
 
     assert ch._await_placement_settled(ctx, (2512, 9300, 0)) is True
-    assert ctx.events.ticks == ch.PLACEMENT_SETTLE_TICKS
+    assert ctx.events.deadline_ticks == ch.PLACEMENT_SETTLE_TICKS
+    assert ctx.state.data["chin_free_at"] == 4242.0
 
 
 def test_placement_falls_back_to_polling_without_an_event_stream(monkeypatch):

@@ -625,12 +625,16 @@ def _await_placement_settled(ctx, tile, timeout_s=PLACEMENT_WAIT_TIMEOUT_S):
     logs, and much earlier than the animation ending -- and two ticks after it is when the player
     can act again (measured in-game 2026-08-21).
 
-    Event path (2026-08-21, Task 7 of the tick-accurate-timing plan): when ctx.events is live,
-    GROUND_ITEM_SPAWNED fires the instant the item lands -- no polling latency at all -- and
-    wait_ticks aligns the two-tick wait to the actual tick boundary instead of counting wall-clock
-    ms from whatever arbitrary phase this happened to be called at. It waits the ticks itself and
-    returns, so unlike the polling path below it never sets chin_free_at -- there is nothing left
-    for _wait_until_free to do, which is correct: the wait already happened, aligned.
+    Event path (2026-08-21, Task 7 of the tick-accurate-timing plan; revised same day, I4 of the
+    whole-branch review): when ctx.events is live, GROUND_ITEM_SPAWNED fires the instant the item
+    lands -- no polling latency at all -- and deadline_after_ticks computes the aligned two-tick
+    boundary instead of counting wall-clock ms from whatever arbitrary phase this happened to be
+    called at. It RECORDS that deadline into chin_free_at rather than sleeping it out here, the
+    same as the polling path below -- an earlier version called wait_ticks and slept inline,
+    which put the whole of the NEXT action's setup (HTTP lookups, the mouse flight) after the
+    window instead of overlapping it, reintroducing the exact pessimisation (7.44s -> 6.16s) that
+    _wait_until_free/chin_free_at exists to avoid. See that function's own docstring for why
+    deferring instead of sleeping is the point.
 
     None back from wait_for_event covers two real cases the same way: the listener died (falls
     back to polling next time ctx.events is checked, same as ctx.events being None outright), and
@@ -653,7 +657,7 @@ def _await_placement_settled(ctx, tile, timeout_s=PLACEMENT_WAIT_TIMEOUT_S):
         )
         if landed is None:
             return False
-        events.wait_ticks(PLACEMENT_SETTLE_TICKS)
+        ctx.state.data["chin_free_at"] = events.deadline_after_ticks(PLACEMENT_SETTLE_TICKS)
         return True
 
     # No event stream (older engine, or the listener died): the polling path, unchanged.

@@ -612,6 +612,13 @@ def get_ammo_count():
 # ---------------- UDP event stream ----------------
 def make_udp_listener(port: int = UDP_PORT) -> socket.socket:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # (I5, 2026-08-21) Bump past Windows' 64KB default: the spawn-event budget
+    # (ControllerPlugin.SPAWN_EVENT_CAP_PER_TICK) allows up to 40 OBJECT_/GROUND_ITEM_ packets per
+    # tick, and routines that never opted into ctx.events (or that block for seconds between
+    # pump() calls) only drain the socket once per main-loop iteration -- the kernel silently
+    # drops on overflow, and a dropped packet is not necessarily a harmless spawn: PLAYER_DIED
+    # shares the same socket.
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
     s.bind(("127.0.0.1", port))
     s.setblocking(False)
     return s
@@ -2155,7 +2162,13 @@ def main():
         while True:
             debug_log.tick(ctx)
 
-            events = event_stream.pump()
+            # drain(), NOT pump() -- pump() only reports what arrived on THIS call, and a
+            # blocking helper (wait_for_event/wait_ticks/deadline_after_ticks) used elsewhere in
+            # a tick() call pumps the socket in its own wait loop too. drain() is the only method
+            # that hands back everything pumped anywhere since the last drain(), so nothing seen
+            # mid-wait (e.g. PLAYER_DIED during retrieve_trap's 3s HTTP confirm loop) is silently
+            # dropped before reaching handle_generic_events/on_event (C1, 2026-08-21).
+            events = event_stream.drain()
             handle_generic_events(state, events)
             if routine is not None and hasattr(routine, "on_event"):
                 for event_type, payload in events:
