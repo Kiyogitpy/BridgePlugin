@@ -45,6 +45,17 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   while `controller.py` is running. (Action tools were removed 2026-08-12; if live click/mouse
   debugging is needed again, drive it through `controller.py` itself.)
 - **Tests**: `python -m pytest tests/` from `ControllerAddon/`.
+- **Looking at what the client is actually drawing** (added 2026-08-21): `GET /screenshot?name=<label>`
+  dumps the current rendered frame to `~/.runelite/bridge-screenshots/` and returns its absolute
+  path plus every coordinate-space measurement needed to interpret it (`imageWidth/Height`,
+  `realWidth/Height`, `stretchedWidth/Height`, `canvasWidth/Height`, `canvasScreenX/Y`,
+  `stretchScaleX/Y`, `gameState`, `loginIndex`). Read the PNG straight off disk. `GET
+  /widgets/dump` lists every visible widget with ids, text, actions, and both canvas and screen
+  bounds; `?scan=true` brute-forces `getWidget(group, child)` over a bounded id range instead of
+  walking `getWidgetRoots()`. **Use both before concluding a screen "isn't a widget"** — a root
+  that isn't attached to the root list is invisible to the walk but still resolves by id, so the
+  walk alone is not proof. Both are read-only and cost nothing when unused. NumPy and Pillow are
+  already installed, so measuring a dumped frame needs no new dependency.
 
 ## The routine contract
 
@@ -118,6 +129,31 @@ steps above.
   scaling. `controller.py` compensates by scaling every bridge response through
   `get_dpi_scale()`/`_scale_screen_coords()`. If clicks are consistently off by a fixed ratio,
   suspect this before anything else.
+- **Two different pixel spaces, and mixing them costs you the stretch factor.** Widget bounds
+  (`Widget.getBounds()`) and everything `Perspective` projects are in the game's **real**
+  (pre-stretch) render resolution — `client.getRealDimensions()` — and must go through
+  `RuneLiteUtil.canvasToScreen`, which applies `getStretchScale()` before adding the canvas's
+  screen origin. Frames captured via `DrawManager` (`GET /screenshot`) are the opposite: they
+  come back in **post-stretch canvas** space, the same size as `canvas.getWidth()/getHeight()`,
+  so a pixel measured off a dumped frame maps to screen by adding `canvasScreenX/Y` and nothing
+  else. Passing a frame-measured pixel to `canvasToScreen` scales it a second time — a live 2.06x
+  error in the geometry this was confirmed in. `GET /screenshot` reports `imageWidth/Height`
+  alongside both `realWidth/Height` and `stretchedWidth/Height` specifically so this can be
+  settled by comparison instead of assumption.
+- **The OSRS login screen has a layout rule; it is not a fraction of the canvas.** The login UI
+  is drawn at a **fixed pixel size in real (pre-stretch) render space, horizontally centred and
+  top-anchored** — so a button is at `(realWidth / 2, <fixed y>)`, fed to `canvasToScreen`. This
+  was measured 2026-08-21 across four geometries (aspect 1.76 → 4.91, stretch 2.06x → none): the
+  "Play Now" text top stayed at real y 241.1 ± 0.1 throughout, and a vertically-centred layout
+  would have shifted it by 82px. It replaced a fraction of the canvas's *stretched* size, which
+  was confirmed broken live — a window resize moved the reported point ~80px off target. Two
+  things defeat a canvas fraction: the login art is letterboxed at some window sizes (142px bars
+  each side at 2529x1377, none at 1202x682), and the UI doesn't scale with the canvas at all.
+  See `LoginProvider.java` for the derivation table and the known `loginIndex` values (10 = Play
+  Now, 24 = message dialog with an "Ok" button, e.g. after a disconnect). **These screens are
+  genuinely not widgets** — re-confirmed against the current client by both dump modes — but the
+  screens immediately after them are (CLICK HERE TO PLAY is widget 378.77), so check before
+  assuming either way.
 - **Simulated human "mistakes" are intentional, not bugs.** `controller.click_entity` has a
   `MISTAKE_MISCLICK_CHANCE` (~4.5%, see `settings.py`) chance of deliberately aiming beside the
   target instead of on it, logged as `[!] Misclick -- aimed beside X instead of on it`. This is

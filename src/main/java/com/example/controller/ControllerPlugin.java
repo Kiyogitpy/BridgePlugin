@@ -18,6 +18,7 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.PluginManager;
 import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.DrawManager;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.util.ImageUtil;
@@ -69,6 +70,9 @@ public class ControllerPlugin extends Plugin
 	@Inject
 	private SafespotOverlay safespotOverlay;
 
+	@Inject
+	private DrawManager drawManager;
+
 	private NavigationButton navButton;
 
 	private BridgeHttpServer server;
@@ -117,6 +121,8 @@ public class ControllerPlugin extends Plugin
 		new ConfigProvider(client, clientThread, server, config).register();
 		new ConsumablesProvider(client, clientThread, server, config).register();
 		new LoginProvider(client, clientThread, server).register();
+		new ScreenshotProvider(client, clientThread, server, drawManager).register();
+		new WidgetDumpProvider(client, clientThread, server).register();
 		new SlayerConfigProvider(client, clientThread, server, config).register();
 		new MenuStateProvider(client, clientThread, server).register();
 		new SpellbookProvider(client, clientThread, server).register();
