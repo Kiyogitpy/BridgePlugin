@@ -616,20 +616,47 @@ def lay_trap(ctx, tile):
 
 
 def _await_placement_settled(ctx, tile, timeout_s=PLACEMENT_WAIT_TIMEOUT_S):
-    """Watch for the trap hitting the floor as an ITEM on `tile` and record when the player will
-    be free again (two game ticks later) -- WITHOUT sleeping it out here. True if the item was
-    seen, False if none showed up in `timeout_s` (caller falls back to the animation).
+    """Watch for the trap hitting the floor as an ITEM on `tile` and become free again (two game
+    ticks later). True if the item was seen, False if none showed up in `timeout_s` (caller falls
+    back to the animation).
 
     The item is deliberately what this watches. A trap being laid is on the floor as an item from
     the moment it leaves the pack -- earlier than the object spawn HunterPlugin's "Trap placed"
     logs, and much earlier than the animation ending -- and two ticks after it is when the player
     can act again (measured in-game 2026-08-21).
 
-    Recording the deadline rather than sleeping on it is the point. Sleeping here put the whole
-    of the next action's setup AFTER the window opened -- ~100ms of HTTP (objects, ground items,
-    idle check, target lookup) plus a 300-800ms human mouse flight -- so the click landed several
-    hundred ms late and the timing compounded away. _wait_until_free lets all of that happen
-    DURING the wait instead, so only the leftover remainder is ever slept."""
+    Event path (2026-08-21, Task 7 of the tick-accurate-timing plan): when ctx.events is live,
+    GROUND_ITEM_SPAWNED fires the instant the item lands -- no polling latency at all -- and
+    wait_ticks aligns the two-tick wait to the actual tick boundary instead of counting wall-clock
+    ms from whatever arbitrary phase this happened to be called at. It waits the ticks itself and
+    returns, so unlike the polling path below it never sets chin_free_at -- there is nothing left
+    for _wait_until_free to do, which is correct: the wait already happened, aligned.
+
+    None back from wait_for_event covers two real cases the same way: the listener died (falls
+    back to polling next time ctx.events is checked, same as ctx.events being None outright), and
+    an old client build that has never emitted GROUND_ITEM_SPAWNED at all (wait_for_event just
+    times out) -- either way this returns False and the caller falls back to
+    _await_action_finished, exactly as if there were no event stream feeding it.
+
+    Recording the deadline rather than sleeping on it is the point of the POLLING path. Sleeping
+    here put the whole of the next action's setup AFTER the window opened -- ~100ms of HTTP
+    (objects, ground items, idle check, target lookup) plus a 300-800ms human mouse flight -- so
+    the click landed several hundred ms late and the timing compounded away. _wait_until_free lets
+    all of that happen DURING the wait instead, so only the leftover remainder is ever slept."""
+    events = getattr(ctx, "events", None)
+    if events is not None:
+        landed = events.wait_for_event(
+            "GROUND_ITEM_SPAWNED",
+            match=lambda p: p.get("id") == BOX_TRAP_ITEM_ID
+            and (p.get("x"), p.get("y"), p.get("plane")) == tuple(tile),
+            timeout_s=timeout_s,
+        )
+        if landed is None:
+            return False
+        events.wait_ticks(PLACEMENT_SETTLE_TICKS)
+        return True
+
+    # No event stream (older engine, or the listener died): the polling path, unchanged.
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         items = controller.get_ground_items(fresh=True) or []
@@ -807,6 +834,19 @@ def retrieve_trap(ctx, tile, state, obj):
     # verified before the first live run -- but an instanced routine must use the object lookup.
     # Whatever is left of the window after the hover and the lookups above -- often nothing.
     _wait_until_free(ctx)
+
+    # Clear the event mirror's buffer immediately before the click -- not earlier, not left out.
+    # wait_for_event (used below via _await_placement_settled, which runs AFTER this click) does
+    # NOT consume the event it matches, and the buffer holds up to EVENT_BUFFER_MAX_TICKS of
+    # history. Without this, a GROUND_ITEM_SPAWNED left over from re-laying THIS SAME trap on a
+    # PREVIOUS cycle -- this tile gets acted on repeatedly all run -- would still be sitting in
+    # the buffer and would satisfy the wait on its own, making a click that did nothing (missed,
+    # resolved to Attack on a wandering chinchompa, whatever) look like a successful placement.
+    # Clearing right here, after every setup step above has already run and with nothing left
+    # between this and the click, is what closes that window.
+    events = getattr(ctx, "events", None)
+    if events is not None:
+        events.clear()
 
     if not controller.click_entity(ctx.ser, target, refresh_target=refresh,
                                     refresh_legs=TRAP_CLICK_REFRESH_LEGS):

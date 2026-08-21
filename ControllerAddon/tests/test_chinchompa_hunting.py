@@ -33,6 +33,7 @@ class _Ctx:
     def __init__(self):
         self.ser = object()
         self.state = _State()
+        self.events = None    # EventStream, or None under the old engine / a dead listener
 
 
 # --- classify_trap ------------------------------------------------------------------
@@ -253,6 +254,66 @@ def test_await_placement_settled_gives_up_when_the_trap_was_taken_not_re_laid(mo
     assert ch._await_placement_settled(_Ctx(), (2512, 9300, 0)) is False
 
 
+def test_placement_uses_the_event_stream_when_available(monkeypatch):
+    """The GROUND_ITEM_SPAWNED event is the instant the trap hits the floor -- the same moment
+    HunterPlugin logs "Trap placed". Polling for it costs up to a poll interval on top."""
+    class _Events:
+        def __init__(self):
+            self.asked = []
+        def wait_for_event(self, types, match=None, timeout_s=1.0):
+            self.asked.append(types)
+            return {"id": 10008, "x": 2512, "y": 9300, "plane": 0}
+        def wait_ticks(self, n):
+            self.ticks = n
+
+    ctx = _Ctx()
+    ctx.events = _Events()
+    monkeypatch.setattr(ch.controller, "get_ground_items",
+                        lambda **kw: (_ for _ in ()).throw(
+                            AssertionError("must not poll when the event stream is available")))
+
+    assert ch._await_placement_settled(ctx, (2512, 9300, 0)) is True
+    assert ctx.events.ticks == ch.PLACEMENT_SETTLE_TICKS
+
+
+def test_placement_falls_back_to_polling_without_an_event_stream(monkeypatch):
+    """ctx.events is None under the old engine or if the listener died -- the routine must keep
+    working exactly as it does today."""
+    ctx = _Ctx()
+    ctx.events = None
+    calls = {"n": 0}
+
+    def _items(**_kw):
+        calls["n"] += 1
+        return [_item(2512, 9300)]
+
+    monkeypatch.setattr(ch.controller, "get_ground_items", _items)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(ch.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(ch.time, "time", lambda: clock["t"])
+
+    assert ch._await_placement_settled(ctx, (2512, 9300, 0)) is True
+    assert calls["n"] >= 1
+
+
+def test_placement_event_wait_returns_false_on_an_old_client_that_never_emits_the_event(monkeypatch):
+    """An engine on an old client build that has never sent GROUND_ITEM_SPAWNED still hands a
+    live ctx.events -- wait_for_event just times out and returns None. The event path must return
+    False (not crash, not silently succeed) so retrieve_trap's caller falls back to
+    _await_action_finished, same as if there were no event stream feeding it at all."""
+    class _NeverEvents:
+        def wait_for_event(self, types, match=None, timeout_s=1.0):
+            return None      # timed out -- no such event was ever emitted
+        def wait_ticks(self, n):
+            raise AssertionError("must not wait ticks when nothing landed")
+
+    ctx = _Ctx()
+    ctx.events = _NeverEvents()
+
+    assert ch._await_placement_settled(ctx, (2512, 9300, 0)) is False
+    assert "chin_free_at" not in ctx.state.data
+
+
 # --- _await_trap_laid ---------------------------------------------------------------
 
 def _lay_confirm_stubs(monkeypatch, object_appears_after_polls=None):
@@ -420,6 +481,72 @@ def test_retrieve_trap_succeeds_when_the_trap_comes_back_to_the_pack(monkeypatch
     _retrieve_stubs(monkeypatch, trap, after=[])
 
     assert ch.retrieve_trap(_Ctx(), (2518, 9302, 0), "failed", trap) is True
+
+
+def test_retrieve_trap_clears_the_event_buffer_immediately_before_the_click(monkeypatch):
+    """wait_for_event does not consume the event it matches, and the buffer holds up to
+    EVENT_BUFFER_MAX_TICKS of history -- so without a clear() right before the click,
+    _await_placement_settled (which runs AFTER the click) could match a GROUND_ITEM_SPAWNED left
+    over from a PREVIOUS placement on the same tile and conclude this click landed when it did
+    nothing at all. clear() has to happen right before click_entity, not merely somewhere in the
+    call -- a clear() that ran earlier (e.g. before the idle wait or the fresh object lookup)
+    would still leave a window for a same-tile spawn to slip back into the buffer before the
+    click actually fires."""
+    trap = _obj(9385, 2518, 9302)     # collapsed
+    order = []
+
+    class _Events:
+        def clear(self):
+            order.append("clear")
+        def wait_for_event(self, types, match=None, timeout_s=1.0):
+            # No such event was ever emitted in this test -- the point here is only the ordering
+            # of clear() against the click, not the placement-detection path itself.
+            return None
+        def wait_ticks(self, n):
+            raise AssertionError("must not be reached when wait_for_event returned None")
+
+    monkeypatch.setattr(ch.controller, "wait_until_player_idle", lambda **kw: True)
+    monkeypatch.setattr(ch.controller, "get_object_at", lambda x, y, p, i, radius=0: trap)
+    monkeypatch.setattr(ch.controller, "get_player", lambda: {"animation": -1})
+    monkeypatch.setattr(ch.controller, "click_entity",
+                        lambda ser, target, **kw: order.append("click") or True)
+    monkeypatch.setattr(ch.controller, "get_objects",
+                        lambda radius=0, fresh=False: [] if order.count("click") else [trap])
+    monkeypatch.setattr(ch, "box_trap_count", lambda: 0)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(ch.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(ch.time, "time", lambda: clock["t"])
+
+    ctx = _Ctx()
+    ctx.events = _Events()
+
+    ch.retrieve_trap(ctx, (2518, 9302, 0), "failed", trap)
+
+    assert order == ["clear", "click"], \
+        "clear() must happen immediately before the click, not after it or not at all"
+
+
+def test_retrieve_trap_tolerates_no_event_stream_when_clearing(monkeypatch):
+    """ctx.events is None under the old engine or a dead listener -- the clear-before-click guard
+    must not crash in that case."""
+    trap = _obj(9385, 2518, 9302)
+    monkeypatch.setattr(ch.controller, "wait_until_player_idle", lambda **kw: True)
+    monkeypatch.setattr(ch.controller, "get_object_at", lambda x, y, p, i, radius=0: trap)
+    monkeypatch.setattr(ch.controller, "get_player", lambda: {"animation": -1})
+    monkeypatch.setattr(ch.controller, "click_entity", lambda ser, target, **kw: True)
+    monkeypatch.setattr(ch.controller, "get_objects", lambda radius=0, fresh=False: [])
+    # No item ever shows up either -- forces the polling fallback in _await_placement_settled
+    # (ctx.events is None) to time out quickly rather than hitting a real bridge over HTTP.
+    monkeypatch.setattr(ch.controller, "get_ground_items", lambda **kw: [])
+    monkeypatch.setattr(ch, "box_trap_count", lambda: 0)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(ch.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(ch.time, "time", lambda: clock["t"])
+
+    ctx = _Ctx()
+    ctx.events = None
+
+    assert ch.retrieve_trap(ctx, (2518, 9302, 0), "failed", trap) is True
 
 
 def test_retrieve_trap_fails_when_the_trap_is_untouched(monkeypatch):
