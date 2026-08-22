@@ -12,7 +12,8 @@ reporting live game state; the Python side reads that state and decides what to 
 ```
 RuneLite client (Java plugin, src/main/java/com/example/)
   └─ HTTP bridge on localhost:8080 (BridgeHttpServer.java, providers/*Provider.java)
-  └─ UDP event stream on port 50555 (PLAYER_DIED, NPC_DIED, LEVEL_UP, HP_CHANGED, CHAT_MESSAGE, ...)
+  └─ UDP event stream on port 50555 (PLAYER_DIED, NPC_DIED, LEVEL_UP, HP_CHANGED, CHAT_MESSAGE,
+        TICK, OBJECT_SPAWNED/DESPAWNED, GROUND_ITEM_SPAWNED/DESPAWNED, XP_GAINED, ...)
         ↕
 Python controller (ControllerAddon/)
   └─ controller.py     — engine: bridge polling, Arduino serial driving, panic key,
@@ -23,6 +24,8 @@ Python controller (ControllerAddon/)
   └─ travel.py         — shared walking helpers (Shortest Path plugin integration,
                           minimap/viewport hop-clicking)
   └─ login.py          — auto-login if the bridge reports logged out
+  └─ bridge_events.py  — live mirror of the UDP stream + a game-tick clock; lets a routine
+                          act ON a tick boundary instead of polling and sleeping margins
   └─ debug_log.py      — the `[category] message` log lines seen in routine output
   └─ mcp_debug_server.py — exposes bridge/controller primitives as MCP tools (see .mcp.json),
                             for live interactive debugging outside a running routine
@@ -79,6 +82,22 @@ define (see `controller.py`'s own header comment for the authoritative version):
   teardown just delays it. Backed by the side-effect-free predicate `ControllerState.break_due()`;
   routines without the hook are unaffected. There is **no** equivalent hook for a safety stop or
   for process exit (the panic key is a hard `os._exit` by design) — only breaks are covered.
+- `ctx.events` — a `bridge_events.EventStream`, or **`None`**. Added 2026-08-21. A live mirror of
+  the UDP stream plus a game-tick clock, so a routine can wait for a pushed event and act ON a
+  tick boundary instead of polling HTTP and sleeping a conservative margin. Every consumer MUST
+  tolerate `None` and keep a working fallback — it is absent whenever the engine did not start a
+  listener. Two hard rules:
+  - **It is an accelerator, never a source of truth.** It may answer "has X happened yet" for
+    timing. Anything acted on — which entity to click, whether an action succeeded — is still
+    confirmed against HTTP. UDP is lossy and these routines run unattended for hours on a real
+    account, so a dropped packet must cost latency, never a wrong click.
+  - **`wait_for_event` does not consume what it matches**, and the buffer holds ~10 ticks. Call
+    `ctx.events.clear()` immediately before the action whose result you are about to wait for, or
+    an identical event from a previous action can satisfy the wait. See `retrieve_trap`.
+  Useful methods: `wait_for_event(types, match=, timeout_s=)` → payload or `None` on timeout
+  (a normal outcome, not an error); `wait_ticks(n)`; `deadline_after_ticks(n)` → a wall-clock
+  deadline to record and overlap your own work against, rather than sleeping inline;
+  `clear()`; and `ticks` (`phase_ms`, `ms_until_next`, `is_stale`).
 - `SKIP_STRAY_DIALOG_CHECK = True` — optional module-level flag; opts out of the engine-level
   `check_stray_dialog` (dismisses a "click here to continue" dialogue via Space before every
   tick). Added 2026-08-14 for `routines/pest_control.py`: that check only presses Space once per
@@ -220,6 +239,31 @@ steps above.
   Pass `min_path_tiles=0` to force a computed route anyway. Deliberately not a large threshold:
   `_walk_greedy` is obstacle-blind and every extra tile of gate is another chance to wedge
   against a wall it can't route around.
+
+- **`TickClock` is no longer a self-registered EventBus subscriber** (changed 2026-08-21). It is
+  bumped explicitly by `ControllerPlugin.onGameTick` via `tickClock.bump()`, because RuneLite does
+  not guarantee subscriber ordering and the emitted `TICK` payload must carry the number for the
+  tick it is announcing, not the previous one. Anyone adding a `GameTick` handler needs to know
+  this: there is one writer. Dropping the self-registration also fixed a latent leak — `shutDown()`
+  never unregistered it, so every plugin disable/enable cycle left another instance subscribed.
+- **A `@Subscribe` method MUST be named `on<EventSimpleName>` — this is enforced, not stylistic.**
+  RuneLite's `EventBus.register()` does `checkArgument(method.getName().equals("on" +
+  parameterClazz.getSimpleName()))`, and the throw escapes the whole `register(this)` loop before
+  the subscriber map is built. So ONE misnamed handler stops the ENTIRE plugin from registering —
+  every other handler dies with it and the client comes up with no bridge at all. CONFIRMED
+  2026-08-21 against `client-1.12.36.jar` in the Gradle cache, after a review caught an
+  `onXpGained(StatChanged)` that would have shipped this. The corollary: you cannot have two
+  independently-named handlers for one event type, so a second consumer of an event has to be
+  folded into the existing method (see `onStatChanged`, which serves both LEVEL_UP and XP_GAINED).
+- **`UdpEventSender.send()` makes two SYNCHRONOUS blocking socket writes on the client thread.**
+  Anything emitted at high frequency stutters the game. This is why the object/ground-item spawn
+  events are capped by `SPAWN_EVENT_CAP_PER_TICK` (40, shared across all four types): a scene swap
+  replays the whole scene as spawn events in one tick — verified against the decompiled
+  `GameEventManager.simulateGameEvents` — which without a cap is hundreds of blocking writes on
+  RuneLite's render thread. Note a `GameState`-based guard does NOT work for this: `GameState` is
+  already `LOGGED_IN` at the CLICK-HERE-TO-PLAY screen (see `LoginProvider.java`), and scene swaps
+  from ordinary walking never change it at all. Dropped events past the cap are intentional — the
+  Python mirror is an accelerator with an HTTP fallback.
 
 ## Sub-tick data and clicking while moving
 
