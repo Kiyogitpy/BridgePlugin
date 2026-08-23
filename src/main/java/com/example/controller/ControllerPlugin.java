@@ -15,6 +15,8 @@ import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.game.ItemManager;
+import net.runelite.client.input.KeyManager;
+import net.runelite.client.input.MouseManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.PluginManager;
@@ -79,12 +81,19 @@ public class ControllerPlugin extends Plugin
 	@Inject
 	private DrawManager drawManager;
 
+	@Inject
+	private MouseManager mouseManager;
+
+	@Inject
+	private KeyManager keyManager;
+
 	private NavigationButton navButton;
 
 	private BridgeHttpServer server;
 	private UdpEventSender udpSender;
 	private NpcTrackerRegistry npcTrackerRegistry;
 	private TickClock tickClock;
+	private RecorderProvider recorderProvider;
 
 	private int lastHp = -1;
 	private int lastPrayer = -1;
@@ -137,12 +146,19 @@ public class ControllerPlugin extends Plugin
 		new WidgetDumpProvider(client, clientThread, server).register();
 		new SlayerConfigProvider(client, clientThread, server, config).register();
 		new MenuStateProvider(client, clientThread, server).register();
+		new WidgetProvider(client, clientThread, server).register();
 		new SpellbookProvider(client, clientThread, server).register();
 		new MixologyProvider(client, clientThread, server).register();
 		new PyramidPlunderProvider(client, clientThread, server).register();
 		new GolemProvider(client, clientThread, server).register();
 		new LastActionProvider(client, clientThread, server, eventBus).register();
 		new LastChatMessageProvider(client, clientThread, server, eventBus).register();
+
+		// Held in a field, unlike every other provider: it owns MouseManager/KeyManager listeners
+		// that live outside the EventBus, so shutDown() has to be able to unregister them (see
+		// RecorderProvider.unregister).
+		recorderProvider = new RecorderProvider(client, clientThread, server, eventBus, mouseManager, keyManager);
+		recorderProvider.register();
 
 		server.register("/mining-config", () -> ConfigExporter.exportMining(config));
 		server.register("/gemstone-crab-config", () -> ConfigExporter.exportGemstoneCrab(config));
@@ -187,6 +203,12 @@ public class ControllerPlugin extends Plugin
 	{
 		clientToolbar.removeNavigation(navButton);
 		overlayManager.remove(safespotOverlay);
+
+		if (recorderProvider != null)
+		{
+			recorderProvider.unregister();
+			recorderProvider = null;
+		}
 
 		if (server != null)
 		{

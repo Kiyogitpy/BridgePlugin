@@ -11,6 +11,7 @@ nbproject/
 data/
 .worktrees/
 ControllerAddon/logs/
+ControllerAddon/recordings/
 .superpowers/
 .memsearch/
 *.pyc

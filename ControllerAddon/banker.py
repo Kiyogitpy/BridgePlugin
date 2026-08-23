@@ -237,15 +237,16 @@ def has_coal_bag() -> bool:
 
 
 def fill_coal_bag(ctx) -> bool:
-    """Click the coal bag at an open bank to fill it (to 27 coal, 36 with a Smithing cape --
-    this project doesn't special-case the cape). UNCERTAIN which of Fill/Empty a plain
-    left-click resolves to once the bag already holds coal -- the OSRS Wiki's Blast Furnace
-    strategy guide notes the bank-side option can become "Empty" once the bag isn't empty,
-    the opposite problem from empty_coal_bag below. Verify live which action a plain click
-    actually performs in each state; add the wrong one to Controller Settings -> Clicking ->
-    Forced Actions if needed. check_ui_blockers=False since this is an inventory-item click,
-    same reasoning as every other inventory click in this codebase (see
-    routines/firemaking.py's/routines/blast_furnace.py's own notes on this)."""
+    """Right-click the coal bag at an open bank and explicitly select "Fill" -- CORRECTED
+    2026-08-22 (user report, live Blast Furnace session): this used to be a plain click_entity
+    left-click, which the function's own prior docstring already flagged as an unverified
+    guess (uncertain whether a plain click resolves to Fill or Empty once the bag already
+    holds coal). Confirmed live the plain click was wrong often enough to be a real bug --
+    explicit menu selection via click_menu_action (same idiom empty_fur_pouch below uses)
+    removes the ambiguity the same way it did there. offset=(0, 0): the bag's inventory icon
+    is small, same reasoning empty_fur_pouch's own Take-sized click uses.
+    check_ui_blockers=False since this is an inventory-item click, same reasoning as every
+    other inventory click in this codebase."""
     bag = next(
         (i for i in controller.get_inventory() if COAL_BAG_NAME in (i.get("name") or "").lower()),
         None,
@@ -254,7 +255,7 @@ def fill_coal_bag(ctx) -> bool:
         return False
 
     debug_log.log("bank", "filling coal bag")
-    if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False):
+    if not controller.click_menu_action(ctx.ser, bag, "fill", offset=(0, 0), check_ui_blockers=False):
         return False
 
     controller.human_delay(0.6, 1.0)
@@ -403,17 +404,26 @@ def deposit_inventory(ctx, config: dict) -> None:
     if not bank.get("open"):
         return
 
-    if has_looting_bag():
-        empty_looting_bag(ctx)
+    # ADDED 2026-08-22 (user report, live Blast Furnace session): opt-out for a routine that
+    # manages its own container (e.g. blast_furnace.py's coal bag, deliberately emptied at the
+    # conveyor belt via banker.empty_coal_bag, not into the bank) and doesn't want the generic
+    # "empty every container into the bank" step firing on every single bank visit -- CONFIRMED
+    # live this was doing exactly that (deposit_all_containers below, unconditionally, every
+    # trip) even though blast_furnace.py's own flow never needs it and it serves no purpose
+    # there once the bag's contents are already handled explicitly. Defaults to running (every
+    # other existing caller's behavior is unchanged) unless a caller explicitly opts out.
+    if not config.get("skipContainerDeposit"):
+        if has_looting_bag():
+            empty_looting_bag(ctx)
 
-    # Empties looting bag/herb sack/seed box/coal bag/etc. into the bank via the bank
-    # interface's own "Deposit Containers" widget button, in one click -- CONFIRMED (user
-    # request 2026-08-06): herb sack and seed box are kept out of the item-by-item deposit pass
-    # below (see routines/slayer.py's protected_supply_names) so the container itself never
-    # gets banked away, but that alone would leave its contents trapped inside it forever.
-    # Redundant with empty_looting_bag above for that one bag specifically, which is harmless --
-    # emptying an already-empty container is a no-op.
-    deposit_all_containers(ctx)
+        # Empties looting bag/herb sack/seed box/coal bag/etc. into the bank via the bank
+        # interface's own "Deposit Containers" widget button, in one click -- CONFIRMED (user
+        # request 2026-08-06): herb sack and seed box are kept out of the item-by-item deposit
+        # pass below (see routines/slayer.py's protected_supply_names) so the container itself
+        # never gets banked away, but that alone would leave its contents trapped inside it
+        # forever. Redundant with empty_looting_bag above for that one bag specifically, which
+        # is harmless -- emptying an already-empty container is a no-op.
+        deposit_all_containers(ctx)
 
     if not keep:
         deposit_all = bank.get("depositInventory") or {}
@@ -422,13 +432,27 @@ def deposit_inventory(ctx, config: dict) -> None:
             controller.human_delay(0.3, 0.6)
         return
 
-    # Keeping specific items -- deposit one stack at a time instead of
-    # Deposit-all, skipping anything on the keep list.
+    # Keeping specific items -- deposit one DISTINCT item name at a time instead of Deposit-all,
+    # skipping anything on the keep list. Shift+click instead of a plain click -- CORRECTED
+    # 2026-08-22 (user report, live session): shift+click on an inventory item while the bank is
+    # open is OSRS's own "deposit every item of this type" shortcut (same "shift = all" mechanic
+    # banker.withdraw_all_shift already uses on the withdraw side), so it's one click per
+    # distinct item name instead of one click per individual item slot -- a real difference for
+    # non-stackable items like bars: a steel trip depositing up to 27 individual Steel bars used
+    # to click each one separately. `deposited_names` tracks which names have already been
+    # shift-deposited so later slots holding the same (now already-gone) item name aren't
+    # clicked again.
+    deposited_names = set()
     for item in controller.get_inventory():
         name = (item.get("name") or "").lower()
         if any(k in name for k in keep):
             continue
+        if name in deposited_names:
+            continue
+        deposited_names.add(name)
+        controller.key_down(ctx.ser, "SHIFT")
         controller.click_entity(ctx.ser, item)
+        controller.key_up(ctx.ser, "SHIFT")
         controller.human_delay(0.2, 0.4)
 
 
@@ -536,6 +560,65 @@ def withdraw_loadout(ctx, config: dict, fresh: bool = False) -> None:
         withdraw_best_food(ctx, config.get("autoFoodQuantity", 10))
     if config.get("autoPrayer"):
         withdraw_best_prayer_restore(ctx, config.get("autoPrayerQuantity", 10))
+
+
+def withdraw_all_shift(ctx, name: str, fresh: bool = False) -> bool:
+    """Shift+left-click a bank item once to withdraw its entire stack -- OSRS's own bank
+    shift-click default action, naturally capped by however many free inventory slots the
+    player actually has rather than needing an explicit quantity. ADDED 2026-08-22 (user
+    report, live Blast Furnace session): withdraw_loadout's per-unit click loop (one click per
+    unit of quantity) is fine for the handful of potions/food every other routine withdraws
+    (see withdraw_coins_via_x's docstring in blast_furnace.py for the same observation), but
+    is slow and needlessly click-heavy for a 27-28 unit ore withdrawal that's meant to fill
+    the rest of inventory anyway -- one shift-click does the same job. Only safe to use when
+    the caller wants "as much of this single item as fits", not an exact partial quantity
+    (e.g. NOT bronze bars' 14 Copper ore + 14 Tin ore split -- shift-clicking Copper there
+    would happily fill all 28 slots with copper and leave none for tin).
+
+    Exact-name match preferred over substring, same reasoning as click_menu_action's
+    option-matching and the coal/coal-bag substring-collision note in
+    routines/blast_furnace.py's run_trip -- a bare substring search for "coal" could otherwise
+    resolve to "Coal bag" instead of "Coal" if the bag sorts earlier in the bank.
+
+    Polls inventory for the item's actual arrival before returning, rather than trusting a
+    fixed delay -- CORRECTED 2026-08-22 (user report, live session): a fixed human_delay here
+    wasn't a strong enough guarantee the withdrawal had actually landed server-side before the
+    caller went on to close the bank. CONFIRMED live this raced the real game-tick boundary:
+    closing the bank interface (ESC) before the withdrawal was processed cancelled it outright,
+    leaving inventory with none of the withdrawn item at all -- the caller's own conveyor
+    deposit then found 0 to deposit. Same "poll, don't just sleep" reasoning
+    wait_until_bank_item_gone already applies to the coal-bag-withdrawal race, just watching
+    for the item's arrival in inventory instead of its disappearance from the bank."""
+    bank = controller.get_bank(fresh=fresh)
+    name_lower = name.lower()
+    slot = next(
+        (s for s in bank.get("items", []) if name_lower == (s.get("name") or "").lower()),
+        None,
+    )
+    if slot is None:
+        slot = next(
+            (s for s in bank.get("items", []) if name_lower in (s.get("name") or "").lower()),
+            None,
+        )
+    if slot is None:
+        debug_log.log("bank", f"{name} not found in bank, skipping")
+        return False
+
+    debug_log.log("bank", f"shift-withdrawing all {slot.get('name')}")
+    controller.key_down(ctx.ser, "SHIFT")
+    ok = controller.click_entity(ctx.ser, slot)
+    controller.key_up(ctx.ser, "SHIFT")
+    if not ok:
+        return False
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if any(name_lower in (i.get("name") or "").lower() for i in controller.get_inventory()):
+            return True
+        time.sleep(0.15)
+
+    debug_log.log("bank", f"shift-withdrawn {name} never showed up in inventory -- may have raced the bank closing")
+    return False
 
 
 def search_bank(ctx, query: str) -> bool:

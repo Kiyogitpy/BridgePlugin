@@ -26,6 +26,34 @@ public class PlayerProvider extends BridgeProvider
 	public void register()
 	{
 		server.register("/player", () -> onClient(this::getPlayer));
+		server.registerQuery("/varbit", query -> onClient(() -> getVarbit(query)));
+	}
+
+	// ADDED 2026-08-22 (user directive, Blast Furnace live session): generic passthrough to
+	// client.getVarbitValue(id) -- not tied to any one routine's data model, same "expose the
+	// raw client primitive, let the Python side interpret it" idiom /player's other fields
+	// already follow. First use: routines/blast_furnace.py reading the bar-dispenser-ready-count
+	// varbit the official RuneLite Blast Furnace plugin itself reads (BarsOres.java in
+	// net.runelite.client.plugins.blastfurnace, e.g. varbit 943 for Steel bar) to confirm a
+	// dispenser collection actually happened instead of trusting a blind click+Space.
+	private Object getVarbit(Map<String, String> query)
+	{
+		Map<String, Object> result = new HashMap<>();
+		String idStr = query.get("id");
+		if (idStr == null || idStr.isEmpty())
+		{
+			result.put("value", null);
+			return result;
+		}
+		try
+		{
+			result.put("value", client.getVarbitValue(Integer.parseInt(idStr)));
+		}
+		catch (NumberFormatException e)
+		{
+			result.put("value", null);
+		}
+		return result;
 	}
 
 	private Object getPlayer()

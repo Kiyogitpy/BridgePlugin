@@ -332,6 +332,161 @@ increase inside the same short wait loop already used for other post-click signa
 jump, confirmation chat message, ...) — an XP increase is proof the underlying skill check
 succeeded, sub-tick and often faster than any other available signal.
 
+## Recording a human session before writing a routine
+
+`ControllerAddon/recorder.py` + `providers/RecorderProvider.java` (added 2026-08-23, user request)
+capture a **human** playing an activity by hand, so a new routine can be written by reading the log
+instead of guessing the activity's mechanics and live-debugging them into existence. Prefer this
+over starting a new routine from scratch.
+
+```
+python -u recorder.py sunstone-mining      # from ControllerAddon/, then go play. Ctrl+C stops.
+```
+
+Three files land in `ControllerAddon/recordings/` (gitignored):
+`<stamp>_<label>.jsonl` (every record, raw), `.log` (the readable narrative — the one you read to
+build), `.summary` (object/npc/anim/varbit ids, xp, net inventory).
+
+- **Requires a client rebuild + restart** (`./gradlew.bat run`) before `/recorder/*` exists — it's
+  compiled into the Java plugin. `recorder.py` detects the 404 and says so rather than failing
+  obscurely.
+- **Safe to run alongside anything.** It imports only `settings`+`requests` — deliberately *not*
+  `controller.py` — so it never touches the Arduino serial port, same rationale as
+  `mcp_debug_server.py`.
+- **Endpoints**: `GET /recorder/arm?on=true&label=X` (arming clears the buffer and resets seq),
+  `GET /recorder/events?since=<seq>&limit=<n>`, `GET /recorder/status`. Disarmed by default — every
+  listener returns immediately, so an unused recorder costs nothing.
+
+**Why the capture is Java-side and not a Python poll of `/last-action`:** that endpoint holds only
+the most recent click (two clicks inside one poll interval and the first is gone); a
+MenuOptionClicked's `param0`/`param1` are *scene* coordinates that only the client thread can
+convert to a real world tile (and inside an instance need `WorldPoint.fromLocalInstance` — see the
+instancing gotcha above, already handled here); and outcome correlation needs events observed as
+they fire, not inferred from end state.
+
+**Outcome correlation is the point.** The hard part of every routine here isn't "what to click", it's
+"how do I know the click worked". So each action opens a 5-tick (~3s) window, and every ambient
+record landing inside it (animation, spotanim, ground gfx, the clicked object transforming, XP,
+inventory delta, chat, varbit flip) is tagged `causedBy: <action seq>`. The narrative log nests
+those under the click. A despawn+spawn pair on one tile renders as a single `became` line — that's
+a depleting rock / opening door / lighting brazier, usually the best success-signal available.
+An action with **no** observed outcome is called out explicitly; that's the case needing a
+precondition or retry in the eventual routine.
+
+Records are append-only with monotonic `seq` (the `?since=` cursor depends on it) — actions are
+*not* held back until their window closes; `recorder.py` does the grouping at render time.
+
+**Every record carries `t` (ms since arm), `wall` (absolute epoch ms), `tick`, and `tickAge`.**
+`tick` is a mirror of `client.getTickCount()` refreshed on GameTick, because records are also
+created on the AWT thread (mouse/key listeners) where touching the client isn't safe — so it can be
+stale in a way that *looks* valid. `tickAge` (ms since that tick fired) makes staleness visible;
+`t` is the authoritative ordering key, and the narrative flags any action whose `tickAge >= 600`.
+
+Volume guards, all load-bearing: ambient records are capped to 12 tiles; other players' animations
+are dropped entirely (a crowded bank would otherwise dominate); object spawn/despawn is suppressed
+for 1.5s after any non-`LOGGED_IN` state, because `GameObjectSpawned` fires for *every* object in
+the scene on each region load and would evict the real recording out of the ring buffer. Mouse
+moves are batched into polyline records rather than one per sample. A `dropped` counter surfaces
+any hole in the recording, loudly.
+
+**Keystroke privacy**: the key listener sets `isEnabledOnLoginScreen() == false` and drops
+everything unless the game state is `LOGGED_IN`, so an account password can't land in a plaintext
+recording. Note this does *not* cover a bank PIN typed while already logged in.
+
+### Findings from the first live recording (Falconry, 2026-08-23) — all fixed, don't re-derive
+
+- **`MenuAction.WALK`'s `param0`/`param1` are CANVAS coordinates, not scene coordinates.** Recorded
+  values were identical to `canvasX/canvasY` (400,216), and 400 is outside the 104-tile scene grid.
+  Every other tile-based action (objects, ground items) *does* use scene coords. The walk
+  destination is only knowable from `getLocalDestinationLocation()` **after** the click is
+  processed, so it's read on the next tick and emitted as a `walkdest` record attributed back to
+  the action. Don't try to decode a walk target from the menu event.
+- **`AnimationChanged` never fires for an NPC that spawns already animating** — the animation is
+  part of its initial state, not a change to it. The Gyr Falcon spawns mid-swoop, so its animation
+  was entirely absent while the player's and the kebbit's were present. NPC animations therefore
+  come from a per-tick diff in `diffNearbyNpcs`, not the event; the event is kept for the local
+  player only (always fires there, and gives sub-tick timing for free). This costs no fidelity —
+  unlike screen position, which animation is playing is genuinely tick-quantised server-side.
+- **NPCs transform in place: same index, different id.** The Dashing kebbit *becomes* the Gyr Falcon
+  at index 12323 — no spawn, no despawn, so an id-change check is the only way to see it. Emitted as
+  `npcchange`. Assume this pattern anywhere an NPC "turns into" something.
+- **A first-event baseline silently eats one unit of everything.** The first `ItemContainerChanged`
+  and the first `StatChanged` per skill were being consumed to establish a diff baseline, so 7
+  catches summarised as "+6 Bones / Hunter +936" — exactly one catch short. `seedBaselines()` now
+  captures inventory and all-skill XP at arm time.
+- **Varbit noise is defined by fraction-of-ticks, not total count.** Three varps changing every tick
+  (101/101/61 over ~100 ticks) buried the real signals. A flat count-12 cutoff hid the noise but
+  *also* hid `varbit 14192` (14 changes — the falcon-has-a-catch flag, the most useful value in the
+  session). `noise_cutoff` scales with elapsed ticks instead. Suppression affects only the narrative;
+  the `.jsonl` and `.summary` always keep everything.
+- Renderer gotcha: the Java fields are camelCase (`targetX`, `playerPlane`). Building the key as
+  `targetx` renders every position as `?` rather than raising — the capture looked broken when it
+  was perfect.
+- **A MINIMAP click is not a `WALK`.** It fires `MenuAction.CANCEL` with `param0`/`param1` both 0
+  and no target at all — indistinguishable from dismissing a right-click menu, from the event
+  alone. CONFIRMED live 2026-08-23 (full Falconry bank run): every long-distance leg of a 5-region
+  trip logged as a meaningless "Cancel" with the destination lost, which is exactly the data a
+  travel routine needs. Both `WALK` and `CANCEL` now speculatively resolve a destination on the
+  next tick, and a **destination-changed** comparison decides which it was (a real menu cancel
+  moves nothing). Don't try to classify it by canvas position — the minimap moves between
+  fixed/resizable layouts.
+- **Decode packed widget ids.** RuneLite packs interfaces as `(group << 16) | child`; the raw
+  integer is useless (`25362456`), the pair is not (`387.24` = ring slot on the worn-equipment
+  interface). `param0` rides along as the slot index *within* the component (inventory/bank slot),
+  which is a different thing from the child. `fmt_widget` does this. Verified against the bank run:
+  `12.45` bank Empty-containers, `15.3` bank container (+slot), `149.0` inventory (+slot),
+  `387.16/.18/.24` cape/weapon/ring equipment slots.
+
+## Clicking interface elements (`/widget`)
+
+`WidgetProvider.java` + `controller.get_widget(group, child, index=None)` (added 2026-08-23) give a
+clickable screen position for **any** interface element by group/child id. Before it, the only
+reachable interface elements were the handful `BankProvider` hard-codes — and `/equipment` reports
+what is *worn* but carries **no screen position**, so a routine physically could not click a worn
+item. That blocked `routines/falconry.py`, which must un-wield a Dramen staff after a fairy-ring
+hop because the falconry glove needs the same weapon slot.
+
+The intended workflow is: **record yourself doing the thing, read the decoded `group.child` out of
+`recorder.py`'s log, address it here.** That is why this is generic rather than more named buttons.
+
+- Returned dict has `screenX`/`screenY` (the element's *centre*), so it goes straight into
+  `click_entity`/`click_menu_action` — always with `check_ui_blockers=False`, same as every other
+  interface click (see `travel.teleport_to_ferox` for the rotate-forever loop that flag causes).
+- `found:false` (wrong id) is deliberately distinct from `clickable:false` (right id, interface
+  closed). Both return HTTP 200 — a closed interface is a normal state for a polling caller.
+- `GET /widget/children?group=G&child=C` lists populated dynamic children, for finding which index
+  holds what without guessing.
+- Keyboard shortcuts still beat clicking a tab: `E` opens worn equipment.
+
+## Current state of routines/falconry.py
+
+Written 2026-08-23 **entirely from a recorded human run** (`recordings/2026-08-23_121236_falconry-
+entire-run.*`) rather than from guesswork — the first routine built that way, and the reference for
+how the recorder is meant to pay off. Hunts Dashing kebbits and does the full Castle Wars bank round
+trip. **Not yet run live.**
+
+Signals it keys off, all established from the recording rather than assumed:
+- **`varbit 14192`**: `5` = falcon is sitting on a kill and must be retrieved, `0` = it can be
+  thrown. Verified by pairing, not by guessing at meaning — exactly two changes per successful
+  catch across two recordings (54/27 and 14/7), never moving on a miss.
+- **The falcon has no animation at all**, so there is nothing to wait on visually — confirmed
+  across both recordings once NPC animation capture was known-working.
+- A **miss is normal** (~40% of throws: 46 attempts → 27 catches), never treated as an error.
+- **Bank trigger is free inventory slots.** Fur/meat go to their pouches until 28 each, then spill;
+  post-spill each catch costs ~2 slots. Count slots from the live inventory list, **never** from
+  distinct item names — 11 Bones is 11 slots, not 1 (the bug that made the recorder report 22 free
+  while the game refused fur pickups).
+- `Quick-falcon` on Matthias does the whole 500gp transaction in one click; the human's preceding
+  `Talk-to` contributed nothing.
+
+The bank trip dispatches on **current region**, not a stored step counter — `ctx.state.data` is
+wiped on restart while the character's position is not, so a counter desyncs exactly mid-trip.
+
+**Loadout requirement (a deliberate deviation from the recording):** ring of dueling, Ardougne
+cloak and Dramen staff must be in the **inventory**, not worn. The human used the worn-equipment
+interface; this uses `click_menu_action` (right-click → read `/menu` → pick by name), the pattern
+already proven live here, which needs a screen position that `/equipment` does not provide.
+
 ## Live-debugging workflow
 
 Use this loop by default when debugging a routine live against the running RuneLite client — it

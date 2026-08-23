@@ -14,10 +14,14 @@
 #   - PREREQUISITES ASSUMED, NOT VERIFIED: standing in the Blast Furnace basement on a mass
 #     world; Ice gloves or Smiths gloves (i) equipped (so bars never need bucket-of-water
 #     cooling); already own a coal bag.
-#   - Loading the conveyor belt ("Put-ore-on") is a two-click "use" action -- click the
-#     ore/coal item, then click the conveyor belt -- same item-then-target idiom
-#     routines/firemaking.py established for tinderbox+log, just with a world object as the
-#     second click.
+#   - Loading the conveyor belt: a single left-click on the conveyor belt itself is enough --
+#     CORRECTED 2026-08-22 (user report, live session): this used to assume a two-click "use"
+#     action (click the ore/coal item, then click the conveyor belt, the same item-then-target
+#     idiom routines/firemaking.py uses for tinderbox+log). CONFIRMED live that's wrong: the
+#     conveyor's own left-click default action ("Put-ore-on") automatically consumes every
+#     matching ore/coal already in inventory on its own -- one click starts an action that runs
+#     until nothing matching is left, it does not need to be re-clicked per item or per ore
+#     type. See deposit_via_conveyor.
 #   - A genuinely cold furnace with no coal in it at all can yield the wrong (lower-tier) bar
 #     if ore arrives with no coal ever present -- but see the ordering note in run_trip below
 #     for why this routine deposits ore before the coal bag's contents on every trip after
@@ -55,6 +59,24 @@ import debug_log
 
 COAL_BAG_CAPACITY = 27
 
+# Varbit IDs the official RuneLite Blast Furnace plugin itself reads to know how many bars of
+# each type are currently sitting in the bar dispenser, ready to collect (BarsOres.java in
+# net.runelite.client.plugins.blastfurnace, decompiled from client-1.12.36.jar -- see
+# BlastFurnaceOverlay.render's use of BarsOres.getVarbit()/Client.getVarbitValue). ADDED
+# 2026-08-22 (user directive, live session): lets run_trip's collect step confirm a dispenser
+# click actually produced bars instead of trusting a blind click+Space -- see PlayerProvider's
+# new /varbit endpoint (controller.get_varbit) and run_trip's collect block below.
+BAR_VARBITS = {
+    "bronze": 941,
+    "iron": 942,
+    "steel": 943,
+    "mithril": 944,
+    "adamantite": 945,
+    "runite": 946,
+    "silver": 948,
+    "gold": 947,
+}
+
 # Per-bar-type trip patterns, reproduced verbatim from Blast Furnace_Strategies.txt's "Bar
 # patterns" table (which assumes a coal bag + ice gloves). Each trip is a "deposit" list of
 # (item name, quantity) pairs -- listed here with "Coal" first for readability against the
@@ -85,8 +107,26 @@ BAR_TYPES = {
     },
     "steel": {
         "level": 30,
+        # CORRECTED 2026-08-22 (user report): the wiki's own single-trip "27 Coal, 27 Iron"
+        # pattern carries a footnote -- "Load furnace with at least 27 coal before starting, or
+        # iron bars will be made" -- which this routine's steady-state loop was silently
+        # violating: repeating a single 27-coal+27-iron trip forever deposits both onto the
+        # conveyor in the SAME action, but with no coal ever banked in the furnace ahead of
+        # time, ore can land before the furnace has any coal to consume it with, yielding iron
+        # bars instead of steel (see the module header's ordering note, and Blast Furnace.txt's
+        # own "bulk-loading coal, if needed, every few cycles" line -- the furnace keeps a coal
+        # reserve across trips, it isn't consumed strictly same-trip-only). Fix: a pure-coal
+        # priming trip (54 Coal = 27 in the bag + 27 loose, no ore, no collect) followed by TWO
+        # pure-iron trips (27 Iron ore each, no coal carried, collect) -- CORRECTED again same
+        # day (user report): consumption is 1 coal per steel bar, not 2, so one priming trip's
+        # 54 coal covers two 27-iron trips' worth of bars (54 total), not just one. The cycle
+        # repeats sustainably forever via tick()'s existing trip-index wraparound (same
+        # priming-trip shape mithril/adamantite/runite already use below, just with two
+        # ore-only trips per priming trip here instead of one ore-with-coal trip each).
         "trips": [
-            {"deposit": [("Coal", 27), ("Iron ore", 27)], "collect": True},
+            {"deposit": [("Coal", 54)], "collect": False},
+            {"deposit": [("Iron ore", 27)], "collect": True},
+            {"deposit": [("Iron ore", 27)], "collect": True},
         ],
     },
     "gold": {
@@ -301,7 +341,7 @@ def plan_bank_withdrawals(trip: dict) -> tuple:
     return withdraw, need_bag_fill, loose_coal, bag_coal
 
 
-def run_trip(ctx, config: dict, trip: dict) -> bool:
+def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
     """Execute one full trip: bank for this trip's materials (depositing any bars/leftovers
     from the previous trip along the way, via the normal keepItems-aware deposit), walk to
     the conveyor belt, deposit the primary ore and any loose coal before the coal bag's
@@ -312,14 +352,24 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
     Note: the Ferox teleport fallback cannot fill the coal bag (banker.bank_up doesn't
     support it), so it only works for bar types that don't require coal (bronze/iron/silver/gold).
 
-    Coal handling: the coal bag is only kept across trips (not deposited) for bar types that
-    actually need coal -- freeing its slot for bar types that don't, since every trip pattern
-    here already budgets all 28 inventory slots and a carried-but-unneeded bag would overflow
-    that by one (see plan_bank_withdrawals). If the bag isn't currently held (e.g. a prior
-    non-coal trip banked it away, or this is the first coal-needing trip of the session),
-    it's withdrawn back from the bank in its OWN withdraw_loadout call, before the materials
-    withdrawal: the bridge's /bank endpoint is cached per game tick (BankProvider.java), so a
-    same-tick re-fetch between two entries in a single withdraw_loadout call can still return
+    `bar_uses_coal_bag` (whether ANY trip in the active bar type's pattern needs coal, computed
+    once by tick() from the whole trip list -- see plan_bank_withdrawals for the per-trip
+    `need_bag_fill` this is deliberately distinct from) controls whether the coal bag's slot is
+    kept across EVERY trip of that bar type, not just the ones that fill it. CORRECTED
+    2026-08-22 (user report, live session): this used to key off the current trip's own
+    `need_bag_fill` instead, freeing the bag's slot on any trip that doesn't itself deposit
+    coal -- fine for bar types with only one trip pattern, but wrong for steel's alternating
+    priming-trip/iron-only-trip cycle: an iron-only trip has no "Coal" entry of its own
+    (need_bag_fill False), so the bag got deposited away and its slot's worth of extra room let
+    shift-withdrawing "all" Iron ore grab 28 instead of the intended 27, drifting the two
+    iron-only trips' totals (28 then 26) out of sync with the one-time 54-coal priming budget --
+    CONFIRMED live this produced iron bars later once the imbalance ran the furnace's coal
+    reserve out early. Keeping the bag (even empty) reserves its slot on every trip of a
+    coal-using bar type, so a single-item withdraw list's shift-click-all is naturally capped at
+    27 instead of 28. If the bag isn't currently held (e.g. this is the very first trip of the
+    session), it's withdrawn back from the bank in its OWN withdraw_loadout call, before the
+    materials withdrawal: the bridge's /bank endpoint is cached per game tick (BankProvider.java),
+    so a same-tick re-fetch between two entries in a single withdraw_loadout call can still return
     a stale, pre-withdrawal snapshot -- putting the bag first in the SAME call (as an earlier
     version of this function tried) doesn't reliably avoid banker.withdraw_loadout's
     substring-matching "Coal" search resolving to a still-cached "Coal bag" slot. Confirming the
@@ -334,11 +384,24 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
     emptied, since the bag can only be emptied into slots that are actually free (see module
     header). Coffer coins are handled entirely separately by maybe_top_up_coffer's own
     dedicated bank visit, so this function never carries coins itself."""
+    # Clear the dispenser FIRST, before withdrawing any new materials -- CORRECTED 2026-08-22
+    # (user report, live session): an earlier version of this check ran later, right before the
+    # conveyor deposit but AFTER the materials withdrawal -- CONFIRMED live that's exactly
+    # backwards: by then inventory is already full of the ore/coal just withdrawn for THIS
+    # trip, so a stuck-full dispenser had nowhere to put collected bars and the routine got
+    # stuck re-clicking with a full inventory instead of actually collecting anything. Run this
+    # here instead, at the very top of the trip, while inventory still holds whatever was left
+    # over from the PREVIOUS trip's own end-of-trip collect (typically near-empty, or at worst
+    # a few uncollected bars) -- see collect_bars' own docstring for why checking every trip
+    # (not just the ones this pattern schedules a collect on) matters at all.
+    if not collect_bars(ctx, config):
+        return False
+
     withdraw, need_bag_fill, loose_coal, bag_coal = plan_bank_withdrawals(trip)
 
     keep_items = []
     need_bag_withdraw = False
-    if need_bag_fill:
+    if bar_uses_coal_bag:
         keep_items.append("coal bag")
         need_bag_withdraw = not banker.has_coal_bag()
 
@@ -350,11 +413,18 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
             ctx.state.trigger_safety_stop("failed to open the Blast Furnace bank chest")
             return False
         # The bank's quantity-mode selector (1/5/10/X/All) persists across close/reopen, so a
-        # prior maybe_top_up_coffer visit earlier this same tick can leave it on "X" -- reset
-        # before deposit_inventory's keepItems-aware path (which clicks individual items,
-        # unlike the mode-independent deposit-all button) runs in whatever mode was left over.
-        banker.set_quantity_mode(ctx, "one")
-        banker.deposit_inventory(ctx, bank_cfg)
+        # prior maybe_top_up_coffer visit earlier this same tick can leave it on "X" -- CORRECTED
+        # 2026-08-22 (user report, live session): this used to unconditionally reset it to "one"
+        # on EVERY bank visit, even trips where nothing downstream actually reads the mode --
+        # CONFIRMED live this was clicking "1" for no reason on every single trip. Neither
+        # deposit_inventory (shift+click, mode-independent, see its own docstring) nor
+        # withdraw_all_shift (also shift+click) care about the mode at all; only
+        # withdraw_loadout's per-unit-click loop does (bronze's Copper+Tin split, and the coal
+        # bag's own single-unit withdraw below), so only reset when one of those is actually
+        # about to run this trip.
+        if need_bag_withdraw or len(withdraw) != 1:
+            banker.set_quantity_mode(ctx, "one")
+        banker.deposit_inventory(ctx, dict(bank_cfg, skipContainerDeposit=True))
         if need_bag_withdraw:
             banker.withdraw_loadout(ctx, {"withdraw": [{"name": "coal bag", "quantity": 1}]})
             # A single fresh=True read isn't enough here -- CONFIRMED (final branch review): it
@@ -368,7 +438,22 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
         # call's /bank reads to bypass the bridge's per-tick cache instead of waiting out a full
         # game tick for it to naturally reflect the bag being gone -- see the docstring above and
         # withdraw_loadout's own fresh parameter.
-        banker.withdraw_loadout(ctx, bank_cfg, fresh=need_bag_withdraw)
+        #
+        # ADDED 2026-08-22 (user report, live session): when `withdraw` is a single entry (every
+        # bar type except bronze's Copper+Tin split -- see plan_bank_withdrawals), shift-click
+        # withdraw-all is a single click instead of withdraw_loadout's one-click-per-unit loop
+        # (up to 27-28 clicks for a full-inventory ore trip). Not safe for a multi-entry withdraw
+        # (bronze): shift-clicking Copper first would happily fill all 28 slots with copper and
+        # leave none for Tin, so that case still goes through the exact-quantity loop below.
+        if len(withdraw) == 1:
+            if not banker.withdraw_all_shift(ctx, withdraw[0]["name"], fresh=need_bag_withdraw):
+                banker.close_bank(ctx)
+                ctx.state.trigger_safety_stop(
+                    f"shift-click withdrawal of {withdraw[0]['name']} never showed up in inventory"
+                )
+                return False
+        else:
+            banker.withdraw_loadout(ctx, bank_cfg, fresh=need_bag_withdraw)
         if need_bag_fill:
             controller.human_delay(0.3, 0.5)  # let a just-withdrawn bag register in
                                                     # get_inventory() before fill_coal_bag
@@ -393,39 +478,44 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
         ctx.state.trigger_safety_stop("no bank found near the Blast Furnace")
         return False
 
-    conveyor = find_object(config, "Conveyor belt")
-    if conveyor is None:
+    # Just an up-front presence check here ("are we even at the Blast Furnace") -- the actual
+    # click target is re-fetched fresh inside deposit_via_conveyor immediately before each
+    # click, not this snapshot. CORRECTED 2026-08-22 (user report, live session): this used to
+    # be the exact dict clicked later too, but that reused a screenX/screenY snapshot taken
+    # here, before the bank trip/coal-bag emptying that happens in between -- CONFIRMED live the
+    # camera can drift enough in that gap for the cached position to go stale and miss.
+    if find_conveyor(config) is None:
         ctx.state.trigger_safety_stop("conveyor belt not found nearby -- are you at the Blast Furnace?")
         return False
 
     controller.open_inventory_tab(ctx.ser)
 
     # Deposit the primary ore (and any loose coal beyond the bag's capacity) FIRST, before
-    # touching the bag -- withdraw_loadout above already filled every slot this trip budgets
-    # for (see plan_bank_withdrawals), so the coal bag has nowhere to empty into until
-    # something else has been deposited to free room. This also matches the real click order
-    # the money-making guides describe for coal-bag trips (e.g. the runite guide: ore onto
-    # the belt first, "then emptying your coal bag of coal and depositing that right after"),
-    # not a strict coal-always-first rule. The coal-before-ore caution in Blast Furnace.txt is
-    # about a genuinely cold furnace with no coal in it at all, not the steady-state cycle
-    # this routine repeats -- watch the very first cycle closely during live verification
-    # (Step 3) in case a cold start needs an explicit priming trip this plan didn't include
-    # for Steel specifically.
-    for name, qty in trip["deposit"]:
-        if name.lower() == "coal":
-            continue  # coal (loose and/or bagged) is handled below, after ore frees room
-        deposited = deposit_items(ctx, name, qty, conveyor)
-        if deposited < qty:
-            ctx.state.trigger_safety_stop(
-                f"only deposited {deposited}/{qty} {name} onto the conveyor belt -- ran out?"
-            )
-            return False
-
+    # touching the bag -- withdraw_loadout/withdraw_all_shift above already filled every slot
+    # this trip budgets for (see plan_bank_withdrawals), so the coal bag has nowhere to empty
+    # into until something else has been deposited to free room. This also matches the real
+    # click order the money-making guides describe for coal-bag trips (e.g. the runite guide:
+    # ore onto the belt first, "then emptying your coal bag of coal and depositing that right
+    # after"), not a strict coal-always-first rule. The coal-before-ore caution in Blast
+    # Furnace.txt is about a genuinely cold furnace with no coal in it at all, not the
+    # steady-state cycle this routine repeats. CONFIRMED live (user report, 2026-08-22) that
+    # Steel specifically DID need an explicit priming trip -- see BAR_TYPES["steel"]'s own note
+    # above for the alternating coal/iron fix.
+    #
+    # A single click on the conveyor deposits every matching ore/coal already in inventory at
+    # once (see deposit_via_conveyor) -- so the primary ore and any loose coal go in the SAME
+    # click here rather than one click pair per item.
+    ore_names = [name for name, qty in trip["deposit"] if name.lower() != "coal"]
+    ore_qty = sum(qty for name, qty in trip["deposit"] if name.lower() != "coal")
+    deposit_names = list(ore_names)
     if loose_coal > 0:
-        deposited = deposit_items(ctx, "Coal", loose_coal, conveyor)
-        if deposited < loose_coal:
+        deposit_names.append("Coal")
+    if deposit_names:
+        expected = ore_qty + loose_coal
+        deposited = deposit_via_conveyor(ctx, config, deposit_names)
+        if deposited < expected:
             ctx.state.trigger_safety_stop(
-                f"only deposited {deposited}/{loose_coal} loose Coal onto the conveyor belt -- ran out?"
+                f"only deposited {deposited}/{expected} ore/coal onto the conveyor belt -- ran out?"
             )
             return False
 
@@ -434,7 +524,7 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
             ctx.state.trigger_safety_stop("couldn't empty the coal bag at the conveyor belt")
             return False
         controller.human_delay(0.3, 0.6)
-        deposited = deposit_items(ctx, "Coal", bag_coal, conveyor)
+        deposited = deposit_via_conveyor(ctx, config, ["Coal"])
         if deposited < bag_coal:
             ctx.state.trigger_safety_stop(
                 f"only deposited {deposited}/{bag_coal} bagged Coal onto the conveyor belt -- ran out?"
@@ -442,50 +532,213 @@ def run_trip(ctx, config: dict, trip: dict) -> bool:
             return False
 
     if trip.get("collect"):
-        dispenser = find_object(config, "Bar dispenser")
-        if dispenser is None:
-            ctx.state.trigger_safety_stop("bar dispenser not found nearby")
+        if not collect_bars(ctx, config):
             return False
-        debug_log.log("blast furnace", "collecting bars")
-        controller.human_delay(0.2, 0.4)
-        controller.click_entity(ctx.ser, dispenser)
-        controller.human_delay(0.6, 1.0)
 
     return True
 
 
-def deposit_items(ctx, name: str, quantity: int, target: dict) -> int:
-    """Deposit up to `quantity` inventory items named `name` onto `target` (the conveyor
-    belt) via the item-then-target two-click idiom -- click the item, then click the
-    conveyor. Ore/coal aren't stackable in inventory, so this is a real loop, one click pair
-    per item, not a single bulk action. Each iteration re-looks-up the item fresh via
-    find_item rather than reusing one slot reference repeatedly (unlike bank-slot
-    withdrawals, which target a persistent bank-side stack): depositing an item empties its
-    inventory slot, so a stale reference from an earlier iteration could click whatever ends
-    up in that slot next instead. Only counts an item as deposited when BOTH clicks return
-    True (click_entity returns False on a blocked or off-window aim point; note this does
-    NOT catch every near-miss -- a small chance of an intentionally jittered "close but not
-    on target" click still resolves as a normal, successful click in the game's own menu
-    resolution, so the shortfall check below is a real improvement but not an absolute
-    guarantee) -- an unregistered attempt sleeps briefly and tries again next iteration
-    against a fresh find_item lookup, up to the `quantity` cap. Returns how many were
-    actually deposited, so the caller can tell a real shortfall (ran out of that item) from
-    success."""
-    deposited = 0
-    for _ in range(quantity):
-        item = find_item(name)
-        if item is None:
+def collect_bars(ctx, config: dict) -> bool:
+    """Collect everything currently sitting in the bar dispenser, verified via the same varbit
+    the official RuneLite Blast Furnace plugin itself reads to show a bar-ready icon
+    (BAR_VARBITS, decompiled from BarsOres.java/BlastFurnaceOverlay.java in
+    client-1.12.36.jar) -- ADDED 2026-08-22 (user directive: "we can actually tell if we have
+    bars in the dispenser. look at default plugin blast furnace").
+
+    Called from TWO places in run_trip: unconditionally near the top of every trip (before the
+    conveyor deposit), and again at the trip's own scheduled `collect` point below. The first
+    call is not optional polish -- CONFIRMED live (user report) the Blast Furnace itself
+    refuses to accept new ore/coal onto the conveyor while the dispenser is full ("it cant put
+    more ore before the dispenser is empty"), so a dispenser left stuck full by an earlier
+    missed collection (e.g. a routine restart mid-cycle, which is exactly how this was found
+    live -- a prior process was killed mid-collect-retry, leaving 27 Steel bars stranded)
+    deadlocks every following trip's conveyor deposit with a "0/N -- ran out?" safety stop that
+    has nothing to do with the conveyor itself and looks unrelated until you know to check the
+    dispenser. Checking first, every trip, breaks that deadlock instead of only ever
+    discovering it after a conveyor deposit has already failed. Cheap when there's nothing to
+    collect: the varbit read up front returns immediately without ever touching the dispenser.
+
+    Re-fetches the dispenser object fresh on every retry inside the loop, not once outside it
+    -- CORRECTED 2026-08-22 (user report, live session): a single snapshot resolved before the
+    loop went stale after the very first click's own walk-over shifted the player (and hence
+    the camera-projected screen position of the stationary dispenser), and every retry kept
+    re-clicking that same now-wrong point, 7 attempts in a row, never once landing on the real
+    thing -- same staleness class deposit_via_conveyor was already corrected for.
+
+    Returns False only on a hard failure that should safety-stop the trip (dispenser not found
+    at all); True otherwise, including the "couldn't verify, tried once anyway" (unmapped bar
+    type or unsupported /varbit endpoint) and "still not empty after retries" (soft-logged, not
+    fatal) cases -- same soft-retry posture maybe_top_up_coffer uses elsewhere in this file,
+    since an occasional missed collection shouldn't halt an otherwise-working session by itself
+    (the next call to this function, at the start of the following trip, will just try again)."""
+    bar_type = (config.get("barType") or "iron").lower()
+    varbit_id = BAR_VARBITS.get(bar_type)
+    # The /varbit bridge endpoint needs a RuneLite client rebuild+restart to exist at all
+    # (PlayerProvider.java, Java-side change) -- against an old, not-yet-rebuilt client, every
+    # controller.get_varbit call below would return None forever. Probe once up front: a None
+    # here means "can't verify" (unsupported endpoint, or a genuinely failed request), not "0
+    # bars ready" -- fall back to a single best-effort pass either way rather than looping
+    # blind for the full timeout on every single call.
+    if varbit_id is not None and controller.get_varbit(varbit_id) is None:
+        varbit_id = None
+
+    if varbit_id is not None and controller.get_varbit(varbit_id) == 0:
+        return True  # nothing ready -- the common case for the pre-deposit check
+
+    if find_object(config, "Bar dispenser") is None:
+        ctx.state.trigger_safety_stop("bar dispenser not found nearby")
+        return False
+
+    debug_log.log("blast furnace", "collecting bars")
+
+    deadline = time.time() + 20.0
+    attempted = False
+    last_pos = None
+    nudge_key = "LEFT"
+    while time.time() < deadline:
+        if varbit_id is not None and attempted and controller.get_varbit(varbit_id) == 0:
+            break  # confirmed collected -- dispenser reports nothing left ready
+
+        dispenser = find_object(config, "Bar dispenser")
+        if dispenser is None:
+            ctx.state.trigger_safety_stop("bar dispenser went out of range mid-collect")
+            return False
+
+        # ADDED 2026-08-22 (user report, live session): on a mass world this room is busy with
+        # other players/dwarves, and a screen point that's technically inside the dispenser's
+        # own clickbox can still be occluded by someone standing between the camera and it --
+        # CONFIRMED live 7+ retries in a row resolved to the EXACT same screen position (player
+        # and camera both genuinely stationary, so a stale-cache theory doesn't fit -- the
+        # bridge's per-tick cache had long since rolled over across that many seconds) and
+        # still never registered. Nudging the camera when a retry's position matches the
+        # previous one forces a different viewing angle instead of clicking the same
+        # potentially-blocked pixel again -- same idiom rotate_camera_away_from_ui already uses
+        # for the conceptually similar "can't cleanly reach this point" problem.
+        pos = (dispenser.get("screenX"), dispenser.get("screenY"))
+        if attempted and pos == last_pos:
+            controller.nudge_camera_yaw(ctx.ser, nudge_key)
+            nudge_key = "RIGHT" if nudge_key == "LEFT" else "LEFT"
+            dispenser = find_object(config, "Bar dispenser")
+            if dispenser is None:
+                ctx.state.trigger_safety_stop("bar dispenser went out of range mid-collect")
+                return False
+            pos = (dispenser.get("screenX"), dispenser.get("screenY"))
+        last_pos = pos
+
+        attempted = True
+        controller.human_delay(0.2, 0.4)
+        controller.click_entity(ctx.ser, dispenser)
+        # Settle delay before polling idle: CONFIRMED live (user report) a walk-over triggered
+        # by this click doesn't register as movement immediately -- see
+        # wait_until_player_idle's own docstring for the full account of why this order
+        # (settle, then idle-poll, then Space) matters.
+        controller.human_delay(0.6, 0.9)
+        controller.wait_until_player_idle(timeout_s=8.0)
+        controller.human_delay(0.3, 0.6)
+        controller.key_tap(ctx.ser, "SPACE")
+        controller.human_delay(0.5, 0.8)
+
+        if varbit_id is None:
+            break  # unmapped bar type -- can't verify, one pass is all we can do
+
+    if varbit_id is not None:
+        still_ready = controller.get_varbit(varbit_id)
+        if still_ready not in (0, None):
+            debug_log.log(
+                "blast furnace",
+                f"bar dispenser still shows {still_ready} {bar_type} bar(s) ready after retries -- may have missed a collection",
+            )
+
+    return True
+
+
+def deposit_via_conveyor(ctx, config: dict, names: list, timeout_s: float = 30.0) -> int:
+    """Left-click the conveyor belt ONCE -- CORRECTED 2026-08-22 (user report, live session):
+    this used to click each matching inventory item then the conveyor, once per item (see
+    module header). CONFIRMED live that's unnecessary: the conveyor's own left-click default
+    action ("Put-ore-on") automatically consumes every matching ore/coal already in inventory
+    on its own, across however many of `names` are present -- no need to select an item first,
+    and no need to re-click the conveyor per item or per ore type. This is why run_trip passes
+    the primary ore AND any loose coal together in one `names` list: they get deposited in the
+    same single click.
+
+    Takes `config` and calls find_conveyor(config) itself, immediately before clicking, rather
+    than taking an already-resolved object dict -- CORRECTED 2026-08-22 (user report, live
+    session): a dict resolved once at the top of run_trip and reused here went stale by the
+    time this actually clicked (after a full bank trip and/or coal-bag emptying in between),
+    landing off the belt because the camera had moved since that snapshot was taken. Re-fetching
+    fresh right before the click is the same "look it up again, don't trust a stale reference"
+    reasoning the old deposit_items docstring already applied to inventory items, just extended
+    to the conveyor itself now that it's looked up once per run_trip instead of once per item.
+
+    Since it's now one queued action rather than a click-per-item loop, success is measured by
+    polling inventory (via find_item) until none of `names` remain or `timeout_s` elapses,
+    then returning the before/after count difference -- same shortfall semantics run_trip's
+    callers already expect (a return value less than what was expected means it ran out or got
+    interrupted), just measured by counting instead of by counting successful click pairs.
+
+    Re-clicks (re-fetching a fresh conveyor position) if inventory shows NO progress for
+    `stall_retry_s` -- CORRECTED 2026-08-22 (user report, live session): the original version
+    clicked once, then blindly polled for the full timeout_s. CONFIRMED live the initial click
+    can silently fail to register the Put-ore-on action at all (e.g. fired too soon after the
+    bank closed) with no error from click_entity itself -- inventory just never changes, and the
+    old code burned the entire 30s timeout finding that out before safety-stopping. Retrying
+    after a shorter stall window catches this the same tick instead of losing a full 30s to it
+    every time it happens.
+
+    CORRECTED again same day (user report, live session): "no inventory progress yet" isn't
+    the same as "the click failed" -- a successful click that's still walking the player toward
+    the conveyor (out of immediate range) also shows no inventory change until the walk
+    finishes, and reclicking during that walk risks a misclick that sends the player somewhere
+    else entirely, interrupting the very deposit that was already working ("didnt wait for ore
+    to get processed so went to bank instead and now stuck" -- the disrupted deposit likely
+    never actually reached 0, but the interruption confused what should have been a hard
+    shortfall stop). Now also tracks the player's own local position each poll: movement counts
+    as progress too (resets the stall timer, same as an inventory-count drop), so a reclick only
+    fires when BOTH inventory and position have been static for the full stall window -- a
+    much stronger signal the original click genuinely never registered at all."""
+    names_lower = {n.lower() for n in names}
+
+    def matching_count() -> int:
+        return sum(1 for i in controller.get_inventory() if (i.get("name") or "").lower() in names_lower)
+
+    before = matching_count()
+    if before == 0:
+        return 0
+
+    target = find_conveyor(config)
+    if target is None:
+        debug_log.log("blast furnace", "conveyor belt not found for deposit -- may have moved out of range")
+        return 0
+
+    if not controller.click_entity(ctx.ser, target):
+        return 0
+
+    stall_retry_s = 4.0
+    deadline = time.time() + timeout_s
+    last_count = before
+    last_progress_at = time.time()
+    last_local = None
+    while time.time() < deadline:
+        time.sleep(0.6)
+        count = matching_count()
+        player = controller.get_player()
+        local = (player.get("localX"), player.get("localY"))
+        moved = last_local is not None and local != last_local
+        last_local = local
+        if count < last_count or moved:
+            last_count = count
+            last_progress_at = time.time()
+        elif time.time() - last_progress_at >= stall_retry_s:
+            debug_log.log("blast furnace", "no progress depositing onto the conveyor -- reclicking")
+            retry_target = find_conveyor(config)
+            if retry_target is not None:
+                controller.click_entity(ctx.ser, retry_target)
+            last_progress_at = time.time()
+        if count == 0:
             break
-        if not controller.click_entity(ctx.ser, item, check_ui_blockers=False):
-            controller.human_delay(0.2, 0.4)
-            continue
-        controller.human_delay(0.15, 0.3)
-        if not controller.click_entity(ctx.ser, target):
-            controller.human_delay(0.2, 0.4)
-            continue
-        controller.human_delay(0.3, 0.5)
-        deposited += 1
-    return deposited
+
+    return before - matching_count()
 
 
 def tick(ctx):
@@ -512,8 +765,14 @@ def tick(ctx):
     trips = pattern["trips"]
     index = ctx.state.data.get("bf_trip_index", 0) % len(trips)
     trip = trips[index]
+    # Whether ANY trip in this bar type's pattern needs coal -- see run_trip's own docstring for
+    # why this (computed once, across the whole pattern) is what decides whether the coal bag's
+    # slot is kept across every trip, not the current trip's own need_bag_fill.
+    bar_uses_coal_bag = any(
+        any(name.lower() == "coal" for name, _ in t["deposit"]) for t in trips
+    )
 
-    if not run_trip(ctx, config, trip):
+    if not run_trip(ctx, config, trip, bar_uses_coal_bag):
         return
 
     ctx.state.data["bf_trip_index"] = (index + 1) % len(trips)
@@ -551,3 +810,40 @@ def find_object(config: dict, name: str):
 
     candidates.sort(key=lambda o: o.get("distance", 9999))
     return candidates[0]
+
+
+def find_conveyor(config: dict):
+    """The Blast Furnace's conveyor belt, NOT via plain find_object -- CONFIRMED live (bridge
+    /objects query while standing at the belt, 2026-08-22): "Conveyor belt" resolves to THREE
+    separate entries, not one -- two tiles belonging to the same multi-tile GameObject (id
+    9101, registered at both (1943,4965) and (1943,4966), same as any multi-tile object is
+    registered at every tile it occupies) plus a third, differently-id'd GameObject (9100) one
+    tile further north again at (1943,4967). find_object's plain nearest-distance pick lands on
+    the SOUTHERNMOST of these -- CONFIRMED (user report, live session) that click consistently
+    lands one tile off (south) of the belt's actual clickable spot; the correct spot is the
+    next tile north of the nearest one, same object id, not the nearest tile itself and not the
+    third (differently-id'd, two tiles further) candidate either.
+
+    Picks the nearest candidate, then prefers another candidate exactly one tile north (same x,
+    y+1) if one exists among the matches, falling back to the plain nearest pick otherwise (so
+    this degrades to find_object's old behavior if the belt's on-screen tile layout is ever
+    read differently, e.g. approached from an unexpected side)."""
+    candidates = [
+        o for o in controller.get_objects()
+        if "conveyor belt" in (o.get("name") or "").lower()
+        and o.get("visible", True)
+        and 0 <= o.get("distance", 9999) <= config.get("maxObjectDistance", 15)
+    ]
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda o: o.get("distance", 9999))
+    nearest = candidates[0]
+    north = next(
+        (
+            o for o in candidates
+            if o.get("x") == nearest.get("x") and o.get("y") == nearest.get("y", 0) + 1
+        ),
+        None,
+    )
+    return north if north is not None else nearest

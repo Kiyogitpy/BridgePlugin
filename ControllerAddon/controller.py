@@ -153,6 +153,19 @@ def get_player():
     return api_get("/player") or {}
 
 
+def get_varbit(varbit_id: int):
+    """Raw client.getVarbitValue(varbit_id) passthrough (PlayerProvider's /varbit) -- generic,
+    not tied to any one routine's data model, same "expose the primitive, let the Python side
+    interpret it" idiom /player's other fields already follow. ADDED 2026-08-22 (user
+    directive, Blast Furnace live session) so a routine can read a game-tracked value (e.g. the
+    official Blast Furnace plugin's own bar-dispenser-ready-count varbit, see
+    routines/blast_furnace.py's BAR_VARBITS) instead of guessing whether an action worked from
+    timing alone. Returns None if the value couldn't be read (bad/missing id, or the request
+    failed) -- callers should treat that as "can't verify", not "value is zero"."""
+    resp = api_get("/varbit", params={"id": varbit_id}) or {}
+    return resp.get("value")
+
+
 def _player_activity_snapshot():
     """(localX, localY) -- the player's own local position, sampled multiple times a tick while
     walking (RuneLite interpolates it smoothly, not just once per game tick) and held exactly
@@ -345,6 +358,34 @@ def get_spellbook():
 
 def get_menu():
     return api_get("/menu") or {"open": False}
+
+
+def get_widget(group: int, child: int, index: int = None):
+    """A clickable screen position for an interface element, by group/child id (WidgetProvider).
+
+    The returned dict carries screenX/screenY like any other clickable entity, so it can be passed
+    straight to click_entity/click_menu_action -- pass check_ui_blockers=False, same as every other
+    interface click in this codebase (see travel.teleport_to_ferox for why: an interface element is
+    always "behind a UI panel" by definition, and rotating the camera can never clear it).
+
+    `index` addresses a dynamic child within a container (an inventory or bank slot). Get the ids
+    by recording yourself doing the thing and reading them out of recorder.py's log, which decodes
+    the packed id into group.child for exactly this purpose.
+
+    Always returns a dict: {"found": False} when the widget doesn't exist, and found-but
+    clickable:False when it exists with no drawn area (its interface is closed) -- those are
+    different problems and worth telling apart."""
+    params = {"group": group, "child": child}
+    if index is not None:
+        params["index"] = index
+    return api_get("/widget", params=params) or {"found": False}
+
+
+def get_widget_children(group: int, child: int):
+    """Every populated dynamic child of a container widget, for discovering which index holds
+    what. Returns a list (empty if the widget is absent or has no children)."""
+    body = api_get("/widget/children", params={"group": group, "child": child}) or {}
+    return body.get("children") or []
 
 
 def get_consumables():
@@ -2103,6 +2144,7 @@ ROUTINE_FILES = {
     "NMZ": "routines/nmz.py",
     "PYRAMID_PLUNDER": "routines/pyramid_plunder.py",
     "CHINCHOMPA_HUNTING": "routines/chinchompa_hunting.py",
+    "FALCONRY": "routines/falconry.py",
 }
 
 
