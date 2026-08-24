@@ -685,68 +685,83 @@ def _dose(name: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def search_and_withdraw(ctx, item_name: str, quantity: int) -> bool:
-    """Search-then-click withdraw for exactly one named item, guaranteeing it's scrolled onto
+def search_and_withdraw(
+    ctx,
+    item_name: str,
+    quantity: int,
+    contains: bool = False,
+) -> bool:
+    """Search-then-click withdraw for one named item, guaranteeing it's scrolled onto
     an on-screen, clickable position first (see search_bank's docstring for why that matters).
-    Originally private (used only by withdraw_best_food/withdraw_best_prayer_restore below) --
-    made public 2026-08-08 for routines/golem_crafting.py's fur withdrawal, which hit the exact
-    same bug: banker.withdraw_loadout clicks a bank slot's raw screenX/screenY with no
-    search/visibility step, which silently fails (is_point_within_window rejects the far
-    off-screen point, click_entity just returns False) for anything not on the bank's first
-    visible page -- CONFIRMED live 2026-08-08, this account's real (large, unsorted) bank
-    reports "Sunlight antelope fur" at screenY=5271 against a display nowhere near that tall.
-    Deliberately NOT folded into withdraw_loadout itself -- that function's substring-matching
-    lookup and blast_furnace.py's run_trip rely on specific call-ordering/sleep timing around it
-    (see run_trip's own docstring, the "Coal" vs "Coal bag" collision) that a rewrite risks
-    silently breaking for an already-working routine; this is a separate, additive entry point
-    for callers (so far golem_crafting.py) that want the extra visibility guarantee explicitly.
 
-    Search by the base name, without any trailing (N) dose/charge suffix -- CONFIRMED live
-    2026-08-06: searching the item's full exact name (e.g. "Sanfew serum(4)") failed every
-    time, because key_tap has no way to send a shifted character like "(" or ")" -- there's no
-    such single key on a real keyboard, it's Shift+9/Shift+0. The base name alone is still
-    specific enough to filter down to just that item's dose variants (rarely more than a
-    handful), and the exact-name match below still picks the one dose we actually chose.
+    Search by the base name, without any trailing (N) dose/charge suffix.
+
+    By default, the bank item name must exactly match item_name. If contains=True,
+    the bank item name only needs to contain item_name. This is useful for items
+    with dose/charge suffixes such as "Ring of dueling(8)" while preserving the
+    existing exact-match behavior for other callers.
     """
     search_query = _DOSE_RE.sub("", item_name).strip()
+
     if not search_bank(ctx, search_query):
         return False
 
     bank = controller.get_bank()
-    # CONFIRMED live 2026-08-12: a bank search can surface a zero-stock "placeholder" slot whose
-    # name exactly matches item_name (e.g. searching "Ranarr weed" on an account with none in
-    # stock still returned a qty=0 "Ranarr weed" placeholder alongside qty=0 "Grimy ranarr
-    # weed") -- clicking it is a no-op at best; observed live to instead silently interact with
-    # whatever the PREVIOUS search's result slot still rendered at that screen position,
-    # withdrawing the wrong item. Requiring qty > 0 makes this a clean "not found" instead.
+
+    # Require qty > 0 so zero-stock placeholder slots are ignored.
     slot = next(
-        (s for s in bank.get("items", [])
-         if (s.get("name") or "").lower() == item_name.lower() and s.get("qty", 0) > 0),
+        (
+            s
+            for s in bank.get("items", [])
+            if (
+                item_name.lower() in (s.get("name") or "").lower()
+                if contains
+                else (s.get("name") or "").lower() == item_name.lower()
+            )
+            and s.get("qty", 0) > 0
+        ),
         None,
     )
+
     if slot is None:
-        debug_log.log("bank", f"{item_name} not found (or out of stock) after searching '{search_query}'")
+        debug_log.log(
+            "bank",
+            f"{item_name} not found (or out of stock) after searching '{search_query}'",
+        )
         return False
 
     set_quantity_mode(ctx, "one")
-    debug_log.log("bank", f"withdrawing {quantity}x {slot.get('name')}")
-    # Track whether the clicks actually landed instead of assuming success -- CONFIRMED live
-    # 2026-08-06: a concurrent human interaction moved the mouse mid-sequence and every withdraw
-    # click failed ("aim point is outside the RuneLite window"), but this still unconditionally
-    # returned True, telling the caller a withdrawal happened when nothing was actually taken.
+
+    debug_log.log(
+        "bank",
+        f"withdrawing {quantity}x {slot.get('name')}",
+    )
+
+    # Track whether the clicks actually landed instead of assuming success.
     landed = 0
+
     for _ in range(quantity):
         if controller.click_entity(ctx.ser, slot):
             landed += 1
-        controller.human_delay(0.15, 0.3)
-    clear_bank_search(ctx)
-    if landed == 0:
-        debug_log.log("bank", f"withdrawing {slot.get('name')} failed -- no click landed")
-        return False
-    if landed < quantity:
-        debug_log.log("bank", f"only {landed}/{quantity} withdraw clicks on {slot.get('name')} landed")
-    return True
 
+        controller.human_delay(0.15, 0.3)
+
+    clear_bank_search(ctx)
+
+    if landed == 0:
+        debug_log.log(
+            "bank",
+            f"withdrawing {slot.get('name')} failed -- no click landed",
+        )
+        return False
+
+    if landed < quantity:
+        debug_log.log(
+            "bank",
+            f"only {landed}/{quantity} withdraw clicks on {slot.get('name')} landed",
+        )
+
+    return True
 
 def withdraw_best_food(ctx, quantity: int = 1) -> bool:
     """Auto-pick whichever food is actually in the bank, preferring the highest heal amount,

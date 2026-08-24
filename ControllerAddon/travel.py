@@ -570,7 +570,7 @@ EXACT_TILE_POLL_INTERVAL_S = 0.6   # one game tick -- the soonest the player's o
 EXACT_TILE_TIMEOUT_S = 8.0         # generous for the short, in-render-range hops this is for
 
 
-def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
+def walk_to_exact_tile(ctx, x: int, y: int, plane: int, wait_for_arrival: bool = True) -> bool:
     """Walk to the EXACT world tile (x, y, plane) and wait until standing exactly on it.
 
     Deliberately not walk_to/_hop_to above: those treat landing within WALK_ARRIVAL_TOLERANCE
@@ -598,6 +598,22 @@ def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
       - refresh_target (2026-08-10 user report): the tile doesn't move but its screen projection
         does (camera auto-follow/momentum) during move_to_human's flight time, so the final
         approach re-aims at the tile's live position instead of a pre-click snapshot.
+
+    `wait_for_arrival=False` (added 2026-08-23, user directive) fires the walk and returns as soon
+    as the click is out, so the caller can issue its NEXT click while the player is still moving.
+    That is what a human does: MEASURED across a full hand-played golem carve
+    (recordings/2026-08-23_194302_golem-carving), the human clicked the target object 0.6-1.0s
+    after each walk click, from a tile they had not reached yet, 4 times out of 4 -- and the side
+    that got carved was the tile they were walking TO, not the one they clicked from (confirmed by
+    resolving GOLEM_2_{NORTH,EAST,SOUTH,WEST}_PROGRESS against runelite-api-1.12.36.jar). The game
+    queues the interaction and performs it on arrival, so blocking here buys no correctness -- it
+    is pure added latency, and worse, the block is what turns an over-tight confirmation timeout
+    into an action-destroying re-walk rather than a harmless extra wait. Pair it with a
+    `*_refresh_target` factory plus `refresh_legs` on the following click so the aim is corrected
+    mid-flight against un-cached position reads. See CLAUDE.md's "Sub-tick data and clicking while
+    moving" for the standing preference this implements.
+
+    Default is True, which reproduces every existing caller's behaviour exactly.
     """
     player = controller.get_player()
     if player.get("x") == x and player.get("y") == y and player.get("plane", 0) == plane:
@@ -609,6 +625,8 @@ def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
     controller.key_down(ctx.ser, "SHIFT")
     controller.click_entity(ctx.ser, point, offset=(0, 0), refresh_target=refresh)
     controller.key_up(ctx.ser, "SHIFT")
+    if not wait_for_arrival:
+        return True
     waited = 0.0
     while waited < EXACT_TILE_TIMEOUT_S:
         time.sleep(EXACT_TILE_POLL_INTERVAL_S)

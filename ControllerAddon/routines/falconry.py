@@ -59,6 +59,12 @@ import travel
 KEBBIT_NAME = "Dashing kebbit"
 FALCON_NAME = "Gyr Falcon"
 FALCONER_NAME = "Matthias"
+# Worn in the WEAPON slot (see _leg_fairy_ring's/_unequip_dramen_staff's own comments -- CONFIRMED
+# live, not a hands slot) for as long as an active falcon is out. No "wear" code exists anywhere
+# in this file because none is needed: the game puts it there automatically once Matthias grants a
+# falcon and clears it automatically once the falcon is gone, so checking for it is a direct read
+# of "do we currently have a usable falcon", not something this routine has to maintain itself.
+FALCONER_GLOVE_NAME = "falconer's glove"
 
 BONES_NAME = "Bones"
 FUR_NAME = "Dashing kebbit fur"
@@ -93,9 +99,18 @@ BANK_CHEST_ID = 4483
 FAIRY_RING_ID = 29495
 STILE_ID = 19222
 
+# Used ONLY by _bank_trip's own REGION_FALCONRY dispatch (crossing the stile flips the reported
+# region before the walk home is actually finished -- see that function's own comment) to tell
+# "still finishing the walk home" apart from "genuinely back at the hunting ground, safe to
+# depart again". Deliberately NOT used by _leg_walk_home's own stile-avoidance check, which needs
+# a tighter bound (TILE_STILE's own y) -- CONFIRMED live 2026-08-24 that this 6-tile-wide buffer
+# is far more than crossing the stile actually moves the player, so using it there let the
+# routine climb back and forth over the same stile forever (see that function's own comment).
+SOUTH_OF_STILE_Y = 3615
+
 # Menu options, exactly as they appeared in the recording's menuAction/option fields.
 OPT_CASTLE_WARS = "Castle Wars"
-OPT_KANDARIN_MONASTERY = "Kandarin Monastery"
+OPT_KANDARIN_MONASTERY = "Monastery Teleport"
 OPT_LAST_DESTINATION = "Last-destination"
 OPT_QUICK_FALCON = "Quick-falcon"
 
@@ -210,21 +225,35 @@ def _shift_click(ctx, item) -> bool:
         controller.key_up(ctx.ser, "SHIFT")
 
 
-def _use_teleport(ctx, item_substring: str, option: str) -> bool:
-    """Right-click a teleport item in the INVENTORY and pick its destination by name.
+def _use_teleport(ctx, item_substring: str, option: str, left_click: bool = False) -> bool:
+    """Use a teleport item in the INVENTORY to reach `option`'s destination.
 
     Inventory, not worn: the recorded human used the worn-equipment interface, but a right-click
     menu read back through GET /menu (controller.click_menu_action) is the pattern this codebase
     already has working, and it needs a clickable screen position -- which /equipment does not
     provide for worn items. Keeping the teleports in the inventory avoids the whole problem.
-    See the module docstring's loadout note."""
+    See the module docstring's loadout note.
+
+    left_click, if True, skips the right-click + GET /menu selection entirely and just left-clicks
+    the item -- ADDED 2026-08-24 (user directive) for the ring of dueling's Castle Wars hop: the
+    user has Castle Wars set as that ring's own left-click default action (client-side menu-entry
+    swap, same idea as routines/chinchompa_hunting.py's swapped trap options -- see CLAUDE.md),
+    so drilling into the right-click menu is unnecessary there. `option` is still passed for the
+    debug log message even on this path; it plays no role in what actually gets clicked. Default
+    False (unchanged right-click-menu behavior) for every other teleport until confirmed the same
+    way -- see _leg_bank's ardougne cloak call, which is NOT confirmed to have this swap."""
     item = _first_inventory_item(item_substring)
     if item is None:
         debug_log.log("falconry", f"no {item_substring} in inventory -- cannot teleport")
         return False
 
     debug_log.log("falconry", f"teleporting: {option}")
-    if not controller.click_menu_action(ctx.ser, item, option, check_ui_blockers=False):
+    if left_click:
+        controller.human_delay(0.05, 0.12)
+        ok = controller.click_entity(ctx.ser, item, check_ui_blockers=False, simulate_mistakes=False)
+    else:
+        ok = controller.click_menu_action(ctx.ser, item, option, check_ui_blockers=False)
+    if not ok:
         return False
 
     controller.human_delay(3.0, 3.6)  # teleport animation + region load
@@ -285,7 +314,22 @@ def _hunt(ctx, config, player, region):
         ctx.state.data["banking"] = True
         return
 
-    # 4. Throw at a kebbit.
+    # 4. Make sure we actually have an active falcon before trying to hunt with it -- ADDED
+    #    2026-08-24 (user directive, CORRECTED same day: an NPC lookup for the Gyr Falcon was
+    #    tried first and rejected -- the falcon can be legitimately out of view mid-hunt, e.g.
+    #    off attacking a kebbit, making that check unreliable). The Falconer's glove is what
+    #    Matthias hands over with an active falcon (see FALCONER_GLOVE_NAME's own comment) and
+    #    disappears again once it is gone, so equipment is the direct, unambiguous signal here --
+    #    proactive rather than _throw_falcon's reactive "N failed throws" counter, which only
+    #    notices a missing falcon after several wasted throw attempts against nothing.
+    equipment = controller.get_equipment()
+    weapon = (equipment.get("weapon") or {}).get("name") or ""
+    if FALCONER_GLOVE_NAME not in weapon.lower():
+        debug_log.log("falconry", "no falconer's glove equipped -- hiring a falcon from Matthias")
+        _hire_falcon(ctx)
+        return
+
+    # 5. Throw at a kebbit.
     _throw_falcon(ctx, config)
 
 
@@ -412,7 +456,20 @@ def _wait_until(predicate, timeout_s: float, poll_interval_s: float = 0.1) -> bo
 
 def _bank_trip(ctx, config, region):
     if region == REGION_FALCONRY:
-        _leg_depart(ctx, config)
+        # CONFIRMED live 2026-08-24: climbing the stile flips the reported region to
+        # REGION_FALCONRY before _leg_walk_home's own "south of the fence line" check
+        # (player.y < 3615) goes true and clears "banking" -- so a plain region dispatch here
+        # teleported the character away again (_leg_depart) immediately after crossing the
+        # stile, having never actually finished the walk home. Reusing the exact same y
+        # threshold _leg_walk_home already uses tells the two cases apart: still north of it
+        # means the return walk is not actually done yet (route back into _leg_walk_home, which
+        # clears "banking" itself once travel.walk_to(TILE_HUNT) reports arrival); at or south of
+        # it means we are genuinely back at the hunting ground and it is safe to depart again.
+        player = controller.get_player()
+        if player.get("y", 0) >= SOUTH_OF_STILE_Y:
+            _leg_walk_home(ctx)
+        else:
+            _leg_depart(ctx, config)
     elif region == REGION_CASTLE_WARS:
         _leg_bank(ctx, config)
     elif region in (REGION_MONASTERY, REGION_FAIRY_RING):
@@ -426,7 +483,7 @@ def _bank_trip(ctx, config, region):
 
 
 def _leg_depart(ctx, config):
-    _use_teleport(ctx, RING_OF_DUELING, OPT_CASTLE_WARS)
+    _use_teleport(ctx, RING_OF_DUELING, OPT_CASTLE_WARS, left_click=True)
 
 
 def _leg_bank(ctx, config):
@@ -475,7 +532,7 @@ def _restock_ring_of_dueling(ctx) -> None:
         return
 
     debug_log.log("falconry", "ring of dueling used up -- withdrawing a replacement")
-    if not banker.search_and_withdraw(ctx, "Ring of dueling", 1):
+    if not banker.search_and_withdraw(ctx, "Ring of dueling", 1, contains=True):
         debug_log.log("falconry", "no ring of dueling in the bank")
         ctx.state.trigger_safety_stop("falconry: out of rings of dueling")
 
@@ -516,22 +573,39 @@ def _leg_walk_home(ctx):
         return
 
     player = controller.get_player()
-    if player.get("y", 0) < 3615:
-        # Already south of the stile fence line -- head straight for the hunting ground.
+    if player.get("y", 0) < TILE_STILE["y"]:
+        # CONFIRMED live 2026-08-24: this used to compare against SOUTH_OF_STILE_Y (3615) here
+        # too, a 6-tile-wide buffer below the stile's own position (3621). Climbing only moves
+        # the player a short distance to the other side -- nowhere near enough to clear that
+        # buffer -- so on the very next tick the stile was STILL found within radius=15 (visible
+        # from the south side too) and got clicked again, climbing straight back north. That
+        # repeated forever: climb south, re-click, climb north... except the outer dispatch
+        # (_bank_trip) kept routing back here since y never dropped below 3615 either way.
+        # Comparing against the stile's own y instead means this branch -- which never touches
+        # the stile object again -- is taken on the very first tick after crossing, before there
+        # is ever another chance to re-click it. SOUTH_OF_STILE_Y stays as-is for _bank_trip's
+        # own (coarser, and unaffected by this bug) depart-vs-still-walking-home decision.
         if travel.walk_to(ctx, TILE_HUNT):
             debug_log.log("falconry", "back at the hunting ground")
             ctx.state.data["banking"] = False
         return
 
-    stile = next((o for o in controller.get_objects(radius=15)
-                  if o.get("id") == STILE_ID and o.get("visible", True)), None)
+    # get_object_at (single-entity, uncached), not the bulk get_objects scan -- CORRECTED
+    # 2026-08-24 (user question) to the preferred accessor for a fixed-position object already
+    # known by world tile + id, same idiom as golem_crafting.py's plinth/object clicks. Also
+    # carries refresh_target so the click stays aimed at the stile's live screen position even if
+    # the camera drifts between resolving it and the click landing.
+    stile = controller.get_object_at(TILE_STILE["x"], TILE_STILE["y"], TILE_STILE["plane"],
+                                      STILE_ID, radius=15)
     if stile is None:
         debug_log.log("falconry", "walking to the stile")
         travel.walk_to(ctx, TILE_STILE)
         return
 
     debug_log.log("falconry", "climbing over the stile")
-    if controller.click_entity(ctx.ser, stile):
+    refresh_target = controller.object_refresh_target(
+        TILE_STILE["x"], TILE_STILE["y"], TILE_STILE["plane"], STILE_ID, radius=15)
+    if controller.click_entity(ctx.ser, stile, refresh_target=refresh_target):
         controller.human_delay(2.0, 3.0)
 
 

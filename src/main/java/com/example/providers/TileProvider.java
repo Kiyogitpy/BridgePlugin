@@ -28,11 +28,65 @@ public class TileProvider extends BridgeProvider
 	public void register()
 	{
 		server.registerQuery("/tiles", query -> getTiles(isFresh(query)));
+		server.registerQuery("/tile/at", query -> onClient(() -> getTileAt(query)));
 	}
 
 	private Object getTiles(boolean fresh)
 	{
 		return cache.get(tickClock.get(), fresh, null, () -> (List<Map<String, Object>>) onClient(this::computeTiles));
+	}
+
+	/**
+	 * Exact lookup by world tile position (uncached, unlike the bulk /tiles) -- the tile
+	 * equivalent of ObjectProvider's getObjectAt/GroundItemProvider's getGroundItemAt, for
+	 * re-checking one specific tile's walkability/state without a caller re-scanning the whole
+	 * plane every poll. Filters computeTiles()'s own already-computed list rather than converting
+	 * the caller's (x, y, plane) back into a LocalPoint and indexing the scene array directly --
+	 * same reasoning as ObjectProvider's getObjectAt: that reverse conversion is the exact class
+	 * of instance-template bug already found for PlayerProvider/NPCProvider/ObjectProvider/
+	 * GroundItemProvider (see CLAUDE.md's "Instanced areas break forward world-coordinate
+	 * conversion"). Inherits /tiles' own existing limitation of only covering client.getPlane() --
+	 * a lookup for a different plane always misses, same as the bulk endpoint already would.
+	 */
+	private Object getTileAt(Map<String, String> query)
+	{
+		Map<String, Object> notFound = new HashMap<>();
+		notFound.put("found", false);
+
+		Integer x = parseIntParam(query.get("x"));
+		Integer y = parseIntParam(query.get("y"));
+		Integer plane = parseIntParam(query.get("plane"));
+		if (x == null || y == null || plane == null)
+		{
+			return notFound;
+		}
+
+		for (Map<String, Object> tile : computeTiles())
+		{
+			if (x.equals(tile.get("x")) && y.equals(tile.get("y")) && plane.equals(tile.get("plane")))
+			{
+				Map<String, Object> found = new HashMap<>(tile);
+				found.put("found", true);
+				return found;
+			}
+		}
+		return notFound;
+	}
+
+	private Integer parseIntParam(String s)
+	{
+		if (s == null || s.isEmpty())
+		{
+			return null;
+		}
+		try
+		{
+			return Integer.parseInt(s);
+		}
+		catch (NumberFormatException e)
+		{
+			return null;
+		}
 	}
 
 	private List<Map<String, Object>> computeTiles()

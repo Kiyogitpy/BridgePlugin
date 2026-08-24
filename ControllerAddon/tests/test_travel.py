@@ -332,3 +332,75 @@ def test_request_shortest_path_without_config_sends_no_cfg_params(monkeypatch):
     controller.request_shortest_path(3200, 3200, 0)
 
     assert not [k for k in seen if k.startswith("cfg.")]
+
+
+# --- walk_to_exact_tile's non-blocking mode (2026-08-23) -----------------------------
+#
+# Added so a routine can click its target while still walking, which is what a human does --
+# MEASURED at 0.6-1.0s between the walk click and the object click, four times out of four, in
+# recordings/2026-08-23_194302_golem-carving. Blocking for exact arrival first is safe but
+# structurally slower than a human, and the block is what makes an over-tight confirmation
+# timeout destructive rather than merely slow. See CLAUDE.md's "Sub-tick data and clicking while
+# moving".
+
+
+def _stub_walk_click(monkeypatch, player_tile, arrival_tile=None):
+    """Stubs the bridge/serial calls walk_to_exact_tile makes. Returns the get_player call log;
+    `arrival_tile` (if given) is what get_player reports from the 2nd call on, simulating arrival."""
+    calls = []
+    seq = {"n": 0}
+
+    def fake_get_player():
+        seq["n"] += 1
+        calls.append(seq["n"])
+        if arrival_tile is not None and seq["n"] > 1:
+            return dict(arrival_tile)
+        return dict(player_tile)
+
+    monkeypatch.setattr(controller, "get_player", fake_get_player)
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p: {"onScreen": True, "screenX": 100, "screenY": 100})
+    monkeypatch.setattr(controller, "get_ground_walk_screen_pos", lambda x, y, p: (100, 100))
+    monkeypatch.setattr(controller, "key_down", lambda ser, k: None)
+    monkeypatch.setattr(controller, "key_up", lambda ser, k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    monkeypatch.setattr(travel.time, "sleep",
+                        lambda d: pytest.fail(f"non-blocking walk must not sleep (slept {d}s)"))
+    return calls
+
+
+class _Ctx:
+    """Minimal stand-in for controller.Context -- walk_to_exact_tile only ever reads ctx.ser."""
+    ser = None
+
+
+def test_walk_to_exact_tile_can_fire_and_forget_without_waiting_for_arrival(monkeypatch):
+    """The whole point: return as soon as the click is out, so the caller can issue its target
+    click while the player is still walking."""
+    calls = _stub_walk_click(monkeypatch, {"x": 10, "y": 10, "plane": 0})
+
+    assert travel.walk_to_exact_tile(_Ctx(), 12, 12, 0, wait_for_arrival=False) is True
+    assert len(calls) == 1, \
+        "only the already-standing-there pre-check may read the player; no arrival poll"
+
+
+def test_the_non_blocking_walk_still_early_outs_when_already_standing_there(monkeypatch):
+    """The pre-check is the one get_player read that must survive -- clicking a walk to the tile
+    you are already on is wasted motion whether or not the caller intends to block."""
+    clicks = []
+    _stub_walk_click(monkeypatch, {"x": 12, "y": 12, "plane": 0})
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: clicks.append(e) or True)
+
+    assert travel.walk_to_exact_tile(None, 12, 12, 0, wait_for_arrival=False) is True
+    assert clicks == [], "no click may go out when the player is already on the target tile"
+
+
+def test_the_non_blocking_walk_still_reports_an_unprojectable_tile(monkeypatch):
+    """False still means "can't be clicked at all", which is what the caller's miss counter and
+    hop-closer fallback key off -- that contract must not change with the new mode."""
+    _stub_walk_click(monkeypatch, {"x": 10, "y": 10, "plane": 0})
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p: {"onScreen": False})
+
+    assert travel.walk_to_exact_tile(None, 12, 12, 0, wait_for_arrival=False) is False

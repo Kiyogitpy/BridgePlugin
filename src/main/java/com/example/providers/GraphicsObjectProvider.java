@@ -35,11 +35,71 @@ public class GraphicsObjectProvider extends BridgeProvider
 	public void register()
 	{
 		server.registerQuery("/graphics-objects", query -> getGraphicsObjects(isFresh(query)));
+		server.registerQuery("/graphics-object/at", query -> onClient(() -> getGraphicsObjectAt(query)));
 	}
 
 	private Object getGraphicsObjects(boolean fresh)
 	{
 		return cache.get(tickClock.get(), fresh, null, () -> (List<Map<String, Object>>) onClient(this::computeGraphicsObjects));
+	}
+
+	/**
+	 * Exact lookup by tile position + graphics-object id (uncached, unlike the bulk
+	 * /graphics-objects) -- the graphics-object equivalent of ObjectProvider's getObjectAt, for a
+	 * routine re-checking a specific timing cue (e.g. Mastering Mixology's Agitator/Alembic flash
+	 * -- routines/mastering_mixology.py's AGITATOR_CUE_GRAPHICS_ID/ALEMBIC_CUE_GRAPHICS_ID)
+	 * without scanning the whole bulk list every poll.
+	 *
+	 * NOTE: unlike ObjectProvider/GroundItemProvider/NPCProvider/PlayerProvider, this provider
+	 * does NOT apply WorldPoint.fromLocalInstance() (see computeGraphicsObjects' plain
+	 * WorldPoint.fromLocal call) -- it inherits whatever coordinate correctness the bulk
+	 * /graphics-objects endpoint already has, which is UNVERIFIED inside an instance (see
+	 * CLAUDE.md's "Instanced areas break forward world-coordinate conversion": assume the same
+	 * gap until checked, same as every other provider not in the four already fixed). Filters
+	 * computeGraphicsObjects()' own list rather than a fresh reverse lookup, same reasoning as
+	 * ObjectProvider's getObjectAt.
+	 */
+	private Object getGraphicsObjectAt(Map<String, String> query)
+	{
+		Map<String, Object> notFound = new HashMap<>();
+		notFound.put("found", false);
+
+		Integer x = parseIntParam(query.get("x"));
+		Integer y = parseIntParam(query.get("y"));
+		Integer plane = parseIntParam(query.get("plane"));
+		Integer id = parseIntParam(query.get("id"));
+		if (x == null || y == null || plane == null || id == null)
+		{
+			return notFound;
+		}
+
+		for (Map<String, Object> obj : computeGraphicsObjects())
+		{
+			if (id.equals(obj.get("id")) && x.equals(obj.get("x")) && y.equals(obj.get("y"))
+				&& plane.equals(obj.get("plane")))
+			{
+				Map<String, Object> found = new HashMap<>(obj);
+				found.put("found", true);
+				return found;
+			}
+		}
+		return notFound;
+	}
+
+	private Integer parseIntParam(String s)
+	{
+		if (s == null || s.isEmpty())
+		{
+			return null;
+		}
+		try
+		{
+			return Integer.parseInt(s);
+		}
+		catch (NumberFormatException e)
+		{
+			return null;
+		}
 	}
 
 	private List<Map<String, Object>> computeGraphicsObjects()

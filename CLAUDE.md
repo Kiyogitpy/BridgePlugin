@@ -309,6 +309,50 @@ break forward world-coordinate conversion" above for why both are implemented by
 already-corrected bulk `/objects`/`/ground-items` lists rather than a fresh forward lookup) for
 ready-made `refresh_target` factories instead of hand-writing the lambda at each call site.
 
+**`click_menu_action` has NO `refresh_target`, so never hand it a position resolved before a
+walk.** Added 2026-08-23 after breaking it live. The bare-click path hides stale coordinates
+because `click_entity` re-aims mid-flight from an un-cached endpoint; the menu path has no such
+parameter, so it right-clicks exactly the pixel you give it. Escalating a hijacked plinth click to
+`click_menu_action` using the object from the `/objects` list fetched at the top of the tick — i.e.
+before the player walked — produced a menu of pure ground options (`['Cancel', 'Mark Safespot',
+'Examine', 'Walk here']`): a right-click on bare tile, with the object never involved. Re-resolve
+through `get_object_at`/`get_npc_by_index` immediately before calling it. Also pass `offset=(0, 0)`
+for a small target: the default `(-7, +7)` nudge is by itself enough to slide off a plinth.
+
+**This is the PREFERRED pattern for every new click site — reach for it before
+`wait_until_player_idle()`.** Stated as a standing directive 2026-08-23 (user): a single-entity
+accessor is not tick-limited, so a click can be aimed while the player is still walking, and that
+is what closes the gap to human speed. The shape is:
+
+1. Fire the walk **without waiting for arrival** (no blocking exact-arrival poll).
+2. Issue the target click a beat later, passing a `*_refresh_target` factory **and**
+   `refresh_legs` — the un-cached endpoint behind the factory re-resolves the target's live screen
+   position at each leg, so the aim stays correct even though the player (and camera) moved after
+   the click was decided.
+3. Confirm the outcome on a pushed/un-gated signal (XP_GAINED, a varbit, a state endpoint), not
+   on a fixed sleep.
+
+**Measured against a human, 2026-08-23** (`recordings/2026-08-23_194302_golem-carving.*`, captured
+via `recorder.py` — see "Recording a human session" above): a human clicks the target object
+**0.6–1.0s after the walk click**, from a tile they have not reached yet, four times out of four,
+and every one of those interactions resolved correctly — the game queues the interaction and
+performs it on arrival. Waiting for stillness first is therefore not a correctness requirement,
+it is pure latency we were adding on top of the game's own cadence.
+
+The legacy pattern — `walk_to_exact_tile`/`wait_until_player_idle()` blocking until the player has
+fully stopped, then resolving a screen position once — is *safe* but structurally slower than a
+human, and its blocking walk is what makes an over-tight confirmation timeout destructive rather
+than merely slow (a timeout re-walks and interrupts the action that had genuinely started; see
+`routines/golem_crafting.py`'s craft_phase notes). Prefer the accessor + `refresh_legs` path for
+anything new; leave existing blocking call sites alone unless their throughput is actually a
+problem.
+
+Note the endpoints for this already exist and are already un-cached — `/object/at`,
+`/ground-item/at`, `/npc/by-index`, `/npc/nearest`, `/player`, `/combat` — so adopting this
+needs **no Java change and no client rebuild**, only the Python call site. Check whether the
+accessor you need is already there before proposing a new provider.
+
+
 **XP gain is another sub-tick, general-purpose signal — not specific to any one routine.** Added
 2026-08-17 (user directive, generalized from `pyramid_plunder.py`'s tomb-door confirmation):
 `client.getSkillExperience(Skill.X)` reflects the moment the client's own `StatChanged` event
@@ -529,6 +573,138 @@ cores/fur, loots gems, and cycles bank ↔ mine ↔ craft on its own. Several ot
 (`slayer.py`, `mining.py`, `blast_furnace.py`, etc.) exist and were not touched this session —
 don't assume they share golem_crafting.py's specific fixes (sticky targeting, inventory-change
 reclick gates, etc.) unless verified.
+
+**craft_phase was rebuilt 2026-08-23 from a hand-played recording** (`recordings/2026-08-23_
+194302_golem-carving`) after it failed live, and everything below is MEASURED — do not re-derive
+it by reasoning:
+
+- **One side takes ~11.8s** (11.9/11.9/11.7/11.7 across four sides). The first `progress` bump
+  lands **+2.1s** after the click even from a tile you already stand on; bumps then arrive every
+  ~2.4s (values 2→4→6→8) and the side completes with the chat line "You finish crafting the golem
+  from this angle." `GOLEM_SIDE_TIMEOUT_S` was **4.0s** — under half the action it was timing.
+- **A timeout here is destructive, not merely slow.** `carve_plan` re-picks a side from the
+  player's new position on the next tick and walks away, interrupting a carve that had genuinely
+  started and resetting its progress to 0. That is why the old value produced an unbroken retry
+  loop rather than just a sluggish routine. Because `_await_side_done` resets its deadline on
+  every progress bump, a real carve can never reach the timeout — **every timeout is a click that
+  produced zero progress**, never a slow carve. Useful when reading logs.
+- **The side carved is the tile you walked TO, not the tile you clicked from** — confirmed 3/3 by
+  resolving `GOLEM_2_{NORTH,EAST,SOUTH,WEST}_PROGRESS` against `runelite-api-1.12.36.jar` and
+  matching each against the walk destination in flight. The game queues the interaction and
+  performs it on arrival, which is what makes clicking mid-walk safe. The human clicks the object
+  **0.6-1.0s** after the walk click, never waiting to arrive.
+- **A bare left-click on the plinth gets hijacked by whatever is on top of the aim pixel.**
+  CONFIRMED live with the recorder running alongside the routine: a failing click was logged as
+  `Walk here -> DoveHorn (level-115)` instead of `Shape-golem`. Roughly **30-40% of carve attempts
+  fail this way** in a populated world. `/last-action` reports what a click actually resolved to,
+  so a wrong action is provable in ~1.5s instead of inferred after the timeout.
+- **The fast retry is capped at ONE per side, and the cap is load-bearing.** Retrying immediately
+  re-clicks essentially the same pixel; the routine locked into a 20-attempt loop clicking
+  (1093,766) while the clickbox centre sat at (1100,759), on a tile that had carved fine three
+  minutes earlier. The old timeout wait was **accidentally load-bearing** — it let the camera and
+  the world drift so each retry aimed slightly differently. A second consecutive hijack therefore
+  falls through to the full wait on purpose. Never "optimize" that budget upward.
+- **The hijacks are OTHER PLAYERS CAMPED ON THE SIDE TILES, and the aim was never wrong.**
+  RESOLVED 2026-08-23 by dumping a frame (`GET /screenshot`) and marking the reported clickbox
+  centre on it: the crosshair sits correctly on the plinth, but other players' models are drawn
+  over it. `GET /players` at the same moment had `DoveHorn` standing on the south plinth's exact
+  east tile — the same player, camped there for 30+ minutes of logs — and `M0T1S` beside the
+  north plinth. Measured failure rate by side over 110 attempts: **east 67%, west 53%, south 12%,
+  north 8%** (48% overall). The east/west skew is simply where those particular players were
+  standing; it is not geometry, and a future run with a different crowd will skew differently.
+  This also explains the 20-attempt lockup — a parked player never moves, so the geometry the
+  retry depends on never drifts.
+  **The fix is to stop relying on the default left-click action**: `click_menu_action` (right-click,
+  read `/menu`, pick "Start-golem"/"Shape-golem"/"Insert-core" by name) is immune to whatever is
+  drawn on top, which is exactly why `chinchompa_hunting.py`'s `recover_dropped_trap` uses it for
+  ground items on tiles chinchompas wander across — see that routine's note on the asymmetry
+  between a bare click and a menu selection. NOT yet implemented; the retry path above is only a
+  mitigation.
+- **The click escalation is now three tiers, and each tier exists for a different failure.**
+  (1) bare left-click with `refresh_target`+`refresh_legs` — fast, human-looking, and what works
+  when nothing is in the way; (2) ONE fast retry when `/last-action` proves the click resolved
+  wrongly; (3) `click_menu_action` picking the option by name, which is the only tier that beats a
+  player standing on the pixel. Tier 3 was added after the routine HALTED live 2026-08-23 21:04 —
+  five consecutive failures on the south plinth's east side, safety-stopped and down until
+  restarted, because a player was stacked on our own tile and no amount of waiting made them move.
+  VERIFIED live: bare click hijacked -> fast retry hijacked -> menu selection landed and the carve
+  proceeded, with zero menu misses once tier 3 re-resolved its position (see the
+  `click_menu_action` gotcha above for the mistake that cost a deploy).
+- **Known limitation in that mitigation: `gc_side_hijacks` is not keyed per side.** It only resets
+  on a click that was NOT hijacked, so once any side hijacks, the next side's FIRST hijack already
+  reads as "again" and skips its own fast retry — observed live 2026-08-23 20:50:44, where the
+  west side's first attempt fell straight through to the full wait. This is safe (it errs toward
+  the slow, proven path) and merely leaves value unclaimed: in practice the fast path helps about
+  the first hijack after each success rather than one per side. The fix is to key the counter by
+  side, or clear it when the planned side changes — deliberately not done unsupervised, since the
+  budget cap is the thing standing between this and the 20-click spin it replaced.
+- **A Goat Pit fur run legitimately stops golem production for ~15 minutes.** MEASURED
+  2026-08-23 22:23-22:38: bank fur exhausted -> `hunt_phase` -> 166 Telekinetic Grab casts before
+  "pit is now filled with goats -- harvesting", then a 46-tile Shortest Path walk back to the
+  mine. Nothing is wrong during that window and the routine recovers on its own. Worth knowing
+  before diagnosing a "stall": any watchdog keyed on golems-per-hour needs a threshold above this,
+  or it fires every time fur runs out. A log that stops GROWING is the unambiguous stuck signal;
+  golem count alone is not.
+- **`Insert-core` needs the SAME escalation as a carve — fixing only the carve moves the failure
+  here.** LIVE HALT 2026-08-24 02:17: with carving fixed, the identical hijack relocated to the
+  one unprotected click on the same object. Signature: click positions alternating between two
+  values across five attempts (the click resolves to "Walk here", the player moves, the next tick
+  walks back). It strands a WHOLE golem — all four sides carved, progress 5, only the last step
+  failing. Now escalates the same way, VERIFIED live 02:39 completing a golem that would have
+  stranded.
+- **ROOT CAUSE of every "starting golem ... never registered" halt: NO FUR. `Start-golem` is not
+  offered at all when you are out of fur** — identified by the user 2026-08-24 after seven of my
+  hypotheses had died. Everything fits: fur is inventory-wide so BOTH plinths refuse at once; the
+  game gives no rejection message so the option is simply ABSENT from the right-click menu
+  (`['Cancel','Mark Safespot','Examine','Walk here']` every time); it strikes only at progress 0
+  because a part-carved golem can still be Shape-golem'd without fur; and a restart appears to fix
+  it only because restarting forces a bank trip that refills fur. CONFIRMED on the fix's first
+  deploy: the bank held **15 Wyrmscraig goat fur** while the routine carried none.
+  Two things conspired. `has_start_materials` checks sunstone and cores and **never fur**. And
+  `gc_fur_stock` is a local estimate this file's own comments already warned "can read >0 while
+  the pouch is genuinely empty" — its one authoritative correction, `GOLEM_CHAT_NOT_ENOUGH_FUR`,
+  only ever fires on **Insert-core**, so nothing catches an out-of-fur condition at the start
+  step. craft_phase now treats a start refusal WITH sunstone and cores in hand as exactly that:
+  zero the stale estimate and go to bank_phase (which restocks, and falls through to hunt_phase
+  when the bank is empty too).
+  **Lesson: when the game silently declines to OFFER an action, the missing ingredient is one the
+  precondition check does not cover.** Read the full recipe before theorising about clicks — the
+  absent menu entry was saying "you cannot do this", not "you missed".
+- **Start-step failures: what was RULED OUT before the cause was found, so nobody re-derives it.** Three halts at
+  "starting golem", progress 0 (21:04, 22:04, 02:00, 02:27, 02:34). Each of these was killed by
+  measurement, not reasoning:
+  - *Bad aim point* — NO. A frame dump with the reported centre marked shows the crosshair sitting
+    squarely on the plinth (an Empty plinth renders as a dark hexagonal socket; it is easy to
+    mistake for bare ground at low zoom).
+  - *Missing materials* — NO. 15 Sunstone + 4 cores present at the time of failure.
+  - *Another player occupying the plinth* — NO. `/players` showed nobody adjacent.
+  - *Wrong start side* — NO. East and west failed identically, so `choose_start_side`'s new
+    `avoid` set (added the same night) does not address it.
+  The one condition every failure shared: **inventory at 28/28**. Unproven as a cause. Pit spikes
+  are now shed before both mining and crafting (`_shed_pit_junk`), which is justified on budget
+  grounds anyway — leftovers were also capping mining at 15 sunstone against the 20 budget. If a
+  halt recurs on a NON-full inventory, that hypothesis is dead too and the next place to look is
+  ObjectProvider's clickbox reporting or an unidentified Start-golem precondition.
+- **One specific tile, (2597, 2257), intermittently fails to project — the north plinth's EAST
+  approach tile.** MEASURED 2026-08-24 over a 2.5h run: **10 of 10** `couldn't walk to ...` walk
+  failures were on that tile and no other, across four separate occurrences (03:37, 04:01, 05:30,
+  06:09). `walk_to_exact_tile` returns False only when `get_ground_walk_point` reports the tile
+  not on screen — yet checking `/ground/walk` for that exact tile seconds after one failure
+  reported `onScreen:true` at (1150,621). So it is transient and tile-specific, not camera-wide.
+  Survivable today (the approach back-off switches to the other plinth and production continues),
+  but it is the cleanest remaining lead in this routine: something about that one tile's
+  projection fails while its three neighbours never do. Start at `get_ground_walk_point` /
+  `CombatProvider`'s `/ground/walk`, not at the routine.
+- **Process note worth heeding: six fixes were made to what looked like one problem, and each
+  relocated the failure instead of removing it** (carve timeout -> hijack retry -> retry guard ->
+  menu escalation -> stale aim -> stillness -> menu-miss degrade -> side avoidance -> insert
+  escalation). That pattern is the signal to stop patching and question the model. Every tier
+  built re-aims at the SAME pixel `/object/at` reports, so when that pixel is unusable, all tiers
+  fail identically — better retries cannot fix a bad target.
+- Insert-core was observed succeeding from the **west** tile while `/golem` reports the south
+  plinth's `insertSide` as `north` (core consumed 0.3s after the click, too fast to have walked).
+  Either the insert side is not a standing requirement or `insertSide` means something else. Not
+  resolved.
 
 ## Current state of routines/chinchompa_hunting.py
 
