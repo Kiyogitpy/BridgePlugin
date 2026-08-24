@@ -20,6 +20,13 @@ import settings
 import travel
 
 
+# Re-aim checkpoints for an engage click. MEASURED 2026-08-24 with bench_hover.py against a moving
+# NPC: refresh_legs=3 recovered ~74% of the target's in-flight drift for a 613ms flight, while
+# refresh_legs=6 cost 1140ms for no measurable accuracy gain -- 3 is the sweet spot and fits
+# inside a human's own measured 0.6-1.0s click-after-walk budget. Only the v1 engine uses this;
+# the v2 engine (human_move.py) re-aims at its own submovement boundaries and ignores it.
+ENGAGE_REFRESH_LEGS = 3
+
 # GET /slayer-config already includes the master switch (SlayerConfigProvider reads it off
 # ControllerConfig too) alongside every slayer-specific setting -- bridge_config (GET /config)
 # isn't needed here.
@@ -749,10 +756,16 @@ def maybe_loot(ctx):
                     debug_log.log("combat", f"re-engaging {target_npc.get('name')} "
                                              f"(index={current_target_index}) after loot pickup")
                     controller.human_delay(0.15, 0.6)
+                    # Same uncached re-resolve as the fresh-engage path below -- target_npc came
+                    # from the TickCache-gated get_npcs(), so its screen position is stale.
+                    fresh_npc = controller.get_npc_by_index(current_target_index)
+                    if fresh_npc is not None and fresh_npc.get("screenX") is not None:
+                        target_npc = fresh_npc
                     if controller.click_entity(
                         ctx.ser,
                         target_npc,
-                        refresh_target=lambda: controller.get_npc_screen_pos_by_index(current_target_index),
+                        refresh_target=controller.npc_index_refresh_target(current_target_index),
+                        refresh_legs=ENGAGE_REFRESH_LEGS,
                     ):
                         ctx.state.data["engage_committed_at"] = time.time()
                         ctx.state.data["engage_last_pos"] = None
@@ -835,11 +848,22 @@ def maybe_loot(ctx):
                 # this matters here specifically and didn't for click_entity elsewhere. Fetching
                 # fresh right before the click -- after the delay instead of before it -- turns
                 # that same delay into a camera-settle window instead of working against it.
-                fresh_items = controller.get_ground_items()
-                click_target = next(
-                    (i for i in fresh_items if (i.get("id"), i.get("x"), i.get("y")) == key),
-                    item,
+                # CORRECTED 2026-08-24: this re-fetched via controller.get_ground_items(), which
+                # is TickCache-gated -- so "fresh" was only ever fresh to the current game tick,
+                # up to 600ms old, which is precisely the staleness the comment above sets out to
+                # avoid. get_ground_item_at hits /ground-item/at instead: an uncached
+                # single-entity lookup, and exactly what get_ground_items' own docstring tells
+                # callers to prefer once they know the tile and id (which `key` is).
+                #
+                # This matters more here than for an NPC click: click_menu_action has NO
+                # refresh_target parameter (see CLAUDE.md), so it right-clicks precisely the pixel
+                # it is handed. Re-resolving immediately beforehand is the only correction
+                # available. Symptom when it is stale, seen live: "No 'take' entry in menu ...
+                # ['Cancel', 'Mark Safespot', 'Walk here']" -- a right-click on bare ground.
+                fresh_item = controller.get_ground_item_at(
+                    key[1], key[2], item.get("plane", 0), key[0]
                 )
+                click_target = fresh_item if fresh_item is not None else item
                 # Right-click + explicit "Take" menu selection, not a plain left click_entity --
                 # a ground item can share its click point with an NPC (very common mid-fight, an
                 # enemy dies right on top of its own drop, or a new one walks over it), and
@@ -999,10 +1023,21 @@ def engage_target(ctx, combat: dict):
                              f"(id={target['id']}, index={target['index']}, dist={target.get('distance')})")
     controller.human_delay(0.15, 0.6)
     target_index = target["index"]
+    # Re-resolve from the UNCACHED single-entity endpoint immediately before clicking.
+    # pick_target chose from controller.get_npcs(), which is TickCache-gated, so its
+    # screenX/screenY can be a full game tick (600ms) stale -- and these monsters move. Identified
+    # 2026-08-24 while chasing a live "still a lot of misses" report: the cursor was landing
+    # within 1px of the coordinate it was given, so the coordinate itself was the problem.
+    # /npc/by-index is not cached (CLAUDE.md, "Sub-tick data and clicking while moving"), so this
+    # costs one round trip and removes the staleness the click was inheriting.
+    fresh = controller.get_npc_by_index(target_index)
+    if fresh is not None and fresh.get("screenX") is not None:
+        target = fresh
     if controller.click_entity(
         ctx.ser,
         target,
-        refresh_target=lambda: controller.get_npc_screen_pos_by_index(target_index),
+        refresh_target=controller.npc_index_refresh_target(target_index),
+        refresh_legs=ENGAGE_REFRESH_LEGS,
     ):
         ctx.state.data["current_target_index"] = target_index
         ctx.state.data["engage_committed_at"] = time.time()

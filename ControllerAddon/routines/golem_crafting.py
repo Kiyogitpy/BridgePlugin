@@ -60,6 +60,7 @@
 # Run with:
 #     python controller.py routines/golem_crafting.py
 
+import math
 import time
 
 import banker
@@ -114,6 +115,23 @@ CRAFTING_LEVEL_REQUIRED = 60
 # rock once the current one is no longer the closest match returned (i.e. genuinely depleted or
 # out of range), never proactively mid-approach -- the switching itself was the bug, not the
 # existence of multiple rock spots.
+#
+# CONFIRMED 2026-08-24 (user's own play, two recorded sessions + user directive): Sunstone's
+# in-game "momentum" mechanic means mining speed itself depends on click cadence -- a human who
+# reclicks within the same ~1.5-2s window the swing actually resolves in stays fast (occasional
+# bonus-ore procs, "Your momentum allows you to break off another chunk of sunstone."); any
+# hesitation between swings costs real momentum, not just wall-clock time. The routine's own
+# recorded cadence was measured at roughly 2x the human's (~3.5-4s/rock vs ~1.6s/rock) even
+# though find_mining_target always had a target ready -- so the lost time was overwhelmingly
+# click_entity's OWN move-then-click travel, paid AFTER the swing was already confirmed done,
+# not detection latency. The user's own technique, confirmed against the recordings: stand where
+# 4 "sunstone rocks" tiles are all in reach (this spot's 4 respawn in a fixed, deterministic
+# ~3-tick round-robin -- see recordings/2026-08-24_154518_golem-mining2-and-chisel.jsonl's
+# objspawn sequence), and pre-hover the mouse on the NEXT ready rock while the current swing is
+# still resolving, so only a click -- not a move-then-click -- has to fire once confirmation
+# arrives. See mine_phase's own pre-hover step below, built on the existing
+# controller.hover_entity primitive (already used this exact way by
+# routines/mastering_mixology.py's speedup functions).
 MINING_TARGET_NAMES = ("sunstone rocks",)
 
 # CONFIRMED LIVE 2026-08-08 (MCP debug session): exact inventory item names for the raw ore, the
@@ -279,13 +297,43 @@ def can_end_on_insert(start: str, insert_side: str) -> bool:
     return side_order(start, insert_side)[-1] == insert_side
 
 
-def choose_start_side(station: dict, player_x: int, player_y: int) -> str:
-    """Whichever valid start side (east/west, see can_end_on_insert) is nearer to the player.
+# Consecutive failures on one plinth's start side before preferring the other one. Two, not one:
+# a single failure is ordinary (a deliberate misclick, a player wandering through the aim point),
+# and switching on every miss would just thrash between the two sides.
+SIDE_AVOID_THRESHOLD = 2
+
+
+def _sides_to_avoid(fail_counts: dict, station_name: str) -> set:
+    """Sides of `station_name` that have failed enough times in a row to be worth stepping away
+    from. Keyed per plinth: the two have independent geometry, so a bad angle on one says nothing
+    about the other."""
+    prefix = f"{station_name}:"
+    return {key[len(prefix):] for key, count in (fail_counts or {}).items()
+            if key.startswith(prefix) and count >= SIDE_AVOID_THRESHOLD}
+
+
+def choose_start_side(station: dict, player_x: int, player_y: int, avoid=()) -> str:
+    """Whichever valid start side (east/west, see can_end_on_insert) is nearer to the player,
+    preferring one not in `avoid`.
 
     Both produce a correct four-side order, so the choice is free -- making it adaptive is what
     keeps plinth alternation cheap: arriving from the other plinth, carving begins on the near
-    side instead of walking around the golem first."""
+    side instead of walking around the golem first.
+
+    `avoid` added 2026-08-24 after THREE live halts with one shape: "starting golem from east side
+    of south plinth" at progress 0, five failures, safety stop (21:04, 22:04, 02:00). Frozen at the
+    third: our player on the east tile, /object/at reporting the plinth clickable:true with a
+    clickbox at screen (1158,771), and a right-click there returning only ground options
+    (['Cancel','Mark Safespot','Examine','Walk here']). The reported clickbox CENTRE is simply not
+    on the clickable shape from that angle, so every tier of the escalation chain re-aims at the
+    same unusable pixel. No retry strategy fixes a bad aim point -- standing somewhere else does,
+    and on a fresh golem this choice is free. Never returns None: if both sides are avoided,
+    carving from a bad one still beats not carving, and the ordinary miss limits stay the
+    backstop."""
     candidates = [s for s in SIDES if can_end_on_insert(s, station["insertSide"])]
+    preferred = [s for s in candidates if s not in avoid]
+    if preferred:
+        candidates = preferred
     return min(
         candidates,
         key=lambda s: max(
@@ -295,7 +343,7 @@ def choose_start_side(station: dict, player_x: int, player_y: int) -> str:
     )
 
 
-def carve_plan(station: dict, player_x: int, player_y: int) -> list:
+def carve_plan(station: dict, player_x: int, player_y: int, avoid=()) -> list:
     """The sides still needing carving, in the order to carve them.
 
     Reading `done` from the varbits is what makes a resumed run correct for free: whatever the
@@ -303,11 +351,50 @@ def carve_plan(station: dict, player_x: int, player_y: int) -> list:
     restart. On a resumed golem whose insert side is already carved the plan will NOT end on the
     insert side -- that is legal, and craft_phase walks there afterwards. Ending on the insert
     side is a best-effort saving on fresh golems, never a correctness requirement."""
-    order = side_order(choose_start_side(station, player_x, player_y), station["insertSide"])
+    order = side_order(choose_start_side(station, player_x, player_y, avoid=avoid),
+                       station["insertSide"])
     return [side for side in order if not station["sides"][side]["done"]]
 
 
-def choose_station(stations: list, last_station, player_x: int, player_y: int):
+# How long to leave a plinth alone after it refuses to start a golem, and how many consecutive
+# back-offs (with no golem completing in between) before treating it as a real anomaly. SEVEN
+# hypotheses for that refusal were killed by measurement -- see CLAUDE.md's "what has been RULED
+# OUT" -- so the cause is unknown, but every occurrence recovered on a plain restart, which means
+# it is transient. Backing off lets the routine discover that on its own instead of ending an
+# unattended session; the limit stops the back-off becoming its own infinite mine<->craft loop.
+STATION_BLOCK_S = 150.0
+STATION_BLOCK_LIMIT = 6
+
+
+def _block_station(ctx, station: dict) -> None:
+    """Mark a plinth unusable for STATION_BLOCK_S and send the routine off to mine meanwhile.
+    Safety-stops only if this keeps happening with nothing completing in between."""
+    blocked = dict(ctx.state.data.get("gc_blocked_stations") or {})
+    blocked[station["name"]] = time.time() + STATION_BLOCK_S
+    ctx.state.data["gc_blocked_stations"] = blocked
+    ctx.state.data["gc_side_misses"] = 0
+    ctx.state.data["gc_phase"] = "mine"
+    streak = ctx.state.data.get("gc_block_streak", 0) + 1
+    ctx.state.data["gc_block_streak"] = streak
+    debug_log.log(
+        "golem crafting",
+        f"{station['name']} plinth refused to start a golem -- backing off for "
+        f"{STATION_BLOCK_S:.0f}s and mining meanwhile ({streak}/{STATION_BLOCK_LIMIT})",
+    )
+    if streak >= STATION_BLOCK_LIMIT:
+        ctx.state.trigger_safety_stop(
+            f"both plinths refused to start a golem {STATION_BLOCK_LIMIT} times in a row with "
+            f"nothing completing in between; station state: {station}"
+        )
+
+
+def _blocked_station_names(ctx) -> set:
+    now = time.time()
+    return {name for name, until in (ctx.state.data.get("gc_blocked_stations") or {}).items()
+            if until > now}
+
+
+def choose_station(stations: list, last_station, player_x: int, player_y: int, blocked=()):
     """Which plinth to work on next, or None if `stations` is empty.
 
     Finishing an in-progress golem takes priority, and the more advanced of two in-progress ones
@@ -318,6 +405,11 @@ def choose_station(stations: list, last_station, player_x: int, player_y: int):
     either plinth is correct, so fall through to whichever is nearer."""
     if not stations:
         return None
+    # A blocked plinth is skipped -- unless every one is blocked, in which case carving from a
+    # difficult plinth still beats not carving, and the miss limits remain the backstop.
+    unblocked = [s for s in stations if s.get("name") not in blocked]
+    if unblocked:
+        stations = unblocked
     in_progress = [s for s in stations if s.get("progress", 0) > 0]
     if in_progress:
         return max(in_progress, key=lambda s: s.get("progress", 0))
@@ -384,12 +476,18 @@ def goat_in_grab_range(player: dict, goat: dict) -> bool:
     return max(dx, dy) <= GRAB_RANGE_TILES
 
 
-def find_mining_target(committed_pos=None):
+def find_mining_target(committed_pos=None, exclude_pos=None):
     """A single object in MINING_TARGET_NAMES ("Sunstone rocks") to click -- sticky, not just
     "whichever is closest right now": if `committed_pos` (an (x, y) world tile) is given and
     still among the visible candidates, THAT one is returned regardless of whether something
     else is now nearer, only falling back to the closest candidate otherwise. Returns None if
     nothing is in range at all.
+
+    `exclude_pos`, if given, drops that exact (x, y) tile from consideration even if it is still
+    reporting as a ready "sunstone rocks" object -- ADDED 2026-08-24 for mine_phase's pre-hover
+    step (see that function's own comment): right after clicking a rock, its own depletion has
+    not necessarily propagated to the bridge's object list yet, so picking "the next rock to
+    hover" without excluding the one just clicked can hand back the SAME tile.
 
     CORRECTED 2026-08-08 (live session, user report, second pass): the first version of this
     always returned the plain closest match, re-derived fresh on every call -- CONFIRMED live
@@ -406,6 +504,7 @@ def find_mining_target(committed_pos=None):
         if (o.get("name") or "").lower() in MINING_TARGET_NAMES
         and o.get("visible", True)
         and 0 <= o.get("distance", 9999) <= MAX_OBJECT_DISTANCE
+        and (exclude_pos is None or (o.get("x"), o.get("y")) != exclude_pos)
     ]
     if not candidates:
         return None
@@ -565,6 +664,82 @@ SUNSTONE_PER_TRIP = 20
 # that for a stalled click.
 MINE_RECLICK_TIMEOUT_S = 8.0
 
+# How far (px) a pre-hovered rock's screen position may have drifted since the hover before
+# mine_phase treats it as stale and falls back to a normal move+click instead of a bare click --
+# ADDED 2026-08-24 alongside the pre-hover step (see MINING_TARGET_NAMES's own comment). Loose
+# enough to absorb ordinary camera/interpolation jitter between ticks (tens of px, observed live)
+# but tight enough that a real drift doesn't fire a click into empty ground.
+HOVER_STALE_PX = 25
+
+# Reaction delay used for the fast (already-hovering) click path -- deliberately shorter than the
+# 0.15-0.5s used before a fresh move_to_human, since a human who is already resting their cursor
+# on the next rock reacts to the confirmation almost immediately (recordings/2026-08-24_154518_
+# golem-mining2-and-chisel.log: successive click timestamps track the swing's own resolution
+# within ~0.1-0.3s once the mouse doesn't have to travel first).
+HOVER_CLICK_REACTION_S = (0.05, 0.2)
+
+# How long the pre-hover waits for the player to actually stop walking before it resolves and
+# hovers the next rock (see mine_phase's own comment for the bug this fixes). Deliberately short:
+# the rocks mine_phase picks are close, so a genuine walk between them is well under this, and if
+# it does time out the pre-hover is simply skipped -- costing one normal move+click next tick,
+# which is exactly what happened before this optimisation existed.
+HOVER_IDLE_TIMEOUT_S = 2.0
+
+
+# The `skill` value XP_GAINED carries for a mining swing. ControllerPlugin.onStatChanged sends
+# Skill.getName() verbatim, which is the DISPLAY name ("Mining"), not the enum constant
+# ("MINING") -- VERIFIED 2026-08-23 by disassembling Skill.class out of runelite-api-1.12.33.jar
+# in the Gradle cache, where every constant carries both strings, rather than assuming which one
+# getName() returns. Get this wrong and the match silently never fires: the gate would fall back
+# to raw_count forever and look like it worked.
+MINING_SKILL_NAME = "Mining"
+
+
+def _mining_xp_seen(ctx) -> bool:
+    """Whether a Mining XP_GAINED event has arrived since mine_phase last cleared the buffer.
+
+    A zero-timeout PEEK at bridge_events' mirror, never a wait: mine_phase performs one bounded
+    action per call so the engine's safety/break/PvP checks keep their cadence between swings,
+    and blocking here for even one timeout would stall all of them on every unresolved swing.
+    wait_for_event with timeout_s=0 pumps the socket once, scans, and returns immediately.
+
+    Returns False when ctx.events is None (the engine started no listener -- see the routine
+    contract in CLAUDE.md); mine_phase's inventory-count check is the fallback that carries the
+    gate on its own in that case, exactly as it did before this signal existed."""
+    if ctx.events is None:
+        return False
+    return ctx.events.wait_for_event(
+        "XP_GAINED",
+        match=lambda payload: payload.get("skill") == MINING_SKILL_NAME,
+        timeout_s=0.0,
+    ) is not None
+
+
+def _mine_swing_pending(last_raw, raw_count, mining_xp_seen, last_click_time, now) -> bool:
+    """Whether the swing mine_phase last clicked for is still unresolved -- i.e. whether to hold
+    off re-clicking. Pure, so the whole gate is testable without a client or a serial port.
+
+    Two independent proofs that the swing resolved, in the order they are trusted:
+
+    1. `mining_xp_seen` -- the game's OWN answer. XP is granted at the instant the swing
+       succeeds; the client's StatChanged fires there and ControllerPlugin.onStatChanged pushes
+       it straight out over UDP, so this needs no HTTP round trip and does not care where the
+       ore ended up.
+    2. `raw_count > last_raw` -- the original inference, kept as the fallback. UDP is lossy by
+       design (see the routine contract's "accelerator, never a source of truth"), and a dropped
+       XP packet must cost latency, never a stalled trip.
+
+    `last_raw is None` means nothing has been clicked yet this trip, so there is no swing to be
+    pending. Past MINE_RECLICK_TIMEOUT_S nothing is pending either: click_entity's deliberate
+    simulated misclick (see CLAUDE.md) can land a click that produces neither signal, ever, and
+    an unbounded wait would trade "clicks too often" for "freezes forever" the first time that
+    happens."""
+    if last_raw is None:
+        return False
+    if mining_xp_seen or raw_count > last_raw:
+        return False
+    return now - last_click_time < MINE_RECLICK_TIMEOUT_S
+
 
 def _hop_toward_point(ctx, x: int, y: int, plane: int) -> bool:
     """One single hop toward a world tile -- same viewport-then-minimap idiom as travel.py's own
@@ -593,6 +768,30 @@ def _step_toward_plinth(ctx, config: dict) -> None:
     if target is None:
         return
     _hop_toward_point(ctx, target["x"], target["y"], target.get("plane", 0))
+
+
+def _shed_pit_junk(ctx, phase_label: str) -> None:
+    """Drop leftover Wooden spikes -- they are pit-only and useless anywhere else.
+
+    _ensure_wooden_spikes takes them from the supply AT the pit and nothing outside hunt_phase
+    uses them, so any still carried are leftovers from a drop pass that did not fully land
+    (_drop_all at hunt exit is the primary cleanup, but it is one-shot and the routine may not
+    hunt again for an hour).
+
+    Called from BOTH mine_phase and craft_phase, because craft_phase is reachable without passing
+    through mine_phase at all -- has_start_materials only needs 4 raw + 1 core, which a part-used
+    batch already satisfies. OBSERVED live 2026-08-24: 4 leftover spikes left the inventory at
+    28/28, which both capped mining at 15 sunstone against the 20 budget AND rode into a craft
+    phase where every Start-golem attempt failed with a menu offering no golem option -- plinth
+    correctly rendered and aimed at, materials present, nobody else nearby. Whether the full
+    inventory CAUSES that is unproven; shedding pit-only junk is justified on budget grounds
+    regardless."""
+    if not _count_named(WOODEN_SPIKES_NAME):
+        return
+    controller.key_tap(ctx.ser, "w")   # inventory tab -- same idiom hunt_phase's own drop uses
+    controller.human_delay(0.2, 0.4)
+    debug_log.log("golem crafting", f"dropping leftover pit spikes before {phase_label}")
+    _drop_all(ctx, WOODEN_SPIKES_NAME)
 
 
 def mine_phase(ctx, config: dict) -> None:
@@ -628,6 +827,10 @@ def mine_phase(ctx, config: dict) -> None:
     before it noticed, 4 over target. Checking the budget FIRST, every single call regardless of
     isIdle, means gc_phase flips to "chisel" on the very next tick() after crossing it.
 
+    REWRITTEN 2026-08-23 (user request): the reclick gate keys off the Mining XP_GAINED event
+    rather than inferring the swing's outcome from raw sunstone appearing in the inventory. See
+    _mine_swing_pending/_mining_xp_seen and the gate's own comment block below.
+
     CORRECTED 2026-08-08 (live session, user request): moving the check earlier still isn't
     enough on its own -- the character is still mid-swing right up until something actually
     interrupts it, and chisel_phase has no reason to be at the mining spot at all. So the moment
@@ -635,6 +838,8 @@ def mine_phase(ctx, config: dict) -> None:
     just flipping gc_phase and hoping for the best: the movement itself breaks the mining
     animation immediately, same as a player manually walking off would, and it's a step in a
     direction the routine needs to cover anyway before craft_phase can do anything."""
+    _shed_pit_junk(ctx, "mining")
+
     raw_count = _count_named(RAW_SUNSTONE_NAME)
     cores_have = _count_named(SUNSTONE_CORE_NAME)
     if raw_count + cores_have >= SUNSTONE_PER_TRIP or len(controller.get_inventory()) >= controller.INVENTORY_SIZE:
@@ -644,6 +849,8 @@ def mine_phase(ctx, config: dict) -> None:
         ctx.state.data["gc_mine_target_pos"] = None
         ctx.state.data["gc_mine_last_raw_count"] = None
         ctx.state.data["gc_mine_last_click_time"] = 0.0
+        ctx.state.data["gc_mine_hover_pos"] = None
+        ctx.state.data["gc_mine_hover_screen"] = None
         return
 
     # CORRECTED 2026-08-08 (live session, user report: "still reclicks when already clicked a
@@ -657,6 +864,17 @@ def mine_phase(ctx, config: dict) -> None:
     # noise, not progress. Once it rises, the previous click is spent and it's fine to evaluate
     # a new one.
     #
+    # REWRITTEN 2026-08-23 (user request): raw_count is now the FALLBACK, not the primary signal.
+    # Mining XP is the game's own direct answer to the same question -- it is granted at the
+    # instant the swing succeeds, the client's StatChanged fires there, and ControllerPlugin
+    # pushes it straight out as XP_GAINED over UDP (see CLAUDE.md's "XP gain is another sub-tick,
+    # general-purpose signal"). That is strictly better evidence than inferring success from an
+    # item appearing: it needs no HTTP round trip, and it holds regardless of what the swing
+    # actually yielded or where it went. raw_count stays because UDP is lossy by design and
+    # ctx.events can be None -- the routine contract's "accelerator, never a source of truth"
+    # means a dropped packet must cost latency, never a stalled trip. Both live in
+    # _mine_swing_pending, which is pure so the whole gate is unit-testable.
+    #
     # CORRECTED 2026-08-08 (live session, user follow-up: "if misclick was true for last click
     # reclick"): click_entity's own simulate_mistakes feature (a deliberate, randomized near-miss
     # aimed beside the target -- see its own comment, this is intentional human-mimicry, not a
@@ -668,7 +886,8 @@ def mine_phase(ctx, config: dict) -> None:
     # retried instead of stalling the whole trip.
     last_raw = ctx.state.data.get("gc_mine_last_raw_count")
     last_click_time = ctx.state.data.get("gc_mine_last_click_time", 0.0)
-    if last_raw is not None and raw_count <= last_raw and time.time() - last_click_time < MINE_RECLICK_TIMEOUT_S:
+    if _mine_swing_pending(last_raw, raw_count, _mining_xp_seen(ctx),
+                           last_click_time, time.time()):
         return
 
     committed_pos = ctx.state.data.get("gc_mine_target_pos")
@@ -684,8 +903,49 @@ def mine_phase(ctx, config: dict) -> None:
     ctx.state.data["gc_mine_target_pos"] = (rock.get("x"), rock.get("y"))
 
     debug_log.log("golem crafting", f"mining {rock.get('name')} (dist={rock.get('distance')})")
-    controller.human_delay(0.15, 0.5)
-    if not controller.click_entity(ctx.ser, rock):
+    if ctx.events is not None:
+        # pump() BEFORE clear(), not clear() on its own -- clear() only empties the mirror, so a
+        # Mining XP packet belonging to the PREVIOUS swing that is still sitting unread in the
+        # socket would simply be pumped in afterwards and resolve the swing we are about to
+        # issue, before it has even landed. Pumping first pulls it into the mirror so clear()
+        # can actually drop it. Nothing is lost from the routine's own event dispatch: pump()
+        # also queues into the stream's pending list, which only main()'s drain() empties.
+        ctx.events.pump()
+        ctx.events.clear()
+
+    # ADDED 2026-08-24 (user directive, "pre hover the next ore before exp drop then just click
+    # when that hits" -- see MINING_TARGET_NAMES's own comment above for the full rationale):
+    # if the previous call already rested the mouse on THIS exact rock while its predecessor's
+    # swing was still resolving, only a click has to fire now -- skip click_entity's own
+    # move_to_human entirely, provided the rock's screen position hasn't drifted meaningfully
+    # since the hover (camera/interpolation jitter). A stale hover just falls through to the
+    # normal move+click path below, no worse off than before this existed.
+    hover_pos = ctx.state.data.get("gc_mine_hover_pos")
+    hover_screen = ctx.state.data.get("gc_mine_hover_screen")
+    already_hovering = (
+        hover_pos == (rock.get("x"), rock.get("y"))
+        and hover_screen is not None
+        and rock.get("screenX") is not None
+        and rock.get("screenY") is not None
+        and math.hypot(rock["screenX"] - hover_screen[0], rock["screenY"] - hover_screen[1]) <= HOVER_STALE_PX
+        # The rock not having drifted is only half the picture -- something else (e.g.
+        # _shed_pit_junk dropping items, or the engine's own idle-mouse nudge) could have moved
+        # the CURSOR away from the hover point without the rock itself moving at all. Checking
+        # the cursor's actual current position is what makes this safe to blind-click.
+        and math.hypot(*(a - b for a, b in zip(controller.get_cursor_pos(), hover_screen))) <= HOVER_STALE_PX
+    )
+    if already_hovering:
+        controller.human_delay(*HOVER_CLICK_REACTION_S)
+        controller.click_human(ctx.ser)
+        clicked = True
+    else:
+        controller.human_delay(0.15, 0.5)
+        clicked = controller.click_entity(ctx.ser, rock)
+
+    ctx.state.data["gc_mine_hover_pos"] = None
+    ctx.state.data["gc_mine_hover_screen"] = None
+
+    if not clicked:
         # ADDED 2026-08-08 (live session): find_mining_target's MAX_OBJECT_DISTANCE radius can
         # report a rock as "found" while it's still off the actual rendered viewport -- CONFIRMED
         # live for this same problem with the monolith right after a fresh bank trip, before
@@ -696,6 +956,37 @@ def mine_phase(ctx, config: dict) -> None:
 
     ctx.state.data["gc_mine_last_raw_count"] = raw_count
     ctx.state.data["gc_mine_last_click_time"] = time.time()
+
+    # Rest the mouse on a DIFFERENT ready rock right now, while this swing plays out on the
+    # server, so the click that resolves it only has to fire, not travel -- see the pre-hover
+    # comment above. exclude_pos guards against the rock just clicked still reporting as ready
+    # (its own depletion may not have propagated to the bridge's object list yet).
+    # FIXED 2026-08-24 (user report: "we hover before we stop moving so the cursor ends up
+    # wrong"). This runs immediately after click_entity, when the player is usually still WALKING
+    # to the rock it just clicked -- and a walking player invalidates every screen position
+    # continuously, because the camera follows them. The original code hovered straight away and
+    # then recorded next_rock's PREDICTED screen point as the anchor, so the next tick measured
+    # staleness against a value nothing had ever verified. With HOVER_STALE_PX at 25 a drift small
+    # enough to pass that gate is still easily enough to sit off a rock's clickbox, and the fast
+    # path then fired click_human into bare ground.
+    #
+    # Waiting costs nothing here: the swing this hover is meant to overlap lasts seconds AFTER
+    # the player arrives, so the window it exploits is still wide open. The rock is re-resolved
+    # after the wait because the position read before the walk is stale by definition.
+    if not controller.wait_until_player_idle(timeout_s=HOVER_IDLE_TIMEOUT_S):
+        return  # still moving -- any position resolved now is already stale; next tick clicks normally
+
+    next_rock = find_mining_target(exclude_pos=(rock.get("x"), rock.get("y")))
+    if (next_rock is not None
+            and next_rock.get("screenX") is not None
+            and next_rock.get("screenY") is not None
+            and controller.hover_entity(ctx.ser, next_rock)):
+        # Record where the cursor ACTUALLY ended up, not where it was predicted to. The aim jitter
+        # alone (ENTITY_AIM_RADIUS) and hover_entity's own offset already move the landing point
+        # off next_rock's centre, so the prediction was never the right anchor for a staleness
+        # check even with a perfectly stationary player.
+        ctx.state.data["gc_mine_hover_pos"] = (next_rock.get("x"), next_rock.get("y"))
+        ctx.state.data["gc_mine_hover_screen"] = controller.get_cursor_pos()
 
 
 # How many sunstone cores to chisel per mining trip (== golems per trip, one core each) --
@@ -897,7 +1188,16 @@ def on_event(ctx, event_type, payload) -> None:
 # action, so a click that genuinely landed and is just still animating shows the per-side
 # `progress` field rising, and only a truly stalled value past this deadline means the click
 # didn't land.
-GOLEM_SIDE_TIMEOUT_S = 4.0
+# CORRECTED 2026-08-23 from 4.0s, using a hand-played recording rather than an estimate
+# (recordings/2026-08-23_194302_golem-carving): a side's FIRST observable `progress` bump lands
+# +2.1s after the click even when the player is already standing on the tile, and the carve walk
+# is now fired without waiting for arrival, so the walk's remaining flight time lands inside this
+# window too. At 4.0s the first bump arrived just PAST the deadline whenever any walking was
+# left -- and a timeout here is not a harmless extra wait: carve_plan re-picks a side from the
+# player's new position on the next tick and walks away, INTERRUPTING the carve that had
+# genuinely started and resetting its progress to 0. CONFIRMED live 2026-08-23 as an unbroken
+# retry loop that safety-stopped after 5 attempts with only the first side ever completing.
+GOLEM_SIDE_TIMEOUT_S = 8.0
 
 # FINDING D (2026-08-20 whole-branch review): GOLEM_SIDE_TIMEOUT_S was picked without live
 # confirmation of how long a single side carve actually takes -- in-repo evidence on this is
@@ -908,10 +1208,102 @@ GOLEM_SIDE_TIMEOUT_S = 4.0
 # underway), rather than guessing the right fixed constant. This is the hard cap on that
 # extension, so a side that is climbing but never actually finishes (a genuine anomaly, not a slow
 # carve) still terminates instead of waiting forever.
-GOLEM_SIDE_MAX_WAIT_S = 15.0
+# CORRECTED 2026-08-23 from 15.0s: a full side is ~11.8s from the click (MEASURED at 11.9/11.9/
+# 11.7/11.7 across four sides), and with the walk now in flight during that window the realistic
+# worst case is ~15s -- i.e. the old cap sat exactly ON the value it was meant to bound. This only
+# bites once `progress` has stopped climbing entirely, so headroom costs nothing in the normal
+# case and only decides how long a genuinely stuck side waits before being called stuck.
+GOLEM_SIDE_MAX_WAIT_S = 25.0
 
 # Insert-core gets a little longer -- it consumes a core and a fur and plays a longer animation
 # before the station's progress varbit resets.
+# Re-aim checkpoints for the plinth click while the player is still walking toward the side tile
+# (see _click_station). refresh_target alone only re-aims ONCE, partway through the flight, which
+# is enough for a camera drift against a stationary player but not for a player who is crossing
+# tiles during the flight. 3 legs is the smallest value that actually tracks; see CLAUDE.md's
+# "Sub-tick data and clicking while moving" for why the un-cached /object/at read behind
+# object_refresh_target is what makes this possible at all.
+GOLEM_CLICK_REFRESH_LEGS = 3
+
+# How long to leave between firing the carve walk and clicking the plinth. Straight off the
+# recording: the human's four walk-click -> object-click gaps were 1.0s, 1.0s, 0.6s and 0.6s.
+# Not a settle margin -- the player is deliberately still moving when the click lands.
+GOLEM_WALK_TO_CLICK_GAP_S = (0.6, 1.0)
+
+# Every option a legitimate plinth click can resolve to. craft_phase does not get to choose --
+# the game picks based on the station's own state -- so all three are accepted and only something
+# OUTSIDE this set proves the click went somewhere it shouldn't have.
+GOLEM_PLINTH_OPTIONS = ("Start-golem", "Shape-golem", "Insert-core")
+
+# How long to wait for the game to report what the plinth click resolved to before giving up and
+# falling back to the ordinary confirmation. Deliberately short: this is a fast NEGATIVE check,
+# and "no answer yet" must never be read as failure (see _click_resolved_wrongly).
+GOLEM_CLICK_ECHO_TIMEOUT_S = 1.5
+GOLEM_CLICK_ECHO_POLL_S = 0.1
+
+# How many times in a row the fast hijack retry may fire for one side before deferring to the
+# ordinary confirmation wait. One, and the bound is the whole point -- see the REGRESSION FIX note
+# at the call site. An immediate retry re-clicks the same geometry, so on its own it converts an
+# occasional stall into a deterministic lock; the slow path's wait is what lets the world move.
+# There is deliberately no larger "hijack limit" any more: with a budget of one, consecutive
+# hijacks degrade to exactly the pre-existing behaviour and are already bounded by
+# GOLEM_SIDE_MISS_LIMIT, so a second counter would only add a second way to safety-stop.
+GOLEM_FAST_RETRY_BUDGET = 1
+
+
+def _click_resolved_wrongly(before: dict, after: dict, object_id: int):
+    """Whether a plinth click provably resolved to the WRONG action. Tri-state, and the third
+    state is the whole point:
+
+      False -- provably right: a golem option, on the plinth we aimed at.
+      True  -- provably wrong: the game recognised some other action instead.
+      None  -- unknown: nothing new has been processed yet.
+
+    CONFIRMED live 2026-08-23 (recordings/2026-08-23_201416_routine-carve-drops, captured with
+    the recorder running alongside the routine): a bare left-click on the plinth is resolved by
+    the game against whatever is on top of that pixel, and another PLAYER standing there turns it
+    into "Walk here" on them --
+
+        20:14:34.056  Walk here  ->                        <- the fire-and-forget walk
+        20:14:35.034  Walk here  -> DoveHorn (level-115)   <- the plinth click, hijacked
+
+    -- after which the routine waited out the entire GOLEM_SIDE_TIMEOUT_S for a carve that was
+    never going to start. It cannot be a slow carve: _await_side_done resets its deadline on every
+    `progress` bump and bumps arrive ~2.4s apart, so a genuine carve can never reach that timeout.
+    Every timeout is a click that produced zero progress.
+
+    `None` must never be treated as failure. /last-action reports an action being RECOGNISED, not
+    completing (see controller.get_last_action), and a click that has not been processed yet looks
+    identical to one that never will -- calling that a miss would re-introduce exactly the
+    destructive early-abort that made the 4.0s timeout so damaging.
+
+    The `tick` comparison is load-bearing for the same reason FINDING A made _await_side_done
+    transition-based: /last-action holds only the MOST RECENT click, so a successful PREVIOUS
+    carve is byte-identical to this one succeeding. Only a genuinely new action counts."""
+    if not after:
+        return None
+    if before and (after.get("tick") == before.get("tick")
+                   and after.get("option") == before.get("option")
+                   and after.get("id") == before.get("id")):
+        return None
+    if after.get("option") in GOLEM_PLINTH_OPTIONS and after.get("id") == object_id:
+        return False
+    return True
+
+
+def _await_click_echo(before: dict, object_id: int):
+    """Poll /last-action briefly for the game's own verdict on the plinth click just issued.
+    Returns _click_resolved_wrongly's tri-state; None on timeout, which hands control back to the
+    ordinary confirmation path unchanged."""
+    deadline = time.time() + GOLEM_CLICK_ECHO_TIMEOUT_S
+    while time.time() < deadline:
+        verdict = _click_resolved_wrongly(before, controller.get_last_action(), object_id)
+        if verdict is not None:
+            return verdict
+        time.sleep(GOLEM_CLICK_ECHO_POLL_S)
+    return None
+
+
 GOLEM_INSERT_TIMEOUT_S = 6.0
 
 # How often to re-read /golem while awaiting a confirmation. Well under the 0.6s game tick, since
@@ -951,7 +1343,7 @@ GOLEM_APPROACH_MISS_LIMIT = 5
 GOLEM_STATE_MISS_LIMIT = 5
 
 
-def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
+def walk_to_exact_tile(ctx, x: int, y: int, plane: int, wait_for_arrival: bool = True) -> bool:
     """Walk to the exact world tile (x, y) and wait until standing exactly on it. Deliberately
     NOT travel.py's walk_to/_hop_to: those consider landing within WALK_ARRIVAL_TOLERANCE
     (3 tiles) of the target "arrived", which is useless for either of this function's two
@@ -1000,7 +1392,7 @@ def walk_to_exact_tile(ctx, x: int, y: int, plane: int) -> bool:
     # the docstring above is this behaviour's whole provenance record, and test_golem_crafting.py
     # patches `gc.walk_to_exact_tile` by name in several craft_phase tests, so the name has to
     # stay a real attribute of this module either way.
-    return travel.walk_to_exact_tile(ctx, x, y, plane)
+    return travel.walk_to_exact_tile(ctx, x, y, plane, wait_for_arrival=wait_for_arrival)
 
 
 def _station_by_name(state: dict, name: str):
@@ -1036,7 +1428,7 @@ def _any_station_visible(stations: list, objects: list) -> bool:
     return any(s.get("objectId") in visible_ids for s in stations)
 
 
-def _click_station(ctx, station, objects: list) -> bool:
+def _click_station(ctx, station, objects: list, use_menu: bool = False) -> bool:
     """Click the plinth (resolved out of the already-fetched `objects` list), hopping closer
     first if it isn't on screen. Returns False if the click did not go out, in which case the
     caller should retry next tick.
@@ -1048,22 +1440,72 @@ def _click_station(ctx, station, objects: list) -> bool:
     if obj is None:
         _hop_toward_point(ctx, station["x"], station["y"], station.get("plane", 0))
         return False
+    if use_menu:
+        # Stop moving before trusting any screen position. CONFIRMED live 2026-08-23 21:24: an
+        # escalation right-clicked bare tile even though it had just re-resolved the plinth,
+        # because the player was still walking -- the position was read at 21:24:47.571 and the
+        # cursor landed at 21:24:47.771, 200ms and roughly a third of a tile later, 6px off the
+        # object. The bare-click path tolerates that via refresh_legs re-aiming mid-flight;
+        # click_menu_action aims exactly once, so its aim is only trustworthy from a standstill.
+        # This is already the slow path, so the wait costs the fast one nothing. See
+        # wait_until_player_idle's own docstring -- it exists for precisely this call shape.
+        controller.wait_until_player_idle()
+        # Re-resolve the plinth's CURRENT screen position first. `objects` was fetched at the top
+        # of craft_phase, before the walk, so its screenX/screenY is stale by however far the
+        # player travelled -- the bare-click path hides that with refresh_target/refresh_legs
+        # re-aiming mid-flight, but click_menu_action has no such parameter and would right-click
+        # the stale pixel. CONFIRMED live 2026-08-23 21:12: the first menu escalations opened a
+        # menu of pure ground options (['Cancel', 'Mark Safespot', 'Examine', 'Walk here']) --
+        # a right-click on bare tile, not on the plinth at all. offset=(0,0) for the same reason:
+        # click_menu_action's default (-7, +7) nudge is enough to slide off a small plinth.
+        fresh = controller.get_object_at(
+            obj.get("x"), obj.get("y"), obj.get("plane", 0), station["objectId"],
+            radius=MAX_OBJECT_DISTANCE,
+        )
+        if fresh is not None:
+            obj = fresh
+        # Right-click and pick the option BY NAME out of /menu, instead of trusting whatever the
+        # default left-click action resolves to. LIVE HALT 2026-08-23 21:04: another player was
+        # standing on the plinth's east tile -- players do not block each other, so they stack on
+        # OUR tile -- and every bare left-click resolved to them ("Walk here -> DoveHorn"), five
+        # in a row, until the routine safety-stopped and stayed down. This is exactly the case
+        # click_menu_action's own docstring was written for. All three options are offered because
+        # craft_phase does not get to choose which one the game presents for the station's current
+        # state; click_menu_action tries a sequence in priority order against the one menu it
+        # already reads back, so this costs no extra right-click.
+        if controller.click_menu_action(ctx.ser, obj, GOLEM_PLINTH_OPTIONS, offset=(0, 0)):
+            return True
+        # The menu route is a best-effort ESCALATION, so a miss degrades to the ordinary click
+        # rather than being charged as a hard miss. LIVE HALT 2026-08-23 22:04: five consecutive
+        # menu misses safety-stopped a routine that had just produced 22 golems in 36 minutes on
+        # its bare-click path. The plinth is ringed by four unnamed clickable marker objects, one
+        # per side tile (62359-62362 around the north plinth, 62355-62358 around the south), and
+        # the one standing on OUR OWN tile competes for the click -- a frame dump with both
+        # centres marked showed the empty plinth's reported clickbox centre landing on bare ground
+        # at that camera angle, so the menu contained only the marker's "Examine". Falling through
+        # costs one wasted right-click; not falling through costs the session.
+        debug_log.log("golem crafting",
+                      f"menu had no golem option for {station['name']} plinth "
+                      f"-- falling back to an ordinary click")
+        use_menu = False
     refresh = controller.object_refresh_target(
         obj.get("x"), obj.get("y"), obj.get("plane", 0), station["objectId"],
         radius=MAX_OBJECT_DISTANCE,
     )
-    if not controller.click_entity(ctx.ser, obj, refresh_target=refresh):
+    if not controller.click_entity(ctx.ser, obj, refresh_target=refresh,
+                                   refresh_legs=GOLEM_CLICK_REFRESH_LEGS):
         _hop_toward_point(ctx, station["x"], station["y"], station.get("plane", 0))
         return False
     return True
 
 
-def _click_station_tracked(ctx, station, miss_key: str, objects: list) -> bool:
+def _click_station_tracked(ctx, station, miss_key: str, objects: list,
+                           use_menu: bool = False) -> bool:
     """_click_station with a bounded miss counter -- see GOLEM_APPROACH_MISS_LIMIT's own comment
     for why an uncounted click failure is exactly the same unbounded-loop shape as an uncounted
     walk failure. _click_station already hops toward the station on a miss; this adds the
     counting and the eventual safety-stop escalation once hopping alone hasn't fixed it."""
-    if _click_station(ctx, station, objects):
+    if _click_station(ctx, station, objects, use_menu=use_menu):
         ctx.state.data[miss_key] = 0
         return True
     misses = ctx.state.data.get(miss_key, 0) + 1
@@ -1080,15 +1522,26 @@ def _click_station_tracked(ctx, station, miss_key: str, objects: list) -> bool:
     return False
 
 
-def _walk_to_station_tile(ctx, station, tile: dict, miss_key: str) -> bool:
+def _walk_to_station_tile(ctx, station, tile: dict, miss_key: str,
+                          wait_for_arrival: bool = True) -> bool:
     """walk_to_exact_tile toward `tile`, with a bounded miss counter (`miss_key`) and a
     _hop_toward_point fallback toward the station's own tile on failure -- see
     GOLEM_APPROACH_MISS_LIMIT's own comment for why an uncounted failure here is exactly the
     no-progress spin this overhaul exists to remove. walk_to_exact_tile only returns False when
     the target tile can't be projected onto the viewport at all (see its own docstring), meaning
     the camera/position genuinely needs to change before the next attempt can possibly succeed --
-    which is exactly what the hop provides."""
-    if walk_to_exact_tile(ctx, tile["x"], tile["y"], tile.get("plane", 0)):
+    which is exactly what the hop provides.
+
+    `wait_for_arrival=False` (2026-08-23) fires the walk and returns immediately so the caller can
+    click the plinth while the player is still moving -- the carve step's mode. The side that gets
+    carved is the tile walked TO, not the tile clicked from: MEASURED 3/3 in
+    recordings/2026-08-23_194302_golem-carving, by resolving GOLEM_2_{NORTH,EAST,SOUTH,WEST}_
+    PROGRESS against runelite-api-1.12.36.jar and matching each against the walk destination in
+    flight at the moment of the click. The game queues the interaction and performs it on arrival.
+    The insert step keeps the blocking default -- it is normally a no-op walk (the carve order
+    ends on the insert side) so there is no latency there to reclaim."""
+    if walk_to_exact_tile(ctx, tile["x"], tile["y"], tile.get("plane", 0),
+                          wait_for_arrival=wait_for_arrival):
         ctx.state.data[miss_key] = 0
         return True
     misses = ctx.state.data.get(miss_key, 0) + 1
@@ -1099,14 +1552,34 @@ def _walk_to_station_tile(ctx, station, tile: dict, miss_key: str) -> bool:
         f"(miss {misses}/{GOLEM_APPROACH_MISS_LIMIT}) -- hopping closer",
     )
     if misses >= GOLEM_APPROACH_MISS_LIMIT:
-        ctx.state.trigger_safety_stop(
+        # Flag it rather than deciding here: whether an unreachable approach tile is fatal depends
+        # on whether a golem is already part-carved, which only craft_phase knows. LIVE HALT
+        # 2026-08-24 03:37 stopped the session outright on target (2597,2257) -- and /ground/walk
+        # reported that same tile onScreen at (1150,621) moments later, i.e. it was transient.
+        ctx.state.data["gc_approach_exhausted"] = (
             f"couldn't reach a tile near {station['name']} plinth after "
             f"{GOLEM_APPROACH_MISS_LIMIT} attempts; target ({tile['x']}, {tile['y']}, "
             f"plane {tile.get('plane', 0)})"
         )
+        ctx.state.data[miss_key] = 0
         return False
     _hop_toward_point(ctx, station["x"], station["y"], station.get("plane", 0))
     return False
+
+
+def _handle_approach_exhausted(ctx, station: dict, fresh_golem: bool) -> None:
+    """Decide what an exhausted approach means, now that _walk_to_station_tile only reports it.
+
+    Fresh plinth: nothing is committed, and the condition has been observed transient (see that
+    function's own note), so back off and come back. Part-carved: its 4 sunstone are already
+    spent and abandoning the golem destroys them, so stop loudly instead."""
+    reason = ctx.state.data.pop("gc_approach_exhausted", None)
+    if not reason:
+        return
+    if fresh_golem:
+        _block_station(ctx, station)
+        return
+    ctx.state.trigger_safety_stop(reason)
 
 
 def _await_side_done(station_name: str, side: str, timeout_s: float, already_done: bool = False) -> bool:
@@ -1295,6 +1768,7 @@ def craft_phase(ctx, config: dict) -> None:
     blowing under load -- now tolerates GOLEM_STATE_MISS_LIMIT consecutive misses before
     safety-stopping, the same tolerance handle_missing_target's own poll layer gives every other
     lookup in this file, rather than asserting "rebuild the client" off a single transient blip."""
+    _shed_pit_junk(ctx, "crafting")
     state = controller.get_golem()
     if state is None:
         misses = ctx.state.data.get("gc_golem_state_misses", 0) + 1
@@ -1383,7 +1857,8 @@ def craft_phase(ctx, config: dict) -> None:
     player = controller.get_player()
     player_x, player_y = player.get("x", 0), player.get("y", 0)
     station = choose_station(
-        stations, ctx.state.data.get("gc_last_station"), player_x, player_y
+        stations, ctx.state.data.get("gc_last_station"), player_x, player_y,
+        blocked=_blocked_station_names(ctx)
     )
     fresh_golem = station.get("progress", 0) == 0
 
@@ -1404,7 +1879,9 @@ def craft_phase(ctx, config: dict) -> None:
             ctx.state.data["gc_phase"] = "bank"
             return
 
-    plan = carve_plan(station, player_x, player_y)
+    plan = carve_plan(station, player_x, player_y,
+                      avoid=_sides_to_avoid(ctx.state.data.get("gc_side_fail_counts"),
+                                            station["name"]))
 
     # FINDING B (2026-08-20 whole-branch review): fresh_golem (progress == 0, i.e. no golem in
     # progress on this plinth) and an EMPTY carve plan (every side's own `done` reads True) are
@@ -1429,22 +1906,111 @@ def craft_phase(ctx, config: dict) -> None:
     if plan:
         side = plan[0]
         tile = station["sides"][side]
-        if not _walk_to_station_tile(ctx, station, tile, "gc_side_walk_misses"):
+        # Fire-and-forget: the plinth click below goes out while the player is still walking,
+        # which is what a human does -- MEASURED at 0.6-1.0s between the walk click and the object
+        # click, 4 times out of 4, in recordings/2026-08-23_194302_golem-carving. The game queues
+        # the interaction and carves the side we are walking TO (confirmed 3/3, see
+        # _walk_to_station_tile's docstring), so waiting to arrive first buys no correctness at
+        # all -- it only adds latency, and the block is what made an over-tight
+        # GOLEM_SIDE_TIMEOUT_S destructive rather than merely slow.
+        if not _walk_to_station_tile(ctx, station, tile, "gc_side_walk_misses",
+                                     wait_for_arrival=False):
+            _handle_approach_exhausted(ctx, station, fresh_golem)
             return
         verb = "starting golem" if fresh_golem else "shaping golem"
         debug_log.log("golem crafting", f"{verb} from {side} side of {station['name']} plinth ({4 - len(plan)}/4 done)")
-        if not _click_station_tracked(ctx, station, "gc_side_click_misses", objects):
+        controller.human_delay(*GOLEM_WALK_TO_CLICK_GAP_S)
+        before_action = controller.get_last_action()
+        # A side whose bare click already got hijacked once goes straight to the menu route --
+        # the cheap click has been shown not to work against whatever is sitting on that pixel.
+        escalate = ctx.state.data.get("gc_side_hijacks", 0) >= GOLEM_FAST_RETRY_BUDGET
+        if escalate:
+            debug_log.log("golem crafting",
+                          f"{side} side: bare click was hijacked -- selecting the action from the "
+                          f"right-click menu instead")
+        if not _click_station_tracked(ctx, station, "gc_side_click_misses", objects,
+                                      use_menu=escalate):
             return
+        # Ask the game what that click actually resolved to before committing to the full
+        # confirmation wait. A bare left-click is resolved against whatever sits on top of the
+        # aim pixel, and another PLAYER standing there turns it into "Walk here" on them --
+        # CONFIRMED live 2026-08-23, see _click_resolved_wrongly. Retrying immediately costs one
+        # tick; waiting it out costs GOLEM_SIDE_TIMEOUT_S for a carve that never started.
+        hijacked = _await_click_echo(before_action, station["objectId"]) is True
+        already_retried = ctx.state.data.get("gc_side_hijacks", 0) >= GOLEM_FAST_RETRY_BUDGET
+        if hijacked and not already_retried:
+            ctx.state.data["gc_side_hijacks"] = ctx.state.data.get("gc_side_hijacks", 0) + 1
+            debug_log.log(
+                "golem crafting",
+                f"{side} side click was hijacked (resolved to another target) -- retrying now",
+            )
+            return
+        if hijacked and not escalate:
+            # REGRESSION FIX 2026-08-23, caught live within minutes of deploying the fast path:
+            # retrying immediately re-clicks essentially the same pixel, because nothing about the
+            # geometry has changed in ~1.6s. The routine locked into a 20-attempt loop on the north
+            # plinth's east side, clicking (1093,766) every time while the clickbox centre sat at
+            # (1100,759) -- and the same tile and object had carved fine three minutes earlier.
+            # The old timeout wait turned out to be accidentally load-bearing: it gave the camera
+            # and the world time to drift, so each retry aimed somewhere slightly different and
+            # eventually connected. Falling through to it here is what supplies that drift, and it
+            # makes a spin structurally impossible rather than merely bounded.
+            debug_log.log(
+                "golem crafting",
+                f"{side} side click was hijacked again -- falling back to the full wait so the "
+                f"camera and the world can move before the next attempt",
+            )
+        else:
+            ctx.state.data["gc_side_hijacks"] = 0
         if not _await_side_done(station["name"], side, GOLEM_SIDE_TIMEOUT_S, already_done=station["sides"][side]["done"]):
             debug_log.log("golem crafting", f"{side} side didn't register within {GOLEM_SIDE_TIMEOUT_S}s -- retrying next tick")
+            # Remember WHICH side failed, so a start side we cannot actually click from stops
+            # being chosen (see choose_start_side's `avoid`). Three live halts came from
+            # re-aiming at the same unusable pixel until the miss limit ran out.
+            fails = dict(ctx.state.data.get("gc_side_fail_counts") or {})
+            key = f"{station['name']}:{side}"
+            fails[key] = fails.get(key, 0) + 1
+            ctx.state.data["gc_side_fail_counts"] = fails
             ctx.state.data["gc_side_misses"] = ctx.state.data.get("gc_side_misses", 0) + 1
             if ctx.state.data["gc_side_misses"] >= GOLEM_SIDE_MISS_LIMIT:
+                if fresh_golem:
+                    # ROOT CAUSE (user, 2026-08-24): **Start-golem is not offered at all when you
+                    # have no fur.** Sunstone and cores are in hand -- has_start_materials just
+                    # checked them -- so the only remaining ingredient is fur, and the game says
+                    # nothing because the option is simply absent rather than rejected. That is
+                    # why the right-click menu showed only ['Cancel','Mark Safespot','Examine',
+                    # 'Walk here'], why BOTH plinths refused at once (fur is inventory-wide), why
+                    # it only ever struck at progress 0 (a part-carved golem shapes fine without
+                    # fur), and why a restart appeared to fix it (a restart forces a bank trip).
+                    #
+                    # gc_fur_stock cannot be trusted here: this file's own comments record that it
+                    # is a local estimate which can "read >0 while the pouch is genuinely empty",
+                    # and its one authoritative correction (GOLEM_CHAT_NOT_ENOUGH_FUR) only ever
+                    # fires on Insert-core. So zero it and go restock -- bank_phase refills from
+                    # the bank, and falls through to hunt_phase when the bank is empty too.
+                    debug_log.log(
+                        "golem crafting",
+                        f"{station['name']} plinth will not start a golem though sunstone and "
+                        f"cores are in hand -- out of fur, going to bank",
+                    )
+                    ctx.state.data["gc_fur_stock"] = 0
+                    ctx.state.data["gc_side_misses"] = 0
+                    ctx.state.data["gc_phase"] = "bank"
+                    return
+                # A golem already part-carved is different: its 4 sunstone are spent and
+                # abandoning it destroys them, so a stuck side there stays a hard stop.
                 ctx.state.trigger_safety_stop(
                     f"{station['name']} plinth's {side} side never registered after "
                     f"{GOLEM_SIDE_MISS_LIMIT} attempts; station state: {station}"
                 )
             return
         ctx.state.data["gc_side_misses"] = 0
+        ctx.state.data["gc_block_streak"] = 0
+        # This side worked, so it is not a bad angle -- clear its streak rather than letting an
+        # old run of failures keep steering us away from a side that is fine now.
+        fails = dict(ctx.state.data.get("gc_side_fail_counts") or {})
+        fails.pop(f"{station['name']}:{side}", None)
+        ctx.state.data["gc_side_fail_counts"] = fails
         return
 
     # All four sides carved -- insert the core. The carve order ended here on a fresh golem, so
@@ -1453,6 +2019,7 @@ def craft_phase(ctx, config: dict) -> None:
     insert_side = station["insertSide"]
     tile = station["sides"][insert_side]
     if not _walk_to_station_tile(ctx, station, tile, "gc_insert_walk_misses"):
+        _handle_approach_exhausted(ctx, station, fresh_golem=False)
         return
 
     if find_item(SUNSTONE_CORE_NAME) is None:
@@ -1484,8 +2051,26 @@ def craft_phase(ctx, config: dict) -> None:
     # from. See that function's own docstring.
     before_total_crafted = state.get("totalCrafted", 0)
     before_progress = station.get("progress", 0)
-    if not _click_station_tracked(ctx, station, "gc_insert_click_misses", objects):
+    # Same escalation the carve step gets. LIVE HALT 2026-08-24 02:17: once carving was fixed the
+    # identical hijack simply moved here, and Insert-core had no defence -- the click positions
+    # alternated between (1118,653) and (1217,764) over five attempts, i.e. the click resolved to
+    # "Walk here", the player moved, the next tick walked back, oscillating until the miss limit
+    # ran out with all four sides carved and a golem's materials stranded on the plinth.
+    insert_escalate = ctx.state.data.get("gc_insert_hijacks", 0) >= GOLEM_FAST_RETRY_BUDGET
+    if insert_escalate:
+        debug_log.log("golem crafting",
+                      "insert click was hijacked -- selecting Insert-core from the right-click "
+                      "menu instead")
+    before_action = controller.get_last_action()
+    if not _click_station_tracked(ctx, station, "gc_insert_click_misses", objects,
+                                  use_menu=insert_escalate):
         return
+    if _await_click_echo(before_action, station["objectId"]) is True and not insert_escalate:
+        ctx.state.data["gc_insert_hijacks"] = ctx.state.data.get("gc_insert_hijacks", 0) + 1
+        debug_log.log("golem crafting",
+                      "insert click was hijacked (resolved to another target) -- retrying now")
+        return
+    ctx.state.data["gc_insert_hijacks"] = 0
     if not _await_golem_complete(
         station["name"], GOLEM_INSERT_TIMEOUT_S, before_total_crafted, before_progress
     ):
@@ -1829,6 +2414,43 @@ def _ensure_wooden_spikes(ctx, config: dict) -> bool:
 PIT_CLEAR_TIMEOUT_S = 20.0
 
 
+# How many drop passes to make over a junk item before accepting whatever is left. Bounded
+# because this runs unattended and an item that genuinely cannot be dropped must not spin.
+DROP_MAX_PASSES = 3
+
+
+def _drop_all(ctx, name: str) -> None:
+    """Drop every inventory item matching `name`, re-reading the inventory between passes and
+    retrying whatever survived.
+
+    USER REPORT 2026-08-24: wooden spikes were still in the inventory after a fur session. The
+    drop was a single fire-and-forget pass with no verification, and two things routinely defeat
+    it -- click_entity's deliberate MISTAKE_MISCLICK_CHANCE near-miss (~4.5% per click, so a
+    4-spike drop leaves one behind about one time in six; CONFIRMED live 22:38, 4 clicked and 1
+    survived), and any interruption mid-pass (a disconnect landed in exactly that window at
+    01:28:06). Nothing retried what was left, so it sat there until some later hunt happened to
+    clear it.
+
+    Left-click-to-drop depends on "Drop" being set in Controller Settings -> Clicking -> Forced
+    Actions -- the same client-side convention routines/shipwreck_salvaging.py's drop_salvage
+    documents. Verified working for both Goat horn and Wooden spikes by the run's own behaviour:
+    every hunt after a drop pass had to re-take spikes from the supply, which only happens when
+    none are carried.
+
+    check_ui_blockers=False for the reason drop_salvage records: an inventory item's own screen
+    position is naturally inside the floating inventory panel, so the world-click blocker check
+    flags every one of them and rotates the camera forever instead of clicking."""
+    name_lower = name.lower()
+    for _ in range(DROP_MAX_PASSES):
+        remaining = [i for i in controller.get_inventory()
+                     if name_lower in (i.get("name") or "").lower()]
+        if not remaining:
+            return
+        for item in remaining:
+            controller.click_entity(ctx.ser, item, check_ui_blockers=False)  # "Drop"
+            controller.human_delay(0.2, 0.4)
+
+
 def _pit_ready_to_reline(ctx, pit: dict) -> bool:
     """Right-click the Goat Pit and check whether its menu currently offers "Line" (collection
     finished) rather than "Clear" (still processing) -- CONFIRMED live (user observation) this
@@ -1862,6 +2484,35 @@ GOAT_NO_GOAT_CLEAR_STREAK = 3
 # opposite failure: if a cast/click never actually resolves as expected, this phase would
 # repeat forever with no progress. ADDED 2026-08-08 (final whole-branch review).
 MAX_HUNT_ACTIONS = 60
+
+
+# Consecutive Telekinetic Grab casts that never went out before treating the spellbook as
+# genuinely unreachable. cast_telekinetic_grab returns False for exactly this case ("spellbook not
+# open/wrong spellbook active"); hunt_phase used to DISCARD that return, so an unopenable
+# spellbook burned all MAX_HUNT_ACTIONS casts over ~7 minutes and then reported the generic "Grab
+# may not be resolving as expected" -- LIVE 2026-08-24 04:38, where /spellbook said visible:false
+# and the inventory tab was open the entire time. Small but not 1: a single False can be a
+# transient miss or a tab still animating.
+SPELL_FAILURE_LIMIT = 4
+
+
+def _note_cast_failed(ctx) -> None:
+    """Record a Grab cast that never actually went out, and stop with the REAL reason once it is
+    clearly not transient. Named separately from the generic hunt-action budget so the safety-stop
+    message can say "the spellbook will not open" instead of guessing at rune costs or goat
+    behaviour."""
+    streak = ctx.state.data.get("gc_cast_failures", 0) + 1
+    ctx.state.data["gc_cast_failures"] = streak
+    if streak >= SPELL_FAILURE_LIMIT:
+        ctx.state.trigger_safety_stop(
+            f"Telekinetic Grab could not be cast {SPELL_FAILURE_LIMIT} times in a row -- the "
+            f"spellbook will not open (GET /spellbook reports visible:false). Check the Magic-tab "
+            f"keybind: open_spellbook_if_needed taps 'T'."
+        )
+
+
+def _note_cast_landed(ctx) -> None:
+    ctx.state.data["gc_cast_failures"] = 0
 
 
 def hunt_phase(ctx, config: dict) -> None:
@@ -2055,7 +2706,14 @@ def hunt_phase(ctx, config: dict) -> None:
         goats.sort(key=lambda n: n.get("distance", 9999))
         target = goats[0]
         debug_log.log("golem crafting", f"casting Telekinetic Grab on {target.get('name')} (dist={target.get('distance')})")
-        controller.cast_telekinetic_grab(ctx.ser, target)
+        if controller.cast_telekinetic_grab(ctx.ser, target):
+            _note_cast_landed(ctx)
+        else:
+            # The clicks never went out -- almost always the spellbook not being open. Counting
+            # this as an ordinary hunt action would spend the whole budget before saying so.
+            _note_cast_failed(ctx)
+            if ctx.state.safety_stopped:
+                return
         if target.get("index") is not None:
             cooldowns[target["index"]] = now + GOAT_GRAB_COOLDOWN_S
         controller.human_delay(0.6, 1.0)
@@ -2115,11 +2773,7 @@ def hunt_phase(ctx, config: dict) -> None:
                                        # inventory items; a still-open Magic tab from Grab-
                                        # casting would otherwise leave Goat horns unclickable.
     controller.human_delay(0.2, 0.4)
-    for horn in [i for i in controller.get_inventory()
-                 if GOAT_HORN_NAME.lower() in (i.get("name") or "").lower()]:
-        controller.click_entity(ctx.ser, horn, check_ui_blockers=False)  # "Drop" (confirmed
-                                                                          # live Forced Action)
-        controller.human_delay(0.2, 0.4)
+    _drop_all(ctx, GOAT_HORN_NAME)   # "Drop" -- confirmed live Forced Action
 
     spilled_fur = any(
         (i.get("name") or "").lower() in {f.lower() for f in FUR_PRIORITY}
@@ -2129,10 +2783,7 @@ def hunt_phase(ctx, config: dict) -> None:
     ctx.state.data["gc_pit_filled"] = False
     if spilled_fur:
         debug_log.log("golem crafting", "fur pouch full -- skipping bank, heading to mine phase")
-        for spikes in [i for i in controller.get_inventory()
-                       if WOODEN_SPIKES_NAME.lower() in (i.get("name") or "").lower()]:
-            controller.click_entity(ctx.ser, spikes, check_ui_blockers=False)  # "Drop"
-            controller.human_delay(0.2, 0.4)
+        _drop_all(ctx, WOODEN_SPIKES_NAME)
         ctx.state.data["gc_fur_stock"] = FUR_POUCH_CAPACITY
         ctx.state.data["gc_hunt_standing"] = False
         ctx.state.data["gc_pouch_opened_this_hunt"] = False
