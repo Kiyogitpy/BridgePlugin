@@ -44,7 +44,7 @@ import time
 from settings import (
     HM2_CURVE_FRACTION, HM2_D_REF, HM2_LATERAL_ERROR, HM2_LOOKAHEAD_SEGMENTS,
     HM2_LATERAL_DECAY, HM2_MAX_MS, HM2_MAX_SUBMOVES, HM2_MED_REF_MS, HM2_MIN_MS, HM2_PRIMARY_TIME_SHARE,
-    HM2_FINAL_CORRECTIONS, HM2_SEGMENT_MS, HM2_SIGMA, HM2_TOLERANCE_PX, HM2_SLOPE_MS_PER_BIT, HM2_TREMOR_PX, HM2_UNDERSHOOT_MEAN,
+    HM2_CORRECTION_TOLERANCE_PX, HM2_FINAL_CORRECTIONS, HM2_MIN_PX_PER_SEGMENT, HM2_TREMOR_MAX_FRACTION, HM2_REPLAN_MIN_DRIFT_PX, HM2_SEGMENT_MS, HM2_SIGMA, HM2_TOLERANCE_PX, HM2_SLOPE_MS_PER_BIT, HM2_TREMOR_PX, HM2_UNDERSHOOT_MEAN,
     HM2_UNDERSHOOT_SIGMA,
 )
 
@@ -149,6 +149,12 @@ def _submove_path(p0, p1, rng: random.Random, steps: int):
     c1 = (x0 + dx / 3.0 + px * off_a, y0 + dy / 3.0 + py * off_a)
     c2 = (x0 + 2.0 * dx / 3.0 + px * off_b, y0 + 2.0 * dy / 3.0 + py * off_b)
 
+    # Tremor scaled to the submovement, NOT absolute. A flat HM2_TREMOR_PX is invisible on the
+    # primary reach but is 75% of a 2px final correction, so the cursor churned in place near the
+    # target -- reported live as "hovers over it and jitters like crazy". A real hand is steadier
+    # on small precise movements, not equally shaky.
+    tremor = min(HM2_TREMOR_PX, seg_len * HM2_TREMOR_MAX_FRACTION)
+
     out = []
     for i in range(1, steps + 1):
         t = _ease(i / steps)
@@ -158,8 +164,8 @@ def _submove_path(p0, p1, rng: random.Random, steps: int):
         if i < steps:
             # Tremor everywhere except the final sample, so the submovement still lands exactly
             # where it was planned to.
-            bx += rng.gauss(0.0, HM2_TREMOR_PX)
-            by += rng.gauss(0.0, HM2_TREMOR_PX)
+            bx += rng.gauss(0.0, tremor)
+            by += rng.gauss(0.0, tremor)
         out.append((bx, by))
     return out
 
@@ -192,7 +198,12 @@ def build_segments(start, target, rng: random.Random = random, duration_ms: floa
     for idx, p in enumerate(points):
         span_ms = primary_ms if idx == 0 else correction_ms
         span_ms = max(HM2_SEGMENT_MS, span_ms)
+        # Bound segment count by DISTANCE as well as time. A 2px correction spread over five
+        # 18ms segments is five chances to wobble for two pixels of travel; one segment does the
+        # same job and looks like a settle rather than a twitch.
+        gap_px = math.hypot(p[0] - cur[0], p[1] - cur[1])
         steps = max(1, int(round(span_ms / HM2_SEGMENT_MS)))
+        steps = max(1, min(steps, int(math.ceil(gap_px / HM2_MIN_PX_PER_SEGMENT))))
         step_ms = span_ms / steps
 
         for pos in _submove_path(cur, p, rng, steps):
@@ -296,7 +307,7 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
                 target_lost = True          # died/despawned: finish on the last known good point
             else:
                 moved = (float(updated[0]), float(updated[1]))
-                if math.hypot(moved[0] - target[0], moved[1] - target[1]) > 1.0:
+                if math.hypot(moved[0] - target[0], moved[1] - target[1]) > HM2_REPLAN_MIN_DRIFT_PX:
                     target = moved
                     # Replan the approach from where the cursor actually is toward where the
                     # target actually is. Keeps the submovement structure rather than teleporting
@@ -309,7 +320,12 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
         p = points[idx]
         span_ms = primary_ms if idx == 0 else correction_ms
         span_ms = max(HM2_SEGMENT_MS, span_ms)
+        # Bound segment count by DISTANCE as well as time. A 2px correction spread over five
+        # 18ms segments is five chances to wobble for two pixels of travel; one segment does the
+        # same job and looks like a settle rather than a twitch.
+        gap_px = math.hypot(p[0] - cur[0], p[1] - cur[1])
         steps = max(1, int(round(span_ms / HM2_SEGMENT_MS)))
+        steps = max(1, min(steps, int(math.ceil(gap_px / HM2_MIN_PX_PER_SEGMENT))))
         step_ms = span_ms / steps
 
         for pos in _submove_path(cur, p, rng, steps):
@@ -375,7 +391,7 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
         if abort is not None and abort.is_set():
             return
         dx, dy = target[0] - cur[0], target[1] - cur[1]
-        if math.hypot(dx, dy) <= HM2_TOLERANCE_PX:
+        if math.hypot(dx, dy) <= HM2_CORRECTION_TOLERANCE_PX:
             break
         dur = max(1, int(round(HM2_SEGMENT_MS)))
         send_line(ser, f"S {int(round(dx / _px_per_unit * 100))} "

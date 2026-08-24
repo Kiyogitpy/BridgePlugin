@@ -139,7 +139,14 @@ HM2_PRIMARY_TIME_SHARE = 0.62  # of total duration; corrections share the remain
 # The offsets are large because they OPPOSE each other -- a Bezier does not reach its control
 # points, so a +/-0.5 offset pair yields a bulge of roughly 20% of the movement length, not 50%.
 HM2_CURVE_FRACTION = 0.35      # S-curve control-point offset, as a fraction of submovement length
-HM2_TREMOR_PX = 1.5            # mid-frequency wobble amplitude
+HM2_TREMOR_PX = 1.5            # mid-frequency wobble amplitude (ceiling; see next line)
+HM2_TREMOR_MAX_FRACTION = 0.06 # ...but never more than this fraction of the submovement's own
+                               # length. A flat 1.5px is invisible on a 300px reach and 75% of a
+                               # 2px correction; unscaled, it made the cursor churn in place near
+                               # the target ("hovers over it and jitters like crazy").
+HM2_MIN_PX_PER_SEGMENT = 2.5   # a submovement gets at most one segment per this much travel, so
+                               # a short correction is one settling move rather than several
+                               # tremor-dominated ones
 
 # Emission. Segment length trades smoothness against how far Python runs ahead of the cursor;
 # the firmware queue holds 16, so LOOKAHEAD must stay well under that.
@@ -154,6 +161,25 @@ HM2_SEGMENT_MS = 18.0
 # only ~74% of the gap, so the residual falls as 0.26^n and 3 corrections left a 5-6px miss on
 # the first few movements. 6 takes that below a pixel while costing nothing in steady state.
 HM2_FINAL_CORRECTIONS = 6
+# Tolerance for the FINAL-CORRECTION loop specifically -- deliberately NOT HM2_TOLERANCE_PX.
+#
+# GetCursorPos returns INTEGERS, so the cursor's measured position is quantised to 1px. A
+# tolerance below that quantum can never be satisfied for a target on a fractional pixel: the
+# loop bounces between two adjacent integers until its budget runs out. Reported live as "the
+# mouse kinda just hovers over it and jitters like crazy", and raising HM2_FINAL_CORRECTIONS
+# from 3 to 6 for cold-start accuracy is what made it obvious.
+#
+# 1.5 sits above the measurement resolution with margin. It does NOT loosen real accuracy:
+# bench-measured landing error is ~0.65px mean, well inside this. HM2_TOLERANCE_PX (0.6) stays
+# where it is -- it governs SUBMOVEMENT PLANNING, where it is load-bearing for the submovement
+# count distribution and is never compared against a quantised measurement.
+HM2_CORRECTION_TOLERANCE_PX = 1.5
+
+# Ignore target drift smaller than this when deciding whether to replan mid-flight. Without it,
+# a slowly-walking NPC triggers a replan on EVERY refresh, and near the target each replanned
+# submovement is a tiny hop -- a burst of micro-movements in place rather than one settling
+# approach. Same jitter report as above.
+HM2_REPLAN_MIN_DRIFT_PX = 6.0
 HM2_LOOKAHEAD_SEGMENTS = 3
 
 # ---------------- Humanization profile drift ----------------

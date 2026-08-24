@@ -298,6 +298,95 @@ def test_v2_tolerates_a_target_that_disappears_mid_flight(monkeypatch):
     assert math.hypot(pos[0] - 400, pos[1] - 200) < 8.0
 
 
+def _run_capturing_segments(target, seed, scale=0.757, refresh=None):
+    """Drive move() against an INTEGER-quantised cursor, like the real GetCursorPos."""
+    pos = [0.0, 0.0]
+    emitted = []
+
+    def send(ser, line):
+        _, qx, qy, _d = line.split()
+        pos[0] += int(qx) / 100.0 * scale
+        pos[1] += int(qy) / 100.0 * scale
+        emitted.append((int(qx), int(qy)))
+
+    import unittest.mock as _m
+    with _m.patch.object(human_move.time, "sleep", lambda *_: None):
+        human_move._px_per_unit = scale
+        human_move.move(None, target[0], target[1],
+                        get_cursor_pos=lambda: (round(pos[0]), round(pos[1])),
+                        send_line=send, refresh_target=refresh, rng=random.Random(seed))
+    return pos, emitted
+
+
+def _run_capturing_track(target, seed, scale=0.757, refresh=None):
+    """Same as _run_capturing_segments but returns the cursor's path, for _dawdle_px."""
+    pos = [0.0, 0.0]
+    track = []
+
+    def send(ser, line):
+        _, qx, qy, _d = line.split()
+        pos[0] += int(qx) / 100.0 * scale
+        pos[1] += int(qy) / 100.0 * scale
+        track.append((pos[0], pos[1]))
+
+    import unittest.mock as _m
+    with _m.patch.object(human_move.time, "sleep", lambda *_: None):
+        human_move._px_per_unit = scale
+        human_move.move(None, target[0], target[1],
+                        get_cursor_pos=lambda: (round(pos[0]), round(pos[1])),
+                        send_line=send, refresh_target=refresh, rng=random.Random(seed))
+    return track
+
+
+def _settle_px(track, target, near=6.0):
+    """Path length travelled after the LAST time the cursor was further than `near` from target
+    -- i.e. the final settling phase only.
+
+    This is the metric that captures the reported symptom ("the mouse kinda just hovers over it
+    and jitters like crazy"). Two metrics were tried and rejected first, and both are worth not
+    repeating: counting direction REVERSALS flags the engine's intentional tremor as a bug, and
+    measuring from the FIRST arrival within `near` counts an entire legitimate movement whenever
+    the trajectory happens to sweep past the target early (that read 48px on a reach whose real
+    settle was 3px).
+    """
+    last = -1
+    for i, (x, y) in enumerate(track):
+        if math.hypot(x - target[0], y - target[1]) > near:
+            last = i
+    seg = track[last + 1:]
+    if len(seg) < 2:
+        return 0.0
+    return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(seg, seg[1:]))
+
+
+def test_v2_settles_instead_of_dawdling_on_a_static_target():
+    """REGRESSION, reported live 2026-08-24. Tremor was an ABSOLUTE 1.5px regardless of how far
+    a submovement travelled. On the primary reach that is invisible; on a 2px final correction it
+    is 75% of the movement, and every correction still got a full complement of segments -- so
+    the cursor churned in place near the target."""
+    worst = 0.0
+    for seed in range(12):
+        track = _run_capturing_track((300, 200), seed)
+        worst = max(worst, _settle_px(track, (300, 200)))
+    assert worst < 15.0, f"{worst:.0f}px of churn in the settle phase -- visible as jitter"
+
+
+def test_v2_settles_while_tracking_a_moving_target():
+    """The same symptom's worse half: a walking NPC also triggered a replan on every refresh."""
+    worst = 0.0
+    for seed in range(10):
+        live = [400.0, 250.0]
+
+        def refresh():
+            live[0] += 2.0
+            live[1] += 1.0
+            return (live[0], live[1])
+
+        track = _run_capturing_track((400, 250), seed, refresh=refresh)
+        worst = max(worst, _settle_px(track, (live[0], live[1])))
+    assert worst < 12.0, f"{worst:.0f}px of churn in the settle phase while tracking"
+
+
 def test_v2_stops_promptly_on_abort(monkeypatch):
     class Abort:
         def is_set(self):
