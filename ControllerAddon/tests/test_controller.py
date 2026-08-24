@@ -127,7 +127,7 @@ def test_move_to_human_tracking_reaims_once_per_leg_after_the_first(monkeypatch)
 
     exact_calls = []
 
-    def fake_exact(ser, wx, wy, *, fps, duration_scale):
+    def fake_exact(ser, wx, wy, *, fps, duration_scale, **kw):
         exact_calls.append((wx, wy))
         positions.append((wx, wy))
 
@@ -154,7 +154,7 @@ def test_move_to_human_tracking_first_leg_does_not_fly_the_full_distance(monkeyp
     monkeypatch.setattr(controller, "get_cursor_pos", lambda: (0, 0))
     exact_calls = []
     monkeypatch.setattr(controller, "_move_to_human_exact",
-                         lambda ser, wx, wy, *, fps, duration_scale: exact_calls.append((wx, wy)))
+                         lambda ser, wx, wy, *, fps, duration_scale, **kw: exact_calls.append((wx, wy)))
 
     controller._move_to_human_tracking(None, (0, 0), 100, 0, fps=190, aim_radius=0,
                                         duration_scale=1.0, refresh_target=lambda: (100, 0), legs=4)
@@ -181,7 +181,7 @@ def test_move_to_human_tracking_stops_repolling_after_target_lost(monkeypatch):
     monkeypatch.setattr(controller, "get_cursor_pos", lambda: positions[-1])
     monkeypatch.setattr(
         controller, "_move_to_human_exact",
-        lambda ser, wx, wy, *, fps, duration_scale: positions.append((wx, wy)),
+        lambda ser, wx, wy, *, fps, duration_scale, **kw: positions.append((wx, wy)),
     )
     refresh_calls = []
 
@@ -193,6 +193,72 @@ def test_move_to_human_tracking_stops_repolling_after_target_lost(monkeypatch):
                                         duration_scale=1.0, refresh_target=fake_refresh, legs=4)
 
     assert len(refresh_calls) == 1  # tried once (leg 1), not again for legs 2/3
+
+
+# ---- per-leg duration floor, 2026-08-24 ----
+# MEASURED (bench_hover.py, Dashing kebbit anchor): estimate_duration_ms floors every hop at
+# MOVE_MIN_DURATION_MS, and _move_to_human_tracking's waypoints are *fractions* of the remaining
+# distance, so every leg is short enough to pay that floor in full. refresh_legs=6 measured a
+# 1380ms median flight -- 6 * 200ms of floor plus delays -- to cover ~250px that a single hop
+# covers in ~242ms. A mid-flight tracking leg is part of one continuous gesture, not a discrete
+# click movement, so it gets the lower TRACKING_LEG_MIN_DURATION_MS floor instead.
+
+def test_estimate_duration_ms_honors_a_custom_floor():
+    """The floor must be a parameter, not a constant baked into the clamp.
+
+    Note what the low floor actually buys: the duration model's own intercept (90 + 0.55*dist,
+    then **0.92 * 1.9) never produces less than ~105ms however short the hop, so a 60ms floor is
+    inert as a floor. Its real effect is removing the 200ms *clamp*, letting a short leg fall to
+    its natural duration (~150ms for the ~42px legs a 6-leg flight actually uses)."""
+    assert controller.estimate_duration_ms(5) == controller.MOVE_MIN_DURATION_MS
+    # Raising the floor is the deterministic direction, and proves the parameter is wired.
+    assert controller.estimate_duration_ms(5, min_ms=1000) == 1000
+    # Lowering it lets the natural value through instead of clamping up to 200.
+    assert controller.TRACKING_LEG_MIN_DURATION_MS <= controller.estimate_duration_ms(
+        5, min_ms=controller.TRACKING_LEG_MIN_DURATION_MS) < controller.MOVE_MIN_DURATION_MS
+    # The ceiling and the distance model itself must be untouched by the new parameter.
+    assert controller.estimate_duration_ms(5000, min_ms=60) == 1800
+
+
+def test_move_to_human_tracking_uses_reduced_floor_for_non_final_legs(monkeypatch):
+    """Non-final legs are mid-gesture corrections and take the reduced floor; the final leg is
+    the visible settling approach onto the target and keeps the full one."""
+    positions = [(0, 0)]
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: positions[-1])
+    floors = []
+
+    def fake_exact(ser, wx, wy, *, fps, duration_scale, min_duration_ms):
+        floors.append(min_duration_ms)
+        positions.append((wx, wy))
+
+    monkeypatch.setattr(controller, "_move_to_human_exact", fake_exact)
+
+    controller._move_to_human_tracking(None, (0, 0), 400, 400, fps=190, aim_radius=0,
+                                        duration_scale=1.0, refresh_target=lambda: (400, 400),
+                                        legs=4)
+
+    assert floors[:-1] == [controller.TRACKING_LEG_MIN_DURATION_MS] * 3
+    assert floors[-1] == controller.MOVE_MIN_DURATION_MS
+
+
+def test_move_to_human_non_tracking_paths_keep_the_full_floor(monkeypatch):
+    """Regression guard: the single-checkpoint and plain paths are unchanged, so every existing
+    caller's click still moves at exactly the speed it did before."""
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (0, 0))
+    monkeypatch.setattr(controller, "maybe_overshoot_point", lambda *a, **k: None)
+    floors = []
+    # Defaulted, not required: these paths deliberately don't pass the kwarg at all, so what's
+    # asserted is the EFFECTIVE floor they run at.
+    monkeypatch.setattr(
+        controller, "_move_to_human_exact",
+        lambda ser, wx, wy, *, fps, duration_scale,
+        min_duration_ms=controller.MOVE_MIN_DURATION_MS: floors.append(min_duration_ms),
+    )
+
+    controller.move_to_human(None, 500, 500)  # plain path, no refresh at all
+    controller.move_to_human(None, 500, 500, refresh_target=lambda: (500, 500))  # midflight path
+
+    assert floors == [controller.MOVE_MIN_DURATION_MS] * 3
 
 
 def test_get_human_profile_returns_same_profile_until_interval_elapses(monkeypatch):

@@ -88,6 +88,7 @@ import serial
 import win32gui
 
 import debug_log
+import human_move  # v2 movement engine; only reached when settings.HUMAN_MOVE_V2 is on
 from settings import *  # noqa: F401,F403 -- all tunables collected in settings.py
 
 
@@ -285,6 +286,12 @@ def get_prayers():
 
 
 def get_npcs(fresh=False):
+    """Bulk NPC scan -- TickCache-gated (see CLAUDE.md's "Sub-tick data" section), so this can
+    return a stale-by-up-to-a-tick snapshot. Prefer get_npc_by_index (re-checking a specific
+    instance already committed to) or get_npc_screen_pos (nearest of a known type) when the
+    caller already knows what it's looking for -- both are uncached single-entity lookups.
+    Reserve this bulk call for a genuine area scan where the target isn't known yet (e.g.
+    "whichever cow is closest")."""
     params = {"fresh": "true"} if fresh else None
     return api_get("/npcs", params=params) or []
 
@@ -294,6 +301,13 @@ def get_players():
 
 
 def get_objects(radius=None, fresh=False):
+    # Bulk scan -- TickCache-gated (see CLAUDE.md's "Sub-tick data" section). Prefer
+    # get_object_at when the caller already knows the specific tile+id it's looking for (a fixed
+    # object already committed to -- a plinth, a stile, a bank booth): that's an uncached
+    # single-entity lookup, cheaper than this and never stale by a tick. Reserve this bulk call
+    # for a genuine area scan where the target isn't known yet (e.g. "whichever sunstone rocks
+    # spot is nearest and ready").
+    #
     # radius (tiles, optional): bounds the scene walk to a box around the player instead of the
     # whole loaded scene. CONFIRMED live 2026-08-02 -- building screen-projection data for every
     # object in the entire scene, every game tick, regardless of whether any caller actually cares
@@ -348,8 +362,25 @@ def get_object_screen_pos_at(x: int, y: int, plane: int, obj_id: int, radius=Non
 
 
 def get_tiles(fresh=False):
+    """Bulk tile scan (walkability, collision, paint/model data) -- TickCache-gated, and only
+    ever covers the player's CURRENT plane (see TileProvider.java's own computeTiles). Prefer
+    get_tile_at when the caller already knows the specific tile it's checking (e.g. re-verifying
+    a single anchor's walkability) -- that's an uncached single-tile lookup, cheaper than
+    scanning the whole plane. Reserve this bulk call for a genuine area scan (e.g.
+    golem_crafting.py's _nearest_walkable_tile searching a radius around a blocked anchor)."""
     params = {"fresh": "true"} if fresh else None
     return api_get("/tiles", params=params) or []
+
+
+def get_tile_at(x: int, y: int, plane: int):
+    """Exact lookup by world tile position (uncached, unlike get_tiles) -- the tile equivalent
+    of get_object_at/get_ground_item_at. Added 2026-08-24 alongside /tile/at (TileProvider.java).
+    Returns None if not found (e.g. a plane other than the player's current one -- see the
+    Java-side docstring for why that's a real, inherited limitation, not a bug here)."""
+    data = api_get("/tile/at", params={"x": x, "y": y, "plane": plane})
+    if not data or not data.get("found"):
+        return None
+    return data
 
 
 def get_spellbook():
@@ -393,6 +424,10 @@ def get_consumables():
 
 
 def get_ground_items(fresh=False):
+    """Bulk ground-item scan -- TickCache-gated (see CLAUDE.md's "Sub-tick data" section).
+    Prefer get_ground_item_at when the caller already knows the specific tile+id it's looking
+    for (an item already committed to looting): that's an uncached single-entity lookup.
+    Reserve this bulk call for a genuine area scan where the target isn't known yet."""
     params = {"fresh": "true"} if fresh else None
     return api_get("/ground-items", params=params) or []
 
@@ -449,8 +484,25 @@ def get_equipment():
 
 
 def get_graphics_objects(fresh=False):
+    """Bulk ground-anchored spotanim scan (e.g. a telegraphed AoE, Mastering Mixology's
+    Agitator/Alembic flash cue) -- TickCache-gated. Prefer get_graphics_object_at when the
+    caller already knows the specific tile+id it's watching for (a known timing cue at a known
+    station/tile) -- that's an uncached single-entity lookup. Reserve this bulk call for a
+    genuine area scan where the effect's id/position isn't already known."""
     params = {"fresh": "true"} if fresh else None
     return api_get("/graphics-objects", params=params) or []
+
+
+def get_graphics_object_at(x: int, y: int, plane: int, obj_id: int):
+    """Exact lookup by tile position + graphics-object id (uncached, unlike get_graphics_objects)
+    -- the graphics-object equivalent of get_object_at/get_ground_item_at. Added 2026-08-24
+    alongside /graphics-object/at (GraphicsObjectProvider.java). NOT confirmed correct inside an
+    instance -- see that endpoint's own docstring on why it inherits the bulk endpoint's
+    unverified coordinate handling there."""
+    data = api_get("/graphics-object/at", params={"x": x, "y": y, "plane": plane, "id": obj_id})
+    if not data or not data.get("found"):
+        return None
+    return data
 
 
 def get_tormented_demon_config():
@@ -1002,7 +1054,10 @@ def build_bezier_path(start: tuple, end: tuple) -> Bezier:
     return Bezier((sx, sy), (c1x, c1y), (c2x, c2y), (ex2, ey2))
 
 
-def estimate_duration_ms(dist: float) -> float:
+def estimate_duration_ms(dist: float, min_ms: float = MOVE_MIN_DURATION_MS) -> float:
+    """min_ms is the duration floor. It dominates completely below ~130px, which is every leg of
+    a refresh_legs tracking flight -- see TRACKING_LEG_MIN_DURATION_MS for why those legs pass a
+    lower one, and why the default is right for every ordinary click movement."""
     base = 90 + 0.55 * dist
     base = base ** 0.92
     # Real click-to-click recordings (aim trainer and live OSRS play) run
@@ -1011,7 +1066,7 @@ def estimate_duration_ms(dist: float) -> float:
     # movement itself -- take roughly half the gap here.
     base *= 1.9
     jitter = random.uniform(0.85, 1.15)
-    return clamp(base * jitter, 200, 1800)
+    return clamp(base * jitter, min_ms, 1800)
 
 
 def micro_pause_chance(dist: float) -> bool:
@@ -1219,6 +1274,18 @@ def move_to_human(
     instead of hand-writing the lambda each time. Implemented and reviewed (including an
     independent second pass) but not yet exercised against a live client as of 2026-08-14.
     """
+    # v2 engine dispatch (settings.HUMAN_MOVE_V2, off by default). This is the ONLY edit the v2
+    # rollout makes to the existing movement path -- every click_entity/hover_entity call site
+    # inherits it through this one branch, and turning the flag off restores v1 exactly. See
+    # human_move.py and docs/superpowers/specs/2026-08-24-human-mouse-movement-v2-design.md.
+    # refresh_legs is intentionally ignored by v2: its submovement boundaries are already the
+    # re-aim points, so it has no artificial legs to configure.
+    if HUMAN_MOVE_V2:
+        human_move.move(ser, x, y, get_cursor_pos=get_cursor_pos, send_line=send_line,
+                        abort=_movement_abort, duration_scale=duration_scale,
+                        refresh_target=refresh_target)
+        return
+
     start = get_cursor_pos()
 
     if refresh_target is not None and refresh_legs is not None and refresh_legs > 1:
@@ -1341,11 +1408,19 @@ def _move_to_human_tracking(ser: serial.Serial, start: tuple, x: int, y: int, *,
 
         # Matches the single-checkpoint MOVING_TARGET branch's own final-approach fps (this
         # function generalizes that branch, not the separate overshoot branch's fps value).
-        leg_fps = fps if leg < legs - 1 else max(110, fps - 15)
-        _move_to_human_exact(ser, waypoint[0], waypoint[1], fps=leg_fps, duration_scale=duration_scale)
+        final_leg = leg == legs - 1
+        leg_fps = max(110, fps - 15) if final_leg else fps
+        # Only the final leg is a discrete "land on the target" movement; the rest are mid-
+        # gesture corrections, so they don't pay the full per-hop floor. Without this the floor
+        # alone made a `legs`-way flight cost legs * MOVE_MIN_DURATION_MS regardless of distance
+        # -- see TRACKING_LEG_MIN_DURATION_MS for the measurements.
+        leg_floor = MOVE_MIN_DURATION_MS if final_leg else TRACKING_LEG_MIN_DURATION_MS
+        _move_to_human_exact(ser, waypoint[0], waypoint[1], fps=leg_fps, duration_scale=duration_scale,
+                              min_duration_ms=leg_floor)
 
 
-def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140, duration_scale: float = 1.0) -> None:
+def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140, duration_scale: float = 1.0,
+                          min_duration_ms: float = MOVE_MIN_DURATION_MS) -> None:
     sx, sy = get_cursor_pos()
     ex, ey = x, y
     dist = math.hypot(ex - sx, ey - sy)
@@ -1353,7 +1428,7 @@ def _move_to_human_exact(ser: serial.Serial, x: int, y: int, *, fps: int = 140, 
         return
 
     bez = build_bezier_path((sx, sy), (ex, ey))
-    duration_ms = estimate_duration_ms(dist) * duration_scale
+    duration_ms = estimate_duration_ms(dist, min_ms=min_duration_ms) * duration_scale
     steps = max(18, int((duration_ms / 1000.0) * fps))
     t0 = time.perf_counter()
 
