@@ -140,6 +140,97 @@ public final class RuneLiteUtil
 		return x >= 0 && y >= 0 && x <= vw && y <= vh;
 	}
 
+	// Grid offsets (as fractions of the bounding box's width/height) tried in order after the
+	// dead-center point fails Shape.contains() -- ordered roughly outward from center so the
+	// first hit is usually still fairly central.
+	private static final double[][] SHAPE_SAMPLE_FRACTIONS = {
+		{0.5, 0.5}, {0.5, 0.3}, {0.5, 0.7}, {0.3, 0.5}, {0.7, 0.5},
+		{0.3, 0.3}, {0.7, 0.3}, {0.3, 0.7}, {0.7, 0.7},
+	};
+
+	/**
+	 * A point actually inside {@code shape}, not just inside its bounding box. Confirmed live
+	 * 2026-08-02: for a non-convex or ring/spoke model (the boat's Helm -- a steering wheel),
+	 * the bounding box's dead-center point can fall in the model's own "hole", which the bounds
+	 * alone can't tell you -- clicking that point missed the model entirely and landed on the
+	 * tile behind it. Samples a small grid of candidate points across the bounding box and
+	 * returns the first one Shape.contains() confirms is real, falling back to a vertex from the
+	 * shape's own outline (guaranteed to be on it) if none of those land inside either.
+	 *
+	 * Moved here from ObjectProvider 2026-08-24 when NPCProvider/PvpProvider needed the same
+	 * logic for Actor.getConvexHull(); it was never object-specific, only object-first.
+	 */
+	public static Point pointInsideShape(java.awt.Shape shape, java.awt.Rectangle bounds)
+	{
+		for (double[] fraction : SHAPE_SAMPLE_FRACTIONS)
+		{
+			int x = bounds.x + (int) (bounds.width * fraction[0]);
+			int y = bounds.y + (int) (bounds.height * fraction[1]);
+			if (shape.contains(x, y))
+			{
+				return new Point(x, y);
+			}
+		}
+
+		java.awt.geom.PathIterator it = shape.getPathIterator(null);
+		double[] coords = new double[6];
+		while (!it.isDone())
+		{
+			int segType = it.currentSegment(coords);
+			if (segType == java.awt.geom.PathIterator.SEG_MOVETO || segType == java.awt.geom.PathIterator.SEG_LINETO)
+			{
+				return new Point((int) coords[0], (int) coords[1]);
+			}
+			it.next();
+		}
+
+		return new Point((int) bounds.getCenterX(), (int) bounds.getCenterY());
+	}
+
+	/**
+	 * screenX/screenY/visible/onScreen/clickable for an entity that has a real on-screen model,
+	 * aiming at a point genuinely inside its clickable shape rather than at the ground-tile
+	 * projection under its feet. Falls back to exactly the old localToScreen + visibility()
+	 * behavior whenever no usable shape is available right now (model not loaded, off-screen,
+	 * or an entity type that has no hull at all).
+	 *
+	 * Generalizes what ObjectProvider has done since 2026-08-01 via TileObject.getClickbox() --
+	 * where the ground-tile point was CONFIRMED live to miss (a boat's salvaging hook, whose
+	 * model sits far enough off the tile's ground height that clicking the tile did nothing).
+	 * Actors (NPCs, players) expose the equivalent shape as Actor.getConvexHull().
+	 *
+	 * The returned point is CANVAS space converted through canvasToScreen -- both getClickbox()
+	 * and getConvexHull() project into the game's real (pre-stretch) render resolution, so they
+	 * need exactly the same stretch handling as Perspective's own output. Do not convert twice.
+	 */
+	public static Map<String, Object> shapeCoords(Client client, java.awt.Shape shape,
+												   LocalPoint fallbackLocal, int plane, boolean alive)
+	{
+		java.awt.Rectangle bounds = shape != null ? shape.getBounds() : null;
+		if (bounds != null && bounds.width > 0 && bounds.height > 0)
+		{
+			Point inside = pointInsideShape(shape, bounds);
+			Point screen = canvasToScreen(client, inside.x, inside.y);
+			boolean onScreen = isOnScreen(client, new net.runelite.api.Point(inside.x, inside.y));
+
+			Map<String, Object> data = new HashMap<>();
+			data.put("screenX", screen.x);
+			data.put("screenY", screen.y);
+			data.put("visible", alive);
+			data.put("onScreen", onScreen);
+			data.put("clickable", onScreen && alive);
+			// Debug field: which path this took. Not consumed by any routine, but it's the only
+			// way to tell a real hull-aimed point from a fallback tile-centre one on the wire.
+			data.put("usedClickbox", true);
+			return data;
+		}
+
+		Map<String, Object> data = new HashMap<>(screenCoords(client, fallbackLocal, plane));
+		data.putAll(visibility(client, fallbackLocal, plane, alive));
+		data.put("usedClickbox", false);
+		return data;
+	}
+
 	public static Map<String, Object> visibility(Client client, LocalPoint local, int plane, boolean alive)
 	{
 		Map<String, Object> vis = new HashMap<>();

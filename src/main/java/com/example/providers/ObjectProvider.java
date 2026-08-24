@@ -7,7 +7,6 @@ import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
 
-import java.awt.Point;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -451,85 +450,17 @@ public class ObjectProvider extends BridgeProvider
 		// object's own raw (possibly boat-local) LocalPoint/clickbox, not the top-level-transformed
 		// WorldPoint above -- both Perspective.localToCanvas and getClickbox already handle a
 		// LocalPoint tagged with a nested WorldView correctly on their own.
-		java.awt.Shape clickbox = obj.getClickbox();
-		java.awt.Rectangle clickBounds = clickbox != null ? clickbox.getBounds() : null;
-		// Debug field (2026-08-02): which path buildObjectData actually took -- not consumed by
-		// any routine.
-		data.put("debugHasClickbox", clickBounds != null && clickBounds.width > 0 && clickBounds.height > 0);
-
-		if (clickBounds != null && clickBounds.width > 0 && clickBounds.height > 0)
-		{
-			Point insideShape = pointInsideShape(clickbox, clickBounds);
-			int canvasX = insideShape.x;
-			int canvasY = insideShape.y;
-
-			Point screen = RuneLiteUtil.canvasToScreen(client, canvasX, canvasY);
-			data.put("screenX", screen.x);
-			data.put("screenY", screen.y);
-
-			boolean onScreen = RuneLiteUtil.isOnScreen(client, new net.runelite.api.Point(canvasX, canvasY));
-			data.put("visible", true);
-			data.put("onScreen", onScreen);
-			data.put("clickable", onScreen);
-		}
-		else
-		{
-			net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, local, plane);
-			if (point != null)
-			{
-				Point screen = RuneLiteUtil.canvasToScreen(client, point.getX(), point.getY());
-				data.put("screenX", screen.x);
-				data.put("screenY", screen.y);
-			}
-			data.putAll(RuneLiteUtil.visibility(client, local, plane, true));
-		}
+		// Behavior is unchanged; the implementation moved to RuneLiteUtil.shapeCoords 2026-08-24
+		// so NPCProvider/PvpProvider could aim at Actor.getConvexHull() the same way instead of
+		// duplicating the grid-sampling logic. See that method for the full rationale.
+		Map<String, Object> coords = RuneLiteUtil.shapeCoords(client, obj.getClickbox(), local, plane, true);
+		data.putAll(coords);
+		// Pre-existing field name, kept so anything already reading it doesn't break; shapeCoords
+		// reports the same fact as "usedClickbox".
+		data.put("debugHasClickbox", coords.get("usedClickbox"));
 
 		data.put("distance", RuneLiteUtil.distanceToPlayer(client, wp));
 		return data;
 	}
 
-	// Grid offsets (as fractions of the bounding box's width/height) tried in order after the
-	// dead-center point fails Shape.contains() -- ordered roughly outward from center so the
-	// first hit is usually still fairly central.
-	private static final double[][] SHAPE_SAMPLE_FRACTIONS = {
-		{0.5, 0.5}, {0.5, 0.3}, {0.5, 0.7}, {0.3, 0.5}, {0.7, 0.5},
-		{0.3, 0.3}, {0.7, 0.3}, {0.3, 0.7}, {0.7, 0.7},
-	};
-
-	/**
-	 * A point actually inside {@code shape}, not just inside its bounding box. Confirmed live
-	 * 2026-08-02: for a non-convex or ring/spoke model (the boat's Helm -- a steering wheel),
-	 * the bounding box's dead-center point can fall in the model's own "hole", which
-	 * getClickbox()'s bounds alone can't tell you -- clicking that point missed the model
-	 * entirely and landed on the tile behind it. Samples a small grid of candidate points across
-	 * the bounding box and returns the first one Shape.contains() confirms is real, falling back
-	 * to a vertex from the shape's own outline (guaranteed to be on it) if none of those land
-	 * inside either.
-	 */
-	private Point pointInsideShape(java.awt.Shape shape, java.awt.Rectangle bounds)
-	{
-		for (double[] fraction : SHAPE_SAMPLE_FRACTIONS)
-		{
-			int x = bounds.x + (int) (bounds.width * fraction[0]);
-			int y = bounds.y + (int) (bounds.height * fraction[1]);
-			if (shape.contains(x, y))
-			{
-				return new Point(x, y);
-			}
-		}
-
-		java.awt.geom.PathIterator it = shape.getPathIterator(null);
-		double[] coords = new double[6];
-		while (!it.isDone())
-		{
-			int segType = it.currentSegment(coords);
-			if (segType == java.awt.geom.PathIterator.SEG_MOVETO || segType == java.awt.geom.PathIterator.SEG_LINETO)
-			{
-				return new Point((int) coords[0], (int) coords[1]);
-			}
-			it.next();
-		}
-
-		return new Point((int) bounds.getCenterX(), (int) bounds.getCenterY());
-	}
 }

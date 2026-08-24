@@ -166,13 +166,14 @@ public class PvpProvider extends BridgeProvider
 				}
 			}
 
-			net.runelite.api.Point point = RuneLiteUtil.localToScreen(client, player.getLocalLocation(), wp.getPlane());
-			if (point != null)
-			{
-				Point screen = RuneLiteUtil.canvasToScreen(client, point.getX(), point.getY());
-				data.put("screenX", screen.x);
-				data.put("screenY", screen.y);
-			}
+			// Player extends Actor, so the same convex hull NPCProvider aims at is available here
+			// -- aim inside the actual model rather than at the ground tile under its feet (see
+			// RuneLiteUtil.shapeCoords). This also gains visible/onScreen/clickable, which this
+			// endpoint never reported at all before; golem_crafting.py already reads /players to
+			// work out whether someone is camped on a plinth tile, and "is that player's model
+			// actually drawn on screen" is directly useful for that.
+			data.putAll(RuneLiteUtil.shapeCoords(client, player.getConvexHull(),
+				player.getLocalLocation(), wp.getPlane(), true));
 
 			list.add(data);
 		}

@@ -206,7 +206,19 @@ public class NPCProvider extends BridgeProvider
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
 		data.put("plane", wp.getPlane());
-		data.putAll(RuneLiteUtil.screenCoords(client, npc.getLocalLocation(), plane));
+		// Aim at a point inside the npc's actual on-screen model (Actor.getConvexHull()), not at
+		// the ground-tile projection under its feet -- the same correction ObjectProvider has made
+		// via TileObject.getClickbox() since 2026-08-01. Added 2026-08-24 after bench_hover.py
+		// showed /npc/by-index reporting a tile-centre point: harmless for a short, squat npc like
+		// a Dashing kebbit (feet and body nearly coincide) but increasingly wrong for a tall model
+		// or one standing on a raised/sloped tile. Falls back to the previous behavior whenever no
+		// hull is available (model not loaded, off-screen), so nothing regresses when it isn't.
+		//
+		// Deliberately in the SHARED builder, so /npcs, /npc/nearest and /npc/by-index all agree.
+		// They must: a routine picks a target from the bulk list and then re-aims through
+		// npc_index_refresh_target -> /npc/by-index mid-flight, and if the two disagreed about
+		// where the npc is, every tracked click would jump between two different points.
+		data.putAll(RuneLiteUtil.shapeCoords(client, npc.getConvexHull(), npc.getLocalLocation(), plane, alive));
 		data.put("distance", RuneLiteUtil.distanceToPlayer(client, wp));
 		data.put("hpRatio", npc.getHealthRatio());
 		data.put("hpScale", npc.getHealthScale());
@@ -216,7 +228,11 @@ public class NPCProvider extends BridgeProvider
 		// Additive, doesn't replace "attackable" (existing routines already filter on that) --
 		// see RuneLiteUtil.hasAttackOption's own doc for why this is a more direct signal.
 		data.put("hasAttackOption", RuneLiteUtil.hasAttackOption(npc));
-		data.putAll(RuneLiteUtil.visibility(client, npc.getLocalLocation(), plane, alive));
+		// NOTE: visible/onScreen/clickable come from shapeCoords above, which resolves them from
+		// the hull it actually aimed at. The old separate RuneLiteUtil.visibility(...) call that
+		// used to live here was removed with that change -- running it here would silently
+		// overwrite the hull-derived values with ground-tile ones, so the endpoint would report
+		// clickability for a point it wasn't returning.
 		return data;
 	}
 }
