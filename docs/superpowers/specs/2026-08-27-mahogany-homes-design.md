@@ -35,7 +35,9 @@ already covers everything needed here — see Architecture §3.
   when its value is **1, 3, or 4** (ported verbatim from
   `MahoganyHomesPlugin.doesHotspotRequireAttention` — this is more specific than the wiki's
   informal "3/2/1/0" table and is the value actually used by working plugin code). Not every
-  home uses all 8 slots (Ross/Norman/Tau have 7; Sarah/Jess have 8, etc.).
+  home uses all 8 slots (Ross/Norman/Tau/Barbara/Leela have 7, Sarah has 6, Jess/Mariah/Bob/Jeff
+  have 8 — see `HotspotObjects`'s own per-home array lengths, which `MahoganyHomesProvider.java`
+  ports as `Home.slotObjectIds`/`slotTypes`).
 - **The same in-game object id is reused across a hotspot's whole lifecycle** — e.g. object
   39990 shows as "Bookcase" (action `Remove`) before it's cleared and "Bookcase space" (action
   `Build`) after, confirmed directly in the recordings (`Remove -> object Bookcase (39990)` then
