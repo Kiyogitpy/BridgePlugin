@@ -1245,3 +1245,42 @@ def test_click_menu_action_without_refresh_is_unchanged(monkeypatch):
     controller.click_menu_action(None, {"screenX": 5, "screenY": 6}, "take")
     assert seen["refresh_target"] is None
     assert seen["refresh_legs"] is None
+
+
+# ---- firmware v3 protocol probe ----
+
+class _FakeSer:
+    def __init__(self, response=b""):
+        self._response = response
+        self.written = []
+
+    def write(self, data):
+        self.written.append(bytes(data))
+
+    def reset_input_buffer(self):
+        pass
+
+    def readline(self):
+        return self._response
+
+
+def test_probe_firmware_protocol_v3():
+    ser = _FakeSer(b"HB 3\n")
+    assert controller.probe_firmware_protocol(ser) == 3
+    assert b"V\n" in ser.written
+
+
+def test_probe_firmware_protocol_legacy_times_out():
+    # Pre-v3 firmware ignores unknown lines entirely; readline returns b"" on timeout.
+    assert controller.probe_firmware_protocol(_FakeSer(b"")) == 2
+
+
+def test_probe_firmware_protocol_garbage_is_legacy():
+    assert controller.probe_firmware_protocol(_FakeSer(b"\x00\xffnoise\n")) == 2
+
+
+def test_probe_firmware_protocol_never_raises():
+    class Broken:
+        def reset_input_buffer(self):
+            raise OSError("port died")
+    assert controller.probe_firmware_protocol(Broken()) == 2

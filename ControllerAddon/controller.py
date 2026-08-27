@@ -1154,6 +1154,36 @@ def send_line(ser: serial.Serial, s: str) -> None:
     ser.write((s + "\n").encode("ascii", errors="ignore"))
 
 
+# Firmware protocol level, set ONCE by probe_firmware_protocol() in main(). 2 = pre-V legacy
+# (the firmware ignores unknown lines and answers nothing). Everything v3-only -- the X flush
+# in human_move.move, scroll_wheel, the startup R -- must gate on this rather than on graceful
+# degradation: an IGNORED X means the queued motion plays anyway, which would silently corrupt
+# the mover's rewound position bookkeeping.
+FIRMWARE_PROTOCOL = 2
+
+
+def probe_firmware_protocol(ser) -> int:
+    """Ask the firmware its protocol level ("V" -> "HB <n>"). Called once at startup, never
+    mid-flight (it consumes the input buffer). The negative path is the 1 s read timeout set
+    at port open; any failure at all reports legacy rather than raising."""
+    try:
+        ser.reset_input_buffer()
+        send_line(ser, "V")
+        line = ser.readline().decode("ascii", "replace").strip()
+        if line.startswith("HB "):
+            return max(2, int(line.split()[1]))
+    except Exception:
+        pass
+    return 2
+
+
+def scroll_wheel(ser: serial.Serial, clicks: int) -> None:
+    """Scroll the wheel `clicks` detents (positive = away from the user). Queued firmware-side,
+    so it keeps program order with motion and clicks. Silently unavailable pre-v3."""
+    if FIRMWARE_PROTOCOL >= 3 and clicks:
+        send_line(ser, f"W {max(-127, min(127, int(clicks)))}")
+
+
 def move_rel_arduino(ser: serial.Serial, dx: int, dy: int, *, max_step: int = 20) -> None:
     while dx != 0 or dy != 0:
         sx = max(-max_step, min(max_step, dx))
@@ -2807,6 +2837,14 @@ def main():
 
     with serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1) as ser:
         time.sleep(2.0)  # Pro Micro reset
+
+        global FIRMWARE_PROTOCOL
+        FIRMWARE_PROTOCOL = probe_firmware_protocol(ser)
+        debug_log.log("serial", f"firmware protocol v{FIRMWARE_PROTOCOL}"
+                                + ("" if FIRMWARE_PROTOCOL >= 3 else " (no flush/wheel/reset)"))
+        if FIRMWARE_PROTOCOL >= 3:
+            send_line(ser, "R")   # clean slate: releases anything a crashed predecessor left held
+
         register_fidget_serial(ser)   # arms in-wait fidgeting; see human_delay
 
         ctx = Context(ser, state, events=event_stream)
