@@ -46,6 +46,32 @@ public class MahoganyHomesProviderTest
 	}
 
 	@Test
+	public void parsesContractReminderMessage()
+	{
+		MahoganyHomesProvider.ParsedAssignment parsed = MahoganyHomesProvider.parseReminder(
+			"You're currently on an Adept Contract. Go see Jeff in the middle of Varrock, "
+				+ "west of the museum. You can get another job once you have furnished his home.");
+		assertNotNull(parsed);
+		assertEquals(3, parsed.tier);
+		assertEquals("Jeff", parsed.homeDisplayName);
+	}
+
+	@Test
+	public void reminderPatternIgnoresAnAssignmentMessage()
+	{
+		assertNull(MahoganyHomesProvider.parseReminder(
+			"Adept Contract: Go see Jeff in the middle of Varrock, west of the museum."));
+	}
+
+	@Test
+	public void assignmentPatternIgnoresAReminderMessage()
+	{
+		assertNull(MahoganyHomesProvider.parseAssignment(
+			"You're currently on an Adept Contract. Go see Jeff in the middle of Varrock, "
+				+ "west of the museum. You can get another job once you have furnished his home."));
+	}
+
+	@Test
 	public void recognizesCompletionMessage()
 	{
 		assertEquals(true, MahoganyHomesProvider.isCompletionMessage(

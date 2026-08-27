@@ -31,8 +31,9 @@ import java.util.regex.Pattern;
  * (ControllerAddon/recordings/2026-08-27_*mahogny-homes*.log). Simpler and needs no widget id.
  *
  * Deliberately NOT TickCache-gated (same reasoning as GolemProvider): routines/mahogany_homes.py
- * polls this as its click-confirmation signal (remainingCount dropping), so a stale read would
- * reintroduce exactly the lag the varbits are here to remove.
+ * re-reads the whole `hotspots` list on every poll and picks the first slot still flagged
+ * needsAttention, so a stale read would reintroduce exactly the lag the varbits are here to
+ * remove (it would keep re-clicking a hotspot it had already finished).
  */
 public class MahoganyHomesProvider extends BridgeProvider
 {
@@ -44,6 +45,13 @@ public class MahoganyHomesProvider extends BridgeProvider
 	// Ported verbatim from the reference plugin's own CONTRACT_FINISHED pattern.
 	private static final Pattern CONTRACT_FINISHED =
 		Pattern.compile("You have completed [\\d,]+ contracts with a total of [\\d,]+ points?\\.");
+
+	// Ported from the reference plugin's REMINDER_PATTERN. The game re-states the active contract
+	// on request ("Talk-to" a Mahogany Homes NPC / the Estate agent), which is the ONLY way to
+	// recover currentHome/contractTier after a client restart mid-contract -- the assignment
+	// message is long gone by then and nothing else on the wire carries the home's name.
+	private static final Pattern CONTRACT_REMINDER =
+		Pattern.compile("You're currently on an? (\\w+) Contract\\. Go see (\\w+)[ ,][\\w\\s,-]*\\. You can get another job once you have furnished \\w+ home\\.", Pattern.CASE_INSENSITIVE);
 
 	private final EventBus eventBus;
 
@@ -80,6 +88,10 @@ public class MahoganyHomesProvider extends BridgeProvider
 		}
 
 		ParsedAssignment parsed = parseAssignment(message);
+		if (parsed == null)
+		{
+			parsed = parseReminder(message);
+		}
 		if (parsed != null)
 		{
 			Home home = Home.byDisplayName(parsed.homeDisplayName);
@@ -94,7 +106,22 @@ public class MahoganyHomesProvider extends BridgeProvider
 	/** Package-private (not private) so MahoganyHomesProviderTest can call it directly. */
 	static ParsedAssignment parseAssignment(String message)
 	{
-		Matcher matcher = CONTRACT_ASSIGNED.matcher(message);
+		return parseWith(CONTRACT_ASSIGNED, message);
+	}
+
+	/**
+	 * The "you're currently on a ... Contract" reminder line. Same two capture groups (tier,
+	 * home display name) as an assignment, so it feeds currentHome/contractTier identically --
+	 * this is the mid-contract restart recovery path. Package-private for the test.
+	 */
+	static ParsedAssignment parseReminder(String message)
+	{
+		return parseWith(CONTRACT_REMINDER, message);
+	}
+
+	private static ParsedAssignment parseWith(Pattern pattern, String message)
+	{
+		Matcher matcher = pattern.matcher(message);
 		if (!matcher.matches())
 		{
 			return null;
@@ -161,18 +188,23 @@ public class MahoganyHomesProvider extends BridgeProvider
 			int value = client.getVarbitValue(varb);
 			// Ported verbatim from the reference plugin's doesHotspotRequireAttention.
 			boolean needsAttention = value == 1 || value == 3 || value == 4;
+			HotspotType type = home.slotTypes[i];
 
 			Map<String, Object> slot = new LinkedHashMap<>();
 			slot.put("varb", varb);
 			slot.put("objectId", home.slotObjectIds[i]);
 			slot.put("value", value);
 			slot.put("needsAttention", needsAttention);
+			// Per-slot cost, so the routine can ask "can I afford THIS hotspot" instead of only
+			// "can I afford the whole rest of the contract" (requiredMaterials below) -- being 2
+			// planks short of the total must not stop the 90% of the contract already affordable.
+			slot.put("material", type.material.name());
+			slot.put("quantity", type.count);
 			hotspots.add(slot);
 
 			if (needsAttention)
 			{
 				remaining++;
-				HotspotType type = home.slotTypes[i];
 				if (type.material == MaterialType.PLANK)
 				{
 					planks += type.count;
