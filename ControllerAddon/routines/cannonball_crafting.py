@@ -318,9 +318,11 @@ def click_smelt_via_menu(ctx, furnace) -> bool:
     drawn on top of the furnace's aim pixel, which is the failure a bare click cannot retry its
     way out of (golem_crafting.py's plinth hijacks, same shape).
 
-    Re-resolves the object through /object/at immediately before clicking: click_menu_action has
-    no refresh_target and right-clicks exactly the pixel it is handed, so a position from the
-    /objects scan at the top of the tick is not safe to give it once the player has moved."""
+    Re-resolves the object through /object/at immediately before clicking, then passes
+    refresh_target too: click_menu_action gained refresh_target/refresh_legs 2026-08-27, so the
+    right-click now re-aims mid-flight the same as click_smelt's bare-click path. The idle-wait
+    stays regardless -- see golem_crafting.py's own equivalent escalation for why removing it is
+    a separate, live-verified change and not part of adopting the new parameter."""
     x, y, plane = furnace.get("x"), furnace.get("y"), furnace.get("plane", 0)
     obj_id = furnace.get("id")
     if None in (x, y, obj_id):
@@ -332,8 +334,10 @@ def click_smelt_via_menu(ctx, furnace) -> bool:
         return False
 
     debug_log.log("cannonball", "escalating to the right-click menu for Smelt")
+    refresh = controller.object_refresh_target(x, y, plane, obj_id)
     # offset=(0, 0): aim at the reported centre, not the default (-7, +7) nudge.
-    return controller.click_menu_action(ctx.ser, fresh, "Smelt", offset=(0, 0))
+    return controller.click_menu_action(ctx.ser, fresh, "Smelt", offset=(0, 0),
+                                         refresh_target=refresh, refresh_legs=REFRESH_LEGS)
 
 
 def await_smelt_started(ctx, bar_name, bars_before) -> bool:
