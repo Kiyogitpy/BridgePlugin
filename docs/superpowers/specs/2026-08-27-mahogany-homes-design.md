@@ -42,9 +42,19 @@ already covers everything needed here — see Architecture §3.
   later `Build -> object Bookcase space (39990)`). Some slots only ever need `Repair` (clocks,
   mirrors, sinks, ranges, hat stands, a bathtub) and never go through Remove/Build at all.
   **This is why work_phase is one unified loop, not three phases** — see Architecture §4.
-- `Hotspot` also gives, per varbit slot, the **full set of object ids** that can ever render at
-  that slot across every home and tier (6-12 ids per slot) — a cheap cross-check for "is this
-  really a Mahogany Homes hotspot" independent of the live action name.
+- **`/objects` (`ObjectProvider.java`) does not expose per-object menu actions** — checked
+  directly against the source (`data.put(...)` calls only cover `id`, `name`, `x/y/plane`,
+  screen/clickbox coords, `distance`; no `actions` field exists). So "scan for an object whose
+  action is Remove/Build/Repair" — my first draft's plan for `work_phase` — isn't implementable
+  against the bulk endpoint. It also isn't necessary: **`HotspotObjects` gives one fixed object
+  id per home per slot, stable across that slot's entire Remove→Build lifecycle** — confirmed
+  directly against the recordings (object 39990 is "Bookcase" while `Remove`-able and "Bookcase
+  space" once `Build`-able, same id both times, matching `HotspotObjects.JEFF`'s slot-1 entry).
+  `Hotspot`'s wider 12-id-per-varbit pool (used by the reference plugin to highlight objects
+  without knowing in advance which home is active) is therefore **not needed at all** here, since
+  the provider always knows the active home and so already knows the exact id for every slot.
+  `work_phase` becomes: ask the provider which slots need attention (each with its fixed object
+  id already attached), filter the bulk `/objects` list by that id, click it.
 - **There is no varbit for "which contract is currently assigned."** The reference plugin's own
   approach is to regex the *contractor's dialogue widget text* for the home name and a separate
   chat-message regex for the tier. **This routine doesn't need either lookup**: the recordings
@@ -62,9 +72,21 @@ already covers everything needed here — see Architecture §3.
   `currentHome` to null.
 
 **Contract request**: the user has NPC Contact (Lunar spellbook) configured so that a single
-left-click cast auto-selects the last-used tier, which is set to Adept. No contractor NPC visit,
-no tier-selection dialogue to navigate — confirmed by the user, overriding what the recordings
-show (the recordings predate this NPC Contact setup and instead walk to a contractor each time).
+left-click cast auto-selects the last-used tier, which is set to Adept. **The recordings already
+show exactly this flow** — re-reading them after the user's correction: every "Last-tier
+contract" click is on **widget 218.113** (`packed 14286961`), which is
+`InterfaceID.MagicSpellbook.NPC_CONTACT` — confirmed by extracting the real constant value from
+`runelite-api-1.12.33.jar` via `javap -v` (`218<<16 | 113 == 14286961`, exact match). It is a
+single click (`menuAction CC_OP`, a spell cast) with **no dialogue, no tier menu, no second
+click** — animation 4413 + spotanim 728 fire immediately, Magic XP +63 lands ~0.4s later (the
+spell's own cast confirmation), and the assignment chat lines arrive ~4.4s after that with all
+8 hotspot varbits reset to 0 in the same tick. There is no contractor-NPC travel anywhere in this
+sequence (completion-to-recast gap is ~2.6s in the recordings, far too short to walk anywhere) —
+my first pass at this spec misread that gap as a fast walk; it's a spell cast from wherever the
+player stands. `InterfaceID.LunarContactNpc.CON_CONTRACTOR_AMY` (also confirmed present, value
+4915262) is the "who do you want to contact" list entry used only the *first* time NPC Contact is
+ever set up for Amy specifically — not needed here since the account is already configured to
+skip straight to a remembered last-tier request.
 
 **Clicking**: the user has RuneLite's menu-entry swapper configured so `Remove`/`Build`/`Repair`
 are always the left-click default on a hotspot object, the same trick `chinchompa_hunting.py`
@@ -96,14 +118,24 @@ One endpoint, `GET /mahogany-homes`, uncached (not one of the six `TickCache`-ga
 ```
 hasContract: bool
 homeName: string | null          # enum name, e.g. "JEFF"
-contractTier: int                # 0 = none assigned
+npcName: string | null           # display name for Talk-to matching, e.g. "Jeff"
+contractTier: int                # 0 = none assigned, 1-4 = Beginner..Expert
 npcId: int
 standingLocation: {x, y, plane}
 area: {x, y, width, height, plane}
 ladderObjectIds: [int]
-remainingCount: int              # hotspots still requiring attention
-requiredMaterials: {minPlanks, maxPlanks, minSteelBars, maxSteelBars}
+hotspots: [{varb, objectId, value, needsAttention}]   # one entry per active slot, in order
+remainingCount: int               # count of hotspots with needsAttention == true
+totalSlots: int
+requiredMaterials: {planks: int, steelBars: int}      # exact, summed live from needsAttention slots
 ```
+
+`requiredMaterials` is an **exact** live count (summing only the slots currently
+`needsAttention`), not the wiki's min-max range — computed the same way the reference plugin's
+`getRequiredMaterialsForVarbs` does, from each slot's known plank/bar cost
+(`HotspotObjects.HotspotType`: B1-B4 = 1-4 planks, RP = 1 plank, SB = 1 steel bar). This is more
+useful to a bot than a range: bank_phase can withdraw precisely enough instead of a worst-case
+guess.
 
 ### 2. Routine wiring
 
@@ -129,17 +161,25 @@ than walking cross-map.
    teleport tablets, verify Xeric's talisman charge and NPC Contact rune stock (astral/cosmic +
    whatever spellbook-swap needs), confirm hammer+saw carried. Entered at startup and whenever
    `work_phase` finds materials have run out.
-2. **request_contract_phase** — `hasContract == false`: left-click NPC Contact, then poll
-   `/mahogany-homes` until `hasContract && contractTier == 3`.
+2. **request_contract_phase** — `hasContract == false`: open the Magic tab if needed, click
+   widget **group 218, child 113** (`InterfaceID.MagicSpellbook.NPC_CONTACT`, confirmed live in
+   all 4 recordings and matched against the real constant value in `runelite-api-1.12.33.jar`),
+   then poll `/mahogany-homes` until `hasContract && contractTier == 3`. No dialogue to navigate.
 3. **travel_phase** — teleport toward the assigned city, then `walk_to(standingLocation)`.
-4. **work_phase** — while `remainingCount > 0`: scan `/objects` in `area` for an object offering
-   `Remove`, `Build`, or `Repair` (cross-checked against the ported hotspot id set), walk to it
-   and plain-left-click (`click_entity` with `refresh_target`/`refresh_legs`, no menu
-   escalation), confirm via `remainingCount` dropping or an XP-gain check (per `CLAUDE.md`'s
-   general sub-tick XP-signal pattern). Remove and Build chain naturally through the same object
-   id across successive scans — no special-casing needed. If no actionable object is found while
-   `remainingCount > 0` and materials should be sufficient, treat it as an out-of-materials
-   condition (same lesson as golem_crafting's silent-menu-absence bug) and go to `bank_phase`.
+4. **work_phase** — while `remainingCount > 0`: take the first `needsAttention` entry from
+   `hotspots`, filter the bulk `/objects` list for that entry's `objectId` (ids are disjoint
+   across homes, so this is unambiguous), walk to it and plain-left-click (`click_entity` with
+   `object_refresh_target`/`refresh_legs`, no menu escalation), confirm via `remainingCount`
+   dropping or a Construction XP-gain check (per `CLAUDE.md`'s general sub-tick XP-signal
+   pattern — needs `constructionXp` added to `PlayerProvider`, not currently exposed). Remove and
+   Build chain naturally through the same object id across successive polls — no special-casing
+   needed. If the object for the current `needsAttention` slot isn't found in `/objects` at all,
+   that means the player isn't close enough yet (walk closer and retry) — the object is always
+   physically present once `needsAttention` is true, so "not found" is never an out-of-materials
+   signal here (unlike golem_crafting's Start-golem, Mahogany Homes hotspot objects don't
+   disappear from the menu when short on materials, as far as any recording shows). Out-of-
+   materials is instead detected by checking `/inventory` against `requiredMaterials` before
+   committing to a click, and going to `bank_phase` if insufficient.
 5. **turn_in_phase** — `remainingCount == 0`: walk to `npcId`, Talk-to, accept the tea, loop back
    to `bank_phase` (if low) or `request_contract_phase`.
 
@@ -148,8 +188,8 @@ than walking cross-map.
 - **Beginner/Novice/Expert tiers** — Adept only, per the recordings and the user's choice. The
   ported data model covers all tiers for free if this changes later, but no other tier's flow is
   exercised or tested.
-- **Contractor-NPC dialogue navigation** — replaced entirely by NPC Contact; no code path visits
-  Amy/Marlo/Ellie/Angelo.
+- **Contractor-NPC dialogue navigation** — replaced entirely by the NPC Contact spell click; no
+  code path visits or talks to Amy/Marlo/Ellie/Angelo in person.
 - **Menu-escalation / hijack handling for hotspot clicks** — plain left-click only, per the
   menu-swap assumption above. If this assumption turns out wrong for some house layout, that's a
   live finding to fix then, not something to build defensively for now.
@@ -158,11 +198,16 @@ than walking cross-map.
 
 ## Verification
 
-`py_compile` every touched Python file and a Gradle compile for the Java provider, then the full
-`pytest` suite, plus new unit tests for the pure phase-transition logic (work_phase's
-target-selection, the out-of-materials heuristic, the assignment/completion regexes) against
-synthetic data. First live run should watch one full contract end-to-end (request → travel →
+`py_compile` every touched Python file and a Gradle compile for the Java provider (including the
+new `constructionXp` field on `PlayerProvider`), then the full `pytest` suite, plus new unit
+tests: the pure phase-transition logic (work_phase's target-selection, the out-of-materials
+check against `/inventory`), and a small JUnit test for `MahoganyHomesProvider`'s chat-message
+regex parsing (tier + home name extraction, and the completion pattern), consistent with the
+project's existing `TickCacheTest`/`TickClockTest` precedent for testing pure Java logic outside
+a live client. First live run should watch one full contract end-to-end (request → travel →
 work_phase → turn-in) before leaving it to loop, per the project's live-debugging workflow — this
 is a brand new routine with no prior live run at all, unlike golem_crafting/chinchompa_hunting's
-already-debugged baselines. Nothing in this design depends on an unverified widget id, so the
-first live run is confirming behavior, not discovering ids.
+already-debugged baselines. Every widget/interface id this design depends on (NPC_CONTACT) is
+already confirmed both against the recordings and against the real `runelite-api` jar, so the
+first live run is confirming *behavior* (does work_phase's click land correctly, does the
+out-of-materials fallback trigger correctly), not discovering unknown ids.
