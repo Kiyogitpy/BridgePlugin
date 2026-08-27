@@ -482,7 +482,15 @@ def switch_bank_tab(ctx, index: int) -> bool:
     skips the click entirely if `currentTab` (BankProvider.java, VarbitID.BANK_CURRENTTAB)
     already reports `index` -- a human wouldn't click a tab they're already viewing. Returns
     True in that case the same as an actual successful switch, since the caller's postcondition
-    (now viewing that tab) already holds either way."""
+    (now viewing that tab) already holds either way.
+
+    CORRECTED 2026-08-27 (user report: misclicking a UI element used to cascade into a confusing
+    downstream safety stop): the click used to be trusted as a successful switch outright, with
+    no confirmation it landed -- a dropped/misclicked tap left the caller reading the WRONG tab's
+    contents, surfacing later as an unrelated failure (mastering_mixology.py hard safety-stopping
+    on the very next thing that looked wrong instead of on the actual missed click). Now retries
+    via controller.ensure_ui_state, re-checking `currentTab` with a fresh bank read after each
+    click, before declaring success or giving up."""
     bank = controller.get_bank()
     if bank.get("currentTab") == index:
         return True
@@ -492,9 +500,16 @@ def switch_bank_tab(ctx, index: int) -> bool:
         debug_log.log("bank", f"tab {index} button not found (bank open?)")
         return False
 
-    controller.click_entity(ctx.ser, tab, offset=(0, 0), check_ui_blockers=False)
-    controller.human_delay(0.3, 0.5)
-    return True
+    def click_tab():
+        controller.click_entity(ctx.ser, tab, offset=(0, 0), check_ui_blockers=False)
+
+    def tab_is_active():
+        return controller.get_bank(fresh=True).get("currentTab") == index
+
+    ok = controller.ensure_ui_state(click_tab, tab_is_active, retry_delay_s=(0.3, 0.5))
+    if not ok:
+        debug_log.log("bank", f"clicked tab {index} but currentTab never confirmed the switch")
+    return ok
 
 
 def wait_until_bank_item_gone(ctx, name_substring: str, timeout_s: float = 1.5, poll_interval_s: float = 0.15) -> bool:

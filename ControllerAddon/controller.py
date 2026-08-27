@@ -86,6 +86,7 @@ import keyboard  # panic-key / manual trigger
 import requests
 import serial
 import win32gui
+import winsound  # pause/resume acknowledgment beep -- stdlib, Windows-only like win32gui above
 
 import debug_log
 import human_move  # v2 movement engine; only reached when settings.HUMAN_MOVE_V2 is on
@@ -95,17 +96,59 @@ from settings import *  # noqa: F401,F403 -- all tunables collected in settings.
 # ---------------- panic button ----------------
 def panic_exit():
     print("\n[!] Emergency exit triggered (F1 pressed).")
+    winsound.Beep(PANIC_BEEP_HZ, PANIC_BEEP_DURATION_MS)
     os._exit(0)  # hard kill, works even if a thread is stuck
 
 
-def start_panic_listener():
-    keyboard.add_hotkey('f1', panic_exit)
+def _panic_watchdog() -> None:
+    """Blocks on the panic hotkey and exits the moment it fires -- runs forever on its own
+    daemon thread (see start_panic_listener), same shape as _pause_watchdog.
 
-    def watchdog():
+    CORRECTED 2026-08-27 (user direction: "make sure they are built the same as pause but just
+    exits instead of pauses"): this used to ALSO register a plain keyboard.add_hotkey('f1', ...)
+    callback alongside this same wait-loop, both wired to panic_exit -- harmless only because
+    os._exit is idempotent-ish (the second call, if ever reached, exits an already-dead
+    process), but an inconsistent shape once pause could no longer do the same double-wiring
+    (see _pause_watchdog's own note on why). Unified to the single wait-loop mechanism."""
+    while True:
         keyboard.wait('f1')
         panic_exit()
 
-    threading.Thread(target=watchdog, daemon=True).start()
+
+def start_panic_listener():
+    threading.Thread(target=_panic_watchdog, daemon=True).start()
+
+
+# ---------------- pause toggle ----------------
+def toggle_pause(state: "ControllerState"):
+    state.paused = not state.paused
+    if state.paused:
+        debug_log.log("!", "Paused (F2 pressed). Automation frozen -- press F2 to resume.")
+        winsound.Beep(PAUSE_BEEP_HZ, PAUSE_BEEP_DURATION_MS)
+    else:
+        debug_log.log("!", "Resumed (F2 pressed).")
+        winsound.Beep(RESUME_BEEP_HZ, PAUSE_BEEP_DURATION_MS)
+
+
+def _pause_watchdog(state: "ControllerState") -> None:
+    """Blocks on the pause hotkey and toggles state.paused each time it fires -- runs forever on
+    its own daemon thread (see start_pause_listener).
+
+    CORRECTED 2026-08-27 (user report): a bare keyboard.add_hotkey('f2', ...) callback -- what
+    this used to be -- stopped firing once RuneLite, rather than the terminal/IDE, had window
+    focus. start_panic_listener's F1 handling already has a second, redundant path for exactly
+    this reason: a dedicated thread blocking on keyboard.wait, which was confirmed to keep
+    working focus-independently. Pause can't use the same belt-and-suspenders shape panic does
+    (add_hotkey AND a wait-loop both wired to the same action) -- toggling isn't idempotent like
+    panic_exit's hard os._exit is, so firing both for one keypress would immediately cancel back
+    out. This is the wait-loop alone, replacing add_hotkey rather than duplicating it."""
+    while True:
+        keyboard.wait('f2')
+        toggle_pause(state)
+
+
+def start_pause_listener(state: "ControllerState"):
+    threading.Thread(target=lambda: _pause_watchdog(state), daemon=True).start()
 
 
 # ---------------- bridge HTTP helpers ----------------
@@ -466,6 +509,76 @@ def get_widget_children(group: int, child: int):
     what. Returns a list (empty if the widget is absent or has no children)."""
     body = api_get("/widget/children", params={"group": group, "child": child}) or {}
     return body.get("children") or []
+
+
+def get_active_tab():
+    """The sidebar tab index currently on screen (WidgetProvider's /widget/active-tab --
+    VarClientInt.INVENTORY_TAB), the same authoritative per-tick signal PrayerProvider already
+    trusts for its own tab (see that file's comment: a widget group's own non-null/hidden state
+    is NOT reliable evidence of which tab is actually showing -- it can stay loaded from an
+    earlier session even while a different tab is the one visible). Returns None when the
+    endpoint doesn't exist yet (un-rebuilt client) or the bridge is down -- callers must treat
+    that as "can't verify", not "wrong tab", same degrade-gracefully stance as hover_matches."""
+    data = api_get("/widget/active-tab")
+    if not data:
+        return None
+    return data.get("tab")
+
+
+def ensure_ui_state(action_fn, check_fn, tries: int = 3, retry_delay_s=(0.2, 0.35)) -> bool:
+    """Generic verify-then-retry wrapper for a UI action (a tab hotkey tap, a widget click)
+    whose success can be confirmed by re-reading live state. Returns True immediately if
+    check_fn() already holds -- the idempotent-skip idiom open_inventory_tab/open_prayer_tab
+    already used -- otherwise calls action_fn(), waits, and re-checks, up to `tries` times.
+
+    Added because a single unconfirmed tap/click was being trusted as success outright
+    throughout this codebase (banker.switch_bank_tab clicked a bank tab once and returned True
+    unconditionally; golem_crafting.py blind-tapped the inventory hotkey with no check at all).
+    A dropped keypress, a simulated misclick (click_entity's MISTAKE_MISCLICK_CHANCE), or a
+    stray click landing on the wrong element all used to desync a routine's assumption about
+    what's on screen -- surfacing later as a confusing, unrelated safety stop instead of being
+    caught and retried here where the cause is still known.
+
+    check_fn() returning None means the signal can't be read at all (e.g. an un-rebuilt client
+    missing a new endpoint) -- fails OPEN in that case (fires the action once and trusts it,
+    same degrade-gracefully stance as hover_matches) rather than blocking every caller on a
+    feature that doesn't exist yet."""
+    state = check_fn()
+    if state is None:
+        action_fn()
+        return True
+    if state:
+        return True
+    for _ in range(tries):
+        action_fn()
+        human_delay(*retry_delay_s)
+        if check_fn():
+            return True
+    return False
+
+
+def click_widget(ser: serial.Serial, group: int, child: int, index: int = None,
+                  verify_fn=None, tries: int = 3, offset=(0, 0)) -> bool:
+    """Click an interface element by group/child id (see get_widget) -- the same two calls
+    (get_widget then click_entity) every existing widget click site already makes by hand,
+    offered here as one call for new sites that want click-landed verification for free instead
+    of hand-rolling it (see banker.switch_bank_tab for the same idiom applied to bank tabs).
+
+    verify_fn (optional, zero-arg, same Optional[bool] contract as ensure_ui_state's check_fn)
+    confirms the click actually landed and retries via ensure_ui_state if not. Without it, this
+    is just get_widget + a single click_entity call, same as every existing call site."""
+    widget = get_widget(group, child, index=index)
+    if not widget.get("clickable") or widget.get("screenX") is None:
+        return False
+
+    def do_click():
+        click_entity(ser, widget, offset=offset, check_ui_blockers=False)
+
+    if verify_fn is None:
+        do_click()
+        return True
+
+    return ensure_ui_state(do_click, verify_fn, tries=tries)
 
 
 def get_consumables():
@@ -1144,20 +1257,25 @@ INVENTORY_TAB_KEY = "w"
 PRAYER_TAB_KEY = "r"
 
 
-def open_inventory_tab(ser: serial.Serial) -> None:
-    if get_state().get("inventoryTabOpen"):
-        return
-    key_tap(ser, INVENTORY_TAB_KEY)
-    human_delay(0.2, 0.35)
+def open_inventory_tab(ser: serial.Serial) -> bool:
+    """Idempotent-skip if already open, otherwise taps the hotkey and RETRIES until
+    inventoryTabOpen actually confirms the switch (see ensure_ui_state) -- a single unconfirmed
+    tap used to be trusted as success (CONFIRMED live bug: golem_crafting.py's own blind
+    key_tap(ctx.ser, "w") calls, which this now replaces)."""
+    return ensure_ui_state(
+        lambda: key_tap(ser, INVENTORY_TAB_KEY),
+        lambda: get_state().get("inventoryTabOpen"),
+    )
 
 
-def open_prayer_tab(ser: serial.Serial) -> None:
-    """Tap the prayer-tab hotkey unless it's already open -- PrayerProvider's "icons"
-    are only populated while it is (see its "tabOpen" flag)."""
-    if get_prayers().get("tabOpen"):
-        return
-    key_tap(ser, PRAYER_TAB_KEY)
-    human_delay(0.2, 0.35)
+def open_prayer_tab(ser: serial.Serial) -> bool:
+    """Tap the prayer-tab hotkey unless it's already open, retrying until PrayerProvider's
+    "tabOpen" confirms the switch (see ensure_ui_state) -- its "icons" are only populated while
+    that's true."""
+    return ensure_ui_state(
+        lambda: key_tap(ser, PRAYER_TAB_KEY),
+        lambda: get_prayers().get("tabOpen"),
+    )
 
 
 # ---------------- Human-like trajectory generation ----------------
@@ -2409,6 +2527,7 @@ class ControllerState:
                                            # debug_log.tick()'s per-tick snapshot line
 
         self.start_time = time.time()
+        self.paused = False
         self.safety_stopped = False
         self.safety_reason = None
         self._safety_reminder_at = 0.0
@@ -2684,6 +2803,7 @@ def main():
     udp = make_udp_listener(UDP_PORT)
     event_stream = bridge_events.EventStream(udp)
     state = ControllerState()
+    start_pause_listener(state)
 
     with serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1) as ser:
         time.sleep(2.0)  # Pro Micro reset
@@ -2712,6 +2832,10 @@ def main():
                     except Exception as exc:
                         debug_log.log_exception("on_event", exc)
                         raise
+
+            if state.paused:
+                time.sleep(0.5)
+                continue
 
             bridge_config = state.refresh_bridge_config()
 

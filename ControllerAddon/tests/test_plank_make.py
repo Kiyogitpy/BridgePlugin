@@ -39,6 +39,7 @@ class FakeState:
         self.config = None
         self.safety_stopped = False
         self.stop_reason = None
+        self.paused = False
 
     def trigger_safety_stop(self, reason):
         self.safety_stopped = True
@@ -409,6 +410,28 @@ def test_cast_phase_pauses_when_the_window_loses_focus(monkeypatch, _instant_cas
     monkeypatch.setattr(pm, "cast_once", lambda *a: pytest.fail("must not click unfocused"))
     pm.cast_phase(ctx, pm.DEFAULT_CONFIG, _inventory(log_count=25))
     assert not ctx.state.safety_stopped
+
+
+def test_cast_phase_stops_mid_load_when_paused(monkeypatch, _instant_cast_phase):
+    """LIVE BUG (user report, 2026-08-27): cast_phase's loop can run for a whole inventory
+    (~45s) inside ONE tick() call, and the engine's own F2 pause gate only runs BETWEEN tick()
+    calls -- so pressing F2 mid-load kept clicking for ~16s in the observed log before it took
+    effect. Same shape as the windowFocused check above: this loop has to re-check paused
+    itself, same idiom."""
+    ctx = FakeCtx()
+    casts = [0]
+
+    def _cast(_ctx, _config, _inventory):
+        casts[0] += 1
+        if casts[0] == 2:
+            ctx.state.paused = True  # F2 pressed mid-load, after the 2nd cast lands
+        return True
+
+    monkeypatch.setattr(pm, "cast_once", _cast)
+    monkeypatch.setattr(controller, "get_inventory", lambda: _inventory(log_count=25))
+    pm.cast_phase(ctx, pm.DEFAULT_CONFIG, _inventory(log_count=25))
+    assert casts[0] == 2                    # stopped right after the pause was noticed
+    assert not ctx.state.safety_stopped     # pausing is not a safety stop
 
 
 def test_cast_phase_stops_when_the_coins_run_out_mid_load(monkeypatch, _instant_cast_phase):

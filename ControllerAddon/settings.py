@@ -34,6 +34,18 @@ CONFIG_POLL_INTERVAL = 1.0   # how often GET /config is refreshed
 STATE_POLL_INTERVAL = 0.3    # pace of the main decision loop
 INVENTORY_SIZE = 28
 
+# ---------------- Pause/resume/panic feedback (added 2026-08-27) ----------------
+# toggle_pause beeps on every F2 press so it's audible without alt-tabbing back to check --
+# see start_pause_listener's own note on why F2 needs to work without focus in the first place.
+# Two different tones so pause vs resume is tellable by ear alone. panic_exit's own beep is
+# deliberately much lower/deeper than either -- a distinct "something serious just happened"
+# tone for the hard-kill hotkey, not just a third shade of the same pause/resume pair.
+PAUSE_BEEP_HZ = 500      # lower tone: pausing
+RESUME_BEEP_HZ = 900     # higher tone: resuming
+PAUSE_BEEP_DURATION_MS = 180
+PANIC_BEEP_HZ = 150      # much deeper than either pause tone -- the emergency-exit hotkey
+PANIC_BEEP_DURATION_MS = 250
+
 # ---------------- Human-like aiming ----------------
 DEFAULT_AIM_RADIUS = 10         # px; move_to_human's own fallback when a caller doesn't specify one
 ENTITY_AIM_RADIUS = 3           # px; used by click_entity -- tighter than the generic default since

@@ -788,8 +788,7 @@ def _shed_pit_junk(ctx, phase_label: str) -> None:
     regardless."""
     if not _count_named(WOODEN_SPIKES_NAME):
         return
-    controller.key_tap(ctx.ser, "w")   # inventory tab -- same idiom hunt_phase's own drop uses
-    controller.human_delay(0.2, 0.4)
+    controller.open_inventory_tab(ctx.ser)   # verified switch, see controller.ensure_ui_state
     debug_log.log("golem crafting", f"dropping leftover pit spikes before {phase_label}")
     _drop_all(ctx, WOODEN_SPIKES_NAME)
 
@@ -2817,11 +2816,11 @@ def hunt_phase(ctx, config: dict) -> None:
     while time.time() < deadline and not _pit_ready_to_reline(ctx, pit):
         time.sleep(1.0)
 
-    controller.key_tap(ctx.ser, "w")  # switch to Inventory -- CONFIRMED live (same idiom
-                                       # chisel_phase already uses) needed before clicking
-                                       # inventory items; a still-open Magic tab from Grab-
-                                       # casting would otherwise leave Goat horns unclickable.
-    controller.human_delay(0.2, 0.4)
+    # Switch to Inventory -- CONFIRMED live needed before clicking inventory items; a still-open
+    # Magic tab from Grab-casting would otherwise leave Goat horns unclickable. Verified switch
+    # (see controller.ensure_ui_state), not a blind tap -- a still-open Magic tab is exactly a
+    # case a dropped keypress here would silently leave unresolved.
+    controller.open_inventory_tab(ctx.ser)
     _drop_all(ctx, GOAT_HORN_NAME)   # "Drop" -- confirmed live Forced Action
 
     spilled_fur = any(

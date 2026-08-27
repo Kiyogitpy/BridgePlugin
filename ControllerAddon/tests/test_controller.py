@@ -100,6 +100,205 @@ def test_get_objects_with_no_radius_and_no_fresh_sends_no_params(monkeypatch):
     assert captured["params"] is None
 
 
+# ---- panic listener (F1), 2026-08-27 ----
+# Rebuilt to match the corrected pause listener's shape (user direction: "make sure they are
+# built the same as pause but just exits instead of pauses") -- a single dedicated daemon
+# thread blocking on keyboard.wait, replacing the old add_hotkey+wait-loop double registration
+# (harmless there only because os._exit is idempotent-ish; still an inconsistent shape once
+# pause could no longer use it -- see _pause_watchdog's own note).
+
+class _StopPanicWatchdogLoop(Exception):
+    """Breaks _panic_watchdog's otherwise-infinite loop deterministically inside a test."""
+
+
+def test_panic_exit_beeps_before_exiting(monkeypatch):
+    order = []
+    monkeypatch.setattr(controller.winsound, "Beep",
+                        lambda freq, dur: order.append(("beep", freq, dur)))
+    monkeypatch.setattr(controller.os, "_exit", lambda code: order.append(("exit", code)))
+
+    controller.panic_exit()
+
+    assert order == [("beep", controller.PANIC_BEEP_HZ, controller.PANIC_BEEP_DURATION_MS),
+                      ("exit", 0)]
+
+
+def test_panic_beep_is_deeper_than_either_pause_tone():
+    """A distinct 'something serious happened' tone, not just a third shade of pause/resume."""
+    assert controller.PANIC_BEEP_HZ < controller.PAUSE_BEEP_HZ
+    assert controller.PANIC_BEEP_HZ < controller.RESUME_BEEP_HZ
+
+
+def test_panic_watchdog_exits_each_time_the_hotkey_fires(monkeypatch):
+    wait_calls = {"n": 0}
+    exits = []
+
+    def fake_wait(key):
+        wait_calls["n"] += 1
+        if wait_calls["n"] > 2:
+            raise _StopPanicWatchdogLoop()
+
+    monkeypatch.setattr(controller.keyboard, "wait", fake_wait)
+    monkeypatch.setattr(controller, "panic_exit", lambda: exits.append(1))
+
+    with pytest.raises(_StopPanicWatchdogLoop):
+        controller._panic_watchdog()
+
+    assert wait_calls["n"] == 3
+    assert exits == [1, 1]
+
+
+def test_panic_watchdog_waits_on_the_f1_key(monkeypatch):
+    seen = []
+
+    def fake_wait(key):
+        seen.append(key)
+        raise _StopPanicWatchdogLoop()
+
+    monkeypatch.setattr(controller.keyboard, "wait", fake_wait)
+
+    with pytest.raises(_StopPanicWatchdogLoop):
+        controller._panic_watchdog()
+
+    assert seen == ["f1"]
+
+
+def test_start_panic_listener_runs_the_watchdog_on_its_own_daemon_thread(monkeypatch):
+    started = {}
+
+    class _FakeThread:
+        def __init__(self, target, daemon):
+            started["target"] = target
+            started["daemon"] = daemon
+
+        def start(self):
+            started["started"] = True
+
+    monkeypatch.setattr(controller.threading, "Thread", _FakeThread)
+
+    controller.start_panic_listener()
+
+    assert started["daemon"] is True
+    assert started["started"] is True
+    assert callable(started["target"])
+
+
+def test_start_panic_listener_does_not_also_register_add_hotkey(monkeypatch):
+    """The old shape double-registered (add_hotkey AND a wait-loop thread, both wired to
+    panic_exit) -- harmless for an idempotent hard exit, but not the single-mechanism shape
+    pause needs, and no longer what panic should do either now that they're meant to match."""
+    monkeypatch.setattr(controller.threading, "Thread", lambda target, daemon: type(
+        "T", (), {"start": lambda self: None})())
+    calls = []
+    monkeypatch.setattr(controller.keyboard, "add_hotkey",
+                        lambda key, fn: calls.append(key))
+
+    controller.start_panic_listener()
+
+    assert calls == []
+
+
+def test_toggle_pause_beeps_when_pausing(monkeypatch):
+    beeps = []
+    monkeypatch.setattr(controller.winsound, "Beep", lambda freq, dur: beeps.append((freq, dur)))
+    state = controller.ControllerState()
+
+    controller.toggle_pause(state)  # False -> True (paused)
+
+    assert len(beeps) == 1
+
+
+def test_toggle_pause_beeps_when_resuming(monkeypatch):
+    beeps = []
+    monkeypatch.setattr(controller.winsound, "Beep", lambda freq, dur: beeps.append((freq, dur)))
+    state = controller.ControllerState()
+    state.paused = True
+
+    controller.toggle_pause(state)  # True -> False (resumed)
+
+    assert len(beeps) == 1
+
+
+def test_toggle_pause_uses_a_different_tone_for_pause_vs_resume(monkeypatch):
+    """Audible feedback for a hotkey the user can't visually confirm without alt-tabbing --
+    distinct tones so pause vs resume is tellable by ear alone, not just that SOMETHING fired."""
+    beeps = []
+    monkeypatch.setattr(controller.winsound, "Beep", lambda freq, dur: beeps.append(freq))
+    state = controller.ControllerState()
+
+    controller.toggle_pause(state)  # pause
+    controller.toggle_pause(state)  # resume
+
+    assert beeps[0] != beeps[1]
+
+
+# ---- pause listener (F2), 2026-08-27 ----
+# CONFIRMED report: a bare keyboard.add_hotkey('f2', ...) callback (the old implementation)
+# stopped firing once RuneLite, not the terminal, had focus. start_panic_listener's (F1) own
+# dedicated thread running a keyboard.wait loop was the one confirmed to keep working
+# focus-independently -- start_pause_listener now mirrors that instead of add_hotkey.
+
+class _StopWatchdogLoop(Exception):
+    """Breaks _pause_watchdog's otherwise-infinite loop deterministically inside a test."""
+
+
+def test_pause_watchdog_toggles_once_per_hotkey_press(monkeypatch):
+    wait_calls = {"n": 0}
+    toggled = []
+
+    def fake_wait(key):
+        wait_calls["n"] += 1
+        if wait_calls["n"] > 3:
+            raise _StopWatchdogLoop()
+
+    monkeypatch.setattr(controller.keyboard, "wait", fake_wait)
+    monkeypatch.setattr(controller, "toggle_pause", lambda state: toggled.append(state))
+    state = controller.ControllerState()
+
+    with pytest.raises(_StopWatchdogLoop):
+        controller._pause_watchdog(state)
+
+    assert wait_calls["n"] == 4
+    assert toggled == [state, state, state]  # one toggle per of the first 3 presses
+
+
+def test_pause_watchdog_waits_on_the_f2_key(monkeypatch):
+    seen = []
+
+    def fake_wait(key):
+        seen.append(key)
+        raise _StopWatchdogLoop()
+
+    monkeypatch.setattr(controller.keyboard, "wait", fake_wait)
+    state = controller.ControllerState()
+
+    with pytest.raises(_StopWatchdogLoop):
+        controller._pause_watchdog(state)
+
+    assert seen == ["f2"]
+
+
+def test_start_pause_listener_runs_the_watchdog_on_its_own_daemon_thread(monkeypatch):
+    started = {}
+
+    class _FakeThread:
+        def __init__(self, target, daemon):
+            started["target"] = target
+            started["daemon"] = daemon
+
+        def start(self):
+            started["started"] = True
+
+    monkeypatch.setattr(controller.threading, "Thread", _FakeThread)
+    state = controller.ControllerState()
+
+    controller.start_pause_listener(state)
+
+    assert started["daemon"] is True
+    assert started["started"] is True
+    assert callable(started["target"])
+
+
 # ---- move_to_human's refresh_legs (multi-leg tracking) additions, 2026-08-14 ----
 # Pure-logic coverage only -- live mouse movement genuinely can't be unit tested, but
 # _move_to_human_tracking's leg/refresh bookkeeping is cheap to verify with the real cursor and
@@ -766,6 +965,145 @@ def test_click_entity_withholds_click_on_persistent_hover_mismatch(monkeypatch):
     # an escalation path (golem_crafting's tiers) can tell "pixel contested" from "aim failed"
     # -- while every plain truthiness check keeps working.
     assert getattr(ok, "withheld", False)
+
+
+def test_get_active_tab_returns_int_from_widget_endpoint(monkeypatch):
+    monkeypatch.setattr(controller, "api_get", lambda path, params=None, timeout=0.3: {"tab": 5})
+    assert controller.get_active_tab() == 5
+
+
+def test_get_active_tab_returns_none_when_endpoint_missing(monkeypatch):
+    """An un-rebuilt client has no /widget/active-tab (api_get returns None) -- callers must
+    treat that as 'can't verify', not 'wrong tab'."""
+    monkeypatch.setattr(controller, "api_get", lambda path, params=None, timeout=0.3: None)
+    assert controller.get_active_tab() is None
+
+
+def test_ensure_ui_state_returns_true_without_acting_when_already_in_state(monkeypatch):
+    acted = []
+    ok = controller.ensure_ui_state(lambda: acted.append(1), lambda: True)
+    assert ok
+    assert acted == []
+
+
+def test_ensure_ui_state_retries_action_until_check_passes(monkeypatch):
+    """The regression case this exists for: a single unconfirmed tap/click used to be trusted as
+    success outright. Here the check only starts passing after the second action, so a
+    single-attempt caller would have wrongly reported success."""
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    calls = []
+
+    def action():
+        calls.append(1)
+
+    def check():
+        return len(calls) >= 2
+
+    ok = controller.ensure_ui_state(action, check, tries=3)
+    assert ok
+    assert len(calls) == 2
+
+
+def test_ensure_ui_state_gives_up_after_tries_exhausted(monkeypatch):
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    calls = []
+    ok = controller.ensure_ui_state(lambda: calls.append(1), lambda: False, tries=3)
+    assert not ok
+    assert len(calls) == 3
+
+
+def test_ensure_ui_state_degrades_when_check_cannot_verify(monkeypatch):
+    """check_fn returning None means the signal doesn't exist (un-rebuilt client) -- must not
+    block forever on a feature that isn't there, same degrade-gracefully stance as
+    hover_matches. Fires the action once and trusts it, same as the old unverified behavior."""
+    calls = []
+    ok = controller.ensure_ui_state(lambda: calls.append(1), lambda: None, tries=3)
+    assert ok
+    assert len(calls) == 1
+
+
+def test_open_inventory_tab_skips_tap_when_already_open(monkeypatch):
+    monkeypatch.setattr(controller, "get_state", lambda: {"inventoryTabOpen": True})
+    taps = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: taps.append(key))
+    controller.open_inventory_tab(None)
+    assert taps == []
+
+
+def test_open_inventory_tab_retries_until_the_tab_actually_opens(monkeypatch):
+    """CONFIRMED live bug (golem_crafting.py before this fix): a blind key_tap('w') with no
+    verification at all -- a dropped keypress left the routine clicking inventory slots on
+    whatever tab was actually showing. open_inventory_tab must now keep tapping until
+    inventoryTabOpen actually flips, not just once."""
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    state = {"open": False, "taps": 0}
+
+    def fake_key_tap(ser, key):
+        state["taps"] += 1
+        if state["taps"] >= 2:
+            state["open"] = True
+
+    monkeypatch.setattr(controller, "key_tap", fake_key_tap)
+    monkeypatch.setattr(controller, "get_state", lambda: {"inventoryTabOpen": state["open"]})
+
+    ok = controller.open_inventory_tab(None)
+    assert ok
+    assert state["taps"] == 2
+
+
+def test_open_prayer_tab_retries_until_the_tab_actually_opens(monkeypatch):
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    state = {"open": False, "taps": 0}
+
+    def fake_key_tap(ser, key):
+        state["taps"] += 1
+        if state["taps"] >= 2:
+            state["open"] = True
+
+    monkeypatch.setattr(controller, "key_tap", fake_key_tap)
+    monkeypatch.setattr(controller, "get_prayers", lambda: {"tabOpen": state["open"]})
+
+    ok = controller.open_prayer_tab(None)
+    assert ok
+    assert state["taps"] == 2
+
+
+def test_click_widget_returns_false_when_not_clickable(monkeypatch):
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda group, child, index=None: {"found": True, "clickable": False})
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: clicked.append(1))
+    assert not controller.click_widget(None, 149, 0)
+    assert clicked == []
+
+
+def test_click_widget_without_verify_fn_clicks_once_and_returns_true(monkeypatch):
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda group, child, index=None:
+                        {"found": True, "clickable": True, "screenX": 10, "screenY": 10})
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: clicked.append(1))
+    assert controller.click_widget(None, 149, 0)
+    assert clicked == [1]
+
+
+def test_click_widget_verifies_and_retries_via_verify_fn(monkeypatch):
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda group, child, index=None:
+                        {"found": True, "clickable": True, "screenX": 10, "screenY": 10})
+    state = {"clicks": 0, "done": False}
+
+    def fake_click_entity(ser, entity, **kw):
+        state["clicks"] += 1
+        if state["clicks"] >= 2:
+            state["done"] = True
+
+    monkeypatch.setattr(controller, "click_entity", fake_click_entity)
+
+    ok = controller.click_widget(None, 149, 0, verify_fn=lambda: state["done"])
+    assert ok
+    assert state["clicks"] == 2
 
 
 def test_human_delay_without_serial_is_a_plain_sleep(monkeypatch):

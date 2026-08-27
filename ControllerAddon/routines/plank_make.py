@@ -356,6 +356,13 @@ def cast_phase(ctx, config, inventory):
         if ctx.state.safety_stopped:
             return
 
+        # LIVE BUG (user report, 2026-08-27): the engine's own F2 pause gate only runs between
+        # tick() calls too, same reasoning as the windowFocused re-check below -- without this,
+        # a mid-load F2 press was observed continuing to click for ~16s (a whole inventory's
+        # worth of casts) before the pause actually took effect.
+        if ctx.state.paused:
+            return
+
         logs = count_item(inventory, log_name)
         if logs == 0:
             if casts:

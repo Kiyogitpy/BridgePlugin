@@ -4,6 +4,7 @@ import com.example.bridge.BridgeHttpServer;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
 import net.runelite.api.ItemComposition;
+import net.runelite.api.VarClientInt;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.util.Text;
@@ -44,6 +45,16 @@ import java.util.Map;
  *       dynamic child within it (an inventory or bank slot inside its container widget).</li>
  *   <li>{@code GET /widget/children?group=387&child=0} -- every child with a resolvable position,
  *       for discovering which index holds what without guessing.</li>
+ *   <li>{@code GET /widget/active-tab} -- {@code {"tab": <int>}}, the sidebar tab index currently
+ *       on screen. Added 2026-08-27 (user report: routines had no way to sanity-check "am I
+ *       actually looking at the inventory" before clicking into it, and a blind tab-hotkey tap
+ *       with no verification -- see golem_crafting.py's pre-fix key_tap(ctx.ser, "w") calls --
+ *       could silently leave inventory clicks landing on whatever tab was actually open). Backed
+ *       by {@code VarClientInt.INVENTORY_TAB}, the same authoritative per-tick signal
+ *       PrayerProvider already relies on for its own tab (see that class's comment on why a
+ *       widget group's own non-null/hidden state is NOT reliable evidence of which tab is
+ *       actually showing -- it can stay loaded from earlier in the session regardless), exposed
+ *       generically here instead of adding another one-off per-tab boolean.</li>
  * </ul>
  * Always 200 with {@code found:false} rather than an error when the widget is absent -- an
  * interface that is simply closed is a normal, expected state for a polling caller, not a failure.
@@ -63,6 +74,14 @@ public class WidgetProvider extends BridgeProvider
 	{
 		server.registerQuery("/widget", query -> onClient(() -> getWidget(query)));
 		server.registerQuery("/widget/children", query -> onClient(() -> getChildren(query)));
+		server.register("/widget/active-tab", () -> onClient(this::getActiveTab));
+	}
+
+	private Object getActiveTab()
+	{
+		Map<String, Object> result = new HashMap<>();
+		result.put("tab", client.getVarcIntValue(VarClientInt.INVENTORY_TAB));
+		return result;
 	}
 
 	private Object getWidget(Map<String, String> query)

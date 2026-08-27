@@ -778,6 +778,16 @@ def process_phase(ctx, config: dict) -> None:
     # already been finished off the front, computed fresh from live inventory state each loop
     # iteration instead of separately persisted bookkeeping.
     while True:
+        # Same shape as plank_make.py's cast_phase: this loop can walk through every
+        # unprocessed potion in one tick() call, so the engine's own F2/safety-stop gates
+        # (which only run BETWEEN tick() calls) can't interrupt it mid-batch on their own --
+        # LIVE BUG (user report, 2026-08-27) confirmed for cast_phase first, same fix here.
+        # safety_stopped in particular can be set BY _process_one itself (a stray click
+        # starting the wrong potion), so without this the loop barreled on to the next
+        # station even after that.
+        if ctx.state.safety_stopped or ctx.state.paused:
+            return
+
         # id-based (Fix 1, final whole-branch review): processing transforms a base potion in
         # place while keeping its display `name` identical, so a name-in-RECIPE_TABLE test can
         # never distinguish unprocessed from processed. See UNFINISHED_IDS/FINISHED_IDS above.
