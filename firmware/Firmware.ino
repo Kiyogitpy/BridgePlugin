@@ -85,7 +85,7 @@ static const uint32_t CHAIN_MAX_LAG_US = 50000UL;
 
 static const uint16_t CLICK_HOLD_MS = 60;  // only for the legacy one-shot MLC/MRC/MMC path
 
-enum : uint8_t { CMD_SEG = 0, CMD_BTN = 1, CMD_KEY = 2 };
+enum : uint8_t { CMD_SEG = 0, CMD_BTN = 1, CMD_KEY = 2, CMD_WHEEL = 3 };
 
 struct Cmd {
   uint8_t type;
@@ -110,6 +110,14 @@ static uint32_t last_report_us = 0;
 // Sub-pixel remainder carried between segments -- this is what makes fractional motion real
 // rather than repeatedly truncated. Always strictly within +/-100.
 static int32_t carry_x_q = 0, carry_y_q = 0;
+
+// v3: what WE are currently holding down, for R and the stuck-input watchdog. Mouse buttons
+// are the MOUSE_* bitmask values (1/2/4), so a mask works; keys are just a depth counter --
+// enough to know "something is held", which is all the watchdog needs.
+static uint8_t held_buttons = 0;
+static uint8_t held_keys = 0;
+static uint32_t last_line_us = 0;
+static const uint32_t STUCK_INPUT_TIMEOUT_US = 60000000UL;  // 60 s; longest legit hold is ~5 s
 
 // Start time the NEXT segment should use, so a stream of segments stays phase-locked instead of
 // each one starting slightly late and accumulating drift.
@@ -211,6 +219,15 @@ static void flushQueue() {
   q_count = seg_active ? 1 : 0;
 }
 
+static void releaseAllInputs() {
+  Mouse.release(MOUSE_LEFT);
+  Mouse.release(MOUSE_RIGHT);
+  Mouse.release(MOUSE_MIDDLE);
+  Keyboard.releaseAll();
+  held_buttons = 0;
+  held_keys = 0;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Command decoding
 // ---------------------------------------------------------------------------------------------
@@ -279,6 +296,19 @@ static void handleLine(const char *line) {
     Serial.print("HB 3\n");   // solicited, single short line: cannot stall (see header)
     return;
   }
+  if (line[0] == 'R' && !line[1]) {
+    // Hard reset: unlike X, this abandons the ACTIVE segment too, and forgets the sub-pixel
+    // carry and chain phase -- the whole point is a clean slate after a crashed sender, and
+    // chaining onto a dead session's timeline would be wrong. q_head is left as-is: with
+    // q_count = 0 and seg_active false, no path reads the abandoned slot.
+    q_count = 0;
+    seg_active = false;
+    carry_x_q = 0;
+    carry_y_q = 0;
+    chain_valid = false;
+    releaseAllInputs();
+    return;
+  }
 
   // "M <dx> <dy>" -- legacy immediate move. Enqueued as a zero-duration segment so it keeps its
   // place in program order relative to clicks; with an empty queue that is indistinguishable
@@ -309,6 +339,17 @@ static void handleLine(const char *line) {
              clampLong(dxq, -MAX_SEG_Q, MAX_SEG_Q),
              clampLong(dyq, -MAX_SEG_Q, MAX_SEG_Q),
              (uint16_t)clampLong(dur, 0, MAX_SEG_MS), 0, 0);
+    }
+    return;
+  }
+
+  // "W <n>" -- scroll wheel, n detents. Queued so it keeps program order with motion/clicks.
+  if (line[0] == 'W' && (line[1] == ' ' || line[1] == '\t')) {
+    const char *p = line + 1;
+    bool ok;
+    int32_t n = parseLong(p, ok);
+    if (ok && n != 0) {
+      q_push(CMD_WHEEL, 0, 0, 0, (uint8_t)(int8_t)clampLong(n, -127, 127), 0);
     }
     return;
   }
@@ -408,12 +449,25 @@ static void serviceQueue() {
     }
 
     if (c.type == CMD_BTN) {
-      if (c.p1 == BTN_PRESS) Mouse.press(c.p0);
-      else Mouse.release(c.p0);
+      if (c.p1 == BTN_PRESS) {
+        Mouse.press(c.p0);
+        held_buttons |= c.p0;
+      } else {
+        Mouse.release(c.p0);
+        held_buttons &= (uint8_t)~c.p0;
+      }
     } else if (c.type == CMD_KEY) {
-      if (c.p1 == KEY_WRITE) Keyboard.write(c.p0);
-      else if (c.p1 == KEY_PRESS) Keyboard.press(c.p0);
-      else Keyboard.release(c.p0);
+      if (c.p1 == KEY_WRITE) {
+        Keyboard.write(c.p0);
+      } else if (c.p1 == KEY_PRESS) {
+        Keyboard.press(c.p0);
+        if (held_keys < 255) held_keys++;
+      } else {
+        Keyboard.release(c.p0);
+        if (held_keys) held_keys--;
+      }
+    } else if (c.type == CMD_WHEEL) {
+      Mouse.move(0, 0, (int8_t)c.p0);
     }
     q_pop();
   }
@@ -469,6 +523,7 @@ static void pumpSerial() {
     if (c == '\n') {
       while (len > 0 && isSpaceChar(buf[len - 1])) len--;
       buf[len] = '\0';
+      last_line_us = micros();
       handleLine(buf);
       len = 0;
       return;   // one command per pass, so motion is serviced promptly between commands
@@ -500,4 +555,14 @@ void loop() {
   }
   serviceQueue();
   serviceMotion();
+
+  // Stuck-input watchdog (v3). The host's panic key is a hard process kill that cannot send
+  // key-ups, so anything held at that instant would otherwise stay down FOREVER. Fires only
+  // when something is actually held: breaks (minutes of silence, nothing held) never trip it,
+  // and any legitimate hold happens inside a flight that streams segments constantly.
+  // micros() wraps every ~71 min; the unsigned subtraction handles the wrap.
+  if ((held_buttons || held_keys) &&
+      (uint32_t)(micros() - last_line_us) > STUCK_INPUT_TIMEOUT_US) {
+    releaseAllInputs();
+  }
 }
