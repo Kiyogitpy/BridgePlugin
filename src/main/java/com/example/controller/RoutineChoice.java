@@ -23,7 +23,8 @@ public enum RoutineChoice
 	PYRAMID_PLUNDER("Pyramid Plunder"),
 	CHINCHOMPA_HUNTING("Chinchompa Hunting"),
 	FALCONRY("Falconry (Dashing kebbit)"),
-	PLANK_MAKE("Plank Make");
+	PLANK_MAKE("Plank Make"),
+	MAHOGANY_HOMES("Mahogany Homes");
 
 	private final String label;
 
