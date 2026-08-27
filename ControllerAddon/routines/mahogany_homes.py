@@ -228,3 +228,64 @@ def _withdraw_up_to(ctx, name: str, target: int) -> None:
     if need <= 0:
         return
     banker.withdraw_loadout(ctx, {"withdraw": [{"name": name, "quantity": need}]}, fresh=True)
+
+
+def request_contract_phase(ctx, config: dict, state: dict) -> None:
+    if state.get("hasContract"):
+        return
+
+    last_cast = ctx.state.data.get("mh_contact_cast_at", 0.0)
+    if time.time() - last_cast < CONTACT_RETRY_COOLDOWN_S:
+        return
+
+    controller.key_tap(ctx.ser, MAGIC_TAB_KEY)
+    controller.human_delay(0.3, 0.5)
+
+    widget = controller.get_widget(NPC_CONTACT_GROUP, NPC_CONTACT_CHILD)
+    if not widget or not widget.get("clickable"):
+        debug_log.log("mahogany_homes", "NPC Contact not clickable -- Lunar spellbook active?")
+        return
+
+    debug_log.log("mahogany_homes", "casting NPC Contact for a new contract")
+    controller.click_entity(ctx.ser, widget, offset=(0, 0), check_ui_blockers=False)
+    ctx.state.data["mh_contact_cast_at"] = time.time()
+
+
+def travel_phase(ctx, config: dict, state: dict) -> None:
+    home_name = state.get("homeName")
+    if ctx.state.data.get("mh_last_home") != home_name:
+        ctx.state.data["mh_last_home"] = home_name
+        ctx.state.data["mh_teleported_this_contract"] = False
+
+    target = state.get("standingLocation") or {}
+    player = controller.get_player()
+    if _chebyshev(player, target) > TRAVEL_TELEPORT_DISTANCE and not ctx.state.data.get("mh_teleported_this_contract"):
+        teleport_name = CITY_TELEPORTS.get(home_name)
+        if teleport_name is None:
+            ctx.state.trigger_safety_stop(f"unrecognized Mahogany Homes home {home_name!r}")
+            return
+
+        item = next(
+            (i for i in controller.get_inventory() if teleport_name in (i.get("name") or "").lower()),
+            None,
+        )
+        if item is None:
+            debug_log.log("mahogany_homes", f"no {teleport_name} in inventory -- banking")
+            ctx.state.data["mh_phase"] = "bank"
+            return
+
+        debug_log.log("mahogany_homes", f"breaking {teleport_name} toward {home_name}")
+        controller.click_entity(ctx.ser, item, check_ui_blockers=False)
+        controller.human_delay(2.5, 3.2)
+        ctx.state.data["mh_teleported_this_contract"] = True
+        return
+
+    if not travel.walk_to(ctx, target):
+        debug_log.log("mahogany_homes", f"still walking toward {home_name}'s standing tile")
+        return
+
+    ctx.state.data["mh_phase"] = "work"
+
+
+def _chebyshev(a: dict, b: dict) -> int:
+    return max(abs(a.get("x", 0) - b.get("x", 0)), abs(a.get("y", 0) - b.get("y", 0)))

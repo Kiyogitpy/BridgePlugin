@@ -4,9 +4,12 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "routines"))
 
+import time
+
 import mahogany_homes as mh
 import controller
 import banker
+import travel
 
 
 def _hotspot(varb, object_id, value, needs_attention):
@@ -213,3 +216,108 @@ def test_bank_phase_withdraws_up_to_target_and_advances_phase(monkeypatch):
     assert mh.DEFAULT_CONFIG["plankName"] in names
     assert "Steel bar" in names
     assert ctx.state.data["mh_phase"] == "travel"
+
+
+# --- request_contract_phase -----------------------------------------------------------
+
+def test_request_contract_phase_skips_when_already_has_contract():
+    ctx = _Ctx()
+    mh.request_contract_phase(ctx, mh.DEFAULT_CONFIG, {"hasContract": True})
+    assert "mh_contact_cast_at" not in ctx.state.data
+
+
+def test_request_contract_phase_casts_npc_contact_when_no_contract(monkeypatch):
+    clicked = {}
+
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "get_widget",
+                         lambda group, child, index=None: {"clickable": True, "screenX": 1, "screenY": 2})
+
+    def fake_click(ser, entity, **kw):
+        clicked["entity"] = entity
+        return True
+
+    monkeypatch.setattr(controller, "click_entity", fake_click)
+
+    ctx = _Ctx()
+    mh.request_contract_phase(ctx, mh.DEFAULT_CONFIG, {"hasContract": False})
+
+    assert clicked["entity"] == {"clickable": True, "screenX": 1, "screenY": 2}
+    assert "mh_contact_cast_at" in ctx.state.data
+
+
+def test_request_contract_phase_respects_cooldown(monkeypatch):
+    calls = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: calls.append(key))
+
+    ctx = _Ctx()
+    ctx.state.data["mh_contact_cast_at"] = time.time()
+    mh.request_contract_phase(ctx, mh.DEFAULT_CONFIG, {"hasContract": False})
+
+    assert calls == []  # still on cooldown -- must not re-cast
+
+
+# --- travel_phase ---------------------------------------------------------------
+
+def test_travel_phase_teleports_then_walks(monkeypatch):
+    clicked = {}
+
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})
+    monkeypatch.setattr(controller, "get_inventory",
+                         lambda: [_item("Varrock teleport", 8)])
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+
+    def fake_click(ser, entity, **kw):
+        clicked["entity"] = entity
+
+    monkeypatch.setattr(controller, "click_entity", fake_click)
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: True)
+
+    ctx = _Ctx()
+    state = {"homeName": "JEFF", "standingLocation": {"x": 3239, "y": 3450, "plane": 0}}
+    mh.travel_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert clicked["entity"]["name"] == "Varrock teleport"
+    assert ctx.state.data["mh_teleported_this_contract"] is True
+
+
+def test_travel_phase_walks_to_standing_tile_after_teleport_and_advances_to_work(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3239, "y": 3448, "plane": 0})
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: True)
+
+    ctx = _Ctx()
+    ctx.state.data["mh_last_home"] = "JEFF"
+    ctx.state.data["mh_teleported_this_contract"] = True
+    state = {"homeName": "JEFF", "standingLocation": {"x": 3239, "y": 3450, "plane": 0}}
+    mh.travel_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert ctx.state.data["mh_phase"] == "work"
+
+
+def test_travel_phase_banks_when_teleport_item_missing(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+
+    ctx = _Ctx()
+    state = {"homeName": "JEFF", "standingLocation": {"x": 3239, "y": 3450, "plane": 0}}
+    mh.travel_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert ctx.state.data["mh_phase"] == "bank"
+
+
+def test_travel_phase_resets_teleport_flag_on_new_home(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Falador teleport", 8)])
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: None)
+
+    ctx = _Ctx()
+    ctx.state.data["mh_last_home"] = "JEFF"
+    ctx.state.data["mh_teleported_this_contract"] = True
+    state = {"homeName": "TAU", "standingLocation": {"x": 3047, "y": 3345, "plane": 0}}
+    mh.travel_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    # New home -> the flag must have been reset before being set again by this same call.
+    assert ctx.state.data["mh_last_home"] == "TAU"
+    assert ctx.state.data["mh_teleported_this_contract"] is True
