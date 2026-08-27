@@ -785,13 +785,24 @@ def test_recovering_a_dropped_trap_goes_through_the_menu_not_a_bare_click(monkey
 
 def test_recover_dropped_trap_passes_refresh_target(monkeypatch):
     """recover_dropped_trap's Take click should re-resolve the trap item's live screen position,
-    same as every other ground-item menu click in this codebase."""
+    same as every other ground-item menu click in this codebase.
+
+    box_trap_count() must report an increase on its first post-click poll (not stay flat like a
+    permanently-empty pack), and time.sleep/time.time run on a fake clock -- otherwise the
+    confirmation loop below the click has nothing to see, runs out its full REAL-TIME
+    RETRIEVE_CONFIRM_TIMEOUT_S, and burns ~3s of wall-clock every time the suite runs, same fix as
+    the sibling test above."""
     tile = (2513, 9301, 0)
     item = {"x": tile[0], "y": tile[1], "plane": tile[2], "id": ch.BOX_TRAP_ITEM_ID}
     monkeypatch.setattr(controller, "wait_until_player_idle", lambda *a, **k: True)
     monkeypatch.setattr(controller, "get_ground_item_at", lambda x, y, plane, item_id: item)
-    monkeypatch.setattr(ch, "box_trap_count", lambda: 0)
+    counts = iter([0] + [1] * 50)
+    monkeypatch.setattr(ch, "box_trap_count", lambda: next(counts))
     monkeypatch.setattr(ch, "_note_acted_on", lambda ctx, tile: None)
+    monkeypatch.setattr(ch, "_await_action_finished", lambda **kw: True)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(ch.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(ch.time, "time", lambda: clock["t"])
     seen = {}
     def _fake_click_menu_action(ser, entity, option, **kw):
         seen.update(kw)
