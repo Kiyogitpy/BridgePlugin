@@ -202,7 +202,7 @@ def tick(ctx):
         controller.click_entity(
             ctx.ser,
             npc,
-            refresh_target=lambda: controller.get_npc_screen_pos_by_index(npc_index),
+            refresh_target=controller.npc_index_refresh_target(npc_index),
         )
 
 
