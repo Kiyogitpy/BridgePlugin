@@ -718,26 +718,29 @@ def test_flush_fires_on_replan_and_flight_still_lands(monkeypatch):
 
 
 def test_flush_rewind_keeps_queue_pacing_tight(monkeypatch):
-    """Direct check on the REWIND ITSELF, not just eventual landing (see the previous test's
-    docstring for why landing alone proves nothing here -- the closed-loop final corrections
-    absorb a broken rewind just as well as a working one).
+    """Partial check on the rewind, via one observable SIDE EFFECT -- see
+    test_flush_rewinds_queued_ms_to_the_committed_emission (below) for a direct assertion
+    on the rewound value itself, which is the one that actually distinguishes every wrong-entry
+    case; this test only catches an UNDER-correction (a stale/unrewound queued_ms), and says so
+    plainly rather than overclaiming.
 
     The signal: move()'s backpressure throttle keeps `queued_ms` within HM2_LOOKAHEAD_SEGMENTS *
-    HM2_SEGMENT_MS of elapsed real time (see the `ahead`/`slack` check right after every send).
-    If cur/queued_ms are NOT rewound on flush, queued_ms is left at its full pre-flush value --
-    a whole lookahead window (~54ms / 3 segments) ahead of where the firmware actually is after
-    the flush discarded most of that queue. The very next backpressure check then believes it is
-    already over budget and sleeps a full extra segment before the SECOND post-flush segment
-    goes out. A correct rewind leaves queued_ms close enough to elapsed that no such sleep is
-    needed.
+    HM2_SEGMENT_MS of elapsed real time (`ahead = queued_ms - elapsed; sleep iff ahead - 54 > 0`,
+    right after every send). If cur/queued_ms are NOT rewound on flush at all, queued_ms is left
+    at its full pre-flush value -- a whole lookahead window (~54ms / 3 segments) ahead of where
+    the firmware actually is after the flush discarded most of that queue -- so the very next
+    backpressure check believes it is already over budget and sleeps a full extra segment before
+    the SECOND post-flush segment goes out.
 
-    MEASURED directly (not inferred) across 8 seeds by running this exact scenario against the
-    real move() and against a copy with the rewind loop's body replaced by `pass`: the gap
-    between the first two post-flush sends is 0.0ms every time with the rewind intact, and
-    ~16-21ms (one segment) every time with it stubbed out. This is a clean, rng-independent
-    discriminator -- it depends only on segment DURATIONS (pure ms arithmetic, unaffected by
-    _px_per_unit or plan_submovements' random path shape), so it catches a deleted, inverted, or
-    wrong-entry rewind without needing to predict the flight's geometry.
+    BUT the direction only cuts one way: `ahead` is `queued_ms - elapsed`, so a SMALLER queued_ms
+    only ever reduces `ahead`/`slack`, never grows it -- it can never trigger a sleep. That means
+    this gap is silent (0ms, same as a correct rewind) for an OVER-correction (rewinding to an
+    earlier entry than the algorithm specifies), for an INVERTED comparison (rewinding nearly to
+    the start of the flight, also smaller-than-correct), and in general for any mis-pick that
+    lands on or before the correct entry. MEASURED directly across 8 seeds: with the rewind
+    stubbed out entirely (a no-op/deletion -- the one case this DOES catch), the gap between the
+    first two post-flush sends is consistently ~16-21ms (one segment); with the rewind intact,
+    consistently 0.0ms.
     """
     clk, fw = _flush_rig(monkeypatch)
     sent = []   # (line, t_ms_at_send) for every line actually sent, in order
@@ -769,6 +772,98 @@ def test_flush_rewind_keeps_queue_pacing_tight(monkeypatch):
         f"{gap:.1f}ms gap between the first two post-flush segments -- queued_ms was not "
         f"rewound close to elapsed, so the backpressure throttle still thinks it's queued a "
         f"stale lookahead window ahead of the firmware")
+
+
+def test_flush_rewinds_queued_ms_to_the_committed_emission(monkeypatch):
+    """Direct check on the REWOUND VALUE ITSELF, not a side effect. The pacing test above
+    (test_flush_rewind_keeps_queue_pacing_tight) only trips for an under-correction; this
+    test catches an over-correction, an inverted comparison, or a mis-pick in either direction
+    too, because it asserts the rewound `queued_ms` equals the value the algorithm SPECIFIES,
+    not just something a downstream side effect happens to tolerate.
+
+    How the rewound queued_ms is recovered from outside move(), with no change to human_move.py:
+      1. _drain(t0, queued_ms) sleeps the fake clock until elapsed == queued_ms (measured from
+         t0), and the very next statement in move() is `cur = tuple(get_cursor_pos())` -- the
+         first get_cursor_pos() call after the single one at the very top of the function
+         (`start = get_cursor_pos()`). On this rig t0 == 0 (the fake clock starts at 0.0 and
+         nothing sleeps before t0 is captured), so the clock reading at that SECOND
+         get_cursor_pos() call equals the FINAL queued_ms, in milliseconds, exactly.
+      2. queued_ms only ever grows after that point via the normal `queued_ms += dur` per sent
+         segment. Subtracting the duration of every segment sent between the flush and that
+         second get_cursor_pos() call removes everything accumulated AFTER the rewind, leaving
+         the rewound value itself.
+
+    The expected value is computed independently from data this test already captures (every
+    send, in order, plus the elapsed time at the moment flush_queue() was invoked): replicate
+    move()'s own specified algorithm -- commit_ms = flush_elapsed_ms + HM2_FLUSH_COMMIT_MS,
+    expected = the first PRE-flush cumulative duration sum >= commit_ms -- the exact emission the
+    implementation's scan is specified to pick.
+    """
+    clk, fw = _flush_rig(monkeypatch)
+    events = []   # chronological across BOTH hooks: ("S", dur_ms) | ("X",) | ("POS", clk.t)
+
+    def spy_send(ser, line):
+        if line == "X":
+            events.append(("X",))
+        elif line.startswith("S "):
+            events.append(("S", float(line.split()[3])))
+        fw.send(ser, line)
+
+    def spy_pos():
+        events.append(("POS", clk.t))
+        return fw.pos()
+
+    flush_info = {}
+
+    def flush_queue():
+        flush_info["elapsed_ms"] = clk.t * 1000.0
+        spy_send(None, "X")
+
+    state = {"target": (800, 0), "calls": 0}
+
+    def refresh():
+        state["calls"] += 1
+        if state["calls"] == 1:
+            state["target"] = (800, 260)
+        return state["target"]
+
+    human_move.move(None, 800, 0,
+                    get_cursor_pos=spy_pos, send_line=spy_send,
+                    refresh_target=refresh,
+                    flush_queue=flush_queue,
+                    rng=random.Random(6))
+
+    assert fw.flushes == 1
+    assert "elapsed_ms" in flush_info
+
+    x_idx = next(i for i, ev in enumerate(events) if ev[0] == "X")
+    pos_indices = [i for i, ev in enumerate(events) if ev[0] == "POS"]
+    # pos_indices[0] is the `start = get_cursor_pos()` call at the very top of move(), before any
+    # S/X events at all; pos_indices[1] is the next one -- the only other get_cursor_pos() call
+    # in the open-loop portion of the function, immediately after _drain(t0, final_queued_ms).
+    assert len(pos_indices) >= 2, "expected a post-emission-loop get_cursor_pos() call"
+    drain_pos_idx = pos_indices[1]
+    assert drain_pos_idx > x_idx, "the flush must precede the end of the open-loop emission"
+
+    pre_flush_durs = [ev[1] for ev in events[:x_idx] if ev[0] == "S"]
+    post_flush_durs = [ev[1] for ev in events[x_idx + 1:drain_pos_idx] if ev[0] == "S"]
+
+    commit_ms = flush_info["elapsed_ms"] + settings.HM2_FLUSH_COMMIT_MS
+    cum = 0.0
+    expected_queued_ms = None
+    for d in pre_flush_durs:
+        cum += d
+        if cum >= commit_ms:
+            expected_queued_ms = cum
+            break
+    assert expected_queued_ms is not None, "test scenario didn't queue enough to reach commit_ms"
+
+    final_queued_ms = events[drain_pos_idx][1] * 1000.0
+    actual_queued_ms = final_queued_ms - sum(post_flush_durs)
+
+    assert abs(actual_queued_ms - expected_queued_ms) <= settings.HM2_SEGMENT_MS / 4, (
+        f"rewound queued_ms={actual_queued_ms:.1f}ms, expected {expected_queued_ms:.1f}ms "
+        f"(commit_ms={commit_ms:.1f}) -- the rewind picked the wrong emission")
 
 
 def test_no_flush_without_replan(monkeypatch):
