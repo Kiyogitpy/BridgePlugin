@@ -931,3 +931,25 @@ Two things it does differently from the other routines, on purpose:
   reset, since a plan built from scratch adopts traps already laid near the anchor.
 - **No banking phase at all.** Box traps and red chinchompas both stack, so the inventory
   genuinely cannot fill — there is nothing to bank, and adding a bank cycle would be dead code.
+
+## Current state of routines/mahogany_homes.py
+
+Written 2026-08-27 from four human recordings (`recordings/2026-08-27_{174045,175143,180346,
+181548}_mahogny-homes{,2,3,4}.*`) plus the decompiled reference plugin
+(`data/decompiled/mahogany-homes-plugin/`, sideloaded Plugin Hub jar, documentation only).
+Runs Adept-tier contracts: NPC Contact spell (widget 218.113, confirmed against both the
+recordings and `runelite-api-1.12.33.jar`) requests a contract with no dialogue to navigate,
+`MahoganyHomesProvider.java` tracks which home/tier is active purely from the assignment chat
+message (no varbit exists for this), teleport tablets/Xeric's talisman get the player to the
+right city, and a plain left-click on each hotspot's fixed object id (one id per home per slot,
+stable across its whole Remove-then-Build lifecycle) does the work, relying on the user's own
+client-side menu swap rather than any hijack-escalation machinery. **Not yet run live** — every
+widget/interface id this depends on was verified against the recordings and the real
+`runelite-api` jar rather than guessed, but `HOTSPOT_CLICK_COOLDOWN_S`/`TURN_IN_CLICK_COOLDOWN_S`
+(both first-draft guesses, see the routine's own module docstring) and the overall phase timing
+need a live session to confirm, the same way golem_crafting's own click cadence was corrected
+after its first live run. No plank sack in this version — planks are carried loose and restocked
+more often, a deliberate simplification to avoid golem_crafting's known fur-pouch stale-estimate
+failure mode in a routine with no live mileage yet. See
+`docs/superpowers/specs/2026-08-27-mahogany-homes-design.md` for the full design and
+`docs/superpowers/plans/2026-08-27-mahogany-homes.md` for the implementation history.
