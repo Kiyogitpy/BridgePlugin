@@ -52,7 +52,18 @@ def tick(ctx):
 
     debug_log.log("mining", f"swinging at {rock.get('name')} (dist={rock.get('distance')})")
     controller.human_delay(0.15, 0.5)
-    controller.click_entity(ctx.ser, rock)
+    # rock's screenX/screenY came from the bulk /objects list, which is TickCache-gated (see
+    # CLAUDE.md's "Sub-tick data and clicking while moving") -- by the time the physical click
+    # lands, the cached position can be stale (camera turn, the rock's own animation). Passing
+    # refresh_target re-resolves the rock's live position via the un-cached /object/at endpoint
+    # (identified by id + last-known tile) at each leg of the click's flight, the same pattern
+    # CLAUDE.md calls out as preferred over trusting a single stale snapshot.
+    controller.click_entity(
+        ctx.ser, rock,
+        refresh_target=controller.object_refresh_target(
+            rock["x"], rock["y"], rock["plane"], rock["id"]
+        ),
+    )
 
 
 def pick_rock(objects: list, config: dict):
