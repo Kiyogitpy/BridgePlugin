@@ -431,7 +431,8 @@ def _hire_falcon(ctx) -> bool:
         return False
 
     debug_log.log("falconry", "hiring a falcon from Matthias")
-    if not controller.click_menu_action(ctx.ser, matthias, OPT_QUICK_FALCON):
+    refresh = controller.npc_index_refresh_target(matthias["index"])
+    if not controller.click_menu_action(ctx.ser, matthias, OPT_QUICK_FALCON, refresh_target=refresh):
         return False
 
     controller.human_delay(1.5, 2.2)
