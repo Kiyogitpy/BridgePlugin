@@ -265,6 +265,51 @@ steps above.
   from ordinary walking never change it at all. Dropped events past the cap are intentional — the
   Python mirror is an accelerator with an HTTP fallback.
 
+## Arduino firmware protocol (v3)
+
+`firmware/Firmware.ino` speaks protocol v3 as of 2026-08-27 (see its own header block for the
+full derivation). Purely additive over v1/v2 — a v2 firmware silently ignores every v3 command,
+so either side can be upgraded first. The new commands: `X` flush (discard every queued
+command now; the active segment always finishes), `V` version query (responds `HB 3`), `R`
+reset (flush including the active segment, release every held button/key), `W <n>` scroll wheel.
+Plus a 60s stuck-input watchdog: if any button/key is held with no serial line arriving for 60s,
+everything is released — the panic path is a hard process kill that cannot send key-ups, so this
+is the only thing standing between that and a button held forever.
+
+**The contract that matters most: `X` drops queued button/key commands too, not just motion, so
+it is only ever legal from inside `move()`'s flight loop, where nothing but segments are queued.**
+A future agent adding a serial write from a background thread, or a drag primitive, has no reason
+to look in `human_move.py` for this — the constraint lives in the firmware's own comment and here,
+not in any type signature. Sending `X` while a click or key-down is queued would silently discard
+it.
+
+`controller.FIRMWARE_PROTOCOL` (set once at startup by `probe_firmware_protocol`) gates every v3
+feature, and it is a hard probe rather than graceful degradation on purpose: an ignored `X` on a
+v2 board doesn't fail loudly — the queued motion just plays out anyway while `move()`'s Python-side
+bookkeeping (`cur`/`queued_ms`) has already rewound as if it didn't. That produces silently wrong
+clicks (aimed from a stale position estimate), not a visible failure, which is a far worse outcome
+than refusing to use `X` at all against an unprobed or pre-v3 device.
+
+`ControllerAddon/firmware_bench.py` is the flash-day checklist — run it after every reflash before
+trusting the device. It opens the same COM port `controller.py` does, so **never run it alongside
+controller.py** (same one-process-per-port constraint as the general Arduino serial port gotcha
+above).
+
+**Open follow-up (not yet verified live):** `HM2_FLUSH_COMMIT_MS` (22.0, in `settings.py`) plus
+the rewind's "first emission at or past `commit_ms`" selection rule double-count the active
+segment, so the rewind lands one-sidedly ~18ms / one segment AHEAD of what the firmware actually
+played (reproduced deterministically on 8/8 seeds against the test rig, 2026-08-27). Left alone
+deliberately, pending real hardware measurement — see the ruling in
+`docs/superpowers/plans/2026-08-27-firmware-v3-flush.md`. The direction is benign (the next replan
+undershoots into the residual corrections rather than overshooting), it does NOT accumulate across
+multiple flushes within one flight, and the second-order cost is real: firmware buffer depth drops
+from 54ms to ~36ms for the remainder of a flushed flight only, which the firmware's own
+`CHAIN_MAX_LAG_US` (50ms) absorbs without a phase restart. The next live session after a flash
+should measure the real post-flush commit latency; the candidate one-line fix, if it's warranted,
+is to select the LAST emission with `t_ms <= commit_ms` instead of the first one at or past it —
+that restores exactly the semantics `settings.py`'s own comment originally claimed. Do not change
+`HM2_FLUSH_COMMIT_MS` or the selection rule without that measurement in hand.
+
 ## Sub-tick data and clicking while moving
 
 Most game state is genuinely capped at OSRS's own 0.6s server tick — HP, true tile position,

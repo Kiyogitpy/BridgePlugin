@@ -54,7 +54,7 @@
 //        one segment (~18 ms) before being seen.
 //   V    Version query. Responds "HB 3\n" -- the ONE solicited serial write in this firmware.
 //        A single short line cannot fill the 64-byte CDC TX buffer, so it cannot stall even if
-//        the host never reads it; the never-write rule below still holds for UNSOLICITED output.
+//        the host never reads it; the never-write rule above still holds for UNSOLICITED output.
 //   R    Reset: flush everything INCLUDING the active segment, zero the sub-pixel carry and
 //        chain phase, release every held mouse button and key. For startup cleanup after a
 //        crashed sender and for safety tooling.

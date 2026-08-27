@@ -774,14 +774,11 @@ def test_flush_rewind_keeps_queue_pacing_tight(monkeypatch):
         f"stale lookahead window ahead of the firmware")
 
 
-def test_flush_rewinds_queued_ms_to_the_committed_emission(monkeypatch):
-    """Direct check on the REWOUND VALUE ITSELF, not a side effect. The pacing test above
-    (test_flush_rewind_keeps_queue_pacing_tight) only trips for an under-correction; this
-    test catches an over-correction, an inverted comparison, or a mis-pick in either direction
-    too, because it asserts the rewound `queued_ms` equals the value the algorithm SPECIFIES,
-    not just something a downstream side effect happens to tolerate.
+def _run_instrumented_flush_flight(monkeypatch, rng_seed=6):
+    """Runs the standard flush-on-replan scenario (target jumps from (800,0) to (800,260) at the
+    first refresh) with full instrumentation, and returns everything the flush-rewind tests below
+    need to recover the rewound `queued_ms` from OUTSIDE move(), with no change to human_move.py:
 
-    How the rewound queued_ms is recovered from outside move(), with no change to human_move.py:
       1. _drain(t0, queued_ms) sleeps the fake clock until elapsed == queued_ms (measured from
          t0), and the very next statement in move() is `cur = tuple(get_cursor_pos())` -- the
          first get_cursor_pos() call after the single one at the very top of the function
@@ -793,11 +790,13 @@ def test_flush_rewinds_queued_ms_to_the_committed_emission(monkeypatch):
          second get_cursor_pos() call removes everything accumulated AFTER the rewind, leaving
          the rewound value itself.
 
-    The expected value is computed independently from data this test already captures (every
-    send, in order, plus the elapsed time at the moment flush_queue() was invoked): replicate
-    move()'s own specified algorithm -- commit_ms = flush_elapsed_ms + HM2_FLUSH_COMMIT_MS,
-    expected = the first PRE-flush cumulative duration sum >= commit_ms -- the exact emission the
-    implementation's scan is specified to pick.
+    Returns a dict: `events` (chronological ("S", dur_ms) | ("X",) | ("POS", clk.t) records
+    across both hooks), `flush_info` (`elapsed_ms` -- clk.t*1000 at the instant flush_queue() was
+    invoked, and `t_tail_ms` -- FakeFirmware's own `t_tail` right after that flush, i.e. what the
+    firmware timeline says actually played), `fw`, and `clk`. Shared by
+    test_flush_rewinds_queued_ms_to_the_committed_emission and
+    test_flush_rewind_bias_is_bounded_and_never_negative so both check the SAME recorded flight
+    rather than each re-deriving their own.
     """
     clk, fw = _flush_rig(monkeypatch)
     events = []   # chronological across BOTH hooks: ("S", dur_ms) | ("X",) | ("POS", clk.t)
@@ -818,6 +817,7 @@ def test_flush_rewinds_queued_ms_to_the_committed_emission(monkeypatch):
     def flush_queue():
         flush_info["elapsed_ms"] = clk.t * 1000.0
         spy_send(None, "X")
+        flush_info["t_tail_ms"] = fw.t_tail
 
     state = {"target": (800, 0), "calls": 0}
 
@@ -831,12 +831,19 @@ def test_flush_rewinds_queued_ms_to_the_committed_emission(monkeypatch):
                     get_cursor_pos=spy_pos, send_line=spy_send,
                     refresh_target=refresh,
                     flush_queue=flush_queue,
-                    rng=random.Random(6))
+                    rng=random.Random(rng_seed))
 
-    assert fw.flushes == 1
-    assert "elapsed_ms" in flush_info
+    return {"events": events, "flush_info": flush_info, "fw": fw, "clk": clk}
 
-    x_idx = next(i for i, ev in enumerate(events) if ev[0] == "X")
+
+def _recover_rewound_queued_ms(run):
+    """Given a completed _run_instrumented_flush_flight() result, extract the rewound queued_ms
+    value move() actually used, per the recovery procedure documented on that helper. Uses the
+    LAST 'X' in the event stream (identical to the first for a single-flush flight, and required
+    for a multi-flush one) since only the FINAL flush's rewind is still live by the time the
+    open-loop emission finishes -- an earlier flush's rewind was already superseded."""
+    events = run["events"]
+    x_idx = max(i for i, ev in enumerate(events) if ev[0] == "X")
     pos_indices = [i for i, ev in enumerate(events) if ev[0] == "POS"]
     # pos_indices[0] is the `start = get_cursor_pos()` call at the very top of move(), before any
     # S/X events at all; pos_indices[1] is the next one -- the only other get_cursor_pos() call
@@ -845,8 +852,32 @@ def test_flush_rewinds_queued_ms_to_the_committed_emission(monkeypatch):
     drain_pos_idx = pos_indices[1]
     assert drain_pos_idx > x_idx, "the flush must precede the end of the open-loop emission"
 
-    pre_flush_durs = [ev[1] for ev in events[:x_idx] if ev[0] == "S"]
     post_flush_durs = [ev[1] for ev in events[x_idx + 1:drain_pos_idx] if ev[0] == "S"]
+    final_queued_ms = events[drain_pos_idx][1] * 1000.0
+    return final_queued_ms - sum(post_flush_durs), x_idx, drain_pos_idx
+
+
+def test_flush_rewinds_queued_ms_to_the_committed_emission(monkeypatch):
+    """Direct check on the REWOUND VALUE ITSELF, not a side effect. The pacing test above
+    (test_flush_rewind_keeps_queue_pacing_tight) only trips for an under-correction; this
+    test catches an over-correction, an inverted comparison, or a mis-pick in either direction
+    too, because it asserts the rewound `queued_ms` equals the value the algorithm SPECIFIES,
+    not just something a downstream side effect happens to tolerate.
+
+    The expected value is computed independently from data this test already captures (every
+    send, in order, plus the elapsed time at the moment flush_queue() was invoked): replicate
+    move()'s own specified algorithm -- commit_ms = flush_elapsed_ms + HM2_FLUSH_COMMIT_MS,
+    expected = the first PRE-flush cumulative duration sum >= commit_ms -- the exact emission the
+    implementation's scan is specified to pick.
+    """
+    run = _run_instrumented_flush_flight(monkeypatch)
+    events, flush_info, fw = run["events"], run["flush_info"], run["fw"]
+
+    assert fw.flushes == 1
+    assert "elapsed_ms" in flush_info
+
+    actual_queued_ms, x_idx, _ = _recover_rewound_queued_ms(run)
+    pre_flush_durs = [ev[1] for ev in events[:x_idx] if ev[0] == "S"]
 
     commit_ms = flush_info["elapsed_ms"] + settings.HM2_FLUSH_COMMIT_MS
     cum = 0.0
@@ -858,12 +889,54 @@ def test_flush_rewinds_queued_ms_to_the_committed_emission(monkeypatch):
             break
     assert expected_queued_ms is not None, "test scenario didn't queue enough to reach commit_ms"
 
-    final_queued_ms = events[drain_pos_idx][1] * 1000.0
-    actual_queued_ms = final_queued_ms - sum(post_flush_durs)
-
     assert abs(actual_queued_ms - expected_queued_ms) <= settings.HM2_SEGMENT_MS / 4, (
         f"rewound queued_ms={actual_queued_ms:.1f}ms, expected {expected_queued_ms:.1f}ms "
         f"(commit_ms={commit_ms:.1f}) -- the rewind picked the wrong emission")
+
+
+def test_flush_rewind_bias_is_bounded_and_never_negative(monkeypatch):
+    """Pins the KNOWN, deliberately-unfixed +18ms/one-segment rewind bias documented in
+    CLAUDE.md's "Arduino firmware protocol (v3)" section (added 2026-08-27 alongside this test)
+    and in docs/superpowers/plans/2026-08-27-firmware-v3-flush.md.
+
+    HM2_FLUSH_COMMIT_MS (22.0) plus the rewind's "first PRE-flush emission with t_ms >= commit_ms"
+    selection rule double-count the active segment: the rewound queued_ms lands at or past
+    commit_ms by construction, which is at or past what the firmware timeline (`fw.t_tail`, the
+    end of the last segment FakeFirmware did NOT discard) actually reaches. That is a real,
+    reproduced deviation from the plan's own stated intent ("rewind to the last emission that
+    does play") -- NOT a fixed fact, an open question pending real hardware measurement. This
+    test exists so the bias can be caught if it ever GROWS past its currently-measured size,
+    without anyone having to re-derive the arithmetic above: if this test starts failing, check
+    whether HM2_FLUSH_COMMIT_MS or the rewind's selection rule changed (regression), or whether
+    the CLAUDE.md note's candidate fix (select the LAST emission with t_ms <= commit_ms) landed
+    (fix -- update this test's bound, don't just loosen it blindly).
+
+    The bound: the bias must be non-negative (the rewind is never BEHIND what the firmware
+    actually played -- that direction would mean move()'s bookkeeping thinks LESS motion is
+    queued than really is, which is the dangerous direction: a replan could then queue MORE
+    motion on top of an underestimated backlog) and at most one segment (HM2_SEGMENT_MS) plus a
+    small epsilon for float slop -- today nothing in the suite would notice if this bias grew to
+    two segments instead of one.
+    """
+    run = _run_instrumented_flush_flight(monkeypatch)
+    fw, flush_info = run["fw"], run["flush_info"]
+
+    assert fw.flushes == 1
+    assert "t_tail_ms" in flush_info
+
+    actual_queued_ms, _, _ = _recover_rewound_queued_ms(run)
+    bias_ms = actual_queued_ms - flush_info["t_tail_ms"]
+
+    epsilon = 1e-6
+    assert bias_ms >= -epsilon, (
+        f"rewound queued_ms={actual_queued_ms:.2f}ms landed BEHIND what the firmware actually "
+        f"played (t_tail={flush_info['t_tail_ms']:.2f}ms) by {-bias_ms:.2f}ms -- this is the "
+        f"dangerous direction (see docstring); investigate before loosening this bound")
+    assert bias_ms <= settings.HM2_SEGMENT_MS + epsilon, (
+        f"rewind bias grew to {bias_ms:.2f}ms (more than one HM2_SEGMENT_MS="
+        f"{settings.HM2_SEGMENT_MS}ms segment) ahead of what the firmware actually played "
+        f"(t_tail={flush_info['t_tail_ms']:.2f}ms, rewound queued_ms={actual_queued_ms:.2f}ms) "
+        f"-- known bias documented in CLAUDE.md has grown beyond its measured size")
 
 
 def test_no_flush_without_replan(monkeypatch):
@@ -875,6 +948,140 @@ def test_no_flush_without_replan(monkeypatch):
                     flush_queue=lambda: fw.send(None, "X"),
                     rng=random.Random(3))
     assert fw.flushes == 0
+
+
+def _run_flush_replan(monkeypatch, seed, refresh_delay_s):
+    """Shared rig for the sub-threshold guard test below: a real replan (target jumps from
+    (800, 0) to (800, 260) -- 260px, far past HM2_REPLAN_MIN_DRIFT_PX) at the first refresh,
+    optionally after burning `refresh_delay_s` of fake-clock time INSIDE the refresh_target
+    callback itself (mimicking a slow HTTP round trip). That delay advances elapsed_ms without
+    advancing queued_ms, shrinking `queued_ms - commit_ms` (commit_ms = elapsed_ms +
+    HM2_FLUSH_COMMIT_MS) without changing whether the outer drift check fires -- letting a test
+    isolate the inner sub-threshold guard from the outer replan-or-not decision.
+    """
+    clk, fw = _flush_rig(monkeypatch)
+    state = {"target": (800, 0), "calls": 0}
+
+    def refresh():
+        state["calls"] += 1
+        if state["calls"] == 1:
+            if refresh_delay_s:
+                clk.sleep(refresh_delay_s)
+            state["target"] = (800, 260)
+        return state["target"]
+
+    human_move.move(None, 800, 0,
+                    get_cursor_pos=fw.pos, send_line=fw.send,
+                    refresh_target=refresh,
+                    flush_queue=lambda: fw.send(None, "X"),
+                    rng=random.Random(seed))
+    clk.t += 5.0
+    return state, fw
+
+
+def test_flush_skipped_when_reclaim_is_under_one_segment(monkeypatch):
+    """Sub-threshold guard: `queued_ms - commit_ms > HM2_SEGMENT_MS` in move() skips the flush
+    entirely when a replan would reclaim less than one segment's worth of queued motion --
+    "a flush that saves nothing is just serial noise" (human_move.py's own comment on that line).
+    Nothing previously exercised the branch where a REAL replan happens (the target genuinely
+    moves past HM2_REPLAN_MIN_DRIFT_PX, so the outer `if` is entered) but the flush is correctly
+    withheld anyway because too little is left to reclaim.
+
+    Two runs of the identical scenario, differing only in whether refresh_target() burns 30ms of
+    fake-clock time before returning the moved target: the delayed run's `queued_ms - commit_ms`
+    drops under HM2_SEGMENT_MS (it doesn't touch whether the 260px jump clears
+    HM2_REPLAN_MIN_DRIFT_PX at all), so this proves the difference in flush count is caused by the
+    inner guard specifically, not by refresh_target() being skipped or the outer drift check never
+    firing.
+    """
+    for seed in (6, 1, 2):
+        immediate_state, immediate_fw = _run_flush_replan(monkeypatch, seed, refresh_delay_s=0.0)
+        assert immediate_state["calls"] >= 1, "positive control: refresh_target was never called"
+        assert immediate_fw.flushes >= 1, (
+            "positive control failed: an immediate replan (no refresh delay) should still flush "
+            "-- if this doesn't hold, the delayed-run flushes==0 below proves nothing")
+
+        delayed_state, delayed_fw = _run_flush_replan(monkeypatch, seed, refresh_delay_s=0.03)
+        assert delayed_state["calls"] >= 1, "refresh_target was never called"
+        assert delayed_fw.flushes == 0, (
+            "flush fired despite queued_ms - commit_ms being under one HM2_SEGMENT_MS -- the "
+            "sub-threshold guard should have withheld it")
+
+
+def test_two_flushes_in_one_flight_keep_emit_log_monotonic(monkeypatch):
+    """`del emit_log[i + 1:]` (human_move.py, right after a flush rewinds cur/queued_ms) trims
+    every emission logged AFTER the entry the rewind picked. Nothing exercised a SECOND flush in
+    one flight before this test, which is the only path that proves it matters: without the trim,
+    an earlier flush's now-stale tail entries (timestamped past the point the queue was actually
+    rewound to) would still be sitting in emit_log, and a later flush's ascending `for i, ... if
+    t_ms >= commit_ms: break` scan could match one of those stale entries instead of a genuine
+    post-rewind emission -- silently picking the wrong rewind point.
+
+    NOTE landing accuracy is NOT used to check this (see
+    test_flush_fires_on_replan_and_flight_still_lands's own docstring: HM2_FINAL_CORRECTIONS' six
+    closed-loop corrections, each re-reading the TRUE cursor, absorb a wrong-entry rewind just
+    fine) -- confirmed for this exact bug too, during development of this test: a temporarily
+    de-trimmed copy of human_move.py (the `del` line replaced with `pass`) still landed within a
+    few px of every target across a broad search of jump sequences and seeds.
+
+    A same-run "replay the captured commit_ms/emission data with trimming toggled" analysis was
+    tried and DELIBERATELY ABANDONED: a wrong pick at flush N doesn't just affect the value read
+    back at the end, it feeds `cur`/`queued_ms` into `plan_submovements`/`_plan_spans` for
+    everything from flush N onward, so a truly de-trimmed run's LATER commit_ms values and S
+    durations are themselves different real numbers, not the same sequence with one entry
+    swapped. A same-data replay can't see that cascade (confirmed directly: replaying this exact
+    scenario's own real commit_ms/duration data with trimming on vs off came out IDENTICAL --
+    885.0ms both ways -- despite an actual independent de-trimmed run diverging by 21ms).
+
+    So this test pins the rewound VALUE ITSELF against a value independently measured against
+    the real, correctly-trimmed human_move.py, the same style as
+    test_flush_rewinds_queued_ms_to_the_committed_emission but anchored to a fixed number instead
+    of a same-run replica, precisely BECAUSE a same-run replica can't be trusted here. The jump
+    sequence and seed were found by search specifically because a live de-trimmed copy diverges
+    on them: MEASURED, correct human_move.py -> 885.0ms; the same scenario against a copy with
+    `del emit_log[i + 1:]` replaced by `pass` -> 906.0ms, a 21ms (more than one HM2_SEGMENT_MS)
+    difference, comfortably outside this test's tolerance. It takes 4 flushes (not 2) to land on
+    a scenario with that large a margin; any flush after the first exercises the same `del
+    emit_log[i + 1:]` line, so "two flushes" in this test's name means "more than one", not
+    literally two.
+    """
+    clk, fw = _flush_rig(monkeypatch)
+    events = []   # chronological across BOTH hooks: ("S", dur_ms) | ("X",) | ("POS", clk.t)
+
+    def spy_send(ser, line):
+        if line == "X":
+            events.append(("X",))
+        elif line.startswith("S "):
+            events.append(("S", float(line.split()[3])))
+        fw.send(ser, line)
+
+    def spy_pos():
+        events.append(("POS", clk.t))
+        return fw.pos()
+
+    jumps = [(740, 399), (627, 482), (644, 777), (387, 841), (434, 123)]
+    state = {"target": jumps[0], "calls": 0}
+
+    def refresh():
+        state["calls"] += 1
+        if state["calls"] < len(jumps):
+            state["target"] = jumps[state["calls"]]
+        return state["target"]
+
+    human_move.move(None, jumps[0][0], jumps[0][1],
+                    get_cursor_pos=spy_pos, send_line=spy_send,
+                    refresh_target=refresh,
+                    flush_queue=lambda: spy_send(None, "X"),
+                    rng=random.Random(180))
+
+    assert fw.flushes == 4, f"expected exactly four flushes, got {fw.flushes}"
+
+    actual_queued_ms, _, _ = _recover_rewound_queued_ms({"events": events})
+    expected_queued_ms = 885.0   # measured against the real, correctly-trimmed implementation
+    assert abs(actual_queued_ms - expected_queued_ms) <= settings.HM2_SEGMENT_MS / 4, (
+        f"rewound queued_ms={actual_queued_ms:.1f}ms after the last flush, expected "
+        f"{expected_queued_ms:.1f}ms (measured against a correctly-trimmed run) -- a later "
+        f"flush's scan may have picked a stale, untrimmed entry from an earlier one")
 
 
 def test_flushed_flight_skips_scale_learning(monkeypatch):
