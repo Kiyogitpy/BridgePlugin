@@ -44,7 +44,7 @@ import random
 import time
 
 from settings import (
-    HM2_CURVE_FRACTION, HM2_D_REF, HM2_LATERAL_ERROR, HM2_LOOKAHEAD_SEGMENTS,
+    HM2_CURVE_FRACTION, HM2_D_REF, HM2_FLUSH_COMMIT_MS, HM2_LATERAL_ERROR, HM2_LOOKAHEAD_SEGMENTS,
     HM2_LATERAL_DECAY, HM2_MAX_MEAN_PX_PER_MS, HM2_MAX_MS, HM2_MAX_SUBMOVES, HM2_MED_REF_MS, HM2_MIN_MS, HM2_PRIMARY_TIME_SHARE,
     HM2_CORRECTION_TOLERANCE_PX, HM2_FINAL_CORRECTIONS, HM2_MAX_CORRECTION_PX_PER_MS, HM2_MIN_PX_PER_SEGMENT, HM2_TREMOR_MAX_FRACTION, HM2_REPLAN_MIN_DRIFT_PX, HM2_SEGMENT_MS, HM2_SIGMA, HM2_TOLERANCE_PX, HM2_SLOPE_MS_PER_BIT, HM2_TEMPO_SIGMA, HM2_TEMPO_TAU_S, HM2_TREMOR_PX, HM2_UNDERSHOOT_MEAN,
     HM2_UNDERSHOOT_SIGMA,
@@ -405,7 +405,8 @@ def _drain(t0: float, queued_ms: float) -> None:
 
 
 def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
-         duration_scale: float = 1.0, refresh_target=None, rng: random.Random = random) -> None:
+         duration_scale: float = 1.0, refresh_target=None, flush_queue=None,
+         rng: random.Random = random) -> None:
     """Drive the cursor to (x, y).
 
     Dependencies are injected rather than imported from controller, so this module can be unit
@@ -415,6 +416,15 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
     the natural correction points of a human reach, so tracking a moving target costs nothing
     extra here -- unlike v1, where re-aiming forced an artificial leg boundary and each leg paid
     a full duration floor.
+
+    flush_queue, if given, is a zero-arg callable that retracts every QUEUED (unplayed) firmware
+    segment -- the active one finishes (see firmware/Firmware.ino's X command). It is invoked
+    only when a re-aim replans the flight, and only when enough motion is queued to be worth
+    retracting; the emission log below is what lets the bookkeeping rewind to the last segment
+    that actually plays. Callers MUST pass None unless the firmware probe confirmed protocol
+    v3: against older firmware X is silently ignored, the queued motion plays anyway, and the
+    rewound bookkeeping would be wrong. A flushed flight never feeds _learn_scale -- its
+    emitted units include motion that never happened.
     """
     start = get_cursor_pos()
     target = (float(x), float(y))
@@ -436,6 +446,13 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
     queued_ms = 0.0
     t0 = time.perf_counter()
     target_lost = False
+    emit_log = []      # (cumulative queued ms after this emission, planned x, planned y)
+    # A flush on replan rewinds cur/queued_ms below but deliberately does NOT rewind units_x/
+    # units_y or carry_x/carry_y. The units are only consumed by _learn_scale, which `flushed`
+    # skips entirely below, so a stale total there is harmless. The sub-pixel carries already
+    # diverge from the firmware's own carry by under a pixel on every flight, flushed or not --
+    # that's what the residual corrections at the end of move() exist to absorb.
+    flushed = False
 
     # A while loop, not `for idx, p in enumerate(points)`: re-aiming REPLANS the remaining
     # submovements, and enumerate() would keep walking the original list.
@@ -465,6 +482,24 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
                 moved = (float(updated[0]), float(updated[1]))
                 if math.hypot(moved[0] - target[0], moved[1] - target[1]) > HM2_REPLAN_MIN_DRIFT_PX:
                     target = moved
+                    # Retract what hasn't played. Everything queued past elapsed + the commit
+                    # margin (serial latency + the active segment, which always finishes) is
+                    # motion toward the OLD target that the firmware will now never perform, so
+                    # rewind cur/queued_ms to the last emission that does play and let the
+                    # replan start from there. Skipped when there's less than a segment's worth
+                    # to reclaim -- a flush that saves nothing is just serial noise.
+                    if flush_queue is not None:
+                        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                        commit_ms = elapsed_ms + HM2_FLUSH_COMMIT_MS
+                        if queued_ms - commit_ms > HM2_SEGMENT_MS:
+                            flush_queue()
+                            flushed = True
+                            for i, (t_ms, ex, ey) in enumerate(emit_log):
+                                if t_ms >= commit_ms:
+                                    queued_ms = t_ms
+                                    cur = (ex, ey)
+                                    del emit_log[i + 1:]
+                                    break
                     # Replan the approach from where the cursor actually is toward where the
                     # target actually is. Keeps the submovement structure rather than teleporting
                     # the aim: the remaining corrections just close on the new position.
@@ -505,6 +540,7 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
             dur = max(1, int(round(step_ms)))
             send_line(ser, f"S {qx} {qy} {dur}")
             queued_ms += dur
+            emit_log.append((queued_ms, cur[0], cur[1]))
 
             # Stay a few segments ahead of the firmware, never more. The queue holds 16 and
             # applies backpressure, but blocking on a full queue would make our own timing
@@ -535,8 +571,9 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
     # `actual` pixels, so px-per-unit is their ratio; an EMA keeps one noisy movement from
     # yanking the calibration. This is what lets the path above be planned open-loop at all, and
     # it self-tunes on any machine instead of hardcoding this one's 0.74.
-    _learn_scale(math.hypot(units_x, units_y),
-                 math.hypot(cur[0] - start[0], cur[1] - start[1]))
+    if not flushed:
+        _learn_scale(math.hypot(units_x, units_y),
+                     math.hypot(cur[0] - start[0], cur[1] - start[1]))
 
     # Residual correction. Small once the scale is learned, and genuinely human -- a settling
     # touch at the end of a reach is exactly what the submovement model predicts anyway.

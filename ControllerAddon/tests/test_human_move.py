@@ -615,3 +615,131 @@ def test_calibration_load_tolerates_missing_and_corrupt_files():
         f.write('{"px_per_unit": 9.0, "samples": 3}')
     human_move._load_calibration()                      # out-of-range value
     assert human_move._px_per_unit == 1.0
+
+
+# ---- v3 flush (retractable firmware queue) ----
+
+class FakeClock:
+    """move() paces itself with time.perf_counter/time.sleep; this replaces both so a test
+    controls elapsed time exactly and runs instantly."""
+    def __init__(self):
+        self.t = 0.0
+
+    def perf_counter(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += max(0.0, seconds)
+
+
+class FakeFirmware:
+    """Minimal model of Firmware.ino's queue: S segments play back-to-back on the fake clock,
+    and X drops every segment not yet STARTED at that instant -- the active one finishes,
+    mirroring flushQueue() keeping queue[q_head]. Positions are in pixels because the isolated
+    calibration starts _px_per_unit at 1.0 and a flushed flight never updates it."""
+    def __init__(self, clk):
+        self.clk = clk
+        self.segs = []        # [start_ms, end_ms, dx_px, dy_px]
+        self.t_tail = 0.0     # timeline position of the last queued segment's end
+        self.flushes = 0
+
+    def _now_ms(self):
+        return self.clk.t * 1000.0
+
+    def send(self, ser, line):
+        if line == "X":
+            self.flushes += 1
+            self.segs = [s for s in self.segs if s[0] <= self._now_ms()]
+            self.t_tail = self.segs[-1][1] if self.segs else self._now_ms()
+            return
+        if not line.startswith("S "):
+            return
+        _, dxq, dyq, dur = line.split()
+        start = max(self.t_tail, self._now_ms())
+        end = start + max(1.0, float(dur))
+        self.segs.append([start, end, int(dxq) / 100.0, int(dyq) / 100.0])
+        self.t_tail = end
+
+    def pos(self):
+        now, x, y = self._now_ms(), 0.0, 0.0
+        for start, end, dx, dy in self.segs:
+            if now >= end:
+                x += dx
+                y += dy
+            elif now > start:
+                frac = (now - start) / (end - start)
+                x += dx * frac
+                y += dy * frac
+        return (round(x), round(y))
+
+
+def _flush_rig(monkeypatch):
+    clk = FakeClock()
+    monkeypatch.setattr(human_move.time, "perf_counter", clk.perf_counter)
+    monkeypatch.setattr(human_move.time, "sleep", clk.sleep)
+    return clk, FakeFirmware(clk)
+
+
+def test_flush_fires_on_replan_and_flight_still_lands(monkeypatch):
+    """A big mid-flight target jump must (a) send X to retract queued motion and (b) still
+    finish on the NEW target -- proving the post-flush bookkeeping rewind is consistent with
+    what the firmware actually played."""
+    clk, fw = _flush_rig(monkeypatch)
+    state = {"target": (800, 0), "calls": 0}
+
+    def refresh():
+        state["calls"] += 1
+        if state["calls"] == 1:
+            state["target"] = (800, 260)
+        return state["target"]
+
+    human_move.move(None, 800, 0,
+                    get_cursor_pos=fw.pos, send_line=fw.send,
+                    refresh_target=refresh,
+                    flush_queue=lambda: fw.send(None, "X"),
+                    rng=random.Random(6))
+    clk.t += 5.0   # let every queued segment play out
+    assert fw.flushes >= 1
+    fx, fy = fw.pos()
+    miss = math.hypot(fx - 800, fy - 260)
+    assert miss <= settings.HM2_CORRECTION_TOLERANCE_PX + 4, (
+        f"landed {miss:.1f}px off the moved target -- post-flush rewind is inconsistent "
+        f"with played motion")
+
+
+def test_no_flush_without_replan(monkeypatch):
+    """A stationary target must never pay a flush."""
+    clk, fw = _flush_rig(monkeypatch)
+    human_move.move(None, 600, 300,
+                    get_cursor_pos=fw.pos, send_line=fw.send,
+                    refresh_target=lambda: (600, 300),
+                    flush_queue=lambda: fw.send(None, "X"),
+                    rng=random.Random(3))
+    assert fw.flushes == 0
+
+
+def test_flushed_flight_skips_scale_learning(monkeypatch):
+    """Emitted units on a flushed flight include motion that never played, so feeding them to
+    _learn_scale would poison the persisted calibration. A clean flight must still learn."""
+    clk, fw = _flush_rig(monkeypatch)
+    state = {"target": (800, 0), "calls": 0}
+
+    def refresh():
+        state["calls"] += 1
+        if state["calls"] == 1:
+            state["target"] = (800, 260)
+        return state["target"]
+
+    before = human_move._scale_samples
+    human_move.move(None, 800, 0,
+                    get_cursor_pos=fw.pos, send_line=fw.send,
+                    refresh_target=refresh,
+                    flush_queue=lambda: fw.send(None, "X"),
+                    rng=random.Random(6))
+    assert human_move._scale_samples == before, "flushed flight fed the calibration"
+
+    clk2, fw2 = _flush_rig(monkeypatch)
+    human_move.move(None, 500, 200,
+                    get_cursor_pos=fw2.pos, send_line=fw2.send,
+                    rng=random.Random(7))
+    assert human_move._scale_samples == before + 1, "clean flight failed to learn"

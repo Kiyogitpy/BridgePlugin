@@ -340,6 +340,13 @@ HM2_TEMPO_SIGMA = 0.12
 HM2_TEMPO_TAU_S = 300.0
 HM2_LOOKAHEAD_SEGMENTS = 3
 
+# Motion that is already committed at the instant an X flush reaches the firmware: serial +
+# parse latency (~2-4 ms) plus the active segment, which ALWAYS finishes (it executes in place
+# at queue[q_head] and is never evicted -- see firmware/Firmware.ino's flushQueue). move()
+# rewinds its position/time bookkeeping to the first emission at or past elapsed + this margin;
+# a rewind short of reality by up to one segment is absorbed by the residual corrections.
+HM2_FLUSH_COMMIT_MS = 22.0
+
 # ---------------- Humanization profile drift ----------------
 # HumanProfile (controller.py) holds the parameters that drive pick_aim_point,
 # build_bezier_path, and human_delay. It re-rolls on a randomized interval during a session so
