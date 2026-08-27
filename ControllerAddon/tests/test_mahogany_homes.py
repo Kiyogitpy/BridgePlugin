@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "routines"))
 
 import mahogany_homes as mh
 import controller
+import banker
 
 
 def _hotspot(varb, object_id, value, needs_attention):
@@ -125,6 +126,12 @@ class _State:
     def __init__(self):
         self.data = {}
         self.config = mh.DEFAULT_CONFIG
+        self.safety_stopped = False
+        self.safety_reason = None
+
+    def trigger_safety_stop(self, reason):
+        self.safety_stopped = True
+        self.safety_reason = reason
 
 
 class _Ctx:
@@ -172,3 +179,37 @@ def test_needs_bank_trip_false_when_everything_sufficient(monkeypatch):
     ctx = _Ctx()
     state = {"hasContract": False}
     assert mh.needs_bank_trip(ctx, mh.DEFAULT_CONFIG, state) is False
+
+
+# --- bank_phase -----------------------------------------------------------------------
+
+def test_bank_phase_breaks_home_teleport_when_no_bank_and_no_teleport_leaves_safety_stopped(monkeypatch):
+    monkeypatch.setattr(banker, "find_nearby_bank", lambda config: None)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    ctx = _Ctx()
+    mh.bank_phase(ctx, mh.DEFAULT_CONFIG, {"hasContract": False})
+    # No bank in range and no home teleport tablet in inventory -- genuine dead end.
+    assert ctx.state.safety_stopped is True
+
+
+def test_bank_phase_withdraws_up_to_target_and_advances_phase(monkeypatch):
+    withdrawn = []
+
+    monkeypatch.setattr(banker, "find_nearby_bank", lambda config: {"id": 1, "name": "Bank booth"})
+    monkeypatch.setattr(banker, "open_bank", lambda ctx, bank_obj: True)
+    monkeypatch.setattr(banker, "close_bank", lambda ctx: None)
+
+    def fake_withdraw_loadout(ctx, config, fresh=False):
+        withdrawn.append(config["withdraw"][0])
+
+    monkeypatch.setattr(banker, "withdraw_loadout", fake_withdraw_loadout)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+
+    ctx = _Ctx()
+    mh.bank_phase(ctx, mh.DEFAULT_CONFIG, {"hasContract": True})
+
+    names = {w["name"] for w in withdrawn}
+    assert mh.DEFAULT_CONFIG["plankName"] in names
+    assert "Steel bar" in names
+    assert ctx.state.data["mh_phase"] == "travel"

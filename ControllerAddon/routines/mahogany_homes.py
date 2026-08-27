@@ -184,3 +184,47 @@ def needs_bank_trip(ctx, config: dict, state: dict) -> bool:
             return True
 
     return False
+
+
+def bank_phase(ctx, config: dict, state: dict) -> None:
+    bank_config = config.get("bank", {})
+    bank_obj = banker.find_nearby_bank(bank_config)
+    if bank_obj is None:
+        home_teleport = config.get("homeTeleport", "varrock teleport")
+        item = next(
+            (i for i in controller.get_inventory() if home_teleport in (i.get("name") or "").lower()),
+            None,
+        )
+        if item is None:
+            ctx.state.trigger_safety_stop(
+                f"out of {home_teleport} and no bank in range for Mahogany Homes restocking"
+            )
+            return
+        debug_log.log("mahogany_homes", f"breaking {home_teleport} to reach a bank")
+        controller.click_entity(ctx.ser, item, check_ui_blockers=False)
+        controller.human_delay(2.5, 3.2)
+        return
+
+    if not banker.open_bank(ctx, bank_obj):
+        ctx.state.trigger_safety_stop("failed to open the bank for Mahogany Homes restocking")
+        return
+
+    restock = config.get("restock", {})
+    plank_name = config.get("plankName", "Teak plank")
+
+    _withdraw_up_to(ctx, plank_name, restock.get("targetPlanks", 0))
+    _withdraw_up_to(ctx, "Steel bar", restock.get("targetSteelBars", 0))
+    for tablet_name, target in restock.get("tabletTargets", {}).items():
+        _withdraw_up_to(ctx, tablet_name, target)
+
+    banker.close_bank(ctx)
+    controller.human_delay(0.3, 0.6)
+    ctx.state.data["mh_phase"] = "request_contract" if not state.get("hasContract") else "travel"
+
+
+def _withdraw_up_to(ctx, name: str, target: int) -> None:
+    have = count_item(controller.get_inventory(), name)
+    need = deficit(have, target)
+    if need <= 0:
+        return
+    banker.withdraw_loadout(ctx, {"withdraw": [{"name": name, "quantity": need}]}, fresh=True)
