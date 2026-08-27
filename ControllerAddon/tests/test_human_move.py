@@ -635,8 +635,15 @@ class FakeClock:
 class FakeFirmware:
     """Minimal model of Firmware.ino's queue: S segments play back-to-back on the fake clock,
     and X drops every segment not yet STARTED at that instant -- the active one finishes,
-    mirroring flushQueue() keeping queue[q_head]. Positions are in pixels because the isolated
-    calibration starts _px_per_unit at 1.0 and a flushed flight never updates it."""
+    mirroring flushQueue() keeping queue[q_head]. NOTE: segment dx/dy are NOT guaranteed to be
+    pixels, despite the name -- `_isolate_calibration` only redirects _CALIBRATION_PATH, it does
+    not reset _px_per_unit. That's a module global set once, at import time, by
+    _load_calibration() reading the REAL machine's calibration file (human_move.py:396) --
+    before any fixture runs, and measured at 0.737 during the 2026-08-27 review that caught this
+    comment. The landing tests below still converge on target regardless of that scale: the
+    open-loop `cur` move() tracks internally is exact plan-space bookkeeping independent of
+    _px_per_unit, and the closed-loop final corrections re-read this class's own pos() every
+    iteration and self-correct for whatever scale is actually in effect."""
     def __init__(self, clk):
         self.clk = clk
         self.segs = []        # [start_ms, end_ms, dx_px, dy_px]
@@ -682,8 +689,11 @@ def _flush_rig(monkeypatch):
 
 def test_flush_fires_on_replan_and_flight_still_lands(monkeypatch):
     """A big mid-flight target jump must (a) send X to retract queued motion and (b) still
-    finish on the NEW target -- proving the post-flush bookkeeping rewind is consistent with
-    what the firmware actually played."""
+    finish on the NEW target. This is a coarse regression guard, NOT proof the rewind itself is
+    correct -- HM2_FINAL_CORRECTIONS' six closed-loop corrections (each re-reading the TRUE
+    cursor via get_cursor_pos()) would absorb a missing, inverted, or wrong-entry rewind just as
+    well; a null-rewind was measured to pass this exact assertion on 6/6 seeds. See
+    test_flush_rewind_keeps_queue_pacing_tight for a test that checks the rewind itself."""
     clk, fw = _flush_rig(monkeypatch)
     state = {"target": (800, 0), "calls": 0}
 
@@ -705,6 +715,60 @@ def test_flush_fires_on_replan_and_flight_still_lands(monkeypatch):
     assert miss <= settings.HM2_CORRECTION_TOLERANCE_PX + 4, (
         f"landed {miss:.1f}px off the moved target -- post-flush rewind is inconsistent "
         f"with played motion")
+
+
+def test_flush_rewind_keeps_queue_pacing_tight(monkeypatch):
+    """Direct check on the REWIND ITSELF, not just eventual landing (see the previous test's
+    docstring for why landing alone proves nothing here -- the closed-loop final corrections
+    absorb a broken rewind just as well as a working one).
+
+    The signal: move()'s backpressure throttle keeps `queued_ms` within HM2_LOOKAHEAD_SEGMENTS *
+    HM2_SEGMENT_MS of elapsed real time (see the `ahead`/`slack` check right after every send).
+    If cur/queued_ms are NOT rewound on flush, queued_ms is left at its full pre-flush value --
+    a whole lookahead window (~54ms / 3 segments) ahead of where the firmware actually is after
+    the flush discarded most of that queue. The very next backpressure check then believes it is
+    already over budget and sleeps a full extra segment before the SECOND post-flush segment
+    goes out. A correct rewind leaves queued_ms close enough to elapsed that no such sleep is
+    needed.
+
+    MEASURED directly (not inferred) across 8 seeds by running this exact scenario against the
+    real move() and against a copy with the rewind loop's body replaced by `pass`: the gap
+    between the first two post-flush sends is 0.0ms every time with the rewind intact, and
+    ~16-21ms (one segment) every time with it stubbed out. This is a clean, rng-independent
+    discriminator -- it depends only on segment DURATIONS (pure ms arithmetic, unaffected by
+    _px_per_unit or plan_submovements' random path shape), so it catches a deleted, inverted, or
+    wrong-entry rewind without needing to predict the flight's geometry.
+    """
+    clk, fw = _flush_rig(monkeypatch)
+    sent = []   # (line, t_ms_at_send) for every line actually sent, in order
+
+    def spy_send(ser, line):
+        sent.append((line, clk.t * 1000.0))
+        fw.send(ser, line)
+
+    state = {"target": (800, 0), "calls": 0}
+
+    def refresh():
+        state["calls"] += 1
+        if state["calls"] == 1:
+            state["target"] = (800, 260)
+        return state["target"]
+
+    human_move.move(None, 800, 0,
+                    get_cursor_pos=fw.pos, send_line=spy_send,
+                    refresh_target=refresh,
+                    flush_queue=lambda: spy_send(None, "X"),
+                    rng=random.Random(6))
+
+    assert fw.flushes == 1
+    x_idx = next(i for i, (line, _) in enumerate(sent) if line == "X")
+    post_flush_sends = [t for line, t in sent[x_idx + 1:] if line.startswith("S ")]
+    assert len(post_flush_sends) >= 2, "flushed flight didn't emit enough afterward to check pacing"
+    gap = post_flush_sends[1] - post_flush_sends[0]
+    assert gap < settings.HM2_SEGMENT_MS / 2, (
+        f"{gap:.1f}ms gap between the first two post-flush segments -- queued_ms was not "
+        f"rewound close to elapsed, so the backpressure throttle still thinks it's queued a "
+        f"stale lookahead window ahead of the firmware")
 
 
 def test_no_flush_without_replan(monkeypatch):

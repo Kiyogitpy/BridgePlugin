@@ -343,8 +343,19 @@ HM2_LOOKAHEAD_SEGMENTS = 3
 # Motion that is already committed at the instant an X flush reaches the firmware: serial +
 # parse latency (~2-4 ms) plus the active segment, which ALWAYS finishes (it executes in place
 # at queue[q_head] and is never evicted -- see firmware/Firmware.ino's flushQueue). move()
-# rewinds its position/time bookkeeping to the first emission at or past elapsed + this margin;
-# a rewind short of reality by up to one segment is absorbed by the residual corrections.
+# rewinds its position/time bookkeeping to the first emission at or past elapsed + this margin.
+# MEASURED 2026-08-27 (8 seeds): that rewind actually lands roughly one segment AHEAD of what
+# played, not short of it. commit_ms already budgets for the active segment's remaining time on
+# its own, and the scan then picks the emission ACTIVE AT commit_ms (the first entry with
+# t_ms >= it) rather than the last one ending at or before it -- so the active segment's
+# duration is effectively counted twice. Measured error: +18ms and +1.2 to +30.6px, one-sided,
+# across those 8 seeds. Left uncorrected deliberately: the direction is the benign one -- an
+# ahead-of-reality cur makes the replan UNDERshoot, which the residual corrections (and
+# HM2_UNDERSHOOT_MEAN/HM2_UNDERSHOOT_SIGMA) already exist to absorb, and re-deriving the margin
+# with no reflashed hardware to verify against would be a design change made blind. Second-order
+# cost: queued_ms stays ~18ms optimistic for the rest of a flushed flight, so the lookahead
+# throttle (HM2_LOOKAHEAD_SEGMENTS) effectively holds roughly one segment LESS real firmware
+# buffer than its nominal three for that flight.
 HM2_FLUSH_COMMIT_MS = 22.0
 
 # ---------------- Humanization profile drift ----------------
