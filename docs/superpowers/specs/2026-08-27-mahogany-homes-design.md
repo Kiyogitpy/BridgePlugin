@@ -45,14 +45,21 @@ already covers everything needed here — see Architecture §3.
 - `Hotspot` also gives, per varbit slot, the **full set of object ids** that can ever render at
   that slot across every home and tier (6-12 ids per slot) — a cheap cross-check for "is this
   really a Mahogany Homes hotspot" independent of the live action name.
-- **There is no varbit for "which contract is currently assigned."** The reference plugin learns
-  it by regex-matching the *contractor's own dialogue widget text* on every game tick
-  (`client.getWidget(...)`, not an event) — `"(Please could you g|G)o see (\w*)..."`. This is a
-  single-entity widget read, not gated by the bulk-endpoint tick cache, so polling `/widget` for
-  it live is exactly as reliable as the plugin's own approach. The exact widget ids the decompile
-  hardcodes (dialogue text ~231.6, tier-select ~217/218) are from a build that may not match this
-  client's widget layout 1:1 — **treat them as a starting guess to verify against `/widgets/dump`
-  during implementation, not as confirmed ids.**
+- **There is no varbit for "which contract is currently assigned."** The reference plugin's own
+  approach is to regex the *contractor's dialogue widget text* for the home name and a separate
+  chat-message regex for the tier. **This routine doesn't need either lookup**: the recordings
+  show the single game-message chat line printed once a contract is accepted already contains
+  both — `"Adept Contract: Go see Jeff in the middle of Varrock, west of the museum."` — so one
+  regex against that one line (`r"(\w+) Contract: Go see (\w+)[,.]"`, group 1 = tier, group 2 =
+  the homeowner's first name) gives tier and home in a single step. This is a deliberate
+  simplification over the reference plugin's split widget+chat approach, made possible because
+  `LastChatMessageProvider.java` (`/last-chat-message`) already captures every GAMEMESSAGE with
+  its tick — confirmed present and already wired into `ControllerPlugin.java`. It also removes
+  the plan's only real risk item: no widget id needs verifying against a live client before this
+  works, since chat message text is stable, cosmetic-only game content. The same regex family
+  catches contract completion (`"You have completed [\d,]* contracts with a total of [\d,]*
+  points\.?"`, ported verbatim from the reference plugin's `CONTRACT_FINISHED` pattern) to reset
+  `currentHome` to null.
 
 **Contract request**: the user has NPC Contact (Lunar spellbook) configured so that a single
 left-click cast auto-selects the last-used tier, which is set to Adept. No contractor NPC visit,
@@ -75,13 +82,14 @@ for Hosidius, restocked from the bank, rather than walking cross-map on every co
 
 Ports the plugin's static data (`Home`, `Hotspot`, `HotspotObjects`, `RequiredMaterialsByTier` —
 copied close to verbatim, same object ids and constants) plus the state-tracking subset of its
-logic: dialogue-widget polling to detect the assigned home + tier
-(`checkForAssignmentDialog`/`checkForContractTierDialog` equivalents), the varbit map, and
-`getCompletedCount`/`getRepairableVarbs`/`getRequiredMaterialsForVarbs`. **Explicitly not
-ported**: overlays, hint arrows, world-map pin, teleport-item highlighting, and config
+logic, simplified per the chat-regex discovery above: an `EventBus`-subscribed `onChatMessage`
+matches the assignment line for home+tier and the completion line to clear it (see Researched
+facts), plus the varbit map and `getCompletedCount`/`getRepairableVarbs`/
+`getRequiredMaterialsForVarbs`. **Explicitly not ported**: overlays, hint arrows, world-map pin,
+teleport-item highlighting, dialogue-widget polling (superseded by the chat regex), and config
 persistence across client restarts (a bot-only session; losing `currentHome` on a client restart
-mid-contract is an acceptable gap — the dialogue-widget re-poll or the next chat message recovers
-it, since the contract itself isn't lost server-side).
+mid-contract is an acceptable gap — the next assignment/completion chat message recovers it,
+since the contract itself isn't lost server-side).
 
 One endpoint, `GET /mahogany-homes`, uncached (not one of the six `TickCache`-gated providers):
 
@@ -150,11 +158,11 @@ than walking cross-map.
 
 ## Verification
 
-Confirm the decompiled dialogue-widget ids against `/widgets/dump` on a live client before
-wiring `MahoganyHomesProvider`'s home/tier detection to them. `py_compile` every touched file,
-then the full `pytest` suite, plus new unit tests for the pure phase-transition logic
-(work_phase's target-selection, the out-of-materials heuristic) against synthetic bridge data.
-First live run should watch one full contract end-to-end (request → travel → work_phase →
-turn-in) before leaving it to loop, per the project's live-debugging workflow — this is a brand
-new routine with no prior live run at all, unlike golem_crafting/chinchompa_hunting's
-already-debugged baselines.
+`py_compile` every touched Python file and a Gradle compile for the Java provider, then the full
+`pytest` suite, plus new unit tests for the pure phase-transition logic (work_phase's
+target-selection, the out-of-materials heuristic, the assignment/completion regexes) against
+synthetic data. First live run should watch one full contract end-to-end (request → travel →
+work_phase → turn-in) before leaving it to loop, per the project's live-debugging workflow — this
+is a brand new routine with no prior live run at all, unlike golem_crafting/chinchompa_hunting's
+already-debugged baselines. Nothing in this design depends on an unverified widget id, so the
+first live run is confirming behavior, not discovering ids.
