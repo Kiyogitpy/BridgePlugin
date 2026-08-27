@@ -461,16 +461,7 @@ def work_phase(ctx, config: dict, state: dict) -> None:
     # per-slot HotspotType, added for exactly this.
     inventory = controller.get_inventory()
     plank_name = config.get("plankName", "Teak plank")
-    material = target.get("material")
-    needed = target.get("quantity", 0)
-    material_name = "Steel bar" if material == "STEEL_BAR" else plank_name
-    have = count_item(inventory, material_name)
-    if deficit(have, needed) > 0:
-        debug_log.log(
-            "mahogany_homes",
-            f"short on {material_name} for hotspot {target['objectId']} "
-            f"(have {have}, need {needed}) -- banking",
-        )
+    if not _can_afford(inventory, plank_name, state, target):
         ctx.state.data["mh_phase"] = "bank"
         return
 
@@ -495,6 +486,46 @@ def work_phase(ctx, config: dict, state: dict) -> None:
         refresh_legs=2,
     )
     ctx.state.data["mh_last_hotspot_click"] = time.time()
+
+
+def _can_afford(inventory: list, plank_name: str, state: dict, target: dict) -> bool:
+    """Cost of THIS ONE hotspot, not of the whole remaining contract. Comparing against
+    state["requiredMaterials"] (the sum over every hotspot still needing attention) meant that
+    being 2 planks short of a 14-plank contract sent us to the bank before touching any of the
+    90% we could already afford.
+
+    `material`/`quantity` come from MahoganyHomesProvider's own per-slot HotspotType, added for
+    exactly this -- and they only exist on a REBUILT client. Against an older bridge the fields
+    are absent, and a `quantity` defaulting to 0 would read as "this hotspot is free": fail-open,
+    clicking hotspots we cannot pay for and silently achieving nothing. So an absent field falls
+    back to the old whole-contract check instead, which is merely conservative."""
+    quantity = target.get("quantity")
+    if quantity is None:
+        required = state.get("requiredMaterials") or {}
+        have_planks = count_item(inventory, plank_name)
+        have_bars = count_item(inventory, "Steel bar")
+        if (deficit(have_planks, required.get("planks", 0)) > 0
+                or deficit(have_bars, required.get("steelBars", 0)) > 0):
+            debug_log.log(
+                "mahogany_homes",
+                f"per-hotspot cost missing from /mahogany-homes (client not rebuilt?) -- fell "
+                f"back to the whole-contract check and we're short (have {have_planks} planks/"
+                f"{have_bars} bars, need {required.get('planks', 0)}/"
+                f"{required.get('steelBars', 0)}) -- banking",
+            )
+            return False
+        return True
+
+    material_name = "Steel bar" if target.get("material") == "STEEL_BAR" else plank_name
+    have = count_item(inventory, material_name)
+    if deficit(have, quantity) > 0:
+        debug_log.log(
+            "mahogany_homes",
+            f"short on {material_name} for hotspot {target['objectId']} "
+            f"(have {have}, need {quantity}) -- banking",
+        )
+        return False
+    return True
 
 
 def _approach_missing_hotspot(ctx, config: dict, state: dict, target: dict) -> None:

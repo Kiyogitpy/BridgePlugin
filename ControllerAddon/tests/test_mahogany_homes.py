@@ -591,6 +591,36 @@ def test_work_phase_prices_a_steel_bar_hotspot_against_bars_not_planks(monkeypat
     assert ctx.state.data["mh_phase"] == "bank"
 
 
+def test_work_phase_falls_back_to_the_contract_total_when_per_hotspot_cost_is_missing(monkeypatch):
+    # material/quantity only exist on a REBUILT client. Defaulting a missing quantity to 0 would
+    # read as "this hotspot is free" -- fail-OPEN, clicking hotspots we cannot pay for. An absent
+    # field must fall back to the old (merely conservative) whole-contract check instead.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 2)])
+    stale = _hotspot(10554, 39989, 3, True)
+    del stale["material"], stale["quantity"]
+
+    ctx = _Ctx()
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG,
+                  _work_state([stale], required={"planks": 9, "steelBars": 0}))
+    assert ctx.state.data["mh_phase"] == "bank"
+
+
+def test_work_phase_fallback_still_works_when_the_contract_total_is_affordable(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 20)])
+    monkeypatch.setattr(controller, "get_objects", lambda: [_object(39989, distance=2)])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
+    clicked = {}
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicked.setdefault("entity", entity))
+    stale = _hotspot(10554, 39989, 3, True)
+    del stale["material"], stale["quantity"]
+
+    ctx = _Ctx()
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG,
+                  _work_state([stale], required={"planks": 9, "steelBars": 0}))
+    assert clicked["entity"]["id"] == 39989
+
+
 def test_work_phase_walks_closer_when_object_not_yet_visible(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory",
                          lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
