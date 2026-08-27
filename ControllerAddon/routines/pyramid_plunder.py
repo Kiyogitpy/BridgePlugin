@@ -610,7 +610,9 @@ def lobby_tick(ctx, config, mummy: dict) -> None:
     confirmation in-call instead, same shape as quick_leave's own inRun poll."""
     if not controller.wait_until_player_idle(timeout_s=5.0):
         return
-    if not controller.click_menu_action(ctx.ser, mummy, "Start-minigame", check_ui_blockers=False):
+    refresh = controller.npc_index_refresh_target(mummy["index"])
+    if not controller.click_menu_action(ctx.ser, mummy, "Start-minigame", check_ui_blockers=False,
+                                         refresh_target=refresh):
         return
     note_progress(ctx)
     deadline = time.time() + RUN_START_CONFIRM_TIMEOUT_S
@@ -1189,8 +1191,12 @@ def quick_leave(ctx, config) -> None:
     # the option isn't on that object's menu at all, which is also how a wrong name-fallback
     # candidate gets rejected -- so walk the candidates until one actually offers Quick-leave.
     for exit_door in exit_doors[:3]:
+        refresh = controller.object_refresh_target(
+            exit_door.get("x"), exit_door.get("y"), exit_door.get("plane", 0), exit_door.get("id"),
+        )
         if controller.click_menu_action(ctx.ser, exit_door, "Quick-leave",
-                                         offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False):
+                                         offset=TOMB_DOOR_AIM_OFFSET, check_ui_blockers=False,
+                                         refresh_target=refresh):
             deadline = time.time() + QUICK_LEAVE_CONFIRM_TIMEOUT_S
             left = False
             while time.time() < deadline:
