@@ -564,7 +564,10 @@ def _leg_fairy_ring(ctx):
     # Last-destination reuses the previously-dialled code (AKQ in the recording) in one click,
     # with no interface to drive -- which is why the human used it and why this does too.
     debug_log.log("falconry", "taking the fairy ring to the last destination (AKQ)")
-    if controller.click_menu_action(ctx.ser, ring, OPT_LAST_DESTINATION):
+    refresh = controller.object_refresh_target(
+        ring.get("x"), ring.get("y"), ring.get("plane", 0), ring.get("id"),
+    )
+    if controller.click_menu_action(ctx.ser, ring, OPT_LAST_DESTINATION, refresh_target=refresh):
         controller.human_delay(3.0, 4.0)
 
 
