@@ -2217,6 +2217,30 @@ def test_a_single_failed_cast_does_not_stop_the_hunt():
     assert not ctx.state.safety_stopped
 
 
+def test_menu_escalation_plinth_click_passes_refresh_target(monkeypatch):
+    """The use_menu=True escalation right-clicks the plinth via click_menu_action -- now that
+    click_menu_action can re-aim mid-flight (2026-08-27), the escalation should hand it a
+    refresh_target factory instead of a bare screen position, same as every other click site."""
+    station = _station("north", 2596, 2257)
+    monkeypatch.setattr(controller, "wait_until_player_idle", lambda *a, **k: True)
+    monkeypatch.setattr(
+        controller, "get_object_at",
+        lambda x, y, plane, obj_id, radius=None: {
+            "id": obj_id, "x": x, "y": y, "plane": plane, "name": "Shape-golem",
+        },
+    )
+    seen = {}
+    def _fake_click_menu_action(ser, entity, option, **kw):
+        seen.update(kw)
+        return True
+    monkeypatch.setattr(controller, "click_menu_action", _fake_click_menu_action)
+
+    objects = [{"id": station["objectId"], "x": station["x"], "y": station["y"], "plane": 0}]
+    assert gc._click_station(_ctx(), station, objects, use_menu=True) is True
+    assert seen.get("refresh_target") is not None, \
+        "menu escalation must re-resolve the plinth's live screen position"
+
+
 def test_a_landed_cast_clears_the_failure_streak():
     ctx = _ctx()
     for _ in range(gc.SPELL_FAILURE_LIMIT - 1):

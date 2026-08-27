@@ -1445,16 +1445,17 @@ def _click_station(ctx, station, objects: list, use_menu: bool = False) -> bool:
         # escalation right-clicked bare tile even though it had just re-resolved the plinth,
         # because the player was still walking -- the position was read at 21:24:47.571 and the
         # cursor landed at 21:24:47.771, 200ms and roughly a third of a tile later, 6px off the
-        # object. The bare-click path tolerates that via refresh_legs re-aiming mid-flight;
-        # click_menu_action aims exactly once, so its aim is only trustworthy from a standstill.
-        # This is already the slow path, so the wait costs the fast one nothing. See
+        # object. This is already the slow path, so the wait costs the fast one nothing. See
         # wait_until_player_idle's own docstring -- it exists for precisely this call shape.
+        # click_menu_action GAINED refresh_target/refresh_legs 2026-08-27 (see its own docstring)
+        # and now re-aims mid-flight like a bare click, but the idle-wait stays: it was ALSO
+        # covering "click_menu_action aims exactly once" (now false too), yet removing a wait
+        # this codebase's own notes call load-bearing on a live, unattended routine is a separate,
+        # live-verified change -- not bundled into this factory-adoption pass.
         controller.wait_until_player_idle()
         # Re-resolve the plinth's CURRENT screen position first. `objects` was fetched at the top
         # of craft_phase, before the walk, so its screenX/screenY is stale by however far the
-        # player travelled -- the bare-click path hides that with refresh_target/refresh_legs
-        # re-aiming mid-flight, but click_menu_action has no such parameter and would right-click
-        # the stale pixel. CONFIRMED live 2026-08-23 21:12: the first menu escalations opened a
+        # player travelled. CONFIRMED live 2026-08-23 21:12: the first menu escalations opened a
         # menu of pure ground options (['Cancel', 'Mark Safespot', 'Examine', 'Walk here']) --
         # a right-click on bare tile, not on the plinth at all. offset=(0,0) for the same reason:
         # click_menu_action's default (-7, +7) nudge is enough to slide off a small plinth.
@@ -1464,6 +1465,10 @@ def _click_station(ctx, station, objects: list, use_menu: bool = False) -> bool:
         )
         if fresh is not None:
             obj = fresh
+        refresh = controller.object_refresh_target(
+            obj.get("x"), obj.get("y"), obj.get("plane", 0), station["objectId"],
+            radius=MAX_OBJECT_DISTANCE,
+        )
         # Right-click and pick the option BY NAME out of /menu, instead of trusting whatever the
         # default left-click action resolves to. LIVE HALT 2026-08-23 21:04: another player was
         # standing on the plinth's east tile -- players do not block each other, so they stack on
@@ -1473,7 +1478,9 @@ def _click_station(ctx, station, objects: list, use_menu: bool = False) -> bool:
         # craft_phase does not get to choose which one the game presents for the station's current
         # state; click_menu_action tries a sequence in priority order against the one menu it
         # already reads back, so this costs no extra right-click.
-        if controller.click_menu_action(ctx.ser, obj, GOLEM_PLINTH_OPTIONS, offset=(0, 0)):
+        if controller.click_menu_action(ctx.ser, obj, GOLEM_PLINTH_OPTIONS, offset=(0, 0),
+                                         refresh_target=refresh,
+                                         refresh_legs=GOLEM_CLICK_REFRESH_LEGS):
             return True
         # The menu route is a best-effort ESCALATION, so a miss degrades to the ordinary click
         # rather than being charged as a hard miss. LIVE HALT 2026-08-23 22:04: five consecutive
