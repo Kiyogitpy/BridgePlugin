@@ -321,3 +321,182 @@ def test_travel_phase_resets_teleport_flag_on_new_home(monkeypatch):
     # New home -> the flag must have been reset before being set again by this same call.
     assert ctx.state.data["mh_last_home"] == "TAU"
     assert ctx.state.data["mh_teleported_this_contract"] is True
+
+
+def test_work_phase_advances_to_turn_in_when_nothing_left():
+    ctx = _Ctx()
+    state = {"hotspots": [_hotspot(10554, 39989, 0, False)], "requiredMaterials": {"planks": 0, "steelBars": 0}}
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert ctx.state.data["mh_phase"] == "turn_in"
+
+
+def test_work_phase_banks_when_materials_insufficient(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 1)])
+    ctx = _Ctx()
+    state = {
+        "hotspots": [_hotspot(10554, 39989, 3, True)],
+        "requiredMaterials": {"planks": 5, "steelBars": 0},
+    }
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert ctx.state.data["mh_phase"] == "bank"
+
+
+def test_work_phase_walks_closer_when_object_not_yet_visible(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                         lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda: [])
+    walked = {}
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: walked.setdefault("target", target))
+
+    ctx = _Ctx()
+    state = {
+        "hotspots": [_hotspot(10554, 39989, 3, True)],
+        "requiredMaterials": {"planks": 3, "steelBars": 0},
+        "standingLocation": {"x": 3239, "y": 3450, "plane": 0},
+        "homeName": "JEFF",
+    }
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert walked["target"] == {"x": 3239, "y": 3450, "plane": 0}
+
+
+def test_work_phase_clicks_the_hotspot_object(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                         lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda: [_object(39989, distance=2)])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
+
+    clicked = {}
+    monkeypatch.setattr(controller, "click_entity",
+                         lambda ser, entity, **kw: clicked.setdefault("entity", entity))
+
+    ctx = _Ctx()
+    state = {
+        "hotspots": [_hotspot(10554, 39989, 3, True)],
+        "requiredMaterials": {"planks": 3, "steelBars": 0},
+        "standingLocation": {"x": 3239, "y": 3450, "plane": 0},
+        "homeName": "JEFF",
+    }
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert clicked["entity"]["id"] == 39989
+    assert "mh_last_hotspot_click" in ctx.state.data
+
+
+def test_work_phase_respects_click_cooldown(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                         lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda: [_object(39989, distance=2)])
+
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: clicked.append(entity))
+
+    ctx = _Ctx()
+    ctx.state.data["mh_last_hotspot_click"] = time.time()
+    state = {
+        "hotspots": [_hotspot(10554, 39989, 3, True)],
+        "requiredMaterials": {"planks": 3, "steelBars": 0},
+        "standingLocation": {"x": 3239, "y": 3450, "plane": 0},
+        "homeName": "JEFF",
+    }
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert clicked == []
+
+
+def test_turn_in_phase_talks_to_homeowner(monkeypatch):
+    monkeypatch.setattr(controller, "get_npc_nearest",
+                         lambda npc_id: {"index": 5, "screenX": 10, "screenY": 20})
+    monkeypatch.setattr(controller, "get_widgets_dump", lambda: [])
+
+    talked = {}
+    monkeypatch.setattr(controller, "click_menu_action",
+                         lambda ser, entity, option, **kw: talked.setdefault("option", option))
+
+    ctx = _Ctx()
+    state = {"npcId": 10415, "npcName": "Jeff"}
+    mh.turn_in_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert talked["option"] == "Talk-to"
+
+
+def test_turn_in_phase_accepts_offered_tea(monkeypatch):
+    monkeypatch.setattr(controller, "get_npc_nearest", lambda npc_id: {"index": 5})
+    monkeypatch.setattr(controller, "get_widgets_dump",
+                         lambda: [{"text": "Yes, I'd love a cuppa.", "screenX": 40, "screenY": 50}])
+
+    clicked = {}
+    monkeypatch.setattr(controller, "click_entity",
+                         lambda ser, entity, **kw: clicked.setdefault("entity", entity))
+
+    ctx = _Ctx()
+    ctx.state.data["mh_last_turnin_click"] = time.time()  # skip the Talk-to click this tick
+    state = {"npcId": 10415, "npcName": "Jeff"}
+    mh.turn_in_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert clicked["entity"]["screenX"] == 40
+
+
+def test_tick_starts_in_bank_phase_when_stock_is_low(monkeypatch):
+    # PHASE_HANDLERS holds direct function references captured at module-load time, so
+    # patching mh.bank_phase itself would NOT change what tick() actually calls through the
+    # dict -- monkeypatch.setitem on the dict is the correct way to intercept it.
+    monkeypatch.setattr(controller, "get_mahogany_homes_state", lambda: {"hasContract": False})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: {"runes": []})
+    monkeypatch.setitem(mh.PHASE_HANDLERS, "bank",
+                         lambda ctx, config, state: ctx.state.data.setdefault("called", "bank"))
+
+    ctx = _Ctx()
+    mh.tick(ctx)
+    assert ctx.state.data["mh_phase"] == "bank"
+    assert ctx.state.data["called"] == "bank"
+
+
+def test_tick_moves_to_request_contract_once_stocked(monkeypatch):
+    monkeypatch.setattr(controller, "get_mahogany_homes_state", lambda: {"hasContract": False})
+    restock = mh.DEFAULT_CONFIG["restock"]
+    monkeypatch.setattr(controller, "get_inventory", lambda: [
+        _item(mh.DEFAULT_CONFIG["plankName"], restock["targetPlanks"]),
+        _item("Steel bar", restock["targetSteelBars"]),
+        _item("Varrock teleport", 8), _item("Ardougne teleport", 8), _item("Falador teleport", 8),
+    ])
+    monkeypatch.setattr(controller, "get_rune_pouch",
+                         lambda: {"runes": [{"name": "Astral rune", "quantity": 1000},
+                                             {"name": "Cosmic rune", "quantity": 1000}]})
+    monkeypatch.setitem(mh.PHASE_HANDLERS, "request_contract",
+                         lambda ctx, config, state: ctx.state.data.setdefault("called", "request"))
+
+    ctx = _Ctx()
+    ctx.state.data["mh_phase"] = "bank"
+    mh.tick(ctx)
+    assert ctx.state.data["mh_phase"] == "request_contract"
+    assert ctx.state.data["called"] == "request"
+
+
+def test_tick_resets_to_request_contract_when_contract_disappears_mid_flow(monkeypatch):
+    # Stock must read as sufficient here -- otherwise needs_bank_trip (which calls the real
+    # controller.get_inventory/get_rune_pouch when unmocked) sees an empty inventory against a
+    # bridge-less test environment and diverts to "bank" before this test ever gets to exercise
+    # the request_contract reset it's actually checking.
+    monkeypatch.setattr(controller, "get_mahogany_homes_state", lambda: {"hasContract": False})
+    restock = mh.DEFAULT_CONFIG["restock"]
+    monkeypatch.setattr(controller, "get_inventory", lambda: [
+        _item(mh.DEFAULT_CONFIG["plankName"], restock["targetPlanks"]),
+        _item("Steel bar", restock["targetSteelBars"]),
+        _item("Varrock teleport", 8), _item("Ardougne teleport", 8), _item("Falador teleport", 8),
+    ])
+    monkeypatch.setattr(controller, "get_rune_pouch",
+                         lambda: {"runes": [{"name": "Astral rune", "quantity": 1000},
+                                             {"name": "Cosmic rune", "quantity": 1000}]})
+    monkeypatch.setitem(mh.PHASE_HANDLERS, "request_contract",
+                         lambda ctx, config, state: ctx.state.data.setdefault("called", "request"))
+
+    ctx = _Ctx()
+    ctx.state.data["mh_phase"] = "turn_in"
+    mh.tick(ctx)
+    assert ctx.state.data["mh_phase"] == "request_contract"
+    assert ctx.state.data["called"] == "request"
+
+
+def test_tick_does_nothing_when_disabled():
+    ctx = _Ctx()
+    ctx.state.config = dict(mh.DEFAULT_CONFIG)
+    ctx.state.config["enabled"] = False
+    mh.tick(ctx)
+    assert "mh_phase" not in ctx.state.data

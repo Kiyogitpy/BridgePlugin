@@ -289,3 +289,110 @@ def travel_phase(ctx, config: dict, state: dict) -> None:
 
 def _chebyshev(a: dict, b: dict) -> int:
     return max(abs(a.get("x", 0) - b.get("x", 0)), abs(a.get("y", 0) - b.get("y", 0)))
+
+
+def work_phase(ctx, config: dict, state: dict) -> None:
+    hotspots = state.get("hotspots") or []
+    target = pick_next_hotspot(hotspots)
+    if target is None:
+        ctx.state.data["mh_phase"] = "turn_in"
+        return
+
+    required = state.get("requiredMaterials") or {}
+    inventory = controller.get_inventory()
+    plank_name = config.get("plankName", "Teak plank")
+    have_planks = count_item(inventory, plank_name)
+    have_bars = count_item(inventory, "Steel bar")
+    if (deficit(have_planks, required.get("planks", 0)) > 0
+            or deficit(have_bars, required.get("steelBars", 0)) > 0):
+        debug_log.log(
+            "mahogany_homes",
+            f"short on materials for the rest of this contract (have {have_planks} planks/"
+            f"{have_bars} bars, need {required.get('planks', 0)}/{required.get('steelBars', 0)}) -- banking",
+        )
+        ctx.state.data["mh_phase"] = "bank"
+        return
+
+    objects = controller.get_objects()
+    obj = find_object_by_id(objects, target["objectId"])
+    if obj is None:
+        debug_log.log(
+            "mahogany_homes",
+            f"hotspot object {target['objectId']} not visible yet -- walking toward "
+            f"{state.get('homeName')}'s house",
+        )
+        travel.walk_to(ctx, state.get("standingLocation") or {})
+        return
+
+    last_click = ctx.state.data.get("mh_last_hotspot_click", 0.0)
+    if time.time() - last_click < HOTSPOT_CLICK_COOLDOWN_S:
+        return
+
+    debug_log.log("mahogany_homes", f"working hotspot {target['objectId']} (varb {target['varb']})")
+    controller.click_entity(
+        ctx.ser, obj,
+        refresh_target=controller.object_refresh_target(obj["x"], obj["y"], obj["plane"], obj["id"]),
+        refresh_legs=2,
+    )
+    ctx.state.data["mh_last_hotspot_click"] = time.time()
+
+
+def turn_in_phase(ctx, config: dict, state: dict) -> None:
+    npc_id = state.get("npcId")
+    npc = controller.get_npc_nearest(npc_id)
+    if npc is None:
+        debug_log.log("mahogany_homes", f"homeowner npc {npc_id} not visible -- walking to standing tile")
+        travel.walk_to(ctx, state.get("standingLocation") or {})
+        return
+
+    _accept_tea_if_offered(ctx)
+
+    last_click = ctx.state.data.get("mh_last_turnin_click", 0.0)
+    if time.time() - last_click < TURN_IN_CLICK_COOLDOWN_S:
+        return
+
+    debug_log.log("mahogany_homes", f"turning in the contract with {state.get('npcName')}")
+    controller.click_menu_action(ctx.ser, npc, "Talk-to")
+    ctx.state.data["mh_last_turnin_click"] = time.time()
+
+
+def _accept_tea_if_offered(ctx) -> None:
+    option = next(
+        (w for w in controller.get_widgets_dump() if "cuppa" in (w.get("text") or "").lower()),
+        None,
+    )
+    if option is not None:
+        debug_log.log("mahogany_homes", "accepting the offered cup of tea")
+        controller.click_entity(ctx.ser, option, offset=(0, 0), check_ui_blockers=False)
+
+
+PHASE_HANDLERS = {
+    "bank": bank_phase,
+    "request_contract": request_contract_phase,
+    "travel": travel_phase,
+    "work": work_phase,
+    "turn_in": turn_in_phase,
+}
+
+
+def tick(ctx) -> None:
+    config = ctx.state.config
+    if not config.get("enabled", True):
+        return
+
+    state = controller.get_mahogany_homes_state()
+    phase = ctx.state.data.get("mh_phase") or "bank"
+
+    if not state.get("hasContract"):
+        if needs_bank_trip(ctx, config, state):
+            phase = "bank"
+        elif phase != "request_contract":
+            phase = "request_contract"
+    elif phase in ("bank", "request_contract"):
+        phase = "travel"
+    elif phase == "work" and needs_bank_trip(ctx, config, state):
+        debug_log.log("mahogany_homes", "running low mid-contract -- banking")
+        phase = "bank"
+
+    ctx.state.data["mh_phase"] = phase
+    PHASE_HANDLERS[phase](ctx, config, state)
