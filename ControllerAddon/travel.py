@@ -621,7 +621,7 @@ def walk_to_exact_tile(ctx, x: int, y: int, plane: int, wait_for_arrival: bool =
     point = controller.get_ground_walk_point(x, y, plane)
     if not point.get("onScreen"):
         return False
-    refresh = lambda: controller.get_ground_walk_screen_pos(x, y, plane)
+    refresh = controller.ground_tile_refresh_target(x, y, plane)
     controller.key_down(ctx.ser, "SHIFT")
     controller.click_entity(ctx.ser, point, offset=(0, 0), refresh_target=refresh)
     controller.key_up(ctx.ser, "SHIFT")

@@ -404,3 +404,29 @@ def test_the_non_blocking_walk_still_reports_an_unprojectable_tile(monkeypatch):
                         lambda x, y, p: {"onScreen": False})
 
     assert travel.walk_to_exact_tile(None, 12, 12, 0, wait_for_arrival=False) is False
+
+
+def test_walk_to_exact_tile_uses_the_ground_tile_refresh_target_factory(monkeypatch):
+    """Regression: walk_to_exact_tile used to hand-roll its own lambda duplicating
+    ground_tile_refresh_target's body instead of calling the factory. Assert the factory itself
+    gets called so a future edit can't silently reintroduce the duplicate."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 0, "y": 0, "plane": 0})
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                         lambda x, y, plane: {"onScreen": True})
+    monkeypatch.setattr(controller, "key_down", lambda ser, key: None)
+    monkeypatch.setattr(controller, "key_up", lambda ser, key: None)
+
+    factory_calls = []
+    real_factory = controller.ground_tile_refresh_target
+    def _spy_factory(x, y, plane):
+        factory_calls.append((x, y, plane))
+        return real_factory(x, y, plane)
+    monkeypatch.setattr(controller, "ground_tile_refresh_target", _spy_factory)
+
+    click_kwargs = []
+    monkeypatch.setattr(controller, "click_entity",
+                         lambda ser, e, **kw: click_kwargs.append(kw) or True)
+
+    travel.walk_to_exact_tile(_Ctx(), 12, 12, 0, wait_for_arrival=False)
+    assert factory_calls == [(12, 12, 0)]
+    assert click_kwargs and click_kwargs[0].get("refresh_target") is not None
