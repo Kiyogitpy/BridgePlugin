@@ -39,6 +39,32 @@
 // This firmware never writes to the serial port. On a 32U4 the CDC Serial.write() stalls when
 // the host is not draining, and controller.py never reads -- so any unsolicited output would
 // risk wedging the device.
+//
+// PROTOCOL v3 (2026-08-27). Again purely ADDITIVE -- v1/v2 commands are untouched, and a v2
+// firmware silently ignores every v3 command, so either side can be upgraded first. The Python
+// side MUST feature-detect via `V` before relying on `X` (an ignored X means queued motion
+// plays anyway, which silently corrupts the sender's position bookkeeping).
+//
+//   X    Flush: discard every queued command NOW. The active segment always finishes (it is
+//        executed in place at queue[q_head]; see flushQueue). Immediate, not queued -- a queued
+//        flush could not retract anything ahead of itself. NOTE: X drops queued button/key
+//        commands too, so the sender must only flush while nothing but segments are queued
+//        (controller.py only sends it from inside a mouse flight). Worst-case latency: while
+//        the queue lacks QUEUE_RESERVE free slots, serial is not read, so an X can wait up to
+//        one segment (~18 ms) before being seen.
+//   V    Version query. Responds "HB 3\n" -- the ONE solicited serial write in this firmware.
+//        A single short line cannot fill the 64-byte CDC TX buffer, so it cannot stall even if
+//        the host never reads it; the never-write rule below still holds for UNSOLICITED output.
+//   R    Reset: flush everything INCLUDING the active segment, zero the sub-pixel carry and
+//        chain phase, release every held mouse button and key. For startup cleanup after a
+//        crashed sender and for safety tooling.
+//   W <n>  Scroll wheel, n detents (positive = away from user), clamped to +/-127. Queued, so
+//          it keeps program order with motion and clicks like every other queued command.
+//
+// WATCHDOG (v3): if any button/key is held and no serial line has arrived for 60 s, everything
+// is released. The panic path on the host is a hard process kill that cannot send key-ups; this
+// is the only thing standing between that and a button held forever. It never fires when
+// nothing is held, so multi-minute idle periods (scheduled breaks) are unaffected.
 // ---------------------------------------------------------------------------------------------
 
 static const uint32_t BAUD = 115200;   // nominal only: this is USB CDC, the rate is not real
@@ -178,6 +204,13 @@ static void q_pop() {
   q_count--;
 }
 
+// Drop everything queued but NEVER the active segment: serviceMotion executes the active
+// command in place at queue[q_head] and endSegment pops it, so evicting the head mid-play
+// would leave the interpolator reading a slot q_push is free to overwrite.
+static void flushQueue() {
+  q_count = seg_active ? 1 : 0;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Command decoding
 // ---------------------------------------------------------------------------------------------
@@ -235,6 +268,17 @@ enum : uint8_t { KEY_WRITE = 0, KEY_PRESS = 1, KEY_RELEASE = 2 };
 
 static void handleLine(const char *line) {
   if (!line[0]) return;
+
+  // v3 immediate commands -- these act NOW, not in queue order. X exists to retract queued
+  // motion, so queueing it would defeat its purpose; V is a pure query.
+  if (line[0] == 'X' && !line[1]) {
+    flushQueue();
+    return;
+  }
+  if (line[0] == 'V' && !line[1]) {
+    Serial.print("HB 3\n");   // solicited, single short line: cannot stall (see header)
+    return;
+  }
 
   // "M <dx> <dy>" -- legacy immediate move. Enqueued as a zero-duration segment so it keeps its
   // place in program order relative to clicks; with an empty queue that is indistinguishable
