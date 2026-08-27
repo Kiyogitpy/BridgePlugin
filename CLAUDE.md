@@ -295,6 +295,20 @@ trusting the device. It opens the same COM port `controller.py` does, so **never
 controller.py** (same one-process-per-port constraint as the general Arduino serial port gotcha
 above).
 
+**VERIFIED ON HARDWARE 2026-08-27, first flash: `ALL PASS`, including `--watchdog`.** So every v3
+firmware command has now actually executed on the device — `V` answered `HB 3`, `X` cut a 375px
+uninterrupted travel down to 112px (fraction 0.30 against a 0.50 bound) with 0px of drift after,
+`R` released a held SHIFT, and the 60s watchdog released one on its own after 65s of silence.
+Note the bench's flush check is deliberately scale-free (it measures an uninterrupted baseline in
+the same run and bounds the flushed travel as a fraction of it) because `S` moves raw HID mouse
+units, not pixels: an earlier absolute-pixel window PASSED on a device where `X` did nothing at
+all. The 375px over 500 units also puts this machine at 0.75 px/unit, within 2% of the 0.737 in
+`.hm2_calibration.json`. What is still unverified is the ROUTINE-level behavior, not the firmware:
+no live session has yet run a moving-target routine with flushing enabled. Success signal to watch
+for is `_settle_on_target_before_click`'s corrective move firing less often; the failure signal is
+any cursor stall on a flushed flight, which would mean the reduced lookahead described below is
+biting in practice.
+
 **Open follow-up (not yet verified live):** `HM2_FLUSH_COMMIT_MS` (22.0, in `settings.py`) plus
 the rewind's "first emission at or past `commit_ms`" selection rule double-count the active
 segment, so the rewind lands one-sidedly ~18ms / one segment AHEAD of what the firmware actually
