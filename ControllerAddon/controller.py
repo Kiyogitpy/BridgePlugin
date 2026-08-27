@@ -731,6 +731,32 @@ def get_mastering_mixology_config():
     return api_get("/mastering-mixology-config")
 
 
+def get_mahogany_homes_config():
+    return api_get("/mahogany-homes-config")
+
+
+def get_mahogany_homes_state():
+    return api_get("/mahogany-homes") or {"hasContract": False}
+
+
+def get_widgets_dump(scan: bool = False):
+    data = api_get("/widgets/dump", params={"scan": "true"} if scan else None)
+    if not data:
+        return []
+    return data.get("widgets", [])
+
+
+def get_npc_nearest(npc_id: int):
+    """Full entity dict for the nearest NPC of this *type* (unlike get_npc_screen_pos, which
+    only returns a bare (x, y) tuple) -- needed wherever the caller also wants the NPC's index
+    (for get_npc_by_index-based tracking) or wants to pass the result straight into
+    click_menu_action, which reads more than just screenX/screenY off its `entity` argument."""
+    data = api_get("/npc/nearest", params={"id": npc_id})
+    if not data or not data.get("found"):
+        return None
+    return data
+
+
 def get_mixology_state():
     return api_get("/mixology-state") or {
         "inLab": False, "orders": [], "hopper": {"mox": 0, "aga": 0, "lye": 0},
@@ -2794,6 +2820,7 @@ ROUTINE_FILES = {
     "CHINCHOMPA_HUNTING": "routines/chinchompa_hunting.py",
     "FALCONRY": "routines/falconry.py",
     "PLANK_MAKE": "routines/plank_make.py",
+    "MAHOGANY_HOMES": "routines/mahogany_homes.py",
 }
 
 
