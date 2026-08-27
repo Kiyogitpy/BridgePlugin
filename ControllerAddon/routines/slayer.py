@@ -316,6 +316,11 @@ AUTO_PRAYER_LADDERS = {
 # unable to ever detect "off" again.
 OFFENSIVE_PRAYER_STUCK_ON_TICKS = 3
 
+# Re-aim checkpoints for the loot right-click's flight. The flight is ~1s and the player is
+# usually moving during it, so a few mid-flight corrections are what keep the cursor on a small
+# icon; see controller.click_menu_action's refresh_target note.
+LOOT_REFRESH_LEGS = 3
+
 # maybe_loot gives up on a ground item after this many click-and-wait attempts each still ending
 # with the item sitting there unpicked (see LOOT_PENDING_TIMEOUT_TICKS -- an "attempt" is a full
 # click-then-wait-for-resolution cycle, not a per-tick reclick) -- CONFIRMED live 2026-08-05: a
@@ -766,6 +771,8 @@ def maybe_loot(ctx):
                         target_npc,
                         refresh_target=controller.npc_index_refresh_target(current_target_index),
                         refresh_legs=ENGAGE_REFRESH_LEGS,
+                        expected_action="Attack",
+                        expected_target=target_npc.get("name"),
                     ):
                         ctx.state.data["engage_committed_at"] = time.time()
                         ctx.state.data["engage_last_pos"] = None
@@ -883,8 +890,19 @@ def maybe_loot(ctx):
                 # before one finally landed dead-on. Aiming exactly at the item's own
                 # screenX/screenY (GroundItemProvider's precise anchor point) instead of
                 # jittering off it fixes that.
-                controller.click_menu_action(ctx.ser, click_target, "take",
-                                              target_hint=click_target.get("name"), offset=(0, 0))
+                # refresh_target (2026-08-27): the re-resolve above is only accurate at the
+                # instant it happens, and the right-click lands ~1.0s later -- during a fight the
+                # player is moving and the camera trails, so a ground item's small icon drifts out
+                # from under the aim point. MEASURED live: 3 misses in one session, each reading
+                # back a menu of pure ground options and costing a ~7s retry. click_menu_action
+                # can now re-aim mid-flight like any other click.
+                controller.click_menu_action(
+                    ctx.ser, click_target, "take",
+                    target_hint=click_target.get("name"), offset=(0, 0),
+                    refresh_target=controller.ground_item_refresh_target(
+                        key[1], key[2], item.get("plane", 0), key[0]),
+                    refresh_legs=LOOT_REFRESH_LEGS,
+                )
 
                 if same_target:
                     ctx.state.data["loot_stuck_attempts"] = ctx.state.data.get("loot_stuck_attempts", 0) + 1
@@ -1038,6 +1056,8 @@ def engage_target(ctx, combat: dict):
         target,
         refresh_target=controller.npc_index_refresh_target(target_index),
         refresh_legs=ENGAGE_REFRESH_LEGS,
+        expected_action="Attack",
+        expected_target=target.get("name"),
     ):
         ctx.state.data["current_target_index"] = target_index
         ctx.state.data["engage_committed_at"] = time.time()

@@ -37,16 +37,49 @@ Design notes and the full derivation:
 docs/superpowers/specs/2026-08-24-human-mouse-movement-v2-design.md
 """
 
+import json
 import math
+import os
 import random
 import time
 
 from settings import (
     HM2_CURVE_FRACTION, HM2_D_REF, HM2_LATERAL_ERROR, HM2_LOOKAHEAD_SEGMENTS,
-    HM2_LATERAL_DECAY, HM2_MAX_MS, HM2_MAX_SUBMOVES, HM2_MED_REF_MS, HM2_MIN_MS, HM2_PRIMARY_TIME_SHARE,
-    HM2_CORRECTION_TOLERANCE_PX, HM2_FINAL_CORRECTIONS, HM2_MIN_PX_PER_SEGMENT, HM2_TREMOR_MAX_FRACTION, HM2_REPLAN_MIN_DRIFT_PX, HM2_SEGMENT_MS, HM2_SIGMA, HM2_TOLERANCE_PX, HM2_SLOPE_MS_PER_BIT, HM2_TREMOR_PX, HM2_UNDERSHOOT_MEAN,
+    HM2_LATERAL_DECAY, HM2_MAX_MEAN_PX_PER_MS, HM2_MAX_MS, HM2_MAX_SUBMOVES, HM2_MED_REF_MS, HM2_MIN_MS, HM2_PRIMARY_TIME_SHARE,
+    HM2_CORRECTION_TOLERANCE_PX, HM2_FINAL_CORRECTIONS, HM2_MAX_CORRECTION_PX_PER_MS, HM2_MIN_PX_PER_SEGMENT, HM2_TREMOR_MAX_FRACTION, HM2_REPLAN_MIN_DRIFT_PX, HM2_SEGMENT_MS, HM2_SIGMA, HM2_TOLERANCE_PX, HM2_SLOPE_MS_PER_BIT, HM2_TEMPO_SIGMA, HM2_TEMPO_TAU_S, HM2_TREMOR_PX, HM2_UNDERSHOOT_MEAN,
     HM2_UNDERSHOOT_SIGMA,
 )
+
+
+# Session tempo: a slowly-drifting log-duration offset shared by every movement, because a
+# human's pace is autocorrelated (fast spells, slow spells) and i.i.d. draws have neither --
+# see HM2_TEMPO_SIGMA's comment for the five-recording measurement behind it. One
+# Ornstein-Uhlenbeck process, advanced by wall-clock time whenever a duration is drawn.
+_tempo_state = {"value": None, "at": None}
+
+
+def _reset_tempo(value=None, now=None):
+    """value=None re-arms the random session-start mood; a number pins the mood (tests)."""
+    _tempo_state["value"] = value
+    _tempo_state["at"] = now
+
+
+def _tempo_now(rng: random.Random = random, now: float = None) -> float:
+    if now is None:
+        now = time.monotonic()
+    st = _tempo_state
+    if st["value"] is None:
+        # A session starts in a random mood, not at the average pace.
+        st["value"] = rng.gauss(0.0, HM2_TEMPO_SIGMA)
+        st["at"] = now
+        return st["value"]
+    dt = max(0.0, now - (st["at"] if st["at"] is not None else now))
+    st["at"] = now
+    if dt > 0.0:
+        alpha = math.exp(-dt / HM2_TEMPO_TAU_S)
+        st["value"] = (alpha * st["value"]
+                       + rng.gauss(0.0, HM2_TEMPO_SIGMA * math.sqrt(max(0.0, 1.0 - alpha * alpha))))
+    return st["value"]
 
 
 def duration_for(dist: float, rng: random.Random = random) -> float:
@@ -60,8 +93,15 @@ def duration_for(dist: float, rng: random.Random = random) -> float:
     d = max(1.0, float(dist))
     median = HM2_MED_REF_MS + HM2_SLOPE_MS_PER_BIT * math.log2(d / HM2_D_REF)
     median = max(HM2_MIN_MS, median)
-    ms = median * math.exp(rng.gauss(0.0, HM2_SIGMA))
-    return min(HM2_MAX_MS, max(HM2_MIN_MS, ms))
+    # The session's drifting mood rides on top of the per-movement draw -- see _tempo_now.
+    ms = median * math.exp(rng.gauss(0.0, HM2_SIGMA) + _tempo_now(rng))
+    ms = min(HM2_MAX_MS, max(HM2_MIN_MS, ms))
+    # The superhuman-speed floor is applied AFTER the HM2_MAX_MS cap so the cap can never win
+    # against it: beyond HM2_MAX_MS * HM2_MAX_MEAN_PX_PER_MS px (3500 at current settings -- a
+    # 4K diagonal qualifies) the two constraints conflict, and running longer than the human's
+    # longest observed reach is the safer side of that conflict than moving faster than the
+    # human's top speed.
+    return max(ms, d / HM2_MAX_MEAN_PX_PER_MS)
 
 
 def plan_submovements(start, target, rng: random.Random = random, tolerance: float = None):
@@ -170,6 +210,80 @@ def _submove_path(p0, p1, rng: random.Random, steps: int):
     return out
 
 
+def _plan_spans(points, start, duration_ms, primary_share=None):
+    """Allocate each submovement's time: a fixed share to the primary, the rest split among the
+    corrections BY DISTANCE.
+
+    Returns (points, spans_ms) -- the points pass through untouched; the tuple shape is kept so
+    a future filtering step has somewhere to live. Two things this is deliberately NOT:
+
+    NOT an equal split among corrections, which is what it replaced. Their distances span four
+    orders of magnitude, so equal time made correction 1 run 2.3-2.5x FASTER than the primary
+    while corrections 2..n sat effectively stationary -- one 775px reach spent 406ms, 19% of the
+    movement, not moving. MEASURED fastest/slowest submovement within one movement: p50 31.3x,
+    p90 153x, worst 631x. USER-REPORTED as "sometimes it'd go super human speed other times very
+    slow ... a human would be relatively consistent".
+
+    NOT purely by distance either, which was the first attempt at the fix and overshot: that
+    makes every submovement run at exactly the same speed, and a real reach does not. MEASURED
+    from the recording, the corrective phase runs median 4.2x (p90 17.9x) slower per pixel than
+    the ballistic throw -- the classic two-component reach. HM2_PRIMARY_TIME_SHARE is what
+    reproduces that asymmetry; see its comment for the arithmetic tying 0.62 to the measured
+    4.2x.
+
+    It also deliberately does NOT drop tiny trailing submovements. Merging anything under ~1.5px
+    into its predecessor was tried and reverted the same day: it tripped
+    test_v2_settles_while_tracking_a_moving_target from 5.5px of settle churn to 13.1px against a
+    12.0px budget (the old engine scores 3.5px), because while chasing a moving target those
+    small final approaches are exactly what does the settling. It is also the wrong trade on its
+    own terms -- those slow trailing corrections are one of the few places this engine reproduces
+    a human's homing phase at all.
+
+    `primary_share` is overridable for the mid-flight replan path. A replanned suffix is the
+    HOMING phase of a reach already in progress, not a fresh throw, so handing its first
+    submovement a full ballistic share is wrong twice over -- it inflates that leg and starves
+    the settle that follows. CONFIRMED by test_v2_settles_while_tracking_a_moving_target, which
+    went to 13.1px of settle churn against a 12.0px budget when the replan used the default.
+    """
+    cur = (float(start[0]), float(start[1]))
+    merged, dists = [], []
+    for p in points:
+        merged.append(p)
+        dists.append(math.hypot(p[0] - cur[0], p[1] - cur[1]))
+        cur = p
+
+    if len(merged) <= 1:
+        return merged, [duration_ms]
+
+    share = HM2_PRIMARY_TIME_SHARE if primary_share is None else primary_share
+    if share <= 0.0:
+        total = sum(dists)
+        if total <= 1e-9:
+            return merged, [max(HM2_SEGMENT_MS, duration_ms / len(merged))] * len(merged)
+        return merged, [max(HM2_SEGMENT_MS, duration_ms * d / total) for d in dists]
+
+    primary_ms = duration_ms * share
+    rest = max(0.0, duration_ms - primary_ms)
+    tail = sum(dists[1:])
+    if tail <= 1e-9:
+        return merged, [duration_ms] + [HM2_SEGMENT_MS] * (len(merged) - 1)
+    spans = [primary_ms] + [max(HM2_SEGMENT_MS, rest * d / tail) for d in dists[1:]]
+    return merged, spans
+
+
+def _step_plan(span_ms: float, gap_px: float):
+    """(steps, step_ms) for one submovement: segment count bounded by TIME and by DISTANCE.
+
+    A 2px correction spread over five 18ms segments is five chances to wobble for two pixels of
+    travel; one segment does the same job and looks like a settle rather than a twitch. Shared by
+    build_segments, move()'s main loop, and the residual-correction loop so the bounding rule
+    cannot drift between them.
+    """
+    steps = max(1, int(round(span_ms / HM2_SEGMENT_MS)))
+    steps = max(1, min(steps, int(math.ceil(gap_px / HM2_MIN_PX_PER_SEGMENT))))
+    return steps, span_ms / steps
+
+
 def build_segments(start, target, rng: random.Random = random, duration_ms: float = None):
     """Full movement as a list of (dx_hundredths, dy_hundredths, dur_ms) firmware segments.
 
@@ -184,27 +298,17 @@ def build_segments(start, target, rng: random.Random = random, duration_ms: floa
         duration_ms = duration_for(total_dist, rng)
 
     points = plan_submovements(start, target, rng)
-    n_corrections = max(0, len(points) - 1)
 
-    # The primary gets the lion's share of the time; corrections split the rest and are quicker,
-    # matching the shape of a real reach (one fast throw, then small fast fixes).
-    primary_ms = duration_ms * HM2_PRIMARY_TIME_SHARE if n_corrections else duration_ms
-    correction_ms = (duration_ms - primary_ms) / n_corrections if n_corrections else 0.0
+    points, spans_ms = _plan_spans(points, start, duration_ms)
 
     segments = []
     cur = start
     carry_x = carry_y = 0.0
 
     for idx, p in enumerate(points):
-        span_ms = primary_ms if idx == 0 else correction_ms
-        span_ms = max(HM2_SEGMENT_MS, span_ms)
-        # Bound segment count by DISTANCE as well as time. A 2px correction spread over five
-        # 18ms segments is five chances to wobble for two pixels of travel; one segment does the
-        # same job and looks like a settle rather than a twitch.
+        span_ms = max(HM2_SEGMENT_MS, spans_ms[idx])
         gap_px = math.hypot(p[0] - cur[0], p[1] - cur[1])
-        steps = max(1, int(round(span_ms / HM2_SEGMENT_MS)))
-        steps = max(1, min(steps, int(math.ceil(gap_px / HM2_MIN_PX_PER_SEGMENT))))
-        step_ms = span_ms / steps
+        steps, step_ms = _step_plan(span_ms, gap_px)
 
         for pos in _submove_path(cur, p, rng, steps):
             dx = pos[0] - cur[0] + carry_x
@@ -228,17 +332,67 @@ def build_segments(start, target, rng: random.Random = random, duration_ms: floa
 _px_per_unit = 1.0
 _SCALE_ALPHA = 0.25          # EMA weight -- slow enough that one odd movement cannot yank it
 _SCALE_MIN, _SCALE_MAX = 0.2, 3.0
+_scale_samples = 0       # movements measured so far; see _learn_scale's adaptive weight
+
+# Calibration persistence (2026-08-27). The pointer scale is a property of the MACHINE, not of
+# a session, but it used to reset to 1.0 on every process start -- so the first flights after
+# each restart under-traveled (~26% on this machine) and the residual-correction loop, the
+# least human-looking motion in the engine, cleaned up the difference. Bites hardest in
+# routines that fly the mouse rarely (plank_make: ~4 moves/minute). Every I/O path here
+# swallows failures -- a state file must never be able to break movement.
+_CALIBRATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".hm2_calibration.json")
+
+
+def _save_calibration() -> None:
+    try:
+        tmp = _CALIBRATION_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"px_per_unit": _px_per_unit, "samples": _scale_samples}, f)
+        os.replace(tmp, _CALIBRATION_PATH)   # atomic-ish: a crash mid-write can't tear the file
+    except Exception:
+        pass
+
+
+def _load_calibration() -> None:
+    global _px_per_unit, _scale_samples
+    try:
+        with open(_CALIBRATION_PATH) as f:
+            data = json.load(f)
+        px = float(data["px_per_unit"])
+        samples = int(data.get("samples", 0))
+    except Exception:
+        return
+    if not (_SCALE_MIN <= px <= _SCALE_MAX) or samples < 1:
+        return
+    _px_per_unit = px
+    # Floor the imported confidence at the point where _learn_scale's adaptive weight has
+    # already settled to the flat EMA (1/alpha samples), so a fresh session's first sample is
+    # damped rather than treated as the first measurement ever; cap it so an ancient count
+    # can't make the estimate feel more settled than the EMA can express.
+    _scale_samples = max(int(round(1.0 / _SCALE_ALPHA)), min(samples, 20))
 
 
 def _learn_scale(units: float, actual_px: float) -> None:
     """Update the px-per-unit estimate from one completed movement."""
-    global _px_per_unit
+    global _px_per_unit, _scale_samples
     if units < 20.0 or actual_px <= 0.0:
         return                # too short to measure reliably
     ratio = actual_px / units
     if not (_SCALE_MIN <= ratio <= _SCALE_MAX):
         return                # nonsense (cursor hit a screen edge, or the move was interrupted)
-    _px_per_unit = (1.0 - _SCALE_ALPHA) * _px_per_unit + _SCALE_ALPHA * ratio
+    # The weight is raised for the first few samples (1/n, floored at _SCALE_ALPHA) so the
+    # estimate converges in ONE movement rather than the eight-to-ten a flat 0.25 needs from the
+    # 1.0 starting guess. _px_per_unit resets on every process start, and until it converges the
+    # planned path under-travels -- on this machine by ~26% -- which is what makes the residual
+    # correction above large in the first place. It bites hardest in routines that fly the mouse
+    # rarely: routines/plank_make.py moves it about four times a minute.
+    alpha = max(_SCALE_ALPHA, 1.0 / (_scale_samples + 1))
+    _px_per_unit = (1.0 - alpha) * _px_per_unit + alpha * ratio
+    _scale_samples += 1
+    _save_calibration()
+
+
+_load_calibration()   # restore the machine's learned scale from the previous run, if any
 
 
 def _drain(t0: float, queued_ms: float) -> None:
@@ -269,10 +423,12 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
         return
 
     duration_ms = duration_for(total_dist, rng) * max(0.05, duration_scale)
+    # duration_for enforces the superhuman-speed floor on ITS output, but a duration_scale
+    # below 1.0 shrinks the budget after the fact -- re-apply the floor so no caller can plan
+    # a mean speed past the human-measured cap.
+    duration_ms = max(duration_ms, total_dist / HM2_MAX_MEAN_PX_PER_MS)
     points = plan_submovements(start, target, rng)
-    n_corrections = max(0, len(points) - 1)
-    primary_ms = duration_ms * HM2_PRIMARY_TIME_SHARE if n_corrections else duration_ms
-    correction_ms = (duration_ms - primary_ms) / n_corrections if n_corrections else 0.0
+    points, spans_ms = _plan_spans(points, start, duration_ms)
 
     cur = (float(start[0]), float(start[1]))
     carry_x = carry_y = 0.0
@@ -313,20 +469,17 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
                     # target actually is. Keeps the submovement structure rather than teleporting
                     # the aim: the remaining corrections just close on the new position.
                     points = points[:idx] + plan_submovements(cur, target, rng)
-                    n_corrections = max(0, len(points) - idx - 1)
-                    correction_ms = ((duration_ms - primary_ms) / n_corrections
-                                     if n_corrections else correction_ms)
+                    # Re-allocate the REMAINING time across the replanned suffix, by distance.
+                    remaining = max(HM2_SEGMENT_MS, duration_ms - queued_ms)
+                    tail, suffix = _plan_spans(points[idx:], cur, remaining, primary_share=0.0)
+                    points = points[:idx] + tail
+                    spans_ms = spans_ms[:idx] + suffix
 
         p = points[idx]
-        span_ms = primary_ms if idx == 0 else correction_ms
-        span_ms = max(HM2_SEGMENT_MS, span_ms)
-        # Bound segment count by DISTANCE as well as time. A 2px correction spread over five
-        # 18ms segments is five chances to wobble for two pixels of travel; one segment does the
-        # same job and looks like a settle rather than a twitch.
+        span_ms = max(HM2_SEGMENT_MS,
+                      spans_ms[idx] if idx < len(spans_ms) else HM2_SEGMENT_MS)
         gap_px = math.hypot(p[0] - cur[0], p[1] - cur[1])
-        steps = max(1, int(round(span_ms / HM2_SEGMENT_MS)))
-        steps = max(1, min(steps, int(math.ceil(gap_px / HM2_MIN_PX_PER_SEGMENT))))
-        step_ms = span_ms / steps
+        steps, step_ms = _step_plan(span_ms, gap_px)
 
         for pos in _submove_path(cur, p, rng, steps):
             if abort is not None and abort.is_set():
@@ -393,9 +546,27 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
         dx, dy = target[0] - cur[0], target[1] - cur[1]
         if math.hypot(dx, dy) <= HM2_CORRECTION_TOLERANCE_PX:
             break
-        dur = max(1, int(round(HM2_SEGMENT_MS)))
-        send_line(ser, f"S {int(round(dx / _px_per_unit * 100))} "
-                       f"{int(round(dy / _px_per_unit * 100))} {dur}")
-        queued_ms += dur
+        # Duration SCALES WITH THE GAP, capped at a human-measured top speed. This used to be a
+        # flat HM2_SEGMENT_MS however far the correction had to travel, so the cursor snapped
+        # faster the further the planned path had fallen short -- and the residual is largest
+        # exactly while _px_per_unit is still converging. MEASURED: a 527px reach hit 7.6 px/ms
+        # and a 900px one ~13 px/ms, against a human maximum of 5.37 (n=2097 windows,
+        # recordings/2026-08-26_225917_mousemove). See HM2_MAX_CORRECTION_PX_PER_MS.
+        gap = math.hypot(dx, dy)
+        span_ms = max(HM2_SEGMENT_MS, gap / HM2_MAX_CORRECTION_PX_PER_MS)
+        steps, step_ms = _step_plan(span_ms, gap)
+        dur = max(1, int(round(step_ms)))
+        # Straight-line walk to the target -- a settle, not another curved reach.
+        prev = cur
+        for k in range(1, steps + 1):
+            if abort is not None and abort.is_set():
+                return
+            want = (cur[0] + dx * k / steps, cur[1] + dy * k / steps)
+            sx = int(round((want[0] - prev[0]) / _px_per_unit * 100))
+            sy = int(round((want[1] - prev[1]) / _px_per_unit * 100))
+            prev = want
+            if sx or sy:
+                send_line(ser, f"S {sx} {sy} {dur}")
+                queued_ms += dur
         _drain(t0, queued_ms)
         cur = tuple(float(v) for v in get_cursor_pos())

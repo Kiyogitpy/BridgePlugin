@@ -1492,8 +1492,19 @@ def _click_station(ctx, station, objects: list, use_menu: bool = False) -> bool:
         obj.get("x"), obj.get("y"), obj.get("plane", 0), station["objectId"],
         radius=MAX_OBJECT_DISTANCE,
     )
-    if not controller.click_entity(ctx.ser, obj, refresh_target=refresh,
-                                   refresh_legs=GOLEM_CLICK_REFRESH_LEGS):
+    # expected_action (added 2026-08-27): verify via /hover that the default left-click is one
+    # of the plinth's own options BEFORE committing the click -- prevention for the exact
+    # player-camped-on-the-pixel hijack the /last-action echo below detects after the fact.
+    # The full option set, because craft_phase does not get to choose which one the game offers
+    # (see GOLEM_PLINTH_OPTIONS' own comment). A withheld click comes back as the falsy
+    # CLICK_WITHHELD sentinel and must NOT hop -- the aim was fine, the pixel is contested --
+    # so it propagates to the caller's hijack budget instead.
+    res = controller.click_entity(ctx.ser, obj, refresh_target=refresh,
+                                  refresh_legs=GOLEM_CLICK_REFRESH_LEGS,
+                                  expected_action=GOLEM_PLINTH_OPTIONS)
+    if not res:
+        if getattr(res, "withheld", False):
+            return res
         _hop_toward_point(ctx, station["x"], station["y"], station.get("plane", 0))
         return False
     return True
@@ -1505,9 +1516,15 @@ def _click_station_tracked(ctx, station, miss_key: str, objects: list,
     for why an uncounted click failure is exactly the same unbounded-loop shape as an uncounted
     walk failure. _click_station already hops toward the station on a miss; this adds the
     counting and the eventual safety-stop escalation once hopping alone hasn't fixed it."""
-    if _click_station(ctx, station, objects, use_menu=use_menu):
+    res = _click_station(ctx, station, objects, use_menu=use_menu)
+    if res:
         ctx.state.data[miss_key] = 0
         return True
+    if getattr(res, "withheld", False):
+        # NOT an aim miss: the aim landed and hover verification proved the pixel is contested
+        # (or the option absent). Counting it here would let a parked player walk the routine
+        # into the safety stop; the caller's hijack budget bounds it instead, so it propagates.
+        return res
     misses = ctx.state.data.get(miss_key, 0) + 1
     ctx.state.data[miss_key] = misses
     debug_log.log(
@@ -1928,15 +1945,24 @@ def craft_phase(ctx, config: dict) -> None:
             debug_log.log("golem crafting",
                           f"{side} side: bare click was hijacked -- selecting the action from the "
                           f"right-click menu instead")
-        if not _click_station_tracked(ctx, station, "gc_side_click_misses", objects,
-                                      use_menu=escalate):
+        res = _click_station_tracked(ctx, station, "gc_side_click_misses", objects,
+                                     use_menu=escalate)
+        withheld = (not res) and getattr(res, "withheld", False)
+        if not res and not withheld:
             return
         # Ask the game what that click actually resolved to before committing to the full
         # confirmation wait. A bare left-click is resolved against whatever sits on top of the
         # aim pixel, and another PLAYER standing there turns it into "Walk here" on them --
         # CONFIRMED live 2026-08-23, see _click_resolved_wrongly. Retrying immediately costs one
         # tick; waiting it out costs GOLEM_SIDE_TIMEOUT_S for a carve that never started.
-        hijacked = _await_click_echo(before_action, station["objectId"]) is True
+        # A WITHHELD click (added 2026-08-27) is the same signal caught BEFORE the click by
+        # hover verification -- no wasted click, no ~1.5s echo wait -- so it feeds the identical
+        # escalation below. Every downstream bound still holds: first withhold spends the fast
+        # retry, the second escalates to the menu route, and if THAT falls back and is withheld
+        # again (the option genuinely absent -- the out-of-fur shape) the flow drops into
+        # _await_side_done's timeout exactly as before, so gc_side_misses still climbs toward
+        # the out-of-fur recovery instead of spinning.
+        hijacked = withheld or _await_click_echo(before_action, station["objectId"]) is True
         already_retried = ctx.state.data.get("gc_side_hijacks", 0) >= GOLEM_FAST_RETRY_BUDGET
         if hijacked and not already_retried:
             ctx.state.data["gc_side_hijacks"] = ctx.state.data.get("gc_side_hijacks", 0) + 1
@@ -2062,10 +2088,17 @@ def craft_phase(ctx, config: dict) -> None:
                       "insert click was hijacked -- selecting Insert-core from the right-click "
                       "menu instead")
     before_action = controller.get_last_action()
-    if not _click_station_tracked(ctx, station, "gc_insert_click_misses", objects,
-                                  use_menu=insert_escalate):
+    res = _click_station_tracked(ctx, station, "gc_insert_click_misses", objects,
+                                 use_menu=insert_escalate)
+    insert_withheld = (not res) and getattr(res, "withheld", False)
+    if not res and not insert_withheld:
         return
-    if _await_click_echo(before_action, station["objectId"]) is True and not insert_escalate:
+    # Same fold as the carve step (2026-08-27): a withheld click is the hijack detected BEFORE
+    # the click by hover verification, so it spends the same budget -- and past the budget it
+    # falls through to _await_golem_complete's timeout and the existing miss counting, bounded
+    # exactly as before.
+    if (insert_withheld or _await_click_echo(before_action, station["objectId"]) is True) \
+            and not insert_escalate:
         ctx.state.data["gc_insert_hijacks"] = ctx.state.data.get("gc_insert_hijacks", 0) + 1
         debug_log.log("golem crafting",
                       "insert click was hijacked (resolved to another target) -- retrying now")

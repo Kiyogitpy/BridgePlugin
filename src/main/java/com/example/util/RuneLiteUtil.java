@@ -160,8 +160,82 @@ public final class RuneLiteUtil
 	 * Moved here from ObjectProvider 2026-08-24 when NPCProvider/PvpProvider needed the same
 	 * logic for Actor.getConvexHull(); it was never object-specific, only object-first.
 	 */
+	/**
+	 * Area centroid of a shape's outline, or null if it is degenerate (zero area, or fewer than
+	 * three vertices). Uses the standard polygon centroid formula over the flattened path, with
+	 * the outline treated as closed whether or not it carries an explicit SEG_CLOSE.
+	 *
+	 * Deliberately the AREA centroid rather than the mean of the vertices: the vertex mean is
+	 * pulled toward whichever part of the outline happens to carry more points, so it wanders as
+	 * the model's tessellation changes even when the silhouette does not.
+	 */
+	private static Point polygonCentroid(java.awt.Shape shape)
+	{
+		if (shape == null)
+		{
+			return null;
+		}
+
+		java.util.List<double[]> pts = new java.util.ArrayList<>();
+		java.awt.geom.PathIterator it = shape.getPathIterator(null);
+		double[] coords = new double[6];
+		while (!it.isDone())
+		{
+			int segType = it.currentSegment(coords);
+			if (segType == java.awt.geom.PathIterator.SEG_MOVETO
+				|| segType == java.awt.geom.PathIterator.SEG_LINETO)
+			{
+				pts.add(new double[]{coords[0], coords[1]});
+			}
+			it.next();
+		}
+
+		if (pts.size() < 3)
+		{
+			return null;
+		}
+
+		double area2 = 0.0, cx = 0.0, cy = 0.0;
+		for (int i = 0; i < pts.size(); i++)
+		{
+			double[] a = pts.get(i);
+			double[] b = pts.get((i + 1) % pts.size());   // wraps, so an unclosed path still works
+			double cross = a[0] * b[1] - b[0] * a[1];
+			area2 += cross;
+			cx += (a[0] + b[0]) * cross;
+			cy += (a[1] + b[1]) * cross;
+		}
+
+		if (Math.abs(area2) < 1e-6)
+		{
+			return null;
+		}
+		return new Point((int) Math.round(cx / (3.0 * area2)), (int) Math.round(cy / (3.0 * area2)));
+	}
+
 	public static Point pointInsideShape(java.awt.Shape shape, java.awt.Rectangle bounds)
 	{
+		// Area centroid first. For a CONVEX shape it is mathematically guaranteed to be inside,
+		// and -- the point of this -- it moves CONTINUOUSLY as the shape deforms.
+		//
+		// The grid scan below cannot: it returns the FIRST fraction that passes contains(), so a
+		// model animating by a pixel can flip which fraction wins and teleport the aim point
+		// between candidates. MEASURED live 2026-08-27 against a Gargoyle that never changed
+		// tile: the reported aim point jittered p50 6.3px, p90 38.3px, max 69.5px frame to frame,
+		// over a total spread of 79x51px. Half of all polls therefore exceeded
+		// HM2_REPLAN_MIN_DRIFT_PX (6.0), so human_move.move kept replanning its approach as it
+		// arrived -- USER-REPORTED as "some weird defects at the very end of targeting".
+		//
+		// Actor.getConvexHull() is convex by construction, so actors always take this path. The
+		// scan stays behind it for genuinely concave clickboxes, where the centroid can land in
+		// a hole -- the boat's Helm (a steering wheel) is the confirmed case that put the scan
+		// here in the first place, and contains() still sends it down the old path.
+		Point centroid = polygonCentroid(shape);
+		if (centroid != null && shape.contains(centroid.x, centroid.y))
+		{
+			return centroid;
+		}
+
 		for (double[] fraction : SHAPE_SAMPLE_FRACTIONS)
 		{
 			int x = bounds.x + (int) (bounds.width * fraction[0]);

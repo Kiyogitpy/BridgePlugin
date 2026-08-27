@@ -153,11 +153,42 @@ public class NPCProvider extends BridgeProvider
 			{
 				Map<String, Object> data = buildNpcData(npc, local);
 				data.put("found", true);
+				putViewerMotion(data, npc, local);
 				return data;
 			}
 		}
 
 		return notFound;
+	}
+
+	/**
+	 * Every motion source that shifts this NPC's screen projection, for
+	 * controller.py's npc_index_refresh_target hold key (added 2026-08-27). Tile-only
+	 * deadbanding held a stale aim point whenever the PLAYER was the thing moving -- the NPC's
+	 * tile never changes while our own walk slides its projection continuously, which is
+	 * exactly "clicks land behind walkers". LocalPoints are the client's per-frame interpolated
+	 * positions (128 units/tile), so sub-tile motion is visible here while a fully still scene
+	 * reads identically poll after poll and lets the hold suppress hull-animation jitter.
+	 * By-index only, deliberately not in buildNpcData -- the bulk /npcs list is TickCache-gated
+	 * and per-row viewer state there would just be stale duplication.
+	 */
+	private void putViewerMotion(Map<String, Object> data, NPC npc, Player local)
+	{
+		LocalPoint npcLocal = npc.getLocalLocation();
+		if (npcLocal != null)
+		{
+			data.put("npcLocalX", npcLocal.getX());
+			data.put("npcLocalY", npcLocal.getY());
+		}
+		LocalPoint playerLocal = local != null ? local.getLocalLocation() : null;
+		if (playerLocal != null)
+		{
+			data.put("playerLocalX", playerLocal.getX());
+			data.put("playerLocalY", playerLocal.getY());
+		}
+		data.put("cameraYaw", client.getCameraYaw());
+		data.put("cameraPitch", client.getCameraPitch());
+		data.put("cameraScale", client.getScale());
 	}
 
 	private Object getNpcTypes()

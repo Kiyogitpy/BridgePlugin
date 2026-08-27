@@ -110,6 +110,9 @@ def test_get_objects_with_no_radius_and_no_fresh_sends_no_params(monkeypatch):
 def test_move_to_human_without_refresh_legs_never_uses_tracking(monkeypatch):
     """Regression guard for the "purely additive" claim: refresh_legs=None (the default for
     every pre-existing caller) must never reach _move_to_human_tracking at all."""
+    # Pins the v1 engine explicitly: HUMAN_MOVE_V2 defaults ON since 2026-08-26, and this
+    # test is about the v1 dispatch path specifically.
+    monkeypatch.setattr(controller, "HUMAN_MOVE_V2", False)
     monkeypatch.setattr(controller, "get_cursor_pos", lambda: (0, 0))
     monkeypatch.setattr(controller, "maybe_overshoot_point", lambda *a, **k: None)
     monkeypatch.setattr(controller, "_move_to_human_exact", lambda *a, **k: None)
@@ -244,6 +247,9 @@ def test_move_to_human_tracking_uses_reduced_floor_for_non_final_legs(monkeypatc
 def test_move_to_human_non_tracking_paths_keep_the_full_floor(monkeypatch):
     """Regression guard: the single-checkpoint and plain paths are unchanged, so every existing
     caller's click still moves at exactly the speed it did before."""
+    # Pins the v1 engine explicitly: HUMAN_MOVE_V2 defaults ON since 2026-08-26, and this
+    # test is about the v1 dispatch path specifically.
+    monkeypatch.setattr(controller, "HUMAN_MOVE_V2", False)
     monkeypatch.setattr(controller, "get_cursor_pos", lambda: (0, 0))
     monkeypatch.setattr(controller, "maybe_overshoot_point", lambda *a, **k: None)
     floors = []
@@ -556,3 +562,348 @@ def test_make_udp_listener_bumps_the_receive_buffer_past_the_windows_default():
         assert actual >= (1 << 20)
     finally:
         s.close()
+
+
+# ---- npc_index_refresh_target deadband ----
+
+def test_npc_refresh_ignores_animation_but_follows_real_movement(monkeypatch):
+    """NPCProvider aims at Actor.getConvexHull(), recomputed every frame, so an animating
+    monster's reported point moves while the monster does not. MEASURED live 2026-08-27 on a
+    Gargoyle that never changed tile: p50 7.2px, p90 35.2px, max 55.4px of jitter -- over
+    HM2_REPLAN_MIN_DRIFT_PX on most polls, which made move() replan as it arrived.
+
+    Re-aiming at a hull is right; re-aiming at ANIMATION is not.
+    """
+    frames = [
+        {"found": True, "x": 10, "y": 20, "plane": 0, "screenX": 100, "screenY": 200},
+        {"found": True, "x": 10, "y": 20, "plane": 0, "screenX": 148, "screenY": 236},  # animating
+        {"found": True, "x": 10, "y": 20, "plane": 0, "screenX": 91,  "screenY": 173},  # animating
+        {"found": True, "x": 11, "y": 20, "plane": 0, "screenX": 160, "screenY": 205},  # WALKED
+        {"found": True, "x": 11, "y": 20, "plane": 0, "screenX": 205, "screenY": 250},  # animating
+    ]
+    monkeypatch.setattr(controller, "get_npc_by_index", lambda idx: frames.pop(0))
+    refresh = controller.npc_index_refresh_target(7)
+
+    assert refresh() == (100, 200)
+    assert refresh() == (100, 200)      # held: same tile, only the model moved
+    assert refresh() == (100, 200)
+    assert refresh() == (160, 205)      # tile changed -- a human would look again
+    assert refresh() == (160, 205)
+
+
+def test_npc_refresh_reports_a_lost_target_as_none(monkeypatch):
+    """A target that dies or despawns must still read as gone, not as its last held point --
+    move()'s target_lost path depends on it."""
+    monkeypatch.setattr(controller, "get_npc_by_index", lambda idx: None)
+    assert controller.npc_index_refresh_target(7)() is None
+
+
+def test_npc_refresh_state_is_per_factory(monkeypatch):
+    """The held point lives in the closure, so one factory is one click's flight. Callers build
+    them inline at the call site; sharing one would hold a stale point across clicks."""
+    monkeypatch.setattr(controller, "get_npc_by_index",
+                        lambda idx: {"found": True, "x": 1, "y": 2, "plane": 0,
+                                     "screenX": 50, "screenY": 60})
+    a = controller.npc_index_refresh_target(1)
+    assert a() == (50, 60)
+    monkeypatch.setattr(controller, "get_npc_by_index",
+                        lambda idx: {"found": True, "x": 1, "y": 2, "plane": 0,
+                                     "screenX": 999, "screenY": 999})
+    assert a() == (50, 60)                                    # same factory holds
+    assert controller.npc_index_refresh_target(1)() == (999, 999)   # a fresh one re-resolves
+
+
+def test_npc_refresh_follows_projection_while_the_player_moves(monkeypatch):
+    """The tile-only deadband held a stale point whenever *we* were the thing moving: the NPC's
+    tile never changes while the player walks, but its screen projection slides continuously --
+    which is exactly 'clicks land behind'. With the viewer-motion fields present (playerLocal*,
+    camera*), a change in OUR position must invalidate the hold."""
+    base = {"found": True, "x": 10, "y": 20, "plane": 0,
+            "npcLocalX": 6464, "npcLocalY": 6464,
+            "cameraYaw": 512, "cameraPitch": 300, "cameraScale": 550}
+    frames = [
+        dict(base, playerLocalX=6000, playerLocalY=6000, screenX=100, screenY=200),
+        dict(base, playerLocalX=6050, playerLocalY=6000, screenX=130, screenY=210),  # we walked
+        dict(base, playerLocalX=6100, playerLocalY=6000, screenX=160, screenY=220),  # still walking
+    ]
+    monkeypatch.setattr(controller, "get_npc_by_index", lambda idx: frames.pop(0))
+    refresh = controller.npc_index_refresh_target(7)
+    assert refresh() == (100, 200)
+    assert refresh() == (130, 210)
+    assert refresh() == (160, 220)
+
+
+def test_npc_refresh_still_holds_through_animation_when_nothing_moves(monkeypatch):
+    """When every motion source is still (npc tile+local, player local, camera), hull-animation
+    jitter in the reported point must still be held -- the original 2026-08-27 fix."""
+    base = {"found": True, "x": 10, "y": 20, "plane": 0,
+            "npcLocalX": 6464, "npcLocalY": 6464,
+            "playerLocalX": 6000, "playerLocalY": 6000,
+            "cameraYaw": 512, "cameraPitch": 300, "cameraScale": 550}
+    frames = [
+        dict(base, screenX=100, screenY=200),
+        dict(base, screenX=148, screenY=236),   # hull animating
+        dict(base, screenX=91, screenY=173),    # hull animating
+    ]
+    monkeypatch.setattr(controller, "get_npc_by_index", lambda idx: frames.pop(0))
+    refresh = controller.npc_index_refresh_target(7)
+    assert refresh() == (100, 200)
+    assert refresh() == (100, 200)
+    assert refresh() == (100, 200)
+
+
+def test_npc_refresh_follows_camera_rotation(monkeypatch):
+    """Camera motion shifts every projection with neither tile changing -- must re-resolve."""
+    base = {"found": True, "x": 10, "y": 20, "plane": 0,
+            "npcLocalX": 6464, "npcLocalY": 6464,
+            "playerLocalX": 6000, "playerLocalY": 6000,
+            "cameraPitch": 300, "cameraScale": 550}
+    frames = [
+        dict(base, cameraYaw=512, screenX=100, screenY=200),
+        dict(base, cameraYaw=700, screenX=300, screenY=200),
+    ]
+    monkeypatch.setattr(controller, "get_npc_by_index", lambda idx: frames.pop(0))
+    refresh = controller.npc_index_refresh_target(7)
+    assert refresh() == (100, 200)
+    assert refresh() == (300, 200)
+
+
+# ---- pre-click settle + hover verification ----
+
+def _click_entity_harness(monkeypatch, cursor=(100, 100)):
+    """Common mocks for exercising click_entity without serial/bridge. Returns (moves, clicks)."""
+    moves, clicks = [], []
+    monkeypatch.setattr(controller, "move_to_human", lambda ser, x, y, **k: moves.append((x, y)))
+    monkeypatch.setattr(controller, "click_human", lambda ser: clicks.append(1))
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: cursor)
+    monkeypatch.setattr(controller, "is_point_within_window", lambda x, y: True)
+    controller._movement_abort.clear()
+    return moves, clicks
+
+
+def test_click_entity_settles_before_click_when_target_drifted(monkeypatch):
+    """The terminal blind window: after move_to_human returns, nothing used to re-check the
+    target before the mouse-down. While the player walks, that last ~100-300ms is easily tens
+    of px of drift -- so click_entity now takes one more look and settles if it moved."""
+    moves, clicks = _click_entity_harness(monkeypatch)
+    entity = {"name": "Goblin", "id": 1, "screenX": 100, "screenY": 100}
+    ok = controller.click_entity(None, entity, offset=(0, 0), simulate_mistakes=False,
+                                 check_ui_blockers=False,
+                                 refresh_target=lambda: (150, 100))
+    assert ok
+    assert len(moves) == 2                 # main flight + one settle
+    assert moves[-1] == (150, 100)         # settle re-aimed at the refreshed position
+    assert clicks == [1]
+
+
+def test_click_entity_skips_settle_when_cursor_already_on_target(monkeypatch):
+    moves, clicks = _click_entity_harness(monkeypatch)
+    entity = {"name": "Goblin", "id": 1, "screenX": 100, "screenY": 100}
+    ok = controller.click_entity(None, entity, offset=(0, 0), simulate_mistakes=False,
+                                 check_ui_blockers=False,
+                                 refresh_target=lambda: (104, 103))
+    assert ok
+    assert len(moves) == 1                 # within tolerance: no extra motion
+    assert clicks == [1]
+
+
+def test_click_entity_settle_tolerates_lost_target(monkeypatch):
+    """refresh_target returning None mid-settle = target died/despawned; click the last-known
+    point anyway, same as move()'s own target_lost path."""
+    moves, clicks = _click_entity_harness(monkeypatch)
+    entity = {"name": "Goblin", "id": 1, "screenX": 100, "screenY": 100}
+    ok = controller.click_entity(None, entity, offset=(0, 0), simulate_mistakes=False,
+                                 check_ui_blockers=False,
+                                 refresh_target=lambda: None)
+    assert ok
+    assert len(moves) == 1
+    assert clicks == [1]
+
+
+def test_hover_matches_accepts_case_insensitive_substring(monkeypatch):
+    monkeypatch.setattr(controller, "get_hover",
+                        lambda: {"menuOpen": False, "option": "Attack",
+                                 "target": "Gargoyle (level-111)"})
+    assert controller.hover_matches(expected_action="attack", expected_target="gargoyle")
+
+
+def test_hover_matches_blocks_wrong_default_action(monkeypatch):
+    monkeypatch.setattr(controller, "get_hover",
+                        lambda: {"menuOpen": False, "option": "Walk here", "target": ""})
+    monkeypatch.setattr(controller.time, "sleep", lambda s: None)
+    assert not controller.hover_matches(expected_action="Attack", expected_target="Gargoyle")
+
+
+def test_hover_matches_never_blocks_without_the_endpoint(monkeypatch):
+    """An un-rebuilt client has no /hover (api_get returns None) -- verification must degrade
+    to the old click-and-check-last-action behavior, not withhold every click."""
+    monkeypatch.setattr(controller, "get_hover", lambda: None)
+    assert controller.hover_matches(expected_action="Attack")
+
+
+def test_hover_matches_ignores_an_open_menu(monkeypatch):
+    """With a real right-click menu open, left-click semantics are the menu's, not the world's."""
+    monkeypatch.setattr(controller, "get_hover", lambda: {"menuOpen": True})
+    assert controller.hover_matches(expected_action="Attack")
+
+
+def test_click_entity_withholds_click_on_persistent_hover_mismatch(monkeypatch):
+    """Verify-then-click: when the hover text persistently says the left-click would do the
+    wrong thing (someone camped on the pixel, target slipped away), do NOT click -- return False
+    so the caller retries, instead of burning the click and discovering via /last-action."""
+    moves, clicks = _click_entity_harness(monkeypatch)
+    monkeypatch.setattr(controller, "get_hover",
+                        lambda: {"menuOpen": False, "option": "Walk here", "target": ""})
+    monkeypatch.setattr(controller.time, "sleep", lambda s: None)
+    entity = {"name": "Gargoyle", "id": 1, "screenX": 100, "screenY": 100}
+    ok = controller.click_entity(None, entity, offset=(0, 0), simulate_mistakes=False,
+                                 check_ui_blockers=False,
+                                 refresh_target=lambda: (100, 100),
+                                 expected_action="Attack")
+    assert not ok
+    assert clicks == []                    # the wrong click was never sent
+    # The withheld case returns the CLICK_WITHHELD sentinel, not plain False, so a caller with
+    # an escalation path (golem_crafting's tiers) can tell "pixel contested" from "aim failed"
+    # -- while every plain truthiness check keeps working.
+    assert getattr(ok, "withheld", False)
+
+
+def test_human_delay_without_serial_is_a_plain_sleep(monkeypatch):
+    """Nothing that imports controller without owning the Arduino (tests, analysis tools) may
+    grow fidget behavior -- unregistered means exactly the old single sleep."""
+    slept = []
+    monkeypatch.setattr(controller.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(controller, "sample_human_delay", lambda a, b: 5.0)
+    monkeypatch.setattr(controller, "_fidget_ser", None)
+    controller.human_delay(1.0, 6.0)
+    assert slept == [5.0]
+
+
+def test_long_waits_are_split_into_human_length_still_segments(monkeypatch):
+    """MEASURED: the human never sits still >4.5s during active play; a 9s bot wait used to be
+    one 9s freeze. It must become several human-length still segments with fidgets between."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(controller.time, "perf_counter", lambda: clock["t"])
+
+    slept = []
+
+    def fake_sleep(s):
+        slept.append(s)
+        clock["t"] += s
+
+    monkeypatch.setattr(controller.time, "sleep", fake_sleep)
+    monkeypatch.setattr(controller, "sample_human_delay", lambda a, b: 9.0)
+    monkeypatch.setattr(controller, "_fidget_ser", object())
+    fidgets = []
+    monkeypatch.setattr(controller, "_maybe_fidget_during_wait", lambda: fidgets.append(1))
+    controller.human_delay(2.0, 12.0)
+    assert sum(slept) >= 9.0                                       # never shorter than drawn
+    assert max(slept) <= controller.IDLE_FIDGET_MAX_STILL_S        # no single long freeze
+    assert len(slept) >= 2
+    assert len(fidgets) >= 1
+
+
+def test_fidget_returns_the_cursor_exactly_to_its_origin(monkeypatch):
+    """Position-invariance is the safety contract: hover-parking call sites rest the cursor on
+    a future click target through a wait, so the return leg must land exactly on the origin."""
+    moves = []
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **k: moves.append((x, y, k.get("aim_radius"))))
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (500, 400))
+    monkeypatch.setattr(controller, "get_state", lambda: {"windowFocused": True})
+    monkeypatch.setattr(controller, "get_menu", lambda: {"open": False})
+    monkeypatch.setattr(controller, "is_point_within_window", lambda x, y: True)
+    monkeypatch.setattr(controller.random, "random", lambda: 0.0)     # always fidget
+    monkeypatch.setattr(controller.time, "sleep", lambda s: None)
+    monkeypatch.setattr(controller, "_fidget_ser", object())
+    controller._movement_abort.clear()
+    controller._maybe_fidget_during_wait()
+    assert len(moves) == 2
+    assert (moves[0][0], moves[0][1]) != (500, 400)   # actually went somewhere
+    assert (moves[1][0], moves[1][1]) == (500, 400)   # and came exactly back
+    assert moves[1][2] == 0                            # no jitter on the return leg
+
+
+def test_fidget_skips_when_a_menu_is_open(monkeypatch):
+    """Moving the cursor off an open right-click menu closes it -- a fidget mid-menu would
+    break click_menu_action's read-then-select flow."""
+    moves = []
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **k: moves.append((x, y)))
+    monkeypatch.setattr(controller, "get_state", lambda: {"windowFocused": True})
+    monkeypatch.setattr(controller, "get_menu", lambda: {"open": True})
+    monkeypatch.setattr(controller.random, "random", lambda: 0.0)
+    monkeypatch.setattr(controller, "_fidget_ser", object())
+    controller._movement_abort.clear()
+    controller._maybe_fidget_during_wait()
+    assert moves == []
+
+
+def test_pointer_acceleration_warning_fires_only_when_detected(monkeypatch):
+    """Acceleration makes px-per-unit speed-dependent, which _px_per_unit (a single scalar)
+    cannot express -- so it gets a loud startup warning. Unreadable (None) must NOT warn:
+    a headless environment has no pointer to be wrong about."""
+    for detected, expected in ((True, True), (False, False), (None, False)):
+        monkeypatch.setattr(controller, "_windows_pointer_acceleration_enabled",
+                            lambda d=detected: d)
+        assert controller.warn_if_pointer_acceleration() is expected
+
+
+def test_hover_matches_accepts_any_of_a_sequence_of_actions(monkeypatch):
+    """State-dependent actions the caller doesn't choose (GOLEM_PLINTH_OPTIONS): any match in
+    the sequence passes; a hover outside the whole set still blocks."""
+    monkeypatch.setattr(controller, "get_hover",
+                        lambda: {"menuOpen": False, "option": "Shape-golem", "target": "Plinth"})
+    options = ("Start-golem", "Shape-golem", "Insert-core")
+    assert controller.hover_matches(expected_action=options)
+    monkeypatch.setattr(controller, "get_hover",
+                        lambda: {"menuOpen": False, "option": "Walk here", "target": ""})
+    monkeypatch.setattr(controller.time, "sleep", lambda s: None)
+    assert not controller.hover_matches(expected_action=options)
+
+
+def test_click_entity_clicks_when_hover_confirms(monkeypatch):
+    moves, clicks = _click_entity_harness(monkeypatch)
+    monkeypatch.setattr(controller, "get_hover",
+                        lambda: {"menuOpen": False, "option": "Attack",
+                                 "target": "Gargoyle (level-111)"})
+    entity = {"name": "Gargoyle", "id": 1, "screenX": 100, "screenY": 100}
+    ok = controller.click_entity(None, entity, offset=(0, 0), simulate_mistakes=False,
+                                 check_ui_blockers=False,
+                                 refresh_target=lambda: (100, 100),
+                                 expected_action="Attack", expected_target="Gargoyle")
+    assert ok
+    assert clicks == [1]
+
+
+def test_click_menu_action_passes_refresh_target_through_to_the_right_click(monkeypatch):
+    """The right-click used to be the ONE interaction with no mid-flight correction available.
+
+    CONFIRMED live 2026-08-27: slayer's loot right-click lands ~1.0s after the item is resolved,
+    and over that window a moving player plus the camera's trailing animation drift a ground
+    item's small icon out from under the aim point -- three misses in one session, each reading
+    back ['Cancel', 'Mark Safespot', 'Walk here'] and costing a ~7s retry.
+    """
+    seen = {}
+
+    def fake_click_entity(ser, entity, **kw):
+        seen.update(kw)
+        return False          # stop before the menu read; only the plumbing is under test
+
+    monkeypatch.setattr(controller, "click_entity", fake_click_entity)
+    sentinel = lambda: (1, 2)
+    controller.click_menu_action(None, {"screenX": 5, "screenY": 6}, "take",
+                                 refresh_target=sentinel, refresh_legs=3)
+    assert seen["refresh_target"] is sentinel
+    assert seen["refresh_legs"] == 3
+    assert seen["button"] == "right"
+
+
+def test_click_menu_action_without_refresh_is_unchanged(monkeypatch):
+    """Purely additive: omitting both must reproduce the previous behaviour exactly."""
+    seen = {}
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: seen.update(kw) or False)
+    controller.click_menu_action(None, {"screenX": 5, "screenY": 6}, "take")
+    assert seen["refresh_target"] is None
+    assert seen["refresh_legs"] is None

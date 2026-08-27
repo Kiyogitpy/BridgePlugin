@@ -41,6 +41,26 @@ ENTITY_AIM_RADIUS = 3           # px; used by click_entity -- tighter than the g
 DEFAULT_OVERSHOOT_PX = 22       # px; how far a simulated overshoot flies past the target
 DEFAULT_OVERSHOOT_CHANCE = 0.42  # probability a given move overshoots before correcting
 
+# ---------------- Moving-target clicking (added 2026-08-27) ----------------
+# After move_to_human returns, click_entity takes ONE more look at the target (refresh_target)
+# before the mouse-down -- the flight's last re-aim happens at a submovement boundary, so the
+# settle + click tail (~100-300ms) used to be blind, and while the player walks that is easily
+# tens of px of drift ("clicks land behind"). Only a drift beyond this triggers a corrective
+# move; the threshold absorbs the aim jitter (ENTITY_AIM_RADIUS soft-clamped at 2.5x) plus the
+# caller offset that mid-flight refreshes deliberately drop, so a stationary target never pays
+# an extra motion.
+PRECLICK_MAX_DRIFT_PX = 18
+# Verify-then-click: with expected_action/expected_target passed to click_entity, the /hover
+# endpoint (what a left-click would do RIGHT NOW) is read before committing the click. The
+# hover text updates a render frame after the cursor stops, so a mismatch is re-read a few
+# times before it counts.
+HOVER_VERIFY_TRIES = 3
+HOVER_VERIFY_RETRY_DELAY_S = 0.04
+# npc_index_refresh_target's hold key quantizes LocalPoints (128 units/tile) so only real
+# motion -- own player, camera, or the NPC -- invalidates the held aim point, while hull
+# animation jitter still holds. 16 units = 1/8 tile, ~5-11px on screen at typical zoom.
+NPC_HOLD_LOCAL_QUANTUM = 16
+
 # ---------------- Moving-target re-aiming ----------------
 MOVING_TARGET_MIN_DIST = 60             # px; shorter moves finish too fast to bother re-aiming
 MOVING_TARGET_MIDFLIGHT_FRACTION = 0.6  # fly this far toward the stale point before re-aiming
@@ -82,10 +102,22 @@ TRACKING_LEG_MIN_DURATION_MS = 60       # ms; non-final legs of a refresh_legs t
 # silently ignored and the cursor will not move -- so do not enable this without checking the
 # firmware, e.g. with scratch probe verify_firmware_v2.py.
 #
-# Overridable from the environment so a live test run does not need an edit to a tracked file
-# (same pattern as SERIAL_PORT above), which also means a forgotten edit can never leave v2 on:
-#     HUMAN_MOVE_V2=1 python -u controller.py routines/golem_crafting.py
-HUMAN_MOVE_V2 = os.environ.get("HUMAN_MOVE_V2", "0") == "1"
+# ON by default since 2026-08-26 (user: "we want to move to v2"). It was opt-in until then.
+# Overridable from the environment either way (same pattern as SERIAL_PORT above), so a live
+# comparison against the v1 engine needs no edit to a tracked file:
+#     HUMAN_MOVE_V2=0 python -u controller.py routines/golem_crafting.py
+#
+# Enabled off the back of a live comparison on routines/plank_make.py that day, all three
+# configs measured the same way (aim is logged pre-jitter, so landing error includes
+# ENTITY_AIM_RADIUS):
+#
+#                        long flight (>400px)     landing error          cycle
+#     v1                 0.789s  1062 px/s        mean 2.32px max 6.1px  53.26s
+#     v2 (old timing)    0.346s  2244 px/s        mean 1.28px max 1.4px  --
+#     v2 (human timing)  0.671s  1538 px/s        mean 0.94px max 1.4px  53.98s
+#
+# i.e. v2 at the corrected timing is MORE accurate than v1, not less, and costs 1.4% throughput.
+HUMAN_MOVE_V2 = os.environ.get("HUMAN_MOVE_V2", "1") == "1"
 
 # Duration model. MEASURED from recorder.py captures of a human hand-playing versus the routine
 # playing the same activity, using the ONE reach-extraction method validated against 40
@@ -95,19 +127,61 @@ HUMAN_MOVE_V2 = os.environ.get("HUMAN_MOVE_V2", "0") == "1"
 # variation is STRUCTURED -- 51% of its timing is predicted by distance, versus 28% for the
 # human, because duration is literally f(distance) * uniform(0.85, 1.15).
 HM2_D_REF = 52.0        # px, ~the median reach distance (human 54.7, bot 51.0)
-HM2_MED_REF_MS = 200.0  # ms at HM2_D_REF. Today's speed, taken from the CODE rather than a
-                        # measurement: estimate_duration_ms(52) = 153.8, clamped up by its own
-                        # 200 ms floor. The recording's 184 ms would bake in the extractor's
-                        # known 11% underestimate.
-HM2_SLOPE_MS_PER_BIT = 68.8  # NOT the human's measured 148.7 -- see below.
-HM2_SIGMA = 0.675       # human log-duration sigma (the current engine's own is only ~0.154)
-HM2_MIN_MS = 90.0
-HM2_MAX_MS = 1800.0
-# HM2_SLOPE_MS_PER_BIT is scaled by the same factor as the median (148.7 * 200/432 = 68.8).
+HM2_MED_REF_MS = 170.0  # ms at HM2_D_REF. RE-FITTED 2026-08-27 against
+                        # recordings/2026-08-27_001343_human_dataset (13m11s of mixed banking,
+                        # slayer and travel; 136 clean reaches after discarding any spanning a
+                        # dropped-record gap). Bucketed medians -- 259ms at 64-128px, 425 at
+                        # 128-256, 454 at 256-512, 651 at 512-1024 -- fit 170ms at 52px.
+                        # Was 432, which is the median duration ACROSS all distances rather than
+                        # the value AT the reference distance, so it was far too slow for short
+                        # reaches. Predicts 413ms at the 211px median against a measured 415.
+HM2_SLOPE_MS_PER_BIT = 120.5  # ms per doubling of distance, from the same 2026-08-27 fit.
+                              # NOTE this reverses a same-day change to 60.0 that was fitted to
+                              # the 42-second banking-only recording (n=32 reaches). That sample
+                              # was too small: the larger mixed dataset puts the slope at 120.5,
+                              # near the golem capture's 148.7 and nowhere near 60. The lesson is
+                              # in the intercept, not the slope -- 432ms at the reference
+                              # distance was the actual error, and re-fitting the slope to
+                              # compensate for it on a small sample was chasing the wrong knob.
+HM2_SIGMA = 0.368       # log-duration spread AROUND the distance model.
+                        # CORRECTED 2026-08-27 from 0.675, which was a DOUBLE COUNT: that figure
+                        # was measured across all distances, so it contained the distance
+                        # variation this model already applies through HM2_SLOPE_MS_PER_BIT, and
+                        # the two multiplied. Residual spread around the fitted model is 0.368
+                        # (n=136). USER-REPORTED symptom of the double count: "veeeery slow" --
+                        # at 0.675 one reach in ten ran 2.38x the median and one in a hundred
+                        # 4.81x; at 0.368 that is 1.60x and 2.35x.
+HM2_MIN_MS = 90.0       # 1st percentile of the re-fitted model is ~72ms; 194 (scaled from the
+                        # old 432 median) would have clipped a large share of short reaches.
+HM2_MAX_MS = 1400.0           # MEASURED: the human's LONGEST single reach was 1287ms in the 42s
+                              # sample and 1320ms across 13 minutes of mixed activity, so this
+                              # cap is confirmed by both. 3888 let the lognormal tail
+                              # plan 2-4s flights that no human in the sample ever made -- the
+                              # other half of "veeeery slow", and far more visible than the
+                              # median because a single 3s flight is impossible to miss.
+#
+# CHANGED 2026-08-26 (user: "we want to move to v2 so making it look more human is the aim").
+# v2 originally kept the OLD ENGINE'S SPEED on purpose and fixed only the shape of the timing
+# distribution. That left it running at 200/432 = 46% of human duration, and it showed: MEASURED
+# live that day on routines/plank_make.py, an 842px reach took v2 264ms (3188 px/s) where v1 took
+# 748ms (1025 px/s) and a human's own measured model predicts ~1029ms. Fitts's law puts the
+# floor for that reach near 360ms, so v2 was below what a human can physically do, not merely
+# fast. USER-REPORTED as "looks way too fast".
+#
+# The fix is to undo ONLY the speed-preservation half, keeping everything v2 actually fixed. All
+# four constants are scaled by 432/200 = 2.16, which lands the two that were ever MEASURED
+# (median 432, slope 148.7) back on their real human values -- 68.8 * 2.16 = 148.6, i.e. exactly
+# reversing the note below. Because median and slope scale together, the RELATIVE distance
+# signature v2 exists to control is untouched at 0.344/bit; only the absolute clock changes.
+# HM2_MIN_MS/HM2_MAX_MS are scaled by the same factor so the distribution's tails keep their
+# shape (the new floor, 194ms, lands almost exactly on v1's own 200ms MOVE_MIN_DURATION_MS).
+#
+# ORIGINAL RATIONALE, kept because it is still what governs the ratio between these two numbers:
+# HM2_SLOPE_MS_PER_BIT was scaled by the same factor as the median (148.7 * 200/432 = 68.8).
 # Keeping the human's ABSOLUTE slope while halving the median would raise the RELATIVE slope from
 # 0.344/bit to 0.744/bit -- i.e. "keep current speed" would have made the distance signature
 # stronger than a human's, not weaker. Simulated: r^2 0.190 and sigma 0.684, against human
-# targets of 0.280 and 0.675, and the current engine's 0.322 / 0.154.
+# targets of 0.280 and 0.675, and the v1 engine's 0.322 / 0.154.
 
 # Submovement structure. The primary reach deliberately UNDERSHOOTS; corrections follow until the
 # cursor is inside tolerance. Human reaches need 4+ submovements 42% of the time; the current
@@ -131,7 +205,32 @@ HM2_TOLERANCE_PX = 0.6         # a reach ends when the cursor is this close. LOA
                                # here: at 2.0 only 7% of reaches need 4+ submovements, at 1.0 it is
                                # 19%, at 0.6 it is 41% -- against a human's 42%. A human keeps
                                # making sub-pixel settling corrections; stopping at 2px does not.
-HM2_PRIMARY_TIME_SHARE = 0.62  # of total duration; corrections share the remainder
+# The primary's share of the clock. KEPT, after briefly being retired and restored the same day.
+#
+# Retiring it (allocating every submovement's time purely by distance) made all submovements run
+# at the SAME speed by construction -- and that is not human. MEASURED from the recording: a real
+# reach is ballistic-then-homing, and the corrective phase runs median 4.2x, p90 17.9x SLOWER per
+# pixel than the initial throw. Uniform speed has no mechanism for that asymmetry.
+#
+# Working back from that 4.2x: the primary carries ~HM2_UNDERSHOOT_MEAN (0.88) of the distance
+# and the corrections ~0.12, so ratio = (0.88/Tp) / (0.12/Tc) = 7.33 * Tc/Tp. Solving for 4.2
+# gives Tp = 0.64 -- which is what this constant already was. It was never the defect; the equal
+# split AMONG the corrections was (see _plan_spans).
+#
+HM2_PRIMARY_TIME_SHARE = 0.62
+
+
+# Ceiling on a whole movement's MEAN speed, px/ms, applied as a duration floor in duration_for.
+# MEASURED: duration_for could plan 10.3 px/ms at 2000px, where the human's per-reach mean speed
+# is p50 0.68, p90 1.10. NOTE the cap sits BELOW the fastest single reach in the recording: two
+# independent extractions of that maximum disagreed (3.43 vs 1.70 px/ms) because they segment
+# reaches differently, so it is one disputed outlier rather than a solid number. 2.5 clears both
+# extractions' p90 comfortably while refusing the disputed tail -- erring low is the safe side
+# here. HM2_MAX_CORRECTION_PX_PER_MS bounds only the residual
+# correction loop, so the planned path needs its own bound. Only ever clips the tail, and leaves
+# the guarded statistics inside their assertions (r^2 0.197 -> 0.204, log-sigma 0.682 -> 0.681,
+# median duration 423 -> 412ms).
+HM2_MAX_MEAN_PX_PER_MS = 2.5
 
 # Path shape. TUNED EMPIRICALLY (tests/test_human_move.py measures both properties directly):
 # these values give straightness 0.787 and 40% of reaches at 4+ submovements, against human
@@ -175,11 +274,58 @@ HM2_FINAL_CORRECTIONS = 6
 # count distribution and is never compared against a quantised measurement.
 HM2_CORRECTION_TOLERANCE_PX = 1.5
 
+# Speed ceiling for the final-correction loop, px per ms.
+#
+# ADDED 2026-08-26 (user: "sometimes half of a path is super slow then goes blazing fast").
+# That loop used to emit the WHOLE residual gap as one segment with a hardcoded HM2_SEGMENT_MS
+# duration, whatever the distance -- so the further the planned path fell short, the faster the
+# cursor snapped to close it. The gap is largest exactly when _px_per_unit is still converging
+# (it starts at 1.0; this machine's true value is ~0.74), which under-travels the whole planned
+# path by ~26% and then crams that 26% into 18ms. On a 527px reach that is 7.6 px/ms.
+#
+# MEASURED from a human banking by hand (recordings/2026-08-26_225917_mousemove, n=2097 windows
+# of ~10ms): p50 0.40, p90 2.06, p99 3.99, max 5.37 px/ms. So the old behaviour EXCEEDED the
+# fastest instant in the whole human session, and a 900px reach at the un-learned scale would
+# have hit 13 px/ms -- 2.4x it.
+#
+# CORRECTED 2026-08-26 from 4.0, after USER-REPORTED "if it misses the correction is very fast".
+# 4.0 was derived from the human's OVERALL instantaneous speed (p99 3.99) -- the wrong
+# population. A correction is the HOMING phase of a reach, and measured on its own it is an
+# order of magnitude slower: splitting each recorded reach at its ballistic/homing boundary
+# gives correction-phase speeds of p50 0.141, p90 0.329, MAX 0.498 px/ms (n=67, the larger
+# 2026-08-27 dataset; the 42s banking sample agreed at 0.207/0.358/0.428). The old cap was
+# ~10x the fastest correction the human ever made, so it barely bound anything. 0.50 sits just
+# above that measured maximum.
+HM2_MAX_CORRECTION_PX_PER_MS = 0.50
+
 # Ignore target drift smaller than this when deciding whether to replan mid-flight. Without it,
 # a slowly-walking NPC triggers a replan on EVERY refresh, and near the target each replanned
 # submovement is a tiny hop -- a burst of micro-movements in place rather than one settling
 # approach. Same jitter report as above.
 HM2_REPLAN_MIN_DRIFT_PX = 6.0
+
+# How long the mouse button is held per click. MEASURED 2026-08-27 across five human recordings
+# (n=589 down->up pairs, dominated by the 13-minute mixed session at n=359): median 85-90ms,
+# p90 ~125ms, max 242ms, log-sigma ~0.27. sample_human_delay's median is sqrt(min*max) and its
+# sigma is ln(max/min)/4, so this range lands median 85ms / sigma 0.266 with the fat upper tail
+# the old (0.045, 0.11) range's tighter geometry under-produced (its median sat at 70ms).
+CLICK_HOLD_RANGE_S = (0.05, 0.145)
+
+# ---------------- Session tempo (added 2026-08-27) ----------------
+# A human's movement durations are NOT independent draws: MEASURED over five human recordings
+# (786 reaches; the 13m11s 2026-08-27_001343_human_dataset dominates at n=564), the residual
+# around the distance model has lag-1 autocorrelation ~0.15, and the long session's 2-minute
+# block means wander with sigma 0.120 against 0.050 expected under independence -- fast spells
+# and slow spells, on a timescale of minutes. Modeled as one Ornstein-Uhlenbeck "mood" term
+# added to duration_for's log-duration draw: stationary sigma below, time constant ~5 minutes,
+# session starting in a random mood. Rides ON TOP of HM2_SIGMA (marginal grows 0.368 -> 0.387
+# in quadrature, still under the human's 0.49-0.66 measured with the same reach segmentation),
+# so every existing distribution bound still holds with the tempo pinned to 0.
+# The same measurement pass KILLED the handedness hypothesis: mean signed path curvature was
+# tiny against its sigma AND flipped sign between sessions (left-bulge share 39-64%), so v2's
+# zero-mean curve draw is already right -- do not add a curvature bias.
+HM2_TEMPO_SIGMA = 0.12
+HM2_TEMPO_TAU_S = 300.0
 HM2_LOOKAHEAD_SEGMENTS = 3
 
 # ---------------- Humanization profile drift ----------------
@@ -224,10 +370,35 @@ MISCLICK_RECLICK_DELAY_S = (0.25, 0.55)
 # every single time, at normal click speed) is a tell; real players glance
 # the mouse around between actions too, but that's a small resting-hand
 # shift, not a full click-speed traverse across the viewport.
-IDLE_MOUSE_MOVE_MIN_INTERVAL_S = 15.0
-IDLE_MOUSE_MOVE_MAX_INTERVAL_S = 20.0
-IDLE_MOUSE_MOVE_RADIUS_PX = 20      # px; how far the idle drift wanders from the cursor's current spot
+# RETUNED TWICE 2026-08-27. First against measurement (human never rests >4.5s in active play,
+# so a nudge every 15-20s was frozen for multiples of the human's whole stillness range), then
+# re-triggered after phase-a-verify live-measured the interval itself as the new stillness
+# ceiling (bot still-p90 7.1s ~= the 4-9s timer): the drift now fires on time since the last
+# DELIBERATE cursor movement, with the budget drawn from IDLE_FIDGET_STILL_* below -- so a
+# routine actively driving the mouse never pays a pre-action drift, and only genuine idle is
+# filled in. The old MIN/MAX interval constants are gone with the wall-clock timer.
+IDLE_MOUSE_MOVE_RADIUS_PX = 30      # px; how far the idle drift wanders from the cursor's current spot
 IDLE_MOUSE_MOVE_SPEED_SCALE = 3.5   # multiplies move_to_human's normal travel time -- idle drift should look slow
+
+# ---------------- In-wait fidgeting (added 2026-08-27) ----------------
+# MEASURED (13.1 active human minutes vs 164 active bot minutes, breaks excluded, same reach
+# segmentation as the tempo fit): the human cursor is busy 80% of active play and NEVER sits
+# still longer than 4.5s (still>1s: 2.9/min, median 1.5s, p90 2.3s); the bot's sat frozen 87%
+# of the time with still-period p90 11.8s and runs past 100s -- the loudest remaining
+# behavioral difference after the within-reach kinematics were fitted. Long human_delay sleeps
+# are therefore split into human-length still segments separated by small out-and-back drifts.
+# The fidget is POSITION-INVARIANT (it always returns to its origin) so human_delay remains a
+# drop-in sleep: hover-parking call sites (rest the mouse on a target now, click it later --
+# see hover_entity and mastering_mixology's speedups) rely on the cursor staying put through
+# the wait. Known blind spot, deliberate: routines' own poll loops sleeping 0.2-0.5s per
+# iteration never enter this path -- that is Phase B (a background fidgeter behind a global
+# action lock), to be built only if a live re-measure still shows long freezes.
+IDLE_FIDGET_MIN_SLEEP_S = 2.0      # only sleeps at least this long fidget at all
+IDLE_FIDGET_CHANCE = 0.75          # per still-segment boundary; a human sometimes just waits
+IDLE_FIDGET_RADIUS_PX = (15, 80)   # out-leg distance from the resting position
+IDLE_FIDGET_STILL_MEDIAN_S = 1.5   # lognormal still-segment length between fidgets (measured)
+IDLE_FIDGET_STILL_SIGMA = 0.33     # ln(2.3/1.5)/1.2816, from the human's median -> p90
+IDLE_FIDGET_MAX_STILL_S = 4.0      # the human's longest observed active still was 4.5s
 
 # ---------------- Approach-tile humanization ----------------
 # See travel.maybe_approach_before_click -- occasionally walk partway toward

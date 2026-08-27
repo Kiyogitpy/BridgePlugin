@@ -15,11 +15,90 @@ import random
 import statistics
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import controller
 import human_move
 import settings
+
+
+@pytest.fixture(autouse=True)
+def _isolate_calibration(tmp_path, monkeypatch):
+    """Every test writes its pointer-scale calibration to a throwaway file. Without this,
+    any test that exercises _learn_scale (directly or through move()) would overwrite the
+    REAL machine's persisted calibration with fabricated test values."""
+    monkeypatch.setattr(human_move, "_CALIBRATION_PATH", str(tmp_path / "cal.json"))
+
+
+@pytest.fixture(autouse=True)
+def _pin_tempo():
+    """Pin the session-tempo drift to exactly 0 so every distribution test measures the fast
+    i.i.d. component alone, deterministically -- the tempo tests below drive the drift
+    explicitly with injected clocks instead."""
+    import time as _time
+    human_move._reset_tempo(0.0, now=_time.monotonic())
+    yield
+    human_move._reset_tempo(None)
+
+
+# ---- session tempo ----
+
+def test_tempo_is_a_slow_drift_not_iid():
+    """MEASURED 2026-08-27 over five human recordings (n=786 reaches): the residual around the
+    distance model has lag-1 autocorrelation ~0.15, and the 13-minute session's 2-minute block
+    means wander with sigma 0.120 against 0.050 expected under independence. A human has fast
+    spells and slow spells; i.i.d. draws have neither."""
+    rng = random.Random(11)
+    human_move._reset_tempo(None)
+    # Steps much shorter than the time constant: consecutive values barely move.
+    now = 0.0
+    prev = human_move._tempo_now(rng, now=now)
+    max_step = 0.0
+    for _ in range(50):
+        now += 2.0
+        cur = human_move._tempo_now(rng, now=now)
+        max_step = max(max_step, abs(cur - prev))
+        prev = cur
+    assert max_step < settings.HM2_TEMPO_SIGMA * 0.5
+
+    # Steps much longer than the time constant: values decorrelate and the stationary spread
+    # is the configured sigma.
+    vals = []
+    for _ in range(3000):
+        now += settings.HM2_TEMPO_TAU_S * 10
+        vals.append(human_move._tempo_now(rng, now=now))
+    sigma = statistics.pstdev(vals)
+    assert 0.8 * settings.HM2_TEMPO_SIGMA <= sigma <= 1.2 * settings.HM2_TEMPO_SIGMA
+    assert abs(statistics.mean(vals)) < settings.HM2_TEMPO_SIGMA * 0.2
+
+
+def test_tempo_shifts_every_duration_in_the_session_together():
+    """The mood multiplies the whole session's clock: the same seed at tempo +0.2 must produce
+    durations ~exp(0.2) longer than at tempo 0 (until the clamps bite)."""
+    import time as _time
+    rng = random.Random(42)
+    human_move._reset_tempo(0.0, now=_time.monotonic())
+    base = [human_move.duration_for(300.0, random.Random(i)) for i in range(200)]
+    human_move._reset_tempo(0.2, now=_time.monotonic())
+    shifted = [human_move.duration_for(300.0, random.Random(i)) for i in range(200)]
+    ratio = statistics.median(shifted) / statistics.median(base)
+    assert 1.15 <= ratio <= 1.30      # exp(0.2) = 1.221
+
+
+def test_session_starts_in_a_random_mood():
+    """A fresh process should not always begin at the average pace -- the first call draws the
+    mood from the stationary distribution."""
+    firsts = []
+    for i in range(400):
+        human_move._reset_tempo(None)
+        firsts.append(human_move._tempo_now(random.Random(i), now=0.0))
+    sigma = statistics.pstdev(firsts)
+    assert 0.8 * settings.HM2_TEMPO_SIGMA <= sigma <= 1.2 * settings.HM2_TEMPO_SIGMA
+
+# MEASURED, recordings/2026-08-26_225917_mousemove: fastest ~10ms window in the whole session.
+HUMAN_MAX_INSTANT_PX_PER_MS = 5.37
 
 
 def _fit_r2(dists, durs):
@@ -35,7 +114,16 @@ def _fit_r2(dists, durs):
 
 
 def _sample_distances(rng, n):
-    return [max(15.0, math.exp(rng.gauss(math.log(55), 0.95))) for _ in range(n)]
+    """Reach distances drawn from the MEASURED human distribution.
+
+    RE-DERIVED 2026-08-27 from recordings/2026-08-27_001343_human_dataset (13m11s of mixed
+    banking/slayer/travel, 136 clean reaches): median 211px, p90 559px, max 973px, which is
+    lognormal with mu=ln(211) and sigma~0.76. It previously used median 55px / sigma 0.95, which
+    was a guess -- and it mattered, because every threshold below is a statistic OF this
+    distribution. Comparing an engine r^2 measured over one distance distribution against a
+    human r^2 measured over a different one is not a comparison at all.
+    """
+    return [max(15.0, math.exp(rng.gauss(math.log(211), 0.76))) for _ in range(n)]
 
 
 # ---- the core fix: timing must not be a function of distance ----
@@ -43,36 +131,67 @@ def _sample_distances(rng, n):
 def test_duration_is_only_weakly_predicted_by_distance():
     """THE regression guard for v2's entire reason to exist.
 
-    The measured bot was 0.512; the human 0.280. v1's formula simulates at 0.322. If this climbs
-    back toward 0.5 the distance signature has returned.
+    The old bot measured 0.512. The human measured 0.280 on the golem capture and 0.375 on the
+    larger 2026-08-27 mixed dataset -- so "human" is a range, not a point, and the thing to guard
+    is not drifting back toward the bot's 0.512.
+
+    RE-BASED 2026-08-27: this asserted < 0.32, a threshold taken from the golem figure while the
+    r^2 was computed over a made-up distance distribution (see _sample_distances). Measured over
+    the human's real distance distribution the engine sits at 0.402 and the human at 0.375.
     """
     rng = random.Random(1234)
     dists = _sample_distances(rng, 4000)
     durs = [human_move.duration_for(d, rng) for d in dists]
-    assert _fit_r2(dists, durs) < 0.32
+    assert _fit_r2(dists, durs) < 0.50
 
 
 def test_duration_spread_matches_the_human_not_the_old_engine():
-    """v1's own log-duration sigma is ~0.154 (its +/-15% jitter). The human's is 0.675."""
+    """v1's own log-duration sigma is ~0.154 (its +/-15% jitter).
+
+    RE-BASED 2026-08-27. The old 0.675 target was a DOUBLE COUNT -- measured across all
+    distances, so it also contained the variation HM2_SLOPE_MS_PER_BIT already applies. Measured
+    the same way as this assertion (across the human's real distance distribution) the human is
+    0.401 and the engine 0.519; the residual spread around the distance model, which is what
+    HM2_SIGMA actually sets, is 0.368.
+    """
     rng = random.Random(99)
     durs = [human_move.duration_for(d, rng) for d in _sample_distances(rng, 4000)]
     sigma = statistics.pstdev([math.log(d) for d in durs])
-    assert 0.55 <= sigma <= 0.80
+    assert 0.35 <= sigma <= 0.70
 
 
-def test_duration_median_preserves_current_speed():
-    """'Keep current speed' was an explicit decision -- v2 fixes structure, not throughput."""
+def test_duration_median_matches_the_measured_human():
+    """The human's measured median is 432ms (see human_move.py's header table).
+
+    REVERSED 2026-08-26. This used to assert 150-260ms, encoding the original "keep current
+    speed" decision: v2 fixed the SHAPE of the timing distribution but deliberately kept the old
+    engine's clock, leaving it at 200/432 = 46% of human duration. MEASURED live that day on
+    routines/plank_make.py, an 842px reach took v2 264ms against v1's 748ms and a human model's
+    ~1029ms -- below the ~360ms Fitts's law floor for that reach, i.e. faster than a human can
+    physically point. See settings.py's HM2_* block for the full derivation.
+
+    RE-BASED 2026-08-27 against the larger mixed dataset: the human's median reach is 415ms
+    (n=136) and the engine now sits at 405ms over the same distance distribution. The earlier
+    380-480 window came from a 432ms figure that was the median ACROSS all distances being used
+    as the value AT the 52px reference distance -- which made every short reach far too slow.
+    """
     rng = random.Random(7)
     durs = [human_move.duration_for(d, rng) for d in _sample_distances(rng, 4000)]
-    assert 150.0 <= statistics.median(durs) <= 260.0
+    assert 350.0 <= statistics.median(durs) <= 480.0
 
 
 def test_duration_respects_clamps():
+    """HM2_MAX_MS caps the duration EXCEPT where that would force a superhuman mean speed:
+    beyond HM2_MAX_MS * HM2_MAX_MEAN_PX_PER_MS px (3500 at current settings, within reach of a
+    4K diagonal) the speed cap wins and the duration is allowed past the cap instead -- moving
+    faster than the measured human top speed is the worse detection signature of the two."""
     rng = random.Random(5)
     for d in (1, 5, 50, 500, 5000, 50000):
         for _ in range(200):
             ms = human_move.duration_for(d, rng)
-            assert settings.HM2_MIN_MS <= ms <= settings.HM2_MAX_MS
+            assert ms >= settings.HM2_MIN_MS
+            assert ms <= max(settings.HM2_MAX_MS, d / settings.HM2_MAX_MEAN_PX_PER_MS)
+            assert d / ms <= settings.HM2_MAX_MEAN_PX_PER_MS
 
 
 # ---- submovement structure ----
@@ -397,3 +516,102 @@ def test_v2_stops_promptly_on_abort(monkeypatch):
     human_move.move(None, 500, 500, get_cursor_pos=lambda: (0, 0),
                     send_line=lambda ser, s: lines.append(s), abort=Abort())
     assert lines == []
+
+
+# ---- the end-of-path snap ----
+
+def test_no_segment_ever_exceeds_human_top_speed_even_when_the_scale_is_wrong():
+    """USER-REPORTED 2026-08-26: "sometimes half of a path is super slow then goes blazing fast".
+
+    The residual-correction loop used to emit the WHOLE remaining gap as one segment with a flat
+    HM2_SEGMENT_MS duration, so the further the planned path fell short the FASTER the cursor
+    closed it. The gap is largest exactly while _px_per_unit is still converging from its 1.0
+    starting guess toward this machine's ~0.74, which under-travels the whole path by ~26%.
+
+    Human speeds MEASURED from recordings/2026-08-26_225917_mousemove (n=2097 ~10ms windows):
+    p50 0.40, p99 3.99, max 5.37 px/ms. The old code hit 7.6 px/ms on a 527px reach and would
+    have hit ~13 px/ms on a 900px one -- 2.4x the fastest instant in the whole human session.
+    """
+    scale = 0.74                      # what the OS actually does
+    pos = [0.0, 0.0]
+    speeds = []
+
+    def send(ser, line):
+        _, qx, qy, dur = line.split()
+        dx, dy = int(qx) / 100.0 * scale, int(qy) / 100.0 * scale
+        pos[0] += dx
+        pos[1] += dy
+        speeds.append(math.hypot(dx, dy) / max(1, int(dur)))
+
+    import unittest.mock as _m
+    with _m.patch.object(human_move.time, "sleep", lambda *_: None):
+        human_move._px_per_unit = 1.0          # the un-learned starting guess
+        human_move._scale_samples = 0
+        human_move.move(None, 900, 0,
+                        get_cursor_pos=lambda: (round(pos[0]), round(pos[1])),
+                        send_line=send, rng=random.Random(3))
+
+    # Bounded by the human's fastest OBSERVED instant, not by the correction cap: the planned
+    # path legitimately runs at ballistic speed (~1-2 px/ms), and only the residual corrections
+    # are held to HM2_MAX_CORRECTION_PX_PER_MS. Asserting the correction cap over every segment
+    # conflated the two populations -- see that constant's comment for the measurement showing
+    # the homing phase is an order of magnitude slower than the throw.
+    assert max(speeds) <= HUMAN_MAX_INSTANT_PX_PER_MS
+    assert math.hypot(900 - pos[0], 0 - pos[1]) <= 3.0     # still lands
+
+
+def test_pointer_scale_converges_on_the_first_measurement():
+    """A flat 0.25 EMA needed eight to ten movements to get from 1.0 to ~0.74. plank_make.py
+    flies the mouse about four times a MINUTE, so that left it mis-calibrated -- and therefore
+    snapping at the end of every reach -- for minutes after each restart."""
+    human_move._px_per_unit = 1.0
+    human_move._scale_samples = 0
+    human_move._learn_scale(units=1000.0, actual_px=740.0)
+    assert abs(human_move._px_per_unit - 0.74) < 0.01
+
+    # ...and later samples are still damped, so one odd movement cannot yank the calibration.
+    for _ in range(6):
+        human_move._learn_scale(units=1000.0, actual_px=740.0)
+    human_move._learn_scale(units=1000.0, actual_px=2000.0)
+    assert human_move._px_per_unit < 1.1
+
+
+# ---- calibration persistence ----
+
+def test_pointer_scale_persists_across_restart():
+    """_px_per_unit is a property of the MACHINE (the Windows pointer-speed setting), not of a
+    session -- but it reset to 1.0 on every process start, so the first flights after each
+    restart under-traveled (~26% on this machine) and the residual-correction loop cleaned up
+    the difference. Learning it once should survive a restart."""
+    human_move._px_per_unit = 1.0
+    human_move._scale_samples = 0
+    human_move._learn_scale(units=1000.0, actual_px=740.0)
+    learned = human_move._px_per_unit
+
+    # Simulate a process restart: state back to defaults, then load what was persisted.
+    human_move._px_per_unit = 1.0
+    human_move._scale_samples = 0
+    human_move._load_calibration()
+    assert abs(human_move._px_per_unit - learned) < 1e-9
+    # The restored estimate must count as already-settled: a fresh session's first sample
+    # should be damped by the EMA, not treated as the first measurement ever (which gets
+    # alpha 1.0 and would throw the loaded value away).
+    assert human_move._scale_samples >= 4
+
+
+def test_calibration_load_tolerates_missing_and_corrupt_files():
+    human_move._px_per_unit = 1.0
+    human_move._scale_samples = 0
+    human_move._load_calibration()                      # no file yet
+    assert human_move._px_per_unit == 1.0
+    assert human_move._scale_samples == 0
+
+    with open(human_move._CALIBRATION_PATH, "w") as f:
+        f.write("{not json")
+    human_move._load_calibration()                      # corrupt file
+    assert human_move._px_per_unit == 1.0
+
+    with open(human_move._CALIBRATION_PATH, "w") as f:
+        f.write('{"px_per_unit": 9.0, "samples": 3}')
+    human_move._load_calibration()                      # out-of-range value
+    assert human_move._px_per_unit == 1.0

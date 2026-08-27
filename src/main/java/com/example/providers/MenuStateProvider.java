@@ -49,6 +49,44 @@ public class MenuStateProvider extends BridgeProvider
 	public void register()
 	{
 		server.register("/menu", () -> onClient(this::getMenuState));
+		server.register("/hover", () -> onClient(this::getHoverState));
+	}
+
+	/**
+	 * What a LEFT-CLICK would do right now, without opening any menu (added 2026-08-27 for
+	 * verify-then-click on moving targets -- see controller.py's hover_matches). The client
+	 * rebuilds its menu entries every render frame for whatever is under the cursor, so the
+	 * highest-index entry (see getMenuState's ordering comment: highest index = top-priority =
+	 * the default action) is exactly what the game's own top-left hover text shows. Un-cached
+	 * and read-only, same live style as /menu itself.
+	 *
+	 * menuOpen matters to the consumer: with a real right-click menu displayed, a left-click
+	 * selects a menu row rather than acting on the world, so verification must not apply.
+	 */
+	private Object getHoverState()
+	{
+		Map<String, Object> data = new HashMap<>();
+		data.put("menuOpen", client.isMenuOpen());
+
+		MenuEntry[] entries = client.getMenu().getMenuEntries();
+		data.put("count", entries.length);
+		if (entries.length > 0)
+		{
+			MenuEntry top = entries[entries.length - 1];
+			data.put("option", Text.removeTags(top.getOption()));
+			data.put("target", Text.removeTags(top.getTarget()));
+		}
+
+		List<Map<String, Object>> entryList = new ArrayList<>();
+		for (MenuEntry entry : entries)
+		{
+			Map<String, Object> entryData = new HashMap<>();
+			entryData.put("option", Text.removeTags(entry.getOption()));
+			entryData.put("target", Text.removeTags(entry.getTarget()));
+			entryList.add(entryData);
+		}
+		data.put("entries", entryList);
+		return data;
 	}
 
 	private Object getMenuState()

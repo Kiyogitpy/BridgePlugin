@@ -22,7 +22,8 @@ public enum RoutineChoice
 	NMZ("Nightmare Zone"),
 	PYRAMID_PLUNDER("Pyramid Plunder"),
 	CHINCHOMPA_HUNTING("Chinchompa Hunting"),
-	FALCONRY("Falconry (Dashing kebbit)");
+	FALCONRY("Falconry (Dashing kebbit)"),
+	PLANK_MAKE("Plank Make");
 
 	private final String label;
 

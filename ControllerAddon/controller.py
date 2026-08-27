@@ -391,6 +391,55 @@ def get_menu():
     return api_get("/menu") or {"open": False}
 
 
+def get_hover():
+    """What a left-click would do RIGHT NOW: the default (top) entry of the client's live menu,
+    read without opening any menu (MenuStateProvider's /hover, added 2026-08-27). None when the
+    endpoint doesn't exist yet -- requires a client rebuild -- or the bridge is down."""
+    return api_get("/hover")
+
+
+def _hover_field_matches(expected, haystack: str) -> bool:
+    """expected may be None (skip), one string, or a sequence of strings -- ANY match passes.
+    The sequence form exists for state-dependent actions the caller doesn't get to choose
+    (golem_crafting's GOLEM_PLINTH_OPTIONS: the game picks Start-/Shape-golem/Insert-core from
+    the plinth's own state, and only something outside that set proves a wrong click)."""
+    if expected is None:
+        return True
+    if isinstance(expected, str):
+        expected = (expected,)
+    return any(e.lower() in haystack for e in expected)
+
+
+def hover_matches(expected_action=None, expected_target=None,
+                  tries: int = None, retry_delay_s: float = None) -> bool:
+    """True when the current hover's default action/target contain the expected strings
+    (case-insensitive substring match, tags already stripped server-side; each expectation may
+    also be a sequence of acceptable strings -- see _hover_field_matches).
+
+    Deliberately never blocks when it CANNOT verify: /hover missing (un-rebuilt client) or a
+    real right-click menu open (left-click semantics are the menu's, not the world's) both
+    return True, degrading to the old click-then-check-/last-action behavior. A mismatch is
+    re-read a few times first -- the hover text updates a render frame after the cursor stops,
+    so the first read after a settle can be one frame stale."""
+    if tries is None:
+        tries = HOVER_VERIFY_TRIES
+    if retry_delay_s is None:
+        retry_delay_s = HOVER_VERIFY_RETRY_DELAY_S
+    for attempt in range(tries):
+        data = get_hover()
+        if not data:
+            return True
+        if data.get("menuOpen"):
+            return True
+        option = (data.get("option") or "").lower()
+        target = (data.get("target") or "").lower()
+        if _hover_field_matches(expected_action, option) and _hover_field_matches(expected_target, target):
+            return True
+        if attempt < tries - 1:
+            time.sleep(retry_delay_s)
+    return False
+
+
 def get_widget(group: int, child: int, index: int = None):
     """A clickable screen position for an interface element, by group/child id (WidgetProvider).
 
@@ -455,6 +504,46 @@ def get_ground_item_screen_pos_at(x: int, y: int, plane: int, item_id: int):
 
 def get_inventory():
     return api_get("/inventory") or []
+
+
+def get_rune_pouch():
+    """Rune pouch contents (InventoryProvider./rune-pouch, added 2026-08-27).
+
+    A rune pouch is a CONTAINER, so get_inventory reports only the pouch item and says nothing
+    about the runes inside -- which left a routine unable to see it was about to run out until a
+    cast actually failed. The contents live in varbits, not an ItemContainer.
+
+    Returns {"carried": bool, "runes": [{"slot", "type", "quantity", "id"?, "name"?}], "total"}.
+    `carried` is reported separately from an empty `runes` list on purpose: every underlying
+    varbit reads 0 both when the pouch is empty and when no pouch is held at all, and those are
+    different problems -- one is "restock", the other is "you forgot the pouch".
+
+    `id`/`name` are best-effort (see the provider's own comment); a slot always carries its raw
+    `type` and `quantity`, so counting runes works even if the name lookup does not.
+
+    Returns an empty dict against a client too old to have the endpoint, so callers must treat a
+    missing "carried" key as "cannot tell" rather than "no pouch"."""
+    return api_get("/rune-pouch") or {}
+
+
+def rune_pouch_count(name_substring: str):
+    """Units of a named rune in the pouch, or None if that cannot be determined.
+
+    None and 0 are deliberately different: None means the endpoint is missing, the name lookup
+    failed, or no pouch is carried -- none of which are evidence of an empty pouch. Only a real
+    zero reading returns 0."""
+    pouch = get_rune_pouch()
+    if not pouch or not pouch.get("carried"):
+        return None
+    wanted = name_substring.lower()
+    for rune in pouch.get("runes", []):
+        rune_name = (rune.get("name") or "").lower()
+        if rune_name and wanted in rune_name:
+            return rune.get("quantity", 0)
+    # A pouch that resolves names but doesn't hold this one genuinely has none of it.
+    if any(r.get("name") for r in pouch.get("runes", [])):
+        return 0
+    return None
 
 
 def get_bank(fresh=False):
@@ -655,8 +744,69 @@ def get_npc_screen_pos_by_index(npc_index: int):
 def npc_index_refresh_target(npc_index: int):
     """refresh_target factory for tracking a specific committed-to NPC instance through a
     click's flight -- by index, so it can never resolve to a different individual of the same
-    species (see get_npc_by_index)."""
-    return lambda: get_npc_screen_pos_by_index(npc_index)
+    species (see get_npc_by_index).
+
+    DEADBANDED ON THE NPC'S TILE, not on its pixels (2026-08-27). NPCProvider aims at
+    Actor.getConvexHull(), which is recomputed every frame, so an animating monster's reported
+    aim point moves even when the monster does not. MEASURED live against a Gargoyle that never
+    changed tile: the point jittered p50 7.2px, p90 35.2px, max 55.4px frame to frame. That is
+    above human_move's HM2_REPLAN_MIN_DRIFT_PX (6.0) on more than half of all polls, so
+    move() kept replanning its approach as the cursor arrived -- USER-REPORTED as "some weird
+    defects at the very end of targeting".
+
+    Aiming at the hull is still right; re-aiming at ANIMATION is not. A human looks at a
+    monster, decides where it is, and clicks -- they do not re-target as its arms swing. So this
+    returns a held point and only re-resolves when the NPC's actual world tile changes, which is
+    when a human would look again. A monster that walks is still tracked; one that merely
+    animates is ignored.
+
+    DEADBAND KEY WIDENED 2026-08-27 (same day, follow-up): tile-only holding was itself a bug
+    for the click-while-moving pattern -- when the PLAYER is the thing moving, the NPC's tile
+    never changes while its screen projection slides continuously, so the hold served a stale
+    point for the whole flight and the click landed behind. The key now covers every motion
+    source that actually moves the projection: the NPC's tile AND interpolated LocalPoint, the
+    player's own LocalPoint, and the camera -- all from the same /npc/by-index response (fields
+    added to NPCProvider the same day; absent on an older client build, where this degrades to
+    the original tile-only key). LocalPoints are quantized (NPC_HOLD_LOCAL_QUANTUM) so only
+    real motion re-resolves; a stationary scene still holds through hull-animation jitter.
+
+    NOTE the state lives in the closure, so a factory is good for ONE click's flight -- which is
+    how every caller already uses it (built inline at the call site). Reusing one across clicks
+    would hold a stale point for as long as the whole scene stayed still.
+    """
+    held = {"key": None, "point": None}
+
+    def refresh():
+        data = get_npc_by_index(npc_index)
+        if data is None:
+            return None
+        x, y = data.get("screenX"), data.get("screenY")
+        if x is None or y is None:
+            return None
+        key = _npc_view_key(data)
+        if held["point"] is not None and key == held["key"]:
+            return held["point"]
+        held["key"] = key
+        held["point"] = (int(x), int(y))
+        return held["point"]
+
+    return refresh
+
+
+def _npc_view_key(data: dict) -> tuple:
+    """Everything that moves an NPC's screen projection, folded into one comparable key --
+    see npc_index_refresh_target. Fields missing from an older client build come through as
+    None, so the key degrades gracefully toward the original tile-only behavior."""
+    def quant(field):
+        v = data.get(field)
+        return None if v is None else int(v) // NPC_HOLD_LOCAL_QUANTUM
+
+    return (
+        (data.get("x"), data.get("y"), data.get("plane")),
+        (quant("npcLocalX"), quant("npcLocalY")),
+        (quant("playerLocalX"), quant("playerLocalY")),
+        (data.get("cameraYaw"), data.get("cameraPitch"), data.get("cameraScale")),
+    )
 
 
 def ground_tile_refresh_target(x: int, y: int, plane: int):
@@ -769,6 +919,38 @@ def set_dpi_aware():
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+def _windows_pointer_acceleration_enabled():
+    """The live "Enhance pointer precision" setting: True/False, or None when it can't be read
+    (non-Windows, API failure). SPI_GETMOUSE returns [threshold1, threshold2, acceleration];
+    the third element is 0 with the checkbox off, nonzero with it on."""
+    try:
+        params = (ctypes.c_int * 3)()
+        if not ctypes.windll.user32.SystemParametersInfoW(0x0003, 0, ctypes.byref(params), 0):
+            return None
+        return params[2] != 0
+    except Exception:
+        return None
+
+
+def warn_if_pointer_acceleration() -> bool:
+    """Loud startup warning when Windows pointer acceleration is on (added 2026-08-27). The
+    whole movement stack assumes a LINEAR px-per-mouse-unit ratio -- human_move's _px_per_unit
+    calibration is a single scalar -- and acceleration makes that ratio speed-dependent, so
+    every fast flight over- or under-travels and _learn_scale thrashes between contradictory
+    measurements instead of converging. This was previously a manual checklist item in the
+    live-debugging docs; a human forgetting it produced clicks that are consistently off by a
+    speed-dependent amount, which looks exactly like a calibration bug. Warn-only rather than a
+    hard stop: reading the setting can race a user actively changing it, and a headless test
+    environment has no pointer to be wrong about."""
+    accel = _windows_pointer_acceleration_enabled()
+    if accel:
+        debug_log.log("!", "Windows 'Enhance pointer precision' (pointer acceleration) is ON -- "
+                           "every planned mouse path will mis-travel by a speed-dependent amount "
+                           "and the pointer-scale calibration cannot converge. Turn it off in "
+                           "Settings > Devices > Mouse > Additional mouse options > Pointer Options.")
+    return bool(accel)
 
 
 _dpi_scale_cache = None
@@ -884,7 +1066,7 @@ def mouse_left_click(ser: serial.Serial) -> None:
 def click_human(ser: serial.Serial) -> None:
     debug_log.log("action", f"click_human at {get_cursor_pos()}")
     mouse_left_down(ser)
-    human_delay(0.045, 0.11)
+    human_delay(*CLICK_HOLD_RANGE_S)
     mouse_left_up(ser)
     human_delay(0.03, 0.09)
 
@@ -904,7 +1086,7 @@ def mouse_right_click(ser: serial.Serial) -> None:
 def right_click_human(ser: serial.Serial) -> None:
     debug_log.log("action", f"right_click_human at {get_cursor_pos()}")
     mouse_right_down(ser)
-    human_delay(0.045, 0.11)
+    human_delay(*CLICK_HOLD_RANGE_S)
     mouse_right_up(ser)
     human_delay(0.03, 0.09)
 
@@ -1163,10 +1345,87 @@ def sample_human_delay(min_s: float, max_s: float) -> float:
     return min_s  # pathological fallback; not expected to trigger (see validation note above)
 
 
+# ---------------- In-wait fidgeting (added 2026-08-27, see settings' own block) ----------------
+_fidget_ser = None
+_fidgeting = False
+
+
+def register_fidget_serial(ser) -> None:
+    """Hand the in-wait fidgeter the serial connection. Called once from main(); anything that
+    imports controller without owning the Arduino (tests, analysis tools) never registers, and
+    human_delay stays a plain sleep for them."""
+    global _fidget_ser
+    _fidget_ser = ser
+
+
+def _maybe_fidget_during_wait() -> None:
+    """One small out-and-back resting-hand drift from wherever the cursor is. Position-
+    invariant on purpose -- the return leg lands exactly on the origin (aim_radius=0) so a
+    cursor parked on a future click target is still parked there afterwards. Skipped whenever
+    it could interfere: unfocused window, an open right-click menu (moving off one closes it),
+    a movement abort, or a target outside the window. Never raises -- a fidget must not be
+    able to break the wait it decorates."""
+    ser = _fidget_ser
+    if ser is None or _movement_abort.is_set():
+        return
+    if random.random() > IDLE_FIDGET_CHANCE:
+        return
+    try:
+        if not get_state().get("windowFocused"):
+            return
+        if get_menu().get("open"):
+            return
+        ox, oy = get_cursor_pos()
+        angle = random.uniform(0, 2 * math.pi)
+        dist = random.uniform(*IDLE_FIDGET_RADIUS_PX)
+        tx = int(round(ox + dist * math.cos(angle)))
+        ty = int(round(oy + dist * math.sin(angle)))
+        if not is_point_within_window(tx, ty):
+            return
+        scale = random.uniform(1.2, 2.2)      # a resting-hand shift, not a click-speed traverse
+        move_to_human(ser, tx, ty, aim_radius=3, duration_scale=scale)
+        if _movement_abort.is_set():
+            return
+        time.sleep(random.uniform(0.08, 0.35))
+        move_to_human(ser, ox, oy, aim_radius=0, duration_scale=scale)
+    except Exception:
+        pass
+
+
+def _sleep_with_fidgets(total_s: float) -> None:
+    """Sleep `total_s` as a sequence of human-length still segments separated by fidgets --
+    the still-segment distribution is the MEASURED human one (median 1.5s, p90 2.3s, capped at
+    4s), so even a 30s wait never shows the frozen-cursor signature. Fidget travel time only
+    ever EXTENDS the total wait, never shortens it -- min_s floors elsewhere stay honored."""
+    global _fidgeting
+    deadline = time.perf_counter() + total_s
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return
+        seg = random.lognormvariate(math.log(IDLE_FIDGET_STILL_MEDIAN_S), IDLE_FIDGET_STILL_SIGMA)
+        seg = max(0.05, min(remaining, min(IDLE_FIDGET_MAX_STILL_S, seg)))
+        time.sleep(seg)
+        if deadline - time.perf_counter() > 1.0:   # enough room for an out-and-back
+            _fidgeting = True
+            try:
+                _maybe_fidget_during_wait()
+            finally:
+                _fidgeting = False
+
+
 def human_delay(min_s: float, max_s: float) -> None:
     """Drop-in replacement for time.sleep(random.uniform(min_s, max_s)) -- same call shape,
-    fat-tailed instead of uniform. See sample_human_delay for the distribution."""
-    time.sleep(sample_human_delay(min_s, max_s))
+    fat-tailed instead of uniform (see sample_human_delay). Draws of at least
+    IDLE_FIDGET_MIN_SLEEP_S are additionally broken up by position-invariant fidgets (see
+    _sleep_with_fidgets); the cursor ends the wait where it began it, so callers relying on a
+    parked cursor are unaffected. Short draws -- including every down/up hold inside a click --
+    stay a plain sleep."""
+    delay = sample_human_delay(min_s, max_s)
+    if delay < IDLE_FIDGET_MIN_SLEEP_S or _fidget_ser is None or _fidgeting:
+        time.sleep(delay)
+        return
+    _sleep_with_fidgets(delay)
 
 
 def pick_aim_point(x: int, y: int, radius: int) -> tuple:
@@ -1235,6 +1494,12 @@ def maybe_overshoot_point(start, aim, *, overshoot_px=DEFAULT_OVERSHOOT_PX, chan
     return ox, oy
 
 
+# When the cursor last started a deliberate movement -- the idle-drift trigger measures
+# stillness from here (see maybe_idle_mouse_move). Bumped at move_to_human entry, so every
+# click, walk, hover and in-wait fidget resets it.
+_last_mouse_activity = time.monotonic()
+
+
 def move_to_human(
     ser: serial.Serial,
     x: int,
@@ -1274,6 +1539,9 @@ def move_to_human(
     instead of hand-writing the lambda each time. Implemented and reviewed (including an
     independent second pass) but not yet exercised against a live client as of 2026-08-14.
     """
+    global _last_mouse_activity
+    _last_mouse_activity = time.monotonic()
+
     # v2 engine dispatch (settings.HUMAN_MOVE_V2, off by default). This is the ONLY edit the v2
     # rollout makes to the existing movement path -- every click_entity/hover_entity call site
     # inherits it through this one branch, and turning the flag off restores v1 exactly. See
@@ -1281,9 +1549,24 @@ def move_to_human(
     # refresh_legs is intentionally ignored by v2: its submovement boundaries are already the
     # re-aim points, so it has no artificial legs to configure.
     if HUMAN_MOVE_V2:
-        human_move.move(ser, x, y, get_cursor_pos=get_cursor_pos, send_line=send_line,
+        # v2 plans its own submovement structure, but the AIM-POINT randomization still lives
+        # here: without this, every v2 flight landed exactly on the reported pixel, silently
+        # dropping the deliberate anti-detection jitter every caller's aim_radius asks for.
+        # The offset is drawn ONCE per flight and carried through refresh_target, not redrawn
+        # per refresh -- same rationale as _move_to_human_tracking's fixed per-flight jitter
+        # (redrawing per re-aim adds wasted wander even for a stationary target).
+        aim = pick_aim_point(x, y, aim_radius)
+        off_x, off_y = aim[0] - x, aim[1] - y
+        v2_refresh = refresh_target
+        if refresh_target is not None and (off_x or off_y):
+            def v2_refresh():
+                updated = refresh_target()
+                if updated is None:
+                    return None
+                return updated[0] + off_x, updated[1] + off_y
+        human_move.move(ser, aim[0], aim[1], get_cursor_pos=get_cursor_pos, send_line=send_line,
                         abort=_movement_abort, duration_scale=duration_scale,
-                        refresh_target=refresh_target)
+                        refresh_target=v2_refresh)
         return
 
     start = get_cursor_pos()
@@ -1636,7 +1919,7 @@ def cast_telekinetic_grab(ser: serial.Serial, target: dict) -> bool:
     # position by index mid-flight (same mechanism slayer.py's engage_target already uses for
     # moving combat targets) rather than trusting the one snapshot for the whole click.
     npc_index = target.get("index")
-    refresh = (lambda: get_npc_screen_pos_by_index(npc_index)) if npc_index is not None else None
+    refresh = npc_index_refresh_target(npc_index) if npc_index is not None else None
     # CORRECTED 2026-08-09 (autonomous session, root-caused from hunt_test15.log: 60 straight
     # Grab-cast attempts, zero pit fills, with "drifted off the hunt standing tile" recurring
     # throughout -- the signature of casts resolving as ground-walks instead of landing on the
@@ -1687,9 +1970,38 @@ def rotate_camera_to_reveal(ser: serial.Serial, x) -> None:
 # ConsumablesProvider, PrayerProvider, ObjectProvider) already returns
 # *absolute* screen coordinates (canvas offset baked in server-side) -- do
 # not add the canvas offset again here.
+class _ClickWithheld:
+    """Falsy click_entity result for a click withheld by hover verification, so a caller can
+    tell it apart from every other False (aim off-screen, UI blocker, abort, target lost)
+    without breaking the many existing `if click_entity(...)` truthiness checks. Check it via
+    `getattr(result, "withheld", False)` -- a plain bool has no attributes, so the same
+    expression is safe on every return value. Semantically a DETECTED hijack: the aim landed,
+    but whatever owns the pixel would take the click (see golem_crafting's escalation tiers,
+    the caller this exists for)."""
+    withheld = True
+
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return "CLICK_WITHHELD"
+
+
+CLICK_WITHHELD = _ClickWithheld()
+
+
 def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_target=None,
                   check_ui_blockers=True, simulate_mistakes=True, button: str = "left",
-                  refresh_legs: int = None) -> bool:
+                  refresh_legs: int = None, expected_action=None,
+                  expected_target=None):
+    """expected_action/expected_target (added 2026-08-27, both optional and opt-in): verify
+    BEFORE the click that the hover's default action matches -- see hover_matches; each may be
+    one string or a sequence of acceptable strings. On a persistent mismatch after one
+    corrective re-aim, the click is withheld and the falsy CLICK_WITHHELD sentinel returned
+    (all other failures still return plain False), converting the whole hijack/drift failure
+    class (a player camped on the pixel, the target slipped out from under the cursor) from
+    /last-action post-hoc detection into prevention. Left-button clicks only -- a right-click
+    opens a menu that is its own confirmation."""
     x, y = entity.get("screenX"), entity.get("screenY")
     if x is None or y is None:
         return False
@@ -1732,19 +2044,82 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
     )
     if _movement_abort.is_set():
         return False
+
+    # A deliberate simulated miss skips BOTH the settle and the hover verification -- each
+    # would "correct" the miss the moment it was made, defeating the humanization. The
+    # corrective reclick below is the one that gets the full treatment.
+    if not missed:
+        _settle_on_target_before_click(ser, refresh_target)
+        if _movement_abort.is_set():
+            return False
+        if (expected_action or expected_target) and button != "right" \
+                and not _verify_hover_before_click(ser, expected_action, expected_target,
+                                                   refresh_target):
+            debug_log.log("!", f"withholding click on {entity.get('name')} -- hover never "
+                               f"matched action={expected_action!r} target={expected_target!r}")
+            return CLICK_WITHHELD
+
     if button == "right":
         right_click_human(ser)
     else:
         click_human(ser)
 
     if missed:
-        _reclick_after_misclick(ser, entity, offset, refresh_target, check_ui_blockers, button, refresh_legs)
+        _reclick_after_misclick(ser, entity, offset, refresh_target, check_ui_blockers, button,
+                                refresh_legs, expected_action, expected_target)
 
     return True
 
 
+def _settle_on_target_before_click(ser: serial.Serial, refresh_target) -> None:
+    """One last look at the target between the flight ending and the mouse-down (added
+    2026-08-27). move()'s final re-aim happens at its last submovement boundary, so the settle
+    tail plus click delay (~100-300ms) was blind -- while the player walks, easily tens of px
+    of drift, i.e. exactly 'clicks land behind walkers'. Compares the cursor against the
+    target's LIVE position and issues one short corrective move only past PRECLICK_MAX_DRIFT_PX
+    (generous enough to absorb aim jitter plus the caller offset that refreshes deliberately
+    drop -- see move_to_human's v2 dispatch -- so a stationary target never pays extra motion).
+    A None refresh means the target died/despawned: click the last-known point anyway, same as
+    move()'s own target_lost path."""
+    if refresh_target is None:
+        return
+    updated = refresh_target()
+    if updated is None:
+        return
+    tx, ty = int(updated[0]), int(updated[1])
+    cur = get_cursor_pos()
+    if math.hypot(tx - cur[0], ty - cur[1]) <= PRECLICK_MAX_DRIFT_PX:
+        return
+    if not is_point_within_window(tx, ty):
+        return
+    debug_log.log("action", f"pre-click settle -- target drifted to ({tx},{ty}), cursor at {cur}")
+    move_to_human(ser, tx, ty, aim_radius=2, refresh_target=refresh_target)
+
+
+def _verify_hover_before_click(ser: serial.Serial, expected_action, expected_target,
+                                refresh_target) -> bool:
+    """hover_matches with one corrective re-aim in between: the first mismatch may just mean
+    the target drifted off the cursor, so re-resolve and re-settle once before giving up."""
+    if hover_matches(expected_action, expected_target):
+        return True
+    if refresh_target is None:
+        return False
+    updated = refresh_target()
+    if updated is None:
+        return False
+    tx, ty = int(updated[0]), int(updated[1])
+    if not is_point_within_window(tx, ty):
+        return False
+    debug_log.log("action", f"hover mismatch -- re-aiming at ({tx},{ty}) before deciding")
+    move_to_human(ser, tx, ty, aim_radius=2, refresh_target=refresh_target)
+    if _movement_abort.is_set():
+        return False
+    return hover_matches(expected_action, expected_target)
+
+
 def _reclick_after_misclick(ser: serial.Serial, entity: dict, offset, refresh_target,
-                             check_ui_blockers: bool, button: str, refresh_legs: int = None) -> None:
+                             check_ui_blockers: bool, button: str, refresh_legs: int = None,
+                             expected_action: str = None, expected_target: str = None) -> None:
     """Corrective follow-up after click_entity's own simulated near-miss: a human who clicks
     empty ground beside a target notices nothing happened and clicks again almost immediately,
     they don't just give up and stand there. Without this, every caller that cares about the
@@ -1779,6 +2154,16 @@ def _reclick_after_misclick(ser: serial.Serial, entity: dict, offset, refresh_ta
     move_to_human(ser, aim_x, aim_y, aim_radius=ENTITY_AIM_RADIUS, refresh_target=refresh_target,
                   refresh_legs=refresh_legs)
     if _movement_abort.is_set():
+        return
+    # The corrective click is the one the human is actually paying attention to -- it gets the
+    # same settle + verification the primary click would have.
+    _settle_on_target_before_click(ser, refresh_target)
+    if _movement_abort.is_set():
+        return
+    if (expected_action or expected_target) and button != "right" \
+            and not _verify_hover_before_click(ser, expected_action, expected_target,
+                                               refresh_target):
+        debug_log.log("!", f"withholding reclick on {entity.get('name')} -- hover never matched")
         return
     if button == "right":
         right_click_human(ser)
@@ -1825,7 +2210,8 @@ MENU_POLL_TIMEOUT_S = 0.6
 
 
 def click_menu_action(ser: serial.Serial, entity: dict, option, target_hint: str = None,
-                       offset=(-7, 7), check_ui_blockers=True) -> bool:
+                       offset=(-7, 7), check_ui_blockers=True, refresh_target=None,
+                       refresh_legs: int = None) -> bool:
     # option: str | Sequence[str] -- see the docstring's own note on the sequence form.
     """Right-click `entity`, read back the resulting context menu via GET /menu, and left-click
     whichever entry's option matches `option` (case-insensitive substring, e.g. "take") -- picks
@@ -1859,9 +2245,27 @@ def click_menu_action(ser: serial.Serial, entity: dict, option, target_hint: str
     A `target_hint` that matches nothing is likewise retried WITHOUT the hint before giving up
     (same menu, no extra click) -- an over-narrow hint should cost precision, not the whole
     interaction.
+
+    `refresh_target`/`refresh_legs` (2026-08-27) are handed straight to the underlying
+    click_entity, so the RIGHT-click can re-aim mid-flight exactly like an ordinary left click
+    already could. This used to be the one interaction in the codebase with no correction
+    available once the flight had started, which made it structurally fragile for anything small
+    or anything clicked while the player was moving -- CLAUDE.md carried a standing warning never
+    to hand it a position resolved before a walk.
+
+    CONFIRMED live 2026-08-27, slayer looting: resolve-to-right-click took ~1.0s, and over that
+    window the player's movement and the camera's trailing animation drifted a ground item's tiny
+    icon out from under the aim point. Signature is a menu of pure ground options -- "No 'take'
+    entry in menu for Granite maul (['Cancel', 'Mark Safespot', 'Walk here'])" -- three times in
+    one session, each costing a ~7s retry. Note the window had just doubled: human-timed v2
+    movement roughly doubled flight duration versus the engine before it, so this got worse
+    before it got fixed.
+
+    Purely additive -- omitting both reproduces the previous behaviour exactly.
     """
     if not click_entity(ser, entity, offset=offset, check_ui_blockers=check_ui_blockers,
-                         simulate_mistakes=False, button="right"):
+                         simulate_mistakes=False, button="right",
+                         refresh_target=refresh_target, refresh_legs=refresh_legs):
         return False
 
     deadline = time.time() + MENU_POLL_TIMEOUT_S
@@ -1951,20 +2355,31 @@ def consume_first(ser: serial.Serial, category: str) -> bool:
     return click_entity(ser, items[0], check_ui_blockers=False)
 
 
+def _draw_idle_still_segment() -> float:
+    """Next allowed still-period length, from the SAME measured human distribution the in-wait
+    fidgeter uses (median 1.5s, p90 2.3s, capped at the human's observed 4.5s maximum)."""
+    seg = random.lognormvariate(math.log(IDLE_FIDGET_STILL_MEDIAN_S), IDLE_FIDGET_STILL_SIGMA)
+    return min(IDLE_FIDGET_MAX_STILL_S, seg)
+
+
 def maybe_idle_mouse_move(ctx, state: "ControllerState") -> None:
-    """Every IDLE_MOUSE_MOVE_MIN/MAX_INTERVAL_S seconds or so, drift the
-    cursor a short distance from wherever it already is, slowly, with no
-    click. A small nearby nudge (not a jump clear across the viewport at
-    normal click speed) reads as a resting hand shifting slightly, not a
-    purposeful move -- the whole point of this being "idle". Purely cosmetic
-    movement -- it always runs before the caller's real action for this
-    tick and never replaces it.
+    """Drift the cursor a short distance from wherever it already is, slowly, with no click --
+    a resting hand shifting slightly, not a purposeful move.
+
+    RETUNED 2026-08-27 after the phase-a-verify live measurement: this used to fire on a
+    15-20s wall-clock timer regardless of what the mouse was doing, which both let the cursor
+    freeze for multiples of the human's entire stillness range AND (had the timer simply been
+    tightened) would have inserted slow drifts ahead of REAL actions, taxing throughput. It now
+    triggers on time since the last deliberate cursor movement (`_last_mouse_activity`, bumped
+    by move_to_human -- so clicks, walks and the in-wait fidgets all reset it), with the budget
+    drawn from the measured human still-segment distribution. While the routine is actively
+    driving the mouse this never fires at all; only genuine idle gets filled in.
+    `state.next_idle_move_at` holds the drawn still BUDGET in seconds, not an absolute time.
     """
-    now = time.time()
     if state.next_idle_move_at is None:
-        state.next_idle_move_at = now + random.uniform(IDLE_MOUSE_MOVE_MIN_INTERVAL_S, IDLE_MOUSE_MOVE_MAX_INTERVAL_S)
+        state.next_idle_move_at = _draw_idle_still_segment()
         return
-    if now < state.next_idle_move_at:
+    if time.monotonic() - _last_mouse_activity < state.next_idle_move_at:
         return
 
     cx, cy = get_cursor_pos()
@@ -1972,7 +2387,7 @@ def maybe_idle_mouse_move(ctx, state: "ControllerState") -> None:
     if is_point_within_window(*point):
         move_to_human(ctx.ser, point[0], point[1], duration_scale=IDLE_MOUSE_MOVE_SPEED_SCALE)
 
-    state.next_idle_move_at = now + random.uniform(IDLE_MOUSE_MOVE_MIN_INTERVAL_S, IDLE_MOUSE_MOVE_MAX_INTERVAL_S)
+    state.next_idle_move_at = _draw_idle_still_segment()
 
 
 # ---------------- controller state ----------------
@@ -2220,6 +2635,7 @@ ROUTINE_FILES = {
     "PYRAMID_PLUNDER": "routines/pyramid_plunder.py",
     "CHINCHOMPA_HUNTING": "routines/chinchompa_hunting.py",
     "FALCONRY": "routines/falconry.py",
+    "PLANK_MAKE": "routines/plank_make.py",
 }
 
 
@@ -2263,6 +2679,7 @@ def main():
     set_dpi_aware()  # must happen before any cursor/window coordinate queries below,
                       # otherwise Windows silently virtualizes them to 96 DPI while
                       # RuneLite's Java window reports/receives real physical pixels
+    warn_if_pointer_acceleration()
     start_panic_listener()
     udp = make_udp_listener(UDP_PORT)
     event_stream = bridge_events.EventStream(udp)
@@ -2270,6 +2687,7 @@ def main():
 
     with serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1) as ser:
         time.sleep(2.0)  # Pro Micro reset
+        register_fidget_serial(ser)   # arms in-wait fidgeting; see human_delay
 
         ctx = Context(ser, state, events=event_stream)
         routine = None

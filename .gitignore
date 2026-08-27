@@ -16,3 +16,4 @@ ControllerAddon/recordings/
 .memsearch/
 *.pyc
 ControllerAddon/*.log
+ControllerAddon/.hm2_calibration.json
