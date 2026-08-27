@@ -1712,9 +1712,18 @@ def move_to_human(
                 if updated is None:
                     return None
                 return updated[0] + off_x, updated[1] + off_y
+        # Retracting queued-but-unplayed motion on a re-aim only means anything if the firmware
+        # understands 'X' (protocol v3, see probe_firmware_protocol) -- a pre-v3 board silently
+        # ignores unknown lines, so sending it there would just log a no-op while queued motion
+        # keeps playing out from under a fresh aim. flush stays None for every device that hasn't
+        # been reflashed, which is what keeps this seam bit-for-bit inert until Task 4 lands.
+        flush = None
+        if FIRMWARE_PROTOCOL >= 3:
+            def flush():
+                send_line(ser, "X")
         human_move.move(ser, aim[0], aim[1], get_cursor_pos=get_cursor_pos, send_line=send_line,
                         abort=_movement_abort, duration_scale=duration_scale,
-                        refresh_target=v2_refresh)
+                        refresh_target=v2_refresh, flush_queue=flush)
         return
 
     start = get_cursor_pos()
