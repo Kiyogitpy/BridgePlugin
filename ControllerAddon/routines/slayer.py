@@ -862,10 +862,12 @@ def maybe_loot(ctx):
                 # single-entity lookup, and exactly what get_ground_items' own docstring tells
                 # callers to prefer once they know the tile and id (which `key` is).
                 #
-                # This matters more here than for an NPC click: click_menu_action has NO
-                # refresh_target parameter (see CLAUDE.md), so it right-clicks precisely the pixel
-                # it is handed. Re-resolving immediately beforehand is the only correction
-                # available. Symptom when it is stale, seen live: "No 'take' entry in menu ...
+                # This mattered even more here than for an NPC click, back when click_menu_action
+                # had no refresh_target parameter and right-clicked precisely the pixel it was
+                # handed -- re-resolving immediately beforehand was the only correction available.
+                # Fixed 2026-08-27 (see the refresh_target= passed below); re-resolving here still
+                # matters as the position fed into that factory, it just isn't the only defense
+                # anymore. Symptom when it was stale, seen live: "No 'take' entry in menu ...
                 # ['Cancel', 'Mark Safespot', 'Walk here']" -- a right-click on bare ground.
                 fresh_item = controller.get_ground_item_at(
                     key[1], key[2], item.get("plane", 0), key[0]
