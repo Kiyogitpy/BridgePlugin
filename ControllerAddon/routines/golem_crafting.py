@@ -1751,7 +1751,12 @@ def _collect_golem_gift(ctx, last_station: dict, item_name) -> bool:
             "golem crafting",
             f"gem-bag-full pickup attempt {attempt}/{GOLEM_GEM_PICKUP_ATTEMPTS}: {target.get('name')}",
         )
-        controller.click_menu_action(ctx.ser, target, "take", target_hint=target.get("name"), offset=(0, 0))
+        refresh = controller.ground_item_refresh_target(
+            target.get("x"), target.get("y"), target.get("plane", 0), target.get("id"),
+        )
+        controller.click_menu_action(ctx.ser, target, "take", target_hint=target.get("name"),
+                                      offset=(0, 0), refresh_target=refresh,
+                                      refresh_legs=GOLEM_CLICK_REFRESH_LEGS)
         controller.human_delay(0.6, 1.0)
 
     still_there = any(
@@ -2442,7 +2447,11 @@ def _ensure_wooden_spikes(ctx, config: dict) -> bool:
     # consumes 1 per cycle, so a 1-at-a-time take meant a Spikes supply round trip every single
     # cycle). Taking 5 at once covers 5 relining cycles per visit instead of 1.
     debug_log.log("golem crafting", "taking 5 wooden spikes from the Spikes supply")
-    controller.click_menu_action(ctx.ser, supply, "take-5")
+    refresh = controller.object_refresh_target(
+        supply.get("x"), supply.get("y"), supply.get("plane", 0), supply.get("id"),
+    )
+    controller.click_menu_action(ctx.ser, supply, "take-5", refresh_target=refresh,
+                                  refresh_legs=GOLEM_CLICK_REFRESH_LEGS)
     controller.human_delay(0.4, 0.7)
     return find_item(WOODEN_SPIKES_NAME) is not None
 

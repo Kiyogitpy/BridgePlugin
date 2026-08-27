@@ -418,7 +418,7 @@ def _two_station_golem(monkeypatch, north, south, ground_items, click_calls):
     ground_state = list(ground_items)
     monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: list(ground_state))
 
-    def _fake_click_menu_action(ser, entity, option, target_hint=None, offset=(0, 0)):
+    def _fake_click_menu_action(ser, entity, option, target_hint=None, offset=(0, 0), **kw):
         click_calls.append(entity)
         if entity in ground_state:
             ground_state.remove(entity)
@@ -847,7 +847,7 @@ def test_gem_bag_pickup_gives_up_after_max_attempts_but_still_clears_the_flag(mo
     monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [gem])
     monkeypatch.setattr(
         controller, "click_menu_action",
-        lambda ser, entity, option, target_hint=None, offset=(0, 0): click_calls.append(entity) or True,
+        lambda ser, entity, option, target_hint=None, offset=(0, 0), **kw: click_calls.append(entity) or True,
     )
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
 
@@ -856,6 +856,42 @@ def test_gem_bag_pickup_gives_up_after_max_attempts_but_still_clears_the_flag(mo
     assert len(click_calls) == gc.GOLEM_GEM_PICKUP_ATTEMPTS, "must retry up to the attempt cap, not give up after one click"
     assert ctx.state.data["gc_gem_bag_full"] is False, "must still clear the flag once retries are exhausted, to avoid spinning forever on a lost cause"
     assert ctx.state.data["gc_phase"] == "bank"
+
+
+def test_gem_pickup_menu_click_passes_refresh_target(monkeypatch):
+    """_collect_golem_gift's click_menu_action Take should re-resolve the gift's live screen
+    position, same as every other ground-item menu click in this codebase (see slayer.py's
+    maybe_loot for the reference pattern)."""
+    station = _station("north", 2596, 2257)
+    item = {"x": station["x"], "y": station["y"], "plane": 0, "id": 5, "name": "Uncut sapphire"}
+    monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [item])
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    seen = {}
+    def _fake_click_menu_action(ser, entity, option, **kw):
+        seen.update(kw)
+        return True
+    monkeypatch.setattr(controller, "click_menu_action", _fake_click_menu_action)
+
+    gc._collect_golem_gift(_ctx(), station, "Uncut sapphire")
+    assert seen.get("refresh_target") is not None
+
+
+def test_spikes_supply_menu_click_passes_refresh_target(monkeypatch):
+    """_ensure_wooden_spikes's Take-5 click should re-resolve the supply's live screen
+    position."""
+    supply = {"x": 100, "y": 200, "plane": 0, "id": 42, "name": "Spikes supply"}
+    monkeypatch.setattr(gc, "find_item", lambda name: None if name == gc.WOODEN_SPIKES_NAME
+                         else {"name": name})
+    monkeypatch.setattr(gc, "find_object", lambda name: supply)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    seen = {}
+    def _fake_click_menu_action(ser, entity, option, **kw):
+        seen.update(kw)
+        return True
+    monkeypatch.setattr(controller, "click_menu_action", _fake_click_menu_action)
+
+    gc._ensure_wooden_spikes(_ctx(), gc.DEFAULT_CONFIG)
+    assert seen.get("refresh_target") is not None
 
 
 # --- FINDING E: walk_to_exact_tile early-out / the branch's headline saving ----------
