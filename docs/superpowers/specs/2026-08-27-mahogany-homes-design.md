@@ -169,11 +169,19 @@ than walking cross-map.
 4. **work_phase** — while `remainingCount > 0`: take the first `needsAttention` entry from
    `hotspots`, filter the bulk `/objects` list for that entry's `objectId` (ids are disjoint
    across homes, so this is unambiguous), walk to it and plain-left-click (`click_entity` with
-   `object_refresh_target`/`refresh_legs`, no menu escalation), confirm via `remainingCount`
-   dropping or a Construction XP-gain check (per `CLAUDE.md`'s general sub-tick XP-signal
-   pattern — needs `constructionXp` added to `PlayerProvider`, not currently exposed). Remove and
-   Build chain naturally through the same object id across successive polls — no special-casing
-   needed. If the object for the current `needsAttention` slot isn't found in `/objects` at all,
+   `object_refresh_target`/`refresh_legs`, no menu escalation), confirm via a short click
+   cooldown before the next scan/click naturally re-reads `remainingCount`. **Not** a Construction
+   XP-gain check, despite `CLAUDE.md`'s general sub-tick XP-signal pattern being the usual
+   preference here: the wiki's own XP table (`Mahogany Homes.txt`'s "Experience costs" section)
+   has separate Build/Repair XP columns but **none for Remove**, meaning a Remove click likely
+   grants 0 XP — an XP-gain wait would time out on every single Remove click rather than confirm
+   it quickly, which is worse than a plain cooldown, not better. `constructionXp` is still added
+   to `PlayerProvider` (cheap, generically useful, matches the established per-skill-XP-field
+   pattern), but nothing in this design consumes it yet — a documented option for a later
+   Build/Repair-only speedup once Remove's real XP behavior is confirmed live, not something
+   this version depends on. Remove and Build chain naturally through the same object id across
+   successive polls — no special-casing needed. If the object for the current `needsAttention`
+   slot isn't found in `/objects` at all,
    that means the player isn't close enough yet (walk closer and retry) — the object is always
    physically present once `needsAttention` is true, so "not found" is never an out-of-materials
    signal here (unlike golem_crafting's Start-golem, Mahogany Homes hotspot objects don't
