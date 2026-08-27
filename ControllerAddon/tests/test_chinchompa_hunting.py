@@ -764,7 +764,7 @@ def test_recovering_a_dropped_trap_goes_through_the_menu_not_a_bare_click(monkey
     monkeypatch.setattr(ch.controller, "wait_until_player_idle", lambda **kw: True)
     monkeypatch.setattr(ch.controller, "get_ground_item_at", lambda x, y, p, i: item)
     monkeypatch.setattr(ch.controller, "click_menu_action",
-                        lambda ser, target, options, target_hint=None:
+                        lambda ser, target, options, target_hint=None, **kw:
                             used.update(target=target, options=options, hint=target_hint) or True)
 
     def _no_bare_click(*_a, **_k):
@@ -781,6 +781,25 @@ def test_recovering_a_dropped_trap_goes_through_the_menu_not_a_bare_click(monkey
     assert ch.recover_dropped_trap(_Ctx(), (2513, 9301, 0), item) is True
     assert "Take" in used["options"]
     assert used["target"] is item
+
+
+def test_recover_dropped_trap_passes_refresh_target(monkeypatch):
+    """recover_dropped_trap's Take click should re-resolve the trap item's live screen position,
+    same as every other ground-item menu click in this codebase."""
+    tile = (2513, 9301, 0)
+    item = {"x": tile[0], "y": tile[1], "plane": tile[2], "id": ch.BOX_TRAP_ITEM_ID}
+    monkeypatch.setattr(controller, "wait_until_player_idle", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_ground_item_at", lambda x, y, plane, item_id: item)
+    monkeypatch.setattr(ch, "box_trap_count", lambda: 0)
+    monkeypatch.setattr(ch, "_note_acted_on", lambda ctx, tile: None)
+    seen = {}
+    def _fake_click_menu_action(ser, entity, option, **kw):
+        seen.update(kw)
+        return True
+    monkeypatch.setattr(controller, "click_menu_action", _fake_click_menu_action)
+
+    ch.recover_dropped_trap(_Ctx(), tile, item)
+    assert seen.get("refresh_target") is not None
 
 
 def test_a_tile_the_player_can_never_reach_gets_blocked(monkeypatch):

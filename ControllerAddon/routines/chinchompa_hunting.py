@@ -916,8 +916,11 @@ def recover_dropped_trap(ctx, tile, item):
     _note_acted_on(ctx, tile)
     debug_log.log("chins", f"a timed-out trap is lying at {tile[0]},{tile[1]} -- picking it back up")
 
+    refresh = controller.ground_item_refresh_target(tile[0], tile[1], tile[2], BOX_TRAP_ITEM_ID)
     if not controller.click_menu_action(ctx.ser, target, DROPPED_TRAP_ACTIONS,
-                                        target_hint=BOX_TRAP_ITEM_NAME):
+                                        target_hint=BOX_TRAP_ITEM_NAME,
+                                        refresh_target=refresh,
+                                        refresh_legs=TRAP_CLICK_REFRESH_LEGS):
         return False
 
     deadline = time.time() + RETRIEVE_CONFIRM_TIMEOUT_S
