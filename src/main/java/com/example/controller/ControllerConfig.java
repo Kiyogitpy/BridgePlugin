@@ -79,6 +79,9 @@ public interface ControllerConfig extends Config
 	@ConfigSection(name = "Mastering Mixology", description = "Mastering Mixology routine settings", position = 14)
 	String masteringMixologySection = "masteringMixology";
 
+	@ConfigSection(name = "Mahogany Homes", description = "Mahogany Homes routine settings", position = 15)
+	String mahoganyHomesSection = "mahoganyHomes";
+
 	// ============================================================
 	// General
 	// ============================================================
@@ -1165,6 +1168,22 @@ public interface ControllerConfig extends Config
 		position = 3
 	)
 	default boolean masteringMixologySpeedupsEnabled()
+	{
+		return true;
+	}
+
+	// ============================================================
+	// Mahogany Homes
+	// ============================================================
+
+	@ConfigItem(
+		keyName = "mahoganyHomesEnabled",
+		name = "Mahogany Homes Enabled",
+		description = "Secondary switch on top of launching controller.py with routines/mahogany_homes.py.",
+		section = mahoganyHomesSection,
+		position = 0
+	)
+	default boolean mahoganyHomesEnabled()
 	{
 		return true;
 	}

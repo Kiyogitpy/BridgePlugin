@@ -151,6 +151,7 @@ public class ControllerPlugin extends Plugin
 		new MixologyProvider(client, clientThread, server).register();
 		new PyramidPlunderProvider(client, clientThread, server).register();
 		new GolemProvider(client, clientThread, server).register();
+		new MahoganyHomesProvider(client, clientThread, server, eventBus).register();
 		new LastActionProvider(client, clientThread, server, eventBus).register();
 		new LastChatMessageProvider(client, clientThread, server, eventBus).register();
 
@@ -167,6 +168,7 @@ public class ControllerPlugin extends Plugin
 		server.register("/blast-furnace-config", () -> ConfigExporter.exportBlastFurnace(config));
 		server.register("/golem-crafting-config", () -> ConfigExporter.exportGolemCrafting(config));
 		server.register("/mastering-mixology-config", () -> ConfigExporter.exportMasteringMixology(config));
+		server.register("/mahogany-homes-config", () -> ConfigExporter.exportMahoganyHomes(config));
 
 		try
 		{

@@ -1284,3 +1284,41 @@ def test_probe_firmware_protocol_never_raises():
         def reset_input_buffer(self):
             raise OSError("port died")
     assert controller.probe_firmware_protocol(Broken()) == 2
+
+
+def test_get_mahogany_homes_state_returns_dict(monkeypatch):
+    monkeypatch.setattr(controller, "api_get", lambda path, **kw: {"hasContract": False})
+    assert controller.get_mahogany_homes_state() == {"hasContract": False}
+
+
+def test_get_mahogany_homes_state_defaults_to_no_contract_on_404(monkeypatch):
+    monkeypatch.setattr(controller, "api_get", lambda path, **kw: None)
+    assert controller.get_mahogany_homes_state() == {"hasContract": False}
+
+
+def test_get_mahogany_homes_config_passes_through(monkeypatch):
+    monkeypatch.setattr(controller, "api_get", lambda path, **kw: {"enabled": True})
+    assert controller.get_mahogany_homes_config() == {"enabled": True}
+
+
+def test_get_widgets_dump_returns_widget_list(monkeypatch):
+    monkeypatch.setattr(controller, "api_get",
+                         lambda path, **kw: {"widgets": [{"group": 1, "child": 2}]})
+    assert controller.get_widgets_dump() == [{"group": 1, "child": 2}]
+
+
+def test_get_widgets_dump_fails_safe_to_empty_list(monkeypatch):
+    monkeypatch.setattr(controller, "api_get", lambda path, **kw: None)
+    assert controller.get_widgets_dump() == []
+
+
+def test_get_npc_nearest_returns_full_entity(monkeypatch):
+    monkeypatch.setattr(controller, "api_get",
+                         lambda path, **kw: {"found": True, "screenX": 5, "screenY": 6, "index": 9})
+    result = controller.get_npc_nearest(10415)
+    assert result == {"found": True, "screenX": 5, "screenY": 6, "index": 9}
+
+
+def test_get_npc_nearest_returns_none_when_not_found(monkeypatch):
+    monkeypatch.setattr(controller, "api_get", lambda path, **kw: {"found": False})
+    assert controller.get_npc_nearest(10415) is None
