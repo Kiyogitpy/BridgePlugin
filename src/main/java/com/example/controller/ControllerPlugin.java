@@ -153,6 +153,7 @@ public class ControllerPlugin extends Plugin
 		new PyramidPlunderProvider(client, clientThread, server).register();
 		new GolemProvider(client, clientThread, server).register();
 		new MahoganyHomesProvider(client, clientThread, server, eventBus).register();
+		new RaidsProvider(client, clientThread, server, eventBus, pluginManager).register();
 		new LastActionProvider(client, clientThread, server, eventBus).register();
 		new LastChatMessageProvider(client, clientThread, server, eventBus).register();
 

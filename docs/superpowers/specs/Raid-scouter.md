@@ -1,7 +1,24 @@
 # Raid scouter (Chambers of Xeric) — design
 
-Status: design approved 2026-08-29, not yet implemented.
+Status: implemented 2026-08-30, **not yet run live**.
 Author: brainstormed with the user 2026-08-29.
+
+## Implementation status (2026-08-30)
+
+`RaidsProvider.java` (`GET /raid`), `controller.get_raid()`, `RoutineChoice.RAID_SCOUTER`, and
+`routines/raid_scouter.py` all exist and are wired into the GUI dropdown. `setup` → `scout` →
+`reroll` → `hold` → `depart` are all implemented exactly per the MEASURED section below.
+`RaidsProviderTest.java` (Java, 6 tests) and `tests/test_raid_scouter.py` (Python, 27 tests)
+both pass; the full existing suite (848 Python tests, full Gradle test task) was re-run clean
+after this change. Nothing here has touched a live client yet.
+
+**`hop_phase` is deliberately a safety-stop, not a click sequence.** No recording of a human
+hopping worlds exists (see the "World hopping" section below, unchanged since design), and
+nothing in this codebase drives a world change today. Guessing pixel or widget positions for an
+interface nobody has recorded is exactly what CLAUDE.md's live-debugging lessons warn against.
+The routine therefore completes one full, correct cycle — scout, match, alert, wait for the
+main, leave — and stops cleanly with an actionable message instead of clicking blind. Record a
+human hopping worlds, then extend `hop_phase` the same way every other phase was built here.
 
 ## Goal
 
@@ -365,6 +382,19 @@ The entry click was logged `(nothing observed -- click may have been ignored or 
 range)` and the region changed **5.6s later**: it was clicked from 14 tiles away and the
 player walked there first. **Budget the walk** — the same omission that looped the
 mahogany-homes door and hotspot clicks.
+
+### The SAME confirmation widget is reused for the exit, with different text
+
+The second full setup cycle late in the recording (the human demonstrating what a world
+hop's return trip looks like) includes a real `Climb` → `Continue` on the Steps. The
+confirmation is **widget 219.1 slot 1 again** — same group, same slot — but the text
+reads **"Leave."**, not "Yes, reload the raid." Since the routine's confirm step
+presses the `1` key rather than matching on text (see below), this needs no branching
+at all: the same `_confirm_dialog_if_open` handles both the reroll confirm and the
+depart confirm identically. Also confirms the earlier `GAME_OBJECT_FIRST_OPTION` =
+`Climb` note directly: the exit click landed varbit 5432 at 0 and it **stayed there**
+(NPCs from inside the raid despawn, the outside NPCs — Captain Rimor, Stuliette —
+appear) through LOADING → LOGGED_IN, unlike a reload's dip-and-return.
 
 ### The reroll cycle, performed 37 times
 

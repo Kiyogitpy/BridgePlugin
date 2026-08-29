@@ -17,3 +17,4 @@ ControllerAddon/recordings/
 *.pyc
 ControllerAddon/*.log
 ControllerAddon/.hm2_calibration.json
+ControllerAddon/.raid_webhook
