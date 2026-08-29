@@ -60,6 +60,30 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   walk alone is not proof. Both are read-only and cost nothing when unused. NumPy and Pillow are
   already installed, so measuring a dumped frame needs no new dependency.
 
+## Offline OSRS research MCP
+
+The `osrs-wiki` MCP server in `.mcp.json` provides the local OSRS reference corpus. **Use it
+before external web lookups or broad filesystem searches** whenever the question involves Wiki
+gameplay information, decoded game-cache definitions, interfaces/scripts/symbols, RuneLite source,
+or Plugin Hub source. It runs entirely from these already-built local databases:
+
+- `wiki.sqlite` — revision-pinned OSRS Wiki pages, redirects, equipment requirements, and
+  structured NPC/object/ground-item spawns.
+- `cache.sqlite` — decoded game-cache configurations, interfaces, scripts, and symbols; it does
+  not include binary assets such as models, maps, sprites, or audio.
+- `runelite-code.sqlite` — revision-pinned Java from RuneLite API/client/HTTP API, Plugin Hub
+  tooling, and Plugin Hub plugins.
+
+Choose tools by source: use `search_unified` for a combined Wiki + cache query, `search_wiki`
+plus `get_wiki_page`/`get_wiki_sections`/`get_wiki_section` for game mechanics and Wiki prose,
+and `search_spawns` for NPC/object/ground-item coordinates. Use `search_cache` for raw client
+definitions (optionally restricting `kind`, for example `config/obj`, `config/loc`,
+`config/varbit`, `interface`, or `script`), then call `get_cache_entry` with the returned exact
+kind and ID. Use `search_code` for RuneLite or Plugin Hub implementations (optionally restrict
+to `runelite-api`, `runelite-client`, `runelite-http-api`, `pluginhub-tooling`, or
+`pluginhub/<internalName>`), then use `get_code_entry` with the returned case-sensitive kind and
+ID. Keep queries short and distinctive; this is lexical full-text search, not semantic retrieval.
+
 ## Reference implementations in `data/decompiled/`
 
 **Documentation only — nothing here is on our build path.** These are decompiled or vendored
@@ -139,6 +163,64 @@ check. Do take `curtain`, which our name list was missing.
 
 See `docs/superpowers/specs/2026-08-29-global-collision-pathfinding-design.md` for the design
 this feeds.
+
+## Vendored m8aq readers (`GET /api/...`)
+
+Added 2026-08-29. `src/main/java/net/runelite/client/plugins/m8aq/api/` is a **byte-identical
+copy of RLitePlus/m8aq-plugins' reader tree**, kept in its ORIGINAL package on purpose, and
+`com.example.providers.M8aqProvider` is the only adapter between it and our bridge. This is the
+one place in the repo where third-party source sits on the build path -- everything else under
+`data/decompiled/` is still documentation only.
+
+66 endpoints, `GET /api/<group>/<reader>` (kebab-cased), plus `GET /api/all` (every reader in one
+snapshot, which is `export/GameOutput`) and `GET /api/index` (the live path list). Read
+`/api/index` rather than hardcoding a path list from memory. Python: `controller.get_api(group,
+reader)`, `get_api_all()`, `get_api_index()`.
+
+What it adds that we never had: every storage container (rune pouch, herb sack, log basket,
+gem/coal bag, seed box, fish barrel, looting bag, essence pouches, potion storage, seed vault,
+group/house storage, death recovery), run energy/weight/destination (`player/movement`),
+poison/venom/antifire/stamina timers (`player/status-effects`), `player/magic`,
+`player/transportation`, all of `runtime/`, `social/`, `trade/` (GE, shops, player trade),
+`progression/` (quests, diaries, collection log, combat achievements), `ui/dialogue`,
+`ui/interfaces`, and nine minigames including Wintertodt, Blast Furnace, Giants' Foundry, GOTR
+and Soul Wars.
+
+Five things to know before touching any of it:
+
+- **Never edit a file under `api/`.** The no-edits rule is what makes `tools/sync-m8aq.sh` a
+  clean overwrite instead of a conflict-ridden rewrite of 71 files, and it is the whole reason
+  the package was not renamed to `com.example`. Wrap behaviour in `M8aqProvider` instead. See
+  `src/main/java/net/runelite/client/plugins/m8aq/VENDORED.md` for the pinned upstream commit.
+- **Discovery is reflection, deliberately.** `ReaderCatalog` finds every public class with a
+  `public static State getState(Client)` via a Guava classpath scan, so a reader added upstream
+  becomes an endpoint on the next client rebuild with **no code change**. That is the payoff for
+  vendoring verbatim. The cost: a scan that walks nothing yields zero endpoints and no error --
+  a bridge that is up and serves none of this. Hence the startup count log, the `stderr` warning
+  below `MINIMUM_EXPECTED_READERS`, and `M8aqProviderTest`'s floor assertion. MEASURED under the
+  Gradle test classloader: 67 discovered, 66 endpoints.
+- **Namespaced under `/api/` because eight names collide.** `Bank`, `Inventory`, `Equipment`,
+  `Prayer`, `Npcs`, `Skills`, `GroundItems` and `TileObjects` are all readers here AND existing
+  endpoints of ours with a different JSON shape. The two coexist and mean different things --
+  `/bank` is not `/api/storage/bank`.
+- **No `TickCache`, on purpose.** These are varbit and item-container reads, not the bulk scene
+  scans that cache exists to make cheap; each request reads fresh on the client thread like
+  `/player` and `/object/at`. A reader that throws returns an `{"reader", "error"}` dict rather
+  than a 500, because several are interface-dependent and legitimately unhappy with their
+  interface closed -- so on the Python side `None` means "bridge/endpoint unavailable" and an
+  `error` key means "this reader failed", and neither means "empty container".
+- **Serialization needed no Gson adapters, and that was checked, not assumed.** Every field is a
+  primitive, `String`, enum, `WorldPoint`, `List<ItemSlot>` or `LocalPoint` (which stores
+  `worldView` as an `int`, not a reference); the heavy `Widget` fields are already `transient`,
+  which Gson honours; the one lambda field (`EssencePouches.Pouch.degradationReader`) lives on an
+  enum, which Gson emits by name. Re-check this after a sync that adds a field type.
+
+The real standing risk is **not** the sync mechanism, it is that reader field names become a
+Python-facing contract we do not control: an upstream rename silently changes JSON keys.
+`/api/index` makes a moved *endpoint* visible and `M8aqProviderTest.knownPathsAreStable` fails
+the build on one, but nothing catches a renamed field. Diff `/api/all` after every sync.
+
+Upstream has **no LICENSE file** (confirmed via the GitHub API, 2026-08-29).
 
 ## The routine contract
 

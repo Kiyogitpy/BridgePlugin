@@ -3,6 +3,15 @@
     "osrs-debug": {
       "command": "C:\\Users\\Kiyo\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
       "args": ["ControllerAddon/mcp_debug_server.py"]
+    },
+    "osrs-wiki": {
+      "command": "C:\\Users\\Kiyo\\Documents\\Httpbridge\\data\\decompiled\\osrs-wiki-cache-utils-main\\osrs-wiki-cache-utils-v0.3.0-x86_64-pc-windows-msvc.exe",
+      "args": [
+        "serve",
+        "--database", "C:\\Users\\Kiyo\\Documents\\Httpbridge\\data\\decompiled\\osrs-wiki-cache-utils-main\\wiki.sqlite",
+        "--cache-database", "C:\\Users\\Kiyo\\Documents\\Httpbridge\\data\\decompiled\\osrs-wiki-cache-utils-main\\cache.sqlite",
+        "--code-database", "C:\\Users\\Kiyo\\Documents\\Httpbridge\\data\\decompiled\\osrs-wiki-cache-utils-main\\runelite-code.sqlite"
+      ]
     }
   }
 }

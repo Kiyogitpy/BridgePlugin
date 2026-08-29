@@ -156,6 +156,18 @@ public class ControllerPlugin extends Plugin
 		new LastActionProvider(client, clientThread, server, eventBus).register();
 		new LastChatMessageProvider(client, clientThread, server, eventBus).register();
 
+		// The vendored m8aq readers, served under /api/. Wrapped because discovery is a Guava
+		// classpath scan: if it throws under some classloader we lose 66 endpoints, not the whole
+		// bridge. See M8aqProvider's class comment.
+		try
+		{
+			new M8aqProvider(client, clientThread, server).register();
+		}
+		catch (Throwable t)
+		{
+			System.out.println("m8aq reader endpoints unavailable: " + t);
+		}
+
 		// Held in a field, unlike every other provider: it owns MouseManager/KeyManager listeners
 		// that live outside the EventBus, so shutDown() has to be able to unregister them (see
 		// RecorderProvider.unregister).

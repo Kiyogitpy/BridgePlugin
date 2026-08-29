@@ -1,0 +1,136 @@
+package net.runelite.client.plugins.m8aq.api.skills.smithing;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import net.runelite.api.Client;
+import net.runelite.api.ItemComposition;
+import net.runelite.api.Player;
+import net.runelite.api.gameval.AnimationID;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.VarClientID;
+import net.runelite.api.widgets.Widget;
+
+/** Provides a read-only snapshot of ordinary bar smelting and furnace activity. */
+public final class Furnace
+{
+	private static final String SMELTING_TITLE = "What would you like to smelt?";
+
+	private Furnace()
+	{
+	}
+
+	/**
+	 * Reads the current furnace state from the client.
+	 * This method must be called on the client thread.
+	 *
+	 * @param client RuneLite client
+	 * @return immutable state snapshot
+	 */
+	public static State getState(Client client)
+	{
+		Objects.requireNonNull(client, "client");
+		boolean operatingFurnace = isOperatingFurnace(client.getLocalPlayer());
+		Widget root = client.getWidget(InterfaceID.Skillmulti.UNIVERSE);
+		Widget title = client.getWidget(InterfaceID.Skillmulti.TITLE);
+		boolean open = root != null && !root.isHidden()
+			&& title != null && !title.isHidden()
+			&& SMELTING_TITLE.equals(title.getText());
+		if (!open)
+		{
+			return new State(false, operatingFurnace, 0, Collections.emptyList());
+		}
+
+		return new State(
+			true,
+			operatingFurnace,
+			client.getVarcIntValue(VarClientID.SKILLMULTI_QUANTITY),
+			readProducts(client));
+	}
+
+	private static boolean isOperatingFurnace(Player player)
+	{
+		if (player == null)
+		{
+			return false;
+		}
+
+		int animation = player.getAnimation();
+		return animation == AnimationID.HUMAN_FURNACE
+			|| animation == AnimationID.HUMAN_FURNACE_NOSTALL;
+	}
+
+	private static List<Product> readProducts(Client client)
+	{
+		List<Product> products = new ArrayList<>();
+		for (int componentId = InterfaceID.Skillmulti.A;
+			componentId <= InterfaceID.Skillmulti.R;
+			componentId++)
+		{
+			Widget item = findItem(client.getWidget(componentId));
+			if (item == null)
+			{
+				continue;
+			}
+
+			int itemId = item.getItemId();
+			ItemComposition definition = client.getItemDefinition(itemId);
+			products.add(new Product(
+				itemId,
+				definition == null ? "Unknown" : definition.getName()));
+		}
+		return Collections.unmodifiableList(products);
+	}
+
+	private static Widget findItem(Widget slot)
+	{
+		if (slot == null || slot.isHidden())
+		{
+			return null;
+		}
+
+		Widget[] children = slot.getDynamicChildren();
+		if (children != null)
+		{
+			for (Widget child : children)
+			{
+				if (child != null && !child.isHidden() && child.getItemId() > 0)
+				{
+					return child;
+				}
+			}
+		}
+		return null;
+	}
+
+	/** Immutable product displayed by the bar-smelting interface. */
+	@Getter
+	@RequiredArgsConstructor(access = AccessLevel.PRIVATE)
+	public static final class Product
+	{
+		/** @return output item ID */
+		private final int itemId;
+		/** @return output item name */
+		private final String name;
+	}
+
+	/** Immutable furnace state captured from one client read. */
+	@Getter
+	@RequiredArgsConstructor(access = AccessLevel.PRIVATE)
+	public static final class State
+	{
+		/** @return whether the ordinary bar-smelting selection screen is visible */
+		private final boolean open;
+		/** @return whether the local player is performing a furnace animation */
+		private final boolean operatingFurnace;
+		/** @return requested smelting quantity, or zero while the screen is closed */
+		private final int requestedQuantity;
+		/** @return immutable list of products currently displayed */
+		private final List<Product> displayedProducts;
+
+	}
+}

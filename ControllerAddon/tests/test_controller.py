@@ -1322,3 +1322,57 @@ def test_get_npc_nearest_returns_full_entity(monkeypatch):
 def test_get_npc_nearest_returns_none_when_not_found(monkeypatch):
     monkeypatch.setattr(controller, "api_get", lambda path, **kw: {"found": False})
     assert controller.get_npc_nearest(10415) is None
+
+
+# --- m8aq reader endpoints (/api/...) -----------------------------------------
+
+
+def test_get_api_builds_the_group_reader_path(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(controller, "api_get",
+                        lambda path, **kw: captured.update(path=path) or {"charges": 3})
+
+    assert controller.get_api("storage", "rune-pouch") == {"charges": 3}
+    assert captured["path"] == "/api/storage/rune-pouch"
+
+
+def test_get_api_returns_none_when_the_endpoint_is_unavailable(monkeypatch):
+    """An un-rebuilt client must read as "can't verify", never as an empty container."""
+    monkeypatch.setattr(controller, "api_get", lambda path, **kw: None)
+    assert controller.get_api("player", "movement") is None
+
+
+def test_get_api_passes_a_server_side_reader_error_through(monkeypatch):
+    """M8aqProvider answers a throwing reader with an error dict rather than a 500, so callers
+    can tell "this reader failed" from "the bridge is down" (None)."""
+    monkeypatch.setattr(controller, "api_get",
+                        lambda path, **kw: {"reader": "Dialogue", "error": "NullPointerException: null"})
+
+    result = controller.get_api("ui", "dialogue")
+
+    assert result["error"].startswith("NullPointerException")
+
+
+def test_get_api_all_hits_the_aggregate_endpoint(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(controller, "api_get",
+                        lambda path, **kw: captured.update(path=path) or {"capturedTick": 7, "groups": {}})
+
+    assert controller.get_api_all()["capturedTick"] == 7
+    assert captured["path"] == "/api/all"
+
+
+def test_get_api_index_fails_safe_to_empty_dict(monkeypatch):
+    monkeypatch.setattr(controller, "api_get", lambda path, **kw: None)
+    assert controller.get_api_index() == {}
+
+
+def test_get_api_index_returns_the_group_listing(monkeypatch):
+    monkeypatch.setattr(controller, "api_get", lambda path, **kw: {
+        "count": 66, "aggregate": "/api/all", "groups": {"Storage": ["/api/storage/rune-pouch"]},
+    })
+
+    index = controller.get_api_index()
+
+    assert index["count"] == 66
+    assert index["groups"]["Storage"] == ["/api/storage/rune-pouch"]

@@ -746,6 +746,55 @@ def get_widgets_dump(scan: bool = False):
     return data.get("widgets", [])
 
 
+def get_api(group: str, reader: str):
+    """One vendored m8aq game-state reader (M8aqProvider's /api/<group>/<reader>).
+
+    These are the RLitePlus/m8aq-plugins readers vendored under
+    src/main/java/net/runelite/client/plugins/m8aq/api/ -- 66 snapshot endpoints covering things
+    this bridge never exposed: every storage container (rune pouch, herb sack, log basket, gem/
+    coal bag, seed box, fish barrel, looting bag, essence pouches, potion storage, seed vault,
+    group/house storage, death recovery), run energy/weight/destination (player/movement),
+    poison/venom/antifire/stamina timers (player/status-effects), quests, diaries, collection
+    log, the GE, shops, player trade, and nine minigames. Call get_api_index() for the live list
+    rather than hardcoding one from memory -- the surface grows whenever tools/sync-m8aq.sh
+    pulls upstream.
+
+    Both arguments are the kebab-cased path segments, e.g. get_api("storage", "rune-pouch") or
+    get_api("player", "status-effects").
+
+    Returns None when the endpoint is unavailable -- an un-rebuilt client, a bad group/reader
+    name, or the bridge being down -- so callers must treat that as "can't verify", never as an
+    empty container. A reader that throws server-side returns a dict with an "error" key instead
+    of its normal fields (several readers legitimately fail while their interface is closed), so
+    check for that before trusting the shape.
+
+    Not tick-cached: every call reads fresh on the client thread, the same as /player and
+    /object/at. These are varbit and item-container reads, not the bulk scene scans TickCache
+    exists to make cheap."""
+    return api_get(f"/api/{group}/{reader}")
+
+
+def get_api_all():
+    """Every m8aq reader in one snapshot (/api/all), as {"capturedTick": int, "groups": {...}}.
+
+    One client-thread round trip for all 66 readers instead of 66 of them, which is worth it for
+    a debugging dump or a one-shot survey. It is the wrong tool inside a routine's tick loop:
+    it reads everything on every call, including nine minigames the routine does not care about.
+    Use get_api() there. Returns None if the endpoint is unavailable."""
+    return api_get("/api/all")
+
+
+def get_api_index():
+    """The live list of m8aq reader endpoints (/api/index), as
+    {"count": int, "aggregate": "/api/all", "groups": {"Storage": [...], ...}}.
+
+    Exists so the available surface can be discovered from Python without reading Java, and so a
+    sync that renames or removes a reader is visible by diffing this against a previous run.
+    Returns an empty dict when the endpoint is unavailable -- distinguishable from a successful
+    call, which always carries a non-zero "count"."""
+    return api_get("/api/index") or {}
+
+
 def get_npc_nearest(npc_id: int):
     """Full entity dict for the nearest NPC of this *type* (unlike get_npc_screen_pos, which
     only returns a bare (x, y) tuple) -- needed wherever the caller also wants the NPC's index
