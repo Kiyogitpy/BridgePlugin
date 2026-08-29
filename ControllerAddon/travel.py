@@ -687,7 +687,13 @@ def _hop_index(route: list, start: int, px: int, py: int, flags: dict) -> int:
     for i in range(start, len(route) - 1):
         ax, ay = route[i]["x"], route[i]["y"]
         bx, by = route[i + 1]["x"], route[i + 1]["y"]
-        if flags and not _passable(flags.get((ax, ay)), flags.get((bx, by)), bx - ax, by - ay):
+        fa = flags.get((ax, ay))
+        fb = flags.get((bx, by))
+        # BOTH sides must be KNOWN before a crossing may cut a hop short. flags covers only
+        # COLLISION_SCAN_RADIUS tiles around the player while hops aim 16-24, and _passable
+        # answers False when either flag is None -- so treating unknown as blocked truncated
+        # every hop to the scan radius. Past the window we hop and let the stall recovery act.
+        if fa is not None and fb is not None and not _passable(fa, fb, bx - ax, by - ay):
             break
         if max(abs(bx - px), abs(by - py)) > limit:
             break
@@ -745,7 +751,7 @@ def _open_door(ctx, door: dict, recheck) -> bool:
     debug_log.log("travel", f"the {door.get('name')} at ({dx},{dy}) is still shut after "
                             f"{budget:.1f}s -- another player may be holding it, or the "
                             f"click missed")
-    return True
+    return False
 
 
 def open_door_toward(ctx, goal: dict) -> bool:
@@ -771,18 +777,6 @@ def open_door_toward(ctx, goal: dict) -> bool:
         return False
     return _open_door(ctx, door,
                       lambda: _door_on_route(route, plane, _collision_flags(px, py, plane)))
-
-
-def _is_short_hop(target: dict, min_path_tiles: float | None = None) -> bool:
-    """Deprecated: kept for backward compatibility with old tests that mock it.
-
-    New code should use route_to directly. This function is NOT used by the new walk_to."""
-    threshold = SHORT_HOP_TILES if min_path_tiles is None else min_path_tiles
-    player = controller.get_player()
-    px, py = player.get("x"), player.get("y")
-    if px is None or player.get("plane") != target["plane"]:
-        return False
-    return max(abs(target["x"] - px), abs(target["y"] - py)) <= threshold
 
 
 def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
@@ -818,6 +812,9 @@ def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
         if px is None:
             return False
 
+        if _within_tolerance(px, py, target["x"], target["y"], tolerance):
+            return True
+
         flags = _collision_flags(px, py, plane)
         index = _nearest_step_index(route, px, py)
 
@@ -838,9 +835,6 @@ def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
                 route = refreshed
                 last_pos = None
                 continue
-
-        if _within_tolerance(px, py, target["x"], target["y"], tolerance):
-            return True
 
         if last_pos == (px, py):
             stalls += 1

@@ -266,6 +266,12 @@ def test_walking_a_route_still_walks_through_an_object_transport_it_failed_to_cl
     monkeypatch.setattr(travel.controller, "get_player",
                         lambda: {"x": 3000, "y": 3000, "plane": 0})
     monkeypatch.setattr(travel, "_use_transport", lambda ctx, transport, waypoint: False)
+    # Hermetic: get_player never advances, so every hop after the transport failure stalls and
+    # _walk_along_path's own stall recovery calls _open_blocking_door -> _shut_doors_in_range ->
+    # controller.get_objects on EVERY one of WALK_MAX_HOPS iterations. Unstubbed, that reaches
+    # the live client over real HTTP -- MEASURED: 118s for this one test with a running client,
+    # against <1s once it's stubbed like every other controller.* call here.
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])
     hops = []
     monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane: hops.append((x, y)) or True)
 
