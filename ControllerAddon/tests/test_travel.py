@@ -1529,8 +1529,8 @@ BLOCK_MOVEMENT_WEST = 128
 BLOCK_MOVEMENT_OBJECT = 256
 
 
-def _door(x, y, name="Door", actions=("Open",), object_type="WallObject",
-          flags=BLOCK_MOVEMENT_NORTH, plane=0):
+def _route_door(x, y, name="Door", actions=("Open",), object_type="WallObject",
+                 flags=BLOCK_MOVEMENT_NORTH, plane=0):
     return {"id": 7452, "name": name, "objectType": object_type, "actions": list(actions),
             "collisionFlags": flags, "x": x, "y": y, "plane": plane}
 
@@ -1540,17 +1540,6 @@ def _open_grid(tiles, blocked=()):
     grid = {tile: 0 for tile in tiles}
     for tile, value in blocked:
         grid[tile] = value
-        # For 2-tile routes only, add reciprocal flags to predecessors to fully block crossings.
-        # Longer routes don't need this because the block falls on a tile already in the path.
-        if len(tiles) == 2:
-            try:
-                idx = tiles.index(tile)
-                if value & BLOCK_MOVEMENT_NORTH and idx > 0:
-                    grid[tiles[idx - 1]] = grid.get(tiles[idx - 1], 0) | BLOCK_MOVEMENT_NORTH
-                if value & BLOCK_MOVEMENT_SOUTH and idx < len(tiles) - 1:
-                    grid[tiles[idx + 1]] = grid.get(tiles[idx + 1], 0) | BLOCK_MOVEMENT_SOUTH
-            except ValueError:
-                pass
     return grid
 
 
@@ -1559,7 +1548,7 @@ def test_finds_the_edge_door_standing_on_the_blocked_crossing():
     on one of them. MEASURED live -- a shut door records its blocked edge on BOTH tiles."""
     route = [(1746, 3533), (1746, 3534), (1746, 3535)]
     flags = _open_grid(route, blocked=[((1746, 3534), BLOCK_MOVEMENT_NORTH)])
-    door = _door(1746, 3534)
+    door = _route_door(1746, 3534)
     assert travel.first_door_on_route(route, 0, [door], flags) is door
 
 
@@ -1569,7 +1558,7 @@ def test_finds_the_full_tile_door_standing_on_a_route_tile():
     tile, not because any edge is marked."""
     route = [(3046, 3349), (3046, 3348), (3046, 3347)]
     flags = _open_grid(route, blocked=[((3046, 3348), BLOCK_MOVEMENT_OBJECT)])
-    door = _door(3046, 3348, object_type="GameObject", flags=131328)
+    door = _route_door(3046, 3348, object_type="GameObject", flags=131328)
     assert travel.first_door_on_route(route, 0, [door], flags) is door
 
 
@@ -1579,15 +1568,16 @@ def test_ignores_an_open_door_because_clicking_one_CLOSES_it():
     them, and left-clicking the open one turns a working walk into a wedged one."""
     route = [(1746, 3533), (1746, 3534), (1746, 3535)]
     flags = _open_grid(route, blocked=[((1746, 3534), BLOCK_MOVEMENT_NORTH)])
-    open_door = _door(1746, 3534, actions=("Close",))
+    open_door = _route_door(1746, 3534, actions=("Close",))
     assert travel.first_door_on_route(route, 0, [open_door], flags) is None
 
 
 def test_finds_a_curtain():
     """Taken from Vitalite's name list, which we were missing."""
     route = [(1746, 3533), (1746, 3534)]
-    flags = _open_grid(route, blocked=[((1746, 3534), BLOCK_MOVEMENT_NORTH)])
-    curtain = _door(1746, 3534, name="Curtain")
+    flags = _open_grid(route, blocked=[((1746, 3533), BLOCK_MOVEMENT_NORTH),
+                                       ((1746, 3534), BLOCK_MOVEMENT_SOUTH)])
+    curtain = _route_door(1746, 3534, name="Curtain")
     assert travel.first_door_on_route(route, 0, [curtain], flags) is curtain
 
 
@@ -1595,21 +1585,22 @@ def test_ignores_furniture_that_also_offers_open():
     """Drawers and cupboards fill every Mahogany Homes house and all offer Open. A live scan
     beside Falador's door returned Drawers and a Cupboard within 7 tiles."""
     route = [(1746, 3533), (1746, 3534)]
-    flags = _open_grid(route, blocked=[((1746, 3534), BLOCK_MOVEMENT_NORTH)])
-    drawers = _door(1746, 3534, name="Drawers")
+    flags = _open_grid(route, blocked=[((1746, 3533), BLOCK_MOVEMENT_NORTH),
+                                       ((1746, 3534), BLOCK_MOVEMENT_SOUTH)])
+    drawers = _route_door(1746, 3534, name="Drawers")
     assert travel.first_door_on_route(route, 0, [drawers], flags) is None
 
 
 def test_returns_none_when_the_whole_route_is_clear():
     route = [(1746, 3533), (1746, 3534), (1746, 3535)]
     flags = _open_grid(route)
-    assert travel.first_door_on_route(route, 0, [_door(1746, 3534)], flags) is None
+    assert travel.first_door_on_route(route, 0, [_route_door(1746, 3534)], flags) is None
 
 
 def test_ignores_a_door_on_another_plane():
     route = [(2616, 3317), (2617, 3317)]
     flags = _open_grid(route, blocked=[((2616, 3317), BLOCK_MOVEMENT_EAST)])
-    downstairs = _door(2616, 3317, plane=0)
+    downstairs = _route_door(2616, 3317, plane=0)
     assert travel.first_door_on_route(route, 1, [downstairs], flags) is None
 
 
@@ -1617,7 +1608,16 @@ def test_unknown_flags_never_invent_a_door():
     """An absent collision reading means "cannot tell", never "blocked" -- an un-rebuilt or
     out-of-scene answer must behave as before, not conjure a door to click."""
     route = [(1746, 3533), (1746, 3534)]
-    assert travel.first_door_on_route(route, 0, [_door(1746, 3534)], {}) is None
+    assert travel.first_door_on_route(route, 0, [_route_door(1746, 3534)], {}) is None
+
+
+def test_a_half_known_crossing_yields_no_door():
+    """Deliberately strict: when only ONE side of a crossing has a collision reading we decline
+    to name a door. An unknown reading must never produce a click -- left-clicking an open door
+    CLOSES it, turning a working walk into a wedged one."""
+    route = [(1746, 3533), (1746, 3534)]
+    flags = {(1746, 3533): BLOCK_MOVEMENT_NORTH}      # (1746,3534) unknown
+    assert travel.first_door_on_route(route, 0, [_route_door(1746, 3534)], flags) is None
 
 
 def test_blocked_crossing_reports_the_first_one_only():

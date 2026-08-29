@@ -260,7 +260,11 @@ def first_door_on_route(route, plane: int, objects: list, flags: dict, start: in
     crossing = blocked_crossing_on_route(route, flags, start, lookahead)
     if crossing is None:
         return None
-    # Verify the crossing is blocked by known flags, not missing data
+    # Require known flags on BOTH tiles to report a door. An unknown flag means "cannot tell",
+    # which must never produce a click -- left-clicking an OPEN door CLOSES it, turning a
+    # working walk into a wedged one. This is stricter than the edge-blocking rule (either side
+    # proves a shut door when both are known) but correctness demands it when acting on missing
+    # data could produce a worse outcome than doing nothing.
     a, b = crossing
     if flags.get(a) is None or flags.get(b) is None:
         return None
