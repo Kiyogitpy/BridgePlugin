@@ -372,6 +372,44 @@ steps above.
   anti-detection humanization, not a targeting bug — code that reacts to a click's outcome must
   handle this (see golem_crafting.py's mining reclick gate for an example of a bug this caused:
   waiting forever for an inventory change that a misclick will never produce).
+- **`controller.py` EXISTS TWICE in a running process, so its module-level state is duplicated.**
+  It is run as a script (`python controller.py routines/x.py`), so it lives in `sys.modules` as
+  `__main__` — and every routine and shared module then does `import controller`, which loads the
+  same file AGAIN under the name `controller`. Python caches by NAME, so those are two distinct
+  module objects. PROVEN 2026-08-30 by loading it both ways and comparing identity, after the
+  numbers in a log stopped adding up (an idle-drift line claiming 3.1s of stillness one second
+  after a click).
+  The engine loop lives in `__main__`; routine calls go through `controller`. So **any
+  module-level variable one of them writes, the other cannot see.** Confirmed casualties:
+  `_last_mouse_activity` and `_busy_until` (the idle drift never saw routine activity at all, and
+  drifted straight through active play), and `_fidget_ser` (in-wait fidgeting has never fired for
+  a routine-side wait). `FIRMWARE_PROTOCOL` is safe only because nothing outside `controller.py`
+  reads it.
+  **Anything that must be shared across those copies belongs in its own module** —
+  `input_state.py` exists for exactly this and is only ever imported by name, so there is one of
+  it however many times `controller.py` is loaded. `tests/test_controller.py` has a test that
+  fails the moment shared input state migrates back into `controller.py`.
+  THE AUDIT IS NOT FINISHED: only the three variables above were checked. This class of bug fails
+  SILENTLY — nothing errors, the state simply never arrives — so the remaining module-level
+  mutable state in `controller.py` is worth a deliberate sweep rather than waiting for the next
+  symptom.
+
+- **The panic key can go dead SILENTLY under load, so it has two independent paths.**
+  USER-REPORTED live 2026-08-30, mid-run: F1 and F2 both stopped responding while the routine was
+  still driving the mouse. `keyboard.wait()` rides a Windows LOW-LEVEL HOOK, and Windows silently
+  REMOVES such a hook when its callback overruns `LowLevelHooksTimeout` (default 300ms; confirmed
+  not overridden on this machine). Once dropped it is gone for the life of the process, with no
+  error anywhere. The suspected trigger was the hotspot burst having just become much busier — a
+  tight click loop making two extra HTTP calls per click is exactly the GIL pressure that starves
+  such a callback — though that specific causation is inferred, not proven.
+  `_async_key_watchdog` polls `GetAsyncKeyState` on a daemon thread instead: no hook, so nothing
+  to lose, and it keeps working when the foreground window is elevated. F1 runs BOTH paths
+  (`panic_exit` is a hard `os._exit`, so a double fire is harmless); F2 runs ONLY the polled one
+  and is edge-triggered, because toggling is not idempotent and two paths would cancel each press
+  out. Panic HAD this redundancy until 2026-08-27, when it was unified to one mechanism for
+  symmetry with pause — **that unification is what removed the protection this failure needed.**
+  Do not re-unify them.
+
 - **Arduino serial port**: only one process can hold the COM port at a time. The MCP debug
   server no longer touches it at all (read-only bridge queries only, see above) — the only real
   contender is a stray/leftover `controller.py` process.
@@ -521,6 +559,43 @@ steps above.
   "still shut" about a door that worked -- the confirmation also succeeds on `_crossed()` (the
   player having crossed the door's blocked edge since the click), because getting through is the
   outcome that matters, not the doorway's state at poll time.
+  **PARTLY SUPERSEDED 2026-08-30.** A good share of those "still shut" timeouts was not the door
+  swinging at all: `_open_door` clicked with a BARE `click_entity` and so aimed at the pixel the
+  door occupied when the ROUTE was computed, while the player was still walking toward it. The
+  recorder showed every click registering as `Open Door` because the MENU resolved correctly --
+  but a stale aim still lands somewhere useless. It now passes `refresh_target`; see "A click's
+  DEPARTURE is aimed too" above. Both effects are real; do not assume a "still shut" log means
+  the door closed behind you until the aim has been ruled out.
+
+- **ADJACENCY IS NOT INTERACTABILITY, and `goal_adjacent` does not give you a tile you can act
+  from.** `worldmap.find_path(goal_adjacent=True)` stops at ANY tile cardinally adjacent to the
+  goal — and it never has to cross a wall to get there, so the route is perfectly valid by the
+  static map's own rules while the tile it lands on cannot touch the target at all. MEASURED live
+  2026-08-30 at BARBARA's: the Bed hotspot at (1749,3539) has its north and east edges walled
+  (16416 / 65664) and only its south and west open (135432 / 132354), both inside the bedroom.
+  The walker parked on the north tile, `can_reach` went on (correctly) answering False, and the
+  routine sat there until its ceiling stopped it. `travel.interaction_tiles(goal)` answers the
+  question that actually matters — which tiles have an OPEN EDGE to the target — from live
+  collision, and walking to one of those routes through the bedroom door, which
+  `open_door_toward` then finds as an ordinary door on the route. Empty means "cannot tell";
+  fall back rather than refuse to work.
+
+- **A route can cross a tile that live collision refuses, so `walk_to` re-routes around it --
+  EXCEPT when a shut door is standing there.** The static map is not live: it cannot know what is
+  standing on a tile right now, and it bakes doors OPEN. MEASURED live 2026-08-30 at TAU's,
+  Falador, where the door is DIAGONAL — which the game cannot express as a `WallObject` on a
+  cardinal edge, so it is a `GameObject` blocking its WHOLE TILE both open and shut. OPENING it
+  therefore does not clear a tile, it MOVES a full-tile blocker: door 24051 ("Close") sat on
+  (3046,3347) reading 131841, the route ran straight through, `_hop_index` refused the first
+  crossing and the walk died one tile from the door. `worldmap.find_path` now takes `avoid=` and
+  `walk_to` feeds it tiles it has learned are really blocked (`WALK_MAX_REROUTES`, 4). The detour
+  is normally free — at TAU's it was the SAME 51 steps.
+  **The exception is load-bearing and cost a regression to find:** at ROSS's the only way in is a
+  SHUT door at (2610,3316), and after the door budget was spent the reroute excluded that very
+  tile, leaving no route at all — failing HARDER than before the reroute existed. A shut door is
+  to be OPENED, never routed around. `_door_on_route` is the discriminator and it is exact: it
+  only ever returns a door offering "Open", so TAU's open leaf ("Close") is avoided and ROSS's
+  shut door is not.
 
 - **MINIMAP for distance, viewport only for short precise hops -- and every viewport walk click
   is SHIFT-clicked.** User directive 2026-08-29. `_hop_to` used to prefer a viewport click
@@ -744,21 +819,40 @@ accessor you need is already there before proposing a new provider.
   hover-parking through a wait still works; it skips when a right-click menu is open (moving
   off one closes it), the window is unfocused, or an abort is set; it only ever lengthens a
   wait, never shortens it; and it arms only via `register_fidget_serial(ser)` in main() — an
-  import without the Arduino keeps the old plain sleep. KNOWN BLIND SPOT, deliberate:
+  import without the Arduino keeps the old plain sleep. **CAVEAT FOUND 2026-08-30 and NOT yet
+  fixed: `main()` runs in `__main__`, so it arms THAT copy's `_fidget_ser`, while a routine
+  calling `controller.human_delay` reaches the other copy, where it is still `None`. So in-wait
+  fidgeting has never actually fired for a routine-side wait** — see "controller.py exists
+  twice", below. The live verification recorded below measured freeze TAILS, which this would
+  not have shown. KNOWN BLIND SPOT, deliberate:
   routines' own 0.2-0.5s-per-iteration poll loops never enter this path; Phase B (a
   background fidgeter behind a global action lock) exists as a design only.
   **VERIFIED live 2026-08-27** (recordings/2026-08-27_023951_phase-a-verify, 3.8 active min of
   slayer): freeze tail dead (max 103s → 8.5s, p90 11.8s → 7.1s), settles firing correctly, no
   interference — but the residual p90 sat exactly at the then-4-9s idle-move timer, i.e. the
   TIMER was the new ceiling. `maybe_idle_mouse_move` therefore no longer runs on wall-clock at
-  all: it triggers on time since the last DELIBERATE cursor movement (`_last_mouse_activity`,
-  bumped at move_to_human entry, so clicks/walks/fidgets all reset it) with the budget drawn
-  from the same measured still-segment distribution — an actively-clicking routine never pays
-  a pre-action drift (the old timer fired unconditionally before every tick, so naively
-  tightening it would have taxed every action), while genuine idle fills in at human cadence.
-  NOT yet re-measured live; next live session, re-run the same diff on a 30+ active-minute
-  recording — if still-p90 stays >4-5s after this, the remaining freezes are the poll-loop
-  blind spot and Phase B is what's left.
+  all: it triggers on time since the last DELIBERATE cursor movement, with the budget drawn
+  from the same measured still-segment distribution.
+  **CORRECTED 2026-08-30 — the sentence above was NOT true in practice, for two separate
+  reasons, and both are now fixed.** (a) The marker lived in `controller.py`, which is loaded
+  TWICE in a running process (see "controller.py exists twice", below), so the engine read one
+  copy while every routine click bumped the other: the trigger never saw routine activity at
+  all and fired continuously through active play. It now lives in `input_state.py`. (b) Even
+  once shared, the drawn budget can be ~1s, which is well inside the ordinary gap between two of
+  our own actions, so it still drifted mid-work — MEASURED 14 drifts per 48 clicks, 5 of them
+  after under 2.5s. `IDLE_MOVE_MIN_STILL_S` (4.0) is now a floor beneath the drawn budget; the
+  same measurement this feature rests on says the human is NEVER still longer than 4.5s, so a
+  drift at 1.3s was out-moving them rather than imitating them. AFTER: 7 drifts, stillness
+  `[4.0, 4.4, 4.4, 17.7, 4.0, 4.5, 4.5]`s, none under 4s. USER-REPORTED throughout as the cursor
+  being "dragged back" mid-work; `maybe_idle_mouse_move` now LOGS every drift, because one that
+  moves the cursor with no click is otherwise invisible in a log full of clicks — which is
+  exactly how it hid.
+  Routines can also declare themselves busy (`controller.mark_busy(seconds)`) — belt and braces,
+  and NOT sufficient on its own: marking work_phase busy left `_climb` unmarked and the drifts
+  simply reappeared there. Prefer the floor; reach for `mark_busy` only for a genuinely long
+  pending action.
+  Still not re-measured on a 30+ active-minute recording; if still-p90 stays >4-5s the remaining
+  freezes are the poll-loop blind spot and Phase B is what's left.
 - The fitting scripts live in the session scratchpad, not the repo; the numbers and method are
   recorded in the settings comments. Reach segmentation: movement bursts split on 150ms
   stillness, kept if ≥30px and 80-3000ms; stillness stats count only ACTIVE play (a click
@@ -1573,6 +1667,52 @@ notes inline correct where they matter most.
   2026-08-29 by `worldmap.py`, whose own module docstring opens with this exact measurement as
   its reason to exist: the static map covers all four planes, so an upstairs route is now no
   different from a ground-floor one.
+
+**Live session 2026-08-30, first run against the global collision map. Nine routing/aiming bugs.
+The single most useful thing to carry forward is the SHAPE four of them shared.**
+
+- **A RECOVERY THAT SITS BEHIND AN EARLY-RETURNING GATE CANNOT RUN.** `work_phase` checks
+  `travel.can_reach` and RETURNS when it is False. Three separate recoveries lived *after* that
+  gate, in the `HOTSPOT_UNREACHABLE_CLICKS` branch — NOELLA's split-floor climb-down, NORMAN's
+  "head for the hotspot, not the standing tile", and the ladder handling — so on the very homes
+  they were written for they could never execute. They only ever fired when reachability was
+  UNKNOWN (`None`), which is exactly why **their unit tests passed while the live case wedged**:
+  the tests exercised the None path, not the False path. When adding a recovery, ask which gate
+  returns before it, and write the test against the answer the live failure actually produces.
+- **`standingLocation` is a per-home HINT, not a tile you can stand on** (LEELA's is solid on all
+  four edges), and it is ALWAYS reported at plane 0 — so no walk should ever demand an exact
+  route to it, and a walk aimed at it from an upper floor cannot succeed in any circumstance.
+  `travel_phase` now climbs first when the planes differ.
+- **Every loop needs a ceiling, and the ones that lacked them were the ones that hurt.**
+  `travel_phase`'s walk branch and `work_phase`'s unreachable branch both logged nothing and
+  counted nothing — two live stalls of 79 ticks and 46s with ZERO output, indistinguishable from
+  a healthy idle routine. Both are now counted and safety-stop. A silent loop is worse than a
+  crash: it looks like it is working.
+
+**Hotspot clicks are a BURST, not a click, and the numbers come from the user's own recordings.**
+MEASURED across four human sessions (n=1194 hotspot actions): median gap between clicks **0.20s**,
+p25 0.18s, 339 of 500 bursts are more than one click on the same option (mean 2.46, max 8), and
+Remove->Build median **2.06s**. The bot on the same activity managed 3.89s / 3.62s, because the
+gate was a fixed wall-clock cooldown that always paid the worst case. So the gate is now a
+SIGNAL:
+
+- Keep clicking until the hotspot's varbit moves, then **carry straight on into the next action**
+  (Remove -> Build is the same object id) rather than handing back to the ~1.1s engine loop.
+- **Construction XP is the "the build landed" signal** (USER: "remove is nearly instant so we can
+  keep clicking until we get experience drop") — Remove pays no XP, Build/Repair does, and
+  `constructionXp` on `/player` is sub-tick. The varbit is the secondary "an action landed,
+  re-aim" trigger.
+- **Aim once, then click IN PLACE** (`click_human`), which is what the human's 0.20s cadence
+  actually is — re-flying the cursor for every repeat costs 1.0-1.1s each. But **re-aim whenever
+  the player has moved or the model changed**: standing still the projection cannot slide, moving
+  it slides continuously. USER: "if we continuously click we gotta update the object x y otherwise
+  while we move we click away".
+- **Do NOT stop the burst because the player is walking.** The ROSS reasoning (re-clicking
+  mid-walk re-queues and re-paths) applies to a re-AIMED click on a later tick, not to an in-place
+  repeat, and the human recordings spam straight through the approach. A burst spent walking must
+  also not count as a failed attempt, or the unreachable guard walks away from a hotspot we are
+  still on our way to.
+- NOT yet verified at scale: the best post-change sample is n=5.
 
 **First long live session, 2026-08-28 — everything below was MEASURED, don't re-derive it.**
 
