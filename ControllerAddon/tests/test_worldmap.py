@@ -73,3 +73,78 @@ def test_indexer_packs_the_documented_layout():
     assert worldmap.Indexer.packed(0, 1, 0) == 1 << 14
     assert worldmap.Indexer.packed(0, 0, 1) == 1 << 28
     assert worldmap.Indexer.SET_MEANS_PASSABLE is True
+
+
+import time
+
+
+# MEASURED 2026-08-29. BFS on unit-weight edges gives a unique shortest LENGTH regardless of
+# neighbour visiting order, so these are stable even if the particular tiles chosen differ.
+def test_routes_upstairs_where_shortest_path_returns_nothing():
+    path = worldmap.find_path(2617, 3317, 1, 2617, 3316)
+    assert path is not None
+    assert len(path) == 4
+    assert path[0] == (2617, 3317)
+    assert path[-1] == (2617, 3316)
+
+
+def test_routes_from_outside_a_house_to_inside_it():
+    """Straight through Ross's front door, which the map treats as open."""
+    path = worldmap.find_path(2614, 3319, 0, 2616, 3318)
+    assert path is not None and len(path) == 30
+
+
+def test_routes_across_a_city():
+    path = worldmap.find_path(3013, 3355, 0, 3037, 3346)
+    assert path is not None and len(path) == 42
+
+
+def test_routes_between_cities():
+    path = worldmap.find_path(2965, 3379, 0, 3213, 3424)
+    assert path is not None and len(path) == 314
+
+
+def test_a_cross_city_route_stays_fast_enough_to_run_every_hop():
+    started = time.time()
+    worldmap.find_path(2965, 3379, 0, 3213, 3424)
+    assert time.time() - started < 1.0
+
+
+def test_a_furniture_goal_has_no_exact_route_but_an_adjacent_one():
+    """ROSS's Broken Range at (2617,3318) is furniture, so nothing can route ONTO it. This is
+    what travel._routable_goal used to paper over; goal_adjacent replaces it."""
+    assert worldmap.find_path(2614, 3319, 0, 2617, 3318) is None
+    adjacent = worldmap.find_path(2614, 3319, 0, 2617, 3318, goal_adjacent=True)
+    assert adjacent is not None and len(adjacent) == 4
+
+
+def test_goal_adjacent_succeeds_immediately_when_already_beside_the_goal():
+    """Barbara's, the live geometry from 2026-08-29: the player stood one tile from a hotspot
+    it could not reach. Being adjacent is the routing answer; whether the EDGE is open is
+    travel.can_reach's question, not this one's."""
+    path = worldmap.find_path(1750, 3536, 0, 1749, 3536, goal_adjacent=True)
+    assert path == [(1750, 3536)]
+
+
+def test_a_walled_off_goal_returns_none_rather_than_a_wrong_route():
+    assert worldmap.find_path(1750, 3536, 0, 1749, 3536) is None
+
+
+def test_the_node_cap_bounds_a_hopeless_search():
+    assert worldmap.find_path(2965, 3379, 0, 3213, 3424, max_nodes=100) is None
+
+
+def test_reachable_from_returns_distances_including_the_start():
+    reach = worldmap.reachable_from(2617, 3317, 1)
+    assert reach[(2617, 3317)] == 0
+    assert (2617, 3316) in reach
+    assert reach[(2617, 3316)] == 3
+    # East and south are walled off at this tile; nothing beyond them is in the fill.
+    assert (2618, 3317) not in reach
+
+
+def test_reachable_from_respects_its_radius():
+    reach = worldmap.reachable_from(3213, 3424, 0, radius=3, max_nodes=10_000)
+    assert reach
+    for x, y in reach:
+        assert max(abs(x - 3213), abs(y - 3424)) <= 3
