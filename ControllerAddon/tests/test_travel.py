@@ -391,6 +391,54 @@ def test_can_reach_is_false_through_a_wall_even_at_distance_one(monkeypatch):
         "a wall on the shared edge means unreachable, however close we stand"
 
 
+# MEASURED LIVE 2026-08-29 at MARIAH's, the second silent deadlock of the session. A multi-tile
+# object is reported at ONE anchor tile, so the anchor's own eight neighbours can all be blocked
+# while the object's OTHER half stands beside a perfectly walkable tile. Table 40002 was reported
+# at (1769,3622) with every neighbour blocked (Chairs north and south, its own blocking east and
+# west), while (1768,3622) -- the same object's west half, flags 131328 -- is cardinally adjacent
+# to walkable (1767,3622). USER: "can reach on west side of that table".
+#
+# can_reach said False, work_phase took its unreachable branch, and because the branch's walk goal
+# was already within HOUSE_ARRIVAL_TOLERANCE the whole tick became a no-op that logged nothing and
+# advanced no counter -- 79 ticks of total silence the first time, 46s the second.
+
+def test_can_reach_reaches_a_multi_tile_object_by_its_other_half(monkeypatch):
+    cells = {(1766, 3622): 0, (1767, 3622): 0, (1767, 3623): 0, (1766, 3621): 0,
+             # the Table: anchor plus its west half, both OBJECT-blocked
+             (1769, 3622): travel.BLOCK_MOVEMENT_OBJECT,
+             (1768, 3622): travel.BLOCK_MOVEMENT_OBJECT,
+             # Chairs boxing the anchor in north and south
+             (1769, 3621): travel.BLOCK_MOVEMENT_OBJECT,
+             (1769, 3623): travel.BLOCK_MOVEMENT_OBJECT,
+             (1770, 3622): travel.BLOCK_MOVEMENT_OBJECT}
+    monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=6: _grid(cells))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1767, "y": 3622, "plane": 0})
+
+    reach = travel.reachable_set(1767, 3622, 0)
+    assert (1768, 3622) not in reach and (1769, 3622) not in reach
+
+    assert travel.can_reach({"x": 1769, "y": 3622, "plane": 0}, reach) is True,         "the object's west half is beside a walkable tile, so the object is reachable"
+
+
+def test_can_reach_does_not_extend_through_a_WALL_blocked_neighbour(monkeypatch):
+    """The footprint extension above must key on BLOCK_MOVEMENT_OBJECT and nothing else.
+
+    A WALL blocks with the directional MOVEMENT_* bits and never carries 256 -- ROSS's exterior
+    wall reads 65664/16416 -- so extending onto a wall tile would put back the exact "clicking
+    through a wall" regression the edge test was added to kill. USER on that one: "stuck outside
+    ross again... this is absurd"."""
+    cells = {(2617, 3320): 0,
+             (2617, 3319): travel.BLOCK_MOVEMENT_SOUTH,
+             # the wall tile between us and the goal -- directional bits ONLY, no OBJECT bit
+             (2617, 3318): travel.BLOCK_MOVEMENT_NORTH | travel.BLOCK_MOVEMENT_SOUTH,
+             (2617, 3317): travel.BLOCK_MOVEMENT_OBJECT}
+    monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=6: _grid(cells))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2617, "y": 3320, "plane": 0})
+
+    reach = travel.reachable_set(2617, 3320, 0)
+    assert travel.can_reach({"x": 2617, "y": 3317, "plane": 0}, reach) is not True,         "a wall-blocked tile is not another half of the goal object"
+
+
 def test_can_reach_is_true_diagonally_when_a_corner_route_is_open(monkeypatch):
     # JEFF's upstairs: player (3241,3447), hotspot (3242,3446) whose cardinal neighbours are all
     # furniture -- unwalkable, but with no wall on the edges, so the corner route reaches.
@@ -831,6 +879,100 @@ def test_open_door_toward_does_nothing_when_the_way_is_clear(walker, monkeypatch
     assert walker["clicked"] == []
 
 
+# MEASURED LIVE 2026-08-29 at TAU's house, Falador -- the run's third safety stop. TAU's door is
+# DIAGONAL, which the game cannot model as a WallObject on a cardinal edge, so it is a GameObject
+# blocking its WHOLE tile both open and shut. OPENING it does not clear a tile, it MOVES the
+# full-tile blocker: door 24051 ("Close") stood on (3046,3347) reading 131841
+# (BLOCK_LINE_OF_SIGHT_FULL | BLOCK_MOVEMENT_OBJECT). The static map bakes doors open and knows
+# nothing of where a leaf rests, so find_path routed through that tile; _hop_index refused the
+# very first crossing against live flags, the hop collapsed onto the player's own tile, and
+# walk_to returned False with "route makes no further progress" -- 35 tiles from the bank.
+#
+# The detour is free: re-routing with that one tile avoided is the SAME 51 steps live.
+
+def test_walk_to_reroutes_around_a_tile_blocked_only_in_LIVE_collision(walker, monkeypatch):
+    walker["pos"] = (3047, 3347, 0)
+    leaf = (3046, 3347)
+
+    through = [(3047, 3347), leaf, (3046, 3348), (3045, 3348), (3044, 3348)]
+    around = [(3047, 3347), (3047, 3348), (3046, 3348), (3045, 3348), (3044, 3348)]
+
+    def fake_find_path(sx, sy, plane, gx, gy, goal_adjacent=False, avoid=None, **kw):
+        return around if (avoid and leaf in avoid) else through
+
+    monkeypatch.setattr(travel.worldmap, "find_path", fake_find_path)
+    # The leaf tile is object-blocked; everything else is clear.
+    cells = {t: 0 for t in through + around}
+    cells[leaf] = travel.BLOCK_MOVEMENT_OBJECT
+    monkeypatch.setattr(controller, "get_collision",
+                        lambda x, y, plane, radius=6: _grid(cells))
+
+    assert travel.walk_to(_Ctx(), {"x": 3044, "y": 3348, "plane": 0}) is True
+    assert leaf not in walker["hops"], "must not hop onto the tile the open door leaf occupies"
+    assert walker["hops"], "should have walked the detour rather than giving up"
+
+
+def test_walk_to_does_not_route_around_a_shut_door_it_should_open(walker, monkeypatch):
+    """MEASURED LIVE 2026-08-30 at ROSS's, and a regression the reroute itself introduced.
+
+    ROSS's front door at (2610,3316) is the ONLY way in. The walker correctly identified it and
+    tried to open it three times (DOOR_MAX_OPENS_PER_WALK); each attempt timed out. With the door
+    budget spent, the reroute then excluded that tile as "blocked in live collision" -- removing
+    the single tile the route needs, so no route existed at all and the walk failed harder than
+    before the reroute was added.
+
+    A shut door is to be OPENED, not routed around. The distinction is exact and comes from the
+    object's own actions: TAU's blocker was an OPEN door's leaf ("Close"), which is genuinely
+    immovable furniture and SHOULD be avoided; ROSS's is a shut door ("Open"), which should not.
+    """
+    walker["pos"] = (2612, 3316, 0)
+    door_tile = (2610, 3316)
+    route = [(2612, 3316), (2611, 3316), door_tile] + [(2609 - i, 3316) for i in range(18)]
+
+    avoided = {}
+
+    def fake_find_path(sx, sy, plane, gx, gy, goal_adjacent=False, avoid=None, **kw):
+        if avoid:
+            avoided["set"] = set(avoid)
+            return None
+        return route
+
+    monkeypatch.setattr(travel.worldmap, "find_path", fake_find_path)
+    cells = {t: 0 for t in route}
+    cells[door_tile] = travel.BLOCK_MOVEMENT_OBJECT
+    monkeypatch.setattr(controller, "get_collision",
+                        lambda x, y, plane, radius=6: _grid(cells))
+    # A SHUT door stands on it -- the thing _door_on_route finds.
+    monkeypatch.setattr(travel, "_door_on_route",
+                        lambda route_, plane, flags, start=0: {
+                            "id": 40178, "name": "Door", "x": door_tile[0], "y": door_tile[1],
+                            "plane": 0, "actions": ["Open"]})
+    monkeypatch.setattr(travel, "_open_door", lambda ctx, door, recheck: False)
+
+    travel.walk_to(_Ctx(), {"x": 2592, "y": 3316, "plane": 0})
+
+    assert door_tile not in avoided.get("set", set()),         "a shut door must be opened, never excluded from the route"
+
+
+def test_walk_to_still_fails_when_no_detour_exists(walker, monkeypatch):
+    """The reroute must not become an infinite retry. When avoiding the blocked tile leaves no
+    route at all, walk_to still returns a definite False."""
+    walker["pos"] = (3047, 3347, 0)
+    leaf = (3046, 3347)
+    through = [(3047, 3347), leaf] + [(3046 - i, 3348) for i in range(20)]
+
+    def fake_find_path(sx, sy, plane, gx, gy, goal_adjacent=False, avoid=None, **kw):
+        return None if (avoid and leaf in avoid) else through
+
+    monkeypatch.setattr(travel.worldmap, "find_path", fake_find_path)
+    cells = {t: 0 for t in through}
+    cells[leaf] = travel.BLOCK_MOVEMENT_OBJECT
+    monkeypatch.setattr(controller, "get_collision",
+                        lambda x, y, plane, radius=6: _grid(cells))
+
+    assert travel.walk_to(_Ctx(), {"x": 3027, "y": 3348, "plane": 0}) is False
+
+
 def test_walk_to_gives_up_after_the_stall_budget_when_no_door_explains_it(walker, monkeypatch):
     """walk_to's STALL branch, previously uncovered. `test_a_door_on_the_route_is_opened_before_
     hopping` (née test_a_stall_opens_the_door_on_the_route) does NOT reach this branch -- its door
@@ -850,3 +992,76 @@ def test_walk_to_gives_up_after_the_stall_budget_when_no_door_explains_it(walker
 
     assert travel.walk_to(_Ctx(), {"x": 3219, "y": 3200, "plane": 0}) is False
     assert walker["clicked"] == [], "no door was ever found -- nothing should have been clicked"
+
+
+def test_a_door_click_re_aims_while_we_walk_to_it(monkeypatch):
+    """USER 2026-08-30: "i think the door isnt updated when we try to click it, nearly always
+    lands somewhere else".
+
+    Exactly right, and it is the same class of bug as the hotspot burst. _open_door clicked with
+    a BARE click_entity -- no refresh_target -- so it aimed at the pixel the door occupied when
+    the ROUTE was computed, while the player was still walking toward it. By the time the cursor
+    arrived the projection had slid, and the click landed on whatever was now under it.
+
+    This very likely explains the door failures measured the same night: ROSS's front door logged
+    three consecutive "still shut" timeouts (2.7s, 4.1s, 6.2s budgets, all spent) while the
+    recorder showed clicks registering -- and a stale aim produces precisely that, a click that
+    goes somewhere harmless and a doorway that never opens.
+
+    object_refresh_target re-resolves the door's live screen position from /object/at, which is
+    un-cached, so the aim tracks through the flight. CLAUDE.md calls this the preferred pattern
+    for every click site where the player may be moving."""
+    kwargs = {}
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3048, "y": 3348, "plane": 0})
+    monkeypatch.setattr(controller, "object_refresh_target",
+                        lambda x, y, plane, obj_id, **kw: ("refresh", x, y, plane, obj_id))
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: kwargs.update(kw) or True)
+
+    door = {"id": 24050, "name": "Door", "x": 3046, "y": 3348, "plane": 0,
+            "actions": ["Open"], "screenX": 100, "screenY": 100}
+
+    travel._open_door(_Ctx(), door, lambda: None)
+
+    assert kwargs.get("refresh_target") == ("refresh", 3046, 3348, 0, 24050),         "a door click must track the door's live screen position while we walk to it"
+
+
+# MEASURED LIVE 2026-08-30 at BARBARA's. The Bed hotspot 40013 sits at (1749,3539) inside the
+# bedroom. Its four neighbours, by LIVE collision:
+#
+#   (1749,3540) north  flags 16416   edge CLOSED   <- the bedroom's north WALL
+#   (1750,3539) east   flags 65664   edge CLOSED
+#   (1749,3538) south  flags 135432  edge OPEN     <- inside the bedroom
+#   (1748,3539) west   flags 132354  edge OPEN     <- inside the bedroom
+#
+# worldmap.find_path(goal_adjacent=True) stops at ANY tile cardinally adjacent to the goal, so it
+# happily returned a two-step route ending on (1749,3540) -- it never had to cross the wall, so
+# the route is valid by the MAP's rules. But you cannot interact with the bed from there, so
+# can_reach kept answering False and the routine sat outside the wall until the ceiling stopped
+# it. ADJACENCY IS NOT INTERACTABILITY, and the static map cannot tell a wall from furniture.
+#
+# interaction_tiles answers the question that actually matters: which tiles can I act on this
+# thing FROM. Walking to one of those routes through the bedroom door (7452 at (1748,3537)),
+# which is then an ordinary door on the route for open_door_toward to find.
+
+def test_interaction_tiles_only_returns_tiles_with_an_open_edge_to_the_goal(monkeypatch):
+    cells = {(1749, 3539): 138510,   # the bed itself
+             (1749, 3540): 16416,    # north: wall between it and the bed
+             (1750, 3539): 65664,    # east: wall
+             (1749, 3538): 135432,   # south: open
+             (1748, 3539): 132354}   # west: open
+    monkeypatch.setattr(controller, "get_collision",
+                        lambda x, y, plane, radius=6: _grid(cells))
+
+    tiles = travel.interaction_tiles({"x": 1749, "y": 3539, "plane": 0})
+
+    assert (1749, 3538) in tiles and (1748, 3539) in tiles
+    assert (1749, 3540) not in tiles, "the bedroom's north wall is not an approach tile"
+    assert (1750, 3539) not in tiles
+
+
+def test_interaction_tiles_is_empty_when_the_client_cannot_tell(monkeypatch):
+    """Same contract as every other live-collision consumer: empty means "cannot tell", and the
+    caller must fall back rather than refuse to work."""
+    monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=6: [])
+    assert travel.interaction_tiles({"x": 1749, "y": 3539, "plane": 0}) == []

@@ -323,7 +323,8 @@ _CARDINAL_STEPS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
 
 def find_path(sx: int, sy: int, plane: int, gx: int, gy: int, *,
-              goal_adjacent: bool = False, max_nodes: int = MAX_SEARCH_NODES):
+              goal_adjacent: bool = False, max_nodes: int = MAX_SEARCH_NODES,
+              avoid: set | None = None):
     """Shortest cardinal route from (sx, sy) to (gx, gy) on `plane`, INCLUDING the start tile.
     None when no walking route exists within `max_nodes`.
 
@@ -344,6 +345,15 @@ def find_path(sx: int, sy: int, plane: int, gx: int, gy: int, *,
     Cardinal-only, matching the map's edge model. The client walks its own diagonals, so this
     route is LONGER than the walk the player actually performs -- which is why travel picks
     each hop by distance from the player rather than by index along the route.
+
+    `avoid` is a set of (x, y) the route may not step onto. It exists because this map is STATIC
+    and cannot know what is standing on a tile right now: doors are baked open and it cannot tell
+    furniture from a wall. MEASURED live 2026-08-29 at TAU's, Falador -- a DIAGONAL door, which
+    the game models as a GameObject blocking its WHOLE tile rather than a WallObject on an edge,
+    so OPENING it merely moves a full-tile blocker onto another tile (24051 on (3046,3347), flags
+    131841). The route ran straight through it, live collision refused the step, and the walk
+    died one tile from the door. travel.walk_to now feeds tiles it has learned are really blocked
+    back in here and asks again. The start tile is never excluded -- we are standing on it.
     """
     start = (sx, sy)
     goal = (gx, gy)
@@ -375,7 +385,9 @@ def find_path(sx: int, sy: int, plane: int, gx: int, gy: int, *,
         x, y = current
         for dx, dy in _CARDINAL_STEPS:
             neighbour = (x + dx, y + dy)
-            if neighbour not in previous and passable(x, y, plane, dx, dy):
+            if neighbour in previous or (avoid and neighbour in avoid):
+                continue
+            if passable(x, y, plane, dx, dy):
                 previous[neighbour] = current
                 queue.append(neighbour)
     return None

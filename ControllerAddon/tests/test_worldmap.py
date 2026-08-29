@@ -180,6 +180,39 @@ def test_goal_adjacent_succeeds_immediately_when_already_beside_the_goal():
     assert path == [(1750, 3536)]
 
 
+# MEASURED LIVE 2026-08-29 at TAU's house, Falador. The static map bakes every door OPEN and does
+# not model where an opened door's LEAF comes to rest -- and at TAU's the door is DIAGONAL, which
+# the game cannot express as a WallObject on a cardinal edge, so it is a GameObject that blocks its
+# WHOLE TILE both open and shut. Opening it therefore does not clear a tile, it MOVES a full-tile
+# blocker: door 24051 ("Close") sat on (3046,3347) reading flags 131841
+# (BLOCK_LINE_OF_SIGHT_FULL | BLOCK_MOVEMENT_OBJECT). find_path routed straight through that tile,
+# live collision refused it, the hop collapsed onto the player's own tile and walk_to reported
+# "route makes no further progress" -- 35 tiles from a bank it then tried to open anyway.
+#
+# `avoid` is what lets the walker ask for the SAME route again minus a tile it has just learned is
+# blocked in reality. Deliberately general rather than door-specific: the static map cannot tell
+# furniture from a wall anywhere, so "re-route around what live collision refuses" is the whole
+# class of fix, not a special case.
+
+def test_find_path_routes_around_a_tile_in_avoid():
+    direct = worldmap.find_path(3047, 3347, 0, 3040, 3348, goal_adjacent=True)
+    assert direct is not None
+
+    blocked = direct[1]
+    detour = worldmap.find_path(3047, 3347, 0, 3040, 3348, goal_adjacent=True,
+                                avoid={blocked})
+    assert detour is not None, "a single blocked tile must not make the whole target unreachable"
+    assert blocked not in detour
+    assert detour[0] == (3047, 3347)
+
+
+def test_avoid_can_make_a_goal_genuinely_unreachable():
+    """Walling the start in with `avoid` must return None, not a route that ignores it."""
+    walled = {(3048, 3347), (3046, 3347), (3047, 3348), (3047, 3346)}
+    assert worldmap.find_path(3047, 3347, 0, 3040, 3348, goal_adjacent=True,
+                              avoid=walled) is None
+
+
 def test_a_walled_off_goal_returns_none_rather_than_a_wrong_route():
     assert worldmap.find_path(1750, 3536, 0, 1749, 3536) is None
 

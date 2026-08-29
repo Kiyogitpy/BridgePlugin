@@ -440,6 +440,22 @@ MISCLICK_RECLICK_DELAY_S = (0.25, 0.55)
 # routine actively driving the mouse never pays a pre-action drift, and only genuine idle is
 # filled in. The old MIN/MAX interval constants are gone with the wall-clock timer.
 IDLE_MOUSE_MOVE_RADIUS_PX = 30      # px; how far the idle drift wanders from the cursor's current spot
+# The drift exists to kill FREEZES, so it must not fire inside the ordinary gaps between our own
+# actions. MEASURED live 2026-08-30 across three attempts at this: drifts were firing after as
+# little as 1.3s of stillness, repeatedly, while the routine was actively clicking hotspots --
+# each one walking the cursor off target so the next click flew it back. USER, three times over:
+# "when we flick i think the idle function drags back the mouse" ... "seems like flicking still
+# happen" ... "we still flick like crazy".
+#
+# Marking individual call sites busy did NOT work: work_phase got a mark_busy and the drifts
+# simply reappeared inside _climb, which has none. Every clicking path would need one, and new
+# ones keep appearing -- so the floor lives HERE instead, in one place, where no call site can
+# forget it.
+#
+# 4.0s is not a hunch. The same measurement this whole feature rests on (see the In-wait
+# fidgeting block below) found the human is NEVER still longer than 4.5s. A drift at 1.3s is not
+# imitating the human, it is out-moving them; one past 4s fills a gap they would never leave.
+IDLE_MOVE_MIN_STILL_S = 4.0
 IDLE_MOUSE_MOVE_SPEED_SCALE = 3.5   # multiplies move_to_human's normal travel time -- idle drift should look slow
 
 # ---------------- In-wait fidgeting (added 2026-08-27) ----------------

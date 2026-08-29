@@ -89,6 +89,7 @@ import win32gui
 import winsound  # pause/resume acknowledgment beep -- stdlib, Windows-only like win32gui above
 
 import debug_log
+import input_state
 import human_move  # v2 movement engine; only reached when settings.HUMAN_MOVE_V2 is on
 from settings import *  # noqa: F401,F403 -- all tunables collected in settings.py
 
@@ -115,8 +116,56 @@ def _panic_watchdog() -> None:
         panic_exit()
 
 
+# Virtual-key codes for the hook-independent watchdog below.
+VK_F1 = 0x70
+VK_F2 = 0x71
+
+
+def _async_key_down(vk: int) -> bool:
+    """Is this virtual key physically down RIGHT NOW, straight from the OS?
+
+    GetAsyncKeyState asks Windows directly rather than riding a message hook, which is the whole
+    point -- see _async_key_watchdog."""
+    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+def _async_key_watchdog(vk: int, action, poll_s: float = 0.05, _stop=None) -> None:
+    """Fire `action` once per PRESS of `vk`, polling the OS instead of hooking it.
+
+    WHY A SECOND PATH EXISTS. USER-REPORTED 2026-08-30, mid-run: "my f1 and f2 doesnt work now
+    hmm" -- the panic key had silently stopped responding while the routine was still driving the
+    mouse, which is the one failure this program must never have. `keyboard.wait()` rides a
+    Windows LOW-LEVEL HOOK, and Windows SILENTLY REMOVES such a hook when its callback overruns
+    LowLevelHooksTimeout (default 300ms; confirmed not overridden on that machine). Once dropped
+    it is gone for the life of the process, with no error raised anywhere. The hotspot burst had
+    just become far busier -- a tight click loop making two extra HTTP calls per click -- and that
+    is exactly the GIL pressure that starves such a callback.
+
+    GetAsyncKeyState needs no hook, so there is nothing to lose, and it keeps working when the
+    foreground window is elevated. Panic HAD this belt-and-braces shape (add_hotkey plus a
+    wait-loop) until 2026-08-27, when it was unified to one mechanism for symmetry with pause --
+    that change removed the very redundancy this failure needed.
+
+    EDGE-TRIGGERED, and that matters: panic_exit is idempotent, but pause is a TOGGLE, so a
+    level-triggered loop would flip it dozens of times per keypress."""
+    was_down = False
+    while True:
+        if _stop is not None and _stop():
+            return
+        down = _async_key_down(vk)
+        if down and not was_down:
+            action()
+        was_down = down
+        if poll_s:
+            time.sleep(poll_s)
+
+
 def start_panic_listener():
+    # TWO independent paths on purpose -- see _async_key_watchdog. panic_exit is a hard os._exit,
+    # so whichever fires first wins and a double fire is harmless.
     threading.Thread(target=_panic_watchdog, daemon=True).start()
+    threading.Thread(target=lambda: _async_key_watchdog(VK_F1, panic_exit),
+                     daemon=True).start()
 
 
 # ---------------- pause toggle ----------------
@@ -148,7 +197,12 @@ def _pause_watchdog(state: "ControllerState") -> None:
 
 
 def start_pause_listener(state: "ControllerState"):
-    threading.Thread(target=lambda: _pause_watchdog(state), daemon=True).start()
+    # Pause gets the hook-independent path too, but ONLY that one: toggling is not idempotent, so
+    # running both mechanisms would cancel each keypress back out (the exact reason _pause_watchdog
+    # could not copy panic's old double-wiring). The polled watchdog is edge-triggered and cannot
+    # be silently unhooked, so it is the better single mechanism of the two.
+    threading.Thread(target=lambda: _async_key_watchdog(VK_F2, lambda: toggle_pause(state)),
+                     daemon=True).start()
 
 
 # ---------------- bridge HTTP helpers ----------------
@@ -739,6 +793,15 @@ def get_mahogany_homes_state():
     return api_get("/mahogany-homes") or {"hasContract": False}
 
 
+def get_raid():
+    """RaidsProvider.java's mirror of RuneLite's own built-in Chambers of Xeric raids plugin.
+    None on total bridge failure (routine treats that like every other endpoint's None -- can't
+    tell, not "no raid"); a dict with raidsPluginEnabled=false if the bridge answered but the
+    built-in plugin was never found active (either not yet loaded, or the user disabled it) --
+    see docs/superpowers/specs/Raid-scouter.md for the field-by-field meaning."""
+    return api_get("/raid")
+
+
 def get_widgets_dump(scan: bool = False):
     data = api_get("/widgets/dump", params={"scan": "true"} if scan else None)
     if not data:
@@ -1262,6 +1325,14 @@ def mouse_left_click(ser: serial.Serial) -> None:
 
 
 def click_human(ser: serial.Serial) -> None:
+    # A CLICK IS ACTIVITY, even when it moves nothing. `_last_mouse_activity` gates
+    # maybe_idle_mouse_move's drift and used to be bumped only by move_to_human -- harmless while
+    # every click was preceded by a move, but mahogany_homes' hotspot burst now repeats a click
+    # IN PLACE (which is what the human's measured 0.20s cadence actually is), and those clicks
+    # moved nothing. USER 2026-08-30, watching it live: "when we flick i think the idle function
+    # drags back the mouse" -- exactly that: mid-work the engine believed the mouse had been
+    # still for seconds and inserted a slow idle drift, pulling the cursor off the target.
+    input_state.mark_mouse_activity()
     debug_log.log("action", f"click_human at {get_cursor_pos()}")
     mouse_left_down(ser)
     human_delay(*CLICK_HOLD_RANGE_S)
@@ -1697,10 +1768,28 @@ def maybe_overshoot_point(start, aim, *, overshoot_px=DEFAULT_OVERSHOOT_PX, chan
     return ox, oy
 
 
-# When the cursor last started a deliberate movement -- the idle-drift trigger measures
-# stillness from here (see maybe_idle_mouse_move). Bumped at move_to_human entry, so every
-# click, walk, hover and in-wait fidget resets it.
-_last_mouse_activity = time.monotonic()
+# When the mouse was last deliberately used -- the idle-drift trigger measures stillness from
+# here (see maybe_idle_mouse_move). Bumped at move_to_human entry, so every walk, hover and
+# in-wait fidget resets it, AND by click_human, so an in-place repeat click counts too (see its
+# comment: without that, a burst of stationary clicks reads as an idle hand).
+# NOTE: the markers themselves live in input_state.py, NOT here. controller.py is loaded TWICE in
+# a running process -- once as `__main__` (it is the script) and again as `controller` (every
+# routine imports it) -- so a module-level variable here exists twice and the engine's copy never
+# sees a routine's writes. That is not theoretical: it is what made the idle drift fire straight
+# through active work. See input_state.py's docstring for the proof.
+
+# Until when an ACTION IS IN FLIGHT, so the idle drift must hold off. Waiting ~2s for a queued
+# interaction to complete genuinely IS stillness, and the drawn still-segment budget is ~1.5s --
+# so without this the drift fires between bursts, walks the cursor off target, and the next click
+# has to fly it back. MEASURED live 2026-08-30: 14 drifts against 48 clicks, 5 of them after
+# under 2.5s of stillness, every one of those mid-work. USER: "when we flick i think the idle
+# function drags back the mouse". Set by whoever knows an action is pending (see mark_busy).
+# GENUINE idle is deliberately untouched -- filling that in is measured anti-freeze behaviour.
+def mark_busy(seconds: float) -> None:
+    """Declare an action in flight for the next `seconds`, holding off the idle drift.
+
+    Thin pass-through so routines keep calling controller.mark_busy; the state is shared."""
+    input_state.mark_busy(seconds)
 
 
 def move_to_human(
@@ -1742,8 +1831,7 @@ def move_to_human(
     instead of hand-writing the lambda each time. Implemented and reviewed (including an
     independent second pass) but not yet exercised against a live client as of 2026-08-14.
     """
-    global _last_mouse_activity
-    _last_mouse_activity = time.monotonic()
+    input_state.mark_mouse_activity()
 
     # v2 engine dispatch (settings.HUMAN_MOVE_V2, off by default). This is the ONLY edit the v2
     # rollout makes to the existing movement path -- every click_entity/hover_entity call site
@@ -2215,6 +2303,29 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
     /last-action post-hoc detection into prevention. Left-button clicks only -- a right-click
     opens a menu that is its own confirmation."""
     x, y = entity.get("screenX"), entity.get("screenY")
+
+    # DEPART FROM THE LIVE POSITION, not the caller's snapshot. A refresh_target means "this
+    # target MOVES, keep up with it" -- honouring that only mid-flight, while setting off toward
+    # whatever stale screenX/screenY the caller happens to be holding, is half a contract.
+    #
+    # MEASURED live 2026-08-30 in mahogany_homes' hotspot burst: `obj` came from ONE /objects read
+    # at the top of the tick, so while the player ran, every re-aimed click set off toward where
+    # the hotspot HAD been and was only hauled forward mid-flight. USER, watching it: "as we move
+    # the mouse have to flick more but we flick back for some reason after we click" -- that flick
+    # back IS the departure toward the stale pixel. Fixed here rather than in the routine so no
+    # other call site can inherit it: slayer, golem_crafting, tormented_demon and travel's door
+    # click all pass a refresh_target, and every one of them was setting off from a snapshot.
+    #
+    # Falls back to the caller's coordinates whenever the refresh cannot answer (object gone,
+    # bridge hiccup, a door whose id changes as it opens) -- the pre-existing behaviour.
+    if refresh_target is not None:
+        try:
+            fresh = refresh_target()
+        except Exception:
+            fresh = None
+        if fresh:
+            x, y = fresh
+
     if x is None or y is None:
         return False
 
@@ -2591,12 +2702,31 @@ def maybe_idle_mouse_move(ctx, state: "ControllerState") -> None:
     if state.next_idle_move_at is None:
         state.next_idle_move_at = _draw_idle_still_segment()
         return
-    if time.monotonic() - _last_mouse_activity < state.next_idle_move_at:
+    if input_state.is_busy():
+        return      # an action is still in flight -- see input_state.mark_busy
+    still = input_state.seconds_since_mouse_activity()
+    # A FLOOR, not just the drawn budget. The drawn still-segment can be as short as ~1s, which
+    # is well inside the ordinary gap between two of our own actions -- so the drift fired mid-
+    # work, over and over, dragging the cursor off target. See IDLE_MOVE_MIN_STILL_S for the
+    # three live attempts this replaced and the human measurement behind the number.
+    if still < IDLE_MOVE_MIN_STILL_S:
+        return
+    if still < state.next_idle_move_at:
         return
 
     cx, cy = get_cursor_pos()
     point = pick_aim_point(cx, cy, IDLE_MOUSE_MOVE_RADIUS_PX)
     if is_point_within_window(*point):
+        # LOGGED because this moves the cursor with no click, so an unexpected one is invisible
+        # in a log full of clicks -- and that is exactly how it bit us. USER 2026-08-30: "when we
+        # flick i think the idle function drags back the mouse". The cause was click_human not
+        # counting as mouse activity (see its comment), so a burst of in-place clicks read as an
+        # idle hand; but with no log line there was no way to see the drift happening, only its
+        # effect. One line per genuine idle drift is cheap: it fires only when the routine has
+        # NOT touched the mouse for a measured human still-segment.
+        debug_log.log("action",
+                      f"idle drift {cx},{cy} -> {point[0]},{point[1]} after "
+                      f"{input_state.seconds_since_mouse_activity():.1f}s of no mouse activity")
         move_to_human(ctx.ser, point[0], point[1], duration_scale=IDLE_MOUSE_MOVE_SPEED_SCALE)
 
     state.next_idle_move_at = _draw_idle_still_segment()
@@ -2850,6 +2980,7 @@ ROUTINE_FILES = {
     "FALCONRY": "routines/falconry.py",
     "PLANK_MAKE": "routines/plank_make.py",
     "MAHOGANY_HOMES": "routines/mahogany_homes.py",
+    "RAID_SCOUTER": "routines/raid_scouter.py",
 }
 
 

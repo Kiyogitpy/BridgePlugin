@@ -69,6 +69,25 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {})
     monkeypatch.setattr(worldmap, "reachable_from", lambda x, y, plane, **kw: {})
 
+    # `get_mahogany_homes_state` joined this list when work_phase's hotspot click became a BURST:
+    # _hotspot_progressed re-reads it after every click to see whether the varbit has moved, so
+    # an unstubbed test reached the RUNNING CLIENT once per click and got whatever house the
+    # character happened to be standing in. CAUGHT 2026-08-30 by three pre-existing tests going
+    # red -- the live answer made _hotspot_progressed report progress, which reset
+    # mh_hotspot_clicks and stopped the unreachable escalation ever being reached. `{}` yields no
+    # hotspots, so the honest "no progress observed" default; tests about the burst patch it.
+    monkeypatch.setattr(controller, "get_mahogany_homes_state", lambda: {})
+
+    # Burst repeats are in-place clicks, which would otherwise reach the serial port.
+    monkeypatch.setattr(controller, "click_human", lambda ser: True)
+
+    # The hotspot burst sleeps the human inter-click gap between clicks, so an unstubbed test
+    # that reaches the click path pays up to HOTSPOT_SPAM_MAX_CLICKS x HOTSPOT_SPAM_GAP_MAX_S of
+    # real wall clock. Sixteen tests here already stubbed this individually; defaulting it keeps
+    # the suite at seconds rather than minutes. Nothing in this file asserts on delay timing --
+    # the cooldown tests drive `mh_last_hotspot_click` directly instead.
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+
 
 @pytest.fixture(autouse=True)
 def _stub_widgets_dump(monkeypatch):
@@ -478,7 +497,692 @@ def test_request_contract_phase_resets_stuck_counter_once_clickable(monkeypatch)
     assert ctx.state.data["mh_contact_stuck"] == 0
 
 
+# MEASURED LIVE 2026-08-29, twice in one session: work_phase's "hotspot is visible but not
+# reachable" branch is a SILENT INFINITE LOOP. It logs nothing itself; open_door_toward logs only
+# when it finds a door; and its walk goal is the home's standing tile, which -- once we are inside
+# the house -- is already within HOUSE_ARRIVAL_TOLERANCE, so walk_to returns True immediately
+# without clicking. No counter advances either: mh_work_stuck was just reset (the object IS
+# visible) and mh_hotspot_clicks is never touched on this path.
+#
+# Result: 79 ticks of ZERO output the first time, 46s the second, with the routine ticking
+# happily and doing absolutely nothing. USER: "another deadlock doing nothing".
+#
+# The underlying false negative is fixed in travel.can_reach (multi-tile objects), but this
+# branch must not be ABLE to spin silently whatever can_reach answers -- that is what turned a
+# wrong answer into a frozen routine instead of a visible failure.
+
+def test_work_phase_cannot_spin_silently_when_a_hotspot_reads_unreachable(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1766, "y": 3620, "plane": 0})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(mh, "plank_sack_count", lambda *a, **kw: 0)
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda **kw: [_object(40002, distance=3, x=1769, y=3622, plane=0)])
+    monkeypatch.setattr(travel, "reachable_set", lambda *a, **kw: {(1766, 3620)})
+    monkeypatch.setattr(travel, "can_reach", lambda *a, **kw: False)
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: None)
+    # The walk is a no-op: the goal is already within tolerance. This is the live condition.
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, *a, **kw: True)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **kw: True)
+
+    ctx = _Ctx()
+    state = {
+        "homeName": "MARIAH",
+        "standingLocation": {"x": 1766, "y": 3621, "plane": 0},
+        "area": {"x": 1760, "y": 3616, "width": 14, "height": 12, "plane": 0},
+        "hotspots": [_hotspot(10554, 40002, 3, True, quantity=3)],
+        "requiredMaterials": {"planks": 3, "steelBars": 0},
+    }
+    state["hotspots"][0]["location"] = {"x": 1769, "y": 3622, "plane": 0}
+
+    for _ in range(mh.STUCK_TICK_LIMIT + 2):
+        mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert ctx.state.safety_stopped, (
+        "work_phase span on an unreachable hotspot forever, logging nothing and clicking nothing"
+    )
+
+
+# MEASURED LIVE 2026-08-29 at TAU's: bank_phase discarded travel.walk_to's return value. The walk
+# to the Falador bank died at TAU's diagonal door ("route makes no further progress"), and this
+# then tried to open a bank booth THIRTY-FIVE tiles away regardless -- 20s of wait_until_player_idle
+# retries, then "failed to open the bank", a safety stop naming the wrong cause entirely.
+#
+# walk_to's own docstring says it plainly: "False now means something". A caller that ignores it
+# converts a walking failure into a misattributed downstream one.
+
+def test_bank_phase_does_not_try_to_open_a_bank_it_failed_to_walk_to(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3047, "y": 3347, "plane": 0})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(banker, "find_nearby_bank",
+                        lambda cfg: {"x": 3013, "y": 3354, "plane": 0, "distance": 35})
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, *a, **kw: False)
+    monkeypatch.setattr(banker, "open_bank",
+                        lambda ctx, obj: pytest.fail("must not reach for a bank 35 tiles away"))
+
+    ctx = _Ctx()
+    mh.bank_phase(ctx, mh.DEFAULT_CONFIG, {"hasContract": False})
+
+    assert not ctx.state.safety_stopped or "bank" not in (ctx.state.safety_reason or "").lower()         or "walk" in (ctx.state.safety_reason or "").lower(),         "a failed WALK must not be reported as a failure to OPEN the bank"
+
+
+# MEASURED from the user's OWN recordings 2026-08-29 (4 human sessions, n=1194 hotspot actions):
+# the human SPAM-CLICKS. Median gap between hotspot actions 0.20s, p25 0.18s; 339 of 500 bursts
+# are more than one click on the same option, mean burst 2.46, max 8. Remove->Build median 2.06s.
+# The bot on the same activity that night: median gap 3.89s, Remove->Build median 3.62s -- about
+# 1.5s of pure latency per pair, because the gate was a FIXED wall-clock cooldown (0.6s remove /
+# 2.4s build + 0.7s per tile) that always paid the worst case even when the action had finished.
+#
+# So the gate becomes a SIGNAL instead of a timer: click, and keep clicking at the human's own
+# cadence until the hotspot's varbit actually moves. This is both faster AND closer to the
+# recorded human, which is the rare case where those pull the same way.
+#
+# The engine loop is ~1.1s, so the burst has to happen INSIDE one work_phase call -- successive
+# engine ticks physically cannot produce a 0.2s cadence.
+
+def _burst_ctx_and_state(hot_value=3):
+    ctx = _Ctx()
+    state = {
+        "homeName": "MARIAH",
+        "standingLocation": {"x": 1766, "y": 3621, "plane": 0},
+        "area": {"x": 1760, "y": 3616, "width": 14, "height": 12, "plane": 0},
+        "hotspots": [_hotspot(10554, 40002, hot_value, True, quantity=1)],
+        "requiredMaterials": {"planks": 1, "steelBars": 0},
+    }
+    state["hotspots"][0]["location"] = {"x": 1767, "y": 3620, "plane": 0}
+    return ctx, state
+
+
+def test_the_burst_carries_straight_on_into_the_next_action(monkeypatch):
+    """USER 2026-08-30: "keep clicking after we remove so we start the next process".
+
+    A Remove completing is not the end of the work at this hotspot -- the object becomes
+    "<thing> space" (SAME object id, stable across the whole Remove-then-Build lifecycle) and now
+    offers Build. Breaking the burst on the varbit move hands control back to the engine loop,
+    which is ~1.1s, and that is pure dead time between two halves of one job. The human just
+    keeps clicking: their Remove->Build median is 2.06s against our 3.62s.
+
+    The object MODEL changes across the transition, so the click after a state change must
+    re-aim rather than repeat in place -- same reason a moving player must."""
+    aimed, inplace = [], []
+    _stub_for_burst_split(monkeypatch, aimed, inplace)
+    ctx, state = _burst_ctx_and_state()
+    monkeypatch.setattr(mh, "_player_is_moving", lambda prev: False)
+
+    # value 3 -> 5 (remove lands) -> 7 (build lands, nothing left to do)
+    seq = iter([3, 3, 5, 5, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7])
+    monkeypatch.setattr(
+        controller, "get_mahogany_homes_state",
+        lambda: {"hotspots": [{"objectId": 40002, "value": next(seq, 7),
+                               "needsAttention": True, "material": "PLANK", "quantity": 1,
+                               "location": {"x": 1767, "y": 3620, "plane": 0}}]})
+
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert len(aimed) >= 2, (
+        "after the remove lands the burst must re-aim and start the build, not hand back to the "
+        "engine loop for a tick"
+    )
+
+
+def _stub_for_burst_split(monkeypatch, aimed, inplace):
+    """Like _stub_for_burst but keeps the two click KINDS apart: a re-aimed click_entity (which
+    re-resolves the object's live screen position) versus an in-place click_human."""
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(mh, "plank_sack_count", lambda *a, **kw: 0)
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda **kw: [_object(40002, distance=1, x=1767, y=3620, plane=0)])
+    monkeypatch.setattr(travel, "reachable_set", lambda *a, **kw: {(1766, 3620), (1767, 3620)})
+    monkeypatch.setattr(travel, "can_reach", lambda *a, **kw: True)
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: None)
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **kw: None)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, obj, **kw: aimed.append(1) or True)
+    monkeypatch.setattr(controller, "click_human", lambda ser: inplace.append(1) or True)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1766, "y": 3620, "plane": 0})
+
+
+def test_every_click_is_re_aimed_while_the_player_is_moving(monkeypatch):
+    """USER 2026-08-30: "if we continuously click we gotta update the object x y otherwise while
+    we move we click away".
+
+    Exactly right, and it is what makes the in-place repeat unsafe MID-WALK: the object's world
+    tile does not change, but its SCREEN projection slides under the cursor as the player and
+    camera move, so clicking the same pixel again lands on bare ground. click_entity with
+    object_refresh_target re-resolves that projection from /object/at (un-cached), which is what
+    "update the object x y" means in practice.
+
+    So the rule is: re-aim whenever we have moved since the last click, click in place only when
+    standing still."""
+    aimed, inplace = [], []
+    _stub_for_burst_split(monkeypatch, aimed, inplace)
+    ctx, state = _burst_ctx_and_state()
+    monkeypatch.setattr(mh, "_hotspot_now", lambda target: None)
+    monkeypatch.setattr(mh, "_player_is_moving", lambda prev: True)
+
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert not inplace, "a moving player must never repeat a click at a stale pixel"
+    assert len(aimed) == mh.HOTSPOT_SPAM_MAX_CLICKS
+
+
+def test_repeats_are_in_place_once_the_player_has_stopped(monkeypatch):
+    """Standing still, the projection cannot slide, so re-flying the cursor for every repeat is
+    pure latency -- MEASURED live 2026-08-30 at 1.0-1.1s per re-aimed click against the human's
+    0.20s median. The first click still aims."""
+    aimed, inplace = [], []
+    _stub_for_burst_split(monkeypatch, aimed, inplace)
+    ctx, state = _burst_ctx_and_state()
+    monkeypatch.setattr(mh, "_hotspot_now", lambda target: None)
+    monkeypatch.setattr(mh, "_player_is_moving", lambda prev: False)
+
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert len(aimed) == 1, "aim once"
+    assert len(inplace) == mh.HOTSPOT_SPAM_MAX_CLICKS - 1, "then click in place"
+
+
+def _stub_for_burst(monkeypatch, clicks):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1766, "y": 3620, "plane": 0})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(mh, "plank_sack_count", lambda *a, **kw: 0)
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda **kw: [_object(40002, distance=1, x=1767, y=3620, plane=0)])
+    monkeypatch.setattr(travel, "reachable_set", lambda *a, **kw: {(1766, 3620), (1767, 3620)})
+    monkeypatch.setattr(travel, "can_reach", lambda *a, **kw: True)
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: None)
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **kw: None)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, obj, **kw: clicks.append(time.time()) or True)
+    # Repeats inside a burst are in-place click_human calls, not fresh click_entity flights.
+    monkeypatch.setattr(controller, "click_human",
+                        lambda ser: clicks.append(time.time()) or True)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+
+
+def test_work_phase_keeps_clicking_until_the_varbit_moves(monkeypatch):
+    clicks = []
+    _stub_for_burst(monkeypatch, clicks)
+    ctx, state = _burst_ctx_and_state()
+
+    # The varbit moves on the 3rd read -- a human-sized burst.
+    reads = {"n": 0}
+
+    def rows(target):
+        reads["n"] += 1
+        value = 99 if reads["n"] >= 3 else target.get("value")
+        return {"objectId": 40002, "value": value, "needsAttention": False}
+
+    monkeypatch.setattr(mh, "_hotspot_now", rows)
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert 2 <= len(clicks) <= mh.HOTSPOT_SPAM_MAX_CLICKS,         f"expected a human-sized burst, got {len(clicks)} clicks"
+
+
+def test_work_phase_stops_bursting_at_the_human_click_cap(monkeypatch):
+    """A hotspot whose varbit NEVER moves must not be clicked forever inside one tick."""
+    clicks = []
+    _stub_for_burst(monkeypatch, clicks)
+    ctx, state = _burst_ctx_and_state()
+    monkeypatch.setattr(mh, "_hotspot_now", lambda target: None)
+
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert len(clicks) <= mh.HOTSPOT_SPAM_MAX_CLICKS
+    assert ctx.state.data.get("mh_hotspot_clicks", 0) == 1,         "one unproductive BURST counts as one failure, so HOTSPOT_UNREACHABLE_CLICKS still means 5 bursts"
+
+
+def test_a_completed_action_does_not_leave_a_long_cooldown_behind(monkeypatch):
+    """The burst is the whole point only if what follows it is short. The old gate set a FIXED
+    2.4s (+0.7s/tile) cooldown before every click and paid it whether or not the action had
+    finished -- so even with the burst exiting on the varbit, the NEXT action would still wait
+    out the worst case. A burst that saw the varbit move has, by definition, finished."""
+    clicks = []
+    _stub_for_burst(monkeypatch, clicks)
+    ctx, state = _burst_ctx_and_state()
+    monkeypatch.setattr(mh, "_hotspot_now",
+                        lambda target: {"objectId": 40002, "value": 99,
+                                        "needsAttention": False})
+
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert ctx.state.data["mh_hotspot_cooldown"] <= mh.HOTSPOT_SPAM_GAP_MAX_S,         "a finished action must not be followed by the unfinished-action budget"
+
+
+def test_a_burst_keeps_clicking_while_the_player_is_still_walking(monkeypatch):
+    """USER 2026-08-30, watching it live: "it clicks twice player moves then it waits at the thing
+    and clicks again -- need to keep clicking while moving until done".
+
+    An earlier draft stopped the burst the moment the player moved, reasoning from ROSS that
+    re-clicking mid-walk re-queues and re-paths. That does not apply to an IN-PLACE repeat: ROSS
+    was a re-AIMED click on a later tick, which re-resolved the object. Clicking the same pixel
+    again just re-queues the same interaction -- which is exactly what the human recordings show,
+    straight through the approach.
+
+    And a burst spent walking must NOT count as a failed attempt: the action has not started, so
+    charging it against HOTSPOT_UNREACHABLE_CLICKS would walk away from a hotspot we are still
+    on our way to -- the ROSS misdiagnosis, arrived at from the opposite direction."""
+    clicks = []
+    _stub_for_burst(monkeypatch, clicks)
+    ctx, state = _burst_ctx_and_state()
+    monkeypatch.setattr(mh, "_hotspot_now", lambda target: None)
+    monkeypatch.setattr(mh, "_player_is_moving", lambda prev: True)
+
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert len(clicks) == mh.HOTSPOT_SPAM_MAX_CLICKS,         "movement must not cut the burst short -- keep clicking until the varbit moves"
+    assert ctx.state.data.get("mh_hotspot_clicks", 0) == 0,         "a burst spent walking is not a failed attempt"
+    assert ctx.state.data["mh_hotspot_cooldown"] <= mh.HOTSPOT_SPAM_GAP_MAX_S,         "come straight back and keep clicking rather than waiting out the action's budget"
+
+
+# MEASURED LIVE 2026-08-30 at NOELLA's, the only home whose upper floor is DISCONNECTED -- two
+# staircases reaching two halves that do not join. USER: "has to go downstairs then take the
+# other ladder". The player stood at (2661,3319) plane 1 with hotspot 40160 at (2657,3322) plane
+# 1; worldmap.reachable_from returned just EIGHTEEN tiles (the near half), find_path answered
+# None, and can_reach answered False -- all three correct.
+#
+# The routine already had exactly the right recovery (SPLIT_UPPER_FLOOR_HOMES -> climb down and
+# take the other staircase) but it lived AFTER the can_reach gate, in the
+# HOTSPOT_UNREACHABLE_CLICKS branch. can_reach returning False returns early, so on the one home
+# the recovery exists for, it could never be reached. It only ever ran when reachability was
+# UNKNOWN -- which is why its own unit test passed while the live case wedged.
+
+def test_noella_climbs_down_when_the_hotspot_is_on_the_other_half_of_a_split_floor(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [
+        _object(40160, distance=5, x=2657, y=3322, plane=1),
+        _object(16685, distance=2, x=2660, y=3318, plane=1),
+    ])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2661, "y": 3319, "plane": 1})
+    # The live answer: the HOTSPOT is genuinely unreachable (far half of the split floor), while
+    # the staircase on our own half is perfectly reachable -- _climb has its own gate and would
+    # rightly refuse a ladder it cannot path to.
+    monkeypatch.setattr(travel, "can_reach",
+                        lambda goal, reach=None, **kw:
+                        False if (goal.get("x"), goal.get("y")) == (2657, 3322) else True)
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: False)
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, *a, **kw: False)
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **kw: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    menu = {}
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: menu.update(option=option))
+
+    spot = _hotspot(10554, 40160, 3, True)
+    spot["plane"] = 1
+    spot["location"] = {"x": 2657, "y": 3322, "plane": 1}
+    state = _work_state([spot], homeName="NOELLA",
+                        ladderObjectIds=[17026, 16685, 15645, 15648],
+                        standingLocation={"x": 2659, "y": 3322, "plane": 0})
+
+    ctx = _Ctx()
+    for _ in range(mh.HOTSPOT_UNREACHABLE_CLICKS + 2):
+        ctx.state.data["mh_last_ladder_click"] = 0.0
+        mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert menu.get("option") == "Climb-down",         "on a split upper floor the far half is reached by going DOWN and up the other staircase"
+    assert not ctx.state.safety_stopped, "climbing down is the recovery, not a reason to stop"
+
+
+# MEASURED LIVE 2026-08-30 at BARBARA's, and the third instance of one structural mistake.
+# Player (1749,3534), hotspot 40013 at (1749,3539) walled in on all four sides in LIVE collision
+# -- but worldmap finds a 13-step route to a tile beside it, i.e. the way in is a SHUT DOOR the
+# static map bakes open. So the recovery is exactly right in principle: walk at the hotspot, and
+# the walker resolves the door on the way.
+#
+# It walked at the STANDING TILE instead -- (1750,3534), Chebyshev distance ONE from the player,
+# against HOUSE_ARRIVAL_TOLERANCE of 1. walk_to returned True instantly without moving or opening
+# anything, 14 ticks running, until the ceiling stopped it.
+#
+# CLAUDE.md already records this lesson from NORMAN's ("head for the HOTSPOT, not the house's
+# standing tile ... using it as the goal is what makes the doorway between us and it visible to
+# the walker") -- but that fix lives in the HOTSPOT_UNREACHABLE_CLICKS branch, and the can_reach
+# gate returns before ever reaching it. Same shape as the NOELLA split-floor bug: a correct
+# recovery sitting behind a gate that returns early.
+
+def test_the_unreachable_branch_walks_at_the_hotspot_not_the_standing_tile(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1749, "y": 3534, "plane": 0})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(mh, "plank_sack_count", lambda *a, **kw: 0)
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda **kw: [_object(40013, distance=5, x=1749, y=3539, plane=0)])
+    monkeypatch.setattr(travel, "reachable_set", lambda *a, **kw: {(1749, 3534)})
+    monkeypatch.setattr(travel, "can_reach", lambda *a, **kw: False)
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: None)
+
+    walked = {}
+    monkeypatch.setattr(travel, "walk_to",
+                        lambda ctx, target, *a, **kw: walked.setdefault("t", target) or True)
+
+    spot = _hotspot(10554, 40013, 3, True, quantity=1)
+    spot["location"] = {"x": 1749, "y": 3539, "plane": 0}
+    state = {
+        "homeName": "BARBARA",
+        "standingLocation": {"x": 1750, "y": 3534, "plane": 0},
+        "area": {"x": 1744, "y": 3530, "width": 14, "height": 14, "plane": 0},
+        "hotspots": [spot],
+        "requiredMaterials": {"planks": 1, "steelBars": 0},
+    }
+
+    mh.work_phase(_Ctx(), mh.DEFAULT_CONFIG, state)
+
+    assert (walked["t"]["x"], walked["t"]["y"]) == (1749, 3539), (
+        "walking at the standing tile we are already stood beside achieves nothing -- head for "
+        "the hotspot so the walker sees the door between us and it"
+    )
+
+
+def test_the_unreachable_branch_walks_to_a_tile_it_could_act_from(monkeypatch):
+    """The follow-on from BARBARA's, MEASURED live 2026-08-30. Aiming the walk at the hotspot is
+    necessary but not sufficient: find_path(goal_adjacent=True) stops at ANY adjacent tile, and
+    at Barbara's it stopped on (1749,3540) -- adjacent to the Bed but behind the bedroom's north
+    WALL (16416). The player stood there and can_reach kept answering False, correctly.
+
+    Only two tiles can actually touch that bed, (1749,3538) and (1748,3539), both inside the
+    bedroom. Walking to one of THOSE routes through the bedroom door, which open_door_toward then
+    finds as an ordinary door on the route."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1749, "y": 3541, "plane": 0})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(mh, "plank_sack_count", lambda *a, **kw: 0)
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda **kw: [_object(40013, distance=2, x=1749, y=3539, plane=0)])
+    monkeypatch.setattr(travel, "reachable_set", lambda *a, **kw: {(1749, 3541)})
+    monkeypatch.setattr(travel, "can_reach", lambda *a, **kw: False)
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: None)
+    monkeypatch.setattr(travel, "interaction_tiles",
+                        lambda goal, flags=None: [(1749, 3538), (1748, 3539)])
+
+    walked = {}
+    monkeypatch.setattr(travel, "walk_to",
+                        lambda ctx, target, *a, **kw: walked.setdefault("t", target) or True)
+
+    spot = _hotspot(10554, 40013, 3, True, quantity=1)
+    spot["location"] = {"x": 1749, "y": 3539, "plane": 0}
+    state = {
+        "homeName": "BARBARA",
+        "standingLocation": {"x": 1750, "y": 3534, "plane": 0},
+        "area": {"x": 1744, "y": 3530, "width": 14, "height": 14, "plane": 0},
+        "hotspots": [spot],
+        "requiredMaterials": {"planks": 1, "steelBars": 0},
+    }
+
+    mh.work_phase(_Ctx(), mh.DEFAULT_CONFIG, state)
+
+    assert (walked["t"]["x"], walked["t"]["y"]) in {(1749, 3538), (1748, 3539)}, (
+        "walk to a tile we could actually act from, not merely one adjacent through a wall"
+    )
+
+
+# MEASURED LIVE 2026-08-30, after the first idle-drift fix: drifts fell from 14-per-48-clicks to
+# 4-per-28, but one still fired after only 1.5s -- mid-work. USER: "seems like flicking still
+# happen".
+#
+# The cause is the SUPPRESSION WINDOW, not the suppression. mark_busy was handed
+# mh_hotspot_cooldown, which after a SUCCESSFUL action is now HOTSPOT_SPAM_GAP_MAX_S (0.35s) --
+# by design, since a finished action has nothing left to wait out. But the routine then spends a
+# second or three on its own decision work before the next click, and that window was unguarded.
+#
+# Being in work_phase with a hotspot to act on IS being busy, whatever the click cooldown says.
+
+def test_work_phase_holds_the_idle_drift_off_for_the_whole_working_tick(monkeypatch):
+    clicks = []
+    _stub_for_burst(monkeypatch, clicks)
+    ctx, state = _burst_ctx_and_state()
+    monkeypatch.setattr(mh, "_hotspot_now", lambda target: None)
+
+    busy = []
+    monkeypatch.setattr(controller, "mark_busy", lambda s: busy.append(s))
+
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert busy, "work_phase must tell the idle drift it is working"
+    assert max(busy) >= mh.WORK_BUSY_WINDOW_S, (
+        "the window has to outlast the routine's own decision work between clicks, not just the "
+        "click cooldown"
+    )
+
+
+# USER 2026-08-30, describing the residual flicking precisely: "it is most noticable when we run
+# and reclick ... as we move the mouse have to flick more but we flick back for some reason after
+# we click", and "only relevant when we click hotspots".
+#
+# That is exactly what a STALE AIM looks like. click_entity begins its flight at
+# entity["screenX"/"screenY"], and the burst was handing it the SAME obj dict for every re-aim --
+# fetched once at the top of the tick from /objects. While the player runs, that projection is
+# stale within a fraction of a second, so each re-aimed click set off toward where the object had
+# been (the flick BACK) and refresh_target only pulled it forward again MID-FLIGHT.
+#
+# refresh_target fixes the landing, never the departure. A re-aim has to START from the live
+# position, which is what /object/at answers and what object_refresh_target wraps anyway.
+
+def test_every_burst_re_aim_passes_a_refresh_target(monkeypatch):
+    """The routine's half of the contract. The LIVE re-resolve itself now lives in click_entity,
+    which uses refresh_target for the DEPARTURE as well as mid-flight (see
+    test_click_entity_departs_from_the_refreshed_position_not_the_stale_one) -- so all this file
+    has to guarantee is that every re-aim actually hands one over. Without it click_entity has
+    nothing to re-resolve from and sets off toward the tick-old /objects snapshot, which is the
+    "we flick back after we click" the user watched happen."""
+    passed = []
+    _stub_for_burst_split(monkeypatch, [], [])
+    monkeypatch.setattr(controller, "object_refresh_target",
+                        lambda x, y, plane, obj_id, **kw: ("factory", x, y, plane, obj_id))
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, obj, **kw: passed.append(kw.get("refresh_target")) or True)
+    monkeypatch.setattr(mh, "_hotspot_now", lambda target: None)
+    monkeypatch.setattr(mh, "_player_is_moving", lambda prev: True)
+
+    ctx, state = _burst_ctx_and_state()
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert passed, "expected the burst to click"
+    assert all(p == ("factory", 1767, 3620, 0, 40002) for p in passed), (
+        f"every re-aim must carry a refresh_target for the hotspot -- got {passed}"
+    )
+
+
+# USER-REPORTED 2026-08-30, two symptoms with one shared cause and one aggravating one:
+#   "seems like we miss the npc at the end is the mouse move not using updated data?"
+#   "sometimes when we sucessfully click the npc and we walking towards him we time out and
+#    click again and miss"
+#
+# 1. The homeowner is an NPC and NPCs WALK. The turn-in used a bare click_menu_action with no
+#    refresh_target, and CLAUDE.md is explicit about what that means: the menu path "right-clicks
+#    exactly the pixel you give it". Against a moving target that is a miss by construction.
+#    click_menu_action gained refresh_target on 2026-08-27 precisely for this; this call site
+#    never adopted it. npc_index_refresh_target tracks by INDEX, so it can never re-resolve onto
+#    a different individual, and it is tile-deadbanded so hull jitter does not cause replans.
+#
+# 2. TURN_IN_CLICK_COOLDOWN_S was a flat 2.0s with no walk budget, while the hotspot click had
+#    already been given `base + distance * walk` for exactly this reason (the ROSS measurement:
+#    "the game queues the interaction and performs it ON ARRIVAL"). So a talk-to on an NPC a few
+#    tiles away expired while we were still walking, we clicked again -- and because of (1) that
+#    second click aimed where the NPC no longer was. The two faults produce precisely the
+#    sequence reported: click works, walk starts, timeout, re-click, miss.
+
+def _turnin_state():
+    return {"homeName": "ROSS", "npcName": "Ross", "npcId": 10420, "npcUpstairs": False,
+            "standingLocation": {"x": 2613, "y": 3316, "plane": 0},
+            "hotspots": [_hotspot(10554, 40164, 7, False)]}
+
+
+def test_the_turn_in_click_tracks_the_npc_while_it_walks(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2613, "y": 3316, "plane": 0})
+    monkeypatch.setattr(controller, "get_npc_nearest",
+                        lambda npc_id: {"id": 10420, "index": 77, "name": "Ross", "distance": 4,
+                                        "x": 2615, "y": 3318, "plane": 0,
+                                        "screenX": 500, "screenY": 400})
+    monkeypatch.setattr(controller, "npc_index_refresh_target",
+                        lambda idx: ("npc-factory", idx))
+    seen = {}
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: seen.update(kw, option=option))
+
+    ctx = _Ctx()
+    mh.turn_in_phase(ctx, mh.DEFAULT_CONFIG, _turnin_state())
+
+    assert seen.get("option") == "Talk-to"
+    assert seen.get("refresh_target") == ("npc-factory", 77), (
+        "the homeowner walks -- the click must track it, or it lands where the NPC was"
+    )
+
+
+def test_the_turn_in_does_not_reclick_while_we_are_still_walking_to_the_npc(monkeypatch):
+    """USER 2026-08-30: "sometimes when we sucessfully click the npc and we walking towards him we
+    time out and click again and miss", and then: "we can use the walk / idle function instead to
+    verify".
+
+    Exactly right, and better than the alternative. The game QUEUES the interaction and performs
+    it on ARRIVAL, so the honest question is "have we arrived yet", not "has a guessed duration
+    elapsed". TURN_IN_CLICK_COOLDOWN_S was a flat 2.0s first-draft guess with no idea how far the
+    NPC was; budgeting the walk by distance would only have replaced one guess with another,
+    while the player's own movement answers it exactly.
+
+    A re-click while walking is not merely wasted: the NPC has moved on by then, so it lands
+    where he was -- which is the miss that was reported."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2613, "y": 3316, "plane": 0})
+    monkeypatch.setattr(controller, "get_npc_nearest",
+                        lambda npc_id: {"id": 10420, "index": 77, "name": "Ross", "distance": 6,
+                                        "x": 2619, "y": 3316, "plane": 0,
+                                        "screenX": 500, "screenY": 400})
+    monkeypatch.setattr(controller, "npc_index_refresh_target", lambda idx: None)
+    clicks = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, e, o, **kw: clicks.append(o) or True)
+    monkeypatch.setattr(mh, "_player_is_moving", lambda prev: True)
+
+    ctx = _Ctx()
+    state = _turnin_state()
+    mh.turn_in_phase(ctx, mh.DEFAULT_CONFIG, state)      # first click: fine
+    assert len(clicks) == 1
+
+    ctx.state.data["mh_last_turnin_click"] = 0.0          # any time-based gate has expired
+    mh.turn_in_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert len(clicks) == 1, (
+        "still walking means the queued Talk-to has not happened yet -- re-clicking now aims "
+        "where the NPC no longer is"
+    )
+
+
+# SEEN LIVE TWICE, 2026-08-30 (JEFF, then BOB): _approach_missing_hotspot's last-resort walk
+# aims at `standingLocation`, which is ALWAYS reported at plane 0. From an upper floor that walk
+# cannot succeed in any circumstance -- travel rightly answers "target is on plane 0 and we are
+# on 1", and the tick is spent on a bridge call and a misleading "walking toward X's house" line.
+#
+# It is bounded (mh_work_stuck escalates), which is why it was left alone earlier in the session
+# as waste rather than a stall. It is still the documented rule -- "a walk-to-X recovery must
+# pick X on OUR OWN FLOOR" -- and this is the last known place that breaks it.
+
+def test_the_missing_hotspot_fallback_does_not_walk_at_a_plane_0_tile_from_upstairs(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3241, "y": 3486, "plane": 1})
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])   # no ladder in range either
+    monkeypatch.setattr(travel, "walk_to",
+                        lambda ctx, target, *a, **kw: pytest.fail(
+                            "must not walk at a plane-0 tile from plane 1"))
+
+    target = _hotspot(10554, 39987, 3, True)
+    target["location"] = {"x": 3238, "y": 3488, "plane": 1}
+    state = {"homeName": "BOB", "standingLocation": {"x": 3238, "y": 3486, "plane": 0},
+             "ladderObjectIds": [], "hotspots": [target]}
+
+    ctx = _Ctx()
+    mh._approach_missing_hotspot(ctx, mh.DEFAULT_CONFIG, state, target)
+
+    assert ctx.state.data.get("mh_work_stuck", 0) >= 1,         "the stuck counter must still advance so the escalation is reached"
+
+
+# USER 2026-08-30: "an efficiency we can add when clicking contact spell we can immidiatly swap
+# to our inventory with W while we wait for spell to be cast".
+#
+# Free latency. Casting NPC Contact leaves the MAGIC tab open, and travel_phase's very next act
+# is to open the INVENTORY tab before it can click a teleport tablet (an inventory item is not on
+# screen while the spellbook is -- LIVE RUN 2026-08-28, the talisman right-click opened an empty
+# ['Cancel'] menu because it landed on the spellbook). That tab switch currently happens AFTER
+# the spell has resolved, so its cost is serial with the cast. Doing it while the cast animates
+# overlaps the two: the spell does not care which tab is showing.
+
+def test_casting_npc_contact_switches_to_the_inventory_tab_while_it_resolves(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda g, c: {"screenX": 100, "screenY": 100, "clickable": True})
+    order = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: order.append("cast") or True)
+    monkeypatch.setattr(controller, "open_inventory_tab",
+                        lambda ser: order.append("inventory") or True)
+
+    ctx = _Ctx()
+    mh.request_contract_phase(ctx, mh.DEFAULT_CONFIG, {"hasContract": False})
+
+    assert order == ["cast", "inventory"], (
+        f"switch tabs right after the cast, while it resolves -- got {order}"
+    )
+
+
 # --- travel_phase ---------------------------------------------------------------
+
+# MEASURED LIVE 2026-08-29, first run of the routine against the new collision map: with a LEELA
+# contract in hand and the player at (1748,3598) in Hosidius, travel_phase logged
+# "no walking route to (1785,3592) -- not attempting the walk" every tick, forever.
+#
+# The route request was not wrong -- LEELA's `standingLocation` is a SOLID tile. All four of its
+# edges read blocked in both directions on the real map (it is furniture standing inside an
+# otherwise walkable interior, exactly the hazard the TAU session recorded for (3047,3345)), so
+# find_path correctly refuses to route ONTO it and `goal_adjacent=False` demands precisely that.
+# An adjacent route exists and is 43 steps.
+#
+# `standingLocation` is a fixed per-home hint point, NOT a promise that the tile is stand-on-able,
+# so no call site may ask for an exact route to it. Note every one of these walks already accepts
+# arrival within a tolerance of 3+ tiles, which makes an exact-route demand self-contradictory
+# even where the tile happens to be open.
+#
+# This runs against the REAL bundled map rather than a stub on purpose: stubbing walk_to (as every
+# other travel_phase test does) swallows **kw and so cannot see the bug at all.
+LEELA_STANDING_TILE = {"x": 1785, "y": 3592, "plane": 0}
+LEELA_NEARBY_PLAYER_TILE = {"x": 1748, "y": 3598, "plane": 0}
+
+
+def test_leelas_standing_tile_is_solid_on_every_edge():
+    """The premise of the bug below. If a re-dumped map ever opens this tile, this fails first
+    and tells you the regression test underneath it has stopped testing anything."""
+    x, y, plane = 1785, 3592, 0
+    for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+        assert worldmap.passable(x, y, plane, dx, dy) is False
+        assert worldmap.passable(x - dx, y - dy, plane, dx, dy) is False
+
+
+def test_travel_phase_asks_for_a_route_the_map_can_actually_answer(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: dict(LEELA_NEARBY_PLAYER_TILE))
+
+    captured = {}
+
+    def fake_walk_to(ctx, target, *args, **kw):
+        captured["target"] = target
+        captured["goal_adjacent"] = kw.get("goal_adjacent", True)
+        return True
+
+    monkeypatch.setattr(travel, "walk_to", fake_walk_to)
+
+    ctx = _Ctx()
+    ctx.state.data["mh_last_home"] = "LEELA"
+    ctx.state.data["mh_teleported_this_contract"] = True
+    state = {"homeName": "LEELA", "standingLocation": dict(LEELA_STANDING_TILE)}
+    mh.travel_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert captured["target"]["x"] == 1785 and captured["target"]["y"] == 3592
+
+    route = worldmap.find_path(
+        LEELA_NEARBY_PLAYER_TILE["x"], LEELA_NEARBY_PLAYER_TILE["y"], 0,
+        captured["target"]["x"], captured["target"]["y"],
+        goal_adjacent=captured["goal_adjacent"],
+    )
+    assert route is not None, (
+        "travel_phase asked for a route onto LEELA's standing tile, which is solid on every "
+        "edge -- walk_to returns False every tick and the phase spins forever"
+    )
 
 def test_travel_phase_teleports_then_walks(monkeypatch):
     clicked = {}
@@ -518,6 +1222,68 @@ def test_travel_phase_walks_to_standing_tile_after_teleport_and_advances_to_work
     mh.travel_phase(ctx, mh.DEFAULT_CONFIG, state)
 
     assert ctx.state.data["mh_phase"] == "work"
+
+
+# MEASURED LIVE 2026-08-29, second run: the player was UPSTAIRS at JEFF's (plane 1) with a
+# JEFF contract in hand, and travel_phase logged this 32 times in ~40s with nothing to stop it:
+#
+#   [travel] target is on plane 0 and we are on 1 -- walking cannot change floor
+#   [travel] no walking route to (3239,3450) -- not attempting the walk
+#   [mahogany_homes] still walking toward JEFF's standing tile
+#
+# WALKING CANNOT CHANGE FLOOR, and `standingLocation` is ALWAYS reported at plane 0 -- so from
+# any upper floor this walk cannot succeed in any circumstance. It is a hard deadlock, not a slow
+# path. The identical bug was found and fixed in work_phase (_approach_missing_hotspot) and again
+# in turn_in_phase on 2026-08-29; travel_phase was simply never covered, and it is the one phase
+# a restart lands in, so a restart while upstairs wedges the routine on the spot.
+#
+# The descent is owned here for the same reason turn_in_phase owns its own: work_phase's ladder
+# handling lives in _approach_missing_hotspot and does not run in this phase at all.
+
+def test_travel_phase_climbs_down_instead_of_walking_at_a_plane_0_tile_from_upstairs(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3240, "y": 3450, "plane": 1})
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda **kw: [_object(11789, distance=2, x=3240, y=3451, plane=1)])
+    monkeypatch.setattr(travel, "walk_to",
+                        lambda ctx, target, *a, **kw: pytest.fail(
+                            "must not try to walk to a plane-0 tile from plane 1"))
+
+    climbed = {}
+    monkeypatch.setattr(mh, "_climb",
+                        lambda ctx, ladder, option, why, **kw: climbed.update(
+                            ladder=ladder, option=option))
+
+    ctx = _Ctx()
+    ctx.state.data["mh_last_home"] = "JEFF"
+    ctx.state.data["mh_teleported_this_contract"] = True
+    state = {
+        "homeName": "JEFF",
+        "standingLocation": {"x": 3239, "y": 3450, "plane": 0},
+        "area": {"x": 3235, "y": 3445, "width": 10, "height": 12, "plane": 0},
+        "ladderObjectIds": [11789, 11793],
+    }
+    mh.travel_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert climbed["ladder"]["id"] == 11789
+    assert climbed["option"] == "Climb-down"
+
+
+def test_travel_phase_safety_stops_rather_than_retrying_a_routeless_walk_forever(monkeypatch):
+    """The ceiling every other loop in this routine already has. travel_phase's walk branch was
+    the only one without one -- which is why both routing bugs found live on 2026-08-29 presented
+    as an endless spin instead of a stop naming the problem."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3240, "y": 3450, "plane": 0})
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, *a, **kw: False)
+
+    ctx = _Ctx()
+    ctx.state.data["mh_last_home"] = "JEFF"
+    ctx.state.data["mh_teleported_this_contract"] = True
+    state = {"homeName": "JEFF", "standingLocation": {"x": 3239, "y": 3450, "plane": 0}}
+
+    for _ in range(mh.STUCK_TICK_LIMIT + 1):
+        mh.travel_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert ctx.state.safety_stopped, "travel_phase retried a routeless walk forever"
 
 
 def test_travel_phase_banks_when_teleport_item_missing(monkeypatch):
@@ -2530,7 +3296,12 @@ def test_a_reachable_hotspot_is_clicked_immediately(monkeypatch):
 
     ctx = _Ctx()
     mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
-    assert clicked == [40164]
+    # A hotspot click is a BURST now, not one click -- see HOTSPOT_SPAM_GAP_MIN_S for the human
+    # measurement. What matters here is that a reachable hotspot is acted on at once, and that
+    # every click of the burst goes to the SAME object.
+    assert clicked, "a reachable hotspot must be clicked immediately"
+    assert set(clicked) == {40164}
+    assert len(clicked) <= mh.HOTSPOT_SPAM_MAX_CLICKS
 
 
 def test_an_unknown_reachability_answer_still_clicks(monkeypatch):
@@ -2556,7 +3327,9 @@ def test_an_unknown_reachability_answer_still_clicks(monkeypatch):
 
     ctx = _Ctx()
     mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
-    assert clicked == [40164]
+    assert clicked, "an unknown reachability answer must still click, exactly as before"
+    assert set(clicked) == {40164}
+    assert len(clicked) <= mh.HOTSPOT_SPAM_MAX_CLICKS
 
 
 def test_pick_next_hotspot_prefers_one_we_can_actually_reach(monkeypatch):

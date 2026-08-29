@@ -350,6 +350,22 @@ steps above.
   genuinely not widgets** — re-confirmed against the current client by both dump modes — but the
   screens immediately after them are (CLICK HERE TO PLAY is widget 378.77), so check before
   assuming either way.
+- **A click's DEPARTURE is aimed too, not just its landing -- and `refresh_target` now governs
+  both.** `click_entity` used to begin every flight at the caller's `entity["screenX"/"screenY"]`
+  and only consult `refresh_target` mid-flight. For a caller holding a snapshot -- anything read
+  from the bulk `/objects` or `/npcs` scan at the top of a tick -- that means setting off toward
+  where the target WAS and being hauled forward partway there. MEASURED live 2026-08-30 in
+  `mahogany_homes`'s hotspot burst, which re-clicks the same object while the player runs: every
+  re-aim departed toward the tick-old projection. USER, watching it on screen: *"as we move the
+  mouse have to flick more but we flick back for some reason after we click"* -- the flick BACK is
+  the departure toward the stale pixel, and the correction forward is the mid-flight refresh
+  doing its job. `click_entity` now resolves the initial aim through `refresh_target` when one is
+  given, falling back to the caller's coordinates when it cannot answer. **Passing a
+  `refresh_target` is therefore the whole fix at a call site** -- do not re-resolve the position
+  yourself first. The corollary for anything that does NOT pass one: it is aiming at whatever
+  snapshot it was handed, so re-resolve through `/object/at` / `/npc/by-index` immediately before
+  clicking (this is the same trap `click_menu_action` documents below).
+
 - **Simulated human "mistakes" are intentional, not bugs.** `controller.click_entity` has a
   `MISTAKE_MISCLICK_CHANCE` (~4.5%, see `settings.py`) chance of deliberately aiming beside the
   target instead of on it, logged as `[!] Misclick -- aimed beside X instead of on it`. This is

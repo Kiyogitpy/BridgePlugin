@@ -81,6 +81,12 @@ WALK_MAX_HOPS = 60           # hard cap so a bad target can't loop forever
 COLLISION_SCAN_RADIUS = 10   # tiles of live collision fetched per hop. Big enough to see the
                              # doors along one hop, small enough that a 21x21 response per hop
                              # stays cheap. Beyond it we simply hop and let the stall catch it.
+WALK_MAX_REROUTES = 4        # times one walk may re-ask for a route with a tile excluded because
+                             # LIVE collision refuses it. The static map cannot know what stands on
+                             # a tile right now -- MEASURED at TAU's, where an OPENED diagonal door
+                             # leaves a full-tile blocker on a route tile. Small: each reroute
+                             # excludes one tile, and a place needing five of them is not a stale
+                             # map, it is a target we should stop walking at.
 WALK_MAX_STALLS = 4          # total no-progress passes over the WHOLE walk before giving up --
                              # NOT "consecutive": `stalls` is only ever incremented in walk_to's
                              # loop, never reset when a later hop makes real progress, so this is
@@ -388,7 +394,7 @@ def use_fountain(ctx) -> bool:
     return True
 
 
-def route_to(target: dict, *, goal_adjacent: bool = False):
+def route_to(target: dict, *, goal_adjacent: bool = False, avoid: set | None = None):
     """A walking route to `target` as [{"x", "y", "plane"}, ...], or None.
 
     Same plane only, and no transports -- see worldmap.find_path. `goal_adjacent` routes to a
@@ -404,7 +410,7 @@ def route_to(target: dict, *, goal_adjacent: bool = False):
                                 f"-- walking cannot change floor")
         return None
     tiles = worldmap.find_path(px, py, plane, target["x"], target["y"],
-                               goal_adjacent=goal_adjacent)
+                               goal_adjacent=goal_adjacent, avoid=avoid)
     if tiles is None:
         return None
 
@@ -519,7 +525,25 @@ def _open_door(ctx, door: dict, recheck) -> bool:
 
     debug_log.log("travel", f"opening the {door.get('name')} at ({dx},{dy}) in the way "
                             f"({tiles} tiles off, waiting up to {budget:.1f}s)")
-    controller.click_entity(ctx.ser, door)
+    # RE-AIM THROUGH THE FLIGHT. This was a bare click_entity, so it aimed at the pixel the door
+    # occupied when the ROUTE was computed -- while the player was still walking toward it. By the
+    # time the cursor arrived the projection had slid and the click landed on whatever was now
+    # under it. USER 2026-08-30: "i think the door isnt updated when we try to click it, nearly
+    # always lands somewhere else". That also fits the door failures measured the same night --
+    # ROSS's front door timing out three times over (2.7s, 4.1s, 6.2s budgets, all spent) while
+    # the recorder showed clicks registering: a stale aim produces exactly that, a click that goes
+    # somewhere harmless and a doorway that never opens.
+    #
+    # A door's id changes when it swings (24050 shut -> 24051 open), so the refresh stops
+    # resolving the moment it opens -- which is fine and is what we want: by then the click has
+    # already been committed, and click_entity keeps its last good aim when a refresh returns
+    # nothing.
+    controller.click_entity(
+        ctx.ser, door,
+        refresh_target=controller.object_refresh_target(door.get("x"), door.get("y"),
+                                                        door.get("plane", 0), door.get("id")),
+        refresh_legs=2,
+    )
 
     waited = 0.0
     while waited < budget:
@@ -571,6 +595,9 @@ def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
     `goal_adjacent` defaults True because most targets here are objects standing on their own
     (unroutable) tile. Pass False when the target really is a tile to stand on.
     """
+    avoid: set = set()
+    reroutes = 0
+
     route = route_to(target, goal_adjacent=goal_adjacent)
     if route is None:
         debug_log.log("travel", f"no walking route to ({target['x']},{target['y']}) "
@@ -604,7 +631,7 @@ def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
                 _open_door(ctx, door,
                            lambda: _door_on_route(route, plane,
                                                   _collision_flags(px, py, plane), index))
-                refreshed = route_to(target, goal_adjacent=goal_adjacent)
+                refreshed = route_to(target, goal_adjacent=goal_adjacent, avoid=avoid)
                 if refreshed is None:
                     return False
                 route = refreshed
@@ -617,7 +644,7 @@ def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
                 debug_log.log("travel", f"stalled {stalls} times short of "
                                         f"({target['x']},{target['y']}) -- giving up")
                 return False
-            refreshed = route_to(target, goal_adjacent=goal_adjacent)
+            refreshed = route_to(target, goal_adjacent=goal_adjacent, avoid=avoid)
             if refreshed is None:
                 return False
             route = refreshed
@@ -626,8 +653,49 @@ def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
 
         hop = route[_hop_index(route, index, px, py, flags)]
         if (hop["x"], hop["y"]) == (px, py):
-            # The route says we are already as far as this hop can take us and we have not
-            # arrived -- the remaining gap is not walkable. Fail rather than spin.
+            # The route cannot take us any further and we have not arrived. Before giving up, ask
+            # WHY: the static map is not live, so the usual cause is something standing on a route
+            # tile that the map cannot know about. MEASURED live 2026-08-29 at TAU's, Falador --
+            # a DIAGONAL door, which the game models as a GameObject blocking its WHOLE tile
+            # rather than a WallObject on an edge, so OPENING it does not clear a tile, it moves a
+            # full-tile blocker onto another one (24051 on (3046,3347), flags 131841). The route
+            # ran through that tile, _hop_index refused the very first crossing, and the walk died
+            # one tile from the door, 35 tiles short of the bank it then tried to open anyway.
+            #
+            # So: exclude the tile live collision actually refuses and ask for the route again.
+            # The detour is normally free -- at TAU's it is the SAME 51 steps. Deliberately
+            # general rather than door-specific: the map cannot tell furniture from a wall
+            # anywhere, so "re-route around what live collision refuses" covers the whole class.
+            crossing = blocked_crossing_on_route(
+                [(step["x"], step["y"]) for step in route], flags, index)
+            # A SHUT DOOR IS TO BE OPENED, NEVER ROUTED AROUND. MEASURED live 2026-08-30 at
+            # ROSS's, a regression this reroute introduced: its front door at (2610,3316) is the
+            # ONLY way in, the walker had already tried three times to open it (the
+            # DOOR_MAX_OPENS_PER_WALK budget) and each timed out -- and the reroute then excluded
+            # that very tile, leaving no route at all and failing harder than before.
+            #
+            # The discriminator is the object's own actions, and it is exact: TAU's blocker was
+            # an OPEN door's leaf ("Close"), immovable furniture that SHOULD be avoided; ROSS's
+            # is a shut door ("Open"), which should not. _door_on_route already answers precisely
+            # that question -- it only ever returns a door offering "Open".
+            if crossing is not None and _door_on_route(route, plane, flags, index) is not None:
+                debug_log.log("travel",
+                              f"({crossing[1][0]},{crossing[1][1]}) is a shut door we could not "
+                              f"open -- not routing around it")
+                crossing = None
+            if crossing is not None and reroutes < WALK_MAX_REROUTES:
+                _, blocked_tile = crossing
+                if blocked_tile not in avoid:
+                    avoid.add(blocked_tile)
+                    reroutes += 1
+                    debug_log.log("travel",
+                                  f"({blocked_tile[0]},{blocked_tile[1]}) is blocked in live "
+                                  f"collision but not on the map -- re-routing around it")
+                    refreshed = route_to(target, goal_adjacent=goal_adjacent, avoid=avoid)
+                    if refreshed is not None:
+                        route = refreshed
+                        last_pos = None
+                        continue
             debug_log.log("travel", "route makes no further progress toward the target")
             return False
         if not _hop_to(ctx, hop["x"], hop["y"], hop["plane"]):
@@ -753,8 +821,45 @@ def reachable_set(px: int, py: int, plane: int, radius: int = REACH_SCAN_RADIUS)
     return seen
 
 
+def interaction_tiles(goal: dict, flags: dict | None = None) -> list:
+    """Tiles we could actually ACT on `goal` from, as [(x, y), ...], nearest-first by nothing in
+    particular -- the caller picks. Empty when the client cannot tell.
+
+    ADJACENCY IS NOT INTERACTABILITY. worldmap.find_path(goal_adjacent=True) stops at ANY tile
+    cardinally adjacent to the goal, and it never has to cross the wall to get there, so the
+    route is perfectly valid by the static map's own rules -- while the tile it lands on cannot
+    touch the goal at all. MEASURED live 2026-08-30 at BARBARA's: the Bed at (1749,3539) has its
+    north and east edges walled (16416 / 65664) and only its south and west open (135432 /
+    132354), and the walker parked on the north tile and sat there until the ceiling stopped it.
+    The static map cannot tell a wall from furniture; live collision can, which is the same split
+    can_reach already rests on.
+
+    Cardinals only. A diagonal can genuinely reach (see can_reach's JEFF measurement) but makes a
+    poor WALK target: it is the tile the route should end on that matters here, and a cardinal
+    neighbour with an open edge is unambiguous."""
+    gx, gy = goal.get("x"), goal.get("y")
+    if gx is None:
+        return []
+    plane = goal.get("plane", 0)
+    if flags is None:
+        tiles = controller.get_collision(gx, gy, plane, radius=2) or []
+        flags = {(t["x"], t["y"]): t.get("flags") for t in tiles}
+    if not flags:
+        return []      # cannot tell -- the caller must fall back, not refuse to work
+
+    goal_flags = flags.get((gx, gy))
+    out = []
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        near = (gx + dx, gy + dy)
+        if flags.get(near) is None:
+            continue
+        if _edge_open(flags.get(near), goal_flags, -dx, -dy):
+            out.append(near)
+    return out
+
+
 def can_reach(goal: dict, reach: set | None = None, flags: dict | None = None,
-              plane: int | None = None) -> bool | None:
+              plane: int | None = None, _extend: bool = True) -> bool | None:
     """Can we stand ON or NEXT TO `goal`? None when the client could not tell.
 
     Adjacent counts because a hotspot's own tile is furniture by definition -- unwalkable -- and
@@ -821,6 +926,33 @@ def can_reach(goal: dict, reach: set | None = None, flags: dict | None = None,
                 return True
             if (_edge_open(flags.get(near), flags.get(via_y), -dx, 0)
                     and _edge_open(flags.get(via_y), goal_flags, 0, -dy)):
+                return True
+
+    # A MULTI-TILE OBJECT IS REPORTED AT ONE ANCHOR TILE, so every neighbour of that anchor can be
+    # blocked while the object's OTHER half stands beside a perfectly walkable tile. MEASURED live
+    # 2026-08-29 at MARIAH's: Table 40002 reported at (1769,3622) with all eight neighbours
+    # blocked -- Chairs north and south, its own blocking east and west -- while (1768,3622), the
+    # same object's west half, is cardinally adjacent to walkable (1767,3622). USER: "can reach on
+    # west side of that table". Returning False there is a FALSE NEGATIVE about an object the
+    # player can walk up to and click, and it cost two silent deadlocks in one session.
+    #
+    # Scoped to BLOCK_MOVEMENT_OBJECT and nothing else, which is exactly what a second tile of the
+    # same object looks like: a WALL blocks with the directional MOVEMENT_* bits and NEVER carries
+    # 256 (ROSS's exterior wall reads 65664/16416), so this cannot resurrect the "clicking through
+    # a wall" regression the edge test above exists to kill -- see
+    # test_can_reach_does_not_extend_through_a_WALL_blocked_neighbour.
+    #
+    # ONE level deep, never recursive: it answers "is this object touchable", not "flood the
+    # furniture". Being permissive here costs at worst a wasted click, which work_phase's own
+    # HOTSPOT_UNREACHABLE_CLICKS counter already bounds; being strict cost a frozen routine.
+    if _extend:
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            part = (gx + dx, gy + dy)
+            part_flags = flags.get(part)
+            if part_flags is None or not (part_flags & BLOCK_MOVEMENT_OBJECT):
+                continue
+            if can_reach({"x": part[0], "y": part[1], "plane": goal.get("plane")},
+                         reach, flags, plane, _extend=False) is True:
                 return True
     return False
 

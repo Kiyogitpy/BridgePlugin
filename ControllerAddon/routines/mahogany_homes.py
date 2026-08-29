@@ -56,6 +56,34 @@ HOTSPOT_BUILD_COOLDOWN_S = 2.4      # after a Build or Repair -- animation tail 
 # before we arrive?" -- we were. Same omission as the door-open budget, and the same fix.
 HOTSPOT_WALK_ALLOWANCE_S = 0.7      # per tile to the hotspot; 0.6s is one walked tile per tick
 HOTSPOT_COOLDOWN_MAX_S = 8.0        # ceiling, so a genuinely unreachable hotspot still gives up
+
+# SPAM-CLICKING, measured from the user's own four human recordings 2026-08-29 (n=1194 hotspot
+# actions): median gap between actions 0.20s, p25 0.18s, and 339 of 500 bursts are MORE than one
+# click on the same option (mean 2.46, max 8). Remove->Build median 2.06s. The bot the same night
+# managed 3.89s median / 3.62s Remove->Build, because the gate was a fixed wall-clock cooldown
+# that always paid the worst case even when the action had already finished.
+#
+# The gate is now a SIGNAL, not a timer: keep clicking at the human's own cadence until the
+# hotspot's varbit actually moves. Faster AND closer to the recorded human, which is rare.
+#
+# The burst must run INSIDE one work_phase call: the engine loop is ~1.1s, so successive ticks
+# physically cannot produce a 0.2s cadence.
+HOTSPOT_SPAM_GAP_MIN_S = 0.18       # the human's p25
+HOTSPOT_SPAM_GAP_MAX_S = 0.35       # a little past the median, so the cadence is not a metronome
+HOTSPOT_SPAM_MAX_CLICKS = 8         # the human's own measured maximum burst
+HOTSPOT_BURST_MAX_S = 8.0           # total budget for one burst, matching HOTSPOT_COOLDOWN_MAX_S
+# A hotspot's work is usually TWO actions (Remove, then Build) on the same object id, which is
+# stable across the whole lifecycle. Breaking the burst when the Remove lands hands control back
+# to the ~1.1s engine loop between two halves of one job. USER 2026-08-30: "keep clicking after
+# we remove so we start the next process". Bounded, because a hotspot that keeps changing state
+# under us is not something to click forever.
+HOTSPOT_BURST_MAX_ACTIONS = 3
+# How long a working tick tells the idle drift to hold off. It has to outlast the routine's own
+# decision work BETWEEN clicks, not just the click cooldown: MEASURED live 2026-08-30, handing
+# mark_busy the cooldown left a 1-3s unguarded window after every SUCCESSFUL action (a finished
+# action deliberately leaves a 0.35s cooldown), and the drift fired in it. USER: "seems like
+# flicking still happen". Being in work_phase with a hotspot to act on IS being busy.
+WORK_BUSY_WINDOW_S = 3.0
 TURN_IN_CLICK_COOLDOWN_S = 2.0      # first-draft guess, see module docstring
 LADDER_CLICK_COOLDOWN_S = 4.0       # a floor change takes a game tick plus the climb animation;
                                     # without this the next tick would immediately re-click.
@@ -530,8 +558,25 @@ def bank_phase(ctx, config: dict, state: dict) -> None:
     if bank_obj.get("distance", 0) > banker.BANK_APPROACH_TILES:
         debug_log.log("mahogany_homes",
                       f"bank is {bank_obj.get('distance')} tiles away -- walking to it")
-        travel.walk_to(ctx, {"x": bank_obj.get("x"), "y": bank_obj.get("y"),
-                             "plane": bank_obj.get("plane", 0)})
+        # HONOUR THE RETURN VALUE. walk_to's own docstring says "False now means something", and
+        # ignoring it here turned a walking failure into a misattributed one: MEASURED live
+        # 2026-08-29 at TAU's, the walk died at the diagonal door ("route makes no further
+        # progress") and this reached for a bank booth THIRTY-FIVE tiles away anyway -- 20s of
+        # idle-polling, then a safety stop blaming the bank interface for a routing problem.
+        if not travel.walk_to(ctx, {"x": bank_obj.get("x"), "y": bank_obj.get("y"),
+                                    "plane": bank_obj.get("plane", 0)}):
+            stuck = ctx.state.data.get("mh_bank_walk_stuck", 0) + 1
+            ctx.state.data["mh_bank_walk_stuck"] = stuck
+            debug_log.log("mahogany_homes",
+                          f"couldn't walk to the bank at ({bank_obj.get('x')},"
+                          f"{bank_obj.get('y')}) ({stuck}x)")
+            if stuck >= STUCK_TICK_LIMIT:
+                ctx.state.trigger_safety_stop(
+                    f"Mahogany Homes: no walking route to the bank at "
+                    f"({bank_obj.get('x')},{bank_obj.get('y')}) on {stuck} consecutive ticks"
+                )
+            return
+        ctx.state.data["mh_bank_walk_stuck"] = 0
         bank_obj = banker.find_nearby_bank(bank_config) or bank_obj
 
     if not banker.open_bank(ctx, bank_obj):
@@ -668,6 +713,15 @@ def request_contract_phase(ctx, config: dict, state: dict) -> None:
     ctx.state.data["mh_contact_cast_at"] = time.time()
     ctx.state.data["mh_contact_casts"] = casts + 1
 
+    # Swap to the inventory NOW, while the cast resolves. USER 2026-08-30: "we can immidiatly swap
+    # to our inventory with W while we wait for spell to be cast". The spell does not care which
+    # tab is showing, and travel_phase's very first act afterwards is this exact switch -- an
+    # inventory item is not on screen while the spellbook is (LIVE RUN 2026-08-28: the talisman
+    # right-click opened an empty ['Cancel'] menu because it landed on the spellbook). Doing it
+    # here overlaps the tab switch with the cast instead of paying for them one after the other;
+    # travel_phase's own call then finds the tab already open and skips.
+    controller.open_inventory_tab(ctx.ser)
+
 
 def travel_phase(ctx, config: dict, state: dict) -> None:
     home_name = state.get("homeName")
@@ -675,6 +729,7 @@ def travel_phase(ctx, config: dict, state: dict) -> None:
         ctx.state.data["mh_last_home"] = home_name
         ctx.state.data["mh_teleported_this_contract"] = False
         ctx.state.data["mh_teleport_attempts"] = 0
+        ctx.state.data["mh_travel_stuck"] = 0
 
     target = state.get("standingLocation") or {}
     player = controller.get_player()
@@ -736,10 +791,60 @@ def travel_phase(ctx, config: dict, state: dict) -> None:
                           f"walking to {home_name}")
         return
 
-    if not travel.walk_to(ctx, target, goal_adjacent=False):
-        debug_log.log("mahogany_homes", f"still walking toward {home_name}'s standing tile")
+    # WALKING CANNOT CHANGE FLOOR, and `standingLocation` is ALWAYS reported at plane 0 -- so
+    # from any upper floor the walk below cannot succeed in ANY circumstance. MEASURED live
+    # 2026-08-29 at JEFF's, standing on plane 1: "target is on plane 0 and we are on 1" ->
+    # "no walking route to (3239,3450)" -> "still walking toward JEFF's standing tile", 32 times
+    # in ~40s with nothing to stop it. This is the THIRD site of one bug: it was fixed in
+    # work_phase (_approach_missing_hotspot) and again in turn_in_phase, and travel_phase was
+    # never covered -- which matters most here, because this is the phase a restart lands in, so
+    # restarting while upstairs wedges the routine on the spot. The descent has to be owned here
+    # for the same reason turn_in_phase owns its own: work_phase's ladder handling lives in
+    # _approach_missing_hotspot and does not run in this phase at all.
+    player_plane = (controller.get_player() or {}).get("plane")
+    target_plane = target.get("plane") or 0
+    if player_plane is not None and player_plane != target_plane:
+        last_climb = ctx.state.data.get("mh_last_ladder_click", 0.0)
+        if time.time() - last_climb < LADDER_CLICK_COOLDOWN_S:
+            return
+        # Nearest ladder to US -- we want off this floor. Naturally returns None when we are not
+        # at the home at all (the house's ladder ids are simply not in the scene), and the walk
+        # ceiling below is what catches that case rather than an unbounded retry.
+        ladder = _pick_ladder(state, None)
+        if ladder is not None:
+            _climb(ctx, ladder,
+                   "Climb-up" if target_plane > player_plane else "Climb-down",
+                   f"{home_name}'s standing tile is on plane {target_plane}, we're on "
+                   f"{player_plane} -- taking ladder {ladder['id']} before walking",
+                   from_plane=player_plane)
+            return
+
+    # goal_adjacent is left at walk_to's default (True). `standingLocation` is a fixed
+    # per-home HINT point, never a promise the tile can be stood on: MEASURED 2026-08-29,
+    # LEELA's (1785,3592) is solid on all four edges (furniture inside a walkable interior,
+    # the same hazard as TAU's (3047,3345)), so find_path rightly refuses to route ONTO it
+    # and the old goal_adjacent=False demanded exactly that -- walk_to returned False every
+    # tick and this phase spun forever with nothing to stop it. Routing BESIDE the tile costs
+    # nothing: arrival here is already tolerance-based, so an exact route was never required.
+    if not travel.walk_to(ctx, target):
+        # THE CEILING. Every other loop in this routine has one (CONTACT_MAX_CASTS,
+        # TELEPORT_MAX_ATTEMPTS, STUCK_TICK_LIMIT, TURN_IN_MAX_CLICKS); this branch had none,
+        # which is why BOTH routing bugs found live on 2026-08-29 -- the solid standing tile and
+        # the cross-plane walk above -- presented as an endless silent spin rather than a stop
+        # naming the problem. A routeless walk now fails loudly after a bounded number of ticks.
+        stuck = ctx.state.data.get("mh_travel_stuck", 0) + 1
+        ctx.state.data["mh_travel_stuck"] = stuck
+        debug_log.log("mahogany_homes",
+                      f"still walking toward {home_name}'s standing tile ({stuck}x)")
+        if stuck >= STUCK_TICK_LIMIT:
+            ctx.state.trigger_safety_stop(
+                f"Mahogany Homes: no walking route to {home_name}'s standing tile "
+                f"({target.get('x')},{target.get('y')} plane {target_plane}) on {stuck} "
+                f"consecutive ticks"
+            )
         return
 
+    ctx.state.data["mh_travel_stuck"] = 0
     ctx.state.data["mh_phase"] = "work"
 
 
@@ -879,10 +984,103 @@ def work_phase(ctx, config: dict, state: dict) -> None:
         # open_doorway_to, then a blunt open_nearest_shut_door that opened something and hoped.
         # All three existed because there was no route to ask; with a route the door is simply
         # the one standing on it, and that works on any plane.
+        # LOUD AND BOUNDED. This branch used to log nothing, click nothing and advance no
+        # counter, which made it a SILENT INFINITE LOOP -- MEASURED live 2026-08-29 twice in one
+        # session (79 ticks of zero output, then 46s) with the routine ticking and doing nothing.
+        # USER: "another deadlock doing nothing". Three things conspired: the branch is silent;
+        # open_door_toward logs only when it actually finds a door; and the walk goal is the
+        # home's standing tile, which from INSIDE the house is already within
+        # HOUSE_ARRIVAL_TOLERANCE, so walk_to returns True immediately without clicking. Neither
+        # of the two existing counters covers this path -- mh_work_stuck was reset just above
+        # (the object IS visible) and mh_hotspot_clicks is only touched once we get past here.
+        #
+        # The false negative that triggered it is fixed in travel.can_reach (a multi-tile object
+        # is reported at one anchor tile), but no reachability answer, right or wrong, may leave
+        # this routine frozen and silent -- that is what turned one wrong answer into a dead run.
+        unreachable = ctx.state.data.get("mh_unreachable_ticks", 0) + 1
+        ctx.state.data["mh_unreachable_ticks"] = unreachable
+        debug_log.log("mahogany_homes",
+                      f"hotspot {target['objectId']} at "
+                      f"({hotspot_at.get('x')},{hotspot_at.get('y')}) reads unreachable from "
+                      f"({player.get('x')},{player.get('y')}) ({unreachable}x)")
+
+        # A SPLIT UPPER FLOOR is not a door problem and no amount of walking fixes it: NOELLA's
+        # two staircases reach two halves that do not join, so the far half is reached by going
+        # DOWN and back up the other one. USER 2026-08-30: "has to go downstairs then take the
+        # other ladder". MEASURED live the same night -- player (2661,3319) plane 1, hotspot
+        # 40160 at (2657,3322) plane 1, reachable_from returning EIGHTEEN tiles and find_path
+        # None; every answer correct, and no door anywhere to open.
+        #
+        # This recovery already existed, below, in the HOTSPOT_UNREACHABLE_CLICKS branch -- but
+        # that branch sits AFTER this gate, and this gate returns. So on the one home the
+        # recovery was written for it could never run; it only ever fired when reachability was
+        # UNKNOWN, which is exactly why its unit test passed while the live case wedged.
+        if (unreachable >= HOTSPOT_UNREACHABLE_CLICKS
+                and state.get("homeName") in SPLIT_UPPER_FLOOR_HOMES
+                and (player.get("plane") or 0) > 0):
+            if time.time() - ctx.state.data.get("mh_last_ladder_click", 0.0) < LADDER_CLICK_COOLDOWN_S:
+                return
+            ladder = _pick_ladder(state, None)      # nearest to US -- we want off this floor
+            if ladder is not None:
+                ctx.state.data["mh_unreachable_ticks"] = 0
+                ctx.state.data["mh_hotspot_clicks"] = 0
+                ctx.state.data["mh_hotspot_signature"] = None
+                _climb(ctx, ladder, "Climb-down",
+                       f"hotspot {target['objectId']} is on the far half of "
+                       f"{state.get('homeName')}'s split upper floor -- climbing down to take "
+                       f"the other staircase",
+                       from_plane=player.get("plane"))
+                return
+
         travel.open_door_toward(ctx, hotspot_at)
-        travel.walk_to(ctx, _same_floor_walk_goal(state, target, hotspot_at),
-                       tolerance=HOUSE_ARRIVAL_TOLERANCE)
+        # HEAD FOR THE HOTSPOT, not the house's standing tile. We have ALREADY PROVEN we cannot
+        # reach the hotspot from here, so the standing tile is not a goal that helps -- and it is
+        # usually a tile we are already stood on. MEASURED live 2026-08-30 at BARBARA's: player
+        # (1749,3534), standing tile (1750,3534), Chebyshev distance ONE against a tolerance of
+        # one, so walk_to returned True instantly without moving or opening anything -- 14 ticks
+        # of it, until the ceiling stopped the run. The hotspot was walled in on all four sides
+        # live while worldmap found a 13-step route to a tile beside it: the way in was a shut
+        # door, and only a walk aimed AT the hotspot puts that door on the route.
+        #
+        # CLAUDE.md already records this from NORMAN's, but that fix went into the
+        # HOTSPOT_UNREACHABLE_CLICKS branch below, which this gate returns before reaching.
+        # Falls back to the standing tile when the hotspot is on another floor, where walking
+        # cannot help at all and the ladder handling owns it.
+        walk_goal = (hotspot_at if hotspot_at.get("plane", player_plane) == player_plane
+                     else _same_floor_walk_goal(state, target, hotspot_at))
+
+        # ...and aim at a tile we could ACTUALLY ACT FROM, not merely one adjacent to the
+        # hotspot. worldmap.find_path(goal_adjacent=True) stops at ANY cardinal neighbour, and it
+        # never has to cross a wall to get there -- so the route is valid by the static map's own
+        # rules while the tile it lands on cannot touch the hotspot at all. MEASURED live
+        # 2026-08-30 at BARBARA's: the walk ended on (1749,3540), adjacent to the Bed but behind
+        # the bedroom's north wall (16416), and can_reach went on answering False -- correctly --
+        # until the ceiling stopped the run. Only (1749,3538) and (1748,3539) can touch that bed,
+        # both inside the bedroom, and routing to one of them crosses the bedroom door, which
+        # open_door_toward then finds as an ordinary door on the route.
+        #
+        # Nearest first, so we do not cross the house for an approach when a closer one exists.
+        # interaction_tiles returns [] when the client cannot tell, which falls straight back to
+        # the old goal rather than refusing to walk.
+        if walk_goal is hotspot_at:
+            approaches = travel.interaction_tiles(hotspot_at)
+            if approaches:
+                px, py = player.get("x"), player.get("y")
+                if px is not None:
+                    approaches.sort(key=lambda t: max(abs(t[0] - px), abs(t[1] - py)))
+                walk_goal = {"x": approaches[0][0], "y": approaches[0][1],
+                             "plane": hotspot_at.get("plane", player_plane)}
+
+        travel.walk_to(ctx, walk_goal, tolerance=HOUSE_ARRIVAL_TOLERANCE)
+        if unreachable >= STUCK_TICK_LIMIT:
+            ctx.state.trigger_safety_stop(
+                f"Mahogany Homes: hotspot {target['objectId']} at "
+                f"({hotspot_at.get('x')},{hotspot_at.get('y')}) has read unreachable for "
+                f"{unreachable} consecutive ticks and walking is not closing the gap"
+            )
         return
+
+    ctx.state.data["mh_unreachable_ticks"] = 0
 
     if ctx.state.data.get("mh_door_checked") != signature:
         ctx.state.data["mh_door_checked"] = signature
@@ -988,18 +1186,140 @@ def work_phase(ctx, config: dict, state: dict) -> None:
     # all registering correctly in the recorder against the right object, no varbit movement, then
     # the unreachable branch. Capped so a hotspot that truly cannot be reached still gives up.
     base = HOTSPOT_CLICK_COOLDOWN_S if _is_instant_action(obj) else HOTSPOT_BUILD_COOLDOWN_S
-    ctx.state.data["mh_hotspot_cooldown"] = min(
+    unfinished_budget = min(
         base + (obj.get("distance") or 0) * HOTSPOT_WALK_ALLOWANCE_S,
         HOTSPOT_COOLDOWN_MAX_S,
     )
+    ctx.state.data["mh_hotspot_cooldown"] = unfinished_budget
     debug_log.log("mahogany_homes", f"working hotspot {target['objectId']} (varb {target['varb']})")
-    controller.click_entity(
-        ctx.ser, obj,
-        refresh_target=controller.object_refresh_target(obj["x"], obj["y"], obj["plane"], obj["id"]),
-        refresh_legs=2,
-    )
-    ctx.state.data["mh_last_hotspot_click"] = time.time()
-    ctx.state.data["mh_hotspot_clicks"] = ctx.state.data.get("mh_hotspot_clicks", 0) + 1
+
+    # We are working. Hold the idle drift off for the whole tick and the decision work that
+    # follows it, not merely for the click's own cooldown -- see WORK_BUSY_WINDOW_S.
+    controller.mark_busy(WORK_BUSY_WINDOW_S)
+
+    # ONE BURST, not one click. See HOTSPOT_SPAM_GAP_MIN_S for the human measurement this
+    # reproduces. The burst exits the instant the varbit moves, so a fast action costs one gap
+    # rather than the old fixed 2.4s+walk budget.
+    #
+    # `mh_hotspot_clicks` counts BURSTS, deliberately: one unproductive burst is one failure, so
+    # HOTSPOT_UNREACHABLE_CLICKS keeps its exact prior meaning (five fruitless attempts) instead
+    # of being blown through in under a second by the spam itself. That guard is what catches a
+    # hotspot that is visible but not actually reachable, so preserving its semantics is not
+    # optional -- it is the thing standing between this and the walk-away bug of 2026-08-29.
+    # THE BURST. Three signals decide it, and each answers a different question:
+    #   * CONSTRUCTION XP -- "the build landed". USER 2026-08-30: "remove is nearly instant so we
+    #     can keep clicking until we get experience drop". Remove grants NO xp and Build/Repair
+    #     does, so an xp increase means the paying half of this hotspot is finished. It is also
+    #     SUB-TICK: client.getSkillExperience reflects the moment StatChanged fires, unlike the
+    #     tick-quantised scene scans (see CLAUDE.md's note on xp as a general-purpose signal).
+    #   * THE VARBIT -- "an action landed". The only thing that sees a Remove, which pays nothing.
+    #     A change means carry on into the next action rather than hand back to the engine loop.
+    #   * MOVEMENT -- "the projection has slid", so the next click must re-aim.
+    deadline = time.time() + HOTSPOT_BURST_MAX_S
+    xp0 = (controller.get_player() or {}).get("constructionXp")
+    prev_tile = _player_tile()
+    baseline = target.get("value")
+    progressed = False
+    moved = False
+    needs_aim = True
+    actions_done = 0
+    clicks_this_action = 0
+
+    while (time.time() < deadline
+           and actions_done < HOTSPOT_BURST_MAX_ACTIONS
+           and clicks_this_action < HOTSPOT_SPAM_MAX_CLICKS):
+        clicks_this_action += 1
+        if needs_aim:
+            # RE-AIM, STARTING FROM THE LIVE POSITION. The object's world tile never moves, but
+            # its SCREEN projection slides as the player and camera do, and its MODEL changes
+            # when an action lands -- so either makes the previous pixel stale. USER 2026-08-30:
+            # "if we continuously click we gotta update the object x y otherwise while we move we
+            # click away".
+            #
+            # refresh_target alone is NOT enough, and this is the subtle half: click_entity begins
+            # its flight at entity["screenX"/"screenY"], and `obj` was read from /objects ONCE at
+            # the top of this tick. While the player runs that is stale within a fraction of a
+            # second, so every re-aim set off toward where the hotspot HAD been and the refresh
+            # only hauled it forward mid-flight. USER, watching it: "as we move the mouse have to
+            # flick more but we flick back for some reason after we click" -- that flick back is
+            # the departure toward the stale pixel. refresh_target fixes the LANDING; only this
+            # fixes the DEPARTURE.
+            # The live re-resolve lives in click_entity now (it uses refresh_target for the
+            # DEPARTURE as well as mid-flight), so passing the factory is all this needs.
+            controller.click_entity(
+                ctx.ser, obj,
+                refresh_target=controller.object_refresh_target(obj["x"], obj["y"], obj["plane"],
+                                                                obj["id"]),
+                refresh_legs=2,
+            )
+        else:
+            # STANDING STILL with the same model under the cursor: the pixel is still right, so
+            # re-flying the mouse is pure latency. MEASURED live 2026-08-30 -- a re-aimed repeat
+            # costs 1.0-1.1s of flight against the human's 0.20s median, which is the entire gap
+            # this closes. This is what a human repeat-click is: the same pixel, again.
+            controller.click_human(ctx.ser)
+        ctx.state.data["mh_last_hotspot_click"] = time.time()
+
+        if time.time() >= deadline:
+            break
+        # The gap doubles as the sampling interval for every check below, so the burst costs no
+        # sleeps beyond the human cadence it reproduces.
+        controller.human_delay(HOTSPOT_SPAM_GAP_MIN_S, HOTSPOT_SPAM_GAP_MAX_S)
+
+        # KEEP CLICKING THROUGH THE WALK. USER 2026-08-30: "it clicks twice player moves then it
+        # waits at the thing and clicks again -- need to keep clicking while moving until done".
+        # An in-place repeat mid-walk is NOT the ROSS failure: that was a re-AIMED click on a
+        # later tick which re-resolved the object and could re-path. Movement here only chooses
+        # the next click's KIND, and tells the cooldown below that the action never started.
+        if _player_is_moving(prev_tile):
+            moved = True
+            needs_aim = True
+        else:
+            needs_aim = False
+        prev_tile = _player_tile()
+
+        xp = (controller.get_player() or {}).get("constructionXp")
+        if xp0 is not None and xp is not None and xp > xp0:
+            progressed = True
+            break
+
+        row = _hotspot_now(target)
+        if row is not None and row.get("value") != baseline:
+            # An action landed -- almost always the Remove, which pays no xp. Carry straight on:
+            # the object is now "<thing> space" on the SAME object id and offers Build, and
+            # stopping here would spend the ~1.1s engine loop between two halves of one job.
+            progressed = True
+            actions_done += 1
+            baseline = row.get("value")
+            clicks_this_action = 0
+            needs_aim = True
+            if not row.get("needsAttention"):
+                break
+
+    # Hold off the idle drift for as long as this hotspot's action is still in flight. Without
+    # it the cursor wanders off target between bursts and the next click flies it back -- see
+    # controller._busy_until for the live measurement.
+    controller.mark_busy(ctx.state.data.get("mh_hotspot_cooldown", HOTSPOT_CLICK_COOLDOWN_S))
+
+    if progressed:
+        # The varbit MOVED, so this action is finished -- there is nothing left to wait out, and
+        # making the next one wait the unfinished-action budget is exactly the 2.4s of dead time
+        # this whole change exists to remove. Fall through at the human's own inter-action gap.
+        ctx.state.data["mh_hotspot_cooldown"] = HOTSPOT_SPAM_GAP_MAX_S
+        ctx.state.data["mh_hotspot_clicks"] = 0
+    elif moved:
+        # No progress YET, but the player is still travelling: the interaction is queued and
+        # performs on arrival, so the action simply has not begun. Come straight back and keep
+        # clicking rather than standing at the hotspot waiting out a budget sized for an action
+        # that never started -- the exact "waits at the thing and clicks again" the user saw.
+        # This does NOT count as a failed attempt for the same reason.
+        ctx.state.data["mh_hotspot_cooldown"] = HOTSPOT_SPAM_GAP_MAX_S
+    else:
+        # Standing still, clicked our whole burst, and the varbit never moved. THAT is a real
+        # failed attempt -- the hotspot is visible but something is wrong -- so it counts toward
+        # HOTSPOT_UNREACHABLE_CLICKS and backs off to the walk-aware budget.
+        ctx.state.data["mh_hotspot_cooldown"] = unfinished_budget
+        ctx.state.data["mh_hotspot_clicks"] = ctx.state.data.get("mh_hotspot_clicks", 0) + 1
 
 
 def _can_afford(inventory: list, plank_name: str, state: dict, target: dict) -> bool:
@@ -1221,12 +1541,32 @@ def _approach_missing_hotspot(ctx, config: dict, state: dict, target: dict) -> N
                from_plane=player_plane)
         return
 
+    # WALKING CANNOT CHANGE FLOOR, and `standingLocation` is ALWAYS reported at plane 0 -- so from
+    # an upper floor this last-resort walk cannot succeed in ANY circumstance. SEEN LIVE twice on
+    # 2026-08-30 (JEFF, then BOB): travel answers "target is on plane 0 and we are on 1" and the
+    # tick is spent on a bridge call plus a log line claiming we are walking somewhere we are not.
+    # Bounded by mh_work_stuck either way, so this is waste rather than a stall -- but it is the
+    # same rule broken in the same place as the two deadlocks earlier tonight, and this is the
+    # last site that still broke it.
+    player_plane = (controller.get_player() or {}).get("plane")
+    standing_plane = standing.get("plane") if standing else None
+    if (player_plane is not None and standing_plane is not None
+            and player_plane != standing_plane):
+        debug_log.log(
+            "mahogany_homes",
+            f"hotspot object {target['objectId']} not visible yet ({stuck}x) and "
+            f"{state.get('homeName')}'s standing tile is on plane {standing_plane} while we are "
+            f"on {player_plane} -- no ladder in range, so waiting rather than walking nowhere",
+        )
+        return
+
     debug_log.log(
         "mahogany_homes",
         f"hotspot object {target['objectId']} not visible yet ({stuck}x, no ladder to try) "
         f"-- walking toward {state.get('homeName')}'s house",
     )
-    travel.walk_to(ctx, standing, tolerance=HOUSE_ARRIVAL_TOLERANCE, goal_adjacent=False)
+    # goal_adjacent stays default -- standingLocation can be solid furniture, see travel_phase.
+    travel.walk_to(ctx, standing, tolerance=HOUSE_ARRIVAL_TOLERANCE)
 
 
 def turn_in_phase(ctx, config: dict, state: dict) -> None:
@@ -1294,7 +1634,8 @@ def turn_in_phase(ctx, config: dict, state: dict) -> None:
                 return
 
         debug_log.log("mahogany_homes", f"homeowner npc {npc_id} not visible -- walking to standing tile")
-        travel.walk_to(ctx, state.get("standingLocation") or {}, goal_adjacent=False)
+        # goal_adjacent stays default -- standingLocation can be solid furniture, see travel_phase.
+        travel.walk_to(ctx, state.get("standingLocation") or {})
         return
 
     # NOTE: _accept_tea_if_offered is deliberately NOT called here -- see tick(), which calls it
@@ -1303,8 +1644,35 @@ def turn_in_phase(ctx, config: dict, state: dict) -> None:
     if time.time() - last_click < TURN_IN_CLICK_COOLDOWN_S:
         return
 
+    # ARE WE STILL WALKING TO HIM? The game QUEUES the interaction and performs it on ARRIVAL, so
+    # a Talk-to on an NPC several tiles away has simply not happened yet -- and re-clicking now
+    # aims where he WAS, because he walks. USER 2026-08-30: "sometimes when we sucessfully click
+    # the npc and we walking towards him we time out and click again and miss", then: "we can use
+    # the walk / idle function instead to verify".
+    #
+    # That is better than budgeting the walk by distance, which is what the hotspot click does:
+    # it would replace a flat guess (TURN_IN_CLICK_COOLDOWN_S was a first-draft 2.0s) with a
+    # per-tile guess, while the player's own movement answers the question exactly. Only the
+    # FIRST click is unconditional; every repeat has to wait until we have actually stopped.
+    # Keyed on "have we clicked at all", NOT on the click's timestamp: a timestamp of 0.0 is a
+    # legitimate "gate expired" value and would silently skip this check.
+    if (ctx.state.data.get("mh_turnin_tile") is not None
+            and _player_is_moving(ctx.state.data.get("mh_turnin_tile"))):
+        ctx.state.data["mh_turnin_tile"] = _player_tile()
+        return
+
     debug_log.log("mahogany_homes", f"turning in the contract with {state.get('npcName')}")
-    controller.click_menu_action(ctx.ser, npc, "Talk-to")
+    # TRACK HIM. The homeowner WALKS, and click_menu_action right-clicks exactly the pixel it is
+    # given unless a refresh_target says otherwise (it gained one on 2026-08-27 for precisely
+    # this; this call site never adopted it). By INDEX, so a re-resolve can never land on a
+    # different individual. USER: "seems like we miss the npc at the end is the mouse move not
+    # using updated data?" -- it was not.
+    controller.click_menu_action(
+        ctx.ser, npc, "Talk-to",
+        refresh_target=controller.npc_index_refresh_target(npc.get("index")),
+        offset=(0, 0),      # a person is a small target; the default (-7,+7) slides off one
+    )
+    ctx.state.data["mh_turnin_tile"] = _player_tile()
     ctx.state.data["mh_last_turnin_click"] = time.time()
     ctx.state.data["mh_turnin_clicks"] = ctx.state.data.get("mh_turnin_clicks", 0) + 1
 
@@ -1360,6 +1728,45 @@ def _at_the_home(state: dict) -> bool:
     if standing and standing.get("x") is not None:
         return _chebyshev(player, standing) <= HOME_ARRIVAL_TILES
     return True
+
+
+def _player_tile():
+    """The player's current tile as (x, y), or None when the bridge cannot say."""
+    p = controller.get_player() or {}
+    return None if p.get("x") is None else (p["x"], p["y"])
+
+
+def _player_is_moving(prev_tile) -> bool:
+    """Has the player's tile changed since `prev_tile`?
+
+    The game performs a QUEUED interaction on ARRIVAL, so while we are still walking the action
+    has not begun and re-clicking merely re-queues it -- sometimes re-pathing, which is the ROSS
+    failure that made a perfectly reachable hotspot look unreachable. USER 2026-08-29 suggested
+    exactly this signal: "we can use the is player moving function".
+
+    Takes the previous tile rather than polling twice itself, deliberately: inside a burst the
+    inter-click gap IS the sampling interval, so this costs one read we already need instead of
+    an extra sleep on every click. Position rather than `poseAnimation` because position is what
+    we care about, and the animation is tick-quantised the same way regardless.
+
+    Fails CLOSED (reports not moving) when either tile is unknown, so a client hiccup degrades to
+    the old click-anyway behaviour rather than stalling the burst."""
+    now = _player_tile()
+    if now is None or prev_tile is None:
+        return False
+    return now != prev_tile
+
+
+def _hotspot_now(target: dict) -> dict | None:
+    """This hotspot's LIVE row from /mahogany-homes, or None when it is not reported.
+
+    Read fresh every time: these are varbit reads on the client thread, not a cached scene scan,
+    so they are not tick-limited the way /objects is."""
+    state = controller.get_mahogany_homes_state() or {}
+    for h in state.get("hotspots") or []:
+        if h.get("objectId") == target.get("objectId"):
+            return h
+    return None
 
 
 def _is_instant_action(obj: dict) -> bool:

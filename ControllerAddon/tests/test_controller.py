@@ -1376,3 +1376,197 @@ def test_get_api_index_returns_the_group_listing(monkeypatch):
 
     assert index["count"] == 66
     assert index["groups"]["Storage"] == ["/api/storage/rune-pouch"]
+
+
+# --- a click is mouse activity ---------------------------------------------------------------
+
+def test_click_human_counts_as_mouse_activity(monkeypatch):
+    """USER 2026-08-30, watching a hotspot burst live: "when we flick i think the idle function
+    drags back the mouse".
+
+    `_last_mouse_activity` gates maybe_idle_mouse_move's drift and was bumped ONLY by
+    move_to_human. That was harmless while every click was preceded by a move -- but
+    mahogany_homes' hotspot burst now repeats a click IN PLACE (which is what the human's 0.20s
+    median is), and those clicks moved nothing. So mid-work the engine believed the mouse had
+    been still for seconds and inserted a slow idle drift, dragging the cursor off the target
+    between bursts. A click is deliberate input whether or not it moved the cursor."""
+    calls = []
+    monkeypatch.setattr(controller, "mouse_left_down", lambda ser: calls.append("down"))
+    monkeypatch.setattr(controller, "mouse_left_up", lambda ser: calls.append("up"))
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (100, 100))
+
+    import input_state
+    input_state.reset()
+    input_state._last_mouse_activity -= 60.0
+    stale = input_state._last_mouse_activity
+
+    controller.click_human(object())
+
+    assert input_state._last_mouse_activity > stale,         "an in-place click must reset the idle-drift timer, or the engine drifts mid-work"
+
+
+# --- idle drift must not interrupt work in flight ---------------------------------------------
+
+class _IdleState:
+    def __init__(self):
+        self.next_idle_move_at = 0.0
+
+
+def test_idle_drift_is_suppressed_while_an_action_is_in_flight(monkeypatch):
+    """MEASURED live 2026-08-30 over one run: 14 idle drifts against 48 clicks, and 5 of the 14
+    fired after under 2.5s of stillness -- BETWEEN bursts, while the routine was actively working
+    on a hotspot. On screen that is the cursor wandering off target and being flown back for the
+    next click. USER: "when we flick i think the idle function drags back the mouse".
+
+    Bumping _last_mouse_activity on click_human fixed the MID-burst case, but it could not fix
+    this one: waiting ~2s for a queued action to complete genuinely is stillness, and the drawn
+    still-segment budget is ~1.5s. The routine knows it is mid-action though, so it says so.
+    Genuine idle is untouched -- this only silences the drift while work is actually pending."""
+    moved = []
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (500, 500))
+    monkeypatch.setattr(controller, "is_point_within_window", lambda x, y: True)
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **kw: moved.append((x, y)))
+
+    import input_state
+    input_state.reset()
+    input_state._last_mouse_activity -= 60.0
+
+    class _C:
+        ser = object()
+
+    state = _IdleState()
+    controller.mark_busy(5.0)
+    controller.maybe_idle_mouse_move(_C(), state)
+    assert not moved, "an idle drift must not fire while an action is still in flight"
+
+    input_state._busy_until = 0.0
+    state.next_idle_move_at = 0.0
+    controller.maybe_idle_mouse_move(_C(), state)
+    assert moved, "genuine idle must still drift -- this is measured anti-freeze behaviour"
+
+
+def test_input_state_is_shared_across_both_copies_of_controller():
+    """THE POINT OF input_state.py. controller.py is loaded TWICE in a running process -- as
+    `__main__` (it is the script) and as `controller` (every routine imports it) -- so a
+    module-level variable there exists twice, and the engine's copy never sees a routine's
+    writes. PROVEN 2026-08-30 by loading the file both ways and comparing identity.
+
+    input_state is only ever imported by NAME, so there is exactly one of it however many times
+    controller.py is loaded. This test fails the moment shared input state migrates back into
+    controller.py."""
+    import importlib.util, os
+    import input_state
+
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "controller.py")
+    spec = importlib.util.spec_from_file_location("controller_second_copy", path)
+    second = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(second)
+
+    assert second is not controller, "the premise: two copies of controller really do exist"
+    assert second.input_state is input_state,         "both copies of controller must share ONE input_state, or the idle drift goes blind again"
+
+
+def test_idle_drift_will_not_fire_inside_the_gap_between_our_own_actions(monkeypatch):
+    """The fix that finally worked, after two that did not. MEASURED live 2026-08-30: drifts kept
+    firing after 1.3-2.5s of stillness while the routine was actively clicking -- first because
+    click_human did not count as activity, then because the state was in the WRONG COPY of
+    controller, then because marking work_phase busy left _climb (and every other clicking path)
+    unmarked.
+
+    A floor in one place cannot be forgotten by a call site. 4.0s comes from the same measurement
+    the feature rests on: the human is NEVER still longer than 4.5s, so a drift at 1.3s is not
+    imitating them, it is out-moving them."""
+    moved = []
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (500, 500))
+    monkeypatch.setattr(controller, "is_point_within_window", lambda x, y: True)
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **kw: moved.append((x, y)))
+
+    import input_state
+    input_state.reset()
+
+    class _C:
+        ser = object()
+
+    state = _IdleState()
+    # A gap of the size that sits between two of our own actions, with a drawn budget below it.
+    state.next_idle_move_at = 1.0
+    input_state._last_mouse_activity -= 2.0
+    controller.maybe_idle_mouse_move(_C(), state)
+    assert not moved, "2s is an ordinary gap between our own clicks, not a freeze"
+
+    # A genuine freeze still gets filled -- that is the whole point of the feature.
+    input_state._last_mouse_activity -= 10.0
+    controller.maybe_idle_mouse_move(_C(), state)
+    assert moved, "a real freeze must still drift"
+
+
+def test_click_entity_departs_from_the_refreshed_position_not_the_stale_one(monkeypatch):
+    """A refresh_target means "this target MOVES, keep up with it". Honouring it only mid-flight
+    while departing toward entity["screenX"/"screenY"] -- whatever stale snapshot the caller
+    happened to be holding -- is half a contract.
+
+    MEASURED live 2026-08-30 in mahogany_homes' hotspot burst: the obj dict came from ONE
+    /objects read at the top of the tick, and while the player ran, every re-aimed click set off
+    toward where the hotspot had been and was only hauled forward mid-flight. USER: "as we move
+    the mouse have to flick more but we flick back for some reason after we click". The flick
+    back IS the departure toward the stale pixel.
+
+    Fixed HERE rather than in the routine so no other call site can inherit it -- slayer,
+    golem_crafting and travel's door click all pass refresh_target too."""
+    flights = []
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **kw: flights.append((x, y)))
+    monkeypatch.setattr(controller, "click_human", lambda ser: None)
+    monkeypatch.setattr(controller, "_settle_on_target_before_click", lambda ser, rt: None)
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (10, 10))
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+
+    stale = {"name": "Table", "screenX": 900, "screenY": 400}
+
+    controller.click_entity(object(), stale, offset=(0, 0),
+                            refresh_target=lambda: (1180, 660),
+                            simulate_mistakes=False, check_ui_blockers=False)
+
+    assert flights, "expected a flight"
+    assert flights[0] == (1180, 660), (
+        f"the flight must DEPART from the live position, not the stale snapshot -- got {flights[0]}"
+    )
+
+
+# --- panic/pause must not depend on a single hook ---------------------------------------------
+
+def test_async_key_watchdog_fires_the_action_once_per_press(monkeypatch):
+    """USER-REPORTED 2026-08-30, mid-run: "my f1 and f2 doesnt work now hmm" -- the panic key had
+    silently stopped responding while the routine was still driving the mouse.
+
+    The `keyboard` library's wait() rides a Windows low-level hook, and Windows SILENTLY REMOVES
+    such a hook when its callback overruns LowLevelHooksTimeout (default 300ms, confirmed not
+    overridden on that machine). Once dropped, F1 is dead for the life of the process with no
+    error anywhere. The hotspot burst had just become much busier -- a tight click loop making two
+    extra HTTP calls per click -- which is exactly the GIL pressure that starves such a callback.
+
+    GetAsyncKeyState asks the OS for the key's state directly. No hook, so nothing to lose, and
+    it keeps working when the foreground window is elevated. This is the second, independent path
+    panic used to have before it was unified to one on 2026-08-27 for symmetry with pause -- that
+    unification removed the redundancy that would have covered this.
+
+    Edge-triggered: the action fires on the DOWN transition only. Panic is idempotent (os._exit)
+    but pause is a toggle, so a level-triggered watchdog would flip it many times per press."""
+    states = iter([0, 0, 0x8000, 0x8000, 0x8000, 0, 0x8000, 0])
+    fired = []
+    monkeypatch.setattr(controller, "_async_key_down",
+                        lambda vk: bool(next(states, 0) & 0x8000))
+
+    stop = {"n": 0}
+    def should_stop():
+        stop["n"] += 1
+        return stop["n"] > 8
+
+    controller._async_key_watchdog(0x70, lambda: fired.append(1),
+                                   poll_s=0, _stop=should_stop)
+
+    assert len(fired) == 2, f"one fire per press, not per poll -- got {len(fired)}"
