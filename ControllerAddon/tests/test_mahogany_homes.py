@@ -2360,7 +2360,7 @@ def test_a_shortage_from_out_of_town_still_banks(monkeypatch):
     assert called == ["bank"], f"a shortage away from the house must still bank: {called}"
 
 
-def test_a_stuck_hotspot_falls_back_to_opening_any_shut_door(monkeypatch):
+def test_a_door_miss_does_not_stop_the_walk_that_follows(monkeypatch):
     # USER 2026-08-29: "got stuck outside without opening door again". Outside ROSS's house the
     # only way in is a DETOUR door -- both player and hotspot east of its blocked edge -- so a
     # straight-line edge test alone would find nothing.
@@ -2399,11 +2399,14 @@ def test_a_stuck_hotspot_falls_back_to_opening_any_shut_door(monkeypatch):
     assert walked, "a door miss (False) must not stop the walk that follows"
 
 
-def test_the_stuck_fallback_is_skipped_when_a_door_was_provably_in_the_way(monkeypatch):
-    # REWRITTEN for the same reason as the test above: the "strict test staying primary" this
-    # docstring used to describe was about not second-guessing a found door with a second call --
-    # there is only one call now, so the thing left to prove is the mirror case, a True return
-    # (a door WAS found and opened) also does not stop the walk that follows.
+def test_a_door_hit_does_not_stop_the_walk_that_follows(monkeypatch):
+    # Renamed (final review, "misleading test names / one weak assertion"): the old name claimed
+    # the walk is SKIPPED when a door was found -- the opposite of what this test actually
+    # asserts (`assert walked`, i.e. the walk still happens). REWRITTEN for the same reason as
+    # the test above: the "strict test staying primary" this docstring used to describe was about
+    # not second-guessing a found door with a second call -- there is only one call now, so the
+    # thing left to prove is the mirror case, a True return (a door WAS found and opened) also
+    # does not stop the walk that follows.
     monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
     monkeypatch.setattr(controller, "get_objects",
                          lambda radius=None: [_object(40164, distance=3, x=2617, y=3318)])
@@ -2641,6 +2644,56 @@ def test_a_hotspot_behind_a_wall_is_not_clicked_however_close_we_stand(monkeypat
     ctx = _Ctx()
     mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
     assert walked, "it must walk around instead of clicking through the wall"
+
+
+def test_the_reachability_gate_uses_live_collision_not_the_static_map(monkeypatch):
+    # FIX (final review, "the reachability GATE must use live collision, not the static map"):
+    # worldmap.reachable_from bakes every door OPEN, so its flood walks straight through a shut
+    # one -- MEASURED from ROSS's outside tile (2614,3319), it returns 447 tiles including the
+    # hotspot's own cardinal neighbours on the FAR side of the shut front door. If the gate were
+    # still built from that flood, can_reach could answer True from outside the house and this
+    # test's click-guard would fire. Here the static map is stubbed to claim the whole line
+    # through to the hotspot is reachable (exactly the over-permissive answer a door-blind flood
+    # gives); LIVE collision (GET /collision, i.e. travel.reachable_set) is the only thing that
+    # actually shows the wall. can_reach itself is NOT mocked -- unlike the other unreachable
+    # tests -- so this proves the gate is wired to reachable_set's data, not worldmap's.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [_object(40164, distance=2, x=2, y=0)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 0, "y": 0, "plane": 0})
+    monkeypatch.setattr(controller, "click_entity",
+                         lambda ser, entity, **kw: pytest.fail(
+                             "must not click through a door the static map floods through"))
+
+    # The static map's flood: doors baked open, so it happily claims the hotspot's neighbourhood
+    # is reachable. The gate must not be built from this.
+    monkeypatch.setattr(worldmap, "reachable_from",
+                         lambda x, y, plane, **kw: {(0, 0): 0, (1, 0): 1, (2, 0): 2})
+
+    # LIVE collision: a real wall on the crossing between (1,0) and (2,0), the hotspot's tile.
+    BLOCK_MOVEMENT_EAST = 8
+    BLOCK_MOVEMENT_WEST = 128
+    BLOCK_MOVEMENT_OBJECT = 256
+    grid = {(0, 0): 0, (1, 0): BLOCK_MOVEMENT_EAST, (2, 0): BLOCK_MOVEMENT_WEST | BLOCK_MOVEMENT_OBJECT}
+    monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=6: [
+        {"x": tx, "y": ty, "plane": 0, "flags": f} for (tx, ty), f in grid.items()])
+
+    opened, walked = [], []
+    monkeypatch.setattr(travel, "open_door_toward",
+                         lambda ctx, goal: opened.append(goal) or True)
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, goal, **kw: walked.append(goal) or True)
+
+    hs = _hotspot(10554, 40164, 1, True)
+    hs["location"] = {"x": 2, "y": 0, "plane": 0}
+    state = {"homeName": "ROSS", "npcId": 10420,
+             "standingLocation": {"x": 0, "y": 0, "plane": 0},
+             "hotspots": [hs]}
+
+    ctx = _Ctx()
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert opened, "the gate must reject the hotspot despite the static map saying reachable"
+    assert walked
 
 
 def test_a_walled_off_ladder_is_not_clicked_either(monkeypatch):

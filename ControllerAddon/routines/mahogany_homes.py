@@ -765,12 +765,14 @@ def _chebyshev(a: dict, b: dict) -> int:
 def work_phase(ctx, config: dict, state: dict) -> None:
     hotspots = state.get("hotspots") or []
 
-    # One bounded flood per tick, shared by the choice of hotspot and the reachability gate.
-    # worldmap answers on ANY plane, which travel.reachable_set could only do via the client's
-    # own scene -- and it costs no HTTP call at all. Doors are baked open in that map, so a
-    # hotspot behind a shut door reads as reachable-with-a-door-to-open, which is the right
-    # answer for choosing what to work on next. Empty when the client cannot tell, which both
-    # consumers read as "don't know".
+    # One bounded flood per tick, for pick_next_hotspot's RANKING only. worldmap answers on ANY
+    # plane, which travel.reachable_set could only do via the client's own scene -- and it costs
+    # no HTTP call at all. Doors are baked open in that map, so a hotspot behind a shut door reads
+    # as reachable-with-a-door-to-open, which is the right answer for choosing what to work on
+    # next. Empty when the client cannot tell, which every consumer reads as "don't know".
+    # NOTE: the reachability GATE below (hotspot_at / can_reach) deliberately does NOT reuse this
+    # -- see its own comment for why a static-map flood cannot be trusted to decide "can we
+    # actually interact with this right now".
     player = controller.get_player() or {}
     player_plane = player.get("plane") or 0
     reach = (worldmap.reachable_from(player["x"], player["y"], player_plane)
@@ -857,7 +859,20 @@ def work_phase(ctx, config: dict, state: dict) -> None:
     # meant "clicking through a wall". Raw tile distance cannot tell those two cases apart;
     # travel.can_reach now asks whether the EDGE is open, which separates them correctly and
     # answers both live cases right.
-    if hotspot_at and travel.can_reach(hotspot_at, reach, plane=player_plane) is False:
+    # The GATE needs LIVE collision, never the static worldmap flood. worldmap.reachable_from
+    # treats every door as OPEN (deliberately -- see worldmap.py), so its flood walks straight
+    # through a shut one: MEASURED from ROSS's outside tile (2614,3319), it returns 447 tiles
+    # including (2616,3318) and (2618,3318) -- the hotspot's own cardinal neighbours on the FAR
+    # side of the shut front door. can_reach(hotspot_at, reach) built from that flood can answer
+    # True from outside the house, and this gate would never fire. This is exactly the design
+    # doc's split of responsibility: worldmap answers WHERE TO WALK (a shut door is just a route
+    # you have not opened yet); travel.can_reach answers WHETHER AN OBJECT CAN BE INTERACTED WITH
+    # RIGHT NOW, and that has to come from travel.reachable_set's LIVE GET /collision read, which
+    # reports the door's real (shut) edge. Do not "simplify" this back to the worldmap flood --
+    # that is precisely the bug this comment documents.
+    live_reach = (travel.reachable_set(player["x"], player["y"], player_plane)
+                  if player.get("x") is not None else set())
+    if hotspot_at and travel.can_reach(hotspot_at, live_reach, plane=player_plane) is False:
         # Not reachable: open the door standing between us and it, whether it lies straight ahead
         # or behind us. Then walk -- and do not spend a click this tick.
         # ONE call now. This used to be three tiers -- open_frontier_door, then the straight-line
@@ -1072,7 +1087,13 @@ def _climb(ctx, ladder, option, why: str, from_plane: int | None = None) -> None
     # site, not one at a time -- that is why this bug kept reappearing somewhere new.
     here = controller.get_player() or {}
     if here.get("x") is not None and ladder.get("x") is not None:
-        reach = worldmap.reachable_from(here["x"], here["y"], here.get("plane") or 0)
+        # LIVE collision, not the static worldmap flood -- same reasoning as work_phase's own
+        # hotspot gate (see its comment for the measured proof): worldmap.reachable_from treats
+        # every door as open, so it can call a door-blocked ladder "reachable" and this gate would
+        # never fire. travel.reachable_set reads GET /collision, which reports the door's real,
+        # currently-shut edge -- worldmap answers where to walk, travel.can_reach answers whether
+        # we can interact with something right now, and those need different data sources.
+        reach = travel.reachable_set(here["x"], here["y"], here.get("plane") or 0)
         if travel.can_reach(ladder, reach, plane=here.get("plane") or 0) is False:
             debug_log.log("mahogany_homes",
                           f"ladder {ladder.get('id')} at ({ladder.get('x')},{ladder.get('y')}) "

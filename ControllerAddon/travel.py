@@ -81,7 +81,17 @@ WALK_MAX_HOPS = 60           # hard cap so a bad target can't loop forever
 COLLISION_SCAN_RADIUS = 10   # tiles of live collision fetched per hop. Big enough to see the
                              # doors along one hop, small enough that a 21x21 response per hop
                              # stays cheap. Beyond it we simply hop and let the stall catch it.
-WALK_MAX_STALLS = 4          # consecutive no-progress passes before giving up on the walk.
+WALK_MAX_STALLS = 4          # total no-progress passes over the WHOLE walk before giving up --
+                             # NOT "consecutive": `stalls` is only ever incremented in walk_to's
+                             # loop, never reset when a later hop makes real progress, so this is
+                             # a cumulative budget across the walk's life (itself bounded by
+                             # WALK_MAX_HOPS=60), not a run of back-to-back stalls. Comment fixed
+                             # rather than the code during the final review pass: the cumulative
+                             # behaviour is a defensible, already-small safety bound on its own
+                             # (a walk that stalls 4 times total, however spread out, is still
+                             # heading somewhere the route did not expect), and loosening it to
+                             # "reset on progress" is a real behaviour change that wants a live
+                             # session to verify rather than a documentation fix.
                              # Deliberately small: with a real route, a stall means something
                              # the route does not know about, and repeating it does not help.
 SCENE_HALF_WIDTH = 52        # the loaded scene is 104x104 tiles. Used ONLY to reject an
@@ -135,54 +145,17 @@ DOOR_OPEN_ACTION = "open"
 
 # net.runelite.api.CollisionDataFlag, mirrored from the client. ObjectProvider reports the whole
 # entry for an object's TILE as `collisionFlags`; these are the bits meaning "you cannot get past
-# this edge" and "you cannot see past this edge".
-#
-# MEASURED live 2026-08-28 by opening ONE door at Barbara's house and re-reading the same doorway
-# before and after -- the only comparison that actually answers anything here:
-#
-#   SHUT   Door 7452 at (1746,3534)  flags 4104  = MOVEMENT_EAST|LOS_EAST
-#          east neighbour (1747,3534)      65664 = MOVEMENT_WEST|LOS_WEST   (reciprocal)
-#   OPEN   Door 7453 at (1747,3534)  flags 16416 = MOVEMENT_SOUTH|LOS_SOUTH
-#          (1746,3534) now 0, and (1747,3534) no longer carries WEST -- the doorway is CLEAR
-#
-# Three things follow, and all three matter:
-#  1. Movement and line of sight are always set together for the SAME edge.
-#  2. A blocked edge is recorded on BOTH of its tiles, as opposite directions -- it is a genuine
-#     EDGE, not a property of a tile.
-#  3. Opening a door CLEARS the doorway edge and the leaf comes to rest blocking a PERPENDICULAR
-#     edge -- and the object itself moves one tile and changes id (7452 shut -> 7453 open).
-#
-# So the flags do track door state, but only if you compare the same DOORWAY; comparing two
-# different doors' own tiles tells you nothing (an earlier pass at Lumbridge did exactly that,
-# saw a shut door and an open one both reading 1026, and wrongly concluded the flags were useless
-# -- 1026 was the open door's LEAF edge, not its doorway).
-#
-# None of which needs classifying at all, because the useful question is narrower: does one of
-# this door's blocked edges lie on the route we're following? See blocked_crossing_on_route /
-# first_door_on_route. A shut door on the route answers yes; the same door once open answers no.
+# this edge". The full derivation (opening one door at Barbara's and re-reading the same doorway
+# before/after) is folded into first_door_on_route's own docstring now that DOOR_BLOCKING_FLAGS
+# and the line-of-sight constants it was built from are gone -- see that docstring for the
+# measurement. The short version relevant to what's still here: a blocked edge is recorded on
+# BOTH of its tiles, as opposite directions (DOOR_EDGE_BLOCKS below relies on exactly this).
 BLOCK_MOVEMENT_NORTH = 2
 BLOCK_MOVEMENT_EAST = 8
 BLOCK_MOVEMENT_SOUTH = 32
 BLOCK_MOVEMENT_WEST = 128
 BLOCK_MOVEMENT_OBJECT = 256
-BLOCK_MOVEMENT_FLOOR_DECORATION = 262144
 BLOCK_MOVEMENT_FLOOR = 2097152
-BLOCK_MOVEMENT_FULL = 2359552
-BLOCK_LINE_OF_SIGHT_NORTH = 1024
-BLOCK_LINE_OF_SIGHT_EAST = 4096
-BLOCK_LINE_OF_SIGHT_SOUTH = 16384
-BLOCK_LINE_OF_SIGHT_WEST = 65536
-BLOCK_LINE_OF_SIGHT_FULL = 131072
-# Deliberately NOT including BLOCK_MOVEMENT_FULL: it is a COMPOSITE constant (2359552 =
-# BLOCK_MOVEMENT_FLOOR 2097152 | BLOCK_MOVEMENT_FLOOR_DECORATION 262144 | BLOCK_MOVEMENT_OBJECT
-# 256), so ORing it in makes a bare floor decoration read as an obstruction. Caught live the same
-# day on Lumbridge's Trapdoor, flags 262144, which is a hole in the floor and blocks no edge at all.
-DOOR_BLOCKING_FLAGS = (
-    BLOCK_MOVEMENT_NORTH | BLOCK_MOVEMENT_EAST | BLOCK_MOVEMENT_SOUTH | BLOCK_MOVEMENT_WEST
-    | BLOCK_MOVEMENT_OBJECT
-    | BLOCK_LINE_OF_SIGHT_NORTH | BLOCK_LINE_OF_SIGHT_EAST | BLOCK_LINE_OF_SIGHT_SOUTH
-    | BLOCK_LINE_OF_SIGHT_WEST | BLOCK_LINE_OF_SIGHT_FULL
-)
 
 
 # (bit, dx, dy) -- the crossing each movement bit blocks, from the tile that carries it.
@@ -209,12 +182,27 @@ def blocked_crossing_on_route(route, flags, start: int = 0,
     also refuses a destination tile carrying TILE_BLOCKING_FLAGS, which is the only way the
     full-tile doors are visible at all. MEASURED at Falador TAU's -- a GameObject door with
     flags 131328 (BLOCK_LINE_OF_SIGHT_FULL | BLOCK_MOVEMENT_OBJECT) and no edge bits whatever.
+
+    An UNKNOWN crossing is skipped, not reported. `flags` only ever covers COLLISION_SCAN_RADIUS
+    (10) tiles around the player while `lookahead` looks DOOR_ROUTE_LOOKAHEAD (14) steps ahead, so
+    on any route with 11+ remaining steps the crossing sitting at the scan window's own edge was
+    _always_ unknown -- and because _passable(None, ...) is False, that unknown crossing used to
+    be reported as blocked on every such hop. Two real costs: a wasted get_objects fetch on every
+    hop of every walk (first_door_on_route's both-known guard would discard it a moment later
+    anyway), and -- worse -- a transient collision outage mid-poll inside _open_door's `recheck`
+    could make this return a "still blocked" crossing for a door that had genuinely opened,
+    reporting a working open as a failure. Matches _hop_index's own both-known rule for exactly
+    the same reason (see its comment) and COLLISION_SCAN_RADIUS's: past the scan window, hop and
+    let the stall recovery act instead of guessing.
     """
     end = min(len(route) - 1, start + lookahead)
     for i in range(start, end):
         ax, ay = route[i]
         bx, by = route[i + 1]
-        if not _passable(flags.get((ax, ay)), flags.get((bx, by)), bx - ax, by - ay):
+        fa, fb = flags.get((ax, ay)), flags.get((bx, by))
+        if fa is None or fb is None:
+            continue    # cannot tell -- outside the scan window, not necessarily blocked
+        if not _passable(fa, fb, bx - ax, by - ay):
             return (ax, ay), (bx, by)
     return None
 
@@ -240,15 +228,40 @@ def first_door_on_route(route, plane: int, objects: list, flags: dict, start: in
         and fill every Mahogany Homes house.
 
     An absent flags entry means "cannot tell" and yields no door, never a speculative click.
+
+    Why collision FLAGS are trustworthy here at all -- MEASURED live 2026-08-28 by opening ONE
+    door at Barbara's house and re-reading the same doorway before and after (the only comparison
+    that actually answers anything: comparing two DIFFERENT doors' own tiles tells you nothing --
+    an earlier pass at Lumbridge did exactly that, saw a shut door and an open one both reading
+    1026, and wrongly concluded the flags were useless; 1026 was the open door's LEAF edge, not
+    its doorway):
+
+        SHUT   Door 7452 at (1746,3534)  flags 4104  = MOVEMENT_EAST|LOS_EAST
+               east neighbour (1747,3534)      65664 = MOVEMENT_WEST|LOS_WEST   (reciprocal)
+        OPEN   Door 7453 at (1747,3534)  flags 16416 = MOVEMENT_SOUTH|LOS_SOUTH
+               (1746,3534) now 0, and (1747,3534) no longer carries WEST -- doorway CLEAR
+
+    Three things follow, and all three matter:
+      1. Movement and line of sight are always set together for the SAME edge.
+      2. A blocked edge is recorded on BOTH of its tiles, as opposite directions -- it is a
+         genuine EDGE, not a property of a tile (DOOR_EDGE_BLOCKS relies on exactly this).
+      3. Opening a door CLEARS the doorway edge and the leaf comes to rest blocking a
+         PERPENDICULAR edge -- and the object itself moves one tile and changes id (7452 shut ->
+         7453 open).
+
+    None of which needs classifying at all, because the useful question is narrower: does one of
+    this door's blocked edges lie on the route we're following? A shut door on the route answers
+    yes; the same door once open answers no -- which is exactly blocked_crossing_on_route's job.
     """
     crossing = blocked_crossing_on_route(route, flags, start, lookahead)
     if crossing is None:
         return None
-    # Require known flags on BOTH tiles to report a door. An unknown flag means "cannot tell",
-    # which must never produce a click -- left-clicking an OPEN door CLOSES it, turning a
-    # working walk into a wedged one. This is stricter than the edge-blocking rule (either side
-    # proves a shut door when both are known) but correctness demands it when acting on missing
-    # data could produce a worse outcome than doing nothing.
+    # Require known flags on BOTH tiles to report a door. blocked_crossing_on_route now already
+    # skips an unknown crossing rather than returning one, so this is belt and braces rather than
+    # the only thing standing between an unknown reading and a click -- kept because an unknown
+    # flag must never produce one: left-clicking an OPEN door CLOSES it, turning a working walk
+    # into a wedged one, and correctness demands it when acting on missing data could produce a
+    # worse outcome than doing nothing.
     a, b = crossing
     if flags.get(a) is None or flags.get(b) is None:
         return None

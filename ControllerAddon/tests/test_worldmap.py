@@ -72,7 +72,20 @@ def test_indexer_packs_the_documented_layout():
     assert worldmap.Indexer.packed(1, 0, 0) == 1
     assert worldmap.Indexer.packed(0, 1, 0) == 1 << 14
     assert worldmap.Indexer.packed(0, 0, 1) == 1 << 28
-    assert worldmap.Indexer.SET_MEANS_PASSABLE is True
+
+
+def test_set_means_passable_is_actually_honoured_not_decorative(monkeypatch):
+    """north()/east() used to return the raw bit and never read SET_MEANS_PASSABLE at all, so
+    flipping the constant changed nothing -- a future map with inverted polarity (this codebase's
+    own Indexer docstring names Vitalite's map.dat as exactly that: same shape, SET means BLOCKED)
+    would silently produce an inverted map. Asserting the constant's VALUE (as the old version of
+    this test did) passes regardless of whether the code honours it; this asserts the BEHAVIOUR
+    instead, against a real, known bit from the bundled asset (see
+    test_upper_planes_carry_real_wall_geometry): worldmap.north(2617, 3317, 1) is True under the
+    real (True) polarity. Flip the flag and the same real bit must now read as impassable."""
+    assert worldmap.north(2617, 3317, 1) is True
+    monkeypatch.setattr(worldmap.Indexer, "SET_MEANS_PASSABLE", False)
+    assert worldmap.north(2617, 3317, 1) is False
 
 
 import time

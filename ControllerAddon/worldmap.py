@@ -141,11 +141,15 @@ def bits_per_plane() -> dict:
 
 
 def north(x: int, y: int, plane: int) -> bool:
-    return _map().contains(Indexer.packed(x, y, plane))
+    # == Indexer.SET_MEANS_PASSABLE, not the bare bit -- see the class's own docstring: three
+    # maps in data/decompiled/ share this shape while meaning OPPOSITE things, so a future swap
+    # to an inverted-polarity source (e.g. Vitalite's, where SET means BLOCKED) is a one-line
+    # change to that flag instead of a silent, subtly-wrong map everywhere this function is used.
+    return _map().contains(Indexer.packed(x, y, plane)) == Indexer.SET_MEANS_PASSABLE
 
 
 def east(x: int, y: int, plane: int) -> bool:
-    return _map().contains(Indexer.packed(x, y, plane) | Indexer.EAST_FLAG)
+    return _map().contains(Indexer.packed(x, y, plane) | Indexer.EAST_FLAG) == Indexer.SET_MEANS_PASSABLE
 
 
 def south(x: int, y: int, plane: int) -> bool:

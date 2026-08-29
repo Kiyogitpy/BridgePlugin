@@ -572,13 +572,28 @@ def test_walk_to_fails_fast_when_no_route_exists(walker, monkeypatch):
 
 def test_hops_are_bounded_by_distance_not_by_step_index(walker, monkeypatch):
     """A cardinal BFS route is longer than the diagonal walk the client performs, so indexing
-    N steps ahead would silently produce a hop far shorter than the measured 16-24 window."""
+    N steps ahead would silently produce a hop far shorter than the measured 16-24 window.
+
+    This route is deliberately L-shaped (20 tiles north, then east) so that a genuine tile
+    DISTANCE never exceeds WALK_HOP_MAX_TILES anywhere along it -- every point past the corner
+    sits exactly 19 tiles from the start, however far east it goes. An UPPER-bound-only assertion
+    cannot catch a step-INDEX regression here: with `randint` mocked to always return
+    WALK_HOP_MAX_TILES (24), a buggy "advance 24 route-steps" implementation lands at route[24] =
+    (3205,3219), only 5 tiles past the corner -- and that point is ALSO only 19 tiles from the
+    start, so it would pass an upper bound just as the correct answer does. The lower bound below
+    is what actually distinguishes them: the real distance-based hop keeps advancing past that
+    point (nothing along the rest of the route ever exceeds the 24-tile budget), all the way to
+    route[38] = (3219,3219) -- 14 tiles further than the step-index answer."""
     route = [(3200, 3200 + i) for i in range(20)] + [(3200 + i, 3219) for i in range(1, 20)]
     monkeypatch.setattr(travel.worldmap, "find_path", lambda *a, **kw: route)
     monkeypatch.setattr(travel.random, "randint", lambda lo, hi: hi)
     travel.walk_to(_Ctx(), {"x": 3218, "y": 3219, "plane": 0})
     first_x, first_y = walker["hops"][0]
     assert max(abs(first_x - 3200), abs(first_y - 3200)) <= travel.WALK_HOP_MAX_TILES
+    assert first_x > 3205, (
+        f"hop only reached x={first_x} -- that is where a STEP-INDEX-bounded implementation "
+        f"(24 route-steps from the start) would stop, not a genuinely DISTANCE-bounded one, "
+        f"which has nothing along this route to stop it short of the full 39-tile path")
 
 
 def test_a_hop_stops_before_a_shut_door_instead_of_clicking_past_it(walker, monkeypatch):
@@ -619,7 +634,13 @@ def test_a_hop_is_not_truncated_by_tiles_outside_the_collision_window(walker, mo
     assert reach <= travel.WALK_HOP_MAX_TILES
 
 
-def test_a_stall_opens_the_door_on_the_route(walker, monkeypatch):
+def test_a_door_on_the_route_is_opened_before_hopping(walker, monkeypatch):
+    # Renamed (final review, "misleading test names"): this test's name used to claim a STALL
+    # triggers the door open, but doors are resolved BEFORE stepping off on every pass (see
+    # walk_to's own comment: "the priority should be determine door situation - then go in"), so
+    # the door here is found and opened on the very FIRST iteration, before `stalls` is ever
+    # incremented -- no stall occurs anywhere in this test.
+    #
     # Route long enough that target is beyond WALK_ARRIVAL_TOLERANCE (3 tiles).
     # Player starts at (3200, 3200), target at (3219, 3200) = 19 tiles away.
     route = [(3200 + i, 3200) for i in range(20)]
@@ -634,6 +655,33 @@ def test_a_stall_opens_the_door_on_the_route(walker, monkeypatch):
     monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane: True)   # never moves
     travel.walk_to(_Ctx(), {"x": 3219, "y": 3200, "plane": 0})
     assert door in walker["clicked"]
+
+
+def test_door_opening_is_capped_so_a_stuck_wedge_still_fails(walker, monkeypatch):
+    """PORTED from the pre-worldmap suite (`git show 3fb5b41:ControllerAddon/tests/test_travel.py`,
+    `test_door_opening_is_capped_so_a_wedge_that_is_not_a_door_still_fails`), which exercised the
+    now-deleted `_walk_greedy` directly. Retargeted at `walk_to`, the only place
+    DOOR_MAX_OPENS_PER_WALK is still enforced: if the obstruction is reported as a door but
+    clicking it never actually clears the crossing (a "wedge" -- it matches every door heuristic,
+    but the game never opens it, e.g. another player holding it, or a click that keeps missing),
+    the walk must still give up rather than spend DOOR_MAX_OPENS_PER_WALK re-opening the identical
+    door forever. The cap is what bounds that -- this is the untested half of it (the tests above
+    only ever exercise a door that DOES open)."""
+    route = [(3200 + i, 3200) for i in range(20)]
+    door = _route_door(3200 + 1, 3200, plane=0, flags=BLOCK_MOVEMENT_EAST)
+    monkeypatch.setattr(travel.worldmap, "find_path", lambda *a, **kw: route)
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [door])
+    # The crossing NEVER clears -- clicking this "door" is a wedge, not a real fix.
+    monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=2: [
+        {"x": tx, "y": ty, "plane": 0,
+         "flags": BLOCK_MOVEMENT_EAST if (tx, ty) == (3200 + 1, 3200) else 0}
+        for tx, ty in route])
+    monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane: True)   # never moves
+
+    assert travel.walk_to(_Ctx(), {"x": 3219, "y": 3200, "plane": 0}) is False
+    assert len(walker["clicked"]) == travel.DOOR_MAX_OPENS_PER_WALK, (
+        f"expected exactly {travel.DOOR_MAX_OPENS_PER_WALK} door-open attempts, got "
+        f"{len(walker['clicked'])}")
 
 
 def test_open_door_toward_clicks_the_door_between_us_and_a_goal(walker, monkeypatch):
@@ -684,6 +732,77 @@ def test_open_door_toward_confirms_via_crossing_when_the_door_shuts_behind_you(w
     assert door in walker["clicked"]
 
 
+# --- _open_door's confirmation budget: distance-scaled, capped, and honestly reported -------
+#
+# PORTED from the pre-worldmap suite (`git show 3fb5b41:ControllerAddon/tests/test_travel.py`),
+# where these targeted the now-deleted `_open_blocking_door` (found the door itself by searching
+# from the player, then opened it). `_open_door(ctx, door, recheck)` is the direct successor --
+# it no longer does the finding, only the click-and-confirm -- so these are retargeted straight
+# at it: pass the door in directly (matching how every current caller, `open_door_toward` and
+# `walk_to`, actually uses it) and a `recheck` that never returns None or reports a crossing, so
+# the loop is forced to run out its full budget -- which is what makes `sum(slept)` a direct
+# read of the budget these tests exist to check.
+#
+# USER 2026-08-29, on the loop at ROSS's house: "we clicked away before waiting for us to walk to
+# the door and open it". A door is opened by walking to it and THEN opening it, so a flat 2s
+# budget expires before the player has even arrived at a door a few tiles off.
+
+def test_the_open_budget_scales_with_the_distance_to_the_door(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1740, "y": 3534, "plane": 0})
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    slept = []
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    door = _route_door(1746, 3534, flags=BLOCK_MOVEMENT_EAST)   # 6 tiles from the player
+
+    travel._open_door(_Ctx(), door, lambda: door)   # never confirms -- forces the full budget
+
+    # 6 tiles of walking is ~4.2s on its own -- the old flat 2.0s expired before arrival.
+    assert sum(slept) > travel.DOOR_OPEN_WAIT_S, (
+        f"a door 6 tiles off needs the walk budgeted too, slept only {sum(slept)}s")
+    assert sum(slept) >= 6 * travel.DOOR_WALK_ALLOWANCE_S, (
+        f"slept {sum(slept)}s, less than the walk alone")
+
+
+def test_the_open_budget_is_capped_so_a_stuck_door_still_fails_fast(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1700, "y": 3534, "plane": 0})
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    slept = []
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    door = _route_door(1746, 3534, flags=BLOCK_MOVEMENT_EAST)   # 46 tiles from the player
+
+    travel._open_door(_Ctx(), door, lambda: door)
+
+    assert sum(slept) <= travel.DOOR_OPEN_WAIT_MAX_S + travel.DOOR_CONFIRM_POLL_S, (
+        f"the budget must be capped, slept {sum(slept)}s")
+
+
+def test_a_door_underfoot_still_confirms_quickly(monkeypatch):
+    # Zero distance means no walk to budget -- the fast path must stay fast.
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1746, "y": 3534, "plane": 0})
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    slept = []
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    door = _route_door(1746, 3534, flags=BLOCK_MOVEMENT_EAST)   # same tile as the player
+
+    travel._open_door(_Ctx(), door, lambda: door)
+
+    assert sum(slept) <= travel.DOOR_OPEN_WAIT_S + travel.DOOR_WALK_ALLOWANCE_S + 0.31, (
+        f"zero distance should add almost nothing to the budget, slept {sum(slept)}s")
+
+
+def test_a_door_that_never_opens_is_reported_not_silently_accepted(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1744, "y": 3534, "plane": 0})
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    logged = []
+    monkeypatch.setattr(travel.debug_log, "log", lambda cat, msg: logged.append(msg))
+    door = _route_door(1746, 3534, flags=BLOCK_MOVEMENT_EAST)
+
+    travel._open_door(_Ctx(), door, lambda: door)
+
+    assert any("still shut" in m for m in logged), f"a failed open must say so: {logged}"
+
+
 def test_an_upper_plane_route_that_leaves_the_loaded_scene_is_discarded(walker, monkeypatch):
     """Risk 1 from the design doc. Above ground the map has no data outside a building and no
     data reads as PASSABLE, so one missing exterior wall lets BFS escape into open sky. A route
@@ -710,3 +829,24 @@ def test_open_door_toward_does_nothing_when_the_way_is_clear(walker, monkeypatch
         {"x": tx, "y": ty, "plane": 0, "flags": 0} for tx, ty in route])
     assert travel.open_door_toward(_Ctx(), {"x": 3200, "y": 3201, "plane": 0}) is False
     assert walker["clicked"] == []
+
+
+def test_walk_to_gives_up_after_the_stall_budget_when_no_door_explains_it(walker, monkeypatch):
+    """walk_to's STALL branch, previously uncovered. `test_a_door_on_the_route_is_opened_before_
+    hopping` (née test_a_stall_opens_the_door_on_the_route) does NOT reach this branch -- its door
+    is found and opened on the very first iteration, before `stalls` is ever incremented, because
+    doors are resolved BEFORE stepping off on every pass. This is the genuine stall case: the
+    route is completely clear (no blocked crossing anywhere, so _door_on_route never finds
+    anything to open) and _hop_to never actually moves the player -- e.g. a hop that keeps
+    resolving to the wrong click, or a player who is stuck for a reason the collision map cannot
+    see. walk_to must give up once `stalls` exceeds WALK_MAX_STALLS rather than spinning for the
+    full WALK_MAX_HOPS budget."""
+    route = [(3200 + i, 3200) for i in range(20)]
+    monkeypatch.setattr(travel.worldmap, "find_path", lambda *a, **kw: route)
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])   # no door anywhere
+    monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=2: [
+        {"x": tx, "y": ty, "plane": 0, "flags": 0} for tx, ty in route])   # entirely clear
+    monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane: True)   # never moves
+
+    assert travel.walk_to(_Ctx(), {"x": 3219, "y": 3200, "plane": 0}) is False
+    assert walker["clicked"] == [], "no door was ever found -- nothing should have been clicked"
