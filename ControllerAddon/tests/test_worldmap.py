@@ -1,0 +1,75 @@
+"""Tests for worldmap.py, the global collision map and pathfinder.
+
+Every number here was MEASURED against the real asset on 2026-08-29 and is reproduced in
+docs/superpowers/specs/2026-08-29-global-collision-pathfinding-design.md. This suite touches
+no bridge and no serial port -- it is the first pathing code in this repo that can be tested
+without a running client.
+"""
+
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import worldmap
+
+
+# MEASURED 2026-08-29. Doubles as a corruption check on the 3.6 MB asset: any re-dump or a
+# truncated checkout changes these immediately. Planes 1-3 carrying MORE bits than plane 0 is
+# not a bug -- upper planes are mostly open sky, and no data defaults to passable.
+EXPECTED_BITS_PER_PLANE = {0: 10208962, 1: 22268102, 2: 24304088, 3: 25406620}
+
+CARDINALS = ((0, 1), (0, -1), (1, 0), (-1, 0))
+
+
+def test_asset_matches_the_measured_bit_counts():
+    assert worldmap.bits_per_plane() == EXPECTED_BITS_PER_PLANE
+
+
+def test_upper_planes_carry_real_wall_geometry():
+    """ROSS's upper floor, the geometry measured live 2026-08-29: the player at (2617,3317)
+    is walled off to the east and south, which is what Shortest Path cannot tell us at all."""
+    assert worldmap.north(2617, 3317, 1) is True
+    assert worldmap.east(2617, 3317, 1) is False
+    assert worldmap.south(2617, 3317, 1) is False
+    assert worldmap.west(2617, 3317, 1) is True
+
+
+def test_no_data_defaults_to_passable():
+    """Open sky above an outdoor tile. This is a KNOWN LIMITATION, pinned so nobody "fixes" a
+    route that leaks through the void without realising the map allows it by design."""
+    for plane in (1, 2):
+        for dx, dy in CARDINALS:
+            assert worldmap.passable(3213, 3424, plane, dx, dy) is True
+
+
+@pytest.mark.parametrize("x,y", [(3037, 3347), (1746, 3534)])
+def test_doors_are_baked_open(x, y):
+    """Falador's and Barbara's doors. Deliberate -- CacheMapDumper's Exclusion enum does this.
+    The whole model is: route straight through the door, then open it when you reach it."""
+    for dx, dy in CARDINALS:
+        assert worldmap.passable(x, y, 0, dx, dy) is True
+
+
+@pytest.mark.parametrize("x,y", [(2617, 3318), (1749, 3536)])
+def test_furniture_tiles_are_solid(x, y):
+    """ROSS's Broken Range and Barbara's hotspot. A hotspot's own tile can never be routed TO,
+    which is why find_path grows a goal_adjacent mode in Task 2."""
+    for dx, dy in CARDINALS:
+        assert worldmap.passable(x, y, 0, dx, dy) is False
+
+
+def test_south_and_west_are_read_off_the_neighbour():
+    """The map stores only NORTH and EAST per tile; the other two are the neighbour's bits."""
+    assert worldmap.south(2617, 3317, 1) == worldmap.north(2617, 3316, 1)
+    assert worldmap.west(2617, 3317, 1) == worldmap.east(2616, 3317, 1)
+
+
+def test_indexer_packs_the_documented_layout():
+    assert worldmap.Indexer.packed(0, 0, 0) == 0
+    assert worldmap.Indexer.packed(1, 0, 0) == 1
+    assert worldmap.Indexer.packed(0, 1, 0) == 1 << 14
+    assert worldmap.Indexer.packed(0, 0, 1) == 1 << 28
+    assert worldmap.Indexer.SET_MEANS_PASSABLE is True
