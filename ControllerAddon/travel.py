@@ -146,7 +146,7 @@ DOOR_OPEN_WAIT_MAX_S = 9.0    # ceiling, so a door that genuinely never opens st
 # the routine simply could not get in. The name + "Open" action filter is what keeps this tight
 # -- nearby GameObjects such as Drawers also offer "Open" and are excluded by name.
 DOOR_OBJECT_TYPES = ("WallObject", "GameObject")
-DOOR_NAME_HINTS = ("door", "gate")
+DOOR_NAME_HINTS = ("door", "gate", "curtain")   # "curtain" taken from Vitalite's own list
 DOOR_OPEN_ACTION = "open"
 
 # net.runelite.api.CollisionDataFlag, mirrored from the client. ObjectProvider reports the whole
@@ -211,6 +211,74 @@ DOOR_EDGE_BLOCKS = (
     (BLOCK_MOVEMENT_EAST, 1, 0),
     (BLOCK_MOVEMENT_WEST, -1, 0),
 )
+
+
+def blocked_crossing_on_route(route, flags, start: int = 0,
+                              lookahead: int = DOOR_ROUTE_LOOKAHEAD):
+    """The first pair of consecutive route tiles we cannot step between, or None.
+
+    `route` is [(x, y), ...] from worldmap.find_path and `flags` is {(x, y): collision flags}
+    from GET /collision. The map routes straight THROUGH doors by design, so a blocked crossing
+    on a freshly computed route is very nearly a definition of "a shut door is here".
+
+    _passable is the right test rather than _edge_open, and the difference is load-bearing: it
+    also refuses a destination tile carrying TILE_BLOCKING_FLAGS, which is the only way the
+    full-tile doors are visible at all. MEASURED at Falador TAU's -- a GameObject door with
+    flags 131328 (BLOCK_LINE_OF_SIGHT_FULL | BLOCK_MOVEMENT_OBJECT) and no edge bits whatever.
+    """
+    end = min(len(route) - 1, start + lookahead)
+    for i in range(start, end):
+        ax, ay = route[i]
+        bx, by = route[i + 1]
+        if not _passable(flags.get((ax, ay)), flags.get((bx, by)), bx - ax, by - ay):
+            return (ax, ay), (bx, by)
+    return None
+
+
+def first_door_on_route(route, plane: int, objects: list, flags: dict, start: int = 0,
+                        lookahead: int = DOOR_ROUTE_LOOKAHEAD):
+    """The shut door standing on the first blocked crossing of `route`, or None.
+
+    This is the whole door algorithm now, and it replaced roughly 700 lines of heuristics
+    (_door_separates, _within_span, reachable_set/open_frontier_door, open_nearest_shut_door
+    and a three-tier escalation). None of those were wrong exactly -- they were all proxies for
+    a route we could not compute. Given a real route the question becomes trivial and, unlike
+    every one of those tiers, it works identically on any plane.
+
+    The shape is Vitalite's WalkerPath.handlePassThroughObjects: find a door/gate/curtain
+    standing on the player's tile or the next step's tile. Two deliberate deviations:
+
+      * Vitalite matches on NAME ONLY and interacts with action index 0. We require an "Open"
+        action, because left-clicking an OPEN door CLOSES it -- a shut door and an open one are
+        both WallObjects named Door with per-door ids (Falador 24050 shut / 24051 open), so
+        only the action separates them, and getting it wrong wedges a walk that was working.
+      * Matching the object TYPE too, because chests, cupboards and drawers all offer "Open"
+        and fill every Mahogany Homes house.
+
+    An absent flags entry means "cannot tell" and yields no door, never a speculative click.
+    """
+    crossing = blocked_crossing_on_route(route, flags, start, lookahead)
+    if crossing is None:
+        return None
+    # Verify the crossing is blocked by known flags, not missing data
+    a, b = crossing
+    if flags.get(a) is None or flags.get(b) is None:
+        return None
+    tiles = set(crossing)
+
+    for obj in objects or []:
+        if obj.get("plane") != plane or obj.get("objectType") not in DOOR_OBJECT_TYPES:
+            continue
+        if (obj.get("x"), obj.get("y")) not in tiles:
+            continue
+        name = (obj.get("name") or "").lower()
+        if not any(hint in name for hint in DOOR_NAME_HINTS):
+            continue
+        actions = obj.get("actions")
+        if not actions or not any((a or "").lower() == DOOR_OPEN_ACTION for a in actions):
+            continue
+        return obj
+    return None
 
 
 def _door_separates(door: dict, px: int, py: int, gx: int, gy: int):
