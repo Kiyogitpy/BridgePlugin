@@ -1612,6 +1612,31 @@ def test_a_hop_stops_before_a_shut_door_instead_of_clicking_past_it(walker, monk
     assert walker["hops"][0] == (3200, 3204)
 
 
+def test_a_hop_is_not_truncated_by_tiles_outside_the_collision_window(walker, monkeypatch):
+    """Collision is fetched only within COLLISION_SCAN_RADIUS of the player, but hops aim 16-24
+    tiles ahead. _passable answers False when EITHER tile's flags are None, so treating an
+    unknown reading as a wall cut every hop down to the scan radius -- halving walking
+    efficiency wherever the bridge answered at all. Unknown must mean "past our window", not
+    "blocked".
+
+    This mocks get_collision the way the real endpoint behaves: it honours the radius, so tiles
+    beyond it are simply absent from the returned flags.
+    """
+    route = [(3200, 3200 + i) for i in range(30)]
+    monkeypatch.setattr(travel.worldmap, "find_path", lambda *a, **kw: route)
+    monkeypatch.setattr(travel.random, "randint", lambda lo, hi: hi)
+    monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=2: [
+        {"x": tx, "y": ty, "plane": 0, "flags": 0}
+        for tx, ty in route
+        if max(abs(tx - x), abs(ty - y)) <= radius])
+    travel.walk_to(_Ctx(), {"x": 3200, "y": 3229, "plane": 0})
+    first_x, first_y = walker["hops"][0]
+    reach = max(abs(first_x - 3200), abs(first_y - 3200))
+    assert reach > travel.COLLISION_SCAN_RADIUS, (
+        f"first hop reached only {reach} tiles -- truncated to the collision scan window")
+    assert reach <= travel.WALK_HOP_MAX_TILES
+
+
 def test_a_stall_opens_the_door_on_the_route(walker, monkeypatch):
     # Route long enough that target is beyond WALK_ARRIVAL_TOLERANCE (3 tiles).
     # Player starts at (3200, 3200), target at (3219, 3200) = 19 tiles away.
@@ -1647,6 +1672,32 @@ def test_open_door_toward_clicks_the_door_between_us_and_a_goal(walker, monkeypa
         return collision_state
 
     monkeypatch.setattr(controller, "get_collision", get_collision_mock)
+    assert travel.open_door_toward(_Ctx(), {"x": 3219, "y": 3200, "plane": 0}) is True
+    assert door in walker["clicked"]
+
+
+def test_open_door_toward_confirms_via_crossing_when_the_door_shuts_behind_you(walker, monkeypatch):
+    """ROSS's front door swings shut behind you -- MEASURED live 2026-08-29: the recorder shows
+    every click registering as `Open Door` while re-reading the doorway kept saying "still shut",
+    spending the whole confirmation budget on a door that had already worked. _crossed is the
+    fix: getting THROUGH the door counts as success even though the blocked edge never reads
+    open again at poll time -- it is the same collision reading throughout this test."""
+    route = [(3200 + i, 3200) for i in range(20)]
+    door = _route_door(3200 + 1, 3200, plane=0, flags=BLOCK_MOVEMENT_WEST)
+    monkeypatch.setattr(travel.worldmap, "find_path", lambda *a, **kw: route)
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [door])
+    # Collision NEVER clears -- unlike the test above, the door reads shut before AND after.
+    blocked = [{"x": tx, "y": ty, "plane": 0,
+               "flags": BLOCK_MOVEMENT_WEST if (tx, ty) == (3200 + 1, 3200) else 0}
+              for tx, ty in route]
+    monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=2: blocked)
+
+    def fake_click(ser, obj, **kw):
+        walker["clicked"].append(obj)
+        # The click walks us to the door and through it -- simulate arriving on the far side.
+        walker["pos"] = (3200 + 2, 3200, 0)
+
+    monkeypatch.setattr(controller, "click_entity", fake_click)
     assert travel.open_door_toward(_Ctx(), {"x": 3219, "y": 3200, "plane": 0}) is True
     assert door in walker["clicked"]
 

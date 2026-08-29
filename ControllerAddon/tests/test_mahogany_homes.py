@@ -37,12 +37,25 @@ def _no_live_bridge(monkeypatch):
     stub them, so results depended on where the character happened to be standing -- MEASURED
     2026-08-29 in the travel suite, where the same door test passed alone and failed in a full
     run. The defaults are the documented "client cannot tell" answers, which every caller must
-    already handle."""
+    already handle.
+
+    `get_player` is the third instance of this class this session (after two in the travel
+    suite): work_phase calls `controller.get_player()` directly (for the reachability flood
+    fill), unstubbed by test_work_phase_respects_click_cooldown, so with the client closed the
+    call resolves via the bridge's own failure path (api_get's 0.3s timeout + swallowed
+    exception) instead of returning instantly -- enough real wall-clock time for the cooldown
+    window under test to expire before the click gate is even reached, so the "no click yet"
+    assertion failed on a click that should have been suppressed. Verified with `requests`
+    stubbed to record every URL hit across the whole suite: only GET /player was ever reached,
+    and zero calls remain once this default is in place. `{}` matches get_player's own
+    bridge-down return value (`api_get(...) or {}`), so every consumer already treats it as
+    "cannot tell" -- same contract as the get_collision/shortest-path defaults above."""
     monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=6: [])
     monkeypatch.setattr(controller, "request_shortest_path",
                         lambda x, y, plane, config=None: {"requested": False})
     monkeypatch.setattr(controller, "get_shortest_path_result",
                         lambda: {"active": False, "done": False, "steps": []})
+    monkeypatch.setattr(controller, "get_player", lambda: {})
 
 
 @pytest.fixture(autouse=True)
