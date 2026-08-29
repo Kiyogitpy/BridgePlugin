@@ -60,6 +60,86 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   walk alone is not proof. Both are read-only and cost nothing when unused. NumPy and Pillow are
   already installed, so measuring a dumped frame needs no new dependency.
 
+## Reference implementations in `data/decompiled/`
+
+**Documentation only — nothing here is on our build path.** These are decompiled or vendored
+third-party projects kept for reading. Before writing a new subsystem from scratch, check
+whether one of them already solves it; two of the four below were found only after the
+equivalent had already been hand-built and live-debugged for several sessions.
+
+| Directory | What it is | Reach for it when |
+|---|---|---|
+| `PacketUtils/` (EthanApi) | `EthanApiPlugin/PathFinding/GlobalCollisionMap` + `PathingTesting` — a world-wide per-edge collision bitmap and a BFS over it, plus an entity/widget query API | You need a walking route, especially on a plane Shortest Path cannot reach |
+| `Vitalite/api/.../services/pathfinder/` | A 21k-LOC pathing system: local vs global collision, A*/BFS/JPS/flow-field, transports with requirements, teleports, sailing | You need transports, teleports, or a worked example of local-vs-global collision |
+| `CacheMapDumper-main/` | Generates a collision map from an OSRS cache pulled from OpenRS2. Writes RoaringBitmap + gzip, with a Swing viewer | The static map goes stale after a game update, or you need extra per-tile data baked in |
+| `rl-suite-main/` | Deobfuscates a RuneLite injected-client jar into readable source; publishes packet tables (ids, names, lengths, field layouts) for revs 235-240 as TSV in `data/` | You need to read client internals the API does not expose. **See the caveat below before touching the packet half.** |
+| `mahogany-homes-plugin/`, `shortest-path-plugin/`, `sailing-plugin/`, `target-true-tile/` | Sideloaded Plugin Hub jars | Porting a fact the plugin already knows — copy its SOURCE, not your reconstruction of it (see the 231.6 dialogue-widget lesson) |
+| `client-1.12.33/`, `injected-client-1.12.33/` | The RuneLite client itself | Settling an API question against the real jar rather than assuming |
+
+**`rl-suite-main`'s packet tables are not a licence to send packets.** This project drives a
+physical Arduino over serial *specifically* because the input is not software-injected (see
+"What this is"). Adopting packet-based interaction would reverse that decision, and it is the
+user's call to make explicitly — not something to reach for mid-task because it is convenient.
+The deobfuscation half carries no such caveat.
+
+### Collision maps: three of them, and they must never be mixed
+
+All three are per-edge bitmaps storing only NORTH and EAST per tile (south/west are read off
+the neighbour), and all three bake **doors as OPEN** — deliberately. `CacheMapDumper`'s
+`Exclusion` enum is the hand-curated list that does it (guild doors, city gates, arches, prison
+doors), so doors-passable is a decision, not a dump artifact. The model everywhere is: route
+straight through the door, then detect and open it when you reach it.
+
+| Map | Packing | Polarity | Readable from Python |
+|---|---|---|---|
+| EthanApi `PathFinding/map` | `x & 16383 \| y<<14 \| plane<<28`, bit 30 = east | **set = passable** | Yes — RoaringBitmap portable format |
+| Vitalite `map.dat` | `x & 8191 \| y<<13 \| plane<<28`, bit 30 = east | **set = blocked** | No — Java-serialised `SparseBitSet` |
+| CacheMapDumper output | 12-bit x (base 480), 14-bit y, 2-bit plane; data bit 0 = north, 1 = east | **set = blocked** | Yes — RoaringBitmap + gzip |
+
+Same shape, opposite meanings. Reading one with another's indexer produces a map that is
+subtly wrong rather than obviously broken.
+
+MEASURED 2026-08-29 against EthanApi's map: 3.6 MB gzipped / 78 MB decompressed, 82.2 M set
+bits, per-plane p0 10.2 M / p1 22.3 M / p2 24.3 M / p3 25.4 M — **upper planes carry real
+data**, which is the thing Shortest Path structurally cannot give us. Pure-Python BFS over it
+costs 0.13 s to load and 0.4-3 ms for in-house routes, 151 ms for a 314-step cross-city one.
+
+Two properties to know before trusting a route:
+
+- **No data defaults to PASSABLE.** Verified at Varrock square on planes 1 and 2 (open sky above
+  an outdoor tile) — all four edges passable. Upstairs, a missing exterior wall lets a BFS leak
+  through the void.
+- **An object's own blocking is baked into the same bits as a wall's**, so the static map cannot
+  tell furniture from a wall. VERIFIED at JEFF's upper floor: the player stood diagonally beside
+  a hotspot and interacted fine, while the map called every route to it blocked. **This is why
+  `travel.can_reach` stays on the LIVE `collisionFlags` from `ObjectProvider`** — only there do
+  `BLOCK_MOVEMENT_OBJECT` (256) and the directional `MOVEMENT_*` bits stay distinguishable.
+  Vitalite makes the same split (`LocalCollisionMap.all()` uses the global static map for
+  ordinary coordinates and live flags only for instanced ones).
+
+`CacheMapDumper` packs **up to 5 data bits per tile and uses only two**, and
+`Dumper.processRegion` already reads `getWallOrDoor()` and `getInteractType()`. So a "door on
+this tile" bit and an "object-blocked, not wall-blocked" bit are available if the live check
+ever proves insufficient.
+
+### Doors: the model that replaced ours
+
+Vitalite's `WalkerPath.handlePassThroughObjects` is the whole door algorithm, and it is smaller
+than any of the three tiers we built: **when the next step is not reachable, find an object
+named `door`/`gate`/`curtain` (excluding `trapdoor`) standing on the player's tile or on the
+next step's tile, and interact with it.** No orientation, no edge-bit matching, no span tests —
+having a real route is what makes the question trivial. It covers both shapes we measured
+(Barbara's edge doors and Falador's `GameObject` 24050) because both sit *on* a route tile.
+
+**One correction to make when copying it:** Vitalite matches on name only and interacts with
+action index 0. Left-clicking an *open* door **CLOSES** it, turning a working walk into a wedged
+one — a shut door and an open one are both `WallObject`s named `Door` with per-door ids
+(Falador 24050 shut / 24051 open), and only the `Open` action separates them. Keep the action
+check. Do take `curtain`, which our name list was missing.
+
+See `docs/superpowers/specs/2026-08-29-global-collision-pathfinding-design.md` for the design
+this feeds.
+
 ## The routine contract
 
 Every file in `routines/` is a plain Python module `controller.py` loads dynamically. It may
@@ -239,6 +319,217 @@ steps above.
   Pass `min_path_tiles=0` to force a computed route anyway. Deliberately not a large threshold:
   `_walk_greedy` is obstacle-blind and every extra tile of gate is another chance to wedge
   against a wall it can't route around.
+
+- **Shortest Path's collision map thinks closed doors are OPEN, and it will route you straight
+  through one.** MEASURED 2026-08-28 by decoding the plugin's own `collision-map.zip` (2 bits per
+  tile: flag 0 = north passable, flag 1 = east passable; see `SplitFlagMap.get`): of the nine door
+  tiles a human is recorded opening across the four Mahogany Homes recordings, **seven are marked
+  passable on every edge**. Falador's `(3037,3347)` was re-checked against the live client with the
+  player standing beside that very shut door — passable. The dump was generated with doors treated
+  as open, so the pathfinder happily emits a route through a door that is actually closed. And the
+  route carries **no transport step** for `_use_transport` to click: **none** of the eight door ids
+  from those recordings (`11773, 7452, 11775, 1535, 24050, 40178, 1540, 1541`) appear in
+  `transports.tsv` — that file's `Open Door` entries are for *special* doors (quest/locked), not
+  ordinary building doors. travel.py's own "ordinary doors/gates need no key at all" comment is
+  true about the *config key* and misleading about everything else: there is no data at all.
+  Symptom: the walker hop-clicks past the door, the player wedges against it, and `_hop_to`
+  returns True on its timeout regardless — so the loop recomputes the identical hop and burns
+  `WALK_MAX_HOPS` x `WALK_HOP_TIMEOUT_S` (**up to 8 minutes**) before `walk_to` returns False.
+  This is not Mahogany-Homes-specific; that routine just hits it hardest by entering 12 houses.
+  Fixed 2026-08-28 by a **stall-triggered** recovery in both walkers (`_find_blocking_door`/
+  `_open_blocking_door`): only a pass that gained no ground scans for a door, so a walk that works
+  today is untouched. Two things make it safe, and neither is optional:
+  - **"Closed" is decided by the object's ACTIONS, never its name or id.** A shut door and an open
+    one are both `WallObject`s named `Door`, with per-door ids (Falador 24050 shut / 24051 open),
+    so only the action separates them — `Open` vs `Close`. Left-clicking an open door **closes**
+    it, turning a working walk into a wedged one. `ObjectProvider.buildObjectData` gained an
+    `actions` field (impostor-resolved, blanks dropped, index 0 = left-click default) for exactly
+    this; **it needs a client rebuild**, and an absent field reads as "can't tell" and does
+    nothing, so an un-rebuilt client is as stuck as before and never worse.
+  - **Match the `WallObject` type too, not just the action.** Chests, cupboards and drawers all
+    offer `Open` and fill every Mahogany Homes house — a live scan beside the Falador door
+    returned Drawers and a Cupboard within 7 tiles.
+  - **Pick the door off the ROUTE, never by distance to the goal.** The first version required a
+    candidate to be no further from the goal than the player — which LIVE 2026-08-28 rejected all
+    three closed doors around Mariah's house while the routine sat two tiles from its hotspot,
+    walled off. When you are walled off, the door that gets you there is FURTHER in a straight
+    line, not nearer. The pathfinder already knows: it routed (1771,3622)→(1766,3621) in 12 steps
+    straight through the door tile (1765,3624), carrying no transport. So `_find_blocking_door`
+    takes the route and picks the closed door standing on it, anchoring its lookahead at the step
+    nearest the PLAYER (a stalled `_walk_along_path` has already advanced its own index past where
+    the player stands). `_walk_greedy` has no route of its own — `walk_to` sends anything under
+    `SHORT_HOP_TILES` straight to it, and the failing walk was five tiles — so on a stall it now
+    ASKS for one. Verified A/B against the live stuck tile: with the route it returns
+    `Door 7452 (1765,3624)`, without it `None`.
+  - **A walk that must end INSIDE a building needs a tighter tolerance than the default.**
+    `WALK_ARRIVAL_TOLERANCE` is 3, and LIVE 2026-08-28 `walk_to` returned True from (1766,3624) —
+    pressed against the shut door, 3 tiles from the target, `underRoof` still false. A walk that
+    "arrives" outside the door never stalls, so the recovery never runs. `mahogany_homes.py` uses
+    `HOUSE_ARRIVAL_TOLERANCE = 1` for this.
+  - **A visible hotspot is not a reachable one, and `/objects` will happily show you one through a
+    wall** (it returns the whole scene on the player's plane). `work_phase` clicked a Table two
+    tiles away through a wall every 3s indefinitely — and `mh_work_stuck` could never catch it,
+    because *seeing* the object is what resets that counter. The door recovery lives in the
+    walker, so a routine that never walks can never benefit from it: after
+    `HOTSPOT_UNREACHABLE_CLICKS` clicks with no varbit movement, work_phase now walks to the house.
+
+- **Doors: `collisionFlags` + `GET /collision` are the ground truth, and the useful question is
+  per-EDGE, not per-door.** `ObjectProvider` reports `collisionFlags` on every object (the client's
+  own `CollisionData` entry for that object's tile) and `CollisionProvider` serves
+  `GET /collision?x=&y=&plane=&radius=` for ARBITRARY tiles, including empty ones -- needed because
+  the doorway you are trying to walk through usually has no object on your side of it. Both added
+  2026-08-28 on the user's suggestion, after two distance heuristics had been wrong at two
+  different houses.
+
+  MEASURED live by opening Barbara's two doors one at a time and re-reading the SAME doorway:
+
+  | | shut | open |
+  |---|---|---|
+  | outer | id 7452 @ (1746,3534) `mE\|sE` (4104) | id **7453** @ (1747,3534) `mS\|sS`, doorway tiles -> **0** |
+  | inner | id 7452 @ (1748,3537) `mS\|sS` (16416) | id **7453** @ (1748,3536) `mW\|sW`, doorway tile -> **0** |
+
+  Five facts, all confirmed twice:
+  1. Movement and line-of-sight bits are ALWAYS set together for the same edge (`mE|sE`), so the
+     user's "I can see line of sight change when I open doors" is the same signal.
+  2. A blocked edge is recorded on BOTH its tiles as opposite directions (a door reading
+     MOVEMENT_EAST has MOVEMENT_WEST on the tile east of it) -- it is a genuine EDGE, not a tile
+     property, so either side is enough to know the crossing is shut.
+  3. Opening a door CLEARS the doorway edge outright (to 0) and the leaf comes to rest blocking a
+     PERPENDICULAR edge.
+  4. The door object MOVES one tile and CHANGES ID when it opens (7452 shut -> 7453 open).
+  5. A shut door's flags are identical to the plain wall segments beside it (Barbara's read 4104
+     either side), so collision can never IDENTIFY a door -- `actions` ("Open" vs "Close") does
+     that, and always did.
+
+  **Do not compare two different doors' flags to infer state** -- an earlier pass did exactly that
+  at Lumbridge (a shut door and a different open one both read 1026), concluded the flags carried
+  no state, and wrote that up as fact. 1026 was the open door's LEAF edge. Comparing one doorway
+  before and after is the only comparison that answers anything.
+
+  What the code actually asks is narrower and needs no classification at all
+  (`travel._door_separates`): **does one of this shut door's blocked edges lie between the player
+  and the goal?** A shut door across the path answers yes; the same door once open answers no, for
+  free. VERIFIED live: with both doors open and the way in genuinely clear, `_find_blocking_door`
+  returns None. Two traps worth knowing: `BLOCK_MOVEMENT_FULL` (2359552) is a COMPOSITE of
+  `FLOOR | FLOOR_DECORATION | OBJECT`, so ORing it into a mask makes a bare floor decoration read
+  as an obstruction (caught on Lumbridge's Trapdoor, 262144) -- `DOOR_BLOCKING_FLAGS` omits it;
+  and an absent `collisionFlags` means "cannot tell", never "no".
+
+  Scope, honestly: the edge test is a single-axis comparison, so it catches a door squarely across
+  the path and NOT one that is off to the side (Mariah's, where the right door was north of both
+  player and goal). That case is the ROUTE branch's job, and it handled it live. When neither
+  finds anything the answer is now None rather than "open the nearest door that blocks anything"
+  -- VERIFIED that fallback was a false positive: with Barbara's way in clear it still returned
+  the inner door, a wasted click plus a True return that resets the walker's stall tracking.
+
+  **Doors are resolved BEFORE the walk, not after it stalls** (user directive 2026-08-29: "the
+  priority should be determine door situation - then go in"). `travel.walk_to` calls
+  `_open_blocking_door` before stepping off; the stall-triggered recovery remains only as a
+  backstop for doors the edge test cannot see. Waiting for a stall was backwards -- it costs a
+  whole hop timeout to notice, is spent wedged against the door in plain view, and at NORMAN's it
+  never fired at all because the walk "arrived" outside. It costs nothing when the way is clear.
+
+  Three separate bugs were found at NORMAN's house (Falador) on 2026-08-29, and NONE of them was
+  in the door-opening logic -- worth knowing before debugging that code again:
+  - **`DOOR_SEARCH_RADIUS` was 4 while the doors stood 6 and 7 tiles away**, so the routeless
+    branch had zero candidates and returned None. It was never rejecting the door; it never saw
+    one. Now 8, which is only safe because a candidate must prove its edge crosses our path.
+  - **The edge test was single-axis and false-positived at range**: `Door 24057` at (3027,3344),
+    seven tiles west and part of a different building, reported `separates=True` purely because
+    its y-crossing sat between our y and the goal's. A blocked edge spans exactly ONE tile, so
+    the door's other coordinate must also lie in the span we travel through (`_within_span`,
+    with `DOOR_SPAN_MARGIN` for the fact that the walker's path is not a straight line).
+  - **Walking to `standingLocation` could never have worked there.** That tile (3038,3344) is on
+    the SAME side of the shut door 24050 (3037,3347, blocking the 3346|3347 crossing) as the
+    player, so a walk to it crosses no doorway -- the recovery correctly finds nothing between us
+    and that tile, and we end up outside exactly as before. `work_phase`'s unreachable-hotspot
+    walk now targets the HOTSPOT's own `location`, which is what puts the doorway between us and
+    the goal where the walker can see it; it falls back to the standing tile when `location` is
+    absent.
+
+  **A door is NOT always a WallObject, and not every door blocks an EDGE.** MEASURED live
+  2026-08-29 at TAU's house, Falador, from the tile the routine was stuck on:
+
+      Door id=24050 type=GameObject (3046,3348) d=1 actions=['Open'] flags=131328  <- the way in
+      Door id=24050 type=WallObject (3046,3353) d=4 actions=['Open'] flags=4104    <- unrelated
+
+  Same id, different object type. `DOOR_OBJECT_TYPES` was `("WallObject",)`, so the door ONE TILE
+  from the player was invisible to every branch of the search while an unrelated wall door four
+  tiles north was the only candidate. Now `("WallObject", "GameObject")` -- the name + "Open"
+  action filter is what keeps that tight (nearby Drawers also offer "Open" and are excluded by
+  name). And its collision is different in KIND: `131328 = BLOCK_LINE_OF_SIGHT_FULL (131072) |
+  BLOCK_MOVEMENT_OBJECT (256)`, with **no movement edge bits at all**, so `_door_separates`'
+  edge loop could never match it -- a full-tile blocker separates us when its whole TILE lies on
+  the way, which is what the route said (Shortest Path routed (3045,3349) -> (3046,3348) ->
+  (3046,3347) -> (3046,3346) straight through the door tile). Note the line-of-sight bit is the
+  only flag family that marks this door at all, which is why LOS is in the mask and not just
+  movement.
+
+  **`standingLocation` can itself be unwalkable, and that starves everything downstream.**
+  MEASURED the same run: TAU's standing tile (3047,3345) carries BLOCK_MOVEMENT_OBJECT (furniture
+  stands on it), so Shortest Path returns 0 steps to it -- which sends `walk_to` into the
+  obstacle-blind greedy walker AND denies the door escalation the route it needs, so a shut door
+  one tile away could not be found by any path. `travel._routable_goal` retargets an unwalkable
+  goal onto its nearest walkable neighbour ((3047,3345) -> (3046,3346), which routes in 4 steps)
+  using `GET /collision`, and returns the goal untouched whenever the client reports nothing.
+
+  **A hotspot's own tile is NOT routable, and that broke the first attempt at this.** MEASURED
+  live 2026-08-29 at Barbara's: Shortest Path returns 0 steps to (1749,3536) on 5 of 5 calls in
+  0.3-0.7s (so a genuine "no path", not the still-computing race) because the tile holds the
+  furniture. Its neighbours and the home's standing tile route fine (5-7 steps). So a walk aimed
+  at the hotspot falls straight through to the obstacle-blind greedy walker and wedges -- which
+  is what made work_phase loop click-click-walk forever. But aiming at the STANDING tile hides
+  the doorway, because both it and the player sit on the same side of the door. The two questions
+  need two different tiles: **resolve the door against the hotspot you cannot reach, then walk to
+  the tile you can** (`travel.open_doorway_to` exists for exactly this, and work_phase calls it
+  before its walk). VERIFIED live the same run: `opening the Door at (1746,3534) in the way` ->
+  walked in -> `working hotspot 40011`.
+
+  **When shut doors are nearby but none lies on the straight line, ask for a ROUTE.** The edge
+  test is single-axis, so it cannot see a detour -- and a walled-off goal one tile away is pure
+  detour (player (1750,3536), hotspot (1749,3536), both doors correctly answering "I am not
+  between two adjacent tiles"). `_open_blocking_door` now escalates to `_request_computed_path`
+  in exactly that case, which is narrow on purpose: a walk with no shut doors near it never pays
+  for a path request.
+
+  **Opening a door is CONFIRMED, not slept off.** A door is a WallObject whose id encodes its
+  state and changes when it swings -- every pair measured is shut -> shut+1 (Barbara's 7452 ->
+  7453 twice, Falador's 24050 -> 24051) -- and it also moves a tile, so the object you clicked is
+  not there afterwards to re-read. The doorway is, so the confirmation polls the blocked EDGE
+  until it clears (`DOOR_CONFIRM_POLL_S`, bounded by `DOOR_OPEN_WAIT_S`) and logs
+  `still shut after Ns -- another player may be holding it, or the click missed` otherwise. The
+  old fixed 2s sleep both wasted time on a fast open and continued in silence on a failed one.
+  Known rough edge: a door 8 tiles away needs a walk before the open, so 2s can report "still
+  shut" on a click that does land -- seen once on the Varrock bank door, harmless, not yet tuned.
+
+  Also worth knowing: `_request_computed_path` can legitimately return ZERO steps while Shortest
+  Path is still computing -- the identical call a moment later returned 19 steps `TARGET_REACHED`
+  -- which is why the routeless branch has to be correct on its own, not treated as a rare case.
+
+- **MINIMAP for distance, viewport only for short precise hops -- and every viewport walk click
+  is SHIFT-clicked.** User directive 2026-08-29. `_hop_to` used to prefer a viewport click
+  whenever the tile was rendered, with the minimap only as a fallback beyond render distance;
+  with `WALK_HOP_MIN/MAX_TILES` at 16-24 that made nearly every hop of a long route a viewport
+  click into a scene full of interactive scenery. CONFIRMED live the same day
+  (`recordings/2026-08-29_012522_mh-live-run12`): hops resolved as `Chop down` ("You need an
+  axe") and `Cook` ("You haven't got anything to cook") instead of walking, which strands the
+  player somewhere it did not choose and makes the next pass walk back -- the user saw this as
+  clicking back and forth. The minimap has nothing drawn on it to hijack a click; precision is
+  what it lacks, and precision is only wanted at the END of a walk (exact-tile work does not come
+  through `_hop_to` at all -- `walk_to_exact_tile` handles that, and was the ONLY caller obeying
+  CLAUDE.md's own shift-click rule). Now: `HOP_VIEWPORT_MAX_TILES` (6, first draft, wants a live
+  tuning pass) decides, and `_click_walk_point` holds SHIFT for the viewport case.
+
+- **The minimap reaches 28 tiles, and the DIAGONALS are what bound it.** MEASURED live 2026-08-28
+  from (3037,3345) by walking `/minimap/walk` outward in all eight directions: `onMinimap` held to
+  28 everywhere, then failed at 30 on the four diagonals while the cardinals were still on at 32 —
+  a corner sits √2× further from the minimap's centre than a cardinal at the same tile distance.
+  `WALK_HOP_MIN/MAX_TILES` were raised 10-16 → 16-24 on this measurement (user request: fewer
+  stops between clicks, since each hop ends with the player standing still while the next click is
+  aimed and flown). 24 keeps margin under 28 because the minimap's reach is a **user setting** —
+  zooming it in shrinks it — and `_hop_to` now pulls an unreachable aim point in toward the player
+  and retries (`HOP_PULL_IN_FRACTIONS`) instead of abandoning the whole walk, so a zoomed-in
+  minimap degrades to shorter hops rather than a failed trip. Re-measure before raising further.
 
 - **`TickClock` is no longer a self-registered EventBus subscriber** (changed 2026-08-21). It is
   bumped explicitly by `ControllerPlugin.onGameTick` via `tickClock.bump()`, because RuneLite does
@@ -948,8 +1239,355 @@ widget/interface id this depends on was verified against the recordings and the 
 `runelite-api` jar rather than guessed, but `HOTSPOT_CLICK_COOLDOWN_S`/`TURN_IN_CLICK_COOLDOWN_S`
 (both first-draft guesses, see the routine's own module docstring) and the overall phase timing
 need a live session to confirm, the same way golem_crafting's own click cadence was corrected
-after its first live run. No plank sack in this version — planks are carried loose and restocked
-more often, a deliberate simplification to avoid golem_crafting's known fur-pouch stale-estimate
-failure mode in a routine with no live mileage yet. See
+after its first live run.
+
+**Three gaps closed 2026-08-28, two of them things the reference plugin had that the original
+port missed** — worth knowing before porting from a decompile again, because all three were
+found by diffing our data against the reference rather than by reading our own code:
+- **`npcUpstairs`** (reference `Home.isNpcUpstairs`) — true for JESS and NORMAN only. A full
+  re-diff of every other Home field (object ids, per-slot HotspotType, ladders, and the
+  slot↔varbit alignment against `Hotspot`'s authoritative object→varbit map) found **zero**
+  other differences across all 12 homes. `teleportItems` is deliberately not ported (the routine
+  uses its own simplified `CITY_TELEPORTS`) and `hint` is a non-functional UI string.
+- **The plank sack** (reference `MahoganyHomesPlugin.countPlankSackVarb`). Item 24882, one
+  varbit per plank type — 960/18171, 8778/18172, **8780 (teak)/18173**, 8782/18174 — capacity 28.
+  The original "no plank sack, to avoid golem_crafting's stale fur-pouch estimate" reasoning was
+  simply wrong: the count is a **varbit read fresh from the client**, not a running local
+  estimate, so it cannot drift. Two facts MEASURED from the recordings, not assumed: `Fill` is
+  only offered while a **bank interface is open** (same mechanic as `banker.fill_fur_pouch`, and
+  the recording logs it as `CC_OP` on widget 15.3 slot 0), and the game **spends planks straight
+  out of the sack with no Empty step** — varbit 18173 ticks 28→27→25→23 in step with each
+  hotspot's cost, alongside the hotspot varbit, the build animation and the Construction XP drop.
+  So sack planks count toward affordability; counting only loose ones banked with a full sack.
+- **Which FLOOR a hotspot is on.** `/objects` only ever reports the player's current plane, so
+  "not found" could not distinguish "upstairs" from "not close enough", and the routine guessed
+  by right-clicking a ladder with both `Climb-up`/`Climb-down`. `MahoganyHomesProvider` now scans
+  **every** plane of the loaded scene for the hotspot object ids and reports each hotspot's
+  `location`/`plane`, so the direction is decided rather than guessed. Ladders are now chosen by
+  proximity to the **hotspot**, not to the player — which matters for **NOELLA**, the only home
+  of the twelve with two staircases and (per the user) a **disconnected** upper floor: "you have
+  to fix one upstairs climb down take the other ladder fix that upstairs". Because `/objects`
+  returns the whole scene on the current plane, the far half's hotspots are plainly visible from
+  the near half, so work_phase would click an unreachable hotspot forever — and seeing the object
+  is exactly what resets `mh_work_stuck`, so the safety stop never fired. Guarded by
+  `HOTSPOT_UNREACHABLE_CLICKS`, scoped to `SPLIT_UPPER_FLOOR_HOMES` (NOELLA alone) rather than
+  inferred from ladder count: two staircases do not imply a disconnected floor, and applying the
+  guard everywhere would risk climbing away from a merely-slow build in eleven other houses. See
 `docs/superpowers/specs/2026-08-27-mahogany-homes-design.md` for the full design and
 `docs/superpowers/plans/2026-08-27-mahogany-homes.md` for the implementation history.
+
+**Second live session, 2026-08-29 — three bugs, all MEASURED. Don't re-derive them.**
+
+- **A widget text match MUST be scoped to a widget GROUP, or the chatbox answers for you.**
+  `_accept_tea_if_offered` substring-matched `"cuppa"` over the whole `/widgets/dump`, and the
+  chatbox (**group 162**, identifiable by its own All/Game/Public/Private tab labels) keeps
+  `"Aaah, nothing like a nice cuppa tea!"` and `"You drink the tea, you feel energized!"` in
+  scrollback for the rest of the session once any tea has been drunk. Chat history never clears,
+  so the check returned True on EVERY tick and `tick()` never reached a phase handler at all --
+  three clicks aimed at a chat line, then SPACE forever, with `dialogOpen` false throughout. A
+  hard deadlock, not a slow path: the routine could not have made progress in any circumstance.
+  Note the earlier screenX/screenY guard did NOT exclude these -- chat lines have real screen
+  positions. Dialogue OPTIONS live in **group 219** (confirmed from recorder output,
+  `widget 219.1 slot 1`); `DIALOG_OPTION_GROUP` is now what the match is scoped to. Verified by
+  replaying both matchers against the live widget tree that deadlocked: old 3 matches, new 0.
+- **A ladder is clicked at its own reported CENTRE. A tile-corner aim was tried on 2026-08-29 and
+  REVERTED the same day** (user: *"revert the ladder to click center"*) -- it fixed one house and
+  broke another, so don't reach for it again without per-ladder evidence. What is real is that an
+  object's reported point is its **clickbox centroid** (`RuneLiteUtil.shapeCoords` ->
+  `pointInsideShape`, which prefers the area centroid), and how useful that is varies by model:
+  - MARIAH's upper-floor ladder: centroid `(1249,709)` vs the tile centre straight from
+    `/ground/walk` `(1249,707)` -- the SAME point, i.e. the clickbox is effectively the whole TILE
+    while the climbable model occupies only the top of it. A marked frame dump shows the point on
+    bare floorboards. Right-clicking it returned ground options only
+    (`['Cancel','Mark Safespot','Walk here']`) 13 times, then a safety stop.
+  - ROSS's ladder 16683: centroid `(1263,316)` vs tile centre `(1360,386)` -- ~100px apart, and
+    the centroid is squarely ON the model. Here the centroid was already right, and overriding it
+    with a corner aimed a good click away; the rotation then spent the whole stuck budget.
+  The user's fix for the MARIAH-shaped case is to **skew the camera** so top-floor ladders don't
+  need a special aim at all. Do pass `offset=(0, 0)` -- `click_menu_action`'s default `(-7, +7)`
+  nudge is DOWNWARD in screen space and is enough to slide off a small target.
+- **Changing floor is progress and must clear `mh_work_stuck`.** With the corner fix in, the climb
+  worked and the run STILL safety-stopped two ticks later: three attempts at
+  `LADDER_CLICK_COOLDOWN_S` apiece had already spent the 15-tick budget. Keyed on the plane
+  actually CHANGING (not on the menu click being taken) so an up-then-down loop cannot reset the
+  counter forever. **The marker is not consumed on read** -- a climb takes a tick or two to land,
+  so the tick right after the click still reports the old plane; consuming it there lost a descent
+  that genuinely happened and stopped the run anyway.
+- **`turn_in_phase` had no re-validation and no ceiling, and looped forever.** LIVE 2026-08-29 at
+  ROSS's: the phase latched to `"turn_in"` one tick after a single hotspot was built -- work_phase
+  moves there whenever `pick_next_hotspot` returns None, so one transient empty read is enough --
+  and then talked to Ross every ~3s indefinitely while SIX of his seven hotspots still reported
+  `needsAttention`. Nothing re-checked, so it could not recover. turn_in_phase now bounces back to
+  `"work"` whenever we are at the home and a hotspot still needs attention (the mirror of
+  work_phase's own "no hotspot data from out here" guard; the two conditions are mutually
+  exclusive on the same data, so they cannot ping-pong), and `TURN_IN_MAX_CLICKS` (12, per home)
+  safety-stops rather than talking forever -- **a cooldown only sets the RATE of an unbounded
+  loop**, the same lesson as the teleport-tablet and NPC-Contact caps.
+- **The door is resolved BEFORE the first hotspot click, not after five wasted ones.** USER
+  2026-08-29: *"why when we come to the house do we not prioritise opening the god danm door,
+  should be the first thing we click if its closed"*. `travel.walk_to` already resolves doors
+  before stepping off -- but work_phase does not necessarily walk at all: `/objects` returns the
+  whole scene on our plane, so a hotspot behind a shut front door is plainly VISIBLE and was
+  clicked immediately, and the door only got resolved through the unreachable branch,
+  `HOTSPOT_UNREACHABLE_CLICKS` (5) clicks and ~6s later. MEASURED live at MARIAH's: exactly that,
+  twice in one contract. work_phase now calls `travel.open_doorway_to` once per hotspot state
+  (latched on the same `(objectId, value)` signature as the click counter), which costs nothing
+  when the way is clear.
+- **A door is opened by WALKING to it and then opening it, so the confirmation must budget the
+  walk.** `DOOR_OPEN_WAIT_S` was a flat 2.0s, which is less than the ~2.4s of walking to a door
+  four tiles off (one tile per 0.6s tick). USER 2026-08-29 on the loop at ROSS's: *"we clicked
+  away before waiting for us to walk to the door and open it"*. The recorder settles it -- the
+  FIRST click registered as `Open Door` on id 40178 and was good; the budget expired before the
+  player arrived, and the two retries then resolved to `Walk here` because the player had moved
+  off the pixel being re-aimed at. So a working click was reported as a failure and interrupted by
+  its own retry, three times over. The budget is now
+  `DOOR_OPEN_WAIT_S + tiles * DOOR_WALK_ALLOWANCE_S`, capped by `DOOR_OPEN_WAIT_MAX_S` so a door
+  that genuinely never opens still fails fast. This is the same rough edge the 2026-08-28 notes
+  recorded as "seen once on the Varrock bank door, harmless, not yet tuned" -- it is not harmless;
+  it loops. **Do not read `Pick-lock` in a door's actions as "locked and unopenable"** -- that was
+  my own wrong first reading of this failure, and the click was landing fine.
+- **WALKING CANNOT CHANGE FLOOR, and `turn_in_phase` did not know that.** USER-REPORTED
+  2026-08-29 as "stuck upstairs": at ROSS's, with every hotspot built and the player still on
+  plane 1, the phase saw "homeowner npc not visible" and walked at `standingLocation` -- which is
+  ALWAYS reported at plane 0. The walker clicked the identical pixel (1144,724) about thirty
+  times and the player never moved. work_phase's ladder handling could not help: it lives in
+  `_approach_missing_hotspot`, and with no hotspots left work_phase does not run at all. The
+  descent is now owned by turn_in_phase too, and counts against `TURN_IN_MAX_CLICKS` so it cannot
+  loop. Which floor the homeowner is on comes from **`npcUpstairs`** (`_homeowner_plane`), not
+  from `standingLocation.plane` -- the latter is plane 0 even for JESS and NORMAN, the two homes
+  whose owner is upstairs.
+  **General lesson: any "walk to X" recovery in this routine needs to ask whether X is even on
+  our floor first.** Two separate loops this session were a cross-plane walk that could never
+  succeed.
+- **Don't let a travel unit test fall through to the ROUTE branch -- it calls the LIVE bridge.**
+  A door test whose edge geometry did not resolve escalated to `_request_computed_path`, which
+  makes a real HTTP call to the running client, so it passed and failed depending on what the
+  client happened to answer. Pin door tests to the geometry the existing
+  `test_a_door_that_never_opens_*` uses (player, door and goal on one axis, `along` satisfied) so
+  `_door_separates` answers outright.
+- **Every climb resolves the doorway to the LADDER first, and upstairs the collision/LOS edge
+  test is the only thing that can answer it.** USER 2026-08-29: *"there is a door we can open to
+  get to the ladder"*, and *"just use line of sight that works on second floor"*. MEASURED at
+  ROSS's upper floor: the player stood at (2617,3317), ONE tile from `Door 1540` at (2616,3317)
+  whose blocked SOUTH edge (flags 16416 = `BLOCK_MOVEMENT_SOUTH | BLOCK_LINE_OF_SIGHT_SOUTH`) was
+  the only thing between them and the ladder at (2617,3315). All TWELVE `Climb-down` clicks
+  registered in the recorder against the correct object -- the aim was never wrong -- and the
+  player never took a single step, because **the game accepts an object interaction it cannot
+  path to and then simply does nothing**. Door recovery lives in `travel.walk_to` /
+  `open_doorway_to`, and the climb path called NEITHER, so the one action that would have worked
+  was never attempted. `_climb` now calls `open_doorway_to` against the ladder's own tile before
+  clicking it; `_routable_goal` retargets the ladder tile (a full-tile blocker, 131328) onto a
+  walkable neighbour, and `_door_separates` answers from the edge bits alone. VERIFIED live the
+  same run: door opened, ladder climbed, contract turned in -- all inside ONE tick, replacing a
+  loop that had ended three runs.
+  This is also the general shape for upstairs: `_open_blocking_door`'s route branch is useless on
+  plane 1, so the collision/LOS edge test carries the whole load there. `GET /collision` works
+  fine on any plane -- it is only Shortest Path's dumped ground-level map that does not.
+- **A safety-stop reason must not repeat the engine's own suffix.** `trigger_safety_stop` appends
+  ". Automation paused -- fix the issue and restart." itself; the first turn-in ceiling message
+  included that sentence too and printed it twice.
+- **A "walk to X" recovery must pick X on OUR OWN FLOOR -- `standingLocation` is always plane 0.**
+  Hit twice on 2026-08-29 in two different phases, so treat it as the standing rule rather than
+  two bugs. In `work_phase`'s unreachable branch, MEASURED live at JESS's (the home where all
+  seven hotspots are upstairs): the goal was `standingLocation`, Shortest Path answered the
+  cross-plane request with a **`Climb-down Ladder` TRANSPORT**, and the walker rode it DOWN and
+  away from the work -- `"using transport: Climb-down Ladder"` -> `"used the transport but didn't
+  arrive where expected"` -> `"target is on a different plane -- can't walk there yet"`, then the
+  whole cycle again, ~90s of climbing up and down per pass. It still finished the contract, so
+  this shows up as waste rather than a halt, which is exactly why it is easy to miss in a log.
+  The branch now walks to the HOTSPOT's own tile whenever `hotspot.plane == player.plane`, and
+  falls back to the standing tile otherwise (the original outside-the-house case, where the
+  hotspot's own tile is usually furniture and unroutable -- see Barbara's, above).
+- **A click's COOLDOWN must budget the walk, because the game performs a queued interaction on
+  ARRIVAL.** USER 2026-08-29: *"are we checking if we click remove on a furniture but we are a few
+  tiles away do we count that as removed before we arrive?"* -- we were.
+  `HOTSPOT_CLICK_COOLDOWN_S` (0.6, Remove) and `HOTSPOT_BUILD_COOLDOWN_S` (2.4, Build/Repair) are
+  the ACTION's own duration and nothing else, so a click on a hotspot a few tiles off expired
+  while the player was still walking. We re-clicked (re-queueing, sometimes re-pathing), the
+  varbit never moved, and after `HOTSPOT_UNREACHABLE_CLICKS` such clicks work_phase declared a
+  perfectly reachable hotspot "unreachable" and walked away. MEASURED at ROSS's: five
+  `Repair Broken Range` actions ALL registering correctly in the recorder against the right
+  object, zero varbit movement, then the unreachable branch. Now
+  `base + distance * HOTSPOT_WALK_ALLOWANCE_S`, capped by `HOTSPOT_COOLDOWN_MAX_S`. This is the
+  same omission as the door-open budget -- **whenever you time a click, ask whether the player
+  has to walk there first.**
+- **Once STUCK, open the nearest shut door even though nothing is provably in the way.** USER
+  2026-08-29: *"got stuck outside without opening door again"*, with a screenshot showing the
+  character on the grass outside ROSS's and the front door highlighted beside it. `_door_separates`
+  is a single-axis "is this edge between us and the goal" test, so it structurally cannot see a
+  door that is a **DETOUR**: MEASURED there -- player (2614,3319) on the grass north of the house,
+  Broken Range at (2617,3318) inside, and the only way in a door at (2610,3316) whose blocked edge
+  (2610|2611) has BOTH of us to its east. The strict answer "not between us" was correct and
+  useless. The route branch that normally catches a detour had returned no route that moment.
+  `travel.open_nearest_shut_door` is the last resort, called ONLY from work_phase's unreachable
+  branch and only after `open_doorway_to` finds nothing -- scoped that tightly because the same
+  looseness in the ordinary pre-walk check was tried earlier and reverted as a false positive.
+  Once stuck, a wasted door click costs a second; not trying costs the contract. It picks the door
+  nearest to US (we must reach it to open it, and a detour door is by definition further from the
+  goal than we are). VERIFIED live the same run: `stuck -- opening the nearest shut Door at
+  (2610,3316)` -> 3-tile route -> hotspot 40164 completed -> on to 40165.
+- **REACHABILITY IS DECIDED BEFORE THE FIRST CLICK. This supersedes the click-then-discover
+  design and most of the door machinery written earlier the same night.** `/objects` returns the
+  whole scene on the player's plane, so a hotspot behind a wall, a shut door or a ceiling is
+  plainly VISIBLE -- and work_phase used to click it from wherever it stood, discovering it could
+  not reach the thing only after `HOTSPOT_UNREACHABLE_CLICKS` failures (~20s). MEASURED over one
+  full ROSS contract 2026-08-29: **15 of 27 hotspot clicks -- 56% -- achieved nothing**, across
+  three stuck events. USER: *"every time we have to walk through a door now we have to get stuck
+  on the outside 5 clicks in a row this is unacceptable."*
+  `travel.reachable_set()` flood-fills the client's own collision grid (`GET /collision`, one call,
+  ~0.11s for a 29x29 block) and everything else follows from it. This is the USER's own room model
+  -- *"we know the houses bounds... if we are in room 1, room 2 has a thing we need to repair then
+  we just check the bounds for a door"* -- with the rooms DERIVED from collision rather than from
+  a per-house wall-id catalogue, which is why it needs no per-home data and handles the Falador
+  `GameObject` door for free:
+  - the flood fill from the player IS "room 1" (walls and shut doors both stop it);
+  - `can_reach(hotspot)` false IS "the thing is in room 2";
+  - `open_frontier_door()` finds the shut door whose blocked edge has **one side inside the fill
+    and one side outside** -- by construction a way out of the region we are trapped in, whether
+    it lies straight ahead or is a DETOUR behind us, which is exactly what `_door_separates`'
+    single-axis test structurally cannot see;
+  - `pick_next_hotspot(hotspots, reach)` prefers a hotspot we can actually get to.
+  Three hard-won rules, each of which cost a live failure:
+  - **Count ALL EIGHT neighbours, not the four cardinals.** MEASURED upstairs at JEFF's: the
+    player stood at (3241,3447), DIAGONALLY adjacent to the hotspot at (3242,3446) whose every
+    cardinal neighbour is furniture. A cardinal-only test called it unreachable and the routine
+    walked in place forever instead of clicking a thing it was standing beside -- strictly worse
+    than the waste it replaced. USER: *"wtf it is reachable hes standing next to it"*.
+  - **The model NEVER vetoes a point-blank click.** At `distance <= 1` the gate is skipped
+    entirely: if the model and the character's own position disagree, the position wins.
+  - **An empty fill means "cannot tell", never "nothing is reachable"** -- an un-rebuilt client or
+    a tile outside the loaded scene must behave exactly as before, not refuse to work.
+  The fill is cardinal-only on purpose, so it can only UNDER-report; the failure mode is the old
+  behaviour, never a confident walk into a wall. And unlike Shortest Path it works on ANY plane.
+- **The three door tiers, precise first.** USER 2026-08-29: *"we cannot use the cannot reach
+  fallback for regular usage, this has to be last resort fallback"* -- before the frontier test
+  existed the blunt tier was firing three or four times per contract and was effectively the
+  primary mechanism. Order is now `open_frontier_door` (names the exact door on the room
+  boundary) -> `open_doorway_to` (straight-line edge test) -> `open_nearest_shut_door` (opens
+  something and hopes; reached only when both above find nothing, which should be near never).
+- **A hotspot can be genuinely unreachable with NO door anywhere.** MEASURED upstairs at JEFF's:
+  of three hotspots needing attention one was walled off and there was no shut door in range at
+  all. USER: *"there is no doors but we are on the second floor"*. Bare list order fixated on it,
+  walked, and wedged the greedy walker; reachable work sat two tiles away. Hence
+  `pick_next_hotspot`'s reachability preference -- and note it still returns an unreachable
+  hotspot when EVERY one is unreachable, so a walled-off contract falls through to the door/walk
+  recovery rather than reporting "no work left" and going to turn_in on an unfinished contract.
+- **Both Python test suites are now hermetic (`_no_live_bridge` autouse fixtures).** `get_collision`,
+  `request_shortest_path` and `get_shortest_path_result` all reach the RUNNING CLIENT when a test
+  does not stub them, so results depended on where the character happened to be standing -- the
+  same door test passed alone and failed in a full run, and flipped between runs as the live
+  player moved house. Mark a test `@pytest.mark.real_bridge_helper` (registered in
+  `tests/conftest.py`) only when it is testing a controller bridge helper itself.
+- **The reachability gate belongs at EVERY world-object click site, not one at a time.** The
+  invariant is: **the game ACCEPTS a click on anything you can see -- through walls, through
+  floors -- and then silently does nothing.** Fixing only work_phase's hotspot clicks moved the
+  failure to the next ungated site rather than removing it. MEASURED live 2026-08-29 at ROSS's:
+  player (2618,3315), ladder 16683 at (2617,3315), cardinally ADJACENT -- but (2618,3315) carries
+  `BLOCK_MOVEMENT_WEST` (65664), so the shared edge is a wall. `menu-select Climb-up Ladder`
+  registered THREE times in the recorder, the player never changed floor, and the run
+  safety-stopped. USER: *"i mean at this point am i going to have to hardcode each door?"* -- no:
+  none of the four failures that night were door-specific. Gated today: hotspots (work_phase),
+  ladders (`_climb`). **Still ungated: the homeowner NPC in `turn_in_phase`.**
+- **ADJACENCY IS NOT REACHABILITY -- the EDGE decides, and raw tile distance cannot tell the two
+  cases apart.** Two live geometries the same night, identical at Chebyshev distance 1, opposite
+  answers:
+  - ROSS's, player (2617,3319) / Broken Range (2617,3318): the exterior wall runs on exactly that
+    edge (y=3319 blocks south, y=3318 blocks north). Unreachable.
+  - JEFF's upstairs, player (3241,3447) / hotspot (3242,3446): diagonal, every cardinal neighbour
+    furniture but no wall on the edges. Reachable -- the character interacted fine.
+  An earlier "the model never vetoes a point-blank click" override was added for the second case
+  and PRODUCED the first (clicking through a wall); it is gone. `can_reach` now tests the movement
+  bits on the shared edge for cardinals, and for diagonals requires one of the two orthogonal
+  corner routes to be open -- the game's own rule. Accepting diagonals unconditionally was also
+  wrong at ROSS's, where (2616,3319)/(2618,3319) are diagonal to the hotspot but behind the wall.
+- **A reachable set is (x, y) with NO plane in it, and the floors share a coordinate space.**
+  MEASURED at ROSS's: a plane-1 hotspot was judged "reachable" against a plane-0 flood fill purely
+  because its x/y landed on a walkable ground-floor tile, so work_phase preferred it over the
+  ground-floor hotspots and went ladder-hunting. `can_reach` takes the fill's `plane` and returns
+  **None** for a cross-floor question -- the honest answer, since reaching another floor is a
+  ladder problem, not a reachability one.
+- **`pick_next_hotspot` ranks: reachable here (0) > another floor (1) > this floor but walled off
+  (2).** The 0/1 gap is what stops the ping-pong. USER 2026-08-29: *"why do we click the door
+  inbetween each remove / build"* -- with cross-floor ranked equal to reachable, it alternated
+  ground-floor work with upstairs attempts, and each attempt re-opened ROSS's self-closing front
+  door on the way to a ladder. Finish the floor, then climb once. Rank 2 is still RETURNED when
+  nothing better exists, so a walled-off contract reaches the door/walk recovery instead of
+  reporting "no work left" and turning in an unfinished contract.
+- **A door that swings shut behind you cannot be confirmed by re-reading the doorway.** MEASURED
+  at ROSS's front door (40178): the recorder shows EVERY click registering as `Open Door` -- eight
+  across one session -- while the confirmation logged `still shut` and spent the whole budget, up
+  to 6.9s each time. USER: *"this door is always closed, so when we open it it instantly closes
+  behind us"*. Both confirmation loops now also succeed on `_crossed()` -- the player having
+  crossed the door's blocked edge since the click. Getting through is the outcome; the doorway's
+  state at poll time is not.
+- **Do not leave an unconditional door resolution beside a reachability gate.** `_climb` kept an
+  earlier `open_doorway_to(ladder)` call after the gate was added, so with the ladder ALREADY
+  reachable it still ran the straight-line edge test -- which false-positives on whatever door
+  shares an axis, at ROSS's the front door BEHIND us. That is what walked the character outside
+  between each Remove/Build. USER: *"still doesnt make much sense since we can reach them so why
+  would we step out"*. MEASURED from inside the house: `can_reach(ladder)` was True and the door
+  was opened anyway. Door work belongs only inside the gate.
+- **Shortest Path cannot route on plane 1 at all.** MEASURED with 20s waits: every plane-1 target
+  returns `active:false, done:false` and never completes, and a plane-0 target requested while
+  standing upstairs comes back `steps=1, SEARCH_EXHAUSTED` where the single "step" is the player's
+  own current tile. Its dumped collision map is ground level only. So upstairs there is no route,
+  which also means `_open_blocking_door`'s route branch has nothing to work with and `walk_to`
+  falls straight through to the obstacle-blind greedy walker. CONFIRMED live: eleven identical
+  `Walk here` clicks at canvas (554,331) with the player never moving, while the client displayed
+  "destination could not be reached". Not fixed -- know it before debugging an upstairs walk.
+
+**First long live session, 2026-08-28 — everything below was MEASURED, don't re-derive it.**
+
+- **The active contract is read off the NPC dialogue WIDGET (231.6) on a GameTick, not off chat.**
+  This is a verbatim port of the reference plugin's `checkForAssignmentDialog`, and it replaced a
+  chat-event parse that could never work. The *assignment* does arrive as a GAMEMESSAGE and parses
+  fine; the line that re-states an ALREADY-ACTIVE contract — the one that recovers state after a
+  restart mid-contract — does not. Symptom: restart with a contract in hand, `hasContract` stays
+  false, and `request_contract_phase` re-casts NPC Contact once per tick forever over a contract
+  the account already holds. Three separate hypotheses died before the user said "why don't we just
+  copy the mahogany home plugin, it recognises the contract" — all three were about the chat event
+  (`ChatMessageType.DIALOG` being filtered out; RuneLite embedding the speaker in `getMessage()` as
+  `Amy|You're currently on...`; the game's non-breaking spaces, which Java's `\s` does not match).
+  Each was real, each was fixed, and none of them was sufficient. **The widget carries the full,
+  untruncated, already-assembled text with no speaker prefix and no message-type question to get
+  wrong.** Lesson for the next port from a decompile: when the reference plugin reads a different
+  SOURCE for the same fact, copy the source, don't reconstruct the fact from a nearer one.
+  `GET /mahogany-homes` now also returns **`lastChat`** — what the provider last parsed and whether
+  it matched — added after the third dead hypothesis. Instrument the boundary sooner than that.
+- **`WorldPoint.fromLocalInstance(client, local)` stamps the WORLD VIEW's current plane on the
+  result — pass the plane explicitly when scanning planes you are not standing on.** This silently
+  broke `MahoganyHomesProvider`'s all-planes hotspot scan in the one direction that matters: every
+  hotspot found upstairs reported `plane: 0` while the player stood downstairs, so `work_phase` read
+  "same floor as me", never tried a staircase, and clicked at a hotspot through a ceiling until the
+  unreachable guard safety-stopped the run (CONFIRMED live at Larry's, Falador: `/objects` did not
+  contain 40098/40099 at all, while the scan happily reported both at plane 0). Use the
+  three-argument overload. This applies to ANY future multi-plane scan, not just this provider.
+- **A tablet teleport takes 3.8s from click to region change** (varbit 12393 → anim 4069 → anim 4071
+  → spotanim 678 → LOADING → LOGGED_IN), measured off `recordings/2026-08-28_173427_mh-live-run5`.
+  The confirmation was a single `human_delay(2.5, 3.2)` and one position read — landing ~0.4s BEFORE
+  arrival — so a teleport that worked read as a failure and the retry broke another tablet. It is
+  now POLLED (`_await_teleport`, `TELEPORT_CONFIRM_TIMEOUT_S`): reading too early costs a tablet,
+  waiting too long costs idle seconds, and that asymmetry decides it.
+- **`TRAVEL_TELEPORT_DISTANCE` is 150, not 40, and the number is load-bearing.** It means "are we in
+  a different city", and 40 could not express that: the Falador tablet lands **74 tiles** from
+  Larry's own standing tile, so standing in Falador having just arrived, the gate still said
+  "teleport". The only thing preventing a second tablet was the `mh_teleported_this_contract` latch
+  — far too thin a thread, and when the latch was wrong (above) it teleported Falador→Falador once a
+  tick. The four destinations in `CITY_TELEPORTS` are 248+ tiles apart at their closest (Falador
+  2965,3379 → Varrock 3213,3424) and the worst intra-city landing is ~75, so 150 has room both ways.
+- **Anything that spends a consumable on repeat needs a CEILING, not just a cooldown.** Two loops in
+  one session burned real resources before being stopped by hand (three teleport tablets; NPC
+  Contact casts). Hence `TELEPORT_MAX_ATTEMPTS` (2, then safety-stop rather than walk cross-country)
+  and `CONTACT_MAX_CASTS` (5). A cooldown only sets the RATE of an unbounded loop.
+- **The initial `mh_phase` is derived from live state, never defaulted to `"bank"`.** It used to be
+  `data.get("mh_phase") or "bank"`, and with a contract in progress nothing below overrode it
+  (`"bank"` deliberately does not auto-promote, to preserve work_phase's mid-contract diversion) —
+  so EVERY restart mid-contract went banking. Live, that meant restarting inside Mariah's house and
+  going for the Hosidius bank booth 21 tiles away through a wall.
+- **`bank_phase` walks to a bank more than `banker.BANK_APPROACH_TILES` (8) away, via
+  `travel.walk_to`, before opening it.** `banker.open_bank` gained its own minimap-hop approach the
+  same day, but a minimap hop cannot open a closed door, and this routine banks from inside the
+  contract house. Two things made the old behaviour a dead loop rather than a slow success:
+  `find_nearby_bank` accepts anything within `maxBankDistance` (40) while `_refresh_bank_object`
+  only re-resolves within **15**, so every retry re-aimed at the identical stale pixel; and the
+  booth's projection landed on the chatbox tab strip, so all five clicks resolved to "Switch tab".

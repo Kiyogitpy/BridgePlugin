@@ -310,6 +310,38 @@ HM2_CORRECTION_TOLERANCE_PX = 1.5
 # above that measured maximum.
 HM2_MAX_CORRECTION_PX_PER_MS = 0.50
 
+# When the residual after the open-loop path is too big to be a SETTLE, fly a fresh curved reach
+# instead of the straight-line correction below it. IDENTIFIED 2026-08-28 by the user: dragging
+# the physical mouse away mid-flight produced "a monotone uniform movement back" -- because the
+# correction loop is a constant-velocity straight walk with no curve, tremor or easing. That is
+# right for a few px of scale residual and badly wrong for a long haul, and it is reached
+# whenever the real cursor diverges from the open-loop plan: a hand on the mouse, or a target
+# whose projection jumps with the camera (MEASURED the same day: flights logged dist=133px with
+# open_err=255px, and one dist=31px with open_err=800px).
+# 60px is chosen to sit above the largest residual a plausible pointer-scale error can produce
+# (a 300px reach at 12% off is ~36px) and below the divergences actually observed, so ordinary
+# settling still takes the cheap straight path. At the 0.50 px/ms cap above, 60px is already
+# ~120ms of uniform slide -- about where it becomes visible.
+HM2_RECURVE_PX = 60.0
+HM2_MAX_RECURVE = 2            # bounded: a recurved reach can itself fall short, but not forever
+
+# Minimum cosine between the net MOUSE UNITS commanded during a flight and the net PIXELS the
+# cursor actually moved, for that flight to be allowed to teach the pointer-scale estimator.
+# The pointer scale is a single isotropic scalar, so it can only stretch or shrink motion ALONG
+# the commanded direction -- it can never rotate it. A net displacement pointing somewhere else
+# therefore contains motion nobody commanded (a hand on the mouse, the pointer clipping a screen
+# edge), and its ratio would teach the estimator a number unrelated to this machine.
+# MEASURED 2026-08-28: clean flights sit at cos 1.00000 (worst deviation 0.03 deg) whether the
+# assumed scale is correct, 26% stale or 40% over -- a stale scale produces large but perfectly
+# COLLINEAR errors, which is exactly why this rejects on direction and not on size; those large
+# samples are the most informative ones there are. Injected drags measured 17.0 and 31.7 deg.
+# 0.999 (2.6 deg) sits in the enormous gap between the two.
+# KNOWN LIMIT: a disturbance closely parallel to the movement axis is not caught (a +60,+40 drag
+# on a reach toward +600,+300 measured 0.83 deg). Bounding that needs a robust statistic over
+# several samples, not a per-flight test -- deliberately not done, as every polluting sample
+# actually observed live was far off-axis.
+HM2_SCALE_COLLINEAR_MIN = 0.999
+
 # Ignore target drift smaller than this when deciding whether to replan mid-flight. Without it,
 # a slowly-walking NPC triggers a replan on EVERY refresh, and near the target each replanned
 # submovement is a tiny hop -- a burst of micro-movements in place rather than one settling

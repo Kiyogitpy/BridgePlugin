@@ -32,6 +32,20 @@ def _item(name, quantity=1):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_bridge(monkeypatch):
+    """Keep the suite hermetic. These reach the RUNNING CLIENT over HTTP when a test does not
+    stub them, so results depended on where the character happened to be standing -- MEASURED
+    2026-08-29 in the travel suite, where the same door test passed alone and failed in a full
+    run. The defaults are the documented "client cannot tell" answers, which every caller must
+    already handle."""
+    monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=6: [])
+    monkeypatch.setattr(controller, "request_shortest_path",
+                        lambda x, y, plane, config=None: {"requested": False})
+    monkeypatch.setattr(controller, "get_shortest_path_result",
+                        lambda: {"active": False, "done": False, "steps": []})
+
+
+@pytest.fixture(autouse=True)
 def _stub_widgets_dump(monkeypatch):
     """tick() now calls _accept_tea_if_offered unconditionally, which reads /widgets/dump. Stub
     it out by default so no test accidentally makes a real (bridge-less) HTTP call; tests that
@@ -444,13 +458,18 @@ def test_request_contract_phase_resets_stuck_counter_once_clickable(monkeypatch)
 def test_travel_phase_teleports_then_walks(monkeypatch):
     clicked = {}
 
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})
+    # UPDATED 2026-08-28: the latch now requires the click to succeed AND the player to have
+    # actually moved, so this has to simulate a teleport that really happened.
+    positions = iter([{"x": 3000, "y": 3000, "plane": 0}, {"x": 3239, "y": 3450, "plane": 0}])
+    monkeypatch.setattr(controller, "get_player", lambda: next(positions, {"x": 3239, "y": 3450, "plane": 0}))
     monkeypatch.setattr(controller, "get_inventory",
                          lambda: [_item("Varrock teleport", 8)])
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
 
     def fake_click(ser, entity, **kw):
         clicked["entity"] = entity
+        return True
 
     monkeypatch.setattr(controller, "click_entity", fake_click)
     monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: True)
@@ -477,6 +496,7 @@ def test_travel_phase_walks_to_standing_tile_after_teleport_and_advances_to_work
 
 
 def test_travel_phase_banks_when_teleport_item_missing(monkeypatch):
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
 
@@ -488,10 +508,12 @@ def test_travel_phase_banks_when_teleport_item_missing(monkeypatch):
 
 
 def test_travel_phase_resets_teleport_flag_on_new_home(monkeypatch):
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})
+    positions = iter([{"x": 3000, "y": 3000, "plane": 0}, {"x": 3047, "y": 3345, "plane": 0}])
+    monkeypatch.setattr(controller, "get_player", lambda: next(positions, {"x": 3047, "y": 3345, "plane": 0}))
     monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Falador teleport", 8)])
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
-    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: None)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
 
     ctx = _Ctx()
     ctx.state.data["mh_last_home"] = "JEFF"
@@ -507,6 +529,7 @@ def test_travel_phase_resets_teleport_flag_on_new_home(monkeypatch):
 def test_travel_phase_uses_the_menu_for_xerics_talisman(monkeypatch):
     # The talisman's LEFT-CLICK default is not the destination we want -- "Xeric's Glade" has to
     # be picked by name off the right-click menu. Tablets ("Break") are fine bare-clicked.
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})
     monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Xeric's talisman")])
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
@@ -548,7 +571,11 @@ def _work_state(hotspots, required=None, **extra):
     return state
 
 
-def test_work_phase_advances_to_turn_in_when_nothing_left():
+def test_work_phase_advances_to_turn_in_when_nothing_left(monkeypatch):
+    # Standing AT the home is now part of the claim -- an empty hotspot list from across the map
+    # means "no data", not "finished". This test never said where it was standing (it reached the
+    # live bridge for a position), so it says so now.
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3239, "y": 3450, "plane": 0})
     ctx = _Ctx()
     mh.work_phase(ctx, mh.DEFAULT_CONFIG, _work_state([_hotspot(10554, 39989, 0, False)],
                                                       {"planks": 0, "steelBars": 0}))
@@ -567,7 +594,7 @@ def test_work_phase_works_a_hotspot_it_can_afford_even_when_the_contract_total_c
     # THE C3 REGRESSION: comparing against requiredMaterials (the whole remaining contract) sent
     # us to the bank without touching any of the hotspots we could already pay for.
     monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 3)])
-    monkeypatch.setattr(controller, "get_objects", lambda: [_object(39989, distance=2)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(39989, distance=2)])
     monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
     clicked = {}
     monkeypatch.setattr(controller, "click_entity",
@@ -607,7 +634,7 @@ def test_work_phase_falls_back_to_the_contract_total_when_per_hotspot_cost_is_mi
 
 def test_work_phase_fallback_still_works_when_the_contract_total_is_affordable(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 20)])
-    monkeypatch.setattr(controller, "get_objects", lambda: [_object(39989, distance=2)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(39989, distance=2)])
     monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
     clicked = {}
     monkeypatch.setattr(controller, "click_entity",
@@ -624,7 +651,7 @@ def test_work_phase_fallback_still_works_when_the_contract_total_is_affordable(m
 def test_work_phase_walks_closer_when_object_not_yet_visible(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory",
                          lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
-    monkeypatch.setattr(controller, "get_objects", lambda: [])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3100, "y": 3300, "plane": 0})
     walked = {}
     monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: walked.setdefault("target", target))
@@ -640,7 +667,7 @@ def test_work_phase_climbs_a_ladder_when_at_the_house_but_the_hotspot_is_missing
     # while standingLocation is always plane 0 -- "not found" here means "wrong floor".
     monkeypatch.setattr(controller, "get_inventory",
                          lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
-    monkeypatch.setattr(controller, "get_objects", lambda: [_object(11789, distance=3)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(11789, distance=3)])
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3239, "y": 3451, "plane": 0})
     monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: pytest.fail("must not walk"))
 
@@ -659,7 +686,7 @@ def test_work_phase_climbs_a_ladder_when_at_the_house_but_the_hotspot_is_missing
 def test_work_phase_does_not_re_climb_within_the_ladder_cooldown(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory",
                          lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
-    monkeypatch.setattr(controller, "get_objects", lambda: [_object(11789, distance=3)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(11789, distance=3)])
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3239, "y": 3451, "plane": 0})
     clicks = []
     monkeypatch.setattr(controller, "click_menu_action",
@@ -674,7 +701,7 @@ def test_work_phase_does_not_re_climb_within_the_ladder_cooldown(monkeypatch):
 def test_work_phase_safety_stops_when_a_hotspot_stays_unreachable(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory",
                          lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
-    monkeypatch.setattr(controller, "get_objects", lambda: [])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3239, "y": 3451, "plane": 0})
     monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: True)
 
@@ -689,7 +716,7 @@ def test_work_phase_safety_stops_when_a_hotspot_stays_unreachable(monkeypatch):
 def test_work_phase_clicks_the_hotspot_object(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory",
                          lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
-    monkeypatch.setattr(controller, "get_objects", lambda: [_object(39989, distance=2)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(39989, distance=2)])
     monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
 
     clicked = {}
@@ -707,7 +734,7 @@ def test_work_phase_clicks_the_hotspot_object(monkeypatch):
 def test_work_phase_respects_click_cooldown(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory",
                          lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
-    monkeypatch.setattr(controller, "get_objects", lambda: [_object(39989, distance=2)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(39989, distance=2)])
 
     clicked = []
     monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: clicked.append(entity))
@@ -739,7 +766,9 @@ def test_tick_accepts_offered_tea_whatever_phase_it_is_in(monkeypatch):
     # check sited inside turn_in_phase could therefore never fire for the tick it mattered on.
     monkeypatch.setattr(controller, "get_mahogany_homes_state", lambda: {"hasContract": False})
     monkeypatch.setattr(controller, "get_widgets_dump",
-                         lambda: [{"text": "Yes, I'd love a cuppa.", "screenX": 40, "screenY": 50}])
+                         lambda: [{"group": mh.DIALOG_OPTION_GROUP, "child": 1,
+                                   "text": "Yes, I'd love a cuppa.",
+                                   "screenX": 40, "screenY": 50}])
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
     monkeypatch.setattr(controller, "get_rune_pouch", lambda: {"runes": []})
     monkeypatch.setitem(mh.PHASE_HANDLERS, "bank", lambda ctx, config, state: None)
@@ -894,3 +923,1741 @@ def test_tick_does_nothing_when_disabled():
     ctx.state.config["enabled"] = False
     mh.tick(ctx)
     assert "mh_phase" not in ctx.state.data
+
+
+# --- knowing which FLOOR a hotspot is on ---------------------------------------------
+#
+# Adept homes put hotspots upstairs (JESS and NORMAN even put the HOMEOWNER upstairs -- the
+# reference plugin's Home.npcUpstairs, ported 2026-08-28). /objects only ever reports the
+# player's CURRENT plane, so before MahoganyHomesProvider started scanning every plane for the
+# hotspot objects, "not in /objects" could not distinguish "upstairs" from "not close enough".
+# The routine coped by right-clicking the ladder with BOTH ["Climb-up", "Climb-down"] and taking
+# whichever the ladder offered -- fine in a two-storey house, but a guess, and on a three-storey
+# one it can climb the wrong way and then have to guess its way back.
+
+def test_climbs_up_when_the_hotspot_is_known_to_be_on_a_higher_floor(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(11789, distance=3)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3239, "y": 3451, "plane": 0})
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: pytest.fail("must not walk"))
+    menu = {}
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: menu.update(option=option))
+
+    spot = _hotspot(10554, 39989, 3, True)
+    spot["plane"] = 1                      # provider located it upstairs
+    mh.work_phase(_Ctx(), mh.DEFAULT_CONFIG, _work_state([spot]))
+
+    assert menu["option"] == "Climb-up"
+
+
+def test_climbs_down_when_the_hotspot_is_known_to_be_on_a_lower_floor(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(11789, distance=3)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3239, "y": 3451, "plane": 2})
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: pytest.fail("must not walk"))
+    menu = {}
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: menu.update(option=option))
+
+    spot = _hotspot(10554, 39989, 3, True)
+    spot["plane"] = 1
+    mh.work_phase(_Ctx(), mh.DEFAULT_CONFIG, _work_state([spot]))
+
+    assert menu["option"] == "Climb-down"
+
+
+def test_unknown_hotspot_plane_keeps_the_old_both_directions_guess(monkeypatch):
+    """Against a client that hasn't been rebuilt the provider sends no plane, so the routine must
+    fall back to offering both directions rather than assuming a floor."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(11789, distance=3)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3239, "y": 3451, "plane": 0})
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: pytest.fail("must not walk"))
+    menu = {}
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: menu.update(option=option))
+
+    mh.work_phase(_Ctx(), mh.DEFAULT_CONFIG, _work_state([_hotspot(10554, 39989, 3, True)]))
+
+    assert list(menu["option"]) == ["Climb-up", "Climb-down"]
+
+
+def test_a_hotspot_on_our_own_floor_is_walked_to_not_climbed_to(monkeypatch):
+    """Knowing the plane also rules the ladder OUT: if the hotspot is on this floor and simply
+    isn't rendered yet, climbing is exactly the wrong move -- it leaves the floor the work is on."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(11789, distance=3)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3239, "y": 3451, "plane": 0})
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: pytest.fail("must not climb"))
+    walked = {}
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: walked.setdefault("t", target))
+
+    spot = _hotspot(10554, 39989, 3, True)
+    spot["plane"] = 0
+    mh.work_phase(_Ctx(), mh.DEFAULT_CONFIG, _work_state([spot]))
+
+    assert walked["t"] == {"x": 3239, "y": 3450, "plane": 0}
+
+
+# --- NOELLA: two staircases, disconnected upper floors -------------------------------
+#
+# USER REPORT 2026-08-28: "in ardougne we have two ladders in one house and the upstairs isnt
+# connected so to solve that house you have to fix one upstairs climb down take the other ladder
+# fix that upstairs". NOELLA is the house -- it is the ONLY one of the twelve with four ladder
+# ids (17026, 16685, 15645, 15648 = two separate staircases); every other home has two (one
+# staircase, up + down) or none.
+#
+# Two distinct failures here, and the second one bites even when the floor is known:
+#  - Climbing the ladder nearest the PLAYER can land us in the upstairs section the hotspot is
+#    not in. The ladder has to be chosen by proximity to the HOTSPOT.
+#  - /objects reports the whole scene on the player's CURRENT plane, so a hotspot in the OTHER
+#    upstairs section is perfectly visible from this one. work_phase therefore finds it and
+#    clicks it forever, and because seeing the object is what resets mh_work_stuck, the stuck
+#    counter never grows and the safety stop never fires. It needs its own progress guard.
+
+def test_climbs_the_ladder_nearest_the_hotspot_not_the_one_nearest_us(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    # Two staircases. The near one (2 tiles) leads to the wrong half of the upper floor; the
+    # hotspot sits above the far one (12 tiles).
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [
+        _object(17026, distance=2, x=2653, y=3318),
+        _object(15645, distance=12, x=2665, y=3318),
+    ])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2653, "y": 3318, "plane": 0})
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: pytest.fail("must not walk"))
+    menu = {}
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: menu.update(entity=entity, option=option))
+
+    spot = _hotspot(10554, 40156, 3, True)
+    spot["plane"] = 1
+    spot["location"] = {"x": 2666, "y": 3319, "plane": 1}
+    state = _work_state([spot], homeName="NOELLA",
+                        ladderObjectIds=[17026, 16685, 15645, 15648],
+                        standingLocation={"x": 2659, "y": 3322, "plane": 0})
+    mh.work_phase(_Ctx(), mh.DEFAULT_CONFIG, state)
+
+    assert menu["entity"]["id"] == 15645, "took the ladder nearest us, not the one under the hotspot"
+    assert menu["option"] == "Climb-up"
+
+
+def test_a_visible_but_unreachable_hotspot_eventually_climbs_down_to_switch_sections(monkeypatch):
+    """The disconnected-upstairs case. The hotspot is on our own plane and fully visible in
+    /objects, so nothing today stops the routine clicking it forever."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [
+        _object(40156, distance=14, x=2666, y=3319, plane=1),
+        _object(16685, distance=2, x=2653, y=3318, plane=1),
+    ])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2653, "y": 3318, "plane": 1})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    menu = {}
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: menu.update(entity=entity, option=option))
+
+    spot = _hotspot(10554, 40156, 3, True)
+    spot["plane"] = 1
+    spot["location"] = {"x": 2666, "y": 3319, "plane": 1}
+    state = _work_state([spot], homeName="NOELLA",
+                        ladderObjectIds=[17026, 16685, 15645, 15648],
+                        standingLocation={"x": 2659, "y": 3322, "plane": 0})
+
+    ctx = _Ctx()
+    for _ in range(mh.HOTSPOT_UNREACHABLE_CLICKS + 2):
+        ctx.state.data["mh_last_hotspot_click"] = 0.0     # bypass the click cooldown
+        ctx.state.data["mh_last_ladder_click"] = 0.0
+        mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert menu.get("option") == "Climb-down", "never gave up on the unreachable hotspot"
+
+
+def test_real_progress_resets_the_unreachable_counter(monkeypatch):
+    """A hotspot whose varbit value moves is being worked successfully -- that must never be
+    mistaken for the unreachable case, or an ordinary multi-stage build would climb away mid-job."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(40156, distance=2, plane=1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2666, "y": 3319, "plane": 1})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: pytest.fail("must not climb away mid-build"))
+
+    ctx = _Ctx()
+    for value in (1, 3, 4, 1, 3, 4, 1):          # varbit moving every tick = real progress
+        spot = _hotspot(10554, 40156, value, True)
+        spot["plane"] = 1
+        ctx.state.data["mh_last_hotspot_click"] = 0.0
+        mh.work_phase(ctx, mh.DEFAULT_CONFIG, _work_state([spot]))
+
+
+def test_the_unreachable_guard_is_scoped_to_noella_only(monkeypatch):
+    """Two staircases does not imply a disconnected upper floor, so this is keyed on the one home
+    known to have one rather than inferred from ladder count. Everywhere else a hotspot that keeps
+    refusing must stay on the existing walk/stuck/safety-stop path -- climbing away from a slow
+    build would be a new failure mode in eleven houses to fix a quirk in one."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [
+        _object(39989, distance=14, x=3250, y=3460, plane=1),
+        _object(11793, distance=2, x=3239, y=3451, plane=1),
+    ])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3239, "y": 3451, "plane": 1})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: pytest.fail("JEFF has one staircase"))
+
+    spot = _hotspot(10554, 39989, 3, True)
+    spot["plane"] = 1
+    ctx = _Ctx()
+    for _ in range(mh.HOTSPOT_UNREACHABLE_CLICKS + 3):
+        ctx.state.data["mh_last_hotspot_click"] = 0.0
+        ctx.state.data["mh_last_ladder_click"] = 0.0
+        mh.work_phase(ctx, mh.DEFAULT_CONFIG, _work_state([spot]))
+
+
+# --- plank sack ----------------------------------------------------------------------
+#
+# USER REPORT 2026-08-28: "when loading up on planks we never fill the plank sack. after filling
+# inventory once with teak we should click the plank sack confirm its full 28/28 then top up the
+# inventory again". The sack was left out of the first draft ON PURPOSE (see the module docstring)
+# to dodge golem_crafting's stale fur-pouch-estimate failure -- but that reasoning does not apply
+# here, because the sack's contents are a real VARBIT, not an estimate.
+#
+# The reference plugin has this and the original port missed it: MahoganyHomesPlugin.
+# countPlankSackVarb maps plank id -> varbit (960/18171, 8778/18172, 8780/18173, 8782/18174) and
+# adds it to the inventory count whenever item 24882 is carried.
+#
+# MEASURED in recordings/2026-08-27_174045_mahogny-homes.log:812-870, which is exactly the loop
+# the user describes:
+#   Withdraw-All Teak plank -> inv +17 [28/28 used]
+#   Fill Plank sack         -> varbit 18173 = 26, inv -17
+#   Withdraw-All Teak plank -> inv +17 [28/28 used]
+#   Fill Plank sack         -> varbit 18173 = 28, inv -2     <- full, 28 is the cap
+#   Withdraw-All Teak plank -> inv +2  [28/28 used]
+
+def test_plank_sack_count_reads_the_varbit_for_the_configured_plank(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Plank sack", 1)])
+    seen = {}
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: seen.setdefault("id", vid) and 0 or 26)
+    assert mh.plank_sack_count("Teak plank") == 26
+    assert seen["id"] == 18173, "Teak plank must read varbit 18173"
+
+
+def test_plank_sack_count_is_zero_without_the_sack(monkeypatch):
+    """The varbit keeps its last value when the sack is banked, so reading it unconditionally
+    would credit us planks we are not carrying -- exactly the stale-estimate trap the sack was
+    originally left out to avoid."""
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 5)])
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: 28)
+    assert mh.plank_sack_count("Teak plank") == 0
+
+
+def test_planks_available_counts_the_sack_as_well_as_the_inventory(monkeypatch):
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: 28)
+    inv = [_item("Teak plank", 10), _item("Plank sack", 1)]
+    assert mh.planks_available(inv, "Teak plank") == 38
+
+
+def test_an_unknown_plank_type_has_no_sack_varbit(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Plank sack", 1)])
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: pytest.fail("no varbit to read"))
+    assert mh.plank_sack_count("Elder plank") == 0
+
+
+def test_bank_phase_fills_the_sack_then_tops_the_inventory_back_up(monkeypatch):
+    """The whole loop. The sack starts at 9, so it takes two fills to reach 28, and the run must
+    end with one more withdraw so the inventory is full of loose planks too."""
+    counts = iter([9, 26, 28, 28, 28, 28])
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: next(counts))
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Plank sack", 1)])
+
+    calls = []
+    monkeypatch.setattr(mh, "_withdraw_all", lambda ctx, name: calls.append(("withdraw", name)))
+    monkeypatch.setattr(banker, "fill_plank_sack", lambda ctx: calls.append(("fill",)) or True)
+
+    mh._load_plank_sack(_Ctx(), "Teak plank")
+
+    assert calls == [("withdraw", "Teak plank"), ("fill",),
+                     ("withdraw", "Teak plank"), ("fill",),
+                     ("withdraw", "Teak plank")], calls
+
+
+def test_no_plank_sack_means_no_fill_loop_at_all(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 5)])
+    monkeypatch.setattr(mh, "_withdraw_all", lambda ctx, name: pytest.fail("no sack to load"))
+    monkeypatch.setattr(banker, "fill_plank_sack", lambda ctx: pytest.fail("no sack to fill"))
+    mh._load_plank_sack(_Ctx(), "Teak plank")
+
+
+def test_a_sack_that_stops_absorbing_ends_the_loop(monkeypatch):
+    """If the bank runs out of planks mid-fill the varbit stops moving. Without a no-progress
+    exit that is an unbounded withdraw/fill loop against an empty bank."""
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: 12)      # never moves
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Plank sack", 1)])
+    fills = []
+    monkeypatch.setattr(mh, "_withdraw_all", lambda ctx, name: None)
+    monkeypatch.setattr(banker, "fill_plank_sack", lambda ctx: fills.append(1) or True)
+
+    mh._load_plank_sack(_Ctx(), "Teak plank")
+    assert len(fills) <= mh.PLANK_SACK_MAX_FILLS
+
+
+def test_a_full_sack_alone_can_afford_a_hotspot_with_no_loose_planks(monkeypatch):
+    """Sack planks are spent directly by the game -- CONFIRMED in the recordings, where varbit
+    18173 ticks down in step with each hotspot's cost, next to the build animation and the
+    Construction XP drop. Counting only loose planks would bank with a full sack in hand."""
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: 28)
+    inv = [_item("Plank sack", 1)]
+    assert mh._can_afford(inv, "Teak plank", {}, _hotspot(10554, 39989, 3, True, quantity=3))
+
+
+def test_an_empty_sack_and_no_loose_planks_still_banks(monkeypatch):
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: 0)
+    inv = [_item("Plank sack", 1)]
+    assert not mh._can_afford(inv, "Teak plank", {}, _hotspot(10554, 39989, 3, True, quantity=3))
+
+
+def test_steel_bar_hotspots_never_count_the_plank_sack(monkeypatch):
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: 28)
+    inv = [_item("Plank sack", 1)]
+    spot = _hotspot(10554, 39989, 3, True, material="STEEL_BAR", quantity=1)
+    assert not mh._can_afford(inv, "Teak plank", {}, spot)
+
+
+# --- teleporting away from the magic tab ---------------------------------------------
+#
+# LIVE RUN 2026-08-28, first ever. request_contract_phase presses F6 to open the MAGIC tab and
+# cast NPC Contact, and nothing ever switched back -- so travel_phase's right-click on the
+# Xeric's talisman landed on the spellbook instead of the inventory. The controller log shows
+# "No 'Xeric's Glade' entry in menu for Xeric's talisman (['Cancel'])" and the recorder, which
+# sees what the CLIENT saw, logs no talisman interaction at all: the menu was empty.
+#
+# The second bug is what turned that miss into a disaster: mh_teleported_this_contract was
+# latched unconditionally, right after a click that had plainly failed. travel_phase then
+# believed it had already teleported and fell through to walking -- "following a 715-tile route
+# from Shortest Path", on foot, from Ardougne toward Hosidius. The run had to be paused by hand.
+
+def test_travel_phase_opens_the_inventory_tab_before_clicking_a_teleport(monkeypatch):
+    """The magic tab is still up from the NPC Contact cast, so an inventory item is not on
+    screen. controller.open_inventory_tab confirms the switch via /state's inventoryTabOpen
+    rather than firing a key and hoping."""
+    order = []
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: order.append("tab") or True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Xeric's talisman", 1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2674, "y": 3314, "plane": 0})
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: order.append("click") or True)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+
+    state = {"homeName": "MARIAH", "standingLocation": {"x": 1766, "y": 3621, "plane": 0}}
+    mh.travel_phase(_Ctx(), mh.DEFAULT_CONFIG, state)
+
+    assert order[:2] == ["tab", "click"], f"inventory tab not opened before the click: {order}"
+
+
+def test_a_failed_teleport_click_is_not_latched_as_done(monkeypatch):
+    """The bug that cost the run. A click that returns falsy must leave the latch clear so the
+    next tick retries the teleport -- latching it makes travel_phase believe it has already
+    teleported and walk to another continent instead."""
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Xeric's talisman", 1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2674, "y": 3314, "plane": 0})
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: False)
+    monkeypatch.setattr(mh, "TELEPORT_CONFIRM_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: pytest.fail("must not walk"))
+
+    ctx = _Ctx()
+    state = {"homeName": "MARIAH", "standingLocation": {"x": 1766, "y": 3621, "plane": 0}}
+    mh.travel_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert not ctx.state.data.get("mh_teleported_this_contract")
+
+
+def test_a_teleport_that_does_not_move_us_is_not_latched_either(monkeypatch):
+    """A click can be accepted and still not teleport (out of charges, a dialogue eats it). The
+    latch has to key on actually having MOVED, not on the click returning true."""
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Xeric's talisman", 1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2674, "y": 3314, "plane": 0})
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: pytest.fail("must not walk"))
+    monkeypatch.setattr(mh, "TELEPORT_CONFIRM_TIMEOUT_S", 0.05)
+
+    ctx = _Ctx()
+    state = {"homeName": "MARIAH", "standingLocation": {"x": 1766, "y": 3621, "plane": 0}}
+    mh.travel_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert not ctx.state.data.get("mh_teleported_this_contract")
+
+
+def test_a_teleport_that_moves_us_is_latched(monkeypatch):
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Xeric's talisman", 1)])
+    positions = iter([{"x": 2674, "y": 3314, "plane": 0}, {"x": 1752, "y": 3566, "plane": 0}])
+    monkeypatch.setattr(controller, "get_player", lambda: next(positions))
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+
+    ctx = _Ctx()
+    state = {"homeName": "MARIAH", "standingLocation": {"x": 1766, "y": 3621, "plane": 0}}
+    mh.travel_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert ctx.state.data.get("mh_teleported_this_contract") is True
+
+
+def test_withdraw_all_uses_one_shift_click_not_a_per_unit_loop(monkeypatch):
+    """LIVE RUN 2026-08-28: this went through withdraw_loadout with quantity 28, which clicks
+    once per unit -- 28 clicks at the booth for a withdrawal with room for ten, most of them
+    skipped as off-window. withdraw_all_shift is one click, capped by free slots, and polls for
+    arrival rather than sleeping."""
+    calls = []
+    monkeypatch.setattr(banker, "withdraw_all_shift",
+                        lambda ctx, name, **kw: calls.append(name) or True)
+    monkeypatch.setattr(banker, "withdraw_loadout",
+                        lambda ctx, cfg, **kw: pytest.fail("per-unit click loop"))
+    mh._withdraw_all(_Ctx(), "Teak plank")
+    assert calls == ["Teak plank"]
+
+
+def test_an_unreachable_hotspot_outside_a_split_floor_home_walks_instead_of_clicking(monkeypatch):
+    """LIVE RUN 2026-08-28, the failure the user caught: stuck at (1771,3622) outside Mariah's
+    house, clicking the Table at (1769,3622) every 3s forever. /objects returns the whole scene on
+    the player's plane, so a hotspot behind a wall is perfectly visible -- and seeing the object is
+    exactly what resets mh_work_stuck, so the safety stop never fires either.
+
+    The routine never WALKED, which is why travel.py's door recovery never got a chance: it only
+    runs inside a walk. So the unreachable guard must apply everywhere, not just to NOELLA, and
+    outside a split-floor home its answer is "walk to the house", which is what opens the door."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(40002, distance=2, x=1769, y=3622)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1771, "y": 3622, "plane": 0})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: pytest.fail("MARIAH has no split floor"))
+    walked = []
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: walked.append(target) or True)
+
+    spot = _hotspot(10554, 40002, 3, True, quantity=3)
+    spot["plane"] = 0
+    state = _work_state([spot], homeName="MARIAH",
+                        standingLocation={"x": 1766, "y": 3621, "plane": 0})
+
+    ctx = _Ctx()
+    for _ in range(mh.HOTSPOT_UNREACHABLE_CLICKS + 2):
+        ctx.state.data["mh_last_hotspot_click"] = 0.0
+        mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert walked, "never walked -- so the door recovery could never run"
+    assert walked[0] == {"x": 1766, "y": 3621, "plane": 0}
+
+
+def test_walking_into_a_house_uses_a_tight_arrival_tolerance(monkeypatch):
+    """LIVE 2026-08-28, second attempt: the walk to the standing tile returned True from
+    (1766,3624) -- standing AGAINST the shut door, three tiles from the target, which is inside
+    walk_to's default WALK_ARRIVAL_TOLERANCE of 3. underRoof was still False. A walk that
+    "arrives" outside the door never stalls, so the door recovery never runs, and the next tick
+    resumes clicking the unreachable hotspot: a loop, not a fix.
+
+    Entering a building needs the walk to actually reach the tile, so it presses against the door
+    and the stall recovery opens it."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Teak plank", 20), _item("Steel bar", 5)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(40002, distance=2, x=1769, y=3622)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1771, "y": 3622, "plane": 0})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    kwargs = {}
+    monkeypatch.setattr(travel, "walk_to",
+                        lambda ctx, target, **kw: kwargs.update(kw) or True)
+
+    spot = _hotspot(10554, 40002, 3, True, quantity=3)
+    spot["plane"] = 0
+    state = _work_state([spot], homeName="MARIAH",
+                        standingLocation={"x": 1766, "y": 3621, "plane": 0})
+
+    ctx = _Ctx()
+    for _ in range(mh.HOTSPOT_UNREACHABLE_CLICKS + 2):
+        ctx.state.data["mh_last_hotspot_click"] = 0.0
+        mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert kwargs.get("tolerance") == mh.HOUSE_ARRIVAL_TOLERANCE
+    assert kwargs.get("tolerance", 99) < 3, "default tolerance stops outside the door"
+
+
+# --- the initial phase on a fresh process start ---------------------------------------
+#
+# CONFIRMED live 2026-08-28 (run 4): `ctx.state.data.get("mh_phase") or "bank"` meant every
+# restart began in bank_phase. With a contract already in progress none of tick()'s branches
+# override that ("bank" deliberately does NOT auto-promote, so work_phase's mid-contract
+# diversion survives), so a routine restarted mid-contract went banking with a full inventory of
+# planks -- from INSIDE Mariah's house, 20 tiles from the Hosidius bank through a wall. There is
+# no diversion to preserve on a fresh start (ctx.state.data is empty by definition), so the
+# initial phase must be derived from live state instead of assumed.
+
+def _stock_the_inventory(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [
+        _item(mh.DEFAULT_CONFIG["plankName"], mh.DEFAULT_CONFIG["restock"]["targetPlanks"]),
+        _item("Steel bar", mh.DEFAULT_CONFIG["restock"]["targetSteelBars"]),
+        _item("Varrock teleport", 8), _item("Ardougne teleport", 8),
+        _item("Falador teleport", 8),
+    ])
+    monkeypatch.setattr(controller, "get_rune_pouch",
+                        lambda: {"runes": [{"name": "Astral rune", "quantity": 1000},
+                                           {"name": "Cosmic rune", "quantity": 1000}]})
+
+
+def test_tick_on_a_fresh_start_mid_contract_goes_to_work_not_bank(monkeypatch):
+    _stock_the_inventory(monkeypatch)
+    monkeypatch.setattr(controller, "get_mahogany_homes_state",
+                        lambda: {"hasContract": True, "contractTier": 3})
+    for phase in mh.PHASE_HANDLERS:
+        monkeypatch.setitem(mh.PHASE_HANDLERS, phase,
+                            lambda ctx, config, state, p=phase: ctx.state.data.setdefault("called", p))
+
+    ctx = _Ctx()                      # no mh_phase -- exactly what a restart looks like
+    mh.tick(ctx)
+
+    assert ctx.state.data["mh_phase"] == "travel"
+    assert ctx.state.data["called"] == "travel"
+
+
+def test_tick_on_a_fresh_start_mid_contract_still_banks_when_genuinely_low(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 1)])
+    monkeypatch.setattr(controller, "get_rune_pouch",
+                        lambda: {"runes": [{"name": "Astral rune", "quantity": 1000},
+                                           {"name": "Cosmic rune", "quantity": 1000}]})
+    monkeypatch.setattr(controller, "get_mahogany_homes_state",
+                        lambda: {"hasContract": True, "contractTier": 3})
+    for phase in mh.PHASE_HANDLERS:
+        monkeypatch.setitem(mh.PHASE_HANDLERS, phase,
+                            lambda ctx, config, state, p=phase: ctx.state.data.setdefault("called", p))
+
+    ctx = _Ctx()
+    mh.tick(ctx)
+
+    assert ctx.state.data["mh_phase"] == "bank"
+    assert ctx.state.data["called"] == "bank"
+
+
+def test_tick_still_honours_an_explicit_bank_diversion_from_work_phase(monkeypatch):
+    # The counterpart guard: a well-stocked inventory must NOT undo a diversion work_phase
+    # already recorded, or the C3 livelock comes straight back.
+    _stock_the_inventory(monkeypatch)
+    monkeypatch.setattr(controller, "get_mahogany_homes_state",
+                        lambda: {"hasContract": True, "contractTier": 3})
+    for phase in mh.PHASE_HANDLERS:
+        monkeypatch.setitem(mh.PHASE_HANDLERS, phase,
+                            lambda ctx, config, state, p=phase: ctx.state.data.setdefault("called", p))
+
+    ctx = _Ctx()
+    ctx.state.data["mh_phase"] = "bank"
+    mh.tick(ctx)
+
+    assert ctx.state.data["mh_phase"] == "bank"
+    assert ctx.state.data["called"] == "bank"
+
+
+# --- approaching a bank that is a room away -------------------------------------------
+#
+# banker.open_bank's own approach step (added the same day) minimap-hops toward a distant bank,
+# and a minimap hop cannot open a closed door -- which is exactly what stands between this
+# routine and the bank most of the time, since it banks from INSIDE the contract house. Only
+# travel.walk_to carries the stall-triggered door recovery, so the approach belongs here.
+
+def test_bank_phase_walks_to_a_bank_that_is_a_room_away(monkeypatch):
+    _mock_bank(monkeypatch)
+    monkeypatch.setattr(banker, "find_nearby_bank",
+                        lambda config: {"id": 1, "name": "Bank booth", "distance": 21,
+                                        "x": 1747, "y": 3598, "plane": 0})
+    walked = []
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: walked.append((target, kw)) or True)
+
+    mh.bank_phase(_Ctx(), mh.DEFAULT_CONFIG, {"hasContract": True})
+
+    assert walked, "a bank 21 tiles away must be walked to, not clicked at through a wall"
+    target, kw = walked[0]
+    assert (target["x"], target["y"], target["plane"]) == (1747, 3598, 0)
+    assert kw.get("min_path_tiles") == 0, \
+        "must force a computed route -- greedy walking is obstacle-blind and we start indoors"
+
+
+def test_bank_phase_does_not_walk_to_a_bank_it_is_already_at(monkeypatch):
+    _mock_bank(monkeypatch)
+    monkeypatch.setattr(banker, "find_nearby_bank",
+                        lambda config: {"id": 1, "name": "Bank booth", "distance": 2,
+                                        "x": 1747, "y": 3598, "plane": 0})
+    walked = []
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: walked.append(target) or True)
+
+    mh.bank_phase(_Ctx(), mh.DEFAULT_CONFIG, {"hasContract": True})
+
+    assert walked == []
+
+
+# --- confirming a teleport actually happened ------------------------------------------
+#
+# LIVE RUN 2026-08-28 (run 5, stopped by hand after it burned three Falador teleports):
+# MEASURED from the recording, a tablet teleport takes 3.8s from the click to the region
+# change (varbit 12393 -> anim 4069 -> anim 4071 -> spotanim 678 -> LOADING -> LOGGED_IN).
+# The confirmation was a single human_delay(2.5, 3.2) and then one position read, which
+# landed ~0.4s BEFORE the player arrived -- so a teleport that worked perfectly was recorded
+# as "didn't take us anywhere". The retry then broke a second tablet in Falador to go to
+# Falador, and a third, one per tick. Nothing capped it: the Falador tablet lands 74 tiles
+# from Larry's standing tile, well past TRAVEL_TELEPORT_DISTANCE, so the only thing standing
+# between a false negative and the whole stack of 155 tablets was the latch it had just failed
+# to set.
+
+def _teleport_harness(monkeypatch, positions, click_result=True):
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Falador teleport", 155)])
+    monkeypatch.setattr(controller, "get_player", lambda: positions.pop(0) if len(positions) > 1 else positions[0])
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(mh, "TELEPORT_CONFIRM_TIMEOUT_S", 0.4)
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicks.append(entity) or click_result)
+    return clicks
+
+
+HOSIDIUS = {"x": 1765, "y": 3621, "plane": 0}
+FALADOR = {"x": 2964, "y": 3379, "plane": 0}
+LARRY_TILE = {"x": 3038, "y": 3364, "plane": 0}
+
+
+def test_travel_phase_waits_out_a_slow_teleport_instead_of_reclicking(monkeypatch):
+    # The player only arrives on the FOURTH position read -- exactly the shape of the live
+    # failure, where the single read fired 0.4s early.
+    clicks = _teleport_harness(monkeypatch, [dict(HOSIDIUS), dict(HOSIDIUS),
+                                             dict(HOSIDIUS), dict(FALADOR)])
+
+    ctx = _Ctx()
+    mh.travel_phase(ctx, mh.DEFAULT_CONFIG,
+                    {"homeName": "LARRY", "standingLocation": LARRY_TILE})
+
+    assert len(clicks) == 1, f"one tablet per teleport, not {len(clicks)}"
+    assert ctx.state.data.get("mh_teleported_this_contract") is True
+
+
+def test_travel_phase_stops_burning_tablets_after_repeated_failures(monkeypatch):
+    # Nothing moves, ever -- out of charges, or a dialogue eating every click. The attempt cap
+    # is what turns "burn the whole stack, one per tick" into a diagnosable stop.
+    clicks = _teleport_harness(monkeypatch, [dict(HOSIDIUS)])
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: pytest.fail("must not walk"))
+
+    ctx = _Ctx()
+    state = {"homeName": "LARRY", "standingLocation": LARRY_TILE}
+    for _ in range(5):
+        mh.travel_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert len(clicks) <= mh.TELEPORT_MAX_ATTEMPTS, \
+        f"burned {len(clicks)} tablets on a teleport that never works"
+    assert ctx.state.safety_stopped is True
+
+
+def test_travel_phase_gives_each_new_contract_a_fresh_teleport_budget(monkeypatch):
+    clicks = _teleport_harness(monkeypatch, [dict(HOSIDIUS)])
+
+    ctx = _Ctx()
+    for _ in range(mh.TELEPORT_MAX_ATTEMPTS):
+        mh.travel_phase(ctx, mh.DEFAULT_CONFIG,
+                        {"homeName": "LARRY", "standingLocation": LARRY_TILE})
+    spent = len(clicks)
+
+    ctx.state.safety_stopped = False
+    mh.travel_phase(ctx, mh.DEFAULT_CONFIG,
+                    {"homeName": "TAU", "standingLocation": {"x": 2650, "y": 3283, "plane": 0}})
+
+    assert len(clicks) > spent, "a new contract must get its own teleport attempts"
+
+
+def test_travel_phase_walks_when_already_in_the_right_city(monkeypatch):
+    """LIVE RUN 2026-08-28: the Falador tablet lands 74 tiles from Larry's standing tile, and
+    TRAVEL_TELEPORT_DISTANCE was 40 -- so standing in Falador, already arrived, the gate still
+    read "too far, teleport". Only the mh_teleported_this_contract latch stopped a second
+    tablet, which is far too thin a thread: the moment the latch was wrong (it was), the
+    routine teleported Falador -> Falador on a loop. The four destinations in CITY_TELEPORTS
+    are 248+ tiles apart, so a threshold above the worst intra-city landing separates them
+    cleanly."""
+    clicks = _teleport_harness(monkeypatch, [dict(FALADOR)])
+    walked = []
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: walked.append(target) or True)
+
+    ctx = _Ctx()
+    mh.travel_phase(ctx, mh.DEFAULT_CONFIG,
+                    {"homeName": "LARRY", "standingLocation": LARRY_TILE})
+
+    assert clicks == [], "already in Falador -- a Falador teleport buys nothing"
+    assert walked, "should have walked to Larry's tile instead"
+
+
+# --- a cast that never produces a contract ---------------------------------------------
+#
+# LIVE RUN 2026-08-28 (run 8): the provider learns the active contract from chat, and after a
+# client restart the only line the game offers is the DIALOG reminder it was dropping -- so
+# hasContract stayed false and this phase re-cast NPC Contact once per tick, indefinitely, for a
+# contract it already had. The provider bug is fixed; the unbounded loop it exposed is a second
+# defect. Same shape as the teleport cap: a cast that changes nothing must be bounded.
+
+def _contract_harness(monkeypatch):
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda group, child, index=None: {"clickable": True,
+                                                          "screenX": 10, "screenY": 10})
+    casts = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: casts.append(entity) or True)
+    return casts
+
+
+def test_request_contract_stops_recasting_when_no_contract_ever_registers(monkeypatch):
+    casts = _contract_harness(monkeypatch)
+
+    ctx = _Ctx()
+    for _ in range(mh.CONTACT_MAX_CASTS + 4):
+        ctx.state.data["mh_contact_cast_at"] = 0.0     # skip the retry cooldown
+        mh.request_contract_phase(ctx, mh.DEFAULT_CONFIG, {"hasContract": False})
+
+    assert len(casts) <= mh.CONTACT_MAX_CASTS, f"cast {len(casts)} times with nothing to show"
+    assert ctx.state.safety_stopped is True
+
+
+def test_request_contract_budget_resets_once_a_contract_arrives(monkeypatch):
+    casts = _contract_harness(monkeypatch)
+
+    ctx = _Ctx()
+    for _ in range(mh.CONTACT_MAX_CASTS - 1):
+        ctx.state.data["mh_contact_cast_at"] = 0.0
+        mh.request_contract_phase(ctx, mh.DEFAULT_CONFIG, {"hasContract": False})
+    spent = len(casts)
+
+    mh.request_contract_phase(ctx, mh.DEFAULT_CONFIG, {"hasContract": True})   # it landed
+
+    ctx.state.data["mh_contact_cast_at"] = 0.0
+    mh.request_contract_phase(ctx, mh.DEFAULT_CONFIG, {"hasContract": False})  # next contract
+
+    assert len(casts) == spent + 1
+    assert ctx.state.safety_stopped is False
+
+
+# --- an unreachable hotspot is walked TO, not merely "toward the house" ----------------
+#
+# MEASURED live 2026-08-29 at NORMAN's, Falador. standingLocation is (3038,3344) and the shut
+# door 24050 sits at (3037,3347) blocking the 3346|3347 crossing -- so the standing tile is on
+# the SAME side of that door as the player. Walking there therefore crosses no doorway, the door
+# recovery has nothing to resolve (correctly: nothing is between us and that tile), and we end up
+# standing outside exactly as before. The hotspot is the thing we actually need to reach, and it
+# is the goal that makes the doorway between us and it visible to the walker.
+
+def test_work_phase_walks_to_the_hotspot_itself_when_it_cannot_be_reached(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 20)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(40089, distance=2)])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3034, "y": 3341, "plane": 0})
+    walked, doorways = [], []
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: walked.append(target) or True)
+    monkeypatch.setattr(travel, "open_doorway_to",
+                        lambda ctx, goal: doorways.append(goal) or True)
+
+    hotspot = _hotspot(10554, 40089, 3, True)
+    hotspot["location"] = {"x": 3035, "y": 3346, "plane": 0}
+    state = _work_state([hotspot])
+    state["standingLocation"] = {"x": 3038, "y": 3344, "plane": 0}
+
+    ctx = _Ctx()
+    ctx.state.data["mh_hotspot_signature"] = (40089, 3)
+    ctx.state.data["mh_hotspot_clicks"] = mh.HOTSPOT_UNREACHABLE_CLICKS
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert doorways and (doorways[0]["x"], doorways[0]["y"]) == (3035, 3346), (
+        f"the DOOR must be resolved against the unreachable hotspot: {doorways}")
+    assert walked and (walked[0]["x"], walked[0]["y"]) == (3038, 3344), (
+        f"but the WALK must target a routable tile: {walked}")
+
+
+def test_work_phase_falls_back_to_the_standing_tile_without_a_hotspot_location(monkeypatch):
+    # `location` is null when the object is outside the loaded scene, and on an un-rebuilt client
+    # the field does not exist at all -- keep the old target rather than walking nowhere.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 20)])
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_object(40089, distance=2)])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3034, "y": 3341, "plane": 0})
+    walked = []
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: walked.append(target) or True)
+
+    state = _work_state([_hotspot(10554, 40089, 3, True)])
+    state["standingLocation"] = {"x": 3038, "y": 3344, "plane": 0}
+
+    ctx = _Ctx()
+    ctx.state.data["mh_hotspot_signature"] = (40089, 3)
+    ctx.state.data["mh_hotspot_clicks"] = mh.HOTSPOT_UNREACHABLE_CLICKS
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert walked and (walked[0]["x"], walked[0]["y"]) == (3038, 3344)
+
+
+# --- the tea option has to be actually clickable ---------------------------------------
+#
+# LIVE 2026-08-29: "accepting the offered cup of tea" fired on EVERY tick of an entire run, each
+# time followed by "Skipping click on None -- aim point is outside the RuneLite window". The
+# text match found a widget carrying "cuppa" that had no usable screen position -- a dialogue
+# option that is present in the interface tree but not currently on screen. click_entity's own
+# guard caught it every time, so nothing broke, but it is a wasted widget scan and a click
+# attempt per tick, and it buried the real log lines.
+
+def test_tea_is_not_clicked_when_the_option_has_no_screen_position(monkeypatch):
+    monkeypatch.setattr(controller, "get_widgets_dump",
+                        lambda: [{"group": mh.DIALOG_OPTION_GROUP, "text": "Yes, I'd love a cuppa.", "screenX": None, "screenY": None}])
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: clicked.append(e))
+    logged = []
+    monkeypatch.setattr(mh.debug_log, "log", lambda cat, msg: logged.append(msg))
+
+    mh._accept_tea_if_offered(_Ctx())
+
+    assert clicked == [], "an option with no screen position must not be clicked"
+    assert not any("tea" in m for m in logged), f"and must not be announced: {logged}"
+
+
+def test_tea_is_still_accepted_when_the_option_is_on_screen(monkeypatch):
+    monkeypatch.setattr(controller, "get_widgets_dump",
+                        lambda: [{"group": mh.DIALOG_OPTION_GROUP, "text": "Yes, I'd love a cuppa.", "screenX": 400, "screenY": 900}])
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: clicked.append(e))
+
+    mh._accept_tea_if_offered(_Ctx())
+
+    assert clicked and clicked[0]["screenX"] == 400
+
+
+# --- Remove and Build are not the same wait --------------------------------------------
+#
+# User, 2026-08-29: "the remove action is basically instant so we can just reclick after that,
+# but after building there is a slight animation delay after exp drop where we can't click."
+#
+# That asymmetry is visible in the four hand-played recordings, and a single flat cooldown cannot
+# express it. MEASURED over 427 consecutive hotspot actions (varbits 10554-10561, excluding the
+# bulk contract-assignment writes):
+#     median 2.39s   p25 0.60s   p75 3.00s
+# p25 is exactly ONE game tick -- the Remove -> Build chain -- while p75 carries the build's
+# animation tail. Ours ran a flat 3.80s median at TAU, ~1.6x slower than the human.
+#
+# A build target is named "<thing> space" ("Drawer space", "Table space", "Bookcase space" in our
+# own run logs); anything else is a Remove or a Repair.
+
+def test_only_remove_is_treated_as_instant():
+    """User, 2026-08-29: "repair should be similar to build i believe" -- so Remove is the ONLY
+    instant one. The object's own left-click action says which it is (actions[0], impostor-
+    resolved by ObjectProvider), which is the one signal that separates Repair from Remove:
+    both act on named furniture, while only Build acts on a "<thing> space"."""
+    assert mh._is_instant_action({"name": "Drawers", "actions": ["Remove"]}) is True
+    assert mh._is_instant_action({"name": "Drawer space", "actions": ["Build"]}) is False
+    assert mh._is_instant_action({"name": "Broken Sink", "actions": ["Repair"]}) is False
+    assert mh._is_instant_action({"name": "Hat stand", "actions": ["Repair"]}) is False
+    # No actions field (older client build): fall back to the name, and default to the SLOW
+    # wait -- clicking too early loses the click outright, waiting merely costs a moment.
+    assert mh._is_instant_action({"name": "Drawer space"}) is False
+    assert mh._is_instant_action({}) is False
+
+
+def test_removing_uses_the_short_cooldown_and_building_the_long_one(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 20)])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 0, "y": 0, "plane": 0})
+
+    for name, actions, expected in (("Drawers", ["Remove"], mh.HOTSPOT_CLICK_COOLDOWN_S),
+                                    ("Drawer space", ["Build"], mh.HOTSPOT_BUILD_COOLDOWN_S),
+                                    ("Broken Sink", ["Repair"], mh.HOTSPOT_BUILD_COOLDOWN_S)):
+        # distance=0: standing on it, so the walk allowance contributes nothing and the BASE
+        # shows through. The walk term itself is covered by its own tests below.
+        obj = _object(39989, distance=0)
+        obj["name"] = name
+        obj["actions"] = actions
+        monkeypatch.setattr(controller, "get_objects", lambda **kw: [obj])
+        ctx = _Ctx()
+        mh.work_phase(ctx, mh.DEFAULT_CONFIG, _work_state([_hotspot(10554, 39989, 3, True)]))
+        assert ctx.state.data["mh_hotspot_cooldown"] == expected, \
+            f"{name!r} should wait {expected}s, got {ctx.state.data.get('mh_hotspot_cooldown')}"
+
+
+def test_the_remove_cooldown_is_about_one_game_tick():
+    # The human's p25. Faster than this would be clicking into an action the game has not
+    # accepted yet; slower throws away the whole Remove -> Build chain.
+    assert 0.5 <= mh.HOTSPOT_CLICK_COOLDOWN_S <= 1.0
+    assert mh.HOTSPOT_BUILD_COOLDOWN_S > mh.HOTSPOT_CLICK_COOLDOWN_S
+
+
+# --- the tea dialogue must be CLOSED, not clicked at forever ---------------------------
+#
+# CONFIRMED live 2026-08-29 (run16, user: "clicking back and forth not sure wtf is going on").
+# After Barbara's contract completed, the routine alternated corner to corner every tick:
+#     accepting the offered cup of tea -> click (571,1173)        bottom-left
+#     turning in the contract with Barbara -> right-click (2010,172)   top-right
+#     No 'Talk-to' entry in menu for Barbara (['Cancel','Mark Safespot','Walk here'])
+# The tea option was clicked unbounded with no confirmation and no cooldown, and because the
+# dialogue stayed open it also blocked the Talk-to menu, so every turn-in right-click resolved to
+# bare ground -- at a different screen position each time as the camera swung. Two faults, one
+# visible symptom.
+
+def test_tea_is_not_reclicked_within_its_cooldown(monkeypatch):
+    monkeypatch.setattr(controller, "get_widgets_dump",
+                        lambda: [{"group": mh.DIALOG_OPTION_GROUP, "text": "Yes, I'd love a cuppa.", "screenX": 571, "screenY": 1173}])
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: clicks.append(e))
+
+    ctx = _Ctx()
+    for _ in range(6):
+        mh._accept_tea_if_offered(ctx)
+
+    assert len(clicks) == 1, f"one click per cooldown, not {len(clicks)} in a row"
+
+
+def test_handling_the_tea_dialogue_stops_the_rest_of_the_tick(monkeypatch):
+    """An open dialogue eats the Talk-to menu, so clicking an NPC across the screen in the same
+    tick can only ever miss -- and it is what made the corner-to-corner clicking visible."""
+    monkeypatch.setattr(controller, "get_widgets_dump",
+                        lambda: [{"group": mh.DIALOG_OPTION_GROUP, "text": "Yes, I'd love a cuppa.", "screenX": 571, "screenY": 1173}])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    assert mh._accept_tea_if_offered(_Ctx()) is True
+
+
+def test_no_tea_on_offer_lets_the_tick_continue(monkeypatch):
+    monkeypatch.setattr(controller, "get_widgets_dump", lambda: [])
+    assert mh._accept_tea_if_offered(_Ctx()) is False
+
+
+# --- "no hotspots need attention" is not the same as "the contract is done" -------------
+#
+# CONFIRMED live 2026-08-29 (user: "we havent done a single task in barbara yet" while the
+# routine was repeatedly trying to hand the contract in). Standing at (1739,3549), OUTSIDE
+# Barbara's area (x 1746-1756, y 3531-3542), every hotspot varbit read 0:
+#     hasContract true, homeName BARBARA, remaining 0 / 7, all values 0, needsAttention false
+# A value of 0 there means "no data" -- the varbits carry the contract's state only while the
+# house is loaded -- and work_phase read it as "nothing left to do" and advanced to turn_in.
+#
+# The two cases are distinguishable by POSITION: a genuinely finished contract is finished while
+# we are standing in the house we just worked. An empty hotspot list from across the map is the
+# routine having no idea, and the answer to that is to go there, not to claim the reward.
+
+def _far_from(home_area):
+    return {"x": home_area["x"] - 8, "y": home_area["y"] + 18, "plane": 0}
+
+
+def test_an_empty_hotspot_list_from_outside_the_house_is_not_a_finished_contract(monkeypatch):
+    area = {"x": 1746, "y": 3531, "width": 10, "height": 11, "plane": 0}
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1739, "y": 3549, "plane": 0})
+
+    ctx = _Ctx()
+    state = _work_state([])
+    state["area"] = area
+    state["standingLocation"] = {"x": 1750, "y": 3534, "plane": 0}
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert ctx.state.data["mh_phase"] != "turn_in", \
+        "standing across the map with no hotspot data is not proof the contract is complete"
+    assert ctx.state.data["mh_phase"] == "travel"
+
+
+def test_an_empty_hotspot_list_inside_the_house_does_finish_the_contract(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1750, "y": 3535, "plane": 0})
+
+    ctx = _Ctx()
+    state = _work_state([])
+    state["area"] = {"x": 1746, "y": 3531, "width": 10, "height": 11, "plane": 0}
+    state["standingLocation"] = {"x": 1750, "y": 3534, "plane": 0}
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert ctx.state.data["mh_phase"] == "turn_in"
+
+
+def test_a_missing_area_falls_back_to_the_standing_tile(monkeypatch):
+    # `area` is only on a rebuilt client; distance to standingLocation answers the same question.
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1750, "y": 3535, "plane": 0})
+    ctx = _Ctx()
+    state = _work_state([])
+    state["standingLocation"] = {"x": 1750, "y": 3534, "plane": 0}
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert ctx.state.data["mh_phase"] == "turn_in"
+def test_a_climb_that_changed_floor_clears_the_not_reachable_counter(monkeypatch):
+    # LIVE 2026-08-29 at MARIAH's: the corner rotation found a working corner on its THIRD
+    # attempt and the Climb-down went through -- then the safety stop fired two ticks later,
+    # because three attempts at LADDER_CLICK_COOLDOWN_S apiece had already spent the 15-tick
+    # budget. Changing floor is progress and must clear the counter.
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1766, "y": 3621, "plane": 0})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [])
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: True)
+
+    ctx = _Ctx()
+    ctx.state.data["mh_work_stuck"] = 14          # one tick short of STUCK_TICK_LIMIT
+    ctx.state.data["mh_ladder_click_plane"] = 1   # we clicked the ladder while on plane 1
+
+    state = {"homeName": "MARIAH", "standingLocation": {"x": 1766, "y": 3621, "plane": 0},
+             "ladderObjectIds": [11802]}
+    target = {"objectId": 40289, "location": {"x": 1764, "y": 3623, "plane": 0}, "plane": 0}
+    mh._approach_missing_hotspot(ctx, mh.DEFAULT_CONFIG, state, target)
+
+    assert ctx.state.safety_stopped is False, "a climb that changed floor must not safety-stop"
+    assert ctx.state.data["mh_work_stuck"] == 1
+
+
+def test_a_climb_that_did_not_change_floor_still_counts_toward_the_stop(monkeypatch):
+    # The other half: keying the reset on the menu click being taken rather than on the plane
+    # actually changing would let an up-then-down loop reset the counter forever.
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1766, "y": 3621, "plane": 1})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [])
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: True)
+
+    ctx = _Ctx()
+    ctx.state.data["mh_work_stuck"] = 14
+    ctx.state.data["mh_ladder_click_plane"] = 1   # same plane we are still on -- no progress
+
+    state = {"homeName": "MARIAH", "standingLocation": {"x": 1766, "y": 3621, "plane": 0},
+             "ladderObjectIds": [11802]}
+    target = {"objectId": 40289, "location": {"x": 1764, "y": 3623, "plane": 0}, "plane": 0}
+    mh._approach_missing_hotspot(ctx, mh.DEFAULT_CONFIG, state, target)
+
+    assert ctx.state.safety_stopped is True, "no floor change means no progress -- the stop must still fire"
+
+
+def test_the_climb_marker_survives_the_tick_before_the_descent_lands(monkeypatch):
+    # A climb takes a tick or two to land, so the tick right after the click still reports the
+    # old plane. LIVE 2026-08-29: consuming the marker on that tick lost the descent entirely --
+    # the player reached plane 0 and the run safety-stopped anyway.
+    plane = {"now": 1}
+    monkeypatch.setattr(controller, "get_player",
+                         lambda: {"x": 1766, "y": 3621, "plane": plane["now"]})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [])
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: True)
+    monkeypatch.setattr(mh, "_climb", lambda *a, **kw: None)
+
+    ctx = _Ctx()
+    ctx.state.data["mh_work_stuck"] = 5
+    ctx.state.data["mh_ladder_click_plane"] = 1
+
+    state = {"homeName": "MARIAH", "standingLocation": {"x": 1766, "y": 3621, "plane": 0},
+             "ladderObjectIds": [11802]}
+    target = {"objectId": 40289, "location": {"x": 1764, "y": 3623, "plane": 0}, "plane": 0}
+
+    mh._approach_missing_hotspot(ctx, mh.DEFAULT_CONFIG, state, target)   # still on plane 1
+    assert ctx.state.data["mh_ladder_click_plane"] == 1, "marker must survive an in-flight climb"
+
+    plane["now"] = 0                                                      # the descent lands
+    mh._approach_missing_hotspot(ctx, mh.DEFAULT_CONFIG, state, target)
+    assert ctx.state.data["mh_work_stuck"] == 1, "the landed climb must clear the counter"
+    assert ctx.state.data["mh_ladder_click_plane"] is None
+
+
+def test_turn_in_goes_back_to_work_when_hotspots_still_need_attention(monkeypatch):
+    # LIVE 2026-08-29 at ROSS's: the phase latched to "turn_in" one tick after a single hotspot
+    # was built, then talked to Ross once every ~3s indefinitely while SIX of his seven hotspots
+    # still reported needsAttention. Nothing re-checked, so it could not recover on its own.
+    monkeypatch.setattr(controller, "get_npc_nearest",
+                         lambda npc_id: pytest.fail("must not talk while work remains"))
+    monkeypatch.setattr(controller, "click_menu_action",
+                         lambda *a, **kw: pytest.fail("must not talk while work remains"))
+
+    ctx = _Ctx()
+    state = {"npcId": 10420, "npcName": "Ross", "homeName": "ROSS",
+             "standingLocation": {"x": 100, "y": 100, "plane": 0},
+             "area": {"x": 95, "y": 95, "width": 10, "height": 10, "plane": 0},
+             "hotspots": [_hotspot(10554, 40164, 1, False),
+                          _hotspot(10556, 40165, 3, True)]}
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 100, "y": 100, "plane": 0})
+
+    mh.turn_in_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert ctx.state.data["mh_phase"] == "work"
+
+
+def test_turn_in_still_talks_when_the_contract_really_is_done(monkeypatch):
+    monkeypatch.setattr(controller, "get_npc_nearest", lambda npc_id: {"index": 5, "name": "Ross"})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 100, "y": 100, "plane": 0})
+    talked = {}
+    monkeypatch.setattr(controller, "click_menu_action",
+                         lambda ser, npc, option, **kw: talked.setdefault("option", option))
+
+    ctx = _Ctx()
+    state = {"npcId": 10420, "npcName": "Ross", "homeName": "ROSS",
+             "standingLocation": {"x": 100, "y": 100, "plane": 0},
+             "area": {"x": 95, "y": 95, "width": 10, "height": 10, "plane": 0},
+             "hotspots": [_hotspot(10554, 40164, 7, False)]}
+    mh.turn_in_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert talked["option"] == "Talk-to"
+
+
+def test_turn_in_has_a_ceiling_not_just_a_cooldown(monkeypatch):
+    # A cooldown only sets the RATE of an unbounded loop -- same lesson as the teleport tablet
+    # and NPC Contact caps.
+    monkeypatch.setattr(controller, "get_npc_nearest", lambda npc_id: {"index": 5, "name": "Ross"})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 100, "y": 100, "plane": 0})
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **kw: True)
+
+    ctx = _Ctx()
+    state = {"npcId": 10420, "npcName": "Ross", "homeName": "ROSS",
+             "standingLocation": {"x": 100, "y": 100, "plane": 0},
+             "area": {"x": 95, "y": 95, "width": 10, "height": 10, "plane": 0},
+             "hotspots": [_hotspot(10554, 40164, 7, False)]}
+
+    for _ in range(mh.TURN_IN_MAX_CLICKS + 2):
+        ctx.state.data["mh_last_turnin_click"] = 0.0     # bypass the cooldown, not the ceiling
+        mh.turn_in_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert ctx.state.safety_stopped is True
+    assert "Ross" in ctx.state.safety_reason
+
+
+def test_work_phase_opens_a_shut_door_before_its_first_hotspot_click(monkeypatch):
+    # USER 2026-08-29: "why when we come to the house do we not prioritise opening the god danm
+    # door, should be the first thing we click if its closed". /objects returns the whole scene
+    # on our plane, so a hotspot behind a shut front door is VISIBLE and used to be clicked
+    # straight away -- the door was only resolved by the unreachable branch, five wasted clicks
+    # later. MEASURED live at MARIAH's: exactly that, twice in one contract.
+    order = []
+    monkeypatch.setattr(travel, "open_doorway_to",
+                         lambda ctx, goal: order.append(("door", goal["x"], goal["y"])))
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [_object(40002, distance=2, x=1769, y=3622)])
+    monkeypatch.setattr(controller, "click_entity",
+                         lambda ser, entity, **kw: order.append(("click", entity["id"])) or True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1766, "y": 3620, "plane": 0})
+
+    hs = _hotspot(10554, 40002, 1, True)
+    hs["location"] = {"x": 1769, "y": 3622, "plane": 0}
+    state = {"homeName": "MARIAH", "npcId": 10422,
+             "standingLocation": {"x": 1766, "y": 3621, "plane": 0},
+             "hotspots": [hs]}
+
+    ctx = _Ctx()
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert order and order[0] == ("door", 1769, 3622), \
+        f"the door must be resolved before the first click, got {order}"
+
+
+def test_the_door_is_not_re_resolved_on_every_click_of_the_same_hotspot(monkeypatch):
+    doors = []
+    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: doors.append(goal))
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [_object(40002, distance=2, x=1769, y=3622)])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1766, "y": 3620, "plane": 0})
+
+    hs = _hotspot(10554, 40002, 1, True)
+    hs["location"] = {"x": 1769, "y": 3622, "plane": 0}
+    state = {"homeName": "MARIAH", "npcId": 10422,
+             "standingLocation": {"x": 1766, "y": 3621, "plane": 0},
+             "hotspots": [hs]}
+
+    ctx = _Ctx()
+    for _ in range(4):
+        ctx.state.data["mh_last_hotspot_click"] = 0.0     # bypass the click cooldown
+        mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert len(doors) == 1, f"door check must run once per hotspot state, ran {len(doors)}x"
+
+
+def test_climb_clicks_the_ladders_own_reported_centre(monkeypatch):
+    # USER 2026-08-29: "revert the ladder to click center". A tile-corner aim was tried and
+    # reverted the same day -- it broke ladders that already worked. MEASURED: at MARIAH's the
+    # reported centroid and the tile centre were the SAME point ((1249,709) vs (1249,707)), i.e.
+    # bare floor; at ROSS's, ladder 16683 reports (1263,316) against a tile centre of (1360,386)
+    # and the centroid is squarely ON the model. An unconditional override aimed a good click
+    # away from its target.
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                         lambda x, y, plane: pytest.fail("must not derive a corner any more"))
+    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)
+    seen = {}
+    def _menu(ser, entity, option, **kw):
+        seen["entity"] = entity
+        seen["offset"] = kw.get("offset")
+        return True
+    monkeypatch.setattr(controller, "click_menu_action", _menu)
+
+    ctx = _Ctx()
+    ladder = {"id": 16683, "name": "Ladder", "x": 2617, "y": 3315, "plane": 0,
+              "screenX": 1263, "screenY": 316}
+    mh._climb(ctx, ladder, "Climb-up", "why")
+
+    assert seen["entity"]["screenX"] == 1263 and seen["entity"]["screenY"] == 316
+    # offset=(0, 0) is what makes it the CENTRE -- the default (-7, +7) nudges off it.
+    assert seen["offset"] == (0, 0)
+
+
+def test_turn_in_climbs_down_instead_of_walking_at_a_tile_on_another_floor(monkeypatch):
+    # LIVE 2026-08-29 at ROSS's, USER-REPORTED as "stuck upstairs": every hotspot was built and
+    # the player was still on plane 1, but standingLocation is always plane 0. WALKING CANNOT
+    # CHANGE FLOOR, so the walker clicked the identical pixel (1144,724) about thirty times with
+    # the player never moving. work_phase's ladder handling could not help -- it lives in
+    # _approach_missing_hotspot, and with no hotspots left work_phase never runs.
+    monkeypatch.setattr(controller, "get_npc_nearest", lambda npc_id: None)   # downstairs
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2618, "y": 3318, "plane": 1})
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [{"id": 16683, "name": "Ladder", "distance": 3,
+                                               "x": 2617, "y": 3315, "plane": 1,
+                                               "screenX": 500, "screenY": 500}])
+    monkeypatch.setattr(travel, "walk_to",
+                         lambda *a, **kw: pytest.fail("must not walk at a plane-0 tile from plane 1"))
+    climbed = {}
+    monkeypatch.setattr(controller, "click_menu_action",
+                         lambda ser, entity, option, **kw: climbed.setdefault("option", option))
+
+    ctx = _Ctx()
+    state = {"npcId": 10420, "npcName": "Ross", "homeName": "ROSS", "npcUpstairs": False,
+             "standingLocation": {"x": 2613, "y": 3316, "plane": 0},
+             "ladderObjectIds": [16683], "hotspots": []}
+    mh.turn_in_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert climbed.get("option") == "Climb-down"
+
+
+def test_turn_in_climbs_UP_for_a_homeowner_who_is_upstairs(monkeypatch):
+    # JESS and NORMAN are the two homes where npcUpstairs is true, so the direction is not a
+    # constant -- standingLocation being plane 0 cannot answer this on its own.
+    monkeypatch.setattr(controller, "get_npc_nearest", lambda npc_id: None)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2618, "y": 3318, "plane": 0})
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [{"id": 16683, "name": "Ladder", "distance": 3,
+                                               "x": 2617, "y": 3315, "plane": 0,
+                                               "screenX": 500, "screenY": 500}])
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: pytest.fail("should climb, not walk"))
+    climbed = {}
+    monkeypatch.setattr(controller, "click_menu_action",
+                         lambda ser, entity, option, **kw: climbed.setdefault("option", option))
+
+    ctx = _Ctx()
+    state = {"npcId": 10419, "npcName": "Jess", "homeName": "JESS", "npcUpstairs": True,
+             "standingLocation": {"x": 2613, "y": 3316, "plane": 0},
+             "ladderObjectIds": [16683], "hotspots": []}
+    mh.turn_in_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert climbed.get("option") == "Climb-up"
+
+
+def test_turn_in_still_walks_when_the_homeowner_is_on_our_own_floor(monkeypatch):
+    # Same floor, just not rendered yet -- walking is the right answer and must be preserved.
+    monkeypatch.setattr(controller, "get_npc_nearest", lambda npc_id: None)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2650, "y": 3350, "plane": 0})
+    monkeypatch.setattr(controller, "click_menu_action",
+                         lambda *a, **kw: pytest.fail("must not climb on our own floor"))
+    walked = {}
+    monkeypatch.setattr(travel, "walk_to",
+                         lambda ctx, goal, **kw: walked.setdefault("goal", goal))
+
+    ctx = _Ctx()
+    state = {"npcId": 10420, "npcName": "Ross", "homeName": "ROSS", "npcUpstairs": False,
+             "standingLocation": {"x": 2613, "y": 3316, "plane": 0},
+             "ladderObjectIds": [16683], "hotspots": []}
+    mh.turn_in_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert walked["goal"]["x"] == 2613
+
+
+def test_the_cross_floor_turn_in_cannot_loop_forever(monkeypatch):
+    # An unbounded climb loop is exactly what this phase must not be able to do.
+    monkeypatch.setattr(controller, "get_npc_nearest", lambda npc_id: None)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2618, "y": 3318, "plane": 1})
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [{"id": 16683, "name": "Ladder", "distance": 3,
+                                               "x": 2617, "y": 3315, "plane": 1,
+                                               "screenX": 500, "screenY": 500}])
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **kw: True)
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: True)
+
+    ctx = _Ctx()
+    state = {"npcId": 10420, "npcName": "Ross", "homeName": "ROSS", "npcUpstairs": False,
+             "standingLocation": {"x": 2613, "y": 3316, "plane": 0},
+             "ladderObjectIds": [16683], "hotspots": []}
+    for _ in range(mh.TURN_IN_MAX_CLICKS + 2):
+        ctx.state.data["mh_last_ladder_click"] = 0.0     # bypass the cooldown, not the ceiling
+        mh.turn_in_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert ctx.state.safety_stopped is True
+def test_the_unreachable_walk_targets_a_tile_on_our_own_floor(monkeypatch):
+    # MEASURED live 2026-08-29 at JESS's, where all seven hotspots are on plane 1: the walk goal
+    # was standingLocation, which is ALWAYS reported at plane 0, so Shortest Path answered with a
+    # "Climb-down Ladder" TRANSPORT and carried the player DOWN, away from the work. Log read
+    # "using transport: Climb-down Ladder" -> "used the transport but didn't arrive where
+    # expected" -> "target is on a different plane -- can't walk there yet", then repeated.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [_object(40171, distance=2, x=2613, y=3296)])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2622, "y": 3293, "plane": 1})
+    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)
+    walked = {}
+    monkeypatch.setattr(travel, "walk_to",
+                         lambda ctx, goal, **kw: walked.setdefault("goal", goal))
+
+    hs = _hotspot(10554, 40171, 3, True)
+    hs["location"] = {"x": 2613, "y": 3296, "plane": 1}      # upstairs, like us
+    state = {"homeName": "JESS", "npcId": 10419,
+             "standingLocation": {"x": 2620, "y": 3300, "plane": 0},   # always plane 0
+             "hotspots": [hs]}
+
+    ctx = _Ctx()
+    ctx.state.data["mh_hotspot_clicks"] = mh.HOTSPOT_UNREACHABLE_CLICKS
+    ctx.state.data["mh_hotspot_signature"] = (40171, 3)
+    ctx.state.data["mh_door_checked"] = (40171, 3)
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert walked["goal"]["plane"] == 1, \
+        f"must walk to a tile on our own floor, got {walked['goal']}"
+    assert walked["goal"]["x"] == 2613
+
+
+def test_the_unreachable_walk_still_uses_the_standing_tile_from_outside(monkeypatch):
+    # The original case must be preserved: standing outside on plane 0 with a plane-0 hotspot,
+    # the standing tile is the routable goal and the hotspot's own tile usually is not.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [_object(40002, distance=2, x=1769, y=3622)])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1760, "y": 3620, "plane": 0})
+    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)
+    walked = {}
+    monkeypatch.setattr(travel, "walk_to",
+                         lambda ctx, goal, **kw: walked.setdefault("goal", goal))
+
+    hs = _hotspot(10554, 40002, 1, True)
+    hs["location"] = {"x": 1769, "y": 3622, "plane": 0}
+    state = {"homeName": "MARIAH", "npcId": 10422,
+             "standingLocation": {"x": 1766, "y": 3621, "plane": 0},
+             "hotspots": [hs]}
+
+    ctx = _Ctx()
+    ctx.state.data["mh_hotspot_clicks"] = mh.HOTSPOT_UNREACHABLE_CLICKS
+    ctx.state.data["mh_hotspot_signature"] = (40002, 1)
+    ctx.state.data["mh_door_checked"] = (40002, 1)
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    # The STANDING tile, not the hotspot: on our own floor the hotspot's own tile is usually
+    # furniture and unroutable, which is the whole reason the standing tile is the walk goal.
+    assert walked["goal"]["x"] == 1766 and walked["goal"]["plane"] == 0
+
+
+def test_a_finished_contract_is_turned_in_before_banking(monkeypatch):
+    # USER 2026-08-29: "another big nono was finishing barbaras house then before handing in the
+    # contract go to bank and then back again wasting a tp ... finish the contract first then
+    # bank". MEASURED live at Barbara's: every hotspot built, and it still teleported to the
+    # Varrock bank and back before turning in -- a full round trip plus a tablet for nothing.
+    monkeypatch.setattr(controller, "get_mahogany_homes_state",
+                         lambda: {"hasContract": True, "contractTier": 3, "homeName": "BARBARA",
+                                  "npcId": 10416, "npcName": "Barbara",
+                                  "standingLocation": {"x": 1750, "y": 3534, "plane": 0},
+                                  "area": {"x": 1745, "y": 3530, "width": 12, "height": 10,
+                                           "plane": 0},
+                                  "hotspots": [_hotspot(10554, 40011, 7, False)]})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1750, "y": 3534, "plane": 0})
+    monkeypatch.setattr(mh, "needs_bank_trip", lambda ctx, config, state: True)   # low on planks
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: {"runes": []})
+
+    called = []
+    monkeypatch.setitem(mh.PHASE_HANDLERS, "bank", lambda *a: called.append("bank"))
+    monkeypatch.setitem(mh.PHASE_HANDLERS, "turn_in", lambda *a: called.append("turn_in"))
+    monkeypatch.setitem(mh.PHASE_HANDLERS, "work", lambda *a: called.append("work"))
+
+    ctx = _Ctx()
+    ctx.state.data["mh_phase"] = "work"
+    mh.tick(ctx)
+
+    assert "bank" not in called, f"must not bank while a finished contract is unclaimed: {called}"
+
+
+def test_still_banks_mid_contract_when_work_remains(monkeypatch):
+    # The other half: genuinely running out of planks part-way through must still divert.
+    monkeypatch.setattr(controller, "get_mahogany_homes_state",
+                         lambda: {"hasContract": True, "contractTier": 3, "homeName": "BARBARA",
+                                  "npcId": 10416, "npcName": "Barbara",
+                                  "standingLocation": {"x": 1750, "y": 3534, "plane": 0},
+                                  "area": {"x": 1745, "y": 3530, "width": 12, "height": 10,
+                                           "plane": 0},
+                                  "hotspots": [_hotspot(10554, 40011, 3, True)]})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1750, "y": 3534, "plane": 0})
+    monkeypatch.setattr(mh, "needs_bank_trip", lambda ctx, config, state: True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: {"runes": []})
+
+    called = []
+    monkeypatch.setitem(mh.PHASE_HANDLERS, "bank", lambda *a: called.append("bank"))
+    monkeypatch.setitem(mh.PHASE_HANDLERS, "work", lambda *a: called.append("work"))
+
+    ctx = _Ctx()
+    ctx.state.data["mh_phase"] = "work"
+    mh.tick(ctx)
+
+    assert called == ["bank"], f"a real mid-contract shortage must still bank: {called}"
+
+
+def test_a_shortage_from_out_of_town_still_banks(monkeypatch):
+    # Away from the house every hotspot varbit reads "nothing needs attention", so the
+    # finished-contract check must be gated on actually being AT the home -- otherwise it would
+    # suppress every legitimate restock made from out of town.
+    monkeypatch.setattr(controller, "get_mahogany_homes_state",
+                         lambda: {"hasContract": True, "contractTier": 3, "homeName": "BARBARA",
+                                  "npcId": 10416, "npcName": "Barbara",
+                                  "standingLocation": {"x": 1750, "y": 3534, "plane": 0},
+                                  "area": {"x": 1745, "y": 3530, "width": 12, "height": 10,
+                                           "plane": 0},
+                                  "hotspots": [_hotspot(10554, 40011, 0, False)]})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3430, "plane": 0})
+    monkeypatch.setattr(mh, "needs_bank_trip", lambda ctx, config, state: True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: {"runes": []})
+
+    called = []
+    monkeypatch.setitem(mh.PHASE_HANDLERS, "bank", lambda *a: called.append("bank"))
+    monkeypatch.setitem(mh.PHASE_HANDLERS, "work", lambda *a: called.append("work"))
+
+    ctx = _Ctx()
+    ctx.state.data["mh_phase"] = "work"
+    mh.tick(ctx)
+
+    assert called == ["bank"], f"a shortage away from the house must still bank: {called}"
+
+
+def test_a_stuck_hotspot_falls_back_to_opening_any_shut_door(monkeypatch):
+    # USER 2026-08-29: "got stuck outside without opening door again". Outside ROSS's house the
+    # only way in is a DETOUR door -- both player and hotspot east of its blocked edge -- so the
+    # strict edge test correctly finds nothing. Having already proven the hotspot is unreachable,
+    # "no door is provably in the way" is not an answer we can act on.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [_object(40164, distance=3, x=2617, y=3318)])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2614, "y": 3319, "plane": 0})
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: True)
+    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)   # strict finds none
+    fallback = []
+    monkeypatch.setattr(travel, "open_nearest_shut_door",
+                         lambda ctx, goal: fallback.append(goal) or True)
+
+    hs = _hotspot(10554, 40164, 1, True)
+    hs["location"] = {"x": 2617, "y": 3318, "plane": 0}
+    state = {"homeName": "ROSS", "npcId": 10420,
+             "standingLocation": {"x": 2613, "y": 3316, "plane": 0},
+             "hotspots": [hs]}
+
+    ctx = _Ctx()
+    ctx.state.data["mh_hotspot_clicks"] = mh.HOTSPOT_UNREACHABLE_CLICKS
+    ctx.state.data["mh_hotspot_signature"] = (40164, 1)
+    ctx.state.data["mh_door_checked"] = (40164, 1)
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert fallback, "a stuck hotspot must try the nearest shut door when the strict test finds none"
+
+
+def test_the_stuck_fallback_is_skipped_when_a_door_was_provably_in_the_way(monkeypatch):
+    # The strict test staying primary matters: it opens the RIGHT door rather than the nearest.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [_object(40164, distance=3, x=2617, y=3318)])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2614, "y": 3319, "plane": 0})
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: True)
+    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: True)    # strict found one
+    monkeypatch.setattr(travel, "open_nearest_shut_door",
+                         lambda ctx, goal: pytest.fail("must not second-guess the strict test"))
+
+    hs = _hotspot(10554, 40164, 1, True)
+    hs["location"] = {"x": 2617, "y": 3318, "plane": 0}
+    state = {"homeName": "ROSS", "npcId": 10420,
+             "standingLocation": {"x": 2613, "y": 3316, "plane": 0},
+             "hotspots": [hs]}
+
+    ctx = _Ctx()
+    ctx.state.data["mh_hotspot_clicks"] = mh.HOTSPOT_UNREACHABLE_CLICKS
+    ctx.state.data["mh_hotspot_signature"] = (40164, 1)
+    ctx.state.data["mh_door_checked"] = (40164, 1)
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+
+def test_the_click_cooldown_budgets_the_walk_to_the_hotspot(monkeypatch):
+    # USER 2026-08-29: "are we checking if we click remove on a furniture but we are a few tiles
+    # away do we count that as removed before we arrive?" -- we were. The game QUEUES an
+    # interaction and performs it on ARRIVAL, so until the player gets there the varbit cannot
+    # move. With only the action's own duration budgeted, the cooldown expired mid-walk, we
+    # re-clicked, every such click counted as "no progress", and HOTSPOT_UNREACHABLE_CLICKS fired
+    # on a perfectly reachable hotspot. MEASURED live at ROSS's: five `Repair Broken Range`
+    # actions all registering correctly in the recorder, no varbit movement, then "unreachable".
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 20)])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 0, "y": 0, "plane": 0})
+
+    obj = _object(39989, distance=5)
+    obj["name"] = "Drawers"
+    obj["actions"] = ["Remove"]
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [obj])
+
+    ctx = _Ctx()
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, _work_state([_hotspot(10554, 39989, 3, True)]))
+
+    cooldown = ctx.state.data["mh_hotspot_cooldown"]
+    assert cooldown > mh.HOTSPOT_CLICK_COOLDOWN_S, \
+        f"5 tiles of walking must be budgeted, got {cooldown}s"
+    assert cooldown == pytest.approx(
+        mh.HOTSPOT_CLICK_COOLDOWN_S + 5 * mh.HOTSPOT_WALK_ALLOWANCE_S)
+
+
+def test_the_click_cooldown_is_capped_for_a_far_hotspot(monkeypatch):
+    # Capped so a hotspot that genuinely cannot be reached still reaches the unreachable guard.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 20)])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 0, "y": 0, "plane": 0})
+
+    obj = _object(39989, distance=40)
+    obj["name"] = "Drawer space"
+    obj["actions"] = ["Build"]
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [obj])
+
+    ctx = _Ctx()
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, _work_state([_hotspot(10554, 39989, 3, True)]))
+    assert ctx.state.data["mh_hotspot_cooldown"] == mh.HOTSPOT_COOLDOWN_MAX_S
+
+
+def test_an_unreachable_hotspot_is_never_clicked_at_all(monkeypatch):
+    # USER 2026-08-29: "every time we have to walk through a door now we have to get stuck on the
+    # outside 5 clicks in a row this is unacceptable." Reachability is decided BEFORE the first
+    # click now, so the five-wasted-click discovery cannot happen.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [_object(40164, distance=3, x=2617, y=3318)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2614, "y": 3319, "plane": 0})
+    monkeypatch.setattr(controller, "click_entity",
+                         lambda ser, entity, **kw: pytest.fail("must not click what we cannot reach"))
+    monkeypatch.setattr(travel, "can_reach", lambda goal, reach=None, **kw: False)
+    opened, walked = [], []
+    monkeypatch.setattr(travel, "open_frontier_door",
+                         lambda ctx, goal: opened.append(goal) or True)
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, goal, **kw: walked.append(goal) or True)
+
+    hs = _hotspot(10554, 40164, 1, True)
+    hs["location"] = {"x": 2617, "y": 3318, "plane": 0}
+    state = {"homeName": "ROSS", "npcId": 10420,
+             "standingLocation": {"x": 2613, "y": 3316, "plane": 0},
+             "hotspots": [hs]}
+
+    ctx = _Ctx()
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert opened, "an unreachable hotspot must resolve the frontier door"
+    assert walked, "...and then walk"
+    assert ctx.state.data.get("mh_hotspot_clicks", 0) == 0, "no click may be spent"
+
+
+def test_a_reachable_hotspot_is_clicked_immediately(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [_object(40164, distance=1, x=2617, y=3318)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2617, "y": 3317, "plane": 0})
+    monkeypatch.setattr(travel, "can_reach", lambda goal, reach=None, **kw: True)
+    monkeypatch.setattr(travel, "open_frontier_door",
+                         lambda ctx, goal: pytest.fail("reachable -- no door work needed"))
+    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)
+    monkeypatch.setattr(controller, "object_refresh_target",
+                         lambda x, y, plane, obj_id: (lambda: None))
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                         lambda ser, entity, **kw: clicked.append(entity["id"]) or True)
+
+    hs = _hotspot(10554, 40164, 1, True)
+    hs["location"] = {"x": 2617, "y": 3318, "plane": 0}
+    state = {"homeName": "ROSS", "npcId": 10420,
+             "standingLocation": {"x": 2613, "y": 3316, "plane": 0},
+             "hotspots": [hs]}
+
+    ctx = _Ctx()
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert clicked == [40164]
+
+
+def test_an_unknown_reachability_answer_still_clicks(monkeypatch):
+    # None means the client could not tell (older build, tile outside the scene). That must
+    # behave exactly as before rather than refusing to work.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [_object(40164, distance=1, x=2617, y=3318)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2617, "y": 3317, "plane": 0})
+    monkeypatch.setattr(travel, "can_reach", lambda goal, reach=None, **kw: None)
+    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)
+    monkeypatch.setattr(controller, "object_refresh_target",
+                         lambda x, y, plane, obj_id: (lambda: None))
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                         lambda ser, entity, **kw: clicked.append(entity["id"]) or True)
+
+    hs = _hotspot(10554, 40164, 1, True)
+    hs["location"] = {"x": 2617, "y": 3318, "plane": 0}
+    state = {"homeName": "ROSS", "npcId": 10420,
+             "standingLocation": {"x": 2613, "y": 3316, "plane": 0},
+             "hotspots": [hs]}
+
+    ctx = _Ctx()
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert clicked == [40164]
+
+
+def test_pick_next_hotspot_prefers_one_we_can_actually_reach(monkeypatch):
+    # MEASURED live 2026-08-29 upstairs at JEFF's: of three hotspots needing attention, 39994
+    # (3242,3446) was walled off while 39995 and 39996 were reachable -- and there was NO shut
+    # door anywhere in range, so no door logic could have helped. USER: "there is no doors but we
+    # are on the second floor". Bare list order fixated on the unreachable one, walked at it, and
+    # wedged the obstacle-blind greedy walker (Shortest Path cannot route on plane 1 at all),
+    # while reachable work sat two tiles away.
+    reach = {(3238, 3455)}          # only 39995's neighbourhood is walkable
+    monkeypatch.setattr(travel, "can_reach",
+                         lambda loc, r=None, **kw: (loc["x"], loc["y"]) == (3238, 3454))
+
+    def _hs(obj_id, x, y):
+        h = _hotspot(10554, obj_id, 3, True)
+        h["location"] = {"x": x, "y": y, "plane": 1}
+        return h
+
+    hotspots = [_hs(39994, 3242, 3446), _hs(39995, 3238, 3454), _hs(39996, 3242, 3447)]
+    assert mh.pick_next_hotspot(hotspots)["objectId"] == 39994, "list order, unchanged"
+    assert mh.pick_next_hotspot(hotspots, reach)["objectId"] == 39995
+
+
+def test_pick_next_hotspot_keeps_list_order_when_everything_is_reachable(monkeypatch):
+    # The normal case must be untouched.
+    monkeypatch.setattr(travel, "can_reach", lambda loc, r=None, **kw: True)
+
+    def _hs(obj_id, x, y):
+        h = _hotspot(10554, obj_id, 3, True)
+        h["location"] = {"x": x, "y": y, "plane": 0}
+        return h
+
+    hotspots = [_hs(1, 0, 0), _hs(2, 5, 5)]
+    assert mh.pick_next_hotspot(hotspots, {(0, 1)})["objectId"] == 1
+
+
+def test_pick_next_hotspot_falls_back_when_nothing_is_reachable(monkeypatch):
+    # All walled off: still return something and let the door/walk recovery run, rather than
+    # reporting "no work left" and going to turn_in on a contract that isn't finished.
+    monkeypatch.setattr(travel, "can_reach", lambda loc, r=None, **kw: False)
+
+    def _hs(obj_id):
+        h = _hotspot(10554, obj_id, 3, True)
+        h["location"] = {"x": 1, "y": 1, "plane": 0}
+        return h
+
+    hotspots = [_hs(7), _hs(8)]
+    assert mh.pick_next_hotspot(hotspots, {(0, 0)})["objectId"] == 7
+
+
+def test_pick_next_hotspot_ignores_reachability_it_cannot_determine(monkeypatch):
+    # An empty reach set is the client saying "cannot tell" -- plain list order, never a guess.
+    monkeypatch.setattr(travel, "can_reach",
+                         lambda loc, r=None, **kw: pytest.fail("must not ask with no grid"))
+    h = _hotspot(10554, 40011, 3, True)
+    h["location"] = {"x": 1, "y": 1, "plane": 0}
+    assert mh.pick_next_hotspot([h], set())["objectId"] == 40011
+
+def test_a_hotspot_behind_a_wall_is_not_clicked_however_close_we_stand(monkeypatch):
+    # The replacement for an earlier "standing next to it, just click" override, which was added
+    # after a walk-in-place loop at JEFF's and then produced the OPPOSITE failure at ROSS's:
+    # player (2617,3319), hotspot (2617,3318), Chebyshev distance 1, exterior wall on exactly that
+    # edge -- so "adjacent" meant clicking through a wall. USER: "stuck outside ross again... this
+    # is absurd". Raw tile distance cannot separate the two cases; travel.can_reach's edge test
+    # can, so the routine simply trusts it.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [_object(40164, distance=1, x=2617, y=3318)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2617, "y": 3319, "plane": 0})
+    monkeypatch.setattr(travel, "reachable_set", lambda x, y, plane, radius=None: {(2617, 3319)})
+    monkeypatch.setattr(travel, "can_reach", lambda goal, reach=None, flags=None, **kw: False)
+    monkeypatch.setattr(controller, "click_entity",
+                         lambda ser, entity, **kw: pytest.fail("that is through a wall"))
+    monkeypatch.setattr(travel, "open_frontier_door", lambda ctx, goal: False)
+    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)
+    walked = []
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, goal, **kw: walked.append(goal) or True)
+
+    hs = _hotspot(10554, 40164, 1, True)
+    hs["location"] = {"x": 2617, "y": 3318, "plane": 0}
+    state = {"homeName": "ROSS", "npcId": 10420,
+             "standingLocation": {"x": 2613, "y": 3316, "plane": 0},
+             "hotspots": [hs]}
+
+    ctx = _Ctx()
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert walked, "it must walk around instead of clicking through the wall"
+
+
+def test_a_walled_off_ladder_is_not_clicked_either(monkeypatch):
+    # MEASURED live 2026-08-29 at ROSS's: player (2618,3315), ladder 16683 at (2617,3315) --
+    # cardinally adjacent, but (2618,3315) carries BLOCK_MOVEMENT_WEST so the shared edge is a
+    # wall. `menu-select Climb-up Ladder` registered THREE times, the player never changed floor,
+    # and the run safety-stopped. The game accepts an interaction it cannot path to and silently
+    # does nothing -- the same failure as clicking an unreachable hotspot, at a call site that had
+    # not been gated. USER: "i mean at this point am i going to have to hardcode each door?" -- no:
+    # gate every world-object click on reachability, once.
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2618, "y": 3315, "plane": 0})
+    monkeypatch.setattr(travel, "reachable_set",
+                         lambda x, y, plane, radius=None: {(2618, 3315)})
+    monkeypatch.setattr(travel, "can_reach", lambda goal, reach=None, **kw: False)
+    monkeypatch.setattr(controller, "click_menu_action",
+                         lambda *a, **kw: pytest.fail("that ladder is behind a wall"))
+    opened, walked = [], []
+    monkeypatch.setattr(travel, "open_frontier_door",
+                         lambda ctx, goal: opened.append(goal) or True)
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, goal, **kw: walked.append(goal) or True)
+
+    ctx = _Ctx()
+    ladder = {"id": 16683, "name": "Ladder", "x": 2617, "y": 3315, "plane": 0,
+              "screenX": 100, "screenY": 100}
+    mh._climb(ctx, ladder, "Climb-up", "why")
+
+    assert opened and walked, "it must open the way and walk, not click through the wall"
+
+
+def test_a_reachable_ladder_is_still_clicked_normally(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2617, "y": 3316, "plane": 0})
+    monkeypatch.setattr(travel, "reachable_set",
+                         lambda x, y, plane, radius=None: {(2617, 3316), (2617, 3315)})
+    monkeypatch.setattr(travel, "can_reach", lambda goal, reach=None, **kw: True)
+    # A REACHABLE ladder must involve no door work whatsoever. The old unconditional
+    # open_doorway_to here ran the straight-line edge test every climb and false-positived on the
+    # front door behind us at ROSS's, stepping outside between each Remove/Build.
+    monkeypatch.setattr(travel, "open_doorway_to",
+                         lambda ctx, goal: pytest.fail("ladder is reachable -- no door work"))
+    monkeypatch.setattr(travel, "open_frontier_door",
+                         lambda ctx, goal: pytest.fail("ladder is reachable -- no door work"))
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: pytest.fail("no walk needed"))
+    climbed = {}
+    monkeypatch.setattr(controller, "click_menu_action",
+                         lambda ser, e, option, **kw: climbed.setdefault("option", option))
+
+    ctx = _Ctx()
+    ladder = {"id": 16683, "name": "Ladder", "x": 2617, "y": 3315, "plane": 0,
+              "screenX": 100, "screenY": 100}
+    mh._climb(ctx, ladder, "Climb-up", "why")
+    assert climbed["option"] == "Climb-up"
+
+
+def test_a_hotspot_on_another_floor_is_not_judged_by_our_own_floors_grid(monkeypatch):
+    # A reachable set is (x, y) with no plane in it, and the two floors share a coordinate space.
+    # MEASURED at ROSS's: a plane-1 hotspot was judged "reachable" against a plane-0 flood fill
+    # purely because its x/y landed on a walkable ground-floor tile, so work_phase preferred it
+    # over the ground-floor hotspots and went ladder-hunting. Cross-floor must answer None.
+    assert travel.can_reach({"x": 10, "y": 10, "plane": 1}, {(10, 10)}, plane=0) is None

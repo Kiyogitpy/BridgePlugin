@@ -36,11 +36,89 @@ MAGIC_TAB_KEY = "F6"
 
 CONTACT_RETRY_COOLDOWN_S = 6.0     # spell cast -> assignment chat measured at ~4.4s in the
                                     # recordings; this just stops re-casting while waiting.
-HOTSPOT_CLICK_COOLDOWN_S = 2.5      # first-draft guess, see module docstring
+# MEASURED 2026-08-29 against the four hand-played recordings (427 consecutive hotspot actions,
+# varbits 10554-10561, bulk contract-assignment writes excluded): the human runs a median 2.39s
+# between actions with p25 0.60s and p75 3.00s. Ours was a flat 2.5s cooldown producing a 3.80s
+# median at TAU -- about 1.6x slower.
+#
+# The spread is not noise, it is two different actions (user, 2026-08-29): "the remove action is
+# basically instant so we can just reclick after that, but after building there is a slight
+# animation delay after exp drop where we can't click". p25 of 0.60s is exactly ONE game tick --
+# the Remove -> Build chain -- and p75 carries the build's animation tail. A single flat value
+# cannot express that, so it pays the build's price for every remove.
+HOTSPOT_CLICK_COOLDOWN_S = 0.6      # after a REMOVE only -- one tick, the human's p25
+HOTSPOT_BUILD_COOLDOWN_S = 2.4      # after a Build or Repair -- animation tail past the XP drop
+# ...plus the WALK, because the game queues an interaction and performs it ON ARRIVAL. Both
+# constants above are the ACTION's own duration and nothing else, so a click on a hotspot a few
+# tiles away expired long before the action could even begin. USER 2026-08-29: "are we checking
+# if we click remove on a furniture but we are a few tiles away do we count that as removed
+# before we arrive?" -- we were. Same omission as the door-open budget, and the same fix.
+HOTSPOT_WALK_ALLOWANCE_S = 0.7      # per tile to the hotspot; 0.6s is one walked tile per tick
+HOTSPOT_COOLDOWN_MAX_S = 8.0        # ceiling, so a genuinely unreachable hotspot still gives up
 TURN_IN_CLICK_COOLDOWN_S = 2.0      # first-draft guess, see module docstring
 LADDER_CLICK_COOLDOWN_S = 4.0       # a floor change takes a game tick plus the climb animation;
                                     # without this the next tick would immediately re-click.
-TRAVEL_TELEPORT_DISTANCE = 40       # tiles -- skip teleporting if already this close
+# tiles -- skip teleporting if already this close. RAISED 40 -> 150 on 2026-08-28: this is
+# meant to mean "are we in a different city", and 40 could not, because the Falador tablet lands
+# 74 tiles from Larry's own standing tile. Standing in Falador having just arrived, the gate
+# still said "too far" and only the mh_teleported_this_contract latch stopped a second tablet --
+# so a single wrong latch (which happened, see TELEPORT_CONFIRM_TIMEOUT_S) meant teleporting
+# Falador -> Falador once a tick. The four destinations in CITY_TELEPORTS are 248+ tiles apart
+# at their closest (Falador 2965,3379 to Varrock 3213,3424), and the worst intra-city landing is
+# ~75, so 150 separates them with room on both sides.
+TRAVEL_TELEPORT_DISTANCE = 150
+# Arrival tolerance for a walk that must end up INSIDE a building. travel.walk_to defaults to
+# WALK_ARRIVAL_TOLERANCE (3), and LIVE 2026-08-28 that returned True from (1766,3624) -- pressed
+# against Mariah's shut front door, three tiles from the standing tile, underRoof still False. A
+# walk that "arrives" outside the door never stalls, so travel.py's door recovery never runs and
+# the next tick goes back to clicking a hotspot it cannot reach. 1 forces the walk to actually
+# press into the doorway, which is what triggers the door to be opened.
+HOUSE_ARRIVAL_TOLERANCE = 1
+
+# MEASURED live 2026-08-28 from recordings/2026-08-28_173427_mh-live-run5: a tablet teleport
+# takes 3.8s from the click to the region change (varbit 12393 -> anim 4069 -> anim 4071 ->
+# spotanim 678 -> LOADING -> LOGGED_IN). The confirmation used to be a single human_delay(2.5,
+# 3.2) followed by one position read, which landed ~0.4s BEFORE the player arrived -- so a
+# teleport that worked perfectly read as a failure and the retry broke another tablet. Polled,
+# not slept: a teleport that lands early costs no extra wait.
+TELEPORT_CONFIRM_TIMEOUT_S = 10.0
+TELEPORT_CONFIRM_POLL_S = 0.3
+# ... and a hard cap on top, because a confirmation that is wrong for ANY reason (out of
+# charges, a dialogue eating the click) otherwise spends one tablet per tick forever. The
+# Falador tablet lands 74 tiles from Larry's standing tile -- past TRAVEL_TELEPORT_DISTANCE --
+# so the latch below is the ONLY thing preventing a second teleport, and a cap is the only
+# thing preventing 155 of them. Live run 5 burned three before it was stopped by hand.
+TELEPORT_MAX_ATTEMPTS = 2
+
+# ... and the same ceiling on NPC Contact casts that register no contract. See
+# request_contract_phase; 5 leaves room for a genuinely dropped click without becoming a loop.
+CONTACT_MAX_CASTS = 5
+
+# The homeowner's cup of tea. Rate-limited and capped for the same reason as everything else that
+# repeats: without both, an option that stays on screen is clicked once per tick forever.
+TEA_CLICK_COOLDOWN_S = 1.5
+TEA_MAX_CLICKS = 3
+
+# The multi-choice dialogue OPTION list. Confirmed from recorder output ("widget 219.1 slot 1").
+# The tea match MUST be scoped to it -- see _accept_tea_if_offered for the deadlock that scoping
+# it by text alone caused.
+DIALOG_OPTION_GROUP = 219
+
+# Talking to the homeowner repeats, so it needs a CEILING and not only a cooldown -- a cooldown
+# only sets the RATE of an unbounded loop. Generous: a real turn-in costs a click or two plus a
+# retry when the first right-click misses.
+TURN_IN_MAX_CLICKS = 12
+
+TELEPORT_MIN_DISPLACEMENT = 30      # tiles a teleport must move us before we believe it
+                                    # happened. Comfortably above any walk a single tick could
+                                    # produce, and far below the hundreds of tiles every teleport
+                                    # in CITY_TELEPORTS actually covers.
+# Bounds every bulk /objects scan this routine makes. A whole-scene walk costs ~124ms of
+# client-thread time in a Falador house (9266 objects, MEASURED 2026-08-29) and buys nothing:
+# every hotspot, ladder and door we care about is inside the contract house. Comfortably wider
+# than HOME_ARRIVAL_TILES so a hotspot stays visible from the approach.
+OBJECT_SCAN_RADIUS = 16
+
 HOME_ARRIVAL_TILES = 12             # every home's WorldArea is ~10x10 with standingLocation
                                     # roughly central, so this covers the whole house plus a
                                     # margin: "close enough that a missing hotspot means the
@@ -52,6 +130,116 @@ HOME_ARRIVAL_TILES = 12             # every home's WorldArea is ~10x10 with stan
 # and at the engine's poll cadence 15 ticks is tens of seconds, not an instant trip. Every one of
 # these counters resets to 0 on any real progress, so it only fires on a genuine hang.
 STUCK_TICK_LIMIT = 15
+
+# How many clicks one hotspot may absorb WITHOUT its varbit value moving before we conclude we
+# cannot actually reach it from where we are standing, and climb down to try the other staircase.
+#
+# This exists for NOELLA, the only home of the twelve with two staircases (four ladder ids) and,
+# per the user 2026-08-28, an upper floor split into two DISCONNECTED halves: "you have to fix one
+# upstairs climb down take the other ladder fix that upstairs". /objects reports the whole scene
+# on the player's current plane, so a hotspot in the far half is plainly visible from the near one
+# -- work_phase finds it, clicks it, and nothing ever says stop, because seeing the object is
+# exactly what resets mh_work_stuck.
+#
+# A successful action always moves the hotspot's varbit, so a value that does not move is a click
+# achieving nothing. FIRST-DRAFT VALUE -- like HOTSPOT_CLICK_COOLDOWN_S it wants a live session to
+# confirm; too low risks climbing away from a hotspot that was merely slow to register.
+HOTSPOT_UNREACHABLE_CLICKS = 5
+
+# --- plank sack ---------------------------------------------------------------------------
+#
+# PORTED 2026-08-28 from MahoganyHomesPlugin.countPlankSackVarb, which the original port missed
+# alongside npcUpstairs. The sack (item 24882) holds up to 28 planks and keeps a SEPARATE varbit
+# per plank type, so a routine must read the one matching the plank it actually carries.
+#
+# This is why the sack is safe here when golem_crafting's fur pouch was not: the count is a real
+# varbit read fresh from the client, not a local running estimate that can silently drift from
+# reality. The module docstring's original "no plank sack, to avoid the fur-pouch failure mode"
+# reasoning simply does not apply to a container the game will tell you the contents of.
+PLANK_SACK_VARBITS = {
+    "plank": 18171,
+    "oak plank": 18172,
+    "teak plank": 18173,
+    "mahogany plank": 18174,
+}
+PLANK_SACK_CAPACITY = 28      # MEASURED: the recording's second Fill stops at varbit 18173 == 28
+PLANK_SACK_MAX_FILLS = 4      # withdraw/fill rounds before giving up. 28 planks needs at most two
+                              # from empty; the extra headroom is for a part-full sack, and the
+                              # bound is what stops an unbounded loop against a bank out of stock.
+
+
+def plank_sack_count(plank_name: str, inventory: list | None = None) -> int:
+    """How many planks of `plank_name` are in the plank sack right now, or 0.
+
+    Gated on actually CARRYING the sack: the varbit keeps its last value after the sack is
+    banked, so reading it unconditionally would credit us planks we do not have -- which is
+    precisely the stale-estimate trap the sack was originally left out to avoid."""
+    varbit = PLANK_SACK_VARBITS.get((plank_name or "").lower())
+    if varbit is None:
+        return 0
+    inv = inventory if inventory is not None else controller.get_inventory()
+    if not any(banker.PLANK_SACK_NAME in (i.get("name") or "").lower() for i in inv):
+        return 0
+    return controller.get_varbit(varbit) or 0
+
+
+def planks_available(inventory: list, plank_name: str) -> int:
+    """Loose planks plus sacked ones -- what the reference plugin's own supply check counts."""
+    return count_item(inventory, plank_name) + plank_sack_count(plank_name, inventory)
+
+
+def _withdraw_all(ctx, name: str) -> None:
+    """Withdraw as much of `name` as the inventory will hold, in ONE shift-click.
+
+    CORRECTED after the 2026-08-28 live run: this first went through withdraw_loadout with
+    quantity 28, and that helper sets quantity mode to "one" and clicks once PER UNIT -- 28
+    clicks at a bank booth for a withdrawal that only had room for ten, most of them logged as
+    "Skipping click on Teak plank -- aim point is outside the RuneLite window". banker's own
+    withdraw_all_shift is built for exactly this case ("as much of this single item as fits"),
+    is a single shift-click, and POLLS for the item actually arriving instead of sleeping --
+    which also closes the documented race where closing the bank too early cancels the
+    withdrawal outright."""
+    banker.withdraw_all_shift(ctx, name, fresh=True)
+
+
+def _load_plank_sack(ctx, plank_name: str) -> None:
+    """Fill the plank sack, then leave the inventory full of loose planks too.
+
+    The loop the user described and the recording confirms (recordings/2026-08-27_174045_
+    mahogny-homes.log:812-870): withdraw-all -> Fill -> withdraw-all -> Fill -> withdraw-all,
+    with varbit 18173 stepping 9 -> 26 -> 28. Bank must already be OPEN: Fill is only offered on
+    an inventory item while a bank interface is up (see banker.fill_plank_sack)."""
+    if not banker.has_plank_sack():
+        return
+
+    last = None
+    for _ in range(PLANK_SACK_MAX_FILLS):
+        count = plank_sack_count(plank_name)
+        if count >= PLANK_SACK_CAPACITY:
+            break
+        if last is not None and count <= last:
+            # The sack took nothing last round -- the bank is out of planks. Without this the
+            # loop would keep withdrawing nothing and filling nothing until MAX_FILLS.
+            debug_log.log("mahogany_homes",
+                          f"plank sack stuck at {count}/{PLANK_SACK_CAPACITY} -- bank is out of "
+                          f"{plank_name}")
+            break
+        last = count
+        _withdraw_all(ctx, plank_name)
+        banker.fill_plank_sack(ctx)
+
+    # Top the inventory back up so we carry a full load of loose planks ON TOP of the full sack.
+    _withdraw_all(ctx, plank_name)
+    debug_log.log("mahogany_homes",
+                  f"plank sack at {plank_sack_count(plank_name)}/{PLANK_SACK_CAPACITY}")
+
+# The homes whose upper floor is split into DISCONNECTED halves, so that reaching one hotspot can
+# require climbing back down and taking a different staircase. Deliberately an explicit list and
+# NOT inferred from `len(ladderObjectIds) > 2`: two staircases do not imply a disconnected floor,
+# and applying the unreachable guard to the other eleven homes would risk climbing away from a
+# hotspot that was merely slow -- a new failure mode in eleven houses to fix a quirk in one.
+# NOELLA is the only home reported (user, 2026-08-28) to have this layout.
+SPLIT_UPPER_FLOOR_HOMES = {"NOELLA"}
 
 # Which teleport item gets a player near each home's city, as (item name substring, menu option).
 # A menu option of None means the item's own left-click default already teleports -- true for
@@ -86,8 +274,16 @@ KEEP_ITEMS = [
     "plank", "steel bar",
 ]
 
-# No plank sack in this version -- planks are carried loose. See the plan's Task 5 for why the
-# sack was left out rather than built the way golem_crafting's fur pouch was.
+# PLANK SACK: supported as of 2026-08-28 (user report: "we never fill the plank sack"). The
+# first draft left it out to dodge golem_crafting's stale fur-pouch-estimate failure -- that
+# reasoning was wrong here, and the reference plugin had the feature all along
+# (MahoganyHomesPlugin.countPlankSackVarb, missed by the original port alongside npcUpstairs).
+# The sack's contents are a real VARBIT read fresh from the client, never a local estimate, so
+# the drift that broke the fur pouch cannot happen. It adds 28 planks of capacity on top of the
+# inventory, and the game spends them straight from the sack -- no Empty step. See
+# PLANK_SACK_VARBITS and _load_plank_sack.
+#
+# It costs ONE inventory slot, which the budget below already had spare.
 #
 # SLOT BUDGET (28 inventory slots). The original comment here assumed 3 slots for the 3 tablet
 # types; teleport TABLETS DO NOT STACK, so 8 of each was 24 slots on its own and the loadout
@@ -191,11 +387,45 @@ def tier_number(name: str) -> int:
     return {"beginner": 1, "novice": 2, "adept": 3, "expert": 4}.get((name or "").lower(), 0)
 
 
-def pick_next_hotspot(hotspots: list):
-    for hotspot in hotspots:
-        if hotspot.get("needsAttention"):
-            return hotspot
-    return None
+def pick_next_hotspot(hotspots: list, reach: set | None = None, plane: int | None = None):
+    """The next hotspot to work, preferring one we can actually REACH.
+
+    MEASURED live 2026-08-29 upstairs at JEFF's: of three hotspots needing attention, 39994
+    (3242,3446) was walled off while 39995 and 39996 were both reachable -- and there was no shut
+    door anywhere in range, so no amount of door logic could help. Taking them in bare list order
+    fixated on the one unreachable hotspot, walked at it, and wedged the obstacle-blind greedy
+    walker, while reachable work sat two tiles away. Order within each group is preserved, so
+    behaviour is unchanged whenever everything is reachable (the normal case).
+
+    `reach` is a set of walkable (x, y) from travel.reachable_set. None -- or an empty set, which
+    is what the client returns when it cannot tell -- falls back to plain list order."""
+    pending = [h for h in hotspots if h.get("needsAttention")]
+    if not pending:
+        return None
+    if not reach:
+        return pending[0]
+
+    def _rank(hotspot) -> int:
+        """0 = reachable right now, 1 = another floor, 2 = this floor but walled off.
+
+        The gap between 0 and 1 is what stops the routine ping-ponging. USER 2026-08-29: "why do
+        we click the door inbetween each remove / build" -- with cross-floor ranked the same as
+        reachable, it alternated between working a ground-floor hotspot and attempting the
+        upstairs one, and every attempt re-opened the self-closing door at ROSS's on the way to a
+        ladder it could not reach. Finish this floor, THEN climb once.
+
+        2 sorts last but is still returned when nothing better exists, so a walled-off contract
+        falls through to the door/walk recovery rather than reporting "no work left" and turning
+        in an unfinished contract."""
+        loc = hotspot.get("location")
+        if not loc or loc.get("x") is None:
+            return 0             # unknown -- do not deprioritise on a guess
+        answer = travel.can_reach(loc, reach, plane=plane)
+        if answer is True:
+            return 0
+        return 1 if answer is None else 2
+
+    return min(pending, key=_rank)
 
 
 def find_object_by_id(objects: list, object_id: int):
@@ -238,7 +468,7 @@ def needs_bank_trip(ctx, config: dict, state: dict) -> bool:
     inventory = controller.get_inventory()
     plank_name = config.get("plankName", "Teak plank")
 
-    if deficit(count_item(inventory, plank_name), restock.get("minPlanks", 0)) > 0:
+    if deficit(planks_available(inventory, plank_name), restock.get("minPlanks", 0)) > 0:
         return True
     if deficit(count_item(inventory, "Steel bar"), restock.get("minSteelBars", 0)) > 0:
         return True
@@ -287,6 +517,19 @@ def bank_phase(ctx, config: dict, state: dict) -> None:
         controller.human_delay(2.5, 3.2)
         return
 
+    # Walk into range before clicking. banker.open_bank has its own approach step, but it
+    # minimap-hops, and a minimap hop cannot open a closed door -- which is the usual thing
+    # between this routine and the bank, because it banks from INSIDE the contract house.
+    # travel.walk_to is the only walker carrying the stall-triggered door recovery.
+    # min_path_tiles=0 forces a computed route: a bank a room away is under SHORT_HOP_TILES, so
+    # otherwise this would be the obstacle-blind greedy walker starting from indoors.
+    if bank_obj.get("distance", 0) > banker.BANK_APPROACH_TILES:
+        debug_log.log("mahogany_homes",
+                      f"bank is {bank_obj.get('distance')} tiles away -- walking to it")
+        travel.walk_to(ctx, {"x": bank_obj.get("x"), "y": bank_obj.get("y"),
+                             "plane": bank_obj.get("plane", 0)}, min_path_tiles=0)
+        bank_obj = banker.find_nearby_bank(bank_config) or bank_obj
+
     if not banker.open_bank(ctx, bank_obj):
         ctx.state.trigger_safety_stop("failed to open the bank for Mahogany Homes restocking")
         return
@@ -305,8 +548,15 @@ def bank_phase(ctx, config: dict, state: dict) -> None:
     keep = list(KEEP_ITEMS) + [plank_name] + list(restock.get("runeTargets", {}))
     banker.deposit_inventory(ctx, {"keepItems": keep, "skipContainerDeposit": True})
 
-    _withdraw_up_to(ctx, plank_name, restock.get("targetPlanks", 0))
     _withdraw_up_to(ctx, "Steel bar", restock.get("targetSteelBars", 0))
+    # Bank still OPEN here on purpose -- Fill is only offered on the sack while a bank interface
+    # is up (see banker.fill_plank_sack). With a sack, _load_plank_sack does the plank withdrawal
+    # itself in whole-inventory shift-clicks and ends with the inventory topped back up, so
+    # running the per-unit _withdraw_up_to first would just be ten wasted clicks.
+    if banker.has_plank_sack():
+        _load_plank_sack(ctx, plank_name)
+    else:
+        _withdraw_up_to(ctx, plank_name, restock.get("targetPlanks", 0))
     for tablet_name, target in restock.get("tabletTargets", {}).items():
         _withdraw_up_to(ctx, tablet_name, target)
     _withdraw_runes(ctx, restock)
@@ -369,6 +619,21 @@ def _withdraw_runes(ctx, restock: dict) -> None:
 
 def request_contract_phase(ctx, config: dict, state: dict) -> None:
     if state.get("hasContract"):
+        ctx.state.data["mh_contact_casts"] = 0
+        return
+
+    # A cast that lands but registers no contract must be bounded. LIVE RUN 2026-08-28: the
+    # provider only learned the active contract from a GAMEMESSAGE, while the line that recovers
+    # an in-progress contract after a client restart is a DIALOG -- so hasContract stayed false
+    # and this re-cast NPC Contact once per tick for a contract we already held. That provider
+    # bug is fixed; this is the loop it exposed, and the same reasoning as TELEPORT_MAX_ATTEMPTS:
+    # anything that spends a resource on repeat needs a ceiling, not just a cooldown.
+    casts = ctx.state.data.get("mh_contact_casts", 0)
+    if casts >= CONTACT_MAX_CASTS:
+        ctx.state.trigger_safety_stop(
+            f"Mahogany Homes: cast NPC Contact {casts} times and no contract ever registered "
+            f"-- the bridge is not seeing the assignment/reminder chat line"
+        )
         return
 
     last_cast = ctx.state.data.get("mh_contact_cast_at", 0.0)
@@ -397,6 +662,7 @@ def request_contract_phase(ctx, config: dict, state: dict) -> None:
     debug_log.log("mahogany_homes", "casting NPC Contact for a new contract")
     controller.click_entity(ctx.ser, widget, offset=(0, 0), check_ui_blockers=False)
     ctx.state.data["mh_contact_cast_at"] = time.time()
+    ctx.state.data["mh_contact_casts"] = casts + 1
 
 
 def travel_phase(ctx, config: dict, state: dict) -> None:
@@ -404,6 +670,7 @@ def travel_phase(ctx, config: dict, state: dict) -> None:
     if ctx.state.data.get("mh_last_home") != home_name:
         ctx.state.data["mh_last_home"] = home_name
         ctx.state.data["mh_teleported_this_contract"] = False
+        ctx.state.data["mh_teleport_attempts"] = 0
 
     target = state.get("standingLocation") or {}
     player = controller.get_player()
@@ -413,6 +680,22 @@ def travel_phase(ctx, config: dict, state: dict) -> None:
             ctx.state.trigger_safety_stop(f"unrecognized Mahogany Homes home {home_name!r}")
             return
         teleport_name, menu_option = entry
+
+        attempts = ctx.state.data.get("mh_teleport_attempts", 0)
+        if attempts >= TELEPORT_MAX_ATTEMPTS:
+            ctx.state.trigger_safety_stop(
+                f"{teleport_name} did not move us on {attempts} attempts toward {home_name} "
+                f"-- stopping rather than breaking the whole stack or walking cross-country"
+            )
+            return
+        ctx.state.data["mh_teleport_attempts"] = attempts + 1
+
+        # request_contract_phase leaves the MAGIC tab open (F6, for NPC Contact), and an
+        # inventory item is not on screen while it is -- LIVE RUN 2026-08-28: the talisman
+        # right-click opened an empty menu (['Cancel']) because it landed on the spellbook.
+        # open_inventory_tab confirms the switch against /state rather than firing a key and
+        # hoping.
+        controller.open_inventory_tab(ctx.ser)
 
         item = next(
             (i for i in controller.get_inventory() if teleport_name in (i.get("name") or "").lower()),
@@ -425,15 +708,28 @@ def travel_phase(ctx, config: dict, state: dict) -> None:
 
         if menu_option is None:
             debug_log.log("mahogany_homes", f"breaking {teleport_name} toward {home_name}")
-            controller.click_entity(ctx.ser, item, check_ui_blockers=False)
+            clicked = controller.click_entity(ctx.ser, item, check_ui_blockers=False)
         else:
             # The item's left-click default is NOT the destination we want (Xeric's talisman),
             # so pick the option by name off the right-click menu instead.
             debug_log.log("mahogany_homes",
                           f"{teleport_name} -> {menu_option} toward {home_name}")
-            controller.click_menu_action(ctx.ser, item, menu_option, check_ui_blockers=False)
-        controller.human_delay(2.5, 3.2)
-        ctx.state.data["mh_teleported_this_contract"] = True
+            clicked = controller.click_menu_action(ctx.ser, item, menu_option,
+                                                   check_ui_blockers=False)
+
+        # Latch on having actually MOVED, never on the click returning true. LIVE RUN 2026-08-28:
+        # this was set unconditionally one line after a click that had plainly failed, so
+        # travel_phase believed it had teleported and fell through to walking -- a 715-tile route
+        # from Ardougne to Hosidius, on foot, which had to be stopped by hand. A click can also be
+        # accepted and still not teleport (out of charges, a dialogue eating it), so the click's
+        # own return value is not sufficient evidence either.
+        moved = _await_teleport(player)
+        if clicked and moved:
+            ctx.state.data["mh_teleported_this_contract"] = True
+        else:
+            debug_log.log("mahogany_homes",
+                          f"{teleport_name} didn't take us anywhere -- retrying rather than "
+                          f"walking to {home_name}")
         return
 
     if not travel.walk_to(ctx, target):
@@ -443,14 +739,48 @@ def travel_phase(ctx, config: dict, state: dict) -> None:
     ctx.state.data["mh_phase"] = "work"
 
 
+def _await_teleport(before: dict) -> bool:
+    """Poll until the player is TELEPORT_MIN_DISPLACEMENT tiles from `before`, or give up.
+
+    Polled rather than slept because the two failure directions are wildly asymmetric: waiting
+    too long costs a couple of idle seconds, while reading too early costs a TABLET and starts a
+    retry loop (see TELEPORT_CONFIRM_TIMEOUT_S -- that is exactly what live run 5 did)."""
+    deadline = time.time() + TELEPORT_CONFIRM_TIMEOUT_S
+    while True:
+        if _chebyshev(controller.get_player(), before) > TELEPORT_MIN_DISPLACEMENT:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(TELEPORT_CONFIRM_POLL_S)
+
+
 def _chebyshev(a: dict, b: dict) -> int:
     return max(abs(a.get("x", 0) - b.get("x", 0)), abs(a.get("y", 0) - b.get("y", 0)))
 
 
 def work_phase(ctx, config: dict, state: dict) -> None:
     hotspots = state.get("hotspots") or []
-    target = pick_next_hotspot(hotspots)
+
+    # One flood fill per tick, shared by the choice of hotspot and the reachability gate below.
+    # Empty when the client cannot tell, which both consumers read as "don't know".
+    player = controller.get_player() or {}
+    player_plane = player.get("plane") or 0
+    reach = (travel.reachable_set(player["x"], player["y"], player_plane)
+             if player.get("x") is not None else set())
+
+    target = pick_next_hotspot(hotspots, reach, player_plane)
     if target is None:
+        # "Nothing needs attention" only means the contract is DONE if we are standing in the
+        # house we just worked. CONFIRMED live 2026-08-29: from (1739,3549), outside Barbara's
+        # area, every hotspot varbit read 0 with needsAttention false -- the varbits carry the
+        # contract's state only while the house is loaded -- and this read it as a finished
+        # contract and went to turn_in, trying to claim a reward for work it had not done.
+        if not _at_the_home(state):
+            debug_log.log("mahogany_homes",
+                          f"no hotspot data for {state.get('homeName')} from out here -- "
+                          f"going to the house before deciding anything")
+            ctx.state.data["mh_phase"] = "travel"
+            return
         ctx.state.data["mh_phase"] = "turn_in"
         return
 
@@ -465,7 +795,11 @@ def work_phase(ctx, config: dict, state: dict) -> None:
         ctx.state.data["mh_phase"] = "bank"
         return
 
-    objects = controller.get_objects()
+    # Bounded scan. MEASURED 2026-08-29: an unbounded /objects walks the WHOLE scene -- 9266
+    # objects, 124ms of client-thread work -- and this runs every tick, which the user felt as
+    # lag spikes while the cursor was in flight. A hotspot is inside the contract house and
+    # HOME_ARRIVAL_TILES away at most, so the whole-scene walk was never buying anything here.
+    objects = controller.get_objects(radius=OBJECT_SCAN_RADIUS)
     obj = find_object_by_id(objects, target["objectId"])
     if obj is None:
         _approach_missing_hotspot(ctx, config, state, target)
@@ -475,10 +809,175 @@ def work_phase(ctx, config: dict, state: dict) -> None:
     # after the click, so a stuck streak clears the moment we are actually in position.
     ctx.state.data["mh_work_stuck"] = 0
 
-    last_click = ctx.state.data.get("mh_last_hotspot_click", 0.0)
-    if time.time() - last_click < HOTSPOT_CLICK_COOLDOWN_S:
+    # Count clicks that achieve nothing. A successful action always moves the hotspot's varbit, so
+    # the (objectId, value) pair changing IS progress and clears the count; a pair that stays put
+    # across several clicks means the object is visible but not actually reachable from here.
+    # /objects reports the whole scene on our own plane, so on a split upper floor (NOELLA) the
+    # far half's hotspots are fully visible from the near half -- see SPLIT_UPPER_FLOOR_HOMES.
+    signature = (target["objectId"], target.get("value"))
+    if ctx.state.data.get("mh_hotspot_signature") != signature:
+        ctx.state.data["mh_hotspot_signature"] = signature
+        ctx.state.data["mh_hotspot_clicks"] = 0
+
+    # The DOOR comes first, before the first click at this hotspot. USER 2026-08-29: "why when we
+    # come to the house do we not prioritise opening the god danm door, should be the first thing
+    # we click if its closed". travel.walk_to already resolves doors before stepping off, but
+    # work_phase does not necessarily walk at all: /objects returns the whole scene on our plane,
+    # so a hotspot behind a shut front door is plainly VISIBLE and was clicked straight away --
+    # the door only got resolved via the unreachable branch below, five wasted clicks and ~6s
+    # later. MEASURED live 2026-08-29 at MARIAH's: exactly that, twice in one contract.
+    # Runs once per hotspot state (the same signature latch), and costs nothing when the way is
+    # already clear -- the edge test returns None without asking for a route unless a shut door
+    # actually lies near the line we would travel.
+    # REACHABILITY IS DECIDED BEFORE THE FIRST CLICK, not discovered by failing five of them.
+    # /objects returns the whole scene on our plane, so a hotspot behind a wall or a shut door is
+    # plainly visible and used to be clicked from wherever we stood; only after
+    # HOTSPOT_UNREACHABLE_CLICKS failures (~20s) did anything try the door. MEASURED over one full
+    # ROSS contract 2026-08-29: 15 of 27 hotspot clicks -- 56% -- achieved nothing, across three
+    # separate stuck events. USER: "every time we have to walk through a door now we have to get
+    # stuck on the outside 5 clicks in a row this is unacceptable."
+    #
+    # travel.can_reach flood-fills the client's own collision grid, so the answer is known up
+    # front and on ANY plane (Shortest Path returns nothing upstairs). It returns None when the
+    # client cannot tell, and that is deliberately treated as "carry on and click" -- an older
+    # build behaves exactly as it did before rather than refusing to work at all.
+    hotspot_at = target.get("location")
+    # NOTE: there is deliberately NO "but we are standing right next to it, just click" override
+    # here any more. It was added after a walk-in-place loop at JEFF's and it is what produced the
+    # opposite failure at ROSS's: the player stood at (2617,3319) with the hotspot at (2617,3318),
+    # Chebyshev distance 1 -- and the exterior wall runs exactly along that edge, so "adjacent"
+    # meant "clicking through a wall". Raw tile distance cannot tell those two cases apart;
+    # travel.can_reach now asks whether the EDGE is open, which separates them correctly and
+    # answers both live cases right.
+    if hotspot_at and travel.can_reach(hotspot_at, reach, plane=player_plane) is False:
+        # Not reachable: the door on the FRONTIER of where we can walk is the way out, whether it
+        # lies straight ahead or behind us. Then walk -- and do not spend a click this tick.
+        if not travel.open_frontier_door(ctx, hotspot_at):
+            travel.open_doorway_to(ctx, hotspot_at)
+        travel.walk_to(ctx, _same_floor_walk_goal(state, target, hotspot_at),
+                       min_path_tiles=0, tolerance=HOUSE_ARRIVAL_TOLERANCE)
         return
 
+    if ctx.state.data.get("mh_door_checked") != signature:
+        ctx.state.data["mh_door_checked"] = signature
+        if hotspot_at:
+            travel.open_doorway_to(ctx, hotspot_at)
+
+    if ctx.state.data.get("mh_hotspot_clicks", 0) >= HOTSPOT_UNREACHABLE_CLICKS:
+        split_floor = state.get("homeName") in SPLIT_UPPER_FLOOR_HOMES
+        player_plane = (controller.get_player() or {}).get("plane") or 0
+        upstairs = player_plane > 0
+
+        if split_floor and upstairs:
+            last_climb = ctx.state.data.get("mh_last_ladder_click", 0.0)
+            if time.time() - last_climb < LADDER_CLICK_COOLDOWN_S:
+                return
+            ladder = _pick_ladder(state, None)     # nearest to US -- we want off this floor
+            if ladder is not None:
+                ctx.state.data["mh_hotspot_clicks"] = 0
+                ctx.state.data["mh_hotspot_signature"] = None
+                _climb(ctx, ladder, "Climb-down",
+                       f"hotspot {target['objectId']} is visible but unreachable after "
+                       f"{HOTSPOT_UNREACHABLE_CLICKS} clicks -- climbing down to take "
+                       f"{state.get('homeName')}'s other staircase",
+                       from_plane=(controller.get_player() or {}).get("plane"))
+                return
+
+        # Not a split-floor problem: we are simply not able to reach the thing we can see --
+        # standing outside the house is the ordinary case. WALK, because walking is the only
+        # thing that runs travel.py's door recovery, and a shut front door is exactly what puts
+        # a visible hotspot out of reach. LIVE 2026-08-28: without this the routine clicked a
+        # Table two tiles away through a wall, every 3s, indefinitely -- and mh_work_stuck could
+        # never catch it, because seeing the object is what resets that counter.
+        ctx.state.data["mh_hotspot_clicks"] = 0
+        ctx.state.data["mh_hotspot_signature"] = None
+        debug_log.log("mahogany_homes",
+                      f"hotspot {target['objectId']} visible but unreachable after "
+                      f"{HOTSPOT_UNREACHABLE_CLICKS} clicks -- walking to it "
+                      f"in {state.get('homeName')}'s house (resolves a shut door first)")
+        # Head for the HOTSPOT, not the house's standing tile. MEASURED live 2026-08-29 at
+        # NORMAN's: standingLocation (3038,3344) sits on the SAME side of the shut door 24050
+        # (3037,3347, blocking the 3346|3347 crossing) as the player, so a walk there crosses no
+        # doorway at all -- the door recovery correctly finds nothing between us and that tile,
+        # and we end up standing outside exactly as before. The hotspot is what we actually need
+        # to reach, and using it as the goal is what makes the doorway between us and it visible
+        # to the walker (which now resolves doors BEFORE stepping off -- see travel.walk_to).
+        # Falls back to the standing tile when `location` is absent (object outside the loaded
+        # scene, or an un-rebuilt client), rather than walking nowhere.
+        # Two DIFFERENT tiles, for two different questions. MEASURED live 2026-08-29 at
+        # Barbara's: the hotspot's own tile (1749,3536) holds furniture, so Shortest Path returns
+        # no route to it whatsoever (0 steps on 5 of 5 calls) and walk_to falls through to the
+        # obstacle-blind greedy walker, which wedges -- that is what made the previous attempt
+        # loop click-click-walk forever. The standing tile routes in 6 steps, but it sits on the
+        # SAME side of the door as we do, so a walk there never reveals the doorway.
+        # So: resolve the door against the hotspot we cannot reach, then walk to the tile we can.
+        hotspot_at = target.get("location")
+        if hotspot_at:
+            # Strict first: the edge test proves a door is between us and the hotspot.
+            # If it finds nothing, fall back to opening the nearest shut door anyway -- we have
+            # ALREADY proven we cannot reach this hotspot, so "no door is provably in the way" is
+            # not an answer we can act on. MEASURED live 2026-08-29 outside ROSS's house: player
+            # on the grass at (2614,3319), Broken Range inside at (2617,3318), and the only way in
+            # a door at (2610,3316) that is a DETOUR WEST -- both of us east of its blocked edge,
+            # so the single-axis test says "not between us", correctly and uselessly. The route
+            # branch that normally catches a detour returned no route at that moment. USER: "got
+            # stuck outside without opening door again". Scoped to this stuck path on purpose: the
+            # same looseness in the ordinary pre-walk check was tried before and reverted as a
+            # false positive.
+            # Three tiers, precise first, and the LAST one is a genuine last resort. USER
+            # 2026-08-29: "we cannot use the cannot reach fallback for regular usage, this has to
+            # be last resort fallback" -- in run28 the blunt tier was doing all the work, firing
+            # three or four times per contract, because nothing above it could see a detour door.
+            #   1. open_frontier_door -- names the exact door on the boundary of the region we
+            #      are stuck in, from the collision flood fill. Handles detours, any plane.
+            #   2. open_doorway_to    -- the straight-line edge test.
+            #   3. open_nearest_shut_door -- opens something and hopes. Only reached when the two
+            #      above found nothing at all, which with the frontier test in place should be
+            #      close to never.
+            if not travel.open_frontier_door(ctx, hotspot_at):
+                if not travel.open_doorway_to(ctx, hotspot_at):
+                    travel.open_nearest_shut_door(ctx, hotspot_at)
+
+        # Normally the STANDING tile: the hotspot's own tile is usually furniture and unroutable
+        # (Barbara's, above), so it is the tile we can actually walk to. The ONE exception is
+        # being on a different floor from it -- `standingLocation` is always reported at plane 0,
+        # so from upstairs that is a cross-plane request, and Shortest Path answers it with a
+        # **Climb-down Ladder TRANSPORT** that carries us DOWN and away from the work. MEASURED
+        # live 2026-08-29 at JESS's, where all seven hotspots are on plane 1: "following a
+        # 14-tile route" -> "using transport: Climb-down Ladder" -> "used the transport but
+        # didn't arrive where expected" -> "target is on a different plane -- can't walk there
+        # yet", then the whole cycle again, ~90s a pass. Only then is the hotspot the better
+        # goal, and only if it is on OUR floor. Deliberately narrow: widening this to every
+        # same-plane case regresses the Barbara's/NORMAN's behaviour the standing tile exists for.
+        walk_goal = state.get("standingLocation") or {}
+        if (walk_goal.get("plane") is not None and walk_goal.get("plane") != player_plane
+                and hotspot_at and hotspot_at.get("plane") == player_plane):
+            walk_goal = hotspot_at
+        travel.walk_to(ctx, walk_goal, min_path_tiles=0, tolerance=HOUSE_ARRIVAL_TOLERANCE)
+        return
+
+    last_click = ctx.state.data.get("mh_last_hotspot_click", 0.0)
+    cooldown = ctx.state.data.get("mh_hotspot_cooldown", HOTSPOT_CLICK_COOLDOWN_S)
+    if time.time() - last_click < cooldown:
+        return
+
+    # How long to wait before the NEXT click depends on what this one is, not on an average of
+    # both -- see HOTSPOT_CLICK_COOLDOWN_S. A build target is named "<thing> space".
+    #
+    # ...and on how far we have to WALK to it. The game queues the interaction and performs it on
+    # ARRIVAL (the same fact golem_crafting's carve notes record: "the side carved is the tile you
+    # walked TO"), so until the player gets there the action has not started and the varbit cannot
+    # move. Without this the cooldown expired mid-walk, we re-clicked -- re-queueing, sometimes
+    # re-pathing -- and every one of those clicks counted as "no progress", so
+    # HOTSPOT_UNREACHABLE_CLICKS fired on a hotspot that was perfectly reachable and work_phase
+    # walked away from it. MEASURED live 2026-08-29 at ROSS's: five `Repair Broken Range` actions
+    # all registering correctly in the recorder against the right object, no varbit movement, then
+    # the unreachable branch. Capped so a hotspot that truly cannot be reached still gives up.
+    base = HOTSPOT_CLICK_COOLDOWN_S if _is_instant_action(obj) else HOTSPOT_BUILD_COOLDOWN_S
+    ctx.state.data["mh_hotspot_cooldown"] = min(
+        base + (obj.get("distance") or 0) * HOTSPOT_WALK_ALLOWANCE_S,
+        HOTSPOT_COOLDOWN_MAX_S,
+    )
     debug_log.log("mahogany_homes", f"working hotspot {target['objectId']} (varb {target['varb']})")
     controller.click_entity(
         ctx.ser, obj,
@@ -486,6 +985,7 @@ def work_phase(ctx, config: dict, state: dict) -> None:
         refresh_legs=2,
     )
     ctx.state.data["mh_last_hotspot_click"] = time.time()
+    ctx.state.data["mh_hotspot_clicks"] = ctx.state.data.get("mh_hotspot_clicks", 0) + 1
 
 
 def _can_afford(inventory: list, plank_name: str, state: dict, target: dict) -> bool:
@@ -502,7 +1002,7 @@ def _can_afford(inventory: list, plank_name: str, state: dict, target: dict) -> 
     quantity = target.get("quantity")
     if quantity is None:
         required = state.get("requiredMaterials") or {}
-        have_planks = count_item(inventory, plank_name)
+        have_planks = planks_available(inventory, plank_name)
         have_bars = count_item(inventory, "Steel bar")
         if (deficit(have_planks, required.get("planks", 0)) > 0
                 or deficit(have_bars, required.get("steelBars", 0)) > 0):
@@ -516,8 +1016,14 @@ def _can_afford(inventory: list, plank_name: str, state: dict, target: dict) -> 
             return False
         return True
 
-    material_name = "Steel bar" if target.get("material") == "STEEL_BAR" else plank_name
-    have = count_item(inventory, material_name)
+    is_bar = target.get("material") == "STEEL_BAR"
+    material_name = "Steel bar" if is_bar else plank_name
+    # Planks in the SACK count: the game consumes them straight from it, no Empty needed.
+    # CONFIRMED in the recordings -- varbit 18173 ticks down 28->27->25->23 in step with each
+    # hotspot's cost, alongside the hotspot varbit, the build animation and the Construction XP
+    # drop (recordings/2026-08-27_174045_mahogny-homes.log:1648). Counting loose planks only
+    # would send us to the bank with a full sack in hand.
+    have = count_item(inventory, "Steel bar") if is_bar else planks_available(inventory, plank_name)
     if deficit(have, quantity) > 0:
         debug_log.log(
             "mahogany_homes",
@@ -526,6 +1032,88 @@ def _can_afford(inventory: list, plank_name: str, state: dict, target: dict) -> 
         )
         return False
     return True
+
+
+def _pick_ladder(state: dict, near: dict | None):
+    """The home's nearest ladder to `near` (a {"x","y"} dict), or to the player when `near` is
+    None or has no coordinates.
+
+    Choosing by proximity to the HOTSPOT rather than to the player is what makes NOELLA work: its
+    two staircases lead to two disconnected halves of the upper floor, so the nearest ladder to us
+    is a coin flip on whether it reaches the hotspot at all. Every other home has one staircase or
+    none, where the two choices coincide -- so this is strictly better, never different, elsewhere.
+    """
+    ladder_ids = state.get("ladderObjectIds") or []
+    if not ladder_ids:
+        return None
+
+    ladders = [o for o in controller.get_objects(radius=OBJECT_SCAN_RADIUS)
+               if o.get("id") in ladder_ids]
+    if not ladders:
+        return None
+
+    if near and near.get("x") is not None:
+        return min(ladders, key=lambda o: _chebyshev(o, near))
+    return min(ladders, key=lambda o: o.get("distance", float("inf")))
+
+
+def _climb(ctx, ladder, option, why: str, from_plane: int | None = None) -> None:
+    """Click one ladder, respecting the shared climb cooldown. `option` is a single menu option
+    when the direction is known, or a sequence to let the ladder decide."""
+    debug_log.log("mahogany_homes", why)
+
+    # A LADDER WE CANNOT REACH MUST NOT BE CLICKED, for exactly the reason a hotspot must not be:
+    # the game ACCEPTS an interaction it cannot path to and then silently does nothing. MEASURED
+    # live 2026-08-29 at ROSS's: player (2618,3315), ladder 16683 at (2617,3315) -- cardinally
+    # adjacent, but (2618,3315) carries BLOCK_MOVEMENT_WEST (65664), so the shared edge is a wall.
+    # `menu-select Climb-up Ladder` registered three times, the player never changed floor, and
+    # the run safety-stopped. Adjacency is not reachability; the EDGE decides.
+    #
+    # This is the same gate work_phase applies to hotspots. It belongs at EVERY world-object click
+    # site, not one at a time -- that is why this bug kept reappearing somewhere new.
+    here = controller.get_player() or {}
+    if here.get("x") is not None and ladder.get("x") is not None:
+        reach = travel.reachable_set(here["x"], here["y"], here.get("plane") or 0)
+        if travel.can_reach(ladder, reach, plane=here.get("plane") or 0) is False:
+            debug_log.log("mahogany_homes",
+                          f"ladder {ladder.get('id')} at ({ladder.get('x')},{ladder.get('y')}) "
+                          f"is walled off from here -- opening the way instead of clicking it")
+            if not travel.open_frontier_door(ctx, ladder):
+                travel.open_doorway_to(ctx, ladder)
+            travel.walk_to(ctx, ladder, min_path_tiles=0, tolerance=HOUSE_ARRIVAL_TOLERANCE)
+            ctx.state.data["mh_last_ladder_click"] = time.time()
+            return
+
+    # NOTE: no unconditional door resolution here. There used to be one, and once the
+    # reachability gate above existed it became pure harm: with the ladder already reachable it
+    # still ran the straight-line edge test, which false-positives on whatever door happens to
+    # share an axis with us -- at ROSS's that is the front door BEHIND us, so every climb attempt
+    # opened it and stepped outside. USER 2026-08-29: "why do we click the door inbetween each
+    # remove / build" and "still doesnt make much sense since we can reach them so why would we
+    # step out". MEASURED from inside the house: can_reach(ladder) was True and the door was
+    # opened anyway. The gate above is the only place door work belongs -- it runs exactly when
+    # the ladder cannot be reached, and not otherwise.
+
+    # Click the ladder's own reported point -- its clickbox CENTRE. USER 2026-08-29: "revert the
+    # ladder to click center".
+    #
+    # A tile-corner aim was tried the same day and REVERTED, because it broke ladders that were
+    # already working. The two houses differ in a way that matters: at MARIAH's the reported
+    # centroid and the tile centre from /ground/walk were the SAME point ((1249,709) vs
+    # (1249,707)), i.e. the clickbox was effectively the whole tile and the point landed on bare
+    # floorboards. At ROSS's, ladder 16683 reports (1263,316) against a tile centre of
+    # (1360,386) -- ~100px apart, and the centroid is squarely ON the model. So overriding the
+    # centroid unconditionally aimed a good click away from its target, and the corner rotation
+    # then burned the whole stuck budget getting nowhere. Do not reintroduce a blanket override;
+    # if a specific ladder needs a different point, it needs evidence for that ladder.
+    #
+    # offset=(0, 0) is what makes this the CENTRE: click_menu_action's default (-7, +7) nudge is
+    # applied to whatever pixel it is handed, and +7 is DOWNWARD in screen space.
+    controller.click_menu_action(ctx.ser, ladder, option, offset=(0, 0), check_ui_blockers=False)
+    ctx.state.data["mh_last_ladder_click"] = time.time()
+    # The plane we climbed FROM. _approach_missing_hotspot compares it against the live plane to
+    # tell a climb that actually moved us from one that only opened a menu -- see the reset there.
+    ctx.state.data["mh_ladder_click_plane"] = from_plane
 
 
 def _approach_missing_hotspot(ctx, config: dict, state: dict, target: dict) -> None:
@@ -543,6 +1131,25 @@ def _approach_missing_hotspot(ctx, config: dict, state: dict, target: dict) -> N
     scene from well down the street, and climbing one before arriving would just be noise. Only
     once we are standing in the house does an unfound hotspot mean "wrong floor". _chebyshev
     ignores plane on purpose, so being upstairs still reads as "at the house"."""
+    player = controller.get_player()
+
+    # Changing FLOOR is progress, so it clears the not-reachable counter. Without this the count
+    # is really "ticks since the hotspot appeared", and a climb that works still safety-stops:
+    # LIVE 2026-08-29 at MARIAH's, a Climb-down that went through on the third attempt was
+    # followed by the stop firing two ticks later anyway: three attempts at
+    # LADDER_CLICK_COOLDOWN_S apiece had already spent the 15-tick budget, so the climb that
+    # actually worked never got credit for it.
+    # Keyed on the plane actually CHANGING rather than on the menu click being taken, so an
+    # up-then-down loop cannot reset the counter forever and stall the safety stop.
+    # NOT popped on read: a climb takes a tick or two to land, so the tick right after the click
+    # still reports the old plane. LIVE 2026-08-29 the marker was consumed on that tick and the
+    # descent -- which did happen -- went unnoticed, so the stop fired anyway. It is cleared only
+    # once it has actually answered the question.
+    climbed_from = ctx.state.data.get("mh_ladder_click_plane")
+    if climbed_from is not None and player.get("plane") != climbed_from:
+        ctx.state.data["mh_work_stuck"] = 0
+        ctx.state.data["mh_ladder_click_plane"] = None
+
     stuck = ctx.state.data.get("mh_work_stuck", 0) + 1
     ctx.state.data["mh_work_stuck"] = stuck
     if stuck >= STUCK_TICK_LIMIT:
@@ -554,30 +1161,43 @@ def _approach_missing_hotspot(ctx, config: dict, state: dict, target: dict) -> N
         return
 
     standing = state.get("standingLocation") or {}
-    at_the_house = _chebyshev(controller.get_player(), standing) <= HOME_ARRIVAL_TILES
+    at_the_house = _chebyshev(player, standing) <= HOME_ARRIVAL_TILES
+
+    # Which FLOOR the hotspot is on, when the bridge could find the object in the scene (it scans
+    # every plane, unlike /objects -- see MahoganyHomesProvider.locateHotspotObjects). None means
+    # either an un-rebuilt client or an object outside render distance; both fall back to the old
+    # "offer both directions and take whichever the ladder gives" guess.
+    target_plane = target.get("plane")
+    player_plane = player.get("plane")
+    same_floor = (target_plane is not None and player_plane is not None
+                  and target_plane == player_plane)
 
     ladder = None
-    if at_the_house:
-        ladder_ids = state.get("ladderObjectIds") or []
-        if ladder_ids:
-            ladder = min(
-                (o for o in controller.get_objects() if o.get("id") in ladder_ids),
-                key=lambda o: o.get("distance", float("inf")),
-                default=None,
-            )
+    # A hotspot KNOWN to be on this floor is never a ladder problem -- climbing would leave the
+    # floor the work is on and strand us a storey away from a hotspot we could have walked to.
+    # (On a split upper floor that judgement is made in work_phase instead, where the object is
+    # actually visible; this branch only runs when it is not.)
+    if at_the_house and not same_floor:
+        # By proximity to the HOTSPOT, not to us -- see _pick_ladder.
+        ladder = _pick_ladder(state, target.get("location"))
 
     if ladder is not None:
         last_climb = ctx.state.data.get("mh_last_ladder_click", 0.0)
         if time.time() - last_climb < LADDER_CLICK_COOLDOWN_S:
             return
-        debug_log.log(
-            "mahogany_homes",
-            f"hotspot {target['objectId']} not on this floor -- climbing ladder {ladder['id']} "
-            f"({stuck}x since the last worked hotspot)",
-        )
-        controller.click_menu_action(ctx.ser, ladder, ["Climb-up", "Climb-down"],
-                                     check_ui_blockers=False)
-        ctx.state.data["mh_last_ladder_click"] = time.time()
+        # With a known plane the direction is decided, not guessed: a sequence would still work in
+        # a two-storey house, but a three-storey one can be climbed the wrong way and then has to
+        # guess its way back.
+        if target_plane is not None and player_plane is not None:
+            option = "Climb-up" if target_plane > player_plane else "Climb-down"
+            where = f"on plane {target_plane}, we're on {player_plane}"
+        else:
+            option = ["Climb-up", "Climb-down"]
+            where = "on an unknown floor"
+        _climb(ctx, ladder, option,
+               f"hotspot {target['objectId']} {where} -- taking ladder {ladder['id']} "
+               f"({stuck}x since the last worked hotspot)",
+               from_plane=player_plane)
         return
 
     debug_log.log(
@@ -585,13 +1205,73 @@ def _approach_missing_hotspot(ctx, config: dict, state: dict, target: dict) -> N
         f"hotspot object {target['objectId']} not visible yet ({stuck}x, no ladder to try) "
         f"-- walking toward {state.get('homeName')}'s house",
     )
-    travel.walk_to(ctx, standing)
+    travel.walk_to(ctx, standing, tolerance=HOUSE_ARRIVAL_TOLERANCE)
 
 
 def turn_in_phase(ctx, config: dict, state: dict) -> None:
+    # A contract with work left in it is not a contract to claim. LIVE 2026-08-29 at ROSS's: the
+    # phase latched to "turn_in" one tick after a single hotspot was built -- work_phase only
+    # moves here when pick_next_hotspot returns None, so one transient empty read was enough --
+    # and then talked to Ross once every ~3s indefinitely while SIX of his seven hotspots still
+    # reported needsAttention. Nothing re-checked, so it could not recover on its own.
+    # This is the mirror of work_phase's own "no hotspot data from out here" guard, and the two
+    # conditions are mutually exclusive on the same data, so they cannot ping-pong.
+    if _at_the_home(state) and pick_next_hotspot(state.get("hotspots") or []) is not None:
+        debug_log.log("mahogany_homes",
+                      f"{state.get('homeName')} still has hotspots needing attention -- "
+                      f"back to work rather than claiming a reward for it")
+        ctx.state.data["mh_phase"] = "work"
+        return
+
+    # A ceiling, not just a cooldown -- see the teleport/NPC-Contact caps for why anything that
+    # repeats needs one. The counter is per-home, so a normal turn-in (which changes homeName)
+    # always starts fresh.
+    if ctx.state.data.get("mh_turnin_home") != state.get("homeName"):
+        ctx.state.data["mh_turnin_home"] = state.get("homeName")
+        ctx.state.data["mh_turnin_clicks"] = 0
+
+    if ctx.state.data.get("mh_turnin_clicks", 0) >= TURN_IN_MAX_CLICKS:
+        # No trailing "Automation paused..." here -- the engine appends its own, and saying it
+        # twice is what the first version of this message did. The count covers BOTH ways this
+        # phase can spend an attempt (talking, and climbing toward the homeowner), because either
+        # repeating without the contract clearing means the same thing: it is not progressing.
+        ctx.state.trigger_safety_stop(
+            f"Mahogany Homes: {TURN_IN_MAX_CLICKS} attempts to reach and turn in with "
+            f"{state.get('npcName')} at {state.get('homeName')}'s house without the contract "
+            f"clearing"
+        )
+        return
+
     npc_id = state.get("npcId")
     npc = controller.get_npc_nearest(npc_id)
     if npc is None:
+        # WALKING CANNOT CHANGE FLOOR. LIVE 2026-08-29 at ROSS's: with every hotspot built and
+        # the player still upstairs, this walked at `standingLocation` -- which is always plane 0
+        # -- from plane 1, and the walker clicked the identical pixel (1144,724) about thirty
+        # times without the player moving. work_phase's ladder handling could never help: it
+        # lives in _approach_missing_hotspot, and with no hotspots left work_phase does not run.
+        # So the descent has to be owned here too.
+        player = controller.get_player() or {}
+        player_plane = player.get("plane")
+        owner_plane = _homeowner_plane(state)
+
+        if player_plane is not None and player_plane != owner_plane:
+            last_climb = ctx.state.data.get("mh_last_ladder_click", 0.0)
+            if time.time() - last_climb < LADDER_CLICK_COOLDOWN_S:
+                return
+            ladder = _pick_ladder(state, None)     # nearest to US -- we want off this floor
+            if ladder is not None:
+                # Counts against the same ceiling: both paths mean "the turn-in is not
+                # progressing", and an unbounded climb loop is exactly what this phase must not
+                # be able to do.
+                ctx.state.data["mh_turnin_clicks"] = ctx.state.data.get("mh_turnin_clicks", 0) + 1
+                _climb(ctx, ladder,
+                       "Climb-up" if owner_plane > player_plane else "Climb-down",
+                       f"{state.get('npcName')} is on plane {owner_plane}, we're on "
+                       f"{player_plane} -- taking ladder {ladder['id']} to turn in",
+                       from_plane=player_plane)
+                return
+
         debug_log.log("mahogany_homes", f"homeowner npc {npc_id} not visible -- walking to standing tile")
         travel.walk_to(ctx, state.get("standingLocation") or {})
         return
@@ -605,16 +1285,125 @@ def turn_in_phase(ctx, config: dict, state: dict) -> None:
     debug_log.log("mahogany_homes", f"turning in the contract with {state.get('npcName')}")
     controller.click_menu_action(ctx.ser, npc, "Talk-to")
     ctx.state.data["mh_last_turnin_click"] = time.time()
+    ctx.state.data["mh_turnin_clicks"] = ctx.state.data.get("mh_turnin_clicks", 0) + 1
 
 
-def _accept_tea_if_offered(ctx) -> None:
+# Only Remove is instant (user, 2026-08-29: "the remove action is basically instant so we can
+# just reclick after that"; and, correcting an earlier guess of mine, "repair should be similar
+# to build"). Build and Repair both run an animation past the XP drop that swallows clicks.
+INSTANT_HOTSPOT_ACTION = "remove"
+
+
+def _same_floor_walk_goal(state: dict, target: dict, hotspot_at: dict | None) -> dict:
+    """Where to WALK when we cannot reach the hotspot.
+
+    Normally the home's standing tile: a hotspot's own tile is furniture and unroutable, so the
+    standing tile is the one we can actually get to. The exception is being on a different floor
+    from it -- `standingLocation` is always reported at plane 0, so from upstairs that is a
+    cross-plane request and Shortest Path answers it with a Climb-down Ladder TRANSPORT that
+    carries us away from the work (MEASURED at JESS's)."""
+    goal = state.get("standingLocation") or {}
+    player_plane = (controller.get_player() or {}).get("plane") or 0
+    if (goal.get("plane") is not None and goal.get("plane") != player_plane
+            and hotspot_at and hotspot_at.get("plane") == player_plane):
+        return hotspot_at
+    return goal
+
+
+def _homeowner_plane(state: dict) -> int:
+    """Which floor the homeowner is standing on.
+
+    `standingLocation` is always reported at plane 0, so it cannot answer this on its own --
+    `npcUpstairs` is the field that does (true for JESS and NORMAN only, ported from the
+    reference plugin's Home.isNpcUpstairs)."""
+    return 1 if state.get("npcUpstairs") else 0
+
+
+def _at_the_home(state: dict) -> bool:
+    """Are we actually at the contract house, close enough to trust its hotspot varbits?
+
+    Prefers the home's own WorldArea (rebuilt clients report `area`), falling back to distance
+    from standingLocation. Fails OPEN when neither is reported -- an older client build should
+    behave exactly as it did before rather than refusing to ever turn a contract in."""
+    player = controller.get_player()
+    px, py = player.get("x"), player.get("y")
+    if px is None:
+        return True
+
+    area = state.get("area")
+    if area and area.get("x") is not None:
+        return (area["x"] <= px < area["x"] + area.get("width", 0)
+                and area["y"] <= py < area["y"] + area.get("height", 0))
+
+    standing = state.get("standingLocation")
+    if standing and standing.get("x") is not None:
+        return _chebyshev(player, standing) <= HOME_ARRIVAL_TILES
+    return True
+
+
+def _is_instant_action(obj: dict) -> bool:
+    """Can we reclick immediately after acting on this hotspot object?
+
+    Decided from the object's own left-click action (`actions[0]`, impostor-resolved by
+    ObjectProvider) rather than its name, because the name cannot separate Repair from Remove --
+    both act on named furniture like "Hat stand", while only Build acts on a "<thing> space".
+
+    Fails SLOW when the client does not report actions (older build): clicking too early loses
+    the click outright and costs a whole retry, while waiting needlessly costs a moment."""
+    actions = obj.get("actions")
+    if not actions:
+        return False
+    return (actions[0] or "").lower() == INSTANT_HOTSPOT_ACTION
+
+
+def _accept_tea_if_offered(ctx) -> bool:
+    # Scoped to the dialogue OPTION list, and that scoping is load-bearing -- a text match over
+    # the whole widget tree is not merely imprecise here, it DEADLOCKS the routine. LIVE
+    # 2026-08-29 (run18): the chatbox (group 162) keeps "Aaah, nothing like a nice cuppa tea!"
+    # and "You drink the tea, you feel energized!" in its scrollback for the rest of the session
+    # once any tea has been drunk, and those lines carry real screen coordinates, so the
+    # screenX/screenY guard below did not exclude them. Chat history never clears, so this
+    # returned True on EVERY tick and tick() never reached a phase handler at all: three clicks
+    # aimed at a chat line, then SPACE forever, with `dialogOpen` false the whole time.
+    #
+    # A screen position is still part of the match. LIVE 2026-08-29 (earlier): the text match
+    # alone hit a widget carrying "cuppa" with no usable coordinates -- present in the interface
+    # tree but not on screen -- so this announced itself and attempted a click on every tick,
+    # with click_entity's guard refusing it each time.
     option = next(
-        (w for w in controller.get_widgets_dump() if "cuppa" in (w.get("text") or "").lower()),
+        (w for w in controller.get_widgets_dump()
+         if w.get("group") == DIALOG_OPTION_GROUP
+         and "cuppa" in (w.get("text") or "").lower()
+         and w.get("screenX") is not None and w.get("screenY") is not None),
         None,
     )
-    if option is not None:
-        debug_log.log("mahogany_homes", "accepting the offered cup of tea")
-        controller.click_entity(ctx.ser, option, offset=(0, 0), check_ui_blockers=False)
+    if option is None:
+        ctx.state.data["mh_tea_clicks"] = 0
+        return False
+
+    # Bounded and rate-limited. CONFIRMED live 2026-08-29: with neither, this re-clicked the same
+    # option every tick for as long as the dialogue stayed open, and the caller went on to
+    # right-click the homeowner across the screen in the SAME tick -- which could only miss,
+    # because an open dialogue eats the Talk-to menu. The user saw it as clicking back and forth.
+    last = ctx.state.data.get("mh_tea_click_at", 0.0)
+    if time.time() - last < TEA_CLICK_COOLDOWN_S:
+        return True                       # still settling -- but the dialogue IS up, so stop here
+
+    clicks = ctx.state.data.get("mh_tea_clicks", 0)
+    if clicks >= TEA_MAX_CLICKS:
+        # Never spend the whole session on a cuppa. Space is the engine's own way past a
+        # "click here to continue", and costs nothing if this turns out not to be one.
+        debug_log.log("mahogany_homes",
+                      f"tea dialogue still up after {clicks} clicks -- pressing Space instead")
+        controller.key_tap(ctx.ser, "SPACE")
+        ctx.state.data["mh_tea_click_at"] = time.time()
+        return True
+
+    debug_log.log("mahogany_homes", "accepting the offered cup of tea")
+    controller.click_entity(ctx.ser, option, offset=(0, 0), check_ui_blockers=False)
+    ctx.state.data["mh_tea_click_at"] = time.time()
+    ctx.state.data["mh_tea_clicks"] = clicks + 1
+    return True
 
 
 PHASE_HANDLERS = {
@@ -637,9 +1426,22 @@ def tick(ctx) -> None:
     # homeowner's tea offer arrive on the SAME tick: by the time hasContract flips false, tick()
     # has already left the "turn_in" phase, so a call sited inside that phase can never fire for
     # the tick the dialogue is actually up on. Cheap -- no-ops immediately when nothing matches.
-    _accept_tea_if_offered(ctx)
+    # A dialogue on screen blocks every menu, so nothing else this tick can succeed -- and
+    # trying anyway is what produced the corner-to-corner clicking.
+    if _accept_tea_if_offered(ctx):
+        return
 
-    phase = ctx.state.data.get("mh_phase") or "bank"
+    phase = ctx.state.data.get("mh_phase")
+    if phase is None:
+        # Fresh process, or the routine file changed -- ctx.state.data has just been wiped, so
+        # by definition there is no work_phase diversion to preserve here. This used to default
+        # to "bank", and with a contract already in progress nothing below overrode it ("bank"
+        # deliberately does not auto-promote), so EVERY restart mid-contract went banking.
+        # CONFIRMED live 2026-08-28: restarted inside Mariah's house carrying 19 planks and 2
+        # bars, it went straight for the Hosidius bank booth 20 tiles away through a wall.
+        # Derive it from live state instead; the no-contract branch just below re-derives it
+        # again anyway, so this only decides the has-contract case.
+        phase = "bank" if needs_bank_trip(ctx, config, state) else "travel"
 
     if state.get("hasContract") and not _tier_matches(config, state):
         # Should be unreachable live (NPC Contact is configured to request Adept), but an
@@ -667,8 +1469,25 @@ def tick(ctx) -> None:
         # once it has actually restocked.
         phase = "travel"
     elif phase == "work" and needs_bank_trip(ctx, config, state):
-        debug_log.log("mahogany_homes", "running low mid-contract -- banking")
-        phase = "bank"
+        # FINISH THE CONTRACT BEFORE RESTOCKING. USER 2026-08-29: "another big nono was finishing
+        # barbaras house then before handing in the contract go to bank and then back again
+        # wasting a tp ... finish the contract first then bank". MEASURED live that run at
+        # Barbara's: every hotspot was already built, and this still diverted to the Varrock bank
+        # and teleported back before turning in -- a whole round trip plus a tablet, to top up
+        # planks that were not needed yet. Turning in first costs nothing: hasContract then flips
+        # false and the branch above sends us to the bank anyway, from wherever we end up.
+        #
+        # Gated on being AT the home, because the hotspot varbits only carry the contract's state
+        # while the house is loaded -- from out of town every hotspot reads "nothing needs
+        # attention", and without the gate that would suppress every legitimate restock. Same
+        # reasoning as work_phase's own "no hotspot data from out here" guard.
+        if _at_the_home(state) and pick_next_hotspot(state.get("hotspots") or []) is None:
+            debug_log.log("mahogany_homes",
+                          "low on supplies, but this contract is finished -- turning it in "
+                          "before banking")
+        else:
+            debug_log.log("mahogany_homes", "running low mid-contract -- banking")
+            phase = "bank"
 
     ctx.state.data["mh_phase"] = phase
     PHASE_HANDLERS[phase](ctx, config, state)

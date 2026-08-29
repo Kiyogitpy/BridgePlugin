@@ -139,6 +139,17 @@ public class GameStateProvider extends BridgeProvider
 		List<Map<String, Object>> uiBlockers = new ArrayList<>();
 		addBlockerRect(uiBlockers, WidgetInfo.RESIZABLE_VIEWPORT_INVENTORY_CONTAINER);
 		addBlockerRect(uiBlockers, WidgetInfo.RESIZABLE_VIEWPORT_BOTTOM_LINE_INVENTORY_CONTAINER);
+		// The chat tab strip (162.1) -- the row of All/Game/Public/... buttons along the bottom
+		// edge of the viewport. MEASURED live 2026-08-28: banker.open_bank aimed at a Bank booth
+		// whose projected point landed at real canvas (264,646), inside 162.19's 56x23 bounds at
+		// (253,645), and every click resolved to "Switch tab" instead of the bank. In resizable
+		// mode this strip is drawn OVER the 3D viewport, and viewportHeight (668 here) does not
+		// subtract it, so nothing else in the bridge marks those pixels unclickable.
+		// Deliberately just the button row and not the whole chatbox (162.0, 519x165): the strip
+		// is what was measured stealing a click. Whether the message area above it also consumes
+		// world clicks depends on the transparent-chatbox setting and has NOT been measured --
+		// if a target is ever hijacked there, WidgetInfo.CHATBOX_PARENT is the one-line change.
+		addBlockerRect(uiBlockers, WidgetInfo.CHATBOX_BUTTONS);
 		data.put("uiBlockers", uiBlockers);
 
 		// True while a "click here to continue"-style dialogue (NPC/player chat, an

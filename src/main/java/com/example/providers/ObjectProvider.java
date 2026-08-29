@@ -74,7 +74,9 @@ public class ObjectProvider extends BridgeProvider
 		}
 
 		Integer radius = parseIntParam(query.get("radius"));
-		List<Map<String, Object>> objects = computeObjects(radius != null ? radius : OBJECT_AT_DEFAULT_RADIUS);
+		List<Map<String, Object>> objects = computeObjects(
+			radius != null ? radius : OBJECT_AT_DEFAULT_RADIUS,
+			new Target(x, y, plane, id));
 		for (Map<String, Object> obj : objects)
 		{
 			if (id.equals(obj.get("id")) && x.equals(obj.get("x")) && y.equals(obj.get("y"))
@@ -236,12 +238,24 @@ public class ObjectProvider extends BridgeProvider
 
 	private List<Map<String, Object>> computeObjects(Integer radius)
 	{
+		return computeObjects(radius, null);
+	}
+
+	/** See buildObjectData's collision block: hoisted out of the per-object path. Only ever read
+	 *  and written on the client thread, inside one computeObjects call. */
+	private CollisionData[] collisionMapsThisCall;
+
+	private List<Map<String, Object>> computeObjects(Integer radius, Target want)
+	{
 		List<Map<String, Object>> list = new ArrayList<>();
+
+		WorldView collisionView = client.getTopLevelWorldView();
+		collisionMapsThisCall = collisionView != null ? collisionView.getCollisionMaps() : null;
 
 		WorldView topLevel = client.getTopLevelWorldView();
 		if (topLevel != null)
 		{
-			walkWorldViewRecursively(topLevel, true, list, 0, radius);
+			walkWorldViewRecursively(topLevel, true, list, 0, radius, want);
 		}
 
 		return list;
@@ -265,7 +279,7 @@ public class ObjectProvider extends BridgeProvider
 	//      further WorldEntities, each with their own child WorldView), so rather than walking
 	//      only the player's specific view, this recurses through every WorldEntity's view
 	//      starting from the top level, at any depth, catching sub-views nothing else pointed at.
-	private void walkWorldViewRecursively(WorldView view, boolean isTopLevel, List<Map<String, Object>> out, int depth, Integer radius)
+	private void walkWorldViewRecursively(WorldView view, boolean isTopLevel, List<Map<String, Object>> out, int depth, Integer radius, Target want)
 	{
 		if (depth > MAX_WORLD_VIEW_DEPTH)
 		{
@@ -284,7 +298,7 @@ public class ObjectProvider extends BridgeProvider
 				// routine that only ever cares about objects within its own maxDistance/
 				// maxSailDistance anyway. null preserves the old unbounded behavior for callers
 				// that genuinely need the whole scene.
-				walkScene(scene, client.getPlane(), out, radius);
+				walkScene(scene, client.getPlane(), out, radius, want);
 			}
 			else
 			{
@@ -295,7 +309,7 @@ public class ObjectProvider extends BridgeProvider
 				// deck is already far smaller than any reasonable radius.
 				for (int nestedPlane = 0; nestedPlane < Constants.MAX_Z; nestedPlane++)
 				{
-					walkScene(scene, nestedPlane, out, null);
+					walkScene(scene, nestedPlane, out, null, want);
 				}
 			}
 		}
@@ -305,12 +319,12 @@ public class ObjectProvider extends BridgeProvider
 			WorldView childView = entity.getWorldView();
 			if (childView != null)
 			{
-				walkWorldViewRecursively(childView, false, out, depth + 1, radius);
+				walkWorldViewRecursively(childView, false, out, depth + 1, radius, want);
 			}
 		}
 	}
 
-	private void walkScene(Scene scene, int plane, List<Map<String, Object>> out, Integer radius)
+	private void walkScene(Scene scene, int plane, List<Map<String, Object>> out, Integer radius, Target want)
 	{
 		Tile[][][] tiles = scene.getTiles();
 		if (tiles == null || plane < 0 || plane >= tiles.length || tiles[plane] == null)
@@ -360,7 +374,10 @@ public class ObjectProvider extends BridgeProvider
 				{
 					if (obj != null)
 					{
+						if (matchesTarget(want, obj))
+					{
 						out.add(buildObjectData(obj, "GameObject", plane));
+					}
 					}
 				}
 
@@ -370,27 +387,41 @@ public class ObjectProvider extends BridgeProvider
 				WallObject wallObj = tile.getWallObject();
 				if (wallObj != null)
 				{
+					if (matchesTarget(want, wallObj))
+				{
 					out.add(buildObjectData(wallObj, "WallObject", plane));
+				}
 				}
 
 				GroundObject groundObj = tile.getGroundObject();
 				if (groundObj != null)
 				{
+					if (matchesTarget(want, groundObj))
+				{
 					out.add(buildObjectData(groundObj, "GroundObject", plane));
+				}
 				}
 
 				DecorativeObject decorativeObj = tile.getDecorativeObject();
 				if (decorativeObj != null)
 				{
+					if (matchesTarget(want, decorativeObj))
+				{
 					out.add(buildObjectData(decorativeObj, "DecorativeObject", plane));
+				}
 				}
 			}
 		}
 	}
 
-	private Map<String, Object> buildObjectData(TileObject obj, String objectType, int plane)
+	/**
+	 * Real top-level, instance-corrected world position of a scene object. Lifted out of
+	 * buildObjectData 2026-08-28 so the /object/at pre-filter can compare positions WITHOUT
+	 * paying for the rest of that method; one implementation, so the filter and the built
+	 * result can never disagree about where an object is.
+	 */
+	private WorldPoint worldPointOf(TileObject obj)
 	{
-		Map<String, Object> data = new HashMap<>();
 		LocalPoint local = obj.getLocalLocation();
 		// x/y/plane/distance always resolved to real top-level-world coordinates (even for an
 		// object that lives in a boat's own nested WorldView), so every object this endpoint
@@ -409,6 +440,56 @@ public class ObjectProvider extends BridgeProvider
 		{
 			wp = WorldPoint.fromLocalInstance(client, local);
 		}
+		return wp;
+	}
+
+	/**
+	 * What /object/at is looking for. Lets the scene walk reject an object BEFORE paying for
+	 * its composition/impostor lookup and its clickbox convex hull.
+	 *
+	 * MEASURED 2026-08-28 live: /object/at cost 70ms median in a mining area and 193.9ms in a
+	 * Falador house (9205 objects inside the default radius), against the 54ms of firmware
+	 * motion human_move keeps queued -- so every mid-flight re-aim drained the queue and
+	 * visibly froze the cursor. Over one live Mahogany Homes run: 28% of flights froze, 72
+	 * freeze events, 45% of total flight time, worst single freeze 206ms.
+	 * Shrinking the radius is NOT sufficient -- radius 12 still measured 47ms median in that
+	 * scene -- because the cost is per-OBJECT (clickbox hull plus grid sampling in
+	 * RuneLiteUtil.shapeCoords), not per-tile. Filtering first makes it per-tile.
+	 */
+	private static final class Target
+	{
+		private final int x, y, plane, id;
+
+		private Target(int x, int y, int plane, int id)
+		{
+			this.x = x;
+			this.y = y;
+			this.plane = plane;
+			this.id = id;
+		}
+	}
+
+	/** id first: a free field read that rejects essentially everything. */
+	private boolean matchesTarget(Target want, TileObject obj)
+	{
+		if (want == null)
+		{
+			return true;
+		}
+		if (obj.getId() != want.id)
+		{
+			return false;
+		}
+		WorldPoint wp = worldPointOf(obj);
+		return wp != null && wp.getX() == want.x && wp.getY() == want.y
+			&& wp.getPlane() == want.plane;
+	}
+
+	private Map<String, Object> buildObjectData(TileObject obj, String objectType, int plane)
+	{
+		Map<String, Object> data = new HashMap<>();
+		LocalPoint local = obj.getLocalLocation();
+		WorldPoint wp = worldPointOf(obj);
 
 		data.put("id", obj.getId());
 		data.put("objectType", objectType);
@@ -435,6 +516,69 @@ public class ObjectProvider extends BridgeProvider
 		// content-variant ids 54918-54928 the plan's VESSEL_ID_TO_BASE table expects). This field
 		// is the impostor-resolved id (same as "id" for a non-multiloc object) for exactly that use.
 		data.put("impostorId", comp != null ? comp.getId() : obj.getId());
+
+		// ADDED 2026-08-28: the object's menu actions, impostor-resolved (same `comp` the name above
+		// comes from), nulls and blanks dropped, order preserved -- index 0 is the left-click default.
+		// Needed because a CLOSED door and an OPEN one are both WallObjects named "Door" with
+		// per-door ids (Falador's is 24050 closed / 24051 open, Varrock's 11775, Ardougne's 40178),
+		// so neither `name` nor `id` can tell them apart without a hardcoded id table. The action
+		// can: "Open" vs "Close". travel.py's door recovery keys on exactly this.
+		//
+		// Cheap enough for the bulk scan: getActions() is a field read on a composition already
+		// fetched above, and the list is at most 5 short strings -- nothing like the clickbox convex
+		// hull that dominates this method's cost (see the /object/at pre-filter note above).
+		if (comp != null && comp.getActions() != null)
+		{
+			List<String> actions = new ArrayList<>();
+			for (String action : comp.getActions())
+			{
+				if (action != null && !action.isEmpty())
+				{
+					actions.add(action);
+				}
+			}
+			data.put("actions", actions);
+		}
+
+		// ADDED 2026-08-28 (user's suggestion, after the action check alone kept picking the wrong
+		// door): the client's OWN collision entry for this object's tile -- the same data the game
+		// walks the player with. One int carrying BOTH families of CollisionDataFlag bits:
+		// movement (NORTH 2 / EAST 8 / SOUTH 32 / WEST 128 / OBJECT 256 / FULL 2359552) and line
+		// of sight (NORTH 1024 / EAST 4096 / SOUTH 16384 / WEST 65536 / FULL 131072).
+		//
+		// Why it matters for doors: "Open" in the action list says the door CAN be opened, not
+		// that it is currently shut in a way that blocks us -- and neither the name nor the id
+		// distinguishes the two states. The collision entry does, directly and without inference:
+		// a shut door blocks movement (and sight) across its edge, an open one does not. It also
+		// removes the need to GUESS which of several nearby doors is in the way, which is what
+		// travel.py's routeless fallback was getting wrong (CONFIRMED live at Barbara's house,
+		// Hosidius: two shut doors within 4 tiles, both FURTHER from the goal than the player, so
+		// the distance rule rejected both and the walk never recovered).
+		//
+		// Top-level view only -- a nested WorldView (a boat's deck) has its own collision map and
+		// its own scene indices, and mixing them would read a meaningless tile. Absent field means
+		// "could not tell", same contract as `actions`.
+		if (local != null && local.getWorldView() <= WorldView.TOPLEVEL)
+		{
+			// Resolved ONCE per request, not once per object. MEASURED 2026-08-29: /objects walks
+			// ~9200 objects in a Falador house, and doing getTopLevelWorldView() +
+			// getCollisionMaps() inside that loop put two virtual calls per object on the client
+			// thread for a value that cannot change mid-request -- which the user felt as lag
+			// spikes while the cursor was in flight, since routines poll /objects every tick.
+			CollisionData[] maps = collisionMapsThisCall;
+			if (maps != null && plane >= 0 && plane < maps.length && maps[plane] != null)
+			{
+				int[][] flags = maps[plane].getFlags();
+				int sx = local.getSceneX();
+				int sy = local.getSceneY();
+				if (flags != null && sx >= 0 && sx < flags.length
+					&& flags[sx] != null && sy >= 0 && sy < flags[sx].length)
+				{
+					data.put("collisionFlags", flags[sx][sy]);
+				}
+			}
+		}
+
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
 		data.put("plane", wp.getPlane());

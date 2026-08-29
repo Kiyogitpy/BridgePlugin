@@ -779,6 +779,16 @@ def get_minimap_walk_point(x: int, y: int, plane: int):
     return api_get("/minimap/walk", params={"x": x, "y": y, "plane": plane}) or {"onMinimap": False}
 
 
+def get_collision(x: int, y: int, plane: int, radius: int = 6):
+    """The client's own CollisionData for a square of tiles around (x, y) -- see
+    CollisionProvider. Returns a list of {x, y, plane, flags}, empty when the client cannot
+    answer (older build, or the tile is outside the loaded scene). Unlike the per-object
+    `collisionFlags` field this covers ARBITRARY tiles, including empty ones, which is what a
+    walker needs: the doorway or the goal tile usually has no object on our side of it."""
+    data = api_get("/collision", params={"x": x, "y": y, "plane": plane, "radius": radius})
+    return (data or {}).get("tiles", [])
+
+
 def get_ground_walk_point(x: int, y: int, plane: int):
     return api_get("/ground/walk", params={"x": x, "y": y, "plane": plane}) or {"onScreen": False}
 

@@ -67,3 +67,88 @@ def test_switch_bank_tab_gives_up_after_repeated_misses(monkeypatch):
 
     assert not banker.switch_bank_tab(_Ctx(), 8)
     assert len(clicks) == 3
+
+
+# --- open_bank approaches a distant bank instead of clicking at it -------------------
+#
+# CONFIRMED live 2026-08-28 (mahogany_homes run 4, safety-stopped on "failed to open the bank"):
+# find_nearby_bank accepts a booth up to maxBankDistance (40) away, and open_bank then clicked
+# it from wherever it stood. Standing inside Mariah's house in Hosidius, the booth 21 tiles away
+# through a wall still reported onScreen -- projection has no notion of occlusion -- and its
+# projected point landed on the chatbox tab strip at the bottom of the viewport, so all five
+# clicks resolved to "Switch tab" on widget 162.19 instead of the bank. Two things made it a
+# dead loop rather than a slow success: _refresh_bank_object only re-resolves within 15 tiles,
+# so every retry re-aimed at the identical stale pixel; and nothing ever moved the player.
+
+def _bank(distance, on_screen=True, x=1747, y=3598, plane=0):
+    return {"id": 25808, "name": "Bank booth", "distance": distance, "onScreen": on_screen,
+            "visible": True, "x": x, "y": y, "plane": plane, "screenX": 549, "screenY": 1358}
+
+
+def _quiet(monkeypatch):
+    monkeypatch.setattr(controller, "wait_until_player_idle", lambda **kw: True)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [])
+
+
+def test_open_bank_walks_toward_a_bank_that_is_too_far_to_click(monkeypatch):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(banker, "is_open", lambda: False)
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, plane: {"onMinimap": True, "screenX": 70, "screenY": 80})
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicks.append(entity) or True)
+
+    banker.open_bank(_Ctx(), _bank(distance=21), timeout_s=0.5)
+
+    assert clicks, "should have done something"
+    assert all(c.get("onMinimap") for c in clicks), \
+        f"a bank 21 tiles away must be walked to, not clicked at: {clicks}"
+
+
+def test_open_bank_clicks_a_bank_it_is_already_standing_at(monkeypatch):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(banker, "is_open", lambda: False)
+    walked = []
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, plane: walked.append((x, y)) or {"onMinimap": True})
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicks.append(entity) or True)
+
+    banker.open_bank(_Ctx(), _bank(distance=2), timeout_s=0.5)
+
+    assert walked == [], "a bank 2 tiles away needs no approach walk"
+    assert clicks and clicks[0]["id"] == 25808
+
+
+def test_open_bank_still_clicks_a_far_bank_the_minimap_cannot_reach(monkeypatch):
+    # The minimap only reaches ~28 tiles, and a bank beyond it must not deadlock the loop --
+    # fall back to the old behaviour (click it and let the game walk there).
+    _quiet(monkeypatch)
+    monkeypatch.setattr(banker, "is_open", lambda: False)
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, plane: {"onMinimap": False})
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicks.append(entity) or True)
+
+    banker.open_bank(_Ctx(), _bank(distance=35), timeout_s=0.5)
+
+    assert clicks and clicks[0]["id"] == 25808
+
+
+def test_open_bank_does_not_click_an_offscreen_bank_the_minimap_cannot_reach(monkeypatch):
+    # Unchanged pre-existing behaviour: an off-screen aim point is outside the RuneLite window,
+    # so clicking it is refused anyway -- spending the timeout is better than a guaranteed miss.
+    _quiet(monkeypatch)
+    monkeypatch.setattr(banker, "is_open", lambda: False)
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, plane: {"onMinimap": False})
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicks.append(entity) or True)
+
+    banker.open_bank(_Ctx(), _bank(distance=35, on_screen=False), timeout_s=0.5)
+
+    assert clicks == []

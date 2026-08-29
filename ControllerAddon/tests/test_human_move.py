@@ -1109,3 +1109,189 @@ def test_flushed_flight_skips_scale_learning(monkeypatch):
                     get_cursor_pos=fw2.pos, send_line=fw2.send,
                     rng=random.Random(7))
     assert human_move._scale_samples == before + 1, "clean flight failed to learn"
+
+
+def test_a_starved_queue_does_not_break_the_residual_corrections(monkeypatch):
+    """REGRESSION, found live 2026-08-28: clicks landed tens of px past their target and the
+    cursor kept drifting after move() returned.
+
+    Root cause was the interaction of two things that are each harmless alone. refresh_target is
+    a BLOCKING bridge call made inside the emission loop, and the loop only runs
+    HM2_LOOKAHEAD_SEGMENTS * HM2_SEGMENT_MS (54ms) ahead of the firmware -- so a slow response
+    (measured: 189ms on the first /objects call of a process, ~10ms warm) empties the queue and
+    the firmware goes IDLE. queued_ms was a plain sum of segment durations, which does not model
+    that idle, so from then on it under-stated the true finish time, _drain computed a negative
+    remaining and stopped waiting at all, and every residual correction then read a cursor that
+    had not moved yet, saw the same gap, and re-issued the same motion -- six times -- with the
+    whole stack playing out after move() returned.
+
+    MEASURED live over 181 flights: the 37 that starved had a median final error of 7.1px
+    (max 87.1) and 28 exhausted all six corrections; the 144 that never starved had a 1.0px
+    median and never needed more than two.
+
+    The scale mismatch below is load-bearing: with a perfectly calibrated pointer scale the open
+    loop lands dead on target, there is no residual to correct, and the bug cannot show itself.
+    That is why it only ever bit early in a run, while the persisted calibration was still off.
+    """
+    clk, fw = _flush_rig(monkeypatch)
+    # Firmware moves 1px per unit; plan as if it moved 0.889 -- a 12.5% overshoot, matching the
+    # stale 0.64 that had been persisted against this machine's true ~0.74.
+    monkeypatch.setattr(human_move, "_px_per_unit", 0.889)
+    monkeypatch.setattr(human_move, "_scale_samples", 4)
+
+    def slow_refresh():
+        clk.t += 0.190          # the measured cold-bridge stall, longer than the 54ms buffer
+        return (600, 300)       # target never moves
+
+    human_move.move(None, 600, 300,
+                    get_cursor_pos=fw.pos, send_line=fw.send,
+                    refresh_target=slow_refresh, rng=random.Random(1))
+
+    settled_at_return = fw.pos()
+    clk.t += 5.0                # let anything still queued play out
+    x, y = fw.pos()
+    drift = math.hypot(x - settled_at_return[0], y - settled_at_return[1])
+    miss = math.hypot(x - 600, y - 300)
+
+    assert drift <= 2.0, (
+        f"cursor drifted {drift:.1f}px AFTER move() returned -- corrections were stacked into "
+        f"the queue and never waited for, so the click is aimed at a cursor still in flight")
+    assert miss <= settings.HM2_CORRECTION_TOLERANCE_PX + 4, (
+        f"landed {miss:.1f}px off a STATIONARY target after the queue starved")
+
+
+def _straightness(points):
+    """net displacement / path length. A perfectly collinear walk is 1.0; the engine's own
+    curved reaches measure ~0.79 (see test_path_is_less_straight_than_the_old_engine)."""
+    path = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(points, points[1:]))
+    net = math.hypot(points[-1][0] - points[0][0], points[-1][1] - points[0][1])
+    return net / path if path else 1.0
+
+
+def test_a_large_divergence_is_re_flown_as_a_curve_not_a_straight_slide(monkeypatch):
+    """REGRESSION, reported by the user 2026-08-28: dragging the physical mouse away while the
+    cursor was mid-flight produced "a monotone uniform movement back".
+
+    The residual-correction loop is a straight-line, constant-velocity walk -- correct for a few
+    px of pointer-scale residual, and the only thing that runs when the REAL cursor has diverged
+    far from the open-loop plan. A hand on the mouse does that; so does a target whose screen
+    projection jumps with the camera, which is the unattended-bot version of the same thing
+    (MEASURED: flights logged dist=133px against open_err=255px, one dist=31px against 800px).
+
+    Measured on the RECOVERY PHASE ONLY -- everything emitted after the post-path cursor read,
+    which is where the divergence is first observed. Slicing from the drag instead would fold in
+    the main path's own curved segments and pass either way (confirmed: 0.71 both with and
+    without the fix). Isolated properly the two are unambiguous: the old straight walk measures
+    exactly 1.0000, the re-flown reach 0.89.
+    """
+    clk, fw = _flush_rig(monkeypatch)
+    monkeypatch.setattr(human_move, "_px_per_unit", 1.0)
+    emitted, reads = [], []
+    drag = {"off": [0.0, 0.0], "index": None}
+    inner_send = fw.send
+
+    def recording_send(ser, line):
+        if line.startswith("S "):
+            _, dxq, dyq, _dur = line.split()
+            emitted.append((int(dxq) / 100.0, int(dyq) / 100.0))
+            # Yank the cursor sideways partway through the flight -- the drag.
+            if drag["index"] is None and len(emitted) == 12:
+                drag["off"] = [300.0, -200.0]
+                drag["index"] = len(emitted)
+        inner_send(ser, line)
+
+    def dragged_cursor():
+        reads.append(len(emitted))
+        x, y = fw.pos()
+        return (round(x + drag["off"][0]), round(y + drag["off"][1]))
+
+    human_move.move(None, 600, 300,
+                    get_cursor_pos=dragged_cursor, send_line=recording_send,
+                    rng=random.Random(11))
+
+    assert drag["index"] is not None, "drag never fired -- flight was shorter than expected"
+    assert len(reads) >= 2, "no post-path cursor read"
+    recovery, x, y = [(0.0, 0.0)], 0.0, 0.0
+    for dx, dy in emitted[reads[1]:]:          # reads[1] = the read right after _drain
+        x += dx; y += dy
+        recovery.append((x, y))
+    assert len(recovery) > 5, "recovery was too short to characterise"
+
+    straightness = _straightness(recovery)
+    assert straightness < 0.99, (
+        f"recovery path straightness {straightness:.4f} -- the cursor slid back in a straight "
+        f"constant-velocity line instead of being re-flown as a curved human reach")
+
+
+def _ratios_fed_to_the_estimator(monkeypatch, drag, assumed_scale, seed=5):
+    """Run one flight on the fake firmware (which moves exactly 1px per unit, so the TRUE scale
+    is 1.0) and return every px-per-unit ratio the flight offered the estimator.
+
+    Spying on the ratios rather than counting samples is deliberate: a large residual is now
+    re-flown as a fresh curved reach (see HM2_RECURVE_PX), and that recovery flight is clean and
+    legitimately teaches. Counting calls would conflate it with the disturbed flight we care
+    about."""
+    clk, fw = _flush_rig(monkeypatch)
+    monkeypatch.setattr(human_move, "_px_per_unit", assumed_scale)
+    monkeypatch.setattr(human_move, "_scale_samples", 6)
+    ratios = []
+    real_learn = human_move._learn_scale
+
+    def spy(units, actual_px):
+        ratios.append(actual_px / units)
+        return real_learn(units, actual_px)
+
+    monkeypatch.setattr(human_move, "_learn_scale", spy)
+    state = {"n": 0, "off": [0.0, 0.0]}
+    inner_send = fw.send
+
+    def send(ser, line):
+        if line.startswith("S "):
+            state["n"] += 1
+            if drag and state["n"] == 10:
+                state["off"] = list(drag)
+        inner_send(ser, line)
+
+    def cursor():
+        x, y = fw.pos()
+        return (round(x + state["off"][0]), round(y + state["off"][1]))
+
+    human_move.move(None, 600, 300, get_cursor_pos=cursor, send_line=send,
+                    rng=random.Random(seed))
+    return ratios
+
+
+def test_a_disturbed_flight_does_not_teach_the_pointer_scale(monkeypatch):
+    """REGRESSION, measured live 2026-08-28: the persisted pointer scale wandered 0.60-1.77
+    across runs against this machine's true ~0.74, with single flights moving it by up to 0.80.
+    The polluting samples were flights where something other than our own emitted units moved
+    the cursor -- a hand on the mouse, or the pointer clipping a screen edge. `actual_px` then
+    includes displacement we never commanded, so the ratio describes nothing about this machine.
+
+    That matters beyond tidiness: the bad value is PERSISTED to .hm2_calibration.json and loaded
+    by the next session, where it supplies the open-loop residual everything else has to clean up.
+
+    Rejection is on DIRECTION, not size -- see the sibling test for the property that makes size
+    the wrong test.
+    """
+    ratios = _ratios_fed_to_the_estimator(monkeypatch, (300, -200), 1.0)
+    assert ratios, "no sample at all reached the estimator"
+    worst = max(abs(r - 1.0) for r in ratios)
+    assert worst < 0.05, (
+        f"a dragged flight fed the estimator ratios {[round(r, 3) for r in ratios]} against a "
+        f"true scale of 1.0 -- the drag was learned as if it were pointer speed")
+
+
+def test_a_stale_scale_still_teaches_because_its_error_is_collinear(monkeypatch):
+    """The other half of the guard, and the reason it tests direction rather than magnitude.
+
+    A stale pointer scale produces a LARGE open-loop error -- but a perfectly collinear one,
+    because px-per-unit only ever stretches motion along the commanded direction. Those samples
+    are the most informative ones available: rejecting large errors would leave a wrong persisted
+    calibration unable to correct itself, which is the exact failure the guard exists to prevent.
+    """
+    ratios = _ratios_fed_to_the_estimator(monkeypatch, None, 0.74)
+    assert ratios, "a clean flight with a stale scale taught the estimator nothing"
+    worst = max(abs(r - 1.0) for r in ratios)
+    assert worst < 0.05, (
+        f"clean flight offered ratios {[round(r, 3) for r in ratios]}, expected ~1.0")

@@ -3,15 +3,26 @@ package com.example.providers;
 import com.example.bridge.BridgeHttpServer;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
+import net.runelite.api.Constants;
+import net.runelite.api.GameObject;
+import net.runelite.api.Scene;
+import net.runelite.api.Tile;
+import net.runelite.api.TileObject;
+import net.runelite.api.WallObject;
+import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.util.Text;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,6 +50,18 @@ public class MahoganyHomesProvider extends BridgeProvider
 {
 	private static final int FIRST_HOTSPOT_VARBIT = 10554;
 
+	// The NPC dialogue text box, group 231 child 6 -- the reference plugin's own 15138822.
+	private static final int NPC_DIALOG_GROUP = 231;
+	private static final int NPC_DIALOG_CHILD = 6;
+
+	// Ported verbatim from the reference plugin's CONTRACT_PATTERN. This is the ASSIGNMENT as the
+	// homeowner-finder SPEAKS it, which is a different sentence from the "<Tier> Contract: Go see
+	// X" game message, and the only place the home's name appears when a contract is re-stated.
+	private static final Pattern DIALOG_CONTRACT =
+		Pattern.compile("(Please could you g|G)o see (\\w+)[ ,][\\w\\s,-]*[?.] You can get another job once you have furnished \\w+ home\\.", Pattern.CASE_INSENSITIVE);
+
+	private static final char NBSP = ' ';
+
 	private static final Pattern CONTRACT_ASSIGNED =
 		Pattern.compile("(\\w+) Contract: Go see (\\w+)[, .].*", Pattern.CASE_INSENSITIVE);
 
@@ -58,6 +81,12 @@ public class MahoganyHomesProvider extends BridgeProvider
 	private volatile Home currentHome = null;
 	private volatile int contractTier = 0;
 
+	// Diagnostic only, surfaced on GET /mahogany-homes as "lastChat". Added 2026-08-28 after
+	// three wrong hypotheses about why an in-progress contract would not register: it makes the
+	// boundary between "the chat line never reached this provider" and "it reached it and the
+	// pattern rejected it" directly observable, instead of inferrable. One volatile String.
+	private volatile String lastChat = null;
+
 	public MahoganyHomesProvider(Client client, ClientThread clientThread, BridgeHttpServer server, EventBus eventBus)
 	{
 		super(client, clientThread, server);
@@ -74,11 +103,28 @@ public class MahoganyHomesProvider extends BridgeProvider
 	@Subscribe
 	public void onChatMessage(ChatMessage event)
 	{
-		if (event.getType() != ChatMessageType.GAMEMESSAGE)
+		// DIALOG as well as GAMEMESSAGE. CONFIRMED live 2026-08-28 (run 8) against recorder.py's
+		// raw records: the ASSIGNMENT line arrives as a GAMEMESSAGE ("Adept Contract: Go see
+		// Larry, ...") but the REMINDER line -- the one that recovers an in-progress contract
+		// after a client restart -- only ever arrives as
+		//   {"type": "DIALOG", "message": "Amy|You're currently on an Adept Contract. Go see ..."}
+		// so the old GAMEMESSAGE-only filter meant CONTRACT_REMINDER could never match anything.
+		// Symptom: restart mid-contract -> hasContract false -> the routine re-requested the
+		// contract it already had, one NPC Contact cast per tick, forever.
+		//
+		// The reference plugin reads this off the NPC dialogue WIDGET (231.6) on a tick loop
+		// instead; the chat event carries the same text and needs no polling, but it does carry
+		// the speaker as a "<name>|" prefix, and multi-line dialogue as <br> -- hence
+		// sanitizeMultilineText (which turns <br> into a space) rather than a bare removeTags,
+		// which would run "furnished his" and "home." together and fail the pattern.
+		ChatMessageType type = event.getType();
+		if (type != ChatMessageType.GAMEMESSAGE && type != ChatMessageType.DIALOG)
 		{
 			return;
 		}
-		String message = Text.removeTags(event.getMessage());
+		String message = normalizeWhitespace(type == ChatMessageType.DIALOG
+			? stripDialogSpeaker(Text.sanitizeMultilineText(event.getMessage()))
+			: Text.removeTags(event.getMessage()));
 
 		if (isCompletionMessage(message))
 		{
@@ -92,6 +138,9 @@ public class MahoganyHomesProvider extends BridgeProvider
 		{
 			parsed = parseReminder(message);
 		}
+		lastChat = type.name() + " parsed=" + (parsed != null)
+			+ (parsed != null ? " home=" + parsed.homeDisplayName + " tier=" + parsed.tier : "")
+			+ " text=" + message;
 		if (parsed != null)
 		{
 			Home home = Home.byDisplayName(parsed.homeDisplayName);
@@ -101,6 +150,120 @@ public class MahoganyHomesProvider extends BridgeProvider
 				contractTier = parsed.tier;
 			}
 		}
+	}
+
+	/**
+	 * Reads the active contract straight off the NPC dialogue box, exactly as the reference
+	 * plugin does (its checkForAssignmentDialog, called from its own onGameTick).
+	 *
+	 * WHY THIS AND NOT THE CHAT EVENT: the assignment arrives as a GAMEMESSAGE and parses fine,
+	 * but the line that re-states an ALREADY-ACTIVE contract -- the one that recovers state after
+	 * a client restart mid-contract -- never did. Chased through three wrong theories on
+	 * 2026-08-28 (message type, the "<speaker>|" prefix RuneLite puts on a DIALOG message,
+	 * non-breaking spaces) with the routine looping "casting NPC Contact" over a contract it
+	 * already held. The reference plugin never touches chat for this, and it works: the dialogue
+	 * WIDGET carries the full, untruncated, already-assembled text with no speaker prefix and no
+	 * message-type question to get wrong. Read what works rather than reconstructing it.
+	 *
+	 * Both patterns are tried because the box shows either sentence depending on whether the
+	 * contract was just handed out or is being re-stated; only the reminder carries a tier.
+	 */
+	@Subscribe
+	public void onGameTick(GameTick event)
+	{
+		Widget dialog = client.getWidget(NPC_DIALOG_GROUP, NPC_DIALOG_CHILD);
+		if (dialog == null)
+		{
+			return;
+		}
+		String text = normalizeWhitespace(Text.sanitizeMultilineText(dialog.getText()));
+		if (text == null || text.isEmpty())
+		{
+			return;
+		}
+
+		String name = null;
+		int tier = -1;
+		Matcher assigned = DIALOG_CONTRACT.matcher(text);
+		Matcher reminder = CONTRACT_REMINDER.matcher(text);
+		if (assigned.matches())
+		{
+			name = assigned.group(2);
+		}
+		else if (reminder.matches())
+		{
+			tier = tierFromString(reminder.group(1));
+			name = reminder.group(2);
+		}
+		if (name == null)
+		{
+			return;
+		}
+
+		lastChat = "DIALOG_WIDGET home=" + name + " tier=" + tier + " text=" + text;
+		Home home = Home.byDisplayName(name);
+		if (home != null)
+		{
+			currentHome = home;
+			if (tier != -1)
+			{
+				contractTier = tier;
+			}
+		}
+	}
+
+	/**
+	 * Collapses every run of whitespace to a single plain space.
+	 *
+	 * Both patterns here spell out the exact spacing of a sentence, which makes them brittle in
+	 * two ways this game hits. OSRS uses NON-BREAKING SPACE (U+00A0) in its own text -- visible
+	 * in recorder.py's raw capture as the player name "07 Kiyo" -- and Java's \s does NOT
+	 * match U+00A0, so a single one anywhere in the line fails the whole match. And NPC dialogue
+	 * is line-wrapped with <br>, which Text.sanitizeMultilineText turns into a space, doubling up
+	 * wherever the source already had one. Neither changes what the sentence SAYS, so normalise
+	 * rather than trying to enumerate them in the patterns.
+	 */
+	static String normalizeWhitespace(String message)
+	{
+		if (message == null)
+		{
+			return null;
+		}
+		StringBuilder out = new StringBuilder(message.length());
+		boolean pendingSpace = false;
+		for (int i = 0; i < message.length(); i++)
+		{
+			char c = message.charAt(i);
+			// isWhitespace misses U+00A0 by design (it is non-breaking), which is exactly the one
+			// this has to catch -- so test it explicitly alongside.
+			if (Character.isWhitespace(c) || c == NBSP)
+			{
+				pendingSpace = out.length() > 0;
+				continue;
+			}
+			if (pendingSpace)
+			{
+				out.append(' ');
+				pendingSpace = false;
+			}
+			out.append(c);
+		}
+		return out.toString();
+	}
+
+	/**
+	 * Drops the "<speaker>|" prefix RuneLite puts on a DIALOG chat message, leaving just the
+	 * spoken text. Only the FIRST bar is treated as the separator -- a speaker name has no bar
+	 * in it, and anything later belongs to the line itself.
+	 */
+	static String stripDialogSpeaker(String message)
+	{
+		if (message == null)
+		{
+			return null;
+		}
+		int bar = message.indexOf('|');
+		return bar >= 0 ? message.substring(bar + 1) : message;
 	}
 
 	/** Package-private (not private) so MahoganyHomesProviderTest can call it directly. */
@@ -166,6 +329,7 @@ public class MahoganyHomesProvider extends BridgeProvider
 			data.put("homeName", null);
 			data.put("npcName", null);
 			data.put("contractTier", 0);
+			data.put("lastChat", lastChat);
 			return data;
 		}
 
@@ -173,10 +337,19 @@ public class MahoganyHomesProvider extends BridgeProvider
 		data.put("homeName", home.name());
 		data.put("npcName", home.displayName);
 		data.put("contractTier", contractTier);
+		data.put("lastChat", lastChat);
 		data.put("npcId", home.npcId);
 		data.put("standingLocation", pointMap(home.standingLocation));
 		data.put("area", areaMap(home.area));
 		data.put("ladderObjectIds", home.ladders);
+		// PORTED 2026-08-28 from the reference plugin's Home.isNpcUpstairs (it was the one Home
+		// field the original port missed). True for JESS and NORMAN only -- every other home
+		// takes the constructor overload that defaults it to false. Tells turn_in_phase which
+		// FLOOR the homeowner is on, so "the NPC isn't visible" can mean "climb" rather than
+		// "walk further".
+		data.put("npcUpstairs", home.npcUpstairs);
+
+		Map<Integer, Map<String, Object>> located = locateHotspotObjects(home.slotObjectIds);
 
 		List<Map<String, Object>> hotspots = new ArrayList<>();
 		int remaining = 0;
@@ -200,6 +373,15 @@ public class MahoganyHomesProvider extends BridgeProvider
 			// planks short of the total must not stop the 90% of the contract already affordable.
 			slot.put("material", type.material.name());
 			slot.put("quantity", type.count);
+			// Where this hotspot actually IS, scanned across EVERY plane rather than just the
+			// player's own. /objects only ever reports the current plane, so before this the
+			// routine could not tell "the hotspot is upstairs" from "I'm not close enough yet"
+			// and had to guess by climbing whichever direction a ladder offered. Null when the
+			// object isn't in the loaded scene (out of render distance) -- the routine keeps its
+			// existing walk-then-climb fallback for that case.
+			Map<String, Object> at = located.get(home.slotObjectIds[i]);
+			slot.put("location", at);
+			slot.put("plane", at != null ? at.get("plane") : null);
 			hotspots.add(slot);
 
 			if (needsAttention)
@@ -225,6 +407,124 @@ public class MahoganyHomesProvider extends BridgeProvider
 		data.put("requiredMaterials", materials);
 
 		return data;
+	}
+
+	/**
+	 * Every hotspot object id in `wanted`, located anywhere in the currently loaded scene, on ANY
+	 * plane -- as id -> {x, y, plane}.
+	 *
+	 * Scanning all four planes rather than just the player's is the whole point: a house's upper
+	 * floor is present in the scene while you stand downstairs, so this answers "which FLOOR is
+	 * this hotspot on" outright. /objects cannot (it walks client.getPlane() only), which is why
+	 * routines/mahogany_homes.py previously had to infer the floor by climbing whichever
+	 * direction a ladder happened to offer and seeing whether the hotspot turned up.
+	 *
+	 * A Mahogany Homes house is never instanced, but WorldPoint.fromLocalInstance is used anyway
+	 * -- it is correct in both cases and is the codebase rule for reading a position OUT of the
+	 * client (see CLAUDE.md's instancing gotcha). Hotspots are GameObjects; WallObject is checked
+	 * too because several hotspots are wall-mounted (the reference plugin's own overlay walks
+	 * both).
+	 */
+	private Map<Integer, Map<String, Object>> locateHotspotObjects(int[] wanted)
+	{
+		Map<Integer, Map<String, Object>> found = new HashMap<>();
+
+		WorldView view = client.getTopLevelWorldView();
+		Scene scene = view != null ? view.getScene() : null;
+		Tile[][][] tiles = scene != null ? scene.getTiles() : null;
+		if (tiles == null)
+		{
+			return found;
+		}
+
+		for (int plane = 0; plane < tiles.length && plane < Constants.MAX_Z; plane++)
+		{
+			if (tiles[plane] == null)
+			{
+				continue;
+			}
+			for (Tile[] column : tiles[plane])
+			{
+				if (column == null)
+				{
+					continue;
+				}
+				for (Tile tile : column)
+				{
+					if (tile == null)
+					{
+						continue;
+					}
+					GameObject[] gameObjects = tile.getGameObjects();
+					if (gameObjects != null)
+					{
+						for (GameObject obj : gameObjects)
+						{
+							recordIfWanted(obj, plane, wanted, found);
+						}
+					}
+					WallObject wall = tile.getWallObject();
+					if (wall != null)
+					{
+						recordIfWanted(wall, plane, wanted, found);
+					}
+				}
+			}
+		}
+
+		return found;
+	}
+
+	/**
+	 * Adds obj's real world position to `found` if its id is one of `wanted` and it's not there yet.
+	 *
+	 * `plane` is the plane of the tile array this object was walked out of, and it MUST be passed
+	 * in rather than derived from the client. CONFIRMED live 2026-08-28 (Larry's house, Falador):
+	 * the two-argument WorldPoint.fromLocalInstance(client, local) stamps the WORLD VIEW's own
+	 * current plane onto the result, so every hotspot this scan found upstairs was reported as
+	 * plane 0 while the player stood downstairs. That is the exact question this scan exists to
+	 * answer, and it answered it wrong in the one direction that matters: work_phase read
+	 * "same floor as me", never tried a staircase, and clicked at a hotspot through a ceiling
+	 * until the unreachable guard safety-stopped the run. The reference plugin gets this right --
+	 * it marks the stairs as an objective when the remaining hotspots are upstairs.
+	 */
+	private void recordIfWanted(TileObject obj, int plane, int[] wanted,
+		Map<Integer, Map<String, Object>> found)
+	{
+		if (obj == null || found.containsKey(obj.getId()))
+		{
+			return;
+		}
+		boolean isWanted = false;
+		for (int id : wanted)
+		{
+			if (id == obj.getId())
+			{
+				isWanted = true;
+				break;
+			}
+		}
+		if (!isWanted)
+		{
+			return;
+		}
+
+		LocalPoint local = obj.getLocalLocation();
+		if (local == null)
+		{
+			return;
+		}
+		WorldPoint wp = WorldPoint.fromLocalInstance(client, local, plane);
+		if (wp == null)
+		{
+			return;
+		}
+
+		Map<String, Object> at = new LinkedHashMap<>();
+		at.put("x", wp.getX());
+		at.put("y", wp.getY());
+		at.put("plane", wp.getPlane());
+		found.put(obj.getId(), at);
 	}
 
 	private static Map<String, Object> pointMap(WorldPoint p)
@@ -297,7 +597,7 @@ public class MahoganyHomesProvider extends BridgeProvider
 			new int[]{17026, 16685},
 			new int[]{40171, 40172, 40173, 40174, 40175, 40176, 40177, 40299},
 			new HotspotType[]{HotspotType.B2, HotspotType.B2, HotspotType.B2, HotspotType.B2,
-				HotspotType.B3, HotspotType.B3, HotspotType.RP, HotspotType.SB}),
+				HotspotType.B3, HotspotType.B3, HotspotType.RP, HotspotType.SB}, true),
 		NOELLA(new WorldArea(2652, 3317, 15, 8, 0), "Noella", 10419, new WorldPoint(2659, 3322, 0),
 			new int[]{17026, 16685, 15645, 15648},
 			new int[]{40156, 40157, 40158, 40159, 40160, 40161, 40162, 40163},
@@ -317,7 +617,7 @@ public class MahoganyHomesProvider extends BridgeProvider
 			new int[]{24082, 24085},
 			new int[]{40296, 40089, 40090, 40091, 40092, 40093, 40094},
 			new HotspotType[]{HotspotType.SB, HotspotType.RP, HotspotType.B3, HotspotType.B3,
-				HotspotType.B2, HotspotType.B2, HotspotType.B2}),
+				HotspotType.B2, HotspotType.B2, HotspotType.B2}, true),
 		TAU(new WorldArea(3043, 3340, 10, 11, 0), "Tau", 10417, new WorldPoint(3047, 3345, 0),
 			new int[]{},
 			new int[]{40083, 40084, 40085, 40086, 40087, 40088, 40295},
@@ -361,10 +661,19 @@ public class MahoganyHomesProvider extends BridgeProvider
 		final int[] ladders;
 		final int[] slotObjectIds;
 		final HotspotType[] slotTypes;
+		/** Reference plugin's Home.npcUpstairs -- true for JESS and NORMAN only. */
+		final boolean npcUpstairs;
 
 		Home(WorldArea area, String displayName, int npcId, WorldPoint standingLocation,
 			int[] ladders, int[] slotObjectIds, HotspotType[] slotTypes)
 		{
+			this(area, displayName, npcId, standingLocation, ladders, slotObjectIds, slotTypes, false);
+		}
+
+		Home(WorldArea area, String displayName, int npcId, WorldPoint standingLocation,
+			int[] ladders, int[] slotObjectIds, HotspotType[] slotTypes, boolean npcUpstairs)
+		{
+			this.npcUpstairs = npcUpstairs;
 			this.area = area;
 			this.displayName = displayName;
 			this.npcId = npcId;

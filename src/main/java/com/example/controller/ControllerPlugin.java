@@ -139,6 +139,7 @@ public class ControllerPlugin extends Plugin
 		new GroundItemProvider(client, clientThread, server, itemManager, tickClock).register();
 		new GraphicsObjectProvider(client, clientThread, server, tickClock).register();
 		new TileProvider(client, clientThread, server, tickClock).register();
+		new CollisionProvider(client, clientThread, server).register();
 		new ConfigProvider(client, clientThread, server, config).register();
 		new ConsumablesProvider(client, clientThread, server, config).register();
 		new LoginProvider(client, clientThread, server).register();

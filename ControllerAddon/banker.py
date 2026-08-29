@@ -41,6 +41,11 @@ DEFAULT_BANK_NAMES = ("bank booth", "bank chest", "bank counter", "grand exchang
 FEROX_BANK_NAMES = ("bank chest", "bank booth")
 FEROX_MAX_BANK_DISTANCE = 20
 
+# Past this many tiles open_bank walks toward the bank before clicking it -- see the
+# comment at that branch. Deliberately generous: a normal "arrived at the bank" position
+# is a handful of tiles out, and this must never add a walk to a trip that already works.
+BANK_APPROACH_TILES = 8
+
 
 def find_nearby_bank(config: dict):
     """Return the closest matching bank object within range, or None."""
@@ -164,15 +169,34 @@ def open_bank(ctx, bank_obj, timeout_s: float = 20.0) -> bool:
         # reclicking the same unreachable spot. Per user's own suggested fix: click the minimap
         # toward the bank's world position first so the camera/player turns it into view, then
         # let the loop's next iteration re-resolve and click it normally.
-        if not fresh.get("onScreen", True):
+        off_screen = not fresh.get("onScreen", True)
+        # CONFIRMED live 2026-08-28 (mahogany_homes, safety-stopped on "failed to open the
+        # bank"): distance is the OTHER way this loop can aim somewhere unusable, and unlike
+        # off-screen it looks perfectly fine on the wire. find_nearby_bank accepts a booth up to
+        # maxBankDistance (40) away; standing inside Mariah's house in Hosidius, the Hosidius
+        # booth 21 tiles away THROUGH A WALL still reported onScreen -- projection has no notion
+        # of occlusion -- and projected onto the chatbox tab strip along the bottom of the
+        # viewport, so every click resolved to "Switch tab" on widget 162.19 instead of the bank.
+        # Nothing self-corrected either: _refresh_bank_object only re-resolves within 15 tiles,
+        # so all five retries re-aimed at the identical stale pixel. Walk into range first and
+        # the projection lands in open viewport where a click means what it says.
+        too_far = fresh.get("distance", 0) > BANK_APPROACH_TILES
+        if off_screen or too_far:
             x, y, plane = fresh.get("x"), fresh.get("y"), fresh.get("plane", 0)
             if x is not None and y is not None:
                 point = controller.get_minimap_walk_point(x, y, plane)
                 if point.get("onMinimap"):
-                    debug_log.log("bank", "bank object off-screen -- minimap-walking toward it first")
+                    why = "off-screen" if off_screen else f"{fresh.get('distance')} tiles away"
+                    debug_log.log("bank", f"bank object {why} -- minimap-walking toward it first")
                     controller.click_entity(ctx.ser, point, offset=(0, 0))
                     controller.wait_until_player_idle(timeout_s=max(1.0, deadline - time.time()))
-            continue
+                    continue
+            if off_screen:
+                # An off-screen aim point is outside the RuneLite window, so click_entity would
+                # refuse it anyway -- spending the timeout beats a guaranteed miss. A merely
+                # DISTANT bank is still clickable (the game walks there itself), so fall through
+                # to the click rather than deadlocking on a minimap that cannot reach ~28 tiles.
+                continue
 
         controller.click_entity(ctx.ser, fresh)
 
@@ -356,6 +380,38 @@ def empty_fur_pouch(ctx) -> bool:
 
     debug_log.log("bank", "emptying fur pouch")
     if not controller.click_menu_action(ctx.ser, pouch, "empty", offset=(0, 0), check_ui_blockers=False):
+        return False
+
+    controller.human_delay(0.6, 1.0)
+    return True
+
+
+PLANK_SACK_NAME = "plank sack"
+
+
+def has_plank_sack() -> bool:
+    return any(PLANK_SACK_NAME in (i.get("name") or "").lower() for i in controller.get_inventory())
+
+
+def fill_plank_sack(ctx) -> bool:
+    """Click the plank sack to absorb loose planks from the inventory. Plain click_entity, and
+    ONLY meaningful with a bank interface open -- exactly the same mechanic (and the same reason)
+    as fill_fur_pouch above: in bank context an item's right-click menu is replaced by
+    Deposit-1/5/10/X/All, so click_menu_action(..., "Fill") cannot find the entry, while a plain
+    left-click resolves to Fill correctly.
+
+    CONFIRMED in a human recording rather than assumed -- recordings/2026-08-27_174045_
+    mahogny-homes.log:812 logs the click as menuAction CC_OP on widget 15.3 slot 0 (the bank
+    interface's own inventory panel) with option "Fill", against item Plank sack (24882)."""
+    sack = next(
+        (i for i in controller.get_inventory() if PLANK_SACK_NAME in (i.get("name") or "").lower()),
+        None,
+    )
+    if sack is None:
+        return False
+
+    debug_log.log("bank", "filling plank sack")
+    if not controller.click_entity(ctx.ser, sack, check_ui_blockers=False):
         return False
 
     controller.human_delay(0.6, 1.0)

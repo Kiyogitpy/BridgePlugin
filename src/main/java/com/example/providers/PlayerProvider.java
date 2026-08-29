@@ -17,6 +17,22 @@ import java.util.regex.Pattern;
 
 public class PlayerProvider extends BridgeProvider
 {
+	/**
+	 * Bit 0x4 of a tile's render-rule byte: the tile is under a roof, i.e. indoors.
+	 *
+	 * VERIFIED live 2026-08-28 by walking East Ardougne and sampling every tile, so the proof is a
+	 * TRANSITION rather than one reading that could have been coincidence: 30-odd consecutive
+	 * outdoor tiles all read tileSettings 0 / underRoof false, (2661,3295) and (2660,3295) under a
+	 * roofed structure both read 4 / true, and (2659,3296) went straight back to 0 / false. The
+	 * flag flips with the bit in both directions.
+	 *
+	 * `tileSettings` is still published raw beside `underRoof` on purpose: these bit meanings are
+	 * game-data convention that no javadoc states (0x2 = bridge is the only other one proven here,
+	 * via data/decompiled/target-true-tile/PerspectiveUtil.java), so anything reading a NEW bit
+	 * later can measure it the same way instead of trusting a constant.
+	 */
+	private static final int ROOF_TILE_SETTING = 0x4;
+
 	public PlayerProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
 	{
 		super(client, clientThread, server);
@@ -102,6 +118,42 @@ public class PlayerProvider extends BridgeProvider
 		{
 			data.put("localX", local.getX());
 			data.put("localY", local.getY());
+		}
+
+		// ADDED 2026-08-28 (user request): indoors/outdoors, which `plane` alone cannot answer --
+		// plane is the STOREY, and plane 0 covers both the open street and a house's ground floor.
+		// A roof over the tile is the game's own notion of "inside", and it is exactly what
+		// changes when you cross a door, so this is the signal for "did we actually get in".
+		//
+		// Read from the EXTENDED scene: the reference plugin data/decompiled/target-true-tile/
+		// PerspectiveUtil.java indexes getExtendedTileSettings() as [plane][sceneX + 40][sceneY +
+		// 40] over a 184-wide array (104 + 2*40). The offset is derived from the array's own width
+		// rather than hardcoded to 40, so a client that changes the extended scene size can't turn
+		// this into a silent off-by-N read of the wrong tile.
+		//
+		// `tileSettings` is the raw byte alongside it, deliberately kept: the bit meanings are
+		// game-data conventions no javadoc states (0x2 = bridge/render-one-plane-up is the one the
+		// reference plugin proves), so anything reading a NEW bit later can verify it against real
+		// values instead of trusting a constant, the same way ROOF_TILE_SETTING was verified here.
+		WorldView roofView = p.getWorldView();
+		if (roofView != null && local != null && local.getWorldView() <= WorldView.TOPLEVEL)
+		{
+			Scene scene = roofView.getScene();
+			byte[][][] settings = scene != null ? scene.getExtendedTileSettings() : null;
+			int plane = wp.getPlane();
+			if (settings != null && plane >= 0 && plane < settings.length && settings[plane] != null)
+			{
+				int offset = (settings[plane].length - Constants.SCENE_SIZE) / 2;
+				int sx = local.getSceneX() + offset;
+				int sy = local.getSceneY() + offset;
+				if (sx >= 0 && sx < settings[plane].length
+					&& sy >= 0 && settings[plane][sx] != null && sy < settings[plane][sx].length)
+				{
+					byte tileSetting = settings[plane][sx][sy];
+					data.put("tileSettings", tileSetting);
+					data.put("underRoof", (tileSetting & ROOF_TILE_SETTING) != 0);
+				}
+			}
 		}
 
 		// The boat's own reference position, separate from the player's own foot position above --

@@ -46,7 +46,8 @@ import time
 from settings import (
     HM2_CURVE_FRACTION, HM2_D_REF, HM2_FLUSH_COMMIT_MS, HM2_LATERAL_ERROR, HM2_LOOKAHEAD_SEGMENTS,
     HM2_LATERAL_DECAY, HM2_MAX_MEAN_PX_PER_MS, HM2_MAX_MS, HM2_MAX_SUBMOVES, HM2_MED_REF_MS, HM2_MIN_MS, HM2_PRIMARY_TIME_SHARE,
-    HM2_CORRECTION_TOLERANCE_PX, HM2_FINAL_CORRECTIONS, HM2_MAX_CORRECTION_PX_PER_MS, HM2_MIN_PX_PER_SEGMENT, HM2_TREMOR_MAX_FRACTION, HM2_REPLAN_MIN_DRIFT_PX, HM2_SEGMENT_MS, HM2_SIGMA, HM2_TOLERANCE_PX, HM2_SLOPE_MS_PER_BIT, HM2_TEMPO_SIGMA, HM2_TEMPO_TAU_S, HM2_TREMOR_PX, HM2_UNDERSHOOT_MEAN,
+    HM2_CORRECTION_TOLERANCE_PX, HM2_FINAL_CORRECTIONS, HM2_MAX_CORRECTION_PX_PER_MS,
+    HM2_RECURVE_PX, HM2_MAX_RECURVE, HM2_SCALE_COLLINEAR_MIN, HM2_MIN_PX_PER_SEGMENT, HM2_TREMOR_MAX_FRACTION, HM2_REPLAN_MIN_DRIFT_PX, HM2_SEGMENT_MS, HM2_SIGMA, HM2_TOLERANCE_PX, HM2_SLOPE_MS_PER_BIT, HM2_TEMPO_SIGMA, HM2_TEMPO_TAU_S, HM2_TREMOR_PX, HM2_UNDERSHOOT_MEAN,
     HM2_UNDERSHOOT_SIGMA,
 )
 
@@ -56,6 +57,23 @@ from settings import (
 # see HM2_TEMPO_SIGMA's comment for the five-recording measurement behind it. One
 # Ornstein-Uhlenbeck process, advanced by wall-clock time whenever a duration is drawn.
 _tempo_state = {"value": None, "at": None}
+
+
+# Diagnostics for the 2026-08-28 flush/stall investigation. OFF unless HM2_DIAG=1 is set in the
+# environment, and deliberately I/O-free inside the emission loop -- printing there would add
+# latency at exactly the moment the firmware buffer is shallowest, i.e. it would manufacture the
+# stall we are trying to measure. Counters accumulate; one summary line is emitted per flight.
+DIAG = os.environ.get("HM2_DIAG") == "1"
+
+
+def _diag(msg: str) -> None:
+    if not DIAG:
+        return
+    try:
+        import debug_log
+        debug_log.log("hm2", msg)
+    except Exception:
+        print("[hm2] " + msg)
 
 
 def _reset_tempo(value=None, now=None):
@@ -406,7 +424,7 @@ def _drain(t0: float, queued_ms: float) -> None:
 
 def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
          duration_scale: float = 1.0, refresh_target=None, flush_queue=None,
-         rng: random.Random = random) -> None:
+         rng: random.Random = random, _recurve_depth: int = 0) -> None:
     """Drive the cursor to (x, y).
 
     Dependencies are injected rather than imported from controller, so this module can be unit
@@ -453,6 +471,20 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
     # diverge from the firmware's own carry by under a pixel on every flight, flushed or not --
     # that's what the residual corrections at the end of move() exist to absorb.
     flushed = False
+    diag_starved = 0            # emissions issued after the firmware queue had already run dry
+    diag_min_ahead = 1e9        # shallowest the queue ever got, ms
+    # TRUE stall measure. `starved`/`min_ahead` above read `ahead = queued_ms - elapsed`, which
+    # stopped being able to go negative once queued_ms became idle-aware -- so they now under-report
+    # by construction. This measures the thing itself: how long the firmware sat with an EMPTY
+    # queue waiting for us, which is exactly the visible cursor stutter.
+    diag_idle_ms = 0.0
+    diag_idle_events = 0
+    diag_max_idle = 0.0
+    diag_emissions = 0
+    diag_flushes = 0
+    diag_rewind_px = 0.0
+    diag_flush_log = []
+    diag_corrections = 0
 
     # A while loop, not `for idx, p in enumerate(points)`: re-aiming REPLANS the remaining
     # submovements, and enumerate() would keep walking the original list.
@@ -494,12 +526,22 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
                         if queued_ms - commit_ms > HM2_SEGMENT_MS:
                             flush_queue()
                             flushed = True
+                            diag_flushes += 1
+                            _pre_cur, _pre_q = cur, queued_ms
                             for i, (t_ms, ex, ey) in enumerate(emit_log):
                                 if t_ms >= commit_ms:
                                     queued_ms = t_ms
                                     cur = (ex, ey)
                                     del emit_log[i + 1:]
                                     break
+                            if DIAG:
+                                _back = math.hypot(cur[0] - _pre_cur[0], cur[1] - _pre_cur[1])
+                                diag_rewind_px += _back
+                                diag_flush_log.append(
+                                    "flush#%d at idx%d: elapsed=%.0f commit=%.0f queued %.0f->%.0f "
+                                    "(-%.0fms) cur rewound %.0fpx"
+                                    % (diag_flushes, idx, elapsed_ms, commit_ms, _pre_q,
+                                       queued_ms, _pre_q - queued_ms, _back))
                     # Replan the approach from where the cursor actually is toward where the
                     # target actually is. Keeps the submovement structure rather than teleporting
                     # the aim: the remaining corrections just close on the new position.
@@ -539,13 +581,35 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
             units_y += qy / 100.0
             dur = max(1, int(round(step_ms)))
             send_line(ser, f"S {qx} {qy} {dur}")
-            queued_ms += dur
+            # queued_ms is the firmware's PLAYBACK timeline, not the sum of our durations. If we
+            # were late feeding it (a slow refresh_target, a GC pause, an OS stall), the firmware
+            # ran dry and idled, so playback resumes NOW rather than back-to-back with the last
+            # segment. Summing durations alone silently under-states the finish time for the rest
+            # of the flight: _drain then stops waiting, every residual correction reads a cursor
+            # that has not moved yet, re-issues the same correction, and the stack plays out after
+            # move() returns. MEASURED live 2026-08-28 over 181 flights: the 37 starved ones had a
+            # median final error of 7.1px (max 87.1) and 28 of them exhausted all 6 corrections,
+            # against 1.0px median and never more than 2 corrections on the 144 that never starved.
+            # Identical to the old arithmetic whenever the firmware never idles.
+            if DIAG:
+                _now_ms = (time.perf_counter() - t0) * 1000.0
+                if diag_emissions and _now_ms - queued_ms > 1.0:
+                    _gap = _now_ms - queued_ms       # firmware idled this long: a real stall
+                    diag_idle_ms += _gap
+                    diag_idle_events += 1
+                    diag_max_idle = max(diag_max_idle, _gap)
+                diag_emissions += 1
+            queued_ms = max(queued_ms, (time.perf_counter() - t0) * 1000.0) + dur
             emit_log.append((queued_ms, cur[0], cur[1]))
 
             # Stay a few segments ahead of the firmware, never more. The queue holds 16 and
             # applies backpressure, but blocking on a full queue would make our own timing
             # depend on serial buffering rather than on the plan.
             ahead = queued_ms - (time.perf_counter() - t0) * 1000.0
+            if ahead < diag_min_ahead:
+                diag_min_ahead = ahead
+            if ahead <= 0.0:
+                diag_starved += 1
             slack = ahead - HM2_LOOKAHEAD_SEGMENTS * HM2_SEGMENT_MS
             if slack > 0:
                 time.sleep(slack / 1000.0)
@@ -571,9 +635,28 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
     # `actual` pixels, so px-per-unit is their ratio; an EMA keeps one noisy movement from
     # yanking the calibration. This is what lets the path above be planned open-loop at all, and
     # it self-tunes on any machine instead of hardcoding this one's 0.74.
-    if not flushed:
-        _learn_scale(math.hypot(units_x, units_y),
-                     math.hypot(cur[0] - start[0], cur[1] - start[1]))
+    diag_open_err = math.hypot(target[0] - cur[0], target[1] - cur[1])
+
+    # Only a flight whose observed displacement is COLLINEAR with what was commanded may teach
+    # the estimator. px-per-unit is one isotropic scalar: it scales motion along the commanded
+    # direction and cannot rotate it, so a net displacement pointing elsewhere contains motion we
+    # did not cause. MEASURED 2026-08-28 over 226 consecutive live flights: the samples that
+    # shifted the estimate by >0.05 had a median open-loop error of 54.1px against 2.2px for
+    # every other sample, and single flights moved it by as much as 0.80 -- the persisted value
+    # wandered 0.60-1.77 across runs against this machine's true ~0.74, and a wrong persisted
+    # scale is what supplies the residual that everything else here has to clean up.
+    # Deliberately NOT a test on the SIZE of the error: a genuinely stale scale produces large
+    # errors that are perfectly collinear (measured cos 1.00000 at 26% and 40% stale), and those
+    # are the samples that correct it fastest. See HM2_SCALE_COLLINEAR_MIN.
+    moved = (cur[0] - start[0], cur[1] - start[1])
+    moved_px = math.hypot(*moved)
+    units_mag = math.hypot(units_x, units_y)
+    collinear = True
+    if units_mag > 0.0 and moved_px > 0.0:
+        cos = (units_x * moved[0] + units_y * moved[1]) / (units_mag * moved_px)
+        collinear = cos >= HM2_SCALE_COLLINEAR_MIN
+    if not flushed and collinear:
+        _learn_scale(units_mag, moved_px)
 
     # Residual correction. Small once the scale is learned, and genuinely human -- a settling
     # touch at the end of a reach is exactly what the submovement model predicts anyway.
@@ -583,6 +666,7 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
         dx, dy = target[0] - cur[0], target[1] - cur[1]
         if math.hypot(dx, dy) <= HM2_CORRECTION_TOLERANCE_PX:
             break
+        diag_corrections += 1
         # Duration SCALES WITH THE GAP, capped at a human-measured top speed. This used to be a
         # flat HM2_SEGMENT_MS however far the correction had to travel, so the cursor snapped
         # faster the further the planned path had fallen short -- and the residual is largest
@@ -590,6 +674,20 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
         # and a 900px one ~13 px/ms, against a human maximum of 5.37 (n=2097 windows,
         # recordings/2026-08-26_225917_mousemove). See HM2_MAX_CORRECTION_PX_PER_MS.
         gap = math.hypot(dx, dy)
+        # A gap this size is not a settle: the REAL cursor has diverged from the open-loop plan
+        # (a hand on the mouse, or a target that jumped with the camera). Flying it with the
+        # straight-line walk below would produce a long constant-velocity slide with no curve,
+        # tremor or easing -- the exact signature this engine exists to remove. Fly it as a
+        # fresh human reach instead, and let the settle handle whatever that leaves.
+        if gap > HM2_RECURVE_PX and _recurve_depth < HM2_MAX_RECURVE:
+            move(ser, int(round(target[0])), int(round(target[1])),
+                 get_cursor_pos=get_cursor_pos, send_line=send_line, abort=abort,
+                 duration_scale=duration_scale, rng=rng,
+                 _recurve_depth=_recurve_depth + 1)
+            if abort is not None and abort.is_set():
+                return
+            cur = tuple(float(v) for v in get_cursor_pos())
+            continue
         span_ms = max(HM2_SEGMENT_MS, gap / HM2_MAX_CORRECTION_PX_PER_MS)
         steps, step_ms = _step_plan(span_ms, gap)
         dur = max(1, int(round(step_ms)))
@@ -604,6 +702,19 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
             prev = want
             if sx or sy:
                 send_line(ser, f"S {sx} {sy} {dur}")
-                queued_ms += dur
+                # Same idle-aware timeline as the main loop above -- without it a correction
+                # issued after a starved flight is never waited for at all.
+                queued_ms = max(queued_ms, (time.perf_counter() - t0) * 1000.0) + dur
         _drain(t0, queued_ms)
         cur = tuple(float(v) for v in get_cursor_pos())
+
+    if DIAG:
+        _diag("flight dist=%.0fpx dur=%.0fms open_err=%.1fpx corr=%d final_err=%.1fpx "
+              "flushes=%d rewind=%.0fpx starved=%d min_ahead=%.0fms scale=%.3f "
+              "idle=%.0fms/%d max_idle=%.0fms"
+              % (total_dist, duration_ms, diag_open_err, diag_corrections,
+                 math.hypot(target[0] - cur[0], target[1] - cur[1]),
+                 diag_flushes, diag_rewind_px, diag_starved, diag_min_ahead, _px_per_unit,
+                 diag_idle_ms, diag_idle_events, diag_max_idle))
+        for _rec in diag_flush_log:
+            _diag("  " + _rec)

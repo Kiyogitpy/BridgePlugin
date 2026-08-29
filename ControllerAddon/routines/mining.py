@@ -14,8 +14,8 @@ import debug_log
 
 DEFAULT_CONFIG = {
     "enabled": True,
-    "rockNames": ["Tin rocks", "Copper rocks"],
-    "maxRockDistance": 10,
+    "rockNames": ["Adamantite rocks", "Runite rocks"],
+    "maxRockDistance": 20,
 
     "breaks": {
         "enabled": True,
