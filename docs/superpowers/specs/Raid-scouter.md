@@ -123,6 +123,7 @@ Not gated by `TickCache` — it is a varbit read plus a cached object, the same 
 ```json
 {
   "raidsPluginEnabled": true,
+  "world": 420,
   "inRaid": true,
   "raidPartyId": 8812,
   "raidStarted": false,
@@ -152,6 +153,9 @@ Field notes:
 - **`raidStarted`** — latched by a `ChatMessage` subscriber on `"The raid has begun!"`,
   cleared on `RaidReset` and whenever `raidPartyId` changes. A varbit alone cannot
   answer this.
+- **`world`** — `client.getWorld()`. VERIFIED 2026-08-29 that **no existing provider
+  exposes this**, so it has to be added here. It is the most important field in the
+  alert: a matched layout the user cannot find the world for is useless.
 - **`raidsPluginEnabled`** — checked via `PluginManager`. If the built-in Raids plugin
   is disabled, no `RaidScouted` ever fires and the bridge would report a permanently
   unscouted raid with no explanation. This field turns a silent dead loop into an
@@ -199,7 +203,11 @@ never defaulted — the mahogany-homes `mh_phase` lesson.
 - `EXIT_ON = "raid_started"` (**default**, matches what the user described) — waits for
   `raidStarted`, then leaves.
 - `EXIT_ON = "main_arrived"` — leaves as soon as the configured main's display name
-  appears in `/players`. See the scaling trade-off below.
+  appears in `/players`. See the scaling trade-off below. Only the `name` field is
+  used: the start room is an instance, and `PvpProvider` still reads
+  `player.getWorldLocation()` — it is not in the four providers fixed for instanced
+  coordinates (CLAUDE.md), so **every x/y it reports in there should be assumed
+  wrong**. Names are unaffected.
 
 ### 4. Anti-idle while holding
 
