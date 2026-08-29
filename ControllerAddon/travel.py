@@ -37,6 +37,7 @@ import time
 
 import controller
 import debug_log
+import worldmap
 
 RING_OF_DUELING_NAME = "ring of dueling"
 FOUNTAIN_NAME = "Pool of Refreshment"
@@ -76,6 +77,16 @@ HOP_PULL_IN_FRACTIONS = (1.0, 0.66, 0.4)
 WALK_ARRIVAL_TOLERANCE = 3   # tiles; close enough to call a hop, or the whole trip, arrived
 WALK_HOP_TIMEOUT_S = 8.0     # give up waiting on a single hop after this long
 WALK_MAX_HOPS = 60           # hard cap so a bad target can't loop forever
+
+COLLISION_SCAN_RADIUS = 10   # tiles of live collision fetched per hop. Big enough to see the
+                             # doors along one hop, small enough that a 21x21 response per hop
+                             # stays cheap. Beyond it we simply hop and let the stall catch it.
+WALK_MAX_STALLS = 4          # consecutive no-progress passes before giving up on the walk.
+                             # Deliberately small: with a real route, a stall means something
+                             # the route does not know about, and repeating it does not help.
+SCENE_HALF_WIDTH = 52        # the loaded scene is 104x104 tiles. Used ONLY to reject an
+                             # upper-plane route that escapes into the open sky the map treats
+                             # as walkable -- see route_to and the design doc's risk 1.
 
 # --- closed doors -------------------------------------------------------------------------
 #
@@ -604,68 +615,256 @@ def use_fountain(ctx) -> bool:
     return True
 
 
-def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
-            transports: dict | None = None, min_path_tiles: float | None = None) -> bool:
-    """Get back to a location from save_location(). Tries a computed route
-    from Shortest Path first, falls back to a direct greedy walk if that's
-    unavailable or fails partway. True once within `tolerance` tiles of the
-    target (defaults to WALK_ARRIVAL_TOLERANCE; callers needing a tighter
-    final arrival -- e.g. safespot anchoring, where 3 tiles of slack could
-    still be inside a melee monster's reach -- can pass a smaller value).
+def route_to(target: dict, *, goal_adjacent: bool = False):
+    """A walking route to `target` as [{"x", "y", "plane"}, ...], or None.
 
-    `transports` overrides individual TRANSPORT_POLICY keys for this one walk
-    (e.g. {"avoidWilderness": True}); `min_path_tiles` overrides SHORT_HOP_TILES,
-    the distance below which the pathfinder isn't worth asking at all -- pass 0
-    to force a computed route even for a short hop."""
-    # An unwalkable goal has to be retargeted BEFORE anything else looks at it: Shortest Path
-    # returns no route to a tile that cannot be stood on, which sends the whole walk into the
-    # obstacle-blind greedy fallback AND starves the door escalation of the route it needs.
-    # MEASURED at TAU's, where standingLocation itself carries BLOCK_MOVEMENT_OBJECT.
-    target = _routable_goal(target)
+    Same plane only, and no transports -- see worldmap.find_path. `goal_adjacent` routes to a
+    tile BESIDE the target, which is what you want for anything standing on furniture (a
+    hotspot, a ladder, a bank booth): those tiles are solid and nothing can route onto them.
+    """
+    player = controller.get_player() or {}
+    px, py, plane = player.get("x"), player.get("y"), player.get("plane")
+    if px is None:
+        return None
+    if target.get("plane") is not None and target["plane"] != plane:
+        debug_log.log("travel", f"target is on plane {target['plane']} and we are on {plane} "
+                                f"-- walking cannot change floor")
+        return None
+    tiles = worldmap.find_path(px, py, plane, target["x"], target["y"],
+                               goal_adjacent=goal_adjacent)
+    if tiles is None:
+        return None
 
-    # Doors FIRST, then go in (user directive 2026-08-29). Waiting for a stall was backwards: a
-    # stall costs a whole hop timeout to notice, is spent wedged against the door in plain view,
-    # and at NORMAN's never fired at all because walk_to reported arrival while still outside.
-    # The client's own collision entry tells us the doorway is shut before we take a step, so
-    # there is no reason to discover it the slow way. Costs nothing when nothing is in the way --
-    # _find_blocking_door returns None unless a SHUT door's blocked edge actually crosses our
-    # path -- and the stall-triggered recovery below stays as the backstop for the doors this
-    # cannot see (one off the straight line; see _door_separates' single-axis limit).
-    _open_blocking_door(ctx, target)
+    # Upstairs, refuse a route that wanders outside the loaded scene. The map has NO DATA above
+    # ground outside a building and no data reads as PASSABLE, so a single missing exterior wall
+    # on plane 1+ lets BFS escape into open sky and come back down somewhere convenient -- a
+    # shortcut through nothing. The loaded scene is 104x104 tiles centred near the player, so a
+    # legitimate indoor route on an upper floor never approaches this bound.
+    if plane > 0:
+        for x, y in tiles:
+            if max(abs(x - px), abs(y - py)) > SCENE_HALF_WIDTH:
+                debug_log.log("travel", f"discarding a plane-{plane} route that leaves the "
+                                        f"loaded scene at ({x},{y}) -- the map treats open sky "
+                                        f"as walkable, so this is not a real path")
+                return None
 
-    if _is_short_hop(target, min_path_tiles):
-        debug_log.log("travel", "target is close enough to walk straight to -- skipping Shortest Path")
-        return _walk_greedy(ctx, target, tolerance)
+    return [{"x": x, "y": y, "plane": plane} for x, y in tiles]
 
-    steps, reached, reason = _request_computed_path(target, transport_config(transports))
-    if steps:
-        if not reached:
-            # The route is the best Shortest Path could do, not one that arrives -- follow it
-            # anyway (getting closer beats standing still, and _walk_greedy picks up the
-            # remainder) but say so, because the alternative is a walk that silently stops short
-            # and a caller that can't tell why.
-            debug_log.log("travel", f"Shortest Path couldn't reach the target ({reason}) -- "
-                                    f"following its best partial route, then walking the rest")
-        debug_log.log("travel", f"following a {len(steps)}-tile route from Shortest Path")
-        if _walk_along_path(ctx, steps, target, tolerance):
-            return True
-        debug_log.log("travel", "following the computed route failed partway, falling back to a direct walk")
+
+def _collision_flags(x: int, y: int, plane: int, radius: int = COLLISION_SCAN_RADIUS) -> dict:
+    """Live collision for a square around (x, y), as {(x, y): flags}. Empty when the client
+    cannot answer, which every consumer must read as "cannot tell" rather than "blocked"."""
+    return {(t["x"], t["y"]): t.get("flags")
+            for t in (controller.get_collision(x, y, plane, radius=radius) or [])}
+
+
+def _nearest_step_index(route: list, px: int, py: int) -> int:
+    """Where the player actually is along the route.
+
+    Keyed on POSITION rather than on a marching counter, which is what the old
+    _walk_along_path used. A counter advances whether or not the player moved, so a stalled
+    walk kept aiming further down a route it was no longer travelling."""
+    best, best_distance = 0, None
+    for i, step in enumerate(route):
+        distance = max(abs(step["x"] - px), abs(step["y"] - py))
+        if best_distance is None or distance < best_distance:
+            best, best_distance = i, distance
+    return best
+
+
+def _hop_index(route: list, start: int, px: int, py: int, flags: dict) -> int:
+    """How far along the route to aim, bounded by DISTANCE and stopping at any shut crossing.
+
+    Distance, not step count: a cardinal BFS route is longer than the diagonal walk the client
+    performs, so counting N steps ahead would produce a hop well short of the measured 16-24
+    tile window that WALK_HOP_MIN/MAX_TILES encode.
+
+    Stopping at a shut crossing is Vitalite's rule, and it matters: hop-clicking PAST a shut
+    door is exactly what leaves the player wedged against it with the walker none the wiser.
+    """
+    limit = random.randint(WALK_HOP_MIN_TILES, WALK_HOP_MAX_TILES)
+    furthest = start
+    for i in range(start, len(route) - 1):
+        ax, ay = route[i]["x"], route[i]["y"]
+        bx, by = route[i + 1]["x"], route[i + 1]["y"]
+        if flags and not _passable(flags.get((ax, ay)), flags.get((bx, by)), bx - ax, by - ay):
+            break
+        if max(abs(bx - px), abs(by - py)) > limit:
+            break
+        furthest = i + 1
+    return furthest
+
+
+def _door_on_route(route: list, plane: int, flags: dict, start: int = 0):
+    """The shut door on the route ahead of `start`, or None. Fetches /objects only once a
+    blocked crossing has actually been found, so a clear walk pays nothing for this."""
+    tiles = [(step["x"], step["y"]) for step in route]
+    if blocked_crossing_on_route(tiles, flags, start) is None:
+        return None
+    objects = controller.get_objects(radius=COLLISION_SCAN_RADIUS) or []
+    return first_door_on_route(tiles, plane, objects, flags, start)
+
+
+def _open_door(ctx, door: dict, recheck) -> bool:
+    """Click a shut door and CONFIRM it, rather than sleeping and hoping.
+
+    `recheck` is a zero-argument callable returning the door still blocking the way, or None.
+
+    Two things this gets right that a fixed wait did not, both MEASURED live 2026-08-29:
+
+      * The budget includes the WALK. A door is opened by walking to it and then opening it,
+        and DOOR_OPEN_WAIT_S alone (2.0s) is less than the ~2.4s of walking to a door four
+        tiles off. At ROSS's the FIRST click registered as `Open Door` and was good; the budget
+        expired before the player arrived, and the two retries then resolved to `Walk here`
+        because the player had moved off the pixel being re-aimed at. A working click was
+        reported as a failure and interrupted by its own retry, three times over.
+      * Getting THROUGH counts as success (_crossed). ROSS's front door swings shut behind you,
+        so re-reading the doorway answers "still shut" about a door that worked -- eight clicks
+        across one session, every one registering correctly, every one logged as a failure.
+    """
+    here = controller.get_player() or {}
+    here_x, here_y = here.get("x"), here.get("y")
+    dx, dy = door.get("x"), door.get("y")
+    if here_x is not None and dx is not None:
+        tiles = max(abs(here_x - dx), abs(here_y - dy))
     else:
-        debug_log.log("travel", "Shortest Path unavailable -- walking straight toward the target instead")
+        tiles = door.get("distance") or 0
+    budget = min(DOOR_OPEN_WAIT_S + tiles * DOOR_WALK_ALLOWANCE_S, DOOR_OPEN_WAIT_MAX_S)
 
-    return _walk_greedy(ctx, target, tolerance)
+    debug_log.log("travel", f"opening the {door.get('name')} at ({dx},{dy}) in the way "
+                            f"({tiles} tiles off, waiting up to {budget:.1f}s)")
+    controller.click_entity(ctx.ser, door)
+
+    waited = 0.0
+    while waited < budget:
+        time.sleep(DOOR_CONFIRM_POLL_S)
+        waited += DOOR_CONFIRM_POLL_S
+        if recheck() is None or _crossed(door, here_x, here_y):
+            return True
+
+    debug_log.log("travel", f"the {door.get('name')} at ({dx},{dy}) is still shut after "
+                            f"{budget:.1f}s -- another player may be holding it, or the "
+                            f"click missed")
+    return True
+
+
+def open_door_toward(ctx, goal: dict) -> bool:
+    """Open the shut door standing between the player and `goal`. True if one was clicked.
+
+    Replaces open_doorway_to, open_frontier_door and open_nearest_shut_door -- three tiers that
+    existed only because there was no route to ask. Costs nothing when the way is clear.
+
+    goal_adjacent because the tile you need a DOOR for and the tile you can WALK to are usually
+    different: a hotspot's own tile is furniture and unroutable, while aiming at the standing
+    tile instead hides the doorway (both it and the player sit on the same side of the door).
+    """
+    route = route_to(goal, goal_adjacent=True)
+    if not route or len(route) < 2:
+        return False
+    player = controller.get_player() or {}
+    px, py = player.get("x"), player.get("y")
+    if px is None:
+        return False
+    plane = player.get("plane") or 0
+    door = _door_on_route(route, plane, _collision_flags(px, py, plane))
+    if door is None:
+        return False
+    return _open_door(ctx, door,
+                      lambda: _door_on_route(route, plane, _collision_flags(px, py, plane)))
 
 
 def _is_short_hop(target: dict, min_path_tiles: float | None = None) -> bool:
-    """True when the target is near enough (and on this plane) that a computed route isn't worth
-    the round trip. Plane is a hard gate, not a distance term: a staircase's two ends are a
-    couple of tiles apart horizontally but only the route knows about the staircase."""
+    """Deprecated: kept for backward compatibility with old tests that mock it.
+
+    New code should use route_to directly. This function is NOT used by the new walk_to."""
     threshold = SHORT_HOP_TILES if min_path_tiles is None else min_path_tiles
     player = controller.get_player()
     px, py = player.get("x"), player.get("y")
     if px is None or player.get("plane") != target["plane"]:
         return False
     return max(abs(target["x"] - px), abs(target["y"] - py)) <= threshold
+
+
+def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
+            transports: dict | None = None, min_path_tiles: float | None = None,
+            goal_adjacent: bool = True) -> bool:
+    """Walk to `target`, following a route computed from the global collision map.
+
+    True once within `tolerance` tiles of the target. **False now means something**: there is
+    no walking route at all, returned in milliseconds. That replaces the old behaviour where a
+    routeless walk fell through to an obstacle-blind greedy walker and hop-clicked a wall until
+    WALK_MAX_HOPS x WALK_HOP_TIMEOUT_S ran out -- up to 8 minutes, measured.
+
+    `transports` and `min_path_tiles` are accepted and ignored; they configured Shortest Path,
+    which no longer exists. They are kept so the 39 existing call sites keep working, and are
+    removed from those call sites and from this signature in a later pass.
+
+    `goal_adjacent` defaults True because most targets here are objects standing on their own
+    (unroutable) tile. Pass False when the target really is a tile to stand on.
+    """
+    route = route_to(target, goal_adjacent=goal_adjacent)
+    if route is None:
+        debug_log.log("travel", f"no walking route to ({target['x']},{target['y']}) "
+                                f"-- not attempting the walk")
+        return False
+
+    doors_opened = 0
+    stalls = 0
+    last_pos = None
+
+    for _ in range(WALK_MAX_HOPS):
+        player = controller.get_player() or {}
+        px, py, plane = player.get("x"), player.get("y"), player.get("plane")
+        if px is None:
+            return False
+
+        flags = _collision_flags(px, py, plane)
+        index = _nearest_step_index(route, px, py)
+
+        # Doors are resolved BEFORE stepping off, not after a stall (user directive
+        # 2026-08-29: "the priority should be determine door situation - then go in"). Waiting
+        # for a stall costs a whole hop timeout to notice and is spent wedged against the door
+        # in plain view; at NORMAN's it never fired at all, because the walk "arrived" outside.
+        if doors_opened < DOOR_MAX_OPENS_PER_WALK:
+            door = _door_on_route(route, plane, flags, index)
+            if door is not None:
+                doors_opened += 1
+                _open_door(ctx, door,
+                           lambda: _door_on_route(route, plane,
+                                                  _collision_flags(px, py, plane), index))
+                refreshed = route_to(target, goal_adjacent=goal_adjacent)
+                if refreshed is None:
+                    return False
+                route = refreshed
+                last_pos = None
+                continue
+
+        if _within_tolerance(px, py, target["x"], target["y"], tolerance):
+            return True
+
+        if last_pos == (px, py):
+            stalls += 1
+            if stalls > WALK_MAX_STALLS:
+                debug_log.log("travel", f"stalled {stalls} times short of "
+                                        f"({target['x']},{target['y']}) -- giving up")
+                return False
+            refreshed = route_to(target, goal_adjacent=goal_adjacent)
+            if refreshed is None:
+                return False
+            route = refreshed
+            index = _nearest_step_index(route, px, py)
+        last_pos = (px, py)
+
+        hop = route[_hop_index(route, index, px, py, flags)]
+        if (hop["x"], hop["y"]) == (px, py):
+            # The route says we are already as far as this hop can take us and we have not
+            # arrived -- the remaining gap is not walkable. Fail rather than spin.
+            debug_log.log("travel", "route makes no further progress toward the target")
+            return False
+        if not _hop_to(ctx, hop["x"], hop["y"], hop["plane"]):
+            return False
+
+    return False
 
 
 def _request_computed_path(target: dict, config: dict):
