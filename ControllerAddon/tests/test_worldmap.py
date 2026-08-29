@@ -148,3 +148,29 @@ def test_reachable_from_respects_its_radius():
     assert reach
     for x, y in reach:
         assert max(abs(x - 3213), abs(y - 3424)) <= 3
+
+
+def test_reachable_from_never_exceeds_its_node_cap():
+    """The cap is a HARD bound -- the neighbour loop used to overshoot it by up to 4."""
+    for cap in (1, 5, 37):
+        reach = worldmap.reachable_from(3213, 3424, 0, radius=50, max_nodes=cap)
+        assert len(reach) <= cap
+
+
+@pytest.mark.parametrize("sx,sy,plane,gx,gy", [
+    (2617, 3317, 1, 2617, 3316),
+    (2614, 3319, 0, 2616, 3318),
+    (3013, 3355, 0, 3037, 3346),
+    (2965, 3379, 0, 3213, 3424),
+])
+def test_every_returned_route_is_contiguous_and_walkable(sx, sy, plane, gx, gy):
+    """Length alone cannot catch a BFS that returns the wrong tiles. Each consecutive pair
+    must be a cardinal neighbour AND the edge between them must actually be passable."""
+    path = worldmap.find_path(sx, sy, plane, gx, gy)
+    assert path is not None
+    assert path[0] == (sx, sy)
+    assert path[-1] == (gx, gy)
+    for (ax, ay), (bx, by) in zip(path, path[1:]):
+        dx, dy = bx - ax, by - ay
+        assert abs(dx) + abs(dy) == 1, f"{(ax, ay)} -> {(bx, by)} is not a cardinal step"
+        assert worldmap.passable(ax, ay, plane, dx, dy), f"{(ax, ay)} -> {(bx, by)} is blocked"

@@ -260,6 +260,8 @@ def reachable_from(x: int, y: int, plane: int, *, radius: int = REACH_RADIUS,
         cx, cy = queue.popleft()
         step = distances[(cx, cy)] + 1
         for dx, dy in _CARDINAL_STEPS:
+            if len(distances) >= max_nodes:
+                break
             neighbour = (cx + dx, cy + dy)
             if neighbour in distances:
                 continue
