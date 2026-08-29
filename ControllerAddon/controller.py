@@ -809,36 +809,6 @@ def get_ground_walk_screen_pos(x: int, y: int, plane: int):
     return int(x), int(y)
 
 
-def request_shortest_path(x: int, y: int, plane: int, config: dict | None = None):
-    """Ask the (separately installed) Shortest Path plugin to compute a
-    route to (x, y, plane). requested=False if that plugin isn't
-    installed/running -- see get_shortest_path_result to poll for it.
-
-    `config` is a per-request override of that plugin's own settings, keyed by
-    its ShortestPathConfig option names (useFairyRings, useTeleportationItems,
-    avoidWilderness, calculationCutoff, ...) -- see travel.TRANSPORT_POLICY,
-    which is where the values actually come from. Sent as cfg.-prefixed query
-    params so a config key can never collide with x/y/plane."""
-    params = {"x": x, "y": y, "plane": plane}
-    for key, value in (config or {}).items():
-        params[f"cfg.{key}"] = _config_param_value(value)
-    return api_get("/shortest-path/request", params=params) or {"requested": False}
-
-
-def _config_param_value(value):
-    """Shortest Path's own override map only reads Boolean/Integer/String values, and the bridge
-    re-derives which of those a param is from its text -- so booleans have to go out lowercase
-    ("true"), not Python's str(True) == "True", which would parse as a plain string and be
-    silently ignored by a boolean config getter."""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
-
-
-def get_shortest_path_result():
-    return api_get("/shortest-path/result") or {"active": False, "done": False, "steps": []}
-
-
 def get_config():
     return api_get("/config")
 

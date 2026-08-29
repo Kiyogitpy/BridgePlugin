@@ -134,7 +134,7 @@ def use_helm(ctx) -> bool:
 
 def steer_toward(ctx, target: dict, arrival_tolerance: float = None) -> bool:
     """Drive the boat to within arrival_tolerance tiles of target ({"x", "y", "plane"}), same
-    hop-and-click-minimap loop shape as travel._walk_greedy -- confirmed live that minimap clicks
+    hop-and-click-minimap loop shape as travel._hop_to -- confirmed live that minimap clicks
     steer the boat once the helm is engaged, just with coarser (compass-snapped) heading than foot
     travel.
 
