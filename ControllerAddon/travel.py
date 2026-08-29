@@ -94,9 +94,19 @@ WALK_MAX_STALLS = 4          # total no-progress passes over the WHOLE walk befo
                              # session to verify rather than a documentation fix.
                              # Deliberately small: with a real route, a stall means something
                              # the route does not know about, and repeating it does not help.
-SCENE_HALF_WIDTH = 52        # the loaded scene is 104x104 tiles. Used ONLY to reject an
-                             # upper-plane route that escapes into the open sky the map treats
-                             # as walkable -- see route_to and the design doc's risk 1.
+SCENE_HALF_WIDTH = 52        # the loaded scene is 104x104 tiles. Used to reject an upper-plane
+                             # route that escapes into open sky -- see route_to. Originally added
+                             # because the old map had NO DATA above ground outside a building and
+                             # absent data read PASSABLE there, so a single missing exterior wall
+                             # on plane 1+ let BFS escape into the void. That specific mechanism is
+                             # gone since the 2026-08-29 map swap: unfloored plane 1-3 space is now
+                             # explicitly marked BLOCKED (MEASURED, Falador plane 1 over a 61x61
+                             # box: 5396 passable edges on the old map, 492 on the new), so this is
+                             # now belt-and-braces rather than load-bearing. NOT a reason to drop
+                             # it: genuinely absent data (no container at all for that key, as
+                             # opposed to explicitly-marked open sky) still reads PASSABLE under
+                             # the new polarity too -- see worldmap.py's module docstring item 1 --
+                             # so a real coverage hole could still produce exactly this leak.
 
 # --- closed doors -------------------------------------------------------------------------
 #
@@ -398,17 +408,24 @@ def route_to(target: dict, *, goal_adjacent: bool = False):
     if tiles is None:
         return None
 
-    # Upstairs, refuse a route that wanders outside the loaded scene. The map has NO DATA above
-    # ground outside a building and no data reads as PASSABLE, so a single missing exterior wall
-    # on plane 1+ lets BFS escape into open sky and come back down somewhere convenient -- a
-    # shortcut through nothing. The loaded scene is 104x104 tiles centred near the player, so a
-    # legitimate indoor route on an upper floor never approaches this bound.
+    # Upstairs, refuse a route that wanders outside the loaded scene. This guard predates the
+    # 2026-08-29 map swap, when the map had NO DATA above ground outside a building and absent
+    # data read PASSABLE -- a single missing exterior wall on plane 1+ let BFS escape into open
+    # sky and come back down somewhere convenient, a shortcut through nothing. The new asset
+    # explicitly marks most unfloored plane 1-3 space BLOCKED (MEASURED, Falador plane 1 over a
+    # 61x61 box: 5396 passable edges on the old map, 492 on the new -- see SCENE_HALF_WIDTH's own
+    # comment), so that specific leak is far rarer now. The guard stays as belt-and-braces rather
+    # than the load-bearing check it used to be: genuinely absent data (as opposed to explicitly
+    # marked open sky) still reads PASSABLE under the new polarity too, so a real coverage hole
+    # could still produce this exact shortcut. The loaded scene is 104x104 tiles centred near the
+    # player, so a legitimate indoor route on an upper floor never approaches this bound.
     if plane > 0:
         for x, y in tiles:
             if max(abs(x - px), abs(y - py)) > SCENE_HALF_WIDTH:
                 debug_log.log("travel", f"discarding a plane-{plane} route that leaves the "
-                                        f"loaded scene at ({x},{y}) -- the map treats open sky "
-                                        f"as walkable, so this is not a real path")
+                                        f"loaded scene at ({x},{y}) -- a coverage hole or open "
+                                        f"sky can still read as walkable, so this is not a "
+                                        f"real path")
                 return None
 
     return [{"x": x, "y": y, "plane": plane} for x, y in tiles]

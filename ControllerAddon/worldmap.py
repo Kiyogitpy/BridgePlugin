@@ -13,17 +13,31 @@ happens to be standing.
 
 THREE THINGS TO KNOW BEFORE TRUSTING A ROUTE FROM THIS (all MEASURED, see the design doc):
 
-  1. GENUINELY absent data (no container at all for that key) still defaults to PASSABLE -- that
-     is the reader's own neutral behaviour and is unchanged. But do not assume that covers
-     "outside a building": the asset swapped 2026-08-29 (CacheMapDumper replacing the old
-     EthanApi dump, see .superpowers/sdd/2026-08-29-global-collision-pathfinding/map-swap-
-     report.md) explicitly marks unfloored plane 1-3 tiles as BLOCKED rather than leaving them
-     unmarked -- MEASURED at five separate outdoor plane-1/2 spots, none under any building, all
-     blocked on all four cardinals (see test_unfloored_upper_planes_default_to_blocked). The old
-     asset did the opposite (explicitly marked that same space PASSABLE, which is what used to
+  1. GENUINELY absent data (no container at all for that key) now defaults to PASSABLE, and THIS
+     REVERSED with the 2026-08-29 asset swap (CacheMapDumper replacing the old EthanApi dump, see
+     .superpowers/sdd/2026-08-29-global-collision-pathfinding/map-swap-report.md) -- it is NOT the
+     reader's unchanged neutral behaviour, despite an earlier version of this note claiming that.
+     `_Roaring.contains()` for a missing key is unchanged (always False); what that False MEANS
+     flipped along with Indexer.SET_MEANS_PASSABLE: old asset (True), a missing key read BLOCKED;
+     new asset (False), a missing key reads PASSABLE. Concrete consequence, MEASURED: a coverage
+     hole now produces a confident route through nothing instead of failing fast --
+     `find_path(4500, 200, 0, 4525, 225)` returns a clean 51-tile route across coordinates that
+     are not in the game at all. Two things keep this from being as bad as it sounds: the new dump
+     DOES fence real coastlines (Port Sarim->Musa Point, Falador->open sea and Lumbridge->off-map
+     void all still return None on both the old and new map), and the exposure is confined to a
+     walk whose START tile sits inside a genuinely unmapped region -- a route that only passes
+     near real, mapped terrain stays bounded by that terrain's actual walls.
+
+     Do not conflate this with a SEPARATE mechanism, the "unfloored plane 1-3 reads blocked"
+     finding: the asset EXPLICITLY MARKS most outdoor plane 1-3 space as blocked (a real bit is
+     set, not merely absent) -- MEASURED at five separate outdoor plane-1/2 spots, none under any
+     building, all blocked on all four cardinals (see test_unfloored_upper_planes_default_to_
+     blocked). The old asset explicitly marked that same space PASSABLE (which is what used to
      make this item read "a missing exterior wall upstairs lets a route leak through the void").
-     So a genuine gap in a real upper floor now under-connects rather than over-connects -- the
-     walker's stall detection is still the backstop, just for the opposite failure mode.
+     So: genuinely ABSENT data now OVER-connects (the reversal above, a new exposure); explicitly
+     MARKED open sky now UNDER-connects (the opposite of the old failure mode) -- two different
+     mechanisms with opposite effects on a route. The walker's stall detection is still the
+     backstop for the under-connect case.
   2. An object's own blocking is baked into the same bits as a wall's, so this map CANNOT tell
      furniture from a wall. It must never be used to answer "can I interact with that object
      from here" -- travel.can_reach does that from LIVE collision flags, where

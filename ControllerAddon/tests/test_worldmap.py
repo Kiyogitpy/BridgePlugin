@@ -113,13 +113,20 @@ def test_set_means_passable_is_actually_honoured_not_decorative(monkeypatch):
     own Indexer docstring names Vitalite's map.dat as exactly that: same shape, SET means BLOCKED)
     would silently produce an inverted map. Asserting the constant's VALUE (as the old version of
     this test did) passes regardless of whether the code honours it; this asserts the BEHAVIOUR
-    instead, against a real, known bit from the bundled asset (see
-    test_upper_planes_carry_real_wall_geometry): worldmap.north(2617, 3317, 1) is True under the
-    real (False, since the 2026-08-29 map swap -- see Indexer's docstring) polarity. Flip the flag
-    and the same real bit must now read as impassable."""
+    instead.
+
+    CORRECTED 2026-08-29: this used to exercise only north(2617, 3317, 1), whose True comes from
+    an ABSENT bit (no container entry at all for that edge) resolving to passable under the
+    current polarity -- real, but not proof the code is reading a SET bit rather than always
+    returning a constant for that call shape. east(2617, 3317, 1) is the genuinely SET bit at the
+    same tile (see test_upper_planes_carry_real_wall_geometry: it resolves False/blocked precisely
+    because the underlying bit is SET, not because it's missing), so it is the one that actually
+    exercises polarity against explicitly-blocked data. Flip the flag and both must invert."""
     assert worldmap.north(2617, 3317, 1) is True
+    assert worldmap.east(2617, 3317, 1) is False
     monkeypatch.setattr(worldmap.Indexer, "SET_MEANS_PASSABLE", True)
     assert worldmap.north(2617, 3317, 1) is False
+    assert worldmap.east(2617, 3317, 1) is True
 
 
 import time
@@ -234,6 +241,18 @@ def test_every_returned_route_is_contiguous_and_walkable(sx, sy, plane, gx, gy):
 # travel.walk_to (and therefore worldmap.find_path/reachable_from underneath it) gets asserted
 # against real map coverage nearby.
 #
+# POLARITY FLIP, same day: this test originally asserted "at least one PASSABLE cardinal edge
+# exists nearby", which was correct against the OLD asset (absent data read BLOCKED there, so a
+# passable edge nearby was proof of real coverage) and is now a NON-TEST against the NEW one
+# (Indexer.SET_MEANS_PASSABLE is False -- absent data reads PASSABLE, see worldmap.py's module
+# docstring). Under the new polarity, "some passable edge nearby" is the DEFAULT answer for an
+# empty region with no data at all -- MEASURED over this test's own 21x21 box: three coordinates
+# that are not in the game at all ((9000,9000), (4500,200), (600,9000)) each returned 0 blocked /
+# 1764 passable edges, indistinguishable from real coverage by the old assertion. The fix is to
+# assert BLOCKED edges exist instead: real terrain always has walls somewhere nearby (the anchors
+# above measure 154-1174 blocked edges each), an unmapped region has none, and the 154-vs-0 margin
+# is not close.
+#
 # Gathered from:
 #   - routines/golem_crafting.py's DEFAULT_CONFIG["locations"] (mining/plinth/goatPit/
 #     spikesSupply/bank) -- the exact anchors the original bug report measured as 0/400.
@@ -259,9 +278,11 @@ def test_every_returned_route_is_contiguous_and_walkable(sx, sy, plane, gx, gy):
 # definition, unwalkable on every edge, exactly like every other furniture tile already pinned
 # elsewhere in this suite (test_furniture_tiles_are_solid). Asserting the exact anchor tile is
 # walkable would fail against CORRECT data. What actually distinguishes "the map has no data
-# here" (the real 2026-08-14 bug) from "this exact tile is furniture, but the ground around it is
-# real" is whether the SURROUNDING area has any passable edge at all -- which is exactly what the
-# original bug report's own 60x60-box sampling measured.
+# here" (the real 2026-08-14 bug, and under the current polarity a coverage hole's signature) from
+# "this exact tile is furniture, but the ground around it is real" is whether the SURROUNDING area
+# has any BLOCKED edge at all -- real terrain always has a wall somewhere nearby; an unmapped
+# region, under this asset's polarity, has none. See the POLARITY FLIP note above for why this
+# reads opposite to what the original 60x60-box sampling measured against the old asset.
 ROUTINE_ANCHORS = [
     ("golem_crafting.mining", 2599, 2248, 0),
     ("golem_crafting.plinth", 2595, 2253, 0),
@@ -281,18 +302,21 @@ ANCHOR_COVERAGE_RADIUS = 10  # a dense scan of a 21x21 box -- comfortably bigger
 
 @pytest.mark.parametrize("name,x,y,plane", ROUTINE_ANCHORS, ids=[a[0] for a in ROUTINE_ANCHORS])
 def test_every_hardcoded_routine_anchor_has_nearby_map_coverage(name, x, y, plane):
-    found = False
-    for dx in range(-ANCHOR_COVERAGE_RADIUS, ANCHOR_COVERAGE_RADIUS + 1):
-        for dy in range(-ANCHOR_COVERAGE_RADIUS, ANCHOR_COVERAGE_RADIUS + 1):
-            if any(worldmap.passable(x + dx, y + dy, plane, cdx, cdy) for cdx, cdy in CARDINALS):
-                found = True
-                break
-        if found:
-            break
-    assert found, (
-        f"{name} at ({x},{y},{plane}) has NO passable edge anywhere within "
-        f"{ANCHOR_COVERAGE_RADIUS} tiles -- this is exactly the coverage hole that made every "
-        f"walk_to using this anchor fail instantly against the old asset"
+    # Asserts BLOCKED edges exist, not passable ones -- this asset's polarity means an unmapped
+    # region reads FULLY PASSABLE (see the POLARITY FLIP note above), so a passable-edge test
+    # would happily pass for a coordinate that is not in the game at all. Real terrain always has
+    # a wall somewhere nearby; only a genuine coverage hole has zero blocked edges in the box.
+    blocked = sum(
+        not worldmap.passable(x + dx, y + dy, plane, cdx, cdy)
+        for dx in range(-ANCHOR_COVERAGE_RADIUS, ANCHOR_COVERAGE_RADIUS + 1)
+        for dy in range(-ANCHOR_COVERAGE_RADIUS, ANCHOR_COVERAGE_RADIUS + 1)
+        for cdx, cdy in CARDINALS
+    )
+    assert blocked > 0, (
+        f"{name} at ({x},{y},{plane}) has no collision data at all. NOTE the assertion is on "
+        f"BLOCKED edges, not passable ones: this asset marks blocked edges, so an unmapped "
+        f"region reads FULLY PASSABLE and a passable-edge test would happily pass for a "
+        f"coordinate that is not in the game."
     )
 
 
