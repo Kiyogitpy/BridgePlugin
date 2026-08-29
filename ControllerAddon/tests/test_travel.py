@@ -1607,29 +1607,41 @@ def test_a_hop_stops_before_a_shut_door_instead_of_clicking_past_it(walker, monk
 
 
 def test_a_stall_opens_the_door_on_the_route(walker, monkeypatch):
-    route = [(3200, 3200), (3200, 3201), (3200, 3202)]
-    door = _route_door(3200, 3201, plane=0)
+    # Route long enough that target is beyond WALK_ARRIVAL_TOLERANCE (3 tiles).
+    # Player starts at (3200, 3200), target at (3219, 3200) = 19 tiles away.
+    route = [(3200 + i, 3200) for i in range(20)]
+    door = _route_door(3200 + 1, 3200, plane=0)
     monkeypatch.setattr(travel.worldmap, "find_path", lambda *a, **kw: route)
     monkeypatch.setattr(controller, "get_objects", lambda **kw: [door])
+    # Blocked edge at step 1: BLOCK_MOVEMENT_EAST at x=3201 (cannot move EAST from there)
     monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=2: [
         {"x": tx, "y": ty, "plane": 0,
-         "flags": BLOCK_MOVEMENT_NORTH if (tx, ty) == (3200, 3201) else 0}
+         "flags": BLOCK_MOVEMENT_EAST if (tx, ty) == (3200 + 1, 3200) else 0}
         for tx, ty in route])
     monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane: True)   # never moves
-    travel.walk_to(_Ctx(), {"x": 3200, "y": 3202, "plane": 0})
+    travel.walk_to(_Ctx(), {"x": 3219, "y": 3200, "plane": 0})
     assert door in walker["clicked"]
 
 
 def test_open_door_toward_clicks_the_door_between_us_and_a_goal(walker, monkeypatch):
-    route = [(3200, 3200), (3200, 3201), (3200, 3202)]
-    door = _route_door(3200, 3201, plane=0)
+    """The door is clicked, and the test fixture makes the click succeed by clearing the flags."""
+    route = [(3200 + i, 3200) for i in range(20)]
+    door = _route_door(3200 + 1, 3200, plane=0)
     monkeypatch.setattr(travel.worldmap, "find_path", lambda *a, **kw: route)
     monkeypatch.setattr(controller, "get_objects", lambda **kw: [door])
-    monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=2: [
-        {"x": tx, "y": ty, "plane": 0,
-         "flags": BLOCK_MOVEMENT_NORTH if (tx, ty) == (3200, 3201) else 0}
-        for tx, ty in route])
-    assert travel.open_door_toward(_Ctx(), {"x": 3200, "y": 3202, "plane": 0}) is True
+    # Blocked edge from (3200, 3200) to (3201, 3200): set BLOCK_MOVEMENT_WEST at destination.
+    # Collision starts blocked but clears when the test records a click (simulating door opening).
+    collision_state = [{"x": tx, "y": ty, "plane": 0,
+                        "flags": BLOCK_MOVEMENT_WEST if (tx, ty) == (3200 + 1, 3200) else 0}
+                       for tx, ty in route]
+    def get_collision_mock(x, y, plane, radius=2):
+        # After the first click, the door opens (flags clear).
+        if len(walker["clicked"]) > 0:
+            return [{"x": tx, "y": ty, "plane": 0, "flags": 0} for tx, ty in route]
+        return collision_state
+
+    monkeypatch.setattr(controller, "get_collision", get_collision_mock)
+    assert travel.open_door_toward(_Ctx(), {"x": 3219, "y": 3200, "plane": 0}) is True
     assert door in walker["clicked"]
 
 
