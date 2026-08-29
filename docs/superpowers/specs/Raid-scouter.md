@@ -5,13 +5,28 @@ Author: brainstormed with the user 2026-08-29.
 
 ## Goal
 
-Reroll Chambers of Xeric instances until one matches a target rotation, hold that
-instance, tell the user, wait for their main account to start the raid, then leave and
-begin scouting a fresh instance. Repeat indefinitely.
+Reroll Chambers of Xeric instances until one matches a target rotation, hand that
+instance to the user's main account, then start over on a different world.
 
-The bot **never starts a raid and never fights anything.** It enters the start room,
-reads the layout, and either leaves or waits. This is the single most important safety
-invariant in the whole design.
+The loop, as stated by the user 2026-08-29:
+
+> create a party, enter raid, refresh until we find the configuration, then send
+> discord, wait until main is inside. we leave with same stairs we reroll with. swap
+> world, create a new party and go in again
+
+1. `setup` — make a party, enter the chambers
+2. `scout` / `reroll` — `Reload` the Steps until the layout matches
+3. `handoff` — POST to Discord, then **wait until the main is inside the raid**
+4. `depart` — leave via `Climb` on the **same Steps** used to reroll
+5. `hop` — switch world, then back to 1
+
+The bot **never starts a raid and never fights anything.** It sits in the start room,
+reads the layout, and either reloads, waits, or leaves. This is the single most
+important safety invariant in the whole design.
+
+Note the handoff signal is **the main being inside**, not the raid having begun. That
+is the user's explicit choice and it is the better one: the bot is gone before the raid
+starts, so **the raid scales for the main alone**, not for two players.
 
 ### The target rotation
 
@@ -214,21 +229,25 @@ never defaulted — the mahogany-homes `mh_phase` lesson.
 
 | phase | does | leaves when |
 |---|---|---|
-| `enter` | click the chambers entrance | `inRaid` true **and** `scoutId > last judged` |
+| `setup` | recruiting board → make party → close → enter chambers | `inRaid` true **and** `scoutId > last judged` |
 | `scout` | poll `/raid`, run `evaluate` | `match` → `hold`; `reject` → `reroll`; `abstain` → keep polling |
-| `hold` | fire the webhook once, anti-idle, watch for the handoff | handoff seen, or hold times out → `reroll` |
-| `reroll` | leave the chambers | `inRaid` false → `enter` |
+| `reroll` | `Reload` the Steps, answer the dialogue with `1` | `raidPartyId` goes -1 → a **new** id **and** `scoutId > last judged` |
+| `hold` | POST the webhook once, anti-idle, watch for the main | main inside → `depart`; timeout → `reroll` |
+| `depart` | `Climb` the **same** Steps | `inRaid` false |
+| `hop` | switch world | logged in on a new world → `setup` |
 
-`hold` leaves on whichever the config selects:
+`setup` runs once per **world**, not once per reroll. `reroll` never leaves the
+chambers, so there is no walk-back-to-the-entrance phase.
 
-- `EXIT_ON = "raid_started"` (**default**, matches what the user described) — waits for
-  `raidStarted`, then leaves.
-- `EXIT_ON = "main_arrived"` — leaves as soon as the configured main's display name
-  appears in `/players`. See the scaling trade-off below. Only the `name` field is
-  used: the start room is an instance, and `PvpProvider` still reads
-  `player.getWorldLocation()` — it is not in the four providers fixed for instanced
-  coordinates (CLAUDE.md), so **every x/y it reports in there should be assumed
-  wrong**. Names are unaffected.
+**The main being inside is detected from `/players`** — the configured display name
+appearing in the raid. Only the `name` field is used: the start room is an instance and
+`PvpProvider` still reads `player.getWorldLocation()`, so it is not among the four
+providers fixed for instanced coordinates (CLAUDE.md) and **every x/y it reports in
+there should be assumed wrong**. Names are unaffected.
+
+`hold` must **not** treat the main's arrival as the end of its job. The bot leaves as
+soon as the main is in; it never waits for the raid to begin, and it never presses
+anything resembling a start control.
 
 ### 4. Anti-idle while holding
 
@@ -242,6 +261,37 @@ a **known blind spot** — a routine's own tight poll loop never enters that pat
 is exactly such a loop, so it must not rely on the fidget: it issues an explicit camera
 nudge (an arrow-key press) every `IDLE_NUDGE_S` (first draft: 120s, wants live tuning),
 which is a real input event and unambiguously resets the timer.
+
+### 4b. World hopping — net-new, no precedent in this repo
+
+VERIFIED 2026-08-29: nothing in `ControllerAddon/` or `com.example` hops worlds today.
+This is a new subsystem, not a detail of the routine, and it is the part most likely to
+need its own live-debug session.
+
+It is deliberately **the last phase in the loop**, so a hop that fails costs a cycle and
+never strands the bot mid-raid or mid-handoff. `hop` is only ever entered from `depart`,
+i.e. already outside the chambers with no instance held.
+
+Two candidate mechanisms, to be settled by a **second recording of a human hopping**
+before any code is written:
+
+- **The world switcher interface** — the in-game world list. Reachable via `/widget` by
+  group/child once the recorder names them. Keeps the session alive, no login flow.
+- **Logout → world select → login** — reuses `login.py`'s existing `attempt_login` and
+  `LoginProvider`'s already-derived login-screen geometry (the fixed-pixel layout rule
+  and `loginIndex` values are already solved there). Slower, but built on parts that are
+  proven live.
+
+I recommend the world switcher and expect the logout path to be the fallback, but this
+should not be guessed — record it, the same way the reroll loop was.
+
+Whichever is used, the phase confirms on **`world` actually changing** on `GET /raid`
+(the field added for the webhook does double duty here), never on a fixed sleep, and
+`HOP_MAX_ATTEMPTS` bounds it. A world list is also a place where a misclick can start a
+different activity entirely, so the confirmation matters more than usual.
+
+The routine keeps a short list of recently used worlds and avoids immediately returning
+to one, so a failed hop cannot ping-pong between two worlds forever.
 
 ### 5. Alerting: Discord webhook
 
@@ -269,11 +319,19 @@ iterations — a cooldown only sets the rate of an unbounded loop (CLAUDE.md).
 
 | guard | fires when |
 |---|---|
-| `ENTER_MAX_CLICKS` | entrance clicked N times with `inRaid` still false |
+| `ENTER_MAX_CLICKS` | chambers entrance clicked N times with `inRaid` still false |
 | `SCOUT_TIMEOUT_S` | inside the chambers, no fresh `scoutId` within N seconds |
-| `REROLL_MAX_CLICKS` | exit clicked N times with `inRaid` still true |
+| `RELOAD_MAX_ATTEMPTS` | `Reload` clicked N times with `raidPartyId` never taking a new value |
+| `DIALOG_TIMEOUT_S` | `Reload` clicked, no widget 219 option within N seconds |
+| `DEPART_MAX_CLICKS` | `Climb` clicked N times with `inRaid` still true |
+| `HOP_MAX_ATTEMPTS` | hop attempted N times with `world` unchanged |
 | `HOLD_TIMEOUT_S` | main never showed; webhook a "giving up" note, then reroll |
 | raids plugin disabled | immediate stop, with the fix in the message |
+
+Sizing note: the measured reroll cycle is **4.4–6.5s** end to end, so any timeout here
+wants to be several times that, not tight against it. `RELOAD_MAX_ATTEMPTS` confirms on
+`raidPartyId` rather than on the click being taken — the mahogany-homes lesson that a
+registered click and a completed action are different things.
 
 The safety-stop reason must **not** repeat the engine's own ". Automation paused — fix
 the issue and restart." suffix — `trigger_safety_stop` appends it (mahogany lesson).
@@ -288,28 +346,82 @@ Per CLAUDE.md, a routine file alone is only launchable from the command line. Bo
 No `ControllerConfig.java` section: this routine uses `DEFAULT_CONFIG`/`get_config` and
 does not read the bridge's `GET /config`, same pattern as `gemstone_crab.py`.
 
-## Live-verify items — record a human first
+## MEASURED from a human recording
 
-The entrance and exit interactions are **not** specified here on purpose. Every
-guessed click in this codebase has cost a live session; `falconry.py` was written
-entirely from a recording and is the reference for how that pays off.
+`recordings/2026-08-29_215134_raid-scouter1` — 8m 3s, 107 menu actions, **37 reloads**.
+Everything in this section is read out of the narrative log. It replaced a first draft
+that guessed the loop was enter → leave → re-enter; **it is not**.
 
-**Before writing the routine, record 3-4 full reroll cycles:**
+### Setup, once per world (region 4919, Mount Quidamortem)
 
-```
-python -u recorder.py cox-scout-reroll
-```
+| step | how |
+|---|---|
+| Read Recruiting board | object **29776** @ (1246,3562) p0, first option |
+| Make party | widget **499.59**, `CC_OP` → varp 1427 becomes a party id, varbit 5428 = 1 |
+| Close the party interface | widget **507.2 slot 11** |
+| Enter Chambers of Xeric | object **29777** @ (1232,3573) p0, first option |
 
-Read out of the narrative log, not guessed:
+The entry click was logged `(nothing observed -- click may have been ignored or out of
+range)` and the region changed **5.6s later**: it was clicked from 14 tiles away and the
+player walked there first. **Budget the walk** — the same omission that looped the
+mahogany-homes door and hotspot clicks.
 
-- the entrance object's id, name and action (and whether it is on the party board or
-  the chambers entrance itself)
-- how a human leaves an unstarted raid from the start room — object or interface, and
-  its exact action
-- how a human leaves an **already started** raid (may differ from the above)
-- whether re-entry after a rejected layout needs any party-board interaction at all
-- the tick gap between the click and varbit 5432 flipping, to size the timeouts
-- whether `RaidScouted` lands before or after the player is controllable
+### The reroll cycle, performed 37 times
+
+1. `Reload` on object **Steps id 49999** — **`GAME_OBJECT_SECOND_OPTION`**. The *first*
+   option is `Climb`, which is how you leave, so taking index 0 here would walk the bot
+   out of the raid instead of rerolling it.
+2. A confirmation dialogue opens: widget **219.1 slot 1**, text **"Yes, reload the raid."**
+   Group 219 is `DIALOG_OPTION_GROUP` — scope any text match to that group, never to the
+   whole widget tree (the chatbox is group 162 and keeps history forever).
+3. The human answers by **pressing the `1` key** — 38 presses against 37 reloads, and
+   only 17 `Continue` widget clicks. Prefer the keypress: no aiming, no hijack, immune
+   to where the dialogue renders.
+4. ~2s: LOADING → LOGGED_IN.
+5. ~2s: **varp 1427 takes a new value** — the new instance is ready.
+
+**Measured cycle time, click to click: 5.9s / 6.5s / 4.4s / 4.5s.**
+
+Two facts that shape the routine:
+
+- **No walking between rerolls.** The player respawns ~3 tiles from the Steps every
+  time; all four consecutive reloads above were clicked with zero intervening movement.
+  Only the initial entry needs a walk.
+- **The Steps move every reload.** The instance alternates between regions 13137 and
+  13393 and the Steps alternate with it — (3298,5185) and (3278,5184). **Re-resolve from
+  `/objects` every cycle; never cache the tile.**
+
+### Signals, refined by measurement
+
+| signal | measured behaviour |
+|---|---|
+| varp **1427** | the party/instance id. Goes to **-1** on confirm, then to a **new value** ~2s after the load. The definitive new-instance marker. |
+| varbit **5432** | 1 inside the chambers. **Dips to 0 and back to 1 inside a single batch during a reload** — never read a 0 here as "we left the raid". |
+| varbit **5424**, **9540** | 0 → 2 once the instance settles; 1 while a reload is pending. |
+| varbit **12285** | 109 once settled, 0 during the swap. |
+| varbit **5425** | 5 during the swap, 0 once settled. |
+| varbit **12393** | 1 on the confirm, 0 when the load finishes. **Not reload-specific** — also set when first entering the chambers, and it is the tablet-teleport varbit from mahogany homes. Do not key anything on it alone. |
+
+`Shift` was pressed 52 times — the human shift-clicks to walk, exactly as CLAUDE.md
+requires of us.
+
+### Not covered by this recording
+
+The human never started a raid and was never joined, so these remain unverified:
+
+- **No chat line was seen in the entire 8 minutes.** `"The raid has begun!"` is
+  unconfirmed by recording. It is no longer on the critical path (the handoff is the
+  main's arrival) but `raidStarted` is still reported by the provider, so treat it as
+  unproven until seen live.
+- **`Climb` as the exit.** The action exists on the same Steps object (3 uses, and the
+  human went straight to the Score board and Recruiting board afterwards, so it clearly
+  exits) — but never with another player inside, which is exactly the case that matters.
+- **Whether the instance survives the bot leaving while the main is inside.** The single
+  most important unverified assumption in this design. See the open questions.
+- **World hopping.** Not in the recording at all, and **no world-hop support exists
+  anywhere in this repo today** — verified 2026-08-29 across `ControllerAddon/*.py`,
+  `routines/*.py` and `src/main/java/com/example/`. This is net-new and is the riskiest
+  part of the implementation, not a detail.
 
 Every world-object click site gets a reachability gate (`travel.can_reach`) — the
 invariant from mahogany homes is that **the game accepts a click on anything you can
@@ -336,7 +448,12 @@ Cases, at minimum:
   in the provider, not a rejectable layout — assert it never appears as `reject`
 - an UNKNOWN room abstains, and specifically does **not** reject
 - a stale `scoutId` is refused after re-entry
-- `hold` exits on `raidStarted` under the default `EXIT_ON`
+- `hold` exits to `depart` when the configured main's name appears in `/players`, and
+  does **not** exit on any other player's name
+- `reroll` treats varbit 5432 dipping to 0 mid-reload as normal, **not** as having left
+  the raid (measured: it dips and returns inside one batch)
+- the `Reload` click uses the **second** menu option; a test pins this, since taking
+  index 0 would `Climb` out of the raid instead
 - `HOLD_TIMEOUT_S` rerolls rather than holding forever
 - a webhook raising every exception type still leaves the loop running
 
@@ -345,26 +462,31 @@ Cases, at minimum:
 - Doing any part of the raid. The bot never starts, never fights, never loots.
 - Challenge mode — its layout is static, so there is nothing to scout.
 - Large/full raids — incompatible with an exactly-five-room target.
-- Choosing or joining the party, setting raid size, or managing the CC. Manual setup.
-- World hopping to scout faster.
+- Setting raid size or managing CC membership/ranks. Manual setup. (Creating the party
+  each cycle *is* in scope — it is step 1 of the loop.)
 - Any rotation preference beyond the single exact target; there is no scoring or
   "close enough" tier.
 
 ## Open questions for the first live session
 
-1. **Who leads the party.** The design assumes the bot is a plain member and the main
-   leads, so the bot leaving never transfers leadership or ejects anyone. If the bot
-   ends up leading, the wiki's leadership-transfer rule applies and the main must be
-   ranked recruit+ in the bot's CC — worth confirming before the first unattended run.
-2. **Raid scaling.** Under the default `EXIT_ON = "raid_started"` the bot is inside the
-   instance at the moment the raid starts, so **the raid scales for two players**.
-   Scaling is calculated at start and leaving afterwards does not undo it. If that is
-   unwanted, switch to `EXIT_ON = "main_arrived"`, which costs the ability to detect
-   the start from inside. Flagged rather than decided — it is a gameplay call.
-3. **Whether leaving before the start dissolves the instance.** If the bot is the only
-   one inside an unstarted raid and leaves, the instance may be destroyed. Harmless
-   during `reroll` (that is the intent) but it would break `EXIT_ON = "main_arrived"`
-   if the main has not entered yet. Verify live before enabling that mode.
-4. **`IDLE_NUDGE_S`, `SCOUT_TIMEOUT_S`, `HOLD_TIMEOUT_S`** are all first-draft guesses,
-   in the same category as mahogany homes' click cooldowns — expect to correct them
-   after the first live session, from the recording rather than from reasoning.
+1. **Does the instance survive the bot leaving while the main is inside?** The whole
+   handoff rests on yes. MEASURED that the bot is the party **leader** — the recording
+   shows `Make party`, and reloading sets varp 1427 to -1 and then to a new id, which is
+   the leader's party being torn down and rebuilt. The wiki's rule is that when the
+   leader leaves, leadership passes to the highest-ranked CC member (recruit+), and if
+   there is none **everyone is ejected from the instance**. So the main almost certainly
+   has to be **ranked recruit or above** in the bot's clan chat, or `depart` will throw
+   the main out of the raid it was just handed. **Confirm this with one manual trial
+   before any unattended run** — the failure mode is destroying the good instance at the
+   exact moment it becomes valuable.
+2. **Does the main need to be in the party before the good layout is found?** If joining
+   is only possible before the bot's last `Reload`, the main cannot join on demand and
+   the handoff needs rethinking. The recording has no second player, so this is untested.
+3. **World hop mechanism.** Switcher interface vs logout/login — record a human hopping
+   and pick. See §4b; nothing in the repo does this today.
+4. **`IDLE_NUDGE_S`, `SCOUT_TIMEOUT_S`, `HOLD_TIMEOUT_S`, `HOP_MAX_ATTEMPTS`** are
+   first-draft guesses, in the same category as mahogany homes' click cooldowns. The
+   reroll-side numbers are **not** guesses any more — 4.4–6.5s measured.
+5. **Anti-idle during `hold` is now the longest wait in the loop** and the only one
+   bounded by a human rather than the game. It is also the one phase where the bot is
+   holding something valuable, so a logout there is the most expensive possible failure.
