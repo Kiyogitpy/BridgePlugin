@@ -17,28 +17,48 @@ invariant in the whole design.
 
 Approved by the user 2026-08-29 as the **exact** rule, not a preference ordering:
 
-> The raid's ordered combat+puzzle room list must be **exactly four rooms**: `Vasa`
-> first, followed by `Shamans`, `Vespula` and `Tightrope` in any order. Any extra
-> combat or puzzle room disqualifies the layout.
+> The raid's ordered combat+puzzle room list must be **exactly five rooms**: `Vasa`
+> first, followed by `Shamans`, `Vespula`, `Crabs` and `Tightrope` in any order. Any
+> extra combat or puzzle room disqualifies the layout.
+
+That is the **smallest layout the game can generate** — three combat rooms and two
+puzzle rooms. Corrected by the user 2026-08-29 after an earlier draft of this spec
+specified a four-room target, which **no instance can ever satisfy**; the routine would
+have rerolled forever. The wiki's `Chambers of Xeric (Solo) Speed-Runner` page agrees:
+*"3 combats and 2 puzzles is the smallest possible layout, Tightrope and crabs are the
+fastest puzzle rooms allowing 3 combat rooms for the other supplies."*
+
+Composition of the target, by room type (`RaidRoom.java`):
+
+| room | type |
+|---|---|
+| Vasa, Shamans, Vespula | COMBAT (3) |
+| Crabs, Tightrope | PUZZLE (2) |
 
 | ordered rooms | verdict |
 |---|---|
-| Vasa, Tightrope, Shamans, Vespula | MATCH |
-| Vasa, Vespula, Tightrope, Shamans | MATCH |
-| Vasa, Shamans, Vespula, Tightrope, Crabs | no — five rooms |
-| Tekton, Vasa, Shamans, Vespula, Tightrope | no — Vasa is not first |
-| Vasa, Shamans, Vespula | no — Tightrope absent |
+| Vasa, Crabs, Shamans, Tightrope, Vespula | MATCH |
+| Vasa, Vespula, Tightrope, Shamans, Crabs | MATCH |
+| Vasa, Shamans, Vespula, Crabs, Tightrope, Tekton | no — six rooms |
+| Crabs, Vasa, Shamans, Vespula, Tightrope | no — Vasa is not first |
+| Vasa, Shamans, Vespula, Tightrope | no — Crabs absent |
+| Vasa, Shamans, Muttadiles, Crabs, Tightrope | no — Muttadiles for Vespula |
 
-Note `Tightrope` is a **puzzle** room while `Vasa`/`Shamans`/`Vespula` are **combat**
-rooms (`RaidRoom.java`), so the rule is stated over the combined ordered list — the
-same list RuneLite's own `Raid.toRoomString()` prints. Scavengers, farming, resource
-and start/end rooms are **not** part of the list and never affect the verdict.
+**"Vasa first" means index 0 of the ordered list**, not merely the first *combat* room —
+so a puzzle room appearing before Vasa disqualifies the layout (row 4 above). This is
+the stricter of the two readings and matches what the user picked. If the looser "first
+combat room" variant is ever wanted, it is a one-line change to the predicate, not a
+redesign.
 
-**Precondition: the party must be set to SMALL raids.** A four-room layout is only
-reachable there; large raids fill every floor with eight rooms and can even duplicate
-puzzle rooms, so the target rotation is unobtainable. The routine cannot set this
-itself — it is a manual setup step, and the routine should log loudly if it scouts
-several instances that all exceed four rooms.
+The rule is stated over the **combined** ordered list — the same list RuneLite's own
+`Raid.toRoomString()` prints. Scavengers, farming, resource and start/end rooms are
+**not** part of the list and never affect the verdict.
+
+**Precondition: the party must be set to SMALL raids.** A five-room layout is only
+reachable there; large raids fill every floor with eight rooms — four combat/skilling
+rooms per floor, and duplicate puzzle rooms become possible — so the target rotation is
+unobtainable. The routine cannot set this itself; it is a manual setup step, and the
+routine should log loudly if every instance it scouts exceeds five rooms.
 
 ## Researched facts
 
@@ -83,8 +103,9 @@ reflection, no vendored package, no edits to RuneLite source.
 ### Rooms can legitimately read as UNKNOWN, and that is not a "no match"
 
 `determineRoom` maps instance template chunks to rooms and names every room we care
-about directly (`RAIDS_VASA`, `RAIDS_SHAMANS`, `RAIDS_VESPULA`, `RAIDS_TIGHTROPE` are
-all explicit switch cases). But `buildRaid` skips any room whose tile falls outside the
+about directly (`RAIDS_VASA`, `RAIDS_SHAMANS`, `RAIDS_VESPULA`, `RAIDS_CRABS` and
+`RAIDS_TIGHTROPE` are all explicit switch cases — every one of the five target rooms is
+named, so none of them depends on the rotation solver to be identified). But `buildRaid` skips any room whose tile falls outside the
 loaded 104x104 scene — the room grid is 4x2 rooms of 32 tiles per plane, i.e. 128 tiles
 wide — and `Raid.updateLayout` fills those slots with `RoomType.getUnsolvedRoom()`,
 which is `UNKNOWN_COMBAT` / `UNKNOWN_PUZZLE`.
@@ -133,7 +154,7 @@ Not gated by `TickCache` — it is a varbit read plus a cached object, the same 
   "firstScout": true,
   "gridBase": {"x": 3288, "y": 5320, "plane": 3},
   "layoutCode": "#SCPSFCP#",
-  "rooms": ["Vasa", "Tightrope", "Shamans", "Vespula"],
+  "rooms": ["Vasa", "Crabs", "Shamans", "Tightrope", "Vespula"],
   "allRooms": ["Start", "Vasa", "Scavengers", "...16 slots..."],
   "unknownRooms": 0
 }
@@ -176,8 +197,8 @@ Match evaluation lives **here, in Python**, not in the provider. The Java side r
 rooms; the routine decides. Changing the target rotation must not need a rebuild.
 
 ```python
-TARGET_FIRST = "Vasa"
-TARGET_REST  = frozenset({"Shamans", "Vespula", "Tightrope"})
+TARGET_FIRST = "Vasa"                                        # must be ordered[0]
+TARGET_REST  = frozenset({"Shamans", "Vespula", "Crabs", "Tightrope"})
 TARGET_EXACT = True          # no extra combat/puzzle rooms allowed
 
 def evaluate(rooms):          # -> "match" | "reject" | "abstain"
@@ -227,7 +248,7 @@ which is a real input event and unambiguously resets the timer.
 Chosen by the user 2026-08-29 over terminal/desktop/in-game options. On a match, POST
 once:
 
-> `MATCH  world 420  party 8812` / `Vasa, Tightrope, Shamans, Vespula` / `holding — waiting for main`
+> `MATCH  world 420  party 8812` / `Vasa, Crabs, Shamans, Tightrope, Vespula` / `holding — waiting for main`
 
 **The webhook URL is a secret and must not be committed.** It is read from the
 `RAID_SCOUT_WEBHOOK` environment variable, falling back to
@@ -309,7 +330,10 @@ character happens to be standing (the travel.py lesson from 2026-08-29).
 
 Cases, at minimum:
 
-- the five rows of the verdict table above
+- every row of the verdict table above, including the "Vasa is not first" row that
+  pins index-0 semantics rather than first-combat-room semantics
+- a five-room layout is the smallest the game generates, so a four-room list is a bug
+  in the provider, not a rejectable layout — assert it never appears as `reject`
 - an UNKNOWN room abstains, and specifically does **not** reject
 - a stale `scoutId` is refused after re-entry
 - `hold` exits on `raidStarted` under the default `EXIT_ON`
@@ -320,7 +344,7 @@ Cases, at minimum:
 
 - Doing any part of the raid. The bot never starts, never fights, never loots.
 - Challenge mode — its layout is static, so there is nothing to scout.
-- Large/full raids — incompatible with an exactly-four-room target.
+- Large/full raids — incompatible with an exactly-five-room target.
 - Choosing or joining the party, setting raid size, or managing the CC. Manual setup.
 - World hopping to scout faster.
 - Any rotation preference beyond the single exact target; there is no scoring or
