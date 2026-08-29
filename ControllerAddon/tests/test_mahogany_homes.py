@@ -8,10 +8,12 @@ import time
 
 import pytest
 
+import mahogany_homes
 import mahogany_homes as mh
 import controller
 import banker
 import travel
+import worldmap
 
 
 def _hotspot(varb, object_id, value, needs_attention, material="PLANK", quantity=2):
@@ -37,12 +39,35 @@ def _no_live_bridge(monkeypatch):
     stub them, so results depended on where the character happened to be standing -- MEASURED
     2026-08-29 in the travel suite, where the same door test passed alone and failed in a full
     run. The defaults are the documented "client cannot tell" answers, which every caller must
-    already handle."""
+    already handle.
+
+    `get_player` is the third instance of this class this session (after two in the travel
+    suite): work_phase calls `controller.get_player()` directly (for the reachability flood
+    fill), unstubbed by test_work_phase_respects_click_cooldown, so with the client closed the
+    call resolves via the bridge's own failure path (api_get's 0.3s timeout + swallowed
+    exception) instead of returning instantly -- enough real wall-clock time for the cooldown
+    window under test to expire before the click gate is even reached, so the "no click yet"
+    assertion failed on a click that should have been suppressed. Verified with `requests`
+    stubbed to record every URL hit across the whole suite: only GET /player was ever reached,
+    and zero calls remain once this default is in place. `{}` matches get_player's own
+    bridge-down return value (`api_get(...) or {}`), so every consumer already treats it as
+    "cannot tell" -- same contract as the get_collision default above.
+
+    `request_shortest_path`/`get_shortest_path_result` are gone from this fixture as of the
+    global-collision-pathfinding migration (Task 5 deleted them from controller.py entirely);
+    reachability now comes from `worldmap.reachable_from`, which reads no HTTP at all -- it reads
+    the real, bundled world collision map straight off disk, keyed by real game coordinates. That
+    makes it hermetic in the no-HTTP sense but NOT in the "independent of real map data" sense: a
+    test using a synthetic placeholder tile (most fixtures here use (0,0), which is real open
+    ocean and reads as reachable-from-everywhere under "no data defaults to passable") gets a real
+    answer for a fake coordinate. `{}` here is the same "cannot tell" default `get_collision`
+    already returns -- and is what every one of these tests got for free from the old
+    `travel.reachable_set` + stubbed `get_collision` combination before this migration, so this
+    stub reproduces prior behaviour exactly rather than changing it. Tests that care about a real
+    reach answer patch `worldmap.reachable_from` (or `travel.can_reach` directly) themselves."""
     monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=6: [])
-    monkeypatch.setattr(controller, "request_shortest_path",
-                        lambda x, y, plane, config=None: {"requested": False})
-    monkeypatch.setattr(controller, "get_shortest_path_result",
-                        lambda: {"active": False, "done": False, "steps": []})
+    monkeypatch.setattr(controller, "get_player", lambda: {})
+    monkeypatch.setattr(worldmap, "reachable_from", lambda x, y, plane, **kw: {})
 
 
 @pytest.fixture(autouse=True)
@@ -1492,8 +1517,9 @@ def test_bank_phase_walks_to_a_bank_that_is_a_room_away(monkeypatch):
     assert walked, "a bank 21 tiles away must be walked to, not clicked at through a wall"
     target, kw = walked[0]
     assert (target["x"], target["y"], target["plane"]) == (1747, 3598, 0)
-    assert kw.get("min_path_tiles") == 0, \
-        "must force a computed route -- greedy walking is obstacle-blind and we start indoors"
+    # min_path_tiles no longer exists -- travel.walk_to routes off the global collision map
+    # unconditionally now, so there is no short-hop/obstacle-blind split left to force past.
+    assert "min_path_tiles" not in kw
 
 
 def test_bank_phase_does_not_walk_to_a_bank_it_is_already_at(monkeypatch):
@@ -1672,7 +1698,7 @@ def test_work_phase_walks_to_the_hotspot_itself_when_it_cannot_be_reached(monkey
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3034, "y": 3341, "plane": 0})
     walked, doorways = [], []
     monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: walked.append(target) or True)
-    monkeypatch.setattr(travel, "open_doorway_to",
+    monkeypatch.setattr(travel, "open_door_toward",
                         lambda ctx, goal: doorways.append(goal) or True)
 
     hotspot = _hotspot(10554, 40089, 3, True)
@@ -2030,7 +2056,7 @@ def test_work_phase_opens_a_shut_door_before_its_first_hotspot_click(monkeypatch
     # straight away -- the door was only resolved by the unreachable branch, five wasted clicks
     # later. MEASURED live at MARIAH's: exactly that, twice in one contract.
     order = []
-    monkeypatch.setattr(travel, "open_doorway_to",
+    monkeypatch.setattr(travel, "open_door_toward",
                          lambda ctx, goal: order.append(("door", goal["x"], goal["y"])))
     monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
     monkeypatch.setattr(controller, "get_objects",
@@ -2054,7 +2080,7 @@ def test_work_phase_opens_a_shut_door_before_its_first_hotspot_click(monkeypatch
 
 def test_the_door_is_not_re_resolved_on_every_click_of_the_same_hotspot(monkeypatch):
     doors = []
-    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: doors.append(goal))
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: doors.append(goal))
     monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
     monkeypatch.setattr(controller, "get_objects",
                          lambda radius=None: [_object(40002, distance=2, x=1769, y=3622)])
@@ -2083,7 +2109,7 @@ def test_climb_clicks_the_ladders_own_reported_centre(monkeypatch):
     # away from its target.
     monkeypatch.setattr(controller, "get_ground_walk_point",
                          lambda x, y, plane: pytest.fail("must not derive a corner any more"))
-    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: False)
     seen = {}
     def _menu(ser, entity, option, **kw):
         seen["entity"] = entity
@@ -2201,7 +2227,7 @@ def test_the_unreachable_walk_targets_a_tile_on_our_own_floor(monkeypatch):
                          lambda radius=None: [_object(40171, distance=2, x=2613, y=3296)])
     monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 2622, "y": 3293, "plane": 1})
-    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: False)
     walked = {}
     monkeypatch.setattr(travel, "walk_to",
                          lambda ctx, goal, **kw: walked.setdefault("goal", goal))
@@ -2231,7 +2257,7 @@ def test_the_unreachable_walk_still_uses_the_standing_tile_from_outside(monkeypa
                          lambda radius=None: [_object(40002, distance=2, x=1769, y=3622)])
     monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 1760, "y": 3620, "plane": 0})
-    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: False)
     walked = {}
     monkeypatch.setattr(travel, "walk_to",
                          lambda ctx, goal, **kw: walked.setdefault("goal", goal))
@@ -2334,21 +2360,28 @@ def test_a_shortage_from_out_of_town_still_banks(monkeypatch):
     assert called == ["bank"], f"a shortage away from the house must still bank: {called}"
 
 
-def test_a_stuck_hotspot_falls_back_to_opening_any_shut_door(monkeypatch):
+def test_a_door_miss_does_not_stop_the_walk_that_follows(monkeypatch):
     # USER 2026-08-29: "got stuck outside without opening door again". Outside ROSS's house the
-    # only way in is a DETOUR door -- both player and hotspot east of its blocked edge -- so the
-    # strict edge test correctly finds nothing. Having already proven the hotspot is unreachable,
-    # "no door is provably in the way" is not an answer we can act on.
+    # only way in is a DETOUR door -- both player and hotspot east of its blocked edge -- so a
+    # straight-line edge test alone would find nothing.
+    #
+    # REWRITTEN for the global-collision-pathfinding migration: this used to test a two-tier
+    # fallback (a strict open_doorway_to, then a blunt open_nearest_shut_door reached only when
+    # the first found nothing) that travel.open_door_toward's docstring says it replaces
+    # outright -- it routes off the global map and opens whichever door actually lies on that
+    # route, so there is no longer a second tier to fall back TO. What is left to prove is that
+    # the stuck branch still calls the door opener at all (a False return -- "found no door" --
+    # must not be treated as fatal and must not stop the walk that follows).
     monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
     monkeypatch.setattr(controller, "get_objects",
                          lambda radius=None: [_object(40164, distance=3, x=2617, y=3318)])
     monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 2614, "y": 3319, "plane": 0})
-    monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: True)
-    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)   # strict finds none
-    fallback = []
-    monkeypatch.setattr(travel, "open_nearest_shut_door",
-                         lambda ctx, goal: fallback.append(goal) or True)
+    walked = []
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: walked.append(True) or True)
+    opened = []
+    monkeypatch.setattr(travel, "open_door_toward",
+                         lambda ctx, goal: opened.append(goal) or False)   # found nothing
 
     hs = _hotspot(10554, 40164, 1, True)
     hs["location"] = {"x": 2617, "y": 3318, "plane": 0}
@@ -2362,20 +2395,26 @@ def test_a_stuck_hotspot_falls_back_to_opening_any_shut_door(monkeypatch):
     ctx.state.data["mh_door_checked"] = (40164, 1)
     mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
 
-    assert fallback, "a stuck hotspot must try the nearest shut door when the strict test finds none"
+    assert opened, "a stuck hotspot must still try to open a door"
+    assert walked, "a door miss (False) must not stop the walk that follows"
 
 
-def test_the_stuck_fallback_is_skipped_when_a_door_was_provably_in_the_way(monkeypatch):
-    # The strict test staying primary matters: it opens the RIGHT door rather than the nearest.
+def test_a_door_hit_does_not_stop_the_walk_that_follows(monkeypatch):
+    # Renamed (final review, "misleading test names / one weak assertion"): the old name claimed
+    # the walk is SKIPPED when a door was found -- the opposite of what this test actually
+    # asserts (`assert walked`, i.e. the walk still happens). REWRITTEN for the same reason as
+    # the test above: the "strict test staying primary" this docstring used to describe was about
+    # not second-guessing a found door with a second call -- there is only one call now, so the
+    # thing left to prove is the mirror case, a True return (a door WAS found and opened) also
+    # does not stop the walk that follows.
     monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
     monkeypatch.setattr(controller, "get_objects",
                          lambda radius=None: [_object(40164, distance=3, x=2617, y=3318)])
     monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 2614, "y": 3319, "plane": 0})
-    monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: True)
-    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: True)    # strict found one
-    monkeypatch.setattr(travel, "open_nearest_shut_door",
-                         lambda ctx, goal: pytest.fail("must not second-guess the strict test"))
+    walked = []
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: walked.append(True) or True)
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: True)    # door found + opened
 
     hs = _hotspot(10554, 40164, 1, True)
     hs["location"] = {"x": 2617, "y": 3318, "plane": 0}
@@ -2388,6 +2427,7 @@ def test_the_stuck_fallback_is_skipped_when_a_door_was_provably_in_the_way(monke
     ctx.state.data["mh_hotspot_signature"] = (40164, 1)
     ctx.state.data["mh_door_checked"] = (40164, 1)
     mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+    assert walked, "opening a door must still be followed by the walk"
 
 
 def test_the_click_cooldown_budgets_the_walk_to_the_hotspot(monkeypatch):
@@ -2447,7 +2487,7 @@ def test_an_unreachable_hotspot_is_never_clicked_at_all(monkeypatch):
                          lambda ser, entity, **kw: pytest.fail("must not click what we cannot reach"))
     monkeypatch.setattr(travel, "can_reach", lambda goal, reach=None, **kw: False)
     opened, walked = [], []
-    monkeypatch.setattr(travel, "open_frontier_door",
+    monkeypatch.setattr(travel, "open_door_toward",
                          lambda ctx, goal: opened.append(goal) or True)
     monkeypatch.setattr(travel, "walk_to", lambda ctx, goal, **kw: walked.append(goal) or True)
 
@@ -2460,7 +2500,7 @@ def test_an_unreachable_hotspot_is_never_clicked_at_all(monkeypatch):
     ctx = _Ctx()
     mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
 
-    assert opened, "an unreachable hotspot must resolve the frontier door"
+    assert opened, "an unreachable hotspot must resolve the door standing in the way"
     assert walked, "...and then walk"
     assert ctx.state.data.get("mh_hotspot_clicks", 0) == 0, "no click may be spent"
 
@@ -2471,9 +2511,11 @@ def test_a_reachable_hotspot_is_clicked_immediately(monkeypatch):
                          lambda radius=None: [_object(40164, distance=1, x=2617, y=3318)])
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 2617, "y": 3317, "plane": 0})
     monkeypatch.setattr(travel, "can_reach", lambda goal, reach=None, **kw: True)
-    monkeypatch.setattr(travel, "open_frontier_door",
-                         lambda ctx, goal: pytest.fail("reachable -- no door work needed"))
-    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)
+    # A reachable hotspot skips the unreachable-branch escalation entirely (can_reach is not
+    # False), but the pre-click door check still runs once per hotspot state regardless of
+    # reachability -- see work_phase's own comment: "costs nothing when the way is already
+    # clear". So open_door_toward IS still called here; it just must not block the click.
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: False)
     monkeypatch.setattr(controller, "object_refresh_target",
                          lambda x, y, plane, obj_id: (lambda: None))
     clicked = []
@@ -2499,7 +2541,7 @@ def test_an_unknown_reachability_answer_still_clicks(monkeypatch):
                          lambda radius=None: [_object(40164, distance=1, x=2617, y=3318)])
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 2617, "y": 3317, "plane": 0})
     monkeypatch.setattr(travel, "can_reach", lambda goal, reach=None, **kw: None)
-    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: False)
     monkeypatch.setattr(controller, "object_refresh_target",
                          lambda x, y, plane, obj_id: (lambda: None))
     clicked = []
@@ -2584,12 +2626,12 @@ def test_a_hotspot_behind_a_wall_is_not_clicked_however_close_we_stand(monkeypat
     monkeypatch.setattr(controller, "get_objects",
                          lambda radius=None: [_object(40164, distance=1, x=2617, y=3318)])
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 2617, "y": 3319, "plane": 0})
-    monkeypatch.setattr(travel, "reachable_set", lambda x, y, plane, radius=None: {(2617, 3319)})
+    monkeypatch.setattr(worldmap, "reachable_from",
+                         lambda x, y, plane, **kw: {(2617, 3319): 0})
     monkeypatch.setattr(travel, "can_reach", lambda goal, reach=None, flags=None, **kw: False)
     monkeypatch.setattr(controller, "click_entity",
                          lambda ser, entity, **kw: pytest.fail("that is through a wall"))
-    monkeypatch.setattr(travel, "open_frontier_door", lambda ctx, goal: False)
-    monkeypatch.setattr(travel, "open_doorway_to", lambda ctx, goal: False)
+    monkeypatch.setattr(travel, "open_door_toward", lambda ctx, goal: False)
     walked = []
     monkeypatch.setattr(travel, "walk_to", lambda ctx, goal, **kw: walked.append(goal) or True)
 
@@ -2604,6 +2646,71 @@ def test_a_hotspot_behind_a_wall_is_not_clicked_however_close_we_stand(monkeypat
     assert walked, "it must walk around instead of clicking through the wall"
 
 
+def test_the_reachability_gate_uses_live_collision_not_the_static_map(monkeypatch):
+    # REWRITTEN 2026-08-29 (map-swap task): the original version put its wall on the GOAL's own
+    # adjacent edge. can_reach's local edge test always re-fetches that edge from LIVE
+    # controller.get_collision regardless of which `reach` set it was handed (see can_reach's
+    # `flags is None` fallback, a radius-2 fetch centred on the goal) -- so on that geometry the
+    # answer came out right even when work_phase's `live_reach` argument was swapped for the
+    # door-blind static-map flood. The test passed against the very bug it was meant to catch.
+    #
+    # This version puts the wall SEVERAL TILES BACK, between the player and the goal's
+    # neighbourhood -- ROSS's real shape (player outside, a shut door in the exterior wall,
+    # hotspot inside). The goal's own local geometry (what the radius-2 fallback sees) is open on
+    # every side; the ONLY thing that can catch the far door is the `reach` SET membership test
+    # (`near not in reach`, see can_reach's cardinal/diagonal loops) -- i.e. whether `live_reach`
+    # was built by flooding through the door (worldmap.reachable_from, which bakes doors OPEN) or
+    # by stopping at it (travel.reachable_set, reading the door's real shut edge off LIVE
+    # GET /collision). That is exactly what work_phase's `live_reach` line is supposed to use.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
+    monkeypatch.setattr(controller, "get_objects",
+                         lambda radius=None: [_object(40164, distance=6, x=6, y=0)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 0, "y": 0, "plane": 0})
+
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                         lambda ser, entity, **kw: clicked.append(entity) or True)
+
+    # The static map's flood: doors baked open, so it claims the WHOLE line through to the
+    # hotspot's neighbourhood is reachable -- the over-permissive answer a door-blind flood
+    # always gives. The gate must not be built from this.
+    monkeypatch.setattr(worldmap, "reachable_from",
+                         lambda x, y, plane, **kw: {(x2, 0): x2 for x2 in range(0, 7)})
+
+    # LIVE collision: a real shut door three tiles east of the player -- the ONLY wall in the
+    # scene, and nowhere near the goal's own neighbourhood (a radius-2 probe centred on (6, 0)
+    # sees nothing but open ground either way).
+    BLOCK_MOVEMENT_EAST = 8
+    BLOCK_MOVEMENT_WEST = 128
+    grid = {(x, 0): 0 for x in range(-1, 9)}
+    grid[(3, 0)] = BLOCK_MOVEMENT_EAST
+    grid[(4, 0)] = BLOCK_MOVEMENT_WEST
+    monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=6: [
+        {"x": tx, "y": ty, "plane": 0, "flags": f} for (tx, ty), f in grid.items()
+        if max(abs(tx - x), abs(ty - y)) <= radius])
+
+    opened, walked = [], []
+    monkeypatch.setattr(travel, "open_door_toward",
+                         lambda ctx, goal: opened.append(goal) or True)
+    monkeypatch.setattr(travel, "walk_to",
+                         lambda ctx, goal, **kw: walked.append(goal) or True)
+
+    hs = _hotspot(10554, 40164, 1, True)
+    hs["location"] = {"x": 6, "y": 0, "plane": 0}
+    state = {"homeName": "ROSS", "npcId": 10420,
+             "standingLocation": {"x": 0, "y": 0, "plane": 0},
+             "hotspots": [hs]}
+
+    ctx = _Ctx()
+    mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
+
+    assert not clicked, (
+        "the gate must reject a hotspot beyond a live-shut door, even though the static map "
+        "says the whole line through to it is reachable")
+    assert opened, "must have tried to open the door standing in the way"
+    assert walked
+
+
 def test_a_walled_off_ladder_is_not_clicked_either(monkeypatch):
     # MEASURED live 2026-08-29 at ROSS's: player (2618,3315), ladder 16683 at (2617,3315) --
     # cardinally adjacent, but (2618,3315) carries BLOCK_MOVEMENT_WEST so the shared edge is a
@@ -2613,13 +2720,13 @@ def test_a_walled_off_ladder_is_not_clicked_either(monkeypatch):
     # not been gated. USER: "i mean at this point am i going to have to hardcode each door?" -- no:
     # gate every world-object click on reachability, once.
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 2618, "y": 3315, "plane": 0})
-    monkeypatch.setattr(travel, "reachable_set",
-                         lambda x, y, plane, radius=None: {(2618, 3315)})
+    monkeypatch.setattr(worldmap, "reachable_from",
+                         lambda x, y, plane, **kw: {(2618, 3315): 0})
     monkeypatch.setattr(travel, "can_reach", lambda goal, reach=None, **kw: False)
     monkeypatch.setattr(controller, "click_menu_action",
                          lambda *a, **kw: pytest.fail("that ladder is behind a wall"))
     opened, walked = [], []
-    monkeypatch.setattr(travel, "open_frontier_door",
+    monkeypatch.setattr(travel, "open_door_toward",
                          lambda ctx, goal: opened.append(goal) or True)
     monkeypatch.setattr(travel, "walk_to", lambda ctx, goal, **kw: walked.append(goal) or True)
 
@@ -2633,15 +2740,13 @@ def test_a_walled_off_ladder_is_not_clicked_either(monkeypatch):
 
 def test_a_reachable_ladder_is_still_clicked_normally(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 2617, "y": 3316, "plane": 0})
-    monkeypatch.setattr(travel, "reachable_set",
-                         lambda x, y, plane, radius=None: {(2617, 3316), (2617, 3315)})
+    monkeypatch.setattr(worldmap, "reachable_from",
+                         lambda x, y, plane, **kw: {(2617, 3316): 0, (2617, 3315): 1})
     monkeypatch.setattr(travel, "can_reach", lambda goal, reach=None, **kw: True)
     # A REACHABLE ladder must involve no door work whatsoever. The old unconditional
     # open_doorway_to here ran the straight-line edge test every climb and false-positived on the
     # front door behind us at ROSS's, stepping outside between each Remove/Build.
-    monkeypatch.setattr(travel, "open_doorway_to",
-                         lambda ctx, goal: pytest.fail("ladder is reachable -- no door work"))
-    monkeypatch.setattr(travel, "open_frontier_door",
+    monkeypatch.setattr(travel, "open_door_toward",
                          lambda ctx, goal: pytest.fail("ladder is reachable -- no door work"))
     monkeypatch.setattr(travel, "walk_to", lambda *a, **kw: pytest.fail("no walk needed"))
     climbed = {}
@@ -2661,3 +2766,26 @@ def test_a_hotspot_on_another_floor_is_not_judged_by_our_own_floors_grid(monkeyp
     # purely because its x/y landed on a walkable ground-floor tile, so work_phase preferred it
     # over the ground-floor hotspots and went ladder-hunting. Cross-floor must answer None.
     assert travel.can_reach({"x": 10, "y": 10, "plane": 1}, {(10, 10)}, plane=0) is None
+
+
+def test_pick_next_hotspot_accepts_a_distance_dict_as_the_reach_map(monkeypatch):
+    """worldmap.reachable_from returns {(x, y): distance} where travel.reachable_set returned a
+    set. Both answer `in` and truthiness the same way, so the ranking is unchanged."""
+    reachable = {"x": 10, "y": 10, "plane": 0}
+    walled_off = {"x": 99, "y": 99, "plane": 0}
+    hotspots = [
+        {"objectId": 1, "needsAttention": True, "location": walled_off},
+        {"objectId": 2, "needsAttention": True, "location": reachable},
+    ]
+    monkeypatch.setattr(mahogany_homes.travel, "can_reach",
+                        lambda loc, reach, plane=None: loc == reachable)
+    chosen = mahogany_homes.pick_next_hotspot(hotspots, {(10, 10): 0, (10, 11): 1}, 0)
+    assert chosen["objectId"] == 2
+
+
+def test_pick_next_hotspot_still_returns_a_walled_off_hotspot_when_nothing_else_is_left():
+    """Rank 2 sorts last but is still RETURNED, so a walled-off contract falls through to the
+    door/walk recovery rather than reporting no work left and turning in unfinished."""
+    walled_off = {"x": 99, "y": 99, "plane": 0}
+    hotspots = [{"objectId": 1, "needsAttention": True, "location": walled_off}]
+    assert mahogany_homes.pick_next_hotspot(hotspots, {(10, 10): 0}, 0)["objectId"] == 1

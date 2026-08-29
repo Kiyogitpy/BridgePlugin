@@ -22,6 +22,7 @@ import banker
 import controller
 import debug_log
 import travel
+import worldmap
 
 # InterfaceID.MagicSpellbook.NPC_CONTACT (packed 14286961 == 218<<16 | 113) -- confirmed both
 # against runelite-api-1.12.33.jar (javap -v) and against all four recordings, where every
@@ -397,8 +398,11 @@ def pick_next_hotspot(hotspots: list, reach: set | None = None, plane: int | Non
     walker, while reachable work sat two tiles away. Order within each group is preserved, so
     behaviour is unchanged whenever everything is reachable (the normal case).
 
-    `reach` is a set of walkable (x, y) from travel.reachable_set. None -- or an empty set, which
-    is what the client returns when it cannot tell -- falls back to plain list order."""
+    `reach` is a {(x, y): step distance} dict from worldmap.reachable_from -- costs no HTTP call
+    and answers on any plane, unlike the old travel.reachable_set it replaced. None -- or an
+    empty dict, which is what "cannot tell" looks like -- falls back to plain list order. Both a
+    set and this dict answer `in` and truthiness the same way, so travel.can_reach (below) does
+    not need to know which one it was handed."""
     pending = [h for h in hotspots if h.get("needsAttention")]
     if not pending:
         return None
@@ -520,14 +524,14 @@ def bank_phase(ctx, config: dict, state: dict) -> None:
     # Walk into range before clicking. banker.open_bank has its own approach step, but it
     # minimap-hops, and a minimap hop cannot open a closed door -- which is the usual thing
     # between this routine and the bank, because it banks from INSIDE the contract house.
-    # travel.walk_to is the only walker carrying the stall-triggered door recovery.
-    # min_path_tiles=0 forces a computed route: a bank a room away is under SHORT_HOP_TILES, so
-    # otherwise this would be the obstacle-blind greedy walker starting from indoors.
+    # travel.walk_to routes off the global collision map unconditionally now (no more
+    # short-hop/obstacle-blind split to steer around), and it is the only walker carrying the
+    # door-opening recovery.
     if bank_obj.get("distance", 0) > banker.BANK_APPROACH_TILES:
         debug_log.log("mahogany_homes",
                       f"bank is {bank_obj.get('distance')} tiles away -- walking to it")
         travel.walk_to(ctx, {"x": bank_obj.get("x"), "y": bank_obj.get("y"),
-                             "plane": bank_obj.get("plane", 0)}, min_path_tiles=0)
+                             "plane": bank_obj.get("plane", 0)})
         bank_obj = banker.find_nearby_bank(bank_config) or bank_obj
 
     if not banker.open_bank(ctx, bank_obj):
@@ -732,7 +736,7 @@ def travel_phase(ctx, config: dict, state: dict) -> None:
                           f"walking to {home_name}")
         return
 
-    if not travel.walk_to(ctx, target):
+    if not travel.walk_to(ctx, target, goal_adjacent=False):
         debug_log.log("mahogany_homes", f"still walking toward {home_name}'s standing tile")
         return
 
@@ -761,12 +765,18 @@ def _chebyshev(a: dict, b: dict) -> int:
 def work_phase(ctx, config: dict, state: dict) -> None:
     hotspots = state.get("hotspots") or []
 
-    # One flood fill per tick, shared by the choice of hotspot and the reachability gate below.
-    # Empty when the client cannot tell, which both consumers read as "don't know".
+    # One bounded flood per tick, for pick_next_hotspot's RANKING only. worldmap answers on ANY
+    # plane, which travel.reachable_set could only do via the client's own scene -- and it costs
+    # no HTTP call at all. Doors are baked open in that map, so a hotspot behind a shut door reads
+    # as reachable-with-a-door-to-open, which is the right answer for choosing what to work on
+    # next. Empty when the client cannot tell, which every consumer reads as "don't know".
+    # NOTE: the reachability GATE below (hotspot_at / can_reach) deliberately does NOT reuse this
+    # -- see its own comment for why a static-map flood cannot be trusted to decide "can we
+    # actually interact with this right now".
     player = controller.get_player() or {}
     player_plane = player.get("plane") or 0
-    reach = (travel.reachable_set(player["x"], player["y"], player_plane)
-             if player.get("x") is not None else set())
+    reach = (worldmap.reachable_from(player["x"], player["y"], player_plane)
+             if player.get("x") is not None else {})
 
     target = pick_next_hotspot(hotspots, reach, player_plane)
     if target is None:
@@ -849,19 +859,35 @@ def work_phase(ctx, config: dict, state: dict) -> None:
     # meant "clicking through a wall". Raw tile distance cannot tell those two cases apart;
     # travel.can_reach now asks whether the EDGE is open, which separates them correctly and
     # answers both live cases right.
-    if hotspot_at and travel.can_reach(hotspot_at, reach, plane=player_plane) is False:
-        # Not reachable: the door on the FRONTIER of where we can walk is the way out, whether it
-        # lies straight ahead or behind us. Then walk -- and do not spend a click this tick.
-        if not travel.open_frontier_door(ctx, hotspot_at):
-            travel.open_doorway_to(ctx, hotspot_at)
+    # The GATE needs LIVE collision, never the static worldmap flood. worldmap.reachable_from
+    # treats every door as OPEN (deliberately -- see worldmap.py), so its flood walks straight
+    # through a shut one: MEASURED from ROSS's outside tile (2614,3319), it returns 447 tiles
+    # including (2616,3318) and (2618,3318) -- the hotspot's own cardinal neighbours on the FAR
+    # side of the shut front door. can_reach(hotspot_at, reach) built from that flood can answer
+    # True from outside the house, and this gate would never fire. This is exactly the design
+    # doc's split of responsibility: worldmap answers WHERE TO WALK (a shut door is just a route
+    # you have not opened yet); travel.can_reach answers WHETHER AN OBJECT CAN BE INTERACTED WITH
+    # RIGHT NOW, and that has to come from travel.reachable_set's LIVE GET /collision read, which
+    # reports the door's real (shut) edge. Do not "simplify" this back to the worldmap flood --
+    # that is precisely the bug this comment documents.
+    live_reach = (travel.reachable_set(player["x"], player["y"], player_plane)
+                  if player.get("x") is not None else set())
+    if hotspot_at and travel.can_reach(hotspot_at, live_reach, plane=player_plane) is False:
+        # Not reachable: open the door standing between us and it, whether it lies straight ahead
+        # or behind us. Then walk -- and do not spend a click this tick.
+        # ONE call now. This used to be three tiers -- open_frontier_door, then the straight-line
+        # open_doorway_to, then a blunt open_nearest_shut_door that opened something and hoped.
+        # All three existed because there was no route to ask; with a route the door is simply
+        # the one standing on it, and that works on any plane.
+        travel.open_door_toward(ctx, hotspot_at)
         travel.walk_to(ctx, _same_floor_walk_goal(state, target, hotspot_at),
-                       min_path_tiles=0, tolerance=HOUSE_ARRIVAL_TOLERANCE)
+                       tolerance=HOUSE_ARRIVAL_TOLERANCE)
         return
 
     if ctx.state.data.get("mh_door_checked") != signature:
         ctx.state.data["mh_door_checked"] = signature
         if hotspot_at:
-            travel.open_doorway_to(ctx, hotspot_at)
+            travel.open_door_toward(ctx, hotspot_at)
 
     if ctx.state.data.get("mh_hotspot_clicks", 0) >= HOTSPOT_UNREACHABLE_CLICKS:
         split_floor = state.get("homeName") in SPLIT_UPPER_FLOOR_HOMES
@@ -913,30 +939,18 @@ def work_phase(ctx, config: dict, state: dict) -> None:
         # So: resolve the door against the hotspot we cannot reach, then walk to the tile we can.
         hotspot_at = target.get("location")
         if hotspot_at:
-            # Strict first: the edge test proves a door is between us and the hotspot.
-            # If it finds nothing, fall back to opening the nearest shut door anyway -- we have
-            # ALREADY proven we cannot reach this hotspot, so "no door is provably in the way" is
-            # not an answer we can act on. MEASURED live 2026-08-29 outside ROSS's house: player
-            # on the grass at (2614,3319), Broken Range inside at (2617,3318), and the only way in
-            # a door at (2610,3316) that is a DETOUR WEST -- both of us east of its blocked edge,
-            # so the single-axis test says "not between us", correctly and uselessly. The route
-            # branch that normally catches a detour returned no route at that moment. USER: "got
-            # stuck outside without opening door again". Scoped to this stuck path on purpose: the
-            # same looseness in the ordinary pre-walk check was tried before and reverted as a
-            # false positive.
-            # Three tiers, precise first, and the LAST one is a genuine last resort. USER
-            # 2026-08-29: "we cannot use the cannot reach fallback for regular usage, this has to
-            # be last resort fallback" -- in run28 the blunt tier was doing all the work, firing
-            # three or four times per contract, because nothing above it could see a detour door.
-            #   1. open_frontier_door -- names the exact door on the boundary of the region we
-            #      are stuck in, from the collision flood fill. Handles detours, any plane.
-            #   2. open_doorway_to    -- the straight-line edge test.
-            #   3. open_nearest_shut_door -- opens something and hopes. Only reached when the two
-            #      above found nothing at all, which with the frontier test in place should be
-            #      close to never.
-            if not travel.open_frontier_door(ctx, hotspot_at):
-                if not travel.open_doorway_to(ctx, hotspot_at):
-                    travel.open_nearest_shut_door(ctx, hotspot_at)
+            # We have ALREADY proven we cannot reach this hotspot, so open whatever door stands
+            # between us and it. This used to be three tiers -- open_frontier_door (named the
+            # exact door on the boundary of the region we were stuck in, from the collision flood
+            # fill), then the straight-line open_doorway_to, then a blunt open_nearest_shut_door
+            # that opened something and hoped, reached only when the first two found nothing at
+            # all (MEASURED live 2026-08-29 outside ROSS's house: player on the grass at
+            # (2614,3319), Broken Range inside at (2617,3318), the only way in a door at
+            # (2610,3316) that is a DETOUR WEST of both of us -- neither of the first two tiers
+            # could see it). travel.open_door_toward replaces all three: it asks the global map
+            # for a route to the hotspot and opens whichever door actually lies on it, which
+            # finds the same detour door for free and needs no separate last-resort tier.
+            travel.open_door_toward(ctx, hotspot_at)
 
         # Normally the STANDING tile: the hotspot's own tile is usually furniture and unroutable
         # (Barbara's, above), so it is the tile we can actually walk to. The ONE exception is
@@ -953,7 +967,7 @@ def work_phase(ctx, config: dict, state: dict) -> None:
         if (walk_goal.get("plane") is not None and walk_goal.get("plane") != player_plane
                 and hotspot_at and hotspot_at.get("plane") == player_plane):
             walk_goal = hotspot_at
-        travel.walk_to(ctx, walk_goal, min_path_tiles=0, tolerance=HOUSE_ARRIVAL_TOLERANCE)
+        travel.walk_to(ctx, walk_goal, tolerance=HOUSE_ARRIVAL_TOLERANCE)
         return
 
     last_click = ctx.state.data.get("mh_last_hotspot_click", 0.0)
@@ -1073,14 +1087,21 @@ def _climb(ctx, ladder, option, why: str, from_plane: int | None = None) -> None
     # site, not one at a time -- that is why this bug kept reappearing somewhere new.
     here = controller.get_player() or {}
     if here.get("x") is not None and ladder.get("x") is not None:
+        # LIVE collision, not the static worldmap flood -- same reasoning as work_phase's own
+        # hotspot gate (see its comment for the measured proof): worldmap.reachable_from treats
+        # every door as open, so it can call a door-blocked ladder "reachable" and this gate would
+        # never fire. travel.reachable_set reads GET /collision, which reports the door's real,
+        # currently-shut edge -- worldmap answers where to walk, travel.can_reach answers whether
+        # we can interact with something right now, and those need different data sources.
         reach = travel.reachable_set(here["x"], here["y"], here.get("plane") or 0)
         if travel.can_reach(ladder, reach, plane=here.get("plane") or 0) is False:
             debug_log.log("mahogany_homes",
                           f"ladder {ladder.get('id')} at ({ladder.get('x')},{ladder.get('y')}) "
                           f"is walled off from here -- opening the way instead of clicking it")
-            if not travel.open_frontier_door(ctx, ladder):
-                travel.open_doorway_to(ctx, ladder)
-            travel.walk_to(ctx, ladder, min_path_tiles=0, tolerance=HOUSE_ARRIVAL_TOLERANCE)
+            # ONE call now -- see work_phase's own note on collapsing the three door tiers into
+            # travel.open_door_toward.
+            travel.open_door_toward(ctx, ladder)
+            travel.walk_to(ctx, ladder, tolerance=HOUSE_ARRIVAL_TOLERANCE)
             ctx.state.data["mh_last_ladder_click"] = time.time()
             return
 
@@ -1205,7 +1226,7 @@ def _approach_missing_hotspot(ctx, config: dict, state: dict, target: dict) -> N
         f"hotspot object {target['objectId']} not visible yet ({stuck}x, no ladder to try) "
         f"-- walking toward {state.get('homeName')}'s house",
     )
-    travel.walk_to(ctx, standing, tolerance=HOUSE_ARRIVAL_TOLERANCE)
+    travel.walk_to(ctx, standing, tolerance=HOUSE_ARRIVAL_TOLERANCE, goal_adjacent=False)
 
 
 def turn_in_phase(ctx, config: dict, state: dict) -> None:
@@ -1273,7 +1294,7 @@ def turn_in_phase(ctx, config: dict, state: dict) -> None:
                 return
 
         debug_log.log("mahogany_homes", f"homeowner npc {npc_id} not visible -- walking to standing tile")
-        travel.walk_to(ctx, state.get("standingLocation") or {})
+        travel.walk_to(ctx, state.get("standingLocation") or {}, goal_adjacent=False)
         return
 
     # NOTE: _accept_tea_if_offered is deliberately NOT called here -- see tick(), which calls it

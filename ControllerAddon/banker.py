@@ -970,7 +970,7 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
     saved_location = ctx.state.data.pop("bank_ferox_return_location", None)
     if saved_location is not None:
         debug_log.log("bank", "walking back to the previous location")
-        if not travel.walk_to(ctx, saved_location):
+        if not travel.walk_to(ctx, saved_location, goal_adjacent=False):
             debug_log.log("bank", "couldn't walk all the way back -- continuing from here")
 
     return True

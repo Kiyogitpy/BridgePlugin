@@ -13,17 +13,17 @@
 #   walk_to_exact_tile() -- shift+click force-walk onto ONE specific tile and
 #                           wait until standing exactly on it (no tolerance)
 #
-# walk_to routes through the (separately installed) Shortest Path hub
-# plugin: it posts a PluginMessage asking it to compute an obstacle-aware
-# route, polls for the result, then walks that route by repeatedly clicking
-# a waypoint some tiles ahead via the minimap and letting the game's own
-# pathfinder handle each short hop -- the look-ahead distance is randomized
-# per hop (never below WALK_HOP_MIN_TILES) rather than a fixed number, so
-# consecutive walks don't look identical. If Shortest Path isn't installed,
-# didn't finish in time, or the route turned out to be unusable, this falls
-# back to a straight-line greedy walk toward the target (same hop-and-click
-# trick, no obstacle awareness -- fine over the open terrain around Ferox
-# Enclave, not a real substitute for the computed route).
+# walk_to routes through worldmap.find_path -- a BFS over a static, pre-baked, world-wide
+# collision map (worldmap.py), not the separately-installed Shortest Path plugin this used to
+# depend on. route_to asks for that route; walk_to then walks it by repeatedly clicking a
+# waypoint some tiles ahead via the minimap and letting the game's own pathfinder handle each
+# short hop -- the look-ahead distance is randomized per hop (never below WALK_HOP_MIN_TILES)
+# rather than a fixed number, so consecutive walks don't look identical. The static map treats
+# every door as open, so a route can run straight through one that's actually shut; walk_to
+# catches that against LIVE collision (GET /collision) before each hop and opens the door in the
+# way (see the "closed doors" section below, and open_door_toward for the standalone version of
+# the same check). There is no obstacle-blind fallback any more: a target with no route at all
+# now returns False rather than hop-clicking a wall for up to eight minutes.
 #
 # ASSUMPTIONS TO VERIFY IN-GAME:
 #   - The ring of dueling's Ferox Enclave option is a direct right-click
@@ -37,6 +37,7 @@ import time
 
 import controller
 import debug_log
+import worldmap
 
 RING_OF_DUELING_NAME = "ring of dueling"
 FOUNTAIN_NAME = "Pool of Refreshment"
@@ -77,46 +78,49 @@ WALK_ARRIVAL_TOLERANCE = 3   # tiles; close enough to call a hop, or the whole t
 WALK_HOP_TIMEOUT_S = 8.0     # give up waiting on a single hop after this long
 WALK_MAX_HOPS = 60           # hard cap so a bad target can't loop forever
 
+COLLISION_SCAN_RADIUS = 10   # tiles of live collision fetched per hop. Big enough to see the
+                             # doors along one hop, small enough that a 21x21 response per hop
+                             # stays cheap. Beyond it we simply hop and let the stall catch it.
+WALK_MAX_STALLS = 4          # total no-progress passes over the WHOLE walk before giving up --
+                             # NOT "consecutive": `stalls` is only ever incremented in walk_to's
+                             # loop, never reset when a later hop makes real progress, so this is
+                             # a cumulative budget across the walk's life (itself bounded by
+                             # WALK_MAX_HOPS=60), not a run of back-to-back stalls. Comment fixed
+                             # rather than the code during the final review pass: the cumulative
+                             # behaviour is a defensible, already-small safety bound on its own
+                             # (a walk that stalls 4 times total, however spread out, is still
+                             # heading somewhere the route did not expect), and loosening it to
+                             # "reset on progress" is a real behaviour change that wants a live
+                             # session to verify rather than a documentation fix.
+                             # Deliberately small: with a real route, a stall means something
+                             # the route does not know about, and repeating it does not help.
+SCENE_HALF_WIDTH = 52        # the loaded scene is 104x104 tiles. Used to reject an upper-plane
+                             # route that escapes into open sky -- see route_to. Originally added
+                             # because the old map had NO DATA above ground outside a building and
+                             # absent data read PASSABLE there, so a single missing exterior wall
+                             # on plane 1+ let BFS escape into the void. That specific mechanism is
+                             # gone since the 2026-08-29 map swap: unfloored plane 1-3 space is now
+                             # explicitly marked BLOCKED (MEASURED, Falador plane 1 over a 61x61
+                             # box: 5396 passable edges on the old map, 492 on the new), so this is
+                             # now belt-and-braces rather than load-bearing. NOT a reason to drop
+                             # it: genuinely absent data (no container at all for that key, as
+                             # opposed to explicitly-marked open sky) still reads PASSABLE under
+                             # the new polarity too -- see worldmap.py's module docstring item 1 --
+                             # so a real coverage hole could still produce exactly this leak.
+
 # --- closed doors -------------------------------------------------------------------------
 #
-# Shortest Path CANNOT route us through a shut door, and it does not know that it can't.
-# MEASURED 2026-08-28 by decoding the plugin's own collision-map.zip: of the nine door tiles a
-# human is recorded opening across the four Mahogany Homes recordings, SEVEN are marked passable
-# on every edge -- the collision dump was generated with doors treated as open. Falador's
-# (3037,3347) was re-checked live, with the player standing beside that very door, and reads
-# passable too. So the pathfinder emits a route straight through a closed door, and because none
-# of those door ids appear in transports.tsv either, the route carries no transport step for
-# _use_transport to click. The walker hop-clicks past the door, the player wedges against it, and
-# _hop_to returns True on its timeout regardless -- so the loop recomputes the identical hop and
-# burns WALK_MAX_HOPS x WALK_HOP_TIMEOUT_S (up to 8 minutes) before walk_to finally returns False.
-#
-# The recovery below is deliberately STALL-TRIGGERED rather than proactive: it only ever runs on a
-# pass where the player failed to get closer, which today is a walk that fails outright. Nothing
-# that currently works can regress -- worst case it costs one extra scan on a walk already lost.
-# tiles from the player, for the ROUTELESS fallback only. RAISED 4 -> 8 on 2026-08-29: MEASURED
-# outside NORMAN's house in Falador, the two shut doors stood 6 and 7 tiles away, so a radius of 4
-# found NO candidates at all and the recovery returned None -- the real reason nothing was ever
-# opened there. The old tightness dated from when selection was a distance GUESS and a wide net
-# was dangerous; a candidate must now prove, from the client's own collision entry, that one of
-# its blocked edges actually crosses our path, so the radius can span a house without opening
-# anything unrelated. Widen further only on the same kind of evidence.
-DOOR_SEARCH_RADIUS = 8
-# How far outside the straight-line box between us and the goal a doorway may sit and still count
-# as the way through -- the walker's path is not a perfect line.
-DOOR_SPAN_MARGIN = 1
-DOOR_ROUTE_SEARCH_RADIUS = 10 # ...but WITH a route, the route itself is the correctness check, so
-                              # the search can reach the door the route actually goes through.
-                              # LIVE 2026-08-28: the blocking door sat 6 tiles away, invisible to
-                              # the 4-tile radius.
+# The global collision map (worldmap.py) treats every door as open -- MEASURED 2026-08-28 by
+# decoding Shortest Path's own collision-map.zip, of the nine door tiles a human is recorded
+# opening across four Mahogany Homes recordings, SEVEN read passable on every edge -- so a
+# computed route can run straight through a door that is actually shut. blocked_crossing_on_route
+# / first_door_on_route (below) are what catch that: the first step of the route that LIVE
+# collision (GET /collision, not the static map) says we cannot actually cross.
 DOOR_ROUTE_LOOKAHEAD = 14     # route steps ahead to consider. Enough to cover the way out of a
                               # room without reacting to a door most of a journey away.
-DOOR_ROUTE_ADJACENCY = 1      # a door is "on" a step if it is on it or beside it -- a WallObject
-                              # is anchored to one side of the tile boundary it blocks.
 DOOR_MAX_OPENS_PER_WALK = 4   # a house door, a room door and a spare. A walk needing more than
                               # this is wedged on something that isn't a door, and should fail
                               # rather than wander a building opening everything.
-DOOR_PROGRESS_EPSILON = 1.0   # tiles of headway a hop must make to count as progress. Not 0:
-                              # arriving a tile off the aim point is ordinary, not a stall.
 DOOR_CONFIRM_POLL_S = 0.3     # how often to re-read the doorway while waiting for it to clear
 DOOR_OPEN_WAIT_S = 2.0        # a door opens in a tick or two; long enough that the next hop
                               # isn't clicked while the door is still shut. This is the budget for
@@ -146,59 +150,22 @@ DOOR_OPEN_WAIT_MAX_S = 9.0    # ceiling, so a door that genuinely never opens st
 # the routine simply could not get in. The name + "Open" action filter is what keeps this tight
 # -- nearby GameObjects such as Drawers also offer "Open" and are excluded by name.
 DOOR_OBJECT_TYPES = ("WallObject", "GameObject")
-DOOR_NAME_HINTS = ("door", "gate")
+DOOR_NAME_HINTS = ("door", "gate", "curtain")   # "curtain" taken from Vitalite's own list
 DOOR_OPEN_ACTION = "open"
 
 # net.runelite.api.CollisionDataFlag, mirrored from the client. ObjectProvider reports the whole
 # entry for an object's TILE as `collisionFlags`; these are the bits meaning "you cannot get past
-# this edge" and "you cannot see past this edge".
-#
-# MEASURED live 2026-08-28 by opening ONE door at Barbara's house and re-reading the same doorway
-# before and after -- the only comparison that actually answers anything here:
-#
-#   SHUT   Door 7452 at (1746,3534)  flags 4104  = MOVEMENT_EAST|LOS_EAST
-#          east neighbour (1747,3534)      65664 = MOVEMENT_WEST|LOS_WEST   (reciprocal)
-#   OPEN   Door 7453 at (1747,3534)  flags 16416 = MOVEMENT_SOUTH|LOS_SOUTH
-#          (1746,3534) now 0, and (1747,3534) no longer carries WEST -- the doorway is CLEAR
-#
-# Three things follow, and all three matter:
-#  1. Movement and line of sight are always set together for the SAME edge.
-#  2. A blocked edge is recorded on BOTH of its tiles, as opposite directions -- it is a genuine
-#     EDGE, not a property of a tile.
-#  3. Opening a door CLEARS the doorway edge and the leaf comes to rest blocking a PERPENDICULAR
-#     edge -- and the object itself moves one tile and changes id (7452 shut -> 7453 open).
-#
-# So the flags do track door state, but only if you compare the same DOORWAY; comparing two
-# different doors' own tiles tells you nothing (an earlier pass at Lumbridge did exactly that,
-# saw a shut door and an open one both reading 1026, and wrongly concluded the flags were useless
-# -- 1026 was the open door's LEAF edge, not its doorway).
-#
-# None of which needs classifying at all, because the useful question is narrower: does one of
-# this door's blocked edges lie between us and where we are going? See _door_separates. A shut
-# door across our path answers yes; the same door once open answers no, for free.
+# this edge". The full derivation (opening one door at Barbara's and re-reading the same doorway
+# before/after) is folded into first_door_on_route's own docstring now that DOOR_BLOCKING_FLAGS
+# and the line-of-sight constants it was built from are gone -- see that docstring for the
+# measurement. The short version relevant to what's still here: a blocked edge is recorded on
+# BOTH of its tiles, as opposite directions (DOOR_EDGE_BLOCKS below relies on exactly this).
 BLOCK_MOVEMENT_NORTH = 2
 BLOCK_MOVEMENT_EAST = 8
 BLOCK_MOVEMENT_SOUTH = 32
 BLOCK_MOVEMENT_WEST = 128
 BLOCK_MOVEMENT_OBJECT = 256
-BLOCK_MOVEMENT_FLOOR_DECORATION = 262144
 BLOCK_MOVEMENT_FLOOR = 2097152
-BLOCK_MOVEMENT_FULL = 2359552
-BLOCK_LINE_OF_SIGHT_NORTH = 1024
-BLOCK_LINE_OF_SIGHT_EAST = 4096
-BLOCK_LINE_OF_SIGHT_SOUTH = 16384
-BLOCK_LINE_OF_SIGHT_WEST = 65536
-BLOCK_LINE_OF_SIGHT_FULL = 131072
-# Deliberately NOT including BLOCK_MOVEMENT_FULL: it is a COMPOSITE constant (2359552 =
-# BLOCK_MOVEMENT_FLOOR 2097152 | BLOCK_MOVEMENT_FLOOR_DECORATION 262144 | BLOCK_MOVEMENT_OBJECT
-# 256), so ORing it in makes a bare floor decoration read as an obstruction. Caught live the same
-# day on Lumbridge's Trapdoor, flags 262144, which is a hole in the floor and blocks no edge at all.
-DOOR_BLOCKING_FLAGS = (
-    BLOCK_MOVEMENT_NORTH | BLOCK_MOVEMENT_EAST | BLOCK_MOVEMENT_SOUTH | BLOCK_MOVEMENT_WEST
-    | BLOCK_MOVEMENT_OBJECT
-    | BLOCK_LINE_OF_SIGHT_NORTH | BLOCK_LINE_OF_SIGHT_EAST | BLOCK_LINE_OF_SIGHT_SOUTH
-    | BLOCK_LINE_OF_SIGHT_WEST | BLOCK_LINE_OF_SIGHT_FULL
-)
 
 
 # (bit, dx, dy) -- the crossing each movement bit blocks, from the tile that carries it.
@@ -213,233 +180,122 @@ DOOR_EDGE_BLOCKS = (
 )
 
 
-def _door_separates(door: dict, px: int, py: int, gx: int, gy: int):
-    """Does one of this door's blocked edges lie BETWEEN (px,py) and (gx,gy)?
+def blocked_crossing_on_route(route, flags, start: int = 0,
+                              lookahead: int = DOOR_ROUTE_LOOKAHEAD):
+    """The first pair of consecutive route tiles we cannot step between, or None.
 
-    This is the question the two broken heuristics were both groping at. A door's blocked edge is
-    a crossing between two specific tiles; the door is in our way only if we have to cross it.
-    Direction-agnostic on purpose -- the edge is symmetric, so the same doorway matches whether we
-    approach from inside or out.
+    `route` is [(x, y), ...] from worldmap.find_path and `flags` is {(x, y): collision flags}
+    from GET /collision. The map routes straight THROUGH doors by design, so a blocked crossing
+    on a freshly computed route is very nearly a definition of "a shut door is here".
 
-    None when the client reports no flags ("cannot tell", never "no")."""
-    flags = door.get("collisionFlags")
-    if flags is None:
+    _passable is the right test rather than _edge_open, and the difference is load-bearing: it
+    also refuses a destination tile carrying TILE_BLOCKING_FLAGS, which is the only way the
+    full-tile doors are visible at all. MEASURED at Falador TAU's -- a GameObject door with
+    flags 131328 (BLOCK_LINE_OF_SIGHT_FULL | BLOCK_MOVEMENT_OBJECT) and no edge bits whatever.
+
+    An UNKNOWN crossing is skipped, not reported. `flags` only ever covers COLLISION_SCAN_RADIUS
+    (10) tiles around the player while `lookahead` looks DOOR_ROUTE_LOOKAHEAD (14) steps ahead, so
+    on any route with 11+ remaining steps the crossing sitting at the scan window's own edge was
+    _always_ unknown -- and because _passable(None, ...) is False, that unknown crossing used to
+    be reported as blocked on every such hop. Two real costs: a wasted get_objects fetch on every
+    hop of every walk (first_door_on_route's both-known guard would discard it a moment later
+    anyway), and -- worse -- a transient collision outage mid-poll inside _open_door's `recheck`
+    could make this return a "still blocked" crossing for a door that had genuinely opened,
+    reporting a working open as a failure. Matches _hop_index's own both-known rule for exactly
+    the same reason (see its comment) and COLLISION_SCAN_RADIUS's: past the scan window, hop and
+    let the stall recovery act instead of guessing.
+    """
+    end = min(len(route) - 1, start + lookahead)
+    for i in range(start, end):
+        ax, ay = route[i]
+        bx, by = route[i + 1]
+        fa, fb = flags.get((ax, ay)), flags.get((bx, by))
+        if fa is None or fb is None:
+            continue    # cannot tell -- outside the scan window, not necessarily blocked
+        if not _passable(fa, fb, bx - ax, by - ay):
+            return (ax, ay), (bx, by)
+    return None
+
+
+def first_door_on_route(route, plane: int, objects: list, flags: dict, start: int = 0,
+                        lookahead: int = DOOR_ROUTE_LOOKAHEAD):
+    """The shut door standing on the first blocked crossing of `route`, or None.
+
+    This is the whole door algorithm now, and it replaced roughly 700 lines of heuristics
+    (_door_separates, _within_span, reachable_set/open_frontier_door, open_nearest_shut_door
+    and a three-tier escalation). None of those were wrong exactly -- they were all proxies for
+    a route we could not compute. Given a real route the question becomes trivial and, unlike
+    every one of those tiers, it works identically on any plane.
+
+    The shape is Vitalite's WalkerPath.handlePassThroughObjects: find a door/gate/curtain
+    standing on the player's tile or the next step's tile. Two deliberate deviations:
+
+      * Vitalite matches on NAME ONLY and interacts with action index 0. We require an "Open"
+        action, because left-clicking an OPEN door CLOSES it -- a shut door and an open one are
+        both WallObjects named Door with per-door ids (Falador 24050 shut / 24051 open), so
+        only the action separates them, and getting it wrong wedges a walk that was working.
+      * Matching the object TYPE too, because chests, cupboards and drawers all offer "Open"
+        and fill every Mahogany Homes house.
+
+    An absent flags entry means "cannot tell" and yields no door, never a speculative click.
+
+    Why collision FLAGS are trustworthy here at all -- MEASURED live 2026-08-28 by opening ONE
+    door at Barbara's house and re-reading the same doorway before and after (the only comparison
+    that actually answers anything: comparing two DIFFERENT doors' own tiles tells you nothing --
+    an earlier pass at Lumbridge did exactly that, saw a shut door and an open one both reading
+    1026, and wrongly concluded the flags were useless; 1026 was the open door's LEAF edge, not
+    its doorway):
+
+        SHUT   Door 7452 at (1746,3534)  flags 4104  = MOVEMENT_EAST|LOS_EAST
+               east neighbour (1747,3534)      65664 = MOVEMENT_WEST|LOS_WEST   (reciprocal)
+        OPEN   Door 7453 at (1747,3534)  flags 16416 = MOVEMENT_SOUTH|LOS_SOUTH
+               (1746,3534) now 0, and (1747,3534) no longer carries WEST -- doorway CLEAR
+
+    Three things follow, and all three matter:
+      1. Movement and line of sight are always set together for the SAME edge.
+      2. A blocked edge is recorded on BOTH of its tiles, as opposite directions -- it is a
+         genuine EDGE, not a property of a tile (DOOR_EDGE_BLOCKS relies on exactly this).
+      3. Opening a door CLEARS the doorway edge and the leaf comes to rest blocking a
+         PERPENDICULAR edge -- and the object itself moves one tile and changes id (7452 shut ->
+         7453 open).
+
+    None of which needs classifying at all, because the useful question is narrower: does one of
+    this door's blocked edges lie on the route we're following? A shut door on the route answers
+    yes; the same door once open answers no -- which is exactly blocked_crossing_on_route's job.
+    """
+    crossing = blocked_crossing_on_route(route, flags, start, lookahead)
+    if crossing is None:
         return None
-    dx0, dy0 = door.get("x"), door.get("y")
+    # Require known flags on BOTH tiles to report a door. blocked_crossing_on_route now already
+    # skips an unknown crossing rather than returning one, so this is belt and braces rather than
+    # the only thing standing between an unknown reading and a click -- kept because an unknown
+    # flag must never produce one: left-clicking an OPEN door CLOSES it, turning a working walk
+    # into a wedged one, and correctness demands it when acting on missing data could produce a
+    # worse outcome than doing nothing.
+    a, b = crossing
+    if flags.get(a) is None or flags.get(b) is None:
+        return None
+    tiles = set(crossing)
 
-    # A full-TILE blocker (BLOCK_MOVEMENT_OBJECT, e.g. TAU's GameObject door at flags 131328)
-    # carries no edge bits at all, so the edge loop below can never match it. What separates us
-    # from the goal is its whole tile lying on the way -- which is literally what the route says:
-    # Shortest Path routed (3045,3349) -> (3046,3348) -> (3046,3347) -> (3046,3346) straight
-    # through that tile, because its collision map believes doors are open.
-    if flags & TILE_BLOCKING_FLAGS:
-        # Not our own tile, and not the goal's. CONFIRMED live 2026-08-29 in JESS's house: this
-        # branch claimed a door reported on the PLAYER'S OWN TILE (2617,3294) and looped -- click,
-        # "still shut after 2s", click. You cannot be blocked by the tile you are standing on, and
-        # the goal tile being furniture is the normal case (_routable_goal already retargets it),
-        # not a door in the way. `collisionFlags` is the aggregate for an object's TILE rather
-        # than for that object alone, so a wall door sharing a tile with anything else reads
-        # BLOCK_MOVEMENT_OBJECT and reaches here in the first place.
-        if (dx0, dy0) in ((px, py), (gx, gy)):
-            return False
-        return _within_span(dx0, px, gx) and _within_span(dy0, py, gy)
-
-    for bit, dx, dy in DOOR_EDGE_BLOCKS:
-        if not flags & bit:
+    for obj in objects or []:
+        if obj.get("plane") != plane or obj.get("objectType") not in DOOR_OBJECT_TYPES:
             continue
-        if dx:
-            lo, hi = sorted((dx0, dx0 + dx))
-            crosses = (px <= lo and gx >= hi) or (px >= hi and gx <= lo)
-            along = _within_span(dy0, py, gy)
-        else:
-            lo, hi = sorted((dy0, dy0 + dy))
-            crosses = (py <= lo and gy >= hi) or (py >= hi and gy <= lo)
-            along = _within_span(dx0, px, gx)
-        # BOTH halves are required. A blocked edge spans exactly ONE tile, so sitting on the right
-        # axis proves nothing by itself -- MEASURED live 2026-08-29 outside NORMAN's house, where
-        # Door 24057 SEVEN tiles west of us reported "separates" purely because its y-crossing sat
-        # between our y and the goal's. It belonged to a different building.
-        if crosses and along:
-            return True
-    return False
-
-
-def _within_span(value: int, a: int, b: int) -> bool:
-    """Is `value` within a..b, allowing DOOR_SPAN_MARGIN either side?
-
-    The margin exists because the walker does not travel a perfect straight line between the two
-    points, so the doorway it actually goes through can sit a tile outside the box they span."""
-    lo, hi = sorted((a, b))
-    return lo - DOOR_SPAN_MARGIN <= value <= hi + DOOR_SPAN_MARGIN
+        if (obj.get("x"), obj.get("y")) not in tiles:
+            continue
+        name = (obj.get("name") or "").lower()
+        if not any(hint in name for hint in DOOR_NAME_HINTS):
+            continue
+        actions = obj.get("actions")
+        if not actions or not any((a or "").lower() == DOOR_OPEN_ACTION for a in actions):
+            continue
+        return obj
+    return None
 
 
 # Tile-level blockers, as opposed to the EDGE bits above. A tile carrying either of these
 # cannot be stood on at all. FLOOR_DECORATION is deliberately absent -- Lumbridge's trapdoor
 # reads 262144 and is perfectly walkable.
 TILE_BLOCKING_FLAGS = BLOCK_MOVEMENT_OBJECT | BLOCK_MOVEMENT_FLOOR
-GOAL_NEIGHBOUR_RADIUS = 2      # how far around an unwalkable goal to look for a stand-in
-
-
-def _tile_blocked(flags):
-    """Can this tile be stood on? None when the client did not report flags."""
-    if flags is None:
-        return None
-    return bool(flags & TILE_BLOCKING_FLAGS)
-
-
-def _routable_goal(goal: dict) -> dict:
-    """`goal`, or the nearest walkable tile to it when `goal` itself cannot be stood on.
-
-    MEASURED live 2026-08-29 at TAU's house: standingLocation (3047,3345) carries
-    BLOCK_MOVEMENT_OBJECT -- furniture stands on the home's own standing tile -- so Shortest Path
-    returns 0 steps to it, walk_to falls through to the obstacle-blind greedy walker and wedges
-    against the wall. One tile north, (3047,3346), routes in 4 steps. The same is true of every
-    hotspot tile, which is furniture by definition.
-
-    Prefers the candidate nearest the goal, tie-broken by nearest to the player, so the stand-in
-    is somewhere we would have walked through anyway. Returns `goal` untouched whenever the
-    client reports nothing (older build, tile outside the loaded scene) -- never guess."""
-    gx, gy, plane = goal.get("x"), goal.get("y"), goal.get("plane", 0)
-    if gx is None:
-        return goal
-
-    tiles = controller.get_collision(gx, gy, plane, radius=GOAL_NEIGHBOUR_RADIUS) or []
-    if not tiles:
-        return goal
-
-    by_tile = {(t["x"], t["y"]): t.get("flags") for t in tiles}
-    if _tile_blocked(by_tile.get((gx, gy))) is not True:
-        return goal        # walkable, or unknown -- either way leave it alone
-
-    player = controller.get_player()
-    px, py = player.get("x", gx), player.get("y", gy)
-    candidates = [
-        (tx, ty) for (tx, ty), flags in by_tile.items()
-        if _tile_blocked(flags) is False and (tx, ty) != (gx, gy)
-    ]
-    if not candidates:
-        return goal
-
-    tx, ty = min(candidates, key=lambda t: (max(abs(t[0] - gx), abs(t[1] - gy)),
-                                            max(abs(t[0] - px), abs(t[1] - py))))
-    debug_log.log("travel", f"({gx},{gy}) can't be stood on -- aiming at ({tx},{ty}) instead")
-    return {"x": tx, "y": ty, "plane": plane}
-
-
-def _door_blocks(obj: dict):
-    """Does this object's own tile obstruct movement or sight right now?
-
-    NOT an open/shut test -- see DOOR_BLOCKING_FLAGS above for the measurement that killed that
-    idea. Callers must already have established the door is shut from its `actions`; this only
-    separates a shut door that is genuinely in the way from one merely standing nearby.
-
-    None means "cannot tell", not "no": an older client build has no `collisionFlags` field, and
-    every caller must keep working against one (same contract as `actions`)."""
-    flags = obj.get("collisionFlags")
-    if flags is None:
-        return None
-    return bool(flags & DOOR_BLOCKING_FLAGS)
-
-PATH_REQUEST_TIMEOUT_S = 6.0   # give up waiting for Shortest Path to finish computing
-PATH_POLL_INTERVAL_S = 0.3
-
-# Below this many tiles (Chebyshev, same plane only) walk_to doesn't bother asking Shortest Path
-# at all and goes straight to _walk_greedy: the request plus up to PATH_REQUEST_TIMEOUT_S of
-# polling costs more than the walk itself over a short hop. Deliberately NOT a large number --
-# _walk_greedy is obstacle-blind, so every tile of gate raises the odds of wedging against a wall
-# it can't route around. 25 covers the "already basically there" case (a safespot return, a
-# re-approach after a bank trip) without gambling on open terrain.
-SHORT_HOP_TILES = 25
-
-# Every ShortestPathConfig option the plugin recognises, so a typo in an override can be caught
-# here instead of being silently dropped (the plugin ignores unknown keys, which would leave the
-# baseline quietly in force while the caller believed it had opted in). Taken from
-# ShortestPathConfig's own method names in the installed jar.
-SHORTEST_PATH_CONFIG_KEYS = frozenset({
-    "avoidWilderness", "useAgilityShortcuts", "useGrappleShortcuts", "useBoats", "useCanoes",
-    "useCharterShips", "useShips", "useFairyRings", "useGnomeGliders", "useHotAirBalloons",
-    "useMagicCarpets", "useMagicMushtrees", "useMinecarts", "useQuetzals", "useSpiritTrees",
-    "useTeleportationItems", "useTeleportationLevers", "useTeleportationPortals",
-    "useTeleportationSpells", "useTeleportationSpellsHome", "useTeleportationMinigames",
-    "useWildernessObelisks", "useSeasonalTransports", "includeBankPath", "currencyThreshold",
-    "cancelInstead", "recalculateDistance", "reachedDistance", "unreachableTargetDistance",
-    "calculationCutoff", "usePoh", "usePohFairyRing", "usePohSpiritTree",
-    "useTeleportationPortalsPoh", "pohJewelleryBoxTier", "usePohMountedItems",
-    "costAgilityShortcuts", "costBoats", "costCanoes", "costCharterShips", "costFairyRings",
-    "costGnomeGliders", "costGrappleShortcuts", "costHotAirBalloons", "costMagicCarpets",
-    "costMagicMushtrees", "costMinecarts", "costNonConsumableTeleportationItems",
-    "costQuetzalWhistle", "costQuetzals", "costSeasonalTransports", "costShips",
-    "costSpiritTrees", "costTeleportationBoxes", "costTeleportationLevers",
-    "costTeleportationMinigames", "costTeleportationPortals", "costTeleportationSpells",
-    "costTeleportationSpellsHome", "costWildernessObelisks",
-})
-
-# The transport policy sent with EVERY path request, in full.
-#
-# Two reasons it's explicit rather than "let the plugin use whatever the user ticked in its own
-# panel". First, a route is only useful if we can actually follow it, and _use_transport can only
-# do one thing: click a single menu option on an object or NPC. Every teleport and every
-# destination-picker transport produces an edge we'd have to walk across instead, which for a
-# teleport means minimap-clicking a tile on the far side of the map -- so inheriting a panel with
-# teleports enabled silently breaks routes. Second, the plugin's override map is STICKY: it only
-# replaces the map when a non-empty one arrives and never clears it, so a partial override from
-# one walk would leak into every later walk in the session. Sending the whole map every time is
-# what makes each request independent of the last.
-#
-# On = what _use_transport can execute today (ordinary doors/gates/ladders/stairs need no key at
-# all -- TransportType.TRANSPORT has no toggle and is always on). Off = everything else, until
-# there's code that can actually drive it. Routines opt individual keys back on per call via
-# walk_to(..., transports={...}).
-TRANSPORT_POLICY = {
-    # Single-click object/NPC transports -- executable.
-    "useAgilityShortcuts": True,
-    "useGrappleShortcuts": True,
-    "useBoats": True,
-    "useShips": True,
-
-    # Clickable, but each opens a destination picker _use_transport can't drive.
-    "useCanoes": False,
-    "useCharterShips": False,
-    "useMinecarts": False,
-
-    # Teleports: no object to click at all, or a code/menu UI on top of one.
-    "useTeleportationItems": "None",
-    "useTeleportationSpells": False,
-    "useTeleportationSpellsHome": False,
-    "useTeleportationLevers": False,
-    "useTeleportationPortals": False,
-    "useTeleportationMinigames": False,
-    "useFairyRings": False,
-    "useSpiritTrees": False,
-    "useGnomeGliders": False,
-    "useHotAirBalloons": False,
-    "useMagicCarpets": False,
-    "useMagicMushtrees": False,
-    "useQuetzals": False,
-    "useWildernessObelisks": False,
-
-    # Player-owned house routing -- needs a house teleport plus in-house navigation.
-    "usePoh": False,
-    "usePohFairyRing": False,
-    "usePohSpiritTree": False,
-    "usePohMountedItems": False,
-    "useTeleportationPortalsPoh": False,
-
-    # Leagues/seasonal-only transports, which don't exist on a main.
-    "useSeasonalTransports": False,
-}
-
-
-def transport_config(overrides: dict | None = None) -> dict:
-    """TRANSPORT_POLICY with `overrides` applied, as a fresh dict. Raises ValueError on a key
-    Shortest Path wouldn't recognise -- it ignores unknown keys silently, so a typo would leave
-    the baseline in force while the caller believed it had opted into something."""
-    unknown = set(overrides or {}) - SHORTEST_PATH_CONFIG_KEYS
-    if unknown:
-        raise ValueError(f"not a Shortest Path config key: {', '.join(sorted(unknown))}")
-    config = dict(TRANSPORT_POLICY)
-    config.update(overrides or {})
-    return config
 
 
 def save_location():
@@ -532,289 +388,252 @@ def use_fountain(ctx) -> bool:
     return True
 
 
-def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
-            transports: dict | None = None, min_path_tiles: float | None = None) -> bool:
-    """Get back to a location from save_location(). Tries a computed route
-    from Shortest Path first, falls back to a direct greedy walk if that's
-    unavailable or fails partway. True once within `tolerance` tiles of the
-    target (defaults to WALK_ARRIVAL_TOLERANCE; callers needing a tighter
-    final arrival -- e.g. safespot anchoring, where 3 tiles of slack could
-    still be inside a melee monster's reach -- can pass a smaller value).
+def route_to(target: dict, *, goal_adjacent: bool = False):
+    """A walking route to `target` as [{"x", "y", "plane"}, ...], or None.
 
-    `transports` overrides individual TRANSPORT_POLICY keys for this one walk
-    (e.g. {"avoidWilderness": True}); `min_path_tiles` overrides SHORT_HOP_TILES,
-    the distance below which the pathfinder isn't worth asking at all -- pass 0
-    to force a computed route even for a short hop."""
-    # An unwalkable goal has to be retargeted BEFORE anything else looks at it: Shortest Path
-    # returns no route to a tile that cannot be stood on, which sends the whole walk into the
-    # obstacle-blind greedy fallback AND starves the door escalation of the route it needs.
-    # MEASURED at TAU's, where standingLocation itself carries BLOCK_MOVEMENT_OBJECT.
-    target = _routable_goal(target)
+    Same plane only, and no transports -- see worldmap.find_path. `goal_adjacent` routes to a
+    tile BESIDE the target, which is what you want for anything standing on furniture (a
+    hotspot, a ladder, a bank booth): those tiles are solid and nothing can route onto them.
+    """
+    player = controller.get_player() or {}
+    px, py, plane = player.get("x"), player.get("y"), player.get("plane")
+    if px is None:
+        return None
+    if target.get("plane") is not None and target["plane"] != plane:
+        debug_log.log("travel", f"target is on plane {target['plane']} and we are on {plane} "
+                                f"-- walking cannot change floor")
+        return None
+    tiles = worldmap.find_path(px, py, plane, target["x"], target["y"],
+                               goal_adjacent=goal_adjacent)
+    if tiles is None:
+        return None
 
-    # Doors FIRST, then go in (user directive 2026-08-29). Waiting for a stall was backwards: a
-    # stall costs a whole hop timeout to notice, is spent wedged against the door in plain view,
-    # and at NORMAN's never fired at all because walk_to reported arrival while still outside.
-    # The client's own collision entry tells us the doorway is shut before we take a step, so
-    # there is no reason to discover it the slow way. Costs nothing when nothing is in the way --
-    # _find_blocking_door returns None unless a SHUT door's blocked edge actually crosses our
-    # path -- and the stall-triggered recovery below stays as the backstop for the doors this
-    # cannot see (one off the straight line; see _door_separates' single-axis limit).
-    _open_blocking_door(ctx, target)
+    # Upstairs, refuse a route that wanders outside the loaded scene. This guard predates the
+    # 2026-08-29 map swap, when the map had NO DATA above ground outside a building and absent
+    # data read PASSABLE -- a single missing exterior wall on plane 1+ let BFS escape into open
+    # sky and come back down somewhere convenient, a shortcut through nothing. The new asset
+    # explicitly marks most unfloored plane 1-3 space BLOCKED (MEASURED, Falador plane 1 over a
+    # 61x61 box: 5396 passable edges on the old map, 492 on the new -- see SCENE_HALF_WIDTH's own
+    # comment), so that specific leak is far rarer now. The guard stays as belt-and-braces rather
+    # than the load-bearing check it used to be: genuinely absent data (as opposed to explicitly
+    # marked open sky) still reads PASSABLE under the new polarity too, so a real coverage hole
+    # could still produce this exact shortcut. The loaded scene is 104x104 tiles centred near the
+    # player, so a legitimate indoor route on an upper floor never approaches this bound.
+    if plane > 0:
+        for x, y in tiles:
+            if max(abs(x - px), abs(y - py)) > SCENE_HALF_WIDTH:
+                debug_log.log("travel", f"discarding a plane-{plane} route that leaves the "
+                                        f"loaded scene at ({x},{y}) -- a coverage hole or open "
+                                        f"sky can still read as walkable, so this is not a "
+                                        f"real path")
+                return None
 
-    if _is_short_hop(target, min_path_tiles):
-        debug_log.log("travel", "target is close enough to walk straight to -- skipping Shortest Path")
-        return _walk_greedy(ctx, target, tolerance)
+    return [{"x": x, "y": y, "plane": plane} for x, y in tiles]
 
-    steps, reached, reason = _request_computed_path(target, transport_config(transports))
-    if steps:
-        if not reached:
-            # The route is the best Shortest Path could do, not one that arrives -- follow it
-            # anyway (getting closer beats standing still, and _walk_greedy picks up the
-            # remainder) but say so, because the alternative is a walk that silently stops short
-            # and a caller that can't tell why.
-            debug_log.log("travel", f"Shortest Path couldn't reach the target ({reason}) -- "
-                                    f"following its best partial route, then walking the rest")
-        debug_log.log("travel", f"following a {len(steps)}-tile route from Shortest Path")
-        if _walk_along_path(ctx, steps, target, tolerance):
-            return True
-        debug_log.log("travel", "following the computed route failed partway, falling back to a direct walk")
+
+def _collision_flags(x: int, y: int, plane: int, radius: int = COLLISION_SCAN_RADIUS) -> dict:
+    """Live collision for a square around (x, y), as {(x, y): flags}. Empty when the client
+    cannot answer, which every consumer must read as "cannot tell" rather than "blocked"."""
+    return {(t["x"], t["y"]): t.get("flags")
+            for t in (controller.get_collision(x, y, plane, radius=radius) or [])}
+
+
+def _nearest_step_index(route: list, px: int, py: int) -> int:
+    """Where the player actually is along the route.
+
+    Keyed on POSITION rather than on a marching counter, which is what the old
+    _walk_along_path used. A counter advances whether or not the player moved, so a stalled
+    walk kept aiming further down a route it was no longer travelling."""
+    best, best_distance = 0, None
+    for i, step in enumerate(route):
+        distance = max(abs(step["x"] - px), abs(step["y"] - py))
+        if best_distance is None or distance < best_distance:
+            best, best_distance = i, distance
+    return best
+
+
+def _hop_index(route: list, start: int, px: int, py: int, flags: dict) -> int:
+    """How far along the route to aim, bounded by DISTANCE and stopping at any shut crossing.
+
+    Distance, not step count: a cardinal BFS route is longer than the diagonal walk the client
+    performs, so counting N steps ahead would produce a hop well short of the measured 16-24
+    tile window that WALK_HOP_MIN/MAX_TILES encode.
+
+    Stopping at a shut crossing is Vitalite's rule, and it matters: hop-clicking PAST a shut
+    door is exactly what leaves the player wedged against it with the walker none the wiser.
+    """
+    limit = random.randint(WALK_HOP_MIN_TILES, WALK_HOP_MAX_TILES)
+    furthest = start
+    for i in range(start, len(route) - 1):
+        ax, ay = route[i]["x"], route[i]["y"]
+        bx, by = route[i + 1]["x"], route[i + 1]["y"]
+        fa = flags.get((ax, ay))
+        fb = flags.get((bx, by))
+        # BOTH sides must be KNOWN before a crossing may cut a hop short. flags covers only
+        # COLLISION_SCAN_RADIUS tiles around the player while hops aim 16-24, and _passable
+        # answers False when either flag is None -- so treating unknown as blocked truncated
+        # every hop to the scan radius. Past the window we hop and let the stall recovery act.
+        if fa is not None and fb is not None and not _passable(fa, fb, bx - ax, by - ay):
+            break
+        if max(abs(bx - px), abs(by - py)) > limit:
+            break
+        furthest = i + 1
+    return furthest
+
+
+def _door_on_route(route: list, plane: int, flags: dict, start: int = 0):
+    """The shut door on the route ahead of `start`, or None. Fetches /objects only once a
+    blocked crossing has actually been found, so a clear walk pays nothing for this."""
+    tiles = [(step["x"], step["y"]) for step in route]
+    if blocked_crossing_on_route(tiles, flags, start) is None:
+        return None
+    objects = controller.get_objects(radius=COLLISION_SCAN_RADIUS) or []
+    return first_door_on_route(tiles, plane, objects, flags, start)
+
+
+def _open_door(ctx, door: dict, recheck) -> bool:
+    """Click a shut door and CONFIRM it, rather than sleeping and hoping.
+
+    `recheck` is a zero-argument callable returning the door still blocking the way, or None.
+
+    Two things this gets right that a fixed wait did not, both MEASURED live 2026-08-29:
+
+      * The budget includes the WALK. A door is opened by walking to it and then opening it,
+        and DOOR_OPEN_WAIT_S alone (2.0s) is less than the ~2.4s of walking to a door four
+        tiles off. At ROSS's the FIRST click registered as `Open Door` and was good; the budget
+        expired before the player arrived, and the two retries then resolved to `Walk here`
+        because the player had moved off the pixel being re-aimed at. A working click was
+        reported as a failure and interrupted by its own retry, three times over.
+      * Getting THROUGH counts as success (_crossed). ROSS's front door swings shut behind you,
+        so re-reading the doorway answers "still shut" about a door that worked -- eight clicks
+        across one session, every one registering correctly, every one logged as a failure.
+    """
+    here = controller.get_player() or {}
+    here_x, here_y = here.get("x"), here.get("y")
+    dx, dy = door.get("x"), door.get("y")
+    if here_x is not None and dx is not None:
+        tiles = max(abs(here_x - dx), abs(here_y - dy))
     else:
-        debug_log.log("travel", "Shortest Path unavailable -- walking straight toward the target instead")
+        tiles = door.get("distance") or 0
+    budget = min(DOOR_OPEN_WAIT_S + tiles * DOOR_WALK_ALLOWANCE_S, DOOR_OPEN_WAIT_MAX_S)
 
-    return _walk_greedy(ctx, target, tolerance)
-
-
-def _is_short_hop(target: dict, min_path_tiles: float | None = None) -> bool:
-    """True when the target is near enough (and on this plane) that a computed route isn't worth
-    the round trip. Plane is a hard gate, not a distance term: a staircase's two ends are a
-    couple of tiles apart horizontally but only the route knows about the staircase."""
-    threshold = SHORT_HOP_TILES if min_path_tiles is None else min_path_tiles
-    player = controller.get_player()
-    px, py = player.get("x"), player.get("y")
-    if px is None or player.get("plane") != target["plane"]:
-        return False
-    return max(abs(target["x"] - px), abs(target["y"] - py)) <= threshold
-
-
-def _request_computed_path(target: dict, config: dict):
-    """Ask Shortest Path for a route to target and poll for the result.
-
-    Returns (steps, reached, termination_reason): a list of {"x", "y", "plane"} waypoints in
-    travel order, whether the plugin's own pathfinder actually got to the target, and its
-    PathTerminationReason (TARGET_REACHED / SEARCH_EXHAUSTED / CUTOFF_REACHED / CANCELLED).
-    steps is None if the plugin isn't available or didn't finish in time.
-
-    The result is matched against the target we asked for before it's accepted. Shortest Path
-    replaces its Pathfinder asynchronously, so an early poll can still be reading the PREVIOUS
-    walk's finished path -- and before this check, that path was followed as if it were ours,
-    sending the player off toward wherever the last routine was going. A build too old to report
-    its targets degrades to the old done-is-enough behaviour rather than refusing to path."""
-    ack = controller.request_shortest_path(target["x"], target["y"], target["plane"], config=config)
-    if not ack.get("requested"):
-        return None, False, None
+    debug_log.log("travel", f"opening the {door.get('name')} at ({dx},{dy}) in the way "
+                            f"({tiles} tiles off, waiting up to {budget:.1f}s)")
+    controller.click_entity(ctx.ser, door)
 
     waited = 0.0
-    while waited < PATH_REQUEST_TIMEOUT_S:
-        time.sleep(PATH_POLL_INTERVAL_S)
-        waited += PATH_POLL_INTERVAL_S
+    while waited < budget:
+        time.sleep(DOOR_CONFIRM_POLL_S)
+        waited += DOOR_CONFIRM_POLL_S
+        if recheck() is None or _crossed(door, here_x, here_y):
+            return True
 
-        result = controller.get_shortest_path_result()
-        if not result.get("active"):
-            return None, False, None
-        if not result.get("done") or not _result_is_for(result, target):
-            continue
-
-        steps = result.get("steps") or []
-        return steps or None, bool(result.get("reached", True)), result.get("terminationReason")
-
-    return None, False, None
+    debug_log.log("travel", f"the {door.get('name')} at ({dx},{dy}) is still shut after "
+                            f"{budget:.1f}s -- another player may be holding it, or the "
+                            f"click missed")
+    return False
 
 
-def _result_is_for(result: dict, target: dict) -> bool:
-    """Whether a finished path is the one we asked for. True when the result carries no target
-    info at all -- see _request_computed_path on the older-build fallback."""
-    targets = result.get("targets")
-    if targets is None:
-        return True
-    return any(
-        t.get("x") == target["x"] and t.get("y") == target["y"] and t.get("plane") == target["plane"]
-        for t in targets
-    )
+def open_door_toward(ctx, goal: dict) -> bool:
+    """Open the shut door standing between the player and `goal`. True if one was clicked.
+
+    Replaces open_doorway_to, open_frontier_door and open_nearest_shut_door -- three tiers that
+    existed only because there was no route to ask. Costs nothing when the way is clear.
+
+    goal_adjacent because the tile you need a DOOR for and the tile you can WALK to are usually
+    different: a hotspot's own tile is furniture and unroutable, while aiming at the standing
+    tile instead hides the doorway (both it and the player sit on the same side of the door).
+    """
+    route = route_to(goal, goal_adjacent=True)
+    if not route or len(route) < 2:
+        return False
+    player = controller.get_player() or {}
+    px, py = player.get("x"), player.get("y")
+    if px is None:
+        return False
+    plane = player.get("plane") or 0
+    door = _door_on_route(route, plane, _collision_flags(px, py, plane))
+    if door is None:
+        return False
+    return _open_door(ctx, door,
+                      lambda: _door_on_route(route, plane, _collision_flags(px, py, plane)))
 
 
-def _walk_along_path(ctx, steps: list, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE) -> bool:
-    """Walk a computed route by repeatedly aiming a random number of tiles
-    ahead along it (not straight-line toward the final target) and clicking
-    via the minimap, same hop-and-click trick as _walk_greedy but following
-    an actual obstacle-aware route instead of a straight line.
+def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
+            goal_adjacent: bool = True) -> bool:
+    """Walk to `target`, following a route computed from the global collision map.
 
-    Some steps carry a "transport" (see ShortestPathProvider.describeTransport
-    -- a door, gate, staircase, ladder, cave entrance, or an NPC that ferries
-    you, e.g. a boat captain): minimap-clicking past those doesn't work, since
-    the tile on the far side often isn't reachable by ordinary walking at all
-    (a different floor, a boat's deck, a cave's own coordinate space). When
-    the next transport is within the upcoming hop, this walks right up to it
-    instead of hopping past it, then hands off to _use_transport."""
-    index = 0
+    True once within `tolerance` tiles of the target. **False now means something**: there is
+    no walking route at all, returned in milliseconds. That replaces the old behaviour where a
+    routeless walk fell through to an obstacle-blind greedy walker and hop-clicked a wall until
+    WALK_MAX_HOPS x WALK_HOP_TIMEOUT_S ran out -- up to 8 minutes, measured.
+
+    `goal_adjacent` defaults True because most targets here are objects standing on their own
+    (unroutable) tile. Pass False when the target really is a tile to stand on.
+    """
+    route = route_to(target, goal_adjacent=goal_adjacent)
+    if route is None:
+        debug_log.log("travel", f"no walking route to ({target['x']},{target['y']}) "
+                                f"-- not attempting the walk")
+        return False
+
     doors_opened = 0
+    stalls = 0
     last_pos = None
-    last_aim = None
 
     for _ in range(WALK_MAX_HOPS):
-        player = controller.get_player()
-        px, py = player.get("x"), player.get("y")
+        player = controller.get_player() or {}
+        px, py, plane = player.get("x"), player.get("y"), player.get("plane")
         if px is None:
             return False
 
         if _within_tolerance(px, py, target["x"], target["y"], tolerance):
             return True
 
-        # Same stall recovery as _walk_greedy, and needed here for the same reason: a route can
-        # run straight through a shut door WITHOUT carrying a transport step for it, because
-        # Shortest Path's collision map believes the door tile is passable and transports.tsv has
-        # no entry for ordinary house doors (see the DOOR_* constants). `index` marches on whether
-        # or not the player actually moved, so without this the hops keep aiming further down a
-        # route the player is no longer travelling. The goal passed is the waypoint last aimed at,
-        # not the final target -- it is the one that is reliably on the player's own plane.
-        if last_pos == (px, py) and last_aim is not None:
-            if (doors_opened < DOOR_MAX_OPENS_PER_WALK
-                    and _open_blocking_door(ctx, last_aim, route=steps)):
+        flags = _collision_flags(px, py, plane)
+        index = _nearest_step_index(route, px, py)
+
+        # Doors are resolved BEFORE stepping off, not after a stall (user directive
+        # 2026-08-29: "the priority should be determine door situation - then go in"). Waiting
+        # for a stall costs a whole hop timeout to notice and is spent wedged against the door
+        # in plain view; at NORMAN's it never fired at all, because the walk "arrived" outside.
+        if doors_opened < DOOR_MAX_OPENS_PER_WALK:
+            door = _door_on_route(route, plane, flags, index)
+            if door is not None:
                 doors_opened += 1
+                _open_door(ctx, door,
+                           lambda: _door_on_route(route, plane,
+                                                  _collision_flags(px, py, plane), index))
+                refreshed = route_to(target, goal_adjacent=goal_adjacent)
+                if refreshed is None:
+                    return False
+                route = refreshed
                 last_pos = None
                 continue
+
+        if last_pos == (px, py):
+            stalls += 1
+            if stalls > WALK_MAX_STALLS:
+                debug_log.log("travel", f"stalled {stalls} times short of "
+                                        f"({target['x']},{target['y']}) -- giving up")
+                return False
+            refreshed = route_to(target, goal_adjacent=goal_adjacent)
+            if refreshed is None:
+                return False
+            route = refreshed
+            index = _nearest_step_index(route, px, py)
         last_pos = (px, py)
 
-        hop_index = min(index + random.randint(WALK_HOP_MIN_TILES, WALK_HOP_MAX_TILES), len(steps) - 1)
-        transport_index = _find_next_transport_index(steps, index)
-
-        if transport_index is not None and transport_index <= hop_index:
-            origin_index = transport_index - 1
-            if origin_index > index:
-                origin = steps[origin_index]
-                last_aim = origin
-                if not _hop_to(ctx, origin["x"], origin["y"], origin["plane"]):
-                    return False
-
-            waypoint = steps[transport_index]
-            transport = waypoint["transport"]
-
-            if not _transport_is_executable(transport):
-                # Walking through an unusable transport is only sane when there's something
-                # physically there to walk into. For a teleport (or any edge with no object at
-                # all) the far side is somewhere else entirely, so the "walk through it anyway"
-                # fallback below would minimap-click a tile across the map. Give up on the route
-                # instead and let walk_to fall back to a direct walk.
-                debug_log.log("travel", f"route needs a transport we can't drive "
-                                        f"({transport.get('type')}: {transport.get('displayInfo')}) "
-                                        f"-- abandoning the computed route")
-                return False
-
-            if not _use_transport(ctx, transport, waypoint):
-                debug_log.log("travel", "couldn't use the transport automatically -- trying to walk through it anyway")
-                last_aim = waypoint
-                if not _hop_to(ctx, waypoint["x"], waypoint["y"], waypoint["plane"]):
-                    return False
-
-            index = transport_index
-            continue
-
-        waypoint = steps[hop_index]
-        last_aim = waypoint
-        if not _hop_to(ctx, waypoint["x"], waypoint["y"], waypoint["plane"]):
+        hop = route[_hop_index(route, index, px, py, flags)]
+        if (hop["x"], hop["y"]) == (px, py):
+            # The route says we are already as far as this hop can take us and we have not
+            # arrived -- the remaining gap is not walkable. Fail rather than spin.
+            debug_log.log("travel", "route makes no further progress toward the target")
             return False
-        index = hop_index
+        if not _hop_to(ctx, hop["x"], hop["y"], hop["plane"]):
+            return False
 
     return False
-
-
-def _find_next_transport_index(steps: list, from_index: int):
-    """Index of the next step carrying transport info after from_index, or
-    None if the rest of the route is ordinary walking."""
-    for i in range(from_index + 1, len(steps)):
-        if steps[i].get("transport"):
-            return i
-    return None
-
-
-def _transport_is_executable(transport: dict) -> bool:
-    """Whether _use_transport can actually drive this edge: it clicks one menu option on one
-    object or NPC, so it needs both an id and a name to find. Deliberately keyed on that rather
-    than on the transport's type or its isTeleport flag -- a teleport lever IS a clickable
-    object, and a boat that somehow arrives without object info is NOT, whatever its type says."""
-    return transport.get("objectId") is not None and bool(transport.get("objectName"))
-
-
-TRANSPORT_INTERACT_TIMEOUT_S = 8.0
-
-
-def _use_transport(ctx, transport: dict, waypoint: dict) -> bool:
-    """Interact with a transport edge instead of trying to walk through it.
-
-    Only handles the "menu option on a specific object or NPC" case
-    (transport["objectId"]/["objectName"] present, from ShortestPathProvider
-    parsing e.g. "Open Door 9398" or "Travel Holgart 7789") -- transports
-    that instead rely on an inventory item, a spell, or a UI (fairy ring
-    codes, spirit trees, minecarts, teleport tablets) aren't covered here and
-    this returns False for those so the caller falls back to a plain walk
-    attempt. The same object/NPC name+id can belong to either a game object
-    or an NPC (boat "captains" use this exact same tsv column), so both are
-    tried."""
-    object_id = transport.get("objectId")
-    name = transport.get("objectName")
-    option = transport.get("objectOption")
-    if object_id is None or not name:
-        debug_log.log("travel", f"transport '{transport.get('displayInfo') or transport.get('type')}' "
-                                 f"has no object/NPC info -- can't auto-use it yet (item/spell/UI-based transports "
-                                 f"aren't handled)")
-        return False
-
-    entity = _find_transport_object(object_id) or _find_transport_npc(name)
-    if entity is None:
-        debug_log.log("travel", f"couldn't find '{option} {name}' ({transport.get('type')}) nearby")
-        return False
-
-    debug_log.log("travel", f"using transport: {option} {name} ({transport.get('type')})")
-    if not controller.click_entity(ctx.ser, entity):
-        return False
-
-    # transport["duration"] is in game ticks (0.6s each) per transports.tsv; add slack for
-    # loading transitions (floor changes, boat departures) that a fixed tick count won't cover.
-    time.sleep(max(transport.get("duration", 1), 1) * 0.6 + random.uniform(0.8, 1.4))
-
-    waited = 0.0
-    while waited < TRANSPORT_INTERACT_TIMEOUT_S:
-        player = controller.get_player()
-        px, py, plane = player.get("x"), player.get("y"), player.get("plane")
-        if px is not None and plane == waypoint["plane"] and _within_tolerance(px, py, waypoint["x"], waypoint["y"]):
-            return True
-        time.sleep(0.6)
-        waited += 0.6
-
-    debug_log.log("travel", "used the transport but didn't arrive where expected -- continuing from wherever we ended up")
-    return True
-
-
-def _find_transport_object(object_id: int):
-    candidates = [
-        o for o in controller.get_objects()
-        if o.get("id") == object_id and o.get("clickable")
-    ]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda o: o.get("distance", 9999))
-    return candidates[0]
-
-
-def _find_transport_npc(name: str):
-    name_lower = name.lower()
-    candidates = [
-        n for n in controller.get_npcs()
-        if name_lower in (n.get("name") or "").lower() and n.get("screenX") is not None
-    ]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda n: n.get("distance", 9999))
-    return candidates[0]
 
 
 def _crossed(door: dict, px0: int, py0: int) -> bool:
@@ -847,192 +666,6 @@ def _crossed(door: dict, px0: int, py0: int) -> bool:
             if (py0 <= lo and py >= hi) or (py0 >= hi and py <= lo):
                 return True
     return False
-
-
-def _shut_doors_in_range(px: int, py: int, plane: int, radius: int) -> list:
-    """Every SHUT door/gate within `radius` of the player, on the player's plane.
-
-    "Shut" is the object's own menu action ("Open" vs "Close") and nothing else -- see
-    _find_blocking_door for why neither name nor id can answer it. A door is a WallObject whose
-    id encodes its state and CHANGES when it swings (measured: 7452 -> 7453, 24050 -> 24051), so
-    an id is not even stable across the transition."""
-    doors = []
-    for obj in controller.get_objects(radius=radius) or []:
-        if obj.get("plane") != plane or obj.get("objectType") not in DOOR_OBJECT_TYPES:
-            continue
-        name = (obj.get("name") or "").lower()
-        if not any(hint in name for hint in DOOR_NAME_HINTS):
-            continue
-        actions = obj.get("actions")
-        if not actions or not any((a or "").lower() == DOOR_OPEN_ACTION for a in actions):
-            continue
-        ox, oy = obj.get("x"), obj.get("y")
-        if ox is None or max(abs(ox - px), abs(oy - py)) > radius:
-            continue
-        doors.append(obj)
-    return doors
-
-
-def _find_blocking_door(goal: dict, route: list | None = None):
-    """The closed door most likely standing between the player and `goal`, or None.
-
-    When a `route` is supplied it is the ONLY thing that decides which door: the first closed
-    door standing on (or beside) the next DOOR_ROUTE_LOOKAHEAD steps. That is both more precise
-    and more correct than any distance rule, because Shortest Path's collision map believes doors
-    are passable, so a route to somewhere behind a shut door runs straight THROUGH it.
-
-    LIVE 2026-08-28 is why this exists. Stuck at (1771,3622), two tiles from a hotspot at
-    (1769,3622) but walled off from it, with three closed doors within six tiles -- and the old
-    "the door must be no further from the goal than the player is" rule rejected every one of
-    them. When you are walled off two tiles from your goal, the door that actually gets you there
-    is FURTHER away in a straight line, not nearer. The pathfinder had it right all along: it
-    routed through the door tile (1765,3624) in 12 steps.
-
-    "Closed" is decided by the object's own menu actions, NOT by its name or id. That distinction
-    is load-bearing: a closed door and an open one are both WallObjects named "Door", with per-door
-    ids (Falador 24050 shut / 24051 open, Varrock 11775, Ardougne 40178), so nothing but the action
-    separates them without a hardcoded id table that would need an entry for every door in the
-    game. A shut door offers "Open"; an open one offers "Close" -- and left-clicking THAT would
-    shut the door we just walked through, turning a working walk into a wedged one.
-
-    An `actions` field absent entirely means the client predates it (see ObjectProvider.
-    buildObjectData): return None rather than guessing from the name, so an un-rebuilt client is
-    exactly as stuck as it is today and never worse.
-
-    Candidates must also be no further from `goal` than the player is, so a door behind us is
-    never opened -- otherwise the recovery could ping-pong between the two doors of one room.
-    Equal distance counts as a candidate rather than being excluded: a WallObject is anchored to a
-    tile and reports that tile's coordinates, so the door the player is pressed right up against
-    is frequently reported on the player's OWN tile, tying exactly. Excluding ties would blind the
-    recovery to precisely the door most likely to be the one in the way.
-    """
-    player = controller.get_player()
-    px, py, plane = player.get("x"), player.get("y"), player.get("plane")
-    if px is None or plane != goal.get("plane"):
-        return None
-
-    radius = DOOR_ROUTE_SEARCH_RADIUS if route else DOOR_SEARCH_RADIUS
-    doors = _shut_doors_in_range(px, py, plane, radius)
-
-    if not doors:
-        return None
-
-    # Every door here is already known SHUT from its actions. Where the client also reports
-    # collision, use it to drop the ones obstructing nothing -- direct evidence in place of the
-    # geometry guess below, which was wrong at both Mariah's and Barbara's.
-    blocking = [d for d in doors if _door_blocks(d)]
-    told = any(_door_blocks(d) is not None for d in doors)
-    if told:
-        doors = blocking
-        if not doors:
-            return None
-
-    if route:
-        # Look ahead from the step nearest the PLAYER, not from the head of the list. A stalled
-        # _walk_along_path has already advanced its own index past where the player actually
-        # stands (it advances whether or not the hop arrived), so slicing the route by that index
-        # skips the very door that is blocking us -- caught by test, 2026-08-28.
-        start = min(
-            range(len(route)),
-            key=lambda i: max(abs(route[i]["x"] - px), abs(route[i]["y"] - py)),
-        )
-        for step in route[start:start + DOOR_ROUTE_LOOKAHEAD]:
-            for door in doors:
-                if (max(abs(door["x"] - step["x"]), abs(door["y"] - step["y"]))
-                        <= DOOR_ROUTE_ADJACENCY):
-                    return door
-        return None
-
-    if told:
-        # Prefer a door whose blocked EDGE actually lies between us and the goal -- the
-        # precise version of the question both earlier heuristics were groping at.
-        separating = [d for d in doors if _door_separates(d, px, py, goal["x"], goal["y"])]
-        if separating:
-            return min(separating, key=lambda d: math.hypot(d["x"] - px, d["y"] - py))
-        # Nothing crosses our path, so no door is in the way and we say so. This used to fall
-        # back to "the nearest door that obstructs anything", which VERIFIED live 2026-08-28
-        # is a false positive: with Barbara's OUTER door open and the way in genuinely clear,
-        # it still returned the INNER door 3 tiles away -- a wasted click, and worse a True
-        # return, which resets the walker's stall tracking and hides why it is really stuck.
-        return None
-
-    # No route and no collision data -- fall back to proximity, only safe while it stays tight.
-    player_gap = math.hypot(goal["x"] - px, goal["y"] - py)
-    best, best_gap = None, player_gap
-    for door in doors:
-        gap = math.hypot(goal["x"] - door["x"], goal["y"] - door["y"])
-        if gap <= best_gap:
-            best, best_gap = door, gap
-    return best
-
-
-def _open_blocking_door(ctx, goal: dict, route: list | None = None) -> bool:
-    """Try to clear a stalled walk by opening the closed door in the way. True if one was clicked.
-
-    A plain left-click, not click_menu_action: a shut door's FIRST option is "Open" (every door
-    click in the recordings is a GAME_OBJECT_FIRST_OPTION), and _find_blocking_door has already
-    proved that option is on this object, so there is nothing for a right-click to disambiguate.
-
-    check_ui_blockers is left at its default, matching _use_transport -- which already clicks
-    doors and gates for the transports Shortest Path DOES know about. The False used elsewhere in
-    this file is for INVENTORY/interface clicks (the ring, the seed pod); passing it for a world
-    object skips a check that exists for good reason (see teleport_to_ferox's rotate-forever loop
-    in CLAUDE.md).
-    """
-    goal = _routable_goal(goal)
-    door = _find_blocking_door(goal, route=route)
-
-    if door is None and route is None:
-        # Shut doors around us but none across the straight line: the way in is a DETOUR, and a
-        # single-axis edge test structurally cannot see one. MEASURED live 2026-08-29 at
-        # Barbara's -- player (1750,3536), hotspot (1749,3536) ONE tile west through a wall, two
-        # shut doors nearby and neither between two adjacent tiles. Both "no" answers were
-        # correct; the question was too narrow. The pathfinder can answer it, because its
-        # collision map treats doors as passable and it routes straight through the doorway.
-        # Narrow trigger on purpose: a walk with no shut doors near it never pays for a request.
-        player = controller.get_player()
-        px, py, plane = player.get("x"), player.get("y"), player.get("plane")
-        if px is not None and _shut_doors_in_range(px, py, plane, DOOR_SEARCH_RADIUS):
-            steps, _reached, _reason = _request_computed_path(goal, transport_config())
-            if steps:
-                route = steps
-                door = _find_blocking_door(goal, route=steps)
-
-    if door is None:
-        return False
-
-    dx, dy = door.get("x"), door.get("y")
-
-    # Budget the WALK to the door, not just the swing -- see DOOR_WALK_ALLOWANCE_S.
-    here = controller.get_player() or {}
-    here_x, here_y = here.get("x"), here.get("y")
-    if here_x is not None and dx is not None:
-        tiles = max(abs(here_x - dx), abs(here_y - dy))
-    else:
-        tiles = door.get("distance") or 0
-    budget = min(DOOR_OPEN_WAIT_S + tiles * DOOR_WALK_ALLOWANCE_S, DOOR_OPEN_WAIT_MAX_S)
-
-    debug_log.log("travel", f"opening the {door.get('name')} at ({dx},{dy}) in the way "
-                            f"({tiles} tiles off, waiting up to {budget:.1f}s)")
-    controller.click_entity(ctx.ser, door)
-
-    # CONFIRM, don't sleep and hope. A door is a WallObject whose id encodes its state -- every
-    # pair measured is shut -> shut+1 (Barbara's 7452 -> 7453 twice, Falador's 24050 -> 24051) --
-    # so it also MOVES a tile and stops being the object we clicked. The durable signal is the
-    # one we actually care about: re-read the doorway and the blocked edge is gone. A fixed wait
-    # both burned time when the door opened quickly and continued in silence when it never opened.
-    waited = 0.0
-    while waited < budget:
-        time.sleep(DOOR_CONFIRM_POLL_S)
-        waited += DOOR_CONFIRM_POLL_S
-        # Either the doorway cleared, or we are already through it -- see _crossed.
-        if _find_blocking_door(goal, route=route) is None or _crossed(door, here_x, here_y):
-            return True
-
-    debug_log.log("travel", f"the {door.get('name')} at ({dx},{dy}) is still shut after "
-                            f"{budget:.1f}s -- another player may be holding it, or the "
-                            f"click missed")
-    return True
 
 
 # Reachability is DECIDED, not discovered by failing. See reachable_set.
@@ -1189,197 +822,6 @@ def can_reach(goal: dict, reach: set | None = None, flags: dict | None = None,
             if (_edge_open(flags.get(near), flags.get(via_y), -dx, 0)
                     and _edge_open(flags.get(via_y), goal_flags, 0, -dy)):
                 return True
-    return False
-
-
-def open_frontier_door(ctx, goal: dict) -> bool:
-    """Open the shut door that would EXTEND the reachable area toward `goal`.
-
-    This is the precise version of the door question, and it needs no straight-line reasoning at
-    all: flood-fill what we can walk to, then find a shut door whose own blocked edge has one side
-    inside that area and the other side outside. That door is, by construction, a way out of the
-    region we are trapped in -- whether it lies straight ahead or is a detour behind us, which is
-    exactly the case `_door_separates` structurally cannot see (MEASURED outside ROSS's: the only
-    way in was a door with BOTH player and hotspot to the east of its blocked edge).
-
-    Ties are broken by how close the door's far side gets us to the goal, so with several ways out
-    we take the one that heads the right way. Returns True if a door was clicked."""
-    player = controller.get_player() or {}
-    px, py, plane = player.get("x"), player.get("y"), player.get("plane")
-    if px is None:
-        return False
-
-    reach = reachable_set(px, py, plane)
-    if not reach:
-        return False
-
-    gx, gy = goal.get("x"), goal.get("y")
-    candidates = []
-    for door in _shut_doors_in_range(px, py, plane, DOOR_SEARCH_RADIUS):
-        dx0, dy0 = door.get("x"), door.get("y")
-        flags = door.get("collisionFlags")
-        if flags is None:
-            continue
-        for bit, ex, ey in DOOR_EDGE_BLOCKS:
-            if not flags & bit:
-                continue
-            near, far = (dx0, dy0), (dx0 + ex, dy0 + ey)
-            # One side in, the other out -- the door is on the frontier of where we can go.
-            if (near in reach) == (far in reach):
-                continue
-            outside = far if near in reach else near
-            candidates.append((max(abs(outside[0] - gx), abs(outside[1] - gy)), door))
-
-    if not candidates:
-        return False
-
-    candidates.sort(key=lambda c: c[0])
-    door = candidates[0][1]
-    dx, dy = door.get("x"), door.get("y")
-    tiles = max(abs(px - dx), abs(py - dy))
-    budget = min(DOOR_OPEN_WAIT_S + tiles * DOOR_WALK_ALLOWANCE_S, DOOR_OPEN_WAIT_MAX_S)
-
-    debug_log.log("travel", f"opening the {door.get('name')} at ({dx},{dy}) -- it is the way out "
-                            f"of where we are ({tiles} tiles off, up to {budget:.1f}s)")
-    controller.click_entity(ctx.ser, door)
-
-    waited = 0.0
-    while waited < budget:
-        time.sleep(DOOR_CONFIRM_POLL_S)
-        waited += DOOR_CONFIRM_POLL_S
-        still = [d for d in _shut_doors_in_range(px, py, plane, DOOR_SEARCH_RADIUS)
-                 if (d.get("x"), d.get("y")) == (dx, dy)]
-        if not still or _crossed(door, px, py):
-            return True
-    debug_log.log("travel", f"the {door.get('name')} at ({dx},{dy}) is still shut after "
-                            f"{budget:.1f}s")
-    return True
-
-
-def open_nearest_shut_door(ctx, goal: dict) -> bool:
-    """LAST RESORT: open the nearest shut door to us, without proving it is in the way.
-
-    **Not for regular use** (USER 2026-08-29: "we cannot use the cannot reach fallback for regular
-    usage, this has to be last resort fallback"). `open_frontier_door` is what answers the door
-    question properly -- it names the exact door on the boundary of the region we are stuck in --
-    and this only exists for the case where even that finds nothing. In run28, before the frontier
-    test existed, this blunt tier was firing three or four times per contract and was effectively
-    the primary mechanism; that is the thing it must never be again.
-
-    It is deliberately permissive and must only ever be called from a path that has ALREADY
-    established it is stuck -- an earlier attempt to make the ordinary pre-walk check this loose
-    was reverted as a false positive (see CLAUDE.md).
-
-    Why the strict test is not enough on its own: it is a single-axis "is this edge between us and
-    the goal" question, so it structurally cannot see a door that is a DETOUR. MEASURED live
-    2026-08-29 outside ROSS's house -- player (2614,3319) on the grass north of the building, the
-    Broken Range at (2617,3318) inside it, and the only way in a door at (2610,3316) whose blocked
-    edge (2610|2611) has BOTH of us to the east of it. The straight-line answer "not between us"
-    was correct and useless; the route branch, which is what normally catches a detour, had
-    returned no route at all that moment. The user watched it stand outside and never try the one
-    door in sight.
-
-    Once we are stuck, a wasted door click costs a second and being wrong costs nothing we still
-    have; not trying costs the whole contract. Returns True if a door was clicked."""
-    player = controller.get_player() or {}
-    px, py, plane = player.get("x"), player.get("y"), player.get("plane")
-    if px is None:
-        return False
-
-    doors = _shut_doors_in_range(px, py, plane, DOOR_SEARCH_RADIUS)
-    if not doors:
-        return False
-
-    # Nearest to US, not to the goal: we have to reach it before we can open it, and a detour
-    # door is by definition further from the goal than we are.
-    door = min(doors, key=lambda d: max(abs(d["x"] - px), abs(d["y"] - py)))
-    dx, dy = door.get("x"), door.get("y")
-    tiles = max(abs(px - dx), abs(py - dy))
-    budget = min(DOOR_OPEN_WAIT_S + tiles * DOOR_WALK_ALLOWANCE_S, DOOR_OPEN_WAIT_MAX_S)
-
-    debug_log.log("travel", f"stuck -- opening the nearest shut {door.get('name')} at "
-                            f"({dx},{dy}), {tiles} tiles off, waiting up to {budget:.1f}s")
-    controller.click_entity(ctx.ser, door)
-
-    waited = 0.0
-    while waited < budget:
-        time.sleep(DOOR_CONFIRM_POLL_S)
-        waited += DOOR_CONFIRM_POLL_S
-        # The door MOVES a tile and changes id when it swings, so "is a shut door still standing
-        # on that exact tile" is the durable check -- same reasoning as _open_blocking_door's.
-        still = [d for d in _shut_doors_in_range(px, py, plane, DOOR_SEARCH_RADIUS)
-                 if (d.get("x"), d.get("y")) == (dx, dy)]
-        if not still:
-            return True
-
-    debug_log.log("travel", f"the {door.get('name')} at ({dx},{dy}) is still shut after "
-                            f"{budget:.1f}s")
-    return True
-
-
-def open_doorway_to(ctx, goal: dict) -> bool:
-    """Public form of the door recovery: open the shut door standing between the player and
-    `goal`, if there is one. True if a door was clicked.
-
-    Exists because the tile you need a DOOR for and the tile you can WALK to are often not the
-    same tile. MEASURED live 2026-08-29 at Barbara's: the hotspot at (1749,3536) is furniture, so
-    Shortest Path returns no route to it at all (0 steps, 5 calls out of 5) -- but its neighbours
-    and the home's standing tile route fine. Asking the walker to head for the hotspot therefore
-    just wedges the obstacle-blind greedy fallback, while asking it to head for the standing tile
-    hides the doorway (both tiles are on the same side of it). Resolve the door against the thing
-    you cannot reach; walk to the thing you can."""
-    return _open_blocking_door(ctx, goal)
-
-
-def _walk_greedy(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE) -> bool:
-    """Straight-line walk toward target with no obstacle awareness -- the
-    fallback when Shortest Path isn't available. True once within
-    `tolerance` tiles of the target, False if it gives up (different
-    plane, hop point off the minimap, or WALK_MAX_HOPS exhausted)."""
-    target_x, target_y, target_plane = target["x"], target["y"], target["plane"]
-    doors_opened = 0
-    last_dist = None
-
-    for _ in range(WALK_MAX_HOPS):
-        player = controller.get_player()
-        px, py, plane = player.get("x"), player.get("y"), player.get("plane")
-        if px is None:
-            return False
-
-        if plane != target_plane:
-            debug_log.log("travel", "target is on a different plane -- can't walk there yet")
-            return False
-
-        if _within_tolerance(px, py, target_x, target_y, tolerance):
-            return True
-
-        dist = math.hypot(target_x - px, target_y - py)
-
-        # A hop that bought no ground means something is in the way, and the single thing this
-        # obstacle-blind walker can be wedged against that it can also clear is a shut door (see
-        # the DOOR_* constants for why Shortest Path never warns us about one). Without this the
-        # loop just re-clicks the identical hop until WALK_MAX_HOPS runs out.
-        if last_dist is not None and dist >= last_dist - DOOR_PROGRESS_EPSILON:
-            if doors_opened < DOOR_MAX_OPENS_PER_WALK:
-                # Ask the pathfinder where the way through actually is. This walker has no route
-                # of its own -- walk_to sends anything under SHORT_HOP_TILES straight here -- and
-                # LIVE 2026-08-28 the failing walk was only FIVE tiles, so there was no route to
-                # consult and the proximity fallback picked nothing. Shortest Path routes through
-                # the shut door (its collision map thinks doors are passable), which is exactly
-                # the information needed.
-                steps, _reached, _reason = _request_computed_path(target, transport_config())
-                if _open_blocking_door(ctx, target, route=steps):
-                    doors_opened += 1
-                    last_dist = None   # the door cost a pass; judge progress from after it
-                    continue
-        last_dist = dist
-        hop_dist = min(dist, random.randint(WALK_HOP_MIN_TILES, WALK_HOP_MAX_TILES))
-        hop_x = int(round(px + (target_x - px) / dist * hop_dist))
-        hop_y = int(round(py + (target_y - py) / dist * hop_dist))
-
-        if not _hop_to(ctx, hop_x, hop_y, plane):
-            return False
-
     return False
 
 

@@ -525,13 +525,19 @@ def find_mining_target(committed_pos=None, exclude_pos=None):
 # pass): the first version of handle_missing_target below had no cap on this path at all.
 #
 # CORRECTED 2026-08-08 (live session): bumped from 3 -- CONFIRMED live walking to the bank
-# anchor from ~65 tiles away, travel.walk_to's own Shortest Path route occasionally declares
-# "arrived" (within WALK_ARRIVAL_TOLERANCE) a bit short of where find_nearby_bank can actually
-# detect the bank object, and a retried Shortest Path request right after can get rejected
-# ("Shortest Path unavailable") if the plugin still considers the previous one active -- either
-# way costs one wasted attempt with no real progress. 3 wasn't always enough headroom to still
-# land a couple of genuinely-progressing walks after an unlucky one; this is a blunt mitigation,
-# not a fix for travel.py's own walking algorithm (out of this routine's scope).
+# anchor from ~65 tiles away, the walk occasionally declares "arrived" (within
+# WALK_ARRIVAL_TOLERANCE) a bit short of where find_nearby_bank can actually detect the bank
+# object, costing one wasted attempt with no real progress. 3 wasn't always enough headroom to
+# still land a couple of genuinely-progressing walks after an unlucky one; this is a blunt
+# mitigation, not a fix for travel.py's own walking algorithm (out of this routine's scope).
+#
+# NOTE (global-collision-pathfinding migration): this comment used to also cite a second cause --
+# a retried Shortest Path request getting rejected ("Shortest Path unavailable") if the
+# separately-installed Shortest Path plugin still considered the previous request active.
+# That plugin, and its concurrent-request rejection, are both gone: travel.walk_to now routes off
+# worldmap.py's own offline BFS over a pre-baked collision map, which has no "still busy" state
+# to reject a retry against. The arrival-tolerance mismatch above is the one measured cause that
+# still applies today, and is reason enough on its own to keep this headroom.
 MAX_WALK_ATTEMPTS = 6
 
 # ADDED 2026-08-08 (user request): a bank found by find_nearby_bank within its 40-tile radius
@@ -539,11 +545,13 @@ MAX_WALK_ATTEMPTS = 6
 # direct minimap-click hops straight at its own real position first, same trick travel.py's
 # own _hop_to uses for a route hop beyond render distance -- CONFIRMED that idiom already works
 # for cross-country travel, and it's a cheaper, more targeted fix here than immediately handing
-# off to handle_missing_target's full Shortest-Path walk toward the (possibly-approximate)
-# "bank" anchor tile: clicking the bank object's actual coordinates walks straight at the real
-# thing. Capped, same reasoning as MAX_WALK_ATTEMPTS above -- a bank that never gets closer after
-# a few hops (e.g. genuinely unreachable, or the click isn't landing) should fall through to the
-# anchor-walk fallback instead of hopping at the same spot forever.
+# off to handle_missing_target's full walk (travel.walk_to, routed off worldmap.py's own BFS over
+# a pre-baked collision map -- not the old, now-deleted Shortest Path plugin this comment used to
+# name) toward the (possibly-approximate) "bank" anchor tile: clicking the bank object's actual
+# coordinates walks straight at the real thing. Capped, same reasoning as MAX_WALK_ATTEMPTS above
+# -- a bank that never gets closer after a few hops (e.g. genuinely unreachable, or the click
+# isn't landing) should fall through to the anchor-walk fallback instead of hopping at the same
+# spot forever.
 MAX_BANK_MINIMAP_HOPS = 3
 
 # How far to search for a genuinely walkable substitute tile when a configured location anchor
@@ -638,7 +646,7 @@ def handle_missing_target(ctx, config: dict, location_key: str, miss_counter_key
         # never actually be reached. Substituting the closest genuinely walkable tile within
         # WALKABLE_ANCHOR_SEARCH_RADIUS fixes the anchor itself rather than special-casing the
         # walk logic (travel.py is shared infrastructure well outside this routine's scope).
-        travel.walk_to(ctx, _nearest_walkable_tile(target))
+        travel.walk_to(ctx, _nearest_walkable_tile(target), goal_adjacent=False)
         ctx.state.data[miss_counter_key] = 0
         return True
     debug_log.log("golem crafting", f"{location_key} still not found after {MAX_WALK_ATTEMPTS} walk attempts toward the configured location")

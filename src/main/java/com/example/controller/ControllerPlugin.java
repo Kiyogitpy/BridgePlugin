@@ -183,15 +183,6 @@ public class ControllerPlugin extends Plugin
 		server.register("/mastering-mixology-config", () -> ConfigExporter.exportMasteringMixology(config));
 		server.register("/mahogany-homes-config", () -> ConfigExporter.exportMahoganyHomes(config));
 
-		try
-		{
-			new ShortestPathProvider(client, clientThread, server, pluginManager, eventBus).register();
-		}
-		catch (Throwable t)
-		{
-			System.out.println("Shortest Path integration unavailable: " + t);
-		}
-
 		BufferedImage icon;
 		try
 		{

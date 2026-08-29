@@ -485,7 +485,7 @@ def maintain_safespot(ctx):
     ctx.state.data["current_target_index"] = None
     ctx.state.data["engage_last_pos"] = None
     ctx.state.data["engage_stuck_ticks"] = 0
-    travel.walk_to(ctx, tile, tolerance=SAFESPOT_RETURN_TOLERANCE)
+    travel.walk_to(ctx, tile, tolerance=SAFESPOT_RETURN_TOLERANCE, goal_adjacent=False)
 
 
 def resolve_combat_prayer(combat_prayer: str, prayer_level):

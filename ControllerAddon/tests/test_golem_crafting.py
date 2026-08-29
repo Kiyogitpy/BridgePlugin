@@ -33,6 +33,21 @@ def _no_live_last_action(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
 
 
+@pytest.fixture(autouse=True)
+def _no_live_bridge(monkeypatch):
+    """Keep the suite hermetic. wait_until_player_idle calls get_player over HTTP when a test
+    does not stub it, so the idle check's result depended on the character's actual live state --
+    a moving player caused the check to time out, taking a different code path and breaking
+    pre-hover assertions. MEASURED 2026-08-29: test_mine_phase_hovers_a_different_ready_rock_
+    after_a_successful_click passed alone (character happened to be idle) and failed in a full
+    run (character was moving across the map during other tests).
+
+    Returns a stable idle position (unchanged localX/localY) so wait_until_player_idle returns
+    True immediately. Tests that need a specific position override this."""
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"localX": 10000, "localY": 10000, "x": 100, "y": 100})
+
+
 def _station(name="north", x=2596, y=2257, insert_side="south", progress=0, done=()):
     """A /golem station dict with the real tile geometry, `done` naming carved sides."""
     offsets = {"north": (0, 1), "east": (1, 0), "south": (0, -1), "west": (-1, 0)}
