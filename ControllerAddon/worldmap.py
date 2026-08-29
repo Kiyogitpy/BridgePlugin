@@ -13,9 +13,17 @@ happens to be standing.
 
 THREE THINGS TO KNOW BEFORE TRUSTING A ROUTE FROM THIS (all MEASURED, see the design doc):
 
-  1. No data defaults to PASSABLE. Planes 1-3 are mostly open sky and read as walkable
-     everywhere outside a building, so a missing exterior wall upstairs lets a route leak
-     through the void. The walker's stall detection is the backstop.
+  1. GENUINELY absent data (no container at all for that key) still defaults to PASSABLE -- that
+     is the reader's own neutral behaviour and is unchanged. But do not assume that covers
+     "outside a building": the asset swapped 2026-08-29 (CacheMapDumper replacing the old
+     EthanApi dump, see .superpowers/sdd/2026-08-29-global-collision-pathfinding/map-swap-
+     report.md) explicitly marks unfloored plane 1-3 tiles as BLOCKED rather than leaving them
+     unmarked -- MEASURED at five separate outdoor plane-1/2 spots, none under any building, all
+     blocked on all four cardinals (see test_unfloored_upper_planes_default_to_blocked). The old
+     asset did the opposite (explicitly marked that same space PASSABLE, which is what used to
+     make this item read "a missing exterior wall upstairs lets a route leak through the void").
+     So a genuine gap in a real upper floor now under-connects rather than over-connects -- the
+     walker's stall detection is still the backstop, just for the opposite failure mode.
   2. An object's own blocking is baked into the same bits as a wall's, so this map CANNOT tell
      furniture from a wall. It must never be used to answer "can I interact with that object
      from here" -- travel.can_reach does that from LIVE collision flags, where
@@ -36,8 +44,13 @@ from collections import deque
 MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps", "collision-map.gz")
 
 
-class Indexer:
-    """Where the bit layout and the polarity live, and the ONLY place that should know them.
+class EthanApiIndexer:
+    """RETAINED FOR REFERENCE ONLY -- NOT IN USE. This was `Indexer` until the 2026-08-29 map
+    swap (collision-map.gz predates the Varlamore region and reads zero data there, see
+    docs/superpowers/sdd/2026-08-29-global-collision-pathfinding/). It matched EthanApi's
+    GlobalCollisionMap dump. Kept, under an unambiguous name, purely so a future reader of this
+    file (or of git blame) can see what the old asset's layout was without having to dig it back
+    out of history -- and so it can never again be confused with the layout actually in use.
 
     There are three of these maps in data/decompiled/ and they look alike while meaning
     opposite things:
@@ -47,7 +60,8 @@ class Indexer:
       CacheMapDumper out   12-bit x (base 480), 14-bit y, 2-bit plane          set = BLOCKED
 
     Reading one with another's indexer produces a map that is subtly wrong rather than
-    obviously broken, so switching source means changing this class and nothing else.
+    obviously broken, so switching source means changing the active Indexer class and nothing
+    else -- which is exactly what happened: see `Indexer`, below, for the layout now in use.
     """
 
     X_MASK = 16383
@@ -67,39 +81,148 @@ class Indexer:
         return (x & cls.X_MASK) | ((y & cls.Y_MASK) << cls.Y_SHIFT) | (plane << cls.PLANE_SHIFT)
 
 
+class Indexer:
+    """Where the bit layout and the polarity live, and the ONLY place that should know them.
+
+    CacheMapDumper's layout, in use since the 2026-08-29 map swap (see EthanApiIndexer, above,
+    for what this replaced and why). MEASURED/SPECIFIED against the asset's own generator:
+
+      12-bit x, base 480 (x - 480) at shift 0
+      14-bit y at shift 12
+      2-bit plane at shift 26
+      data bit 0 = NORTH blocked (the base packed value, no marker bit)
+      data bit 1 = EAST blocked, marked by bit 28
+
+    SET_MEANS_PASSABLE is False here -- the opposite polarity from EthanApiIndexer's map. A set
+    bit in THIS map means the edge is BLOCKED. north()/east() compare against this flag rather
+    than the raw bit specifically so this swap needed no change to either of them (see
+    test_set_means_passable_is_actually_honoured_not_decorative).
+
+    Reading one map with another's indexer produces a map that is subtly wrong rather than
+    obviously broken, so switching source means changing this class (or picking a different one
+    entirely) and nothing else.
+    """
+
+    X_BASE = 480
+    X_MASK = 0xFFF
+    Y_MASK = 0x3FFF
+    Y_SHIFT = 12
+    PLANE_SHIFT = 26
+    PLANE_MASK = 3
+    EAST_FLAG = 1 << 28
+    SET_MEANS_PASSABLE = False
+
+    # A RoaringBitmap container key is the top 16 bits of the value (value >> 16). Plane sits at
+    # value bits 26-27, which lands at key bits 10-11 -- key = value >> 16, so key bit i is value
+    # bit (i + 16); plane's low bit (value bit 26) is key bit 10. The east marker (value bit 28)
+    # lands at key bit 12 and does not collide with the plane field. Used by bits_per_plane,
+    # which reads only the header.
+    PLANE_KEY_SHIFT = 10
+    PLANE_KEY_MASK = 3
+
+    @classmethod
+    def packed(cls, x: int, y: int, plane: int) -> int:
+        return (((x - cls.X_BASE) & cls.X_MASK)
+                | ((y & cls.Y_MASK) << cls.Y_SHIFT)
+                | ((plane & cls.PLANE_MASK) << cls.PLANE_SHIFT))
+
+
 class _Roaring:
     """Minimal reader for RoaringBitmap's portable serialization.
 
     Deliberately LAZY: it indexes the container header once (~0.13s) and binary-searches or
-    bit-tests directly in the 78 MB buffer, rather than materialising 82 million integers.
+    bit-tests directly in the buffer, rather than materialising every integer.
+
+    Handles BOTH portable-format cookies. The original asset (EthanApi's dump) never emitted a
+    run container, so only SERIAL_COOKIE_NO_RUNCONTAINER (12346, a bare `cookie, size` pair of
+    u32s) was ever seen. CacheMapDumper's replacement DOES emit run containers -- cookie
+    253243451, whose low 16 bits (`cookie & 0xFFFF`) are SERIAL_COOKIE_RUNCONTAINER (12347) and
+    whose size is packed into the high bits (`(cookie >> 16) + 1`) instead of following as its
+    own u32. That packed cookie is what forced this class to branch on format at all.
     """
 
     SERIAL_COOKIE_NO_RUNCONTAINER = 12346
+    SERIAL_COOKIE_RUNCONTAINER = 12347
     ARRAY_CONTAINER_MAX = 4096
+    # RoaringBitmap only omits the offset header below this container count; every asset this
+    # reader has ever seen (thousands of containers) is far above it, so the omitted-offset path
+    # is not implemented -- an asset that small would need it added, not silently mis-parsed.
+    NO_OFFSET_THRESHOLD = 4
 
     def __init__(self, data: bytes):
         self._data = data
-        cookie, size = struct.unpack_from("<II", data, 0)
-        if cookie != self.SERIAL_COOKIE_NO_RUNCONTAINER:
+        cookie = struct.unpack_from("<I", data, 0)[0]
+
+        if (cookie & 0xFFFF) == self.SERIAL_COOKIE_RUNCONTAINER:
+            size = (cookie >> 16) + 1
+            if size < self.NO_OFFSET_THRESHOLD:
+                raise ValueError(
+                    f"container count {size} is below NO_OFFSET_THRESHOLD "
+                    f"({self.NO_OFFSET_THRESHOLD}); the omitted-offset-header layout isn't "
+                    f"implemented"
+                )
+            run_flag_bytes = (size + 7) // 8
+            run_flags_offset = 4
+            run_flag_bitmap = data[run_flags_offset:run_flags_offset + run_flag_bytes]
+            descriptive = run_flags_offset + run_flag_bytes
+
+            def is_run(i: int) -> bool:
+                return bool((run_flag_bitmap[i >> 3] >> (i & 7)) & 1)
+        elif cookie == self.SERIAL_COOKIE_NO_RUNCONTAINER:
+            size = struct.unpack_from("<I", data, 4)[0]
+            descriptive = 8
+
+            def is_run(i: int) -> bool:
+                return False
+        else:
             raise ValueError(
                 f"unsupported RoaringBitmap cookie {cookie}; this reader handles only the "
-                f"no-run-container portable format ({self.SERIAL_COOKIE_NO_RUNCONTAINER})"
+                f"portable format's two cookies ({self.SERIAL_COOKIE_NO_RUNCONTAINER}, "
+                f"{self.SERIAL_COOKIE_RUNCONTAINER})"
             )
+
         self._containers = {}
-        descriptive = 8
-        offsets = 8 + size * 4
+        offsets = descriptive + size * 4
         for i in range(size):
             key, card_minus_one = struct.unpack_from("<HH", data, descriptive + i * 4)
             offset = struct.unpack_from("<I", data, offsets + i * 4)[0]
-            self._containers[key] = (card_minus_one + 1, offset)
+            cardinality = card_minus_one + 1
+            if is_run(i):
+                kind = "run"
+            elif cardinality <= self.ARRAY_CONTAINER_MAX:
+                kind = "array"
+            else:
+                kind = "bitmap"
+            self._containers[key] = (cardinality, offset, kind)
+
+    def _contains_run(self, offset: int, low: int) -> bool:
+        """RUN container: u16 n_runs, then n_runs * (u16 start, u16 length_minus_1), sorted by
+        start and non-overlapping -- so binary search for the last run starting at or before
+        `low`, then check it covers `low`."""
+        n_runs = struct.unpack_from("<H", self._data, offset)[0]
+        runs_offset = offset + 2
+        lo, hi = 0, n_runs
+        while lo < hi:
+            mid = (lo + hi) // 2
+            start = struct.unpack_from("<H", self._data, runs_offset + mid * 4)[0]
+            if start > low:
+                hi = mid
+            else:
+                lo = mid + 1
+        if lo == 0:
+            return False
+        start, length_minus_1 = struct.unpack_from("<HH", self._data, runs_offset + (lo - 1) * 4)
+        return start <= low <= start + length_minus_1
 
     def contains(self, value: int) -> bool:
         entry = self._containers.get((value >> 16) & 0xFFFF)
         if entry is None:
             return False
-        cardinality, offset = entry
+        cardinality, offset, kind = entry
         low = value & 0xFFFF
-        if cardinality <= self.ARRAY_CONTAINER_MAX:
+        if kind == "run":
+            return self._contains_run(offset, low)
+        if kind == "array":
             lo, hi = 0, cardinality
             while lo < hi:
                 mid = (lo + hi) // 2
@@ -117,7 +240,7 @@ class _Roaring:
     def cardinality_by_key_bits(self, shift: int, mask: int) -> dict:
         """Set bits grouped by a field of the container key. Header-only, so it is cheap."""
         counts = {}
-        for key, (cardinality, _offset) in self._containers.items():
+        for key, (cardinality, _offset, _kind) in self._containers.items():
             bucket = (key >> shift) & mask
             counts[bucket] = counts.get(bucket, 0) + cardinality
         return counts

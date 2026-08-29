@@ -2647,44 +2647,56 @@ def test_a_hotspot_behind_a_wall_is_not_clicked_however_close_we_stand(monkeypat
 
 
 def test_the_reachability_gate_uses_live_collision_not_the_static_map(monkeypatch):
-    # FIX (final review, "the reachability GATE must use live collision, not the static map"):
-    # worldmap.reachable_from bakes every door OPEN, so its flood walks straight through a shut
-    # one -- MEASURED from ROSS's outside tile (2614,3319), it returns 447 tiles including the
-    # hotspot's own cardinal neighbours on the FAR side of the shut front door. If the gate were
-    # still built from that flood, can_reach could answer True from outside the house and this
-    # test's click-guard would fire. Here the static map is stubbed to claim the whole line
-    # through to the hotspot is reachable (exactly the over-permissive answer a door-blind flood
-    # gives); LIVE collision (GET /collision, i.e. travel.reachable_set) is the only thing that
-    # actually shows the wall. can_reach itself is NOT mocked -- unlike the other unreachable
-    # tests -- so this proves the gate is wired to reachable_set's data, not worldmap's.
+    # REWRITTEN 2026-08-29 (map-swap task): the original version put its wall on the GOAL's own
+    # adjacent edge. can_reach's local edge test always re-fetches that edge from LIVE
+    # controller.get_collision regardless of which `reach` set it was handed (see can_reach's
+    # `flags is None` fallback, a radius-2 fetch centred on the goal) -- so on that geometry the
+    # answer came out right even when work_phase's `live_reach` argument was swapped for the
+    # door-blind static-map flood. The test passed against the very bug it was meant to catch.
+    #
+    # This version puts the wall SEVERAL TILES BACK, between the player and the goal's
+    # neighbourhood -- ROSS's real shape (player outside, a shut door in the exterior wall,
+    # hotspot inside). The goal's own local geometry (what the radius-2 fallback sees) is open on
+    # every side; the ONLY thing that can catch the far door is the `reach` SET membership test
+    # (`near not in reach`, see can_reach's cardinal/diagonal loops) -- i.e. whether `live_reach`
+    # was built by flooding through the door (worldmap.reachable_from, which bakes doors OPEN) or
+    # by stopping at it (travel.reachable_set, reading the door's real shut edge off LIVE
+    # GET /collision). That is exactly what work_phase's `live_reach` line is supposed to use.
     monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Teak plank", 28)])
     monkeypatch.setattr(controller, "get_objects",
-                         lambda radius=None: [_object(40164, distance=2, x=2, y=0)])
+                         lambda radius=None: [_object(40164, distance=6, x=6, y=0)])
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 0, "y": 0, "plane": 0})
+
+    clicked = []
     monkeypatch.setattr(controller, "click_entity",
-                         lambda ser, entity, **kw: pytest.fail(
-                             "must not click through a door the static map floods through"))
+                         lambda ser, entity, **kw: clicked.append(entity) or True)
 
-    # The static map's flood: doors baked open, so it happily claims the hotspot's neighbourhood
-    # is reachable. The gate must not be built from this.
+    # The static map's flood: doors baked open, so it claims the WHOLE line through to the
+    # hotspot's neighbourhood is reachable -- the over-permissive answer a door-blind flood
+    # always gives. The gate must not be built from this.
     monkeypatch.setattr(worldmap, "reachable_from",
-                         lambda x, y, plane, **kw: {(0, 0): 0, (1, 0): 1, (2, 0): 2})
+                         lambda x, y, plane, **kw: {(x2, 0): x2 for x2 in range(0, 7)})
 
-    # LIVE collision: a real wall on the crossing between (1,0) and (2,0), the hotspot's tile.
+    # LIVE collision: a real shut door three tiles east of the player -- the ONLY wall in the
+    # scene, and nowhere near the goal's own neighbourhood (a radius-2 probe centred on (6, 0)
+    # sees nothing but open ground either way).
     BLOCK_MOVEMENT_EAST = 8
     BLOCK_MOVEMENT_WEST = 128
-    BLOCK_MOVEMENT_OBJECT = 256
-    grid = {(0, 0): 0, (1, 0): BLOCK_MOVEMENT_EAST, (2, 0): BLOCK_MOVEMENT_WEST | BLOCK_MOVEMENT_OBJECT}
+    grid = {(x, 0): 0 for x in range(-1, 9)}
+    grid[(3, 0)] = BLOCK_MOVEMENT_EAST
+    grid[(4, 0)] = BLOCK_MOVEMENT_WEST
     monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=6: [
-        {"x": tx, "y": ty, "plane": 0, "flags": f} for (tx, ty), f in grid.items()])
+        {"x": tx, "y": ty, "plane": 0, "flags": f} for (tx, ty), f in grid.items()
+        if max(abs(tx - x), abs(ty - y)) <= radius])
 
     opened, walked = [], []
     monkeypatch.setattr(travel, "open_door_toward",
                          lambda ctx, goal: opened.append(goal) or True)
-    monkeypatch.setattr(travel, "walk_to", lambda ctx, goal, **kw: walked.append(goal) or True)
+    monkeypatch.setattr(travel, "walk_to",
+                         lambda ctx, goal, **kw: walked.append(goal) or True)
 
     hs = _hotspot(10554, 40164, 1, True)
-    hs["location"] = {"x": 2, "y": 0, "plane": 0}
+    hs["location"] = {"x": 6, "y": 0, "plane": 0}
     state = {"homeName": "ROSS", "npcId": 10420,
              "standingLocation": {"x": 0, "y": 0, "plane": 0},
              "hotspots": [hs]}
@@ -2692,7 +2704,10 @@ def test_the_reachability_gate_uses_live_collision_not_the_static_map(monkeypatc
     ctx = _Ctx()
     mh.work_phase(ctx, mh.DEFAULT_CONFIG, state)
 
-    assert opened, "the gate must reject the hotspot despite the static map saying reachable"
+    assert not clicked, (
+        "the gate must reject a hotspot beyond a live-shut door, even though the static map "
+        "says the whole line through to it is reachable")
+    assert opened, "must have tried to open the door standing in the way"
     assert walked
 
 
