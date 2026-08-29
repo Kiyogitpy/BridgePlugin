@@ -944,7 +944,7 @@ def return_to_anchor(ctx, anchor):
     if not travel.walk_to_exact_tile(ctx, anchor[0], anchor[1], anchor[2]):
         # Off-screen -- the player got dragged well away somehow. Fall back to the long-distance
         # walker to get back in render range; the next tick's exact walk finishes the job.
-        travel.walk_to(ctx, {"x": anchor[0], "y": anchor[1], "plane": anchor[2]})
+        travel.walk_to(ctx, {"x": anchor[0], "y": anchor[1], "plane": anchor[2]}, goal_adjacent=False)
 
 
 # Consecutive failed lay/retrieve attempts before giving up. This routine is built to run

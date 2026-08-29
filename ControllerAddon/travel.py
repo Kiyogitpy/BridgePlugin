@@ -530,7 +530,6 @@ def open_door_toward(ctx, goal: dict) -> bool:
 
 
 def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
-            transports: dict | None = None, min_path_tiles: float | None = None,
             goal_adjacent: bool = True) -> bool:
     """Walk to `target`, following a route computed from the global collision map.
 
@@ -538,10 +537,6 @@ def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
     no walking route at all, returned in milliseconds. That replaces the old behaviour where a
     routeless walk fell through to an obstacle-blind greedy walker and hop-clicked a wall until
     WALK_MAX_HOPS x WALK_HOP_TIMEOUT_S ran out -- up to 8 minutes, measured.
-
-    `transports` and `min_path_tiles` are accepted and ignored; they configured Shortest Path,
-    which no longer exists. They are kept so the 39 existing call sites keep working, and are
-    removed from those call sites and from this signature in a later pass.
 
     `goal_adjacent` defaults True because most targets here are objects standing on their own
     (unroutable) tile. Pass False when the target really is a tile to stand on.

@@ -736,7 +736,7 @@ def travel_phase(ctx, config: dict, state: dict) -> None:
                           f"walking to {home_name}")
         return
 
-    if not travel.walk_to(ctx, target):
+    if not travel.walk_to(ctx, target, goal_adjacent=False):
         debug_log.log("mahogany_homes", f"still walking toward {home_name}'s standing tile")
         return
 
@@ -1205,7 +1205,7 @@ def _approach_missing_hotspot(ctx, config: dict, state: dict, target: dict) -> N
         f"hotspot object {target['objectId']} not visible yet ({stuck}x, no ladder to try) "
         f"-- walking toward {state.get('homeName')}'s house",
     )
-    travel.walk_to(ctx, standing, tolerance=HOUSE_ARRIVAL_TOLERANCE)
+    travel.walk_to(ctx, standing, tolerance=HOUSE_ARRIVAL_TOLERANCE, goal_adjacent=False)
 
 
 def turn_in_phase(ctx, config: dict, state: dict) -> None:
@@ -1273,7 +1273,7 @@ def turn_in_phase(ctx, config: dict, state: dict) -> None:
                 return
 
         debug_log.log("mahogany_homes", f"homeowner npc {npc_id} not visible -- walking to standing tile")
-        travel.walk_to(ctx, state.get("standingLocation") or {})
+        travel.walk_to(ctx, state.get("standingLocation") or {}, goal_adjacent=False)
         return
 
     # NOTE: _accept_tea_if_offered is deliberately NOT called here -- see tick(), which calls it

@@ -342,7 +342,7 @@ def _retrieve_falcon(ctx, config) -> bool:
             # range, typically because the kebbit ran before dying. Walk back to the hunting spot
             # rather than throwing again (which would silently do nothing).
             debug_log.log("falconry", "catch waiting but the falcon is out of range -- walking back")
-            travel.walk_to(ctx, TILE_HUNT)
+            travel.walk_to(ctx, TILE_HUNT, goal_adjacent=False)
             return True
         return False
 
@@ -378,7 +378,7 @@ def _throw_falcon(ctx, config) -> bool:
     kebbit = _nearest_npc(KEBBIT_NAME, config.get("maxKebbitDistance", 12))
     if kebbit is None:
         debug_log.log("falconry", "no kebbit in range -- walking to the hunting spot")
-        travel.walk_to(ctx, TILE_HUNT)
+        travel.walk_to(ctx, TILE_HUNT, goal_adjacent=False)
         return False
 
     debug_log.log("falconry", f"throwing at a kebbit (dist={kebbit.get('distance')})")
@@ -427,7 +427,7 @@ def _hire_falcon(ctx) -> bool:
     matthias = _nearest_npc(FALCONER_NAME, 20)
     if matthias is None:
         debug_log.log("falconry", "walking to the falconer")
-        travel.walk_to(ctx, TILE_FALCONER)
+        travel.walk_to(ctx, TILE_FALCONER, goal_adjacent=False)
         return False
 
     debug_log.log("falconry", "hiring a falcon from Matthias")
@@ -491,7 +491,7 @@ def _leg_bank(ctx, config):
     bank_obj = banker.find_nearby_bank(config)
     if bank_obj is None:
         debug_log.log("falconry", "walking to the bank chest")
-        travel.walk_to(ctx, TILE_BANK)
+        travel.walk_to(ctx, TILE_BANK, goal_adjacent=False)
         return
 
     if not banker.is_open():
@@ -558,7 +558,7 @@ def _leg_fairy_ring(ctx):
                  if o.get("id") == FAIRY_RING_ID and o.get("visible", True)), None)
     if ring is None:
         debug_log.log("falconry", "walking to the fairy ring")
-        travel.walk_to(ctx, TILE_FAIRY_RING)
+        travel.walk_to(ctx, TILE_FAIRY_RING, goal_adjacent=False)
         return
 
     # Last-destination reuses the previously-dialled code (AKQ in the recording) in one click,
@@ -589,7 +589,7 @@ def _leg_walk_home(ctx):
         # the stile object again -- is taken on the very first tick after crossing, before there
         # is ever another chance to re-click it. SOUTH_OF_STILE_Y stays as-is for _bank_trip's
         # own (coarser, and unaffected by this bug) depart-vs-still-walking-home decision.
-        if travel.walk_to(ctx, TILE_HUNT):
+        if travel.walk_to(ctx, TILE_HUNT, goal_adjacent=False):
             debug_log.log("falconry", "back at the hunting ground")
             ctx.state.data["banking"] = False
         return
@@ -603,7 +603,7 @@ def _leg_walk_home(ctx):
                                       STILE_ID, radius=15)
     if stile is None:
         debug_log.log("falconry", "walking to the stile")
-        travel.walk_to(ctx, TILE_STILE)
+        travel.walk_to(ctx, TILE_STILE, goal_adjacent=False)
         return
 
     debug_log.log("falconry", "climbing over the stile")

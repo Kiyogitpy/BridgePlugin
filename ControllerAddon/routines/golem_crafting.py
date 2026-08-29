@@ -638,7 +638,7 @@ def handle_missing_target(ctx, config: dict, location_key: str, miss_counter_key
         # never actually be reached. Substituting the closest genuinely walkable tile within
         # WALKABLE_ANCHOR_SEARCH_RADIUS fixes the anchor itself rather than special-casing the
         # walk logic (travel.py is shared infrastructure well outside this routine's scope).
-        travel.walk_to(ctx, _nearest_walkable_tile(target))
+        travel.walk_to(ctx, _nearest_walkable_tile(target), goal_adjacent=False)
         ctx.state.data[miss_counter_key] = 0
         return True
     debug_log.log("golem crafting", f"{location_key} still not found after {MAX_WALK_ATTEMPTS} walk attempts toward the configured location")

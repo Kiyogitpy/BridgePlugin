@@ -59,6 +59,12 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   that isn't attached to the root list is invisible to the walk but still resolves by id, so the
   walk alone is not proof. Both are read-only and cost nothing when unused. NumPy and Pillow are
   already installed, so measuring a dumped frame needs no new dependency.
+- **Pathfinding**: `ControllerAddon/worldmap.py` holds a world-wide per-edge collision map
+  (all four planes) and answers `find_path`/`reachable_from` offline in milliseconds. It is
+  the only routing engine; Shortest Path was removed 2026-08-29. Doors are baked open in that
+  map by design -- `travel.open_door_toward` finds the shut one standing on the route. The map
+  CANNOT tell furniture from a wall, so `travel.can_reach` still answers object-interaction
+  adjacency from live collision flags, and must not be moved onto the map.
 
 ## Reference implementations in `data/decompiled/`
 
@@ -1276,6 +1282,31 @@ found by diffing our data against the reference rather than by reading our own c
 `docs/superpowers/specs/2026-08-27-mahogany-homes-design.md` for the full design and
 `docs/superpowers/plans/2026-08-27-mahogany-homes.md` for the implementation history.
 
+**Routing engine replaced 2026-08-29, later the same day as the session below.** Shortest Path
+is gone — deleted along with roughly 700 lines of door/reachability heuristics it made
+necessary (`_door_separates`, `_within_span`, `open_frontier_door`, `open_nearest_shut_door`,
+the three-tier door escalation, and the live-HTTP `travel.reachable_set` flood fill this routine
+used to call directly). `ControllerAddon/worldmap.py` — a world-wide per-edge collision map
+covering all four planes, ported from EthanApi's GlobalCollisionMap and answering
+`find_path`/`reachable_from` offline in milliseconds, no bridge call — is now the **only**
+routing engine, and it fixes the exact gap Shortest Path had: it routes on plane 1+ (Shortest
+Path's dumped collision map was ground level only). Doors are baked OPEN in the map by design
+(`CacheMapDumper`'s `Exclusion` list), so a computed route goes straight through one; the door
+question is answered afterward, from the route itself, by
+`first_door_on_route`/`blocked_crossing_on_route` in `travel.py` — the first blocked crossing on
+the route is very nearly the definition of "a shut door is here" on ANY plane, and it replaces
+every one of the tiers named above with one idea. `travel.open_door_toward(ctx, goal)` is the
+single call site every consumer below now uses. The one thing that did **not** move onto the
+static map: `travel.can_reach` (object-interaction adjacency — "can I click this from here") is
+still answered from **live** `GET /collision` flags, because the static map bakes an object's
+own blocking into the same bits as a wall's and structurally cannot tell furniture from a wall
+(the JEFF finding below). Every MEASURED geometry in this section — ROSS, JEFF, Barbara, TAU —
+is still the evidence the design rests on; they are now also encoded as pinned fixtures in
+`ControllerAddon/tests/test_worldmap.py` and `tests/test_travel.py` rather than living only
+here. The bullets below describe the machinery as it was BUILT that day, on top of Shortest
+Path; read them for the measurements, not for the current API names, which the "ONE call now"
+notes inline correct where they matter most.
+
 **Second live session, 2026-08-29 — three bugs, all MEASURED. Don't re-derive them.**
 
 - **A widget text match MUST be scoped to a widget GROUP, or the chatbox answers for you.**
@@ -1330,9 +1361,11 @@ found by diffing our data against the reference rather than by reading our own c
   whole scene on our plane, so a hotspot behind a shut front door is plainly VISIBLE and was
   clicked immediately, and the door only got resolved through the unreachable branch,
   `HOTSPOT_UNREACHABLE_CLICKS` (5) clicks and ~6s later. MEASURED live at MARIAH's: exactly that,
-  twice in one contract. work_phase now calls `travel.open_doorway_to` once per hotspot state
-  (latched on the same `(objectId, value)` signature as the click counter), which costs nothing
-  when the way is clear.
+  twice in one contract. work_phase now calls `travel.open_door_toward` (the straight-line
+  `open_doorway_to` this originally shipped with was later folded into that one route-based
+  call, see the routing-engine note above) once per hotspot state (latched on the same
+  `(objectId, value)` signature as the click counter), which costs nothing when the way is
+  clear.
 - **A door is opened by WALKING to it and then opening it, so the confirmation must budget the
   walk.** `DOOR_OPEN_WAIT_S` was a flat 2.0s, which is less than the ~2.4s of walking to a door
   four tiles off (one tile per 0.6s tick). USER 2026-08-29 on the loop at ROSS's: *"we clicked
@@ -1359,30 +1392,29 @@ found by diffing our data against the reference rather than by reading our own c
   **General lesson: any "walk to X" recovery in this routine needs to ask whether X is even on
   our floor first.** Two separate loops this session were a cross-plane walk that could never
   succeed.
-- **Don't let a travel unit test fall through to the ROUTE branch -- it calls the LIVE bridge.**
-  A door test whose edge geometry did not resolve escalated to `_request_computed_path`, which
-  makes a real HTTP call to the running client, so it passed and failed depending on what the
-  client happened to answer. Pin door tests to the geometry the existing
-  `test_a_door_that_never_opens_*` uses (player, door and goal on one axis, `along` satisfied) so
-  `_door_separates` answers outright.
-- **Every climb resolves the doorway to the LADDER first, and upstairs the collision/LOS edge
-  test is the only thing that can answer it.** USER 2026-08-29: *"there is a door we can open to
-  get to the ladder"*, and *"just use line of sight that works on second floor"*. MEASURED at
-  ROSS's upper floor: the player stood at (2617,3317), ONE tile from `Door 1540` at (2616,3317)
-  whose blocked SOUTH edge (flags 16416 = `BLOCK_MOVEMENT_SOUTH | BLOCK_LINE_OF_SIGHT_SOUTH`) was
-  the only thing between them and the ladder at (2617,3315). All TWELVE `Climb-down` clicks
-  registered in the recorder against the correct object -- the aim was never wrong -- and the
-  player never took a single step, because **the game accepts an object interaction it cannot
-  path to and then simply does nothing**. Door recovery lives in `travel.walk_to` /
-  `open_doorway_to`, and the climb path called NEITHER, so the one action that would have worked
-  was never attempted. `_climb` now calls `open_doorway_to` against the ladder's own tile before
-  clicking it; `_routable_goal` retargets the ladder tile (a full-tile blocker, 131328) onto a
-  walkable neighbour, and `_door_separates` answers from the edge bits alone. VERIFIED live the
-  same run: door opened, ladder climbed, contract turned in -- all inside ONE tick, replacing a
-  loop that had ended three runs.
-  This is also the general shape for upstairs: `_open_blocking_door`'s route branch is useless on
-  plane 1, so the collision/LOS edge test carries the whole load there. `GET /collision` works
-  fine on any plane -- it is only Shortest Path's dumped ground-level map that does not.
+- **A travel unit test must not fall through to a live call.** The original concern here was a
+  door test whose edge geometry did not resolve escalating to a Shortest Path HTTP request, so it
+  passed or failed depending on what the running client happened to answer. `worldmap.find_path`
+  is pure and offline (no bridge, no serial port, no client), which removed that failure mode by
+  construction rather than by pinning test geometry around it -- see "Both Python test suites are
+  now hermetic", below, for the fixture-based half of this (`travel.can_reach`'s own live
+  `/collision` fallback still needs one).
+- **Every climb resolves the doorway to the LADDER first, because the game accepts an object
+  interaction it cannot path to and then silently does nothing.** USER 2026-08-29: *"there is a
+  door we can open to get to the ladder"*, and *"just use line of sight that works on second
+  floor"*. MEASURED at ROSS's upper floor: the player stood at (2617,3317), ONE tile from `Door
+  1540` at (2616,3317) whose blocked SOUTH edge (flags 16416 = `BLOCK_MOVEMENT_SOUTH |
+  BLOCK_LINE_OF_SIGHT_SOUTH`) was the only thing between them and the ladder at (2617,3315). All
+  TWELVE `Climb-down` clicks registered in the recorder against the correct object -- the aim was
+  never wrong -- and the player never took a single step. `_climb` now flood-fills from
+  `worldmap.reachable_from` and asks `travel.can_reach` whether the ladder is reachable from
+  there; if not, it calls `travel.open_door_toward(ctx, ladder)` (which routes to the ladder via
+  `worldmap.find_path` and opens whichever door the route crosses) before ever clicking the
+  ladder. VERIFIED live the same run: door opened, ladder climbed, contract turned in -- all
+  inside ONE tick, replacing a loop that had ended three runs.
+  This is also the general shape for upstairs: Shortest Path's route branch was useless on plane
+  1 (its dumped collision map was ground level only), which is the reason `worldmap.py` exists at
+  all -- `GET /collision` always worked fine on any plane, and now the offline map does too.
 - **A safety-stop reason must not repeat the engine's own suffix.** `trigger_safety_stop` appends
   ". Automation paused -- fix the issue and restart." itself; the first turn-in ceiling message
   included that sentence too and printed it twice.
@@ -1411,60 +1443,49 @@ found by diffing our data against the reference rather than by reading our own c
   `base + distance * HOTSPOT_WALK_ALLOWANCE_S`, capped by `HOTSPOT_COOLDOWN_MAX_S`. This is the
   same omission as the door-open budget -- **whenever you time a click, ask whether the player
   has to walk there first.**
-- **Once STUCK, open the nearest shut door even though nothing is provably in the way.** USER
-  2026-08-29: *"got stuck outside without opening door again"*, with a screenshot showing the
-  character on the grass outside ROSS's and the front door highlighted beside it. `_door_separates`
-  is a single-axis "is this edge between us and the goal" test, so it structurally cannot see a
-  door that is a **DETOUR**: MEASURED there -- player (2614,3319) on the grass north of the house,
-  Broken Range at (2617,3318) inside, and the only way in a door at (2610,3316) whose blocked edge
-  (2610|2611) has BOTH of us to its east. The strict answer "not between us" was correct and
-  useless. The route branch that normally catches a detour had returned no route that moment.
-  `travel.open_nearest_shut_door` is the last resort, called ONLY from work_phase's unreachable
-  branch and only after `open_doorway_to` finds nothing -- scoped that tightly because the same
-  looseness in the ordinary pre-walk check was tried earlier and reverted as a false positive.
-  Once stuck, a wasted door click costs a second; not trying costs the contract. It picks the door
-  nearest to US (we must reach it to open it, and a detour door is by definition further from the
-  goal than we are). VERIFIED live the same run: `stuck -- opening the nearest shut Door at
-  (2610,3316)` -> 3-tile route -> hotspot 40164 completed -> on to 40165.
-- **REACHABILITY IS DECIDED BEFORE THE FIRST CLICK. This supersedes the click-then-discover
-  design and most of the door machinery written earlier the same night.** `/objects` returns the
-  whole scene on the player's plane, so a hotspot behind a wall, a shut door or a ceiling is
-  plainly VISIBLE -- and work_phase used to click it from wherever it stood, discovering it could
-  not reach the thing only after `HOTSPOT_UNREACHABLE_CLICKS` failures (~20s). MEASURED over one
-  full ROSS contract 2026-08-29: **15 of 27 hotspot clicks -- 56% -- achieved nothing**, across
-  three stuck events. USER: *"every time we have to walk through a door now we have to get stuck
-  on the outside 5 clicks in a row this is unacceptable."*
-  `travel.reachable_set()` flood-fills the client's own collision grid (`GET /collision`, one call,
-  ~0.11s for a 29x29 block) and everything else follows from it. This is the USER's own room model
-  -- *"we know the houses bounds... if we are in room 1, room 2 has a thing we need to repair then
-  we just check the bounds for a door"* -- with the rooms DERIVED from collision rather than from
-  a per-house wall-id catalogue, which is why it needs no per-home data and handles the Falador
-  `GameObject` door for free:
-  - the flood fill from the player IS "room 1" (walls and shut doors both stop it);
-  - `can_reach(hotspot)` false IS "the thing is in room 2";
-  - `open_frontier_door()` finds the shut door whose blocked edge has **one side inside the fill
-    and one side outside** -- by construction a way out of the region we are trapped in, whether
-    it lies straight ahead or is a DETOUR behind us, which is exactly what `_door_separates`'
-    single-axis test structurally cannot see;
-  - `pick_next_hotspot(hotspots, reach)` prefers a hotspot we can actually get to.
-  Three hard-won rules, each of which cost a live failure:
+- **A door click needs no fallback tier any more, because it is answered from a real ROUTE, not
+  a heuristic.** MEASURED that night at ROSS's: player (2614,3319) on the grass north of the
+  house, Broken Range at (2617,3318) inside, and the only way in a door at (2610,3316) whose
+  blocked edge (2610|2611) has BOTH of us to its EAST -- a straight-line "is this edge between us
+  and the goal" test answers "not between us" and is wrong, because the door is a **DETOUR**, not
+  a point on the direct line. That night's fix was a three-tier escalation
+  (`open_frontier_door` -> `open_doorway_to` -> a blunt `open_nearest_shut_door` last resort) built
+  because there was no route to ask and a detour is invisible to a straight-line test. All three
+  are gone: `travel.open_door_toward` asks `worldmap.find_path` for an actual BFS route to the
+  goal and opens whichever shut door the route crosses (`first_door_on_route`, see the
+  routing-engine note above) -- a detour door is on the route exactly as much as a straight-ahead
+  one, so the same ROSS geometry is found with the one call, for free, with no tier order to get
+  right. VERIFIED live the same run: door opened at (2610,3316), hotspot 40164 completed, on to
+  40165.
+- **REACHABILITY IS DECIDED BEFORE THE FIRST CLICK -- click-then-discover was the whole problem,
+  not the door logic specifically.** `/objects` returns the whole scene on the player's plane, so
+  a hotspot behind a wall, a shut door or a ceiling is plainly VISIBLE -- and work_phase used to
+  click it from wherever it stood, discovering it could not reach the thing only after
+  `HOTSPOT_UNREACHABLE_CLICKS` failures (~20s). MEASURED over one full ROSS contract 2026-08-29:
+  **15 of 27 hotspot clicks -- 56% -- achieved nothing**, across three stuck events. USER: *"every
+  time we have to walk through a door now we have to get stuck on the outside 5 clicks in a row
+  this is unacceptable."*
+  A flood fill decides reachability up front instead: `worldmap.reachable_from(x, y, plane)`
+  walks the STATIC map's cardinal edges offline (no HTTP call at all, any plane -- this is what
+  replaced the live `GET /collision`-based `travel.reachable_set()` this routine originally called
+  here) and `travel.can_reach(hotspot, reach, plane=player_plane)` answers whether the hotspot is
+  reachable from that set, still checking the actual click-adjacency edge against LIVE flags
+  (see the routing-engine note above for why that half stays live). `pick_next_hotspot(hotspots,
+  reach, plane)` then prefers a hotspot we can actually get to. Two hard-won rules survive from
+  that night, both still true of `can_reach` today:
   - **Count ALL EIGHT neighbours, not the four cardinals.** MEASURED upstairs at JEFF's: the
     player stood at (3241,3447), DIAGONALLY adjacent to the hotspot at (3242,3446) whose every
     cardinal neighbour is furniture. A cardinal-only test called it unreachable and the routine
     walked in place forever instead of clicking a thing it was standing beside -- strictly worse
-    than the waste it replaced. USER: *"wtf it is reachable hes standing next to it"*.
-  - **The model NEVER vetoes a point-blank click.** At `distance <= 1` the gate is skipped
-    entirely: if the model and the character's own position disagree, the position wins.
+    than the waste it replaced. USER: *"wtf it is reachable hes standing next to it"*. A diagonal
+    is accepted only when one of its two orthogonal corner routes has an open edge (the game's own
+    rule), not by an unconditional point-blank override -- an earlier override shaped that way
+    PRODUCED the ROSS failure below by accepting a diagonal into a wall; it is gone.
   - **An empty fill means "cannot tell", never "nothing is reachable"** -- an un-rebuilt client or
     a tile outside the loaded scene must behave exactly as before, not refuse to work.
   The fill is cardinal-only on purpose, so it can only UNDER-report; the failure mode is the old
-  behaviour, never a confident walk into a wall. And unlike Shortest Path it works on ANY plane.
-- **The three door tiers, precise first.** USER 2026-08-29: *"we cannot use the cannot reach
-  fallback for regular usage, this has to be last resort fallback"* -- before the frontier test
-  existed the blunt tier was firing three or four times per contract and was effectively the
-  primary mechanism. Order is now `open_frontier_door` (names the exact door on the room
-  boundary) -> `open_doorway_to` (straight-line edge test) -> `open_nearest_shut_door` (opens
-  something and hopes; reached only when both above find nothing, which should be near never).
+  behaviour, never a confident walk into a wall. And unlike Shortest Path it works on ANY plane --
+  ground truth for why `worldmap.py` exists at all.
 - **A hotspot can be genuinely unreachable with NO door anywhere.** MEASURED upstairs at JEFF's:
   of three hotspots needing attention one was walled off and there was no shut door in range at
   all. USER: *"there is no doors but we are on the second floor"*. Bare list order fixated on it,
@@ -1472,12 +1493,16 @@ found by diffing our data against the reference rather than by reading our own c
   `pick_next_hotspot`'s reachability preference -- and note it still returns an unreachable
   hotspot when EVERY one is unreachable, so a walled-off contract falls through to the door/walk
   recovery rather than reporting "no work left" and going to turn_in on an unfinished contract.
-- **Both Python test suites are now hermetic (`_no_live_bridge` autouse fixtures).** `get_collision`,
-  `request_shortest_path` and `get_shortest_path_result` all reach the RUNNING CLIENT when a test
-  does not stub them, so results depended on where the character happened to be standing -- the
-  same door test passed alone and failed in a full run, and flipped between runs as the live
-  player moved house. Mark a test `@pytest.mark.real_bridge_helper` (registered in
-  `tests/conftest.py`) only when it is testing a controller bridge helper itself.
+- **Both Python test suites are now hermetic (`_no_live_bridge` autouse fixtures).** `get_collision`
+  reaches the RUNNING CLIENT when a test does not stub it, so a result depended on where the
+  character happened to be standing -- the same door test passed alone and failed in a full run,
+  and flipped between runs as the live player moved house. (`request_shortest_path` and
+  `get_shortest_path_result`, the other two live calls this originally warned about, are gone
+  along with Shortest Path itself -- `worldmap.find_path` needs no live call at all, which is what
+  made the routing HALF of this hermetic by construction rather than by fixture; `get_collision`
+  is what remains to stub, for `travel.can_reach`'s live fallback.) Mark a test
+  `@pytest.mark.real_bridge_helper` (registered in `tests/conftest.py`) only when it is testing a
+  controller bridge helper itself.
 - **The reachability gate belongs at EVERY world-object click site, not one at a time.** The
   invariant is: **the game ACCEPTS a click on anything you can see -- through walls, through
   floors -- and then silently does nothing.** Fixing only work_phase's hotspot clicks moved the
@@ -1527,14 +1552,17 @@ found by diffing our data against the reference rather than by reading our own c
   between each Remove/Build. USER: *"still doesnt make much sense since we can reach them so why
   would we step out"*. MEASURED from inside the house: `can_reach(ladder)` was True and the door
   was opened anyway. Door work belongs only inside the gate.
-- **Shortest Path cannot route on plane 1 at all.** MEASURED with 20s waits: every plane-1 target
-  returns `active:false, done:false` and never completes, and a plane-0 target requested while
-  standing upstairs comes back `steps=1, SEARCH_EXHAUSTED` where the single "step" is the player's
-  own current tile. Its dumped collision map is ground level only. So upstairs there is no route,
-  which also means `_open_blocking_door`'s route branch has nothing to work with and `walk_to`
-  falls straight through to the obstacle-blind greedy walker. CONFIRMED live: eleven identical
-  `Walk here` clicks at canvas (554,331) with the player never moving, while the client displayed
-  "destination could not be reached". Not fixed -- know it before debugging an upstairs walk.
+- **Shortest Path could not route on plane 1 at all -- this measurement is WHY it was replaced.**
+  MEASURED with 20s waits, that night: every plane-1 target returned `active:false, done:false`
+  and never completed, and a plane-0 target requested while standing upstairs came back
+  `steps=1, SEARCH_EXHAUSTED` where the single "step" was the player's own current tile (its
+  dumped collision map was ground level only). So upstairs there was no route, which meant the
+  door recovery had nothing to work with and `walk_to` fell straight through to an obstacle-blind
+  greedy walker -- CONFIRMED live: eleven identical `Walk here` clicks at canvas (554,331) with
+  the player never moving, while the client displayed "destination could not be reached". Fixed
+  2026-08-29 by `worldmap.py`, whose own module docstring opens with this exact measurement as
+  its reason to exist: the static map covers all four planes, so an upstairs route is now no
+  different from a ground-floor one.
 
 **First long live session, 2026-08-28 — everything below was MEASURED, don't re-derive it.**
 
@@ -1591,3 +1619,21 @@ found by diffing our data against the reference rather than by reading our own c
   `find_nearby_bank` accepts anything within `maxBankDistance` (40) while `_refresh_bank_object`
   only re-resolves within **15**, so every retry re-aimed at the identical stale pixel; and the
   booth's projection landed on the chatbox tab strip, so all five clicks resolved to "Switch tab".
+
+**The collision map `worldmap.py` reads is a static snapshot, not a live one.** A game update
+that moves a wall makes a route wrong; the symptom is a walk that stalls at one specific tile,
+not a crash. Regenerating it was deliberately deferred rather than done as part of this rewrite
+(swapping mid-plan would have invalidated every pinned per-plane bit count and route-length
+fixture the earlier tasks encoded). USER (2026-08-29) dumped a fresh map with `CacheMapDumper`
+anyway, staged at `ControllerAddon/map-output/collision-map.gz`, and MEASURED it does **not**
+load with today's reader: its cookie's low 16 bits are 12347 (`SERIAL_COOKIE` *with* run
+containers -- `CacheMapDumper` calls `runOptimize()` before serializing), and `worldmap._Roaring`
+currently accepts only the no-run-container cookie. Swapping to that dump is therefore not the
+ten-line `Indexer` change the design doc originally assumed; it needs three things: (1)
+run-container support in `worldmap._Roaring` -- the run-flag bitmap sits between the cookie and
+the descriptive header, plus a third container type; (2) an `Indexer` change to the dump's own
+layout -- 12-bit x (base 480), 14-bit y, 2-bit plane, and the polarity is **INVERTED** from
+today's map (a set bit means BLOCKED, not passable); (3) re-measurement of every pinned fixture in
+`ControllerAddon/tests/test_worldmap.py`, since the per-plane bit counts and all four route
+lengths there come from the current (EthanApi) map, not this one. Not done here -- recorded as
+its own follow-up task.
