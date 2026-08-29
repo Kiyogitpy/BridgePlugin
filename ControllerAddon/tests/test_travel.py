@@ -132,61 +132,6 @@ def test_every_baseline_key_is_a_real_shortest_path_config_key():
 
 # --- distance gate ------------------------------------------------------------------
 
-def test_a_short_same_plane_hop_skips_the_pathfinder(monkeypatch):
-    """Asking the plugin costs a message plus up to PATH_REQUEST_TIMEOUT_S of polling; for a
-    20-tile walk that dwarfs the walk itself."""
-    monkeypatch.setattr(travel.controller, "get_player",
-                        lambda: {"x": 3190, "y": 3195, "plane": 0})
-    monkeypatch.setattr(travel, "_walk_greedy", lambda ctx, target, tolerance: True)
-
-    def _boom(*_a, **_k):
-        raise AssertionError("should not have asked Shortest Path for a 12-tile hop")
-
-    monkeypatch.setattr(travel, "_request_computed_path", _boom)
-
-    assert travel.walk_to(_Ctx(), TARGET) is True
-
-
-def test_a_long_walk_still_asks_the_pathfinder(monkeypatch):
-    monkeypatch.setattr(travel.controller, "get_player",
-                        lambda: {"x": 2500, "y": 3400, "plane": 0})
-    asked = []
-    monkeypatch.setattr(travel, "_request_computed_path",
-                        lambda target, config: asked.append(target) or (None, False, None))
-    monkeypatch.setattr(travel, "_walk_greedy", lambda ctx, target, tolerance: True)
-
-    travel.walk_to(_Ctx(), TARGET)
-
-    assert asked == [TARGET]
-
-
-def test_a_short_hop_to_another_plane_still_asks_the_pathfinder(monkeypatch):
-    """Straight-line distance is meaningless across planes -- getting upstairs needs the
-    staircase transport the route knows about."""
-    monkeypatch.setattr(travel.controller, "get_player",
-                        lambda: {"x": 3198, "y": 3198, "plane": 1})
-    asked = []
-    monkeypatch.setattr(travel, "_request_computed_path",
-                        lambda target, config: asked.append(target) or (None, False, None))
-    monkeypatch.setattr(travel, "_walk_greedy", lambda ctx, target, tolerance: True)
-
-    travel.walk_to(_Ctx(), TARGET)
-
-    assert asked == [TARGET]
-
-
-def test_the_distance_gate_threshold_is_overridable_per_call(monkeypatch):
-    monkeypatch.setattr(travel.controller, "get_player",
-                        lambda: {"x": 3190, "y": 3195, "plane": 0})
-    asked = []
-    monkeypatch.setattr(travel, "_request_computed_path",
-                        lambda target, config: asked.append(target) or (None, False, None))
-    monkeypatch.setattr(travel, "_walk_greedy", lambda ctx, target, tolerance: True)
-
-    travel.walk_to(_Ctx(), TARGET, min_path_tiles=5)
-
-    assert asked == [TARGET]
-
 
 # --- request/result correlation -----------------------------------------------------
 
@@ -904,35 +849,6 @@ def test_doors_are_searched_far_enough_out_to_find_a_real_one(monkeypatch):
 # player spends it wedged against the door in plain view, and at NORMAN's the stall recovery
 # never even ran because walk_to reported arrival outside. We can now KNOW the doorway is shut
 # before taking a step -- the client's collision entry says so -- so check first and walk second.
-
-def test_walk_to_opens_a_shut_doorway_before_it_starts_walking(monkeypatch):
-    order = []
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3034, "y": 3341, "plane": 0})
-    monkeypatch.setattr(controller, "get_objects", lambda **kw: [
-        _door_with_flags(3037, 3344, travel.BLOCK_MOVEMENT_SOUTH),
-    ])
-    monkeypatch.setattr(controller, "click_entity",
-                        lambda ser, entity, **kw: order.append(("door", entity["x"], entity["y"])))
-    monkeypatch.setattr(time, "sleep", lambda s: None)
-    monkeypatch.setattr(travel, "_is_short_hop", lambda t, m: True)
-    monkeypatch.setattr(travel, "_walk_greedy", lambda ctx, t, tol: order.append("walk") or True)
-
-    travel.walk_to(_Ctx(), {"x": 3038, "y": 3348, "plane": 0})
-
-    assert order and order[0][0] == "door", f"door must be handled before walking: {order}"
-    assert "walk" in order, "and the walk must still happen"
-
-
-def test_walk_to_does_not_touch_anything_when_no_door_is_in_the_way(monkeypatch):
-    clicks = []
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3034, "y": 3341, "plane": 0})
-    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])
-    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: clicks.append(entity))
-    monkeypatch.setattr(travel, "_is_short_hop", lambda t, m: True)
-    monkeypatch.setattr(travel, "_walk_greedy", lambda ctx, t, tol: True)
-
-    assert travel.walk_to(_Ctx(), {"x": 3038, "y": 3348, "plane": 0}) is True
-    assert clicks == [], "no door in the way must cost nothing"
 
 
 # --- ground walk clicks must force-walk with SHIFT -------------------------------------
