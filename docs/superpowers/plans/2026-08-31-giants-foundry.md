@@ -73,8 +73,8 @@ RECORDING_UNLOCKS = [m for m, v in gf.MOULDS.items() if v[3] is False] + [
 
 
 def test_mould_table_shape():
-    # 32 moulds, three parts, every score positive, display names unique
-    assert len(gf.MOULDS) == 32
+    # 33 moulds (11 per part), every score positive, display names unique
+    assert len(gf.MOULDS) == 33
     parts = {"RICASSO": 0, "BLADE": 0, "TIP": 0}
     displays = set()
     for enum, (display, part, scores, purchasable) in gf.MOULDS.items():
@@ -82,7 +82,7 @@ def test_mould_table_shape():
         assert display not in displays
         displays.add(display)
         assert scores and all(v > 0 for v in scores.values())
-    assert parts == {"RICASSO": 11, "BLADE": 11, "TIP": 10}
+    assert parts == {"RICASSO": 11, "BLADE": 11, "TIP": 11}
 
 
 def test_best_moulds_narrow_flat_matches_recording():
