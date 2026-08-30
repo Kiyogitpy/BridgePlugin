@@ -92,6 +92,7 @@ MOULDS = {
     "FLEUR_DE_BLADE":  ("Fleur de Blade", "BLADE", {"BROAD": 4, "HEAVY": 18, "SPIKED": 1}, True),
     "CHOPPA":          ("Choppa!", "BLADE", {"BROAD": 1, "LIGHT": 22, "FLAT": 2}, True),
     # TIP
+    "PEOPLE_POKER_POINT": ("People Poker Point", "TIP", {"NARROW": 4, "HEAVY": 4, "FLAT": 4}, False),
     "CHOPPER_TIP":        ("Chopper Tip", "TIP", {"BROAD": 4, "LIGHT": 4, "SPIKED": 4}, False),
     "MEDUSAS_HEAD":       ("Medusa's Head", "TIP", {"BROAD": 4, "HEAVY": 4, "SPIKED": 4}, False),
     "SERPENTS_FANG":      ("Serpent's Fang", "TIP", {"NARROW": 8, "LIGHT": 6, "SPIKED": 8}, False),
