@@ -589,3 +589,144 @@ def test_on_event_tolerates_none_payload():
     gf.on_event(ctx, "CHAT_MESSAGE", None)
     gf.on_event(ctx, "TICK", {"tick": 1})
     assert ctx.state.stopped is None
+
+
+# ---------------------------------------------------------------------------
+# Task 9: refinement controller
+# ---------------------------------------------------------------------------
+
+def _machines(monkeypatch):
+    objs = [
+        {"id": 44619, "name": "Trip hammer", "x": 3363, "y": 11496, "plane": 0,
+         "screenX": 800, "screenY": 300},
+        {"id": 44620, "name": "Grindstone", "x": 3369, "y": 11493, "plane": 0,
+         "screenX": 600, "screenY": 350},
+        {"id": 44621, "name": "Polishing wheel", "x": 3362, "y": 11484, "plane": 0,
+         "screenX": 500, "screenY": 420},
+        {"id": gf.LAVA_POOL_ID, "name": "Lava pool", "x": 3372, "y": 11497, "plane": 0,
+         "screenX": 650, "screenY": 450},
+        {"id": gf.WATERFALL_ID, "name": "Waterfall", "x": 3357, "y": 11488, "plane": 0,
+         "screenX": 250, "screenY": 150},
+        {"id": gf.STORAGE_FULL_ID, "name": "Preform storage", "x": 3366, "y": 11485,
+         "plane": 0, "screenX": 520, "screenY": 380},
+    ]
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: objs)
+    return {o["id"]: o for o in objs}
+
+
+def test_refine_ready_idle_clicks_machine(monkeypatch):
+    ctx = _Ctx()
+    _machines(monkeypatch)
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: clicks.append(ent["id"]) or True)
+    gf.refine_phase(ctx, _st(temperatureStatus="READY", activity="NONE"))
+    assert clicks == [44619]
+
+
+def test_refine_working_out_of_band_interrupts_to_adjust(monkeypatch):
+    # THE QUALITY GUARD: working while TOO_COLD damages the sword every action -- the
+    # controller must interrupt with the heat adjust instead of watching it burn.
+    ctx = _Ctx()
+    _machines(monkeypatch)
+    menu = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **k: menu.append((ent["id"], option)) or True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
+    _serve_state(monkeypatch, _st(temperature=990, temperatureStatus="READY"))
+    gf.refine_phase(ctx, _st(temperature=700, temperatureStatus="TOO_COLD",
+                             activity="HAMMERING"))
+    assert menu == [(gf.LAVA_POOL_ID, "Dunk-preform")]
+
+
+def test_refine_working_never_reclicks(monkeypatch):
+    ctx = _Ctx()
+    _machines(monkeypatch)
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: clicks.append(ent["id"]) or True)
+    gf.refine_phase(ctx, _st(temperatureStatus="READY", activity="HAMMERING"))
+    assert clicks == []    # overwork guard
+
+
+def test_refine_sweet_spot_claims_once(monkeypatch):
+    ctx = _Ctx()
+    _machines(monkeypatch)
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: clicks.append(ent["id"]) or True)
+    st = _st(temperatureStatus="READY", activity="HAMMERING", sweetSpotState="AVAILABLE")
+    gf.refine_phase(ctx, st)
+    gf.refine_phase(ctx, st)     # same AVAILABLE window -> no second click
+    assert clicks == [44619]
+    gf.refine_phase(ctx, _st(temperatureStatus="READY", activity="HAMMERING",
+                             sweetSpotState="CLAIMED"))
+    gf.refine_phase(ctx, _st(temperatureStatus="READY", activity="HAMMERING",
+                             sweetSpotState="AVAILABLE"))
+    assert clicks == [44619, 44619]   # new window -> one more claim
+
+
+def test_refine_too_cold_dunks_then_engages(monkeypatch):
+    ctx = _Ctx()
+    _machines(monkeypatch)
+    menu, clicks = [], []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **k: menu.append((ent["id"], option)) or True)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: clicks.append(ent["id"]) or True)
+    # Serve a state whose temperature is already past target so the inner poll exits
+    # on its first read.
+    hot = _st(temperature=990, temperatureStatus="READY")
+    _serve_state(monkeypatch, hot)
+    cold = _st(temperature=700, temperatureStatus="TOO_COLD", activity="NONE")
+    gf.refine_phase(ctx, cold)
+    assert menu == [(gf.LAVA_POOL_ID, "Dunk-preform")]
+    assert clicks == [44619]     # engaged the hammer right after the ramp
+
+
+def test_refine_too_hot_quenches(monkeypatch):
+    ctx = _Ctx()
+    _machines(monkeypatch)
+    menu = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **k: menu.append((ent["id"], option)) or True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
+    _serve_state(monkeypatch, _st(temperature=400, temperatureStatus="READY",
+                                  requiredTool="GRINDSTONE",
+                                  minimumTemperature=410, maximumTemperature=590))
+    gf.refine_phase(ctx, _st(temperature=700, temperatureStatus="TOO_HOT",
+                             requiredTool="GRINDSTONE", activity="NONE",
+                             minimumTemperature=410, maximumTemperature=590))
+    assert menu == [(gf.WATERFALL_ID, "Quench-preform")]
+
+
+def test_refine_stored_takes_from_storage(monkeypatch):
+    ctx = _Ctx()
+    _machines(monkeypatch)
+    kwargs = {}
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: (clicks.append(ent["id"]), kwargs.update(k)) or True)
+    gf.refine_phase(ctx, _st(phase="STORED", preformState="STORED"))
+    assert clicks == [gf.STORAGE_FULL_ID]
+    assert kwargs.get("expected_action") == "Take-preform"
+
+
+def test_watch_progress_stall_reengages_and_dead_clicks_stop(monkeypatch):
+    ctx = _Ctx()
+    _machines(monkeypatch)
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: clicks.append(ent["id"]) or True)
+    st = _st(temperatureStatus="READY", activity="HAMMERING", completion=200)
+    now = [1000.0]
+    monkeypatch.setattr(gf.time, "time", lambda: now[0])
+    gf.refine_phase(ctx, st)               # working, progress mark set
+    assert clicks == []
+    now[0] += gf.WORK_STALL_S + 1
+    gf.refine_phase(ctx, st)               # stalled -> re-engage (dead click 1)
+    assert clicks == [44619]
+    for _ in range(gf.DEAD_CLICK_LIMIT):
+        now[0] += gf.WORK_STALL_S + 1
+        gf.refine_phase(ctx, st)
+    assert "no progress" in ctx.state.stopped.lower()

@@ -225,6 +225,18 @@ def heat_stop_target(tool, min_t, max_t, actions_left):
 
 
 # ---------------------------------------------------------------------------
+# Task 9: refinement controller constants
+# ---------------------------------------------------------------------------
+
+WORKING_ACTIVITIES = ("HAMMERING", "GRINDING", "POLISHING")
+WORK_STALL_S = 12.0        # > two hammer cycles (3s each) + the nulled first cycle
+WORK_FIRST_ACTION_S = 6.0
+DEAD_CLICK_LIMIT = 5
+HEAT_ADJUST_TIMEOUT_S = 20.0
+HEAT_POLL_S = 0.25
+
+
+# ---------------------------------------------------------------------------
 # Runtime: mould setup interface (group 718 -- MEASURED in the recording)
 # ---------------------------------------------------------------------------
 
@@ -611,7 +623,129 @@ def on_event(ctx, event_type, payload):
 
 
 def refine_phase(ctx, st):
-    pass
+    """One decision per tick: sweet spot > (working? watch, don't touch) > in band?
+    engage machine > out of band? fast-adjust and engage. The overwork rule (MEASURED:
+    clicking a machine mid-action forfeits the next action) is why 'working' returns
+    without clicking anything except a sweet-spot claim."""
+    data = ctx.state.data
+
+    if st.get("preformState") == "STORED":
+        storage = _find_object(STORAGE_FULL_ID)
+        if storage is not None:
+            controller.click_entity(ctx.ser, storage, refresh_target=_refresh(storage),
+                                    expected_action="Take-preform")
+            controller.mark_busy(3.0)
+            controller.human_delay(1.0, 1.5)
+        return
+
+    tool = st.get("requiredTool")
+    if tool not in TOOL_STATS:
+        return    # boundary tick / completed read -- dispatcher resolves next tick
+
+    # Sweet spot: exactly one claim click per AVAILABLE window, and only while the
+    # temperature is right -- claiming out of band damages the sword instead.
+    if st.get("sweetSpotState") == "AVAILABLE":
+        if st.get("temperatureStatus") == "READY" and not data.get("gf_sweet_claimed"):
+            machine = _find_object(TOOL_STATS[tool]["object"])
+            if machine is not None:
+                controller.click_entity(ctx.ser, machine, refresh_target=_refresh(machine),
+                                        simulate_mistakes=False)
+                data["gf_sweet_claimed"] = True
+                return
+    else:
+        data["gf_sweet_claimed"] = False
+
+    working = st.get("activity") in WORKING_ACTIVITIES
+    status = st.get("temperatureStatus")
+    if working:
+        if status in ("TOO_COLD", "TOO_HOT"):
+            # THE QUALITY GUARD: a running machine keeps acting while the temperature
+            # is wrong, and every such action costs 10 quality. Interrupt it by going
+            # straight to the heat adjust -- clicking the lava/waterfall interrupts the
+            # work exactly like any other click, so this is one action, not two.
+            _adjust_heat_and_engage(ctx, st, tool)
+            return
+        _watch_progress(ctx, st)
+        return
+
+    if status == "READY":
+        _click_machine(ctx, st, tool)
+    elif status in ("TOO_COLD", "TOO_HOT"):
+        _adjust_heat_and_engage(ctx, st, tool)
+
+
+def _watch_progress(ctx, st):
+    """While the machine runs, only watch. Progress advancing clears the dead-click
+    counter; WORK_STALL_S with no progress while 'working' means the activity read is
+    stale or the action never started -- re-engage once per stall window."""
+    data = ctx.state.data
+    comp = st.get("completion", 0)
+    mark = data.get("gf_progress_mark")
+    now = time.time()
+    if mark is None or comp > mark[0]:
+        data["gf_progress_mark"] = (comp, now)
+        data["gf_dead_clicks"] = 0
+        return
+    if now - mark[1] > WORK_STALL_S:
+        debug_log.log("gf", f"no progress for {WORK_STALL_S:.0f}s while working -- re-engaging")
+        data["gf_progress_mark"] = (comp, now)
+        _click_machine(ctx, st, st.get("requiredTool"))
+
+
+def _click_machine(ctx, st, tool):
+    data = ctx.state.data
+    if tool not in TOOL_STATS:
+        return False
+    if data.get("gf_dead_clicks", 0) >= DEAD_CLICK_LIMIT:
+        ctx.state.trigger_safety_stop(
+            "giants foundry: machine clicks produce no progress -- aim or state problem")
+        return False
+    machine = _find_object(TOOL_STATS[tool]["object"])
+    if machine is None:
+        return False
+    data["gf_dead_clicks"] = data.get("gf_dead_clicks", 0) + 1   # cleared on progress
+    ok = controller.click_entity(ctx.ser, machine, refresh_target=_refresh(machine))
+    if ok:
+        data["gf_progress_mark"] = (st.get("completion", 0), time.time())
+        controller.mark_busy(WORK_FIRST_ACTION_S)
+    return bool(ok)
+
+
+def _adjust_heat_and_engage(ctx, st, tool):
+    """Fast heat/cool (the human uses ONLY Dunk/Quench -- MEASURED), polled every
+    HEAT_POLL_S against the live temperature varbit, stopped HEAT_STOP_MARGIN short of
+    the band-end target -- and the stop IS the machine click (MEASURED: clicking the
+    next machine interrupts the dunk; there is no separate walk-away click)."""
+    min_t = st.get("minimumTemperature", -1)
+    max_t = st.get("maximumTemperature", -1)
+    if min_t < 0 or max_t < 0:
+        return
+    heating = st.get("temperatureStatus") == "TOO_COLD"
+    actions = actions_left_in_section(st.get("completion", 0), st.get("sectionCount", 0), tool)
+    target = heat_stop_target(tool, min_t, max_t, actions)
+    pool = _find_object(LAVA_POOL_ID if heating else WATERFALL_ID)
+    if pool is None:
+        return
+    option = "Dunk-preform" if heating else "Quench-preform"
+    if not controller.click_menu_action(ctx.ser, pool, option,
+                                        refresh_target=_refresh(pool)):
+        return
+    controller.mark_busy(HEAT_ADJUST_TIMEOUT_S + 2)
+    deadline = time.time() + HEAT_ADJUST_TIMEOUT_S
+    cur = None
+    while time.time() < deadline:
+        cur = read_state()
+        if cur is not None:
+            t = cur.get("temperature", -1)
+            if t >= 0:
+                if heating and t >= target - HEAT_STOP_MARGIN:
+                    break
+                if not heating and t <= target + HEAT_STOP_MARGIN:
+                    break
+            if cur.get("requiredTool") != tool:
+                break    # section moved under us -- re-decide from the top next tick
+        time.sleep(HEAT_POLL_S)
+    _click_machine(ctx, cur or st, tool)
 
 
 def hand_in_phase(ctx, st):
