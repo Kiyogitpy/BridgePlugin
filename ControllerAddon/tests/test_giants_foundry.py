@@ -269,3 +269,79 @@ def test_tick_resets_counters_where_success_is_detected(monkeypatch):
     assert d["gf_pickup_attempts"] == 0      # phase is not PREFORM_READY/COLLECTING
     assert d["gf_fill_attempts"] == 0        # bar count grew
     assert d["gf_last_bars"] == 8
+
+
+# ---------------------------------------------------------------------------
+# Task 5: commission + hand-in
+# ---------------------------------------------------------------------------
+
+def _kovac(monkeypatch):
+    npc = {"id": gf.KOVAC_NPC_ID, "index": 28704, "name": "Kovac",
+           "screenX": 500, "screenY": 300}
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [npc])
+    return npc
+
+
+def test_commission_right_clicks_kovac(monkeypatch):
+    ctx = _Ctx()
+    _kovac(monkeypatch)
+    calls = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **k: calls.append(option) or True)
+    gf.get_commission_phase(ctx, _st(phase="AWAITING_COMMISSION", commissionTypes=[]))
+    assert calls == ["Commission"]
+    assert ctx.state.data["gf_commission_attempts"] == 1
+
+
+def test_commission_ceiling_stops(monkeypatch):
+    ctx = _Ctx()
+    _kovac(monkeypatch)
+    st = _st(phase="AWAITING_COMMISSION", commissionTypes=[])
+    for _ in range(gf.COMMISSION_MAX_ATTEMPTS + 1):
+        gf.get_commission_phase(ctx, st)
+    assert "commission" in ctx.state.stopped
+
+
+def test_hand_in_dialogue_open_advances_not_clicks(monkeypatch):
+    # With the reward dialogue open, hand_in presses keys, never re-clicks Kovac.
+    ctx = _Ctx()
+    _kovac(monkeypatch)
+    monkeypatch.setattr(controller, "get_api",
+                        lambda g, r: {"open": True, "options": []} if (g, r) == ("ui", "dialogue") else None)
+    keys, clicks = [], []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda *a, **k: clicks.append(a) or True)
+    gf.hand_in_phase(ctx, _st(phase="READY_TO_HAND_IN", readyToHandIn=True))
+    assert keys == ["SPACE"] and clicks == []
+
+
+def test_hand_in_dialogue_options_picks_commission(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_api",
+                        lambda g, r: {"open": True,
+                                      "options": ["Can I have another commission?", "No thanks."]}
+                        if (g, r) == ("ui", "dialogue") else None)
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
+    gf.hand_in_phase(ctx, _st(phase="READY_TO_HAND_IN", readyToHandIn=True))
+    assert keys == ["1"]
+
+
+def test_hand_in_no_dialogue_clicks_kovac_with_ceiling(monkeypatch):
+    ctx = _Ctx()
+    _kovac(monkeypatch)
+    calls = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **k: calls.append(option) or True)
+    st = _st(phase="READY_TO_HAND_IN", readyToHandIn=True)
+    for _ in range(gf.HANDIN_MAX_ATTEMPTS + 1):
+        gf.hand_in_phase(ctx, st)
+    assert calls == ["Hand-in"] * gf.HANDIN_MAX_ATTEMPTS
+    assert "hand-in" in ctx.state.stopped.lower()
+
+
+def test_dialogue_options_tolerates_both_shapes():
+    assert gf._dialogue_options({"options": ["a", "b"]}) == ["a", "b"]
+    assert gf._dialogue_options({"options": [{"text": "a"}, {"text": "b"}]}) == ["a", "b"]
+    assert gf._dialogue_options({}) == []

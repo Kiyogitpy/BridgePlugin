@@ -240,6 +240,8 @@ MOULD_JIG_ID = 44777
 # A read that fails this many consecutive ticks means the endpoint genuinely is not
 # there (un-rebuilt client / bridge down), not a blip.
 STATE_UNAVAILABLE_LIMIT = 20
+COMMISSION_MAX_ATTEMPTS = 4
+HANDIN_MAX_ATTEMPTS = 6
 
 
 def read_state():
@@ -298,7 +300,28 @@ def tick(ctx):
 
 # Stubs -- replaced by Tasks 5-9. Defined so PHASE_HANDLERS can bind now.
 def get_commission_phase(ctx, st):
-    pass
+    # Right-click Commission on Kovac -- MEASURED: the commission varbits land ~0.1s
+    # after the click, before the confirmation dialogue is even dismissed. The counter
+    # resets in _reset_counters the moment commissionTypes reads non-empty.
+    data = ctx.state.data
+    d = _dialogue()
+    if _dialogue_open(d):
+        controller.key_tap(ctx.ser, "SPACE")
+        controller.human_delay(0.4, 0.8)
+        return
+    if data.get("gf_commission_attempts", 0) >= COMMISSION_MAX_ATTEMPTS:
+        ctx.state.trigger_safety_stop(
+            "giants foundry: commission never registered after repeated asks")
+        return
+    kovac = _find_kovac()
+    if kovac is None:
+        debug_log.log("gf", "Kovac not visible -- waiting")
+        return
+    data["gf_commission_attempts"] = data.get("gf_commission_attempts", 0) + 1
+    controller.click_menu_action(
+        ctx.ser, kovac, "Commission",
+        refresh_target=controller.npc_index_refresh_target(kovac.get("index")))
+    controller.human_delay(0.8, 1.2)
 
 
 def prepare_phase(ctx, st):
@@ -314,7 +337,94 @@ def refine_phase(ctx, st):
 
 
 def hand_in_phase(ctx, st):
-    pass
+    # Right-click Hand-in on Kovac, then ride the reward dialogue through to the offer
+    # of a NEW commission (MEASURED: Space x2, option key 1, Space). A RUINED sword is
+    # handed in identically -- that is the game's own recovery. Success is detected by
+    # the dispatcher: the foundry varbits all zero and a fresh commission registers.
+    data = ctx.state.data
+    d = _dialogue()
+    if _dialogue_open(d):
+        if _dialogue_options(d):
+            _choose_option(ctx, d, ("commission",), fallback_key="1")
+        else:
+            controller.key_tap(ctx.ser, "SPACE")
+        controller.human_delay(0.4, 0.8)
+        return
+    if data.get("gf_handin_attempts", 0) >= HANDIN_MAX_ATTEMPTS:
+        ctx.state.trigger_safety_stop("giants foundry: hand-in never completed")
+        return
+    kovac = _find_kovac()
+    if kovac is None:
+        return
+    data["gf_handin_attempts"] = data.get("gf_handin_attempts", 0) + 1
+    controller.click_menu_action(
+        ctx.ser, kovac, "Hand-in",
+        refresh_target=controller.npc_index_refresh_target(kovac.get("index")))
+    controller.mark_busy(3.0)
+    controller.human_delay(0.8, 1.2)
+
+
+# ---------------------------------------------------------------------------
+# Runtime: entity + dialogue helpers
+# ---------------------------------------------------------------------------
+
+def _find_object(obj_id, radius=32):
+    for obj in controller.get_objects(radius=radius):
+        if obj.get("id") == obj_id:
+            return obj
+    return None
+
+
+def _refresh(obj):
+    return controller.object_refresh_target(
+        obj.get("x"), obj.get("y"), obj.get("plane", 0), obj.get("id"))
+
+
+def _find_kovac():
+    for npc in controller.get_npcs():
+        if npc.get("id") == KOVAC_NPC_ID or (npc.get("name") or "").lower() == "kovac":
+            return npc
+    return None
+
+
+def _dialogue():
+    d = controller.get_api("ui", "dialogue")
+    if not d or d.get("error"):
+        return {}
+    return d
+
+
+def _dialogue_open(d):
+    # Tolerant read of the m8aq Dialogue reader: exact field names get pinned on the
+    # first live session; any of these shapes means "a dialogue is up".
+    if not d:
+        return False
+    for key in ("open", "isOpen", "visible"):
+        if isinstance(d.get(key), bool):
+            return d[key]
+    dtype = d.get("type")
+    return bool(d.get("options")) or bool(dtype and dtype != "NONE")
+
+
+def _dialogue_options(d):
+    out = []
+    for o in d.get("options") or []:
+        out.append(o if isinstance(o, str) else (o.get("text") or ""))
+    return out
+
+
+def _choose_option(ctx, d, substrings, fallback_key=None):
+    """Press the number key of the first dialogue option matching any substring
+    (case-insensitive). Falls back to fallback_key when nothing matches."""
+    for i, text in enumerate(_dialogue_options(d)):
+        low = text.lower()
+        if any(s in low for s in substrings):
+            controller.key_tap(ctx.ser, str(i + 1))
+            return True
+    if fallback_key is not None:
+        controller.key_tap(ctx.ser, fallback_key)
+        return True
+    return False
 
 
 PHASE_HANDLERS = {
