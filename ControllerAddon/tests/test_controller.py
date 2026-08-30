@@ -1135,7 +1135,10 @@ def test_long_waits_are_split_into_human_length_still_segments(monkeypatch):
     fidgets = []
     monkeypatch.setattr(controller, "_maybe_fidget_during_wait", lambda: fidgets.append(1))
     controller.human_delay(2.0, 12.0)
-    assert sum(slept) >= 9.0                                       # never shorter than drawn
+    # never shorter than drawn -- epsilon because the split's segment draws accumulate float
+    # error (observed failing at 8.999999999999998 with random draws, 2026-08-31); a real
+    # shortening bug would miss by whole segments, not 2e-15s
+    assert sum(slept) >= 9.0 - 1e-9
     assert max(slept) <= controller.IDLE_FIDGET_MAX_STILL_S        # no single long freeze
     assert len(slept) >= 2
     assert len(fidgets) >= 1
