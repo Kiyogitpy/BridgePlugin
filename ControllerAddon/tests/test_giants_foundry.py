@@ -345,3 +345,67 @@ def test_dialogue_options_tolerates_both_shapes():
     assert gf._dialogue_options({"options": ["a", "b"]}) == ["a", "b"]
     assert gf._dialogue_options({"options": [{"text": "a"}, {"text": "b"}]}) == ["a", "b"]
     assert gf._dialogue_options({}) == []
+
+
+# ---------------------------------------------------------------------------
+# Task 6: mould selection execution
+# ---------------------------------------------------------------------------
+
+def _mould_rows(monkeypatch, names):
+    rows = [{"text": n, "screenX": 400, "screenY": 200 + 20 * i}
+            for i, n in enumerate(names)]
+    monkeypatch.setattr(controller, "get_widget_children",
+                        lambda g, c: rows if (g, c) == (gf.MOULD_GROUP, gf.MOULD_LIST_CHILD) else [])
+    return rows
+
+
+def test_prepare_opens_jig_when_moulds_unset(monkeypatch):
+    ctx = _Ctx()
+    jig = {"id": gf.MOULD_JIG_ID, "x": 3370, "y": 11488, "plane": 0,
+           "screenX": 700, "screenY": 300, "name": "Mould jig"}
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [jig])
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: clicked.append(ent.get("id")) or True)
+    gf.prepare_phase(ctx, _st(phase="PREPARING", selectedMoulds={}, mouldSetupOpen=False))
+    assert clicked == [gf.MOULD_JIG_ID]
+    assert ctx.state.data["gf_mould_opens"] == 1
+
+
+def test_prepare_open_jig_ceiling(monkeypatch):
+    ctx = _Ctx()
+    st = _st(phase="PREPARING", selectedMoulds={}, mouldSetupOpen=False)
+    for _ in range(gf.MOULD_MAX_OPENS + 1):
+        gf.prepare_phase(ctx, st)     # no jig visible -> attempts still count
+    assert "mould" in ctx.state.stopped.lower()
+
+
+def test_select_moulds_clicks_best_visible_row_one_part_per_call(monkeypatch):
+    # Narrow Flat, RICASSO tab: with these rows visible the argmax is Chopper Forte +1.
+    ctx = _Ctx()
+    rows = _mould_rows(monkeypatch, ["Chopper Forte", "Serpent Ricasso", "Chopper Forte +1"])
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: clicked.append(ent) or True)
+    st = _st(phase="SELECTING_MOULDS", mouldSetupOpen=True, selectedMoulds={},
+             usableMoulds=list(gf.MOULDS))
+    gf.prepare_phase(ctx, st)
+    assert len(clicked) == 1
+    assert clicked[0]["text"] == "Chopper Forte +1"
+
+
+def test_select_moulds_all_set_clicks_set_button(monkeypatch):
+    ctx = _Ctx()
+    plan = gf.best_moulds(["NARROW", "FLAT"], [])
+    set_button = {"screenX": 660, "screenY": 152, "clickable": True}
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda g, c, index=None: set_button
+                        if (g, c) == (gf.MOULD_GROUP, gf.MOULD_SET_CHILD) else None)
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: clicked.append(ent) or True)
+    st = _st(phase="SELECTING_MOULDS", mouldSetupOpen=True,
+             selectedMoulds={"RICASSO": plan["RICASSO"], "BLADE": plan["BLADE"],
+                              "TIP": plan["TIP"]})
+    gf.prepare_phase(ctx, st)
+    assert clicked == [set_button]

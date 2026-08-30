@@ -225,6 +225,96 @@ def heat_stop_target(tool, min_t, max_t, actions_left):
 
 
 # ---------------------------------------------------------------------------
+# Runtime: mould setup interface (group 718 -- MEASURED in the recording)
+# ---------------------------------------------------------------------------
+
+MOULD_GROUP = 718
+MOULD_SET_CHILD = 6      # "Set Mould" button (recorder: widget 718.6)
+MOULD_LIST_CHILD = 9     # scroll list of mould rows (recorder: "Select <name>" on 718.9)
+MOULD_TAB_CHILD = 12     # part tabs (recorder: "View Fortes/Blades/Tips" on 718.12)
+MOULD_TAB_SLOTS = {"RICASSO": 0, "BLADE": 9, "TIP": 18}
+MOULD_MAX_OPENS = 3
+
+
+def _strip_tags(text):
+    out, depth = [], 0
+    for ch in text or "":
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out).strip()
+
+
+def _open_mould_setup(ctx):
+    data = ctx.state.data
+    if data.get("gf_mould_opens", 0) >= MOULD_MAX_OPENS:
+        ctx.state.trigger_safety_stop(
+            "giants foundry: mould setup never completed (interface not opening, or a "
+            "planned mould row never selectable)")
+        return
+    data["gf_mould_opens"] = data.get("gf_mould_opens", 0) + 1   # reset when mouldSetupOpen reads True
+    jig = _find_object(MOULD_JIG_ID)
+    if jig is None:
+        debug_log.log("gf", "mould jig not visible -- waiting")
+        return
+    controller.click_entity(ctx.ser, jig, refresh_target=_refresh(jig))
+    controller.mark_busy(4.0)
+    controller.human_delay(1.0, 1.6)
+
+
+def _click_widget(ctx, group, child, index=None):
+    w = controller.get_widget(group, child, index=index)
+    if not w or not w.get("screenX"):
+        return False
+    return bool(controller.click_entity(
+        ctx.ser, w, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False))
+
+
+def _select_moulds_in_ui(ctx, st, plan):
+    """One part per call (the varbit confirms between calls): find the first part whose
+    live selection differs from the plan, switch to its tab, and click the best USABLE
+    row that is actually on screen -- if the planned row isn't rendered (scrolled off),
+    the best visible one is taken instead of scrolling, logged. When every part matches,
+    click Set Mould."""
+    selected = st.get("selectedMoulds") or {}
+    commission = st.get("commissionTypes") or []
+    usable = set(st.get("usableMoulds") or [])
+    for part in MOULD_PARTS:
+        want = plan.get(part)
+        if want is None or selected.get(part) == want:
+            continue
+        _click_widget(ctx, MOULD_GROUP, MOULD_TAB_CHILD, index=MOULD_TAB_SLOTS[part])
+        controller.human_delay(0.4, 0.7)
+        rows = controller.get_widget_children(MOULD_GROUP, MOULD_LIST_CHILD) or []
+        best = None
+        for row in rows:
+            enum = MOULD_BY_DISPLAY.get(_strip_tags(row.get("text")).lower())
+            if enum is None or MOULDS[enum][1] != part:
+                continue
+            if usable and enum not in usable:
+                continue
+            s = mould_score(enum, commission)
+            if best is None or s > best[0]:
+                best = (s, enum, row)
+        if best is None:
+            debug_log.log("gf", f"no selectable mould row for {part} -- re-opening")
+            return
+        if best[1] != want:
+            debug_log.log("gf", f"planned {want} not on screen for {part} -- "
+                                f"taking best visible {best[1]}")
+        controller.click_entity(ctx.ser, best[2], offset=(0, 0),
+                                check_ui_blockers=False, simulate_mistakes=False)
+        controller.human_delay(0.5, 0.9)
+        return
+    # every part satisfied -> confirm
+    if _click_widget(ctx, MOULD_GROUP, MOULD_SET_CHILD):
+        controller.human_delay(0.6, 1.0)
+
+
+# ---------------------------------------------------------------------------
 # Runtime: state access + dispatch
 # ---------------------------------------------------------------------------
 
@@ -325,7 +415,30 @@ def get_commission_phase(ctx, st):
 
 
 def prepare_phase(ctx, st):
-    pass
+    plan = best_moulds(st.get("commissionTypes") or [], st.get("usableMoulds") or [])
+    selected = st.get("selectedMoulds") or {}
+    if st.get("mouldSetupOpen"):
+        _select_moulds_in_ui(ctx, st, plan)
+        return
+    # A part-mismatch against the plan only forces a re-open while the mould is not yet
+    # SET (phase PREPARING/SELECTING_MOULDS); once workflowState says MOULD_SET we take
+    # the selection as final -- re-opening a set mould mid-fill would loop.
+    if st.get("phase") != "MOULD_SET" and (
+            len(selected) < 3 or any(selected.get(p) != plan.get(p) for p in plan)):
+        _open_mould_setup(ctx)
+        return
+    if st.get("crucibleBarCount", 0) < CRUCIBLE_CAPACITY:
+        _fill_crucible(ctx, st)
+        return
+    _pour(ctx, st)
+
+
+def _fill_crucible(ctx, st):
+    pass    # Task 7
+
+
+def _pour(ctx, st):
+    pass    # Task 7
 
 
 def pickup_phase(ctx, st):
