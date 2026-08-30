@@ -13,7 +13,9 @@
 #     collects bars. Manual operation is out of scope entirely.
 #   - PREREQUISITES ASSUMED, NOT VERIFIED: standing in the Blast Furnace basement on a mass
 #     world; Ice gloves or Smiths gloves (i) equipped (so bars never need bucket-of-water
-#     cooling); already own a coal bag.
+#     cooling); already own a coal bag. EXCEPTION for gold with Goldsmith gauntlets owned:
+#     the glove-swap method activates itself and wears each pair at the right moment -- see
+#     the "Gold glove-swap method" section below BAR_VARBITS.
 #   - Loading the conveyor belt: a single left-click on the conveyor belt itself is enough --
 #     CORRECTED 2026-08-22 (user report, live session): this used to assume a two-click "use"
 #     action (click the ore/coal item, then click the conveyor belt, the same item-then-target
@@ -56,6 +58,7 @@ import time
 import banker
 import controller
 import debug_log
+import travel
 
 COAL_BAG_CAPACITY = 27
 
@@ -76,6 +79,131 @@ BAR_VARBITS = {
     "silver": 948,
     "gold": 947,
 }
+
+# --- Gold glove-swap method (added 2026-08-31, from a human recording) -------------------
+#
+# recordings/2026-08-31_000524_blast-furnace-gold.* (65s, 3 full 27-bar cycles) shows the
+# goldsmith-gauntlets XP method, and everything below is MEASURED from it, not assumed:
+#   - The spare glove pair rides in inventory (one pair worn, one carried), so Withdraw-All
+#     gold ore yields 27 and the "You don't have enough inventory space to withdraw that
+#     many." chat line is NORMAL on every single withdrawal, never an error.
+#   - Goldsmith gauntlets must be WORN at the moment the furnace smelts (56.2 xp/bar vs
+#     22.5): varbit 955 (gold ore in furnace) = 27, then ~3s later varbit 947 (gold bars in
+#     dispenser) = 27 lands on the SAME tick as the Smithing XP drop, ~9s after the conveyor
+#     click. varbit 947 is therefore the "smelt done, swap now" trigger -- it needs no client
+#     rebuild, unlike a smithingXp field on /player would.
+#   - On that signal the human wears Ice gloves (plain left-click on the inventory pair),
+#     takes the bars (Take Bar dispenser + Space), then wears the gauntlets back ON THE WAY
+#     to the bank. USER (2026-08-31): "when experience drops we swap to ice gloves and pickup
+#     bars then after picked up we swap them on the way to bank".
+#
+# The method activates itself: barType gold + both pairs present (worn or carried) -- see
+# gold_glove_swap_active. Without the gauntlets, gold runs exactly as before (ice gloves
+# permanently worn, no waits added), so no new Java config toggle was needed.
+GOLDSMITH_GAUNTLETS = "Goldsmith gauntlets"
+ICE_GLOVES = "Ice gloves"
+# Measured ~9s from conveyor click to varbit 947 = 27; generous headroom on top because a
+# busy mass world adds server lag, but small enough that a genuinely stalled furnace (empty
+# coffer -- the dwarves stop working) still fails the trip promptly.
+BARS_READY_TIMEOUT_S = 25.0
+GLOVE_WEAR_TIMEOUT_S = 4.0
+# Fallback smelt wait when /varbit can't answer (un-rebuilt client): blind but roughly the
+# measured smelt length, so the collect click lands after the bars exist.
+SMELT_BLIND_WAIT_RANGE_S = (8.5, 10.5)
+
+
+def gold_glove_swap_active(config: dict) -> bool:
+    """Whether this session should run the goldsmith-gauntlets swap method: barType is gold
+    and BOTH glove pairs are present -- each either worn or in inventory (after a restart
+    mid-cycle the ice gloves can be the worn pair, with the gauntlets carried). Read fresh
+    from /equipment + /inventory rather than cached in ctx.state.data, so losing a pair
+    mid-session (shouldn't happen -- keepItems protects them -- but state.data resets have
+    desynced from live inventory before, see the module header of golem_crafting.py) degrades
+    to the plain method next trip instead of wedging on a missing item."""
+    if (config.get("barType") or "").lower() != "gold":
+        return False
+    worn = ((controller.get_equipment().get("gloves") or {}).get("name") or "").lower()
+    carried = {(i.get("name") or "").lower() for i in controller.get_inventory()}
+
+    def present(name: str) -> bool:
+        return worn == name.lower() or name.lower() in carried
+
+    return present(GOLDSMITH_GAUNTLETS) and present(ICE_GLOVES)
+
+
+def ensure_gloves_worn(ctx, name: str) -> bool:
+    """Make sure the named glove pair is the one currently worn, wearing it from inventory if
+    not (plain left-click on the item -- its default action is Wear, the same CC_OP the
+    recording shows on widget 149.0; same click_entity-on-inventory-item pattern
+    tormented_demon.py's equip_starting_loadout already uses live). Verified against
+    /equipment's gloves slot rather than trusting the click, with one full re-click retry --
+    an inventory click can silently miss like any other. Returns False only when the pair
+    can't be worn at all (missing from both hands and inventory, or the wear never
+    registered); callers decide whether that's fatal."""
+    name_lower = name.lower()
+
+    def worn() -> bool:
+        gloves = controller.get_equipment().get("gloves") or {}
+        return (gloves.get("name") or "").lower() == name_lower
+
+    if worn():
+        return True
+
+    controller.open_inventory_tab(ctx.ser)
+    for _ in range(2):
+        item = find_item(name)
+        if item is None:
+            return worn()
+        # check_ui_blockers=False, same as every other interface-element click in this
+        # codebase (see the /widget section of CLAUDE.md for the rotate-forever loop the
+        # default causes on interface clicks).
+        controller.click_entity(ctx.ser, item, check_ui_blockers=False)
+        deadline = time.time() + GLOVE_WEAR_TIMEOUT_S
+        while time.time() < deadline:
+            if worn():
+                return True
+            controller.human_delay(0.2, 0.35)
+    return worn()
+
+
+# The tile the human parks on during the smelt wait (USER walked their character onto it live
+# 2026-08-31 and said "look my tile im standing on"; it is also the recording's walk
+# destinations 4 and 8, and the tile every Take Bar dispenser click fired from, at dist 1 to
+# the dispenser at (1940,4963)). The Blast Furnace room is NOT instanced, so a fixed world
+# tile is safe to hardcode -- same reasoning as chinchompa_hunting's cave tiles.
+DISPENSER_WAIT_TILE = (1940, 4964, 0)
+
+
+def walk_to_dispenser_wait_tile(ctx) -> None:
+    """Fire-and-forget walk to the dispenser standing tile, issued right after the conveyor
+    deposit so the ~9s smelt wait is spent WALKING there instead of standing at the belt --
+    the human does exactly this, and it puts the ice-glove swap and the Take click at dist 1
+    the moment the XP pops. Non-blocking on purpose (wait_for_bars_ready owns the waiting);
+    travel.walk_to_exact_tile handles the shift+click (force-walk, per CLAUDE.md's standing
+    rule for plain ground tiles) and early-outs free if already standing there. Best-effort:
+    a failed projection just means the wait happens where we stand, so the return value is
+    deliberately ignored."""
+    x, y, plane = DISPENSER_WAIT_TILE
+    travel.walk_to_exact_tile(ctx, x, y, plane, wait_for_arrival=False)
+
+
+def wait_for_bars_ready(varbit_id, timeout_s: float = BARS_READY_TIMEOUT_S) -> bool:
+    """Poll the bar-dispenser varbit until it reports bars ready (the recording's smelt-done
+    signal -- lands on the same tick as the Smithing XP drop, so this IS "when experience
+    drops" in signal terms). A None varbit read means "cannot verify" (un-rebuilt client, or
+    an unmapped bar type), never "no bars": fall back to one blind measured-smelt-length wait
+    and report success, same can't-verify posture as collect_bars' own probe. Returns False
+    only on a verified timeout -- bars provably never appeared."""
+    if varbit_id is None or controller.get_varbit(varbit_id) is None:
+        controller.human_delay(*SMELT_BLIND_WAIT_RANGE_S)
+        return True
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        ready = controller.get_varbit(varbit_id)
+        if ready not in (0, None):
+            return True
+        controller.human_delay(0.3, 0.5)
+    return False
 
 # Per-bar-type trip patterns, reproduced verbatim from Blast Furnace_Strategies.txt's "Bar
 # patterns" table (which assumes a coal bag + ice gloves). Each trip is a "deposit" list of
@@ -394,12 +522,23 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
     # over from the PREVIOUS trip's own end-of-trip collect (typically near-empty, or at worst
     # a few uncollected bars) -- see collect_bars' own docstring for why checking every trip
     # (not just the ones this pattern schedules a collect on) matters at all.
-    if not collect_bars(ctx, config):
+    #
+    # glove_swap resolved once per trip, up front, so the pre-trip dispenser clearing below
+    # gets the ice-glove wrap too -- a restart with 27 hot bars stranded in the dispenser
+    # would otherwise try to grab them wearing the gauntlets.
+    glove_swap = gold_glove_swap_active(config)
+    if not collect_bars(ctx, config, glove_swap=glove_swap):
         return False
 
     withdraw, need_bag_fill, loose_coal, bag_coal = plan_bank_withdrawals(trip)
 
     keep_items = []
+    if glove_swap:
+        # The spare pair's slot must survive every bank deposit -- and, like the coal bag's
+        # kept slot, it naturally caps shift-withdraw-all at 27 gold ore (the recording's own
+        # trip size; the "not enough inventory space" chat on each withdrawal is normal).
+        # Both names kept: one is worn, the other carried, and which is which varies.
+        keep_items += [ICE_GLOVES, GOLDSMITH_GAUNTLETS]
     need_bag_withdraw = False
     if bar_uses_coal_bag:
         keep_items.append("coal bag")
@@ -488,6 +627,16 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
         ctx.state.trigger_safety_stop("conveyor belt not found nearby -- are you at the Blast Furnace?")
         return False
 
+    # The gauntlets must be worn BEFORE the ore goes onto the belt: the XP is granted the
+    # moment the furnace smelts, ~9s after the conveyor click (see the glove-swap header
+    # above). Normally a free /equipment read -- the swap-back after the previous collect
+    # already put them on; this catches the first trip of a session and any missed swap-back.
+    if glove_swap and not ensure_gloves_worn(ctx, GOLDSMITH_GAUNTLETS):
+        ctx.state.trigger_safety_stop(
+            f"couldn't wear {GOLDSMITH_GAUNTLETS} before smelting -- is the pair missing?"
+        )
+        return False
+
     controller.open_inventory_tab(ctx.ser)
 
     # Deposit the primary ore (and any loose coal beyond the bag's capacity) FIRST, before
@@ -532,13 +681,28 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
             return False
 
     if trip.get("collect"):
-        if not collect_bars(ctx, config):
+        if glove_swap:
+            # Spend the smelt wait walking to the dispenser's standing tile (non-blocking;
+            # see walk_to_dispenser_wait_tile) so the swap-and-take starts from dist 1.
+            walk_to_dispenser_wait_tile(ctx)
+            # Wait for the smelt to finish (varbit 947 flipping to the bar count, the same
+            # tick as the XP drop) before touching the dispenser at all -- the non-swap paths
+            # deliberately keep their old immediate-check behavior (an unready dispenser is
+            # simply collected at the start of the next trip). A verified timeout here means
+            # ore went in and bars provably never came out, and the usual cause is a drained
+            # coffer (the dwarves stop operating the furnace), so say so.
+            if not wait_for_bars_ready(BAR_VARBITS.get((config.get("barType") or "").lower())):
+                ctx.state.trigger_safety_stop(
+                    "gold bars never appeared in the dispenser after the conveyor deposit -- is the coffer empty?"
+                )
+                return False
+        if not collect_bars(ctx, config, glove_swap=glove_swap):
             return False
 
     return True
 
 
-def collect_bars(ctx, config: dict) -> bool:
+def collect_bars(ctx, config: dict, glove_swap: bool = False) -> bool:
     """Collect everything currently sitting in the bar dispenser, verified via the same varbit
     the official RuneLite Blast Furnace plugin itself reads to show a bar-ready icon
     (BAR_VARBITS, decompiled from BarsOres.java/BlastFurnaceOverlay.java in
@@ -587,6 +751,17 @@ def collect_bars(ctx, config: dict) -> bool:
 
     if find_object(config, "Bar dispenser") is None:
         ctx.state.trigger_safety_stop("bar dispenser not found nearby")
+        return False
+
+    # Ice gloves on BEFORE the dispenser is touched -- hot gold bars can't be taken without
+    # them (the whole reason the pair is carried). Runs on both call sites: the scheduled
+    # end-of-trip collect AND the pre-trip dispenser clearing (a restart with bars stranded).
+    # `glove_swap` guards it so every other bar type / the plain always-worn-ice method is
+    # untouched.
+    if glove_swap and not ensure_gloves_worn(ctx, ICE_GLOVES):
+        ctx.state.trigger_safety_stop(
+            f"couldn't wear {ICE_GLOVES} before collecting bars -- is the pair missing?"
+        )
         return False
 
     debug_log.log("blast furnace", "collecting bars")
@@ -647,6 +822,17 @@ def collect_bars(ctx, config: dict) -> bool:
             debug_log.log(
                 "blast furnace",
                 f"bar dispenser still shows {still_ready} {bar_type} bar(s) ready after retries -- may have missed a collection",
+            )
+
+    if glove_swap:
+        # Swap back on the way to the bank (USER's own phrasing) -- the next batch's XP is
+        # granted while these are worn, so they go on right after the take, and run_trip's
+        # pre-deposit check re-verifies before the ore hits the belt. Soft on failure here
+        # (that check is the hard gate): a missed swap-back alone shouldn't end the session.
+        if not ensure_gloves_worn(ctx, GOLDSMITH_GAUNTLETS):
+            debug_log.log(
+                "blast furnace",
+                f"couldn't swap back to {GOLDSMITH_GAUNTLETS} after collecting -- will retry before the next deposit",
             )
 
     return True
