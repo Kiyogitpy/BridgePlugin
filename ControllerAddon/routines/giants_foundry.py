@@ -327,6 +327,11 @@ STORAGE_FULL_ID = 44634     # "Preform storage", op Take-preform
 CRUCIBLE_ID = 44776
 MOULD_JIG_ID = 44777
 
+PICKUP_MAX_ATTEMPTS = 3
+EQUIP_GROUP = 387     # worn-equipment interface (recorder-decoded)
+WEAPON_CHILD = 18
+SHIELD_CHILD = 20
+
 # A read that fails this many consecutive ticks means the endpoint genuinely is not
 # there (un-rebuilt client / bridge down), not a blip.
 STATE_UNAVAILABLE_LIMIT = 20
@@ -554,7 +559,55 @@ def _is_confirm(opts):
 
 
 def pickup_phase(ctx, st):
-    pass
+    # Pick the preform off the jig. Needs ice/smithing gloves (setup checks) AND both
+    # hand slots empty -- MEASURED: an off-hand Imcando hammer blocks it with the
+    # "free your hands" chat, which on_event flags for the recovery below.
+    data = ctx.state.data
+    if data.get("gf_need_free_hands"):
+        _free_hands(ctx)
+        data["gf_need_free_hands"] = False
+        return
+    if data.get("gf_pickup_attempts", 0) >= PICKUP_MAX_ATTEMPTS:
+        ctx.state.trigger_safety_stop(
+            "giants foundry: could not pick up the preform (hands still full?)")
+        return
+    jig = _find_object(MOULD_JIG_ID)
+    if jig is None:
+        return
+    data["gf_pickup_attempts"] = data.get("gf_pickup_attempts", 0) + 1
+    controller.click_entity(ctx.ser, jig, refresh_target=_refresh(jig),
+                            expected_action="Pick-up")
+    controller.mark_busy(4.0)
+    controller.human_delay(1.2, 1.8)
+
+
+def _free_hands(ctx):
+    # E opens worn equipment; Remove on both hand slots (387.18 weapon, 387.20 shield --
+    # recorder-decoded). An empty slot's menu has no Remove entry, so click_menu_action
+    # returns False harmlessly there.
+    controller.key_tap(ctx.ser, "E")
+    controller.human_delay(0.5, 0.9)
+    for child in (WEAPON_CHILD, SHIELD_CHILD):
+        w = controller.get_widget(EQUIP_GROUP, child)
+        if w and w.get("screenX"):
+            controller.click_menu_action(ctx.ser, w, "Remove",
+                                         offset=(0, 0), check_ui_blockers=False)
+            controller.human_delay(0.4, 0.7)
+    controller.key_tap(ctx.ser, "ESCAPE")
+
+
+def on_event(ctx, event_type, payload):
+    if event_type != "CHAT_MESSAGE":
+        return
+    msg = ((payload or {}).get("message") or "")
+    if "free your hands" in msg:
+        ctx.state.data["gf_need_free_hands"] = True
+    elif "overwork the preform" in msg:
+        # Informational: the overwork guard should make this rare; count it so a log
+        # shows how often it still happens.
+        ctx.state.data["gf_overworked"] = ctx.state.data.get("gf_overworked", 0) + 1
+        debug_log.log("gf", f"overworked the preform "
+                            f"(x{ctx.state.data['gf_overworked']} this session)")
 
 
 def refine_phase(ctx, st):

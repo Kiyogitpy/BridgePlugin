@@ -530,3 +530,62 @@ def test_pour_clicks_crucible_with_expected_action(monkeypatch):
                         lambda ser, ent, **k: kwargs.update(k) or True)
     gf._pour(ctx, _st(phase="MOULD_SET", crucibleBarCount=28, crucibleState="FULL"))
     assert kwargs.get("expected_action") == "Pour"
+
+
+# ---------------------------------------------------------------------------
+# Task 8: pickup + free hands
+# ---------------------------------------------------------------------------
+
+def _jig(monkeypatch):
+    jig = {"id": gf.MOULD_JIG_ID, "x": 3370, "y": 11488, "plane": 0,
+           "screenX": 700, "screenY": 300, "name": "Mould jig"}
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [jig])
+    return jig
+
+
+def test_pickup_clicks_jig(monkeypatch):
+    ctx = _Ctx()
+    _jig(monkeypatch)
+    kwargs = {}
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: kwargs.update(k) or True)
+    gf.pickup_phase(ctx, _st(phase="PREFORM_READY"))
+    assert kwargs.get("expected_action") == "Pick-up"
+    assert ctx.state.data["gf_pickup_attempts"] == 1
+
+
+def test_pickup_free_hands_chat_triggers_unequip_once(monkeypatch):
+    ctx = _Ctx()
+    _jig(monkeypatch)
+    gf.on_event(ctx, "CHAT_MESSAGE",
+                {"message": "You must free your hands so you can hold the preform."})
+    assert ctx.state.data["gf_need_free_hands"] is True
+    keys, menu = [], []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda g, c, index=None: {"screenX": 1028, "screenY": 470, "clickable": True})
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **k: menu.append(option) or True)
+    gf.pickup_phase(ctx, _st(phase="PREFORM_READY"))
+    # The recovery presses E, removes both hand slots, escapes -- and does NOT count as
+    # a pickup attempt.
+    assert keys[0] == "E" and keys[-1] == "ESCAPE"
+    assert menu == ["Remove", "Remove"]
+    assert ctx.state.data["gf_need_free_hands"] is False
+    assert ctx.state.data.get("gf_pickup_attempts", 0) == 0
+
+
+def test_pickup_ceiling(monkeypatch):
+    ctx = _Ctx()
+    _jig(monkeypatch)
+    st = _st(phase="PREFORM_READY")
+    for _ in range(gf.PICKUP_MAX_ATTEMPTS + 1):
+        gf.pickup_phase(ctx, st)
+    assert "pick up" in ctx.state.stopped.lower()
+
+
+def test_on_event_tolerates_none_payload():
+    ctx = _Ctx()
+    gf.on_event(ctx, "CHAT_MESSAGE", None)
+    gf.on_event(ctx, "TICK", {"tick": 1})
+    assert ctx.state.stopped is None
