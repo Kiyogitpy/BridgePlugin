@@ -63,3 +63,49 @@ def test_best_moulds_empty_usable_falls_back_to_all():
     # usableMoulds == [] means "cannot tell" from an un-rebuilt client, not "nothing usable".
     best = gf.best_moulds(["LIGHT", "FLAT"], [])
     assert set(best) == {"RICASSO", "BLADE", "TIP"}
+
+
+# ---------------------------------------------------------------------------
+# Task 2: fill planner
+# ---------------------------------------------------------------------------
+
+FILL = DEFAULT_FILL = [
+    {"item": "Mithril platebody", "metal": "MITHRIL", "bars_each": 4, "target_bars": 14},
+    {"item": "Adamant platelegs", "metal": "ADAMANT", "bars_each": 2, "target_bars": 14},
+]
+
+
+def test_plan_fill_from_empty_matches_recording():
+    # MEASURED: 14 mith via 4-bar bodies quantizes to 4 items (16 bars) -> 2 bars of
+    # planned overflow at the 28 cap, which the human accepted. Loss 2 <= cap 2 -> ok.
+    steps, err = gf.plan_fill(FILL, {}, max_overflow_loss=2)
+    assert err is None
+    assert steps == [
+        {"item": "Mithril platebody", "bars_each": 4, "count": 4},
+        {"item": "Adamant platelegs", "bars_each": 2, "count": 7},
+    ]
+
+
+def test_plan_fill_rejects_overflow_beyond_cap():
+    steps, err = gf.plan_fill(FILL, {}, max_overflow_loss=1)
+    assert steps == []
+    assert "overflow" in err
+
+
+def test_plan_fill_resumes_partial_crucible():
+    # Mid-fill restart: 12 mithril + 14 adamant already in -> one more body finishes it.
+    steps, err = gf.plan_fill(FILL, {"MITHRIL": 12, "ADAMANT": 14}, max_overflow_loss=2)
+    assert err is None
+    assert steps == [{"item": "Mithril platebody", "bars_each": 4, "count": 1}]
+
+
+def test_plan_fill_full_crucible_is_done():
+    steps, err = gf.plan_fill(FILL, {"MITHRIL": 14, "ADAMANT": 14}, max_overflow_loss=2)
+    assert steps == [] and err is None
+
+
+def test_plan_fill_short_config_errors():
+    short = [{"item": "Adamant platelegs", "metal": "ADAMANT", "bars_each": 2, "target_bars": 20}]
+    steps, err = gf.plan_fill(short, {}, max_overflow_loss=2)
+    assert steps == []
+    assert "20/28" in err

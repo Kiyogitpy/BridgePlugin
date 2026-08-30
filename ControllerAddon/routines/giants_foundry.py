@@ -131,3 +131,48 @@ def best_moulds(commission, usable):
         if part not in best or s > best[part][0]:
             best[part] = (s, enum_name)
     return {part: pick[1] for part, pick in best.items()}
+
+
+# ---------------------------------------------------------------------------
+# Pure logic: crucible fill planning
+# ---------------------------------------------------------------------------
+
+CRUCIBLE_CAPACITY = 28
+
+
+def plan_fill(fill_cfg, crucible_contents, max_overflow_loss):
+    """What still needs adding, from the LIVE crucible varbits (crucibleContents) --
+    re-derived every tick, no local estimate (the fur-pouch lesson). Returns
+    (steps, error): steps ordered largest bars_each first so the 28-bar cap (and any
+    quantization loss) lands on the last, cheapest item; ([], None) means the crucible
+    is satisfied; ([], "reason") is a config/stock problem worth a safety stop.
+    Item counts quantize UP (ceil) -- the game caps the final item at remaining space
+    and asks to confirm the loss (MEASURED: 2 bars lost on a 4-bar platebody into 2
+    bars of space); the loss is accepted at execution time iff <= max_overflow_loss."""
+    contents = crucible_contents or {}
+    space = CRUCIBLE_CAPACITY - sum(contents.values())
+    if space <= 0:
+        return [], None
+
+    steps = []
+    planned_bars = 0
+    for entry in fill_cfg:
+        remaining = entry["target_bars"] - contents.get(entry["metal"], 0)
+        if remaining <= 0:
+            continue
+        count = math.ceil(remaining / entry["bars_each"])
+        steps.append({"item": entry["item"], "bars_each": entry["bars_each"], "count": count})
+        planned_bars += count * entry["bars_each"]
+
+    if not steps:
+        return [], None
+    if planned_bars < space:
+        total = CRUCIBLE_CAPACITY - space + planned_bars
+        return [], (f"fill plan only reaches {total}/{CRUCIBLE_CAPACITY} bars -- "
+                    "raise the fill config's target_bars")
+    loss = planned_bars - space
+    if loss > max_overflow_loss:
+        return [], (f"fill plan would overflow {loss} bars "
+                    f"(> max_overflow_loss {max_overflow_loss}) -- adjust the fill config")
+    steps.sort(key=lambda s: -s["bars_each"])
+    return steps, None
