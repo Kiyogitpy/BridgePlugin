@@ -2981,6 +2981,7 @@ ROUTINE_FILES = {
     "PLANK_MAKE": "routines/plank_make.py",
     "MAHOGANY_HOMES": "routines/mahogany_homes.py",
     "RAID_SCOUTER": "routines/raid_scouter.py",
+    "GIANTS_FOUNDRY": "routines/giants_foundry.py",
 }
 
 

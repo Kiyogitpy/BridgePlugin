@@ -730,3 +730,57 @@ def test_watch_progress_stall_reengages_and_dead_clicks_stop(monkeypatch):
         now[0] += gf.WORK_STALL_S + 1
         gf.refine_phase(ctx, st)
     assert "no progress" in ctx.state.stopped.lower()
+
+
+# ---------------------------------------------------------------------------
+# Task 10: setup + before_break + wiring
+# ---------------------------------------------------------------------------
+
+def test_setup_requires_gloves(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_equipment",
+                        lambda: {"items": [{"name": "Rune platebody"}]})
+    gf.setup(ctx)
+    assert "gloves" in ctx.state.stopped.lower()
+
+
+def test_setup_accepts_ice_gloves(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_equipment",
+                        lambda: {"items": [{"name": "Ice gloves"}]})
+    gf.setup(ctx)
+    assert ctx.state.stopped is None
+
+
+def test_setup_cannot_read_equipment_does_not_stop(monkeypatch):
+    # {} is get_equipment's bridge-down value -- "cannot tell" must not stop the run.
+    ctx = _Ctx()
+    gf.setup(ctx)
+    assert ctx.state.stopped is None
+
+
+def test_before_break_stores_equipped_preform(monkeypatch):
+    ctx = _Ctx()
+    storage = {"id": gf.STORAGE_EMPTY_ID, "x": 3366, "y": 11485, "plane": 0,
+               "screenX": 520, "screenY": 380, "name": "Preform storage"}
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [storage])
+    _serve_state(monkeypatch, _st(preformState="EQUIPPED"))
+    kwargs = {}
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: kwargs.update(k) or True)
+    gf.before_break(ctx)
+    assert kwargs.get("expected_action") == "Store-preform"
+
+
+def test_before_break_no_preform_no_click(monkeypatch):
+    ctx = _Ctx()
+    _serve_state(monkeypatch, _st(preformState="NONE", phase="AWAITING_COMMISSION"))
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: clicks.append(1) or True)
+    gf.before_break(ctx)
+    assert clicks == []
+
+
+def test_routine_registered_in_controller():
+    assert controller.ROUTINE_FILES.get("GIANTS_FOUNDRY") == "routines/giants_foundry.py"

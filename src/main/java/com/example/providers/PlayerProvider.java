@@ -236,6 +236,7 @@ public class PlayerProvider extends BridgeProvider
 		data.put("thievingXp", client.getSkillExperience(Skill.THIEVING));
 		data.put("craftingXp", client.getSkillExperience(Skill.CRAFTING));
 		data.put("constructionXp", client.getSkillExperience(Skill.CONSTRUCTION));
+		data.put("smithingXp", client.getSkillExperience(Skill.SMITHING));
 
 		data.put("runEnergy", client.getEnergy() / 100);
 		data.put("specialAttackPercent", client.getVarpValue(VarPlayer.SPECIAL_ATTACK_PERCENT) / 10);

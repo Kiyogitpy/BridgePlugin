@@ -380,6 +380,43 @@ def _reset_counters(data, st, phase):
         data["gf_mould_opens"] = 0
 
 
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+
+def setup(ctx):
+    eq = controller.get_equipment() or {}
+    items = eq.get("items")
+    if items is None:
+        # {} is the bridge-down answer -- cannot tell is never a reason to refuse to start.
+        debug_log.log("gf", "could not read equipment at setup -- glove check skipped")
+        return
+    names = " ".join((i.get("name") or "").lower() for i in items)
+    if "ice gloves" not in names and "smithing gloves (i)" not in names:
+        ctx.state.trigger_safety_stop(
+            "giants foundry: ice gloves / smithing gloves (i) must be equipped to pick "
+            "up preforms")
+        return
+    debug_log.log("gf", "setup ok -- gloves equipped")
+
+
+def before_break(ctx):
+    # Park a held preform in the Preform Storage before a 3-12 minute break -- the
+    # game's own pause mechanism; heat and progress hold indefinitely. On resume the
+    # STORED phase picks it back up.
+    st = read_state()
+    if not st or st.get("preformState") != "EQUIPPED":
+        return
+    storage = _find_object(STORAGE_EMPTY_ID)
+    if storage is None:
+        debug_log.log("gf", "break due but preform storage not visible -- breaking anyway")
+        return
+    debug_log.log("gf", "break due -- storing the preform first")
+    controller.click_entity(ctx.ser, storage, refresh_target=_refresh(storage),
+                            expected_action="Store-preform")
+    controller.human_delay(2.0, 3.0)
+
+
 def tick(ctx):
     data = ctx.state.data
     st = read_state()
