@@ -56,6 +56,7 @@ const RIDGE_TIMEOUT_MS = 10_000;
 const ENTRY_TIMEOUT_STOP = 8; // consecutive ridge TIMEOUTS (fails are normal and reset it)
 const NO_OBSTACLE_STOP = 50; // consecutive "nothing visible" passes (~60s+) before stopping
 const MARK_SKIP_MS = 30_000;
+const PIT_NO_LADDER_STOP = 10; // consecutive no-ladder passes before stopping — the pit should always have a ladder
 
 export const AGILITY_RUNNER_SETTINGS: SettingsSchema = {
     course: {
@@ -184,7 +185,11 @@ export default class AgilityRunner extends TaskBot {
                 ? compileCustomCourse(this.settings.str('obstacles', ''), this.settings.num('customSearchRadius', 20))
                 : courseByLabel(label);
         if (!def) {
-            throw new Error(`AgilityRunner: unknown or empty course '${label}'`);
+            throw new Error(
+                label === CUSTOM_LABEL
+                    ? "AgilityRunner: custom course has no obstacles — enter a comma-separated list in the 'Custom obstacles (lap order)' setting"
+                    : `AgilityRunner: unknown course '${label}'`
+            );
         }
         this.def = def;
 
@@ -588,6 +593,8 @@ class EatFood implements Task {
 
 /** Escape high-z obstacle pits. Only registered for courses with a pit def. */
 class PitEscape implements Task {
+    private noLadderPasses = 0;
+
     constructor(private bot: AgilityRunner) {}
 
     private findLadder(): Loc | null {
@@ -620,6 +627,7 @@ class PitEscape implements Task {
         const pit = this.bot.courseDef().pit!;
         const ladder = this.findLadder();
         if (!ladder) {
+            this.noLadderPasses++;
             const near = Locs.query()
                 .where(l => l.actions().length > 0)
                 .nearest();
@@ -629,9 +637,14 @@ class PitEscape implements Task {
                     near ? `${near.name} [${near.actions().join(', ')}]` : 'none'
                 }`
             );
+            if (this.noLadderPasses >= PIT_NO_LADDER_STOP) {
+                ScriptRunner.stop(`in the pit with no climbable ladder found after ${this.noLadderPasses} passes — cannot escape`);
+                return;
+            }
             await Execution.delayTicks(3);
             return;
         }
+        this.noLadderPasses = 0;
 
         const op =
             ladder.actions().find(a => /climb[- ]up/i.test(a)) ??
