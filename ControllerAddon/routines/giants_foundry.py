@@ -176,3 +176,49 @@ def plan_fill(fill_cfg, crucible_contents, max_overflow_loss):
                     f"(> max_overflow_loss {max_overflow_loss}) -- adjust the fill config")
     steps.sort(key=lambda s: -s["bars_each"])
     return steps, None
+
+
+# ---------------------------------------------------------------------------
+# Pure logic: refinement heat targeting
+# ---------------------------------------------------------------------------
+
+# Per-machine constants ported from easy-giantsfoundry's Stage.java and CONFIRMED in the
+# recording: the trip hammer acts every 5 game ticks for +20 progress / -25 heat; the
+# grindstone and polishing wheel act every 2 ticks for +10 progress and +15 / -17 heat.
+# Passive decay is -1 heat per 2 ticks. `object` is the machine's game-object id.
+TOOL_STATS = {
+    "TRIP_HAMMER":     {"cycle_ticks": 5, "progress": 20, "heat": -25, "object": 44619},
+    "GRINDSTONE":      {"cycle_ticks": 2, "progress": 10, "heat": 15, "object": 44620},
+    "POLISHING_WHEEL": {"cycle_ticks": 2, "progress": 10, "heat": -17, "object": 44621},
+}
+
+# Stop the fast heat/cool this far short of the computed target: the Dunk/Quench ramp
+# runs +-27..33 per tick at the point we ride it (easy-giantsfoundry's measured DX_1
+# curve from index 10; CONFIRMED in the recording, 724->751->780->813), so one poll of
+# latency costs about one fast tick.
+HEAT_STOP_MARGIN = 35
+
+
+def actions_left_in_section(completion, section_count, tool):
+    """How many actions of `tool` until the next section boundary (progress is on the
+    0-1000 scale, sections are equal slices)."""
+    if not section_count:
+        return 0
+    per = 1000.0 / section_count
+    till_next = per - (completion % per)
+    if till_next <= 0:
+        till_next = per
+    return max(1, math.ceil(till_next / TOOL_STATS[tool]["progress"]))
+
+
+def heat_stop_target(tool, min_t, max_t, actions_left):
+    """The band edge to ENTER at so the whole remaining section can run without another
+    lava/waterfall trip (easy-giantsfoundry's targeting): cooling tools (hammer, polish)
+    enter near the top and ride down; the grindstone (heats) enters near the bottom.
+    Clamped into the band -- overshooting the far edge would damage the sword."""
+    delta = TOOL_STATS[tool]["heat"]
+    if delta < 0:
+        target = min_t - delta * actions_left
+    else:
+        target = max_t - delta * actions_left
+    return max(min_t, min(max_t, target))

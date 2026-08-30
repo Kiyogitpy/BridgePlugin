@@ -109,3 +109,38 @@ def test_plan_fill_short_config_errors():
     steps, err = gf.plan_fill(short, {}, max_overflow_loss=2)
     assert steps == []
     assert "20/28" in err
+
+
+# ---------------------------------------------------------------------------
+# Task 3: heat targeting
+# ---------------------------------------------------------------------------
+
+def test_tool_stats_are_the_measured_constants():
+    # easy-giantsfoundry Stage.java, CONFIRMED live in the recording (hammer +20/-25 per
+    # 5 ticks at 916->726; polish +10 per 2 ticks).
+    assert gf.TOOL_STATS["TRIP_HAMMER"] == {"cycle_ticks": 5, "progress": 20, "heat": -25, "object": 44619}
+    assert gf.TOOL_STATS["GRINDSTONE"] == {"cycle_ticks": 2, "progress": 10, "heat": 15, "object": 44620}
+    assert gf.TOOL_STATS["POLISHING_WHEEL"] == {"cycle_ticks": 2, "progress": 10, "heat": -17, "object": 44621}
+
+
+def test_actions_left_in_section():
+    # 5 sections -> 200 per section. At completion 140, 60 to go: 3 hammer actions
+    # (20 each) or 6 grind actions (10 each).
+    assert gf.actions_left_in_section(140, 5, "TRIP_HAMMER") == 3
+    assert gf.actions_left_in_section(140, 5, "GRINDSTONE") == 6
+    # Exactly on a boundary: the whole next section remains.
+    assert gf.actions_left_in_section(200, 5, "TRIP_HAMMER") == 10
+    # No preform data -> 0, never a division by zero.
+    assert gf.actions_left_in_section(0, 0, "TRIP_HAMMER") == 0
+
+
+def test_heat_stop_target_enters_band_at_the_working_end():
+    # Hammer cools (-25/action): enter near the TOP of the band so the whole section
+    # rides down through it. 8 actions from min 830 -> 830+200=1030, clamped to max.
+    assert gf.heat_stop_target("TRIP_HAMMER", 830, 1000, 8) == 1000
+    # 3 actions -> 830+75 = 905, inside the band -> unclamped.
+    assert gf.heat_stop_target("TRIP_HAMMER", 830, 1000, 3) == 905
+    # Grindstone heats (+15): enter near the BOTTOM. 4 actions from max 590 -> 530.
+    assert gf.heat_stop_target("GRINDSTONE", 410, 590, 4) == 530
+    # Never below min.
+    assert gf.heat_stop_target("GRINDSTONE", 410, 590, 20) == 410
