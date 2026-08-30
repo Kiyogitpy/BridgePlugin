@@ -332,6 +332,8 @@ MOULD_JIG_ID = 44777
 STATE_UNAVAILABLE_LIMIT = 20
 COMMISSION_MAX_ATTEMPTS = 4
 HANDIN_MAX_ATTEMPTS = 6
+FILL_MAX_ATTEMPTS = 3
+FILL_DIALOG_TIMEOUT_S = 4.0
 
 
 def read_state():
@@ -434,11 +436,121 @@ def prepare_phase(ctx, st):
 
 
 def _fill_crucible(ctx, st):
-    pass    # Task 7
+    cfg = ctx.state.config
+    data = ctx.state.data
+    steps, err = plan_fill(cfg["fill"], st.get("crucibleContents") or {},
+                           cfg["max_overflow_loss"])
+    if err:
+        ctx.state.trigger_safety_stop(f"giants foundry: {err}")
+        return
+    if not steps:
+        return    # satisfied -- prepare_phase pours on the next tick's read
+
+    step = steps[0]
+    inv = controller.get_inventory() or {}
+    held = [i for i in (inv.get("items") or [])
+            if (i.get("name") or "").lower() == step["item"].lower()]
+    if not held:
+        _restock_from_bank(ctx, steps)
+        return
+
+    if data.get("gf_fill_attempts", 0) >= FILL_MAX_ATTEMPTS:
+        ctx.state.trigger_safety_stop(
+            "giants foundry: crucible fill not progressing (crucible bar count never grew)")
+        return
+    crucible = _find_object(CRUCIBLE_ID)
+    if crucible is None:
+        return
+    data["gf_fill_attempts"] = data.get("gf_fill_attempts", 0) + 1   # reset when bars grow
+    # Explicit Use via the menu -- a wearable's LEFT-click default is Wear/Wield, so a
+    # bare click on platelegs would equip them instead of selecting them.
+    if not controller.click_menu_action(ctx.ser, held[0], "Use",
+                                        offset=(0, 0), check_ui_blockers=False):
+        return
+    controller.human_delay(0.2, 0.4)
+    if not controller.click_entity(ctx.ser, crucible, refresh_target=_refresh(crucible)):
+        return
+    controller.mark_busy(FILL_DIALOG_TIMEOUT_S + 4)
+    _answer_fill_dialogs(ctx, min(step["count"], len(held)), accept_overflow=True)
 
 
 def _pour(ctx, st):
-    pass    # Task 7
+    crucible = _find_object(CRUCIBLE_ID)
+    if crucible is None:
+        return
+    controller.click_entity(ctx.ser, crucible, refresh_target=_refresh(crucible),
+                            expected_action="Pour")
+    controller.mark_busy(4.0)
+    controller.human_delay(1.0, 1.6)
+
+
+def _restock_from_bank(ctx, steps):
+    """Withdraw everything the remaining plan needs in one trip. plan_fill already
+    vetoed any overflow beyond config, so whatever we withdraw here is intended."""
+    bank_obj = banker.find_nearby_bank({"maxBankDistance": 25})
+    if bank_obj is None:
+        debug_log.log("gf", "bank chest not visible -- waiting")
+        return
+    if not banker.open_bank(ctx, bank_obj):
+        return
+    banker.deposit_all_inventory(ctx)
+    need = {}
+    for s in steps:
+        need[s["item"]] = need.get(s["item"], 0) + s["count"]
+    banker.withdraw_loadout(
+        ctx, {"withdraw": [{"name": item, "quantity": n} for item, n in need.items()]},
+        fresh=True)
+    inv = controller.get_inventory() or {}
+    names = [(i.get("name") or "").lower() for i in (inv.get("items") or [])]
+    for item in need:
+        if item.lower() not in names:
+            banker.close_bank(ctx)
+            ctx.state.trigger_safety_stop(f"giants foundry: bank is out of {item}")
+            return
+    banker.close_bank(ctx)
+
+
+def _answer_fill_dialogs(ctx, count, accept_overflow):
+    """Ride the add-to-crucible dialogs: a quantity prompt (option keys; 'X' takes a
+    typed amount -- MEASURED), then possibly the overflow confirm ('Are you sure?').
+    Exact widget/option layout gets pinned on the first live session; matching is by
+    option text so a layout shuffle degrades to the '1' fallback, not a wrong click.
+    Iteration-bounded (not wall-clock) so the hermetic tests' no-op sleep exits
+    instantly: 16 polls x HEAT_POLL_S-sized sleeps ~ FILL_DIALOG_TIMEOUT_S live."""
+    answered_quantity = False
+    for _ in range(int(FILL_DIALOG_TIMEOUT_S / 0.25)):
+        d = _dialogue()
+        opts = _dialogue_options(d)
+        if opts and not answered_quantity and not _is_confirm(opts):
+            picked = False
+            for i, text in enumerate(opts):
+                if text.strip() == str(count):
+                    controller.key_tap(ctx.ser, str(i + 1))
+                    picked = True
+                    break
+            if not picked:
+                for i, text in enumerate(opts):
+                    if text.strip().lower() in ("x", "other"):
+                        controller.key_tap(ctx.ser, str(i + 1))
+                        controller.human_delay(0.6, 0.9)
+                        controller.type_text(ctx.ser, str(count))
+                        picked = True
+                        break
+            if not picked:
+                controller.key_tap(ctx.ser, "1")
+            answered_quantity = True
+            controller.human_delay(0.4, 0.7)
+            continue
+        if opts and _is_confirm(opts):
+            want = ("yes",) if accept_overflow else ("no",)
+            _choose_option(ctx, d, want, fallback_key=None)
+            return
+        time.sleep(0.25)
+
+
+def _is_confirm(opts):
+    low = " ".join(o.lower() for o in opts)
+    return "yes" in low or "no" in low
 
 
 def pickup_phase(ctx, st):

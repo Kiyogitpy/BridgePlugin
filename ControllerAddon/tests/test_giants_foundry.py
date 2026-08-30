@@ -409,3 +409,124 @@ def test_select_moulds_all_set_clicks_set_button(monkeypatch):
                               "TIP": plan["TIP"]})
     gf.prepare_phase(ctx, st)
     assert clicked == [set_button]
+
+
+# ---------------------------------------------------------------------------
+# Task 7: crucible fill + pour
+# ---------------------------------------------------------------------------
+
+def _crucible(monkeypatch, extra_objects=()):
+    cru = {"id": gf.CRUCIBLE_ID, "x": 3373, "y": 11488, "plane": 0,
+           "screenX": 670, "screenY": 320, "name": "Crucible"}
+    objs = [cru] + list(extra_objects)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: objs)
+    return cru
+
+
+def _inv(monkeypatch, names):
+    items = [{"name": n, "screenX": 900, "screenY": 400 + 10 * i, "qty": 1}
+             for i, n in enumerate(names)]
+    monkeypatch.setattr(controller, "get_inventory", lambda: {"items": items})
+    return items
+
+
+def test_fill_uses_item_on_crucible(monkeypatch):
+    ctx = _Ctx()
+    _crucible(monkeypatch)
+    _inv(monkeypatch, ["Mithril platebody"] * 4 + ["Adamant platelegs"] * 7)
+    menu, clicks = [], []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **k: menu.append((ent.get("name"), option)) or True)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: clicks.append(ent.get("id")) or True)
+    st = _st(phase="MOULD_SET", crucibleContents={}, crucibleBarCount=0)
+    gf._fill_crucible(ctx, st)
+    # Selects Use on the first planned item (bodies first -- biggest bars_each), then
+    # clicks the crucible.
+    assert menu == [("Mithril platebody", "Use")]
+    assert clicks == [gf.CRUCIBLE_ID]
+    assert ctx.state.data["gf_fill_attempts"] == 1
+
+
+def test_fill_restocks_from_bank_when_items_missing(monkeypatch):
+    ctx = _Ctx()
+    chest = {"id": gf.BANK_CHEST_ID, "name": "Bank chest", "distance": 2,
+             "screenX": 400, "screenY": 300, "x": 3375, "y": 11493, "plane": 0}
+    _crucible(monkeypatch, extra_objects=[chest])
+    _inv(monkeypatch, [])
+    opened, withdrew = [], []
+    monkeypatch.setattr(banker, "find_nearby_bank", lambda cfg: chest)
+    monkeypatch.setattr(banker, "open_bank", lambda ctx_, obj, **k: opened.append(obj) or True)
+    monkeypatch.setattr(banker, "deposit_all_inventory", lambda ctx_: True)
+    monkeypatch.setattr(banker, "close_bank", lambda ctx_: None)
+
+    def fake_withdraw(ctx_, cfg, fresh=False):
+        withdrew.extend(cfg["withdraw"])
+        _inv(monkeypatch, ["Mithril platebody"] * 4 + ["Adamant platelegs"] * 7)
+    monkeypatch.setattr(banker, "withdraw_loadout", fake_withdraw)
+
+    st = _st(phase="MOULD_SET", crucibleContents={}, crucibleBarCount=0)
+    gf._fill_crucible(ctx, st)
+    assert opened == [chest]
+    assert {w["name"]: w["quantity"] for w in withdrew} == \
+        {"Mithril platebody": 4, "Adamant platelegs": 7}
+    assert ctx.state.stopped is None
+
+
+def test_fill_bank_dry_safety_stops(monkeypatch):
+    ctx = _Ctx()
+    chest = {"id": gf.BANK_CHEST_ID, "name": "Bank chest", "distance": 2,
+             "screenX": 400, "screenY": 300, "x": 3375, "y": 11493, "plane": 0}
+    _crucible(monkeypatch, extra_objects=[chest])
+    _inv(monkeypatch, [])
+    monkeypatch.setattr(banker, "find_nearby_bank", lambda cfg: chest)
+    monkeypatch.setattr(banker, "open_bank", lambda ctx_, obj, **k: True)
+    monkeypatch.setattr(banker, "deposit_all_inventory", lambda ctx_: True)
+    monkeypatch.setattr(banker, "close_bank", lambda ctx_: None)
+    monkeypatch.setattr(banker, "withdraw_loadout", lambda ctx_, cfg, fresh=False: None)
+    st = _st(phase="MOULD_SET", crucibleContents={}, crucibleBarCount=0)
+    gf._fill_crucible(ctx, st)
+    assert "out of" in ctx.state.stopped
+
+
+def test_fill_attempt_ceiling(monkeypatch):
+    ctx = _Ctx()
+    _crucible(monkeypatch)
+    _inv(monkeypatch, ["Mithril platebody"] * 4)
+    st = _st(phase="MOULD_SET", crucibleContents={}, crucibleBarCount=0)
+    for _ in range(gf.FILL_MAX_ATTEMPTS + 1):
+        gf._fill_crucible(ctx, st)   # bar count never grows -> counter never resets
+    assert "fill" in ctx.state.stopped.lower()
+
+
+def test_answer_fill_dialogs_exact_option(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_api",
+                        lambda g, r: {"open": True, "options": ["1", "5", "X", "All"]}
+                        if (g, r) == ("ui", "dialogue") else None)
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
+    gf._answer_fill_dialogs(ctx, count=5, accept_overflow=True)
+    assert keys[0] == "2"
+
+
+def test_answer_fill_dialogs_custom_amount(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_api",
+                        lambda g, r: {"open": True, "options": ["1", "5", "X", "All"]}
+                        if (g, r) == ("ui", "dialogue") else None)
+    keys, typed = [], []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
+    monkeypatch.setattr(controller, "type_text", lambda ser, text: typed.append(text))
+    gf._answer_fill_dialogs(ctx, count=3, accept_overflow=True)
+    assert keys[0] == "3" and typed == ["3"]
+
+
+def test_pour_clicks_crucible_with_expected_action(monkeypatch):
+    ctx = _Ctx()
+    _crucible(monkeypatch)
+    kwargs = {}
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: kwargs.update(k) or True)
+    gf._pour(ctx, _st(phase="MOULD_SET", crucibleBarCount=28, crucibleState="FULL"))
+    assert kwargs.get("expected_action") == "Pour"
