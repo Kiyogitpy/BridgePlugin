@@ -222,3 +222,110 @@ def heat_stop_target(tool, min_t, max_t, actions_left):
     else:
         target = max_t - delta * actions_left
     return max(min_t, min(max_t, target))
+
+
+# ---------------------------------------------------------------------------
+# Runtime: state access + dispatch
+# ---------------------------------------------------------------------------
+
+KOVAC_NPC_ID = 11472
+BANK_CHEST_ID = 44630
+LAVA_POOL_ID = 44631
+WATERFALL_ID = 44632
+STORAGE_EMPTY_ID = 44633    # "Preform storage", op Store-preform (cache config/loc)
+STORAGE_FULL_ID = 44634     # "Preform storage", op Take-preform
+CRUCIBLE_ID = 44776
+MOULD_JIG_ID = 44777
+
+# A read that fails this many consecutive ticks means the endpoint genuinely is not
+# there (un-rebuilt client / bridge down), not a blip.
+STATE_UNAVAILABLE_LIMIT = 20
+
+
+def read_state():
+    """One fresh Giants' Foundry snapshot, or None for 'cannot tell' (endpoint missing,
+    bridge down, or the reader itself erroring). None must always defer, never act."""
+    st = controller.get_api("minigames", "giants-foundry")
+    if not st or st.get("error"):
+        return None
+    return st
+
+
+def _reset_counters(data, st, phase):
+    # Counters reset where success is DETECTED (read back from varbits), never where the
+    # attempt was made -- the mahogany_homes contact-cast lesson: a reset that lives in a
+    # phase handler dies the moment the dispatcher stops routing there.
+    if st.get("commissionTypes"):
+        data["gf_commission_attempts"] = 0
+    if phase not in ("READY_TO_HAND_IN", "RUINED"):
+        data["gf_handin_attempts"] = 0
+    if phase not in ("PREFORM_READY", "COLLECTING_PREFORM"):
+        data["gf_pickup_attempts"] = 0
+    bars = st.get("crucibleBarCount", 0)
+    if bars > data.get("gf_last_bars", -1):
+        data["gf_fill_attempts"] = 0
+    data["gf_last_bars"] = bars
+    if st.get("mouldSetupOpen"):
+        data["gf_mould_opens"] = 0
+
+
+def tick(ctx):
+    data = ctx.state.data
+    st = read_state()
+    if st is None:
+        data["gf_no_state"] = data.get("gf_no_state", 0) + 1
+        if data["gf_no_state"] >= STATE_UNAVAILABLE_LIMIT:
+            ctx.state.trigger_safety_stop(
+                "giants foundry: /api/minigames/giants-foundry unavailable -- "
+                "rebuild + restart the client?")
+        return
+    data["gf_no_state"] = 0
+
+    phase = st.get("phase")
+    if phase == "INACTIVE":
+        ctx.state.trigger_safety_stop(
+            "giants foundry: not at the Foundry -- start inside the minigame area")
+        return
+
+    _reset_counters(data, st, phase)
+
+    handler = PHASE_HANDLERS.get(phase)
+    if handler is None:
+        debug_log.log("gf", f"unhandled phase {phase} -- waiting")
+        return
+    handler(ctx, st)
+
+
+# Stubs -- replaced by Tasks 5-9. Defined so PHASE_HANDLERS can bind now.
+def get_commission_phase(ctx, st):
+    pass
+
+
+def prepare_phase(ctx, st):
+    pass
+
+
+def pickup_phase(ctx, st):
+    pass
+
+
+def refine_phase(ctx, st):
+    pass
+
+
+def hand_in_phase(ctx, st):
+    pass
+
+
+PHASE_HANDLERS = {
+    "AWAITING_COMMISSION": get_commission_phase,
+    "PREPARING": prepare_phase,
+    "SELECTING_MOULDS": prepare_phase,
+    "MOULD_SET": prepare_phase,
+    "PREFORM_READY": pickup_phase,
+    "COLLECTING_PREFORM": pickup_phase,
+    "REFINING": refine_phase,
+    "STORED": refine_phase,
+    "READY_TO_HAND_IN": hand_in_phase,
+    "RUINED": hand_in_phase,
+}

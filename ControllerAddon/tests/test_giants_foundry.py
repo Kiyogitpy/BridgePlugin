@@ -144,3 +144,128 @@ def test_heat_stop_target_enters_band_at_the_working_end():
     assert gf.heat_stop_target("GRINDSTONE", 410, 590, 4) == 530
     # Never below min.
     assert gf.heat_stop_target("GRINDSTONE", 410, 590, 20) == 410
+
+
+# ---------------------------------------------------------------------------
+# Test harness for the runtime half (Tasks 4+)
+# ---------------------------------------------------------------------------
+
+class _State:
+    def __init__(self, config=None):
+        self.config = config or dict(gf.DEFAULT_CONFIG)
+        self.data = {}
+        self.stopped = None
+
+    def trigger_safety_stop(self, reason):
+        if self.stopped is None:
+            self.stopped = reason
+
+
+class _Ctx:
+    def __init__(self, config=None):
+        self.ser = None
+        self.state = _State(config)
+        self.events = None
+
+
+@pytest.fixture(autouse=True)
+def _no_live_bridge(monkeypatch):
+    """Hermetic suite (house rule): stub every controller call that would reach the
+    running client or the Arduino. Defaults are the documented 'cannot tell' answers."""
+    monkeypatch.setattr(controller, "get_api", lambda g, r: None)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [])
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: {})
+    monkeypatch.setattr(controller, "get_equipment", lambda: {})
+    monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: None)
+    monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
+    monkeypatch.setattr(controller, "type_text", lambda ser, text: None)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "mark_busy", lambda s: None)
+    monkeypatch.setattr(controller, "object_refresh_target",
+                        lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "npc_index_refresh_target",
+                        lambda idx: (lambda: None))
+    monkeypatch.setattr(gf.time, "sleep", lambda s: None)
+
+
+def _st(**over):
+    """A minimal healthy API snapshot; override per test."""
+    base = {
+        "phase": "REFINING", "commissionTypes": ["NARROW", "FLAT"],
+        "crucibleContents": {}, "crucibleBarCount": 0, "crucibleState": "EMPTY",
+        "selectedMoulds": {}, "usableMoulds": [],
+        "preformState": "EQUIPPED", "temperature": 900, "completion": 100,
+        "quality": 147, "startingQuality": 147, "qualityLost": 0,
+        "difficulty": 95, "sectionCount": 5, "currentSection": 1,
+        "toolSequence": ["TRIP_HAMMER", "GRINDSTONE", "POLISHING_WHEEL",
+                          "GRINDSTONE", "TRIP_HAMMER"],
+        "requiredTool": "TRIP_HAMMER",
+        "minimumTemperature": 830, "maximumTemperature": 1000,
+        "temperatureStatus": "READY", "sweetSpotState": "NONE",
+        "readyToHandIn": False, "activity": "NONE", "atGiantsFoundry": True,
+    }
+    base.update(over)
+    return base
+
+
+def _serve_state(monkeypatch, st):
+    monkeypatch.setattr(controller, "get_api",
+                        lambda g, r: st if (g, r) == ("minigames", "giants-foundry") else None)
+
+
+# ---------------------------------------------------------------------------
+# Task 4: dispatcher
+# ---------------------------------------------------------------------------
+
+def test_read_state_error_and_none_mean_unavailable(monkeypatch):
+    assert gf.read_state() is None                      # fixture default: get_api -> None
+    _serve_state(monkeypatch, {"error": "boom", "reader": "GiantsFoundry"})
+    assert gf.read_state() is None
+
+
+def test_tick_unavailable_state_defers_then_stops(monkeypatch):
+    ctx = _Ctx()
+    for _ in range(gf.STATE_UNAVAILABLE_LIMIT - 1):
+        gf.tick(ctx)
+    assert ctx.state.stopped is None
+    gf.tick(ctx)
+    assert "unavailable" in ctx.state.stopped
+
+
+def test_tick_inactive_safety_stops(monkeypatch):
+    ctx = _Ctx()
+    _serve_state(monkeypatch, _st(phase="INACTIVE"))
+    gf.tick(ctx)
+    assert "not at the foundry" in ctx.state.stopped.lower()
+
+
+def test_tick_routes_every_known_phase(monkeypatch):
+    seen = []
+    for phase in ("AWAITING_COMMISSION", "PREPARING", "SELECTING_MOULDS", "MOULD_SET",
+                  "PREFORM_READY", "COLLECTING_PREFORM", "REFINING", "STORED",
+                  "READY_TO_HAND_IN", "RUINED"):
+        assert phase in gf.PHASE_HANDLERS, phase
+
+
+def test_tick_resets_counters_where_success_is_detected(monkeypatch):
+    ctx = _Ctx()
+    d = ctx.state.data
+    d["gf_commission_attempts"] = 3
+    d["gf_handin_attempts"] = 4
+    d["gf_pickup_attempts"] = 2
+    d["gf_fill_attempts"] = 2
+    d["gf_last_bars"] = 4
+    # A REFINING read with a commission present and more bars than last time clears all
+    # the counters whose success it proves.
+    _serve_state(monkeypatch, _st(crucibleBarCount=8))
+    monkeypatch.setitem(gf.PHASE_HANDLERS, "REFINING", lambda ctx, st: None)
+    gf.tick(ctx)
+    assert d["gf_commission_attempts"] == 0
+    assert d["gf_handin_attempts"] == 0      # phase is not READY_TO_HAND_IN/RUINED
+    assert d["gf_pickup_attempts"] == 0      # phase is not PREFORM_READY/COLLECTING
+    assert d["gf_fill_attempts"] == 0        # bar count grew
+    assert d["gf_last_bars"] == 8
