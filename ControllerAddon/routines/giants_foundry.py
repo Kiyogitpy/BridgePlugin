@@ -291,6 +291,7 @@ def _select_moulds_in_ui(ctx, st, plan):
     row that is actually on screen -- if the planned row isn't rendered (scrolled off),
     the best visible one is taken instead of scrolling, logged. When every part matches,
     click Set Mould."""
+    data = ctx.state.data
     selected = st.get("selectedMoulds") or {}
     commission = st.get("commissionTypes") or []
     usable = set(st.get("usableMoulds") or [])
@@ -312,8 +313,14 @@ def _select_moulds_in_ui(ctx, st, plan):
             if best is None or s > best[0]:
                 best = (s, enum, row)
         if best is None:
-            debug_log.log("gf", f"no selectable mould row for {part} -- re-opening")
+            data["gf_mould_norow"] = data.get("gf_mould_norow", 0) + 1
+            debug_log.log("gf", f"no selectable mould row for {part} -- re-opening "
+                                f"(x{data['gf_mould_norow']})")
+            if data["gf_mould_norow"] >= MOULD_NOROW_LIMIT:
+                ctx.state.trigger_safety_stop(
+                    f"giants foundry: no selectable mould row for {part} after repeated tries")
             return
+        data["gf_mould_norow"] = 0
         if best[1] != want:
             debug_log.log("gf", f"planned {want} not on screen for {part} -- "
                                 f"taking best visible {best[1]}")
@@ -324,6 +331,8 @@ def _select_moulds_in_ui(ctx, st, plan):
     # every part satisfied -> confirm
     if _click_widget(ctx, MOULD_GROUP, MOULD_SET_CHILD):
         controller.human_delay(0.6, 1.0)
+    else:
+        debug_log.log("gf", "Set Mould click failed (widget not found or not clickable)")
 
 
 # ---------------------------------------------------------------------------
@@ -334,8 +343,12 @@ KOVAC_NPC_ID = 11472
 BANK_CHEST_ID = 44630
 LAVA_POOL_ID = 44631
 WATERFALL_ID = 44632
-STORAGE_EMPTY_ID = 44633    # "Preform storage", op Store-preform (cache config/loc)
-STORAGE_FULL_ID = 44634     # "Preform storage", op Take-preform
+STORAGE_EMPTY_ID = 44633    # "Preform storage" IMPOSTOR variant, op Store-preform
+STORAGE_FULL_ID = 44634     # "Preform storage" IMPOSTOR variant, op Take-preform
+STORAGE_BASE_ID = 44778     # the multiloc's own BASE id -- what ObjectProvider's "id"
+                            # field actually reports; the impostor ids above only ever show
+                            # up in its "impostorId" field. See _find_storage.
+PREFORM_STORAGE_IDS = {STORAGE_BASE_ID, STORAGE_EMPTY_ID, STORAGE_FULL_ID}
 CRUCIBLE_ID = 44776
 MOULD_JIG_ID = 44777
 
@@ -351,6 +364,10 @@ COMMISSION_MAX_ATTEMPTS = 4
 HANDIN_MAX_ATTEMPTS = 6
 FILL_MAX_ATTEMPTS = 3
 FILL_DIALOG_TIMEOUT_S = 4.0
+POUR_MAX_ATTEMPTS = 4
+HEAT_FAIL_LIMIT = 5
+MOULD_NOROW_LIMIT = 5
+STORAGE_NOT_FOUND_LIMIT = 10
 
 
 def read_state():
@@ -378,6 +395,21 @@ def _reset_counters(data, st, phase):
     data["gf_last_bars"] = bars
     if st.get("mouldSetupOpen"):
         data["gf_mould_opens"] = 0
+    # _pour: reset once we've left MOULD_SET (poured) or a preform already exists (the
+    # pour genuinely registered even if the phase read is a tick behind).
+    if phase != "MOULD_SET" or st.get("preformState") in ("EQUIPPED", "STORED"):
+        data["gf_pour_attempts"] = 0
+    # STORED-but-storage-not-found: reset once we're no longer waiting to retrieve one.
+    if phase != "STORED":
+        data["gf_storage_not_found"] = 0
+    # gf_dead_clicks is also cleared inside _watch_progress, but that handler only runs
+    # while the dispatcher keeps routing to REFINING -- tracking completion growth here
+    # too means a healthy session can never accumulate dead clicks across a phase change
+    # the way mh_contact_casts did (see the mahogany_homes contact-cast lesson).
+    completion = st.get("completion", 0)
+    if completion > data.get("gf_last_completion", -1):
+        data["gf_dead_clicks"] = 0
+    data["gf_last_completion"] = completion
 
 
 # ---------------------------------------------------------------------------
@@ -385,18 +417,24 @@ def _reset_counters(data, st, phase):
 # ---------------------------------------------------------------------------
 
 def setup(ctx):
+    # /equipment (EquipmentProvider) is a SLOT-KEYED dict -- {"gloves": {"name": ...}, ...},
+    # no "items" key. It comes back as a totally empty {} only when the client's own
+    # EQUIPMENT ItemContainer is null (bridge down / not logged in yet) -- that is "cannot
+    # tell" and must never stop the run. A non-empty dict with an empty/mismatched
+    # "gloves" sub-dict is a real, successful read of "no ice gloves equipped".
     eq = controller.get_equipment() or {}
-    items = eq.get("items")
-    if items is None:
-        # {} is the bridge-down answer -- cannot tell is never a reason to refuse to start.
-        debug_log.log("gf", "could not read equipment at setup -- glove check skipped")
+    if not eq:
+        debug_log.log("gf", "could not read equipment at setup -- glove/hand check skipped")
         return
-    names = " ".join((i.get("name") or "").lower() for i in items)
-    if "ice gloves" not in names and "smithing gloves (i)" not in names:
+    gloves = ((eq.get("gloves") or {}).get("name") or "").lower()
+    if "ice gloves" not in gloves and "smithing gloves (i)" not in gloves:
         ctx.state.trigger_safety_stop(
             "giants foundry: ice gloves / smithing gloves (i) must be equipped to pick "
             "up preforms")
         return
+    if (eq.get("weapon") or {}).get("name") or (eq.get("shield") or {}).get("name"):
+        debug_log.log("gf", "weapon/shield equipped at setup -- freeing hands")
+        _free_hands(ctx)
     debug_log.log("gf", "setup ok -- gloves equipped")
 
 
@@ -407,7 +445,7 @@ def before_break(ctx):
     st = read_state()
     if not st or st.get("preformState") != "EQUIPPED":
         return
-    storage = _find_object(STORAGE_EMPTY_ID)
+    storage = _find_storage()
     if storage is None:
         debug_log.log("gf", "break due but preform storage not visible -- breaking anyway")
         return
@@ -501,9 +539,8 @@ def _fill_crucible(ctx, st):
         return    # satisfied -- prepare_phase pours on the next tick's read
 
     step = steps[0]
-    inv = controller.get_inventory() or {}
-    held = [i for i in (inv.get("items") or [])
-            if (i.get("name") or "").lower() == step["item"].lower()]
+    inv = controller.get_inventory() or []    # bare list (controller.get_inventory), not {"items": [...]}
+    held = [i for i in inv if (i.get("name") or "").lower() == step["item"].lower()]
     if not held:
         _restock_from_bank(ctx, steps)
         return
@@ -529,9 +566,14 @@ def _fill_crucible(ctx, st):
 
 
 def _pour(ctx, st):
+    data = ctx.state.data
+    if data.get("gf_pour_attempts", 0) >= POUR_MAX_ATTEMPTS:
+        ctx.state.trigger_safety_stop("giants foundry: pour never registered")
+        return
     crucible = _find_object(CRUCIBLE_ID)
     if crucible is None:
         return
+    data["gf_pour_attempts"] = data.get("gf_pour_attempts", 0) + 1   # reset in _reset_counters
     controller.click_entity(ctx.ser, crucible, refresh_target=_refresh(crucible),
                             expected_action="Pour")
     controller.mark_busy(4.0)
@@ -554,8 +596,8 @@ def _restock_from_bank(ctx, steps):
     banker.withdraw_loadout(
         ctx, {"withdraw": [{"name": item, "quantity": n} for item, n in need.items()]},
         fresh=True)
-    inv = controller.get_inventory() or {}
-    names = [(i.get("name") or "").lower() for i in (inv.get("items") or [])]
+    inv = controller.get_inventory() or []
+    names = [(i.get("name") or "").lower() for i in inv]
     for item in need:
         if item.lower() not in names:
             banker.close_bank(ctx)
@@ -587,7 +629,10 @@ def _answer_fill_dialogs(ctx, count, accept_overflow):
                     if text.strip().lower() in ("x", "other"):
                         controller.key_tap(ctx.ser, str(i + 1))
                         controller.human_delay(0.6, 0.9)
-                        controller.type_text(ctx.ser, str(count))
+                        # type_text has no trailing Enter -- this is a numeric chatbox
+                        # prompt, so type_digits_and_enter (which presses Enter) is the
+                        # one that actually submits the amount.
+                        controller.type_digits_and_enter(ctx.ser, str(count))
                         picked = True
                         break
             if not picked:
@@ -596,15 +641,19 @@ def _answer_fill_dialogs(ctx, count, accept_overflow):
             controller.human_delay(0.4, 0.7)
             continue
         if opts and _is_confirm(opts):
-            want = ("yes",) if accept_overflow else ("no",)
+            want = ("yes", "yes.") if accept_overflow else ("no", "no.")
             _choose_option(ctx, d, want, fallback_key=None)
             return
         time.sleep(0.25)
 
 
+CONFIRM_OPTION_TEXTS = ("yes", "yes.", "no", "no.")
+
+
 def _is_confirm(opts):
-    low = " ".join(o.lower() for o in opts)
-    return "yes" in low or "no" in low
+    # Exact match, not "yes"/"no" as a substring of the joined option text -- a plain
+    # substring test false-positives on option text containing "None" or "Now".
+    return any(o.strip().lower() in CONFIRM_OPTION_TEXTS for o in opts)
 
 
 def pickup_phase(ctx, st):
@@ -642,13 +691,13 @@ def _free_hands(ctx):
             controller.click_menu_action(ctx.ser, w, "Remove",
                                          offset=(0, 0), check_ui_blockers=False)
             controller.human_delay(0.4, 0.7)
-    controller.key_tap(ctx.ser, "ESCAPE")
+    controller.key_tap(ctx.ser, "ESC")   # the firmware only knows "ESC" -- see Firmware.ino
 
 
 def on_event(ctx, event_type, payload):
     if event_type != "CHAT_MESSAGE":
         return
-    msg = ((payload or {}).get("message") or "")
+    msg = ((payload or {}).get("message") or "").lower()
     if "free your hands" in msg:
         ctx.state.data["gf_need_free_hands"] = True
     elif "overwork the preform" in msg:
@@ -667,12 +716,19 @@ def refine_phase(ctx, st):
     data = ctx.state.data
 
     if st.get("preformState") == "STORED":
-        storage = _find_object(STORAGE_FULL_ID)
-        if storage is not None:
-            controller.click_entity(ctx.ser, storage, refresh_target=_refresh(storage),
-                                    expected_action="Take-preform")
-            controller.mark_busy(3.0)
-            controller.human_delay(1.0, 1.5)
+        storage = _find_storage()
+        if storage is None:
+            data["gf_storage_not_found"] = data.get("gf_storage_not_found", 0) + 1
+            debug_log.log("gf", "preform stored but storage not visible -- waiting")
+            if data["gf_storage_not_found"] >= STORAGE_NOT_FOUND_LIMIT:
+                ctx.state.trigger_safety_stop(
+                    "giants foundry: preform storage never became visible to retrieve a "
+                    "stored preform")
+            return
+        controller.click_entity(ctx.ser, storage, refresh_target=_refresh(storage),
+                                expected_action="Take-preform")
+        controller.mark_busy(3.0)
+        controller.human_delay(1.0, 1.5)
         return
 
     tool = st.get("requiredTool")
@@ -691,6 +747,25 @@ def refine_phase(ctx, st):
                 return
     else:
         data["gf_sweet_claimed"] = False
+
+    # THE QUALITY GUARD (2): qualityLost growing while temperatureStatus says READY means
+    # our read is stale (the varbits and the working machine are a tick or more apart) or
+    # something else is compounding the damage -- either way, acting on a belief that has
+    # just been contradicted twice in a row risks making it worse. Skip this tick and
+    # re-read rather than clicking blind; a single growing read is not enough (that is the
+    # ordinary one-tick lag between an action and its varbit landing), but two in a row is.
+    quality_lost = st.get("qualityLost", 0)
+    prev_quality_lost = data.get("gf_last_quality_lost")
+    grew = prev_quality_lost is not None and quality_lost > prev_quality_lost
+    data["gf_last_quality_lost"] = quality_lost
+    if grew and st.get("temperatureStatus") == "READY":
+        streak = data.get("gf_quality_drop_streak", 0) + 1
+        data["gf_quality_drop_streak"] = streak
+        if streak >= 2:
+            debug_log.log("gf", "quality dropping while believed correct -- re-reading")
+            return
+    else:
+        data["gf_quality_drop_streak"] = 0
 
     working = st.get("activity") in WORKING_ACTIVITIES
     status = st.get("temperatureStatus")
@@ -753,6 +828,11 @@ def _adjust_heat_and_engage(ctx, st, tool):
     HEAT_POLL_S against the live temperature varbit, stopped HEAT_STOP_MARGIN short of
     the band-end target -- and the stop IS the machine click (MEASURED: clicking the
     next machine interrupts the dunk; there is no separate walk-away click)."""
+    data = ctx.state.data
+    if data.get("gf_heat_fails", 0) >= HEAT_FAIL_LIMIT:
+        ctx.state.trigger_safety_stop(
+            "giants foundry: heat adjust (lava pool / waterfall) click keeps failing")
+        return
     min_t = st.get("minimumTemperature", -1)
     max_t = st.get("maximumTemperature", -1)
     if min_t < 0 or max_t < 0:
@@ -766,7 +846,9 @@ def _adjust_heat_and_engage(ctx, st, tool):
     option = "Dunk-preform" if heating else "Quench-preform"
     if not controller.click_menu_action(ctx.ser, pool, option,
                                         refresh_target=_refresh(pool)):
+        data["gf_heat_fails"] = data.get("gf_heat_fails", 0) + 1   # reset on a successful click
         return
+    data["gf_heat_fails"] = 0
     controller.mark_busy(HEAT_ADJUST_TIMEOUT_S + 2)
     deadline = time.time() + HEAT_ADJUST_TIMEOUT_S
     cur = None
@@ -829,6 +911,17 @@ def _refresh(obj):
         obj.get("x"), obj.get("y"), obj.get("plane", 0), obj.get("id"))
 
 
+def _find_storage():
+    # 44633 ("Store-preform")/44634 ("Take-preform") are multiloc IMPOSTOR variants of the
+    # base object 44778 -- ObjectProvider reports the BASE id in "id" and the impostor in
+    # "impostorId" (see ObjectProvider.buildObjectData). Matching on "id" alone (the old
+    # STORAGE_EMPTY_ID/STORAGE_FULL_ID lookup) never found it.
+    for obj in controller.get_objects(radius=32):
+        if obj.get("id") in PREFORM_STORAGE_IDS or obj.get("impostorId") in PREFORM_STORAGE_IDS:
+            return obj
+    return None
+
+
 def _find_kovac():
     for npc in controller.get_npcs():
         if npc.get("id") == KOVAC_NPC_ID or (npc.get("name") or "").lower() == "kovac":
@@ -844,15 +937,21 @@ def _dialogue():
 
 
 def _dialogue_open(d):
-    # Tolerant read of the m8aq Dialogue reader: exact field names get pinned on the
-    # first live session; any of these shapes means "a dialogue is up".
+    # The real m8aq Dialogue reader (net.runelite.client.plugins.m8aq.api.ui.Dialogue) has
+    # NO open/isOpen/visible/type field at all -- only npcName/npcText/playerText/options/
+    # itemText/itemId/itemName/secondItemId/secondItemName. A "click here to continue" stage
+    # (npcText/playerText/itemText set, options empty) used to collapse to bool(options),
+    # which reads as CLOSED and let hand_in re-click Kovac mid-dialogue, burning its ceiling.
+    # The boolean-key checks are kept for forward-compat in case a future reader adds one.
     if not d:
         return False
     for key in ("open", "isOpen", "visible"):
         if isinstance(d.get(key), bool):
             return d[key]
     dtype = d.get("type")
-    return bool(d.get("options")) or bool(dtype and dtype != "NONE")
+    if dtype and dtype != "NONE":
+        return True
+    return bool(d.get("options") or d.get("npcText") or d.get("playerText") or d.get("itemText"))
 
 
 def _dialogue_options(d):

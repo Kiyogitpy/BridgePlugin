@@ -4,8 +4,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "routines"))
 
-import time
-
 import pytest
 
 import giants_foundry as gf
@@ -175,7 +173,7 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_api", lambda g, r: None)
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [])
     monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
-    monkeypatch.setattr(controller, "get_inventory", lambda: {})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
     monkeypatch.setattr(controller, "get_equipment", lambda: {})
     monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: None)
     monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [])
@@ -183,6 +181,7 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
     monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
     monkeypatch.setattr(controller, "type_text", lambda ser, text: None)
+    monkeypatch.setattr(controller, "type_digits_and_enter", lambda ser, text: None)
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
     monkeypatch.setattr(controller, "mark_busy", lambda s: None)
     monkeypatch.setattr(controller, "object_refresh_target",
@@ -244,7 +243,6 @@ def test_tick_inactive_safety_stops(monkeypatch):
 
 
 def test_tick_routes_every_known_phase(monkeypatch):
-    seen = []
     for phase in ("AWAITING_COMMISSION", "PREPARING", "SELECTING_MOULDS", "MOULD_SET",
                   "PREFORM_READY", "COLLECTING_PREFORM", "REFINING", "STORED",
                   "READY_TO_HAND_IN", "RUINED"):
@@ -269,6 +267,22 @@ def test_tick_resets_counters_where_success_is_detected(monkeypatch):
     assert d["gf_pickup_attempts"] == 0      # phase is not PREFORM_READY/COLLECTING
     assert d["gf_fill_attempts"] == 0        # bar count grew
     assert d["gf_last_bars"] == 8
+
+
+def test_tick_clears_dead_clicks_when_completion_grows(monkeypatch):
+    # gf_dead_clicks used to reset ONLY inside _watch_progress -- a handler the dispatcher
+    # can stop routing to (the mh_contact_casts lesson) -- so a healthy session that left
+    # REFINING for other work could accumulate dead clicks toward DEAD_CLICK_LIMIT forever.
+    # _reset_counters now tracks completion growth itself, every tick, regardless of phase.
+    ctx = _Ctx()
+    d = ctx.state.data
+    d["gf_dead_clicks"] = gf.DEAD_CLICK_LIMIT - 1
+    d["gf_last_completion"] = 50
+    _serve_state(monkeypatch, _st(completion=100))
+    monkeypatch.setitem(gf.PHASE_HANDLERS, "REFINING", lambda ctx, st: None)
+    gf.tick(ctx)
+    assert d["gf_dead_clicks"] == 0
+    assert d["gf_last_completion"] == 100
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +355,24 @@ def test_hand_in_no_dialogue_clicks_kovac_with_ceiling(monkeypatch):
     assert "hand-in" in ctx.state.stopped.lower()
 
 
+def test_hand_in_npc_text_only_dialogue_advances_not_clicks(monkeypatch):
+    # The real m8aq Dialogue reader has NO open/isOpen/visible/type field -- a "click here
+    # to continue" stage shows up as npcText/playerText/itemText with an EMPTY options
+    # list, which used to collapse to bool(options) == False (read as closed) and let
+    # hand_in re-click Kovac mid-dialogue, burning its ceiling.
+    ctx = _Ctx()
+    _kovac(monkeypatch)
+    monkeypatch.setattr(controller, "get_api",
+                        lambda g, r: {"npcText": "Hmm... sword look good.", "options": []}
+                        if (g, r) == ("ui", "dialogue") else None)
+    keys, clicks = [], []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda *a, **k: clicks.append(a) or True)
+    gf.hand_in_phase(ctx, _st(phase="READY_TO_HAND_IN", readyToHandIn=True))
+    assert keys == ["SPACE"] and clicks == []
+
+
 def test_dialogue_options_tolerates_both_shapes():
     assert gf._dialogue_options({"options": ["a", "b"]}) == ["a", "b"]
     assert gf._dialogue_options({"options": [{"text": "a"}, {"text": "b"}]}) == ["a", "b"]
@@ -411,6 +443,17 @@ def test_select_moulds_all_set_clicks_set_button(monkeypatch):
     assert clicked == [set_button]
 
 
+def test_select_moulds_no_row_ceiling_stops(monkeypatch):
+    # get_widget_children's fixture default ([]) means no row is ever selectable --
+    # this must not spin forever.
+    ctx = _Ctx()
+    st = _st(phase="SELECTING_MOULDS", mouldSetupOpen=True, selectedMoulds={},
+             usableMoulds=list(gf.MOULDS))
+    for _ in range(gf.MOULD_NOROW_LIMIT + 1):
+        gf.prepare_phase(ctx, st)
+    assert "mould row" in ctx.state.stopped.lower()
+
+
 # ---------------------------------------------------------------------------
 # Task 7: crucible fill + pour
 # ---------------------------------------------------------------------------
@@ -424,9 +467,10 @@ def _crucible(monkeypatch, extra_objects=()):
 
 
 def _inv(monkeypatch, names):
+    # /inventory is a bare LIST (controller.get_inventory), not {"items": [...]}.
     items = [{"name": n, "screenX": 900, "screenY": 400 + 10 * i, "qty": 1}
              for i, n in enumerate(names)]
-    monkeypatch.setattr(controller, "get_inventory", lambda: {"items": items})
+    monkeypatch.setattr(controller, "get_inventory", lambda: items)
     return items
 
 
@@ -511,13 +555,17 @@ def test_answer_fill_dialogs_exact_option(monkeypatch):
 
 
 def test_answer_fill_dialogs_custom_amount(monkeypatch):
+    # count=3 has no matching option key ("1"/"5") and no confirm text yet -- the "X"
+    # (custom amount) option is picked, and the typed amount MUST go through
+    # type_digits_and_enter (which presses Enter), not type_text (which does not).
     ctx = _Ctx()
     monkeypatch.setattr(controller, "get_api",
                         lambda g, r: {"open": True, "options": ["1", "5", "X", "All"]}
                         if (g, r) == ("ui", "dialogue") else None)
     keys, typed = [], []
     monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
-    monkeypatch.setattr(controller, "type_text", lambda ser, text: typed.append(text))
+    monkeypatch.setattr(controller, "type_digits_and_enter",
+                        lambda ser, text: typed.append(text))
     gf._answer_fill_dialogs(ctx, count=3, accept_overflow=True)
     assert keys[0] == "3" and typed == ["3"]
 
@@ -530,6 +578,16 @@ def test_pour_clicks_crucible_with_expected_action(monkeypatch):
                         lambda ser, ent, **k: kwargs.update(k) or True)
     gf._pour(ctx, _st(phase="MOULD_SET", crucibleBarCount=28, crucibleState="FULL"))
     assert kwargs.get("expected_action") == "Pour"
+
+
+def test_pour_ceiling_stops(monkeypatch):
+    ctx = _Ctx()
+    _crucible(monkeypatch)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
+    st = _st(phase="MOULD_SET", crucibleBarCount=28, crucibleState="FULL")
+    for _ in range(gf.POUR_MAX_ATTEMPTS + 1):
+        gf._pour(ctx, st)   # nothing ever advances the phase past MOULD_SET
+    assert "pour" in ctx.state.stopped.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -568,8 +626,8 @@ def test_pickup_free_hands_chat_triggers_unequip_once(monkeypatch):
                         lambda ser, ent, option, **k: menu.append(option) or True)
     gf.pickup_phase(ctx, _st(phase="PREFORM_READY"))
     # The recovery presses E, removes both hand slots, escapes -- and does NOT count as
-    # a pickup attempt.
-    assert keys[0] == "E" and keys[-1] == "ESCAPE"
+    # a pickup attempt. The firmware only knows "ESC", not "ESCAPE".
+    assert keys[0] == "E" and keys[-1] == "ESC"
     assert menu == ["Remove", "Remove"]
     assert ctx.state.data["gf_need_free_hands"] is False
     assert ctx.state.data.get("gf_pickup_attempts", 0) == 0
@@ -666,6 +724,26 @@ def test_refine_sweet_spot_claims_once(monkeypatch):
     assert clicks == [44619, 44619]   # new window -> one more claim
 
 
+def test_refine_quality_drop_streak_skips_action(monkeypatch):
+    # THE QUALITY GUARD (2): qualityLost growing while temperatureStatus says READY on two
+    # CONSECUTIVE reads means something is wrong with our belief -- skip acting rather than
+    # compounding the damage. A single growing read is not enough (ordinary one-tick lag).
+    ctx = _Ctx()
+    _machines(monkeypatch)
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: clicks.append(ent["id"]) or True)
+    base = dict(temperatureStatus="READY", activity="NONE")
+    gf.refine_phase(ctx, _st(qualityLost=0, **base))       # baseline read -- acts
+    assert clicks == [44619]
+    gf.refine_phase(ctx, _st(qualityLost=5, **base))       # growth #1 -- still acts
+    assert clicks == [44619, 44619]
+    gf.refine_phase(ctx, _st(qualityLost=10, **base))      # growth #2 in a row -- skip
+    assert clicks == [44619, 44619]
+    gf.refine_phase(ctx, _st(qualityLost=10, **base))      # non-growing read resets streak
+    assert clicks == [44619, 44619, 44619]
+
+
 def test_refine_too_cold_dunks_then_engages(monkeypatch):
     ctx = _Ctx()
     _machines(monkeypatch)
@@ -700,6 +778,17 @@ def test_refine_too_hot_quenches(monkeypatch):
     assert menu == [(gf.WATERFALL_ID, "Quench-preform")]
 
 
+def test_adjust_heat_ceiling_stops(monkeypatch):
+    # A pool click that keeps failing (click_menu_action -> False) must not retry forever.
+    ctx = _Ctx()
+    _machines(monkeypatch)
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, ent, option, **k: False)
+    st = _st(temperature=700, temperatureStatus="TOO_COLD", activity="NONE")
+    for _ in range(gf.HEAT_FAIL_LIMIT + 1):
+        gf._adjust_heat_and_engage(ctx, st, "TRIP_HAMMER")
+    assert "heat adjust" in ctx.state.stopped.lower()
+
+
 def test_refine_stored_takes_from_storage(monkeypatch):
     ctx = _Ctx()
     _machines(monkeypatch)
@@ -710,6 +799,34 @@ def test_refine_stored_takes_from_storage(monkeypatch):
     gf.refine_phase(ctx, _st(phase="STORED", preformState="STORED"))
     assert clicks == [gf.STORAGE_FULL_ID]
     assert kwargs.get("expected_action") == "Take-preform"
+
+
+def test_refine_stored_finds_storage_via_impostor_id(monkeypatch):
+    # 44633/44634 are multiloc IMPOSTOR variants of the BASE object 44778 -- ObjectProvider
+    # reports the base id in "id" and the impostor in "impostorId" (ObjectProvider.
+    # buildObjectData). Matching only on "id" == STORAGE_FULL_ID (the pre-fix behaviour)
+    # never finds a real scan, which always reports the base id.
+    ctx = _Ctx()
+    storage = {"id": gf.STORAGE_BASE_ID, "impostorId": gf.STORAGE_FULL_ID,
+               "x": 3366, "y": 11485, "plane": 0, "screenX": 520, "screenY": 380,
+               "name": "Preform storage"}
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [storage])
+    kwargs = {}
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: (clicks.append(ent["id"]), kwargs.update(k)) or True)
+    gf.refine_phase(ctx, _st(phase="STORED", preformState="STORED"))
+    assert clicks == [gf.STORAGE_BASE_ID]
+    assert kwargs.get("expected_action") == "Take-preform"
+
+
+def test_refine_stored_storage_not_found_ceiling(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [])
+    st = _st(phase="STORED", preformState="STORED")
+    for _ in range(gf.STORAGE_NOT_FOUND_LIMIT + 1):
+        gf.refine_phase(ctx, st)
+    assert "preform storage" in ctx.state.stopped.lower()
 
 
 def test_watch_progress_stall_reengages_and_dead_clicks_stop(monkeypatch):
@@ -737,9 +854,12 @@ def test_watch_progress_stall_reengages_and_dead_clicks_stop(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_setup_requires_gloves(monkeypatch):
+    # /equipment is a slot-keyed dict (EquipmentProvider) -- no "items" key. A non-empty
+    # dict with the gloves slot present but not ice/smithing gloves means the read
+    # succeeded and gloves genuinely aren't equipped.
     ctx = _Ctx()
     monkeypatch.setattr(controller, "get_equipment",
-                        lambda: {"items": [{"name": "Rune platebody"}]})
+                        lambda: {"body": {"name": "Rune platebody"}, "gloves": {}})
     gf.setup(ctx)
     assert "gloves" in ctx.state.stopped.lower()
 
@@ -747,16 +867,39 @@ def test_setup_requires_gloves(monkeypatch):
 def test_setup_accepts_ice_gloves(monkeypatch):
     ctx = _Ctx()
     monkeypatch.setattr(controller, "get_equipment",
-                        lambda: {"items": [{"name": "Ice gloves"}]})
+                        lambda: {"gloves": {"name": "Ice gloves"}})
     gf.setup(ctx)
     assert ctx.state.stopped is None
 
 
 def test_setup_cannot_read_equipment_does_not_stop(monkeypatch):
-    # {} is get_equipment's bridge-down value -- "cannot tell" must not stop the run.
+    # {} is get_equipment's bridge-down value (empty ItemContainer) -- "cannot tell"
+    # must not stop the run.
     ctx = _Ctx()
     gf.setup(ctx)
     assert ctx.state.stopped is None
+
+
+def test_setup_frees_hands_if_weapon_or_shield_equipped(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_equipment",
+                        lambda: {"gloves": {"name": "Ice gloves"},
+                                 "weapon": {"name": "Imcando hammer"}, "shield": {}})
+    calls = []
+    monkeypatch.setattr(gf, "_free_hands", lambda ctx_: calls.append(1))
+    gf.setup(ctx)
+    assert ctx.state.stopped is None
+    assert calls == [1]
+
+
+def test_setup_does_not_free_hands_when_empty(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_equipment",
+                        lambda: {"gloves": {"name": "Ice gloves"}, "weapon": {}, "shield": {}})
+    calls = []
+    monkeypatch.setattr(gf, "_free_hands", lambda ctx_: calls.append(1))
+    gf.setup(ctx)
+    assert calls == []
 
 
 def test_before_break_stores_equipped_preform(monkeypatch):
