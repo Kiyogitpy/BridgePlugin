@@ -2166,7 +2166,10 @@ live-debugging workflow (background launch, log to file, recorder running alongs
 2. Rebuild + restart the client (`./gradlew.bat run`) for RoutineChoice + smithingXp.
 3. Quantity-dialog options for the crucible fill (`_answer_fill_dialogs`'s option-text
    matching) — dump `/widgets/dump` while one is open, adjust matchers.
-4. The m8aq `ui/dialogue` field names (`_dialogue_open` tolerant read).
+4. ~~The m8aq `ui/dialogue` field names~~ — resolved from the vendored source during the
+   final review (npcText/playerText/options/itemText; no open/type field). Instead:
+   confirm `GET /objects` at the Foundry reports the Preform storage as base id 44778
+   with the state in `impostorId` (the `_find_storage` assumption).
 5. Mould row/tab widget clicks (row geometry from `get_widget_children(718, 9)`).
 6. Heat-adjust behaviour: watch `_adjust_heat_and_engage` overshoot/undershoot; tune
    `HEAT_STOP_MARGIN` from the log before trusting long runs.

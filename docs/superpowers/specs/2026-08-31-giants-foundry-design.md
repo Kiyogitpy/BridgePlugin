@@ -248,16 +248,21 @@ commission varbits populated for the *new* sword. Ceiling `TURN_IN_MAX_CLICKS`-s
 
 - Every click loop has a ceiling and a counter that **resets where success is detected**
   (a varbit/phase change), never where the attempt is made: commission (4), mould (3),
-  fill attempts per item (3), pickup (2), machine clicks with zero progress AND zero
-  temperature movement (5), hand-in (6).
+  fill attempts per item (3), pickup (3), pour (4), heat-adjust click failures (5),
+  mould-row-not-found (5), storage-not-found (10), machine clicks with zero progress
+  (5, cleared whenever completion grows), hand-in (6). (Amended post-implementation:
+  the final review added the pour/heat/mould-row/storage ceilings and simplified the
+  dead-click reset to completion growth.)
 - Every wait budgets the walk (machines are 3–14 tiles apart; MEASURED distances in
   `Stage.java`: hammer→lava 4, grindstone→lava 7, polish→waterfall 10…).
 - All object clicks pass `object_refresh_target` (+ `expected_action` where the option is
   fixed: "Use", "Pour", "Pick-up", "Dunk-preform", "Quench-preform", "Hand-in",
   "Commission"). Machines are fixed scenery — aims are stable — but the pattern is policy.
-- XP is the sub-tick success signal for machine work: snapshot `smithingXp` before a work
-  click, poll for increase (add the one-line `PlayerProvider` field if absent — the only
-  possible Java change; **everything else needs no rebuild**).
+- XP as the sub-tick success signal for machine work: `smithingXp` IS now on `/player`
+  (the one Java change; everything else needs no rebuild), but v1 as implemented keys the
+  stall watchdog on `completion` (also a fresh varbit read) and does not consume the XP
+  field yet — adopting it is a live-session follow-up, not a merge blocker. (Amended
+  post-implementation to match what shipped.)
 - Progress stall watchdog: `completion` unchanged for `WORK_STALL_S` (~12s, > two hammer
   cycles + the nulled first cycle) while believing we're working → re-evaluate from
   scratch; twice consecutively → safety-stop.
