@@ -274,6 +274,7 @@ IMBUE_CONFIRM_S = 4.0
 POWERUP_MAX_CLICKS = 6
 CELL_MAX_CLICKS = 6
 RESTOCK_MAX_CLICKS = 6
+DEPOSIT_MAX_CLICKS = 6
 GUARDIAN_MISSING_LIMIT = 15
 MINE_STALL_TICKS = 25
 MINE_RECLICK_S = 5.0           # leave an in-progress mine alone this long after a delta
@@ -431,9 +432,14 @@ def _click_escalating(ctx, entity, options):
     if res and not getattr(res, "withheld", False):
         return True
     fresh = _reresolve(entity)
-    return bool(controller.click_menu_action(
-        ctx.ser, fresh, options[0], offset=(0, 0),
-        refresh_target=_refresh_for(fresh)))
+    for option in options:
+        # State-dependent verbs (Place-cell vs Recharge vs Strengthen): the menu only
+        # offers the applicable one, and click_menu_action returns False on a miss, so
+        # trying in order finds it without knowing the state.
+        if controller.click_menu_action(ctx.ser, fresh, option, offset=(0, 0),
+                                        refresh_target=_refresh_for(fresh)):
+            return True
+    return False
 
 
 def _approach_or_click(ctx, entity, options, counter_key, max_clicks, stop_reason):
@@ -584,7 +590,7 @@ def between_rounds_phase(ctx, st):
     cfg = ctx.state.config
     inv = st.get("inventory") or {}
 
-    if cfg.get("repair_pouches"):
+    if cfg.get("repair_pouches") and not data.get("gotr_repair_disabled"):
         pouches = read_pouches()
         if pouches is not None and not pouches_degraded(pouches):
             # Success detection for the repair loop -- reset lives HERE, where the
@@ -605,6 +611,7 @@ def between_rounds_phase(ctx, st):
     if _runes_in_inventory():
         _deposit_runes(ctx)
         return
+    data["gotr_deposit_clicks"] = 0
 
     controller.human_delay(1.0, 2.5)
 
@@ -637,8 +644,11 @@ def _repair_pouches(ctx):
         debug_log.log("gotr", f"NPC Contact widget not clickable ({stuck}x) -- "
                               "Lunar spellbook active?")
         if stuck >= CONTACT_STUCK_LIMIT:
-            debug_log.log("gotr", "giving up on pouch repair this window")
-            data["gotr_contact_casts"] = CONTACT_MAX_CASTS
+            # Permanent for the session: a widget that is never clickable means the
+            # spellbook is wrong, and re-probing it every round costs real actions.
+            debug_log.log("gotr", "NPC Contact never clickable -- pouch repair "
+                                  "disabled for this session")
+            data["gotr_repair_disabled"] = True
         return
     data["gotr_contact_stuck"] = 0
     data["gotr_contact_casts"] = data.get("gotr_contact_casts", 0) + 1
@@ -656,7 +666,8 @@ def _restock_cells(ctx):
         return
     reach = travel.can_reach(table)
     if reach is False:
-        travel.walk_to(ctx, table)
+        if not travel.walk_to(ctx, table):
+            data["gotr_restock_clicks"] = data.get("gotr_restock_clicks", 0) + 1
         return
     data["gotr_restock_clicks"] = data.get("gotr_restock_clicks", 0) + 1
     _click_escalating(ctx, table, (TAKE_ACTION,))
@@ -664,14 +675,21 @@ def _restock_cells(ctx):
 
 
 def _deposit_runes(ctx):
+    data = ctx.state.data
+    if data.get("gotr_deposit_clicks", 0) >= DEPOSIT_MAX_CLICKS:
+        ctx.state.trigger_safety_stop("gotr: rune deposit never registered at the pool")
+        return
     pool = _find_object_by_name(DEPOSIT_POOL_NAME, exact=True)
     if pool is None:
+        data["gotr_deposit_clicks"] = data.get("gotr_deposit_clicks", 0) + 1
         debug_log.log("gotr", "deposit pool not visible")
         return
     reach = travel.can_reach(pool)
     if reach is False:
-        travel.walk_to(ctx, pool)
+        if not travel.walk_to(ctx, pool):
+            data["gotr_deposit_clicks"] = data.get("gotr_deposit_clicks", 0) + 1
         return
+    data["gotr_deposit_clicks"] = data.get("gotr_deposit_clicks", 0) + 1
     _click_escalating(ctx, pool, (DEPOSIT_ACTION,))
     controller.human_delay(1.0, 1.6)
 
@@ -773,7 +791,8 @@ def altar_trip_phase(ctx, st):
         return
     reach = travel.can_reach(portal)
     if reach is False:
-        travel.walk_to(ctx, portal)
+        if not travel.walk_to(ctx, portal):
+            data["gotr_altar_enters"] = data.get("gotr_altar_enters", 0) + 1
         return
     data["gotr_altar_enters"] = data.get("gotr_altar_enters", 0) + 1
     debug_log.log("gotr", f"entering the {altar} portal")
@@ -874,7 +893,8 @@ def portal_trip_phase(ctx, st):
         return
     reach = travel.can_reach(portal)
     if reach is False:
-        travel.walk_to(ctx, portal)
+        if not travel.walk_to(ctx, portal):
+            data["gotr_portal_enters"] = data.get("gotr_portal_enters", 0) + 1
         return
     data["gotr_portal_enters"] = data.get("gotr_portal_enters", 0) + 1
     _click_escalating(ctx, portal, (PORTAL_GUARDIAN_ACTION,))
@@ -890,6 +910,7 @@ def craft_phase(ctx, st):
     if _runes_in_inventory():
         _deposit_runes(ctx)
         return
+    data["gotr_deposit_clicks"] = 0
     inv = st.get("inventory") or {}
     if inv.get("guardianEssence", 0) > 0:
         space = pouch_free_space(read_pouches())
@@ -909,7 +930,8 @@ def craft_phase(ctx, st):
         return
     reach = travel.can_reach(bench)
     if reach is False:
-        travel.walk_to(ctx, bench)
+        if not travel.walk_to(ctx, bench):
+            data["gotr_craft_stall"] = data.get("gotr_craft_stall", 0) + 1
         return
     data["gotr_craft_stall"] = data.get("gotr_craft_stall", 0) + 1
     _click_escalating(ctx, bench, (WORKBENCH_ACTION,))
@@ -947,7 +969,8 @@ def mine_phase(ctx, st):
                 controller.mark_busy(3.0)
                 controller.human_delay(1.5, 2.5)
                 return
-        travel.walk_to(ctx, node)
+        if not travel.walk_to(ctx, node):
+            data["gotr_mine_stall"] = data.get("gotr_mine_stall", 0) + 1
         return
     data["gotr_mine_stall"] = data.get("gotr_mine_stall", 0) + 1
     _click_escalating(ctx, node, (MINE_ACTION,))
@@ -1027,6 +1050,20 @@ def setup(ctx):
         return
     held = [n for n in names if any(p in n for p in POUCH_NAMES)]
     debug_log.log("gotr", f"setup ok -- pouches held: {held or 'none'}")
+    if ctx.state.config.get("repair_pouches"):
+        magic = controller.get_api("player", "magic")
+        book = ""
+        if isinstance(magic, dict) and not magic.get("error"):
+            for key in ("spellbook", "book", "activeSpellbook"):
+                if isinstance(magic.get(key), str):
+                    book = magic[key].lower()
+                    break
+        if book and "lunar" not in book:
+            # Spec: degrade to a warning and disable repair, never a hard stop. An
+            # unreadable reader (book == "") gates nothing.
+            debug_log.log("gotr", f"spellbook is '{book}', not Lunar -- pouch repair "
+                                  "disabled for this session")
+            ctx.state.data["gotr_repair_disabled"] = True
 
 
 def tick(ctx):
