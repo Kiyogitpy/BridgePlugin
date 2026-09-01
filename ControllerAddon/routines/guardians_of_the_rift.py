@@ -1,0 +1,127 @@
+# routines/guardians_of_the_rift.py
+#
+# Guardians of the Rift, unattended, on mass/official worlds: mine guardian fragments,
+# craft guardian essence at the Workbench (filling essence pouches, depositing crafted
+# runes in the Deposit Pool), imbue at whichever altar pair is active (choosing the
+# energy type we have LESS of), power the Great Guardian with the stones, and spend the
+# charged cell on the barrier hub. Between rounds: repair degraded essence pouches via
+# NPC Contact (Lunar spellbook) and restock uncharged cells. Reward points are hoarded
+# -- the Rewards Guardian is never touched.
+#
+# Design: docs/superpowers/specs/2026-09-01-guardians-of-the-rift-design.md
+# NO RECORDING EXISTS for this activity (user decision, 2026-09-01): every constant in
+# the LIVE-VERIFY block below is a research-derived first draft. The spec's
+# "Live-verification checklist" section is the first live session's worklist.
+#
+# Run with:
+#     python controller.py routines/guardians_of_the_rift.py
+#
+# Ground truth at runtime is GET /api/minigames/guardians-of-the-rift (the vendored m8aq
+# reader). Gson serializes FIELDS, so the reader's Java convenience methods
+# (isRoundActive() etc.) are absent from the JSON -- round_state() below re-derives them
+# from the raw fields. Nothing load-bearing lives in ctx.state.data: every tick
+# re-derives from the live snapshot, so restarts resume correctly.
+
+import time
+
+import controller
+import debug_log
+import travel
+
+DEFAULT_CONFIG = {
+    "use_large_remains": False,   # 56 Agility rubble shortcut to the east pocket
+    "repair_pouches": True,       # NPC Contact -> Dark Mage between rounds when degraded
+    "min_uncharged_cells": 5,     # restock from the cell table between rounds below this
+    "craft_at_fragments": 60,     # start a workbench pass at/above this many fragments
+    "altar_at_essence": 20,       # head for an altar when loose essence >= this
+    "blocked_altars": [],         # altar enum names this account cannot enter
+                                  # (quest-gated: COSMIC, LAW, DEATH, BLOOD)
+
+    "breaks": {
+        "enabled": True,
+        "everyMinMinutes": 45,
+        "everyMaxMinutes": 75,
+        "durationMinMinutes": 3,
+        "durationMaxMinutes": 12,
+        "microBreaks": True,
+    },
+    "safety": {
+        "stopOnDeath": True,
+        "stopOnInventoryFull": False,
+        "maxRuntimeHours": 0,
+    },
+}
+
+
+def get_config(bridge_config):
+    # No Controller Settings panel section (gemstone_crab pattern) -- config lives here.
+    return DEFAULT_CONFIG
+
+
+# ---------------------------------------------------------------------------
+# Pure logic: game tables and thresholds
+# ---------------------------------------------------------------------------
+
+# Runecraft level to imbue at each altar (wiki "Charging cells" table, rev 15303509).
+ALTAR_LEVELS = {"AIR": 1, "MIND": 2, "WATER": 5, "EARTH": 9, "FIRE": 14, "BODY": 20,
+                "COSMIC": 27, "CHAOS": 35, "NATURE": 44, "LAW": 54, "DEATH": 65,
+                "BLOOD": 77}
+
+# Live barrier tiers, weakest first -- recharge targets the lowest.
+BARRIER_LIVE_ORDER = ["WEAK", "MEDIUM", "STRONG", "OVERCHARGED"]
+
+REPAIR_FRAGMENTS = 12      # fragments consumed repairing a broken cell tile (wiki)
+PORTAL_MIN_SECONDS = 8     # don't chase a huge-remains portal closing sooner than this
+ALTAR_MIN_SECONDS = 10     # don't ENTER an altar rotating away sooner than this
+
+
+# ---------------------------------------------------------------------------
+# Pure logic: phase derivation and selection
+# ---------------------------------------------------------------------------
+
+def round_state(st):
+    """One of: unavailable / outside / lobby / waiting / active / complete / idle.
+    Derived from raw reader fields (the Java isRoundActive() helpers do not serialize)."""
+    if st is None or st.get("error"):
+        return "unavailable"
+    if not st.get("inMainTemple"):
+        return "outside"
+    if not st.get("inArena"):
+        return "lobby"
+    power = st.get("guardianPower", -1)
+    if st.get("finishedGame") or power >= 100:
+        return "complete"
+    if st.get("participating"):
+        if power == 0:
+            return "waiting"
+        if 0 < power < 100:
+            return "active"
+    return "idle"
+
+
+def total_stones(inv):
+    return (inv.get("catalyticGuardianStones", 0)
+            + inv.get("elementalGuardianStones", 0)
+            + inv.get("polyelementalGuardianStones", 0)
+            + inv.get("polycatalyticGuardianStones", 0))
+
+
+def find_repairable(barriers):
+    """The first cell tile offering Repair, or None."""
+    for b in barriers or []:
+        if b.get("state") == "BROKEN_REPAIRABLE":
+            return b
+    return None
+
+
+def choose_cell_tile(barriers):
+    """Where the charged cell goes: first INACTIVE tile (place, 2 energy both types),
+    else the lowest-tier live barrier (recharge). None when nothing usable is loaded."""
+    barriers = barriers or []
+    for b in barriers:
+        if b.get("state") == "INACTIVE":
+            return b
+    live = [b for b in barriers if b.get("state") in BARRIER_LIVE_ORDER]
+    if not live:
+        return None
+    return min(live, key=lambda b: BARRIER_LIVE_ORDER.index(b["state"]))
