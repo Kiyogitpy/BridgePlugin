@@ -182,3 +182,37 @@ def pouch_stored(api):
     """Essence sitting inside held pouches (0 when the reader is unavailable)."""
     held = _held_pouches(api)
     return sum(p.get("storedEssence", 0) for p in held) if held else 0
+
+
+def choose_action(st, cfg, pouch_space=None, disabled=()):
+    """The one in-round action for this tick, priority-ordered (spec: 'in_round priority
+    ladder'). Pure; the runtime passes `disabled` for rungs it has learned cannot work
+    right now (missing cell-tile objects, blocked altars, a spent portal budget)."""
+    inv = st.get("inventory") or {}
+    barriers = st.get("barriers") or []
+
+    # Being inside a side area overrides the ladder -- finish what we are inside of.
+    if (st.get("currentAltar") or "UNKNOWN") != "UNKNOWN" and "altar_trip" not in disabled:
+        return "altar_trip"
+    if st.get("miningArea") == "WEST_HUGE_REMAINS" and "portal_trip" not in disabled:
+        return "portal_trip"
+
+    if ("repair_barrier" not in disabled and find_repairable(barriers) is not None
+            and inv.get("guardianFragments", 0) >= REPAIR_FRAGMENTS):
+        return "repair_barrier"
+    if ("portal_trip" not in disabled and st.get("guardianEssencePortalOpen")
+            and st.get("guardianEssencePortalSecondsRemaining", -1) >= PORTAL_MIN_SECONDS
+            and (inv.get("emptySlots", 0) > 0 or (pouch_space or 0) > 0)):
+        return "portal_trip"
+    if total_stones(inv) > 0:
+        return "spend_stones"
+    if "place_cell" not in disabled and (inv.get("chargedCellTier") or "NONE") != "NONE":
+        return "place_cell"
+    essence = inv.get("guardianEssence", 0)
+    if "altar_trip" not in disabled and (
+            essence >= cfg["altar_at_essence"]
+            or (pouch_space == 0 and essence > 0)):
+        return "altar_trip"
+    if inv.get("guardianFragments", 0) >= cfg["craft_at_fragments"]:
+        return "craft"
+    return "mine"

@@ -177,3 +177,84 @@ def test_pouch_stored():
     api = pouch_api(SMALL=pstate(3, 3), LARGE=pstate(5, 7),
                     GIANT=pstate(9, 9, in_inv=False))
     assert gotr.pouch_stored(api) == 8
+
+
+# --- choose_action ---------------------------------------------------------
+
+CFG = dict(gotr.DEFAULT_CONFIG)
+
+
+def test_action_inside_altar_always_altar_trip():
+    st = make_state(currentAltar="AIR",
+                    inventory=make_inv(elementalGuardianStones=5))
+    assert gotr.choose_action(st, CFG) == "altar_trip"
+
+
+def test_action_inside_huge_pocket_continues_portal_trip():
+    st = make_state(miningArea="WEST_HUGE_REMAINS")
+    assert gotr.choose_action(st, CFG) == "portal_trip"
+
+
+def test_action_repair_beats_everything_outside():
+    st = make_state(barriers=[barrier("BROKEN_REPAIRABLE")],
+                    guardianEssencePortalOpen=True,
+                    guardianEssencePortalSecondsRemaining=20,
+                    inventory=make_inv(guardianFragments=12,
+                                       elementalGuardianStones=3))
+    assert gotr.choose_action(st, CFG) == "repair_barrier"
+
+
+def test_action_repair_needs_12_fragments():
+    st = make_state(barriers=[barrier("BROKEN_REPAIRABLE")],
+                    inventory=make_inv(guardianFragments=11))
+    assert gotr.choose_action(st, CFG) == "mine"
+
+
+def test_action_portal_when_open_with_room():
+    st = make_state(guardianEssencePortalOpen=True,
+                    guardianEssencePortalSecondsRemaining=20)
+    assert gotr.choose_action(st, CFG) == "portal_trip"
+
+
+def test_action_portal_skipped_when_closing_or_full():
+    st = make_state(guardianEssencePortalOpen=True,
+                    guardianEssencePortalSecondsRemaining=3)
+    assert gotr.choose_action(st, CFG) == "mine"
+    st = make_state(guardianEssencePortalOpen=True,
+                    guardianEssencePortalSecondsRemaining=20,
+                    inventory=make_inv(emptySlots=0))
+    assert gotr.choose_action(st, CFG, pouch_space=0) == "mine"
+
+
+def test_action_stones_then_cell():
+    st = make_state(inventory=make_inv(catalyticGuardianStones=2,
+                                       chargedCellTier="STRONG"))
+    assert gotr.choose_action(st, CFG) == "spend_stones"
+    st = make_state(barriers=[barrier("INACTIVE")],
+                    inventory=make_inv(chargedCellTier="STRONG"))
+    assert gotr.choose_action(st, CFG) == "place_cell"
+
+
+def test_action_altar_at_threshold_or_full_pouches():
+    st = make_state(inventory=make_inv(guardianEssence=20))
+    assert gotr.choose_action(st, CFG) == "altar_trip"
+    st = make_state(inventory=make_inv(guardianEssence=3))
+    assert gotr.choose_action(st, CFG, pouch_space=0) == "altar_trip"
+    assert gotr.choose_action(st, CFG, pouch_space=5) == "mine"
+    assert gotr.choose_action(st, CFG, pouch_space=None) == "mine"
+
+
+def test_action_craft_at_fragment_threshold():
+    st = make_state(inventory=make_inv(guardianFragments=60))
+    assert gotr.choose_action(st, CFG) == "craft"
+    st = make_state(inventory=make_inv(guardianFragments=59))
+    assert gotr.choose_action(st, CFG) == "mine"
+
+
+def test_action_disabled_rungs_are_skipped():
+    st = make_state(barriers=[barrier("BROKEN_REPAIRABLE"), barrier("INACTIVE")],
+                    inventory=make_inv(guardianFragments=12, chargedCellTier="WEAK"))
+    assert gotr.choose_action(st, CFG,
+                              disabled={"repair_barrier", "place_cell"}) == "mine"
+    st = make_state(inventory=make_inv(guardianEssence=25))
+    assert gotr.choose_action(st, CFG, disabled={"altar_trip"}) == "mine"
