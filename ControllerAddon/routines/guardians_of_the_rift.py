@@ -953,3 +953,135 @@ def mine_phase(ctx, st):
     _click_escalating(ctx, node, (MINE_ACTION,))
     controller.mark_busy(2.0)
     controller.human_delay(1.0, 1.8)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+
+def _reset_counters(data, st, state):
+    """Counters reset where success is DETECTED (read back from the fresh snapshot),
+    never where the attempt was made -- the mahogany_homes contact-cast lesson."""
+    inv = st.get("inventory") or {}
+    now = time.time()
+
+    if st.get("inArena"):
+        data["gotr_enter_clicks"] = 0
+    if state == "active":
+        # The between-round window is over; next window starts a fresh repair budget.
+        data["gotr_contact_casts"] = 0
+        data["gotr_contact_stuck"] = 0
+
+    frags = inv.get("guardianFragments", 0)
+    mined = st.get("minedFragmentsThisGame", 0)
+    essence = inv.get("guardianEssence", 0)
+    if frags > data.get("gotr_last_frags", -1) or mined > data.get("gotr_last_mined", -1):
+        data["gotr_mine_delta_at"] = now
+        data["gotr_mine_stall"] = 0
+    if (essence > data.get("gotr_last_essence", -1)
+            or frags < data.get("gotr_last_frags", 1 << 30)):
+        data["gotr_craft_delta_at"] = now
+        data["gotr_craft_stall"] = 0
+    if inv.get("unchargedCells", 0) > data.get("gotr_last_uncharged", -1):
+        data["gotr_restock_clicks"] = 0
+    data["gotr_last_frags"] = frags
+    data["gotr_last_mined"] = mined
+    data["gotr_last_essence"] = essence
+    data["gotr_last_uncharged"] = inv.get("unchargedCells", 0)
+
+    stones = total_stones(inv)
+    if stones < data.get("gotr_last_stones", 0):
+        data["gotr_powerup_clicks"] = 0
+    if stones > data.get("gotr_last_stones", -1):
+        data["gotr_imbue_clicks"] = 0
+    data["gotr_last_stones"] = stones
+
+    tier = inv.get("chargedCellTier") or "NONE"
+    if tier == "NONE" and data.get("gotr_last_cell") not in (None, "NONE"):
+        data["gotr_cell_clicks"] = 0
+    data["gotr_last_cell"] = tier
+
+    if find_repairable(st.get("barriers") or []) is None:
+        data["gotr_repair_clicks"] = 0
+
+    current_altar = st.get("currentAltar") or "UNKNOWN"
+    if current_altar != data.get("gotr_last_altar", "UNKNOWN"):
+        data["gotr_altar_enters"] = 0
+        data["gotr_exit_clicks"] = 0
+        data["gotr_imbue_clicks"] = 0
+    data["gotr_last_altar"] = current_altar
+
+    if st.get("miningArea") == "WEST_HUGE_REMAINS":
+        data["gotr_portal_enters"] = 0
+    else:
+        data["gotr_portal_ticks"] = 0
+
+
+def setup(ctx):
+    inv = controller.get_inventory() or []
+    eq = controller.get_equipment() or {}
+    names = [(i.get("name") or "").lower() for i in inv]
+    eq_names = [((eq.get(slot) or {}).get("name") or "").lower() for slot in eq]
+    if not any("pickaxe" in n for n in names + eq_names):
+        ctx.state.trigger_safety_stop("gotr: no pickaxe in inventory or equipped")
+        return
+    held = [n for n in names if any(p in n for p in POUCH_NAMES)]
+    debug_log.log("gotr", f"setup ok -- pouches held: {held or 'none'}")
+
+
+def tick(ctx):
+    data = ctx.state.data
+    st = read_state()
+    if st is None:
+        data["gotr_no_state"] = data.get("gotr_no_state", 0) + 1
+        if data["gotr_no_state"] >= STATE_UNAVAILABLE_LIMIT:
+            ctx.state.trigger_safety_stop(
+                "gotr: /api/minigames/guardians-of-the-rift unavailable -- "
+                "rebuild + restart the client?")
+        return
+    data["gotr_no_state"] = 0
+
+    if st.get("banned"):
+        ctx.state.trigger_safety_stop("gotr: the GOTR ban flag is set on this account")
+        return
+
+    state = round_state(st)
+    _reset_counters(data, st, state)
+
+    if state == "outside":
+        ctx.state.trigger_safety_stop(
+            "gotr: start at the Temple of the Eye (lobby or arena)")
+        return
+    if state == "lobby":
+        enter_arena_phase(ctx, st)
+        return
+    if state in ("waiting", "complete", "idle"):
+        between_rounds_phase(ctx, st)
+        return
+
+    # Active round: one prioritized action, with learned-unworkable rungs disabled.
+    cfg = ctx.state.config
+    now = time.time()
+    disabled = set()
+    if data.get("gotr_no_cell_objects"):
+        disabled |= {"repair_barrier", "place_cell"}
+    if now < data.get("gotr_cell_block_until", 0):
+        disabled.add("place_cell")
+    if now < data.get("gotr_altar_block_until", 0):
+        disabled.add("altar_trip")
+    if now < data.get("gotr_portal_block_until", 0):
+        disabled.add("portal_trip")
+    action = choose_action(st, cfg, pouch_space=pouch_free_space(read_pouches()),
+                           disabled=disabled)
+    ACTION_HANDLERS[action](ctx, st)
+
+
+ACTION_HANDLERS = {
+    "repair_barrier": repair_barrier_phase,
+    "portal_trip": portal_trip_phase,
+    "spend_stones": spend_stones_phase,
+    "place_cell": place_cell_phase,
+    "altar_trip": altar_trip_phase,
+    "craft": craft_phase,
+    "mine": mine_phase,
+}

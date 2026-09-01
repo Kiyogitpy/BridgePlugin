@@ -258,3 +258,77 @@ def test_action_disabled_rungs_are_skipped():
                               disabled={"repair_barrier", "place_cell"}) == "mine"
     st = make_state(inventory=make_inv(guardianEssence=25))
     assert gotr.choose_action(st, CFG, disabled={"altar_trip"}) == "mine"
+
+
+# --- _reset_counters -------------------------------------------------------
+
+def test_reset_counters_enter_and_contact():
+    data = {"gotr_enter_clicks": 3, "gotr_contact_casts": 2, "gotr_contact_stuck": 1}
+    gotr._reset_counters(data, make_state(), "active")
+    assert data["gotr_enter_clicks"] == 0
+    assert data["gotr_contact_casts"] == 0
+    assert data["gotr_contact_stuck"] == 0
+
+
+def test_reset_counters_mine_delta():
+    data = {"gotr_mine_stall": 7, "gotr_last_frags": 5, "gotr_last_mined": 5,
+            "gotr_last_essence": 0}
+    st = make_state(minedFragmentsThisGame=6,
+                    inventory=make_inv(guardianFragments=6))
+    gotr._reset_counters(data, st, "active")
+    assert data["gotr_mine_stall"] == 0
+    assert data["gotr_mine_delta_at"] > 0
+
+
+def test_reset_counters_craft_delta_on_fragments_down():
+    data = {"gotr_craft_stall": 5, "gotr_last_frags": 20, "gotr_last_mined": 20,
+            "gotr_last_essence": 0}
+    st = make_state(minedFragmentsThisGame=20,
+                    inventory=make_inv(guardianFragments=10, guardianEssence=10))
+    gotr._reset_counters(data, st, "active")
+    assert data["gotr_craft_stall"] == 0
+
+
+def test_reset_counters_stones_and_cell():
+    data = {"gotr_powerup_clicks": 3, "gotr_imbue_clicks": 4, "gotr_last_stones": 5,
+            "gotr_last_cell": "STRONG", "gotr_cell_clicks": 2}
+    st = make_state(inventory=make_inv())   # stones now 0, cell now NONE
+    gotr._reset_counters(data, st, "active")
+    assert data["gotr_powerup_clicks"] == 0
+    assert data["gotr_cell_clicks"] == 0
+
+
+def test_reset_counters_imbue_on_stone_gain():
+    data = {"gotr_imbue_clicks": 4, "gotr_last_stones": 0}
+    st = make_state(inventory=make_inv(elementalGuardianStones=5))
+    gotr._reset_counters(data, st, "active")
+    assert data["gotr_imbue_clicks"] == 0
+
+
+def test_reset_counters_altar_change():
+    data = {"gotr_altar_enters": 3, "gotr_exit_clicks": 2, "gotr_imbue_clicks": 1,
+            "gotr_last_altar": "UNKNOWN"}
+    gotr._reset_counters(data, make_state(currentAltar="AIR"), "active")
+    assert data["gotr_altar_enters"] == 0
+    assert data["gotr_exit_clicks"] == 0
+
+
+def test_reset_counters_repair_when_no_broken_tile():
+    data = {"gotr_repair_clicks": 4}
+    gotr._reset_counters(data, make_state(barriers=[barrier("WEAK")]), "active")
+    assert data["gotr_repair_clicks"] == 0
+
+
+def test_reset_counters_portal():
+    data = {"gotr_portal_enters": 3, "gotr_portal_ticks": 10}
+    gotr._reset_counters(data, make_state(miningArea="WEST_HUGE_REMAINS"), "active")
+    assert data["gotr_portal_enters"] == 0
+    data = {"gotr_portal_ticks": 10}
+    gotr._reset_counters(data, make_state(miningArea="NONE"), "active")
+    assert data["gotr_portal_ticks"] == 0
+
+
+def test_action_handlers_cover_every_ladder_result():
+    for name in ("repair_barrier", "portal_trip", "spend_stones", "place_cell",
+                 "altar_trip", "craft", "mine"):
+        assert name in gotr.ACTION_HANDLERS
