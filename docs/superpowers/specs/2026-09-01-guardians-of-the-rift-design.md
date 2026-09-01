@@ -211,8 +211,10 @@ un-gated signal and has a counted ceiling (table at the end).
    node depletes (object transform) or the player idles with no delta for
    `MINE_RECLICK_S`.
 
-Inventory pressure: if `emptySlots == 0` blocks a needed pickup, drop portal
-talismans first (the one junk item class), then proceed.
+Inventory pressure: portal talismans are the one junk item class; v1 deliberately does
+NOT drop them (rare at 1/250 per essence, self-clearing at round end) — the ladder's
+gates simply require free slots or pouch space where a pickup needs one. Revisit only
+if a live session shows talismans actually starving a phase.
 
 ## Clicking policy (applies to every world click in this routine)
 

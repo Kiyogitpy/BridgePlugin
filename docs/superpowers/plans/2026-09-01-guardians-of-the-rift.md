@@ -1,0 +1,1865 @@
+# Guardians of the Rift Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build `ControllerAddon/routines/guardians_of_the_rift.py` — an unattended
+Guardians of the Rift player (mine → craft → imbue → power the Great Guardian → cells,
+with between-round pouch repair) driven by the vendored m8aq reader.
+
+**Architecture:** A poll-driven state machine. Pure functions derive the round phase and
+pick one prioritized action per tick from a fresh `/api/minigames/guardians-of-the-rift`
+snapshot; thin runtime handlers execute that action with the project's standard click
+stack (can_reach gate, refresh_target, hover verification, menu escalation, counted
+ceilings). Nothing load-bearing in `ctx.state.data`.
+
+**Tech Stack:** Python (ControllerAddon), one 2-line Java change + enum entry, pytest.
+
+**Spec:** `docs/superpowers/specs/2026-09-01-guardians-of-the-rift-design.md` — read it
+before starting any task.
+
+## Global Constraints
+
+- **Copy the code blocks in this plan verbatim.** They were written against the real
+  helper signatures in this repo. Do not "improve", rename, or reorder them.
+- Never edit anything under `src/main/java/net/runelite/client/plugins/m8aq/api/`.
+- Tests are hermetic: never call the live bridge. Pure-function tests only.
+- Before every commit that touches Python: `python -m py_compile <each touched file>`
+  from `ControllerAddon/`, then the task's pytest command. py_compile is NOT optional —
+  some modules are imported by no test.
+- All Python commands run from `c:\Users\Kiyo\Documents\Httpbridge\ControllerAddon`.
+  Git commands run from the repo root `c:\Users\Kiyo\Documents\Httpbridge`.
+- Commit messages start with `gotr: `.
+- This routine has NOT been run live and the spec says so; do not soften or remove the
+  LIVE-VERIFY comments — they are the first live session's worklist.
+
+---
+
+### Task 1: Java wiring (XP fields + routine choice) and controller.py routine map
+
+**Files:**
+- Modify: `src/main/java/com/example/providers/PlayerProvider.java` (~line 239)
+- Modify: `src/main/java/com/example/controller/RoutineChoice.java` (~line 29)
+- Modify: `ControllerAddon/controller.py` (~line 2984, the `ROUTINE_FILES` dict)
+
+**Interfaces:**
+- Produces: `GET /player` fields `runecraftXp`, `miningXp` (ints); `RoutineChoice.GUARDIANS_OF_THE_RIFT`; `ROUTINE_FILES["GUARDIANS_OF_THE_RIFT"]`.
+
+- [ ] **Step 1: Add the XP fields to PlayerProvider**
+
+In `src/main/java/com/example/providers/PlayerProvider.java`, find these existing lines
+(~line 235):
+
+```java
+		data.put("hitpointsXp", client.getSkillExperience(Skill.HITPOINTS));
+		data.put("thievingXp", client.getSkillExperience(Skill.THIEVING));
+		data.put("craftingXp", client.getSkillExperience(Skill.CRAFTING));
+		data.put("constructionXp", client.getSkillExperience(Skill.CONSTRUCTION));
+		data.put("smithingXp", client.getSkillExperience(Skill.SMITHING));
+```
+
+Add directly after the `smithingXp` line (same indentation, tabs):
+
+```java
+		data.put("runecraftXp", client.getSkillExperience(Skill.RUNECRAFT));
+		data.put("miningXp", client.getSkillExperience(Skill.MINING));
+```
+
+- [ ] **Step 2: Add the RoutineChoice enum entry**
+
+In `src/main/java/com/example/controller/RoutineChoice.java`, change the last enum entry
+
+```java
+	GIANTS_FOUNDRY("Giants' Foundry");
+```
+
+to
+
+```java
+	GIANTS_FOUNDRY("Giants' Foundry"),
+	GUARDIANS_OF_THE_RIFT("Guardians of the Rift");
+```
+
+- [ ] **Step 3: Add the ROUTINE_FILES key**
+
+In `ControllerAddon/controller.py`, find the `ROUTINE_FILES` dict (~line 2966) and add
+before its closing brace, after the `"GIANTS_FOUNDRY"` line:
+
+```python
+    "GUARDIANS_OF_THE_RIFT": "routines/guardians_of_the_rift.py",
+```
+
+- [ ] **Step 4: Verify the Java compiles**
+
+From the repo root run (this can take a few minutes; use a 600000ms timeout):
+`./gradlew.bat compileJava -q`
+Expected: BUILD SUCCESSFUL (exit code 0).
+
+- [ ] **Step 5: Verify the Python compiles**
+
+From `ControllerAddon/`: `python -m py_compile controller.py`
+Expected: no output, exit 0.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/main/java/com/example/providers/PlayerProvider.java src/main/java/com/example/controller/RoutineChoice.java ControllerAddon/controller.py
+git commit -m "gotr: runecraft/mining xp on /player + routine wiring"
+```
+
+---
+
+### Task 2: Routine module — config, phase derivation, barrier logic (pure) + tests
+
+**Files:**
+- Create: `ControllerAddon/routines/guardians_of_the_rift.py`
+- Create: `ControllerAddon/tests/test_guardians_of_the_rift.py`
+
+**Interfaces:**
+- Produces (used by every later task): `DEFAULT_CONFIG`, `get_config(bridge_config)`,
+  `round_state(st) -> str`, `total_stones(inv) -> int`,
+  `find_repairable(barriers) -> dict | None`, `choose_cell_tile(barriers) -> dict | None`,
+  constants `ALTAR_LEVELS`, `BARRIER_LIVE_ORDER`, `REPAIR_FRAGMENTS`,
+  `PORTAL_MIN_SECONDS`, `ALTAR_MIN_SECONDS`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `ControllerAddon/tests/test_guardians_of_the_rift.py` with exactly:
+
+```python
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "routines"))
+
+import guardians_of_the_rift as gotr
+
+
+def make_inv(**over):
+    inv = {"guardianFragments": 0, "guardianEssence": 0, "unchargedCells": 10,
+           "chargedCellTier": "NONE", "catalyticGuardianStones": 0,
+           "elementalGuardianStones": 0, "polyelementalGuardianStones": 0,
+           "polycatalyticGuardianStones": 0, "chiselPresent": False, "emptySlots": 10}
+    inv.update(over)
+    return inv
+
+
+def make_state(**over):
+    st = {"hudVisible": True, "participating": True, "finishedGame": False,
+          "banned": False, "guardianPower": 50, "altarRotationSecondsRemaining": 60,
+          "elementalEnergy": 0, "catalyticEnergy": 0,
+          "elementalAltar": "AIR", "catalyticAltar": "CHAOS",
+          "guardianEssencePortalOpen": False,
+          "guardianEssencePortalSecondsRemaining": -1,
+          "inMainTemple": True, "inArena": True, "currentAltar": "UNKNOWN",
+          "miningArea": "NONE", "minedFragmentsThisGame": 0,
+          "inventory": make_inv(), "barriers": []}
+    st.update(over)
+    return st
+
+
+def barrier(state, x=3615, y=9500):
+    return {"location": {"x": x, "y": y, "plane": 0}, "state": state}
+
+
+# --- round_state -----------------------------------------------------------
+
+def test_round_state_unavailable():
+    assert gotr.round_state(None) == "unavailable"
+    assert gotr.round_state({"error": "boom"}) == "unavailable"
+
+
+def test_round_state_outside():
+    assert gotr.round_state(make_state(inMainTemple=False)) == "outside"
+
+
+def test_round_state_lobby():
+    assert gotr.round_state(make_state(inArena=False)) == "lobby"
+
+
+def test_round_state_waiting():
+    assert gotr.round_state(make_state(guardianPower=0)) == "waiting"
+
+
+def test_round_state_active():
+    assert gotr.round_state(make_state(guardianPower=50)) == "active"
+    assert gotr.round_state(make_state(guardianPower=1)) == "active"
+    assert gotr.round_state(make_state(guardianPower=99)) == "active"
+
+
+def test_round_state_complete():
+    assert gotr.round_state(make_state(finishedGame=True)) == "complete"
+    assert gotr.round_state(make_state(guardianPower=100)) == "complete"
+
+
+def test_round_state_idle_when_not_participating():
+    assert gotr.round_state(make_state(participating=False, guardianPower=0)) == "idle"
+
+
+def test_round_state_idle_on_unreadable_power():
+    assert gotr.round_state(make_state(guardianPower=-1)) == "idle"
+
+
+# --- stones / barriers -----------------------------------------------------
+
+def test_total_stones_sums_all_four():
+    inv = make_inv(catalyticGuardianStones=2, elementalGuardianStones=3,
+                   polyelementalGuardianStones=1, polycatalyticGuardianStones=4)
+    assert gotr.total_stones(inv) == 10
+    assert gotr.total_stones(make_inv()) == 0
+
+
+def test_find_repairable():
+    assert gotr.find_repairable([]) is None
+    assert gotr.find_repairable([barrier("BROKEN"), barrier("WEAK")]) is None
+    hit = gotr.find_repairable([barrier("BROKEN"), barrier("BROKEN_REPAIRABLE")])
+    assert hit is not None and hit["state"] == "BROKEN_REPAIRABLE"
+
+
+def test_choose_cell_tile_prefers_inactive():
+    tiles = [barrier("WEAK"), barrier("INACTIVE"), barrier("OVERCHARGED")]
+    assert gotr.choose_cell_tile(tiles)["state"] == "INACTIVE"
+
+
+def test_choose_cell_tile_recharges_lowest_live_tier():
+    tiles = [barrier("STRONG"), barrier("MEDIUM"), barrier("OVERCHARGED")]
+    assert gotr.choose_cell_tile(tiles)["state"] == "MEDIUM"
+
+
+def test_choose_cell_tile_ignores_broken_and_noop():
+    tiles = [barrier("BROKEN"), barrier("BROKEN_REPAIRABLE"), barrier("INACTIVE_NO_OP")]
+    assert gotr.choose_cell_tile(tiles) is None
+    assert gotr.choose_cell_tile([]) is None
+    assert gotr.choose_cell_tile(None) is None
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `python -m pytest tests/test_guardians_of_the_rift.py -v`
+Expected: FAIL at import ("No module named 'guardians_of_the_rift'").
+
+- [ ] **Step 3: Create the routine module**
+
+Create `ControllerAddon/routines/guardians_of_the_rift.py` with exactly:
+
+```python
+# routines/guardians_of_the_rift.py
+#
+# Guardians of the Rift, unattended, on mass/official worlds: mine guardian fragments,
+# craft guardian essence at the Workbench (filling essence pouches, depositing crafted
+# runes in the Deposit Pool), imbue at whichever altar pair is active (choosing the
+# energy type we have LESS of), power the Great Guardian with the stones, and spend the
+# charged cell on the barrier hub. Between rounds: repair degraded essence pouches via
+# NPC Contact (Lunar spellbook) and restock uncharged cells. Reward points are hoarded
+# -- the Rewards Guardian is never touched.
+#
+# Design: docs/superpowers/specs/2026-09-01-guardians-of-the-rift-design.md
+# NO RECORDING EXISTS for this activity (user decision, 2026-09-01): every constant in
+# the LIVE-VERIFY block below is a research-derived first draft. The spec's
+# "Live-verification checklist" section is the first live session's worklist.
+#
+# Run with:
+#     python controller.py routines/guardians_of_the_rift.py
+#
+# Ground truth at runtime is GET /api/minigames/guardians-of-the-rift (the vendored m8aq
+# reader). Gson serializes FIELDS, so the reader's Java convenience methods
+# (isRoundActive() etc.) are absent from the JSON -- round_state() below re-derives them
+# from the raw fields. Nothing load-bearing lives in ctx.state.data: every tick
+# re-derives from the live snapshot, so restarts resume correctly.
+
+import time
+
+import controller
+import debug_log
+import travel
+
+DEFAULT_CONFIG = {
+    "use_large_remains": False,   # 56 Agility rubble shortcut to the east pocket
+    "repair_pouches": True,       # NPC Contact -> Dark Mage between rounds when degraded
+    "min_uncharged_cells": 5,     # restock from the cell table between rounds below this
+    "craft_at_fragments": 60,     # start a workbench pass at/above this many fragments
+    "altar_at_essence": 20,       # head for an altar when loose essence >= this
+    "blocked_altars": [],         # altar enum names this account cannot enter
+                                  # (quest-gated: COSMIC, LAW, DEATH, BLOOD)
+
+    "breaks": {
+        "enabled": True,
+        "everyMinMinutes": 45,
+        "everyMaxMinutes": 75,
+        "durationMinMinutes": 3,
+        "durationMaxMinutes": 12,
+        "microBreaks": True,
+    },
+    "safety": {
+        "stopOnDeath": True,
+        "stopOnInventoryFull": False,
+        "maxRuntimeHours": 0,
+    },
+}
+
+
+def get_config(bridge_config):
+    # No Controller Settings panel section (gemstone_crab pattern) -- config lives here.
+    return DEFAULT_CONFIG
+
+
+# ---------------------------------------------------------------------------
+# Pure logic: game tables and thresholds
+# ---------------------------------------------------------------------------
+
+# Runecraft level to imbue at each altar (wiki "Charging cells" table, rev 15303509).
+ALTAR_LEVELS = {"AIR": 1, "MIND": 2, "WATER": 5, "EARTH": 9, "FIRE": 14, "BODY": 20,
+                "COSMIC": 27, "CHAOS": 35, "NATURE": 44, "LAW": 54, "DEATH": 65,
+                "BLOOD": 77}
+
+# Live barrier tiers, weakest first -- recharge targets the lowest.
+BARRIER_LIVE_ORDER = ["WEAK", "MEDIUM", "STRONG", "OVERCHARGED"]
+
+REPAIR_FRAGMENTS = 12      # fragments consumed repairing a broken cell tile (wiki)
+PORTAL_MIN_SECONDS = 8     # don't chase a huge-remains portal closing sooner than this
+ALTAR_MIN_SECONDS = 10     # don't ENTER an altar rotating away sooner than this
+
+
+# ---------------------------------------------------------------------------
+# Pure logic: phase derivation and selection
+# ---------------------------------------------------------------------------
+
+def round_state(st):
+    """One of: unavailable / outside / lobby / waiting / active / complete / idle.
+    Derived from raw reader fields (the Java isRoundActive() helpers do not serialize)."""
+    if st is None or st.get("error"):
+        return "unavailable"
+    if not st.get("inMainTemple"):
+        return "outside"
+    if not st.get("inArena"):
+        return "lobby"
+    power = st.get("guardianPower", -1)
+    if st.get("finishedGame") or power >= 100:
+        return "complete"
+    if st.get("participating"):
+        if power == 0:
+            return "waiting"
+        if 0 < power < 100:
+            return "active"
+    return "idle"
+
+
+def total_stones(inv):
+    return (inv.get("catalyticGuardianStones", 0)
+            + inv.get("elementalGuardianStones", 0)
+            + inv.get("polyelementalGuardianStones", 0)
+            + inv.get("polycatalyticGuardianStones", 0))
+
+
+def find_repairable(barriers):
+    """The first cell tile offering Repair, or None."""
+    for b in barriers or []:
+        if b.get("state") == "BROKEN_REPAIRABLE":
+            return b
+    return None
+
+
+def choose_cell_tile(barriers):
+    """Where the charged cell goes: first INACTIVE tile (place, 2 energy both types),
+    else the lowest-tier live barrier (recharge). None when nothing usable is loaded."""
+    barriers = barriers or []
+    for b in barriers:
+        if b.get("state") == "INACTIVE":
+            return b
+    live = [b for b in barriers if b.get("state") in BARRIER_LIVE_ORDER]
+    if not live:
+        return None
+    return min(live, key=lambda b: BARRIER_LIVE_ORDER.index(b["state"]))
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `python -m pytest tests/test_guardians_of_the_rift.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: py_compile and commit**
+
+Run: `python -m py_compile routines/guardians_of_the_rift.py tests/test_guardians_of_the_rift.py`
+
+```bash
+git add ControllerAddon/routines/guardians_of_the_rift.py ControllerAddon/tests/test_guardians_of_the_rift.py
+git commit -m "gotr: routine module skeleton -- config, round_state, barrier logic"
+```
+
+---
+
+### Task 3: Altar choice and essence-pouch reading (pure) + tests
+
+**Files:**
+- Modify: `ControllerAddon/routines/guardians_of_the_rift.py` (append after `choose_cell_tile`)
+- Modify: `ControllerAddon/tests/test_guardians_of_the_rift.py` (append)
+
+**Interfaces:**
+- Consumes: `ALTAR_LEVELS` (Task 2).
+- Produces: `choose_altar(st, rc_level, blocked=()) -> str | None`,
+  `pouches_degraded(api) -> bool`, `pouch_free_space(api) -> int | None`,
+  `pouch_stored(api) -> int`.
+
+- [ ] **Step 1: Append the failing tests**
+
+Append to `ControllerAddon/tests/test_guardians_of_the_rift.py`:
+
+```python
+# --- choose_altar ----------------------------------------------------------
+
+def test_choose_altar_prefers_lower_energy_type():
+    st = make_state(elementalEnergy=100, catalyticEnergy=20)
+    assert gotr.choose_altar(st, 99) == "CHAOS"
+    st = make_state(elementalEnergy=20, catalyticEnergy=100)
+    assert gotr.choose_altar(st, 99) == "AIR"
+
+
+def test_choose_altar_ties_go_elemental():
+    st = make_state(elementalEnergy=50, catalyticEnergy=50)
+    assert gotr.choose_altar(st, 99) == "AIR"
+
+
+def test_choose_altar_falls_back_when_level_gated():
+    st = make_state(elementalAltar="AIR", catalyticAltar="BLOOD",
+                    elementalEnergy=100, catalyticEnergy=0)
+    # BLOOD needs 77; a level-60 account falls back to the elemental altar
+    assert gotr.choose_altar(st, 60) == "AIR"
+
+
+def test_choose_altar_falls_back_when_blocked():
+    st = make_state(elementalAltar="AIR", catalyticAltar="COSMIC",
+                    elementalEnergy=100, catalyticEnergy=0)
+    assert gotr.choose_altar(st, 60, blocked=("COSMIC",)) == "AIR"
+
+
+def test_choose_altar_none_when_nothing_usable():
+    st = make_state(elementalAltar="UNKNOWN", catalyticAltar="BLOOD")
+    assert gotr.choose_altar(st, 60) is None
+
+
+def test_choose_altar_unknown_rc_level_does_not_gate():
+    st = make_state(elementalAltar="FIRE", catalyticAltar="BLOOD",
+                    elementalEnergy=100, catalyticEnergy=0)
+    assert gotr.choose_altar(st, None) == "BLOOD"
+
+
+# --- pouch readers ---------------------------------------------------------
+
+def pouch_api(**pouches):
+    return {"pouches": pouches}
+
+
+def pstate(stored, capacity, in_inv=True, repair=False):
+    return {"storedEssence": stored, "capacity": capacity, "maximumCapacity": capacity,
+            "repairNeeded": repair, "inInventory": in_inv}
+
+
+def test_pouches_degraded():
+    assert gotr.pouches_degraded(None) is False
+    assert gotr.pouches_degraded({}) is False
+    api = pouch_api(SMALL=pstate(0, 3), GIANT=pstate(0, 9, repair=True))
+    assert gotr.pouches_degraded(api) is True
+    api = pouch_api(GIANT=pstate(0, 9, in_inv=False, repair=True))
+    assert gotr.pouches_degraded(api) is False
+
+
+def test_pouch_free_space():
+    assert gotr.pouch_free_space(None) is None
+    assert gotr.pouch_free_space({}) is None
+    api = pouch_api(SMALL=pstate(1, 3), LARGE=pstate(0, 7),
+                    COLOSSAL=pstate(0, 40, in_inv=False))
+    assert gotr.pouch_free_space(api) == 9
+    assert gotr.pouch_free_space(pouch_api(SMALL=pstate(0, 3, in_inv=False))) == 0
+
+
+def test_pouch_stored():
+    assert gotr.pouch_stored(None) == 0
+    api = pouch_api(SMALL=pstate(3, 3), LARGE=pstate(5, 7),
+                    GIANT=pstate(9, 9, in_inv=False))
+    assert gotr.pouch_stored(api) == 8
+```
+
+- [ ] **Step 2: Run tests to verify the new ones fail**
+
+Run: `python -m pytest tests/test_guardians_of_the_rift.py -v`
+Expected: new tests FAIL with AttributeError (`choose_altar` missing); Task 2 tests still pass.
+
+- [ ] **Step 3: Append the implementation**
+
+Append to `ControllerAddon/routines/guardians_of_the_rift.py`:
+
+```python
+def choose_altar(st, rc_level, blocked=()):
+    """Which ACTIVE altar to visit: the type whose earned energy is LOWER (one point per
+    100 energy per type -- balance is what makes points), falling back to the other when
+    level- or quest-gated. rc_level None means "cannot read the level" and gates nothing.
+    None = neither active altar is usable right now."""
+    def usable(name):
+        if not name or name == "UNKNOWN" or name in blocked:
+            return False
+        level = ALTAR_LEVELS.get(name)
+        if level is None:
+            return False
+        return rc_level is None or rc_level >= level
+
+    elemental = st.get("elementalAltar") or "UNKNOWN"
+    catalytic = st.get("catalyticAltar") or "UNKNOWN"
+    prefer_elemental = st.get("elementalEnergy", 0) <= st.get("catalyticEnergy", 0)
+    order = (elemental, catalytic) if prefer_elemental else (catalytic, elemental)
+    for name in order:
+        if usable(name):
+            return name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pure logic: essence pouches (/api/storage/essence-pouches shape:
+# {"pouches": {"SMALL": {"storedEssence": n, "capacity": n, "repairNeeded": bool,
+#  "inInventory": bool, ...}, ...}, ...})
+# ---------------------------------------------------------------------------
+
+def _held_pouches(api):
+    pouches = (api or {}).get("pouches")
+    if not isinstance(pouches, dict):
+        return None
+    return [p for p in pouches.values() if isinstance(p, dict) and p.get("inInventory")]
+
+
+def pouches_degraded(api):
+    """True when any pouch in the inventory reports repairable degradation."""
+    held = _held_pouches(api)
+    return bool(held) and any(p.get("repairNeeded") for p in held)
+
+
+def pouch_free_space(api):
+    """Free essence capacity across held pouches; None = reader unavailable
+    ("cannot tell" -- callers must not treat it as 0)."""
+    held = _held_pouches(api)
+    if held is None:
+        return None
+    return sum(max(0, p.get("capacity", 0) - p.get("storedEssence", 0)) for p in held)
+
+
+def pouch_stored(api):
+    """Essence sitting inside held pouches (0 when the reader is unavailable)."""
+    held = _held_pouches(api)
+    return sum(p.get("storedEssence", 0) for p in held) if held else 0
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `python -m pytest tests/test_guardians_of_the_rift.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: py_compile and commit**
+
+Run: `python -m py_compile routines/guardians_of_the_rift.py`
+
+```bash
+git add ControllerAddon/routines/guardians_of_the_rift.py ControllerAddon/tests/test_guardians_of_the_rift.py
+git commit -m "gotr: altar choice + essence-pouch readers"
+```
+
+---
+
+### Task 4: The in-round priority ladder `choose_action` (pure) + tests
+
+**Files:**
+- Modify: `ControllerAddon/routines/guardians_of_the_rift.py` (append)
+- Modify: `ControllerAddon/tests/test_guardians_of_the_rift.py` (append)
+
+**Interfaces:**
+- Consumes: `find_repairable`, `total_stones`, `REPAIR_FRAGMENTS`, `PORTAL_MIN_SECONDS` (Task 2).
+- Produces: `choose_action(st, cfg, pouch_space=None, disabled=()) -> str` returning one
+  of `"repair_barrier" | "portal_trip" | "spend_stones" | "place_cell" | "altar_trip" |
+  "craft" | "mine"`.
+
+- [ ] **Step 1: Append the failing tests**
+
+Append to `ControllerAddon/tests/test_guardians_of_the_rift.py`:
+
+```python
+# --- choose_action ---------------------------------------------------------
+
+CFG = dict(gotr.DEFAULT_CONFIG)
+
+
+def test_action_inside_altar_always_altar_trip():
+    st = make_state(currentAltar="AIR",
+                    inventory=make_inv(elementalGuardianStones=5))
+    assert gotr.choose_action(st, CFG) == "altar_trip"
+
+
+def test_action_inside_huge_pocket_continues_portal_trip():
+    st = make_state(miningArea="WEST_HUGE_REMAINS")
+    assert gotr.choose_action(st, CFG) == "portal_trip"
+
+
+def test_action_repair_beats_everything_outside():
+    st = make_state(barriers=[barrier("BROKEN_REPAIRABLE")],
+                    guardianEssencePortalOpen=True,
+                    guardianEssencePortalSecondsRemaining=20,
+                    inventory=make_inv(guardianFragments=12,
+                                       elementalGuardianStones=3))
+    assert gotr.choose_action(st, CFG) == "repair_barrier"
+
+
+def test_action_repair_needs_12_fragments():
+    st = make_state(barriers=[barrier("BROKEN_REPAIRABLE")],
+                    inventory=make_inv(guardianFragments=11))
+    assert gotr.choose_action(st, CFG) == "mine"
+
+
+def test_action_portal_when_open_with_room():
+    st = make_state(guardianEssencePortalOpen=True,
+                    guardianEssencePortalSecondsRemaining=20)
+    assert gotr.choose_action(st, CFG) == "portal_trip"
+
+
+def test_action_portal_skipped_when_closing_or_full():
+    st = make_state(guardianEssencePortalOpen=True,
+                    guardianEssencePortalSecondsRemaining=3)
+    assert gotr.choose_action(st, CFG) == "mine"
+    st = make_state(guardianEssencePortalOpen=True,
+                    guardianEssencePortalSecondsRemaining=20,
+                    inventory=make_inv(emptySlots=0))
+    assert gotr.choose_action(st, CFG, pouch_space=0) == "mine"
+
+
+def test_action_stones_then_cell():
+    st = make_state(inventory=make_inv(catalyticGuardianStones=2,
+                                       chargedCellTier="STRONG"))
+    assert gotr.choose_action(st, CFG) == "spend_stones"
+    st = make_state(barriers=[barrier("INACTIVE")],
+                    inventory=make_inv(chargedCellTier="STRONG"))
+    assert gotr.choose_action(st, CFG) == "place_cell"
+
+
+def test_action_altar_at_threshold_or_full_pouches():
+    st = make_state(inventory=make_inv(guardianEssence=20))
+    assert gotr.choose_action(st, CFG) == "altar_trip"
+    st = make_state(inventory=make_inv(guardianEssence=3))
+    assert gotr.choose_action(st, CFG, pouch_space=0) == "altar_trip"
+    assert gotr.choose_action(st, CFG, pouch_space=5) == "mine"
+    assert gotr.choose_action(st, CFG, pouch_space=None) == "mine"
+
+
+def test_action_craft_at_fragment_threshold():
+    st = make_state(inventory=make_inv(guardianFragments=60))
+    assert gotr.choose_action(st, CFG) == "craft"
+    st = make_state(inventory=make_inv(guardianFragments=59))
+    assert gotr.choose_action(st, CFG) == "mine"
+
+
+def test_action_disabled_rungs_are_skipped():
+    st = make_state(barriers=[barrier("BROKEN_REPAIRABLE"), barrier("INACTIVE")],
+                    inventory=make_inv(guardianFragments=12, chargedCellTier="WEAK"))
+    assert gotr.choose_action(st, CFG,
+                              disabled={"repair_barrier", "place_cell"}) == "mine"
+    st = make_state(inventory=make_inv(guardianEssence=25))
+    assert gotr.choose_action(st, CFG, disabled={"altar_trip"}) == "mine"
+```
+
+- [ ] **Step 2: Run tests to verify the new ones fail**
+
+Run: `python -m pytest tests/test_guardians_of_the_rift.py -v`
+Expected: new tests FAIL with AttributeError (`choose_action` missing).
+
+- [ ] **Step 3: Append the implementation**
+
+Append to `ControllerAddon/routines/guardians_of_the_rift.py`:
+
+```python
+def choose_action(st, cfg, pouch_space=None, disabled=()):
+    """The one in-round action for this tick, priority-ordered (spec: 'in_round priority
+    ladder'). Pure; the runtime passes `disabled` for rungs it has learned cannot work
+    right now (missing cell-tile objects, blocked altars, a spent portal budget)."""
+    inv = st.get("inventory") or {}
+    barriers = st.get("barriers") or []
+
+    # Being inside a side area overrides the ladder -- finish what we are inside of.
+    if (st.get("currentAltar") or "UNKNOWN") != "UNKNOWN" and "altar_trip" not in disabled:
+        return "altar_trip"
+    if st.get("miningArea") == "WEST_HUGE_REMAINS" and "portal_trip" not in disabled:
+        return "portal_trip"
+
+    if ("repair_barrier" not in disabled and find_repairable(barriers) is not None
+            and inv.get("guardianFragments", 0) >= REPAIR_FRAGMENTS):
+        return "repair_barrier"
+    if ("portal_trip" not in disabled and st.get("guardianEssencePortalOpen")
+            and st.get("guardianEssencePortalSecondsRemaining", -1) >= PORTAL_MIN_SECONDS
+            and (inv.get("emptySlots", 0) > 0 or (pouch_space or 0) > 0)):
+        return "portal_trip"
+    if total_stones(inv) > 0:
+        return "spend_stones"
+    if "place_cell" not in disabled and (inv.get("chargedCellTier") or "NONE") != "NONE":
+        return "place_cell"
+    essence = inv.get("guardianEssence", 0)
+    if "altar_trip" not in disabled and (
+            essence >= cfg["altar_at_essence"]
+            or (pouch_space == 0 and essence > 0)):
+        return "altar_trip"
+    if inv.get("guardianFragments", 0) >= cfg["craft_at_fragments"]:
+        return "craft"
+    return "mine"
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `python -m pytest tests/test_guardians_of_the_rift.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: py_compile and commit**
+
+Run: `python -m py_compile routines/guardians_of_the_rift.py`
+
+```bash
+git add ControllerAddon/routines/guardians_of_the_rift.py ControllerAddon/tests/test_guardians_of_the_rift.py
+git commit -m "gotr: in-round priority ladder"
+```
+
+---
+
+### Task 5: Runtime constants and helper layer
+
+**Files:**
+- Modify: `ControllerAddon/routines/guardians_of_the_rift.py` (append)
+
+**Interfaces:**
+- Consumes: `controller.get_api / get_objects / get_object_at / get_npcs /
+  get_npc_by_index / get_inventory / get_player / get_widget / click_entity /
+  click_menu_action / key_tap / human_delay / mark_busy / object_refresh_target /
+  npc_index_refresh_target`; `travel.can_reach / walk_to`.
+- Produces (used by Tasks 6-8): `read_state()`, `read_pouches()`, `_rc_level()`,
+  `_find_object_by_name(names, action=None, radius=40, exact=False)`,
+  `_object_at_tile(x, y, option=None, radius=40)`, `_find_npc_by_name(sub)`,
+  `_click_escalating(ctx, entity, options)`,
+  `_approach_or_click(ctx, entity, options, counter_key, max_clicks, stop_reason)`,
+  `_dialogue()`, `_dialogue_open(d)`, `_choose_option(ctx, d, substrings)`,
+  `_runes_in_inventory()`, `_pouch_items()`, `_fill_pouches(ctx)`,
+  `_empty_pouches(ctx)`, `_await_xp(field, before, timeout_s)`,
+  `_find_dark_mage_widget()`, and every `*_MAX_* / *_LIMIT / *_S` runtime constant
+  named in Tasks 6-8.
+
+- [ ] **Step 1: Append the runtime constants and helpers**
+
+Append to `ControllerAddon/routines/guardians_of_the_rift.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# Runtime constants
+# ---------------------------------------------------------------------------
+
+# LIVE-VERIFY block: every name/action below is a research-derived first draft (no
+# recording exists). The spec's Live-verification checklist tracks these. Names are
+# lowercase because _find_object_by_name lowercases; actions keep in-game casing.
+GREAT_GUARDIAN_NAME = "great guardian"          # NPC, substring match
+POWER_UP_ACTION = "Power-up"
+WORKBENCH_NAME = "workbench"                    # exact
+WORKBENCH_ACTION = "Work-at"
+DEPOSIT_POOL_NAME = "deposit pool"              # exact
+DEPOSIT_ACTION = "Deposit-runes"
+UNCHARGED_CELLS_NAME = "uncharged cells"        # exact -- table near the entry barrier
+TAKE_ACTION = "Take"
+ENTRY_BARRIER_NAME = "barrier"                  # exact
+ENTRY_BARRIER_ACTIONS = ("Pass", "Quick-pass")
+PORTAL_NAME = "portal"                          # exact -- huge-remains portal AND altar exit
+ALTAR_NAME = "altar"                            # exact -- inside the altar room
+ALTAR_IMBUE_ACTION = "Craft-rune"
+EXIT_PORTAL_ACTIONS = ("Use", "Enter", "Exit")
+GUARDIAN_REMAINS_NAMES = ("guardian remains", "guardian parts")   # exact, both
+LARGE_REMAINS_NAME = "large guardian remains"   # exact -- behind the 56 Agility rubble
+HUGE_REMAINS_NAME = "huge guardian remains"     # exact -- inside the portal pocket
+RUBBLE_NAME = "rubble"                          # exact
+RUBBLE_ACTION = "Climb"
+MINE_ACTION = "Mine"
+CELL_TILE_PLACE_OPTIONS = ("Place-cell", "Recharge", "Strengthen")
+CELL_TILE_REPAIR_OPTIONS = ("Repair",)
+PORTAL_GUARDIAN_PREFIX = "guardian of "         # "Guardian of Air" etc., + "Enter"
+PORTAL_GUARDIAN_ACTION = "Enter"
+
+# NPC Contact: spell widget proven live by mahogany_homes; the Dark Mage row in the
+# contact interface (group 75) is LIVE-VERIFY -- _find_dark_mage_widget scans children.
+MAGIC_TAB_KEY = "F6"
+NPC_CONTACT_GROUP = 218
+NPC_CONTACT_CHILD = 113
+DARK_MAGE_CONTACT_GROUP = 75
+DARK_MAGE_SCAN_CHILDREN = 40
+
+POUCH_NAMES = ("colossal pouch", "giant pouch", "large pouch", "medium pouch",
+               "small pouch")
+
+# Ceilings (spec table). Counters reset where success is DETECTED (_reset_counters),
+# never where the attempt is made -- the mahogany_homes contact-cast lesson.
+STATE_UNAVAILABLE_LIMIT = 20
+ENTER_MAX_CLICKS = 6
+CONTACT_MAX_CASTS = 4          # per between-round window; give-up, not a stop
+CONTACT_STUCK_LIMIT = 8
+CONTACT_RESOLVE_S = 15.0       # scan for the Dark Mage row this long after a cast
+ALTAR_ENTER_MAX = 5
+IMBUE_MAX_CLICKS = 8
+IMBUE_CONFIRM_S = 4.0
+POWERUP_MAX_CLICKS = 6
+CELL_MAX_CLICKS = 6
+RESTOCK_MAX_CLICKS = 6
+GUARDIAN_MISSING_LIMIT = 15
+MINE_STALL_TICKS = 25
+MINE_RECLICK_S = 5.0           # leave an in-progress mine alone this long after a delta
+WORKBENCH_STALL_TICKS = 20
+CRAFT_RECLICK_S = 4.0
+PORTAL_TRIP_MAX_TICKS = 60     # forces an exit from the pocket, not a stop
+ACTION_BLOCK_S = 30.0          # how long a learned-unworkable rung stays disabled
+
+
+# ---------------------------------------------------------------------------
+# Runtime helpers
+# ---------------------------------------------------------------------------
+
+def read_state():
+    """One fresh GOTR snapshot, or None for 'cannot tell'. None must defer, never act."""
+    st = controller.get_api("minigames", "guardians-of-the-rift")
+    if not st or st.get("error"):
+        return None
+    return st
+
+
+def read_pouches():
+    api = controller.get_api("storage", "essence-pouches")
+    if not api or api.get("error"):
+        return None
+    return api
+
+
+_rc_cache = {"level": None, "at": 0.0}
+
+
+def _rc_level():
+    """Live Runecraft level via the m8aq skills reader, cached 10 minutes. None =
+    cannot read (gates nothing in choose_altar). The reader's exact shape is
+    LIVE-VERIFY, so extraction is defensive/recursive."""
+    if _rc_cache["level"] is not None and time.time() - _rc_cache["at"] < 600:
+        return _rc_cache["level"]
+    api = controller.get_api("skills", "skills")
+    if not api or api.get("error"):
+        return None
+    level = _find_level(api, "runecraft")
+    if level is not None:
+        _rc_cache["level"] = level
+        _rc_cache["at"] = time.time()
+    return level
+
+
+def _find_level(node, skill):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(k, str) and skill in k.lower():
+                if isinstance(v, int):
+                    return v
+                if isinstance(v, dict):
+                    for key in ("level", "baseLevel", "realLevel", "staticLevel"):
+                        if isinstance(v.get(key), int):
+                            return v[key]
+        label = ""
+        for key in ("skill", "name", "type"):
+            if isinstance(node.get(key), str):
+                label = node[key].lower()
+                break
+        if skill in label:
+            for key in ("level", "baseLevel", "realLevel", "staticLevel"):
+                if isinstance(node.get(key), int):
+                    return node[key]
+        for v in node.values():
+            found = _find_level(v, skill)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for v in node:
+            found = _find_level(v, skill)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_object_by_name(names, action=None, radius=40, exact=False):
+    """Nearest object whose name matches (exact or substring, case-insensitive),
+    optionally requiring an action substring. None when nothing matches."""
+    if isinstance(names, str):
+        names = (names,)
+    names = tuple(n.lower() for n in names)
+    best = None
+    for obj in controller.get_objects(radius=radius):
+        name = (obj.get("name") or "").lower()
+        if exact:
+            if name not in names:
+                continue
+        elif not any(n in name for n in names):
+            continue
+        if action is not None:
+            actions = [a for a in (obj.get("actions") or []) if a]
+            if not any(action.lower() in a.lower() for a in actions):
+                continue
+        d = obj.get("distance", 999)
+        if best is None or d < best.get("distance", 999):
+            best = obj
+    return best
+
+
+def _object_at_tile(x, y, option=None, radius=40):
+    """The object standing on one world tile (optionally offering `option`) -- how
+    barrier cell tiles from the reader's world-point list become clickable entities."""
+    for obj in controller.get_objects(radius=radius):
+        if obj.get("x") != x or obj.get("y") != y:
+            continue
+        if option is None:
+            return obj
+        actions = [a.lower() for a in (obj.get("actions") or []) if a]
+        if any(option.lower() in a for a in actions):
+            return obj
+    return None
+
+
+def _find_npc_by_name(sub):
+    sub = sub.lower()
+    best = None
+    for npc in controller.get_npcs():
+        if sub in (npc.get("name") or "").lower():
+            d = npc.get("distance", 999)
+            if best is None or d < best.get("distance", 999):
+                best = npc
+    return best
+
+
+def _refresh_for(entity):
+    idx = entity.get("index")
+    if idx is not None:
+        return controller.npc_index_refresh_target(idx)
+    return controller.object_refresh_target(
+        entity.get("x"), entity.get("y"), entity.get("plane", 0), entity.get("id"))
+
+
+def _reresolve(entity):
+    idx = entity.get("index")
+    if idx is not None:
+        return controller.get_npc_by_index(idx) or entity
+    if entity.get("id") is not None:
+        return controller.get_object_at(entity.get("x"), entity.get("y"),
+                                        entity.get("plane", 0),
+                                        entity.get("id")) or entity
+    return entity
+
+
+def _click_escalating(ctx, entity, options):
+    """Aimed click with hover verification; a withheld/failed click re-resolves the
+    entity and picks the option by name off the right-click menu -- the golem-plinth
+    tier that beats players camped on the pixel. Mass worlds make this the default."""
+    if isinstance(options, str):
+        options = (options,)
+    res = controller.click_entity(ctx.ser, entity, refresh_target=_refresh_for(entity),
+                                  expected_action=options)
+    if res and not getattr(res, "withheld", False):
+        return True
+    fresh = _reresolve(entity)
+    return bool(controller.click_menu_action(
+        ctx.ser, fresh, options[0], offset=(0, 0),
+        refresh_target=_refresh_for(fresh)))
+
+
+def _approach_or_click(ctx, entity, options, counter_key, max_clicks, stop_reason):
+    """The standard gated click: ceiling -> can_reach -> walk when unreachable ->
+    escalating click. A routeless walk ALSO spends the counter (every loop needs a
+    ceiling). True only when a click was issued."""
+    data = ctx.state.data
+    if data.get(counter_key, 0) >= max_clicks:
+        ctx.state.trigger_safety_stop(f"gotr: {stop_reason}")
+        return False
+    reach = travel.can_reach(entity)
+    if reach is False:
+        if not travel.walk_to(ctx, entity):
+            data[counter_key] = data.get(counter_key, 0) + 1
+        return False
+    data[counter_key] = data.get(counter_key, 0) + 1
+    _click_escalating(ctx, entity, options)
+    return True
+
+
+def _dialogue():
+    d = controller.get_api("ui", "dialogue")
+    if not d or d.get("error"):
+        return {}
+    return d
+
+
+def _dialogue_open(d):
+    # Mirrors giants_foundry: the m8aq Dialogue reader has no open/isOpen field -- any
+    # populated npcText/playerText/itemText/options stage counts as open.
+    if not d:
+        return False
+    for key in ("open", "isOpen", "visible"):
+        if isinstance(d.get(key), bool):
+            return d[key]
+    dtype = d.get("type")
+    if dtype and dtype != "NONE":
+        return True
+    return bool(d.get("npcText") or d.get("playerText") or d.get("itemText")
+                or d.get("options"))
+
+
+def _dialogue_options(d):
+    out = []
+    for o in d.get("options") or []:
+        out.append(o if isinstance(o, str) else (o.get("text") or ""))
+    return out
+
+
+def _choose_option(ctx, d, substrings):
+    """Press the number key of the first dialogue option matching any substring
+    (case-insensitive). False when nothing matched."""
+    for i, text in enumerate(_dialogue_options(d)):
+        low = text.lower()
+        if any(s in low for s in substrings):
+            controller.key_tap(ctx.ser, str(i + 1))
+            return True
+    return False
+
+
+def _runes_in_inventory():
+    for i in controller.get_inventory() or []:
+        if (i.get("name") or "").lower().endswith(" rune"):
+            return True
+    return False
+
+
+def _pouch_items():
+    out = []
+    for i in controller.get_inventory() or []:
+        name = (i.get("name") or "").lower()
+        if any(p in name for p in POUCH_NAMES):
+            out.append(i)
+    return out
+
+
+def _fill_pouches(ctx):
+    # Explicit menu Fill: a pouch's LEFT-click default varies with state, and the
+    # fur-pouch lesson says never trust the default for container items.
+    for pouch in _pouch_items():
+        controller.click_menu_action(ctx.ser, pouch, "Fill", offset=(0, 0),
+                                     check_ui_blockers=False)
+        controller.human_delay(0.3, 0.6)
+
+
+def _empty_pouches(ctx):
+    for pouch in _pouch_items():
+        controller.click_menu_action(ctx.ser, pouch, "Empty", offset=(0, 0),
+                                     check_ui_blockers=False)
+        controller.human_delay(0.3, 0.6)
+
+
+def _await_xp(field, before, timeout_s):
+    """Poll /player for a skill-XP increase -- the sub-tick 'did that work' signal.
+    True on increase; False on timeout; True immediately when the field is absent
+    (un-rebuilt client -- cannot confirm, so don't block)."""
+    if before is None:
+        controller.human_delay(1.0, 1.5)
+        return True
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        now = (controller.get_player() or {}).get(field)
+        if now is not None and now > before:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def _find_dark_mage_widget():
+    """The Dark Mage row of the NPC Contact interface. Child id unknown (LIVE-VERIFY):
+    scan the group's first DARK_MAGE_SCAN_CHILDREN children for the text."""
+    for child in range(DARK_MAGE_SCAN_CHILDREN):
+        w = controller.get_widget(DARK_MAGE_CONTACT_GROUP, child)
+        if w and w.get("clickable") and "dark mage" in (w.get("text") or "").lower():
+            return w
+    return None
+```
+
+- [ ] **Step 2: Verify it compiles and the suite still passes**
+
+Run: `python -m py_compile routines/guardians_of_the_rift.py`
+Run: `python -m pytest tests/test_guardians_of_the_rift.py -v`
+Expected: compile clean; all tests PASS (this task adds no tests — everything here is
+bridge-touching runtime, covered by the hermetic ban).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add ControllerAddon/routines/guardians_of_the_rift.py
+git commit -m "gotr: runtime constants + helper layer"
+```
+
+---
+
+### Task 6: Between-round handlers (enter arena, pouch repair, restock, deposit)
+
+**Files:**
+- Modify: `ControllerAddon/routines/guardians_of_the_rift.py` (append)
+
+**Interfaces:**
+- Consumes: everything from Task 5; `pouches_degraded`, `read_pouches` (Task 3).
+- Produces: `enter_arena_phase(ctx, st)`, `between_rounds_phase(ctx, st)`,
+  `_repair_pouches(ctx)`, `_restock_cells(ctx)`, `_deposit_runes(ctx)`.
+- Uses `ctx.state.data` keys: `gotr_enter_clicks`, `gotr_contact_casts`,
+  `gotr_contact_stuck`, `gotr_contact_cast_at`, `gotr_restock_clicks`.
+
+- [ ] **Step 1: Append the handlers**
+
+Append to `ControllerAddon/routines/guardians_of_the_rift.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# Between rounds
+# ---------------------------------------------------------------------------
+
+def enter_arena_phase(ctx, st):
+    """South of the entry barrier: pass it. Reset lives in _reset_counters (inArena)."""
+    data = ctx.state.data
+    if data.get("gotr_enter_clicks", 0) >= ENTER_MAX_CLICKS:
+        ctx.state.trigger_safety_stop("gotr: could not pass the entry barrier")
+        return
+    barrier_obj = None
+    for act in ENTRY_BARRIER_ACTIONS:
+        barrier_obj = _find_object_by_name(ENTRY_BARRIER_NAME, action=act, exact=True)
+        if barrier_obj is not None:
+            break
+    if barrier_obj is None:
+        debug_log.log("gotr", "entry barrier not visible -- waiting")
+        controller.human_delay(1.0, 2.0)
+        return
+    data["gotr_enter_clicks"] = data.get("gotr_enter_clicks", 0) + 1
+    _click_escalating(ctx, barrier_obj, ENTRY_BARRIER_ACTIONS)
+    controller.mark_busy(2.0)
+    controller.human_delay(1.5, 2.5)
+
+
+def between_rounds_phase(ctx, st):
+    """waiting/complete/idle: repair pouches, restock cells, deposit strays, idle.
+    One action per tick, priority-ordered."""
+    data = ctx.state.data
+    cfg = ctx.state.config
+    inv = st.get("inventory") or {}
+
+    if cfg.get("repair_pouches"):
+        pouches = read_pouches()
+        if pouches is not None and not pouches_degraded(pouches):
+            # Success detection for the repair loop -- reset lives HERE, where the
+            # pouch reader proves it, not in the attempt handler.
+            data["gotr_contact_casts"] = 0
+            data["gotr_contact_stuck"] = 0
+        elif (pouches_degraded(pouches)
+                and data.get("gotr_contact_casts", 0) < CONTACT_MAX_CASTS):
+            _repair_pouches(ctx)
+            return
+
+    if (inv.get("unchargedCells", 0) < cfg["min_uncharged_cells"]
+            and inv.get("emptySlots", 0) > 0
+            and data.get("gotr_restock_clicks", 0) < RESTOCK_MAX_CLICKS):
+        _restock_cells(ctx)
+        return
+
+    if _runes_in_inventory():
+        _deposit_runes(ctx)
+        return
+
+    controller.human_delay(1.0, 2.5)
+
+
+def _repair_pouches(ctx):
+    """NPC Contact -> Dark Mage -> 'repair' dialogue option. CONTACT_MAX_CASTS is a
+    give-up (degraded pouches still work at reduced capacity), never a safety stop."""
+    data = ctx.state.data
+    d = _dialogue()
+    if _dialogue_open(d):
+        if not _choose_option(ctx, d, ("repair",)):
+            controller.key_tap(ctx.ser, "SPACE")
+        controller.human_delay(0.5, 0.9)
+        return
+
+    if time.time() - data.get("gotr_contact_cast_at", 0) < CONTACT_RESOLVE_S:
+        mage = _find_dark_mage_widget()
+        if mage is not None:
+            controller.click_entity(ctx.ser, mage, offset=(0, 0),
+                                    check_ui_blockers=False)
+            controller.human_delay(1.2, 1.8)
+        return
+
+    controller.key_tap(ctx.ser, MAGIC_TAB_KEY)
+    controller.human_delay(0.3, 0.5)
+    spell = controller.get_widget(NPC_CONTACT_GROUP, NPC_CONTACT_CHILD)
+    if not spell or not spell.get("clickable"):
+        stuck = data.get("gotr_contact_stuck", 0) + 1
+        data["gotr_contact_stuck"] = stuck
+        debug_log.log("gotr", f"NPC Contact widget not clickable ({stuck}x) -- "
+                              "Lunar spellbook active?")
+        if stuck >= CONTACT_STUCK_LIMIT:
+            debug_log.log("gotr", "giving up on pouch repair this window")
+            data["gotr_contact_casts"] = CONTACT_MAX_CASTS
+        return
+    data["gotr_contact_stuck"] = 0
+    data["gotr_contact_casts"] = data.get("gotr_contact_casts", 0) + 1
+    data["gotr_contact_cast_at"] = time.time()
+    debug_log.log("gotr", "casting NPC Contact to repair pouches")
+    controller.click_entity(ctx.ser, spell, offset=(0, 0), check_ui_blockers=False)
+    controller.human_delay(1.2, 1.8)
+
+
+def _restock_cells(ctx):
+    data = ctx.state.data
+    table = _find_object_by_name(UNCHARGED_CELLS_NAME, exact=True)
+    if table is None:
+        debug_log.log("gotr", "uncharged-cells table not visible")
+        return
+    reach = travel.can_reach(table)
+    if reach is False:
+        travel.walk_to(ctx, table)
+        return
+    data["gotr_restock_clicks"] = data.get("gotr_restock_clicks", 0) + 1
+    _click_escalating(ctx, table, (TAKE_ACTION,))
+    controller.human_delay(0.8, 1.4)
+
+
+def _deposit_runes(ctx):
+    pool = _find_object_by_name(DEPOSIT_POOL_NAME, exact=True)
+    if pool is None:
+        debug_log.log("gotr", "deposit pool not visible")
+        return
+    reach = travel.can_reach(pool)
+    if reach is False:
+        travel.walk_to(ctx, pool)
+        return
+    _click_escalating(ctx, pool, (DEPOSIT_ACTION,))
+    controller.human_delay(1.0, 1.6)
+```
+
+- [ ] **Step 2: Verify it compiles and the suite still passes**
+
+Run: `python -m py_compile routines/guardians_of_the_rift.py`
+Run: `python -m pytest tests/test_guardians_of_the_rift.py -v`
+Expected: clean, all PASS.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add ControllerAddon/routines/guardians_of_the_rift.py
+git commit -m "gotr: between-round handlers (arena entry, pouch repair, restock, deposit)"
+```
+
+---
+
+### Task 7: In-round handlers
+
+**Files:**
+- Modify: `ControllerAddon/routines/guardians_of_the_rift.py` (append)
+
+**Interfaces:**
+- Consumes: Task 5 helpers; `choose_cell_tile`, `find_repairable` (Task 2);
+  `choose_altar`, `read_pouches`, `pouch_free_space`, `pouch_stored` (Task 3).
+- Produces: `repair_barrier_phase(ctx, st)`, `portal_trip_phase(ctx, st)`,
+  `spend_stones_phase(ctx, st)`, `place_cell_phase(ctx, st)`,
+  `altar_trip_phase(ctx, st)`, `_work_altar(ctx, st)`, `craft_phase(ctx, st)`,
+  `mine_phase(ctx, st)`.
+- Uses `ctx.state.data` keys: `gotr_no_cell_objects`, `gotr_repair_clicks`,
+  `gotr_cell_clicks`, `gotr_cell_block_until`, `gotr_powerup_clicks`,
+  `gotr_guardian_missing`, `gotr_altar_enters`, `gotr_altar_block_until`,
+  `gotr_exit_clicks`, `gotr_imbue_clicks`, `gotr_portal_enters`,
+  `gotr_portal_block_until`, `gotr_portal_ticks`, `gotr_craft_stall`,
+  `gotr_craft_delta_at`, `gotr_mine_stall`, `gotr_mine_delta_at`.
+
+- [ ] **Step 1: Append the handlers**
+
+Append to `ControllerAddon/routines/guardians_of_the_rift.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# In round
+# ---------------------------------------------------------------------------
+
+def repair_barrier_phase(ctx, st):
+    """Repair a BROKEN_REPAIRABLE cell tile (12 fragments -> 25 energy both types)."""
+    data = ctx.state.data
+    tile = find_repairable(st.get("barriers") or [])
+    if tile is None:
+        return
+    loc = tile.get("location") or {}
+    obj = _object_at_tile(loc.get("x"), loc.get("y"))
+    if obj is None:
+        if not data.get("gotr_no_cell_objects"):
+            debug_log.log("gotr", "cell tile not present in /objects -- disabling cell "
+                                  "actions (GroundObject gap, see spec checklist)")
+        data["gotr_no_cell_objects"] = True
+        return
+    if _approach_or_click(ctx, obj, CELL_TILE_REPAIR_OPTIONS, "gotr_repair_clicks",
+                          CELL_MAX_CLICKS, "barrier repair never registered"):
+        controller.mark_busy(2.0)
+        controller.human_delay(0.8, 1.4)
+
+
+def spend_stones_phase(ctx, st):
+    """Use held guardian stones on the Great Guardian (2-3 energy each, 5 RC xp)."""
+    data = ctx.state.data
+    guardian = _find_npc_by_name(GREAT_GUARDIAN_NAME)
+    if guardian is None:
+        miss = data.get("gotr_guardian_missing", 0) + 1
+        data["gotr_guardian_missing"] = miss
+        debug_log.log("gotr", f"Great Guardian not visible ({miss}x)")
+        if miss >= GUARDIAN_MISSING_LIMIT:
+            ctx.state.trigger_safety_stop("gotr: the Great Guardian is never visible")
+        return
+    data["gotr_guardian_missing"] = 0
+    if _approach_or_click(ctx, guardian, (POWER_UP_ACTION,), "gotr_powerup_clicks",
+                          POWERUP_MAX_CLICKS, "power-up never registered"):
+        controller.mark_busy(2.0)
+        controller.human_delay(0.8, 1.4)
+
+
+def place_cell_phase(ctx, st):
+    """Spend the charged cell: place on an INACTIVE tile, else recharge the weakest."""
+    data = ctx.state.data
+    tile = choose_cell_tile(st.get("barriers") or [])
+    if tile is None:
+        debug_log.log("gotr", "no usable cell tile visible -- deferring cell placement")
+        data["gotr_cell_block_until"] = time.time() + ACTION_BLOCK_S
+        return
+    loc = tile.get("location") or {}
+    obj = _object_at_tile(loc.get("x"), loc.get("y"))
+    if obj is None:
+        if not data.get("gotr_no_cell_objects"):
+            debug_log.log("gotr", "cell tile not present in /objects -- disabling cell "
+                                  "actions (GroundObject gap, see spec checklist)")
+        data["gotr_no_cell_objects"] = True
+        return
+    if _approach_or_click(ctx, obj, CELL_TILE_PLACE_OPTIONS, "gotr_cell_clicks",
+                          CELL_MAX_CLICKS, "charged cell never consumed"):
+        controller.mark_busy(2.0)
+        controller.human_delay(0.8, 1.4)
+
+
+def altar_trip_phase(ctx, st):
+    """Outside: enter the active portal guardian for the energy type we have less of.
+    Inside (currentAltar set): _work_altar imbues, empties pouches, and exits."""
+    data = ctx.state.data
+    if (st.get("currentAltar") or "UNKNOWN") != "UNKNOWN":
+        _work_altar(ctx, st)
+        return
+
+    rotation = st.get("altarRotationSecondsRemaining", -1)
+    if 0 <= rotation < ALTAR_MIN_SECONDS:
+        debug_log.log("gotr", "altar pair about to rotate -- waiting to enter")
+        controller.human_delay(1.0, 2.0)
+        return
+
+    cfg = ctx.state.config
+    altar = choose_altar(st, _rc_level(), tuple(cfg.get("blocked_altars") or ()))
+    if altar is None:
+        debug_log.log("gotr", "no enterable active altar -- deferring altar trips")
+        data["gotr_altar_block_until"] = time.time() + ACTION_BLOCK_S
+        return
+
+    if data.get("gotr_altar_enters", 0) >= ALTAR_ENTER_MAX:
+        ctx.state.trigger_safety_stop("gotr: altar portal never entered")
+        return
+    portal = _find_object_by_name(PORTAL_GUARDIAN_PREFIX + altar.lower(),
+                                  action=PORTAL_GUARDIAN_ACTION)
+    if portal is None:
+        # Not a stop: the pair rotates on its own. Defer and let the ladder re-pick.
+        debug_log.log("gotr", f"portal guardian for {altar} not visible -- deferring")
+        data["gotr_altar_block_until"] = time.time() + ACTION_BLOCK_S
+        return
+    reach = travel.can_reach(portal)
+    if reach is False:
+        travel.walk_to(ctx, portal)
+        return
+    data["gotr_altar_enters"] = data.get("gotr_altar_enters", 0) + 1
+    debug_log.log("gotr", f"entering the {altar} portal")
+    _click_escalating(ctx, portal, (PORTAL_GUARDIAN_ACTION,))
+    controller.mark_busy(3.0)
+    controller.human_delay(1.5, 2.5)
+
+
+def _work_altar(ctx, st):
+    """Inside an altar room: imbue loose essence (confirmed on runecraftXp), empty
+    pouches, imbue again, then leave through the exit portal."""
+    data = ctx.state.data
+    inv = st.get("inventory") or {}
+    if inv.get("guardianEssence", 0) > 0:
+        if data.get("gotr_imbue_clicks", 0) >= IMBUE_MAX_CLICKS:
+            ctx.state.trigger_safety_stop("gotr: imbuing never registered at the altar")
+            return
+        altar_obj = (_find_object_by_name(ALTAR_NAME, action=ALTAR_IMBUE_ACTION,
+                                          exact=True)
+                     or _find_object_by_name(ALTAR_NAME, exact=True))
+        if altar_obj is None:
+            debug_log.log("gotr", "altar object not visible inside the altar room")
+            return
+        xp_before = (controller.get_player() or {}).get("runecraftXp")
+        data["gotr_imbue_clicks"] = data.get("gotr_imbue_clicks", 0) + 1
+        _click_escalating(ctx, altar_obj, (ALTAR_IMBUE_ACTION,))
+        controller.mark_busy(2.5)
+        _await_xp("runecraftXp", xp_before, IMBUE_CONFIRM_S)
+        return
+
+    if pouch_stored(read_pouches()) > 0:
+        _empty_pouches(ctx)
+        return
+
+    if data.get("gotr_exit_clicks", 0) >= ALTAR_ENTER_MAX:
+        ctx.state.trigger_safety_stop("gotr: could not leave the altar room")
+        return
+    exit_portal = None
+    for act in EXIT_PORTAL_ACTIONS:
+        exit_portal = _find_object_by_name(PORTAL_NAME, action=act, exact=True)
+        if exit_portal is not None:
+            break
+    if exit_portal is None:
+        exit_portal = _find_object_by_name(PORTAL_NAME, exact=True)
+    if exit_portal is None:
+        debug_log.log("gotr", "exit portal not visible in the altar room")
+        return
+    data["gotr_exit_clicks"] = data.get("gotr_exit_clicks", 0) + 1
+    _click_escalating(ctx, exit_portal, EXIT_PORTAL_ACTIONS)
+    controller.mark_busy(3.0)
+    controller.human_delay(1.2, 2.0)
+
+
+def portal_trip_phase(ctx, st):
+    """The huge-remains portal: enter while open, mine guardian essence inside, fill
+    pouches, and leave when full (or the trip ceiling forces an exit)."""
+    data = ctx.state.data
+    inv = st.get("inventory") or {}
+
+    if st.get("miningArea") == "WEST_HUGE_REMAINS":
+        data["gotr_portal_ticks"] = data.get("gotr_portal_ticks", 0) + 1
+        space = pouch_free_space(read_pouches())
+        if inv.get("guardianEssence", 0) > 0 and space is not None and space > 0:
+            _fill_pouches(ctx)
+            return
+        full = inv.get("emptySlots", 0) == 0 and (space is None or space == 0)
+        if full or data["gotr_portal_ticks"] >= PORTAL_TRIP_MAX_TICKS:
+            exit_portal = _find_object_by_name(PORTAL_NAME, exact=True)
+            if exit_portal is None:
+                debug_log.log("gotr", "exit portal not visible in the huge-remains pocket")
+                return
+            _click_escalating(ctx, exit_portal, EXIT_PORTAL_ACTIONS)
+            controller.mark_busy(3.0)
+            controller.human_delay(1.2, 2.0)
+            return
+        if time.time() - data.get("gotr_mine_delta_at", 0) < MINE_RECLICK_S:
+            return    # actively mining -- leave it alone
+        node = _find_object_by_name(HUGE_REMAINS_NAME, action=MINE_ACTION, exact=True)
+        if node is None:
+            debug_log.log("gotr", "huge remains not visible inside the pocket")
+            return
+        _click_escalating(ctx, node, (MINE_ACTION,))
+        controller.mark_busy(2.0)
+        controller.human_delay(1.0, 1.8)
+        return
+
+    # Outside: enter the portal while the HUD says it is open.
+    if data.get("gotr_portal_enters", 0) >= ALTAR_ENTER_MAX:
+        debug_log.log("gotr", "portal never entered -- giving up on this spawn")
+        data["gotr_portal_block_until"] = time.time() + ACTION_BLOCK_S
+        data["gotr_portal_enters"] = 0
+        return
+    portal = _find_object_by_name(PORTAL_NAME, action=PORTAL_GUARDIAN_ACTION,
+                                  exact=True)
+    if portal is None:
+        debug_log.log("gotr", "huge-remains portal not visible -- waiting")
+        controller.human_delay(0.8, 1.4)
+        return
+    reach = travel.can_reach(portal)
+    if reach is False:
+        travel.walk_to(ctx, portal)
+        return
+    data["gotr_portal_enters"] = data.get("gotr_portal_enters", 0) + 1
+    _click_escalating(ctx, portal, (PORTAL_GUARDIAN_ACTION,))
+    controller.mark_busy(3.0)
+    controller.human_delay(1.5, 2.5)
+
+
+def craft_phase(ctx, st):
+    """The Workbench pass: deposit runes, fill pouches from loose essence, then keep
+    the bench working fragments -> essence. Progress deltas are detected in
+    _reset_counters, which stamps gotr_craft_delta_at and zeroes the stall counter."""
+    data = ctx.state.data
+    if _runes_in_inventory():
+        _deposit_runes(ctx)
+        return
+    inv = st.get("inventory") or {}
+    if inv.get("guardianEssence", 0) > 0:
+        space = pouch_free_space(read_pouches())
+        if space is not None and space > 0:
+            _fill_pouches(ctx)
+            return
+    if time.time() - data.get("gotr_craft_delta_at", 0) < CRAFT_RECLICK_S:
+        return    # crafting is progressing -- let it run
+    if data.get("gotr_craft_stall", 0) >= WORKBENCH_STALL_TICKS:
+        ctx.state.trigger_safety_stop("gotr: workbench crafting never progressed")
+        return
+    bench = _find_object_by_name(WORKBENCH_NAME, exact=True)
+    if bench is None:
+        data["gotr_craft_stall"] = data.get("gotr_craft_stall", 0) + 1
+        debug_log.log("gotr", "workbench not visible -- waiting")
+        controller.human_delay(1.0, 2.0)
+        return
+    reach = travel.can_reach(bench)
+    if reach is False:
+        travel.walk_to(ctx, bench)
+        return
+    data["gotr_craft_stall"] = data.get("gotr_craft_stall", 0) + 1
+    _click_escalating(ctx, bench, (WORKBENCH_ACTION,))
+    controller.mark_busy(3.0)
+    controller.human_delay(2.0, 3.0)
+
+
+def mine_phase(ctx, st):
+    """Mine guardian remains/parts at the temple edges (or the large-remains pocket
+    behind the rubble when configured). Deltas detected in _reset_counters."""
+    data = ctx.state.data
+    cfg = ctx.state.config
+    if time.time() - data.get("gotr_mine_delta_at", 0) < MINE_RECLICK_S:
+        return    # actively mining
+    if data.get("gotr_mine_stall", 0) >= MINE_STALL_TICKS:
+        ctx.state.trigger_safety_stop("gotr: mining never produced fragments")
+        return
+    node = None
+    if cfg.get("use_large_remains"):
+        node = _find_object_by_name(LARGE_REMAINS_NAME, action=MINE_ACTION, exact=True)
+    if node is None:
+        node = _find_object_by_name(GUARDIAN_REMAINS_NAMES, action=MINE_ACTION,
+                                    exact=True)
+    if node is None:
+        data["gotr_mine_stall"] = data.get("gotr_mine_stall", 0) + 1
+        debug_log.log("gotr", "no minable remains visible -- waiting")
+        controller.human_delay(1.0, 2.0)
+        return
+    reach = travel.can_reach(node)
+    if reach is False:
+        if cfg.get("use_large_remains"):
+            rubble = _find_object_by_name(RUBBLE_NAME, action=RUBBLE_ACTION, exact=True)
+            if rubble is not None and travel.can_reach(rubble) is not False:
+                _click_escalating(ctx, rubble, (RUBBLE_ACTION,))
+                controller.mark_busy(3.0)
+                controller.human_delay(1.5, 2.5)
+                return
+        travel.walk_to(ctx, node)
+        return
+    data["gotr_mine_stall"] = data.get("gotr_mine_stall", 0) + 1
+    _click_escalating(ctx, node, (MINE_ACTION,))
+    controller.mark_busy(2.0)
+    controller.human_delay(1.0, 1.8)
+```
+
+- [ ] **Step 2: Verify it compiles and the suite still passes**
+
+Run: `python -m py_compile routines/guardians_of_the_rift.py`
+Run: `python -m pytest tests/test_guardians_of_the_rift.py -v`
+Expected: clean, all PASS.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add ControllerAddon/routines/guardians_of_the_rift.py
+git commit -m "gotr: in-round handlers"
+```
+
+---
+
+### Task 8: Lifecycle — `_reset_counters`, `setup`, `tick`, dispatch + tests
+
+**Files:**
+- Modify: `ControllerAddon/routines/guardians_of_the_rift.py` (append)
+- Modify: `ControllerAddon/tests/test_guardians_of_the_rift.py` (append)
+
+**Interfaces:**
+- Consumes: everything above.
+- Produces: `_reset_counters(data, st, state)`, `setup(ctx)`, `tick(ctx)`,
+  `ACTION_HANDLERS` (dict mapping every `choose_action` result to a Task 7 handler).
+
+- [ ] **Step 1: Append the failing tests**
+
+Append to `ControllerAddon/tests/test_guardians_of_the_rift.py`:
+
+```python
+# --- _reset_counters -------------------------------------------------------
+
+def test_reset_counters_enter_and_contact():
+    data = {"gotr_enter_clicks": 3, "gotr_contact_casts": 2, "gotr_contact_stuck": 1}
+    gotr._reset_counters(data, make_state(), "active")
+    assert data["gotr_enter_clicks"] == 0
+    assert data["gotr_contact_casts"] == 0
+    assert data["gotr_contact_stuck"] == 0
+
+
+def test_reset_counters_mine_delta():
+    data = {"gotr_mine_stall": 7, "gotr_last_frags": 5, "gotr_last_mined": 5,
+            "gotr_last_essence": 0}
+    st = make_state(minedFragmentsThisGame=6,
+                    inventory=make_inv(guardianFragments=6))
+    gotr._reset_counters(data, st, "active")
+    assert data["gotr_mine_stall"] == 0
+    assert data["gotr_mine_delta_at"] > 0
+
+
+def test_reset_counters_craft_delta_on_fragments_down():
+    data = {"gotr_craft_stall": 5, "gotr_last_frags": 20, "gotr_last_mined": 20,
+            "gotr_last_essence": 0}
+    st = make_state(minedFragmentsThisGame=20,
+                    inventory=make_inv(guardianFragments=10, guardianEssence=10))
+    gotr._reset_counters(data, st, "active")
+    assert data["gotr_craft_stall"] == 0
+
+
+def test_reset_counters_stones_and_cell():
+    data = {"gotr_powerup_clicks": 3, "gotr_imbue_clicks": 4, "gotr_last_stones": 5,
+            "gotr_last_cell": "STRONG", "gotr_cell_clicks": 2}
+    st = make_state(inventory=make_inv())   # stones now 0, cell now NONE
+    gotr._reset_counters(data, st, "active")
+    assert data["gotr_powerup_clicks"] == 0
+    assert data["gotr_cell_clicks"] == 0
+
+
+def test_reset_counters_imbue_on_stone_gain():
+    data = {"gotr_imbue_clicks": 4, "gotr_last_stones": 0}
+    st = make_state(inventory=make_inv(elementalGuardianStones=5))
+    gotr._reset_counters(data, st, "active")
+    assert data["gotr_imbue_clicks"] == 0
+
+
+def test_reset_counters_altar_change():
+    data = {"gotr_altar_enters": 3, "gotr_exit_clicks": 2, "gotr_imbue_clicks": 1,
+            "gotr_last_altar": "UNKNOWN"}
+    gotr._reset_counters(data, make_state(currentAltar="AIR"), "active")
+    assert data["gotr_altar_enters"] == 0
+    assert data["gotr_exit_clicks"] == 0
+
+
+def test_reset_counters_repair_when_no_broken_tile():
+    data = {"gotr_repair_clicks": 4}
+    gotr._reset_counters(data, make_state(barriers=[barrier("WEAK")]), "active")
+    assert data["gotr_repair_clicks"] == 0
+
+
+def test_reset_counters_portal():
+    data = {"gotr_portal_enters": 3, "gotr_portal_ticks": 10}
+    gotr._reset_counters(data, make_state(miningArea="WEST_HUGE_REMAINS"), "active")
+    assert data["gotr_portal_enters"] == 0
+    data = {"gotr_portal_ticks": 10}
+    gotr._reset_counters(data, make_state(miningArea="NONE"), "active")
+    assert data["gotr_portal_ticks"] == 0
+
+
+def test_action_handlers_cover_every_ladder_result():
+    for name in ("repair_barrier", "portal_trip", "spend_stones", "place_cell",
+                 "altar_trip", "craft", "mine"):
+        assert name in gotr.ACTION_HANDLERS
+```
+
+- [ ] **Step 2: Run tests to verify the new ones fail**
+
+Run: `python -m pytest tests/test_guardians_of_the_rift.py -v`
+Expected: new tests FAIL with AttributeError (`_reset_counters` missing).
+
+- [ ] **Step 3: Append the lifecycle code**
+
+Append to `ControllerAddon/routines/guardians_of_the_rift.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+
+def _reset_counters(data, st, state):
+    """Counters reset where success is DETECTED (read back from the fresh snapshot),
+    never where the attempt was made -- the mahogany_homes contact-cast lesson."""
+    inv = st.get("inventory") or {}
+    now = time.time()
+
+    if st.get("inArena"):
+        data["gotr_enter_clicks"] = 0
+    if state == "active":
+        # The between-round window is over; next window starts a fresh repair budget.
+        data["gotr_contact_casts"] = 0
+        data["gotr_contact_stuck"] = 0
+
+    frags = inv.get("guardianFragments", 0)
+    mined = st.get("minedFragmentsThisGame", 0)
+    essence = inv.get("guardianEssence", 0)
+    if frags > data.get("gotr_last_frags", -1) or mined > data.get("gotr_last_mined", -1):
+        data["gotr_mine_delta_at"] = now
+        data["gotr_mine_stall"] = 0
+    if (essence > data.get("gotr_last_essence", -1)
+            or frags < data.get("gotr_last_frags", 1 << 30)):
+        data["gotr_craft_delta_at"] = now
+        data["gotr_craft_stall"] = 0
+    if inv.get("unchargedCells", 0) > data.get("gotr_last_uncharged", -1):
+        data["gotr_restock_clicks"] = 0
+    data["gotr_last_frags"] = frags
+    data["gotr_last_mined"] = mined
+    data["gotr_last_essence"] = essence
+    data["gotr_last_uncharged"] = inv.get("unchargedCells", 0)
+
+    stones = total_stones(inv)
+    if stones < data.get("gotr_last_stones", 0):
+        data["gotr_powerup_clicks"] = 0
+    if stones > data.get("gotr_last_stones", -1):
+        data["gotr_imbue_clicks"] = 0
+    data["gotr_last_stones"] = stones
+
+    tier = inv.get("chargedCellTier") or "NONE"
+    if tier == "NONE" and data.get("gotr_last_cell") not in (None, "NONE"):
+        data["gotr_cell_clicks"] = 0
+    data["gotr_last_cell"] = tier
+
+    if find_repairable(st.get("barriers") or []) is None:
+        data["gotr_repair_clicks"] = 0
+
+    current_altar = st.get("currentAltar") or "UNKNOWN"
+    if current_altar != data.get("gotr_last_altar", "UNKNOWN"):
+        data["gotr_altar_enters"] = 0
+        data["gotr_exit_clicks"] = 0
+        data["gotr_imbue_clicks"] = 0
+    data["gotr_last_altar"] = current_altar
+
+    if st.get("miningArea") == "WEST_HUGE_REMAINS":
+        data["gotr_portal_enters"] = 0
+    else:
+        data["gotr_portal_ticks"] = 0
+
+
+def setup(ctx):
+    inv = controller.get_inventory() or []
+    eq = controller.get_equipment() or {}
+    names = [(i.get("name") or "").lower() for i in inv]
+    eq_names = [((eq.get(slot) or {}).get("name") or "").lower() for slot in eq]
+    if not any("pickaxe" in n for n in names + eq_names):
+        ctx.state.trigger_safety_stop("gotr: no pickaxe in inventory or equipped")
+        return
+    held = [n for n in names if any(p in n for p in POUCH_NAMES)]
+    debug_log.log("gotr", f"setup ok -- pouches held: {held or 'none'}")
+
+
+def tick(ctx):
+    data = ctx.state.data
+    st = read_state()
+    if st is None:
+        data["gotr_no_state"] = data.get("gotr_no_state", 0) + 1
+        if data["gotr_no_state"] >= STATE_UNAVAILABLE_LIMIT:
+            ctx.state.trigger_safety_stop(
+                "gotr: /api/minigames/guardians-of-the-rift unavailable -- "
+                "rebuild + restart the client?")
+        return
+    data["gotr_no_state"] = 0
+
+    if st.get("banned"):
+        ctx.state.trigger_safety_stop("gotr: the GOTR ban flag is set on this account")
+        return
+
+    state = round_state(st)
+    _reset_counters(data, st, state)
+
+    if state == "outside":
+        ctx.state.trigger_safety_stop(
+            "gotr: start at the Temple of the Eye (lobby or arena)")
+        return
+    if state == "lobby":
+        enter_arena_phase(ctx, st)
+        return
+    if state in ("waiting", "complete", "idle"):
+        between_rounds_phase(ctx, st)
+        return
+
+    # Active round: one prioritized action, with learned-unworkable rungs disabled.
+    cfg = ctx.state.config
+    now = time.time()
+    disabled = set()
+    if data.get("gotr_no_cell_objects"):
+        disabled |= {"repair_barrier", "place_cell"}
+    if now < data.get("gotr_cell_block_until", 0):
+        disabled.add("place_cell")
+    if now < data.get("gotr_altar_block_until", 0):
+        disabled.add("altar_trip")
+    if now < data.get("gotr_portal_block_until", 0):
+        disabled.add("portal_trip")
+    action = choose_action(st, cfg, pouch_space=pouch_free_space(read_pouches()),
+                           disabled=disabled)
+    ACTION_HANDLERS[action](ctx, st)
+
+
+ACTION_HANDLERS = {
+    "repair_barrier": repair_barrier_phase,
+    "portal_trip": portal_trip_phase,
+    "spend_stones": spend_stones_phase,
+    "place_cell": place_cell_phase,
+    "altar_trip": altar_trip_phase,
+    "craft": craft_phase,
+    "mine": mine_phase,
+}
+```
+
+- [ ] **Step 4: Run the full suite**
+
+Run: `python -m pytest tests/test_guardians_of_the_rift.py -v`
+Expected: all PASS.
+Run: `python -m py_compile routines/guardians_of_the_rift.py tests/test_guardians_of_the_rift.py`
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ControllerAddon/routines/guardians_of_the_rift.py ControllerAddon/tests/test_guardians_of_the_rift.py
+git commit -m "gotr: lifecycle -- counter resets, setup, tick dispatch"
+```
+
+---
+
+### Task 9: Full verification + CLAUDE.md routine-state section
+
+**Files:**
+- Modify: `CLAUDE.md` (append a new section after "Current state of routines/mahogany_homes.py"'s block, before "## Arduino firmware protocol (v3)" — or simply before the "## Arduino firmware protocol (v3)" heading)
+
+**Interfaces:** none — documentation and whole-suite verification.
+
+- [ ] **Step 1: Run the ENTIRE ControllerAddon test suite**
+
+From `ControllerAddon/`: `python -m pytest tests/ -q`
+Expected: everything passes (no regressions in other routines' tests). If anything
+unrelated fails, STOP and report it — do not fix other routines' tests.
+
+- [ ] **Step 2: py_compile every touched Python file**
+
+Run: `python -m py_compile controller.py routines/guardians_of_the_rift.py tests/test_guardians_of_the_rift.py`
+Expected: clean.
+
+- [ ] **Step 3: Add the CLAUDE.md section**
+
+Insert into `CLAUDE.md`, immediately before the line `## Arduino firmware protocol (v3)`:
+
+```markdown
+## Current state of routines/guardians_of_the_rift.py
+
+Written 2026-09-01 from research only — **no human recording exists** (user decision;
+the spec records it). Design: `docs/superpowers/specs/2026-09-01-guardians-of-the-rift-design.md`,
+whose "Live-verification checklist" is the first live session's worklist: every object
+name/action in the routine's LIVE-VERIFY block, the Dark Mage row of the NPC Contact
+interface (group 75 child scan), whether cell tiles (GroundObjects) appear in `/objects`
+at all, and the temple/altar instancing check. **Not yet run live.** Ground truth is
+`GET /api/minigames/guardians-of-the-rift` (round phase re-derived Python-side — Gson
+serializes fields, not the reader's Java helper methods) plus
+`/api/storage/essence-pouches`; `runecraftXp`/`miningXp` were added to `/player` for
+sub-tick imbue/mine confirmation (client rebuild required). Strategy per the user's
+decisions: reactive priority ladder (repair broken barrier > huge-remains portal >
+spend stones > place cell > altar trip balancing elemental/catalytic energy > craft >
+mine), hoard reward points, deposit runes, NPC Contact pouch repair between rounds.
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add CLAUDE.md
+git commit -m "gotr: CLAUDE.md routine-state section"
+```
