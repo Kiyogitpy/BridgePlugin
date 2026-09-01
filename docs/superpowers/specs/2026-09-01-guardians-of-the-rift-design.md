@@ -268,7 +268,7 @@ Canned API snapshots as plain dicts; pure functions get direct unit tests:
 | `ENTER_MAX_CLICKS` | 6 | entry barrier; reset on `inArena` |
 | `CONTACT_MAX_CASTS` | 4 | per between-round window; log-and-skip, not stop |
 | `ALTAR_ENTER_MAX` | 5 | per trip; reset on `currentAltar` change |
-| `IMBUE_MAX_CLICKS` | 8 | per altar visit; reset on xp gain |
+| `IMBUE_MAX_CLICKS` | 8 | per altar visit; reset on stone-count gain in the snapshot (xp gain is also polled inline per click) |
 | `POWERUP_MAX_CLICKS` | 6 | per stone batch; reset on energy delta |
 | `CELL_MAX_CLICKS` | 6 | per charged cell; reset on cell consumed |
 | `MINE_STALL_TICKS` | 25 | no fragment/xp delta while mining; reset on delta |
