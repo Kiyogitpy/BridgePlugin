@@ -674,3 +674,282 @@ def _deposit_runes(ctx):
         return
     _click_escalating(ctx, pool, (DEPOSIT_ACTION,))
     controller.human_delay(1.0, 1.6)
+
+
+# ---------------------------------------------------------------------------
+# In round
+# ---------------------------------------------------------------------------
+
+def repair_barrier_phase(ctx, st):
+    """Repair a BROKEN_REPAIRABLE cell tile (12 fragments -> 25 energy both types)."""
+    data = ctx.state.data
+    tile = find_repairable(st.get("barriers") or [])
+    if tile is None:
+        return
+    loc = tile.get("location") or {}
+    obj = _object_at_tile(loc.get("x"), loc.get("y"))
+    if obj is None:
+        if not data.get("gotr_no_cell_objects"):
+            debug_log.log("gotr", "cell tile not present in /objects -- disabling cell "
+                                  "actions (GroundObject gap, see spec checklist)")
+        data["gotr_no_cell_objects"] = True
+        return
+    if _approach_or_click(ctx, obj, CELL_TILE_REPAIR_OPTIONS, "gotr_repair_clicks",
+                          CELL_MAX_CLICKS, "barrier repair never registered"):
+        controller.mark_busy(2.0)
+        controller.human_delay(0.8, 1.4)
+
+
+def spend_stones_phase(ctx, st):
+    """Use held guardian stones on the Great Guardian (2-3 energy each, 5 RC xp)."""
+    data = ctx.state.data
+    guardian = _find_npc_by_name(GREAT_GUARDIAN_NAME)
+    if guardian is None:
+        miss = data.get("gotr_guardian_missing", 0) + 1
+        data["gotr_guardian_missing"] = miss
+        debug_log.log("gotr", f"Great Guardian not visible ({miss}x)")
+        if miss >= GUARDIAN_MISSING_LIMIT:
+            ctx.state.trigger_safety_stop("gotr: the Great Guardian is never visible")
+        return
+    data["gotr_guardian_missing"] = 0
+    if _approach_or_click(ctx, guardian, (POWER_UP_ACTION,), "gotr_powerup_clicks",
+                          POWERUP_MAX_CLICKS, "power-up never registered"):
+        controller.mark_busy(2.0)
+        controller.human_delay(0.8, 1.4)
+
+
+def place_cell_phase(ctx, st):
+    """Spend the charged cell: place on an INACTIVE tile, else recharge the weakest."""
+    data = ctx.state.data
+    tile = choose_cell_tile(st.get("barriers") or [])
+    if tile is None:
+        debug_log.log("gotr", "no usable cell tile visible -- deferring cell placement")
+        data["gotr_cell_block_until"] = time.time() + ACTION_BLOCK_S
+        return
+    loc = tile.get("location") or {}
+    obj = _object_at_tile(loc.get("x"), loc.get("y"))
+    if obj is None:
+        if not data.get("gotr_no_cell_objects"):
+            debug_log.log("gotr", "cell tile not present in /objects -- disabling cell "
+                                  "actions (GroundObject gap, see spec checklist)")
+        data["gotr_no_cell_objects"] = True
+        return
+    if _approach_or_click(ctx, obj, CELL_TILE_PLACE_OPTIONS, "gotr_cell_clicks",
+                          CELL_MAX_CLICKS, "charged cell never consumed"):
+        controller.mark_busy(2.0)
+        controller.human_delay(0.8, 1.4)
+
+
+def altar_trip_phase(ctx, st):
+    """Outside: enter the active portal guardian for the energy type we have less of.
+    Inside (currentAltar set): _work_altar imbues, empties pouches, and exits."""
+    data = ctx.state.data
+    if (st.get("currentAltar") or "UNKNOWN") != "UNKNOWN":
+        _work_altar(ctx, st)
+        return
+
+    rotation = st.get("altarRotationSecondsRemaining", -1)
+    if 0 <= rotation < ALTAR_MIN_SECONDS:
+        debug_log.log("gotr", "altar pair about to rotate -- waiting to enter")
+        controller.human_delay(1.0, 2.0)
+        return
+
+    cfg = ctx.state.config
+    altar = choose_altar(st, _rc_level(), tuple(cfg.get("blocked_altars") or ()))
+    if altar is None:
+        debug_log.log("gotr", "no enterable active altar -- deferring altar trips")
+        data["gotr_altar_block_until"] = time.time() + ACTION_BLOCK_S
+        return
+
+    if data.get("gotr_altar_enters", 0) >= ALTAR_ENTER_MAX:
+        ctx.state.trigger_safety_stop("gotr: altar portal never entered")
+        return
+    portal = _find_object_by_name(PORTAL_GUARDIAN_PREFIX + altar.lower(),
+                                  action=PORTAL_GUARDIAN_ACTION)
+    if portal is None:
+        # Not a stop: the pair rotates on its own. Defer and let the ladder re-pick.
+        debug_log.log("gotr", f"portal guardian for {altar} not visible -- deferring")
+        data["gotr_altar_block_until"] = time.time() + ACTION_BLOCK_S
+        return
+    reach = travel.can_reach(portal)
+    if reach is False:
+        travel.walk_to(ctx, portal)
+        return
+    data["gotr_altar_enters"] = data.get("gotr_altar_enters", 0) + 1
+    debug_log.log("gotr", f"entering the {altar} portal")
+    _click_escalating(ctx, portal, (PORTAL_GUARDIAN_ACTION,))
+    controller.mark_busy(3.0)
+    controller.human_delay(1.5, 2.5)
+
+
+def _work_altar(ctx, st):
+    """Inside an altar room: imbue loose essence (confirmed on runecraftXp), empty
+    pouches, imbue again, then leave through the exit portal."""
+    data = ctx.state.data
+    inv = st.get("inventory") or {}
+    if inv.get("guardianEssence", 0) > 0:
+        if data.get("gotr_imbue_clicks", 0) >= IMBUE_MAX_CLICKS:
+            ctx.state.trigger_safety_stop("gotr: imbuing never registered at the altar")
+            return
+        altar_obj = (_find_object_by_name(ALTAR_NAME, action=ALTAR_IMBUE_ACTION,
+                                          exact=True)
+                     or _find_object_by_name(ALTAR_NAME, exact=True))
+        if altar_obj is None:
+            debug_log.log("gotr", "altar object not visible inside the altar room")
+            return
+        xp_before = (controller.get_player() or {}).get("runecraftXp")
+        data["gotr_imbue_clicks"] = data.get("gotr_imbue_clicks", 0) + 1
+        _click_escalating(ctx, altar_obj, (ALTAR_IMBUE_ACTION,))
+        controller.mark_busy(2.5)
+        _await_xp("runecraftXp", xp_before, IMBUE_CONFIRM_S)
+        return
+
+    if pouch_stored(read_pouches()) > 0:
+        _empty_pouches(ctx)
+        return
+
+    if data.get("gotr_exit_clicks", 0) >= ALTAR_ENTER_MAX:
+        ctx.state.trigger_safety_stop("gotr: could not leave the altar room")
+        return
+    exit_portal = None
+    for act in EXIT_PORTAL_ACTIONS:
+        exit_portal = _find_object_by_name(PORTAL_NAME, action=act, exact=True)
+        if exit_portal is not None:
+            break
+    if exit_portal is None:
+        exit_portal = _find_object_by_name(PORTAL_NAME, exact=True)
+    if exit_portal is None:
+        debug_log.log("gotr", "exit portal not visible in the altar room")
+        return
+    data["gotr_exit_clicks"] = data.get("gotr_exit_clicks", 0) + 1
+    _click_escalating(ctx, exit_portal, EXIT_PORTAL_ACTIONS)
+    controller.mark_busy(3.0)
+    controller.human_delay(1.2, 2.0)
+
+
+def portal_trip_phase(ctx, st):
+    """The huge-remains portal: enter while open, mine guardian essence inside, fill
+    pouches, and leave when full (or the trip ceiling forces an exit)."""
+    data = ctx.state.data
+    inv = st.get("inventory") or {}
+
+    if st.get("miningArea") == "WEST_HUGE_REMAINS":
+        data["gotr_portal_ticks"] = data.get("gotr_portal_ticks", 0) + 1
+        space = pouch_free_space(read_pouches())
+        if inv.get("guardianEssence", 0) > 0 and space is not None and space > 0:
+            _fill_pouches(ctx)
+            return
+        full = inv.get("emptySlots", 0) == 0 and (space is None or space == 0)
+        if full or data["gotr_portal_ticks"] >= PORTAL_TRIP_MAX_TICKS:
+            exit_portal = _find_object_by_name(PORTAL_NAME, exact=True)
+            if exit_portal is None:
+                debug_log.log("gotr", "exit portal not visible in the huge-remains pocket")
+                return
+            _click_escalating(ctx, exit_portal, EXIT_PORTAL_ACTIONS)
+            controller.mark_busy(3.0)
+            controller.human_delay(1.2, 2.0)
+            return
+        if time.time() - data.get("gotr_mine_delta_at", 0) < MINE_RECLICK_S:
+            return    # actively mining -- leave it alone
+        node = _find_object_by_name(HUGE_REMAINS_NAME, action=MINE_ACTION, exact=True)
+        if node is None:
+            debug_log.log("gotr", "huge remains not visible inside the pocket")
+            return
+        _click_escalating(ctx, node, (MINE_ACTION,))
+        controller.mark_busy(2.0)
+        controller.human_delay(1.0, 1.8)
+        return
+
+    # Outside: enter the portal while the HUD says it is open.
+    if data.get("gotr_portal_enters", 0) >= ALTAR_ENTER_MAX:
+        debug_log.log("gotr", "portal never entered -- giving up on this spawn")
+        data["gotr_portal_block_until"] = time.time() + ACTION_BLOCK_S
+        data["gotr_portal_enters"] = 0
+        return
+    portal = _find_object_by_name(PORTAL_NAME, action=PORTAL_GUARDIAN_ACTION,
+                                  exact=True)
+    if portal is None:
+        debug_log.log("gotr", "huge-remains portal not visible -- waiting")
+        controller.human_delay(0.8, 1.4)
+        return
+    reach = travel.can_reach(portal)
+    if reach is False:
+        travel.walk_to(ctx, portal)
+        return
+    data["gotr_portal_enters"] = data.get("gotr_portal_enters", 0) + 1
+    _click_escalating(ctx, portal, (PORTAL_GUARDIAN_ACTION,))
+    controller.mark_busy(3.0)
+    controller.human_delay(1.5, 2.5)
+
+
+def craft_phase(ctx, st):
+    """The Workbench pass: deposit runes, fill pouches from loose essence, then keep
+    the bench working fragments -> essence. Progress deltas are detected in
+    _reset_counters, which stamps gotr_craft_delta_at and zeroes the stall counter."""
+    data = ctx.state.data
+    if _runes_in_inventory():
+        _deposit_runes(ctx)
+        return
+    inv = st.get("inventory") or {}
+    if inv.get("guardianEssence", 0) > 0:
+        space = pouch_free_space(read_pouches())
+        if space is not None and space > 0:
+            _fill_pouches(ctx)
+            return
+    if time.time() - data.get("gotr_craft_delta_at", 0) < CRAFT_RECLICK_S:
+        return    # crafting is progressing -- let it run
+    if data.get("gotr_craft_stall", 0) >= WORKBENCH_STALL_TICKS:
+        ctx.state.trigger_safety_stop("gotr: workbench crafting never progressed")
+        return
+    bench = _find_object_by_name(WORKBENCH_NAME, exact=True)
+    if bench is None:
+        data["gotr_craft_stall"] = data.get("gotr_craft_stall", 0) + 1
+        debug_log.log("gotr", "workbench not visible -- waiting")
+        controller.human_delay(1.0, 2.0)
+        return
+    reach = travel.can_reach(bench)
+    if reach is False:
+        travel.walk_to(ctx, bench)
+        return
+    data["gotr_craft_stall"] = data.get("gotr_craft_stall", 0) + 1
+    _click_escalating(ctx, bench, (WORKBENCH_ACTION,))
+    controller.mark_busy(3.0)
+    controller.human_delay(2.0, 3.0)
+
+
+def mine_phase(ctx, st):
+    """Mine guardian remains/parts at the temple edges (or the large-remains pocket
+    behind the rubble when configured). Deltas detected in _reset_counters."""
+    data = ctx.state.data
+    cfg = ctx.state.config
+    if time.time() - data.get("gotr_mine_delta_at", 0) < MINE_RECLICK_S:
+        return    # actively mining
+    if data.get("gotr_mine_stall", 0) >= MINE_STALL_TICKS:
+        ctx.state.trigger_safety_stop("gotr: mining never produced fragments")
+        return
+    node = None
+    if cfg.get("use_large_remains"):
+        node = _find_object_by_name(LARGE_REMAINS_NAME, action=MINE_ACTION, exact=True)
+    if node is None:
+        node = _find_object_by_name(GUARDIAN_REMAINS_NAMES, action=MINE_ACTION,
+                                    exact=True)
+    if node is None:
+        data["gotr_mine_stall"] = data.get("gotr_mine_stall", 0) + 1
+        debug_log.log("gotr", "no minable remains visible -- waiting")
+        controller.human_delay(1.0, 2.0)
+        return
+    reach = travel.can_reach(node)
+    if reach is False:
+        if cfg.get("use_large_remains"):
+            rubble = _find_object_by_name(RUBBLE_NAME, action=RUBBLE_ACTION, exact=True)
+            if rubble is not None and travel.can_reach(rubble) is not False:
+                _click_escalating(ctx, rubble, (RUBBLE_ACTION,))
+                controller.mark_busy(3.0)
+                controller.human_delay(1.5, 2.5)
+                return
+        travel.walk_to(ctx, node)
+        return
+    data["gotr_mine_stall"] = data.get("gotr_mine_stall", 0) + 1
+    _click_escalating(ctx, node, (MINE_ACTION,))
+    controller.mark_busy(2.0)
+    controller.human_delay(1.0, 1.8)
