@@ -550,3 +550,127 @@ def _find_dark_mage_widget():
         if w and w.get("clickable") and "dark mage" in (w.get("text") or "").lower():
             return w
     return None
+
+
+# ---------------------------------------------------------------------------
+# Between rounds
+# ---------------------------------------------------------------------------
+
+def enter_arena_phase(ctx, st):
+    """South of the entry barrier: pass it. Reset lives in _reset_counters (inArena)."""
+    data = ctx.state.data
+    if data.get("gotr_enter_clicks", 0) >= ENTER_MAX_CLICKS:
+        ctx.state.trigger_safety_stop("gotr: could not pass the entry barrier")
+        return
+    barrier_obj = None
+    for act in ENTRY_BARRIER_ACTIONS:
+        barrier_obj = _find_object_by_name(ENTRY_BARRIER_NAME, action=act, exact=True)
+        if barrier_obj is not None:
+            break
+    if barrier_obj is None:
+        debug_log.log("gotr", "entry barrier not visible -- waiting")
+        controller.human_delay(1.0, 2.0)
+        return
+    data["gotr_enter_clicks"] = data.get("gotr_enter_clicks", 0) + 1
+    _click_escalating(ctx, barrier_obj, ENTRY_BARRIER_ACTIONS)
+    controller.mark_busy(2.0)
+    controller.human_delay(1.5, 2.5)
+
+
+def between_rounds_phase(ctx, st):
+    """waiting/complete/idle: repair pouches, restock cells, deposit strays, idle.
+    One action per tick, priority-ordered."""
+    data = ctx.state.data
+    cfg = ctx.state.config
+    inv = st.get("inventory") or {}
+
+    if cfg.get("repair_pouches"):
+        pouches = read_pouches()
+        if pouches is not None and not pouches_degraded(pouches):
+            # Success detection for the repair loop -- reset lives HERE, where the
+            # pouch reader proves it, not in the attempt handler.
+            data["gotr_contact_casts"] = 0
+            data["gotr_contact_stuck"] = 0
+        elif (pouches_degraded(pouches)
+                and data.get("gotr_contact_casts", 0) < CONTACT_MAX_CASTS):
+            _repair_pouches(ctx)
+            return
+
+    if (inv.get("unchargedCells", 0) < cfg["min_uncharged_cells"]
+            and inv.get("emptySlots", 0) > 0
+            and data.get("gotr_restock_clicks", 0) < RESTOCK_MAX_CLICKS):
+        _restock_cells(ctx)
+        return
+
+    if _runes_in_inventory():
+        _deposit_runes(ctx)
+        return
+
+    controller.human_delay(1.0, 2.5)
+
+
+def _repair_pouches(ctx):
+    """NPC Contact -> Dark Mage -> 'repair' dialogue option. CONTACT_MAX_CASTS is a
+    give-up (degraded pouches still work at reduced capacity), never a safety stop."""
+    data = ctx.state.data
+    d = _dialogue()
+    if _dialogue_open(d):
+        if not _choose_option(ctx, d, ("repair",)):
+            controller.key_tap(ctx.ser, "SPACE")
+        controller.human_delay(0.5, 0.9)
+        return
+
+    if time.time() - data.get("gotr_contact_cast_at", 0) < CONTACT_RESOLVE_S:
+        mage = _find_dark_mage_widget()
+        if mage is not None:
+            controller.click_entity(ctx.ser, mage, offset=(0, 0),
+                                    check_ui_blockers=False)
+            controller.human_delay(1.2, 1.8)
+        return
+
+    controller.key_tap(ctx.ser, MAGIC_TAB_KEY)
+    controller.human_delay(0.3, 0.5)
+    spell = controller.get_widget(NPC_CONTACT_GROUP, NPC_CONTACT_CHILD)
+    if not spell or not spell.get("clickable"):
+        stuck = data.get("gotr_contact_stuck", 0) + 1
+        data["gotr_contact_stuck"] = stuck
+        debug_log.log("gotr", f"NPC Contact widget not clickable ({stuck}x) -- "
+                              "Lunar spellbook active?")
+        if stuck >= CONTACT_STUCK_LIMIT:
+            debug_log.log("gotr", "giving up on pouch repair this window")
+            data["gotr_contact_casts"] = CONTACT_MAX_CASTS
+        return
+    data["gotr_contact_stuck"] = 0
+    data["gotr_contact_casts"] = data.get("gotr_contact_casts", 0) + 1
+    data["gotr_contact_cast_at"] = time.time()
+    debug_log.log("gotr", "casting NPC Contact to repair pouches")
+    controller.click_entity(ctx.ser, spell, offset=(0, 0), check_ui_blockers=False)
+    controller.human_delay(1.2, 1.8)
+
+
+def _restock_cells(ctx):
+    data = ctx.state.data
+    table = _find_object_by_name(UNCHARGED_CELLS_NAME, exact=True)
+    if table is None:
+        debug_log.log("gotr", "uncharged-cells table not visible")
+        return
+    reach = travel.can_reach(table)
+    if reach is False:
+        travel.walk_to(ctx, table)
+        return
+    data["gotr_restock_clicks"] = data.get("gotr_restock_clicks", 0) + 1
+    _click_escalating(ctx, table, (TAKE_ACTION,))
+    controller.human_delay(0.8, 1.4)
+
+
+def _deposit_runes(ctx):
+    pool = _find_object_by_name(DEPOSIT_POOL_NAME, exact=True)
+    if pool is None:
+        debug_log.log("gotr", "deposit pool not visible")
+        return
+    reach = travel.can_reach(pool)
+    if reach is False:
+        travel.walk_to(ctx, pool)
+        return
+    _click_escalating(ctx, pool, (DEPOSIT_ACTION,))
+    controller.human_delay(1.0, 1.6)
