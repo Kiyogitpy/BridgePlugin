@@ -125,3 +125,60 @@ def choose_cell_tile(barriers):
     if not live:
         return None
     return min(live, key=lambda b: BARRIER_LIVE_ORDER.index(b["state"]))
+
+
+def choose_altar(st, rc_level, blocked=()):
+    """Which ACTIVE altar to visit: the type whose earned energy is LOWER (one point per
+    100 energy per type -- balance is what makes points), falling back to the other when
+    level- or quest-gated. rc_level None means "cannot read the level" and gates nothing.
+    None = neither active altar is usable right now."""
+    def usable(name):
+        if not name or name == "UNKNOWN" or name in blocked:
+            return False
+        level = ALTAR_LEVELS.get(name)
+        if level is None:
+            return False
+        return rc_level is None or rc_level >= level
+
+    elemental = st.get("elementalAltar") or "UNKNOWN"
+    catalytic = st.get("catalyticAltar") or "UNKNOWN"
+    prefer_elemental = st.get("elementalEnergy", 0) <= st.get("catalyticEnergy", 0)
+    order = (elemental, catalytic) if prefer_elemental else (catalytic, elemental)
+    for name in order:
+        if usable(name):
+            return name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pure logic: essence pouches (/api/storage/essence-pouches shape:
+# {"pouches": {"SMALL": {"storedEssence": n, "capacity": n, "repairNeeded": bool,
+#  "inInventory": bool, ...}, ...}, ...})
+# ---------------------------------------------------------------------------
+
+def _held_pouches(api):
+    pouches = (api or {}).get("pouches")
+    if not isinstance(pouches, dict):
+        return None
+    return [p for p in pouches.values() if isinstance(p, dict) and p.get("inInventory")]
+
+
+def pouches_degraded(api):
+    """True when any pouch in the inventory reports repairable degradation."""
+    held = _held_pouches(api)
+    return bool(held) and any(p.get("repairNeeded") for p in held)
+
+
+def pouch_free_space(api):
+    """Free essence capacity across held pouches; None = reader unavailable
+    ("cannot tell" -- callers must not treat it as 0)."""
+    held = _held_pouches(api)
+    if held is None:
+        return None
+    return sum(max(0, p.get("capacity", 0) - p.get("storedEssence", 0)) for p in held)
+
+
+def pouch_stored(api):
+    """Essence sitting inside held pouches (0 when the reader is unavailable)."""
+    held = _held_pouches(api)
+    return sum(p.get("storedEssence", 0) for p in held) if held else 0

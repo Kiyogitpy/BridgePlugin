@@ -103,3 +103,77 @@ def test_choose_cell_tile_ignores_broken_and_noop():
     assert gotr.choose_cell_tile(tiles) is None
     assert gotr.choose_cell_tile([]) is None
     assert gotr.choose_cell_tile(None) is None
+
+
+# --- choose_altar ----------------------------------------------------------
+
+def test_choose_altar_prefers_lower_energy_type():
+    st = make_state(elementalEnergy=100, catalyticEnergy=20)
+    assert gotr.choose_altar(st, 99) == "CHAOS"
+    st = make_state(elementalEnergy=20, catalyticEnergy=100)
+    assert gotr.choose_altar(st, 99) == "AIR"
+
+
+def test_choose_altar_ties_go_elemental():
+    st = make_state(elementalEnergy=50, catalyticEnergy=50)
+    assert gotr.choose_altar(st, 99) == "AIR"
+
+
+def test_choose_altar_falls_back_when_level_gated():
+    st = make_state(elementalAltar="AIR", catalyticAltar="BLOOD",
+                    elementalEnergy=100, catalyticEnergy=0)
+    # BLOOD needs 77; a level-60 account falls back to the elemental altar
+    assert gotr.choose_altar(st, 60) == "AIR"
+
+
+def test_choose_altar_falls_back_when_blocked():
+    st = make_state(elementalAltar="AIR", catalyticAltar="COSMIC",
+                    elementalEnergy=100, catalyticEnergy=0)
+    assert gotr.choose_altar(st, 60, blocked=("COSMIC",)) == "AIR"
+
+
+def test_choose_altar_none_when_nothing_usable():
+    st = make_state(elementalAltar="UNKNOWN", catalyticAltar="BLOOD")
+    assert gotr.choose_altar(st, 60) is None
+
+
+def test_choose_altar_unknown_rc_level_does_not_gate():
+    st = make_state(elementalAltar="FIRE", catalyticAltar="BLOOD",
+                    elementalEnergy=100, catalyticEnergy=0)
+    assert gotr.choose_altar(st, None) == "BLOOD"
+
+
+# --- pouch readers ---------------------------------------------------------
+
+def pouch_api(**pouches):
+    return {"pouches": pouches}
+
+
+def pstate(stored, capacity, in_inv=True, repair=False):
+    return {"storedEssence": stored, "capacity": capacity, "maximumCapacity": capacity,
+            "repairNeeded": repair, "inInventory": in_inv}
+
+
+def test_pouches_degraded():
+    assert gotr.pouches_degraded(None) is False
+    assert gotr.pouches_degraded({}) is False
+    api = pouch_api(SMALL=pstate(0, 3), GIANT=pstate(0, 9, repair=True))
+    assert gotr.pouches_degraded(api) is True
+    api = pouch_api(GIANT=pstate(0, 9, in_inv=False, repair=True))
+    assert gotr.pouches_degraded(api) is False
+
+
+def test_pouch_free_space():
+    assert gotr.pouch_free_space(None) is None
+    assert gotr.pouch_free_space({}) is None
+    api = pouch_api(SMALL=pstate(1, 3), LARGE=pstate(0, 7),
+                    COLOSSAL=pstate(0, 40, in_inv=False))
+    assert gotr.pouch_free_space(api) == 9
+    assert gotr.pouch_free_space(pouch_api(SMALL=pstate(0, 3, in_inv=False))) == 0
+
+
+def test_pouch_stored():
+    assert gotr.pouch_stored(None) == 0
+    api = pouch_api(SMALL=pstate(3, 3), LARGE=pstate(5, 7),
+                    GIANT=pstate(9, 9, in_inv=False))
+    assert gotr.pouch_stored(api) == 8
