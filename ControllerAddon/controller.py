@@ -2982,6 +2982,7 @@ ROUTINE_FILES = {
     "MAHOGANY_HOMES": "routines/mahogany_homes.py",
     "RAID_SCOUTER": "routines/raid_scouter.py",
     "GIANTS_FOUNDRY": "routines/giants_foundry.py",
+    "GUARDIANS_OF_THE_RIFT": "routines/guardians_of_the_rift.py",
 }
 
 

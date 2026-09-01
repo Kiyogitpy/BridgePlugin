@@ -26,7 +26,8 @@ public enum RoutineChoice
 	PLANK_MAKE("Plank Make"),
 	MAHOGANY_HOMES("Mahogany Homes"),
 	RAID_SCOUTER("Raid Scouter (CoX)"),
-	GIANTS_FOUNDRY("Giants' Foundry");
+	GIANTS_FOUNDRY("Giants' Foundry"),
+	GUARDIANS_OF_THE_RIFT("Guardians of the Rift");
 
 	private final String label;
 
