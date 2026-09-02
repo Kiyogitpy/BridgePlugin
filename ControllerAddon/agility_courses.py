@@ -107,6 +107,10 @@ WILDERNESS = Course(
              start=Box(2994, 3959, 2999, 3962), start_tile=(2996, 3960, 0),
              end=Box(2993, 3941, 2998, 3947), xp=20.0, fail_mode="pit",
              duration_s=10.0, match_radius=6),
+        # xp_certain=False both keeps 498.9 out of pending_xp (it is 0 on a forfeited lap)
+        # and, as a consequence, DISABLES the late-XP guard for the largest drop of the lap:
+        # if it lands inside the next step's poll window it can read as that step's success.
+        # Accepted -- positional step resolution self-corrects, at the cost of one cycle.
         Step("rocks", "rocks", 23640, "Climb",
              start=Box(2993, 3941, 2998, 3947), start_tile=(2996, 3945, 0),
              end=Box(2990, 3930, 3000, 3936), xp=498.9, fail_mode="none",

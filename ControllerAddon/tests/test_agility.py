@@ -192,7 +192,10 @@ def scene(monkeypatch):
     monkeypatch.setattr(controller, "get_api", sc.get_api)
     monkeypatch.setattr(controller, "get_varbit", sc.get_varbit)
     monkeypatch.setattr(controller, "get_player", sc.get_player)
-    monkeypatch.setattr(controller, "get_objects", lambda **kw: list(sc.objects))
+    # kwarg-faithful to controller.get_objects at HEAD: a call passing a kwarg that does not
+    # exist there (e.g. interactable=) must fail loudly here rather than pass on a **kw sponge
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda radius=None, fresh=False: list(sc.objects))
     monkeypatch.setattr(controller, "get_object_at",
                         lambda x, y, plane, obj_id, radius=None:
                         next((o for o in sc.objects if o["id"] == obj_id), None))
@@ -208,9 +211,14 @@ def scene(monkeypatch):
     monkeypatch.setattr(controller, "consume_first",
                         lambda ser, cat: (sc.__setattr__("eats", sc.eats + 1) or True)
                         if sc.inventory else False)
-    # a reading may carry its own "inv" list so a test can script an inventory change mid-wait
-    monkeypatch.setattr(controller, "get_inventory",
-                        lambda: list(sc.cur().get("inv", sc.inventory)))
+    # a reading may carry its own "inv" list so a test can script an inventory change mid-wait;
+    # inv=None scripts a FAILED /inventory read (get_inventory returns None, not [])
+    def _get_inventory():
+        inv = sc.cur().get("inv", sc.inventory)
+        return None if inv is None else list(inv)
+    monkeypatch.setattr(controller, "get_inventory", _get_inventory)
+    monkeypatch.setattr(controller, "get_consumables",
+                        lambda: {"food": list(sc.inventory), "prayer": []})
     monkeypatch.setattr(travel, "walk_to",
                         lambda ctx, target, **kw: sc.walks.append(dict(target)) or True)
     sc.clock = clock
@@ -296,6 +304,22 @@ def test_run_step_knockback_failed(scene):
     assert agility.run_step(ctx, W, stones) == "failed"
 
 
+def test_run_step_busy_already_high_at_click_needs_a_rising_edge(scene):
+    """12393 is the game's GENERAL busy flag: it can read 1 at click time (previous obstacle
+    finishing, an eat). The first 0 after that must NOT classify as `failed` and re-click
+    mid-obstacle -- saw_busy arms only on an observed 0->1 edge after the click."""
+    pipe = W.steps[0]
+    scene.objects = [_obj(pipe)]
+    scene.readings = [dict(xp=1000, busy=1, pos=(3004, 3936, 0)),   # busy at click time
+                      dict(xp=1000, busy=1, pos=(3004, 3936, 0)),   # still high, still in START
+                      dict(xp=1000, busy=0, pos=(3004, 3936, 0)),   # the stale 1 drops: NOT failed
+                      dict(xp=1000, busy=1, pos=(3004, 3942, 0)),   # the real rising edge
+                      dict(xp=1000, busy=0, pos=(3004, 3949, 0))]   # end box: success
+    ctx = make_ctx()
+    assert agility.run_step(ctx, W, pipe) == "success"
+    assert scene.clicks == [(23137, "Squeeze-through", "left")]
+
+
 def test_run_step_rocks_forfeited_lap_completes_on_end_box_without_pending(scene):
     rocks = W.steps[4]
     scene.objects = [_obj(rocks)]
@@ -343,6 +367,39 @@ def test_tick_chains_steps_within_one_tick(scene):
     assert ids[:2] == [23137, 23132]
 
 
+def test_tick_rechecks_position_between_chained_steps(scene, monkeypatch):
+    """A step that succeeds and then leaves us in the dungeon (or off course) must be caught
+    at the TOP of the next chained iteration -- not one whole lap later."""
+    pipe, swing = W.steps[0], W.steps[1]
+    scene.objects = [_obj(pipe), _obj(swing)]
+    called = []
+    monkeypatch.setattr(agility, "dungeon_recovery", lambda ctx, course: called.append(course.key))
+    # the post-step delay is real time passing between two chained steps -- let the world move
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: scene.advance())
+    scene.readings = [dict(xp=1000, busy=0, pos=(3004, 3936, 0)),   # resolve: pipe
+                      dict(xp=1000, busy=1, pos=(3004, 3940, 0)),
+                      dict(xp=1012, busy=0, pos=(3004, 3949, 0)),   # pipe success
+                      dict(xp=1012, busy=0, pos=(2998, 10352, 0))]  # ...but now in the pit
+    ctx = make_ctx()
+    agility.tick(ctx)
+    assert [c[0] for c in scene.clicks] == [23137]      # the swing was never clicked
+    assert called == ["wilderness"]
+
+
+def test_tick_does_not_chain_after_a_non_success(scene, monkeypatch):
+    """Only success chains; anything else hands back to the engine loop for its safety
+    checks, break handling and PLAYER_DIED processing."""
+    stones = W.steps[2]
+    scene.objects = [_obj(stones)]
+    monkeypatch.setattr(agility, "handle_outcome", lambda ctx, course, step, outcome: True)
+    scene.readings = [dict(xp=1000, busy=0, pos=(3005, 3958, 0)),
+                      dict(xp=1000, busy=1, pos=(3003, 3960, 0)),
+                      dict(xp=1000, busy=0, pos=(3005, 3958, 0))]   # knockback: "failed"
+    ctx = make_ctx()
+    agility.tick(ctx)
+    assert len(scene.clicks) == 1
+
+
 def test_tick_outside_course_safety_stops(scene):
     scene.readings = [dict(xp=1000, busy=0, pos=(2998, 3916, 0))]
     ctx = make_ctx()
@@ -383,6 +440,32 @@ def test_resolve_step_off_box_walks_to_nearest_start(scene, monkeypatch):
     assert agility.resolve_step(ctx, W) is None
     assert scene.walks and (scene.walks[-1]["x"], scene.walks[-1]["y"]) == (3004, 3950)
     assert ctx.state.data["no_step_ticks"] == 1
+
+
+def test_resolve_step_tag_disabled_walks_to_the_pipe_and_counts_the_tick(scene):
+    """tagDispenser=False walks past the dispenser to the pipe. That makes no step progress,
+    so it must COUNT against no_step_ticks -- otherwise it is an unbounded silent loop."""
+    cfg = dict(agility.DEFAULT_CONFIG)            # a copy: never mutate the module default
+    cfg["tagDispenser"] = False
+    scene.readings = [dict(xp=1000, busy=0, pos=(2995, 3933, 0))]   # the tag start box
+    ctx = make_ctx()
+    ctx.state.config = cfg
+    assert agility.resolve_step(ctx, W) is None
+    assert (scene.walks[-1]["x"], scene.walks[-1]["y"]) == (3004, 3936)
+    assert ctx.state.data["no_step_ticks"] == 1
+    assert agility.DEFAULT_CONFIG["tagDispenser"] is True
+
+
+def test_resolve_step_tag_disabled_ceiling_safety_stops(scene):
+    cfg = dict(agility.DEFAULT_CONFIG)
+    cfg["tagDispenser"] = False
+    scene.readings = [dict(xp=1000, busy=0, pos=(2995, 3933, 0))]
+    ctx = make_ctx()
+    ctx.state.config = cfg
+    ctx.state.data["no_step_ticks"] = agility.NO_STEP_MAX_TICKS - 1
+    assert agility.resolve_step(ctx, W) is None
+    assert ctx.state.safety_stopped
+    assert not scene.walks
 
 
 def test_events_used_only_until_first_match(scene):
@@ -428,6 +511,17 @@ def test_maybe_eat_only_below_threshold_and_stops_when_out_of_food(scene):
     assert ctx.state.safety_stopped and "out of food" in ctx.state.safety_reason
 
 
+def test_maybe_eat_missed_food_click_is_not_out_of_food(scene, monkeypatch):
+    """consume_first returns click_entity's result, so a missed/withheld click is falsy too.
+    "Out of food" is decided from the consumables list, never from the click."""
+    monkeypatch.setattr(controller, "consume_first", lambda ser, cat: False)
+    ctx = make_ctx()
+    scene.inventory = [{"name": "Blighted karambwan", "qty": 3}]
+    scene.readings = [dict(xp=1000, busy=0, pos=(3004, 3936, 0), hp=25)]   # below stopAt
+    assert agility.maybe_eat(ctx, ctx.state.config) is True
+    assert not ctx.state.safety_stopped
+
+
 def test_run_tag_confirms_on_ticket_count(scene):
     tag = W.tag
     scene.objects = [_obj(tag, x=3005, y=3936)]
@@ -453,17 +547,62 @@ def test_run_tag_times_out_as_failed(scene):
 
 def test_tag_failure_ceiling_walks_on_to_the_pipe_instead_of_stopping(scene):
     ctx = make_ctx()
-    ctx.state.data["attempts"] = agility.TAG_MAX_ATTEMPTS - 1
+    ctx.state.data["tag_attempts"] = agility.TAG_MAX_ATTEMPTS - 1
     assert agility.handle_outcome(ctx, W, W.tag, "failed") is True
     assert not ctx.state.safety_stopped
     assert (scene.walks[-1]["x"], scene.walks[-1]["y"]) == (3004, 3936)
-    assert ctx.state.data["attempts"] == 0
+    assert ctx.state.data["tag_attempts"] == 0
 
 
 def test_tag_failure_below_ceiling_retries(scene):
     ctx = make_ctx()
+    # an obstacle counter parked at its own ceiling by a `fell` on the previous lap must not
+    # bleed into the tag: the two budgets are separate
+    ctx.state.data["attempts"] = agility.STEP_MAX_ATTEMPTS
     assert agility.handle_outcome(ctx, W, W.tag, "failed") is True
-    assert ctx.state.data["attempts"] == 1 and not scene.walks
+    assert ctx.state.data["tag_attempts"] == 1 and not scene.walks
+    assert not ctx.state.safety_stopped
+    assert ctx.state.data["attempts"] == agility.STEP_MAX_ATTEMPTS   # untouched
+
+
+def test_tag_failure_ceiling_keeps_the_counter_when_there_is_no_route(scene, monkeypatch):
+    """walk_to False must not reset tag_attempts -- resetting would loop silently."""
+    monkeypatch.setattr(travel, "walk_to",
+                        lambda ctx, target, **kw: (scene.walks.append(dict(target)), False)[1])
+    ctx = make_ctx()
+    ctx.state.data["tag_attempts"] = agility.TAG_MAX_ATTEMPTS - 1
+    assert agility.handle_outcome(ctx, W, W.tag, "failed") is True
+    assert ctx.state.data["tag_attempts"] == agility.TAG_MAX_ATTEMPTS
+
+
+def test_successful_tag_clears_the_tag_counter(scene):
+    ctx = make_ctx()
+    ctx.state.data["tag_attempts"] = 2
+    assert agility.handle_outcome(ctx, W, W.tag, "success") is True
+    assert ctx.state.data["tag_attempts"] == 0
+
+
+def test_run_tag_unreadable_inventory_never_reports_success(scene):
+    """A failed /inventory read is not a ticket count of 0: with no readable baseline the tag
+    can only ever be `failed`, never a spurious success."""
+    tag = W.tag
+    scene.objects = [_obj(tag, x=3005, y=3936)]
+    scene.readings = [dict(xp=1000, busy=0, pos=(2995, 3933, 0), inv=None)]
+    ctx = make_ctx()
+    assert agility.run_tag(ctx, tag, scene.objects[0]) == "failed"
+    assert scene.clicks == [(53224, "Tag", "left")]     # still attempted
+
+
+def test_run_tag_unreadable_baseline_never_becomes_a_spurious_success(scene):
+    """The sharp edge: a FAILED baseline read counted as 0 would make the next SUCCESSFUL
+    read (a stack we were already carrying) look like a ticket we just earned."""
+    tag = W.tag
+    scene.objects = [_obj(tag, x=3005, y=3936)]
+    seven = [{"name": "Wilderness agility ticket", "qty": 7}]
+    scene.readings = [dict(xp=1000, busy=0, pos=(2995, 3933, 0), inv=None),    # baseline fails
+                      dict(xp=1000, busy=0, pos=(2995, 3933, 0), inv=seven)]   # reads fine now
+    ctx = make_ctx()
+    assert agility.run_tag(ctx, tag, scene.objects[0]) == "failed"
 
 
 def test_dungeon_recovery_climbs_and_walks_back_to_failed_step(scene):

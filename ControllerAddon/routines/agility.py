@@ -55,6 +55,8 @@ NO_OBJECT_MAX_TICKS = 10
 NO_STEP_MAX_TICKS = 10
 LAP_STEPS_PER_TICK = 6       # one full lap (5 obstacles + Tag) chained inside one tick
 OBJECT_SEARCH_RADIUS = 8     # /object/at fallback radius when the bulk scan misses the id
+OBJECT_SCAN_RADIUS = 16      # bounds the bulk scene scan: every candidate is within a few
+                             # tiles by construction (we click from the step's own start box)
 XP_EVENT_SKILL = "Agility"   # ControllerPlugin.onStatChanged emits Skill.getName()
 POST_STEP_DELAY = (0.1, 0.3) # the human's measured 0.2s gap between XP drop and next click
 
@@ -106,10 +108,10 @@ def _route_len(a, b):
 # --- locating and clicking --------------------------------------------------------
 
 def locate_object(step):
-    """Nearest scene object with the step's id (bulk interactable scan, TickCache-gated --
+    """Nearest scene object with the step's id (bulk radius-bounded scan, TickCache-gated --
     the one gated read in this routine, used once per step), else an un-cached /object/at
     lookup around the recorded click tile."""
-    objs = controller.get_objects(interactable=True) or []
+    objs = controller.get_objects(radius=OBJECT_SCAN_RADIUS) or []
     cands = [o for o in objs if o.get("id") == step.object_id]
     if cands:
         cands.sort(key=lambda o: o.get("distance", 9999))
@@ -162,12 +164,19 @@ def run_step(ctx, course, step):
         ctx.events.clear()
     x, y, _, _ = player_tile()
     tiles = ac.chebyshev((x, y), step.start_tile) if x is not None else 0
+    # 12393 is the game's GENERAL busy flag, not this obstacle's: it can already read 1 at
+    # click time (the previous obstacle finishing, an eat). Latching saw_busy on that would
+    # make the very next 0 -- with the player still short of the end box -- classify as
+    # `failed` and re-click mid-obstacle. So saw_busy arms only on an observed 0->1 edge
+    # AFTER the click; a busy already at 1 must first be seen to drop. XP stays primary.
+    busy_at_click = busy_flag()
     if not _click_step(ctx, step, obj):
         return "no_click"
     debug_log.log("agility", f"{step.key}: clicked {step.action} (xp={xp0}, pending={pending})")
 
     deadline = _now() + ac.step_budget_s(step, tiles)
     saw_busy = False
+    armed = busy_at_click != 1
     use_events = ctx.events is not None
     while True:
         if use_events:
@@ -186,7 +195,9 @@ def run_step(ctx, course, step):
                 return "failed" if saw_busy else "no_click"
             continue
         xp_gained = threshold is not None and xp is not None and xp >= threshold
-        if busy == 1:
+        if busy == 0:
+            armed = True
+        elif busy == 1 and armed:
             saw_busy = True
         outcome = ac.classify(
             xp_gained=xp_gained, saw_busy=saw_busy, busy_now=busy,
@@ -210,6 +221,8 @@ def handle_outcome(ctx, course, step, outcome) -> bool:
     if outcome == "success":
         data["attempts"] = 0
         data["no_object_ticks"] = 0
+        if step.confirm == "ticket":
+            data["tag_attempts"] = 0
         controller.human_delay(*POST_STEP_DELAY)
         return True
     if outcome == "fell":
@@ -250,13 +263,25 @@ def resolve_step(ctx, course):
         return None
     step = ac.step_for_position(course, x, y, plane)
     if step is not None:
-        data["no_step_ticks"] = 0
         if step.key == "tag" and not ctx.state.config.get("tagDispenser", True):
             step = course.steps[0]
             if not step.start.contains(x, y, plane):
+                # Walking past the dispenser to the pipe makes no step progress, so it must
+                # NOT reset the no-step counter: an un-walkable goal here would otherwise be
+                # an unbounded silent loop (walk, return None, walk, ...) with no ceiling.
+                n = data.get("no_step_ticks", 0) + 1
+                data["no_step_ticks"] = n
+                if n >= NO_STEP_MAX_TICKS:
+                    ctx.state.trigger_safety_stop(
+                        f"tag disabled but could not reach the {step.key} start from ({x},{y}) for {n} ticks")
+                    return None
                 sx, sy, sp = step.start_tile
-                travel.walk_to(ctx, {"x": sx, "y": sy, "plane": sp}, tolerance=1.0, goal_adjacent=False)
+                if not travel.walk_to(ctx, {"x": sx, "y": sy, "plane": sp},
+                                      tolerance=1.0, goal_adjacent=False):
+                    debug_log.log("agility",
+                                  f"tag disabled: no route from ({x},{y}) to the {step.key} start ({sx},{sy})")
                 return None
+        data["no_step_ticks"] = 0
         return step
     n = data.get("no_step_ticks", 0) + 1
     data["no_step_ticks"] = n
@@ -292,6 +317,12 @@ def maybe_eat(ctx, config) -> bool:
         debug_log.log("agility", f"ate food (hp={hp})")
         controller.human_delay(0.3, 0.6)
         return True
+    # consume_first returns click_entity's result, so a MISSED or withheld click is falsy
+    # too -- it is not proof the food is gone. "Out of food" is decided from the same list
+    # consume_first itself reads (controller.py:645-646 and :2676), never from the click.
+    if controller.get_consumables().get("food", []):
+        debug_log.log("agility", f"food click did not land -- retrying next step (hp={hp})")
+        return True
     if hp <= food.get("stopAt", 30):
         ctx.state.trigger_safety_stop(f"out of food at {hp} hp")
         return False
@@ -301,9 +332,14 @@ def maybe_eat(ctx, config) -> bool:
 
 # --- dispenser Tag ----------------------------------------------------------------
 
-def ticket_count() -> int:
+def ticket_count():
+    """Tickets held, or None when /inventory could not be read. None is NOT zero: a failed
+    read that answered 0 would make the next successful read look like a fresh ticket."""
+    inv = controller.get_inventory()
+    if not inv:
+        return None
     total = 0
-    for item in controller.get_inventory() or []:
+    for item in inv:
         if TICKET_NAME in (item.get("name") or "").lower():
             total += int(item.get("qty") or 0)
     return total
@@ -311,7 +347,8 @@ def ticket_count() -> int:
 
 def run_tag(ctx, step, obj) -> str:
     """Tag the dispenser; success = the ticket stack grew (inventory is un-gated). The chat
-    line is only an accelerator."""
+    line is only an accelerator. An unreadable baseline means we cannot confirm anything:
+    still click (the tag is worth attempting), but never declare success on a guess."""
     before = ticket_count()
     if ctx.events is not None:
         ctx.events.clear()
@@ -331,16 +368,20 @@ def run_tag(ctx, step, obj) -> str:
                 use_events = False
         else:
             _sleep(POLL_S)
-        if ticket_count() > before:
-            debug_log.log("agility", f"tagged the dispenser: tickets {before} -> {before + 1}")
+        now_count = ticket_count()
+        if before is not None and now_count is not None and now_count > before:
+            debug_log.log("agility", f"tagged the dispenser: tickets {before} -> {now_count}")
             return "success"
     return "failed"
 
 
 def _handle_tag_failure(ctx, course, step) -> bool:
+    # Its OWN counter, not `attempts`: a tag failure is cheap and must not spend the
+    # obstacle budget (nor be spent BY it -- an `attempts` left at the ceiling by a `fell`
+    # on the previous lap would otherwise skip the tag on its very first try).
     data = ctx.state.data
-    n = data.get("attempts", 0) + 1
-    data["attempts"] = n
+    n = data.get("tag_attempts", 0) + 1
+    data["tag_attempts"] = n
     if n < TAG_MAX_ATTEMPTS:
         debug_log.log("agility", f"tag did not confirm -- retrying ({n}/{TAG_MAX_ATTEMPTS})")
         return True
@@ -349,8 +390,12 @@ def _handle_tag_failure(ctx, course, step) -> bool:
     first = course.steps[0]
     sx, sy, sp = first.start_tile
     debug_log.log("agility", f"tag failed {n} times -- skipping it this lap")
-    data["attempts"] = 0
-    travel.walk_to(ctx, {"x": sx, "y": sy, "plane": sp}, tolerance=1.0, goal_adjacent=False)
+    if travel.walk_to(ctx, {"x": sx, "y": sy, "plane": sp}, tolerance=1.0, goal_adjacent=False):
+        data["tag_attempts"] = 0
+    else:
+        # No route: leave the counter standing so the ceiling keeps being reached (and this
+        # keeps being logged) rather than resetting into a silent loop.
+        debug_log.log("agility", "no route from the dispenser to the pipe start")
     return True
 
 
@@ -418,18 +463,20 @@ def tick(ctx):
     if course is None:
         ctx.state.trigger_safety_stop(f"unknown course {config.get('course')!r}")
         return
-    x, y, plane, _ = player_tile()
-    if x is None:
-        return
-    if ac.in_pit(course, x, y, plane):
-        dungeon_recovery(ctx, course)
-        return
-    if not ac.in_zone(course, x, y, plane):
-        ctx.state.trigger_safety_stop(f"outside the course at ({x},{y},{plane})")
-        return
-
     for _ in range(LAP_STEPS_PER_TICK):
         if ctx.state.safety_stopped:
+            return
+        # Re-checked at the TOP of every chained iteration, not once per tick: a step that
+        # ends in the dungeon (or off the course entirely) must be caught before the next
+        # step is resolved and clicked, not a whole lap later.
+        x, y, plane, _ = player_tile()
+        if x is None:
+            return
+        if ac.in_pit(course, x, y, plane):
+            dungeon_recovery(ctx, course)
+            return
+        if not ac.in_zone(course, x, y, plane):
+            ctx.state.trigger_safety_stop(f"outside the course at ({x},{y},{plane})")
             return
         if not maybe_eat(ctx, config):
             return
@@ -437,5 +484,9 @@ def tick(ctx):
         if step is None:
             return
         outcome = run_step(ctx, course, step)
-        if not handle_outcome(ctx, course, step, outcome):
+        keep_going = handle_outcome(ctx, course, step, outcome)
+        # Chain ONLY on a clean pass. Any other outcome has had its bookkeeping/walk-back
+        # done above; hand back so the engine loop (safety checks, PLAYER_DIED, breaks)
+        # gets its turn before we click again.
+        if not keep_going or outcome != "success":
             return
