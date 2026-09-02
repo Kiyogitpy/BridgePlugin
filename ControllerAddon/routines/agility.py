@@ -171,6 +171,8 @@ def run_step(ctx, course, step):
         busy = busy_flag()
         px, py, pplane, _ = player_tile()
         if px is None:
+            if _now() >= deadline:
+                return "failed" if saw_busy else "no_click"
             continue
         xp_gained = threshold is not None and xp is not None and xp >= threshold
         if busy == 1:

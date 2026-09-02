@@ -168,6 +168,8 @@ class Scene:
 
     def get_player(self):
         x, y, p = self.cur()["pos"]
+        if x is None:
+            return {}
         return {"x": x, "y": y, "plane": p, "hp": self.cur().get("hp", 90)}
 
 
@@ -262,6 +264,16 @@ def test_pending_xp_blocks_late_drop_from_completing_next_step(scene):
     ctx = make_ctx()
     ctx.state.data["pending_xp"] = 12.5
     assert agility.run_step(ctx, W, swing) == "no_click"
+
+
+def test_run_step_times_out_when_player_unreadable(scene):
+    """A persistent /player failure (get_player() -> {}) must still hit the step budget --
+    `px is None` cannot be an unconditional `continue`, or the poll loop never terminates."""
+    pipe = W.steps[0]
+    scene.objects = [_obj(pipe)]
+    scene.readings = [dict(xp=1000, busy=0, pos=(None, None, None))]
+    ctx = make_ctx()
+    assert agility.run_step(ctx, W, pipe) == "no_click"
 
 
 def test_run_step_fell_into_dungeon(scene):
