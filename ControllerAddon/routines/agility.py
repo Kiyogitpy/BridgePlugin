@@ -118,23 +118,28 @@ def locate_object(step):
     return controller.get_object_at(sx, sy, sp, step.object_id, radius=OBJECT_SEARCH_RADIUS)
 
 
-def _click_step(ctx, step, obj):
+def _click_object(ctx, obj, object_id, action, radius=None, label=""):
     """Aimed left-click with a refresh target and hover verification; a withheld click (a
     player camped on the pixel -- common on this course) escalates straight to the right-click
-    menu, which cannot be hijacked by whatever is drawn on top."""
+    menu, which cannot be hijacked by whatever is drawn on top. Shared by every object click
+    site in this routine, not just the obstacle steps -- see the dungeon ladder."""
     refresh = controller.object_refresh_target(
-        obj["x"], obj["y"], obj.get("plane", 0), step.object_id,
-        radius=step.match_radius or None)
+        obj["x"], obj["y"], obj.get("plane", 0), object_id, radius=radius)
     result = controller.click_entity(
         ctx.ser, obj, offset=(0, 0), refresh_target=refresh, refresh_legs=3,
-        expected_action=step.action)
+        expected_action=action)
     if result:
         return True
     if getattr(result, "withheld", False):
-        debug_log.log("agility", f"{step.key}: pixel contested -- using the menu")
+        debug_log.log("agility", f"{label}: pixel contested -- using the menu")
         return bool(controller.click_menu_action(
-            ctx.ser, obj, step.action, offset=(0, 0), refresh_target=refresh))
+            ctx.ser, obj, action, offset=(0, 0), refresh_target=refresh))
     return False
+
+
+def _click_step(ctx, step, obj):
+    return _click_object(ctx, obj, step.object_id, step.action,
+                         radius=step.match_radius or None, label=step.key)
 
 
 # --- the step loop ----------------------------------------------------------------
@@ -378,9 +383,7 @@ def dungeon_recovery(ctx, course) -> None:
     if obj is None:
         debug_log.log("agility", f"ladder {lad['id']} not visible at ({lad['x']},{lad['y']})")
         return
-    refresh = controller.object_refresh_target(lad["x"], lad["y"], lad["plane"], lad["id"], radius=2)
-    if not controller.click_entity(ctx.ser, obj, offset=(0, 0), refresh_target=refresh,
-                                   refresh_legs=3, expected_action=lad["action"]):
+    if not _click_object(ctx, obj, lad["id"], lad["action"], radius=2, label="ladder"):
         return
     deadline = _now() + LADDER_CLIMB_WAIT_S
     while _now() < deadline:

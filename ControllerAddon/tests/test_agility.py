@@ -481,6 +481,26 @@ def test_dungeon_recovery_climbs_and_walks_back_to_failed_step(scene):
     assert ctx.state.data["dungeon_attempts"] == 0
 
 
+def test_dungeon_recovery_withheld_click_escalates_to_menu(scene, monkeypatch):
+    """A player camped on the ladder pixel must not burn a dungeon_attempt with no recourse --
+    the withheld click escalates to the menu the same way _click_step does."""
+    ladder = {"id": 17385, "name": "Ladder", "x": 3005, "y": 10363, "plane": 0,
+              "distance": 1, "screenX": 400, "screenY": 400, "actions": ["Climb-up"]}
+    scene.objects = [ladder]
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **kw: scene.clicks.append((ent["id"], "withheld", "left"))
+                        or controller.CLICK_WITHHELD)
+    scene.readings = [dict(xp=1000, busy=0, pos=(3005, 10362, 0)),
+                      dict(xp=1000, busy=0, pos=(3005, 10362, 0)),
+                      dict(xp=1000, busy=0, pos=(3005, 3962, 0))]     # back on the course
+    ctx = make_ctx()
+    ctx.state.data["fell_step"] = "log"
+    agility.dungeon_recovery(ctx, W)
+    assert scene.clicks[-1] == (17385, "Climb-up", "menu")
+    assert (scene.walks[-1]["x"], scene.walks[-1]["y"]) == (2996, 3960)
+    assert ctx.state.data["dungeon_attempts"] == 0
+
+
 def test_dungeon_recovery_walks_to_ladder_when_far(scene):
     ladder = {"id": 17385, "name": "Ladder", "x": 3005, "y": 10363, "plane": 0,
               "distance": 12, "screenX": 400, "screenY": 400, "actions": ["Climb-up"]}
