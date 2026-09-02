@@ -58,6 +58,12 @@ OBJECT_SEARCH_RADIUS = 8     # /object/at fallback radius when the bulk scan mis
 XP_EVENT_SKILL = "Agility"   # ControllerPlugin.onStatChanged emits Skill.getName()
 POST_STEP_DELAY = (0.1, 0.3) # the human's measured 0.2s gap between XP drop and next click
 
+TAG_MAX_ATTEMPTS = 3         # a lost ticket is cheap; a stalled lap is not
+DUNGEON_MAX_ATTEMPTS = 4
+LADDER_CLIMB_WAIT_S = 6.0
+LADDER_NEAR_TILES = 2
+TICKET_NAME = "wilderness agility ticket"
+
 
 def get_config(bridge_config):
     return DEFAULT_CONFIG
@@ -266,22 +272,130 @@ def resolve_step(ctx, course):
     return None
 
 
-# --- Task 3 fills these in (stubs keep tick() complete) ---------------------------
+# --- eating ----------------------------------------------------------------------
 
 def maybe_eat(ctx, config) -> bool:
+    """Eat between steps only (never inside a step's wait -- an eat mid-obstacle cannot help
+    and the click would be dropped). False only when the routine safety-stopped."""
+    food = config.get("food") or {}
+    if not food.get("enabled"):
+        return True
+    hp = (controller.get_player() or {}).get("hp")
+    if hp is None or hp > food.get("eatAt", 45):
+        return True
+    if controller.consume_first(ctx.ser, "food"):
+        debug_log.log("agility", f"ate food (hp={hp})")
+        controller.human_delay(0.3, 0.6)
+        return True
+    if hp <= food.get("stopAt", 30):
+        ctx.state.trigger_safety_stop(f"out of food at {hp} hp")
+        return False
+    debug_log.log("agility", f"no food left (hp={hp}) -- continuing until stopAt")
     return True
 
 
+# --- dispenser Tag ----------------------------------------------------------------
+
+def ticket_count() -> int:
+    total = 0
+    for item in controller.get_inventory() or []:
+        if TICKET_NAME in (item.get("name") or "").lower():
+            total += int(item.get("qty") or 0)
+    return total
+
+
 def run_tag(ctx, step, obj) -> str:
+    """Tag the dispenser; success = the ticket stack grew (inventory is un-gated). The chat
+    line is only an accelerator."""
+    before = ticket_count()
+    if ctx.events is not None:
+        ctx.events.clear()
+    x, y, _, _ = player_tile()
+    tiles = ac.chebyshev((x, y), (obj["x"], obj["y"])) if x is not None else 0
+    if not _click_step(ctx, step, obj):
+        return "no_click"
+    deadline = _now() + ac.step_budget_s(step, tiles)
+    use_events = ctx.events is not None
+    while _now() < deadline:
+        if use_events:
+            hit = ctx.events.wait_for_event(
+                "CHAT_MESSAGE",
+                match=lambda p: "agility ticket" in (p.get("message") or "").lower(),
+                timeout_s=POLL_S)
+            if hit is not None:
+                use_events = False
+        else:
+            _sleep(POLL_S)
+        if ticket_count() > before:
+            debug_log.log("agility", f"tagged the dispenser: tickets {before} -> {before + 1}")
+            return "success"
     return "failed"
 
 
 def _handle_tag_failure(ctx, course, step) -> bool:
-    return False
+    data = ctx.state.data
+    n = data.get("attempts", 0) + 1
+    data["attempts"] = n
+    if n < TAG_MAX_ATTEMPTS:
+        debug_log.log("agility", f"tag did not confirm -- retrying ({n}/{TAG_MAX_ATTEMPTS})")
+        return True
+    # Give the ticket up rather than the lap: walk onto the pipe's start box so
+    # step_for_position resolves to the pipe instead of the dispenser again.
+    first = course.steps[0]
+    sx, sy, sp = first.start_tile
+    debug_log.log("agility", f"tag failed {n} times -- skipping it this lap")
+    data["attempts"] = 0
+    travel.walk_to(ctx, {"x": sx, "y": sy, "plane": sp}, tolerance=1.0, goal_adjacent=False)
+    return True
 
+
+# --- dungeon recovery -------------------------------------------------------------
 
 def dungeon_recovery(ctx, course) -> None:
-    return None
+    """Fell off the ropeswing/log: climb the pinned dungeon ladder, then walk back to the
+    failed step's start tile (default: the first pit obstacle, for a restart that lost
+    fell_step). One attempt per call; DUNGEON_MAX_ATTEMPTS then safety-stop."""
+    data = ctx.state.data
+    n = data.get("dungeon_attempts", 0) + 1
+    data["dungeon_attempts"] = n
+    if n > DUNGEON_MAX_ATTEMPTS:
+        ctx.state.trigger_safety_stop(f"could not leave the dungeon after {n - 1} attempts")
+        return
+    lad = course.pit_ladder
+    if lad is None:
+        ctx.state.trigger_safety_stop("in a pit with no ladder defined for this course")
+        return
+    x, y, plane, _ = player_tile()
+    if x is None:
+        return
+    if ac.chebyshev((x, y), (lad["x"], lad["y"])) > LADDER_NEAR_TILES:
+        debug_log.log("agility", f"in the dungeon at ({x},{y}) -- walking to the ladder")
+        if not travel.walk_to(ctx, {"x": lad["x"], "y": lad["y"], "plane": lad["plane"]},
+                              tolerance=1.5, goal_adjacent=True):
+            debug_log.log("agility", "no route to the dungeon ladder")
+            return
+    obj = controller.get_object_at(lad["x"], lad["y"], lad["plane"], lad["id"], radius=2)
+    if obj is None:
+        debug_log.log("agility", f"ladder {lad['id']} not visible at ({lad['x']},{lad['y']})")
+        return
+    refresh = controller.object_refresh_target(lad["x"], lad["y"], lad["plane"], lad["id"], radius=2)
+    if not controller.click_entity(ctx.ser, obj, offset=(0, 0), refresh_target=refresh,
+                                   refresh_legs=3, expected_action=lad["action"]):
+        return
+    deadline = _now() + LADDER_CLIMB_WAIT_S
+    while _now() < deadline:
+        _sleep(POLL_S)
+        px, py, pplane, _ = player_tile()
+        if px is None:
+            continue
+        if not ac.in_pit(course, px, py, pplane):
+            data["dungeon_attempts"] = 0
+            back = course.step_by_key(data.get("fell_step")) or course.first_pit_step() or course.steps[0]
+            sx, sy, sp = back.start_tile
+            debug_log.log("agility", f"climbed out at ({px},{py}) -- walking back to {back.key} start ({sx},{sy})")
+            travel.walk_to(ctx, {"x": sx, "y": sy, "plane": sp}, tolerance=1.0, goal_adjacent=False)
+            return
+    debug_log.log("agility", f"still in the dungeon {LADDER_CLIMB_WAIT_S}s after the climb click ({n}/{DUNGEON_MAX_ATTEMPTS})")
 
 
 # --- routine contract -------------------------------------------------------------

@@ -408,3 +408,105 @@ def test_events_used_only_until_first_match(scene):
     ctx.events = Ev()
     assert agility.run_step(ctx, W, pipe) == "success"
     assert calls.count("wait") == 1 and calls[0] == "clear"
+
+
+# ============================ eating / tag / dungeon ==============================
+
+def test_maybe_eat_only_below_threshold_and_stops_when_out_of_food(scene):
+    ctx = make_ctx()
+    cfg = ctx.state.config
+    scene.inventory = [{"name": "Blighted karambwan", "qty": 3}]
+    scene.readings = [dict(xp=1000, busy=0, pos=(3004, 3936, 0), hp=80)]
+    assert agility.maybe_eat(ctx, cfg) is True and scene.eats == 0
+    scene.readings = [dict(xp=1000, busy=0, pos=(3004, 3936, 0), hp=40)]
+    assert agility.maybe_eat(ctx, cfg) is True and scene.eats == 1
+    scene.inventory = []
+    scene.readings = [dict(xp=1000, busy=0, pos=(3004, 3936, 0), hp=40)]
+    assert agility.maybe_eat(ctx, cfg) is True          # above stopAt: keep going, logged
+    scene.readings = [dict(xp=1000, busy=0, pos=(3004, 3936, 0), hp=25)]
+    assert agility.maybe_eat(ctx, cfg) is False
+    assert ctx.state.safety_stopped and "out of food" in ctx.state.safety_reason
+
+
+def test_run_tag_confirms_on_ticket_count(scene):
+    tag = W.tag
+    scene.objects = [_obj(tag, x=3005, y=3936)]
+    seven = [{"name": "Wilderness agility ticket", "qty": 7}]
+    eight = [{"name": "Wilderness agility ticket", "qty": 8}]
+    # the ticket lands on the second poll after the click
+    scene.readings = [dict(xp=1000, busy=0, pos=(2995, 3933, 0), inv=seven),
+                      dict(xp=1000, busy=0, pos=(3000, 3934, 0), inv=seven),
+                      dict(xp=1000, busy=0, pos=(3004, 3935, 0), inv=eight)]
+    ctx = make_ctx()
+    assert agility.run_tag(ctx, tag, scene.objects[0]) == "success"
+    assert scene.clicks == [(53224, "Tag", "left")]
+
+
+def test_run_tag_times_out_as_failed(scene):
+    tag = W.tag
+    scene.objects = [_obj(tag, x=3005, y=3936)]
+    scene.inventory = [{"name": "Wilderness agility ticket", "qty": 7}]
+    scene.readings = [dict(xp=1000, busy=0, pos=(2995, 3933, 0))]
+    ctx = make_ctx()
+    assert agility.run_tag(ctx, tag, scene.objects[0]) == "failed"
+
+
+def test_tag_failure_ceiling_walks_on_to_the_pipe_instead_of_stopping(scene):
+    ctx = make_ctx()
+    ctx.state.data["attempts"] = agility.TAG_MAX_ATTEMPTS - 1
+    assert agility.handle_outcome(ctx, W, W.tag, "failed") is True
+    assert not ctx.state.safety_stopped
+    assert (scene.walks[-1]["x"], scene.walks[-1]["y"]) == (3004, 3936)
+    assert ctx.state.data["attempts"] == 0
+
+
+def test_tag_failure_below_ceiling_retries(scene):
+    ctx = make_ctx()
+    assert agility.handle_outcome(ctx, W, W.tag, "failed") is True
+    assert ctx.state.data["attempts"] == 1 and not scene.walks
+
+
+def test_dungeon_recovery_climbs_and_walks_back_to_failed_step(scene):
+    ladder = {"id": 17385, "name": "Ladder", "x": 3005, "y": 10363, "plane": 0,
+              "distance": 1, "screenX": 400, "screenY": 400, "actions": ["Climb-up"]}
+    scene.objects = [ladder]
+    scene.readings = [dict(xp=1000, busy=0, pos=(3005, 10362, 0)),
+                      dict(xp=1000, busy=0, pos=(3005, 10362, 0)),
+                      dict(xp=1000, busy=0, pos=(3005, 3962, 0))]     # back on the course
+    ctx = make_ctx()
+    ctx.state.data["fell_step"] = "log"
+    agility.dungeon_recovery(ctx, W)
+    assert scene.clicks == [(17385, "Climb-up", "left")]
+    assert (scene.walks[-1]["x"], scene.walks[-1]["y"]) == (2996, 3960)
+    assert ctx.state.data["dungeon_attempts"] == 0
+
+
+def test_dungeon_recovery_walks_to_ladder_when_far(scene):
+    ladder = {"id": 17385, "name": "Ladder", "x": 3005, "y": 10363, "plane": 0,
+              "distance": 12, "screenX": 400, "screenY": 400, "actions": ["Climb-up"]}
+    scene.objects = [ladder]
+    scene.readings = [dict(xp=1000, busy=0, pos=(2998, 10352, 0)),
+                      dict(xp=1000, busy=0, pos=(3005, 10362, 0)),
+                      dict(xp=1000, busy=0, pos=(3005, 3962, 0))]
+    ctx = make_ctx()
+    agility.dungeon_recovery(ctx, W)
+    assert (scene.walks[0]["x"], scene.walks[0]["y"]) == (3005, 10363)
+    # unknown fell_step (restart): default to the first pit obstacle, the ropeswing
+    assert (scene.walks[-1]["x"], scene.walks[-1]["y"]) == (3004, 3950)
+
+
+def test_dungeon_recovery_ceiling_stops(scene):
+    scene.objects = []
+    scene.readings = [dict(xp=1000, busy=0, pos=(3005, 10362, 0))]
+    ctx = make_ctx()
+    ctx.state.data["dungeon_attempts"] = agility.DUNGEON_MAX_ATTEMPTS
+    agility.dungeon_recovery(ctx, W)
+    assert ctx.state.safety_stopped and "dungeon" in ctx.state.safety_reason
+
+
+def test_tick_routes_to_dungeon_recovery(scene, monkeypatch):
+    called = []
+    monkeypatch.setattr(agility, "dungeon_recovery", lambda ctx, course: called.append(course.key))
+    scene.readings = [dict(xp=1000, busy=0, pos=(3005, 10362, 0))]
+    agility.tick(make_ctx())
+    assert called == ["wilderness"]
