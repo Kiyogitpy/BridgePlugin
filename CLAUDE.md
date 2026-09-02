@@ -647,6 +647,25 @@ steps above.
   from ordinary walking never change it at all. Dropped events past the cap are intentional — the
   Python mirror is an accelerator with an HTTP fallback.
 
+## Current state of routines/agility.py
+
+Written 2026-09-02 from a human recording (`recordings/2026-09-02_032621_wilderness-agility.*`,
+one lap) plus live bridge reads the same day. A generic lap engine over per-course data in
+`ControllerAddon/agility_courses.py` (only WILDERNESS shipped; a rooftop is a data entry).
+Design: `docs/superpowers/specs/2026-09-02-agility-runner-design.md`. **Not yet run live**;
+the spec's "Live-verification checklist" is the first session's worklist — it needs one
+deliberate ropeswing fail and one log fail to confirm the dungeon recovery walk-back.
+
+Signals are un-gated on purpose (user directive): Agility XP from `/api/skills/skills`,
+the game's own `busy` varbit 12393 (1 while an obstacle animates, 0 when done -- the signal
+that confirms Rocks on a forfeited lap, where the 498.9 bonus is 0), the player tile from
+`/player`. The step is re-derived from the player's tile every time
+(`agility_courses.step_for_position`, disjoint START boxes pinned by test), so nothing
+load-bearing lives in `ctx.state.data`. Steps are chained inside one `tick` (the human's
+next click lands 0.2s after the previous XP drop; the engine loop's ~1.1s would triple
+that). `pvpSafety.fleeEnabled` is False for this routine (crowded course, user decision).
+Dungeon ladder pinned live: id 17385 at (3005,10363), `Climb-up`.
+
 ## Arduino firmware protocol (v3)
 
 `firmware/Firmware.ino` speaks protocol v3 as of 2026-08-27 (see its own header block for the

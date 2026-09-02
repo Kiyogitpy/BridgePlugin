@@ -27,7 +27,8 @@ public enum RoutineChoice
 	MAHOGANY_HOMES("Mahogany Homes"),
 	RAID_SCOUTER("Raid Scouter (CoX)"),
 	GIANTS_FOUNDRY("Giants' Foundry"),
-	GUARDIANS_OF_THE_RIFT("Guardians of the Rift");
+	GUARDIANS_OF_THE_RIFT("Guardians of the Rift"),
+	AGILITY("Agility (course runner)");
 
 	private final String label;
 
