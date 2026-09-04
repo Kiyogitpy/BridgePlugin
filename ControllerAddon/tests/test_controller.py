@@ -1573,3 +1573,41 @@ def test_async_key_watchdog_fires_the_action_once_per_press(monkeypatch):
                                    poll_s=0, _stop=should_stop)
 
     assert len(fired) == 2, f"one fire per press, not per poll -- got {len(fired)}"
+
+
+# --- event-driven outcomes engine plumbing (2026-09-04) ------------------------------
+
+def test_subscribe_varbits_posts_csv_and_returns_the_bridge_answer(monkeypatch):
+    seen = {}
+
+    def fake_get(path, params=None, timeout=0.3):
+        seen["path"], seen["params"] = path, params
+        return {"varbits": [5667, 13691], "varps": []}
+    monkeypatch.setattr(controller, "api_get", fake_get)
+    controller._subscribe_warned = False
+    assert controller.subscribe_varbits((13691, 5667)) == {"varbits": [5667, 13691], "varps": []}
+    assert seen["path"] == "/events/subscribe"
+    assert seen["params"] == {"varbits": "13691,5667", "varps": ""}
+
+
+def test_subscribe_varbits_warns_once_when_the_bridge_lacks_the_endpoint(monkeypatch):
+    monkeypatch.setattr(controller, "api_get", lambda *a, **k: None)
+    logged = []
+    monkeypatch.setattr(controller.debug_log, "log", lambda cat, msg: logged.append(msg))
+    controller._subscribe_warned = False
+    assert controller.subscribe_varbits((1,)) is None
+    assert controller.subscribe_varbits((1,)) is None
+    assert len([m for m in logged if "events/subscribe" in m]) == 1
+
+
+def test_loop_stats_logs_slow_iterations_and_a_periodic_summary():
+    t = [0.0]
+    stats = controller.LoopStats(now_fn=lambda: t[0])
+    assert stats.record(0.4, 0.2) == []
+    lines = stats.record(1.6, 1.1)
+    assert lines and "slow loop iteration 1.60s" in lines[0] and "tick 1.10s" in lines[0]
+    t[0] = controller.LOOP_STATS_EVERY_S + 1
+    lines = stats.record(0.5, 0.3)
+    summary = [l for l in lines if "iterations" in l]
+    assert summary and "3 iterations" in summary[0] and "mean 0.83s" in summary[0]
+    assert stats.record(0.5, 0.3) == []       # window reset after the summary

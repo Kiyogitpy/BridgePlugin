@@ -55,6 +55,12 @@
 #       this returns, so a slow teardown just delays the break by that much.
 #       Never called while already on a break, and never more than once per break.
 #
+#   VARBIT_SUBSCRIPTIONS = (13691, ...)   # optional module attribute; VARP_SUBSCRIPTIONS likewise.
+#       Varbit/varp ids the bridge should push as VARBIT_CHANGED UDP events for this routine
+#       (opt-in, REPLACE semantics, re-posted after every login). Wait for them with
+#       bridge_events.await_outcome -- see docs/superpowers/specs/2026-09-04-event-driven-
+#       outcomes-design.md.
+#
 # ctx (a Context instance) is what routines use to act:
 #
 #   ctx.ser         -- open serial.Serial connection; pass to click_entity,
@@ -247,6 +253,23 @@ def get_state():
     return api_get("/state") or {}
 
 
+def get_world():
+    """GET /world (WorldProvider.java, added 2026-09-03): the current world number plus the
+    in-game World Switcher's clickable parts -- logout tab, World Switcher button, list
+    bounds and rows -- for a PHYSICAL world hop. listBounds is scaled here because its keys
+    are the ambiguous x/y/width/height shape _scale_screen_coords only special-cases for
+    uiBlockers."""
+    data = api_get("/world") or {}
+    lb = data.get("listBounds")
+    if isinstance(lb, dict):
+        scale = get_dpi_scale()
+        if scale != 1.0:
+            for k in ("x", "y", "width", "height"):
+                if isinstance(lb.get(k), (int, float)):
+                    lb[k] = int(round(lb[k] * scale))
+    return data
+
+
 def get_player():
     return api_get("/player") or {}
 
@@ -278,6 +301,32 @@ def _player_activity_snapshot():
     wait_until_player_idle's own docstring)."""
     p = get_player()
     return (p.get("localX"), p.get("localY"))
+
+
+_subscribe_warned = False
+
+
+def subscribe_varbits(varbits=(), varps=()):
+    """REPLACE the set of varbits/varps the bridge pushes as VARBIT_CHANGED (GET
+    /events/subscribe, EventsProvider.java). Empty clears. None when the bridge cannot answer
+    (older client without the endpoint: logged once, varbit events simply stay off)."""
+    global _subscribe_warned
+    params = {"varbits": ",".join(str(v) for v in varbits),
+              "varps": ",".join(str(v) for v in varps)}
+    result = api_get("/events/subscribe", params=params)
+    if result is None and not _subscribe_warned:
+        _subscribe_warned = True
+        debug_log.log("!", "bridge has no /events/subscribe -- VARBIT_CHANGED events are off "
+                           "(rebuild + restart the client)")
+    return result
+
+
+def _post_routine_subscriptions(routine):
+    """The routine contract's VARBIT_SUBSCRIPTIONS / VARP_SUBSCRIPTIONS, posted on routine load
+    and again after every login (a client restart drops the set)."""
+    varbits = tuple(getattr(routine, "VARBIT_SUBSCRIPTIONS", ()) or ())
+    varps = tuple(getattr(routine, "VARP_SUBSCRIPTIONS", ()) or ())
+    subscribe_varbits(varbits, varps)
 
 
 def wait_until_player_idle(timeout_s: float = 5.0, stable_reads: int = 2,
@@ -397,7 +446,7 @@ def get_players():
     return api_get("/players") or []
 
 
-def get_objects(radius=None, fresh=False):
+def get_objects(radius=None, fresh=False, interactable=False):
     # Bulk scan -- TickCache-gated (see CLAUDE.md's "Sub-tick data" section). Prefer
     # get_object_at when the caller already knows the specific tile+id it's looking for (a fixed
     # object already committed to -- a plinth, a stile, a bank booth): that's an uncached
@@ -429,6 +478,13 @@ def get_objects(radius=None, fresh=False):
         params["radius"] = radius
     if fresh:
         params["fresh"] = "true"
+    if interactable:
+        # Opt-in server-side filter (ADDED 2026-09-01): only objects with menu actions.
+        # MEASURED in the GOTR temple: the full 4,045-object scan cost ~450ms of CLIENT
+        # THREAD time per tick (~200ms after the decor hull-skip); ~3,500 of those objects
+        # are unclickable decor. A caller that only ever matches clickable things should
+        # pass this and skip the decor before ANY per-object work happens.
+        params["interactable"] = "true"
     return api_get("/objects", params=params or None, timeout=1.0) or []
 
 
@@ -929,6 +985,12 @@ def get_slayer_config():
     return api_get("/slayer-config") or {}
 
 
+def get_mining_config():
+    """The Mining section of the config panel (ConfigExporter.exportMining), or None when the
+    bridge cannot answer -- routines/mining.py keeps its own defaults for that case only."""
+    return api_get("/mining-config")
+
+
 def get_npc_screen_pos(npc_id: int):
     """Fresh (screenX, screenY) for the nearest NPC of this *type*, or None if
     none is found. Fine for picking a new target, but NOT for re-checking one
@@ -1298,8 +1360,18 @@ def probe_firmware_protocol(ser) -> int:
 def scroll_wheel(ser: serial.Serial, clicks: int) -> None:
     """Scroll the wheel `clicks` detents (positive = away from the user). Queued firmware-side,
     so it keeps program order with motion and clicks. Silently unavailable pre-v3."""
-    if FIRMWARE_PROTOCOL >= 3 and clicks:
+    if _firmware_protocol() >= 3 and clicks:
         send_line(ser, f"W {max(-127, min(127, int(clicks)))}")
+
+
+def _firmware_protocol() -> int:
+    """The probed protocol, whichever copy of this module asks. main() runs in __main__
+    and sets THAT copy's FIRMWARE_PROTOCOL; a routine's `import controller` reaches the
+    other copy, where it is still the default 2 -- so scroll_wheel silently no-oped for
+    every routine-side caller (CONFIRMED 2026-09-03: the GOTR world-switcher scroll sent
+    nothing). The probe result is mirrored into input_state, the one module that exists
+    once, and read from there."""
+    return max(FIRMWARE_PROTOCOL, getattr(input_state, "firmware_protocol", 2))
 
 
 def move_rel_arduino(ser: serial.Serial, dx: int, dy: int, *, max_step: int = 20) -> None:
@@ -1861,7 +1933,7 @@ def move_to_human(
         # keeps playing out from under a fresh aim. flush stays None for every device that hasn't
         # been reflashed, which is what keeps this seam bit-for-bit inert until Task 4 lands.
         flush = None
-        if FIRMWARE_PROTOCOL >= 3:
+        if _firmware_protocol() >= 3:
             def flush():
                 send_line(ser, "X")
         human_move.move(ser, aim[0], aim[1], get_cursor_pos=get_cursor_pos, send_line=send_line,
@@ -2841,6 +2913,40 @@ class ControllerState:
         return self.break_until is not None and time.time() < self.break_until
 
 
+LOOP_SLOW_LOG_S = 1.0        # one engine-loop iteration slower than this is logged on its own
+LOOP_STATS_EVERY_S = 60.0    # and a mean/p90 summary this often
+
+
+class LoopStats:
+    """Engine-loop iteration timing. The loop iteration is the reaction FLOOR whenever a routine
+    hands back to the engine, and the ~1.1s figure CLAUDE.md remembers was never measured --
+    this is the measurement. record() returns the log lines to emit (pure, testable)."""
+
+    def __init__(self, now_fn=time.monotonic):
+        self._now = now_fn
+        self._window_start = now_fn()
+        self._iters = []
+        self._ticks = []
+
+    def record(self, iteration_s, tick_s):
+        lines = []
+        self._iters.append(iteration_s)
+        self._ticks.append(tick_s)
+        if iteration_s > LOOP_SLOW_LOG_S:
+            lines.append(f"slow loop iteration {iteration_s:.2f}s (tick {tick_s:.2f}s)")
+        now = self._now()
+        if now - self._window_start >= LOOP_STATS_EVERY_S:
+            n = len(self._iters)
+            mean = sum(self._iters) / n
+            p90 = sorted(self._iters)[min(n - 1, int(0.9 * n))]
+            tick_mean = sum(self._ticks) / n
+            lines.append(f"loop: {n} iterations, mean {mean:.2f}s, p90 {p90:.2f}s, "
+                         f"tick mean {tick_mean:.2f}s")
+            self._window_start = now
+            self._iters, self._ticks = [], []
+        return lines
+
+
 class Context:
     """Everything a routine needs that isn't a bare module-level function."""
 
@@ -2997,6 +3103,8 @@ def resolve_config(routine, bridge_config):
 
 def main():
     import login  # local import: login.py imports controller back, deferred to avoid circularity
+    unfocused_since = None
+    unfocused_logged = False
     import bridge_events  # local import: bridge_events imports controller back, same reason
 
     parser = argparse.ArgumentParser(description="Generic RuneLite bridge controller")
@@ -3009,6 +3117,16 @@ def main():
             "routine and ignores the HttpBridge plugin's Routine dropdown -- handy while "
             "developing a routine that isn't wired into ROUTINE_FILES yet. Omit this to pick "
             "the routine live from the RuneLite HttpBridge plugin's Routine setting instead."
+        ),
+    )
+    parser.add_argument(
+        "--no-events",
+        action="store_true",
+        help=(
+            "Start no UDP event listener: ctx.events is None, every await_outcome falls back to "
+            "HTTP polling and the engine loop sleeps a flat STATE_POLL_INTERVAL. The A/B control "
+            "for the event-driven path. NOTE: UDP-only safety signals (PLAYER_DIED via "
+            "handle_generic_events) are off too -- do not run unattended with this."
         ),
     )
     parser.add_argument(
@@ -3029,8 +3147,13 @@ def main():
                       # RuneLite's Java window reports/receives real physical pixels
     warn_if_pointer_acceleration()
     start_panic_listener()
-    udp = make_udp_listener(UDP_PORT)
-    event_stream = bridge_events.EventStream(udp)
+    if args.no_events:
+        udp = None
+        event_stream = None
+        debug_log.log("!", "--no-events: no UDP listener, HTTP polling only")
+    else:
+        udp = make_udp_listener(UDP_PORT)
+        event_stream = bridge_events.EventStream(udp)
     state = ControllerState()
     start_pause_listener(state)
 
@@ -3039,6 +3162,7 @@ def main():
 
         global FIRMWARE_PROTOCOL
         FIRMWARE_PROTOCOL = probe_firmware_protocol(ser)
+        input_state.firmware_protocol = FIRMWARE_PROTOCOL   # shared with the routine-side copy
         debug_log.log("serial", f"firmware protocol v{FIRMWARE_PROTOCOL}"
                                 + ("" if FIRMWARE_PROTOCOL >= 3 else " (no flush/wheel/reset)"))
         if FIRMWARE_PROTOCOL >= 3:
@@ -3050,9 +3174,21 @@ def main():
         routine = None
         active_path = None
         last_warned_routine = "__unset__"
+        loop_stats = LoopStats()
+        iter_start = None
+        last_tick_s = 0.0
+        subs_posted_for = None    # which routine's VARBIT_SUBSCRIPTIONS the bridge currently holds
 
         while True:
             debug_log.tick(ctx)
+            # Iteration timing: this loop is the reaction FLOOR whenever a routine hands back to
+            # the engine, so it is measured (LoopStats) rather than remembered.
+            now_mono = time.monotonic()
+            if iter_start is not None:
+                for line in loop_stats.record(now_mono - iter_start, last_tick_s):
+                    debug_log.log("engine", line)
+            iter_start = now_mono
+            last_tick_s = 0.0
 
             # drain(), NOT pump() -- pump() only reports what arrived on THIS call, and a
             # blocking helper (wait_for_event/wait_ticks/deadline_after_ticks) used elsewhere in
@@ -3060,7 +3196,7 @@ def main():
             # that hands back everything pumped anywhere since the last drain(), so nothing seen
             # mid-wait (e.g. PLAYER_DIED during retrieve_trap's 3s HTTP confirm loop) is silently
             # dropped before reaching handle_generic_events/on_event (C1, 2026-08-21).
-            events = event_stream.drain()
+            events = event_stream.drain() if event_stream is not None else []
             handle_generic_events(state, events)
             if routine is not None and hasattr(routine, "on_event"):
                 for event_type, payload in events:
@@ -3111,14 +3247,35 @@ def main():
             state.config = config
 
             if not login.is_fully_logged_in():
+                subs_posted_for = None    # a relogin (client restart) drops the subscription set
                 login.attempt_login(ctx)
                 time.sleep(login.LOGIN_RETRY_INTERVAL_S)
                 continue
 
             if not get_state().get("windowFocused", True):
                 # Don't blind-click into a backgrounded window (e.g. user alt-tabbed).
+                # Say so after a few seconds: gotr run 73 sat here for five minutes with
+                # NOTHING in the log and the user assumed it was stuck (F1).
+                if unfocused_since is None:
+                    unfocused_since = time.monotonic()
+                elif not unfocused_logged and time.monotonic() - unfocused_since > 5.0:
+                    debug_log.log("!", "RuneLite window is not focused -- waiting (click into the "
+                                       "game window to resume)")
+                    unfocused_logged = True
                 time.sleep(0.5)
                 continue
+            if unfocused_logged:
+                debug_log.log("!", "RuneLite window focused -- resuming")
+            unfocused_since = None
+            unfocused_logged = False
+
+            # Camera defaults (overhead + slight zoom-out) once after every login, for
+            # every routine -- see login.setup_camera.
+            login.ensure_camera_after_login(ctx)
+
+            if subs_posted_for != active_path:
+                _post_routine_subscriptions(routine)
+                subs_posted_for = active_path
 
             check_safety(state, config)
             check_pvp_threat(ctx, state, config)
@@ -3154,16 +3311,21 @@ def main():
             if not getattr(routine, "SKIP_STRAY_DIALOG_CHECK", False):
                 check_stray_dialog(ctx)
             maybe_idle_mouse_move(ctx, state)
+            tick_start = time.monotonic()
             try:
                 routine.tick(ctx)
             except Exception as exc:
                 debug_log.log_exception("tick", exc)
                 raise
+            last_tick_s = time.monotonic() - tick_start
 
             if config.get("breaks", {}).get("microBreaks") and random.random() < 0.15:
                 human_delay(0.3, 1.2)
 
-            time.sleep(STATE_POLL_INTERVAL)
+            if event_stream is not None:
+                event_stream.wait_any(STATE_POLL_INTERVAL)   # wakes on any non-TICK event
+            else:
+                time.sleep(STATE_POLL_INTERVAL)
 
 
 if __name__ == "__main__":
