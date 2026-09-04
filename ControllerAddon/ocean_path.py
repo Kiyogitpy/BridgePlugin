@@ -107,7 +107,7 @@ def find_ocean_route(start: dict, target: dict) -> list | None:
     if raw_path is None:
         return None
 
-    waypoints = _simplify_path(raw_path)
+    waypoints = _smooth_path(_simplify_path(raw_path), passable)
     # Drop the starting point (the boat is already there); keep the rest, including the final
     # target -- sail_to steers through each of these in turn.
     return [{"x": x, "y": y, "plane": start["plane"]} for x, y in waypoints[1:]]
@@ -192,6 +192,41 @@ def _heuristic(a, b):
     # never exceeds any move's real cost regardless of move set (every step's cost >= its straight-
     # line length here), so it stays admissible without needing to special-case the knight moves.
     return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _smooth_path(path, passable):
+    """String-pulling (added 2026-09-04): from each kept point, jump straight to the FARTHEST
+    later point the segment can reach without leaving `passable` (the already-dilated water
+    set), and keep only those. _simplify_path alone keeps every grid-direction change, and an
+    A* line at any angle the 16-direction grid cannot draw exactly (say slope 1/3) is a run of
+    straight/knight alternations -- one "corner" every tile or two, each of which cost
+    steer_toward a hop click and a poll for a bend the compass-snapped heading could not
+    follow anyway. A segment is tested tile by tile (four samples per tile), so a smoothed leg
+    never cuts through the clearance zone the grid route avoided."""
+    if len(path) <= 2:
+        return path
+    smoothed = [path[0]]
+    i = 0
+    last = len(path) - 1
+    while i < last:
+        j = last
+        while j > i + 1 and not _line_clear(path[i], path[j], passable):
+            j -= 1
+        smoothed.append(path[j])
+        i = j
+    return smoothed
+
+
+def _line_clear(a, b, passable) -> bool:
+    """Every tile the straight segment a->b touches (sampled four times per tile) is passable."""
+    steps = max(abs(b[0] - a[0]), abs(b[1] - a[1])) * 4 + 1
+    for k in range(steps + 1):
+        t = k / steps
+        x = int(round(a[0] + (b[0] - a[0]) * t))
+        y = int(round(a[1] + (b[1] - a[1]) * t))
+        if (x, y) not in passable:
+            return False
+    return True
 
 
 def _simplify_path(path):

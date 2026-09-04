@@ -1,0 +1,19 @@
+# Python dependencies for ControllerAddon (Windows-only project).
+# Install from ControllerAddon/:  python -m pip install -r requirements.txt
+# Versions pinned to what the project was last verified against (2026-09-01).
+
+# Core runtime (controller.py and everything it drives)
+requests==2.32.5     # HTTP bridge client (GET /player, /objects, ...)
+pyserial==3.5        # Arduino mouse/keyboard over COM port (import serial)
+keyboard==0.13.5     # panic/pause hotkeys (F1/F2 low-level hook path)
+pywin32==311         # win32gui window focus checks (import win32gui)
+
+# MCP debug server (mcp_debug_server.py, read-only bridge queries)
+mcp==1.29.0
+
+# Frame analysis for GET /screenshot dumps (see CLAUDE.md)
+numpy==2.2.6
+Pillow==11.3.0
+
+# Tests (python -m pytest tests/)
+pytest==9.1.1

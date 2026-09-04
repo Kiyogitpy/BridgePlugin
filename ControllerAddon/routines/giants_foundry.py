@@ -21,6 +21,7 @@ import time
 import banker
 import controller
 import debug_log
+import travel
 
 DEFAULT_CONFIG = {
     # Value-aware crucible fill plan (the recording's own loadout): items usable on the
@@ -31,9 +32,13 @@ DEFAULT_CONFIG = {
     # "write mith and ada to get all items, we have plenty of bars". MEASURED live: the
     # bank ran out of Adamant platelegs after one sword and of Adamant platebodies after
     # three more, with adamant bars and other adamant equipment still sitting there.
+    # 18 mithril / 10 adamant is the wiki's pick past 70 Smithing (Strategies rev
+    # 15275840: best economy AND best xp/reputation per hour -- score 89, a 5-section
+    # sword, against 14/14's 95 and 6 sections). USER 2026-09-04. Platebody quantization
+    # lands it at 20/8 (score 83, still 5 sections) when only bodies are in stock.
     "fill": [
-        {"metal": "MITHRIL", "target_bars": 14, "items": None},   # None = metal_items("Mithril")
-        {"metal": "ADAMANT", "target_bars": 14, "items": None},
+        {"metal": "MITHRIL", "target_bars": 18, "items": None},   # None = metal_items("Mithril")
+        {"metal": "ADAMANT", "target_bars": 10, "items": None},
     ],
     # Item quantization can overflow the 28-bar cap (MEASURED: 4-bar platebody into 2 bars
     # of space -> confirm dialog, 2 bars lost). The planner first trims the last item to an
@@ -172,6 +177,128 @@ def metal_items(metal_display):
         else:
             out.append((f"{metal_display} {suffix}", bars))
     return out
+
+
+METAL_TIERS = ("BRONZE", "IRON", "STEEL", "MITHRIL", "ADAMANT", "RUNE")
+# Adding a bar to the crucible needs its SMELTING level (wiki, Giants' Foundry rev
+# 15264119, "Sword quality > Metal score"); a boost counts, so the boosted level is read.
+METAL_SMITHING_LEVELS = {"BRONZE": 1, "IRON": 15, "STEEL": 30, "MITHRIL": 50,
+                         "ADAMANT": 70, "RUNE": 85}
+
+
+def _metal_usable(metal, stock, smithing_level, need=1):
+    """Covers `need` bars from stock AND is within the Smithing level (an unknown level
+    never filters). MEASURED live 2026-09-04 (gf_live_tier2): Rune planned at Smithing
+    79 with Rune platebodies in the bank -- every Use click was refused and the fill
+    ceiling stopped the run."""
+    if smithing_level is not None and smithing_level < METAL_SMITHING_LEVELS.get(metal, 0):
+        return False
+    return stock is None or _metal_available_bars(metal, stock) >= need
+
+
+def _metal_available_bars(metal, stock):
+    """Crucible bars the bank can supply of this metal across every catalogue item."""
+    return sum(max(0, stock.get(item.lower(), 0)) * bars
+               for item, bars in metal_items(metal.capitalize()))
+
+
+def _metal_in_stock(metal, stock):
+    """Whether the bank holds ANY crucible-usable item of this metal (bars included)."""
+    return _metal_available_bars(metal, stock) > 0
+
+
+def substitute_empty_metals(fill_cfg, stock, smithing_level=None, contents=None):
+    """(fill, swaps): every fill entry whose metal is unusable is re-assigned a lower
+    tier, and the alloy never drops below ONE tier under its original lowest metal
+    (a replacement that is empty too still stops the run through the restock's own
+    "bank is out of" message, so the slide can never reach bronze unnoticed).
+
+    USER 2026-09-04: shift the pair down rather than collapse onto one metal. Wiki
+    (Strategies rev 15275840, 14+14 alloys): Mithril/Adamant 95, Steel/Adamant 77,
+    Steel/Mithril 65, all-Mithril 40 -- two distinct metals is what the score rewards.
+    A literal pair shift fails when the LOWER metal ran out (Steel/Mithril still needs
+    the mithril), hence per-entry: adamant empty -> Steel/Mithril, mithril empty ->
+    Steel/Adamant, both -> Iron/Steel. Higher tiers resolve first so the pair stays
+    ordered. `stock` maps lower-cased item name -> bank quantity; `stock=None` checks
+    the level alone (outside the bank, where stock is unknown but the level is not).
+
+    "Unusable" means the bank cannot COVER what the crucible still lacks of the metal
+    (`target_bars` minus `contents`), or the metal is above `smithing_level`. MEASURED
+    live 2026-09-04 (gf_live_tier7): 11 mithril bars left against 18 read as in stock,
+    the top-up named a platebody the bank no longer had, and the run stopped.
+
+    Only the metals of entries that are KEPT count as taken, and a candidate that can
+    cover its slot's need is preferred: MEASURED live (gf_live_tier8, 13:34) adamant at 1
+    bar and mithril at 11 against 18/10 resolved to Iron 18 / Steel 10 (score 37) because
+    mithril counted as taken by the entry being replaced -- the 11 mithril bars cover the
+    10-bar slot, so Steel 18 / Mithril 10 (61) is the answer. When no candidate covers,
+    the first tier below the metal that is not taken and within the level is used
+    anyway, so the restock stop names it (the one-tier rule, USER)."""
+    contents = contents or {}
+    n = len(fill_cfg)
+    metals = [e["metal"] for e in fill_cfg]
+    needs = [e["target_bars"] - contents.get(m, 0) for e, m in zip(fill_cfg, metals)]
+
+    def tier(m):
+        return METAL_TIERS.index(m) if m in METAL_TIERS else -1
+
+    def level_ok(m):
+        return smithing_level is None or smithing_level >= METAL_SMITHING_LEVELS[m]
+
+    open_entries = [i for i in range(n) if needs[i] > 0 and metals[i] in METAL_TIERS
+                    and not _metal_usable(metals[i], stock, smithing_level, needs[i])]
+    if not open_entries:
+        return list(fill_cfg), []
+    resolved = list(metals)
+    taken = {metals[i] for i in range(n) if i not in open_entries}
+    floor = min((tier(m) for m in metals if m in METAL_TIERS), default=0) - 1
+    swaps = []
+    for i in sorted(open_entries, key=lambda i: -tier(metals[i])):
+        below = [m for m in reversed(METAL_TIERS[:tier(metals[i])])
+                 if m not in taken and level_ok(m)]
+        covering = [m for m in below if tier(m) >= floor
+                    and _metal_usable(m, stock, smithing_level, needs[i])]
+        choice = covering[0] if covering else (below[0] if below else None)
+        if choice is None:
+            continue
+        resolved[i] = choice
+        taken.add(choice)
+        swaps.append((metals[i], choice))
+    fill = []
+    for entry, metal in zip(fill_cfg, resolved):
+        if metal == entry["metal"]:
+            fill.append(entry)
+        else:
+            fill.append({"metal": metal, "target_bars": entry["target_bars"], "items": None})
+    return fill, swaps
+
+
+def _effective_fill(ctx):
+    """The fill plan for THIS sword: the bank-derived downgrade if one is in force
+    (gf_fill_override, cleared by _reset_counters at the pour), else the config."""
+    return ctx.state.data.get("gf_fill_override") or ctx.state.config["fill"]
+
+
+def _smithing_level():
+    return ((controller.get_skills() or {}).get("Smithing") or {}).get("boosted")
+
+
+def _apply_substitution(ctx, stock, smithing, contents=None):
+    """Run substitute_empty_metals over this sword's fill, log each swap, persist the
+    result as the sword's override, and return the fill to plan from."""
+    fill, swaps = substitute_empty_metals(_effective_fill(ctx), stock,
+                                          smithing_level=smithing, contents=contents)
+    for old_metal, new_metal in swaps:
+        if smithing is not None and smithing < METAL_SMITHING_LEVELS[old_metal]:
+            why = f"Smithing {smithing} is below the {METAL_SMITHING_LEVELS[old_metal]} for"
+        else:
+            have = _metal_available_bars(old_metal, stock or {})
+            why = "bank is out of" if have == 0 else f"bank has only {have} bars of"
+        debug_log.log("gf", f"{why} {old_metal.lower()} -- "
+                            f"dropping to {new_metal.lower()} for this sword")
+    if swaps:
+        ctx.state.data["gf_fill_override"] = fill
+    return fill
 
 
 def _fill_items(entry):
@@ -582,6 +709,8 @@ def _reset_counters(data, st, phase):
     if bars > data.get("gf_last_bars", -1):
         data["gf_fill_attempts"] = 0
         data["gf_restock_trips"] = 0
+    if bars < data.get("gf_last_bars", 0):
+        data.pop("gf_fill_override", None)    # poured: the next sword plans from config
     data["gf_last_bars"] = bars
     if st.get("mouldSetupOpen"):
         data["gf_mould_opens"] = 0
@@ -634,10 +763,49 @@ def setup(ctx):
     debug_log.log("gf", "setup ok -- gloves equipped")
 
 
+STORE_CONFIRM_S = 4.0      # the store animation, on top of the walk to the storage
+STORE_TRIES = 2            # a verified left-click, then the right-click menu entry
+
+
+def _await_stored(ctx, storage):
+    """Poll the reader until the preform reads STORED, budgeting the walk to the storage.
+    Iteration-bounded (not wall-clock) like _answer_fill_dialogs so the hermetic tests'
+    no-op sleep exits instantly."""
+    budget = STORE_CONFIRM_S + (storage.get("distance") or 0) * WALK_S_PER_TILE
+    for _ in range(max(1, int(budget / HEAT_POLL_S))):
+        st = read_state()
+        if st and (st.get("preformState") == "STORED" or st.get("preformStored")):
+            return True
+        time.sleep(HEAT_POLL_S)
+    return False
+
+
+def _step_off_machines(ctx, storage):
+    """Last resort before a break with the preform still in hand: a force-walk one tile
+    toward the storage interrupts whatever machine the failed store click may have
+    started. Nothing runs under the preform while nobody is watching; it just cools."""
+    player = controller.get_player() or {}
+    px, py = player.get("x"), player.get("y")
+    if px is None or py is None:
+        return
+    dx = (storage["x"] > px) - (storage["x"] < px)
+    dy = (storage["y"] > py) - (storage["y"] < py)
+    if dx == 0 and dy == 0:
+        dy = 1
+    travel.walk_to_exact_tile(ctx, px + dx, py + dy, player.get("plane", 0),
+                              wait_for_arrival=False)
+
+
 def before_break(ctx):
     # Park a held preform in the Preform Storage before a 3-12 minute break -- the
     # game's own pause mechanism; heat and progress hold indefinitely. On resume the
     # STORED phase picks it back up.
+    # The store is CONFIRMED, never assumed. MEASURED live 2026-09-04 (gf_live_tier5,
+    # 09:15): one unverified click, the preform stayed EQUIPPED through a 5-minute
+    # break, and the sword came back RUINED (148 -> 0 quality; 5 per bad action is
+    # ~40s of a machine running out of band). The break starts when this returns
+    # regardless (engine contract), so a store that never lands ends with a walk off
+    # the machines rather than a hope.
     st = read_state()
     if not st or st.get("preformState") != "EQUIPPED":
         return
@@ -646,9 +814,20 @@ def before_break(ctx):
         debug_log.log("gf", "break due but preform storage not visible -- breaking anyway")
         return
     debug_log.log("gf", "break due -- storing the preform first")
-    controller.click_entity(ctx.ser, storage, refresh_target=_refresh(storage),
-                            expected_action="Store-preform")
-    controller.human_delay(2.0, 3.0)
+    for attempt in range(STORE_TRIES):
+        if attempt == 0:
+            controller.click_entity(ctx.ser, storage, refresh_target=_refresh(storage),
+                                    expected_action="Store-preform")
+        else:
+            controller.click_menu_action(ctx.ser, storage, "Store-preform",
+                                         refresh_target=_refresh(storage), offset=(0, 0))
+        if _await_stored(ctx, storage):
+            debug_log.log("gf", f"preform stored (attempt {attempt + 1})")
+            return
+        debug_log.log("gf", f"[!] store click {attempt + 1} did not register -- "
+                            f"preform still in hand")
+    debug_log.log("gf", "[!] could not store the preform -- walking off the machines for the break")
+    _step_off_machines(ctx, storage)
 
 
 def tick(ctx):
@@ -751,7 +930,11 @@ def _fill_crucible(ctx, st):
     # longer matched, and every tick became a bank trip.
     inv = controller.get_inventory() or []    # bare list (controller.get_inventory), not {"items": [...]}
     held_counts = _inventory_counts(inv)
-    steps, err = plan_fill(cfg["fill"], st.get("crucibleContents") or {},
+    # The level gate applies before ANY fill click, not just at the restock: MEASURED
+    # live 2026-09-04 (gf_live_tier3), Rune platebodies still in hand were used straight
+    # away at Smithing 79. Stock is unknown out here, so only the level is checked.
+    fill = _apply_substitution(ctx, None, _smithing_level(), st.get("crucibleContents"))
+    steps, err = plan_fill(fill, st.get("crucibleContents") or {},
                            cfg["max_overflow_loss"],
                            available=held_counts if held_counts else None)
     if err:
@@ -936,19 +1119,24 @@ WITHDRAW_MENU_STEPS = (10, 5)
 
 def _withdraw_count(ctx, slot, n):
     """USER 2026-09-03: "clicking 12 times on a bar isn't very human" -- take the bulk
-    through the right-click Withdraw-10 / Withdraw-5 entries and only the remainder as
-    single clicks (quantity mode is already 1)."""
+    through the right-click Withdraw-10 / Withdraw-5 entries and the remainder through
+    Withdraw-1. EVERY withdraw is a NAMED menu entry: a bare left-click is whatever the
+    account's Menu Entry Swapper made it. MEASURED live 2026-09-04
+    (recordings/2026-09-04_134458_gf-iron-withdraw): the "single" clicks on Iron bar each
+    resolved to Withdraw-14 (a per-item ui_786444_* swap), 10 + 5 + 14 hit the 28-slot
+    cap, every later withdraw was refused for space, and the run stopped on "bank is out
+    of Steel bar" three times -- the routine's own "Default quantity: 1" click had
+    registered and changed nothing, because a swap ignores the quantity mode."""
     left = n
-    for chunk in WITHDRAW_MENU_STEPS:
+    for chunk in WITHDRAW_MENU_STEPS + (1,):
         while left >= chunk:
             if not controller.click_menu_action(ctx.ser, slot, f"Withdraw-{chunk}",
                                                 offset=(0, 0), check_ui_blockers=False):
-                break            # entry missing (thin stack): fall through to single clicks
+                break            # entry missing (thin stack): fall through to a smaller step
             left -= chunk
             controller.human_delay(0.2, 0.4)
-    for _ in range(left):
-        controller.click_entity(ctx.ser, slot, simulate_mistakes=False)
-        controller.human_delay(0.15, 0.3)
+    if left:
+        debug_log.log("bank", f"[!] {left}x {slot.get('name')} not withdrawn -- no Withdraw entry took")
 
 
 def _restock_from_bank(ctx, steps, st):
@@ -975,7 +1163,11 @@ def _restock_from_bank(ctx, steps, st):
             if name:
                 stock[name] = stock.get(name, 0) + (i.get("qty") or 0)
         cfg = ctx.state.config
-        replanned, err = plan_fill(cfg["fill"], st.get("crucibleContents") or {},
+        # An empty metal drops one tier for the rest of this sword (substitute_empty_metals);
+        # the override is what _fill_crucible plans from outside the bank, so the steel we
+        # withdraw here matches the next tick's plan instead of bouncing back to the bank.
+        fill = _apply_substitution(ctx, stock, _smithing_level(), st.get("crucibleContents"))
+        replanned, err = plan_fill(fill, st.get("crucibleContents") or {},
                                    cfg["max_overflow_loss"], available=stock)
         if err:
             banker.close_bank(ctx)
@@ -997,6 +1189,15 @@ def _restock_from_bank(ctx, steps, st):
     names = [(i.get("name") or "").lower() for i in inv]
     for item in need:
         if item.lower() not in names:
+            # A bank that is no longer open says nothing about stock. MEASURED live
+            # 2026-09-04 (gf_live_tier6, 12:49): a network drop closed the interface
+            # mid-withdraw, the clicks hit nothing, and the empty inventory read as
+            # "out of Mithril bar" with the bars still banked; login.py reconnected 3s
+            # after the stop. Retry next tick -- RESTOCK_MAX_TRIPS still bounds it.
+            if not (controller.get_bank(fresh=True) or {}).get("open"):
+                debug_log.log("gf", f"[!] bank closed under the withdraw of {item} "
+                                    f"(disconnect?) -- retrying next tick")
+                return
             banker.close_bank(ctx)
             ctx.state.trigger_safety_stop(f"giants foundry: bank is out of {item}")
             return

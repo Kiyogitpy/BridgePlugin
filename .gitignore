@@ -12,9 +12,14 @@ data/
 .worktrees/
 ControllerAddon/logs/
 ControllerAddon/recordings/
+ControllerAddon/map-output/
 .superpowers/
 .memsearch/
 *.pyc
 ControllerAddon/*.log
+ControllerAddon/*.err
 ControllerAddon/.hm2_calibration.json
 ControllerAddon/.raid_webhook
+*.stackdump
+hs_err_pid*.log
+client_run.log

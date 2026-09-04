@@ -13,7 +13,9 @@ reporting live game state; the Python side reads that state and decides what to 
 RuneLite client (Java plugin, src/main/java/com/example/)
   └─ HTTP bridge on localhost:8080 (BridgeHttpServer.java, providers/*Provider.java)
   └─ UDP event stream on port 50555 (PLAYER_DIED, NPC_DIED, LEVEL_UP, HP_CHANGED, CHAT_MESSAGE,
-        TICK, OBJECT_SPAWNED/DESPAWNED, GROUND_ITEM_SPAWNED/DESPAWNED, XP_GAINED, ...)
+        TICK, OBJECT_SPAWNED/DESPAWNED, GROUND_ITEM_SPAWNED/DESPAWNED, XP_GAINED, and since
+        2026-09-04: VARBIT_CHANGED (subscribed ids only), WIDGET_LOADED/CLOSED, MENU_CLICKED,
+        GRAPHIC_CHANGED, HITSPLAT, PLAYER_MOVING/STOPPED (per-frame), ...)
         ↕
 Python controller (ControllerAddon/)
   └─ controller.py     — engine: bridge polling, Arduino serial driving, panic key,
@@ -40,6 +42,19 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
 
 - **RuneLite client**: `./gradlew.bat run` (from repo root). Launches via
   `ExamplePluginTest.main`, which loads the Controller plugin and starts the bridge.
+  **Since 2026-09-05 the same command also loads every ZombieLite plugin** (the user's
+  overlay-only boss-helper bundle, `../ZombieLite`, branch `no-packets` on
+  github.com/Kiyogitpy/ZombieLite) when that checkout exists: `run` builds its jar in place
+  (`buildZombieLite`) and `ExamplePluginTest` loads `CustomPlugins.CLASSLIST` by reflection ahead
+  of `ControllerPlugin`, so nothing here compiles against it and a machine without the checkout
+  gets the bridge alone. Why: a Hunllef kill can only be played by hand with ZombieLite's
+  attack/prayer counters up, and `/recorder` lives in this plugin, so recording it needs both in
+  ONE client. `./gradlew.bat checkZombieLite` links all of its plugin classes against this
+  build's RuneLite without launching (run it after pulling ZombieLite or a `latest.release`
+  bump). That branch has NO packet layer: `com.salvation.packets`, the Zombie Updater, the Zombie
+  Prayer automation and the hopper's auto-teleport/logout were deleted 2026-09-05 so nothing in
+  the merged client can inject input -- keep it that way; the "physical Arduino, never
+  software-injected" rule in "What this is" applies to every plugin loaded next to the bridge.
 - **A routine**: `python -u controller.py routines/<name>.py` (from `ControllerAddon/`). Runs
   until the panic key (F1) is pressed, a safety stop triggers, or the process is killed.
 - **MCP debug server** (`osrs-debug` in `.mcp.json`): read-only bridge queries
@@ -266,6 +281,18 @@ define (see `controller.py`'s own header comment for the authoritative version):
   (a normal outcome, not an error); `wait_ticks(n)`; `deadline_after_ticks(n)` → a wall-clock
   deadline to record and overlap your own work against, rather than sleeping inline;
   `clear()`; and `ticks` (`phase_ms`, `ms_until_next`, `is_stale`).
+  **Added 2026-09-04 (event-driven outcomes,
+  `docs/superpowers/specs/2026-09-04-event-driven-outcomes-design.md`):** `mark()` + `since=`
+  replace the clear-before-the-action rule; `await_outcome(signals, budget_s, confirm=,
+  since=, shorten=)` is THE way to wait for a click's outcome -- a listed UDP signal, confirmed
+  by one HTTP read, with the HTTP read deciding alone at the budget, padded by a human
+  reaction draw (`settings.REACTION_DELAY_S`, fitted from the GOTR benchmark). The
+  module-level `bridge_events.await_outcome(ctx.events, ...)` handles `None` by polling.
+  `controller.py --no-events` is the A/B control. Routines may declare `VARBIT_SUBSCRIPTIONS`/
+  `VARP_SUBSCRIPTIONS`; the engine posts them on load and after every login. The engine loop
+  wakes on any non-TICK event (`EventStream.wait_any`) and logs its own iteration time
+  (`LoopStats`, `[engine] loop: ...` every 60s) -- read that line before assuming the loop's
+  cost. `log_gaps.py <log>` shows where a run's time went.
 - `SKIP_STRAY_DIALOG_CHECK = True` — optional module-level flag; opts out of the engine-level
   `check_stray_dialog` (dismisses a "click here to continue" dialogue via Space before every
   tick). Added 2026-08-14 for `routines/pest_control.py`: that check only presses Space once per
@@ -611,6 +638,17 @@ steps above.
   CLAUDE.md's own shift-click rule). Now: `HOP_VIEWPORT_MAX_TILES` (6, first draft, wants a live
   tuning pass) decides, and `_click_walk_point` holds SHIFT for the viewport case.
 
+- **The NEXT hop is clicked BEFORE arrival, not after it** (`HOP_NEXT_CLICK_LEAD_TILES`, 6,
+  added 2026-08-30). USER: "we wait so long the player runs to the tile we clicked before we
+  click the next point resulting in a weird quick stop". MEASURED in that night's recordings
+  (runs 23/24): a 0.6-1.8s dead stop at EVERY hop boundary, because `_hop_to`'s wait released
+  within `WALK_ARRIVAL_TOLERANCE` (3 tiles ≈ 0.9s of running) while the next click needs
+  ~1.5-2s (0.6s poll quantization + walk_to's collision/door bookkeeping + the mouse flight).
+  Hops longer than the lead now release the wait with 6 tiles (~1.8s) still to run, so the next
+  minimap click lands mid-run — the game just replaces the queued destination, which is what
+  the human recordings do. Hops no longer than the lead keep the exact wait (instant release
+  would spam clicks at their own destination). VERIFIED live the same night (Ardougne→JESS,
+  ~30 tiles): 16 consecutive moving ticks across 2-3 hop boundaries, zero stopped ticks.
 - **The minimap reaches 28 tiles, and the DIAGONALS are what bound it.** MEASURED live 2026-08-28
   from (3037,3345) by walking `/minimap/walk` outward in all eight directions: `onMinimap` held to
   28 everywhere, then failed at 30 on the four diagonals while the cardinals were still on at 32 —
@@ -646,6 +684,598 @@ steps above.
   already `LOGGED_IN` at the CLICK-HERE-TO-PLAY screen (see `LoginProvider.java`), and scene swaps
   from ordinary walking never change it at all. Dropped events past the cap are intentional — the
   Python mirror is an accelerator with an HTTP fallback.
+
+## Current state of routines/guardians_of_the_rift.py
+
+- **Outcome-driven since 2026-09-04 (not yet run live in this form).** Every `_commit` window
+  became `_await` (signals + HTTP confirm, chained inside one tick up to `CHAIN_MAX_ACTIONS`/
+  `CHAIN_MAX_S`); Enter clicks take the game's verdict from `MENU_CLICKED`; walks return on
+  `PLAYER_MOVING`. Baseline to beat: run 76, 48% of the round in gaps over 4s, 5732 earned RC
+  XP/round (run 75). First live session's worklist is the spec's live-verification list
+  (`docs/superpowers/specs/2026-09-04-event-driven-outcomes-design.md`), plan Task 13.
+
+Written 2026-09-01 from research only — **no human recording exists** (user decision;
+the spec records it). Design: `docs/superpowers/specs/2026-09-01-guardians-of-the-rift-design.md`,
+whose "Live-verification checklist" is the first live session's worklist: every object
+name/action in the routine's LIVE-VERIFY block, the Dark Mage row of the NPC Contact
+interface (group 75 child scan), whether cell tiles (GroundObjects) appear in `/objects`
+at all, and the temple/altar instancing check. **Not yet run live.** Ground truth is
+`GET /api/minigames/guardians-of-the-rift` (round phase re-derived Python-side — Gson
+serializes fields, not the reader's Java helper methods) plus
+`/api/storage/essence-pouches`; `runecraftXp`/`miningXp` were added to `/player` for
+sub-tick imbue/mine confirmation (client rebuild required). Strategy per the user's
+decisions: reactive priority ladder (repair broken barrier > huge-remains portal >
+spend stones > place cell > altar trip balancing elemental/catalytic energy > craft >
+mine), hoard reward points, deposit runes, NPC Contact pouch repair between rounds.
+
+A human recording DOES exist after all (`recordings/2026-09-01_061225_gotr-human1.*`,
+9m25s, 238 actions) -- use it for cadence questions before reasoning from the wiki.
+
+**Live sessions 2026-09-01 (runs 1-35) and 2026-09-02 (runs 36-41). Everything below was
+MEASURED; the shape most of them share is the transitional-snapshot family.**
+
+- **Log the ladder.** `_log_state` writes one `state=... action=...` line whenever the
+  (round state, chosen rung) pair changes and a heartbeat every 20s. Before it, run 35
+  sat 63s in idle drift, then entered and left the huge-remains portal 6s apart, and the
+  log could not say which rung did either. Read those lines first when debugging.
+- **A portal/altar teleport hides the HUD for 2+ ticks, and that snapshot reads as
+  "idle" (power -1, both altars UNKNOWN, `inArena` still true).** The 2-tick between-round
+  streak was not enough: run 37 exited the huge-remains pocket 3s after entering it (USER:
+  "went in and out of portal twice without mining"). `ACTIVE_SETTLE_S` (5s): between-round
+  ACTIONS wait that long after the last active read; the log shows those ticks as
+  `action=settling`. A genuine round end costs one 5s delay.
+- **The once-per-game mining latch (`gotr_batch_done`) is set the first time the ladder
+  CHOOSES "craft"**, i.e. when the batch target or the altar-timed switch actually fires.
+  Two wrong keys were tried live: unconditional in-round (idled a mid-round join with 0
+  frags for the whole round, run 37) and the reader's mined count > 0 (latched on the
+  FIRST fragment and dragged the bot back over the rubble with 3 frags, run 38). The
+  reader's `minedFragmentsThisGame >= craft_at_fragments` re-latches after a RESTART, which
+  otherwise loses the latch while the game keeps the fragments.
+- **A verified Enter/cell click HOLDS the ladder** (`_hold_action`/`_held_action`): run 38
+  clicked the huge-remains portal with 10s left, the next tick read 7s, the portal rung
+  dropped below `PORTAL_MIN_SECONDS`, place_cell won and its click cancelled the walk. The
+  same shape at the cell tile in run 40 (a portal opening 2.5s after the Place-cell click,
+  cell still in hand three rungs later). A hold is dropped the moment its precondition is
+  gone (cell placed, stones spent), so it never pins a rung with no work. The portal entry
+  is also DISTANCE-gated: `secs < tiles * PORTAL_RUN_S_PER_TILE + PORTAL_ARRIVAL_MARGIN_S`
+  skips the spawn for `PORTAL_SKIP_BLOCK_S`.
+- **THE MINIMAP IS A UI BLOCKER.** Run 39 clicked the identical pixel once a tick for two
+  minutes "heading for the rubble" with the player never moving (USER: "seems stuck"). A
+  frame dump with the point marked put it INSIDE the minimap circle: `/ground/walk`'s
+  `onScreen` tests viewport bounds only, and in the resizable layout the minimap and its
+  orb column are drawn OVER the top-right of the viewport. `GameStateProvider` now adds
+  `RESIZABLE_MINIMAP_WIDGET`/`_STONES_WIDGET`/`FIXED_VIEWPORT_MINIMAP`/`MINIMAP_ORBS` to
+  `uiBlockers` (client rebuild, done 2026-09-02), and `_direct_walk` skips a candidate
+  tile whose projection is under any blocker and pulls in instead (minimap hop when every
+  candidate is). Note the blocker rect moves with the sidebar: canvas 2287 wide put it at
+  x 1852-2287, sidebar collapsed (2529) at 2094-2529 -- never hardcode it.
+- The bridge is NOT the slow part: `/objects?interactable=true` 108ms, everything else
+  15-120ms. The ~5s gap on the FIRST tick of every run was `_reset_counters` seeding its
+  baselines at -1, so the first snapshot read as a mine AND a craft delta and the reclick
+  guards held the rung. The first snapshot now only seeds (`seeded` flag).
+- **WALK FIRST, CLICK CLOSE applies inside altar rooms too.** The Cosmic altar stands 20
+  tiles from its entry portal (player (2122,4833), altar (2142,4833)); at that range the
+  projected point was on the inventory panel's BORDER (widget 161.97, which the container
+  blocker rect did not cover -- both inventory PARENTS are blockers now, rebuilt
+  2026-09-02) and eight withheld clicks safety-stopped run 42. `ALTAR_CLICK_RANGE` (8):
+  `_work_altar` and the exit-portal branch `_direct_walk` in first. Same for Chaos.
+- **An off-window projection needs a RECOVERY, not a retry.** `click_entity` skips a
+  click whose aim point is outside the window (camera facing away) and both tiers return
+  False silently; the Uncharged cells restock spent its whole budget that way at a round
+  end (run 41) and prep started with 4 cells. `_bring_into_view` (camera turn toward the
+  point + walk toward the object) now backs the restock, deposit, entry-barrier and both
+  Enter clicks. VERIFIED on the deposit pool in run 43 (two skips, one turn, then a clean
+  click).
+- Runs 40-45 each completed full rounds unattended; the remaining known waste is ~60-80s
+  of `idle` per round once the 120-fragment batch is spent (user rule: no re-mining).
+- **Altar choice balances energy past a gap (USER 2026-09-02: "balance catalytic and
+  elemental if possible, keeping priority but balance it out").** `choose_altar` still
+  takes the higher-tier altar, but once one type leads by `ENERGY_BALANCE_GAP` (40, about
+  half a full trip's ~78 energy) the lagging type's altar wins when usable. Run 45 had
+  ended 25/209. And `ALTAR_TRIP_MAX_POWER` (96): no new altar trip that close to 100% --
+  the trip started at 99% came back to a finished round holding 40 stones and a cell.
+- **Nothing pulls the bot out of the pocket before the batch**: a WEAK cell carried over
+  from the previous round made place_cell outrank mining at power 10 (run 44) -- place_cell
+  and in-round restock now wait for `batch_done` while `miningArea` is the east pocket.
+- Pouch repair via Astral Contact (the renamed NPC Contact, option 2) VERIFIED live at a
+  round end in run 44: all three pouches back to full capacity.
+- **The chatbox BODY (scrollbar included) swallows clicks too.** Run 46 clicked the walk
+  tile toward the Cosmic altar at screen (1037,1266) -- the chatbox scrollbar -- ~30
+  times, then a scheduled break froze it there (USER: "chat ui scrollbar softlocked us in
+  altar"). `CHATBOX_PARENT` is a blocker now (rebuilt 2026-09-02). Two nets so the NEXT
+  unregistered overlay cannot do this: `_direct_walk` escalates to a minimap hop once
+  the same target has been clicked twice with the player on the same tile
+  (`WALK_STUCK_CLICKS`), and `_stuck_watch` logs `[!] gotr: STUCK?` after
+  `STUCK_WARN_TICKS` (15) in-round ticks with no progress signal (tile, rung, every
+  inventory count, side area) and safety-stops at `STUCK_STOP_TICKS` (40). USER: "you
+  need to monitor and catch this" -- the live monitor keys on `[!]` lines and on any
+  pixel clicked 5+ times in a row; a stops-only filter missed this for 30 ticks.
+- **After a relogin the camera can face AWAY from everything**, so every click site
+  needs the off-window recovery, not just the ones that failed first: run 48 stopped on
+  "power-up never registered" after six skipped right-clicks on the Great Guardian.
+  `_bring_into_view` is now INSIDE `_click_escalating` (since run 58), so every site
+  that uses it gets the recovery for free -- adding it per site kept missing one: the
+  Power-up (run 48), the three exit portals (run 56, "could not leave the altar room"),
+  then the cell tile through `_approach_or_click` (run 58, "charged cell never
+  consumed"). Only the Power-up right-click, which bypasses the helper, keeps its own.
+- **The pouch-repair cast leaves the MAGIC tab up.** `_repair_pouches` presses F6 and
+  clicks the spell; nothing switched back, so every pouch Fill/Empty click afterwards
+  landed on the spellbook -- run 49 clicked the three pouches plus the remains 40 times
+  in a row with `inventoryTabOpen` false, until `_stuck_watch` stopped it. Every
+  inventory-item click site (`_fill_pouches`, `_empty_pouches`, `drop_talismans_phase`)
+  now calls `controller.open_inventory_tab` first, and the cast re-opens it itself.
+- **The huge-remains portal is found by ID (43729 in, 38044 out), never by name.** The
+  temple has other Portals offering Enter -- 43692 at (3615,9469) in the lobby -- and the
+  nearest-by-name pick walked at that one for 15 ticks (run 49). Both ids come from the
+  human recording.
+- **A break must start at the ROUND END, never mid-round.** Run 50: a scheduled break
+  began at 08:25:45 with the bot inside an altar room; the round ended during the
+  8-minute break, the altar exit then dropped it in the LOBBY with 39 stones and a cell
+  wiped, and it waited a whole extra game at the barrier. `before_break` now plays an
+  active round out (it keeps calling `tick`, at most `BREAK_DEFER_MAX_S` = 12 min) and
+  leaves any side area before returning, so the break overlaps prep and the next game
+  instead of eating the current one. The round-over test is SUSTAINED
+  (`BREAK_INACTIVE_READS` = 6 consecutive non-active reads): the first version broke out
+  on one transitional read and started the break inside the Chaos altar 5s after
+  entering it (run 51) -- the same transitional-snapshot family, once more.
+- **"Missing clicks while moving" (USER 2026-09-02) was RE-CLICKING, not missing.** The
+  recorder run alongside run 53 showed routine clicks and game-registered actions matching
+  ~1:1 (74 clicks, 72 actions, one Deposit Pool click became Walk here) -- the game was
+  receiving them. What the eye saw was the cursor re-flying to the SAME target once a tick
+  while the player was still walking to it: MEASURED run 52, Deposit Pool re-clicked within
+  8s on 21 of 41 clicks, huge remains 17 of 37, because those rungs confirmed on an
+  inventory delta with no commit window. Every verified click now gets a commit window of
+  base + `_walk_budget` (tiles * `PORTAL_RUN_S_PER_TILE`), the mahogany "budget the walk"
+  lesson applied to all of them. Diagnose this class with the recorder + the same-target
+  re-click count, not the routine's own log, which reports every one of those clicks as a
+  success.
+- **Leftover essence blocks the between-round cell restock.** The inventory is usually
+  FULL of essence when a round ends (wiped at the next start), so `emptySlots` reads 0 and
+  the Take could not fit -- run 55 left prep with 1 cell and paid an in-round restock trip.
+  `between_rounds_phase` now makes a slot first (fill pouches if they have room, else
+  `_drop_one` essence) and takes cells next tick.
+- **loginIndex 9 is "Failed to login. Please try again."** (a mid-round disconnect whose
+  first auto-login attempt was refused). `LoginProvider` had no click point for it and
+  login.py spun on "no login click point" for minutes (run 56). It now exposes the Try
+  again button as `okButton` (real y 311, same layout family as the index-24 dialog).
+- **A side room after the round has ended reads as "outside".** The HUD is gone, so
+  `side_area()` cannot recognise an altar room / the portal pocket, and the outside
+  streak safety-stopped run 57 on "start at the Temple of the Eye" while standing in the
+  Earth altar. `_leave_side_area` (an exit Portal in the scene is the tell) now runs from
+  the third outside read, and `before_break` reuses it.
+- **The altar Enter must fit inside the rotation timer, walk included.** The game performs
+  the Enter on arrival; run 60 clicked a guardian at 11s on the timer with a 5s run,
+  arrived to a rotated pair and waited out another cycle holding 21 essence.
+  `altar_trip_phase` now waits (walking closer meanwhile) when
+  `rotation < _walk_budget(portal) + ALTAR_ENTER_MARGIN_S`.
+- Network drops (five in two hours on 2026-09-02 night) and failed rounds on a thin world
+  are NOT routine bugs; the routine rides both out (quiet reconnect wait in login.py,
+  `_leave_side_area` for a round that ends while inside an altar).
+- **World hop and camera at startup (2026-09-03).** After seven straight failed rounds on a
+  non-themed world (USER: "gotta be on a guardians of the rift world, otherwise i dont
+  think we finish a game") the routine hops through the in-game World Switcher with REAL
+  clicks (user choice over a client-API hop): `GET /world` (`WorldProvider.java`) reports
+  the current world, the logout-tab button, the World Switcher button, the list's VISIBLE
+  clip (69:17 -- the list widget itself is the 10455px scrollable content and a row can be
+  "inside" it thousands of px off screen) and every numeric row. Two traps met live: the
+  list has TWO numeric columns (world number and player count; "459" appeared twice, the
+  first in the player column) -- `_world_rows` keeps the leftmost column; and
+  `controller.scroll_wheel` silently no-oped from a routine because `FIRMWARE_PROTOCOL` is
+  set in `__main__`'s copy of controller.py only -- it is now mirrored into
+  `input_state.firmware_protocol` and read via `_firmware_protocol()`, which also fixes
+  the flush gate for routine-side flights. `GOTR_WORLDS` has 409 first (USER: "409 is
+  preferred"). VERIFIED live run 66: 465 -> 409 in 7s. The camera defaults (hold UP until
+  the pitch stops rising -- 1024 -> 4160 on a fresh client -- then 3 wheel detents out, only
+  when the pitch actually moved so routine restarts do not keep zooming out) now live in
+  `login.setup_camera`, applied by the ENGINE once after every login for every routine
+  (USER 2026-09-03: "add that as a default in login.py so it always does that for every
+  routine") -- `login.ensure_camera_after_login` runs after the focus gate in main().
+- **Human benchmark (USER, `recordings/2026-09-03_061331_guaridianoftherift-benchmark.*`,
+  8m53s incl. prep): 7545 Runecraft xp (4395 + the 3150 rift bonus at RC 70), Crafting
+  +725, 8 rift guardians assembled + 8 barrier placements, ~60s per bench->altar cycle.**
+  Bot run 74 on the same world, one full round + prep (9m36s): 2625 + 3150 bonus, 5 altar
+  trips + 2 portal trips, ~75-95s per cycle. Per-trip work matches (bench ~30s, altar
+  ~14s, chores ~10s); the cycle loses time in the approach walk before each click (the
+  human clicks the bench/pool from across the arena and lets the game path -- live
+  collision covers 14 tiles, so farther targets read unreachable and were walked to
+  first), the 10s rotation floor, and a do-nothing tick after every teleport. Hence
+  `_arena_direct_click_ok` (arena-side, same side of the rubble, <= 20 tiles: click, the
+  commit budgets the walk) and `ALTAR_MIN_SECONDS` 10 -> 6. The guardian rung
+  (`create_guardian`, Assemble at the lagging type's essence pile, 2x+1 one-type energy)
+  fell back to the barrier for the whole round because the count sat at 10/10 on a full
+  world -- it only fires when the reader shows room. Measure with the recorder's `xp`
+  records over the round window (see the parse in the 2026-09-03 session), not the
+  routine log, which has no XP.
+  **RESULT (run 75, first round with all three changes, 06:59:40-07:09:45 prep+round,
+  10m05s): Runecraft 8882 (5732 earned + 3150 bonus), Crafting 845, 5 altar trips, 2
+  portal trips, 4 guardians assembled -- against the human's 7545 (4395 + 3150) in 8m53s.
+  Per minute 881 vs 848; earned-per-round 5732 vs 4395.** The guardian creation XP
+  (RC 30/100/180/250 per assemble, wiki table) is a big part of the jump. Cycle times that
+  round: 80/100/79/47/69s.
+- **Arena entry is gated on the BARRIER OBJECT'S ID, not the cell ring.** Cache config/loc:
+  43700 `gotr_barrier` passable, 43849 `gotr_barrier_closed` (red, round running), 53263
+  `gotr_barrier_noentry` (200-player cap before a start). The earlier "any live cell barrier
+  means a round is running" heuristic was measured on a quiet world where the ring reads
+  INACTIVE between games; on themed world 409 the ring stays charged between games and run
+  67 waited 47 minutes in front of a passable 43700 (USER: "never enters?"). Run 68 passed
+  on the first click.
+- **Cell targeting: STRENGTHEN (a live barrier exactly one tier below the cell, 7/13/22
+  energy) > RECHARGE (any live barrier, lowest tier first, 2/5/9/15 -- a lesser cell heals
+  a stronger barrier, wiki "Gaining energy" rev 15303509) > PLACE on an INACTIVE tile (2).**
+  USER 2026-09-03: "power guardian, dump our cell, then go deposit runes" (that ladder
+  order already held; only the target changed). A first cut restricted the cell to tiles
+  BELOW its tier after run 69's MEDIUM-on-STRONG clicks were ignored; that was the wrong
+  lesson -- a full-health barrier has nothing to recharge -- so a tile that ignores
+  `CELL_TILE_TRIES` (2) clicks is skipped for `ACTION_BLOCK_S` and the next-best tried.
+- `_startup_checks` defers until the inventory OR equipment reads non-empty: the first
+  logged-in tick after an auto-login served an empty inventory and run 47 stopped on "no
+  pickaxe" with a Rune pickaxe equipped.
+- Round cadence after the fixes (run 40, one full round): prep-mine in the pocket with
+  paced attempts, first frags 2s after the round goes active, 120 frags at +70s, craft ->
+  fill -> craft to a full inventory -> altar (imbue, empty, imbue, exit) -> Power-up ->
+  Place-cell -> portal trip -> craft, repeating; the round ended at 100% with the bot in
+  the portal pocket, and the exit + prep walk ran under the settle guard.
+
+## Current state of routines/blast_furnace.py
+
+**Live gold session 2026-09-04 (bf_live3-9), the first routine converted to event-driven
+outcomes (`docs/superpowers/specs/2026-09-04-event-driven-outcomes-design.md`) and measured
+against its own 2026-08-31 baseline of ~27-30s per 27-bar gold trip. Now 24-25s; what is left
+is game-bound (smelt ~9-11s after the belt click on a shared mass-world furnace, ~6.6s for
+the ore to go onto the belt, the runs). Everything below was MEASURED that morning.**
+
+- **Conveyor: click the tile that OFFERS `Put-ore-on` (id 9100).** The multi-tile 9101 entries
+  report no actions; the old north-of-nearest heuristic picked one from a different standing
+  spot and six clicks resolved to "Walk here" (0/27, safety stop). A refused click (aim behind
+  the sidebar after the bank camera rotation) is re-resolved up to `CONVEYOR_CLICK_TRIES`.
+- **Bank-interface clicks were being refused since the 2026-09-02 blocker rects**: the
+  deposit-all button and the shift-deposit on items inside the bank's side panel hit the
+  UI-blocker check and rotated the camera instead. Every bank-interface click in `banker.py`
+  now passes `check_ui_blockers=False` (the interface-click rule). This is also how the
+  Goldsmith gauntlets got banked that morning (the swap read inactive because the account's
+  ice pair is `Smiths gloves (i)`, cache obj 27031 -- now one of `ICE_GLOVE_NAMES` -- and the
+  glove names are on `keepItems` for EVERY gold trip, swap active or not).
+- **The dispenser Take opens widget group 270** (the skill-select "How many would you like to
+  take?" prompt, same interface as the Giants' Foundry crucible) ~1.5s after the click; Space
+  answers it; group 229 "You take 27 gold bars ... Click here to continue" follows and needs
+  no dismissal. NEITHER `/state.dialogOpen` NOR the m8aq dialogue reader sees 270 -- `/widget`
+  (270.5 clickable) does. Varbit 10670 `chatmodal_unclamp` flips to 1 when a modal opens but
+  STAYS 1 afterwards (read 1 for 5s+ with nothing on screen), so it only counts as a
+  TRANSITION since the click. Before this, each collect paid ~4s in the settle/idle fallback.
+- Bars-ready rides the pushed Smithing `XP_GAINED` (and the subscribed dispenser varbit);
+  glove wears confirm on `INVENTORY_CHANGED` + the equipment slot; the bank opens on
+  `WIDGET_LOADED` 12 (2.0s click-to-deposit, was 4.2s); the belt deposit on inventory deltas.
+- **Two user ideas, both live:** the ice pair is PRE-HOVERED during the smelt (wear 0.2s after
+  the XP drop, was 1.2s), and the gauntlets go back on DURING the run to the bank -- bank
+  click first, wear mid-run, `banker.open_bank`'s own first click re-queues the open
+  (`_swap_back_on_the_run`; `collect_bars(swap_back=False)` from `run_trip`).
+- Every wait runs on `bf._now/_sleep`; the test fixture installs a fake clock, so budgets
+  expire instantly in tests.
+- **Adamantite the same morning (bf_live13-15): a 2-trip cycle (54 coal, then 27 coal + 27
+  ore with the collect) in ~48s per 27 bars.** Three more facts: (1) `/bank` is TICK-CACHED
+  and the deposit before a withdrawal can add a new item type to the bank, shifting every
+  later slot -- a stale snapshot aimed the shift-click one slot off and withdrew ALL 11
+  Mithril chainbodies; `banker` withdrawals now always read fresh and retry once. (2) The
+  non-gold collect used to "check the dispenser immediately, collect next trip" -- an
+  adamantite batch was only picked up two trips later; every bar type now waits for the
+  bars (pushed varbit/XP) and collects in the same trip, and by the time the bag's coal is
+  on the belt the ore's smelt is usually already done (bars ready "after 0.00s"). (3) The
+  routine follows the panel's Bar Type LIVE, per tick -- a dropdown passing through
+  "mithril" on the way to "adamantite" ran one mithril trip. Glove wears and container
+  (coal bag) clicks never simulate a misclick: a miss + corrective reclick is two wears /
+  a deposit of the neighbouring item with the bank open.
+
+## Current state of routines/giants_foundry.py
+
+Written 2026-08-31 from a human recording (`recordings/2026-08-31_003238_giants-foundry.*`)
+and the easy-giantsfoundry Plugin Hub source; design
+`docs/superpowers/specs/2026-08-31-giants-foundry-design.md`. **First live session
+2026-09-03 (runs gf_live1-13, logs in `ControllerAddon/logs/gf_liveN.log`, recorder
+`recordings/2026-09-03_*_giants-foundry-bot1.*`).** The full loop runs unattended:
+commission -> moulds -> bank -> fill -> pour -> pickup -> refine -> hand-in -> next
+commission. Sword 1 handed in with 80 quality lost, sword 2 with 20; everything below was
+MEASURED that day, and the quality work is where the session ended.
+
+- **`activity` (animation-derived) reads NONE for ~half of every 2-tick machine cycle**:
+  anim 9454 plays ~0.7s of the 1.2s wheel/grindstone cycle. The reader's mapping is right;
+  the player genuinely idles between actions. "Working" is therefore progress advanced
+  within `WORK_STALL_S` OR a machine click still inside its walk-budgeted commit window
+  (`WORK_FIRST_ACTION_S + distance * WALK_S_PER_TILE`), never the animation alone. Every
+  re-click of a working machine is an "overwork" that forfeits the next action; five in a
+  row hit `DEAD_CLICK_LIMIT` (run gf_live2), and the stop then left the wheel running
+  while the preform went cold: 147 -> 67 quality.
+- **Quality is lost 5 per bad action, exactly** (varbit 13939; sweet spot claim +5): a
+  machine action outside the band, or the machine ticking once more with the WRONG tool
+  after a section boundary (wiki: "be ready to click away before the machine ticks
+  again"). The human loses 0-2 units per sword. Both loss sites are handled by
+  pre-hovering the pool and clicking in place: `_boundary_watch` (armed one action from
+  the boundary, polls at 100ms, VERIFIED 0.35s flip-to-Quench, no loss on 2 of 3
+  boundaries) and `edge_leave_due` (leave when the action AFTER next would land out of
+  band on a 2-tick tool; one action ahead on the hammer).
+- **The Dunk/Quench ramp accelerates** (easy-giantsfoundry `HeatActionSolver.DX_1`: 27,30,
+  33,37,41,45,49,53,57,62,67,72,77,83,89,95 per tick). A fixed stop margin cannot track it
+  (935 read -> 997 one tick later, run gf_live7). And with the machine pre-hovered, a click
+  inside the same tick window as the reading cancels the ramp BEFORE its next increment
+  (999 -> 971 read, click, 967) while a click 0.4s+ after the reading eats one more step.
+  So the stop polls just after each tick boundary (`ctx.events` tick clock,
+  `_sleep_to_after_next_tick`), aims at `ramp_aim` = target capped one worst-case step
+  inside the band, and clicks IN PLACE (`click_human`, measured 92ms after the reading).
+  **USER: "hover after the move, otherwise the mouse moves away from the object"** -- the
+  machine is hovered only once the first ramp tick shows the player standing at the pool.
+- **USER: Dunk/Quench are the LEFT-click default on this client** (their menu swap);
+  `_pool_click` clicks in place when `/hover` confirms it, a verified left click otherwise,
+  the right-click menu only as the fallback.
+- **The m8aq Dialogue reader returns the menu TITLE as options[0]** ("How many would you
+  like to add?", "Select an Option") plus blank trailing children; number keys count real
+  options from 1. `_dialogue_options` strips it -- before that the crucible prompt pressed
+  "X" for "3" and the first two fills only worked because "X" landed on "All". Restarting
+  with the hand-in "Receive another commission?" Yes/No open needs a number key; Space
+  once a tick forever (run gf_live8).
+- **The m8aq storage/bank reader only carries the container while the bank is OPEN**
+  (`containerLoaded` false otherwise, and it lingers ~1 tick after closing -- run gf_live5
+  planned platebody one tick and platelegs the next, and every tick became a bank trip).
+  Outside the bank the plan is picked from what the inventory HOLDS; inside it,
+  `_restock_from_bank` re-plans from `/bank` items. `plan_fill` takes per-metal
+  alternative items (`"items": [...]` in the fill config) and trims the last item to an
+  exact 28 (4 mith bodies + 3 adamant bodies) instead of accepting the overflow confirm.
+- **This user's bank holds ~950 items**: `/bank` reports real off-window positions for
+  anything not on the visible page, so every withdraw goes through a bank SEARCH first.
+  USER: "search part of it like 'mith' to get all mithril items or 'adam' to get all
+  adamant items" -- `_withdraw_by_metal` searches once per 4-letter metal prefix
+  ("Adamantite bar" shares "adam") and clicks the needed items from the results, falling
+  back to `banker.search_and_withdraw`'s full-name search only for a result below the
+  visible grid. USER: "clicking 12 times on a bar isn't very human" -- `_withdraw_count`
+  takes the bulk through the right-click Withdraw-10 / Withdraw-5 entries and only the
+  remainder as single clicks (VERIFIED live). **Bank UI buttons never get the simulated
+  misclick** (`banker.search_bank`/`clear_bank_search`/`set_quantity_mode`): a misclick
+  plus its corrective reclick is two clicks on a TOGGLE, which opened and closed the
+  search box and typed "adam" into nothing (gf_live30, USER: "the search never got typed
+  adam"). Their Menu Entry Swapper per-item swaps (e.g. `ui_786444_1121` on Mithril
+  platebody) rewrite left-click withdraws -- the user removed that one.
+- **The fill draws from EVERY usable item of a metal** (`metal_items`, wiki bar values:
+  platebody 4; platelegs/plateskirt/chainbody/kiteshield/2h/warhammer/battleaxe 2; bar,
+  full helm, sq shield, scimitar, longsword, claws 1; med helm and the rest are worth 0),
+  taking stock from each in preference order until the metal is covered. USER: "write
+  mith and ada to get all items, we have plenty of bars". VERIFIED live: sword 5 was
+  filled from 1 Adamant plateskirt + 5 Adamant battleaxes after the platebodies ran out.
+- A restart with the sword in hand reports weapon "Preform" on `/equipment`; setup must
+  not "free hands" over it. `RESTOCK_MAX_TRIPS` bounds bank trips that never grow the
+  crucible. `/objects` lists multi-tile objects once per tile (the trip hammer 24 times).
+- **Bars are NOT stackable, and Use-bar-on-crucible adds ONE bar per tick** (12 bars took
+  ~90s live). USER: "click the crucible then select the bar we wanna fill" -- the
+  crucible's Fill (its left-click default) opens the standard skill-selection interface
+  (group 270; the bar's entry was 270.19 with action "Smelt", matched by NAME since the
+  widget dump has no item ids) and the usual quantity prompt follows: 12 bars in ~13s.
+  The bar item is "Adamantite bar"/"Runite bar", not "Adamant bar" (`BAR_NAMES`).
+- **A sweet-spot claim's ~5% bonus can complete the section on the machine's next tick**
+  (wiki warns; MEASURED twice, 5 and 10 quality). After a claim whose bonus crosses the
+  section end the boundary watch is armed immediately (pool hovered, flip polled at
+  100ms). VERIFIED live gf_live25: claim, boundary 3s later, no loss.
+- **`edge_leave_due` asks where action `lead + 1` FIRES** (`action_fires_at`), not the
+  temperature after `lead` actions -- the latter left one action early into a dunk that
+  cancelled itself (two wheel actions fit at 94 -> 76). Lead 1 with the pool hovered or on
+  the hammer, else 2; and only when that action falls inside the current section.
+- **A sweet spot is NOT claimed one action from the band edge** (`edge_leave_due` with lead
+  1): the claim took the tick the leave was due and the next read was 41 on a 59 floor
+  (gf_live26). The boundary watch also rides through a transitional `requiredTool=NONE`
+  read instead of returning (gf_live25 lost 5 to that) and logs arm/flip/timeout.
+- **Open the inventory tab before every inventory-item click** -- after a pause/resume the
+  stats tab was up and the "platebody" right-click offered "View Attack guide" (gf_live27).
+- The Pick-up hover check can withhold the jig click while the player is still walking;
+  a withheld pickup escalates to the right-click menu, and the attempt ceiling re-reads
+  the state first (the third click had picked it up, gf_live18).
+- **An unusable metal drops ONE tier instead of stopping the run (2026-09-04, VERIFIED
+  live).** `substitute_empty_metals` replaces a metal the open bank cannot COVER (its
+  catalogue items, bars included, sum to fewer bars than the crucible still lacks of
+  it -- MEASURED gf_live_tier7: 11 mithril bars left against 18 read as "in stock", the
+  top-up named a platebody the bank no longer had, safety stop) or ABOVE the account's boosted Smithing
+  level (`METAL_SMITHING_LEVELS`, the smelting levels) with a lower tier -- adamant
+  empty -> Steel/Mithril, mithril empty -> Steel/Adamant, both -> Iron/Steel. Only the
+  metals of entries that are KEPT count as taken, and a candidate that can cover its
+  slot's need (down to one tier below the original pair's lowest metal) is preferred:
+  MEASURED gf_live_tier8 13:34, adamant at 1 bar and mithril at 11 against 18/10 first
+  resolved to Iron 18 / Steel 10 (score 37) because mithril counted as taken by the
+  entry being replaced; now Steel 18 / Mithril 10 (61, VERIFIED gf_live_tier9: poured
+  at difficulty 61). When nothing covers, the first untaken tier below is used anyway so
+  the restock stop names it. USER: shift the pair down rather
+  than collapse onto one metal; wiki (Strategies rev 15275840, 14+14) Mithril/Adamant
+  95, Steel/Adamant 77, Steel/Mithril 65, all-Mithril 40. A replacement that is empty
+  too still hits the existing "bank is out of" stop, so stock never slides further; the
+  level, being a hard fact, is skipped past. The adjusted plan lives in `gf_fill_override`
+  for the rest of the sword (so the held steel matches the outside-bank plan instead of
+  bouncing back to the bank) and `_reset_counters` drops it when the bar count falls,
+  i.e. the pour. **The level gate runs before ANY fill click, not only at the restock**
+  (`_apply_substitution` with `stock=None` in `_fill_crucible`): gf_live_tier3 used Rune
+  platebodies still in hand at Smithing 79 because the gate lived only in the bank.
+  Live proof (gf_live_tier4, Mithril/Rune config as the test vehicle since the bank held
+  every real tier): `Smithing 79 is below the 85 for rune -- dropping to adamant` on tick
+  1, one bank trip, 8 Adamantite bars, poured. Default fill is now **18 mithril / 10
+  adamant** (wiki economy pick past 70; USER has far more mith than ada) -- platebody
+  quantization plans 20/8, score 83, still 5 sections; live: 5 Mithril platebody + 8
+  Adamantite bar, exact 28.
+- **`before_break` CONFIRMS the preform store, retries through the menu, and walks off the
+  machines if it still fails (2026-09-04).** MEASURED live (gf_live_tier5, 09:15): the
+  old single unverified click left the preform EQUIPPED through a 5.2-minute break and
+  the sword came back RUINED, 148 -> 0 quality (5 per bad action, so ~40s of a machine
+  running out of band, most likely the click resolving to a machine). The break starts
+  when the hook returns regardless (engine contract), so `_await_stored` polls the reader
+  for STORED with a walk-budgeted window, `STORE_TRIES` escalates to `click_menu_action`
+  "Store-preform", and `_step_off_machines` force-walks one tile toward the storage as the
+  last resort -- a cooling preform costs nothing, a working machine costs the sword. The
+  RUINED handler then handed it in and took a fresh commission on its own, as designed.
+- **"bank is out of X" is only a verdict while the bank is still OPEN (2026-09-04).**
+  MEASURED live (gf_live_tier6, 12:49): a network drop closed the interface mid-withdraw
+  -- `Menu never opened after right-clicking Mithril bar`, eight single clicks into
+  nothing, then `search button not found (bank open?)` -- and the empty inventory read as
+  out of Mithril bar with ~30 swords' worth still banked; login.py reconnected 3s after
+  the stop. `_restock_from_bank` now re-reads `/bank` before the stop and retries next
+  tick when it is closed (RESTOCK_MAX_TRIPS still bounds it). Same family as GOTR's
+  "network drops are not routine bugs": the routine has to ride them out, not stop.
+- **A bare left-click on a bank item is whatever the account's Menu Entry Swapper made
+  it -- every withdraw in `_withdraw_count` is a NAMED menu entry (Withdraw-10/5/1),
+  2026-09-04.** MEASURED (recordings/2026-09-04_134458_gf-iron-withdraw): the three
+  "single" clicks on Iron bar each resolved to `Withdraw-14` (a per-item `ui_786444_*`
+  swap; 786444 is the bank item container 12.12), 10 + 5 + 14 hit the 28-slot cap, every
+  later withdraw was refused with "You don't have enough inventory space", and the run
+  stopped on "bank is out of Steel bar" three times with steel in the bank. The
+  routine's own "Default quantity: 1" click registered (widget 12.29) and changed
+  nothing: a swap ignores the quantity mode. Mithril and steel bars carried no swap,
+  which is why the same code had withdrawn exactly 18 of them all morning. The recorder
+  found this in one run after three log-only guesses; reach for it sooner. NOT fixed:
+  `banker.search_and_withdraw` still single-left-clicks its remainder and is exposed to
+  the same swap.
+- **Planner shape now:** per metal, take stock from each catalogue item in order (bank
+  stock inside the open bank, held inventory outside), cap a metal's need by the crucible's
+  free space, top up a short held plan with the primary item so the restock fetches it,
+  then trim overflow smallest-item-first (later equal-size steps first) to an exact 28.
+
+## Current state of routines/mining.py
+
+Rewritten 2026-09-03 (USER: pick rocks from what is nearby instead of typing a name, and
+"mine tick perfect ... without depending on tick based info"). **Not yet run live.**
+
+- **Rock choice is the sidebar panel's "Mining: Rocks In Current Area" section**
+  (`SettingsPanel.java`): Refresh scans every plane of the loaded scene on the client thread
+  for GameObjects whose impostor-resolved composition offers "Mine", lists each display name
+  once with a filter box and All/None, and persists to the existing `rockNames` key -- so the
+  wrench-icon text field and the panel are one setting. The routine reads it through
+  `GET /mining-config` (`controller.get_mining_config`); before this it ignored the bridge
+  entirely, so that text field had never done anything. A bridge that cannot answer falls back
+  to `DEFAULT_CONFIG`; an EMPTY panel selection means an idle routine with one log line, never
+  the defaults' rocks.
+- **Reaction is event-driven, truth is HTTP.** `mine_rock` clears `ctx.events`, clicks, rests
+  the cursor on the NEXT rock (`hover_entity` + `object_refresh_target`), then blocks on
+  `wait_for_event` for a Mining `XP_GAINED` or an `OBJECT_DESPAWNED` on the rock's own tile
+  (`EVENT_WAIT_S` 0.25 between HTTP checks; `FALLBACK_POLL_S` when `ctx.events` is None). The
+  rock is DONE only when uncached `/object/at` no longer finds its id on its tile -- an XP drop
+  with the rock still standing (gem rocks, amethyst) resets the budget and keeps waiting,
+  because the player keeps swinging on their own. `tick` then chains straight onto the
+  pre-hovered rock (re-validated through `/object/at` first) for up to `CHAIN_MAX_ROCKS` /
+  `CHAIN_MAX_S`, handing back to the engine loop on any non-depleted outcome.
+- **The bulk `/objects` list is tick-cached and still shows a just-emptied rock under its old
+  id**, so every pick after the first excludes the tiles mined this chain (`exclude=`) -- the
+  first test run caught the pre-hover flying straight back to the depleted rock.
+- Budgets all include the walk (`WALK_S_PER_TILE` x distance): `IDLE_GRACE_S` before an idle
+  player with no ore counts as a failed click, `ROCK_BUDGET_S` before re-picking.
+- Live-verification worklist: `IDLE_GRACE_S`/`ROCK_BUDGET_S` against real swing times at the
+  user's level, whether the rock's `OBJECT_DESPAWNED` reliably lands (or only the XP drop
+  does), and the pre-hover's interaction with the misclick/settle machinery on the near-zero
+  click flight.
+- **2026-09-04: `mine_rock`'s wait is `bridge_events.await_outcome`** (mark/since instead of
+  `clear()`, one HTTP confirm per matched signal, `PLAYER_STOPPED` + `/player.moving` false
+  rebases the walk share of the budget on arrival) **and a full inventory BANKS** when a bank
+  is within `BANK_MAX_DISTANCE` (40): deposit all but the pickaxe, walk back to the recorded
+  stand tile, resume; no bank -> the same "inventory full" safety stop. `get_config` forces
+  `safety.stopOnInventoryFull` OFF because `check_safety` runs before `tick` and would win the
+  race. Not yet run live.
+
+## Current state of routines/shipwreck_salvaging.py
+
+Last LIVE session 2026-08-05 (design spec `docs/superpowers/specs/2026-08-01-shipwreck-salvaging-
+design.md` carries every measured fact from those runs). **Offline bugfix pass 2026-09-03, NOT yet
+run live** (USER: "cant live test right now but i want you to bugfix shipwreck_salvaging with mcp
+and improve it for usage soon") -- every fact below came from the osrs-wiki MCP (wiki rev
+15290733, the cache loc/obj dumps, the Plugin Hub sailing / salvaging-afk-timer sources) plus
+`javap` over runelite-api 1.12.38 in the Gradle cache; the client was up but the player was not
+aboard a boat, so `/sailing`/`boatX` could not be exercised. `tests/test_shipwreck_salvaging.py`
+pins all of it. The first live session's worklist, in the order the failures would bite:
+
+- **`stop_boat` could no longer click the sail toggle.** The Sailing Options panel lives in the
+  SIDEBAR, and `GameStateProvider` has reported the whole sidebar as a UI blocker since the
+  2026-09-02 rebuild (inventory-parent containers) -- `click_entity`'s default blocker check
+  would refuse the click and rotate the camera instead, sails staying up, boat ramming the wreck.
+  The toggle click now passes `check_ui_blockers=False` like every other interface click. The Q
+  tap is also verified and retried (`controller.ensure_ui_state`, `STOP_TAB_TRIES`), and
+  "stopped" needs `STOP_STILL_READS` (2) consecutive still polls with `boatSpeed == 0` when the
+  bridge reports it. Watch for `couldn't open the Sailing Options panel` / `sail toggle not found`.
+- **`SALVAGE_CHANNEL_ANIMATIONS` covered ONE hook size.** The three ids confirmed live
+  (13576-13578) are the 2X5 family; runelite-api has 1X3 (13569-13571), 3X8 (13583-13585) and
+  LARGE01 (13591/13592/13594) families too, and the cache shows the hook facility's animation
+  follows the hull it is built on (`salvaging_hook_large_*_b` -> `..._3x8_idle01`). On a bigger
+  boat every recovery (reclick, reposition, give-up) would have fired against a working hook.
+  Also resolved: the "animation stuck at 13352, cause unconfirmed" note -- 13352 is
+  `HUMAN_SAILING_ALPHA_HELM_SMALL01_ACTIVE01_LOOP`, the player still standing at the helm
+  (`HELM_ANIMATIONS`; the routine logs it and reclicks).
+- **On-boat fixture clicks (helm, hook, sail toggle) and salvage drops never get the simulated
+  misclick** (`sailing._FIXTURE_CLICK_KWARGS`, `drop_salvage`): the deck is a few tiles across
+  and `MISCLICK_OFFSET_PX` (20-45px) is bigger than the 7px offset already measured to land on
+  the sail model; the toggle is a toggle (miss + corrective reclick = sails up then down); and a
+  miss beside a salvage item DROPS whatever tool sits in the next slot. Same rule as banker.py's
+  bank buttons.
+- **The level check failed CLOSED**: an unreadable `/skills` read as boosted level 0, every
+  wreck became "above my level", and the routine idled on "no shipwreck in range" until
+  restarted. Unreadable now means "do not filter".
+- **The far branch never repositioned after a short landing.** `sail_to`'s arrival pre-check
+  returns True within braking distance of the TARGET (an approach point beside a lone wreck), so
+  a landing outside the wreck's `WRECK_SQUARE_SIZE` square deployed the hook every
+  `HOOK_CLICK_COOLDOWN_S` forever. `tick` now verifies `_wreck_in_hook_range` after the sail,
+  closes in on the approach point, and gives the wreck up after `HOOK_ENGAGE_MAX_REPOSITION_
+  ATTEMPTS` misses (`far_wreck_miss_count`).
+- **Approach points were float tiles**, and `ocean_path.find_ocean_route` tests the target
+  against `/tiles`' integer set -- obstacle routing was silently OFF for every approach-point
+  sail. Rounded now.
+- A given-up near wreck is now EXCLUDED from `find_wreck_in_hook_range` instead of nulling its
+  result, so a second in-range wreck is still worked.
+- **Chat signals (`on_event`)**: "reclaimed by the sea" (the wreck sank -- the hook does not
+  carry on, CONFIRMED 2026-08-01) clears the click cooldown so the next tick redeploys; a
+  "hazardous waters" refusal blacklists the wreck under the hook for `HAZARD_GIVEUP_S` (30 min)
+  on both give-up keys, because it is the boat's fittings that are lacking, not the approach.
+  Player chat types are ignored.
+- **Salvage is dropped one slot EARLY** (`dropAtFreeSlots`, default 1) so the game's
+  full-inventory "click here to continue" dialogue -- which interrupts the channel and needed the
+  Space workaround -- is avoided on most fills; that workaround is kept as the fallback, and 0
+  restores the old drop-only-when-full behaviour. UNVERIFIED whether an inventory click mid-channel
+  costs anything; if the log shows a reclick after every drop, that is what it is.
+
+**Second offline pass 2026-09-04 (USER: "keep improving it", then "take a look at sailing.py and
+ocean_path and bugfix / improve them"). Still not run live; pinned in `tests/test_sailing`-style
+tests inside `test_shipwreck_salvaging.py`, `tests/test_ocean_path.py` and one new travel test.**
+
+- **EVERY MINIMAP CLICK WAS BEING REFUSED, in `travel.py` too, not just sailing.** The
+  2026-09-02 `GameStateProvider` rebuild added the minimap rects (`RESIZABLE_MINIMAP_WIDGET`,
+  `_STONES_WIDGET`, `FIXED_VIEWPORT_MINIMAP`, `MINIMAP_ORBS`) to `uiBlockers` so a force-walk
+  projected INSIDE the minimap circle would stop being clicked -- correct for a viewport walk,
+  but `click_entity`'s blocker check is a flat rect test, and a minimap HOP is aimed at that
+  rect on purpose. `sailing._hop_to` and `travel._click_walk_point`'s minimap branch both used
+  the default `check_ui_blockers=True`, so since that rebuild each minimap hop was refused and
+  answered with a camera nudge (`Aim point is behind a UI panel -- rotating camera`). GOTR did
+  not notice because its own `_direct_walk` minimap hop already passed `check_ui_blockers=False`.
+  Both now pass it; the viewport (ground) click keeps the check. **Rule: any click aimed at a UI
+  element -- widgets, sidebar panels, the minimap -- opts out of the blocker check.** No live log
+  showed the refusal only because no `travel.walk_to` routine ran after 09-02; the code path is
+  unambiguous.
+- **Braking now budgets the reaction time, not just the coast.** `_dynamic_brake_tiles` was
+  `speed * BRAKE_LOOKAHEAD_TICKS` (post-toggle coast only); the 1.2-2.5s between the brake
+  decision and the toggle click (Q tap + settle, mouse flight, two bridge reads) is 2-4 ticks of
+  FULL-SPEED travel it never charged -- 4-8 tiles at ~2 tiles/tick, which is the "overshot
+  again" of 2026-08-05. Now `speed * (STOP_REACTION_TICKS + BRAKE_LOOKAHEAD_TICKS)`, `sail_to`
+  pre-opens the Sailing Options panel before the FINAL leg so the Q tap is already paid, and
+  `stop_boat` logs `toggling sails N.Ns after the brake decision` -- fit `STOP_REACTION_TICKS`
+  (3, blind) from that number and the existing drift/overshoot line.
+- **`stop_boat` reads `/hover` before clicking the toggle** (`_sails_already_down`): the icon's
+  action flips between "Set sails" and "Un-set sails", so clicking it on an already-stopped boat
+  SETS the sails. Fails open -- unreadable hover, a real menu open, or any text that is not
+  plainly "Set sails" still clicks, because sails left up is the worse failure.
+- **`ocean_path` string-pulls the route** (`_smooth_path`): `_simplify_path` keeps every grid
+  direction change, and a 16-direction A* line at an angle the grid cannot draw (slope 1/3) is
+  a straight/knight alternation with a "corner" every tile or two -- each one a hop click and a
+  poll for a bend the compass-snapped heading could not follow anyway. Smoothing jumps to the
+  farthest later point whose straight segment stays inside the dilated water set (four samples
+  per tile), so a route around a wall keeps its real corners and open water collapses to one
+  waypoint.
+- **`sailing._hop_to` pulls an off-minimap aim point in** (`HOP_PULL_IN_FRACTIONS`, same as
+  travel) instead of failing the leg -- which `sail_to` then re-planned into the same failure
+  `MAX_ROUTE_ATTEMPTS` times.
+- **XP stall watchdog in the routine** (`CHANNEL_XP_STALL_S`, 120s): the channel animation
+  says "working", Sailing XP says whether salvage is actually rolled (every 4 ticks per the
+  wiki's Dec-2025 hotfix; p(no XP in 120s) is under 1e-3 at the worst documented rate). No XP
+  for that long while the animation plays forces one reclick. The clock only runs while the
+  channel animation is playing.
+
+Not changed, still open from the spec: `BRAKE_LOOKAHEAD_TICKS` (3) is unfitted, `SAIL_HOP_MIN/
+MAX_TILES` are untuned for the 16-point compass, and the engine-level `maybe_misclick` guard the
+spec's item 9 describes no longer exists in `controller.py` (the stray-click simulation was
+removed), so it needs no re-adding.
 
 ## Current state of routines/agility.py
 
@@ -1100,8 +1730,11 @@ to reliably running unattended.
 
 1. **Check for a serial-port conflict first.** Confirm no stray process still holds the Arduino:
    `Get-CimInstance Win32_Process -Filter "Name = 'python.exe'"`.
-2. **Launch the routine in the background, unbuffered, logged to a file:**
-   `python -u controller.py routines/<name>.py *> <logfile> 2>&1`.
+2. **Launch the routine in the background, unbuffered, logged to a file in `logs/`:**
+   `python -u controller.py routines/<name>.py *> logs/<logfile> 2>&1`. Live-session logs
+   (`mh_live*.log`, `recorder_run*.err`, ...) belong in `ControllerAddon/logs/` (gitignored,
+   same place `debug_log.py` writes its own `debug_*.log`), never loose in `ControllerAddon/`
+   — 159 of them were swept into `logs/` on 2026-08-31.
 3. **Poll the log with `Read`, not tight loops.** 20-90s gaps between checks are fine — this is a
    live session, not a race.
 4. **Trust the user's live observations over your own read of the log.** If the log looks clean
@@ -1708,6 +2341,105 @@ The single most useful thing to carry forward is the SHAPE four of them shared.*
   a healthy idle routine. Both are now counted and safety-stop. A silent loop is worse than a
   crash: it looks like it is working.
 
+**`open_door_toward` routes to an INTERACTION tile, not merely an adjacent one (fixed
+2026-08-30, mh_live25/26).** ADJACENCY IS NOT INTERACTABILITY applies to the DOOR resolution
+too, not just to walk goals: `goal_adjacent=True` routing stops at ANY cardinally adjacent
+tile, and a neighbour on OUR side of a wall yields a route that crosses nothing — so no door
+is ever found. MEASURED live at JEFF's: hotspot 39991 at (3241,3447), player (3242,3448); the
+hotspot's north neighbour (3241,3448) is adjacent AND one step from the player but walled from
+the hotspot (16416), so `open_door_toward` answered False 15 ticks straight — while the only
+way in ran through the shut inner Door 11775 at (3238,3450) — and the run safety-stopped.
+USER: "it doesnt want to open the inner door, opened the outer door fine". The Barbara's-bed
+fix put `interaction_tiles` only in work_phase's WALK goal; the door primitive kept the blind
+spot, and the walk half no-oped too (nearest interaction tile by straight-line distance was 1
+tile away THROUGH the wall, inside `HOUSE_ARRIVAL_TOLERANCE`, so walk_to returned True without
+moving). `open_door_toward` now routes to the nearest routable interaction tile (open LIVE
+edge to the goal) and falls back to `goal_adjacent` only when live collision cannot tell.
+VERIFIED live the same night at JEFF's and twice at JESS's: door found and opened on the FIRST
+unreachable tick, each contract completed.
+
+**A per-request ceiling reset in a phase handler dies with the phase (fixed 2026-08-30).**
+`mh_contact_casts`' only reset lived in `request_contract_phase`'s hasContract branch -- but the
+dispatcher auto-promotes `request_contract -> travel` on that same fact, so the handler never
+ran again once a contract registered. The counter leaked +1 per contract and CONTACT_MAX_CASTS
+(5) safety-stopped a HEALTHY session every ~5 contracts claiming "no contract ever registered"
+-- twice in two runs (mh_live26 02:18:57, mh_live27 02:28:52), with /mahogany-homes showing the
+new assignment fully parsed both times. (Run 26's stop was first misattributed to the bank
+being out of planks; run 27 disproved that.) The reset now lives at the dispatcher's promote,
+the moment a request provably succeeded. General shape: **a counter whose reset lives in a
+phase handler dies when the dispatcher stops routing to that handler -- put the reset where the
+success is DETECTED, not where the attempt is made.**
+
+**Late 2026-08-30 session (mh_live28-35): six more live fixes, and the pattern most of them
+share is CONTEXT — a recovery keyed to data from the wrong context cannot run when it matters.**
+All are covered by pinned tests; details live in the code comments at each site.
+- `turn_in_phase`'s Talk-to was the last ungated world click (CLAUDE.md had said so): twelve
+  recorder-verified `Talk-to Jess` clicks, zero movement — she was behind shut doors. Now gated
+  on `can_reach` with `open_door_toward(npc)` as the recovery, spending the same turn-in budget.
+- travel_phase's climb-first branch searched the NEW contract's `ladderObjectIds` while standing
+  in the PREVIOUS house (turned in upstairs at Norman's, next contract TAU) — found none, fell
+  through to a cross-plane walk, safety-stopped with a staircase on screen.
+  `_nearest_ladder_by_name` (name + Climb-action filter) is the fallback.
+- `_open_door`'s confirm is MOTION-AWARE: the per-tile budget under-counts when the approach
+  detours around furniture the static map does not know (JESS's (2622,3293) door, 2 tiles
+  straight-line, 4+ tiles real — three timeouts in one night, every click recorder-verified
+  good, and the re-resolution's next click CANCELLED the queued open each time). A route-length
+  budget cannot fix what the map cannot see, so the wait now extends while the player is still
+  moving and only stillness past the budget (or `DOOR_OPEN_WAIT_MAX_S`) spends it.
+- `bank_phase`'s teleport-to-bank branch repeated travel_phase's whole 2026-08-28 history: flat
+  sleep under the measured 3.8s teleport, then a LOADING-screen tick where /objects AND
+  /inventory read empty -> "out of varrock teleport" with a tablet in hand. `_await_teleport`,
+  an empty-inventory-means-cannot-read guard, and `TELEPORT_MAX_ATTEMPTS` — the three things
+  the other branch already had.
+- `travel.interaction_tiles` now filters neighbours that cannot be STOOD on (`FLOOR`-blocked;
+  deliberately NOT the OBJECT bit — Barbara's live-verified approach tiles carry 256 and are
+  pinned in tests). JESS's hotspot 40175 is furniture-ringed with one edge-open-but-FLOOR-blocked
+  neighbour that became an unroutable walk goal: 15 ticks of "no walking route", safety stop.
+  Diagonal-only hotspots stay `can_reach`'s job at click time.
+- Tea = run energy: `request_contract_phase` used to cast NPC Contact 0.25s after the homeowner
+  offered tea, walking out on the refill every contract (live energy 28.62% at that moment, then
+  6%). Below `TEA_ENERGY_THRESHOLD` (50) it advances the turn-in dialogue (≤3 SPACEs) instead of
+  casting over it. VERIFIED live: 6% -> 90.9%.
+**JESS's upper floor is the measured stale-map hotspot** — live collision disagrees with the
+EthanApi map there in three places (furniture at (2622,3292), hotspot ring at (2615,3296), the
+north strip unroutable on the map but walked by players). Occasional stops at that house remain
+possible until the map regeneration follow-up (the CacheMapDumper dump in
+`ControllerAddon/map-output/`) is done.
+
+**Overnight session 2026-08-30 (mh_live39-45, ~7h): six fixes, all pinned in tests, and the
+biggest was a NEW stale-map zone.** Details live in the code comments at each site; the shapes:
+- **The JEFF-exit pocket at (3242,3451) is the second measured stale-map zone** and it wedged
+  TWO phases identically, three hours apart (travel_phase 07:12, bank_phase 10:28): the map
+  funnels that whole neighbourhood through a corridor along y=3450 that live collision walls
+  off whenever JEFF's self-closing front door's OPEN leaf rests across it — an open leaf offers
+  no "Open" action, so the door recovery cannot see it, and avoiding the funnel tile leaves NO
+  map route at all. The fix is `TRAVEL_STUCK_TELEPORT_AT` (5): a walk that provably cannot
+  progress promotes to the city tablet even under the distance gate, in BOTH phases (a bank
+  VISIBLE in the scene never reaches bank_phase's own no-bank teleport branch, so the escape
+  has to live in its walk branch too). VERIFIED live in bank_phase on the fix's first tick.
+  More stale pockets exist west of JEFF ((3236,3452), (3230,3450) route to nowhere on the map)
+  — one more reason the map regeneration follow-up matters.
+- **A found ladder is not a usable ladder**: in Falador the NEW contract's ladder ids resolve
+  across the rooftops in a DIFFERENT building, so `_pick_ladder` succeeded and the by-name
+  fallback never ran (`_routable_ladder` now discards a ladder with no route at all — a shut
+  door keeps its route since the map bakes doors open, so door-blocked same-house ladders
+  survive the filter). Plus `LADDER_WALLED_LIMIT`: the walled-off recovery had no ceiling.
+- **The mh_work_stuck counter is motion-aware now**: NOELLA's working recovery (teleport, door,
+  live-reroute walk, climb) spent its 15-tick budget on "still walking" defer ticks and the
+  stop fired as the player reached plane 1. Walking after a recent ladder click holds the
+  counter; stillness still counts up, so genuine wedges stop exactly as before.
+- **MARIAH's ladder 11802 menu misses**: the clickable pixels sit 3-5px off the centroid in a
+  camera-dependent direction (a fixed nudge is WRONG — the measured success was below-left
+  while "model rises from tile" predicts above). A ground-only menu is a SYNCHRONOUS miss, so
+  `_climb` retries inline with a widening probe ring instead of paying the cooldown per probe
+  (~2.5s vs ~18s). `DOOR_FAILURE_MEMORY_S` also went 120s→1800s (JESS visits arrive ~6min
+  apart, so the dead-door discovery was re-paid every contract) — note the memory only helps
+  when an ALTERNATIVE candidate door exists; at JESS every route funnels through the dead one,
+  so ~5s/visit remains there until the map regen.
+- The session ended at 11:10 on a LEGITIMATE stop: the bank ran out of Teak planks after ~7h
+  at ~40 contracts/hour (three trips, shift-withdraw yielding nothing, sack fill 0/28 with the
+  per-item diagnostic). That stop worked exactly as designed.
+
 **Hotspot clicks are a BURST, not a click, and the numbers come from the user's own recordings.**
 MEASURED across four human sessions (n=1194 hotspot actions): median gap between clicks **0.20s**,
 p25 0.18s, 339 of 500 bursts are more than one click on the same option (mean 2.46, max 8), and
@@ -1765,13 +2497,19 @@ SIGNAL:
   arrival — so a teleport that worked read as a failure and the retry broke another tablet. It is
   now POLLED (`_await_teleport`, `TELEPORT_CONFIRM_TIMEOUT_S`): reading too early costs a tablet,
   waiting too long costs idle seconds, and that asymmetry decides it.
-- **`TRAVEL_TELEPORT_DISTANCE` is 150, not 40, and the number is load-bearing.** It means "are we in
-  a different city", and 40 could not express that: the Falador tablet lands **74 tiles** from
-  Larry's own standing tile, so standing in Falador having just arrived, the gate still said
-  "teleport". The only thing preventing a second tablet was the `mh_teleported_this_contract` latch
-  — far too thin a thread, and when the latch was wrong (above) it teleported Falador→Falador once a
-  tick. The four destinations in `CITY_TELEPORTS` are 248+ tiles apart at their closest (Falador
-  2965,3379 → Varrock 3213,3424) and the worst intra-city landing is ~75, so 150 has room both ways.
+- **`TRAVEL_TELEPORT_DISTANCE` is 110 (was 150, was 40), and BOTH old values failed live — the
+  bound is bank-to-home, not city-centre-to-city-centre.** It means "are we in a different city".
+  40 failed low: the Falador tablet lands **74 tiles** from Larry's own standing tile, so standing
+  in Falador having just arrived, the gate still said "teleport", and only the
+  `mh_teleported_this_contract` latch stood between that and Falador→Falador once a tick. 150
+  failed HIGH (2026-08-30, mh_live28; USER: "it just walked from varock to falador instead of
+  taking a tablet? why"): it was derived from city-centre spacing ("the four destinations are
+  248+ apart"), but the gate is evaluated where the player STANDS — usually a bank after
+  restocking — and NORMAN, TAU and LARRY all sit on Falador's EAST side while the Varrock WEST
+  bank is at ~(3185,3436): all three pairs measure 139-149, under the gate, so EVERY
+  Varrock-bank→Falador-home transition walked ~147 tiles (~90s) instead of breaking a tablet.
+  Real bounds: worst same-city distance ~75, closest cross-city bank→home pair 139; 110 sits
+  between with ~30 tiles of margin each way.
 - **Anything that spends a consumable on repeat needs a CEILING, not just a cooldown.** Two loops in
   one session burned real resources before being stopped by hand (three teleport tablets; NPC
   Contact casts). Hence `TELEPORT_MAX_ATTEMPTS` (2, then safety-stop rather than walk cross-country)

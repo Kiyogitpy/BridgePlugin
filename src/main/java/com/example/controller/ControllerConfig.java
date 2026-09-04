@@ -765,7 +765,7 @@ public interface ControllerConfig extends Config
 	@ConfigItem(
 		keyName = "rockNames",
 		name = "Rock Names",
-		description = "Comma-separated rock names to mine, closest first (e.g. Tin rocks, Copper rocks).",
+		description = "Comma-separated rock names to mine, closest first (e.g. Tin rocks, Copper rocks). Also managed by the Controller Settings sidebar panel's Mining section, which lists whatever is mineable nearby.",
 		section = miningSection,
 		position = 1
 	)

@@ -74,6 +74,17 @@ WALK_HOP_MAX_TILES = 24      # ...or longer than this, to stay safely within min
 HOP_VIEWPORT_MAX_TILES = 6
 
 HOP_PULL_IN_FRACTIONS = (1.0, 0.66, 0.4)
+
+# Release a hop's arrival wait with this many tiles still to run, so the NEXT hop's aim + mouse
+# flight (~1.5-2s: 0.6s poll quantization + walk_to's collision/door bookkeeping + the flight)
+# happens WHILE the player covers them, instead of after the player has arrived and stopped.
+# USER-REPORTED 2026-08-30 ("we wait so long the player runs to the tile we clicked before we
+# click the next point resulting in a weird quick stop") and MEASURED in the same night's
+# recordings: 0.6-1.8s dead stops at EVERY hop boundary, because WALK_ARRIVAL_TOLERANCE (3
+# tiles, ~0.9s of running at 2 tiles/tick) is less runway than the next click needs. 6 tiles is
+# ~1.8s. Only hops LONGER than this get the early release -- a short precision hop releasing
+# instantly would just spam clicks at its own destination.
+HOP_NEXT_CLICK_LEAD_TILES = 6
 WALK_ARRIVAL_TOLERANCE = 3   # tiles; close enough to call a hop, or the whole trip, arrived
 WALK_HOP_TIMEOUT_S = 8.0     # give up waiting on a single hop after this long
 WALK_MAX_HOPS = 60           # hard cap so a bad target can't loop forever
@@ -144,6 +155,18 @@ DOOR_OPEN_WAIT_S = 2.0        # a door opens in a tick or two; long enough that 
 DOOR_WALK_ALLOWANCE_S = 0.7   # per tile between us and the door. 0.6s is one walking tile per
                               # game tick; the extra covers click-to-first-step latency.
 DOOR_OPEN_WAIT_MAX_S = 9.0    # ceiling, so a door that genuinely never opens still fails fast.
+DOOR_FAILURE_MEMORY_S = 1800.0  # how long a door that refused to open is deprioritized when
+                              # another candidate route exists -- see open_door_toward. It only
+                              # reorders PREFERENCE; a door that is the sole way in is still
+                              # clicked (a shut door is to be OPENED, never routed around).
+                              # Was 120s; raised 2026-08-30 (mh_live39): JESS's dead door at
+                              # (2622,3293) fails identically on EVERY visit (6 measured), and
+                              # visits arrive ~6 min apart, so a 2-minute memory expired between
+                              # them and the same ~5s discovery was re-paid each contract. The
+                              # cost of over-remembering is only that a once-held door ranks
+                              # behind a working alternative -- and when no alternative exists
+                              # it is clicked regardless, so a long memory cannot strand a walk.
+_door_failures: dict = {}     # (x, y, plane) -> time.time() of the last confirmed open failure
 
 # A door is a WallObject -- ObjectProvider walks those separately from GameObjects for exactly
 # this reason (see its own comment: "Doors, gates, and fences are WallObjects"). Matching the
@@ -545,15 +568,39 @@ def _open_door(ctx, door: dict, recheck) -> bool:
         refresh_legs=2,
     )
 
+    # The budget does NOT expire while the player is still WALKING toward the door. The
+    # per-tile allowance above assumes the straight-line distance is the walk, and live it is
+    # sometimes not: MEASURED three times in one night at JESS's upstairs (2026-08-30, mh_live27
+    # 02:26:49 / mh_live30 02:56:41 / mh_live34 03:43:37), the door at (2622,3293) sits 2 tiles
+    # from the player -- budget 3.4s -- but the approach detours around full-tile furniture at
+    # (2622,3292) that the static map does not know, so the real walk is 4+ tiles. Every click
+    # registered correctly (recorder-verified); the budget expired mid-detour, and the
+    # re-resolution's next click CANCELLED the queued open it was reporting as failed. A
+    # route-length budget cannot fix this -- the map lacks the very furniture causing the
+    # detour -- so the confirm extends while the player keeps moving, and only stillness (3
+    # polls, ~0.9s) past the budget spends it. DOOR_OPEN_WAIT_MAX_S stays the hard ceiling.
     waited = 0.0
-    while waited < budget:
+    last_pos = (here_x, here_y)
+    still_polls = 0
+    while True:
         time.sleep(DOOR_CONFIRM_POLL_S)
         waited += DOOR_CONFIRM_POLL_S
         if recheck() is None or _crossed(door, here_x, here_y):
             return True
+        now = controller.get_player() or {}
+        pos = (now.get("x"), now.get("y"))
+        if pos[0] is None or pos == last_pos:
+            still_polls += 1
+        else:
+            still_polls = 0
+            last_pos = pos
+        if waited >= DOOR_OPEN_WAIT_MAX_S:
+            break
+        if waited >= budget and still_polls >= 3:
+            break
 
     debug_log.log("travel", f"the {door.get('name')} at ({dx},{dy}) is still shut after "
-                            f"{budget:.1f}s -- another player may be holding it, or the "
+                            f"{waited:.1f}s -- another player may be holding it, or the "
                             f"click missed")
     return False
 
@@ -567,20 +614,67 @@ def open_door_toward(ctx, goal: dict) -> bool:
     goal_adjacent because the tile you need a DOOR for and the tile you can WALK to are usually
     different: a hotspot's own tile is furniture and unroutable, while aiming at the standing
     tile instead hides the doorway (both it and the player sit on the same side of the door).
+
+    But ADJACENCY IS NOT INTERACTABILITY, here as everywhere: goal_adjacent stops at ANY
+    cardinally adjacent tile, and a neighbour on OUR side of a wall yields a route that crosses
+    nothing -- so no door is ever found. MEASURED live 2026-08-30 at JEFF's (mh_live25): hotspot
+    39991 at (3241,3447), player at (3242,3448); the hotspot's north neighbour (3241,3448) is
+    adjacent AND one step from the player, but its shared edge with the hotspot is a wall
+    (16416) -- open_door_toward answered False 15 ticks straight while the only way in ran
+    through the shut inner Door 11775 at (3238,3450), and the run safety-stopped. So route to a
+    tile with an OPEN LIVE EDGE to the goal (interaction_tiles -- the same split can_reach rests
+    on) whenever live collision can name one, and keep goal_adjacent as the fallback for when it
+    cannot ("empty means cannot tell, never refuse to work").
     """
-    route = route_to(goal, goal_adjacent=True)
-    if not route or len(route) < 2:
+    candidates = []
+    for tx, ty in interaction_tiles(goal):
+        candidate = route_to({"x": tx, "y": ty, "plane": goal.get("plane")})
+        if candidate is not None:
+            candidates.append(candidate)
+    candidates.sort(key=len)
+    fallback = route_to(goal, goal_adjacent=True)
+    if fallback is not None:
+        candidates.append(fallback)
+    if not candidates:
         return False
     player = controller.get_player() or {}
     px, py = player.get("x"), player.get("y")
     if px is None:
         return False
     plane = player.get("plane") or 0
-    door = _door_on_route(route, plane, _collision_flags(px, py, plane))
-    if door is None:
+    flags = _collision_flags(px, py, plane)
+
+    # PREFER A ROUTE WHOSE DOOR HAS NOT JUST REFUSED TO OPEN. MEASURED live 2026-08-30, FOUR
+    # visits to JESS's upstairs (runs 27/30/34/37): the shortest route's door at (2622,3293)
+    # takes an accepted Open click and the game never walks a single step toward it (run 37's
+    # motion-aware confirm proved perfect stillness through the whole budget) -- while the
+    # next candidate's door at (2617,3294) works, every time. Without this memory the same
+    # dead door was rediscovered for ~5s per visit. When EVERY candidate's door is
+    # recently-failed, the first is still clicked: A SHUT DOOR IS TO BE OPENED, NEVER ROUTED
+    # AROUND (the ROSS regression -- the only way in must never be excluded), and another
+    # player may simply have been holding it.
+    now = time.time()
+    picked = None
+    for route in candidates:
+        if len(route) < 2:
+            continue
+        door = _door_on_route(route, plane, flags)
+        if door is None:
+            continue
+        failed_at = _door_failures.get((door.get("x"), door.get("y"), plane), 0.0)
+        if now - failed_at >= DOOR_FAILURE_MEMORY_S:
+            picked = (route, door)
+            break
+        if picked is None:
+            picked = (route, door)      # remember the first, in case every door is blacklisted
+    if picked is None:
         return False
-    return _open_door(ctx, door,
-                      lambda: _door_on_route(route, plane, _collision_flags(px, py, plane)))
+    route, door = picked
+    opened = _open_door(ctx, door,
+                        lambda: _door_on_route(route, plane, _collision_flags(px, py, plane)))
+    if not opened:
+        _door_failures[(door.get("x"), door.get("y"), plane)] = time.time()
+    return opened
 
 
 def walk_to(ctx, target: dict, tolerance: float = WALK_ARRIVAL_TOLERANCE,
@@ -851,9 +945,25 @@ def interaction_tiles(goal: dict, flags: dict | None = None) -> list:
     out = []
     for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
         near = (gx + dx, gy + dy)
-        if flags.get(near) is None:
+        near_flags = flags.get(near)
+        if near_flags is None:
             continue
-        if _edge_open(flags.get(near), goal_flags, -dx, -dy):
+        # The tile must be STANDABLE, not merely edge-open -- an open edge from another piece
+        # of furniture is not a place to walk to. MEASURED live 2026-08-30 at JESS's upstairs
+        # (mh_live31 03:08): hotspot 40175's east neighbour (2616,3296) is floor-blocked
+        # furniture (2104334) with no west edge bit, so it passed the edge test, became the
+        # walk goal, and every route to it was rightly None -- 15 ticks of "no walking route",
+        # then a safety stop. Furniture-ringed hotspots like that one are reached DIAGONALLY
+        # (the JEFF pattern), which is can_reach's job at click time, not a walk goal's.
+        #
+        # FLOOR only, deliberately NOT BLOCK_MOVEMENT_OBJECT: Barbara's bed's live-verified
+        # interaction tiles ((1749,3538) 135432 / (1748,3539) 132354, both walked to live on
+        # 2026-08-30) carry the 256 bit and are pinned in test_travel.py -- filtering OBJECT
+        # would regress the exact case interaction_tiles was built for, while every tile in
+        # JESS's furniture ring carries FLOOR.
+        if near_flags & BLOCK_MOVEMENT_FLOOR:
+            continue
+        if _edge_open(near_flags, goal_flags, -dx, -dy):
             out.append(near)
     return out
 
@@ -964,7 +1074,13 @@ def _click_walk_point(ctx, point: dict, shift: bool) -> None:
     there is no reason not to use it for every ground-tile walk rather than only ones near a
     known-risky object."""
     if not shift:
-        controller.click_entity(ctx.ser, point, offset=(0, 0))
+        # check_ui_blockers=False (2026-09-04): GameStateProvider has listed the minimap rects
+        # as UI blockers since the 2026-09-02 rebuild (a force-walk projected INSIDE the minimap
+        # circle clicked nothing for two minutes). A minimap hop is aimed at that rect on
+        # purpose, and with the check on click_entity refuses it and nudges the camera instead
+        # -- the walk never starts. The viewport click below keeps the check: it is what catches
+        # the chatbox scrollbar and the inventory panel.
+        controller.click_entity(ctx.ser, point, offset=(0, 0), check_ui_blockers=False)
         return
     controller.key_down(ctx.ser, "SHIFT")
     try:
@@ -1052,6 +1168,18 @@ def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
     # hijacked by, and SHIFT there means nothing, so it is left alone.
     _click_walk_point(ctx, point, shift=on_ground)
 
+    # Long hops release EARLY -- with HOP_NEXT_CLICK_LEAD_TILES still to run -- so the next
+    # hop's aim and mouse flight overlap the remaining tiles instead of starting after the
+    # player has already arrived and stopped (the measured 0.6-1.8s freeze at every hop
+    # boundary, see the constant's comment). The game replaces a queued destination on the next
+    # click, so clicking again mid-run is exactly what a human does. A hop no longer than the
+    # lead keeps the old exact-ish wait: releasing it instantly would spam clicks.
+    hop_dist = None if ox is None else max(abs(aim_x - ox), abs(aim_y - oy))
+    if hop_dist is not None and hop_dist > HOP_NEXT_CLICK_LEAD_TILES:
+        release = HOP_NEXT_CLICK_LEAD_TILES
+    else:
+        release = WALK_ARRIVAL_TOLERANCE
+
     waited = 0.0
     while waited < WALK_HOP_TIMEOUT_S:
         time.sleep(0.6)
@@ -1060,7 +1188,7 @@ def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
         px, py = player.get("x"), player.get("y")
         # Against the point actually clicked, not the one asked for -- otherwise a pulled-in hop
         # would always wait out the full timeout instead of returning on arrival.
-        if px is not None and _within_tolerance(px, py, aim_x, aim_y):
+        if px is not None and max(abs(px - aim_x), abs(py - aim_y)) <= release:
             break
 
     return True

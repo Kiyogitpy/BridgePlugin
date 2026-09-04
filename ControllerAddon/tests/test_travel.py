@@ -1065,3 +1065,294 @@ def test_interaction_tiles_is_empty_when_the_client_cannot_tell(monkeypatch):
     caller must fall back rather than refuse to work."""
     monkeypatch.setattr(controller, "get_collision", lambda x, y, plane, radius=6: [])
     assert travel.interaction_tiles({"x": 1749, "y": 3539, "plane": 0}) == []
+
+
+# --- the next hop is clicked BEFORE arrival, not after it ------------------------------
+#
+# USER 2026-08-30: "sometimes we wait so long the player runs to the tile we clicked before we
+# click the next point resulting in a weird quick stop". MEASURED in two recordings the same
+# night (2026-08-29_231600_mh-collision-live, runs 23 and 24): the player froze for 0.6-1.8s at
+# EVERY hop boundary -- e.g. a 1.8s dead stop at (3246,3422) at 01:50:32.9 -- because _hop_to's
+# wait only released within WALK_ARRIVAL_TOLERANCE (3 tiles, ~0.9s of running) of the aim, while
+# the next click needs ~1.5-2s to land (0.6s poll quantization + walk_to's collision/door
+# bookkeeping + the human mouse flight). 0.9s of runway < 2s of overhead, so the player beat the
+# click to the tile and stood there. A human clicks the next minimap point several tiles early;
+# run 23's tick trace shows the game happily replacing the queued destination mid-run.
+
+def _hop_wait_harness(monkeypatch, start, aim, step=2):
+    """Player runs from `start` toward `aim` `step` tiles per poll; returns the poll positions."""
+    polled = []
+    pos = {"pos": start}
+
+    def get_player():
+        x, y = pos["pos"]
+        ax, ay = aim
+        polled.append((x, y))
+        dx = max(-step, min(step, ax - x))
+        dy = max(-step, min(step, ay - y))
+        pos["pos"] = (x + dx, y + dy)
+        return {"x": x, "y": y, "plane": 0}
+
+    monkeypatch.setattr(controller, "get_player", get_player)
+    monkeypatch.setattr(controller, "get_ground_walk_point", lambda x, y, p: {"onScreen": False})
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, p: {"onMinimap": True, "screenX": 20, "screenY": 20})
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    return polled
+
+
+def test_a_long_hop_releases_with_enough_runway_to_aim_the_next_click(monkeypatch):
+    polled = _hop_wait_harness(monkeypatch, start=(3000, 3000), aim=(3020, 3000))
+    assert travel._hop_to(_Ctx(), 3020, 3000, 0) is True
+    lx, ly = polled[-1]
+    remaining = max(abs(3020 - lx), abs(3000 - ly))
+    assert remaining > travel.WALK_ARRIVAL_TOLERANCE, (
+        f"released only {remaining} tiles out -- the next click's flight (~1.5-2s) outruns "
+        f"{remaining} tiles of running and the player stops dead at the hop boundary")
+    assert remaining <= travel.HOP_NEXT_CLICK_LEAD_TILES
+
+
+def test_a_short_hop_still_waits_for_real_arrival(monkeypatch):
+    """A hop no longer than the lead would otherwise release instantly and spam clicks."""
+    polled = _hop_wait_harness(monkeypatch, start=(3000, 3000), aim=(3005, 3000))
+    assert travel._hop_to(_Ctx(), 3005, 3000, 0) is True
+    lx, ly = polled[-1]
+    assert max(abs(3005 - lx), abs(3000 - ly)) <= travel.WALK_ARRIVAL_TOLERANCE
+
+
+# --- open_door_toward must route to a tile it could ACT from, not merely one adjacent ---
+#
+# MEASURED live 2026-08-30 at JEFF's (mh_live25): hotspot 39991 at (3241,3447), player at
+# (3242,3448). The hotspot's NORTH neighbour (3241,3448) is cardinally adjacent AND one step
+# from the player -- so goal_adjacent routing stopped there, the one-step route crossed nothing,
+# and open_door_toward found NO door, 15 ticks in a row, until the safety stop -- while the only
+# real way in ran through the shut inner Door 11775 at (3238,3450). The wall between
+# (3241,3448) and the hotspot is exactly the ADJACENCY-IS-NOT-INTERACTABILITY case can_reach and
+# interaction_tiles already encode; the door resolution kept the blind spot. USER: "it doesnt
+# want to open the inner door, opened the outer door fine".
+
+_JEFF_FLAGS = {
+    (3242, 3448): 16416,   # player tile: south edge walled (toward the hotspot's east neighbour)
+    (3241, 3448): 16416,   # hotspot's north neighbour: south edge walled -- the adjacency trap
+    (3241, 3447): 132354,  # the hotspot itself (furniture + north edge)
+    (3242, 3447): 1026,    # east neighbour: open edge to the hotspot -- an interaction tile
+    (3240, 3447): 1026,    # west neighbour: open edge -- an interaction tile
+    (3241, 3446): 16416,   # south neighbour: open edge north -- an interaction tile
+    (3238, 3450): 16416,   # the shut inner door's tile: south edge blocked
+    (3238, 3449): 1026,    # far side of the door edge
+}
+
+_JEFF_DOOR_ROUTE = [(3242, 3448), (3241, 3449), (3240, 3450), (3239, 3450), (3238, 3450),
+                    (3238, 3449), (3239, 3449), (3239, 3448), (3239, 3447), (3240, 3447)]
+
+
+def test_open_door_toward_finds_the_door_when_an_adjacent_tile_is_walled_off(walker, monkeypatch):
+    walker["pos"] = (3242, 3448, 0)
+    door = _route_door(3238, 3450, flags=16416)
+
+    def fake_find_path(px, py, plane, gx, gy, goal_adjacent=False, avoid=None):
+        if goal_adjacent and (gx, gy) == (3241, 3447):
+            # BFS's shortest adjacent tile is the walled-off north neighbour, one step away.
+            return [(3242, 3448), (3241, 3448)]
+        if (gx, gy) in {(3242, 3447), (3240, 3447), (3241, 3446)}:
+            # An interaction tile routes the long way round, through the shut door's edge.
+            return _JEFF_DOOR_ROUTE[:-1] + [(gx, gy)]
+        return None
+
+    monkeypatch.setattr(travel.worldmap, "find_path", fake_find_path)
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [door])
+
+    def get_collision_mock(x, y, plane, radius=2):
+        if walker["clicked"]:      # the click opened the door: its edge clears
+            flags = {**_JEFF_FLAGS, (3238, 3450): 0, (3238, 3449): 0}
+        else:
+            flags = _JEFF_FLAGS
+        return [{"x": tx, "y": ty, "plane": 0, "flags": flags.get((tx, ty), 0)}
+                for tx, ty in set(list(flags) + _JEFF_DOOR_ROUTE)]
+
+    monkeypatch.setattr(controller, "get_collision", get_collision_mock)
+
+    assert travel.open_door_toward(_Ctx(), {"x": 3241, "y": 3447, "plane": 0}) is True
+    assert door in walker["clicked"], (
+        "goal_adjacent routing stopped at the walled-off adjacent tile and never saw the door")
+
+
+def test_interaction_tiles_excludes_neighbours_that_cannot_be_stood_on(monkeypatch):
+    """An open EDGE to the goal is not enough -- the tile itself must be standable, or it is a
+    useless walk goal. MEASURED live 2026-08-30 at JESS's upstairs (mh_live31 03:08, safety
+    stop): hotspot 40175 at (2615,3296) is ringed by other furniture -- its east neighbour
+    (2616,3296) reads flags 2104334 (BLOCK_MOVEMENT_FLOOR + edges, no west bit), so the edge
+    test called it an interaction tile, the routine chose it as the walk goal, and every route
+    to a floor-blocked tile was (correctly) None: 15 ticks of 'no walking route', then the
+    stop. The only real approaches are DIAGONAL (the JEFF pattern) -- an empty list here sends
+    the caller to its fallback instead of marching at furniture."""
+    goal = {"x": 2615, "y": 3296, "plane": 1}
+    flags = {
+        (2615, 3296): 2229506,   # the hotspot itself
+        (2616, 3296): 2104334,   # furniture: floor-blocked, but its west EDGE reads open
+        (2614, 3296): 2229506,   # furniture
+        (2615, 3295): 2228480,   # furniture
+        (2615, 3297): 16416,     # standable, but the shared (south) edge is a wall
+    }
+    assert travel.interaction_tiles(goal, flags) == []
+
+
+# --- a door's confirm budget does not expire while the player is still WALKING to it ----
+#
+# LIVE 2026-08-30, three times in one night at JESS's upstairs (mh_live27 02:26:49, mh_live30
+# 02:56:41, mh_live34 03:43:37): the door at (2622,3293) is 2 tiles from the player -- budget
+# 3.4s -- but the approach detours around a full-tile furniture blocker at (2622,3292) that the
+# static map does not know about, so the real walk is 4+ tiles. Every click registered
+# correctly (recorder-verified); the budget expired mid-detour, "still shut" was logged about a
+# door that was still being walked to, and the re-resolution's click CANCELLED the queued open.
+# Route-length budgeting cannot fix this (the map lacks the very furniture causing the detour),
+# so the confirm is condition-based instead: while the player is still moving, the wait extends
+# up to DOOR_OPEN_WAIT_MAX_S; only stillness plus a shut doorway spends the budget.
+
+def _door_confirm_harness(monkeypatch, positions, opens_after_polls):
+    """get_player walks through `positions` (then holds the last); the door reads shut for
+    `opens_after_polls` recheck calls, then open."""
+    state = {"polls": 0, "pos": 0}
+
+    def get_player():
+        i = min(state["pos"], len(positions) - 1)
+        state["pos"] += 1
+        x, y = positions[i]
+        return {"x": x, "y": y, "plane": 0}
+
+    def recheck():
+        state["polls"] += 1
+        return None if state["polls"] > opens_after_polls else door
+
+    door = _route_door(2622, 3293, flags=BLOCK_MOVEMENT_NORTH)
+    monkeypatch.setattr(controller, "get_player", get_player)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **kw: None)
+    return door, recheck
+
+
+def test_door_confirm_keeps_waiting_while_the_player_is_still_walking(monkeypatch):
+    # 2 tiles away -> budget 3.4s (~12 polls), but the detour walk means the door only opens
+    # after 20 polls -- and the player is moving the whole time.
+    # _crossed also reads get_player once per poll, so the walk list is consumed two
+    # positions per loop -- keep it long enough to outlast the 20 shut polls.
+    walk = [(2622, 3291)] + [(2622 - i % 3, 3291 + i % 2) for i in range(80)]
+    door, recheck = _door_confirm_harness(monkeypatch, walk, opens_after_polls=20)
+    assert travel._open_door(_Ctx(), door, recheck) is True, \
+        "the budget expired on a door the player was still walking to"
+
+
+def test_door_confirm_still_fails_fast_when_the_player_never_moves(monkeypatch):
+    # A click that never moved the player is a dead click: the budget (plus a brief stillness
+    # allowance) must end it -- and the hard ceiling must hold even if movement never stops.
+    door, recheck = _door_confirm_harness(monkeypatch, [(2622, 3291)], opens_after_polls=10 ** 6)
+    assert travel._open_door(_Ctx(), door, recheck) is False
+
+
+# --- a door that would not open is deprioritized, not retried first --------------------
+#
+# LIVE 2026-08-30, FOUR visits to JESS's upstairs across runs 27/30/34/37: the static map's
+# shortest route crosses the door at (2622,3293), the game ACCEPTS the Open click and never
+# takes a single step toward it (the same accepts-then-does-nothing invariant, applied to a
+# door -- run 37's motion-aware confirm proved the player stands perfectly still through the
+# whole budget), and the SECOND resolution's door at (2617,3294) then works, every time. ~5s
+# paid per visit to rediscover the same dead door. So _open_door records a failed door
+# (tile-keyed, short TTL), and open_door_toward prefers a candidate route whose door is not
+# recently-failed -- but when every candidate runs through failed doors it still clicks one,
+# because A SHUT DOOR IS TO BE OPENED, NEVER ROUTED AROUND (the ROSS regression: the only way
+# in must never be excluded).
+
+@pytest.fixture(autouse=True)
+def _clean_door_failures():
+    travel._door_failures.clear()
+    yield
+    travel._door_failures.clear()
+
+
+def _two_door_geometry(monkeypatch, walker):
+    """Goal with two live interaction tiles; the shorter candidate route crosses door A at
+    (2622,3293), the longer crosses door B at (2617,3294). Both doors block the edge their
+    route crosses; neither ever opens (clicks in these tests are inert)."""
+    walker["pos"] = (2622, 3291, 1)
+    door_a = _route_door(2622, 3293, flags=BLOCK_MOVEMENT_NORTH, plane=1)
+    door_b = dict(_route_door(2617, 3294, flags=BLOCK_MOVEMENT_NORTH, plane=1), id=7454)
+    # Interaction tiles of the goal (2620,3296): its east neighbour (2621,3296) -- reached by
+    # the SHORT route through door A -- and its south neighbour (2620,3295), reached by the
+    # LONGER route through door B.
+    route_a = [(2622, 3291), (2622, 3292), (2622, 3293), (2622, 3294), (2622, 3295),
+               (2621, 3296)]
+    route_b = [(2622, 3291), (2621, 3291), (2620, 3292), (2619, 3293), (2617, 3294),
+               (2617, 3295), (2618, 3295), (2619, 3295), (2620, 3295)]
+
+    def fake_find_path(px, py, plane, gx, gy, goal_adjacent=False, avoid=None):
+        if (gx, gy) == (2621, 3296):
+            return route_a
+        if (gx, gy) == (2620, 3295):
+            return route_b
+        return None
+
+    flags = {t: 0 for t in route_a + route_b}
+    flags.update({(2620, 3296): 0, (2621, 3296): 0, (2620, 3295): 0,
+                  (2622, 3293): BLOCK_MOVEMENT_NORTH,      # door A's blocked crossing
+                  (2617, 3294): BLOCK_MOVEMENT_NORTH})     # door B's blocked crossing
+    monkeypatch.setattr(travel.worldmap, "find_path", fake_find_path)
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [door_a, door_b])
+    monkeypatch.setattr(controller, "get_collision",
+                        lambda x, y, plane, radius=2: [
+                            {"x": tx, "y": ty, "plane": 1, "flags": f}
+                            for (tx, ty), f in flags.items()])
+    return door_a, door_b
+
+
+def test_a_door_that_failed_to_open_is_not_the_first_choice_next_time(walker, monkeypatch):
+    door_a, door_b = _two_door_geometry(monkeypatch, walker)
+    goal = {"x": 2620, "y": 3296, "plane": 1}
+
+    travel.open_door_toward(_Ctx(), goal)          # picks the shorter route: door A, which fails
+    assert walker["clicked"] and walker["clicked"][0] is door_a
+    walker["clicked"].clear()
+
+    travel.open_door_toward(_Ctx(), goal)          # door A is now known-bad: go straight to B
+    assert walker["clicked"] and walker["clicked"][0] is door_b, \
+        f"the door that would not open was retried first again: {walker['clicked']}"
+
+
+def test_when_every_candidate_door_has_failed_one_is_still_clicked(walker, monkeypatch):
+    door_a, door_b = _two_door_geometry(monkeypatch, walker)
+    goal = {"x": 2620, "y": 3296, "plane": 1}
+    travel.open_door_toward(_Ctx(), goal)          # A fails
+    travel.open_door_toward(_Ctx(), goal)          # B fails
+    walker["clicked"].clear()
+
+    travel.open_door_toward(_Ctx(), goal)
+    assert walker["clicked"], \
+        "every door recently failed, but a shut door is to be OPENED, never routed around"
+
+
+def test_a_minimap_hop_click_skips_the_ui_blocker_check(monkeypatch):
+    # GameStateProvider has reported the minimap rects as UI blockers since 2026-09-02 (a
+    # force-walk aimed INSIDE the minimap circle clicked nothing for two minutes). A minimap hop
+    # is aimed at that very rect on purpose, so it must opt out of the check -- with it on,
+    # click_entity refuses the click and nudges the camera, and the walk never starts. The
+    # viewport (ground) click keeps the check: that is what catches the chatbox scrollbar.
+    kwargs = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p: {"onScreen": False, "screenX": 10, "screenY": 10})
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, p: {"onMinimap": True, "screenX": 20, "screenY": 20})
+    monkeypatch.setattr(controller, "key_down", lambda ser, k: None)
+    monkeypatch.setattr(controller, "key_up", lambda ser, k: None)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: kwargs.append(kw) or True)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    travel._hop_to(_Ctx(), 3203, 3200, 0)
+    assert kwargs and kwargs[0].get("check_ui_blockers") is False
+
+    kwargs.clear()
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p: {"onScreen": True, "screenX": 10, "screenY": 10})
+    travel._hop_to(_Ctx(), 3203, 3200, 0)
+    assert kwargs and kwargs[0].get("check_ui_blockers", True) is True
+

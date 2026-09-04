@@ -799,3 +799,27 @@ than usual before it's trustworthy unattended:
    lines, to confirm items 3 and 4 (deployed-hook re-click safety, whether
    it survives onto a newly-risen wreck).
 4. Only then a longer unattended soak run.
+
+## Update: offline bugfix pass, not live-verified (2026-09-03)
+
+Done without a boat under the player (the client was up, the player ashore), from the offline OSRS
+corpus and `runelite-api` 1.12.38; see CLAUDE.md's "Current state of routines/shipwreck_salvaging.py"
+for the list and `ControllerAddon/tests/test_shipwreck_salvaging.py` for the pinned facts. Headlines:
+`stop_boat`'s toggle click was refused by the new sidebar UI blocker (interface clicks must pass
+`check_ui_blockers=False`); `SALVAGE_CHANNEL_ANIMATIONS` covered only the 2X5 hook family and now
+covers 1X3/2X5/3X8/LARGE01; on-boat fixture clicks and salvage drops no longer take the simulated
+misclick; the level filter fails open; the far branch verifies hook range after sailing; approach
+points are integer tiles so `ocean_path` routing actually runs; `on_event` reacts to the sunk and
+hazardous-waters messages; salvage drops one slot early (`dropAtFreeSlots`).
+
+## Update: second offline pass -- sailing.py / ocean_path.py (2026-09-04)
+
+Still not live-verified. Minimap hops in BOTH `sailing._hop_to` and `travel._click_walk_point` now
+opt out of `click_entity`'s UI-blocker check (the minimap rects have been blockers since the
+2026-09-02 rebuild, so every hop was being refused); braking budgets the decision-to-toggle
+reaction time (`STOP_REACTION_TICKS`) and `sail_to` pre-opens the Sailing Options panel before the
+final leg; `stop_boat` reads `/hover` so it never clicks "Set sails" on a stopped boat;
+`ocean_path` string-pulls routes (`_smooth_path`); `_hop_to` pulls an off-minimap aim point in;
+the routine gained a Sailing-XP stall watchdog (`CHANNEL_XP_STALL_S`). Fit `STOP_REACTION_TICKS`
+from `stop_boat`'s new "N.Ns after the brake decision" log line on the first live run.
+

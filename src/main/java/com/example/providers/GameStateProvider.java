@@ -139,6 +139,13 @@ public class GameStateProvider extends BridgeProvider
 		List<Map<String, Object>> uiBlockers = new ArrayList<>();
 		addBlockerRect(uiBlockers, WidgetInfo.RESIZABLE_VIEWPORT_INVENTORY_CONTAINER);
 		addBlockerRect(uiBlockers, WidgetInfo.RESIZABLE_VIEWPORT_BOTTOM_LINE_INVENTORY_CONTAINER);
+		// The panel PARENTS too: the container above starts ~50 real px right of the panel's
+		// visible border strip, and a target projected onto that strip is just as dead.
+		// MEASURED live 2026-09-02 (gotr_live42, Cosmic altar): the altar's aim point at
+		// screen (2041,885) sat on the border (widget 161.97, real x 986..1227) while the
+		// container rect began at screen x 2084 -- eight withheld clicks, then a safety stop.
+		addBlockerRect(uiBlockers, WidgetInfo.RESIZABLE_VIEWPORT_INVENTORY_PARENT);
+		addBlockerRect(uiBlockers, WidgetInfo.RESIZABLE_VIEWPORT_BOTTOM_LINE_INVENTORY_PARENT);
 		// The chat tab strip (162.1) -- the row of All/Game/Public/... buttons along the bottom
 		// edge of the viewport. MEASURED live 2026-08-28: banker.open_bank aimed at a Bank booth
 		// whose projected point landed at real canvas (264,646), inside 162.19's 56x23 bounds at
@@ -150,6 +157,23 @@ public class GameStateProvider extends BridgeProvider
 		// world clicks depends on the transparent-chatbox setting and has NOT been measured --
 		// if a target is ever hijacked there, WidgetInfo.CHATBOX_PARENT is the one-line change.
 		addBlockerRect(uiBlockers, WidgetInfo.CHATBOX_BUTTONS);
+		// ...and now the whole chatbox. MEASURED live 2026-09-02 (gotr_live46): a walk tile
+		// toward the Cosmic altar projected to screen (1037,1266) -- the chatbox SCROLLBAR --
+		// and the same pixel was clicked ~30 times with zero movement (USER: "chat ui
+		// scrollbar softlocked us in altar"). The transparent-chatbox question above is
+		// answered: the scrollbar consumes the click regardless.
+		addBlockerRect(uiBlockers, WidgetInfo.CHATBOX_PARENT);
+		// The minimap and its orb cluster. In the resizable layouts the minimap is drawn OVER
+		// the top-right of the 3D viewport, and /ground/walk's onScreen only tests viewport
+		// bounds. MEASURED live 2026-09-02 (gotr_live39): a force-walk toward the rubble
+		// projected to canvas (2073,256) -- inside the minimap circle -- and the same pixel
+		// was clicked once a tick for two minutes with the player never moving, until F1.
+		// Whichever of the fixed/resizable containers is live reports bounds; the others are
+		// hidden and addBlockerRect skips them.
+		addBlockerRect(uiBlockers, WidgetInfo.RESIZABLE_MINIMAP_WIDGET);
+		addBlockerRect(uiBlockers, WidgetInfo.RESIZABLE_MINIMAP_STONES_WIDGET);
+		addBlockerRect(uiBlockers, WidgetInfo.FIXED_VIEWPORT_MINIMAP);
+		addBlockerRect(uiBlockers, WidgetInfo.MINIMAP_ORBS);
 		data.put("uiBlockers", uiBlockers);
 
 		// True while a "click here to continue"-style dialogue (NPC/player chat, an

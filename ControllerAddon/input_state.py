@@ -65,3 +65,8 @@ def reset() -> None:
     global _last_mouse_activity, _busy_until
     _last_mouse_activity = time.monotonic()
     _busy_until = 0.0
+
+# The Arduino firmware protocol version probed by controller.main() -- mirrored here because
+# controller.py is loaded twice (as __main__ and as `controller`) and the routine-side copy
+# never sees main()'s module-level assignment. Read via controller._firmware_protocol().
+firmware_protocol = 2

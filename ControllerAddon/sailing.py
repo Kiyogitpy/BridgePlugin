@@ -46,6 +46,21 @@ SAIL_HOP_TIMEOUT_S = 10.0
 SAIL_MAX_HOPS = 40
 NAVIGATE_TIMEOUT_S = 8.0
 STOP_TIMEOUT_S = 15.0
+STOP_TAB_TRIES = 3        # Q taps stop_boat will make before declaring the Sailing Options panel
+                           # unreachable (2026-09-03) -- one silent tap used to be trusted, and a
+                           # dropped keypress then reported "sail toggle not found" with the boat
+                           # still under full sail.
+STOP_STILL_READS = 2      # consecutive 0.6s polls that must read still before stop_boat returns.
+                           # One matching position read is not "stopped": at under a tile per tick
+                           # the same tile can repeat between two polls mid-coast.
+
+# On-boat fixture clicks (helm, hook, sail toggle) never get click_entity's simulated near-miss
+# (2026-09-03). The deck is a few tiles across with every neighbouring pixel another facility:
+# deploy_hook's own history shows even the default 7px offset landing on the sail model and
+# toggling the sails, and MISCLICK_OFFSET_PX (20-45px) is larger than that. The sail toggle is
+# a TOGGLE besides -- a miss plus its corrective reclick is two clicks, i.e. sails up then down.
+# Same rule banker.py applies to bank UI buttons.
+_FIXTURE_CLICK_KWARGS = {"offset": (0, 0), "simulate_mistakes": False}
 
 # CONFIRMED live 2026-08-02: steer_toward previously only stopped hopping once within
 # SAIL_ARRIVAL_TOLERANCE (5 tiles) of the target -- but the sails stay up and the boat keeps
@@ -65,6 +80,16 @@ STOP_TIMEOUT_S = 15.0
 # sail top speed regardless of how fast it's actually moving right now.
 SAIL_BRAKE_TRIGGER_TILES = 10
 
+STOP_REACTION_TICKS = 3    # UNVERIFIED (2026-09-04) -- ticks the boat keeps sailing at full speed
+                            # between steer_toward deciding to brake and the sail toggle actually
+                            # being clicked: the toggle's mouse flight (~0.5-1.0s), two bridge
+                            # reads and the click itself (~1.2-1.8s all told, 2-3 ticks) -- with
+                            # sail_to now pre-opening the Sailing Options panel so the Q tap and
+                            # its 0.3-0.6s settle are already paid. The old model charged only the
+                            # post-toggle coast (BRAKE_LOOKAHEAD_TICKS) and ignored this entirely,
+                            # which at ~2 tiles/tick is 4-6 tiles of unbudgeted travel -- the
+                            # "overshot again" reports of 2026-08-05 fit that exactly. stop_boat
+                            # logs the measured trigger-to-toggle latency so this can be fitted.
 BRAKE_LOOKAHEAD_TICKS = 3  # UNVERIFIED -- initial guess for how many ticks' worth of the boat's
                             # CURRENT measured speed it keeps coasting for after sails come down.
                             # stop_boat() now logs the measured speed at the moment of toggling
@@ -93,6 +118,14 @@ MAX_ROUTE_ATTEMPTS = 3  # how many times sail_to will re-plan a fresh route afte
 # scan; a boat's WorldView is ~8 tiles per side (confirmed live), so 20 is comfortable margin.
 BOAT_OBJECT_SEARCH_RADIUS = 20
 
+HOP_PULL_IN_FRACTIONS = (1.0, 0.66, 0.4)  # (2026-09-04, mirrors travel.HOP_PULL_IN_FRACTIONS)
+                                           # a hop point off the minimap is re-aimed at these
+                                           # fractions of the way there before the hop is given
+                                           # up -- the minimap's reach is a user setting (zooming
+                                           # it in shrinks it), and giving up on the hop fails the
+                                           # whole leg, which sail_to then re-plans into the same
+                                           # failure MAX_ROUTE_ATTEMPTS times over.
+
 
 def open_sailing_options_tab(ctx) -> None:
     """Tap the Sailing Options tab hotkey unless it's already open -- same idempotent-tap idea
@@ -118,7 +151,9 @@ def use_helm(ctx) -> bool:
         return False
 
     debug_log.log("sailing", "engaging the helm")
-    if not controller.click_entity(ctx.ser, helm):
+    # Default offset kept on purpose -- the rudder click was live-verified with it (2026-08-02);
+    # only the simulated miss is disabled, see _FIXTURE_CLICK_KWARGS.
+    if not controller.click_entity(ctx.ser, helm, simulate_mistakes=False):
         return False
 
     waited = 0.0
@@ -196,13 +231,32 @@ def steer_toward(ctx, target: dict, arrival_tolerance: float = None) -> bool:
 
 
 def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
-    point = controller.get_minimap_walk_point(x, y, plane)
-    if not point.get("onMinimap"):
-        debug_log.log("sailing", "hop point isn't on the minimap, giving up")
+    origin = controller.get_player()
+    ox, oy = origin.get("x"), origin.get("y")
+    point = None
+    for fraction in HOP_PULL_IN_FRACTIONS:
+        aim_x, aim_y = x, y
+        if fraction < 1.0:
+            if ox is None:
+                break
+            aim_x = int(round(ox + (x - ox) * fraction))
+            aim_y = int(round(oy + (y - oy) * fraction))
+            if (aim_x, aim_y) == (ox, oy):
+                break
+        candidate = controller.get_minimap_walk_point(aim_x, aim_y, plane)
+        if candidate.get("onMinimap"):
+            point = candidate
+            x, y = aim_x, aim_y
+            break
+    if point is None:
+        debug_log.log("sailing", "hop point isn't on the minimap at any distance, giving up")
         return False
 
-    if not controller.click_entity(ctx.ser, point, offset=(0, 0)):
-        # click_entity already printed why (blocked by UI, off-window, ...) -- flag it here too so a
+    # check_ui_blockers=False (2026-09-04): the minimap rects ARE UI blockers since the
+    # 2026-09-02 rebuild, and a hop is aimed at the minimap on purpose -- see travel's
+    # _click_walk_point for the same fix. With the check on, every steering click was refused.
+    if not controller.click_entity(ctx.ser, point, offset=(0, 0), check_ui_blockers=False):
+        # click_entity already printed why (off-window, ...) -- flag it here too so a
         # later "stuck -- likely aground" isn't the only signal: the boat may never have gotten a
         # steering click at all, rather than genuinely running aground.
         debug_log.log("sailing", "minimap click didn't land -- boat won't have moved this hop")
@@ -235,10 +289,26 @@ def _dynamic_brake_tiles() -> float:
     speed = controller.get_sailing().get("boatSpeed")
     if speed is None:
         return SAIL_BRAKE_TRIGGER_TILES
-    return max(SAIL_ARRIVAL_TOLERANCE, speed * BRAKE_LOOKAHEAD_TICKS)
+    return max(SAIL_ARRIVAL_TOLERANCE, speed * (STOP_REACTION_TICKS + BRAKE_LOOKAHEAD_TICKS))
 
 
-def stop_boat(ctx, target: dict = None) -> bool:
+def _sails_already_down(ctx, button: dict) -> bool:
+    """Hover the sail toggle and read what a left-click would do (GET /hover). The toggle's menu
+    text flips between "Set sails" and "Un-set sails" (CONFIRMED live 2026-08-02), so a plain
+    click on an already-stopped boat SETS the sails and sends it off again. Fails OPEN: an
+    unreadable hover (un-rebuilt client, bridge down, a real menu open) or any text that is not
+    plainly "Set sails" still clicks, because leaving the sails up is the worse failure."""
+    controller.hover_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False)
+    hover = controller.get_hover()
+    if not hover or hover.get("menuOpen"):
+        return False
+    option = (hover.get("option") or "").lower()
+    if "un-set" in option or "unset" in option:
+        return False
+    return "set sail" in option
+
+
+def stop_boat(ctx, target: dict = None, brake_started_at: float = None) -> bool:
     """Open the Sailing Options panel and click the sail toggle to un-set the sails, then wait
     for the boat to actually stop moving. CONFIRMED live 2026-08-02: this isn't two separately
     labeled buttons ("Take down sails"/"Set sail", the original guess) -- it's a single toggle
@@ -246,60 +316,90 @@ def stop_boat(ctx, target: dict = None) -> bool:
     depending on current state, so clicking it here always resolves to whichever one is actually
     valid right now (matching the confirmed-safe re-click precedent for the salvaging hook).
 
+    Three things changed 2026-09-03, none of them live-verified yet:
+    - The Q tap is verified and retried (controller.ensure_ui_state, STOP_TAB_TRIES). A single
+      unconfirmed tap used to be trusted; a dropped keypress then read as "sail toggle not found"
+      and this returned False with the boat still under full sail.
+    - The toggle click passes check_ui_blockers=False, as every interface click in this codebase
+      must (see CLAUDE.md's /widget section): GameStateProvider now reports the whole sidebar as
+      a UI blocker (rebuilt 2026-09-02 for the inventory-parent containers), and the Sailing
+      Options panel LIVES in that sidebar, so the default check would refuse the click and rotate
+      the camera instead -- click_entity's blocked path -- leaving the sails up.
+    - "Stopped" needs STOP_STILL_READS consecutive still polls, and a still poll also requires
+      boatSpeed == 0 whenever the bridge reports it (see SailingProvider). One repeated position
+      read at 0.6s spacing is not proof of a stop at sub-tile-per-tick speeds.
+
     target: the point steer_toward was actually trying to land on (sail_to passes its own target
     through), logged alongside the drift measurement below as the real overshoot-from-target --
     the more direct number for fitting BRAKE_LOOKAHEAD_TICKS against than drift-from-toggle-point
     alone, since that only measures how far the boat coasted, not whether it landed short of or
     past where it was actually aiming. None (e.g. no caller-supplied target) just skips that part
     of the log line."""
-    open_sailing_options_tab(ctx)
+    opened = controller.ensure_ui_state(
+        lambda: controller.key_tap(ctx.ser, SAILING_OPTIONS_TAB_KEY),
+        lambda: controller.get_sailing().get("facilitiesTabOpen"),
+        tries=STOP_TAB_TRIES, retry_delay_s=(0.3, 0.6),
+    )
+    if not opened:
+        debug_log.log("sailing", f"couldn't open the Sailing Options panel after {STOP_TAB_TRIES} taps -- "
+                                  "the sails are still up")
+        return False
 
     sailing_state = controller.get_sailing()
     button = sailing_state.get("sailToggle") or {}
     if button.get("screenX") is None:
-        debug_log.log("sailing", "sail toggle not found")
+        debug_log.log("sailing", "sail toggle not found -- the sails are still up")
         return False
 
     start_player = controller.get_player()
     start_pos = (start_player.get("x"), start_player.get("y"))
     speed_at_toggle = sailing_state.get("boatSpeed")
 
-    debug_log.log("sailing", "toggling sails")
-    controller.click_entity(ctx.ser, button, offset=(0, 0))
+    if _sails_already_down(ctx, button):
+        debug_log.log("sailing", "sails are already down (hover reads 'Set sails') -- not toggling")
+    else:
+        latency = f" {time.time() - brake_started_at:.1f}s after the brake decision" if brake_started_at else ""
+        debug_log.log("sailing", f"toggling sails{latency}")
+        controller.click_entity(ctx.ser, button, check_ui_blockers=False, **_FIXTURE_CLICK_KWARGS)
 
     waited = 0.0
     last_pos = None
+    still_reads = 0
     while waited < STOP_TIMEOUT_S:
         time.sleep(0.6)
         waited += 0.6
         player = controller.get_player()
         pos = (player.get("x"), player.get("y"))
-        if pos[0] is not None and pos == last_pos:
-            # Drift measurement (2026-08-02): the boat keeps coasting for a bit after un-setting
-            # sails rather than stopping instantly (confirmed live), which can carry it well past
-            # where steer_toward's SAIL_ARRIVAL_TOLERANCE said "close enough, stop now". Logging
-            # the actual distance to see how much to compensate for -- e.g. triggering the stop
-            # earlier, or padding the tolerance -- once this has been observed a few times live.
-            #
-            # speed_at_toggle logged alongside it since 2026-08-04 (boatSpeed added to
-            # SailingProvider) -- pairs each drift sample with the actual measured speed that
-            # produced it, giving real data to fit BRAKE_LOOKAHEAD_TICKS against
-            # (drift_tiles ~= speed_at_toggle * actual_coast_ticks) instead of guessing.
-            #
-            # overshoot (added 2026-08-04, boat-upgrade speed increase): distance from where the
-            # boat actually settled to the target it was aiming for. drift alone can't tell
-            # whether BRAKE_LOOKAHEAD_TICKS's linear speed*ticks model still holds now that the
-            # boat is faster -- overshoot is the direct "how far past/short of center did we land"
-            # number needed to refit it.
-            if start_pos[0] is not None and pos[0] is not None:
-                drift = math.hypot(pos[0] - start_pos[0], pos[1] - start_pos[1])
-                msg = f"stopped -- drifted {drift:.1f} tiles after toggling sails (speed at toggle: {speed_at_toggle})"
-                if target is not None and target.get("x") is not None:
-                    overshoot = math.hypot(pos[0] - target["x"], pos[1] - target["y"])
-                    msg += f" -- {overshoot:.1f} tiles from target"
-                debug_log.log("sailing", msg)
-            return True
+        speed = controller.get_sailing().get("boatSpeed")
+        still = pos[0] is not None and pos == last_pos and (speed is None or speed == 0)
+        still_reads = still_reads + 1 if still else 0
         last_pos = pos
+        if still_reads < STOP_STILL_READS:
+            continue
+        # Drift measurement (2026-08-02): the boat keeps coasting for a bit after un-setting
+        # sails rather than stopping instantly (confirmed live), which can carry it well past
+        # where steer_toward's SAIL_ARRIVAL_TOLERANCE said "close enough, stop now". Logging
+        # the actual distance to see how much to compensate for -- e.g. triggering the stop
+        # earlier, or padding the tolerance -- once this has been observed a few times live.
+        #
+        # speed_at_toggle logged alongside it since 2026-08-04 (boatSpeed added to
+        # SailingProvider) -- pairs each drift sample with the actual measured speed that
+        # produced it, giving real data to fit BRAKE_LOOKAHEAD_TICKS against
+        # (drift_tiles ~= speed_at_toggle * actual_coast_ticks) instead of guessing.
+        #
+        # overshoot (added 2026-08-04, boat-upgrade speed increase): distance from where the
+        # boat actually settled to the target it was aiming for. drift alone can't tell
+        # whether BRAKE_LOOKAHEAD_TICKS's linear speed*ticks model still holds now that the
+        # boat is faster -- overshoot is the direct "how far past/short of center did we land"
+        # number needed to refit it.
+        if start_pos[0] is not None and pos[0] is not None:
+            drift = math.hypot(pos[0] - start_pos[0], pos[1] - start_pos[1])
+            msg = f"stopped -- drifted {drift:.1f} tiles after toggling sails (speed at toggle: {speed_at_toggle})"
+            if target is not None and target.get("x") is not None:
+                overshoot = math.hypot(pos[0] - target["x"], pos[1] - target["y"])
+                msg += f" -- {overshoot:.1f} tiles from target"
+            debug_log.log("sailing", msg)
+        return True
 
     debug_log.log("sailing", "never saw the boat settle -- continuing anyway")
     return True
@@ -328,7 +428,7 @@ def deploy_hook(ctx, hook_name: str) -> bool:
         return False
 
     debug_log.log("sailing", f"deploying {hook.get('name')}")
-    return controller.click_entity(ctx.ser, hook, offset=(0, 0))
+    return controller.click_entity(ctx.ser, hook, **_FIXTURE_CLICK_KWARGS)
 
 
 def sail_to(ctx, target: dict) -> bool:
@@ -386,6 +486,12 @@ def sail_to(ctx, target: dict) -> bool:
         stuck = False
         for i, leg in enumerate(legs):
             is_final_leg = (i == len(legs) - 1)
+            if is_final_leg:
+                # Pre-open the Sailing Options panel so stop_boat's Q tap (and its settle delay)
+                # is already paid by the time the brake decision lands -- every tick between that
+                # decision and the toggle click is full-speed travel (see STOP_REACTION_TICKS).
+                # The panel is a sidebar tab; minimap steering clicks are unaffected by it.
+                open_sailing_options_tab(ctx)
             tolerance = None if is_final_leg else SAIL_ARRIVAL_TOLERANCE
             if not steer_toward(ctx, leg, arrival_tolerance=tolerance):
                 debug_log.log("sailing", f"got stuck heading to a waypoint (attempt {attempt + 1}/{MAX_ROUTE_ATTEMPTS}) -- replanning")
@@ -393,7 +499,7 @@ def sail_to(ctx, target: dict) -> bool:
                 break
 
         if not stuck:
-            return stop_boat(ctx, target)
+            return stop_boat(ctx, target, brake_started_at=time.time())
 
     debug_log.log("sailing", "couldn't find a working route after repeated attempts -- giving up")
     return False

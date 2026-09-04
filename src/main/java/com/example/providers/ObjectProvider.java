@@ -105,8 +105,15 @@ public class ObjectProvider extends BridgeProvider
 			}
 		}
 		Integer finalRadius = radius;
+		// interactable=true (opt-in, ADDED 2026-09-01): emit only objects with at least one
+		// menu action. In the GOTR temple ~3,500 of 4,045 scanned objects are pure decor
+		// (kelp, lace, guides) that no routine can ever click; skipping them BEFORE the
+		// per-object work is what makes the bulk scan cheap. Default (absent/false) keeps
+		// the full list -- existing consumers unchanged.
+		boolean interactableOnly = "true".equalsIgnoreCase(query.get("interactable"));
+		String cacheKey = (radius == null ? "" : radius.toString()) + "|" + interactableOnly;
 
-		return cache.get(tickClock.get(), isFresh(query), radius, () -> (List<Map<String, Object>>) onClient(() -> computeObjects(finalRadius)));
+		return cache.get(tickClock.get(), isFresh(query), cacheKey, () -> (List<Map<String, Object>>) onClient(() -> computeObjects(finalRadius, null, interactableOnly)));
 	}
 
 	// ADDED 2026-08-08 (user investigation): debug-only, uncached, deliberately not the normal
@@ -247,6 +254,15 @@ public class ObjectProvider extends BridgeProvider
 
 	private List<Map<String, Object>> computeObjects(Integer radius, Target want)
 	{
+		return computeObjects(radius, want, false);
+	}
+
+	/** See getObjects: only ever read/written on the client thread inside one call. */
+	private boolean interactableOnlyThisCall;
+
+	private List<Map<String, Object>> computeObjects(Integer radius, Target want, boolean interactableOnly)
+	{
+		interactableOnlyThisCall = interactableOnly;
 		List<Map<String, Object>> list = new ArrayList<>();
 
 		WorldView collisionView = client.getTopLevelWorldView();
@@ -376,7 +392,7 @@ public class ObjectProvider extends BridgeProvider
 					{
 						if (matchesTarget(want, obj))
 					{
-						out.add(buildObjectData(obj, "GameObject", plane));
+						addIfBuilt(out, obj, "GameObject", plane);
 					}
 					}
 				}
@@ -389,7 +405,7 @@ public class ObjectProvider extends BridgeProvider
 				{
 					if (matchesTarget(want, wallObj))
 				{
-					out.add(buildObjectData(wallObj, "WallObject", plane));
+					addIfBuilt(out, wallObj, "WallObject", plane);
 				}
 				}
 
@@ -398,7 +414,7 @@ public class ObjectProvider extends BridgeProvider
 				{
 					if (matchesTarget(want, groundObj))
 				{
-					out.add(buildObjectData(groundObj, "GroundObject", plane));
+					addIfBuilt(out, groundObj, "GroundObject", plane);
 				}
 				}
 
@@ -407,7 +423,7 @@ public class ObjectProvider extends BridgeProvider
 				{
 					if (matchesTarget(want, decorativeObj))
 				{
-					out.add(buildObjectData(decorativeObj, "DecorativeObject", plane));
+					addIfBuilt(out, decorativeObj, "DecorativeObject", plane);
 				}
 				}
 			}
@@ -485,15 +501,45 @@ public class ObjectProvider extends BridgeProvider
 			&& wp.getPlane() == want.plane;
 	}
 
+	/** buildObjectData, tolerating the interactable-only filter's null (skipped object). */
+	private void addIfBuilt(List<Map<String, Object>> out, TileObject obj, String objectType, int plane)
+	{
+		Map<String, Object> built = buildObjectData(obj, objectType, plane);
+		if (built != null)
+		{
+			out.add(built);
+		}
+	}
+
+	/** id -> "has any menu action", for NON-multiloc ids only (a multiloc's current impostor
+	 *  -- and so its actions -- changes with varbits mid-session: cell tiles, doors; those
+	 *  resolve fresh every time). Object definitions are otherwise static for the session,
+	 *  and the repeated composition+action resolution for ~4k objects per tick was about
+	 *  half of the interactable-only scan's remaining cost (MEASURED 2026-09-01: 110ms for
+	 *  220 emitted of 4,052 scanned). Client thread only, no synchronization. */
+	private final Map<Integer, Boolean> interactableById = new HashMap<>();
+
+	/** Returns null (object skipped) when interactableOnlyThisCall is set and the object has
+	 *  no menu actions -- the check runs BEFORE the expensive per-object work (world-point
+	 *  instance correction, collision, clickbox hull/projection), which is the whole point. */
 	private Map<String, Object> buildObjectData(TileObject obj, String objectType, int plane)
 	{
+		if (interactableOnlyThisCall)
+		{
+			Boolean known = interactableById.get(obj.getId());
+			if (known != null && !known)
+			{
+				return null;    // cached non-interactable: skip even the composition lookup
+			}
+		}
+
 		Map<String, Object> data = new HashMap<>();
 		LocalPoint local = obj.getLocalLocation();
-		WorldPoint wp = worldPointOf(obj);
 
 		data.put("id", obj.getId());
 		data.put("objectType", objectType);
 		ObjectComposition comp = client.getObjectDefinition(obj.getId());
+		boolean multiloc = comp != null && comp.getImpostorIds() != null;
 		if (comp != null && comp.getImpostorIds() != null)
 		{
 			// Multiloc (varbit-conditional appearance) object -- the base composition's own name
@@ -539,6 +585,19 @@ public class ObjectProvider extends BridgeProvider
 			}
 			data.put("actions", actions);
 		}
+
+		boolean hasActions = data.containsKey("actions")
+			&& !((List<?>) data.get("actions")).isEmpty();
+		if (!multiloc)
+		{
+			interactableById.put(obj.getId(), hasActions);
+		}
+		if (interactableOnlyThisCall && !hasActions)
+		{
+			return null;
+		}
+
+		WorldPoint wp = worldPointOf(obj);
 
 		// ADDED 2026-08-28 (user's suggestion, after the action check alone kept picking the wrong
 		// door): the client's OWN collision entry for this object's tile -- the same data the game
@@ -597,7 +656,18 @@ public class ObjectProvider extends BridgeProvider
 		// Behavior is unchanged; the implementation moved to RuneLiteUtil.shapeCoords 2026-08-24
 		// so NPCProvider/PvpProvider could aim at Actor.getConvexHull() the same way instead of
 		// duplicating the grid-sampling logic. See that method for the full rationale.
-		Map<String, Object> coords = RuneLiteUtil.shapeCoords(client, obj.getClickbox(), local, plane, true);
+		// Clickbox hulls DOMINATE this method's cost, and most of a scene never needs one:
+		// MEASURED 2026-09-01 in the GOTR temple (4,045 objects, hundreds of them decorative
+		// kelp/lace), one bulk scan cost ~450-500ms of CLIENT THREAD time -- ~75% of the whole
+		// 600ms tick budget while a routine polls /objects each tick, USER-felt as constant
+		// stutter that persisted on an EMPTY world (which ruled out UDP event volume). An
+		// object with NO menu actions cannot be clicked, so nothing ever aims at it: skip the
+		// hull and let shapeCoords fall back to the cheap ground-tile projection for those.
+		// Contract unchanged -- every field still present, `usedClickbox` false for decor.
+		boolean interactable = data.containsKey("actions")
+			&& !((List<?>) data.get("actions")).isEmpty();
+		Map<String, Object> coords = RuneLiteUtil.shapeCoords(
+			client, interactable ? obj.getClickbox() : null, local, plane, true);
 		data.putAll(coords);
 		// Pre-existing field name, kept so anything already reading it doesn't break; shapeCoords
 		// reports the same fact as "usedClickbox".

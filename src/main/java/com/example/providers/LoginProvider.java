@@ -83,6 +83,16 @@ public class LoginProvider extends BridgeProvider
 	 */
 	private static final int LOGIN_INDEX_DIALOG = 24;
 
+	/**
+	 * loginIndex of the "Failed to login. Please try again." screen with its single "Try again"
+	 * button. MEASURED live 2026-09-02 (gotr_live56): a mid-round disconnect, the auto-login's
+	 * first attempt refused, and login.py spun on "no login click point" for minutes because
+	 * this index was unknown. Same layout family as the dialog above; the button box centred on
+	 * real y 311 (canvas 600-680 at 2.06x stretch) on a 1227x668 real canvas.
+	 */
+	private static final int LOGIN_INDEX_LOGIN_FAILED = 9;
+	private static final int TRY_AGAIN_BUTTON_Y = 311;
+
 	/** Vertical centre of the "Play Now" text, in real (pre-stretch) render pixels. */
 	private static final int PLAY_NOW_Y = 252;
 
@@ -119,6 +129,11 @@ public class LoginProvider extends BridgeProvider
 			if (loginIndex == LOGIN_INDEX_PLAY_NOW)
 			{
 				putCentredButton(data, "playNow", PLAY_NOW_Y);
+			}
+			else if (loginIndex == LOGIN_INDEX_LOGIN_FAILED)
+			{
+				// Exposed under the same key: login.py clicks okButton whenever it is present.
+				putCentredButton(data, "okButton", TRY_AGAIN_BUTTON_Y);
 			}
 			else if (loginIndex == LOGIN_INDEX_DIALOG)
 			{

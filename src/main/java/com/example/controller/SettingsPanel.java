@@ -2,7 +2,11 @@ package com.example.controller;
 
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
+import net.runelite.api.GameObject;
 import net.runelite.api.NPC;
+import net.runelite.api.ObjectComposition;
+import net.runelite.api.Scene;
+import net.runelite.api.Tile;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.ui.ColorScheme;
@@ -53,6 +57,19 @@ public class SettingsPanel extends PluginPanel
 	// controllerEnabled/targetNpcNames/taskLocationChoices are all editable from both.
 	private final JCheckBox enabledBox = new JCheckBox("Controller Enabled");
 
+	// Mining section (added 2026-09-03): every object in the loaded scene offering a "Mine"
+	// action, listed by name on Refresh, filtered by the search field, and persisted to the
+	// "rockNames" config key that routines/mining.py reads through GET /mining-config. Same
+	// shape as the nearby-monster list above, so a name chosen here and one typed into the
+	// wrench-icon Rock Names field are the one setting.
+	private final JPanel rockListPanel = new JPanel();
+	private final Map<String, JCheckBox> rockCheckboxes = new LinkedHashMap<>();
+	private final Set<String> selectedRocks = new LinkedHashSet<>();
+	private final JTextField rockSearchField = new JTextField();
+	private final PluginErrorPanel rockErrorPanel = new PluginErrorPanel();
+	private final JLabel rockStatusLabel = new JLabel();
+	private Map<String, Integer> nearbyRocks = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+
 	@Inject
 	SettingsPanel(Client client, ClientThread clientThread, ConfigManager configManager, ControllerConfig config)
 	{
@@ -63,6 +80,7 @@ public class SettingsPanel extends PluginPanel
 
 		selectedTargets.addAll(ConfigExporter.parseList(config.targetNpcNames()));
 		categoryLocationChoice.putAll(ConfigExporter.parseLocationChoices(config.taskLocationChoices()));
+		selectedRocks.addAll(ConfigExporter.parseList(config.rockNames()));
 
 		setLayout(new BorderLayout());
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -78,7 +96,7 @@ public class SettingsPanel extends PluginPanel
 		title.setAlignmentX(Component.LEFT_ALIGNMENT);
 		header.add(title);
 
-		JLabel hint = new JLabel("<html>Search any slayer task monster, pick from nearby monsters, or both.<br>Settings are exposed at <b>/config</b>.</html>");
+		JLabel hint = new JLabel("<html>Search any slayer task monster, pick from nearby monsters, or both.<br>Mining: walk near the rocks and Refresh the Mining section.<br>Settings are exposed at <b>/config</b>.</html>");
 		hint.setForeground(Color.WHITE);
 		hint.setBorder(new EmptyBorder(6, 0, 8, 0));
 		hint.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -118,6 +136,7 @@ public class SettingsPanel extends PluginPanel
 		body.add(collapsibleSection("Add Slayer Task Monster", buildSearchSection(), true));
 		body.add(collapsibleSection("Selected Targets", buildSelectedSection(), true));
 		body.add(collapsibleSection("Monsters In Current Area", buildNearbySection(), true));
+		body.add(collapsibleSection("Mining: Rocks In Current Area", buildMiningSection(), false));
 
 		JScrollPane bodyScroll = new JScrollPane(body);
 		bodyScroll.setBorder(BorderFactory.createEmptyBorder());
@@ -604,6 +623,216 @@ public class SettingsPanel extends PluginPanel
 		configManager.setConfiguration(ControllerConfig.GROUP, "taskLocationChoices", sb.toString());
 	}
 
+	// ---- Mining section -------------------------------------------------------------------
+
+	private JPanel buildMiningSection()
+	{
+		JPanel section = new JPanel(new BorderLayout(0, 4));
+		section.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		section.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+		JPanel top = new JPanel();
+		top.setLayout(new BoxLayout(top, BoxLayout.Y_AXIS));
+		top.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		top.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+		rockSearchField.putClientProperty("JTextField.placeholderText", "Filter, e.g. \"iron\"");
+		rockSearchField.getDocument().addDocumentListener((SimpleDocumentListener) e -> rebuildRockCheckboxes());
+		rockSearchField.setAlignmentX(Component.LEFT_ALIGNMENT);
+		rockSearchField.setMaximumSize(new Dimension(Integer.MAX_VALUE, rockSearchField.getPreferredSize().height));
+		top.add(rockSearchField);
+
+		JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
+		buttons.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+		JButton refreshBtn = new JButton("Refresh");
+		refreshBtn.addActionListener(e -> refreshRockList());
+		buttons.add(refreshBtn);
+
+		JButton selectAllBtn = new JButton("All");
+		selectAllBtn.addActionListener(e -> setAllRocksSelected(true));
+		buttons.add(selectAllBtn);
+
+		JButton clearBtn = new JButton("None");
+		clearBtn.addActionListener(e -> setAllRocksSelected(false));
+		buttons.add(clearBtn);
+		top.add(buttons);
+
+		rockStatusLabel.setForeground(Color.WHITE);
+		rockStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		top.add(rockStatusLabel);
+
+		section.add(top, BorderLayout.NORTH);
+
+		rockListPanel.setLayout(new BoxLayout(rockListPanel, BoxLayout.Y_AXIS));
+		rockListPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+		JScrollPane scroll = new JScrollPane(rockListPanel);
+		scroll.setPreferredSize(new Dimension(0, 200));
+		scroll.setBorder(BorderFactory.createLineBorder(ColorScheme.MEDIUM_GRAY_COLOR));
+		scroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+		scroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER);
+		section.add(scroll, BorderLayout.CENTER);
+
+		rockErrorPanel.setContent("Mining", "Walk near the rocks and click Refresh to list everything mineable here.");
+		section.add(rockErrorPanel, BorderLayout.SOUTH);
+
+		updateRockStatusLabel();
+		return section;
+	}
+
+	/** Scans the whole loaded scene (every plane) for GameObjects whose impostor-resolved
+	 * composition offers a "Mine" action -- rocks, ore veins, mineral deposits -- and lists
+	 * each distinct display name once. Runs on the client thread like refreshNpcList: object
+	 * compositions are only safe to read there. */
+	void refreshRockList()
+	{
+		@SuppressWarnings("unchecked")
+		Map<String, Integer> found = (Map<String, Integer>) RuneLiteUtil.runOnClientThread(client, clientThread, () -> {
+			Map<String, Integer> result = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+			Scene scene = client.getScene();
+			Tile[][][] tiles = scene != null ? scene.getTiles() : null;
+			if (tiles == null)
+			{
+				return result;
+			}
+			for (Tile[][] plane : tiles)
+			{
+				if (plane == null)
+				{
+					continue;
+				}
+				for (Tile[] column : plane)
+				{
+					if (column == null)
+					{
+						continue;
+					}
+					for (Tile tile : column)
+					{
+						if (tile == null)
+						{
+							continue;
+						}
+						for (GameObject obj : tile.getGameObjects())
+						{
+							if (obj == null)
+							{
+								continue;
+							}
+							ObjectComposition comp = client.getObjectDefinition(obj.getId());
+							if (comp != null && comp.getImpostorIds() != null)
+							{
+								comp = comp.getImpostor();
+							}
+							if (comp == null || comp.getName() == null || comp.getName().equals("null")
+								|| comp.getActions() == null)
+							{
+								continue;
+							}
+							for (String action : comp.getActions())
+							{
+								if ("Mine".equalsIgnoreCase(action))
+								{
+									result.putIfAbsent(comp.getName(), obj.getId());
+									break;
+								}
+							}
+						}
+					}
+				}
+			}
+			return result;
+		});
+
+		nearbyRocks = found != null ? found : new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+		rebuildRockCheckboxes();
+	}
+
+	/** Rebuilds the checkbox list from the last scan, showing only names containing the
+	 * search field's text. Selection state lives in selectedRocks, not in the boxes, so
+	 * filtering never loses a tick. */
+	private void rebuildRockCheckboxes()
+	{
+		rockListPanel.removeAll();
+		rockCheckboxes.clear();
+
+		String filter = rockSearchField.getText().trim().toLowerCase();
+		for (Map.Entry<String, Integer> entry : nearbyRocks.entrySet())
+		{
+			String name = entry.getKey();
+			if (!filter.isEmpty() && !name.toLowerCase().contains(filter))
+			{
+				continue;
+			}
+			JCheckBox box = new JCheckBox(name + "  (id " + entry.getValue() + ")");
+			box.setSelected(selectedRocks.contains(name));
+			box.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+			box.setForeground(Color.WHITE);
+			box.setAlignmentX(Component.LEFT_ALIGNMENT);
+			box.addActionListener(e -> {
+				if (box.isSelected())
+				{
+					selectedRocks.add(name);
+				}
+				else
+				{
+					selectedRocks.remove(name);
+				}
+				persistRocks();
+			});
+			rockCheckboxes.put(name, box);
+			rockListPanel.add(box);
+		}
+
+		if (nearbyRocks.isEmpty())
+		{
+			rockErrorPanel.setContent("No Rocks Found", "Nothing mineable is loaded. Make sure you are logged in and near the rocks, then click Refresh.");
+			rockErrorPanel.setVisible(true);
+		}
+		else
+		{
+			rockErrorPanel.setVisible(false);
+		}
+
+		rockListPanel.revalidate();
+		rockListPanel.repaint();
+		updateRockStatusLabel();
+	}
+
+	private void setAllRocksSelected(boolean selected)
+	{
+		for (String name : rockCheckboxes.keySet())
+		{
+			if (selected)
+			{
+				selectedRocks.add(name);
+			}
+			else
+			{
+				selectedRocks.remove(name);
+			}
+		}
+		persistRocks();
+	}
+
+	private void persistRocks()
+	{
+		configManager.setConfiguration(ControllerConfig.GROUP, "rockNames", String.join(", ", selectedRocks));
+		for (Map.Entry<String, JCheckBox> entry : rockCheckboxes.entrySet())
+		{
+			entry.getValue().setSelected(selectedRocks.contains(entry.getKey()));
+		}
+		updateRockStatusLabel();
+	}
+
+	private void updateRockStatusLabel()
+	{
+		rockStatusLabel.setText(nearbyRocks.size() + " mineable here · selected: "
+			+ (selectedRocks.isEmpty() ? "none" : String.join(", ", selectedRocks)));
+	}
+
 	/** Re-syncs every control here from the current config -- called by ControllerPlugin whenever
 	 * ControllerConfig changes from anywhere, so this panel never shows a stale
 	 * value for a setting it shares with the wrench-icon config screens (Controller Enabled,
@@ -624,6 +853,14 @@ public class SettingsPanel extends PluginPanel
 		{
 			entry.getValue().setSelected(selectedTargets.contains(entry.getKey()));
 		}
+
+		selectedRocks.clear();
+		selectedRocks.addAll(ConfigExporter.parseList(config.rockNames()));
+		for (Map.Entry<String, JCheckBox> entry : rockCheckboxes.entrySet())
+		{
+			entry.getValue().setSelected(selectedRocks.contains(entry.getKey()));
+		}
+		updateRockStatusLabel();
 
 		refreshSelectedTargetsPanel();
 		updateStatusLabel(npcCheckboxes.size());

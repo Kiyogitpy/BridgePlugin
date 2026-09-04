@@ -43,6 +43,17 @@ import debug_log
 
 LOGIN_RETRY_INTERVAL_S = 1.0
 
+# Camera defaults applied after EVERY login, for every routine (USER 2026-09-03: "the
+# zoom out and look from above we should probably add that as a default in login.py so
+# it always does that for every routine"). Hold UP until the pitch stops rising, then a
+# few wheel detents over the viewport centre. Idempotent: when the pitch is already at
+# its ceiling this is a routine restart, not a fresh client, and the zoom is left alone
+# so repeated restarts do not keep zooming out (MEASURED gotr runs 65/66).
+CAMERA_PITCH_HOLD_MAX_S = 2.5
+CAMERA_ZOOM_OUT_CLICKS = 3
+
+_camera_pending = True   # a login (or process start) has happened since the last setup
+
 # Log the full bridge status once every this many consecutive no-op attempts.
 # A login screen we have no click point for (an unrecognised loginIndex, e.g.
 # the disconnect/retry screen) otherwise fails silently forever: attempt_login
@@ -62,6 +73,47 @@ def is_fully_logged_in() -> bool:
     return status.get("loggedIn", False) and not status.get("clickToPlay")
 
 
+def setup_camera(ser, log=debug_log.log) -> None:
+    """Overhead pitch + a slight zoom-out. See the CAMERA_* comment above."""
+    import time
+    st = controller.get_state() or {}
+    pitch = st.get("cameraPitch")
+    controller.key_down(ser, "UP")
+    t0 = time.time()
+    last = pitch
+    try:
+        while time.time() - t0 < CAMERA_PITCH_HOLD_MAX_S:
+            time.sleep(0.3)
+            now = (controller.get_state() or {}).get("cameraPitch")
+            if now is not None and last is not None and now <= last and time.time() - t0 > 0.8:
+                break
+            last = now
+    finally:
+        controller.key_up(ser, "UP")
+    if pitch is not None and last is not None and last <= pitch:
+        log("login", f"camera already overhead (pitch {pitch}) -- zoom left alone")
+        return
+    cx = st.get("canvasScreenX", 0) + st.get("viewportWidth", st.get("canvasWidth", 0)) // 2
+    cy = st.get("canvasScreenY", 0) + st.get("viewportHeight", st.get("canvasHeight", 0)) // 2
+    controller.move_to_human(ser, cx, cy, aim_radius=40)
+    controller.scroll_wheel(ser, -CAMERA_ZOOM_OUT_CLICKS)
+    controller.human_delay(0.4, 0.7)
+    log("login", f"camera set: pitch {pitch} -> {last}, zoomed out {CAMERA_ZOOM_OUT_CLICKS}")
+
+
+def ensure_camera_after_login(ctx) -> None:
+    """Called by the engine once per loop while fully logged in and focused: applies the
+    camera defaults the first time after each login (and at process start)."""
+    global _camera_pending
+    if not _camera_pending:
+        return
+    _camera_pending = False
+    try:
+        setup_camera(ctx.ser)
+    except Exception as exc:   # never let a camera nudge take the run down
+        debug_log.log("!", f"camera setup failed: {exc}")
+
+
 def attempt_login(ctx) -> bool:
     """Click through whichever login screen is currently showing.
 
@@ -69,7 +121,8 @@ def attempt_login(ctx) -> bool:
     next tick re-check), False if there was nothing to click yet (e.g. a
     loading transition between screens, or a login screen we have no click
     point for)."""
-    global _consecutive_noops
+    global _consecutive_noops, _camera_pending
+    _camera_pending = True   # a login is in progress: re-apply the camera once it lands
 
     status = controller.get_login_status()
 
@@ -97,6 +150,15 @@ def attempt_login(ctx) -> bool:
         controller.human_delay(2.0, 3.0)
         return True
 
+    if status.get("gameState") in ("CONNECTION_LOST", "LOGGING_IN", "LOADING", "HOPPING"):
+        # The client's own reconnect state ("Connection lost. Please wait...").
+        # There is nothing to click; it either comes back by itself or drops to a
+        # login screen we do handle. MEASURED 2026-09-02 (gotr_live59): 3.5 minutes
+        # of it, reported every 10 attempts as "no login click point" -- noise.
+        if _consecutive_noops == 0:
+            debug_log.log("login", f"{status.get('gameState')} -- waiting for the client")
+        _consecutive_noops += 1
+        return False
     _consecutive_noops += 1
     if _consecutive_noops % STUCK_REPORT_EVERY == 0:
         # The loginIndex is the useful part: it names which login screen we are

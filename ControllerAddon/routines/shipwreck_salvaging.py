@@ -41,6 +41,8 @@ DEFAULT_CONFIG = {
                                     # independently of this routine's config -- pinning to one tier
                                     # name broke the moment the boat's hook got upgraded to Steel.
     "maxSailDistance": 60,   # a farther wreck worth repositioning the boat for
+    "dropAtFreeSlots": 1,    # drop salvage once this many inventory slots are left (0 = only when
+                             # completely full, the pre-2026-09-03 behaviour -- see tick())
 
     "breaks": {
         "enabled": True,
@@ -98,16 +100,44 @@ HOOK_ENGAGE_GIVEUP_COOLDOWN_S = 30.0  # how long to leave a given-up-on wreck al
                                         # that a wreck worth salvaging isn't abandoned for good over
                                         # one bad approach.
 
-SALVAGE_CHANNEL_ANIMATIONS = frozenset({13576, 13577, 13578})  # CONFIRMED live -- the hook's real
-    # salvaging channel cycles through exactly these three animation ids. Used instead of trusting
-    # /combat's isIdle for "is the hook actually working" -- CONFIRMED live 2026-08-05 (user report,
-    # "seems he's stuck on the helm after clicking the hook once"): isIdle's own formula
-    # (!moving && animation == -1 && target == null) makes ANY non-(-1) animation read as "not
-    # idle", channeling or not. Observed live: animation stuck at 13352 (not one of these three,
-    # cause unconfirmed -- possibly a leftover helm/UI interaction pose) for 100+ seconds after a
-    # single hook click, with isIdle reading False the entire time -- silently blocking every
-    # recovery mechanism below (reclick, reposition-on-timeout, give-up-and-blacklist), since they
-    # were all gated behind isIdle first going True.
+# The player's own salvaging-channel animations, ONE FAMILY PER HOOK SIZE -- pinned against
+# runelite-api 1.12.38's AnimationID (javap over the Gradle-cache jar, 2026-09-03) and matched
+# against what the Plugin Hub's salvaging-afk-timer / distraction-reducer plugins treat as
+# "salvaging". Used instead of trusting /combat's isIdle for "is the hook actually working" --
+# CONFIRMED live 2026-08-05 (user report, "seems he's stuck on the helm after clicking the hook
+# once"): isIdle's own formula (!moving && animation == -1 && target == null) makes ANY non-(-1)
+# animation read as "not idle", channeling or not.
+#
+# BUG FIXED 2026-09-03: the set used to hold only the 2X5 family (13576-13578, the three ids
+# CONFIRMED live on the boat of the day). The hook facility's animation family follows the hull
+# the hook is built on (cache: salvaging_hook_bronze -> ..._2x5_idle01, salvaging_hook_large_*_b
+# -> ..._3x8_idle01), so a bigger boat would have read as "never channeling" -- every recovery
+# below (reclick, reposition, give-up) would then fire against a hook that was working fine.
+_SALVAGE_CHANNEL_BY_HULL = {
+    "1x3": (13569, 13570, 13571),   # SAILING_HUMAN_SALVAGE_HOOK_KANDARIN_1X3_{DROP01,IDLE01,RESET01}
+    "2x5": (13576, 13577, 13578),   # ..._2X5_{DROP01,IDLE01,RESET01} -- CONFIRMED live 2026-08-05
+    "3x8": (13583, 13584, 13585),   # ..._3X8_{DROP01,IDLE01,RESET01}
+    "large": (13591, 13592, 13594),  # HUMAN_SAILING_SALVAGE01_LARGE01_{DROP01,IDLE01,RESET01}
+}
+SALVAGE_CHANNEL_ANIMATIONS = frozenset(
+    anim for anims in _SALVAGE_CHANNEL_BY_HULL.values() for anim in anims
+) | frozenset({
+    13596,  # SAILING_HUMAN_SALVAGE_HOOK_KANDARIN_1X3_SALVAGING01
+    13598,  # SAILING_HUMAN_SALVAGE_HOOK_KANDARIN_1X3_PULL01
+})
+# Deliberately NOT in the set: the Sort-salvage poses (13599 1X3_INTERACT01, 13593
+# LARGE01_INTERACT01 -- RuneLite's own IdleNotifier labels them "Sort-salvage") and 13597
+# 1X3_INACTIVE01, whose name suggests a deployed hook with nothing left to pull -- exactly the
+# state the idle-triggered reclick exists to recover from.
+
+# Standing at the helm. 13352 is HUMAN_SAILING_ALPHA_HELM_SMALL01_ACTIVE01_LOOP (runelite-api
+# 1.12.38) -- the "animation stuck at 13352 for 100+ seconds after a single hook click" seen live
+# 2026-08-05 was the player still steering, i.e. the hook click never took effect, not some
+# leftover UI pose. Listed so a log line can say so; the reclick path already covers it.
+HELM_ANIMATIONS = frozenset({
+    13351, 13352, 13353, 13354, 13355,   # HUMAN_SAILING_ALPHA_HELM_SMALL01_*
+    13362, 13363, 13364, 13365, 13366,   # HUMAN_SAILING_HELM_3X8_*
+})
 
 FAR_WRECK_GIVEUP_COOLDOWN_S = 60.0  # CONFIRMED live 2026-08-05 (user report): "we just sail around
                                       # in circles even though we have multiple wreck pairs around
@@ -122,26 +152,69 @@ FAR_WRECK_GIVEUP_COOLDOWN_S = 60.0  # CONFIRMED live 2026-08-05 (user report): "
                                       # failed reposition -- not worth retrying as quickly.
 
 
+# Chat signals (wiki "Shipwreck salvaging", rev 15290733, + Transcript:Jobless Jim). Matched as
+# lowercase substrings so a punctuation/wording tweak does not silently disarm them.
+SUNK_CHAT_FRAGMENT = "reclaimed by the sea"        # "You salvage all you can from the shipwreck
+                                                   #  before it is reclaimed by the sea."
+HAZARD_CHAT_FRAGMENT = "hazardous waters"          # "...not safe to salvage ... hazardous waters."
+CHANNEL_XP_STALL_S = 120.0  # channel animation playing but NO Sailing XP for this long => the
+                             # hook is not really working; reclick. Players roll for salvage every
+                             # 4 ticks (wiki, 5 Dec 2025 hotfix) and the lowest documented success
+                             # rate leaves p(no XP in 120s) below 1e-3, so a real channel cannot
+                             # trip this. A stale animation read or a channel the game has quietly
+                             # ended (the reasons the animation-only gate is not enough) can.
+HAZARD_GIVEUP_S = 30 * 60  # a hazardous-waters refusal is about the BOAT's fittings (mast/hull),
+                            # not the approach -- no reposition fixes it, so the wreck is
+                            # blacklisted for far longer than an ordinary engage failure.
+
+
+def _wreck_key(wreck: dict):
+    return (wreck.get("x"), wreck.get("y"), wreck.get("plane"))
+
+
+def _active_giveup(data: dict, key_name: str, until_name: str, now: float) -> frozenset:
+    key = data.get(key_name)
+    if key and now < data.get(until_name, 0):
+        return frozenset({key})
+    return frozenset()
+
+
+def _holds_salvage(inventory) -> bool:
+    return any((item.get("name") or "").lower().endswith("salvage") for item in inventory)
+
+
 def tick(ctx):
     config = ctx.state.config
+    data = ctx.state.data
+    now = time.time()
 
-    if len(controller.get_inventory()) >= controller.INVENTORY_SIZE:
-        drop_salvage(ctx)
-        return
-
-    near_wreck = find_wreck_in_hook_range(config)
+    # Drop BEFORE the inventory is completely full (default: one slot left). A completely full
+    # inventory makes the game pop its blue "click here to continue" dialogue, which interrupts
+    # the channel and needed the Space workaround in drop_salvage -- that path is kept as the
+    # fallback, but dropping a slot early avoids it on most fills. dropAtFreeSlots=0 restores the
+    # original drop-only-when-full behaviour.
+    inventory = controller.get_inventory()
+    free_slots = controller.INVENTORY_SIZE - len(inventory)
+    if inventory and free_slots <= config.get("dropAtFreeSlots", 1):
+        if _holds_salvage(inventory):
+            drop_salvage(ctx)
+            return
+        if now - data.get("last_no_salvage_message_at", 0) > WAITING_MESSAGE_INTERVAL_S:
+            debug_log.log("salvage", "inventory is full of things that are not salvage -- nothing to drop")
+            data["last_no_salvage_message_at"] = now
 
     # A wreck this routine already gave up repositioning for (see HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS
-    # below) is treated as if it weren't in range at all, for HOOK_ENGAGE_GIVEUP_COOLDOWN_S --
-    # keyed by its own tile position, NOT its object id (SALVAGE_LEVEL_REQ/SUNK_SHIPWRECK_IDS
-    # confirm ids are shared per TIER, e.g. every "Small shipwreck" instance uses the same id --
-    # keying by id would blacklist every wreck of that tier, not just this one stuck instance).
-    if near_wreck is not None:
-        wreck_key = (near_wreck.get("x"), near_wreck.get("y"), near_wreck.get("plane"))
-        if wreck_key == ctx.state.data.get("hook_engage_giveup_key") and time.time() < ctx.state.data.get("hook_engage_giveup_until", 0):
-            near_wreck = None
+    # below) is skipped for HOOK_ENGAGE_GIVEUP_COOLDOWN_S -- keyed by its own tile position, NOT
+    # its object id (SALVAGE_LEVEL_REQ/SUNK_SHIPWRECK_IDS confirm ids are shared per TIER, e.g.
+    # every "Small shipwreck" instance uses the same id -- keying by id would blacklist every wreck
+    # of that tier, not just this one stuck instance). Passed INTO the search (2026-09-03) rather
+    # than nulling its result afterwards, so a second in-range wreck is still found.
+    near_exclude = _active_giveup(data, "hook_engage_giveup_key", "hook_engage_giveup_until", now)
+    near_wreck = find_wreck_in_hook_range(config, exclude=near_exclude)
 
     if near_wreck is not None:
+        data["salvage_current_wreck_key"] = _wreck_key(near_wreck)
+        data.pop("far_wreck_miss_count", None)
         # channeling (SALVAGE_CHANNEL_ANIMATIONS) only gates the reclick itself (avoid
         # spam-clicking mid-channel) -- it must NOT gate this whole branch, or the far-wreck check
         # below never runs. CONFIRMED live 2026-08-02: salvaging is a continuous multi-tick
@@ -155,25 +228,40 @@ def tick(ctx):
         # it here got the routine permanently stuck ("stuck at the helm... not clicking the
         # hook") once navigating got stuck True. stop_boat() already waits for the boat's actual
         # *position* to stabilize before returning, which is the real "safe to deploy" signal.
-        channeling = controller.get_combat().get("animation") in SALVAGE_CHANNEL_ANIMATIONS
-        now = time.time()
+        animation = controller.get_combat().get("animation")
+        channeling = animation in SALVAGE_CHANNEL_ANIMATIONS
         if channeling:
             # Channel confirmed actually running -- clear the stuck trackers below.
-            ctx.state.data.pop("hook_engage_attempt_at", None)
-            ctx.state.data.pop("hook_engage_reposition_count", None)
-        cooldown_elapsed = now - ctx.state.data.get("last_deploy_click_at", 0) > HOOK_CLICK_COOLDOWN_S
-        if not channeling and cooldown_elapsed:
-            attempt_start = ctx.state.data.setdefault("hook_engage_attempt_at", now)
+            data.pop("hook_engage_attempt_at", None)
+            data.pop("hook_engage_reposition_count", None)
+        # XP watchdog (2026-09-04): the animation says "channeling", the XP says whether salvage
+        # is actually being rolled. The stall clock only runs while the channel animation plays.
+        sailing_xp = _sailing_xp()
+        if sailing_xp is not None and sailing_xp != data.get("sailing_xp"):
+            data["sailing_xp"] = sailing_xp
+            data["sailing_xp_changed_at"] = now
+        elif not channeling or "sailing_xp_changed_at" not in data:
+            data["sailing_xp_changed_at"] = now
+        stalled = channeling and now - data["sailing_xp_changed_at"] > CHANNEL_XP_STALL_S
+        if stalled:
+            debug_log.log("salvage", f"channel animation {animation} playing but no Sailing XP for "
+                                      f"{CHANNEL_XP_STALL_S:.0f}s -- reclicking the hook")
+            data["sailing_xp_changed_at"] = now
+        cooldown_elapsed = now - data.get("last_deploy_click_at", 0) > HOOK_CLICK_COOLDOWN_S
+        if (not channeling or stalled) and cooldown_elapsed:
+            if animation in HELM_ANIMATIONS:
+                debug_log.log("salvage", "still standing at the helm -- the last hook click did not take, reclicking")
+            attempt_start = data.setdefault("hook_engage_attempt_at", now)
             if now - attempt_start > HOOK_ENGAGE_TIMEOUT_S:
-                reposition_count = ctx.state.data.get("hook_engage_reposition_count", 0) + 1
-                ctx.state.data["hook_engage_reposition_count"] = reposition_count
+                reposition_count = data.get("hook_engage_reposition_count", 0) + 1
+                data["hook_engage_reposition_count"] = reposition_count
                 if reposition_count > HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS:
                     debug_log.log("salvage", f"giving up on this wreck after {HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS} "
                                               f"reposition attempts -- letting it cool down and looking elsewhere")
-                    ctx.state.data["hook_engage_giveup_key"] = (near_wreck.get("x"), near_wreck.get("y"), near_wreck.get("plane"))
-                    ctx.state.data["hook_engage_giveup_until"] = now + HOOK_ENGAGE_GIVEUP_COOLDOWN_S
-                    ctx.state.data.pop("hook_engage_attempt_at", None)
-                    ctx.state.data.pop("hook_engage_reposition_count", None)
+                    data["hook_engage_giveup_key"] = _wreck_key(near_wreck)
+                    data["hook_engage_giveup_until"] = now + HOOK_ENGAGE_GIVEUP_COOLDOWN_S
+                    data.pop("hook_engage_attempt_at", None)
+                    data.pop("hook_engage_reposition_count", None)
                     return
                 # Sail at a point clear of near_wreck's own collision footprint -- NOT sail_to_pair,
                 # and NOT near_wreck's own (x, y) tile either (that tile IS the solid footprint, see
@@ -185,12 +273,7 @@ def tick(ctx):
                 # boat somewhere it was never stuck getting to before -- observed live 2026-08-04
                 # running the boat aground trying to reach that new point right after sitting fine
                 # at near_wreck.
-                player = controller.get_player()
-                origin_x = player.get("boatX", player.get("x"))
-                origin_y = player.get("boatY", player.get("y"))
-                approach_point = None
-                if origin_x is not None and origin_y is not None:
-                    approach_point = _approach_point_clear_of_wreck(origin_x, origin_y, near_wreck, player)
+                approach_point = _approach_point_from_here(near_wreck)
                 if approach_point is not None:
                     debug_log.log("salvage", "hook isn't engaging after repeated clicks -- repositioning closer "
                                               f"(attempt {reposition_count}/{HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS})")
@@ -204,41 +287,119 @@ def tick(ctx):
                     debug_log.log("salvage", "hook isn't engaging after repeated clicks, but already as close as "
                                               "it's safe to get -- reclicking instead of repositioning "
                                               f"(attempt {reposition_count}/{HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS})")
-                ctx.state.data.pop("hook_engage_attempt_at", None)
+                data.pop("hook_engage_attempt_at", None)
             sailing.deploy_hook(ctx, config.get("hookName", ""))
-            ctx.state.data["last_deploy_click_at"] = now
+            data["last_deploy_click_at"] = time.time()
         return
-    ctx.state.data.pop("hook_engage_attempt_at", None)
-    ctx.state.data.pop("hook_engage_reposition_count", None)
+    data.pop("salvage_current_wreck_key", None)
+    data.pop("hook_engage_attempt_at", None)
+    data.pop("hook_engage_reposition_count", None)
 
-    far_giveup_key = ctx.state.data.get("far_wreck_giveup_key")
-    far_giveup_until = ctx.state.data.get("far_wreck_giveup_until", 0)
-    exclude = frozenset({far_giveup_key}) if far_giveup_key and time.time() < far_giveup_until else frozenset()
+    far_exclude = _active_giveup(data, "far_wreck_giveup_key", "far_wreck_giveup_until", now)
 
-    far_wreck = find_nearby_wreck(config, config.get("maxSailDistance", 60), exclude=exclude)
+    far_wreck = find_nearby_wreck(config, config.get("maxSailDistance", 60), exclude=far_exclude)
     if far_wreck is not None:
         # No "not navigating" gate here either -- see the near-wreck branch's comment above.
         if sail_to_pair(ctx, config, far_wreck):
-            ctx.state.data.pop("far_wreck_giveup_key", None)
+            data.pop("far_wreck_giveup_key", None)
+            # VERIFY the landing before deploying (added 2026-09-03). sail_to has an arrival
+            # pre-check that returns True as soon as the boat is within braking distance of the
+            # TARGET, and a lone wreck's target is an approach point beside it -- so a landing a
+            # few tiles short can leave the hull outside the wreck's WRECK_SQUARE_SIZE square while
+            # every later sail_to call returns instantly. Without this check that was a deploy
+            # click every HOOK_CLICK_COOLDOWN_S forever, never once repositioning. Now: sail to
+            # the approach point instead, and give the wreck up after the same bounded number of
+            # attempts the near branch uses.
+            player = controller.get_player()
+            if not _wreck_in_hook_range(player, far_wreck):
+                misses = data.get("far_wreck_miss_count", 0) + 1
+                data["far_wreck_miss_count"] = misses
+                if misses > HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS:
+                    debug_log.log("salvage", f"still outside hook range of ({far_wreck.get('x')}, {far_wreck.get('y')}) "
+                                              f"after {HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS} approaches -- giving up on it "
+                                              f"for {FAR_WRECK_GIVEUP_COOLDOWN_S:.0f}s")
+                    data["far_wreck_giveup_key"] = _wreck_key(far_wreck)
+                    data["far_wreck_giveup_until"] = time.time() + FAR_WRECK_GIVEUP_COOLDOWN_S
+                    data.pop("far_wreck_miss_count", None)
+                    return
+                approach_point = _approach_point_from_here(far_wreck, player)
+                if approach_point is not None:
+                    debug_log.log("salvage", "landed outside the wreck's hook range -- closing in "
+                                              f"(attempt {misses}/{HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS})")
+                    sailing.sail_to(ctx, approach_point)
+                else:
+                    debug_log.log("salvage", "within clearance of the wreck but the hull does not overlap its "
+                                              "square -- waiting for the next tick's range read")
+                return
+            data.pop("far_wreck_miss_count", None)
             # CONFIRMED live 2026-08-05: sail_to's own arrival pre-check (see sailing.py) means a
             # far_wreck that's already in range returns here almost instantly every tick instead of
             # taking the several seconds a real helm-engage-and-steer cycle used to -- without the
             # same HOOK_CLICK_COOLDOWN_S courtesy the near-wreck branch already has, this spammed a
             # fresh deploy_hook click on literally every tick (~1s) instead of respecting the cooldown.
-            if time.time() - ctx.state.data.get("last_deploy_click_at", 0) > HOOK_CLICK_COOLDOWN_S:
+            if time.time() - data.get("last_deploy_click_at", 0) > HOOK_CLICK_COOLDOWN_S:
                 sailing.deploy_hook(ctx, config.get("hookName", ""))
-                ctx.state.data["last_deploy_click_at"] = time.time()
+                data["last_deploy_click_at"] = time.time()
         else:
             debug_log.log("salvage", f"couldn't reach the wreck pair near ({far_wreck.get('x')}, {far_wreck.get('y')}) "
                                       f"-- giving up on it for {FAR_WRECK_GIVEUP_COOLDOWN_S:.0f}s and trying elsewhere")
-            ctx.state.data["far_wreck_giveup_key"] = (far_wreck.get("x"), far_wreck.get("y"), far_wreck.get("plane"))
-            ctx.state.data["far_wreck_giveup_until"] = time.time() + FAR_WRECK_GIVEUP_COOLDOWN_S
+            data["far_wreck_giveup_key"] = _wreck_key(far_wreck)
+            data["far_wreck_giveup_until"] = time.time() + FAR_WRECK_GIVEUP_COOLDOWN_S
         return
 
-    now = time.time()
-    if now - ctx.state.data.get("last_waiting_message_at", 0) > WAITING_MESSAGE_INTERVAL_S:
+    if now - data.get("last_waiting_message_at", 0) > WAITING_MESSAGE_INTERVAL_S:
         debug_log.log("salvage", "no shipwreck in range -- waiting")
-        ctx.state.data["last_waiting_message_at"] = now
+        data["last_waiting_message_at"] = now
+
+
+def on_event(ctx, event_type, payload):
+    """Two game messages the polling loop cannot see fast enough (added 2026-09-03; the engine
+    drains UDP events and calls this before every tick, see controller.py's main()):
+
+    - The wreck sinking ("...reclaimed by the sea."): the hook does NOT carry on to another wreck
+      (CONFIRMED live 2026-08-01), and the reclick otherwise waits out HOOK_CLICK_COOLDOWN_S plus
+      the engage timer -- clearing both lets the very next tick redeploy.
+    - A hazardous-waters refusal: no amount of repositioning helps (it is the boat's own fittings
+      that are lacking), so the wreck under the hook is blacklisted for HAZARD_GIVEUP_S on BOTH
+      give-up keys instead of burning the reposition budget and retrying every minute.
+
+    Player chat types (PUBLICCHAT, PRIVATECHAT, FRIENDSCHAT, CLAN_*) are ignored so another player
+    typing the words cannot trigger either."""
+    if event_type != "CHAT_MESSAGE" or not payload:
+        return
+    if "CHAT" in (payload.get("type") or "").upper():
+        return
+    message = (payload.get("message") or "").lower()
+    data = ctx.state.data
+    if SUNK_CHAT_FRAGMENT in message:
+        debug_log.log("salvage", "the wreck has sunk -- redeploying on the next tick")
+        data.pop("last_deploy_click_at", None)
+        data.pop("hook_engage_attempt_at", None)
+        return
+    if HAZARD_CHAT_FRAGMENT in message:
+        key = data.get("salvage_current_wreck_key")
+        if key is None:
+            debug_log.log("salvage", "hazardous-waters refusal with no wreck under the hook -- ignoring")
+            return
+        until = time.time() + HAZARD_GIVEUP_S
+        debug_log.log("salvage", f"not safe to salvage here (hazardous waters) -- leaving wreck {key} alone "
+                                  f"for {HAZARD_GIVEUP_S // 60} minutes; the boat needs better fittings for it")
+        data["hook_engage_giveup_key"] = key
+        data["hook_engage_giveup_until"] = until
+        data["far_wreck_giveup_key"] = key
+        data["far_wreck_giveup_until"] = until
+
+
+def _approach_point_from_here(wreck: dict, player: dict = None):
+    """_approach_point_clear_of_wreck measured from the boat's current reference position, or
+    None when that position is unreadable (or already within clearance -- see the helper)."""
+    if player is None:
+        player = controller.get_player()
+    origin_x = player.get("boatX", player.get("x"))
+    origin_y = player.get("boatY", player.get("y"))
+    if origin_x is None or origin_y is None:
+        return None
+    return _approach_point_clear_of_wreck(origin_x, origin_y, wreck, player)
 
 
 def drop_salvage(ctx):
@@ -289,7 +450,11 @@ def drop_salvage(ctx):
     for item in controller.get_inventory():
         name = (item.get("name") or "").lower()
         if name.endswith("salvage"):
-            controller.click_entity(ctx.ser, item, check_ui_blockers=False)
+            # simulate_mistakes=False (2026-09-03): with Drop as the forced left-click, a
+            # simulated near-miss lands on the NEIGHBOURING slot -- fine when that is more salvage,
+            # but it drops whatever tool happens to sit there (chisel, rune pouch, ...) when it is
+            # not. Same reasoning as banker.py's no-misclick rule for bank UI buttons.
+            controller.click_entity(ctx.ser, item, check_ui_blockers=False, simulate_mistakes=False)
             controller.human_delay(0.06, 0.12)  # 40% faster still, on top of the earlier 2x (original 0.2-0.4s)
 
 
@@ -321,13 +486,27 @@ SALVAGE_LEVEL_REQ = {
 }
 
 
-def _boosted_sailing_level() -> int:
-    return controller.get_skills().get("Sailing", {}).get("boosted", 0)
+def _sailing_xp():
+    """Cumulative Sailing XP from /skills, or None when unreadable."""
+    skills = controller.get_skills() or {}
+    xp = (skills.get("Sailing") or {}).get("xp")
+    return xp if isinstance(xp, (int, float)) else None
 
 
-def _wreck_is_salvageable(wreck: dict, sailing_level: int) -> bool:
+def _boosted_sailing_level():
+    """The player's boosted Sailing level, or None when /skills cannot be read right now.
+    FIXED 2026-09-03: this used to default to 0, and 0 fails every SALVAGE_LEVEL_REQ check --
+    so one timed-out /skills read turned every wreck on the ocean into "above my level" and the
+    routine sat logging "no shipwreck in range" until restarted. Unreadable now means "do not
+    filter", the same fail-open stance _wreck_is_salvageable already takes for an unknown id."""
+    skills = controller.get_skills() or {}
+    level = (skills.get("Sailing") or {}).get("boosted")
+    return level if isinstance(level, (int, float)) else None
+
+
+def _wreck_is_salvageable(wreck: dict, sailing_level) -> bool:
     req = SALVAGE_LEVEL_REQ.get(wreck.get("id"))
-    return req is None or sailing_level >= req
+    return req is None or sailing_level is None or sailing_level >= req
 
 
 # Padding added on top of max_dist when bounding /objects' radius-limited scene walk (see
@@ -383,9 +562,12 @@ def _approach_point_clear_of_wreck(origin_x, origin_y, wreck: dict, player: dict
     clearance = WRECK_COLLISION_HALF + max(player.get("boatWidth", 0), player.get("boatHeight", 0)) / 2.0
     if dist <= clearance:
         return None
+    # Rounded to a whole tile (2026-09-03): ocean_path.find_ocean_route tests the target against
+    # /tiles' integer tile set, so a float target silently disabled obstacle routing for every
+    # approach-point sail and sent the boat on a straight line instead.
     return {
-        "x": wx + dx / dist * clearance,
-        "y": wy + dy / dist * clearance,
+        "x": int(round(wx + dx / dist * clearance)),
+        "y": int(round(wy + dy / dist * clearance)),
         "plane": wplane,
     }
 
@@ -598,12 +780,15 @@ def _wreck_in_hook_range(player: dict, wreck: dict) -> bool:
     )
 
 
-def find_wreck_in_hook_range(config: dict):
+def find_wreck_in_hook_range(config: dict, exclude: frozenset = frozenset()):
     """Nearest ACTIVE, actually-salvageable-at-this-level object matching config["wreckNames"]
     whose WRECK_SQUARE_SIZE square overlaps the boat's own true-tile hull footprint
     (_wreck_in_hook_range) -- i.e. whether the hook could engage it without moving. This is the
     near-wreck counterpart to find_nearby_wreck's farther maxSailDistance search; see
-    find_nearby_wreck's docstring (including for the SALVAGE_LEVEL_REQ filter)."""
+    find_nearby_wreck's docstring (including for the SALVAGE_LEVEL_REQ filter).
+
+    exclude: (x, y, plane) keys to skip -- tick() passes its give-up blacklist here (2026-09-03)
+    so a second in-range wreck is still picked instead of the whole branch going dark."""
     names = {n.lower() for n in config.get("wreckNames", [])}
     sailing_level = _boosted_sailing_level()
 
@@ -632,6 +817,8 @@ def find_wreck_in_hook_range(config: dict):
         if not _wreck_in_hook_range(player, o):
             continue
         wx, wy = o.get("x"), o.get("y")
+        if (wx, wy, o.get("plane")) in exclude:
+            continue
         dist = max(abs(wx - origin_x), abs(wy - origin_y))
         if best_dist is None or dist < best_dist:
             best, best_dist = o, dist

@@ -67,6 +67,15 @@ def test_best_moulds_empty_usable_falls_back_to_all():
 # Task 2: fill planner
 # ---------------------------------------------------------------------------
 
+# The 14/14 split the 2026-09-03 live scenarios below were measured under; the shipped
+# default moved to 18/10 on 2026-09-04 (wiki economy pick), so tests about planner
+# MECHANICS pass this explicitly rather than re-deriving every count.
+EVEN_FILL = [
+    {"metal": "MITHRIL", "target_bars": 14, "items": None},
+    {"metal": "ADAMANT", "target_bars": 14, "items": None},
+]
+EVEN_CONFIG = dict(gf.DEFAULT_CONFIG, fill=EVEN_FILL)
+
 FILL = DEFAULT_FILL = [
     {"item": "Mithril platebody", "metal": "MITHRIL", "bars_each": 4, "target_bars": 14},
     {"item": "Adamant platelegs", "metal": "ADAMANT", "bars_each": 2, "target_bars": 14},
@@ -120,7 +129,7 @@ def test_plan_fill_combines_whatever_the_bank_holds():
     # USER 2026-09-03: "write mith and ada to get all items, we have plenty of bars".
     # 2 platebodies (8) + 6 bars covers 14 adamant; mithril from bodies as before.
     available = {"mithril platebody": 100, "adamant platebody": 2, "adamantite bar": 40}
-    steps, err = gf.plan_fill(gf.DEFAULT_CONFIG["fill"], {}, max_overflow_loss=2,
+    steps, err = gf.plan_fill(EVEN_FILL, {}, max_overflow_loss=2,
                               available=available)
     assert err is None
     assert steps == [
@@ -131,7 +140,7 @@ def test_plan_fill_combines_whatever_the_bank_holds():
 
 
 def test_fill_counts_a_bar_stack_by_quantity(monkeypatch):
-    ctx = _Ctx()
+    ctx = _Ctx(EVEN_CONFIG)
     _crucible(monkeypatch)
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [{"name": "Adamantite bar", "qty": 40}])
@@ -163,7 +172,7 @@ def test_plan_fill_tops_up_short_stock_with_the_primary_item():
     # inventory (8 bars) made the held-stock plan reach 24/28 and safety-stop instead of
     # sending the routine to the bank for the rest.
     available = {"mithril platebody": 4, "adamant battleaxe": 4}
-    steps, err = gf.plan_fill(gf.DEFAULT_CONFIG["fill"], {}, max_overflow_loss=2,
+    steps, err = gf.plan_fill(EVEN_FILL, {}, max_overflow_loss=2,
                               available=available)
     assert err is None
     assert sum(s["bars_each"] * s["count"] for s in steps) == 28
@@ -281,6 +290,9 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
     monkeypatch.setattr(controller, "get_equipment", lambda: {})
     monkeypatch.setattr(controller, "get_bank", lambda fresh=False: {"open": False})
+    monkeypatch.setattr(controller, "get_skills", lambda: {})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3369, "y": 11489, "plane": 0})
+    monkeypatch.setattr(gf.travel, "walk_to_exact_tile", lambda *a, **k: True)
     monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: None)
     monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [])
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
@@ -619,7 +631,7 @@ def test_fill_uses_item_on_crucible(monkeypatch):
 
 
 def test_fill_restocks_from_bank_when_items_missing(monkeypatch):
-    ctx = _Ctx()
+    ctx = _Ctx(EVEN_CONFIG)
     chest = {"id": gf.BANK_CHEST_ID, "name": "Bank chest", "distance": 2,
              "screenX": 400, "screenY": 300, "x": 3375, "y": 11493, "plane": 0}
     _crucible(monkeypatch, extra_objects=[chest])
@@ -684,7 +696,7 @@ def test_fill_restock_replans_from_the_open_banks_stock(monkeypatch):
     # tick 1 left the pre-bank plan on the primary item, and the restock stopped on "out of
     # Adamant platelegs" with 9 Adamant platebodies in the same bank. Once the bank is OPEN
     # its item list is the authoritative stock -- re-plan against it before withdrawing.
-    ctx = _Ctx()
+    ctx = _Ctx(EVEN_CONFIG)
     chest = {"id": gf.BANK_CHEST_ID, "name": "Bank chest", "distance": 2,
              "screenX": 400, "screenY": 300, "x": 3375, "y": 11493, "plane": 0}
     _crucible(monkeypatch, extra_objects=[chest])
@@ -716,7 +728,7 @@ def test_fill_uses_a_held_alternative_without_a_bank_trip(monkeypatch):
     # platebodies in hand, yet the pre-bank plan named the primary (platelegs), the held
     # bodies never matched it, and every tick became a bank trip. What we HOLD decides the
     # item outside the bank; the open bank's stock decides it inside.
-    ctx = _Ctx()
+    ctx = _Ctx(EVEN_CONFIG)
     _crucible(monkeypatch)
     _inv(monkeypatch, ["Adamant platebody"] * 3)
     menu, clicks, keys = [], [], []
@@ -860,23 +872,33 @@ def test_withdraw_by_metal_searches_once_per_metal_and_clicks_the_results(monkey
     gf._withdraw_by_metal(ctx, {"Mithril platebody": 4, "Adamant plateskirt": 1,
                                "Adamant battleaxe": 5})
     assert searches == ["mith", "adam"]          # USER: "adam" for all adamant items
-    # USER: "clicking 12 times on a bar isn't very human" -- 5 goes through Withdraw-5
-    assert clicks == ["Mithril platebody"] * 4 + ["Adamant plateskirt"] +         [("Adamant battleaxe", "Withdraw-5")]
+    # USER: "clicking 12 times on a bar isn't very human" -- 5 goes through Withdraw-5.
+    # Every withdraw is a NAMED menu entry, never a bare left-click (see
+    # test_withdraw_count_never_trusts_the_left_click_default).
+    assert clicks == [("Mithril platebody", "Withdraw-1")] * 4 +         [("Adamant plateskirt", "Withdraw-1")] + [("Adamant battleaxe", "Withdraw-5")]
     assert len(cleared) == 2
 
 
-def test_withdraw_count_uses_menu_chunks_then_single_clicks(monkeypatch):
+def test_withdraw_count_never_trusts_the_left_click_default(monkeypatch):
+    # MEASURED live 2026-09-04 (recordings/2026-09-04_134458_gf-iron-withdraw): the three
+    # "single" left-clicks on Iron bar each resolved to Withdraw-14 -- this account's
+    # Menu Entry Swapper rewrites the bar's left-click (CLAUDE.md: per-item ui_786444_*
+    # swaps) -- so 10 + 5 + 14 hit the 28-slot cap, every later withdraw was refused with
+    # "not enough inventory space", and the run stopped on "bank is out of Steel bar"
+    # three times. The routine's own "Default quantity: 1" click had registered and made
+    # no difference. Only a NAMED menu entry is immune to a swap.
     ctx = _Ctx()
     slot = {"name": "Adamantite bar", "screenX": 650, "screenY": 690}
     clicks = []
-    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: clicks.append("1") or True)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: (_ for _ in ()).throw(AssertionError("bare left-click")))
     monkeypatch.setattr(controller, "click_menu_action",
                         lambda ser, ent, option, **k: clicks.append(option) or True)
     gf._withdraw_count(ctx, slot, 12)
-    assert clicks == ["Withdraw-10", "1", "1"]
+    assert clicks == ["Withdraw-10", "Withdraw-1", "Withdraw-1"]
     clicks.clear()
     gf._withdraw_count(ctx, slot, 7)
-    assert clicks == ["Withdraw-5", "1", "1"]
+    assert clicks == ["Withdraw-5", "Withdraw-1", "Withdraw-1"]
 
 
 def test_withdraw_by_metal_falls_back_for_a_result_below_the_grid(monkeypatch):
@@ -923,7 +945,7 @@ def test_pickup_withheld_click_escalates_to_the_menu(monkeypatch):
 def test_bars_fill_through_the_crucible_interface(monkeypatch):
     # USER 2026-09-03: click the crucible (Fill) and pick the bar in its interface instead
     # of Use-bar-on-crucible one bar per tick.
-    ctx = _Ctx()
+    ctx = _Ctx(EVEN_CONFIG)
     _crucible(monkeypatch)
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [{"name": "Adamantite bar", "qty": 1}] * 12)
@@ -947,7 +969,7 @@ def test_bars_fill_through_the_crucible_interface(monkeypatch):
 
 
 def test_bars_fall_back_to_use_when_the_interface_shows_no_entry(monkeypatch):
-    ctx = _Ctx()
+    ctx = _Ctx(EVEN_CONFIG)
     _crucible(monkeypatch)
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [{"name": "Adamantite bar", "qty": 1}] * 12)
@@ -992,6 +1014,9 @@ def test_fill_bank_dry_safety_stops(monkeypatch):
     monkeypatch.setattr(banker, "deposit_all_inventory", lambda ctx_: True)
     monkeypatch.setattr(banker, "close_bank", lambda ctx_: None)
     monkeypatch.setattr(banker, "search_and_withdraw", lambda *a, **k: False)
+    # The bank is OPEN and yields nothing -- a closed bank says nothing about stock
+    # (see test_fill_restock_does_not_call_stock_empty_when_the_bank_closed_under_it).
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: {"open": True, "items": []})
     st = _st(phase="MOULD_SET", crucibleContents={}, crucibleBarCount=0)
     gf._fill_crucible(ctx, st)
     assert "out of" in ctx.state.stopped
@@ -1816,6 +1841,89 @@ def test_before_break_stores_equipped_preform(monkeypatch):
     assert kwargs.get("expected_action") == "Store-preform"
 
 
+def _storage_obj():
+    return {"id": gf.STORAGE_EMPTY_ID, "x": 3366, "y": 11485, "plane": 0,
+            "screenX": 520, "screenY": 380, "name": "Preform storage", "distance": 3}
+
+
+def _state_sequence(monkeypatch, states):
+    """Serve each foundry snapshot in turn, the last one forever."""
+    seq = list(states)
+
+    def serve(g, r):
+        if (g, r) != ("minigames", "giants-foundry"):
+            return None
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+    monkeypatch.setattr(controller, "get_api", serve)
+
+
+def test_before_break_confirms_the_store_and_returns_once_stored(monkeypatch):
+    # MEASURED live 2026-09-04 (gf_live_tier5, 09:15): the store click before a break was
+    # never confirmed; the preform stayed EQUIPPED, something kept working it through the
+    # 5-minute break, and the sword was RUINED (148 -> 0 quality, 5 per bad action).
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [_storage_obj()])
+    reads = []
+
+    def serve(g, r):
+        if (g, r) != ("minigames", "giants-foundry"):
+            return None
+        reads.append(len(clicks))
+        # EQUIPPED until the click, then one more EQUIPPED read (walking), then STORED.
+        if len(clicks) == 0 or len(reads) < 3:
+            return _st(preformState="EQUIPPED")
+        return _st(preformState="STORED", phase="STORED")
+    monkeypatch.setattr(controller, "get_api", serve)
+    clicks, menu = [], []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: clicks.append(ent["name"]) or True)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **k: menu.append(option) or True)
+    gf.before_break(ctx)
+    assert clicks == ["Preform storage"]
+    assert reads[-1] == 1 and len(reads) >= 3   # polled AFTER the click until STORED
+    assert menu == []                            # confirmed on the first click: no retry
+
+
+def test_before_break_retries_through_the_menu_when_the_click_did_not_store(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [_storage_obj()])
+    reads = {"n": 0}
+
+    def serve(g, r):
+        if (g, r) != ("minigames", "giants-foundry"):
+            return None
+        reads["n"] += 1
+        # Stored only once the menu retry has been issued.
+        return _st(preformState="STORED", phase="STORED") if menu else _st(preformState="EQUIPPED")
+    monkeypatch.setattr(controller, "get_api", serve)
+    menu = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **k: menu.append(option) or True)
+    walks = []
+    monkeypatch.setattr(gf.travel, "walk_to_exact_tile", lambda ctx_, x, y, plane, **k: walks.append((x, y)) or True)
+    gf.before_break(ctx)
+    assert menu == ["Store-preform"]
+    assert walks == []
+
+
+def test_before_break_walks_off_the_machines_when_the_store_never_lands(monkeypatch):
+    # The break starts regardless (engine contract), so the last resort is to make sure
+    # no machine is running under the preform while nobody is watching.
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [_storage_obj()])
+    _serve_state(monkeypatch, _st(preformState="EQUIPPED"))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
+    menu = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **k: menu.append(option) or True)
+    walks = []
+    monkeypatch.setattr(gf.travel, "walk_to_exact_tile", lambda ctx_, x, y, plane, **k: walks.append((x, y, plane)) or True)
+    gf.before_break(ctx)
+    assert menu == ["Store-preform"]
+    assert len(walks) == 1
+
+
 def test_before_break_no_preform_no_click(monkeypatch):
     ctx = _Ctx()
     _serve_state(monkeypatch, _st(preformState="NONE", phase="AWAITING_COMMISSION"))
@@ -1828,3 +1936,292 @@ def test_before_break_no_preform_no_click(monkeypatch):
 
 def test_routine_registered_in_controller():
     assert controller.ROUTINE_FILES.get("GIANTS_FOUNDRY") == "routines/giants_foundry.py"
+
+
+# ---------------------------------------------------------------------------
+# Metal downgrade: an empty metal drops one tier instead of stopping the run
+# ---------------------------------------------------------------------------
+
+TIER_FILL = [
+    {"metal": "MITHRIL", "target_bars": 14, "items": None},
+    {"metal": "ADAMANT", "target_bars": 14, "items": None},
+]
+
+
+def _stock(**qty):
+    return {k.replace("_", " ").lower(): v for k, v in qty.items()}
+
+
+def test_substitute_empty_metals_adamant_empty_gives_steel_mithril():
+    # Wiki (Strategies rev 15275840, 14+14 alloys): Steel/Mithril 65 beats all-Mithril 40,
+    # so the replacement keeps two distinct metals -- USER 2026-09-04: shift the pair down.
+    stock = _stock(mithril_platebody=30, steel_platebody=20)
+    fill, swaps = gf.substitute_empty_metals(TIER_FILL, stock)
+    assert [e["metal"] for e in fill] == ["MITHRIL", "STEEL"]
+    assert [e["target_bars"] for e in fill] == [14, 14]
+    assert swaps == [("ADAMANT", "STEEL")]
+
+
+def test_substitute_empty_metals_mithril_empty_gives_steel_adamant():
+    # A literal pair shift (Steel/Mithril) would still need the mithril that ran out; the
+    # empty metal drops to the next tier not already in the alloy: Steel/Adamant (77).
+    stock = _stock(adamantite_bar=40, steel_bar=40)
+    fill, swaps = gf.substitute_empty_metals(TIER_FILL, stock)
+    assert [e["metal"] for e in fill] == ["STEEL", "ADAMANT"]
+    assert swaps == [("MITHRIL", "STEEL")]
+
+
+def test_substitute_empty_metals_both_empty_gives_iron_steel():
+    stock = _stock(steel_platebody=10, iron_platebody=10)
+    fill, swaps = gf.substitute_empty_metals(TIER_FILL, stock)
+    assert [e["metal"] for e in fill] == ["IRON", "STEEL"]
+    # Higher tiers resolve first (adamant takes steel, so mithril must take iron).
+    assert swaps == [("ADAMANT", "STEEL"), ("MITHRIL", "IRON")]
+
+
+def test_substitute_empty_metals_leaves_a_stocked_pair_alone():
+    stock = _stock(mithril_platebody=4, adamantite_bar=14)
+    fill, swaps = gf.substitute_empty_metals(TIER_FILL, stock)
+    assert fill == TIER_FILL
+    assert swaps == []
+
+
+def test_substitute_short_stock_counts_as_empty():
+    # MEASURED live 2026-09-04 (gf_live_tier7, 13:17): 10 Mithril bars + 1 full helm left
+    # (11 bars against an 18-bar target) read as "in stock", the planner topped up with
+    # the primary platebody the bank no longer had, and the run stopped on "bank is out
+    # of Mithril platebody". A metal that cannot COVER its need is as good as empty --
+    # and 11 mithril + 7 steel would be a three-metal alloy the score ignores anyway.
+    stock = _stock(mithril_bar=10, mithril_full_helm=1, steel_platebody=10, adamantite_bar=40)
+    fill, swaps = gf.substitute_empty_metals(TIER_FILL, stock)
+    assert [e["metal"] for e in fill] == ["STEEL", "ADAMANT"]
+    assert swaps == [("MITHRIL", "STEEL")]
+
+
+def test_substitute_need_is_what_the_crucible_still_lacks():
+    # 14 mithril already in the crucible: 4 bars in the bank cover the remaining need.
+    stock = _stock(mithril_bar=4, adamantite_bar=40)
+    fill, swaps = gf.substitute_empty_metals(TIER_FILL, stock, contents={"MITHRIL": 14})
+    assert fill == TIER_FILL
+    assert swaps == []
+
+
+def test_substitute_empty_metals_drops_only_one_tier():
+    # Steel empty too: the pair is Steel/Mithril and the restock's own "bank is out of"
+    # stop names the steel -- never a silent slide all the way to bronze.
+    stock = _stock(mithril_platebody=30, iron_platebody=30)
+    fill, swaps = gf.substitute_empty_metals(TIER_FILL, stock)
+    assert [e["metal"] for e in fill] == ["MITHRIL", "STEEL"]
+    assert swaps == [("ADAMANT", "STEEL")]
+
+
+def test_fill_restock_drops_an_empty_metal_one_tier(monkeypatch):
+    ctx = _Ctx(EVEN_CONFIG)
+    chest = {"id": gf.BANK_CHEST_ID, "name": "Bank chest", "distance": 2,
+             "screenX": 400, "screenY": 300, "x": 3375, "y": 11493, "plane": 0}
+    _crucible(monkeypatch, extra_objects=[chest])
+    _inv(monkeypatch, [])
+    monkeypatch.setattr(banker, "find_nearby_bank", lambda cfg: chest)
+    monkeypatch.setattr(banker, "open_bank", lambda ctx_, obj, **k: True)
+    monkeypatch.setattr(banker, "deposit_all_inventory", lambda ctx_: True)
+    monkeypatch.setattr(banker, "close_bank", lambda ctx_: None)
+    monkeypatch.setattr(banker, "search_bank", lambda ctx_, q: False)
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: {
+        "open": True,
+        "items": [{"name": "Mithril platebody", "qty": 127},
+                  {"name": "Steel platebody", "qty": 20}]})
+    withdrew = []
+
+    def fake_search_and_withdraw(ctx_, name, quantity, contains=False):
+        withdrew.append((name, quantity))
+        _inv(monkeypatch, ["Mithril platebody"] * 4 + ["Steel platebody"] * 3)
+        return True
+    monkeypatch.setattr(banker, "search_and_withdraw", fake_search_and_withdraw)
+    st = _st(phase="MOULD_SET", crucibleContents={}, crucibleBarCount=0)
+    gf._fill_crucible(ctx, st)
+    assert withdrew == [("Mithril platebody", 4), ("Steel platebody", 3)]
+    assert ctx.state.stopped is None
+    assert [e["metal"] for e in ctx.state.data["gf_fill_override"]] == ["MITHRIL", "STEEL"]
+
+
+def test_fill_plans_from_the_override_outside_the_bank(monkeypatch):
+    # The steel just withdrawn must match the outside-bank plan, or every tick after the
+    # restock becomes another bank trip (the gf_live5 shape, one tier down).
+    ctx = _Ctx()
+    ctx.state.data["gf_fill_override"] = [
+        {"metal": "MITHRIL", "target_bars": 14, "items": None},
+        {"metal": "STEEL", "target_bars": 14, "items": None},
+    ]
+    _crucible(monkeypatch)
+    _inv(monkeypatch, ["Steel platebody"] * 3)
+    menu, clicks = [], []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **k: menu.append((ent["name"], option)) or True)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: clicks.append(ent["id"]) or True)
+    trips = []
+    monkeypatch.setattr(gf, "_restock_from_bank", lambda ctx_, steps, st: trips.append(steps))
+    st = _st(phase="MOULD_SET", crucibleContents={"MITHRIL": 16}, crucibleBarCount=16)
+    gf._fill_crucible(ctx, st)
+    assert trips == []
+    assert menu == [("Steel platebody", "Use")]
+    assert clicks == [gf.CRUCIBLE_ID]
+
+
+def test_tick_clears_the_fill_override_when_the_crucible_is_poured(monkeypatch):
+    ctx = _Ctx()
+    d = ctx.state.data
+    d["gf_fill_override"] = [{"metal": "STEEL", "target_bars": 28, "items": None}]
+    d["gf_last_bars"] = 28
+    monkeypatch.setitem(gf.PHASE_HANDLERS, "REFINING", lambda ctx, st: None)
+    # Bars growing keeps the override (still filling this sword)...
+    d["gf_last_bars"] = 16
+    _serve_state(monkeypatch, _st(crucibleBarCount=28))
+    gf.tick(ctx)
+    assert "gf_fill_override" in d
+    # ...the bar count dropping is the pour, and the next sword plans from config again.
+    _serve_state(monkeypatch, _st(crucibleBarCount=0))
+    gf.tick(ctx)
+    assert "gf_fill_override" not in d
+
+
+def test_default_fill_is_the_wiki_economy_split():
+    # USER 2026-09-04 ("quite a bit more mith than ada"): 18 mithril / 10 adamant, the
+    # Strategies page's pick past 70 Smithing. With only platebodies in stock the 4-bar
+    # quantization lands at 20/8 (score 83, still a 5-section sword).
+    assert [(e["metal"], e["target_bars"]) for e in gf.DEFAULT_CONFIG["fill"]] == [
+        ("MITHRIL", 18), ("ADAMANT", 10)]
+    steps, err = gf.plan_fill(gf.DEFAULT_CONFIG["fill"], {}, max_overflow_loss=2,
+                              available={"mithril platebody": 50, "adamant platebody": 50})
+    assert err is None
+    assert [(st["item"], st["count"]) for st in steps] == [
+        ("Mithril platebody", 5), ("Adamant platebody", 2)]
+
+
+RUNE_FILL = [
+    {"metal": "MITHRIL", "target_bars": 18, "items": None},
+    {"metal": "RUNE", "target_bars": 10, "items": None},
+]
+
+
+def test_substitute_metals_above_the_smithing_level_drop_a_tier():
+    # MEASURED live 2026-09-04 (gf_live_tier2): Mithril/Rune planned at Smithing 79 with
+    # Rune platebodies IN the bank; three Use clicks left the crucible at 20 bars and the
+    # fill ceiling safety-stopped. Adding a bar needs its smelting level (wiki), so a
+    # metal above the level is as unusable as an empty one.
+    stock = _stock(mithril_platebody=30, rune_platebody=5, adamantite_bar=20)
+    fill, swaps = gf.substitute_empty_metals(RUNE_FILL, stock, smithing_level=79)
+    assert [e["metal"] for e in fill] == ["MITHRIL", "ADAMANT"]
+    assert swaps == [("RUNE", "ADAMANT")]
+
+
+def test_substitute_replacement_respects_the_smithing_level():
+    # The level is a hard fact, so the replacement skips tiers above it too (stock is
+    # still only dropped one step).
+    stock = _stock(mithril_platebody=30, rune_platebody=5, adamantite_bar=20, steel_bar=9)
+    fill, swaps = gf.substitute_empty_metals(RUNE_FILL, stock, smithing_level=60)
+    assert [e["metal"] for e in fill] == ["MITHRIL", "STEEL"]
+    assert swaps == [("RUNE", "STEEL")]
+
+
+def test_substitute_unknown_smithing_level_does_not_filter():
+    stock = _stock(mithril_platebody=30, rune_platebody=5)
+    fill, swaps = gf.substitute_empty_metals(RUNE_FILL, stock, smithing_level=None)
+    assert fill == RUNE_FILL and swaps == []
+
+
+def test_fill_restock_drops_a_metal_above_the_smithing_level(monkeypatch):
+    ctx = _Ctx(dict(gf.DEFAULT_CONFIG, fill=RUNE_FILL))
+    chest = {"id": gf.BANK_CHEST_ID, "name": "Bank chest", "distance": 2,
+             "screenX": 400, "screenY": 300, "x": 3375, "y": 11493, "plane": 0}
+    _crucible(monkeypatch, extra_objects=[chest])
+    _inv(monkeypatch, [])
+    monkeypatch.setattr(banker, "find_nearby_bank", lambda cfg: chest)
+    monkeypatch.setattr(banker, "open_bank", lambda ctx_, obj, **k: True)
+    monkeypatch.setattr(banker, "deposit_all_inventory", lambda ctx_: True)
+    monkeypatch.setattr(banker, "close_bank", lambda ctx_: None)
+    monkeypatch.setattr(banker, "search_bank", lambda ctx_, q: False)
+    monkeypatch.setattr(controller, "get_skills",
+                        lambda: {"Smithing": {"level": 79, "xp": 1906547, "boosted": 79}})
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: {
+        "open": True,
+        "items": [{"name": "Mithril platebody", "qty": 127},
+                  {"name": "Rune platebody", "qty": 5},
+                  {"name": "Adamantite bar", "qty": 40}]})
+    withdrew = []
+
+    def fake_search_and_withdraw(ctx_, name, quantity, contains=False):
+        withdrew.append((name, quantity))
+        _inv(monkeypatch, ["Mithril platebody"] * 5 + ["Adamantite bar"])
+        return True
+    monkeypatch.setattr(banker, "search_and_withdraw", fake_search_and_withdraw)
+    st = _st(phase="MOULD_SET", crucibleContents={}, crucibleBarCount=0)
+    gf._fill_crucible(ctx, st)
+    assert withdrew == [("Mithril platebody", 5), ("Adamantite bar", 8)]
+    assert ctx.state.stopped is None
+    assert [e["metal"] for e in ctx.state.data["gf_fill_override"]] == ["MITHRIL", "ADAMANT"]
+
+
+def test_fill_never_uses_a_held_item_above_the_smithing_level(monkeypatch):
+    # MEASURED live 2026-09-04 (gf_live_tier3): with Rune platebodies still in hand from
+    # the previous run, the outside-bank plan (held items) used them straight away -- the
+    # level gate lived only in the restock. The level is known everywhere, so the gate
+    # applies before ANY fill click: the rune is dropped to adamant and a bank trip fetches it.
+    ctx = _Ctx(dict(gf.DEFAULT_CONFIG, fill=RUNE_FILL))
+    _crucible(monkeypatch)
+    _inv(monkeypatch, ["Rune platebody"] * 2)
+    monkeypatch.setattr(controller, "get_skills",
+                        lambda: {"Smithing": {"level": 79, "xp": 1906547, "boosted": 79}})
+    menu = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **k: menu.append((ent["name"], option)) or True)
+    trips = []
+    monkeypatch.setattr(gf, "_restock_from_bank", lambda ctx_, steps, st: trips.append(steps))
+    st = _st(phase="MOULD_SET", crucibleContents={"MITHRIL": 20}, crucibleBarCount=20)
+    gf._fill_crucible(ctx, st)
+    assert menu == []
+    assert len(trips) == 1
+    assert [e["metal"] for e in ctx.state.data["gf_fill_override"]] == ["MITHRIL", "ADAMANT"]
+
+
+def test_fill_restock_does_not_call_stock_empty_when_the_bank_closed_under_it(monkeypatch):
+    # MEASURED live 2026-09-04 (gf_live_tier6, 12:49): a network drop closed the bank
+    # mid-withdraw -- the Withdraw-10 menu never opened, eight single clicks hit nothing,
+    # and the empty inventory read as "bank is out of Mithril bar" with the bars still in
+    # the bank. login.py reconnected three seconds after the safety stop. A bank that is
+    # no longer open cannot say anything about stock: retry next tick instead.
+    ctx = _Ctx(EVEN_CONFIG)
+    chest = {"id": gf.BANK_CHEST_ID, "name": "Bank chest", "distance": 2,
+             "screenX": 400, "screenY": 300, "x": 3375, "y": 11493, "plane": 0}
+    _crucible(monkeypatch, extra_objects=[chest])
+    _inv(monkeypatch, [])
+    monkeypatch.setattr(banker, "find_nearby_bank", lambda cfg: chest)
+    monkeypatch.setattr(banker, "open_bank", lambda ctx_, obj, **k: True)
+    monkeypatch.setattr(banker, "deposit_all_inventory", lambda ctx_: True)
+    monkeypatch.setattr(banker, "close_bank", lambda ctx_: None)
+    monkeypatch.setattr(banker, "search_bank", lambda ctx_, q: False)
+    bank = {"open": True, "items": [{"name": "Mithril platebody", "qty": 127},
+                                    {"name": "Adamant platebody", "qty": 9}]}
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: dict(bank))
+
+    def fake_search_and_withdraw(ctx_, name, quantity, contains=False):
+        bank["open"] = False          # the disconnect: interface gone, nothing withdrawn
+        return False
+    monkeypatch.setattr(banker, "search_and_withdraw", fake_search_and_withdraw)
+    st = _st(phase="MOULD_SET", crucibleContents={}, crucibleBarCount=0)
+    gf._fill_crucible(ctx, st)
+    assert ctx.state.stopped is None
+    assert ctx.state.data["gf_restock_trips"] == 1     # still counts toward the ceiling
+
+
+def test_substitute_reuses_a_short_metal_for_the_smaller_slot():
+    # MEASURED live 2026-09-04 (gf_live_tier8, 13:34): adamant down to 1 bar and mithril
+    # to 11 against an 18/10 config resolved to Iron 18 / Steel 10 (score 37), because
+    # each entry treated the OTHER entry's original metal as taken. The 11 mithril bars
+    # cover the 10-bar slot: Steel 18 / Mithril 10 is the right answer (61).
+    stock = _stock(adamantite_bar=1, mithril_bar=11, steel_bar=40)
+    fill = [{"metal": "MITHRIL", "target_bars": 18, "items": None},
+            {"metal": "ADAMANT", "target_bars": 10, "items": None}]
+    out, swaps = gf.substitute_empty_metals(fill, stock)
+    assert [(e["metal"], e["target_bars"]) for e in out] == [("STEEL", 18), ("MITHRIL", 10)]
+    assert swaps == [("ADAMANT", "MITHRIL"), ("MITHRIL", "STEEL")]

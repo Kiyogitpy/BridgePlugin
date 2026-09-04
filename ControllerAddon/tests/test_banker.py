@@ -152,3 +152,102 @@ def test_open_bank_does_not_click_an_offscreen_bank_the_minimap_cannot_reach(mon
     banker.open_bank(_Ctx(), _bank(distance=35, on_screen=False), timeout_s=0.5)
 
     assert clicks == []
+
+
+# --- open_bank's click tracks the booth through the flight, and its resolve window
+# --- budgets the walk ------------------------------------------------------------------
+#
+# USER 2026-08-30, watching a live bank trip (mh_live29 02:51:11): "very stale". The log shows
+# the whole shape: booth clicked at (1122,591), the player then walks toward it, the 3.0s
+# resolve window expires MID-WALK, the loop waits for idle and clicks the booth again at
+# (1265,758) -- 140px from the first aim -- ~9 seconds for what should be one click. Two
+# defects: the click flies with no refresh_target, so its aim is whatever the pre-flight
+# snapshot said (the same trap as every other stale click this repo documents); and the flat
+# 3.0s window cannot cover the walk the game performs before opening the bank, so the retry
+# races -- and can interrupt -- a click that was about to work ("whenever you time a click, ask
+# whether the player has to walk there first").
+
+def test_open_bank_click_carries_a_refresh_target(monkeypatch):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(banker, "is_open", lambda: False)
+    kwargs_seen = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: kwargs_seen.append(kw) or True)
+
+    banker.open_bank(_Ctx(), _bank(distance=4), timeout_s=0.5)
+
+    assert kwargs_seen and kwargs_seen[0].get("refresh_target") is not None, \
+        "the booth click must re-aim mid-flight -- a snapshot aim goes stale while walking"
+
+
+def test_open_bank_resolve_budget_scales_with_the_walk():
+    near = banker._click_resolve_budget(1)
+    far = banker._click_resolve_budget(8)
+    assert far > near, "a click from 8 tiles away must get more time than one from 1 tile"
+    assert far >= 3.0 + 8 * 0.5, f"8 tiles of walking cannot resolve inside {far}s"
+    assert banker._click_resolve_budget(40) <= 12.0, "a genuinely dead click must still fail fast"
+
+
+# --- the first booth click happens while still running in ------------------------------
+#
+# USER 2026-08-30 (mh_live37 04:08:57-04:09:13, watching live): the walk to the bank ran its
+# last ~10 tiles as THREE separate short viewport shift-clicks with flights between them, then
+# an idle wait, then the booth click -- "weird clicks around the bank instead of just updating
+# the bank booth while running there and clicking it". The human clicks the booth from a hop
+# away and lets the game finish the approach. The wait-for-idle-before-EVERY-click rule dates
+# to 2026-08-12 Mixology, when a click had no way to keep its aim true while moving;
+# refresh_target does exactly that now, so the FIRST click goes out mid-run and only RETRIES
+# (which mean something already went wrong) still wait for stillness.
+
+def test_open_bank_first_click_does_not_wait_for_idle(monkeypatch):
+    idles = []
+    monkeypatch.setattr(controller, "wait_until_player_idle",
+                        lambda **kw: idles.append(1) or True)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [])
+    monkeypatch.setattr(banker, "is_open", lambda: False)
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicks.append(len(idles)) or True)
+
+    banker.open_bank(_Ctx(), _bank(distance=6), timeout_s=0.5)
+
+    assert clicks, "should have clicked the booth"
+    assert clicks[0] == 0, \
+        f"the FIRST booth click must fly while still running in -- {clicks[0]} idle waits first"
+
+
+def test_open_bank_retries_still_wait_for_stillness(monkeypatch):
+    idles = []
+    monkeypatch.setattr(controller, "wait_until_player_idle",
+                        lambda **kw: idles.append(1) or True)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [])
+    monkeypatch.setattr(banker, "is_open", lambda: False)
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicks.append(len(idles)) or True)
+
+    banker.open_bank(_Ctx(), _bank(distance=1), timeout_s=8.0)
+
+    assert len(clicks) >= 2, "the harness never opens the bank, so a retry must happen"
+    assert clicks[1] >= 1, "a RETRY means the first click failed -- stillness first, as before"
+
+
+def test_bank_ui_buttons_never_simulate_a_misclick(monkeypatch):
+    # A toggle clicked twice (misclick + corrective reclick) ends up where it started --
+    # the search box opened and closed and "adam" was typed into nothing (gf_live30).
+    seen = []
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: {
+        "open": True, "searchButton": {"screenX": 1123, "screenY": 1006},
+        "quantityButtons": {"one": {"screenX": 719, "screenY": 1006}}})
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: seen.append(k.get("simulate_mistakes")) or True)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "type_text", lambda ser, text: None)
+
+    class _Ctx:
+        ser = None
+    banker.search_bank(_Ctx(), "adamantite")
+    banker.clear_bank_search(_Ctx())
+    banker.set_quantity_mode(_Ctx(), "one")
+    assert seen == [False, False, False]
+
