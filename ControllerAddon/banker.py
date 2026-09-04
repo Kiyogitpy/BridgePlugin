@@ -33,9 +33,32 @@
 import re
 import time
 
+import bridge_events
 import controller
 import debug_log
 import travel
+
+# Event-driven waits (2026-09-04, docs/superpowers/specs/2026-09-04-event-driven-outcomes-
+# design.md): the bank interface is group 12 (InterfaceID.Bankmain); its WIDGET_LOADED /
+# WIDGET_CLOSED and the INVENTORY_CHANGED of a deposit decide WHEN to read /bank and
+# /inventory, which stay the truth. With no event stream these degrade to the same polls as
+# before (bridge_events.await_outcome's None fallback).
+BANK_WIDGET_GROUP = 12
+BANK_CLOSE_BUDGET_S = 0.8
+DEPOSIT_ALL_BUDGET_S = 1.5
+
+
+def _bank_widget(payload) -> bool:
+    return payload.get("groupId") == BANK_WIDGET_GROUP
+
+
+def _events(ctx):
+    return getattr(ctx, "events", None)
+
+
+def _mark(ctx):
+    events = _events(ctx)
+    return events.mark() if events is not None else None
 
 DEFAULT_BANK_NAMES = ("bank booth", "bank chest", "bank counter", "grand exchange booth")
 FEROX_BANK_NAMES = ("bank chest", "bank booth")
@@ -44,7 +67,11 @@ FEROX_MAX_BANK_DISTANCE = 20
 # Past this many tiles open_bank walks toward the bank before clicking it -- see the
 # comment at that branch. Deliberately generous: a normal "arrived at the bank" position
 # is a handful of tiles out, and this must never add a walk to a trip that already works.
-BANK_APPROACH_TILES = 8
+# RAISED 8 -> 12 on 2026-08-30 alongside first-click-while-running: the booth is clicked from
+# a minimap hop away now (the game re-paths the last stretch itself), so "close enough to
+# click" has to cover where that hop actually stops. The through-wall 21-tile chatbox
+# projection this guards against (see the too_far comment) is still comfortably past 12.
+BANK_APPROACH_TILES = 12
 
 
 def find_nearby_bank(config: dict):
@@ -157,8 +184,20 @@ def open_bank(ctx, bank_obj, timeout_s: float = 20.0) -> bool:
         return True
 
     deadline = time.time() + timeout_s
+    first_click = True
     while time.time() < deadline:
-        controller.wait_until_player_idle(timeout_s=max(1.0, deadline - time.time()))
+        # The FIRST click flies while still running in -- clicking the booth mid-approach is
+        # what the human does (the game re-paths to it and opens on arrival), and the click's
+        # aim stays true through the flight via refresh_target below. USER 2026-08-30, watching
+        # the old behaviour live: "weird clicks around the bank instead of just updating the
+        # bank booth while running there and clicking it". The idle wait predates
+        # refresh_target (2026-08-12 Mixology, when a moving player made any aim stale) and
+        # still guards every RETRY: a retry means the first click failed, and re-clicking while
+        # the previous click's walk is still resolving is exactly the redirect loop that
+        # session measured.
+        if not first_click:
+            controller.wait_until_player_idle(timeout_s=max(1.0, deadline - time.time()))
+        first_click = False
         fresh = _refresh_bank_object(bank_obj)
 
         # CONFIRMED live 2026-08-12 (user report: "not doing anything" -> safety-stopped on
@@ -198,22 +237,49 @@ def open_bank(ctx, bank_obj, timeout_s: float = 20.0) -> bool:
                 # to the click rather than deadlocking on a minimap that cannot reach ~28 tiles.
                 continue
 
-        controller.click_entity(ctx.ser, fresh)
+        # refresh_target so the aim tracks the booth THROUGH the flight. USER 2026-08-30,
+        # watching live (mh_live29 02:51:11): "very stale" -- the pre-flight snapshot aim
+        # landed 140px from where the booth projected by the time the cursor arrived (the
+        # player was walking), the click bought nothing, and the loop paid a full idle-wait
+        # before re-clicking: ~9s for what should be one click.
+        refresh = None
+        if fresh.get("x") is not None and fresh.get("id") is not None:
+            refresh = controller.object_refresh_target(
+                fresh["x"], fresh["y"], fresh.get("plane", 0), fresh["id"])
+        mark = _mark(ctx)
+        controller.click_entity(ctx.ser, fresh, refresh_target=refresh)
 
-        # Give the click a few seconds to resolve (open animation/server round trip) without
-        # reclicking yet -- reclicking here would just interrupt a click that's about to work.
-        click_deadline = min(deadline, time.time() + 3.0)
-        while time.time() < click_deadline:
-            if is_open():
-                return True
-            time.sleep(0.3)
+        # Give the click time to resolve without reclicking yet -- reclicking would interrupt
+        # a click that is about to work. Budgets the WALK the game performs first (the same
+        # lesson as the door and hotspot budgets: whenever you time a click, ask whether the
+        # player has to walk there first) -- the old flat 3.0s expired mid-walk from 4+ tiles
+        # out, so the retry raced the bank opening it was waiting for. The interface loading
+        # (WIDGET_LOADED 12) is when /bank is read; the read decides alone at the budget.
+        click_deadline = min(deadline, time.time() + _click_resolve_budget(fresh.get("distance", 0)))
+        if bridge_events.await_outcome(_events(ctx), {"WIDGET_LOADED": _bank_widget},
+                                       max(0.0, click_deadline - time.time()),
+                                       confirm=is_open, since=mark, reaction=False):
+            return True
     return is_open()
+
+
+def _click_resolve_budget(distance) -> float:
+    """Seconds to give one bank click before retrying: base resolve time plus the walk the
+    game performs to reach the booth (~0.6s/tile at run, budgeted at 0.7), capped so a click
+    that will never work still fails fast."""
+    return min(3.0 + max(0, distance or 0) * 0.7, 10.0)
 
 
 def close_bank(ctx) -> None:
     # Escape closes the bank interface like any other RuneScape interface.
     # Adjust this if the Arduino firmware expects a different key string.
+    mark = _mark(ctx)
     controller.key_tap(ctx.ser, "ESC")
+    # Return once the interface is actually gone (WIDGET_CLOSED 12, confirmed by /bank.open)
+    # so a caller's next click never lands on a closing bank; a caller that used to sleep a
+    # flat "let the bank close" delay after this can drop it.
+    bridge_events.await_outcome(_events(ctx), {"WIDGET_CLOSED": _bank_widget}, BANK_CLOSE_BUDGET_S,
+                                confirm=lambda: not is_open(), since=mark, reaction=False)
 
 
 LOOTING_BAG_NAME = "looting bag"
@@ -432,7 +498,7 @@ def _click_bank_button(ctx, button_key: str) -> bool:
     if button.get("screenX") is None:
         return False
 
-    controller.click_entity(ctx.ser, button, offset=(0, 0))
+    controller.click_entity(ctx.ser, button, offset=(0, 0), simulate_mistakes=False)
     controller.human_delay(0.3, 0.6)
     return True
 
@@ -484,8 +550,16 @@ def deposit_inventory(ctx, config: dict) -> None:
     if not keep:
         deposit_all = bank.get("depositInventory") or {}
         if deposit_all.get("screenX") is not None:
+            before = len(controller.get_inventory())
+            mark = _mark(ctx)
             controller.click_entity(ctx.ser, deposit_all, offset=(0, 0))
-            controller.human_delay(0.3, 0.6)
+            if before > 0:
+                # The deposit landing is an INVENTORY_CHANGED; fewer items is the truth.
+                bridge_events.await_outcome(_events(ctx), "INVENTORY_CHANGED", DEPOSIT_ALL_BUDGET_S,
+                                            confirm=lambda: len(controller.get_inventory()) < before,
+                                            since=mark)
+            else:
+                controller.human_delay(0.3, 0.6)
         return
 
     # Keeping specific items -- deposit one DISTINCT item name at a time instead of Deposit-all,
@@ -522,7 +596,7 @@ def set_quantity_mode(ctx, mode: str) -> bool:
         debug_log.log("bank", f"quantity mode button '{mode}' not found (bank open?)")
         return False
 
-    controller.click_entity(ctx.ser, button, offset=(0, 0))
+    controller.click_entity(ctx.ser, button, offset=(0, 0), simulate_mistakes=False)
     controller.human_delay(0.2, 0.4)
     return True
 
@@ -692,6 +766,11 @@ def withdraw_all_shift(ctx, name: str, fresh: bool = False) -> bool:
     return False
 
 
+# Bank UI buttons (search icon, quantity mode, deposit-all) are TOGGLES or one-shot
+# switches: a simulated misclick plus its corrective reclick is two clicks, which flips a
+# toggle twice. MEASURED live 2026-09-03 (giants_foundry gf_live30, USER: "the search never
+# got typed adam"): misclick + reclick on the search icon opened and closed the search box
+# and the query was typed into nothing. simulate_mistakes=False on every one of them.
 def search_bank(ctx, query: str) -> bool:
     """Click the bank's search icon and type `query` into it -- filters the item grid live (no
     Enter needed), re-laying matches out starting from slot 0 so a caller can then find and
@@ -712,7 +791,8 @@ def search_bank(ctx, query: str) -> bool:
         debug_log.log("bank", "search button not found (bank open?)")
         return False
 
-    controller.click_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False)
+    controller.click_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False,
+                          simulate_mistakes=False)
     controller.human_delay(0.2, 0.4)
     controller.type_text(ctx.ser, query)
     # CONFIRMED live 2026-08-12 (Mastering Mixology live session): a 0.3-0.5s settle here --
@@ -740,7 +820,8 @@ def clear_bank_search(ctx) -> bool:
     if button.get("screenX") is None:
         return False
 
-    controller.click_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False)
+    controller.click_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False,
+                          simulate_mistakes=False)
     controller.human_delay(0.2, 0.4)
     return True
 
