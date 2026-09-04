@@ -303,8 +303,7 @@ def test_run_trip_gold_swap_safety_stops_when_bars_never_smelt(monkeypatch):
 
 
 def test_run_trip_non_swap_gold_is_unchanged(monkeypatch):
-    # Without the gauntlets the trip must behave exactly as before: no smelt wait, no glove
-    # names in keepItems, collect called with glove_swap False.
+    # Without the gauntlets: no glove swap anywhere, collect called with glove_swap False.
     recorded = {}
     order = []
     _stub_bank(monkeypatch, recorded)
@@ -319,8 +318,8 @@ def test_run_trip_non_swap_gold_is_unchanged(monkeypatch):
     ctx = _Ctx()
     trip = bf.BAR_TYPES["gold"]["trips"][0]
     assert bf.run_trip(ctx, {"barType": "gold"}, trip, bar_uses_coal_bag=False) is True
-    assert "wait" not in order
-    assert order == [("collect", False), ("collect", False)]
+    # Since 2026-09-04 EVERY bar type waits for the bars and collects in the same trip.
+    assert order == [("collect", False), "wait", ("collect", False)]
     # The glove names are kept on EVERY gold trip, swap or not (live 2026-09-04: a missed
     # swap detection let the deposit-all bank the carried Goldsmith gauntlets).
     keep = [k.lower() for k in recorded["deposit_cfg"].get("keepItems", [])]

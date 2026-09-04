@@ -290,6 +290,19 @@ def _prehover_item(ctx, name: str) -> bool:
     return bool(controller.hover_entity(ctx.ser, item, check_ui_blockers=False))
 
 
+def _prehover_object(ctx, name: str) -> bool:
+    """Rest the cursor on the named nearby object (the dispenser during a non-gold smelt
+    wait) so the Take is a click in place. Courtesy move, never an error."""
+    obj = find_object({}, name)
+    if obj is None or obj.get("screenX") is None:
+        return False
+    refresh = None
+    if obj.get("x") is not None and obj.get("id") is not None:
+        refresh = controller.object_refresh_target(
+            obj["x"], obj["y"], obj.get("plane", 0), obj["id"])
+    return bool(controller.hover_entity(ctx.ser, obj, refresh_target=refresh))
+
+
 def walk_to_dispenser_wait_tile(ctx) -> None:
     """Fire-and-forget walk to the dispenser standing tile, issued right after the conveyor
     deposit so the ~9s smelt wait is spent WALKING there instead of standing at the belt --
@@ -819,27 +832,30 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
             return False
 
     if trip.get("collect"):
+        # EVERY bar type now (2026-09-04, bf_live14): the non-gold paths used to check the
+        # dispenser immediately after the deposit, find nothing (the smelt takes ~10s), and
+        # leave the bars for the start of the NEXT trip -- so an adamantite batch was only
+        # collected two trips later, with the priming trip's coal going in over a full
+        # dispenser meanwhile. The gold path's shape applies to all: spend the smelt wait
+        # walking to the dispenser's standing tile (non-blocking; see
+        # walk_to_dispenser_wait_tile), then wait for the bars on the pushed varbit/XP.
+        walk_to_dispenser_wait_tile(ctx)
         if glove_swap:
-            # Spend the smelt wait walking to the dispenser's standing tile (non-blocking;
-            # see walk_to_dispenser_wait_tile) so the swap-and-take starts from dist 1.
-            walk_to_dispenser_wait_tile(ctx)
             # USER 2026-09-04: "when running from conveyor we can optimise by hovering the
             # gloves in wait for experience to drop" -- park the cursor on the ice pair during
             # the smelt so the wear at the XP drop is a click in place, not a ~1s flight
             # (bf_live6: 1.2s from the XP event to the wear landing).
             _prehover_item(ctx, ice_glove_pair())
-            # Wait for the smelt to finish (varbit 947 flipping to the bar count, the same
-            # tick as the XP drop) before touching the dispenser at all -- the non-swap paths
-            # deliberately keep their old immediate-check behavior (an unready dispenser is
-            # simply collected at the start of the next trip). A verified timeout here means
-            # ore went in and bars provably never came out, and the usual cause is a drained
-            # coffer (the dwarves stop operating the furnace), so say so.
-            if not wait_for_bars_ready(BAR_VARBITS.get((config.get("barType") or "").lower()),
-                                       events=getattr(ctx, "events", None)):
-                ctx.state.trigger_safety_stop(
-                    "gold bars never appeared in the dispenser after the conveyor deposit -- is the coffer empty?"
-                )
-                return False
+        else:
+            _prehover_object(ctx, "Bar dispenser")
+        # A verified timeout here means ore went in and bars provably never came out, and
+        # the usual cause is a drained coffer (the dwarves stop operating the furnace).
+        if not wait_for_bars_ready(BAR_VARBITS.get((config.get("barType") or "").lower()),
+                                   events=getattr(ctx, "events", None)):
+            ctx.state.trigger_safety_stop(
+                "bars never appeared in the dispenser after the conveyor deposit -- is the coffer empty?"
+            )
+            return False
         if not collect_bars(ctx, config, glove_swap=glove_swap, swap_back=False, prehover_bank=True):
             return False
 
