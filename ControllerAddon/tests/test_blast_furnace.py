@@ -518,3 +518,19 @@ def test_ensure_gloves_worn_never_clicks_an_item_while_the_bank_is_open(monkeypa
     monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: clicks.append(e) or True)
     assert bf.ensure_gloves_worn(_Ctx(), "Goldsmith gauntlets") is False
     assert clicks == []
+
+
+def test_ensure_gloves_worn_never_simulates_a_misclick(monkeypatch):
+    # bf_live11: a simulated miss + its corrective reclick wore the pair twice (swapped back).
+    worn = {"name": "Goldsmith gauntlets"}
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"gloves": dict(worn)})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Smiths gloves (i)")])
+    kwargs = []
+
+    def click(ser, entity, **kw):
+        kwargs.append(kw)
+        worn["name"] = "Smiths gloves (i)"
+        return True
+    monkeypatch.setattr(controller, "click_entity", click)
+    assert bf.ensure_gloves_worn(_Ctx(), "Smiths gloves (i)") is True
+    assert kwargs and kwargs[0].get("simulate_mistakes") is False

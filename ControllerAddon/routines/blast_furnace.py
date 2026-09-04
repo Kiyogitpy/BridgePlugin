@@ -258,7 +258,11 @@ def ensure_gloves_worn(ctx, name: str) -> bool:
         # codebase (see the /widget section of CLAUDE.md for the rotate-forever loop the
         # default causes on interface clicks).
         mark = _mark(ctx)
-        controller.click_entity(ctx.ser, item, check_ui_blockers=False)
+        # simulate_mistakes=False: a simulated miss beside the slot plus its corrective
+        # reclick is TWO wears on the same slot -- the pairs swap twice and the wrong pair
+        # ends up on (LIVE bf_live11, USER: "it double clicked the gloves making it
+        # impossible to pickup bars"). Same rule as bank buttons and boat fixtures.
+        controller.click_entity(ctx.ser, item, check_ui_blockers=False, simulate_mistakes=False)
         # Wearing swaps the pairs, so the INVENTORY changes the instant the wear lands --
         # that is the signal; /equipment's gloves slot is the truth.
         if _await(getattr(ctx, "events", None), "INVENTORY_CHANGED", GLOVE_WEAR_TIMEOUT_S,
@@ -1024,8 +1028,14 @@ def collect_bars(ctx, config: dict, glove_swap: bool = False, swap_back: bool = 
             break  # unmapped bar type -- can't verify, one pass is all we can do
         if not landed:
             # Nothing arrived in the budget: the click probably did not take (the walk-over
-            # from range, a contested pixel). The loop re-resolves and re-clicks; give the
-            # player a moment to finish any walk first so the retry does not redirect it.
+            # from range, a contested pixel) -- or the WRONG gloves are on and the game
+            # refused the hot bars (bf_live11). Re-check the ice pair, then let the loop
+            # re-resolve and re-click; give the player a moment to finish any walk first so
+            # the retry does not redirect it.
+            if glove_swap and not ensure_gloves_worn(ctx, ice_pair):
+                ctx.state.trigger_safety_stop(
+                    f"couldn't wear {ice_pair} for the bars -- is the pair missing?")
+                return False
             controller.wait_until_player_idle(timeout_s=4.0)
 
     if varbit_id is not None:
