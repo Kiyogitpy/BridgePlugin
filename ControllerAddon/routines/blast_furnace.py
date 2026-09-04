@@ -646,6 +646,18 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
     # gets the ice-glove wrap too -- a restart with 27 hot bars stranded in the dispenser
     # would otherwise try to grab them wearing the gauntlets.
     glove_swap = gold_glove_swap_active(config)
+    if not glove_swap:
+        # Every non-gold bar is taken hot too, so the ice pair must be the WORN pair for the
+        # whole session. A restart straight after a gold session (2026-09-04) has the
+        # gauntlets on and the ice pair carried; wear the ice pair once, up front. The
+        # gauntlets then ride to the bank and are deposited with the rest -- the coal-bag
+        # patterns need every slot. Soft: no ice pair carried means it is already worn (or
+        # the account has none), and the take itself is what would fail then.
+        carried = {(i.get("name") or "").lower() for i in controller.get_inventory()}
+        for name in ICE_GLOVE_NAMES:
+            if name.lower() in carried:
+                ensure_gloves_worn(ctx, name)
+                break
     if not collect_bars(ctx, config, glove_swap=glove_swap, swap_back=False, prehover_bank=True):
         return False
 

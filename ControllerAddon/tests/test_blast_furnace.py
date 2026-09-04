@@ -534,3 +534,19 @@ def test_ensure_gloves_worn_never_simulates_a_misclick(monkeypatch):
     monkeypatch.setattr(controller, "click_entity", click)
     assert bf.ensure_gloves_worn(_Ctx(), "Smiths gloves (i)") is True
     assert kwargs and kwargs[0].get("simulate_mistakes") is False
+
+
+def test_run_trip_non_gold_wears_the_carried_ice_pair_first(monkeypatch):
+    # After a gold session the gauntlets are on and Smiths gloves (i) are carried; every
+    # other bar type takes hot bars with the ice pair worn for the whole session.
+    recorded = {}
+    _stub_bank(monkeypatch, recorded)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Smiths gloves (i)")])
+    worn = []
+    monkeypatch.setattr(bf, "ensure_gloves_worn", lambda ctx, name: worn.append(name) or True)
+    monkeypatch.setattr(bf, "collect_bars", lambda ctx, config, glove_swap=False, **kw: True)
+    monkeypatch.setattr(bf, "find_conveyor", lambda config: {"name": "Conveyor belt"})
+    monkeypatch.setattr(bf, "deposit_via_conveyor", lambda ctx, config, names: 28)
+    trip = bf.BAR_TYPES["iron"]["trips"][0]
+    assert bf.run_trip(_Ctx(), {"barType": "iron"}, trip, bar_uses_coal_bag=False) is True
+    assert worn == ["Smiths gloves (i)"]
