@@ -4,9 +4,12 @@ import com.example.bridge.BridgeHttpServer;
 import com.example.providers.*;
 import com.example.tracker.CurrentTargetTrackerFactory;
 import com.example.tracker.NpcTrackerRegistry;
+import com.example.util.EventSubscriptions;
+import com.example.util.PlayerMotionTracker;
 import com.example.util.UdpEventSender;
 import com.google.inject.Provides;
 import net.runelite.api.*;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.*;
 import net.runelite.client.callback.ClientThread;
@@ -25,6 +28,7 @@ import net.runelite.client.ui.DrawManager;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.Text;
 
 import javax.inject.Inject;
 import java.awt.image.BufferedImage;
@@ -100,6 +104,10 @@ public class ControllerPlugin extends Plugin
 	private int lastInventoryHash = 0;
 	private int lastAnimation = -1;
 	private String lastTargetKey = "";
+	// 2026-09-04 event-driven outcomes: which varbits/varps VARBIT_CHANGED is emitted for
+	// (opt-in via GET /events/subscribe) and the per-frame PLAYER_MOVING/STOPPED tracker.
+	private final EventSubscriptions eventSubscriptions = new EventSubscriptions();
+	private final PlayerMotionTracker motionTracker = new PlayerMotionTracker();
 	private final Map<Skill, Integer> lastRealLevels = new HashMap<>();
 	// Tracks raw XP per skill (not level) so XP_GAINED can report every gain, including ones
 	// too small to bump a level -- CLAUDE.md's "sub-tick data" note identifies StatChanged's XP
@@ -124,7 +132,8 @@ public class ControllerPlugin extends Plugin
 		tickClock = new TickClock();
 
 		new GameStateProvider(client, clientThread, server).register();
-		new PlayerProvider(client, clientThread, server).register();
+		new PlayerProvider(client, clientThread, server, motionTracker).register();
+		new EventsProvider(client, clientThread, server, eventSubscriptions).register();
 		new PvpProvider(client, clientThread, server).register();
 		new CombatProvider(client, clientThread, server, pluginManager).register();
 		new PrayerProvider(client, clientThread, server).register();
@@ -148,6 +157,7 @@ public class ControllerPlugin extends Plugin
 		new SlayerConfigProvider(client, clientThread, server, config).register();
 		new MenuStateProvider(client, clientThread, server).register();
 		new WidgetProvider(client, clientThread, server).register();
+		new com.example.providers.WorldProvider(client, clientThread, server).register();
 		new SpellbookProvider(client, clientThread, server).register();
 		new MixologyProvider(client, clientThread, server).register();
 		new PyramidPlunderProvider(client, clientThread, server).register();
@@ -298,40 +308,204 @@ public class ControllerPlugin extends Plugin
 			udpSender.send("PRAYER_CHANGED", payload);
 		}
 		lastPrayer = prayer;
+		// ANIMATION_CHANGED / TARGET_CHANGED used to be polled here; since 2026-09-04 they ride
+		// the client's own AnimationChanged / InteractingChanged events (below), which fire as the
+		// packet is processed rather than at this tick handler. Same names, same payloads.
+	}
 
-		Player local = client.getLocalPlayer();
-		if (local != null)
+	// ---- Event-driven outcomes (2026-09-04) -------------------------------------------------
+	// docs/superpowers/specs/2026-09-04-event-driven-outcomes-design.md. Every handler below
+	// guards udpSender == null (shutDown() nulls it before RuneLite unregisters us, see
+	// sendObjectEvent) and stamps tick + atMillis so Python can measure its own reaction latency.
+
+	/** Every event added by the 2026-09-04 event-driven-outcomes work carries these two. */
+	private Map<String, Object> stampedPayload()
+	{
+		Map<String, Object> payload = new HashMap<>();
+		payload.put("tick", tickClock.get());
+		payload.put("atMillis", System.currentTimeMillis());
+		return payload;
+	}
+
+	@Subscribe
+	public void onAnimationChanged(AnimationChanged event)
+	{
+		if (udpSender == null || event.getActor() != client.getLocalPlayer())
 		{
-			int anim = local.getAnimation();
-			if (lastAnimation >= 0 && anim != lastAnimation)
-			{
-				Map<String, Object> payload = new HashMap<>();
-				payload.put("animation", anim);
-				// "from" is the animation being left, not the new one -- the whole point is
-				// telling a mid-sequence pause (e.g. 5212 -> -1, trap check ending, re-lay still
-				// to come) apart from a finished action (5208 -> -1), which "animation" alone
-				// can't do. Read lastAnimation here, before it's overwritten below.
-				payload.put("from", lastAnimation);
-				payload.put("tick", tickClock.get());
-				udpSender.send("ANIMATION_CHANGED", payload);
-			}
-			lastAnimation = anim;
-
-			Actor target = local.getInteracting();
-			String targetKey = target == null ? "" : targetKey(target);
-			if (!targetKey.equals(lastTargetKey))
-			{
-				Map<String, Object> payload = new HashMap<>();
-				payload.put("target", targetKey.isEmpty() ? null : targetKey);
-				if (target instanceof NPC)
-				{
-					payload.put("targetId", ((NPC) target).getId());
-					payload.put("targetName", target.getName());
-				}
-				udpSender.send("TARGET_CHANGED", payload);
-				lastTargetKey = targetKey;
-			}
+			return;
 		}
+		int anim = event.getActor().getAnimation();
+		if (anim == lastAnimation)
+		{
+			return;
+		}
+		Map<String, Object> payload = stampedPayload();
+		payload.put("animation", anim);
+		// "from" is the animation being left, not the new one -- the whole point is telling a
+		// mid-sequence pause (e.g. 5212 -> -1, trap check ending, re-lay still to come) apart
+		// from a finished action (5208 -> -1), which "animation" alone can't do.
+		payload.put("from", lastAnimation);
+		udpSender.send("ANIMATION_CHANGED", payload);
+		lastAnimation = anim;
+	}
+
+	@Subscribe
+	public void onInteractingChanged(InteractingChanged event)
+	{
+		if (udpSender == null || event.getSource() != client.getLocalPlayer())
+		{
+			return;
+		}
+		Actor target = event.getTarget();
+		String key = target == null ? "" : targetKey(target);
+		if (key.equals(lastTargetKey))
+		{
+			return;
+		}
+		Map<String, Object> payload = stampedPayload();
+		payload.put("target", key.isEmpty() ? null : key);
+		if (target instanceof NPC)
+		{
+			payload.put("targetId", ((NPC) target).getId());
+			payload.put("targetName", target.getName());
+		}
+		udpSender.send("TARGET_CHANGED", payload);
+		lastTargetKey = key;
+	}
+
+	// Subscribed ids only: VarbitChanged fires for hundreds of varps on login and every scene
+	// load, which would evict the useful events from the UDP queue. See EventSubscriptions.
+	@Subscribe
+	public void onVarbitChanged(VarbitChanged event)
+	{
+		if (udpSender == null || !eventSubscriptions.matches(event.getVarbitId(), event.getVarpId()))
+		{
+			return;
+		}
+		Map<String, Object> payload = stampedPayload();
+		payload.put("varbitId", event.getVarbitId());
+		payload.put("varpId", event.getVarpId());
+		payload.put("value", event.getValue());
+		udpSender.send("VARBIT_CHANGED", payload);
+	}
+
+	@Subscribe
+	public void onWidgetLoaded(WidgetLoaded event)
+	{
+		if (udpSender == null)
+		{
+			return;
+		}
+		Map<String, Object> payload = stampedPayload();
+		payload.put("groupId", event.getGroupId());
+		udpSender.send("WIDGET_LOADED", payload);
+	}
+
+	@Subscribe
+	public void onWidgetClosed(WidgetClosed event)
+	{
+		if (udpSender == null)
+		{
+			return;
+		}
+		Map<String, Object> payload = stampedPayload();
+		payload.put("groupId", event.getGroupId());
+		udpSender.send("WIDGET_CLOSED", payload);
+	}
+
+	// The game's own verdict on what a click became, pushed instead of polled off /last-action
+	// (LastActionProvider keeps that endpoint; this is the same data as an event).
+	@Subscribe
+	public void onMenuOptionClicked(MenuOptionClicked event)
+	{
+		if (udpSender == null)
+		{
+			return;
+		}
+		Map<String, Object> payload = stampedPayload();
+		payload.put("option", Text.removeTags(event.getMenuOption()));
+		payload.put("target", Text.removeTags(event.getMenuTarget()));
+		payload.put("id", event.getId());
+		payload.put("menuAction", event.getMenuAction() != null ? event.getMenuAction().name() : null);
+		payload.put("param0", event.getParam0());
+		payload.put("param1", event.getParam1());
+		payload.put("itemId", event.getItemId());
+		udpSender.send("MENU_CLICKED", payload);
+	}
+
+	@Subscribe
+	public void onGraphicChanged(GraphicChanged event)
+	{
+		if (udpSender == null || event.getActor() != client.getLocalPlayer())
+		{
+			return;
+		}
+		Map<String, Object> payload = stampedPayload();
+		payload.put("graphic", event.getActor().getGraphic());
+		udpSender.send("GRAPHIC_CHANGED", payload);
+	}
+
+	@Subscribe
+	public void onHitsplatApplied(HitsplatApplied event)
+	{
+		Player local = client.getLocalPlayer();
+		if (udpSender == null || local == null)
+		{
+			return;
+		}
+		Actor actor = event.getActor();
+		boolean onPlayer = actor == local;
+		boolean onTarget = actor != null && actor == local.getInteracting();
+		if (!onPlayer && !onTarget)
+		{
+			return;
+		}
+		Map<String, Object> payload = stampedPayload();
+		payload.put("actor", onPlayer ? "player" : "target");
+		payload.put("amount", event.getHitsplat().getAmount());
+		payload.put("hitsplatType", event.getHitsplat().getHitsplatType());
+		if (actor instanceof NPC)
+		{
+			payload.put("npcIndex", ((NPC) actor).getIndex());
+			payload.put("npcId", ((NPC) actor).getId());
+			payload.put("npcName", actor.getName());
+		}
+		udpSender.send("HITSPLAT", payload);
+	}
+
+	// 50Hz, independent of FPS. The tracker is a few integer compares; the WorldPoint conversion
+	// only runs on a transition (twice per walk). This is the one genuinely sub-tick signal here:
+	// the interpolated local position stops sliding BEFORE the next server tick updates the tile.
+	@Subscribe
+	public void onClientTick(ClientTick event)
+	{
+		if (udpSender == null)
+		{
+			return;
+		}
+		Player local = client.getLocalPlayer();
+		LocalPoint lp = (local != null && client.getGameState() == GameState.LOGGED_IN)
+			? local.getLocalLocation() : null;
+		PlayerMotionTracker.Transition t = lp == null
+			? motionTracker.observe(null, null, 0)
+			: motionTracker.observe(lp.getX(), lp.getY(), client.getTopLevelWorldView().getPlane());
+		if (t == PlayerMotionTracker.Transition.NONE)
+		{
+			return;
+		}
+		Map<String, Object> payload = stampedPayload();
+		if (lp != null)
+		{
+			// fromLocalInstance: instanced areas (Pest Control, ...) break the bare conversion --
+			// see CLAUDE.md "Instanced areas break forward world-coordinate conversion".
+			WorldPoint wp = WorldPoint.fromLocalInstance(client, lp);
+			payload.put("x", wp.getX());
+			payload.put("y", wp.getY());
+			payload.put("plane", wp.getPlane());
+			payload.put("localX", lp.getX());
+			payload.put("localY", lp.getY());
+		}
+		udpSender.send(t == PlayerMotionTracker.Transition.MOVING ? "PLAYER_MOVING" : "PLAYER_STOPPED", payload);
 	}
 
 	@Subscribe

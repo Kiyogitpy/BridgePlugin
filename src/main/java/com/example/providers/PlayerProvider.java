@@ -33,9 +33,14 @@ public class PlayerProvider extends BridgeProvider
 	 */
 	private static final int ROOF_TILE_SETTING = 0x4;
 
-	public PlayerProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
+	// Fed from ControllerPlugin.onClientTick; the HTTP fallback for PLAYER_MOVING/STOPPED.
+	private final com.example.util.PlayerMotionTracker motionTracker;
+
+	public PlayerProvider(Client client, ClientThread clientThread, BridgeHttpServer server,
+		com.example.util.PlayerMotionTracker motionTracker)
 	{
 		super(client, clientThread, server);
+		this.motionTracker = motionTracker;
 	}
 
 	@Override
@@ -228,6 +233,9 @@ public class PlayerProvider extends BridgeProvider
 		}
 		data.put("animation", p.getAnimation());
 		data.put("poseAnimation", p.getPoseAnimation());
+		// Sub-tick: true while the interpolated local position is sliding this frame
+		// (PlayerMotionTracker, fed from ClientTick). The HTTP fallback for PLAYER_MOVING/STOPPED.
+		data.put("moving", motionTracker.isMoving());
 		data.put("hp", client.getBoostedSkillLevel(Skill.HITPOINTS));
 		data.put("hpReal", client.getRealSkillLevel(Skill.HITPOINTS));
 		data.put("prayer", client.getBoostedSkillLevel(Skill.PRAYER));
