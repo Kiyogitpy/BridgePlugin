@@ -403,10 +403,12 @@ def test_action_handlers_cover_every_ladder_result():
 class _Ctx:
     def __init__(self):
         self.ser = object()
+        self.events = None
         self.state = type("S", (), {"data": {}, "config": dict(gotr.DEFAULT_CONFIG)})()
 
 
 def test_direct_walk_skips_ui_blocked_candidates(monkeypatch):
+    monkeypatch.setattr(gotr, "_await_moving", lambda c: True)   # walk sites only test the click
     import controller
     import travel
     walked = []
@@ -427,6 +429,7 @@ def test_direct_walk_skips_ui_blocked_candidates(monkeypatch):
 
 
 def test_direct_walk_falls_back_to_minimap_when_every_candidate_is_blocked(monkeypatch):
+    monkeypatch.setattr(gotr, "_await_moving", lambda c: True)   # walk sites only test the click
     import controller
     import travel
     clicks = []
@@ -502,6 +505,7 @@ def test_direct_walk_escalates_to_minimap_when_the_player_does_not_move(monkeypa
     monkeypatch.setattr(controller, "click_entity",
                         lambda ser, ent, **k: hops.append(ent.get("name")) or True)
     ctx = _Ctx()
+    monkeypatch.setattr(gotr, "_await_moving", lambda c: True)   # walk sites only test the click
     assert gotr._direct_walk(ctx, 3620, 9500)   # first click
     assert gotr._direct_walk(ctx, 3620, 9500)   # same target, not moved: stuck 1
     assert hops == [] and len(walked) == 2
@@ -514,6 +518,7 @@ def test_stuck_watch_warns_then_stops_without_progress(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 2122, "y": 4833})
     stops = []
     ctx = _Ctx()
+    monkeypatch.setattr(gotr, "_await_moving", lambda c: True)   # walk sites only test the click
     ctx.state.trigger_safety_stop = lambda reason: stops.append(reason)
     st = make_state(currentAltar="COSMIC")
     for _ in range(gotr.STUCK_STOP_TICKS):
@@ -544,6 +549,7 @@ def test_before_break_plays_the_round_out_then_returns(monkeypatch):
     monkeypatch.setattr(gotr.time, "sleep", lambda s: None)
     monkeypatch.setattr(controller, "get_objects", lambda **k: [])
     ctx = _Ctx()
+    monkeypatch.setattr(gotr, "_await_moving", lambda c: True)   # walk sites only test the click
     ctx.state.safety_stopped = False
     gotr.before_break(ctx)
     # 3 ticks while active/transitional, then BREAK_INACTIVE_READS-1 more before it
@@ -559,6 +565,7 @@ def test_before_break_is_quick_between_rounds(monkeypatch):
     monkeypatch.setattr(gotr.time, "sleep", lambda s: None)
     monkeypatch.setattr(controller, "get_objects", lambda **k: [])
     ctx = _Ctx()
+    monkeypatch.setattr(gotr, "_await_moving", lambda c: True)   # walk sites only test the click
     ctx.state.safety_stopped = False
     gotr.before_break(ctx)
     assert len(ticks) < gotr.BREAK_INACTIVE_READS
@@ -828,3 +835,33 @@ def test_hud_widget_predicate_and_teleport_confirms(monkeypatch):
     assert gotr._confirm_in_pocket()
     monkeypatch.setattr(gotr, "read_state", lambda: make_state())
     assert gotr._confirm_back_in_arena() and not gotr._confirm_in_pocket()
+
+
+def test_await_moving_returns_at_once_when_already_moving(monkeypatch):
+    ctx = _ECtx(_FakeEvents(None))
+    monkeypatch.setattr(controller, "get_player", lambda: {"moving": True})
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    assert gotr._await_moving(ctx) is True
+    assert ctx.events.calls == []
+
+
+def test_await_moving_waits_for_player_moving_otherwise(monkeypatch):
+    ctx = _ECtx(_FakeEvents(bridge_events.Outcome(True, "PLAYER_MOVING", {}, True, 0.2)))
+    monkeypatch.setattr(controller, "get_player", lambda: {"moving": False})
+    assert gotr._await_moving(ctx) is True
+    assert ctx.events.calls[0]["signals"] == "PLAYER_MOVING"
+    assert ctx.events.calls[0]["budget"] == gotr.WALK_START_BUDGET_S
+
+
+def test_direct_walk_awaits_motion_after_its_click(monkeypatch):
+    ctx = _ECtx()
+    gotr._walk_memo.update({"target": None, "player": None, "stuck": 0})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3600, "y": 9500})
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p: {"onScreen": True, "screenX": 500, "screenY": 400})
+    monkeypatch.setattr(controller, "is_point_blocked_by_ui", lambda x, y: None)
+    monkeypatch.setattr(travel, "walk_to_exact_tile", lambda *a, **k: True)
+    waited = []
+    monkeypatch.setattr(gotr, "_await_moving", lambda c: waited.append(1) or True)
+    assert gotr._direct_walk(ctx, 3610, 9500) is True
+    assert waited == [1]

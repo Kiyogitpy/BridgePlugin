@@ -685,6 +685,18 @@ def _after_stop(seconds):
     return {"PLAYER_STOPPED": seconds}
 
 
+def _await_moving(ctx):
+    """After a walk click: hand control back the moment the player is provably moving
+    (PLAYER_MOVING, or /player.moving already true), else after WALK_START_BUDGET_S. Replaces
+    the flat 0.5-0.9s delay every walk site paid; the reaction pad keeps it human."""
+    if (controller.get_player() or {}).get("moving"):
+        controller.human_delay(*settings.REACTION_DELAY_S)
+        return True
+    return bool(bridge_events.await_outcome(
+        ctx.events, "PLAYER_MOVING", WALK_START_BUDGET_S,
+        confirm=lambda: bool((controller.get_player() or {}).get("moving"))))
+
+
 # Outcome confirms -- one fresh HTTP read each, compared against the pre-click snapshot.
 # Cell barriers are GroundObjects (m8aq readBarriers), NOT varbits, so a cell/repair outcome is
 # the cell or the fragments leaving the INVENTORY; the energy varbits ride along as a trigger.
@@ -925,7 +937,6 @@ def _climb_rubble(ctx):
         if dist > RUBBLE_CLICK_RANGE:
             debug_log.log("gotr", "heading for the rubble shortcut")
             _direct_walk(ctx, rubble.get("x"), rubble.get("y"))
-            controller.human_delay(0.5, 0.9)
             return True
     debug_log.log("gotr", "climbing the rubble shortcut")
     side_before = (p.get("x") or 0) >= POCKET_MIN_X
@@ -969,6 +980,14 @@ WALK_STUCK_CLICKS = 2      # same target, player not moved since the last click,
 
 
 def _direct_walk(ctx, x, y):
+    """_direct_walk_click, then wait for the player to actually be moving (2026-09-04)."""
+    if not _direct_walk_click(ctx, x, y):
+        return False
+    _await_moving(ctx)
+    return True
+
+
+def _direct_walk_click(ctx, x, y):
     """One direct viewport shift-click toward (x, y), pulled in toward the player until
     the tile projects on screen. The static collision map has NO DATA inside the arena
     (MEASURED 2026-09-01: reachable_from(3618,9483) == 1 tile), so travel.walk_to can
@@ -1757,7 +1776,6 @@ def _work_altar(ctx, st):
             # WALK FIRST, CLICK CLOSE -- the rubble rule (see ALTAR_CLICK_RANGE).
             debug_log.log("gotr", "altar is far from the entrance -- walking in")
             _direct_walk(ctx, altar_obj.get("x"), altar_obj.get("y"))
-            controller.human_delay(0.5, 0.9)
             return
         xp_before = (controller.get_player() or {}).get("runecraftXp")
         data["gotr_imbue_clicks"] = data.get("gotr_imbue_clicks", 0) + 1
@@ -1793,7 +1811,6 @@ def _work_altar(ctx, st):
     if _too_far(exit_portal, ALTAR_CLICK_RANGE):
         debug_log.log("gotr", "exit portal is far -- walking toward it")
         _direct_walk(ctx, exit_portal.get("x"), exit_portal.get("y"))
-        controller.human_delay(0.5, 0.9)
         return
     data["gotr_exit_clicks"] = data.get("gotr_exit_clicks", 0) + 1
     _enter(ctx, exit_portal, EXIT_PORTAL_ACTIONS, "gotr_exit_commit", "altar exit",
@@ -2341,7 +2358,6 @@ def _leave_side_area(ctx):
     debug_log.log("gotr", "leaving the side area through its exit portal")
     if _too_far(exit_portal, ALTAR_CLICK_RANGE):
         _direct_walk(ctx, exit_portal.get("x"), exit_portal.get("y"))
-        controller.human_delay(0.5, 0.9)
         return True
     _enter(ctx, exit_portal, EXIT_PORTAL_ACTIONS, "gotr_exit_commit", "side-area exit",
            _confirm_back_in_arena)
