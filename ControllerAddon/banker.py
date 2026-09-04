@@ -687,7 +687,9 @@ def withdraw_loadout(ctx, config: dict, fresh: bool = False) -> None:
         name = entry["name"].lower()
         quantity = entry["quantity"]
 
-        bank = controller.get_bank(fresh=fresh)
+        # Always fresh: see withdraw_all_shift's find_slot for the one-slot-off stale read
+        # that withdrew the wrong item live (2026-09-04). `fresh` is kept for callers.
+        bank = controller.get_bank(fresh=True)
         slot = next(
             (s for s in bank.get("items", []) if name in (s.get("name") or "").lower()),
             None,
@@ -742,35 +744,48 @@ def withdraw_all_shift(ctx, name: str, fresh: bool = False) -> bool:
     deposit then found 0 to deposit. Same "poll, don't just sleep" reasoning
     wait_until_bank_item_gone already applies to the coal-bag-withdrawal race, just watching
     for the item's arrival in inventory instead of its disappearance from the bank."""
-    bank = controller.get_bank(fresh=fresh)
     name_lower = name.lower()
-    slot = next(
-        (s for s in bank.get("items", []) if name_lower == (s.get("name") or "").lower()),
-        None,
-    )
-    if slot is None:
+    del fresh  # kept for callers; every read below is fresh regardless (see find_slot)
+
+    def find_slot():
+        # ALWAYS fresh (2026-09-04, bf_live13): /bank is cached per game tick, and the deposit
+        # that precedes every withdrawal can add a NEW item type to the bank, shifting every
+        # later slot by one. A stale snapshot aimed the shift-click one slot off and withdrew
+        # ALL of the neighbour (11 Mithril chainbodies) instead of the ore -- the caller then
+        # safety-stopped on "never showed up". One un-cached read is cheap; a wrong click is not.
+        bank = controller.get_bank(fresh=True)
         slot = next(
-            (s for s in bank.get("items", []) if name_lower in (s.get("name") or "").lower()),
+            (s for s in bank.get("items", []) if name_lower == (s.get("name") or "").lower()),
             None,
         )
-    if slot is None:
-        debug_log.log("bank", f"{name} not found in bank, skipping")
-        return False
+        if slot is None:
+            slot = next(
+                (s for s in bank.get("items", []) if name_lower in (s.get("name") or "").lower()),
+                None,
+            )
+        return slot
 
-    debug_log.log("bank", f"shift-withdrawing all {slot.get('name')}")
-    controller.key_down(ctx.ser, "SHIFT")
-    ok = controller.click_entity(ctx.ser, slot, check_ui_blockers=False)
-    controller.key_up(ctx.ser, "SHIFT")
-    if not ok:
-        return False
+    for attempt in range(2):
+        slot = find_slot()
+        if slot is None:
+            debug_log.log("bank", f"{name} not found in bank, skipping")
+            return False
 
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        if any(name_lower in (i.get("name") or "").lower() for i in controller.get_inventory()):
-            return True
-        time.sleep(0.15)
+        debug_log.log("bank", f"shift-withdrawing all {slot.get('name')}")
+        controller.key_down(ctx.ser, "SHIFT")
+        ok = controller.click_entity(ctx.ser, slot, check_ui_blockers=False, simulate_mistakes=False)
+        controller.key_up(ctx.ser, "SHIFT")
+        if not ok:
+            return False
 
-    debug_log.log("bank", f"shift-withdrawn {name} never showed up in inventory -- may have raced the bank closing")
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if any(name_lower in (i.get("name") or "").lower() for i in controller.get_inventory()):
+                return True
+            time.sleep(0.15)
+        debug_log.log("bank", f"shift-withdrawn {name} never showed up in inventory"
+                              + (" -- re-reading the bank and retrying" if attempt == 0
+                                 else " -- may have raced the bank closing"))
     return False
 
 
