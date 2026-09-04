@@ -122,7 +122,8 @@ SMELT_BLIND_WAIT_RANGE_S = (8.5, 10.5)
 # decides WHAT happened, and the HTTP read alone decides at the budget -- so an old client or a
 # dropped packet costs latency, never a wrong click. Baseline per gold trip (bf_live2, 2026-08-31):
 # ~27s, ~9s of it the smelt itself; the rest was 0.3-0.9s fixed delays and 0.3-0.6s polls.
-VARBIT_SUBSCRIPTIONS = tuple(BAR_VARBITS.values())   # pushed as VARBIT_CHANGED (engine posts it)
+VB_CHAT_MODAL = 10670             # chatmodal_unclamp: 1 while a chat modal (the dispenser's) is up
+VARBIT_SUBSCRIPTIONS = tuple(BAR_VARBITS.values()) + (VB_CHAT_MODAL,)   # pushed as VARBIT_CHANGED
 BANK_WIDGET_GROUP = 12            # InterfaceID.Bankmain
 DIALOG_WIDGET_GROUPS = (229, 231, 219)   # Messagebox, ChatLeft (npc/player chat), Chatmenu
 DISPENSER_DIALOG_BUDGET_S = 2.5   # dispenser click -> its dialogue, plus the walk
@@ -894,26 +895,45 @@ def collect_bars(ctx, config: dict, glove_swap: bool = False) -> bool:
         events = getattr(ctx, "events", None)
         mark = _mark(ctx)
         controller.click_entity(ctx.ser, dispenser)
-        # The Take opens a dialogue (the game walks over first): WIDGET_LOADED of a chat
-        # interface, confirmed by /state.dialogOpen, is when Space is due -- replacing the
-        # settle + idle-poll + fixed delays (~2s per collect, bf_live2). No dialogue within
-        # the budget: the old settle/idle path, so nothing is worse than before.
+        # MEASURED in the 2026-08-31 recording: Take -> +0.5s varbit 10670 (chatmodal_unclamp,
+        # the game's own "a chat modal is open" flag) = 1 -> the human's Space at +0.9s ->
+        # +1.1s varbit 947 = 0, "You take 27 gold bars", +27 Gold bar. That modal is a widget
+        # group NEITHER /state.dialogOpen NOR the m8aq dialogue reader covers (LIVE bf_live6,
+        # 2026-09-04: both read closed while it was up, so the old dialogue wait never
+        # confirmed and every collect paid ~4s in the settle/idle fallback). The modal varbit
+        # is the confirm now; the bars landing without a modal is accepted too.
         walk_s = 0.7 * max(0, dispenser.get("distance") or 0)
-        if not _await(events, {"WIDGET_LOADED": _dialog_widget, "PLAYER_STOPPED": None},
-                      DISPENSER_DIALOG_BUDGET_S + walk_s, confirm=_dialog_open, since=mark):
-            controller.human_delay(0.6, 0.9)
-            controller.wait_until_player_idle(timeout_s=8.0)
-            controller.human_delay(0.3, 0.6)
-        mark = _mark(ctx)
-        controller.key_tap(ctx.ser, "SPACE")
+
+        def take_outcome():
+            if controller.get_varbit(VB_CHAT_MODAL) == 1 or _dialog_open():
+                return "modal"
+            if varbit_id is not None and controller.get_varbit(varbit_id) == 0:
+                return "landed"
+            return None
+
+        res = _await(events, {"VARBIT_CHANGED": lambda p: p.get("varbitId") in (VB_CHAT_MODAL, varbit_id),
+                              "WIDGET_LOADED": None, "INVENTORY_CHANGED": None,
+                              "PLAYER_STOPPED": None},
+                     DISPENSER_DIALOG_BUDGET_S + walk_s, confirm=take_outcome, since=mark)
+        landed = bool(res) and res.confirmed == "landed"
+        if res and res.confirmed == "modal":
+            mark = _mark(ctx)
+            controller.key_tap(ctx.ser, "SPACE")
+            if varbit_id is None:
+                controller.human_delay(0.5, 0.8)
+            else:
+                landed = bool(_await(events, {"INVENTORY_CHANGED": None,
+                                              "VARBIT_CHANGED": lambda p: p.get("varbitId") == varbit_id and not p.get("value")},
+                                     COLLECT_CONFIRM_S,
+                                     confirm=lambda: controller.get_varbit(varbit_id) == 0,
+                                     since=mark))
         if varbit_id is None:
-            controller.human_delay(0.5, 0.8)
             break  # unmapped bar type -- can't verify, one pass is all we can do
-        # Bars landing: the inventory changes and the dispenser varbit drops to 0.
-        _await(events, {"INVENTORY_CHANGED": None,
-                        "VARBIT_CHANGED": lambda p: p.get("varbitId") == varbit_id and not p.get("value")},
-               COLLECT_CONFIRM_S, confirm=lambda: controller.get_varbit(varbit_id) == 0,
-               since=mark)
+        if not landed:
+            # Nothing arrived in the budget: the click probably did not take (the walk-over
+            # from range, a contested pixel). The loop re-resolves and re-clicks; give the
+            # player a moment to finish any walk first so the retry does not redirect it.
+            controller.wait_until_player_idle(timeout_s=4.0)
 
     if varbit_id is not None:
         still_ready = controller.get_varbit(varbit_id)
