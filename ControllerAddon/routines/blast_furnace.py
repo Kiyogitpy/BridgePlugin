@@ -246,6 +246,11 @@ def ensure_gloves_worn(ctx, name: str) -> bool:
 
     controller.open_inventory_tab(ctx.ser)
     for _ in range(2):
+        if banker.is_open():
+            # With the bank interface up, a left-click on an inventory item DEPOSITS it --
+            # the swap-on-the-run (bf_live10) can reach a retry here with the bank already
+            # open. Never click; the pre-deposit gate wears the pair after the bank closes.
+            return worn()
         item = find_item(name)
         if item is None:
             return worn()

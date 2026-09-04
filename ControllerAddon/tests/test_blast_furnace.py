@@ -506,3 +506,15 @@ def test_collect_bars_prehovers_the_bank_chest_while_the_bars_land(monkeypatch):
     monkeypatch.setattr(controller, "key_tap", tap)
     assert bf.collect_bars(_Ctx(), {"barType": "gold"}, prehover_bank=True) is True
     assert order == ["take", "SPACE", ("hover", "Bank chest")]
+
+
+def test_ensure_gloves_worn_never_clicks_an_item_while_the_bank_is_open(monkeypatch):
+    # bf_live10: a wear retry can land after the bank opened; a left-click on an inventory
+    # item inside the bank interface deposits it.
+    _equip_gloves(monkeypatch, "Smiths gloves (i)")
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Goldsmith gauntlets")])
+    monkeypatch.setattr(banker, "is_open", lambda: True)
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: clicks.append(e) or True)
+    assert bf.ensure_gloves_worn(_Ctx(), "Goldsmith gauntlets") is False
+    assert clicks == []
