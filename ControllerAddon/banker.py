@@ -308,7 +308,7 @@ def empty_looting_bag(ctx) -> bool:
         return False
 
     debug_log.log("bank", "emptying looting bag")
-    if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False):
+    if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False, simulate_mistakes=False):
         return False
 
     controller.human_delay(0.6, 1.0)
@@ -372,7 +372,7 @@ def empty_coal_bag(ctx) -> bool:
         return False
 
     debug_log.log("bank", "emptying coal bag")
-    if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False):
+    if not controller.click_entity(ctx.ser, bag, check_ui_blockers=False, simulate_mistakes=False):
         return False
 
     controller.human_delay(0.6, 1.0)
@@ -411,7 +411,7 @@ def fill_fur_pouch(ctx) -> bool:
         return False
 
     debug_log.log("bank", "filling fur pouch")
-    if not controller.click_entity(ctx.ser, pouch, check_ui_blockers=False):
+    if not controller.click_entity(ctx.ser, pouch, check_ui_blockers=False, simulate_mistakes=False):
         return False
 
     controller.human_delay(0.6, 1.0)
@@ -477,7 +477,7 @@ def fill_plank_sack(ctx) -> bool:
         return False
 
     debug_log.log("bank", "filling plank sack")
-    if not controller.click_entity(ctx.ser, sack, check_ui_blockers=False):
+    if not controller.click_entity(ctx.ser, sack, check_ui_blockers=False, simulate_mistakes=False):
         return False
 
     controller.human_delay(0.6, 1.0)
