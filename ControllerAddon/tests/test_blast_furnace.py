@@ -53,6 +53,16 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_objects", lambda: [])
     monkeypatch.setattr(controller, "get_varbit", lambda vid: None)
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "get_state", lambda: {})
+    monkeypatch.setattr(controller, "get_player", lambda: {"localX": 0, "localY": 0})
+    # Fake clock: every wait in the routine runs on bf._now/_sleep (2026-09-04), so a budget
+    # expires instantly here instead of really sleeping through it.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(bf, "_now", lambda: clock["t"])
+
+    def _sleep(s):
+        clock["t"] += s
+    monkeypatch.setattr(bf, "_sleep", _sleep)
     monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
     monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
     monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
@@ -359,3 +369,84 @@ def test_collect_bars_swap_wears_the_smiths_pair_when_that_is_the_ice_pair(monke
     monkeypatch.setattr(bf, "ensure_gloves_worn", lambda ctx, name: order.append(name) or True)
     assert bf.collect_bars(_Ctx(), {"barType": "gold"}, glove_swap=True) is True
     assert order == ["Smiths gloves (i)", "take", "Goldsmith gauntlets"]
+
+
+# --- event-driven outcomes (2026-09-04) ------------------------------------------------
+
+def _belt(obj_id, x, y, actions, dist=1):
+    return {"name": "Conveyor belt", "id": obj_id, "x": x, "y": y, "distance": dist,
+            "visible": True, "actions": actions, "screenX": 100, "screenY": 100}
+
+
+def test_find_conveyor_prefers_the_tile_that_offers_put_ore_on(monkeypatch):
+    # LIVE bf_live3: the nearest+north heuristic picked a 9101 tile with no actions; six
+    # clicks became "Walk here" and the trip safety-stopped with 0/27 deposited.
+    monkeypatch.setattr(controller, "get_objects", lambda: [
+        _belt(9101, 1943, 4965, [], dist=1), _belt(9101, 1943, 4966, [], dist=1),
+        _belt(9100, 1943, 4967, ["Put-ore-on"], dist=2)])
+    assert bf.find_conveyor({})["id"] == 9100
+
+
+def test_find_conveyor_falls_back_to_north_of_nearest_without_actions(monkeypatch):
+    monkeypatch.setattr(controller, "get_objects", lambda: [
+        _belt(9101, 1943, 4965, None, dist=1), _belt(9101, 1943, 4966, None, dist=2)])
+    assert bf.find_conveyor({})["y"] == 4966
+
+
+def test_deposit_via_conveyor_returns_when_the_ore_is_gone(monkeypatch):
+    inv = {"n": 27}
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Gold ore")] * inv["n"])
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda: [_belt(9100, 1943, 4967, ["Put-ore-on"])])
+    clicks = []
+
+    def click(ser, entity, **kw):
+        clicks.append(entity["id"])
+        inv["n"] = 0          # the single Put-ore-on click takes everything
+        return True
+    monkeypatch.setattr(controller, "click_entity", click)
+    assert bf.deposit_via_conveyor(_Ctx(), {}, ["Gold ore"]) == 27
+    assert clicks == [9100]
+
+
+def test_deposit_via_conveyor_reclicks_only_after_a_real_stall(monkeypatch):
+    inv = {"n": 27}
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Gold ore")] * inv["n"])
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda: [_belt(9100, 1943, 4967, ["Put-ore-on"])])
+    clicks = []
+
+    def click(ser, entity, **kw):
+        clicks.append(entity["id"])
+        if len(clicks) == 2:
+            inv["n"] = 0      # the reclick works
+        return True
+    monkeypatch.setattr(controller, "click_entity", click)
+    assert bf.deposit_via_conveyor(_Ctx(), {}, ["Gold ore"], timeout_s=30.0) == 27
+    assert clicks == [9100, 9100]
+
+
+def test_collect_bars_spaces_the_dialogue_when_it_opens(monkeypatch):
+    varbit = {"value": 27}
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: varbit["value"])
+    monkeypatch.setattr(controller, "get_objects", lambda: [_dispenser()])
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": True})
+    order = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: order.append("take") or True)
+
+    def tap(ser, key):
+        order.append(key)
+        varbit["value"] = 0
+    monkeypatch.setattr(controller, "key_tap", tap)
+    monkeypatch.setattr(controller, "wait_until_player_idle",
+                        lambda **kw: order.append("idle-wait") or True)
+    assert bf.collect_bars(_Ctx(), {"barType": "gold"}) is True
+    assert order == ["take", "SPACE"]          # no settle/idle fallback needed
+
+
+def test_wait_for_bars_ready_is_immediate_when_already_ready(monkeypatch):
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: 27)
+    assert bf.wait_for_bars_ready(947, timeout_s=25.0) is True
+    assert bf._now() == 1000.0                 # no wait spent at all

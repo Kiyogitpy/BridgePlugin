@@ -56,8 +56,10 @@
 import time
 
 import banker
+import bridge_events
 import controller
 import debug_log
+import settings
 import travel
 
 COAL_BAG_CAPACITY = 27
@@ -113,6 +115,67 @@ GLOVE_WEAR_TIMEOUT_S = 4.0
 # Fallback smelt wait when /varbit can't answer (un-rebuilt client): blind but roughly the
 # measured smelt length, so the collect click lands after the bars exist.
 SMELT_BLIND_WAIT_RANGE_S = (8.5, 10.5)
+
+# --- Event-driven outcomes (2026-09-04, docs/superpowers/specs/2026-09-04-event-driven-outcomes-
+# design.md; USER: "optimise blast furnace to be as much subtick as possible") ------------------
+# Every wait below goes through _await: a pushed UDP signal decides WHEN to look, one HTTP read
+# decides WHAT happened, and the HTTP read alone decides at the budget -- so an old client or a
+# dropped packet costs latency, never a wrong click. Baseline per gold trip (bf_live2, 2026-08-31):
+# ~27s, ~9s of it the smelt itself; the rest was 0.3-0.9s fixed delays and 0.3-0.6s polls.
+VARBIT_SUBSCRIPTIONS = tuple(BAR_VARBITS.values())   # pushed as VARBIT_CHANGED (engine posts it)
+BANK_WIDGET_GROUP = 12            # InterfaceID.Bankmain
+DIALOG_WIDGET_GROUPS = (229, 231, 219)   # Messagebox, ChatLeft (npc/player chat), Chatmenu
+DISPENSER_DIALOG_BUDGET_S = 2.5   # dispenser click -> its dialogue, plus the walk
+COLLECT_CONFIRM_S = 3.0           # Space -> dispenser varbit reads 0 / bars in the inventory
+CONVEYOR_STALL_S = 4.0            # no inventory delta and no movement this long -> reclick the belt
+BANK_CLOSE_BUDGET_S = 0.8         # ESC -> bank interface gone
+
+
+def _now():
+    return time.time()
+
+
+def _sleep(s):
+    time.sleep(s)
+
+
+def _await(events, signals, budget_s, confirm, reaction=True, shorten=None, since=None):
+    """bridge_events.await_outcome on this module's clock, with a PRE-CHECK: when confirm()
+    already holds (the bars were ready before we asked, the gloves already on) return at once
+    instead of waiting for a signal that has already been and gone."""
+    if confirm is not None:
+        value = confirm()
+        if value:
+            if reaction:
+                controller.human_delay(*settings.REACTION_DELAY_S)
+            return bridge_events.Outcome(True, None, None, value, 0.0)
+    return bridge_events.await_outcome(events, signals, budget_s, confirm=confirm, since=since,
+                                       reaction=reaction, shorten=shorten,
+                                       now_fn=_now, sleep_fn=_sleep)
+
+
+def _mark(ctx):
+    events = getattr(ctx, "events", None)
+    return events.mark() if events is not None else None
+
+
+def _dialog_open() -> bool:
+    return bool((controller.get_state() or {}).get("dialogOpen"))
+
+
+def _dialog_widget(payload) -> bool:
+    return payload.get("groupId") in DIALOG_WIDGET_GROUPS
+
+
+def _bank_widget(payload) -> bool:
+    return payload.get("groupId") == BANK_WIDGET_GROUP
+
+
+def _await_bank_closed(ctx) -> None:
+    """After ESC: the bank interface going away (WIDGET_CLOSED 12, confirmed by /bank.open)
+    -- replaces the flat 0.3-0.6s "let the bank-closing transition settle" delay."""
+    _await(getattr(ctx, "events", None), {"WIDGET_CLOSED": _bank_widget}, BANK_CLOSE_BUDGET_S,
+           confirm=lambda: not banker.is_open())
 
 
 def gold_glove_swap_active(config: dict) -> bool:
@@ -172,12 +235,13 @@ def ensure_gloves_worn(ctx, name: str) -> bool:
         # check_ui_blockers=False, same as every other interface-element click in this
         # codebase (see the /widget section of CLAUDE.md for the rotate-forever loop the
         # default causes on interface clicks).
+        mark = _mark(ctx)
         controller.click_entity(ctx.ser, item, check_ui_blockers=False)
-        deadline = time.time() + GLOVE_WEAR_TIMEOUT_S
-        while time.time() < deadline:
-            if worn():
-                return True
-            controller.human_delay(0.2, 0.35)
+        # Wearing swaps the pairs, so the INVENTORY changes the instant the wear lands --
+        # that is the signal; /equipment's gloves slot is the truth.
+        if _await(getattr(ctx, "events", None), "INVENTORY_CHANGED", GLOVE_WEAR_TIMEOUT_S,
+                  confirm=worn, since=mark):
+            return True
     return worn()
 
 
@@ -202,23 +266,26 @@ def walk_to_dispenser_wait_tile(ctx) -> None:
     travel.walk_to_exact_tile(ctx, x, y, plane, wait_for_arrival=False)
 
 
-def wait_for_bars_ready(varbit_id, timeout_s: float = BARS_READY_TIMEOUT_S) -> bool:
-    """Poll the bar-dispenser varbit until it reports bars ready (the recording's smelt-done
+def wait_for_bars_ready(varbit_id, timeout_s: float = BARS_READY_TIMEOUT_S, events=None) -> bool:
+    """Wait for the bar-dispenser varbit to report bars ready (the recording's smelt-done
     signal -- lands on the same tick as the Smithing XP drop, so this IS "when experience
-    drops" in signal terms). A None varbit read means "cannot verify" (un-rebuilt client, or
-    an unmapped bar type), never "no bars": fall back to one blind measured-smelt-length wait
-    and report success, same can't-verify posture as collect_bars' own probe. Returns False
-    only on a verified timeout -- bars provably never appeared."""
+    drops" in signal terms). Event-driven since 2026-09-04: the subscribed VARBIT_CHANGED for
+    this bar type or the Smithing XP_GAINED decides when to read the varbit; the varbit read
+    alone decides at the budget. A None varbit read means "cannot verify" (un-rebuilt client,
+    or an unmapped bar type), never "no bars": fall back to one blind measured-smelt-length
+    wait and report success, same can't-verify posture as collect_bars' own probe. Returns
+    False only on a verified timeout -- bars provably never appeared."""
     if varbit_id is None or controller.get_varbit(varbit_id) is None:
         controller.human_delay(*SMELT_BLIND_WAIT_RANGE_S)
         return True
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        ready = controller.get_varbit(varbit_id)
-        if ready not in (0, None):
-            return True
-        controller.human_delay(0.3, 0.5)
-    return False
+    signals = {"VARBIT_CHANGED": lambda p: p.get("varbitId") == varbit_id and (p.get("value") or 0) > 0,
+               "XP_GAINED": lambda p: p.get("skill") == "Smithing"}
+    res = _await(events, signals, timeout_s,
+                 confirm=lambda: controller.get_varbit(varbit_id) not in (0, None))
+    if res:
+        debug_log.log("blast furnace", f"bars ready via {res.signal or 'varbit read'} "
+                                       f"after {res.latency_s:.2f}s")
+    return bool(res)
 
 # Per-bar-type trip patterns, reproduced verbatim from Blast Furnace_Strategies.txt's "Bar
 # patterns" table (which assumes a coal bag + ice gloves). Each trip is a "deposit" list of
@@ -421,7 +488,7 @@ def maybe_top_up_coffer(ctx, config: dict) -> None:
     if not coffer_cfg.get("topUpEnabled"):
         return
 
-    now = time.time()
+    now = _now()
     next_at = ctx.state.data.get("bf_coffer_next_topup_at")
     if next_at is not None and now < next_at:
         return
@@ -442,7 +509,7 @@ def maybe_top_up_coffer(ctx, config: dict) -> None:
         banker.deposit_inventory(ctx, {"keepItems": []})
         withdrew = withdraw_coins_via_x(ctx, amount)
         banker.close_bank(ctx)
-        controller.human_delay(0.3, 0.6)  # let the bank-closing transition settle
+        _await_bank_closed(ctx)           # the bank interface is gone (was a flat 0.3-0.6s)
         if not withdrew or current_coins() < amount:
             debug_log.log("blast furnace", "couldn't withdraw enough coins for coffer top-up -- will retry shortly")
             ctx.state.data["bf_coffer_next_topup_at"] = now + 60
@@ -622,7 +689,7 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
                 ctx.state.trigger_safety_stop("no coal bag in inventory or bank -- this bar type needs one")
                 return False
         banker.close_bank(ctx)
-        controller.human_delay(0.3, 0.6)  # let the bank-closing transition settle
+        _await_bank_closed(ctx)           # the bank interface is gone (was a flat 0.3-0.6s)
     elif config.get("bank", {}).get("teleportFallback"):
         if need_bag_fill:
             ctx.state.trigger_safety_stop(
@@ -711,7 +778,8 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
             # simply collected at the start of the next trip). A verified timeout here means
             # ore went in and bars provably never came out, and the usual cause is a drained
             # coffer (the dwarves stop operating the furnace), so say so.
-            if not wait_for_bars_ready(BAR_VARBITS.get((config.get("barType") or "").lower())):
+            if not wait_for_bars_ready(BAR_VARBITS.get((config.get("barType") or "").lower()),
+                                       events=getattr(ctx, "events", None)):
                 ctx.state.trigger_safety_stop(
                     "gold bars never appeared in the dispenser after the conveyor deposit -- is the coffer empty?"
                 )
@@ -787,11 +855,11 @@ def collect_bars(ctx, config: dict, glove_swap: bool = False) -> bool:
 
     debug_log.log("blast furnace", "collecting bars")
 
-    deadline = time.time() + 20.0
+    deadline = _now() + 20.0
     attempted = False
     last_pos = None
     nudge_key = "LEFT"
-    while time.time() < deadline:
+    while _now() < deadline:
         if varbit_id is not None and attempted and controller.get_varbit(varbit_id) == 0:
             break  # confirmed collected -- dispenser reports nothing left ready
 
@@ -822,20 +890,29 @@ def collect_bars(ctx, config: dict, glove_swap: bool = False) -> bool:
         last_pos = pos
 
         attempted = True
-        controller.human_delay(0.2, 0.4)
+        events = getattr(ctx, "events", None)
+        mark = _mark(ctx)
         controller.click_entity(ctx.ser, dispenser)
-        # Settle delay before polling idle: CONFIRMED live (user report) a walk-over triggered
-        # by this click doesn't register as movement immediately -- see
-        # wait_until_player_idle's own docstring for the full account of why this order
-        # (settle, then idle-poll, then Space) matters.
-        controller.human_delay(0.6, 0.9)
-        controller.wait_until_player_idle(timeout_s=8.0)
-        controller.human_delay(0.3, 0.6)
+        # The Take opens a dialogue (the game walks over first): WIDGET_LOADED of a chat
+        # interface, confirmed by /state.dialogOpen, is when Space is due -- replacing the
+        # settle + idle-poll + fixed delays (~2s per collect, bf_live2). No dialogue within
+        # the budget: the old settle/idle path, so nothing is worse than before.
+        walk_s = 0.7 * max(0, dispenser.get("distance") or 0)
+        if not _await(events, {"WIDGET_LOADED": _dialog_widget, "PLAYER_STOPPED": None},
+                      DISPENSER_DIALOG_BUDGET_S + walk_s, confirm=_dialog_open, since=mark):
+            controller.human_delay(0.6, 0.9)
+            controller.wait_until_player_idle(timeout_s=8.0)
+            controller.human_delay(0.3, 0.6)
+        mark = _mark(ctx)
         controller.key_tap(ctx.ser, "SPACE")
-        controller.human_delay(0.5, 0.8)
-
         if varbit_id is None:
+            controller.human_delay(0.5, 0.8)
             break  # unmapped bar type -- can't verify, one pass is all we can do
+        # Bars landing: the inventory changes and the dispenser varbit drops to 0.
+        _await(events, {"INVENTORY_CHANGED": None,
+                        "VARBIT_CHANGED": lambda p: p.get("varbitId") == varbit_id and not p.get("value")},
+               COLLECT_CONFIRM_S, confirm=lambda: controller.get_varbit(varbit_id) == 0,
+               since=mark)
 
     if varbit_id is not None:
         still_ready = controller.get_varbit(varbit_id)
@@ -918,32 +995,46 @@ def deposit_via_conveyor(ctx, config: dict, names: list, timeout_s: float = 30.0
         debug_log.log("blast furnace", "conveyor belt not found for deposit -- may have moved out of range")
         return 0
 
+    events = getattr(ctx, "events", None)
+    mark = _mark(ctx)
     if not controller.click_entity(ctx.ser, target):
         return 0
 
-    stall_retry_s = 4.0
-    deadline = time.time() + timeout_s
-    last_count = before
-    last_progress_at = time.time()
-    last_local = None
-    while time.time() < deadline:
-        time.sleep(0.6)
+    # Event-driven since 2026-09-04: INVENTORY_CHANGED (ore leaving) and PLAYER_MOVING/STOPPED
+    # (the walk to the belt) decide when to look; the inventory count and the player's local
+    # position are the truth. Same rule as before: a reclick only when BOTH have been static
+    # for CONVEYOR_STALL_S, since a click that is still walking the player shows no delta yet.
+    state = {"count": before, "local": None}
+
+    def progress():
         count = matching_count()
-        player = controller.get_player()
+        player = controller.get_player() or {}
         local = (player.get("localX"), player.get("localY"))
-        moved = last_local is not None and local != last_local
-        last_local = local
-        if count < last_count or moved:
-            last_count = count
-            last_progress_at = time.time()
-        elif time.time() - last_progress_at >= stall_retry_s:
-            debug_log.log("blast furnace", "no progress depositing onto the conveyor -- reclicking")
-            retry_target = find_conveyor(config)
-            if retry_target is not None:
-                controller.click_entity(ctx.ser, retry_target)
-            last_progress_at = time.time()
+        moved = state["local"] is not None and local != state["local"]
+        state["local"] = local
         if count == 0:
+            return "done"
+        if count < state["count"] or moved:
+            state["count"] = count
+            return "progress"
+        return None
+
+    deadline = _now() + timeout_s
+    while _now() < deadline:
+        res = _await(events, {"INVENTORY_CHANGED": None, "PLAYER_MOVING": None,
+                              "PLAYER_STOPPED": None},
+                     min(CONVEYOR_STALL_S, deadline - _now()), confirm=progress,
+                     reaction=False, since=mark)
+        mark = None
+        if res and res.confirmed == "done":
             break
+        if res:
+            continue    # ore is leaving or the player is still walking -- not a stall
+        debug_log.log("blast furnace", "no progress depositing onto the conveyor -- reclicking")
+        retry_target = find_conveyor(config)
+        if retry_target is not None:
+            mark = _mark(ctx)
+            controller.click_entity(ctx.ser, retry_target)
 
     return before - matching_count()
 
@@ -1045,6 +1136,16 @@ def find_conveyor(config: dict):
         return None
 
     candidates.sort(key=lambda o: o.get("distance", 9999))
+    # The bridge reports each object's actions, and only ONE of the belt's entries offers
+    # Put-ore-on (id 9100; the multi-tile 9101 entries report no actions at all). LIVE
+    # 2026-09-04 (bf_live3): the north-of-nearest heuristic below picked a 9101 tile from a
+    # different standing spot and six clicks resolved to "Walk here" -- 0/27 deposited, safety
+    # stop. Prefer the tile that offers the action; the heuristic stays for an older client
+    # build that reports no actions.
+    with_action = [o for o in candidates
+                   if any("put-ore-on" in (a or "").lower() for a in (o.get("actions") or []))]
+    if with_action:
+        return with_action[0]
     nearest = candidates[0]
     north = next(
         (
