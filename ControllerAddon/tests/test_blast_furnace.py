@@ -470,7 +470,7 @@ def test_run_trip_gold_swap_wears_gauntlets_on_the_run_to_the_bank(monkeypatch):
     monkeypatch.setattr(bf, "wait_for_bars_ready", lambda vid, **kw: True)
     collects = []
     monkeypatch.setattr(bf, "collect_bars",
-                        lambda ctx, config, glove_swap=False, swap_back=True: collects.append(swap_back) or True)
+                        lambda ctx, config, glove_swap=False, swap_back=True, **kw: collects.append(swap_back) or True)
     monkeypatch.setattr(bf, "find_conveyor", lambda config: {"name": "Conveyor belt"})
     monkeypatch.setattr(bf, "deposit_via_conveyor", lambda ctx, config, names: 27)
     ctx = _Ctx()
@@ -486,3 +486,23 @@ def test_swap_back_on_the_run_is_a_noop_when_already_worn(monkeypatch):
     monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: clicks.append(e) or True)
     bf._swap_back_on_the_run(_Ctx(), {"name": "Bank chest", "id": 1, "x": 1, "y": 1})
     assert clicks == []
+
+
+def test_collect_bars_prehovers_the_bank_chest_while_the_bars_land(monkeypatch):
+    varbit = {"value": 27}
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: varbit["value"])
+    monkeypatch.setattr(controller, "get_objects", lambda: [_dispenser()])
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": True})
+    monkeypatch.setattr(banker, "find_nearby_bank",
+                        lambda cfg: {"name": "Bank chest", "id": 26707, "x": 1, "y": 2, "screenX": 5, "screenY": 5})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    order = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: order.append("take") or True)
+    monkeypatch.setattr(controller, "hover_entity", lambda ser, e, **kw: order.append(("hover", e["name"])) or True)
+
+    def tap(ser, key):
+        order.append(key)
+        varbit["value"] = 0
+    monkeypatch.setattr(controller, "key_tap", tap)
+    assert bf.collect_bars(_Ctx(), {"barType": "gold"}, prehover_bank=True) is True
+    assert order == ["take", "SPACE", ("hover", "Bank chest")]

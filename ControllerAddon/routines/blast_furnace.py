@@ -637,7 +637,7 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
     # gets the ice-glove wrap too -- a restart with 27 hot bars stranded in the dispenser
     # would otherwise try to grab them wearing the gauntlets.
     glove_swap = gold_glove_swap_active(config)
-    if not collect_bars(ctx, config, glove_swap=glove_swap, swap_back=False):
+    if not collect_bars(ctx, config, glove_swap=glove_swap, swap_back=False, prehover_bank=True):
         return False
 
     withdraw, need_bag_fill, loose_coal, bag_coal = plan_bank_withdrawals(trip)
@@ -819,7 +819,7 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
                     "gold bars never appeared in the dispenser after the conveyor deposit -- is the coffer empty?"
                 )
                 return False
-        if not collect_bars(ctx, config, glove_swap=glove_swap, swap_back=False):
+        if not collect_bars(ctx, config, glove_swap=glove_swap, swap_back=False, prehover_bank=True):
             return False
 
     return True
@@ -848,7 +848,23 @@ def _swap_back_on_the_run(ctx, bank_obj) -> None:
         )
 
 
-def collect_bars(ctx, config: dict, glove_swap: bool = False, swap_back: bool = True) -> bool:
+def _prehover_bank(ctx) -> bool:
+    """USER 2026-09-04: "while using space and getting the bars we can pre aim the bank
+    chest" -- the bars land ~0.7s after the Space (recording +1.1s from the click), which is
+    a cursor flight, so the run-to-the-bank click that follows is a click in place. A courtesy
+    move: no chest in view, or a projection under a UI panel, and it silently does nothing."""
+    bank = banker.find_nearby_bank({})
+    if bank is None or bank.get("screenX") is None:
+        return False
+    refresh = None
+    if bank.get("x") is not None and bank.get("id") is not None:
+        refresh = controller.object_refresh_target(
+            bank["x"], bank["y"], bank.get("plane", 0), bank["id"])
+    return bool(controller.hover_entity(ctx.ser, bank, refresh_target=refresh))
+
+
+def collect_bars(ctx, config: dict, glove_swap: bool = False, swap_back: bool = True,
+                 prehover_bank: bool = False) -> bool:
     """Collect everything currently sitting in the bar dispenser, verified via the same varbit
     the official RuneLite Blast Furnace plugin itself reads to show a bar-ready icon
     (BAR_VARBITS, decompiled from BarsOres.java/BlastFurnaceOverlay.java in
@@ -989,6 +1005,8 @@ def collect_bars(ctx, config: dict, glove_swap: bool = False, swap_back: bool = 
         if res and res.confirmed == "modal":
             mark = _mark(ctx)
             controller.key_tap(ctx.ser, "SPACE")
+            if prehover_bank:
+                _prehover_bank(ctx)    # the bars are landing meanwhile; see _prehover_bank
             if varbit_id is None:
                 controller.human_delay(0.5, 0.8)
             else:
