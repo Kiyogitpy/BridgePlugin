@@ -498,7 +498,8 @@ def _click_bank_button(ctx, button_key: str) -> bool:
     if button.get("screenX") is None:
         return False
 
-    controller.click_entity(ctx.ser, button, offset=(0, 0), simulate_mistakes=False)
+    controller.click_entity(ctx.ser, button, offset=(0, 0), simulate_mistakes=False,
+                            check_ui_blockers=False)
     controller.human_delay(0.3, 0.6)
     return True
 
@@ -552,7 +553,10 @@ def deposit_inventory(ctx, config: dict) -> None:
         if deposit_all.get("screenX") is not None:
             before = len(controller.get_inventory())
             mark = _mark(ctx)
-            controller.click_entity(ctx.ser, deposit_all, offset=(0, 0))
+            # check_ui_blockers=False: a bank BUTTON is inside the bank interface, which the
+            # 2026-09-02 blocker rects cover -- the default check refused it and rotated the
+            # camera instead (LIVE bf_live5, 2026-09-04). Same rule as every interface click.
+            controller.click_entity(ctx.ser, deposit_all, offset=(0, 0), check_ui_blockers=False)
             if before > 0:
                 # The deposit landing is an INVENTORY_CHANGED; fewer items is the truth.
                 bridge_events.await_outcome(_events(ctx), "INVENTORY_CHANGED", DEPOSIT_ALL_BUDGET_S,
@@ -581,7 +585,10 @@ def deposit_inventory(ctx, config: dict) -> None:
             continue
         deposited_names.add(name)
         controller.key_down(ctx.ser, "SHIFT")
-        controller.click_entity(ctx.ser, item)
+        # Inventory items sit inside the bank's own side panel -- an interface click, so it
+        # opts out of the blocker check (LIVE bf_live5, 2026-09-04: refused + camera rotate,
+        # and the ore never left the inventory).
+        controller.click_entity(ctx.ser, item, check_ui_blockers=False)
         controller.key_up(ctx.ser, "SHIFT")
         controller.human_delay(0.2, 0.4)
 
@@ -596,7 +603,8 @@ def set_quantity_mode(ctx, mode: str) -> bool:
         debug_log.log("bank", f"quantity mode button '{mode}' not found (bank open?)")
         return False
 
-    controller.click_entity(ctx.ser, button, offset=(0, 0), simulate_mistakes=False)
+    controller.click_entity(ctx.ser, button, offset=(0, 0), simulate_mistakes=False,
+                            check_ui_blockers=False)
     controller.human_delay(0.2, 0.4)
     return True
 
@@ -690,7 +698,7 @@ def withdraw_loadout(ctx, config: dict, fresh: bool = False) -> None:
 
         debug_log.log("bank", f"withdrawing {quantity}x {slot.get('name')}")
         for _ in range(quantity):
-            controller.click_entity(ctx.ser, slot)
+            controller.click_entity(ctx.ser, slot, check_ui_blockers=False)
             controller.human_delay(0.15, 0.3)
 
     # Auto-pick fallback, independent of the explicit list above -- CONFIRMED (user request
@@ -751,7 +759,7 @@ def withdraw_all_shift(ctx, name: str, fresh: bool = False) -> bool:
 
     debug_log.log("bank", f"shift-withdrawing all {slot.get('name')}")
     controller.key_down(ctx.ser, "SHIFT")
-    ok = controller.click_entity(ctx.ser, slot)
+    ok = controller.click_entity(ctx.ser, slot, check_ui_blockers=False)
     controller.key_up(ctx.ser, "SHIFT")
     if not ok:
         return False
@@ -893,7 +901,7 @@ def search_and_withdraw(
     landed = 0
 
     for _ in range(quantity):
-        if controller.click_entity(ctx.ser, slot):
+        if controller.click_entity(ctx.ser, slot, check_ui_blockers=False):
             landed += 1
 
         controller.human_delay(0.15, 0.3)

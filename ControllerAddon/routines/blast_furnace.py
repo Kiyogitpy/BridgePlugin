@@ -128,6 +128,7 @@ DIALOG_WIDGET_GROUPS = (229, 231, 219)   # Messagebox, ChatLeft (npc/player chat
 DISPENSER_DIALOG_BUDGET_S = 2.5   # dispenser click -> its dialogue, plus the walk
 COLLECT_CONFIRM_S = 3.0           # Space -> dispenser varbit reads 0 / bars in the inventory
 CONVEYOR_STALL_S = 4.0            # no inventory delta and no movement this long -> reclick the belt
+CONVEYOR_CLICK_TRIES = 4          # refused (UI-blocked) conveyor clicks re-resolved before giving up
 BANK_CLOSE_BUDGET_S = 0.8         # ESC -> bank interface gone
 
 
@@ -990,14 +991,23 @@ def deposit_via_conveyor(ctx, config: dict, names: list, timeout_s: float = 30.0
     if before == 0:
         return 0
 
-    target = find_conveyor(config)
-    if target is None:
-        debug_log.log("blast furnace", "conveyor belt not found for deposit -- may have moved out of range")
-        return 0
-
     events = getattr(ctx, "events", None)
-    mark = _mark(ctx)
-    if not controller.click_entity(ctx.ser, target):
+    # A refused click (aim point behind a UI panel -- click_entity rotates the camera and
+    # returns False, telling the caller to re-resolve) used to return 0 here and the trip
+    # safety-stopped 1.8s after the bank closed with "0/27 -- ran out?" (LIVE bf_live5,
+    # 2026-09-04: the camera had just turned LEFT for the bank chest). Re-resolve and retry.
+    mark = None
+    for attempt in range(CONVEYOR_CLICK_TRIES):
+        target = find_conveyor(config)
+        if target is None:
+            debug_log.log("blast furnace", "conveyor belt not found for deposit -- may have moved out of range")
+            return 0
+        mark = _mark(ctx)
+        if controller.click_entity(ctx.ser, target):
+            break
+        debug_log.log("blast furnace", f"conveyor click refused (attempt {attempt + 1}) -- re-resolving")
+        controller.human_delay(0.3, 0.5)
+    else:
         return 0
 
     # Event-driven since 2026-09-04: INVENTORY_CHANGED (ore leaving) and PLAYER_MOVING/STOPPED
