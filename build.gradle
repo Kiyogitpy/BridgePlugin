@@ -36,12 +36,60 @@ tasks.withType(JavaCompile).configureEach {
 	options.release.set(11)
 }
 
+// ZombieLite (../ZombieLite, the user's overlay-only boss-helper plugin bundle, `no-packets`
+// branch) rides along in the SAME client when its checkout is present: `run` builds its jar in
+// place and puts it on the classpath, and ExamplePluginTest loads its CustomPlugins.CLASSLIST by
+// reflection ahead of ControllerPlugin. Nothing here is a compile-time dependency, so a machine
+// without the checkout gets the bridge alone, exactly as before. Added 2026-09-05 so a Hunllef
+// kill can be played by hand with ZombieLite's counters up while /recorder captures it.
+def zombieLiteDir = file('../ZombieLite')
+def zombieLitePresent = zombieLiteDir.isDirectory()
+
+configurations {
+	zombieLite
+}
+
+dependencies {
+	if (zombieLitePresent) {
+		zombieLite files(
+			"${zombieLiteDir}/build/libs/example-1.0-SNAPSHOT.jar",
+			"${zombieLiteDir}/config-processor/build/libs/config-processor.jar",
+			"${zombieLiteDir}/lib/jaco-mp3-player-0.9.5.jar"
+		)
+		// ZombieLite's only Maven runtime dependency beyond the RuneLite client itself. Its lwjgl
+		// deps are NOT needed: HdPlugin is not in CustomPlugins.CLASSLIST and never loads.
+		zombieLite('com.google.inject.extensions:guice-multibindings:4.1.0') {
+			exclude group: 'com.google.inject'
+		}
+	}
+}
+
+tasks.register('buildZombieLite', GradleBuild) {
+	description = "Builds ../ZombieLite plugin jar so run can load it next to the bridge"
+	onlyIf { zombieLitePresent }
+	dir = zombieLiteDir
+	tasks = ['jar', ':config-processor:jar']
+}
+
+tasks.register('checkZombieLite', JavaExec) {
+	description = "Links every ZombieLite plugin class against this build's RuneLite without launching a client"
+	onlyIf { zombieLitePresent }
+	dependsOn 'buildZombieLite'
+	classpath = sourceSets.test.runtimeClasspath + configurations.zombieLite
+	mainClass = 'com.example.ZombieLiteClasspathCheck'
+}
+
 tasks.register('run', JavaExec) {
-	classpath = sourceSets.test.runtimeClasspath
+	if (zombieLitePresent) {
+		dependsOn 'buildZombieLite'
+	}
+	classpath = sourceSets.test.runtimeClasspath + configurations.zombieLite
 	mainClass = pluginMainClass
 
+	// ZombieLite's own launcher sets this for its HD plugin; harmless when that plugin is absent.
+	systemProperty 'rlhd.resource-path', "${zombieLiteDir}/src/main/resources"
 	jvmArgs "-ea"
-	args "--developer-mode", "--debug"
+	args "--developer-mode", "--debug", "--disable-telemetry"
 }
 
 tasks.register('shadowJar', Jar) {

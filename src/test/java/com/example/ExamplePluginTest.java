@@ -5,6 +5,11 @@ import com.sun.jna.Native;
 import com.sun.jna.Pointer;
 import net.runelite.client.RuneLite;
 import net.runelite.client.externalplugins.ExternalPluginManager;
+import net.runelite.client.plugins.Plugin;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 public class ExamplePluginTest
 {
@@ -66,12 +71,40 @@ public class ExamplePluginTest
 		boolean SetProcessDPIAware();
 	}
 
+	/**
+	 * ZombieLite's plugin list, when its jar is on the classpath (build.gradle's `run` puts it
+	 * there whenever ../ZombieLite exists). Resolved by reflection on purpose: this launcher must
+	 * compile and run with no ZombieLite checkout at all, so nothing here may name its classes.
+	 */
+	@SuppressWarnings("unchecked")
+	private static List<Class<? extends Plugin>> zombieLitePlugins()
+	{
+		try
+		{
+			Class<?> custom = Class.forName("com.salvation.plugins.CustomPlugins");
+			Class<? extends Plugin>[] list = (Class<? extends Plugin>[]) custom.getField("CLASSLIST").get(null);
+			System.err.println("[zombielite] loading " + list.length + " ZombieLite plugins alongside the bridge");
+			return new ArrayList<>(Arrays.asList(list));
+		}
+		catch (ClassNotFoundException e)
+		{
+			System.err.println("[zombielite] not on the classpath -- bridge only");
+			return new ArrayList<>();
+		}
+		catch (ReflectiveOperationException | RuntimeException e)
+		{
+			System.err.println("[zombielite] present but unloadable, continuing without it: " + e);
+			return new ArrayList<>();
+		}
+	}
+
+	@SuppressWarnings("unchecked")
 	public static void main(String[] args) throws Exception
 	{
 		makeProcessDpiAware();
-		ExternalPluginManager.loadBuiltin(
-			ControllerPlugin.class
-		);
+		List<Class<? extends Plugin>> plugins = zombieLitePlugins();
+		plugins.add(ControllerPlugin.class);
+		ExternalPluginManager.loadBuiltin(plugins.toArray(new Class[0]));
 		RuneLite.main(args);
 	}
 }
