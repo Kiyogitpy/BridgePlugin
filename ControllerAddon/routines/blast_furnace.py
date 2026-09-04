@@ -637,7 +637,7 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
     # gets the ice-glove wrap too -- a restart with 27 hot bars stranded in the dispenser
     # would otherwise try to grab them wearing the gauntlets.
     glove_swap = gold_glove_swap_active(config)
-    if not collect_bars(ctx, config, glove_swap=glove_swap):
+    if not collect_bars(ctx, config, glove_swap=glove_swap, swap_back=False):
         return False
 
     withdraw, need_bag_fill, loose_coal, bag_coal = plan_bank_withdrawals(trip)
@@ -663,6 +663,8 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
 
     bank_obj = banker.find_nearby_bank(bank_cfg)
     if bank_obj is not None:
+        if glove_swap:
+            _swap_back_on_the_run(ctx, bank_obj)
         if not banker.open_bank(ctx, bank_obj):
             ctx.state.trigger_safety_stop("failed to open the Blast Furnace bank chest")
             return False
@@ -817,13 +819,36 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
                     "gold bars never appeared in the dispenser after the conveyor deposit -- is the coffer empty?"
                 )
                 return False
-        if not collect_bars(ctx, config, glove_swap=glove_swap):
+        if not collect_bars(ctx, config, glove_swap=glove_swap, swap_back=False):
             return False
 
     return True
 
 
-def collect_bars(ctx, config: dict, glove_swap: bool = False) -> bool:
+def _swap_back_on_the_run(ctx, bank_obj) -> None:
+    """USER 2026-09-04: "instead of equipping gold gauntlets before running to bank we can
+    click the bank to start running and while running equip them then reclick bank". The
+    bank click starts the run; the wear lands mid-run (an inventory click drops the queued
+    open-bank interaction but not the walk itself); banker.open_bank's own first click, which
+    fires while still running in, re-queues the open on arrival. Saves the ~1.2s the swap
+    used to block for before the run started (bf_live8). Soft on a failed wear here -- the
+    pre-deposit check in run_trip is the hard gate."""
+    worn = ((controller.get_equipment().get("gloves") or {}).get("name") or "").lower()
+    if worn == GOLDSMITH_GAUNTLETS.lower():
+        return
+    refresh = None
+    if bank_obj.get("x") is not None and bank_obj.get("id") is not None:
+        refresh = controller.object_refresh_target(
+            bank_obj["x"], bank_obj["y"], bank_obj.get("plane", 0), bank_obj["id"])
+    controller.click_entity(ctx.ser, bank_obj, refresh_target=refresh)
+    if not ensure_gloves_worn(ctx, GOLDSMITH_GAUNTLETS):
+        debug_log.log(
+            "blast furnace",
+            f"couldn't swap back to {GOLDSMITH_GAUNTLETS} on the run to the bank -- will retry before the next deposit",
+        )
+
+
+def collect_bars(ctx, config: dict, glove_swap: bool = False, swap_back: bool = True) -> bool:
     """Collect everything currently sitting in the bar dispenser, verified via the same varbit
     the official RuneLite Blast Furnace plugin itself reads to show a bar-ready icon
     (BAR_VARBITS, decompiled from BarsOres.java/BlastFurnaceOverlay.java in
@@ -988,11 +1013,13 @@ def collect_bars(ctx, config: dict, glove_swap: bool = False) -> bool:
                 f"bar dispenser still shows {still_ready} {bar_type} bar(s) ready after retries -- may have missed a collection",
             )
 
-    if glove_swap:
+    if glove_swap and swap_back:
         # Swap back on the way to the bank (USER's own phrasing) -- the next batch's XP is
         # granted while these are worn, so they go on right after the take, and run_trip's
         # pre-deposit check re-verifies before the ore hits the belt. Soft on failure here
         # (that check is the hard gate): a missed swap-back alone shouldn't end the session.
+        # run_trip passes swap_back=False and does this ON THE RUN to the bank instead
+        # (_swap_back_on_the_run); this path stays for any other caller.
         if not ensure_gloves_worn(ctx, GOLDSMITH_GAUNTLETS):
             debug_log.log(
                 "blast furnace",

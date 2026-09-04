@@ -244,7 +244,7 @@ def test_run_trip_gold_swap_keeps_both_glove_pairs_across_the_deposit(monkeypatc
     monkeypatch.setattr(bf, "gold_glove_swap_active", lambda config: True)
     monkeypatch.setattr(bf, "ensure_gloves_worn", lambda ctx, name: True)
     monkeypatch.setattr(bf, "wait_for_bars_ready", lambda vid, **kw: True)
-    monkeypatch.setattr(bf, "collect_bars", lambda ctx, config, glove_swap=False: True)
+    monkeypatch.setattr(bf, "collect_bars", lambda ctx, config, glove_swap=False, **kw: True)
     monkeypatch.setattr(bf, "find_conveyor", lambda config: {"name": "Conveyor belt"})
     monkeypatch.setattr(bf, "deposit_via_conveyor", lambda ctx, config, names: 27)
 
@@ -267,7 +267,7 @@ def test_run_trip_gold_swap_waits_for_smelt_before_collecting(monkeypatch):
     monkeypatch.setattr(bf, "walk_to_dispenser_wait_tile",
                         lambda ctx: order.append("walk"))
     monkeypatch.setattr(bf, "collect_bars",
-                        lambda ctx, config, glove_swap=False: order.append(("collect", glove_swap)) or True)
+                        lambda ctx, config, glove_swap=False, **kw: order.append(("collect", glove_swap)) or True)
     monkeypatch.setattr(bf, "find_conveyor", lambda config: {"name": "Conveyor belt"})
     monkeypatch.setattr(bf, "deposit_via_conveyor",
                         lambda ctx, config, names: order.append(("deposit", tuple(names))) or 27)
@@ -292,7 +292,7 @@ def test_run_trip_gold_swap_safety_stops_when_bars_never_smelt(monkeypatch):
     monkeypatch.setattr(bf, "gold_glove_swap_active", lambda config: True)
     monkeypatch.setattr(bf, "ensure_gloves_worn", lambda ctx, name: True)
     monkeypatch.setattr(bf, "wait_for_bars_ready", lambda vid, **kw: False)
-    monkeypatch.setattr(bf, "collect_bars", lambda ctx, config, glove_swap=False: True)
+    monkeypatch.setattr(bf, "collect_bars", lambda ctx, config, glove_swap=False, **kw: True)
     monkeypatch.setattr(bf, "find_conveyor", lambda config: {"name": "Conveyor belt"})
     monkeypatch.setattr(bf, "deposit_via_conveyor", lambda ctx, config, names: 27)
 
@@ -312,7 +312,7 @@ def test_run_trip_non_swap_gold_is_unchanged(monkeypatch):
     monkeypatch.setattr(bf, "wait_for_bars_ready",
                         lambda vid, **kw: order.append("wait") or True)
     monkeypatch.setattr(bf, "collect_bars",
-                        lambda ctx, config, glove_swap=False: order.append(("collect", glove_swap)) or True)
+                        lambda ctx, config, glove_swap=False, **kw: order.append(("collect", glove_swap)) or True)
     monkeypatch.setattr(bf, "find_conveyor", lambda config: {"name": "Conveyor belt"})
     monkeypatch.setattr(bf, "deposit_via_conveyor", lambda ctx, config, names: 28)
 
@@ -450,3 +450,39 @@ def test_wait_for_bars_ready_is_immediate_when_already_ready(monkeypatch):
     monkeypatch.setattr(controller, "get_varbit", lambda vid: 27)
     assert bf.wait_for_bars_ready(947, timeout_s=25.0) is True
     assert bf._now() == 1000.0                 # no wait spent at all
+
+
+def test_run_trip_gold_swap_wears_gauntlets_on_the_run_to_the_bank(monkeypatch):
+    # USER 2026-09-04: click the bank to start running, wear the gauntlets mid-run, and let
+    # open_bank's own click re-queue the open on arrival.
+    recorded = {}
+    order = []
+    _stub_bank(monkeypatch, recorded)
+    monkeypatch.setattr(banker, "open_bank", lambda ctx, obj: order.append("open_bank") or True)
+    monkeypatch.setattr(banker, "find_nearby_bank",
+                        lambda cfg: {"name": "Bank chest", "id": 26707, "x": 1, "y": 2, "plane": 0})
+    _equip_gloves(monkeypatch, "Smiths gloves (i)")
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: order.append(("click", e.get("name"))) or True)
+    monkeypatch.setattr(bf, "gold_glove_swap_active", lambda config: True)
+    monkeypatch.setattr(bf, "ensure_gloves_worn", lambda ctx, name: order.append(("wear", name)) or True)
+    monkeypatch.setattr(bf, "wait_for_bars_ready", lambda vid, **kw: True)
+    collects = []
+    monkeypatch.setattr(bf, "collect_bars",
+                        lambda ctx, config, glove_swap=False, swap_back=True: collects.append(swap_back) or True)
+    monkeypatch.setattr(bf, "find_conveyor", lambda config: {"name": "Conveyor belt"})
+    monkeypatch.setattr(bf, "deposit_via_conveyor", lambda ctx, config, names: 27)
+    ctx = _Ctx()
+    trip = bf.BAR_TYPES["gold"]["trips"][0]
+    assert bf.run_trip(ctx, {"barType": "gold"}, trip, bar_uses_coal_bag=False) is True
+    assert collects == [False, False]              # collect_bars never swaps back itself
+    assert order[:3] == [("click", "Bank chest"), ("wear", "Goldsmith gauntlets"), "open_bank"]
+
+
+def test_swap_back_on_the_run_is_a_noop_when_already_worn(monkeypatch):
+    _equip_gloves(monkeypatch, "Goldsmith gauntlets")
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: clicks.append(e) or True)
+    bf._swap_back_on_the_run(_Ctx(), {"name": "Bank chest", "id": 1, "x": 1, "y": 1})
+    assert clicks == []
