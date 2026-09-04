@@ -169,6 +169,21 @@ def _dialog_widget(payload) -> bool:
     return payload.get("groupId") in DIALOG_WIDGET_GROUPS
 
 
+# MEASURED bf_live7 07:11:59 (widget dumps every 150ms through a collect): Take -> ~1.5s ->
+# group 270 ("Choose a quantity, then click an item to begin." / "How many would you like to
+# take?"), the same skill-selection interface Giants' Foundry's crucible uses -> Space answers
+# it -> group 229 "You take 27 gold bars from the dispenser. Click here to continue", which
+# needs no dismissal (walking off closes it) -> the bars are in the inventory. Neither
+# /state.dialogOpen nor the m8aq dialogue reader sees group 270; /widget does.
+TAKE_PROMPT_GROUP = 270
+TAKE_PROMPT_CHILD = 5
+
+
+def _take_prompt_open() -> bool:
+    w = controller.get_widget(TAKE_PROMPT_GROUP, TAKE_PROMPT_CHILD) or {}
+    return bool(w.get("clickable"))
+
+
 def _bank_widget(payload) -> bool:
     return payload.get("groupId") == BANK_WIDGET_GROUP
 
@@ -253,6 +268,17 @@ def ensure_gloves_worn(ctx, name: str) -> bool:
 # the dispenser at (1940,4963)). The Blast Furnace room is NOT instanced, so a fixed world
 # tile is safe to hardcode -- same reasoning as chinchompa_hunting's cave tiles.
 DISPENSER_WAIT_TILE = (1940, 4964, 0)
+
+
+def _prehover_item(ctx, name: str) -> bool:
+    """Rest the cursor on the named inventory item (inventory tab opened first) so the click
+    that follows is a click in place. A courtesy move: False when the item is not in the
+    inventory or the hover is refused, never an error."""
+    controller.open_inventory_tab(ctx.ser)
+    item = find_item(name)
+    if item is None:
+        return False
+    return bool(controller.hover_entity(ctx.ser, item, check_ui_blockers=False))
 
 
 def walk_to_dispenser_wait_tile(ctx) -> None:
@@ -774,6 +800,11 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
             # Spend the smelt wait walking to the dispenser's standing tile (non-blocking;
             # see walk_to_dispenser_wait_tile) so the swap-and-take starts from dist 1.
             walk_to_dispenser_wait_tile(ctx)
+            # USER 2026-09-04: "when running from conveyor we can optimise by hovering the
+            # gloves in wait for experience to drop" -- park the cursor on the ice pair during
+            # the smelt so the wear at the XP drop is a click in place, not a ~1s flight
+            # (bf_live6: 1.2s from the XP event to the wear landing).
+            _prehover_item(ctx, ice_glove_pair())
             # Wait for the smelt to finish (varbit 947 flipping to the bar count, the same
             # tick as the XP drop) before touching the dispenser at all -- the non-swap paths
             # deliberately keep their old immediate-check behavior (an unready dispenser is
@@ -903,17 +934,31 @@ def collect_bars(ctx, config: dict, glove_swap: bool = False) -> bool:
         # confirmed and every collect paid ~4s in the settle/idle fallback). The modal varbit
         # is the confirm now; the bars landing without a modal is accepted too.
         walk_s = 0.7 * max(0, dispenser.get("distance") or 0)
+        # chatmodal_unclamp STAYS 1 after a modal closes (MEASURED bf_live7 07:10:30: 1 for 5s+
+        # with nothing on screen), so "== 1" alone is stale: the Space fired before the modal
+        # existed and the first collect of run 7 took three passes. A modal is a TRANSITION --
+        # the varbit flipping to 1 after the click (pushed event, or a read that differs from
+        # the pre-click read) -- or a dialogue the readers do see.
+        modal_before = controller.get_varbit(VB_CHAT_MODAL)
+        modal_event = []
+
+        def modal_flip(p):
+            if p.get("varbitId") == VB_CHAT_MODAL and p.get("value") == 1:
+                modal_event.append(True)
+                return True
+            return p.get("varbitId") == varbit_id
 
         def take_outcome():
-            if controller.get_varbit(VB_CHAT_MODAL) == 1 or _dialog_open():
+            if _take_prompt_open() or _dialog_open() or modal_event or (
+                    modal_before != 1 and controller.get_varbit(VB_CHAT_MODAL) == 1):
                 return "modal"
             if varbit_id is not None and controller.get_varbit(varbit_id) == 0:
                 return "landed"
             return None
 
-        res = _await(events, {"VARBIT_CHANGED": lambda p: p.get("varbitId") in (VB_CHAT_MODAL, varbit_id),
-                              "WIDGET_LOADED": None, "INVENTORY_CHANGED": None,
-                              "PLAYER_STOPPED": None},
+        res = _await(events, {"VARBIT_CHANGED": modal_flip,
+                              "WIDGET_LOADED": lambda p: p.get("groupId") in (TAKE_PROMPT_GROUP,) + DIALOG_WIDGET_GROUPS,
+                              "INVENTORY_CHANGED": None, "PLAYER_STOPPED": None},
                      DISPENSER_DIALOG_BUDGET_S + walk_s, confirm=take_outcome, since=mark)
         landed = bool(res) and res.confirmed == "landed"
         if res and res.confirmed == "modal":
