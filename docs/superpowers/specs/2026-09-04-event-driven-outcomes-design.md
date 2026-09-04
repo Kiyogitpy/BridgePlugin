@@ -199,8 +199,8 @@ confirm.
 | Rung | Signals | Confirm |
 |---|---|---|
 | spend_stones (Power-up) | `INVENTORY_CHANGED` | `total_stones` decreased |
-| place_cell / create_guardian | `INVENTORY_CHANGED`, subscribed cell/barrier varbits | `chargedCellTier == NONE` |
-| repair_barrier | barrier varbits | `find_repairable` is None |
+| place_cell / create_guardian | `INVENTORY_CHANGED`, energy varbits 13685/13686 | `chargedCellTier == NONE` |
+| repair_barrier | `INVENTORY_CHANGED` (fragments spent) | no repairable tile, or fragments decreased |
 | deposit runes | `INVENTORY_CHANGED` | no runes |
 | restock cells | `INVENTORY_CHANGED` | `unchargedCells` increased |
 | craft (Work-at) | `INVENTORY_CHANGED`, `XP_GAINED` | essence up or fragments down |
@@ -208,6 +208,10 @@ confirm.
 | imbue at altar | `XP_GAINED` (Runecraft) | `runecraftXp` increased |
 | altar / portal / exit Enter | `MENU_CLICKED` (verdict, replaces `_enter_resolved`'s poll), then HUD `WIDGET_CLOSED`/`WIDGET_LOADED` (746) or `GRAPHIC_CHANGED` | `regionId` / `currentAltar` / `side_area` changed |
 | walks (`_direct_walk`, `_walk_toward`) | `PLAYER_STOPPED` | player tile |
+
+Cell barriers are GroundObjects, not varbits (m8aq `GuardiansOfTheRift.readBarriers`), so
+their signal is the cell or the fragments leaving the inventory; the energy varbits ride along
+as an extra trigger.
 
 The walk share of a commit (`_walk_budget`, tiles x 0.35s) becomes: wait for `PLAYER_STOPPED`
 (budget = the same estimate, as a ceiling), then the action's own short budget. A click on a
