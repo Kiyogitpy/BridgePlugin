@@ -743,6 +743,62 @@ def _await_mine(ctx, node, st, budget_s=None):
     return res
 
 
+HUD_GROUP = 746                # InterfaceID.GotrHud (0x02ea): the arena HUD interface group
+
+
+def _hud_widget(payload):
+    return payload.get("groupId") == HUD_GROUP
+
+
+# A teleport shows as: the HUD interface closing/reloading, a spotanim on the player, and the
+# interpolation tracker seeing a >2-tile jump (PLAYER_STOPPED). Any of them triggers the HTTP
+# confirm; which one actually fires first is on the live-verification list.
+TELEPORT_SIGNALS = {"WIDGET_LOADED": _hud_widget, "WIDGET_CLOSED": _hud_widget,
+                    "GRAPHIC_CHANGED": None, "PLAYER_STOPPED": None}
+
+
+def _confirm_in_altar():
+    return ((read_state() or {}).get("currentAltar") or "UNKNOWN") != "UNKNOWN"
+
+
+def _confirm_in_pocket():
+    st2 = read_state() or {}
+    return st2.get("miningArea") == "WEST_HUGE_REMAINS" or side_area(st2) == "pocket"
+
+
+def _confirm_back_in_arena():
+    st2 = read_state() or {}
+    return (bool(st2.get("inArena")) and (st2.get("currentAltar") or "UNKNOWN") == "UNKNOWN"
+            and st2.get("miningArea") != "WEST_HUGE_REMAINS")
+
+
+def _enter(ctx, entity, options, key, label, changed):
+    """A verified Enter: click, take the game's own verdict on what the click became
+    (MENU_CLICKED -- replaces _enter_resolved's /last-action poll, kept as the fallback when
+    the event does not arrive), then wait for the teleport (TELEPORT_SIGNALS, HTTP-confirmed by
+    `changed`). True when a verified click was issued (a miss is logged and returns False)."""
+    data = ctx.state.data
+    before = controller.get_last_action()
+    budget = ENTER_COMMIT_S + _walk_budget(entity)
+    if not _click_escalating(ctx, entity, options):
+        return False
+    verdict = bridge_events.await_outcome(ctx.events, "MENU_CLICKED", ENTER_ECHO_TIMEOUT_S,
+                                          confirm=None, since=data.get("gotr_click_mark"),
+                                          reaction=False)
+    if verdict and verdict.payload is not None:
+        option = (verdict.payload.get("option") or "").lower()
+        if not any(o.lower() in option for o in options):
+            debug_log.log("!", f"gotr: {label} click resolved to "
+                               f"{verdict.payload.get('option')!r} on {verdict.payload.get('target')!r}")
+            data.pop("gotr_click_mark", None)
+            return False
+    elif _enter_resolved(before, options[0], label) is False:
+        data.pop("gotr_click_mark", None)
+        return False
+    _await(ctx, key, budget, TELEPORT_SIGNALS, changed)
+    return True
+
+
 def _await(ctx, key, budget_s, signals, confirm, reaction=True, shorten=None):
     """The replacement for _commit's fixed window: block until the click's OUTCOME -- a listed
     UDP signal confirmed by one HTTP read -- or `budget_s`, whichever first (at the budget the
@@ -1255,11 +1311,12 @@ def between_rounds_phase(ctx, st):
         if not _committed(data, "gotr_exit_commit"):
             exit_portal = _find_object_by_name(PORTAL_NAME, radius=12, exact=True)
             if exit_portal is not None:
-                if _click_escalating(ctx, exit_portal, EXIT_PORTAL_ACTIONS):
-                    _commit(data, "gotr_exit_commit", ENTER_COMMIT_S + _walk_budget(exit_portal))
+                _enter(ctx, exit_portal, EXIT_PORTAL_ACTIONS, "gotr_exit_commit",
+                       "pocket exit (between rounds)", _confirm_back_in_arena)
             else:
                 _direct_walk(ctx, GREAT_GUARDIAN_TILE[0], GREAT_GUARDIAN_TILE[1])
-        controller.human_delay(0.5, 0.9)
+        if not data.get("gotr_outcome_hit"):
+            controller.human_delay(0.5, 0.9)
         return
 
     # NO bench work in prep -- USER 2026-09-01: "we try to craft in prep phase?
@@ -1664,14 +1721,12 @@ def altar_trip_phase(ctx, st):
         return
     data["gotr_altar_enters"] = data.get("gotr_altar_enters", 0) + 1
     debug_log.log("gotr", f"entering the {altar} portal")
-    before = controller.get_last_action()
-    budget = ENTER_COMMIT_S + _walk_budget(portal)
-    if (_click_escalating(ctx, portal, (PORTAL_GUARDIAN_ACTION,))
-            and _enter_resolved(before, PORTAL_GUARDIAN_ACTION, f"{altar} Enter") is not False):
-        _commit(data, "gotr_enter_commit", budget)
-        _hold_action(data, "altar_trip", budget)
+    if (_enter(ctx, portal, (PORTAL_GUARDIAN_ACTION,), "gotr_enter_commit", f"{altar} Enter",
+               _confirm_in_altar) and not data.get("gotr_outcome_hit")):
+        _hold_action(data, "altar_trip", ACTION_COMMIT_S)
     controller.mark_busy(3.0)
-    controller.human_delay(0.7, 1.2)
+    if not data.get("gotr_outcome_hit"):
+        controller.human_delay(0.7, 1.2)
 
 
 def _too_far(entity, limit):
@@ -1708,7 +1763,12 @@ def _work_altar(ctx, st):
         data["gotr_imbue_clicks"] = data.get("gotr_imbue_clicks", 0) + 1
         _click_escalating(ctx, altar_obj, (ALTAR_IMBUE_ACTION,))
         controller.mark_busy(2.5)
-        _await_xp("runecraftXp", xp_before, IMBUE_CONFIRM_S)
+        if xp_before is None:
+            _await_xp("runecraftXp", xp_before, IMBUE_CONFIRM_S)   # un-rebuilt client: old path
+        else:
+            _await(ctx, "gotr_imbue_commit", IMBUE_CONFIRM_S,
+                   {"XP_GAINED": lambda p: p.get("skill") == "Runecraft"},
+                   lambda: ((controller.get_player() or {}).get("runecraftXp") or 0) > xp_before)
         return
 
     if pouch_stored(read_pouches()) > 0:
@@ -1736,10 +1796,11 @@ def _work_altar(ctx, st):
         controller.human_delay(0.5, 0.9)
         return
     data["gotr_exit_clicks"] = data.get("gotr_exit_clicks", 0) + 1
-    if _click_escalating(ctx, exit_portal, EXIT_PORTAL_ACTIONS):
-        _commit(data, "gotr_exit_commit", ENTER_COMMIT_S + _walk_budget(exit_portal))
+    _enter(ctx, exit_portal, EXIT_PORTAL_ACTIONS, "gotr_exit_commit", "altar exit",
+           _confirm_back_in_arena)
     controller.mark_busy(3.0)
-    controller.human_delay(0.7, 1.1)
+    if not data.get("gotr_outcome_hit"):
+        controller.human_delay(0.7, 1.1)
 
 
 def portal_trip_phase(ctx, st):
@@ -1768,10 +1829,11 @@ def portal_trip_phase(ctx, st):
             if exit_portal is None:
                 debug_log.log("gotr", "exit portal not visible in the huge-remains pocket")
                 return
-            if _click_escalating(ctx, exit_portal, EXIT_PORTAL_ACTIONS):
-                _commit(data, "gotr_exit_commit", ENTER_COMMIT_S + _walk_budget(exit_portal))
+            _enter(ctx, exit_portal, EXIT_PORTAL_ACTIONS, "gotr_exit_commit", "pocket exit",
+                   _confirm_back_in_arena)
             controller.mark_busy(3.0)
-            controller.human_delay(0.7, 1.1)
+            if not data.get("gotr_outcome_hit"):
+                controller.human_delay(0.7, 1.1)
             return
         if time.time() - data.get("gotr_mine_delta_at", 0) < MINE_RECLICK_S:
             return    # actively mining -- leave it alone
@@ -1819,14 +1881,12 @@ def portal_trip_phase(ctx, st):
             data["gotr_portal_enters"] = data.get("gotr_portal_enters", 0) + 1
         return
     data["gotr_portal_enters"] = data.get("gotr_portal_enters", 0) + 1
-    before = controller.get_last_action()
-    budget = ENTER_COMMIT_S + _walk_budget(portal)
-    if (_click_escalating(ctx, portal, (PORTAL_GUARDIAN_ACTION,))
-            and _enter_resolved(before, PORTAL_GUARDIAN_ACTION, "huge-portal Enter") is not False):
-        _commit(data, "gotr_enter_commit", budget)
-        _hold_action(data, "portal_trip", budget)
+    if (_enter(ctx, portal, (PORTAL_GUARDIAN_ACTION,), "gotr_enter_commit", "huge-portal Enter",
+               _confirm_in_pocket) and not data.get("gotr_outcome_hit")):
+        _hold_action(data, "portal_trip", ACTION_COMMIT_S)
     controller.mark_busy(3.0)
-    controller.human_delay(0.7, 1.2)
+    if not data.get("gotr_outcome_hit"):
+        controller.human_delay(0.7, 1.2)
 
 
 def craft_phase(ctx, st):
@@ -2283,9 +2343,10 @@ def _leave_side_area(ctx):
         _direct_walk(ctx, exit_portal.get("x"), exit_portal.get("y"))
         controller.human_delay(0.5, 0.9)
         return True
-    if _click_escalating(ctx, exit_portal, EXIT_PORTAL_ACTIONS):
-        _commit(data, "gotr_exit_commit", ENTER_COMMIT_S + _walk_budget(exit_portal))
-    controller.human_delay(0.7, 1.1)
+    _enter(ctx, exit_portal, EXIT_PORTAL_ACTIONS, "gotr_exit_commit", "side-area exit",
+           _confirm_back_in_arena)
+    if not data.get("gotr_outcome_hit"):
+        controller.human_delay(0.7, 1.1)
     return True
 
 

@@ -791,3 +791,40 @@ def test_await_mine_stamps_the_delta_clock_on_a_hit(monkeypatch):
     assert ctx.state.data["gotr_mine_delta_at"] > 0
     assert ctx.events.calls[0]["budget"] == gotr.MINE_COMMIT_S + 2.0
     assert ctx.events.calls[0]["shorten"] == {"PLAYER_STOPPED": gotr.MINE_AFTER_STOP_S}
+
+
+def test_enter_uses_the_menu_verdict_then_awaits_the_teleport(monkeypatch):
+    verdict = bridge_events.Outcome(True, "MENU_CLICKED", {"option": "Enter", "target": "Portal"}, True, 0.1)
+    tele = bridge_events.Outcome(True, "WIDGET_LOADED", {"groupId": 746}, True, 2.0)
+    outcomes = iter([verdict, tele])
+
+    class _Ev(_FakeEvents):
+        def await_outcome(self, *a, **k):
+            self.calls.append(k)
+            return next(outcomes)
+    ctx = _ECtx(_Ev(None))
+    monkeypatch.setattr(controller, "get_last_action", lambda: None)
+    monkeypatch.setattr(gotr, "_click_escalating", lambda c, e, o: True)
+    monkeypatch.setattr(gotr, "_walk_budget", lambda e: 1.0)
+    assert gotr._enter(ctx, {"x": 1, "y": 1}, ("Enter",), "gotr_enter_commit", "test", lambda: True) is True
+    assert ctx.events.calls[0]["reaction"] is False              # the verdict is not an action
+    assert ctx.state.data["gotr_outcome_hit"] is True
+
+
+def test_enter_gives_up_when_the_click_became_something_else(monkeypatch):
+    ctx = _ECtx(_FakeEvents(bridge_events.Outcome(True, "MENU_CLICKED", {"option": "Walk here", "target": ""}, True, 0.1)))
+    monkeypatch.setattr(controller, "get_last_action", lambda: None)
+    monkeypatch.setattr(gotr, "_click_escalating", lambda c, e, o: True)
+    monkeypatch.setattr(gotr, "_walk_budget", lambda e: 0.0)
+    assert gotr._enter(ctx, {"x": 1, "y": 1}, ("Enter",), "gotr_enter_commit", "test", lambda: True) is False
+    assert len(ctx.events.calls) == 1
+
+
+def test_hud_widget_predicate_and_teleport_confirms(monkeypatch):
+    assert gotr._hud_widget({"groupId": 746}) and not gotr._hud_widget({"groupId": 162})
+    monkeypatch.setattr(gotr, "read_state", lambda: make_state(currentAltar="AIR", inArena=False))
+    assert gotr._confirm_in_altar() and not gotr._confirm_back_in_arena()
+    monkeypatch.setattr(gotr, "read_state", lambda: make_state(miningArea="WEST_HUGE_REMAINS"))
+    assert gotr._confirm_in_pocket()
+    monkeypatch.setattr(gotr, "read_state", lambda: make_state())
+    assert gotr._confirm_back_in_arena() and not gotr._confirm_in_pocket()
