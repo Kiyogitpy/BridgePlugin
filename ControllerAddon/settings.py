@@ -407,9 +407,12 @@ DELAY_SKEW_RANGE = (0.0, 1.0)                # human_delay: feeds its lognormal 
 # Event-driven outcomes (2026-09-04, docs/superpowers/specs/2026-09-04-event-driven-outcomes-design.md).
 # REACTION_DELAY_S: after a confirmed outcome event, bridge_events.await_outcome sleeps a draw from
 # this range (minus the time the HTTP confirm already took) before returning, so the next click does
-# not land tens of milliseconds after the event every time. Basis: the agility human recording's
-# next click lands ~0.2s after the XP drop. Re-fit from the GOTR benchmark with fit_reaction.py.
-REACTION_DELAY_S = (0.15, 0.35)
+# not land tens of milliseconds after the event every time. MEASURED 2026-09-04 with
+# fit_reaction.py over the GOTR human benchmark (recordings/2026-09-03_061331_*, n=186
+# outcome->next-click pairs): p10 219ms, p25 282ms, median 522ms, p75 1723ms. The tail is clicks
+# that were not reactions to that event at all (an XP drop mid-mining while the human waits), so
+# the range covers the reactive cluster (p10..~median), not p25..p75.
+REACTION_DELAY_S = (0.20, 0.50)
 # Polling cadence of the HTTP confirm when there is no event stream at all (ctx.events is None).
 FALLBACK_POLL_S = 0.25
 
