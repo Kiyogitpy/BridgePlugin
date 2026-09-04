@@ -765,3 +765,29 @@ def test_powerup_confirm_is_fewer_stones(monkeypatch):
     call = ctx.events.calls[0]
     assert "VARBIT_CHANGED" in call["signals"] and call["confirm"]() is True
     assert call["since"] == 1 and "gotr_click_mark" not in ctx.state.data
+
+
+def test_confirm_mined_and_crafted_read_fresh_state(monkeypatch):
+    monkeypatch.setattr(gotr, "read_state", lambda: make_state(
+        inventory=make_inv(guardianFragments=40, guardianEssence=3), minedFragmentsThisGame=40))
+    assert gotr._confirm_mined(30, 30) is True
+    assert gotr._confirm_mined(40, 40) is False
+    assert gotr._confirm_crafted(0, 45) is True        # essence up / fragments down
+    assert gotr._confirm_crafted(3, 40) is False
+
+
+def test_mine_signals_filter_the_mining_skill_and_count_varbit():
+    xp = gotr.MINE_SIGNALS["XP_GAINED"]
+    assert xp({"skill": "Mining"}) and not xp({"skill": "Runecraft"})
+    vb = gotr.MINE_SIGNALS["VARBIT_CHANGED"]
+    assert vb({"varbitId": gotr.VB_MINING_COUNT}) and not vb({"varbitId": 1})
+
+
+def test_await_mine_stamps_the_delta_clock_on_a_hit(monkeypatch):
+    ctx = _ECtx(_FakeEvents(bridge_events.Outcome(True, "XP_GAINED", {"skill": "Mining"}, True, 1.0)))
+    monkeypatch.setattr(gotr, "_walk_budget", lambda e: 2.0)
+    st = make_state(inventory=make_inv(guardianFragments=10))
+    gotr._await_mine(ctx, {"x": 1, "y": 1}, st)
+    assert ctx.state.data["gotr_mine_delta_at"] > 0
+    assert ctx.events.calls[0]["budget"] == gotr.MINE_COMMIT_S + 2.0
+    assert ctx.events.calls[0]["shorten"] == {"PLAYER_STOPPED": gotr.MINE_AFTER_STOP_S}

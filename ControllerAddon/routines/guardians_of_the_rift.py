@@ -710,6 +710,39 @@ def _confirm_more_cells(cells_before):
 CELL_SIGNALS = {"INVENTORY_CHANGED": None, "VARBIT_CHANGED": _energy_varbit}
 
 
+def _confirm_mined(frags_before, mined_before):
+    st2 = read_state() or {}
+    inv2 = st2.get("inventory") or {}
+    return (inv2.get("guardianFragments", 0) > frags_before
+            or st2.get("minedFragmentsThisGame", 0) > mined_before)
+
+
+def _confirm_crafted(ess_before, frags_before):
+    inv2 = _inv_now()
+    return (inv2.get("guardianEssence", 0) > ess_before
+            or inv2.get("guardianFragments", 0) < frags_before)
+
+
+MINE_SIGNALS = {"INVENTORY_CHANGED": None,
+                "XP_GAINED": lambda p: p.get("skill") == "Mining",
+                "VARBIT_CHANGED": lambda p: p.get("varbitId") == VB_MINING_COUNT}
+CRAFT_SIGNALS = {"INVENTORY_CHANGED": None, "XP_GAINED": None}
+
+
+def _await_mine(ctx, node, st, budget_s=None):
+    """After a verified Mine click: the first fragment (inventory/XP/mined-count) is the
+    outcome; a hit stamps gotr_mine_delta_at so MINE_RECLICK_S leaves the swing alone."""
+    inv = st.get("inventory") or {}
+    frags, mined = inv.get("guardianFragments", 0), st.get("minedFragmentsThisGame", 0)
+    budget = (MINE_COMMIT_S if budget_s is None else budget_s) + _walk_budget(node)
+    res = _await(ctx, "gotr_mine_commit", budget, MINE_SIGNALS,
+                 lambda: _confirm_mined(frags, mined), shorten=_after_stop(MINE_AFTER_STOP_S))
+    if res:
+        ctx.state.data["gotr_mine_delta_at"] = time.time()
+        ctx.state.data["gotr_mine_stall"] = 0
+    return res
+
+
 def _await(ctx, key, budget_s, signals, confirm, reaction=True, shorten=None):
     """The replacement for _commit's fixed window: block until the click's OUTCOME -- a listed
     UDP signal confirmed by one HTTP read -- or `budget_s`, whichever first (at the budget the
@@ -1247,8 +1280,12 @@ def between_rounds_phase(ctx, st):
                                         exact=True)
             if node is not None and travel.can_reach(node) is not False:
                 if _click_escalating(ctx, node, (MINE_ACTION,)):
-                    _commit(data, "gotr_mine_commit", MINE_COMMIT_S + _walk_budget(node))
-        controller.human_delay(1.0, 2.0)
+                    # Pre-round the game REFUSES the swing ("no need to do that right
+                    # now"), so this is a short wait that lands the first real swing the
+                    # moment the rift opens, not the full mining budget.
+                    _await_mine(ctx, node, st, budget_s=PREROUND_MINE_BUDGET_S)
+        if not data.get("gotr_outcome_hit"):
+            controller.human_delay(1.0, 2.0)
         return
 
     # Housekeeping -- only while still on the arena side of the rubble.
@@ -1745,9 +1782,10 @@ def portal_trip_phase(ctx, st):
             debug_log.log("gotr", "huge remains not visible inside the pocket")
             return
         if _click_escalating(ctx, node, (MINE_ACTION,)):
-            _commit(data, "gotr_mine_commit", MINE_COMMIT_S + _walk_budget(node))
+            _await_mine(ctx, node, st)
         controller.mark_busy(2.0)
-        controller.human_delay(0.6, 1.0)
+        if not data.get("gotr_outcome_hit"):
+            controller.human_delay(0.6, 1.0)
         return
 
     # Outside: enter the portal while the HUD says it is open.
@@ -1828,10 +1866,16 @@ def craft_phase(ctx, st):
             data["gotr_craft_stall"] = data.get("gotr_craft_stall", 0) + 1
         return
     data["gotr_craft_stall"] = data.get("gotr_craft_stall", 0) + 1
+    ess, frags = inv.get("guardianEssence", 0), inv.get("guardianFragments", 0)
+    budget = CRAFT_COMMIT_S + _walk_budget(bench)
     if _click_escalating(ctx, bench, (WORKBENCH_ACTION,)):
-        _commit(data, "gotr_craft_commit", CRAFT_COMMIT_S + _walk_budget(bench))
+        if _await(ctx, "gotr_craft_commit", budget, CRAFT_SIGNALS,
+                  lambda: _confirm_crafted(ess, frags), shorten=_after_stop(CRAFT_AFTER_STOP_S)):
+            data["gotr_craft_delta_at"] = time.time()
+            data["gotr_craft_stall"] = 0
     controller.mark_busy(3.0)
-    controller.human_delay(1.0, 1.6)
+    if not data.get("gotr_outcome_hit"):
+        controller.human_delay(1.0, 1.6)
 
 
 def mine_phase(ctx, st):
@@ -1870,9 +1914,10 @@ def mine_phase(ctx, st):
         return
     data["gotr_mine_stall"] = data.get("gotr_mine_stall", 0) + 1
     if _click_escalating(ctx, node, (MINE_ACTION,)):
-        _commit(data, "gotr_mine_commit", MINE_COMMIT_S + _walk_budget(node))
+        _await_mine(ctx, node, st)
     controller.mark_busy(2.0)
-    controller.human_delay(0.6, 1.0)
+    if not data.get("gotr_outcome_hit"):
+        controller.human_delay(0.6, 1.0)
 
 
 # ---------------------------------------------------------------------------
