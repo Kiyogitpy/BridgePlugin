@@ -156,7 +156,7 @@ def test_the_buffer_is_pruned_by_tick_age_not_just_count(monkeypatch):
                         lambda sock: [("OBJECT_SPAWNED", {"id": 2, "x": 2, "y": 2,
                                                             "tick": s.ticks.tick})])
     s.pump(now=1002.0)
-    types = [t for t, _ in s._recent]
+    types = [t for _seq, t, _ in s._recent]
     assert "GROUND_ITEM_SPAWNED" not in types
     assert "OBJECT_SPAWNED" in types
 
@@ -177,7 +177,7 @@ def test_the_age_prune_survives_a_tick_counter_reset(monkeypatch):
     monkeypatch.setattr(controller, "poll_udp",
                         lambda sock: [("TICK", {"tick": 3, "atMillis": 3000.0})])
     s.pump(now=1001.0)
-    types = [t for t, _ in s._recent]
+    types = [t for _seq, t, _ in s._recent]
     assert "GROUND_ITEM_SPAWNED" not in types
 
 
@@ -190,7 +190,7 @@ def test_the_age_prune_does_not_drop_payload_less_or_untagged_events(monkeypatch
                                       ("TICK", {"tick": 500, "atMillis": 0})])
     s = bridge_events.EventStream(_FakeSock())
     s.pump(now=1000.0)
-    types = [t for t, _ in s._recent]
+    types = [t for _seq, t, _ in s._recent]
     assert "PLAYER_DIED" in types
 
 
@@ -313,3 +313,130 @@ def test_ctx_still_constructs_without_an_event_stream():
     import controller
     ctx = controller.Context(None, None)
     assert ctx.events is None
+
+
+# --- await_outcome / mark / wait_any (2026-09-04 event-driven outcomes) ------------------
+
+class _Clock:
+    """Injected wall clock: sleep_fn advances it, so a test never really sleeps."""
+    def __init__(self, t=1000.0):
+        self.t = t
+        self.sleeps = []
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.t += s
+
+
+def _no_pad(monkeypatch):
+    monkeypatch.setattr(bridge_events.controller, "sample_human_delay", lambda a, b: 0.0)
+
+
+def test_mark_and_since_exclude_earlier_identical_events(monkeypatch):
+    _no_pad(monkeypatch)
+    clk = _Clock()
+    s = _stream(monkeypatch, [[("INVENTORY_CHANGED", None)], [], [("INVENTORY_CHANGED", None)]])
+    s.pump()                                   # the stale one from a previous action
+    mark = s.mark()
+    res = s.await_outcome({"INVENTORY_CHANGED": None}, budget_s=1.0, confirm=lambda: True,
+                          since=mark, now_fn=clk.now, sleep_fn=clk.sleep)
+    assert res and res.signal == "INVENTORY_CHANGED"
+    # It needed the SECOND event (pumped after one sleep), not the stale first one.
+    assert len(clk.sleeps) >= 1
+
+
+def test_await_outcome_confirms_over_http_and_rejects_a_false_confirm(monkeypatch):
+    _no_pad(monkeypatch)
+    clk = _Clock()
+    s = _stream(monkeypatch, [[("XP_GAINED", {"skill": "Runecraft"})], [("XP_GAINED", {"skill": "Runecraft"})]])
+    answers = iter([False, True, True])
+    res = s.await_outcome({"XP_GAINED": lambda p: p.get("skill") == "Runecraft"}, budget_s=2.0,
+                          confirm=lambda: next(answers), now_fn=clk.now, sleep_fn=clk.sleep)
+    assert res.hit and res.signal == "XP_GAINED" and res.confirmed is True
+    assert res.payload == {"skill": "Runecraft"}
+
+
+def test_await_outcome_falls_back_to_the_final_confirm_at_budget(monkeypatch):
+    _no_pad(monkeypatch)
+    clk = _Clock()
+    s = _stream(monkeypatch, [])
+    calls = []
+    res = s.await_outcome("INVENTORY_CHANGED", budget_s=0.5,
+                          confirm=lambda: calls.append(1) or "delta", now_fn=clk.now, sleep_fn=clk.sleep)
+    assert res.hit and res.signal is None and res.confirmed == "delta"
+    assert calls == [1]                        # confirm runs ONCE, at the budget
+    assert clk.t == pytest.approx(1000.5, abs=0.03)
+
+
+def test_await_outcome_is_falsy_when_nothing_happened(monkeypatch):
+    _no_pad(monkeypatch)
+    clk = _Clock()
+    s = _stream(monkeypatch, [])
+    res = s.await_outcome(["INVENTORY_CHANGED"], budget_s=0.3, confirm=lambda: None,
+                          now_fn=clk.now, sleep_fn=clk.sleep)
+    assert not res and res.signal is None
+
+
+def test_await_outcome_without_confirm_trusts_the_signal(monkeypatch):
+    _no_pad(monkeypatch)
+    clk = _Clock()
+    s = _stream(monkeypatch, [[("MENU_CLICKED", {"option": "Enter"})]])
+    res = s.await_outcome("MENU_CLICKED", budget_s=1.0, now_fn=clk.now, sleep_fn=clk.sleep)
+    assert res and res.payload["option"] == "Enter" and res.confirmed is True
+
+
+def test_reaction_padding_is_reduced_by_confirm_time_and_skippable(monkeypatch):
+    monkeypatch.setattr(bridge_events.controller, "sample_human_delay", lambda a, b: 0.30)
+    clk = _Clock()
+    s = _stream(monkeypatch, [[("INVENTORY_CHANGED", None)]])
+
+    def slow_confirm():
+        clk.t += 0.10       # the HTTP read took 100ms
+        return True
+    res = s.await_outcome("INVENTORY_CHANGED", budget_s=1.0, confirm=slow_confirm,
+                          now_fn=clk.now, sleep_fn=clk.sleep)
+    assert res and clk.sleeps[-1] == pytest.approx(0.20)
+
+    s2 = _stream(monkeypatch, [[("INVENTORY_CHANGED", None)]])
+    clk2 = _Clock()
+    s2.await_outcome("INVENTORY_CHANGED", budget_s=1.0, confirm=lambda: True, reaction=False,
+                     now_fn=clk2.now, sleep_fn=clk2.sleep)
+    assert clk2.sleeps == []
+
+
+def test_shorten_pulls_the_deadline_in_after_a_stop(monkeypatch):
+    _no_pad(monkeypatch)
+    clk = _Clock()
+    s = _stream(monkeypatch, [[("PLAYER_STOPPED", {"x": 1})]])
+    res = s.await_outcome("INVENTORY_CHANGED", budget_s=10.0, confirm=lambda: None,
+                          shorten={"PLAYER_STOPPED": 0.5}, now_fn=clk.now, sleep_fn=clk.sleep)
+    assert not res
+    assert clk.t == pytest.approx(1000.5, abs=0.03)
+
+
+def test_module_await_outcome_polls_confirm_without_a_stream(monkeypatch):
+    _no_pad(monkeypatch)
+    clk = _Clock()
+    answers = iter([None, None, 3])
+    res = bridge_events.await_outcome(None, "INVENTORY_CHANGED", budget_s=5.0,
+                                      confirm=lambda: next(answers), now_fn=clk.now, sleep_fn=clk.sleep)
+    assert res and res.confirmed == 3 and res.signal is None
+    assert clk.sleeps == [bridge_events.FALLBACK_POLL_S, bridge_events.FALLBACK_POLL_S]
+
+
+def test_wait_any_wakes_on_a_real_event_but_not_on_tick(monkeypatch):
+    clk = _Clock()
+    s = _stream(monkeypatch, [[("TICK", {"tick": 1, "atMillis": 1.0})], [], [("XP_GAINED", {"skill": "Mining"})]])
+    assert s.wait_any(1.0, now_fn=clk.now, sleep_fn=clk.sleep) is True
+    assert len(clk.sleeps) == 2
+    assert [t for t, _ in s.drain()] == ["TICK", "XP_GAINED"]   # nothing lost for on_event
+
+
+def test_wait_any_times_out_quietly(monkeypatch):
+    clk = _Clock()
+    s = _stream(monkeypatch, [])
+    assert s.wait_any(0.1, now_fn=clk.now, sleep_fn=clk.sleep) is False
+    assert clk.t == pytest.approx(1000.1, abs=0.03)

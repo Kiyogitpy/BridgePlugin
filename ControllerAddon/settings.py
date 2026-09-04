@@ -404,6 +404,15 @@ CURVE_MAG_LOW_RANGE = (0.06, 0.10)           # build_bezier_path: low end of cur
 CURVE_MAG_HIGH_RANGE = (0.16, 0.24)          # build_bezier_path: high end of curve_mag fraction (was fixed 0.20)
 DELAY_SKEW_RANGE = (0.0, 1.0)                # human_delay: feeds its lognormal sigma directly
 
+# Event-driven outcomes (2026-09-04, docs/superpowers/specs/2026-09-04-event-driven-outcomes-design.md).
+# REACTION_DELAY_S: after a confirmed outcome event, bridge_events.await_outcome sleeps a draw from
+# this range (minus the time the HTTP confirm already took) before returning, so the next click does
+# not land tens of milliseconds after the event every time. Basis: the agility human recording's
+# next click lands ~0.2s after the XP drop. Re-fit from the GOTR benchmark with fit_reaction.py.
+REACTION_DELAY_S = (0.15, 0.35)
+# Polling cadence of the HTTP confirm when there is no event stream at all (ctx.events is None).
+FALLBACK_POLL_S = 0.25
+
 # ---------------- Human mistake simulation ----------------
 # Small, deliberately-imperfect behaviors so supply/prayer upkeep and
 # clicking don't look like a flawless state machine -- real players

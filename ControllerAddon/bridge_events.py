@@ -12,6 +12,7 @@ wrong click.
 import time
 
 import controller
+import settings
 
 GAME_TICK_MS = 600      # OSRS server tick
 EVENT_BUFFER_MAX = 256       # closes the already-arrived race; deliberately not a log
@@ -26,6 +27,48 @@ STALE_AFTER_MS = GAME_TICK_MS * 2  # (I2, 2026-08-21) how long since the last TI
                                     # a pure atMillis+wall-clock computation that would otherwise
                                     # keep reporting a plausible in-range phase forever even with a
                                     # dead listener).
+
+
+FALLBACK_POLL_S = settings.FALLBACK_POLL_S
+WAKE_IGNORED_TYPES = ("TICK",)   # wait_any never wakes the engine loop on a tick boundary --
+                                 # a loop aligned to the server tick aligns every click to it too
+
+
+class Outcome:
+    """Result of await_outcome. Falsy when nothing happened. `signal` is the event type that
+    ended the wait (None when the final HTTP confirm decided), `confirmed` the confirm's value."""
+    __slots__ = ("hit", "signal", "payload", "confirmed", "latency_s")
+
+    def __init__(self, hit, signal, payload, confirmed, latency_s):
+        self.hit = bool(hit)
+        self.signal = signal
+        self.payload = payload
+        self.confirmed = confirmed
+        self.latency_s = latency_s
+
+    def __bool__(self):
+        return self.hit
+
+    def __repr__(self):
+        return (f"Outcome(hit={self.hit}, signal={self.signal!r}, "
+                f"latency_s={self.latency_s:.2f})")
+
+
+def _normalize_signals(signals):
+    if isinstance(signals, str):
+        return {signals: None}
+    if isinstance(signals, dict):
+        return signals
+    return {t: None for t in signals}
+
+
+def _reaction_pad(spent_s, sleep_fn):
+    """Human reaction draw (settings.REACTION_DELAY_S) minus what the confirm read already
+    spent, so an outcome is acted on ~0.15-0.35s after it lands rather than 20ms after."""
+    draw = controller.sample_human_delay(*settings.REACTION_DELAY_S)
+    pad = max(0.0, draw - spent_s)
+    if pad > 0:
+        sleep_fn(pad)
 
 
 class TickModel:
@@ -107,6 +150,7 @@ class EventStream:
         self.ticks = TickModel()
         self._recent = []
         self._pending = []   # events pumped but not yet handed to a dispatcher via drain()
+        self._seq = 0        # monotonic per pumped event; mark()/since= key off it
 
     def pump(self, now=None):
         """Drain the socket, update the mirror and the pending-dispatch queue, return the events
@@ -137,14 +181,15 @@ class EventStream:
         for event_type, payload in events:
             if event_type == "TICK" and payload:
                 self.ticks.update(payload.get("tick"), payload.get("atMillis"), now)
-            self._recent.append((event_type, payload))
+            self._seq += 1
+            self._recent.append((self._seq, event_type, payload))
         self._pending.extend(events)
         if len(self._recent) > EVENT_BUFFER_MAX:
             del self._recent[:-EVENT_BUFFER_MAX]
         current_tick = self.ticks.tick
         if current_tick is not None:
             def _still_fresh(entry):
-                _event_type, payload = entry
+                _seq, _event_type, payload = entry
                 tick = payload.get("tick") if payload else None
                 if tick is None:
                     return True
@@ -189,7 +234,7 @@ class EventStream:
         self.pump(now=now_fn())
 
         while True:
-            for event_type, payload in self._recent:
+            for _seq, event_type, payload in self._recent:
                 if event_type in types and (match is None or match(payload or {})):
                     return payload or {}
             if now_fn() >= deadline:
@@ -236,7 +281,103 @@ class EventStream:
             return now + n * GAME_TICK_MS / 1000.0
         return now + (self.ticks.ms_until_next(now) + (n - 1) * GAME_TICK_MS) / 1000.0
 
+    def mark(self):
+        """Sequence number of the last pumped event. Take one BEFORE the action whose outcome
+        you will wait for and pass it as await_outcome(since=...): only later events can match,
+        so an identical event from a previous action can never satisfy the wait -- without
+        discarding anything on_event still needs (the reason this replaced clear())."""
+        return self._seq
+
+    def await_outcome(self, signals, budget_s, confirm=None, since=None, reaction=True,
+                      shorten=None, now_fn=time.time, sleep_fn=time.sleep):
+        """Block until a listed signal lands (after `since`) AND `confirm()` -- one HTTP read --
+        agrees, or `budget_s` passes, in which case confirm() decides alone (today's polling
+        behaviour, so a dropped packet costs latency, never correctness).
+
+        signals: str | sequence | {type: predicate-or-None}. confirm: zero-arg callable whose
+        truthy value is the outcome; None means the signal IS the truth (MENU_CLICKED).
+        shorten: {type: seconds} -- that event pulls the deadline in to now + seconds (the
+        "arrived, now the action itself has this long" shape). reaction: pad the return with
+        a human reaction draw (settings.REACTION_DELAY_S) minus the confirm's own duration.
+
+        2026-09-04, docs/superpowers/specs/2026-09-04-event-driven-outcomes-design.md."""
+        signals = _normalize_signals(signals)
+        shorten = shorten or {}
+        start = now_fn()
+        deadline = start + budget_s
+        if since is None:
+            since = self._seq           # before the first pump: nothing that arrives during
+                                        # this call is excluded
+        rejected = set()                # seqs whose confirm() came back falsy
+        shortened = set()
+        self.pump(now=now_fn())
+        while True:
+            now = now_fn()
+            for seq, event_type, payload in self._recent:
+                if seq <= since:
+                    continue
+                if event_type in shorten and seq not in shortened:
+                    shortened.add(seq)
+                    deadline = min(deadline, now + shorten[event_type])
+                if event_type not in signals or seq in rejected:
+                    continue
+                predicate = signals[event_type]
+                if predicate is not None and not predicate(payload or {}):
+                    continue
+                t0 = now_fn()
+                value = True if confirm is None else confirm()
+                if value:
+                    if reaction:
+                        _reaction_pad(now_fn() - t0, sleep_fn)
+                    return Outcome(True, event_type, payload or {}, value, now_fn() - start)
+                rejected.add(seq)
+            now = now_fn()
+            if now >= deadline:
+                break
+            sleep_fn(min(EVENT_POLL_INTERVAL_S, deadline - now))
+            self.pump(now=now_fn())
+        value = None if confirm is None else confirm()
+        return Outcome(bool(value), None, None, value, now_fn() - start)
+
+    def wait_any(self, timeout_s, ignore=WAKE_IGNORED_TYPES, now_fn=time.time, sleep_fn=time.sleep):
+        """Sleep at most `timeout_s`, returning True as soon as any event not in `ignore`
+        arrives. The engine loop's replacement for a flat sleep between iterations. Events
+        pumped here stay in _pending for the next drain()."""
+        deadline = now_fn() + timeout_s
+        while True:
+            events = self.pump(now=now_fn())
+            if any(t not in ignore for t, _ in events):
+                return True
+            now = now_fn()
+            if now >= deadline:
+                return False
+            sleep_fn(min(EVENT_POLL_INTERVAL_S, deadline - now))
+
     def clear(self):
         """Drop buffered events -- for a caller that must not match something from before it
-        started waiting."""
+        started waiting. Prefer mark()/since= for new code."""
         self._recent.clear()
+
+
+def await_outcome(events, signals, budget_s, confirm=None, since=None, reaction=True,
+                  shorten=None, now_fn=time.time, sleep_fn=time.sleep):
+    """await_outcome for a routine holding ctx.events, which may be None (engine started no
+    listener, or --no-events): then confirm() is polled every FALLBACK_POLL_S until truthy or
+    the budget -- the same HTTP polling the routines did before this existed."""
+    if events is not None:
+        return events.await_outcome(signals, budget_s, confirm=confirm, since=since,
+                                    reaction=reaction, shorten=shorten,
+                                    now_fn=now_fn, sleep_fn=sleep_fn)
+    start = now_fn()
+    deadline = start + budget_s
+    while True:
+        t0 = now_fn()
+        value = None if confirm is None else confirm()
+        if value:
+            if reaction:
+                _reaction_pad(now_fn() - t0, sleep_fn)
+            return Outcome(True, None, None, value, now_fn() - start)
+        now = now_fn()
+        if now >= deadline:
+            return Outcome(bool(value), None, None, value, now - start)
+        sleep_fn(min(FALLBACK_POLL_S, deadline - now))
