@@ -102,6 +102,9 @@ BAR_VARBITS = {
 # permanently worn, no waits added), so no new Java config toggle was needed.
 GOLDSMITH_GAUNTLETS = "Goldsmith gauntlets"
 ICE_GLOVES = "Ice gloves"
+# Smiths gloves (i) (cache obj 27031, "stuffed with a pair of ice gloves") ARE ice gloves for
+# every purpose here -- user request 2026-09-04. Whichever pair the account has is the ice pair.
+ICE_GLOVE_NAMES = (ICE_GLOVES, "Smiths gloves (i)")
 # Measured ~9s from conveyor click to varbit 947 = 27; generous headroom on top because a
 # busy mass world adds server lag, but small enough that a genuinely stalled furnace (empty
 # coffer -- the dwarves stop working) still fails the trip promptly.
@@ -128,7 +131,19 @@ def gold_glove_swap_active(config: dict) -> bool:
     def present(name: str) -> bool:
         return worn == name.lower() or name.lower() in carried
 
-    return present(GOLDSMITH_GAUNTLETS) and present(ICE_GLOVES)
+    return present(GOLDSMITH_GAUNTLETS) and any(present(n) for n in ICE_GLOVE_NAMES)
+
+
+def ice_glove_pair() -> str:
+    """The ice pair this account actually has -- Ice gloves or Smiths gloves (i) -- worn or
+    carried, read fresh like gold_glove_swap_active. Falls back to plain Ice gloves when
+    neither is visible so the caller's error message names something sensible."""
+    worn = ((controller.get_equipment().get("gloves") or {}).get("name") or "").lower()
+    carried = {(i.get("name") or "").lower() for i in controller.get_inventory()}
+    for name in ICE_GLOVE_NAMES:
+        if worn == name.lower() or name.lower() in carried:
+            return name
+    return ICE_GLOVES
 
 
 def ensure_gloves_worn(ctx, name: str) -> bool:
@@ -533,12 +548,17 @@ def run_trip(ctx, config: dict, trip: dict, bar_uses_coal_bag: bool) -> bool:
     withdraw, need_bag_fill, loose_coal, bag_coal = plan_bank_withdrawals(trip)
 
     keep_items = []
-    if glove_swap:
+    if (config.get("barType") or "").lower() == "gold":
         # The spare pair's slot must survive every bank deposit -- and, like the coal bag's
         # kept slot, it naturally caps shift-withdraw-all at 27 gold ore (the recording's own
         # trip size; the "not enough inventory space" chat on each withdrawal is normal).
-        # Both names kept: one is worn, the other carried, and which is which varies.
-        keep_items += [ICE_GLOVES, GOLDSMITH_GAUNTLETS]
+        # Every glove name is kept: one is worn, the other carried, and which is which
+        # varies; a name the account does not own keeps nothing. Kept for EVERY gold trip,
+        # not only when the swap is active -- LIVE 2026-09-04 the swap read inactive (the
+        # account's ice pair is Smiths gloves (i), which the check did not know) and the
+        # deposit-all banked the carried Goldsmith gauntlets. A missed detection must never
+        # cost the pair again.
+        keep_items += [*ICE_GLOVE_NAMES, GOLDSMITH_GAUNTLETS]
     need_bag_withdraw = False
     if bar_uses_coal_bag:
         keep_items.append("coal bag")
@@ -758,9 +778,10 @@ def collect_bars(ctx, config: dict, glove_swap: bool = False) -> bool:
     # end-of-trip collect AND the pre-trip dispenser clearing (a restart with bars stranded).
     # `glove_swap` guards it so every other bar type / the plain always-worn-ice method is
     # untouched.
-    if glove_swap and not ensure_gloves_worn(ctx, ICE_GLOVES):
+    ice_pair = ice_glove_pair() if glove_swap else ICE_GLOVES
+    if glove_swap and not ensure_gloves_worn(ctx, ice_pair):
         ctx.state.trigger_safety_stop(
-            f"couldn't wear {ICE_GLOVES} before collecting bars -- is the pair missing?"
+            f"couldn't wear {ice_pair} before collecting bars -- is the pair missing?"
         )
         return False
 

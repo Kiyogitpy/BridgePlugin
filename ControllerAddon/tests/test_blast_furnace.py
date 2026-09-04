@@ -311,5 +311,51 @@ def test_run_trip_non_swap_gold_is_unchanged(monkeypatch):
     assert bf.run_trip(ctx, {"barType": "gold"}, trip, bar_uses_coal_bag=False) is True
     assert "wait" not in order
     assert order == [("collect", False), ("collect", False)]
+    # The glove names are kept on EVERY gold trip, swap or not (live 2026-09-04: a missed
+    # swap detection let the deposit-all bank the carried Goldsmith gauntlets).
     keep = [k.lower() for k in recorded["deposit_cfg"].get("keepItems", [])]
-    assert "ice gloves" not in keep
+    assert "goldsmith gauntlets" in keep and "smiths gloves (i)" in keep
+
+
+# --- Smiths gloves (i) as the ice pair (2026-09-04) -----------------------------------
+# LIVE the same day: the account's ice pair is Smiths gloves (i); the swap read inactive, the
+# gauntlets were left off keepItems, and the bank deposit-all took them.
+
+def test_swap_active_with_smiths_gloves_i_as_the_ice_pair(monkeypatch):
+    _equip_gloves(monkeypatch, "Goldsmith gauntlets")
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Smiths gloves (i)")])
+    assert bf.gold_glove_swap_active({"barType": "gold"}) is True
+    _equip_gloves(monkeypatch, "Smiths gloves (i)")
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Goldsmith gauntlets")])
+    assert bf.gold_glove_swap_active({"barType": "gold"}) is True
+
+
+def test_ice_glove_pair_resolves_to_the_pair_the_account_has(monkeypatch):
+    _equip_gloves(monkeypatch, "Goldsmith gauntlets")
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Smiths gloves (i)")])
+    assert bf.ice_glove_pair() == "Smiths gloves (i)"
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Ice gloves")])
+    assert bf.ice_glove_pair() == "Ice gloves"
+    _equip_gloves(monkeypatch, "Smiths gloves (i)")
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    assert bf.ice_glove_pair() == "Smiths gloves (i)"
+    _equip_gloves(monkeypatch, None)
+    assert bf.ice_glove_pair() == "Ice gloves"          # nothing visible: a sensible default
+
+
+def test_collect_bars_swap_wears_the_smiths_pair_when_that_is_the_ice_pair(monkeypatch):
+    order = []
+    varbit = {"value": 27}
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: varbit["value"])
+    monkeypatch.setattr(controller, "get_objects", lambda: [_dispenser()])
+    _equip_gloves(monkeypatch, "Goldsmith gauntlets")
+    monkeypatch.setattr(controller, "get_inventory", lambda: [_item("Smiths gloves (i)")])
+
+    def click(ser, entity, **kw):
+        order.append("take")
+        varbit["value"] = 0
+        return True
+    monkeypatch.setattr(controller, "click_entity", click)
+    monkeypatch.setattr(bf, "ensure_gloves_worn", lambda ctx, name: order.append(name) or True)
+    assert bf.collect_bars(_Ctx(), {"barType": "gold"}, glove_swap=True) is True
+    assert order == ["Smiths gloves (i)", "take", "Goldsmith gauntlets"]

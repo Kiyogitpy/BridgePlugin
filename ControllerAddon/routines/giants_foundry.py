@@ -26,12 +26,18 @@ DEFAULT_CONFIG = {
     # Value-aware crucible fill plan (the recording's own loadout): items usable on the
     # crucible, the metal they melt into, bars per item (wiki: equipment = smithing bar
     # cost minus 1), and how many bars of that metal the crucible should end up holding.
+    # Each metal lists its usable items in preference order (see metal_items); the planner
+    # takes stock from each in turn until the metal's bars are covered -- USER 2026-09-03:
+    # "write mith and ada to get all items, we have plenty of bars". MEASURED live: the
+    # bank ran out of Adamant platelegs after one sword and of Adamant platebodies after
+    # three more, with adamant bars and other adamant equipment still sitting there.
     "fill": [
-        {"item": "Mithril platebody", "metal": "MITHRIL", "bars_each": 4, "target_bars": 14},
-        {"item": "Adamant platelegs", "metal": "ADAMANT", "bars_each": 2, "target_bars": 14},
+        {"metal": "MITHRIL", "target_bars": 14, "items": None},   # None = metal_items("Mithril")
+        {"metal": "ADAMANT", "target_bars": 14, "items": None},
     ],
     # Item quantization can overflow the 28-bar cap (MEASURED: 4-bar platebody into 2 bars
-    # of space -> confirm dialog, 2 bars lost). Accept the confirm iff the loss is <= this.
+    # of space -> confirm dialog, 2 bars lost). The planner first trims the last item to an
+    # exact fit; a residual overflow is accepted (confirm dialog) iff the loss is <= this.
     "max_overflow_loss": 2,
 
     "breaks": {
@@ -139,16 +145,88 @@ def best_moulds(commission, usable):
 
 CRUCIBLE_CAPACITY = 28
 
+# Wiki (Giants' Foundry, rev 15264119): equipment counts for its smithing bar cost minus 1;
+# bars count 1; ornamental variants cannot be added (exact-name matching keeps "(g)"/"(t)"
+# out). Ordered largest-first so a fill costs the fewest Use clicks; bars ahead of the
+# 1-bar equipment because a bar stack is one search + N clicks and nobody minds spending it.
+METAL_ITEM_VALUES = (
+    ("platebody", 4),
+    ("platelegs", 2), ("plateskirt", 2), ("chainbody", 2), ("kiteshield", 2),
+    ("2h sword", 2), ("warhammer", 2), ("battleaxe", 2),
+    ("bar", 1),
+    ("full helm", 1), ("sq shield", 1), ("scimitar", 1), ("longsword", 1), ("claws", 1),
+)
 
-def plan_fill(fill_cfg, crucible_contents, max_overflow_loss):
+
+# The bar is not named like the equipment for two metals (MEASURED live 2026-09-03,
+# gf_live22: "Adamant bar" matched nothing while the bank held Adamantite bars).
+BAR_NAMES = {"Adamant": "Adamantite bar", "Rune": "Runite bar"}
+
+
+def metal_items(metal_display):
+    """Every crucible-usable item of one metal as (name, bars_each), e.g. metal_items("Adamant")."""
+    out = []
+    for suffix, bars in METAL_ITEM_VALUES:
+        if suffix == "bar":
+            out.append((BAR_NAMES.get(metal_display, f"{metal_display} bar"), bars))
+        else:
+            out.append((f"{metal_display} {suffix}", bars))
+    return out
+
+
+def _fill_items(entry):
+    """An entry's usable items in preference order -- the "items" list, the whole metal
+    catalogue when it is None, or the legacy single item/bars_each pair."""
+    if entry.get("items") is None and entry.get("metal") and "item" not in entry:
+        return metal_items(entry["metal"].capitalize())
+    if entry.get("items"):
+        return [(i["item"], i["bars_each"]) for i in entry["items"]]
+    return [(entry["item"], entry["bars_each"])]
+
+
+def _plan_metal(entry, remaining, available):
+    """(item, bars_each, count) steps covering `remaining` bars of one metal. With stock
+    unknown (available is None) the primary item alone; otherwise stock is taken from
+    each item in preference order until the bars are covered, and a metal nothing can
+    cover falls back to the primary (so the restock's own out-of-stock stop names it)."""
+    items = _fill_items(entry)
+    if available is None:
+        item, bars_each = items[0]
+        return [(item, bars_each, math.ceil(remaining / bars_each))]
+    steps = []
+    left = remaining
+    for item, bars_each in items:
+        qty = available.get(item.lower(), 0)
+        if qty <= 0 or left <= 0:
+            continue
+        take = min(qty, math.ceil(left / bars_each))
+        steps.append((item, bars_each, take))
+        left -= take * bars_each
+    if left > 0:
+        # Short stock: top up with the primary item -- the restock fetches it, and the
+        # open bank's own re-plan swaps in whatever it really holds (MEASURED gf_live20:
+        # 4 leftover battleaxes planned 24/28 and safety-stopped instead of banking).
+        item, bars_each = items[0]
+        for i, (name, b, count) in enumerate(steps):
+            if name == item:
+                steps[i] = (name, b, count + math.ceil(left / b))
+                break
+        else:
+            steps.append((item, bars_each, math.ceil(left / bars_each)))
+    return steps
+
+
+def plan_fill(fill_cfg, crucible_contents, max_overflow_loss, available=None):
     """What still needs adding, from the LIVE crucible varbits (crucibleContents) --
     re-derived every tick, no local estimate (the fur-pouch lesson). Returns
-    (steps, error): steps ordered largest bars_each first so the 28-bar cap (and any
-    quantization loss) lands on the last, cheapest item; ([], None) means the crucible
-    is satisfied; ([], "reason") is a config/stock problem worth a safety stop.
-    Item counts quantize UP (ceil) -- the game caps the final item at remaining space
-    and asks to confirm the loss (MEASURED: 2 bars lost on a 4-bar platebody into 2
-    bars of space); the loss is accepted at execution time iff <= max_overflow_loss."""
+    (steps, error): steps ordered largest bars_each first so the 28-bar cap lands on the
+    last, cheapest item; ([], None) means the crucible is satisfied; ([], "reason") is a
+    config/stock problem worth a safety stop. `available` maps lower-cased item name ->
+    bank quantity (None = cannot tell) and picks between each metal's alternatives.
+    Item counts quantize UP (ceil), then the LAST step is trimmed to the smallest count
+    that still fills the crucible -- an exact fit beats the game's overflow confirm
+    (MEASURED: 2 bars lost on a 4-bar platebody into 2 bars of space); a residual loss is
+    accepted at execution time iff <= max_overflow_loss."""
     contents = crucible_contents or {}
     space = CRUCIBLE_CAPACITY - sum(contents.values())
     if space <= 0:
@@ -157,12 +235,15 @@ def plan_fill(fill_cfg, crucible_contents, max_overflow_loss):
     steps = []
     planned_bars = 0
     for entry in fill_cfg:
-        remaining = entry["target_bars"] - contents.get(entry["metal"], 0)
+        # A metal never needs more than the crucible's free space (12 bars of space with
+        # a 14-bar target planned a top-up trip while 12 held bars already fit exactly).
+        remaining = min(entry["target_bars"] - contents.get(entry["metal"], 0),
+                        space - planned_bars)
         if remaining <= 0:
             continue
-        count = math.ceil(remaining / entry["bars_each"])
-        steps.append({"item": entry["item"], "bars_each": entry["bars_each"], "count": count})
-        planned_bars += count * entry["bars_each"]
+        for item, bars_each, count in _plan_metal(entry, remaining, available):
+            steps.append({"item": item, "bars_each": bars_each, "count": count})
+            planned_bars += count * bars_each
 
     if not steps:
         return [], None
@@ -170,11 +251,19 @@ def plan_fill(fill_cfg, crucible_contents, max_overflow_loss):
         total = CRUCIBLE_CAPACITY - space + planned_bars
         return [], (f"fill plan only reaches {total}/{CRUCIBLE_CAPACITY} bars -- "
                     "raise the fill config's target_bars")
+    steps.sort(key=lambda s: -s["bars_each"])
+    # Trim the overflow away, smallest items first (MEASURED gf_live21: trimming only the
+    # last step left 5 bars of overflow when the leftovers made a bigger item the last).
+    for _, step in sorted(enumerate(steps), key=lambda p: (p[1]["bars_each"], -p[0])):
+        while step["count"] > 0 and planned_bars - step["bars_each"] >= space:
+            step["count"] -= 1
+            planned_bars -= step["bars_each"]
+    steps = [st for st in steps if st["count"] > 0]
     loss = planned_bars - space
     if loss > max_overflow_loss:
         return [], (f"fill plan would overflow {loss} bars "
-                    f"(> max_overflow_loss {max_overflow_loss}) -- adjust the fill config")
-    steps.sort(key=lambda s: -s["bars_each"])
+                    f"(> max_overflow_loss {max_overflow_loss}) -- adjust the fill config; "
+                    f"plan was {[(st['item'], st['count']) for st in steps]}")
     return steps, None
 
 
@@ -192,11 +281,90 @@ TOOL_STATS = {
     "POLISHING_WHEEL": {"cycle_ticks": 2, "progress": 10, "heat": -17, "object": 44621},
 }
 
-# Stop the fast heat/cool this far short of the computed target: the Dunk/Quench ramp
-# runs +-27..33 per tick at the point we ride it (easy-giantsfoundry's measured DX_1
-# curve from index 10; CONFIRMED in the recording, 724->751->780->813), so one poll of
-# latency costs about one fast tick.
-HEAT_STOP_MARGIN = 35
+# The Dunk/Quench ramp ACCELERATES: easy-giantsfoundry's measured DX_1 curve from the
+# fast start is 27,30,33,37,41,45,49,53,57,62,67,72,77,83,89,95 per tick (CONFIRMED in the
+# recording, 724->751->780->813). A fixed stop margin cannot track that -- MEASURED live
+# 2026-09-03 (gf_live7): a poll that stopped at 935 for a 939 target peaked at 997 one tick
+# later and the hammer acted out of band twice. And MEASURED gf_live9/10: with the machine
+# pre-hovered, a click issued inside the same tick window as the reading cancels the ramp
+# BEFORE its next increment -- the landing IS the reading (999 -> 971 read, click, 967).
+# So the stop is: poll right after each tick boundary (ctx.events' tick clock), and click
+# on the first reading past `ramp_aim` -- the target, capped one worst-case step inside the
+# band so the first reading past it can never be out of band.
+RAMP_RATE_STEP = 6       # DX_1 grows by 3..6 per tick in the fast regime; assume the worst
+RAMP_INITIAL_RATE = 27   # first fast tick, before any delta has been observed
+RAMP_TICK_MIN = 15       # smaller changes are passive decay, not a ramp tick
+RAMP_MAX_RATE = 95       # the curve's last step; a bigger delta is a stale/late first read
+TICK_S = 0.6
+POLL_AFTER_TICK_S = 0.08  # the bridge serves the new varbit within ~20ms of the boundary
+
+
+RAMP_EDGE_MARGIN = 4     # passive decay (-1 per 2 ticks) before the machine's first action
+
+
+def ramp_aim(target, rate, min_t, max_t, heating):
+    """The temperature to stop at: `target`, capped so that the first reading at or past
+    it (which can overshoot the aim by up to one accelerating step) stays inside the band
+    with room for the passive decay before the machine's first action (MEASURED gf_live28:
+    a quench landed at 395 on a 392 floor)."""
+    step = rate + RAMP_RATE_STEP + RAMP_EDGE_MARGIN
+    return min(target, max_t - step) if heating else max(target, min_t + step)
+
+
+def ramp_stop_reached(t, aim, heating):
+    return t >= aim if heating else t <= aim
+
+
+def action_fires_at(t, tool, n):
+    """The temperature at which the n-th machine action from now fires (n=1 is the next
+    one, at roughly the current reading): each earlier action moves the preform by its
+    heat delta and the passive decay costs about 1 per action."""
+    delta = TOOL_STATS[tool]["heat"]
+    return t + (n - 1) * (delta - 1)
+
+
+def edge_leave_due(t, tool, min_t, max_t, lead=2):
+    """While a machine works, is it time to leave for the pool? MEASURED live 2026-09-03
+    (gf_live12): the wheel fell through its floor and the next poll saw TOO_COLD two or
+    three actions later, 5 quality each. The leave fires when action number `lead + 1`
+    from now would fire OUT of band: with the pool hovered the interrupt registers
+    within a tick (lead 1); otherwise the poll + flight needs the extra action (lead 2).
+    MEASURED gf_live19: the earlier formula measured the temperature AFTER `lead`
+    actions instead of the one action `lead + 1` fires AT, leaving one action early
+    into a dunk that then cancelled itself (two wheel actions fit at 94 -> 76)."""
+    fires = action_fires_at(t, tool, lead + 1)
+    return fires < min_t if TOOL_STATS[tool]["heat"] < 0 else fires > max_t
+
+
+def edge_leave_lead(tool, pool_hovered):
+    if TOOL_STATS[tool]["cycle_ticks"] > 2:
+        return 1                      # the hammer's 3s cycle leaves time either way
+    return 1 if pool_hovered else 2
+
+
+POOL_HOVER_EXTRA_LEAD = 2   # hover the pool this many actions before the leave is due
+
+
+def _pool_for_tool(tool):
+    """The pool a working tool will need next: cooling tools run into the floor (lava),
+    the grindstone into the ceiling (waterfall)."""
+    return LAVA_POOL_ID if TOOL_STATS[tool]["heat"] < 0 else WATERFALL_ID
+
+
+def _pool_click(ctx, pool, option, in_place=False):
+    """Start Dunk/Quench. USER 2026-09-03: "the right click isn't needed for quench and
+    dunk, that is default to left click" (their client-side menu swap) -- so: a click in
+    place when the pool is already hovered and /hover confirms the default, else a
+    verified left click (click_entity withholds on a hover mismatch), else the menu."""
+    if in_place and controller.hover_matches(expected_action=option):
+        controller.click_human(ctx.ser)
+        return True
+    ok = controller.click_entity(ctx.ser, pool, refresh_target=_refresh(pool),
+                                 expected_action=option)
+    if ok:
+        return True
+    return bool(controller.click_menu_action(ctx.ser, pool, option,
+                                             refresh_target=_refresh(pool)))
 
 
 def actions_left_in_section(completion, section_count, tool):
@@ -229,8 +397,10 @@ def heat_stop_target(tool, min_t, max_t, actions_left):
 # ---------------------------------------------------------------------------
 
 WORKING_ACTIVITIES = ("HAMMERING", "GRINDING", "POLISHING")
+SWEET_SPOT_BONUS = 50      # wiki: "a large amount of progress (around 5%)" on the 0-1000 scale
 WORK_STALL_S = 12.0        # > two hammer cycles (3s each) + the nulled first cycle
 WORK_FIRST_ACTION_S = 6.0
+WALK_S_PER_TILE = 0.6      # a queued machine click is performed on ARRIVAL: budget the walk
 DEAD_CLICK_LIMIT = 5
 HEAT_ADJUST_TIMEOUT_S = 20.0
 HEAT_POLL_S = 0.25
@@ -299,6 +469,8 @@ def _select_moulds_in_ui(ctx, st, plan):
         want = plan.get(part)
         if want is None or selected.get(part) == want:
             continue
+        if selected.get(part) and selected.get(part) == data.get("gf_mould_fallback", {}).get(part):
+            continue          # accepted fallback (see below)
         _click_widget(ctx, MOULD_GROUP, MOULD_TAB_CHILD, index=MOULD_TAB_SLOTS[part])
         controller.human_delay(0.4, 0.7)
         rows = controller.get_widget_children(MOULD_GROUP, MOULD_LIST_CHILD) or []
@@ -310,7 +482,12 @@ def _select_moulds_in_ui(ctx, st, plan):
             if usable and enum not in usable:
                 continue
             s = mould_score(enum, commission)
-            if best is None or s > best[0]:
+            # Ties go to the PLANNED row: the plan's argmax walks the catalogue in table
+            # order, this loop walks the UI list in its own order -- MEASURED live
+            # 2026-09-03 (FLAT/HEAVY: Defender Base 18 == Chopper Forte +1 18), the two
+            # disagreed and the selection re-clicked every tick ("clicking forte over and
+            # over").
+            if best is None or s > best[0] or (s == best[0] and enum == want):
                 best = (s, enum, row)
         if best is None:
             data["gf_mould_norow"] = data.get("gf_mould_norow", 0) + 1
@@ -322,6 +499,15 @@ def _select_moulds_in_ui(ctx, st, plan):
             return
         data["gf_mould_norow"] = 0
         if best[1] != want:
+            if selected.get(part) == best[1]:
+                # The fallback is already selected: accept it rather than re-clicking it
+                # once a tick forever (MEASURED live 2026-09-03, gf_live13/14, USER:
+                # "clicking forte over and over" -- Defender Base's row never matched).
+                data.setdefault("gf_mould_fallback", {})[part] = best[1]
+                debug_log.log("gf", f"accepting {best[1]} for {part} (planned {want} not "
+                                    f"selectable); rows seen: "
+                                    f"{[_strip_tags(r.get('text')) for r in rows]}")
+                continue
             debug_log.log("gf", f"planned {want} not on screen for {part} -- "
                                 f"taking best visible {best[1]}")
         controller.click_entity(ctx.ser, best[2], offset=(0, 0),
@@ -363,6 +549,7 @@ STATE_UNAVAILABLE_LIMIT = 20
 COMMISSION_MAX_ATTEMPTS = 4
 HANDIN_MAX_ATTEMPTS = 6
 FILL_MAX_ATTEMPTS = 3
+RESTOCK_MAX_TRIPS = 3
 FILL_DIALOG_TIMEOUT_S = 4.0
 POUR_MAX_ATTEMPTS = 4
 HEAT_FAIL_LIMIT = 5
@@ -385,6 +572,8 @@ def _reset_counters(data, st, phase):
     # phase handler dies the moment the dispatcher stops routing there.
     if st.get("commissionTypes"):
         data["gf_commission_attempts"] = 0
+    if not st.get("selectedMoulds"):
+        data["gf_mould_fallback"] = {}
     if phase not in ("READY_TO_HAND_IN", "RUINED"):
         data["gf_handin_attempts"] = 0
     if phase not in ("PREFORM_READY", "COLLECTING_PREFORM"):
@@ -392,6 +581,7 @@ def _reset_counters(data, st, phase):
     bars = st.get("crucibleBarCount", 0)
     if bars > data.get("gf_last_bars", -1):
         data["gf_fill_attempts"] = 0
+        data["gf_restock_trips"] = 0
     data["gf_last_bars"] = bars
     if st.get("mouldSetupOpen"):
         data["gf_mould_opens"] = 0
@@ -427,12 +617,18 @@ def setup(ctx):
         debug_log.log("gf", "could not read equipment at setup -- glove/hand check skipped")
         return
     gloves = ((eq.get("gloves") or {}).get("name") or "").lower()
-    if "ice gloves" not in gloves and "smithing gloves (i)" not in gloves:
+    # The item is "Smiths gloves (i)" (cache obj 27031) -- an earlier "smithing gloves (i)"
+    # here never matched, so the routine refused to start for anyone wearing the pair.
+    if "ice gloves" not in gloves and "smiths gloves (i)" not in gloves:
         ctx.state.trigger_safety_stop(
-            "giants foundry: ice gloves / smithing gloves (i) must be equipped to pick "
+            "giants foundry: ice gloves / Smiths gloves (i) must be equipped to pick "
             "up preforms")
         return
-    if (eq.get("weapon") or {}).get("name") or (eq.get("shield") or {}).get("name"):
+    # The held preform itself lives in the weapon slot (/equipment reports weapon
+    # "Preform" mid-refine) -- MEASURED live 2026-09-03: a restart with the sword in hand
+    # right-clicked it and chose "Remove Preform". Only OTHER hand items block a pickup.
+    held = [(eq.get(slot) or {}).get("name") or "" for slot in ("weapon", "shield")]
+    if any(name and name.lower() != "preform" for name in held):
         debug_log.log("gf", "weapon/shield equipped at setup -- freeing hands")
         _free_hands(ctx)
     debug_log.log("gf", "setup ok -- gloves equipped")
@@ -490,7 +686,13 @@ def get_commission_phase(ctx, st):
     data = ctx.state.data
     d = _dialogue()
     if _dialogue_open(d):
-        controller.key_tap(ctx.ser, "SPACE")
+        # An option menu (the hand-in chain's "Receive another commission?" Yes/No, left
+        # open by a restart) needs its number key -- Space never selects an option and
+        # pressed once a tick forever (MEASURED live 2026-09-03, gf_live8).
+        if _dialogue_options(d):
+            _choose_option(ctx, d, ("yes", "commission"), fallback_key="1")
+        else:
+            controller.key_tap(ctx.ser, "SPACE")
         controller.human_delay(0.4, 0.8)
         return
     if data.get("gf_commission_attempts", 0) >= COMMISSION_MAX_ATTEMPTS:
@@ -517,8 +719,10 @@ def prepare_phase(ctx, st):
     # A part-mismatch against the plan only forces a re-open while the mould is not yet
     # SET (phase PREPARING/SELECTING_MOULDS); once workflowState says MOULD_SET we take
     # the selection as final -- re-opening a set mould mid-fill would loop.
+    fallback = ctx.state.data.get("gf_mould_fallback", {})
     if st.get("phase") != "MOULD_SET" and (
-            len(selected) < 3 or any(selected.get(p) != plan.get(p) for p in plan)):
+            len(selected) < 3 or any(selected.get(p) != plan.get(p) and
+                                     selected.get(p) != fallback.get(p) for p in plan)):
         _open_mould_setup(ctx)
         return
     if st.get("crucibleBarCount", 0) < CRUCIBLE_CAPACITY:
@@ -527,11 +731,29 @@ def prepare_phase(ctx, st):
     _pour(ctx, st)
 
 
+def _inventory_counts(inv):
+    counts = {}
+    for i in inv:
+        name = (i.get("name") or "").lower()
+        if name:
+            counts[name] = counts.get(name, 0) + (i.get("qty") or i.get("quantity") or 1)
+    return counts
+
+
 def _fill_crucible(ctx, st):
     cfg = ctx.state.config
     data = ctx.state.data
+    # Outside the bank, what we HOLD picks each metal's item (plan_fill's `available`);
+    # inside it, the open bank's own item list does (_restock_from_bank re-plans). The
+    # m8aq storage/bank reader only carries the container while the interface is open, so
+    # it cannot answer here -- MEASURED live 2026-09-03 (gf_live5): it lingered for one tick
+    # after closing, the plan flipped platebody -> platelegs, the three held platebodies no
+    # longer matched, and every tick became a bank trip.
+    inv = controller.get_inventory() or []    # bare list (controller.get_inventory), not {"items": [...]}
+    held_counts = _inventory_counts(inv)
     steps, err = plan_fill(cfg["fill"], st.get("crucibleContents") or {},
-                           cfg["max_overflow_loss"])
+                           cfg["max_overflow_loss"],
+                           available=held_counts if held_counts else None)
     if err:
         ctx.state.trigger_safety_stop(f"giants foundry: {err}")
         return
@@ -539,10 +761,15 @@ def _fill_crucible(ctx, st):
         return    # satisfied -- prepare_phase pours on the next tick's read
 
     step = steps[0]
-    inv = controller.get_inventory() or []    # bare list (controller.get_inventory), not {"items": [...]}
     held = [i for i in inv if (i.get("name") or "").lower() == step["item"].lower()]
+    held_qty = sum((i.get("qty") or i.get("quantity") or 1) for i in held)   # a bar stack is ONE slot
     if not held:
-        _restock_from_bank(ctx, steps)
+        if data.get("gf_restock_trips", 0) >= RESTOCK_MAX_TRIPS:
+            ctx.state.trigger_safety_stop(
+                "giants foundry: restock trips are not progressing the crucible fill")
+            return
+        data["gf_restock_trips"] = data.get("gf_restock_trips", 0) + 1   # reset when bars grow
+        _restock_from_bank(ctx, steps, st)
         return
 
     if data.get("gf_fill_attempts", 0) >= FILL_MAX_ATTEMPTS:
@@ -553,6 +780,14 @@ def _fill_crucible(ctx, st):
     if crucible is None:
         return
     data["gf_fill_attempts"] = data.get("gf_fill_attempts", 0) + 1   # reset when bars grow
+    count = min(step["count"], held_qty)
+    if _is_bar(step["item"]) and _fill_via_crucible(ctx, crucible, step["item"], count):
+        return
+    # The sidebar may not be showing the inventory (MEASURED live 2026-09-03, gf_live27:
+    # after a pause/resume the stats tab was up and the "platebody" right-click offered
+    # "View Attack guide"; three misses hit the fill ceiling). Same rule as GOTR's
+    # inventory clicks: open the tab first.
+    controller.open_inventory_tab(ctx.ser)
     # Explicit Use via the menu -- a wearable's LEFT-click default is Wear/Wield, so a
     # bare click on platelegs would equip them instead of selecting them.
     if not controller.click_menu_action(ctx.ser, held[0], "Use",
@@ -562,7 +797,60 @@ def _fill_crucible(ctx, st):
     if not controller.click_entity(ctx.ser, crucible, refresh_target=_refresh(crucible)):
         return
     controller.mark_busy(FILL_DIALOG_TIMEOUT_S + 4)
-    _answer_fill_dialogs(ctx, min(step["count"], len(held)), accept_overflow=True)
+    _answer_fill_dialogs(ctx, min(step["count"], held_qty), accept_overflow=True)
+
+
+def _is_bar(item):
+    return item.lower().endswith(" bar")
+
+
+FILL_UI_WAIT_S = 3.0
+FILL_UI_SKIP_GROUPS = {149, 12, 15, 162}     # inventory, bank, bank inventory, chatbox
+
+
+def _fill_via_crucible(ctx, crucible, item, count):
+    """USER 2026-09-03: "instead of using a bar then on the crucible, which is very slow,
+    we can click the crucible then select the bar we wanna fill". Bars are not stackable,
+    so Use-bar-on-crucible adds ONE bar per tick (12 bars took ~90s live). Fill on the
+    crucible opens a selection interface; the bar's entry is matched by its name text
+    (the widget dump carries no item ids) and the usual quantity prompt follows. The
+    layout is logged the first time so it can be pinned; nothing found in FILL_UI_WAIT_S
+    means "cannot tell" and the caller falls back to the Use path."""
+    ok = controller.click_entity(ctx.ser, crucible, refresh_target=_refresh(crucible),
+                                 expected_action="Fill")
+    if not ok:
+        if not controller.click_menu_action(ctx.ser, crucible, "Fill",
+                                            refresh_target=_refresh(crucible)):
+            return False
+    controller.mark_busy(FILL_UI_WAIT_S + FILL_DIALOG_TIMEOUT_S + 4)
+    deadline = time.time() + FILL_UI_WAIT_S
+    want = item.lower()
+    while time.time() < deadline:
+        widgets = controller.get_widgets_dump() or []
+        hit = None
+        for w in widgets:
+            if w.get("group") in FILL_UI_SKIP_GROUPS:
+                continue
+            label = _strip_tags(f"{w.get('name') or ''} {w.get('text') or ''}").lower()
+            if want in label and w.get("screenX") is not None:
+                hit = w
+                break
+        if hit is not None:
+            if not ctx.state.data.get("gf_fill_ui_logged"):
+                ctx.state.data["gf_fill_ui_logged"] = True
+                debug_log.log("gf", f"crucible Fill interface: {item} at widget "
+                                    f"{hit.get('group')}.{hit.get('child')}[{hit.get('index')}] "
+                                    f"actions={hit.get('actions')}")
+            controller.click_entity(ctx.ser, hit, offset=(0, 0), check_ui_blockers=False,
+                                    simulate_mistakes=False)
+            _answer_fill_dialogs(ctx, count, accept_overflow=True)
+            return True
+        time.sleep(0.25)
+    groups = sorted({w.get("group") for w in (controller.get_widgets_dump() or [])
+                     if w.get("group") not in FILL_UI_SKIP_GROUPS and w.get("text")})
+    debug_log.log("gf", f"crucible Fill interface: no entry for {item}; text-bearing groups "
+                        f"{groups[:20]} -- falling back to Use")
+    return False
 
 
 def _pour(ctx, st):
@@ -580,22 +868,131 @@ def _pour(ctx, st):
     controller.human_delay(1.0, 1.6)
 
 
-def _restock_from_bank(ctx, steps):
+# USER 2026-09-03: "instead of searching the entire item, just search part of it like
+# 'mith' to get all mithril items or 'ada' to get all adamant items" -- one search per
+# metal lays every usable item of it out from slot 0, and the needed ones are clicked
+# from those results.
+METAL_SEARCH = {"MITHRIL": "mithril", "ADAMANT": "adamant", "RUNE": "rune", "STEEL": "steel",
+                "IRON": "iron", "BRONZE": "bronze"}   # informational; the group key is the first word
+
+
+def _slot_on_grid(bank, slot):
+    """Whether a bank slot's reported point sits inside the visible item grid -- between
+    the tab strip and the quantity buttons. Unknown geometry counts as visible."""
+    y = slot.get("screenY")
+    if y is None:
+        return False
+    tabs = bank.get("tabs") or []
+    top = (tabs[0].get("screenY") if tabs else None)
+    one = (bank.get("quantityButtons") or {}).get("one") or {}
+    bottom = one.get("screenY")
+    if top is not None and y < top + 20:
+        return False
+    if bottom is not None and y > bottom - 40:
+        return False
+    return True
+
+
+def _withdraw_by_metal(ctx, need):
+    """Withdraw {item: count}: one short search per metal (METAL_SEARCH), then click each
+    needed item from the results in quantity-1 mode. A result that is not on the visible
+    grid falls back to banker.search_and_withdraw's full-name search."""
+    groups = {}
+    for item, n in need.items():
+        # USER 2026-09-03: "adam" for all adamant items (bars included -- "Adamantite"
+        # shares the prefix), "mith" for mithril; there are never enough of a metal's
+        # items to push one off the grid. (gf_live30's off-grid bar was a search that
+        # never got typed, since fixed in banker.)
+        key = item.split(" ", 1)[0].lower()[:4]
+        groups.setdefault(key, []).append((item, n))
+    for key, items in groups.items():
+        if not banker.search_bank(ctx, key):
+            for item, n in items:
+                if not banker.search_and_withdraw(ctx, item, n):
+                    debug_log.log("gf", f"search-withdraw of {n}x {item} failed")
+            continue
+        banker.set_quantity_mode(ctx, "one")
+        for item, n in items:
+            bank = controller.get_bank(fresh=True)
+            slot = next((b for b in bank.get("items", [])
+                         if (b.get("name") or "").lower() == item.lower() and b.get("qty", 0) > 0),
+                        None)
+            if slot is None or not _slot_on_grid(bank, slot):
+                # Back-to-back searches are fine (banker.search_bank's own note); the
+                # earlier clear-then-search dance left the bank closed (gf_live30).
+                debug_log.log("gf", f"{item} not on the '{key}' results grid -- full-name search")
+                if not banker.search_and_withdraw(ctx, item, n):
+                    debug_log.log("gf", f"search-withdraw of {n}x {item} failed")
+                if any(i2 != item for i2, _ in items):
+                    banker.search_bank(ctx, key)
+                continue
+            debug_log.log("bank", f"withdrawing {n}x {item} from the '{key}' results")
+            _withdraw_count(ctx, slot, n)
+        banker.clear_bank_search(ctx)
+
+
+WITHDRAW_MENU_STEPS = (10, 5)
+
+
+def _withdraw_count(ctx, slot, n):
+    """USER 2026-09-03: "clicking 12 times on a bar isn't very human" -- take the bulk
+    through the right-click Withdraw-10 / Withdraw-5 entries and only the remainder as
+    single clicks (quantity mode is already 1)."""
+    left = n
+    for chunk in WITHDRAW_MENU_STEPS:
+        while left >= chunk:
+            if not controller.click_menu_action(ctx.ser, slot, f"Withdraw-{chunk}",
+                                                offset=(0, 0), check_ui_blockers=False):
+                break            # entry missing (thin stack): fall through to single clicks
+            left -= chunk
+            controller.human_delay(0.2, 0.4)
+    for _ in range(left):
+        controller.click_entity(ctx.ser, slot, simulate_mistakes=False)
+        controller.human_delay(0.15, 0.3)
+
+
+def _restock_from_bank(ctx, steps, st):
     """Withdraw everything the remaining plan needs in one trip. plan_fill already
     vetoed any overflow beyond config, so whatever we withdraw here is intended."""
     bank_obj = banker.find_nearby_bank({"maxBankDistance": 25})
     if bank_obj is None:
         debug_log.log("gf", "bank chest not visible -- waiting")
         return
-    if not banker.open_bank(ctx, bank_obj):
+    # A restart (or a manual cleanup) can leave the bank interface already up; clicking
+    # the chest's tile through it lands on whatever bank widget covers that pixel.
+    if not controller.get_bank().get("open") and not banker.open_bank(ctx, bank_obj):
         return
     banker.deposit_all_inventory(ctx)
+    # The OPEN bank's item list is the authoritative stock -- re-plan against it before
+    # withdrawing. MEASURED live 2026-09-03 (gf_live4): a transient /api/storage/bank read
+    # failure at tick 1 left the pre-bank plan on the primary item and the restock stopped
+    # on "out of Adamant platelegs" with 9 Adamant platebodies in the same bank.
+    items = (controller.get_bank(fresh=True) or {}).get("items") or []
+    if items:
+        stock = {}
+        for i in items:
+            name = (i.get("name") or "").lower()
+            if name:
+                stock[name] = stock.get(name, 0) + (i.get("qty") or 0)
+        cfg = ctx.state.config
+        replanned, err = plan_fill(cfg["fill"], st.get("crucibleContents") or {},
+                                   cfg["max_overflow_loss"], available=stock)
+        if err:
+            banker.close_bank(ctx)
+            ctx.state.trigger_safety_stop(f"giants foundry: {err}")
+            return
+        if replanned:
+            steps = replanned
     need = {}
     for s in steps:
         need[s["item"]] = need.get(s["item"], 0) + s["count"]
-    banker.withdraw_loadout(
-        ctx, {"withdraw": [{"name": item, "quantity": n} for item, n in need.items()]},
-        fresh=True)
+    # Search-then-withdraw per item, never the blind withdraw_loadout loop. MEASURED live
+    # 2026-09-03 (gf_live1): this user's bank holds 952 items and the platelegs sit in tab
+    # 2 (slot 487) -- /bank reports a real screen position far below the window for
+    # anything not on the visible page, every bare click was skipped as "outside the
+    # RuneLite window", and the empty inventory then read as "bank is out of Adamant
+    # platelegs" on a bank holding 7. search_bank lays the matches out from slot 0.
+    _withdraw_by_metal(ctx, need)
     inv = controller.get_inventory() or []
     names = [(i.get("name") or "").lower() for i in inv]
     for item in need:
@@ -618,6 +1015,7 @@ def _answer_fill_dialogs(ctx, count, accept_overflow):
         d = _dialogue()
         opts = _dialogue_options(d)
         if opts and not answered_quantity and not _is_confirm(opts):
+            debug_log.log("gf", f"crucible prompt options {opts} -- want {count}")
             picked = False
             for i, text in enumerate(opts):
                 if text.strip() == str(count):
@@ -666,6 +1064,12 @@ def pickup_phase(ctx, st):
         data["gf_need_free_hands"] = False
         return
     if data.get("gf_pickup_attempts", 0) >= PICKUP_MAX_ATTEMPTS:
+        # MEASURED live 2026-09-03 (gf_live18): the third click DID pick the preform up,
+        # and the ceiling fired on the same tick off a state read one tick stale.
+        fresh = read_state()
+        if fresh and fresh.get("preformState") == "EQUIPPED":
+            data["gf_pickup_attempts"] = 0
+            return
         ctx.state.trigger_safety_stop(
             "giants foundry: could not pick up the preform (hands still full?)")
         return
@@ -673,8 +1077,14 @@ def pickup_phase(ctx, st):
     if jig is None:
         return
     data["gf_pickup_attempts"] = data.get("gf_pickup_attempts", 0) + 1
-    controller.click_entity(ctx.ser, jig, refresh_target=_refresh(jig),
-                            expected_action="Pick-up")
+    ok = controller.click_entity(ctx.ser, jig, refresh_target=_refresh(jig),
+                                 expected_action="Pick-up")
+    if getattr(ok, "withheld", False):
+        # The hover check refused the pixel twice in a row live (gf_live18) -- a
+        # contested/stale pixel is what the right-click menu beats (the golem_crafting
+        # tier-3 lesson), so escalate instead of spending the attempt budget on it.
+        controller.click_menu_action(ctx.ser, jig, "Pick-up", offset=(0, 0),
+                                     refresh_target=_refresh(jig))
     controller.mark_busy(4.0)
     controller.human_delay(1.2, 1.8)
 
@@ -738,12 +1148,28 @@ def refine_phase(ctx, st):
     # Sweet spot: exactly one claim click per AVAILABLE window, and only while the
     # temperature is right -- claiming out of band damages the sword instead.
     if st.get("sweetSpotState") == "AVAILABLE":
-        if st.get("temperatureStatus") == "READY" and not data.get("gf_sweet_claimed"):
+        # A claim one action from the band edge is worth at most the 5 its bonus action
+        # then loses out of band, and it preempted the edge-leave tick live (gf_live26:
+        # claim at 21:27:49, TOO_COLD at 41 two seconds later). The leave wins.
+        near_edge = (st.get("minimumTemperature", -1) >= 0 and st.get("temperature", -1) >= 0
+                     and edge_leave_due(st["temperature"], tool, st["minimumTemperature"],
+                                        st["maximumTemperature"], lead=1))
+        if st.get("temperatureStatus") == "READY" and not data.get("gf_sweet_claimed")                 and not near_edge:
             machine = _find_object(TOOL_STATS[tool]["object"])
             if machine is not None:
                 controller.click_entity(ctx.ser, machine, refresh_target=_refresh(machine),
                                         simulate_mistakes=False)
                 data["gf_sweet_claimed"] = True
+                data["gf_pool_hovered"] = None
+                # Wiki: "the sweet spot may frequently push progress into the next section
+                # and require a new tool, so the player should be ready to click away".
+                # MEASURED live 2026-09-03 (gf_live23): the bonus crossed the boundary on
+                # the machine's next tick and the ordinary path's pool click came 1.4s
+                # later -- one wrong-tool tick, 5 quality. Arm the watch now.
+                per = 1000.0 / st.get("sectionCount", 0) if st.get("sectionCount") else 0
+                if per and (st.get("completion", 0) % per) + SWEET_SPOT_BONUS >= per                         and _next_tool(st) is not None:
+                    data["gf_boundary_armed"] = (tool, st.get("completion", 0))
+                    _boundary_watch(ctx, st, tool)
                 return
     else:
         data["gf_sweet_claimed"] = False
@@ -767,16 +1193,61 @@ def refine_phase(ctx, st):
     else:
         data["gf_quality_drop_streak"] = 0
 
-    working = st.get("activity") in WORKING_ACTIVITIES
+    # "Working" is NOT the animation alone. MEASURED live 2026-09-03 (gf_live2 + recorder):
+    # the polishing animation (9454) plays ~0.7s of each 1.2s wheel cycle and the player
+    # reads as idle (activity NONE) the rest, so a random poll saw "not working" ~40% of
+    # the time; every such poll re-clicked the wheel, every re-click forfeited an action
+    # ("overwork the preform"), five in a row hit DEAD_CLICK_LIMIT, and the stop left the
+    # wheel running while the preform went cold (quality 147 -> 67). So: progress that
+    # advanced within WORK_STALL_S is working, and so is a machine click still inside its
+    # walk-budgeted commit window (five hammer clicks landed on five consecutive ticks
+    # while the player was still walking there). The memory resets on a tool change so a
+    # section boundary never makes the next machine wait out a stall window.
+    now = time.time()
+    if data.get("gf_work_tool") != tool:
+        data["gf_work_tool"] = tool
+        data.pop("gf_progress_mark", None)
+        data["gf_engage_until"] = 0.0
+    mark = data.get("gf_progress_mark")
+    recent_progress = mark is not None and now - mark[1] < WORK_STALL_S
+    engaged = now < data.get("gf_engage_until", 0.0)
+    working = (st.get("activity") in WORKING_ACTIVITIES) or recent_progress or engaged
     status = st.get("temperatureStatus")
     if working:
         if status in ("TOO_COLD", "TOO_HOT"):
             # THE QUALITY GUARD: a running machine keeps acting while the temperature
-            # is wrong, and every such action costs 10 quality. Interrupt it by going
+            # is wrong, and every such action costs 5 quality. Interrupt it by going
             # straight to the heat adjust -- clicking the lava/waterfall interrupts the
             # work exactly like any other click, so this is one action, not two.
             _adjust_heat_and_engage(ctx, st, tool)
             return
+        min_t, max_t = st.get("minimumTemperature", -1), st.get("maximumTemperature", -1)
+        t = st.get("temperature", -1)
+        actions_left = actions_left_in_section(st.get("completion", 0),
+                                               st.get("sectionCount", 0), tool)
+        if min_t >= 0 and t >= 0 and actions_left > 1:
+            pool_id = _pool_for_tool(tool)
+            lead = edge_leave_lead(tool, data.get("gf_pool_hovered") == pool_id)
+            # Only an action that will actually fire in THIS section can be out of band;
+            # the section's last action hands over to the boundary watch.
+            if lead + 1 <= actions_left and edge_leave_due(t, tool, min_t, max_t, lead=lead):
+                # Leave BEFORE the edge (see edge_leave_due); the last action of a section
+                # is left to the boundary watch, which changes the band anyway.
+                pool = _find_object(pool_id)
+                debug_log.log("gf", f"leaving {tool} at {t} before the band edge {min_t}-{max_t}")
+                _adjust_heat_and_engage(ctx, st, tool, pool=pool,
+                                        prehovered=data.get("gf_pool_hovered") == pool_id,
+                                        heating=TOOL_STATS[tool]["heat"] < 0)
+                return
+            if edge_leave_due(t, tool, min_t, max_t, lead=lead + POOL_HOVER_EXTRA_LEAD) and \
+                    data.get("gf_pool_hovered") != pool_id:
+                # USER 2026-09-03: "hover heat up / waterfall too since we just lost two
+                # quality for being too slow" -- the player is standing still at the
+                # machine, so a hovered pool pixel stays put until the leave.
+                pool = _find_object(pool_id)
+                if pool is not None and controller.hover_entity(
+                        ctx.ser, pool, refresh_target=_refresh(pool)):
+                    data["gf_pool_hovered"] = pool_id
         _watch_progress(ctx, st)
         return
 
@@ -786,10 +1257,23 @@ def refine_phase(ctx, st):
         _adjust_heat_and_engage(ctx, st, tool)
 
 
+HEAT_LEVEL = {"POLISHING_WHEEL": 1, "GRINDSTONE": 2, "TRIP_HAMMER": 3}
+BOUNDARY_WATCH_MARGIN_S = 2.5
+
+
+def _next_tool(st):
+    seq = st.get("toolSequence") or []
+    idx = st.get("currentSection", 0)      # 1-based current -> 0-based index of the NEXT
+    if 0 < idx < len(seq):
+        return seq[idx]
+    return None
+
+
 def _watch_progress(ctx, st):
     """While the machine runs, only watch. Progress advancing clears the dead-click
     counter; WORK_STALL_S with no progress while 'working' means the activity read is
-    stale or the action never started -- re-engage once per stall window."""
+    stale or the action never started -- re-engage once per stall window. One action from
+    a section boundary, hand over to the boundary watch (see _boundary_watch)."""
     data = ctx.state.data
     comp = st.get("completion", 0)
     mark = data.get("gf_progress_mark")
@@ -797,14 +1281,70 @@ def _watch_progress(ctx, st):
     if mark is None or comp > mark[0]:
         data["gf_progress_mark"] = (comp, now)
         data["gf_dead_clicks"] = 0
-        return
-    if now - mark[1] > WORK_STALL_S:
+    elif now - mark[1] > WORK_STALL_S:
         debug_log.log("gf", f"no progress for {WORK_STALL_S:.0f}s while working -- re-engaging")
         data["gf_progress_mark"] = (comp, now)
         _click_machine(ctx, st, st.get("requiredTool"))
+        return
+    tool = st.get("requiredTool")
+    if tool in TOOL_STATS and st.get("temperatureStatus") == "READY" and \
+            actions_left_in_section(comp, st.get("sectionCount", 0), tool) == 1 and \
+            _next_tool(st) is not None and data.get("gf_boundary_armed") != (tool, comp):
+        data["gf_boundary_armed"] = (tool, comp)
+        _boundary_watch(ctx, st, tool)
 
 
-def _click_machine(ctx, st, tool):
+def _boundary_watch(ctx, st, tool):
+    """MEASURED live 2026-09-03 (gf_live7): every section boundary cost 5 quality -- the
+    machine keeps acting after the section completes, once more with the WRONG tool,
+    before the ordinary poll + mouse flight reaches the pool (wiki: "be ready to click
+    away from the machine before the machine ticks again"). So with one action left:
+    hover the pool the next tool needs (hotter tool -> lava, colder -> waterfall), poll
+    fast, and the instant the required tool flips, right-click Dunk/Quench in place and
+    ride the ramp into the new band. Bands never overlap between different heat levels,
+    so the direction is known before the flip; a READY read after the flip (same level)
+    just engages the next machine."""
+    nxt = _next_tool(st)
+    hotter = HEAT_LEVEL.get(nxt, 0) > HEAT_LEVEL.get(tool, 0)
+    pool = _find_object(LAVA_POOL_ID if hotter else WATERFALL_ID)
+    if pool is None:
+        return
+    controller.hover_entity(ctx.ser, pool, refresh_target=_refresh(pool))
+    ctx.state.data["gf_pool_hovered"] = None
+    budget = TOOL_STATS[tool]["cycle_ticks"] * TICK_S + BOUNDARY_WATCH_MARGIN_S
+    controller.mark_busy(budget + HEAT_ADJUST_TIMEOUT_S)
+    debug_log.log("gf", f"boundary watch armed on {tool} at {st.get('completion')} "
+                        f"(next {nxt}, {budget:.1f}s)")
+    deadline = time.time() + budget
+    while time.time() < deadline:
+        cur = read_state()
+        if cur is not None:
+            new_tool = cur.get("requiredTool")
+            if new_tool != tool:
+                if new_tool not in TOOL_STATS:
+                    if cur.get("phase") != "REFINING":
+                        return      # sword finished -- the dispatcher takes it from here
+                    time.sleep(0.1)
+                    continue        # transitional read at the boundary (gf_live25) -- keep polling
+                debug_log.log("gf", f"section boundary: {tool} -> {new_tool} at "
+                                    f"{cur.get('temperature')} ({cur.get('temperatureStatus')})")
+                ctx.state.data["gf_work_tool"] = new_tool
+                ctx.state.data.pop("gf_progress_mark", None)
+                ctx.state.data["gf_engage_until"] = 0.0
+                if cur.get("temperatureStatus") == "READY":
+                    _click_machine(ctx, cur, new_tool)
+                else:
+                    _adjust_heat_and_engage(ctx, cur, new_tool, pool=pool, prehovered=True)
+                return
+        time.sleep(0.1)
+    debug_log.log("gf", f"boundary watch on {tool}: no tool flip within {budget:.1f}s")
+
+
+def _click_machine(ctx, st, tool, in_place=False):
+    """Click the required machine. `in_place` clicks the cursor where it already rests
+    (the machine was hovered once the player stood still at the pool) -- the ramp stop
+    has ~300ms after a tick-aligned reading before the click risks straddling the next
+    tick, and a full click_entity re-resolution (HTTP + settle) measured 0.39-0.69s."""
     data = ctx.state.data
     if tool not in TOOL_STATS:
         return False
@@ -816,18 +1356,41 @@ def _click_machine(ctx, st, tool):
     if machine is None:
         return False
     data["gf_dead_clicks"] = data.get("gf_dead_clicks", 0) + 1   # cleared on progress
-    ok = controller.click_entity(ctx.ser, machine, refresh_target=_refresh(machine))
+    data["gf_pool_hovered"] = None
+    if in_place:
+        controller.click_human(ctx.ser)
+        ok = True
+    else:
+        ok = controller.click_entity(ctx.ser, machine, refresh_target=_refresh(machine))
     if ok:
-        data["gf_progress_mark"] = (st.get("completion", 0), time.time())
-        controller.mark_busy(WORK_FIRST_ACTION_S)
+        now = time.time()
+        budget = WORK_FIRST_ACTION_S + (machine.get("distance") or 0) * WALK_S_PER_TILE
+        data["gf_progress_mark"] = (st.get("completion", 0), now)
+        data["gf_engage_until"] = now + budget     # no repeat click inside the commit window
+        controller.mark_busy(budget)
     return bool(ok)
 
 
-def _adjust_heat_and_engage(ctx, st, tool):
+def _sleep_to_after_next_tick(ctx):
+    """Sleep until just after the next game tick, so the following read is that tick's
+    fresh varbit and a click issued on it lands inside the same tick window (the tick
+    clock is an accelerator: absent or stale, fall back to a plain poll interval)."""
+    events = getattr(ctx, "events", None)
+    ticks = getattr(events, "ticks", None) if events is not None else None
+    now = time.time()
+    if ticks is None or ticks.is_stale(now):
+        time.sleep(HEAT_POLL_S)
+        return
+    time.sleep(ticks.ms_until_next(now) / 1000.0 + POLL_AFTER_TICK_S)
+
+
+def _adjust_heat_and_engage(ctx, st, tool, pool=None, depth=0, heating=None, prehovered=False):
     """Fast heat/cool (the human uses ONLY Dunk/Quench -- MEASURED), polled every
-    HEAT_POLL_S against the live temperature varbit, stopped HEAT_STOP_MARGIN short of
-    the band-end target -- and the stop IS the machine click (MEASURED: clicking the
-    next machine interrupts the dunk; there is no separate walk-away click)."""
+    HEAT_POLL_S against the live temperature varbit and stopped by ramp projection (see
+    ramp_stop_reached) -- and the stop IS the machine click (MEASURED: clicking the next
+    machine interrupts the dunk; there is no separate walk-away click). The machine is
+    pre-hovered while the ramp runs so the stop is a click in place, one tick of latency.
+    `pool` is a pre-resolved pool object (the boundary watch hovers it first)."""
     data = ctx.state.data
     if data.get("gf_heat_fails", 0) >= HEAT_FAIL_LIMIT:
         ctx.state.trigger_safety_stop(
@@ -837,34 +1400,70 @@ def _adjust_heat_and_engage(ctx, st, tool):
     max_t = st.get("maximumTemperature", -1)
     if min_t < 0 or max_t < 0:
         return
-    heating = st.get("temperatureStatus") == "TOO_COLD"
+    if heating is None:
+        heating = st.get("temperatureStatus") == "TOO_COLD"
     actions = actions_left_in_section(st.get("completion", 0), st.get("sectionCount", 0), tool)
     target = heat_stop_target(tool, min_t, max_t, actions)
-    pool = _find_object(LAVA_POOL_ID if heating else WATERFALL_ID)
+    if pool is None:
+        pool = _find_object(LAVA_POOL_ID if heating else WATERFALL_ID)
     if pool is None:
         return
     option = "Dunk-preform" if heating else "Quench-preform"
-    if not controller.click_menu_action(ctx.ser, pool, option,
-                                        refresh_target=_refresh(pool)):
+    t0 = st.get("temperature", -1)
+    if t0 >= 0 and ramp_stop_reached(t0, ramp_aim(target, RAMP_INITIAL_RATE, min_t, max_t, heating),
+                                     heating) and min_t <= t0 <= max_t:
+        debug_log.log("gf", f"{tool} already at {t0} for target {target} -- no {option} needed")
+        _click_machine(ctx, st, tool)
+        return
+    if not _pool_click(ctx, pool, option, in_place=prehovered):
         data["gf_heat_fails"] = data.get("gf_heat_fails", 0) + 1   # reset on a successful click
         return
     data["gf_heat_fails"] = 0
+    data["gf_pool_hovered"] = None
     controller.mark_busy(HEAT_ADJUST_TIMEOUT_S + 2)
-    deadline = time.time() + HEAT_ADJUST_TIMEOUT_S
+    machine = _find_object(TOOL_STATS[tool]["object"])
+    hovered = False
+    started = time.time()
+    deadline = started + HEAT_ADJUST_TIMEOUT_S
     cur = None
+    t = -1
+    last_t, rate = None, RAMP_INITIAL_RATE
+    aim = ramp_aim(target, rate, min_t, max_t, heating)
     while time.time() < deadline:
         cur = read_state()
         if cur is not None:
             t = cur.get("temperature", -1)
             if t >= 0:
-                if heating and t >= target - HEAT_STOP_MARGIN:
-                    break
-                if not heating and t <= target + HEAT_STOP_MARGIN:
+                if last_t is not None and abs(t - last_t) >= RAMP_TICK_MIN:
+                    rate = min(RAMP_MAX_RATE, max(rate, abs(t - last_t)))   # never slows
+                    aim = ramp_aim(target, rate, min_t, max_t, heating)
+                    if not hovered and machine is not None:
+                        # USER 2026-09-03, watching: "you need to hover after the move,
+                        # otherwise the mouse moves away from the object". The first ramp
+                        # tick means the player has reached the pool and stands still --
+                        # only then does a hovered pixel stay on the machine.
+                        hovered = bool(controller.hover_entity(
+                            ctx.ser, machine, refresh_target=_refresh(machine)))
+                last_t = t
+                if ramp_stop_reached(t, aim, heating):
                     break
             if cur.get("requiredTool") != tool:
                 break    # section moved under us -- re-decide from the top next tick
-        time.sleep(HEAT_POLL_S)
-    _click_machine(ctx, cur or st, tool)
+        _sleep_to_after_next_tick(ctx)
+    debug_log.log("gf", f"heat adjust {option} for {tool}: {t0} -> stop at {t} "
+                        f"(aim {aim}, rate {rate:.0f}/tick, target {target}, band {min_t}-{max_t}, "
+                        f"{actions} actions left) after {time.time() - started:.1f}s")
+    _click_machine(ctx, cur or st, tool, in_place=hovered)
+    # Verify the landing: a slow flight can still cost a second tick of ramp, and a
+    # machine acting out of band costs quality every action. One bounded correction.
+    if depth == 0:
+        controller.human_delay(0.7, 0.9)
+        landed = read_state()
+        if landed and landed.get("requiredTool") == tool and \
+                landed.get("temperatureStatus") in ("TOO_COLD", "TOO_HOT"):
+            debug_log.log("gf", f"heat adjust landed out of band at "
+                                f"{landed.get('temperature')} -- correcting")
+            _adjust_heat_and_engage(ctx, landed, tool, depth=depth + 1)
 
 
 def hand_in_phase(ctx, st):
@@ -955,10 +1554,17 @@ def _dialogue_open(d):
 
 
 def _dialogue_options(d):
-    out = []
+    """The REAL options of an open chat menu, in number-key order (key = position + 1).
+    The m8aq Dialogue reader returns every non-hidden child of Chatmenu.OPTIONS in order:
+    the TITLE first ("Select an Option" / "How many would you like to add?"), then the
+    options, then blank trailing children -- MEASURED live 2026-09-03 (gf_live6):
+    ['How many would you like to add?', '1', '3', 'X', 'All', '', '']. Counting keys over
+    the raw list pressed 3 for the option "3" at raw index 2 and selected "X" instead."""
+    raw = []
     for o in d.get("options") or []:
-        out.append(o if isinstance(o, str) else (o.get("text") or ""))
-    return out
+        raw.append(o if isinstance(o, str) else (o.get("text") or ""))
+    raw = raw[1:] if raw else raw     # child 0 is the title
+    return [o for o in raw if o.strip()]
 
 
 def _choose_option(ctx, d, substrings, fallback_key=None):
