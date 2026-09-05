@@ -292,9 +292,12 @@ def test_tick_drops_the_cached_instance_map_when_leaving_the_fight_phase(monkeyp
     ctx = _Ctx()
     ctx.state.data.update({"cg_phase": "fight", "cg_imap": object(), "cg_fight_seen": True,
                           "cg_chest_opened": True})
+    monkeypatch.setattr(controller, "get_player", lambda: {"regionId": 7768})
     monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
                         [{"id": g.OBJ_REWARD_CHEST}])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {})
     cg.tick(ctx)
     assert "cg_imap" not in ctx.state.data
     assert ctx.state.safety_stopped is True   # phase derives to "done" -- incidental to this test
@@ -663,3 +666,57 @@ def test_fight_loop_skips_the_ladder_for_a_dead_hunllef(monkeypatch):
     assert actions_called == []
     assert ctx.state.safety_stopped is False
     assert ctx.state.stops == []
+
+
+def test_time_left_and_note_entry():
+    data = {}
+    assert cg.time_left(data, now=100.0) is None
+    cg.note_entry(data, {"regionId": 12127}, now=100.0)
+    assert "cg_t0" not in data
+    cg.note_entry(data, {"regionId": g.REGION_CORRUPTED}, now=100.0)
+    assert data["cg_t0"] == 100.0
+    cg.note_entry(data, {"regionId": g.REGION_CORRUPTED}, now=200.0)   # never moves
+    assert data["cg_t0"] == 100.0
+    assert cg.time_left(data, now=160.0) == cg.DEFAULT_CONFIG["timer_s"] - 60
+
+
+def _kit_inv():
+    return [{"slot": i, "name": n, "qty": q, "screenX": 1, "screenY": 1} for i, (n, q) in enumerate(
+        [(g.ITEM_ORE, 3), (g.ITEM_BARK, 3), (g.ITEM_LINUM, 3), (g.ITEM_FRAME, 2), (g.ITEM_SHARDS, 300),
+         (g.ITEM_RAW_FISH, 20), (g.ITEM_GRYM, 2)])]
+
+EQ0 = {"weapon": {"name": g.ITEM_SCEPTRE}}
+
+
+def test_prep_phase_ladder():
+    cfg = cg.DEFAULT_CONFIG
+    data = {"cg_t0": 0.0}
+    assert cg.prep_phase(data, [], EQ0, cfg, now=10.0) == "explore_gather"
+    # kit met but before the gather deadline: keep gathering (upgrades come from the ring)
+    assert cg.prep_phase(data, _kit_inv(), EQ0, cfg, now=100.0) == "explore_gather"
+    assert cg.prep_phase(data, _kit_inv(), EQ0, cfg, now=280.0) == "craft"
+    # route done -> craft even if the kit is short
+    data["cg_route_done"] = True
+    assert cg.prep_phase(data, [], EQ0, cfg, now=100.0) == "craft"
+    # hard deadline -> craft regardless
+    data = {"cg_t0": 0.0}
+    assert cg.prep_phase(data, [], EQ0, cfg, now=335.0) == "craft"
+    # crafted, dragon revealed, time left -> upgrade; no time -> enter
+    data = {"cg_t0": 0.0, "cg_route_done": True, "cg_crafted": True, "cg_demi_bosses": {(0, 2): 9047}}
+    assert cg.prep_phase(data, _kit_inv(), EQ0, cfg, now=300.0) == "upgrade"
+    assert cg.prep_phase(data, _kit_inv(), EQ0, cfg, now=400.0) == "enter"
+    # crafted, nothing revealed -> enter
+    data = {"cg_t0": 0.0, "cg_route_done": True, "cg_crafted": True, "cg_demi_bosses": {}}
+    assert cg.prep_phase(data, _kit_inv(), EQ0, cfg, now=300.0) == "enter"
+    # enter_by wins over everything
+    data = {"cg_t0": 0.0}
+    assert cg.prep_phase(data, [], EQ0, cfg, now=421.0) == "enter"
+
+
+def test_derive_phase_prefers_prep_before_the_fight():
+    data = {"cg_t0": 0.0}
+    objects = [{"id": g.OBJ_BARRIER}]
+    assert cg.derive_phase(data, [], objects, inventory=[], equipment=EQ0, cfg=cg.DEFAULT_CONFIG, now=10.0) == "explore_gather"
+    assert cg.derive_phase(data, [], objects, inventory=[], equipment=EQ0, cfg=cg.DEFAULT_CONFIG, now=425.0) == "enter"
+    assert cg.derive_phase(data, [_npc(9036)], objects) == "fight"       # fight still wins
+    assert cg.derive_phase({}, [], objects) == "enter"                    # no t0 (started at the barrier by hand): old behaviour

@@ -23,6 +23,8 @@ import time
 import controller
 import debug_log
 import gauntlet_ids as g
+import gauntlet_kit as kit
+import gauntlet_maze as maze
 import hunllef as h
 import instance_nav
 import travel
@@ -43,6 +45,16 @@ DEFAULT_CONFIG = {
     "tornado_avoid": 3,
     "fight_max_s": 480.0,
     "objects_radius": 12,
+    "gather_deadline_s": 270,
+    "gather_hard_deadline_s": 330,
+    "craft_by_s": 360,
+    "upgrade_min_left_s": 90,
+    "enter_by_s": 420,
+    "timer_s": 450,
+    "room_pitch": 16,
+    "fish_target": 20,
+    "egniol_target": 2,
+    "shard_reserve": 0,
 }
 NO_HUNLLEF_TICKS = 10          # consecutive fight ticks without a Hunllef before re-deriving the phase
 NO_SNAPSHOT_TICKS = 20         # consecutive unreadable snapshots before a safety stop
@@ -56,6 +68,41 @@ LOOT_CONFIRM_S = 4.0           # (I2) budget to confirm the chest actually opene
 
 def get_config(bridge_config):
     return DEFAULT_CONFIG
+
+
+# ----------------------------------------------------------------------------- prep phase
+
+def note_entry(data, player, now):
+    """cg_t0 = the first moment the corrupted region is seen; the 7:30 timer counts from it."""
+    if "cg_t0" not in data and (player or {}).get("regionId") == g.REGION_CORRUPTED:
+        data["cg_t0"] = now
+
+
+def time_left(data, now=None, cfg=DEFAULT_CONFIG):
+    t0 = data.get("cg_t0")
+    if t0 is None:
+        return None
+    now = time.time() if now is None else now
+    return cfg["timer_s"] - (now - t0)
+
+
+def prep_phase(data, inventory, equipment, cfg, now=None):
+    now = time.time() if now is None else now
+    elapsed = now - data["cg_t0"]
+    if elapsed >= cfg["enter_by_s"]:
+        return "enter"
+    met = kit.kit_minimum_met(inventory, equipment, cfg)
+    if (not data.get("cg_route_done") and elapsed < cfg["gather_hard_deadline_s"]
+            and not (met and elapsed >= cfg["gather_deadline_s"])):
+        return "explore_gather"
+    if not data.get("cg_crafted"):
+        return "craft"
+    wanted = {off: nid for off, nid in (data.get("cg_demi_bosses") or {}).items() if nid in g.DEMI_BOSS_WANTED}
+    if wanted and time_left(data, now, cfg) > cfg["upgrade_min_left_s"]:
+        d = kit.kit_deficit(inventory, equipment, cfg, targets=kit.UPGRADES)
+        if d.orb or d.bowstring:
+            return "upgrade"
+    return "enter"
 
 
 # ----------------------------------------------------------------------------- reads
@@ -92,7 +139,7 @@ def read_snapshot(cfg=DEFAULT_CONFIG, ctx=None):
     return snap
 
 
-def derive_phase(data, npcs, objects):
+def derive_phase(data, npcs, objects, inventory=None, equipment=None, cfg=None, now=None):
     """Phase from live state, never from a remembered default (the mahogany_homes lesson).
 
     (M, final-fix-brief.md) VARBIT_FIGHTING_HUNLLEF (varbit 9177, "1 while in the boss room") is a
@@ -104,9 +151,23 @@ def derive_phase(data, npcs, objects):
         data["cg_fight_seen"] = True
         return "fight"
     if g.OBJ_BARRIER in ids and not data.get("cg_fight_seen"):
+        # In the prep phase (before the fight is seen), return the prep phase if possible
+        if data.get("cg_t0") is not None and inventory is not None:
+            if cfg is None:
+                cfg = DEFAULT_CONFIG
+            if now is None:
+                now = time.time()
+            return prep_phase(data, inventory, equipment, cfg, now)
         return "enter"
     if g.OBJ_REWARD_CHEST in ids and data.get("cg_fight_seen"):
         return "done" if data.get("cg_chest_opened") else "loot"
+    # Outside the arena (no barrier visible) but in prep phase
+    if data.get("cg_t0") is not None and inventory is not None and not data.get("cg_fight_seen"):
+        if cfg is None:
+            cfg = DEFAULT_CONFIG
+        if now is None:
+            now = time.time()
+        return prep_phase(data, inventory, equipment, cfg, now)
     return "unknown"
 
 
@@ -521,9 +582,13 @@ def before_break(ctx):
 def tick(ctx):
     cfg = get_config(None)
     data = ctx.state.data
+    player = controller.get_player()
+    note_entry(data, player, time.time())
     npcs = controller.get_npcs(fresh=True)
     objects = controller.get_objects(radius=cfg["objects_radius"], fresh=True)
-    phase = derive_phase(data, npcs, objects)
+    inventory = controller.get_inventory()
+    equipment = controller.get_equipment()
+    phase = derive_phase(data, npcs, objects, inventory=inventory, equipment=equipment, cfg=cfg, now=time.time())
     if phase != data.get("cg_phase"):
         debug_log.log("cg", f"phase {data.get('cg_phase')} -> {phase}")
         if data.get("cg_phase") == "fight" and phase != "fight":
@@ -539,6 +604,9 @@ def tick(ctx):
         loot_phase(ctx, cfg)
     elif phase == "done":
         ctx.state.trigger_safety_stop("cg: chest opened -- run complete")
+    elif phase in ("explore_gather", "craft", "upgrade"):
+        # Prep phases - for now, just idle with a human delay
+        controller.human_delay(1.0, 2.0)
     else:
         if not data.get("cg_unknown_logged"):
             debug_log.log("cg", "not at the Hunllef barrier, in the fight, or at the chest -- start at the barrier")
