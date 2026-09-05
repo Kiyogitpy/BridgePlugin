@@ -720,3 +720,124 @@ def test_derive_phase_prefers_prep_before_the_fight():
     assert cg.derive_phase(data, [], objects, inventory=[], equipment=EQ0, cfg=cg.DEFAULT_CONFIG, now=425.0) == "enter"
     assert cg.derive_phase(data, [_npc(9036)], objects) == "fight"       # fight still wins
     assert cg.derive_phase({}, [], objects) == "enter"                    # no t0 (started at the barrier by hand): old behaviour
+
+
+# ---- explore_gather phase helpers and tests ----
+
+def _player_at(x, y, hp=80, prayer=40):
+    return {"hp": hp, "prayer": prayer, "instX": x, "instY": y, "plane": 1, "regionId": g.REGION_CORRUPTED, "animation": -1}
+
+
+def _grid(size=64):
+    return {"baseX": 13056, "baseY": 5632, "plane": 1, "size": size, "flags": [0] * (size * size)}
+
+
+def _obj(id_, name, x, y):
+    return {"id": id_, "name": name, "instX": x, "instY": y, "objectType": "GameObject", "screenX": 5, "screenY": 5, "actions": []}
+
+
+def test_prep_state_derives_geometry_once(monkeypatch):
+    ctx = _Ctx(); ctx.state.data["cg_t0"] = 0.0
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(13056 + 30, 5632 + 30))
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_obj(g.OBJ_BARRIER, "Barrier", 13056 + 30, 5632 + 22)])
+    st = cg.prep_state(ctx, cg.DEFAULT_CONFIG)
+    assert st["outward"] == (0, 1) and st["barrier"] == (13086, 5654) and st["step"] == 0 and st["sub"] == "to_node"
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: pytest.fail("grid re-read"))
+    assert cg.prep_state(ctx, cg.DEFAULT_CONFIG) is st
+
+
+def test_attacker_and_gather_ladder_prayer_then_attack(monkeypatch):
+    me = (100, 100)
+    npcs = [{"id": 9045, "index": 3, "name": "Corrupted Wolf", "instX": 102, "instY": 100, "interactingPlayer": True, "screenX": 5, "screenY": 5},
+            {"id": 9040, "index": 4, "name": "Corrupted Rat", "instX": 101, "instY": 100, "interactingPlayer": False, "screenX": 5, "screenY": 5}]
+    assert cg.attacker(npcs, me)["id"] == 9045
+    assert cg.attacker([], me) is None
+    calls = []
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*me))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: npcs)
+    monkeypatch.setattr(controller, "get_prayers", lambda: {"active": {}, "tabOpen": True, "icons": {"PROTECT_FROM_MELEE": {"screenX": 1, "screenY": 1}}})
+    monkeypatch.setattr(controller, "get_combat", lambda: {"targetId": None})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(controller, "open_prayer_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: calls.append(("click", entity.get("name") or "icon")) or True)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=1.0: True)
+    assert cg.gather_ladder(ctx, cg.DEFAULT_CONFIG) == "prayer"
+    monkeypatch.setattr(controller, "get_prayers", lambda: {"active": {"PROTECT_FROM_MELEE": True}, "tabOpen": True, "icons": {}})
+    monkeypatch.setattr(controller, "npc_index_refresh_target", lambda index: (lambda: None))
+    assert cg.gather_ladder(ctx, cg.DEFAULT_CONFIG) == "attack"
+    assert ("click", "Corrupted Wolf") in calls
+
+
+def test_gather_ladder_flees_a_demi_boss(monkeypatch):
+    ctx = _Ctx(); ctx.state.data["cg_prep"] = {"prev_centre": (90, 90)}
+    walks = []
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(100, 100))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [{"id": 9046, "index": 1, "name": "Corrupted Bear", "instX": 102, "instY": 100, "interactingPlayer": True}])
+    monkeypatch.setattr(cg.instance_nav, "walk_to", lambda ctx, x, y, **kw: walks.append((x, y)) or True)
+    assert cg.gather_ladder(ctx, cg.DEFAULT_CONFIG) == "flee_demi"
+    assert walks == [(90, 90)]
+
+
+def test_gather_node_loops_until_depleted(monkeypatch):
+    ctx = _Ctx()
+    deposit = next(n for n in g.RESOURCE_NODES.values() if "Deposit" in n)
+    dep_id = next(i for i, n in g.RESOURCE_NODES.items() if n == deposit)
+    depleted_id = next(i for i, n in g.RESOURCE_NODES_DEPLETED.items() if "Deposit" in n)
+    node = _obj(dep_id, deposit, 100, 100)
+    ore = {"n": 0}
+    reads = {"k": 0}
+    def objects(radius=None, fresh=False, interactable=False):
+        reads["k"] += 1
+        return [_obj(depleted_id if ore["n"] >= 3 else dep_id, deposit, 100, 100)]
+    monkeypatch.setattr(controller, "get_objects", objects)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"slot": 0, "name": g.ITEM_ORE, "qty": ore["n"]}] if ore["n"] else [])
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(101, 100))
+    def click(ser, entity, **kw):
+        assert kw.get("expected_action") == "Mine"
+        ore["n"] += 1
+        return True
+    monkeypatch.setattr(controller, "click_entity", click)
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **kw: (lambda: None), raising=False)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=1.0: check())
+    monkeypatch.setattr(cg, "_wait_tick", lambda ctx: None)
+    assert cg.gather_node(ctx, node, cg.DEFAULT_CONFIG)
+    assert ore["n"] == 3
+
+
+def test_explore_gather_phase_lights_then_enters_then_gathers(monkeypatch):
+    ctx = _Ctx(); data = ctx.state.data; data["cg_t0"] = 0.0
+    S = (13056 + 30, 5632 + 30)
+    pitch = cg.DEFAULT_CONFIG["room_pitch"]
+    node_xy = (S[0] + pitch // 2, S[1])                  # between S and the room to the right (outward north)
+    right_room = (S[0] + pitch, S[1])
+    state = {"pos": S, "lit": False, "walks": [], "gathered": []}
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*state["pos"]))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    linum = next(n for n in g.RESOURCE_NODES.values() if "Linum" in n)
+    linum_id = next(i for i, n in g.RESOURCE_NODES.items() if n == linum)
+    def objects(radius=None, fresh=False, interactable=False):
+        return [_obj(g.OBJ_BARRIER, "Barrier", S[0], S[1] - 8), _obj(35999, "Node", *node_xy),
+                _obj(linum_id, linum, right_room[0] + 2, right_room[1])]
+    monkeypatch.setattr(controller, "get_objects", objects)
+    monkeypatch.setattr(cg.maze, "edge_open", lambda imap, a, b: state["lit"])
+    monkeypatch.setattr(cg.instance_nav, "walk_to", lambda ctx, x, y, **kw: (state["walks"].append((x, y)), state.__setitem__("pos", (x, y)))[1] or True)
+    monkeypatch.setattr(cg, "light_node", lambda ctx, node, cfg: state.__setitem__("lit", True) or True)
+    monkeypatch.setattr(cg, "gather_node", lambda ctx, obj, cfg: state["gathered"].append(obj["name"]) or True)
+    monkeypatch.setattr(cg, "gather_ladder", lambda ctx, cfg: "none")
+    monkeypatch.setattr(cg, "pick_up_drops", lambda ctx, cfg: 0)
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)            # walk to the node
+    assert state["walks"] and h.cheb(state["walks"][-1], node_xy) <= 2
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)            # light it
+    assert state["lit"] and data["cg_prep"]["sub"] == "to_room"
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)            # walk into the room
+    assert state["walks"][-1] == right_room
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)            # gather the linum (deficit: yes)
+    assert state["gathered"] == [linum]

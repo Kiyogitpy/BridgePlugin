@@ -64,6 +64,12 @@ ENTER_BUDGET_S = 8.0
 ENTER_MAX_ATTEMPTS = 3         # barrier quick-pass ceiling before safety stop
 LOOT_MAX_ATTEMPTS = 5          # chest open ceiling before safety stop
 LOOT_CONFIRM_S = 4.0           # (I2) budget to confirm the chest actually opened after the click
+NODE_BUDGET_S = 6.0
+GATHER_BUDGET_S = 8.0
+NODE_MAX_FAILS = 2
+ATTACKER_RANGE = 4
+DROP_RANGE = 8
+ROOM_ARRIVAL_TOLERANCE = 4
 
 
 def get_config(bridge_config):
@@ -103,6 +109,237 @@ def prep_phase(data, inventory, equipment, cfg, now=None):
         if d.orb or d.bowstring:
             return "upgrade"
     return "enter"
+
+
+# ----------------------------------------------------------------------------- explore_gather phase
+
+def _me():
+    p = controller.get_player() or {}
+    return (p.get("instX"), p.get("instY")), p
+
+
+def prep_state(ctx, cfg):
+    data = ctx.state.data
+    st = data.get("cg_prep")
+    if st is not None:
+        return st
+    imap = _cached_imap(ctx)
+    me, _ = _me()
+    if imap is None or me[0] is None:
+        return None
+    objects = controller.get_objects(radius=cfg["objects_radius"], fresh=True)
+    barrier = next((o for o in objects if o.get("id") == g.OBJ_BARRIER), None)
+    if barrier is None:
+        return None
+    comp = maze.component(imap, me)
+    centre = maze.component_centre(comp)
+    bpos = (barrier["instX"], barrier["instY"])
+    st = {"start_centre": centre, "barrier": bpos, "outward": maze.outward_from(bpos, centre),
+          "pitch": cfg["room_pitch"], "step": 0, "sub": "to_node", "revealed": set(), "entered": {(0, 0)},
+          "node_fails": 0, "prev_centre": centre}
+    data["cg_prep"] = st
+    data.setdefault("cg_demi_bosses", {})
+    debug_log.log("cg", f"prep: start centre {centre}, barrier {bpos}, outward {st['outward']}")
+    return st
+
+
+def _centre(st, offset):
+    return maze.room_centre(st["start_centre"], st["pitch"], st["outward"], offset)
+
+
+def _room(st, tile):
+    return maze.room_of(tile, st["start_centre"], st["pitch"], st["outward"])
+
+
+def light_node(ctx, node, cfg):
+    before = (node.get("id"), node.get("instX"), node.get("instY"))
+    mark = ctx.events.mark() if ctx.events is not None else None
+    controller.click_menu_action(ctx.ser, node, "Light", target_hint="Node", offset=(0, 0))
+
+    def lit():
+        for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True):
+            if (o.get("instX"), o.get("instY")) == before[1:] and o.get("id") != before[0]:
+                return True
+        if ctx.events is not None:
+            for t, p in ctx.events.since(mark):
+                if t == "CHAT_MESSAGE" and "light the nodes" in str((p or {}).get("message", "")):
+                    return True
+        return False
+    ok = _confirm(ctx, lit, NODE_BUDGET_S)
+    debug_log.log("cg", f"light node at {before[1:]}: {'ok' if ok else 'no change'}")
+    return ok
+
+
+def gather_node(ctx, obj, cfg):
+    name = obj.get("name")
+    action = g.RESOURCE_ACTION.get(name)
+    item = g.RESOURCE_ITEM.get(name)
+    if action is None:
+        return False
+    pos = (obj.get("instX"), obj.get("instY"))
+    got = 0
+    for _ in range(g.RESOURCE_YIELD[name] + 2):
+        live = next((o for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True)
+                     if (o.get("instX"), o.get("instY")) == pos), None)
+        if live is None or live.get("id") in g.RESOURCE_NODES_DEPLETED:
+            break
+        me, _ = _me()
+        if cg_attacker_present(me):
+            return got > 0
+        before = kit.count(controller.get_inventory(), item)
+        controller.click_entity(ctx.ser, live, expected_action=action)
+        if _confirm(ctx, lambda: kit.count(controller.get_inventory(), item) > before, GATHER_BUDGET_S):
+            got += 1
+        else:
+            break
+        _wait_tick(ctx)
+    return got > 0
+
+
+def cg_attacker_present(me):
+    return attacker(controller.get_npcs(fresh=True), me) is not None
+
+
+def attacker(npcs, me):
+    best = None
+    for n in npcs or []:
+        if not n.get("interactingPlayer"):
+            continue
+        pos = (n.get("instX"), n.get("instY"))
+        if pos[0] is None or h.cheb(pos, me) > ATTACKER_RANGE:
+            continue
+        if best is None or h.cheb(pos, me) < h.cheb((best["instX"], best["instY"]), me):
+            best = n
+    return best
+
+
+def pick_up_drops(ctx, cfg):
+    wanted = {g.ITEM_FRAME, g.ITEM_SHARDS, g.ITEM_GRYM, g.ITEM_RAW_FISH, g.ITEM_TELEPORT, g.ITEM_ORB, g.ITEM_BOWSTRING}
+    me, _ = _me()
+    taken = 0
+    for item in controller.get_ground_items(fresh=True) or []:
+        if item.get("name") not in wanted or h.cheb((item.get("instX"), item.get("instY")), me) > DROP_RANGE:
+            continue
+        before = len(controller.get_inventory())
+        controller.click_menu_action(ctx.ser, item, "Take", target_hint=item.get("name"), offset=(0, 0))
+        if _confirm(ctx, lambda: len(controller.get_inventory()) != before or kit.count(controller.get_inventory(), item.get("name")) > 0, 4.0):
+            taken += 1
+    return taken
+
+
+def gather_ladder(ctx, cfg):
+    me, player = _me()
+    npcs = controller.get_npcs(fresh=True)
+    foe = attacker(npcs, me)
+    if foe is None:
+        return "none"
+    if foe.get("id") in g.DEMI_BOSSES or foe.get("id") in g.DEMI_BOSS_DROP:
+        prev = (ctx.state.data.get("cg_prep") or {}).get("prev_centre")
+        if prev:
+            debug_log.log("cg", f"[!] demi-boss {foe.get('name')} attacking -- leaving toward {prev}")
+            instance_nav.walk_to(ctx, prev[0], prev[1])
+        return "flee_demi"
+    style = g.ATTACK_STYLE_BY_NPC_ID.get(foe.get("id"), "MELEE")
+    prayer = g.PROTECT_FOR_STYLE[style]
+    if not (controller.get_prayers().get("active") or {}).get(prayer):
+        do_prayer(ctx, None, prayer, cfg)
+        return "prayer"
+    if int(player.get("hp") or 0) <= cfg["eat_at"]:
+        inv = controller.get_inventory()
+        fish = [i for i in inv if i.get("name") in (g.ITEM_FISH, g.ITEM_CFISH)]
+        if fish:
+            _click_item(ctx, fish[0], "Eat")
+            return "eat"
+    if (controller.get_combat() or {}).get("targetId") != foe.get("id"):
+        controller.click_entity(ctx.ser, foe, refresh_target=controller.npc_index_refresh_target(foe.get("index")),
+                                refresh_legs=2, expected_action="Attack")
+    return "attack"
+
+
+def _nodes(objects):
+    return [o for o in objects if o.get("id") in g.NODE_IDS]
+
+
+def explore_gather_phase(ctx, cfg):
+    data = ctx.state.data
+    st = prep_state(ctx, cfg)
+    if st is None:
+        debug_log.log("cg", "prep: cannot read the grid/barrier yet")
+        return
+    steps = maze.route()
+    if st["step"] >= len(steps):
+        data["cg_route_done"] = True
+        return
+    if gather_ladder(ctx, cfg) != "none":
+        return
+    offset, _, reveal = steps[st["step"]]
+    target = _centre(st, offset)
+    me, _ = _me()
+    imap = _cached_imap(ctx)
+    objects = controller.get_objects(radius=cfg["objects_radius"], fresh=True)
+    here_centre = _centre(st, _room(st, me))
+
+    def advance():
+        st["step"] += 1
+        st["sub"] = "to_node"
+        st["node_fails"] = 0
+        st["prev_centre"] = here_centre
+
+    if st["sub"] == "to_node":
+        node = maze.node_between(_nodes(objects), here_centre, target, st["pitch"])
+        if maze.edge_open(imap, here_centre, target):
+            st["sub"] = "to_room"
+        elif node is None:
+            instance_nav.walk_to(ctx, target[0], target[1], tolerance=ROOM_ARRIVAL_TOLERANCE)
+        elif h.cheb(me, (node["instX"], node["instY"])) > 2:
+            instance_nav.walk_to(ctx, node["instX"], node["instY"], tolerance=2)
+        elif light_node(ctx, node, cfg):
+            st["sub"] = "to_room"
+        else:
+            st["node_fails"] += 1
+            if st["node_fails"] >= NODE_MAX_FAILS:
+                debug_log.log("cg", f"[!] node toward {offset} will not light -- skipping the step")
+                advance()
+        return
+    if st["sub"] == "to_room":
+        if h.cheb(me, target) > ROOM_ARRIVAL_TOLERANCE:
+            instance_nav.walk_to(ctx, target[0], target[1], tolerance=ROOM_ARRIVAL_TOLERANCE)
+            return
+        st["entered"].add(offset)
+        st["sub"] = "gather"
+        return
+    if st["sub"] == "gather":
+        pick_up_drops(ctx, cfg)
+        deficit = kit.kit_deficit(controller.get_inventory(), controller.get_equipment(), cfg)
+        want = {g.ITEM_ORE: deficit.ore, g.ITEM_BARK: deficit.bark, g.ITEM_LINUM: deficit.linum,
+                g.ITEM_GRYM: deficit.grym, g.ITEM_RAW_FISH: deficit.fish}
+        nodes = [o for o in objects if o.get("id") in g.RESOURCE_NODES and _room(st, (o["instX"], o["instY"])) == offset
+                 and want.get(g.RESOURCE_ITEM.get(o.get("name")), 0) > 0]
+        if nodes:
+            nodes.sort(key=lambda o: h.cheb((o["instX"], o["instY"]), me))
+            gather_node(ctx, nodes[0], cfg)
+            return
+        if reveal and reveal not in st["revealed"]:
+            st["sub"] = "reveal"
+            return
+        advance()
+        return
+    if st["sub"] == "reveal":
+        rc = _centre(st, reveal)
+        node = maze.node_between(_nodes(objects), target, rc, st["pitch"])
+        if node is None:
+            debug_log.log("cg", f"[!] no node toward the reveal room {reveal}")
+            st["revealed"].add(reveal); advance(); return
+        if h.cheb(me, (node["instX"], node["instY"])) > 2:
+            instance_nav.walk_to(ctx, node["instX"], node["instY"], tolerance=2)
+            return
+        light_node(ctx, node, cfg)
+        for n in controller.get_npcs(fresh=True):
+            if n.get("id") in g.DEMI_BOSS_DROP and _room(st, (n.get("instX"), n.get("instY"))) == reveal:
+                data["cg_demi_bosses"][reveal] = n["id"]
+                debug_log.log("cg", f"revealed {n.get('name')} ({n['id']}) in {reveal}")
+        st["revealed"].add(reveal)
+        advance()
 
 
 # ----------------------------------------------------------------------------- reads
@@ -604,7 +841,9 @@ def tick(ctx):
         loot_phase(ctx, cfg)
     elif phase == "done":
         ctx.state.trigger_safety_stop("cg: chest opened -- run complete")
-    elif phase in ("explore_gather", "craft", "upgrade"):
+    elif phase == "explore_gather":
+        explore_gather_phase(ctx, cfg)
+    elif phase in ("craft", "upgrade"):
         # Prep phases - for now, just idle with a human delay
         controller.human_delay(1.0, 2.0)
     else:
