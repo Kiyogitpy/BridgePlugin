@@ -893,6 +893,22 @@ def test_prep_state_derives_geometry_once(monkeypatch):
     assert cg.prep_state(ctx, cg.DEFAULT_CONFIG) is st
 
 
+def test_prep_state_refuses_an_oversized_start_component(monkeypatch):
+    """I14: corridors that open up before the first lighting can flood the flood-filled start
+    component with the whole scene -- prep_state must refuse to derive geometry (return None,
+    log a [!]) rather than commit to a bogus start_centre/outward, instead of committing to
+    whatever the runaway flood-fill happened to compute."""
+    ctx = _Ctx(); ctx.state.data["cg_t0"] = 0.0
+    S = (13056 + 30, 5632 + 30)
+    # Fully passable 64x64 grid -- 4096 tiles, well over START_COMPONENT_MAX (600).
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid(size=64))
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*S))
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [_obj(g.OBJ_BARRIER, "Barrier", S[0], S[1] - 8)])
+    assert cg.prep_state(ctx, cg.DEFAULT_CONFIG) is None
+    assert "cg_prep" not in ctx.state.data
+
+
 def test_attacker_and_gather_ladder_prayer_then_attack(monkeypatch):
     me = (100, 100)
     npcs = [{"id": 9045, "index": 3, "name": "Corrupted Wolf", "instX": 102, "instY": 100, "interactingPlayer": True, "screenX": 5, "screenY": 5},
@@ -1074,6 +1090,30 @@ def test_to_node_wedge_advances_to_to_room_when_already_close_enough(monkeypatch
     # in this one call, instead of re-issuing the identical walk_to(target) forever.
     assert walks == []
     assert st["step"] == 1
+
+
+def test_to_node_walks_the_room_centre_with_goal_adjacent(monkeypatch):
+    """I14: a room centre is usually furniture -- the to_node walk toward it (when no lighting
+    node exists and the player is still far away) must route to a tile BESIDE it, not demand the
+    exact centre tile."""
+    ctx = _Ctx(); data = ctx.state.data; data["cg_t0"] = 0.0
+    S = (13056 + 30, 5632 + 30)
+    pitch = cg.DEFAULT_CONFIG["room_pitch"]
+    st = {"start_centre": S, "barrier": (S[0], S[1] - 8), "outward": (0, 1), "pitch": pitch,
+          "step": 0, "sub": "to_node", "revealed": set(), "entered": {(0, 0)}, "node_fails": 0,
+          "prev_centre": S, "fishing_spots": set()}
+    data["cg_prep"] = st
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*S))   # far from the (1,0) room
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [])
+    monkeypatch.setattr(cg.maze, "edge_open", lambda imap, a, b: False)
+    monkeypatch.setattr(cg, "gather_ladder", lambda ctx, cfg: "none")
+    walks = []
+    monkeypatch.setattr(cg.instance_nav, "walk_to", lambda ctx, x, y, **kw: walks.append((x, y, kw)) or True)
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)
+    assert len(walks) == 1
+    assert walks[0][2].get("goal_adjacent") is True
 
 
 def test_explore_gather_phase_lights_then_enters_then_gathers(monkeypatch):

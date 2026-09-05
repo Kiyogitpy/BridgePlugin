@@ -74,6 +74,7 @@ NODE_GATHER_MAX_FAILS = 2      # (C3b) a resource node this many gather_node fai
 ATTACKER_RANGE = 4
 DROP_RANGE = 8
 ROOM_ARRIVAL_TOLERANCE = 4
+START_COMPONENT_MAX = 600      # (I14) start-room flood-fill ceiling -- see prep_state's own comment
 STUCK_WARN_S = 20.0            # log [!] after no progress for this many seconds
 STUCK_STOP_S = 60.0            # safety-stop after no progress for this many seconds (prep phases only)
 
@@ -198,6 +199,15 @@ def prep_state(ctx, cfg):
     if barrier is None:
         return None
     comp = maze.component(imap, me)
+    debug_log.log("cg", f"prep: start component size {len(comp)} tiles")
+    if len(comp) > START_COMPONENT_MAX:
+        # (I14, final-fix-brief.md) Corridors that open up before the first lighting can flood
+        # the flood-filled component with the whole scene, at which point its centre is garbage
+        # in every direction -- refuse to derive geometry from it rather than commit to a bogus
+        # start_centre/outward for the rest of the run.
+        debug_log.log("cg", f"[!] prep: start component size {len(comp)} exceeds {START_COMPONENT_MAX} "
+                            "-- refusing to derive geometry from it (scene likely not fully settled yet)")
+        return None
     centre = maze.component_centre(comp)
     bpos = (barrier["instX"], barrier["instY"])
     st = {"start_centre": centre, "barrier": bpos, "outward": maze.outward_from(bpos, centre),
@@ -335,7 +345,9 @@ def gather_ladder(ctx, cfg):
         prev = (ctx.state.data.get("cg_prep") or {}).get("prev_centre")
         if prev:
             debug_log.log("cg", f"[!] demi-boss {foe.get('name')} attacking -- leaving toward {prev}")
-            instance_nav.walk_to(ctx, prev[0], prev[1])
+            # (I14, final-fix-brief.md) prev is a room CENTRE -- usually furniture, so route to a
+            # tile beside it rather than demanding the exact (often unroutable) centre tile.
+            instance_nav.walk_to(ctx, prev[0], prev[1], goal_adjacent=True)
         return "flee_demi"
     return fight_npc_step(ctx, foe, cfg)
 
@@ -380,13 +392,14 @@ def upgrade_phase(ctx, cfg):
     imap = _cached_imap(ctx)
     if up["sub"] == "go":
         if h.cheb(me, below) > ROOM_ARRIVAL_TOLERANCE and h.cheb(me, room) > ROOM_ARRIVAL_TOLERANCE:
-            instance_nav.walk_to(ctx, below[0], below[1], tolerance=ROOM_ARRIVAL_TOLERANCE); return
+            # (I14) below/room are room CENTRES -- usually furniture.
+            instance_nav.walk_to(ctx, below[0], below[1], tolerance=ROOM_ARRIVAL_TOLERANCE, goal_adjacent=True); return
         if not maze.edge_open(imap, below, room):
             node = maze.node_between(_nodes(controller.get_objects(radius=cfg["objects_radius"], fresh=True)), below, room, st["pitch"])
             if node is None or not light_node(ctx, node, cfg):
                 data["cg_upgrade_done"] = True; return
         if h.cheb(me, room) > ROOM_ARRIVAL_TOLERANCE:
-            instance_nav.walk_to(ctx, room[0], room[1], tolerance=ROOM_ARRIVAL_TOLERANCE); return
+            instance_nav.walk_to(ctx, room[0], room[1], tolerance=ROOM_ARRIVAL_TOLERANCE, goal_adjacent=True); return
         up["sub"] = "fight"; return
     if up["sub"] == "fight":
         npc = next((n for n in controller.get_npcs(fresh=True) if n.get("id") == nid), None)
@@ -495,10 +508,12 @@ def explore_gather_phase(ctx, cfg):
                 st["sub"] = "to_room"
                 # Fall through to to_room logic
             else:
-                instance_nav.walk_to(ctx, target[0], target[1], tolerance=ROOM_ARRIVAL_TOLERANCE)
+                # (I14) target is a room CENTRE -- usually furniture.
+                instance_nav.walk_to(ctx, target[0], target[1], tolerance=ROOM_ARRIVAL_TOLERANCE, goal_adjacent=True)
                 return
         elif h.cheb(me, (node["instX"], node["instY"])) > 2:
-            instance_nav.walk_to(ctx, node["instX"], node["instY"], tolerance=2)
+            # (I14) a lighting node's own tile can be furniture too.
+            instance_nav.walk_to(ctx, node["instX"], node["instY"], tolerance=2, goal_adjacent=True)
             return
         elif light_node(ctx, node, cfg):
             st["sub"] = "to_room"
@@ -512,7 +527,8 @@ def explore_gather_phase(ctx, cfg):
 
     if st["sub"] == "to_room":
         if h.cheb(me, target) > ROOM_ARRIVAL_TOLERANCE:
-            instance_nav.walk_to(ctx, target[0], target[1], tolerance=ROOM_ARRIVAL_TOLERANCE)
+            # (I14) target is a room CENTRE -- usually furniture.
+            instance_nav.walk_to(ctx, target[0], target[1], tolerance=ROOM_ARRIVAL_TOLERANCE, goal_adjacent=True)
             return
         st["entered"].add(offset)
         st["sub"] = "gather"
@@ -569,7 +585,8 @@ def explore_gather_phase(ctx, cfg):
             debug_log.log("cg", f"[!] no node toward the reveal room {reveal}")
             st["revealed"].add(reveal); advance(); return
         if h.cheb(me, (node["instX"], node["instY"])) > 2:
-            instance_nav.walk_to(ctx, node["instX"], node["instY"], tolerance=2)
+            # (I14) a lighting node's own tile can be furniture too.
+            instance_nav.walk_to(ctx, node["instX"], node["instY"], tolerance=2, goal_adjacent=True)
             return
         light_node(ctx, node, cfg)
         for n in controller.get_npcs(fresh=True):
@@ -912,7 +929,8 @@ def teleport_home(ctx, cfg):
             ctx.state.data.pop("cg_imap", None)
             return True
     if st.get("start_centre"):
-        ok = instance_nav.walk_to(ctx, st["start_centre"][0], st["start_centre"][1], tolerance=3)
+        # (I14) start_centre is a room CENTRE -- usually furniture.
+        ok = instance_nav.walk_to(ctx, st["start_centre"][0], st["start_centre"][1], tolerance=3, goal_adjacent=True)
         if ok:
             ctx.state.data.pop("cg_imap", None)
         return ok
