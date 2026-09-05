@@ -27,8 +27,8 @@ All from `recordings/2026-09-05_014024_corrupted-gauntlet-humanrun1.*` (one kill
 prep 6:38), the OSRS Wiki (Corrupted Hunllef, rev 15301498), the game cache (osrs-dumps
 5bc2ff1), and ZombieLite's `Hunllef.java`/`GauntletPlugin.java`.
 
-- **Attack cadence: one attack slot every 5 ticks** (88 of 93 measured gaps exactly 5.0 ticks;
-  the lone 10-tick gap had a tornado cast in it, so a tornado occupies a slot).
+- **Attack cadence: one attack every 5 ticks** (88 of 93 measured gaps exactly 5.0 ticks; the
+  lone 10-tick gap spans a style boundary, where the marker animation sits between attacks).
 - **Style alternates at a MARKER animation after every 4 attacks, ranged first.** Measured in
   ticks from the fight start: attacks 8419 at 7, 12, 17, 22; marker 8754 at 24; attacks at 27,
   32, 37, 42; marker 8755 (tornado cast) at 44; attacks 47 (8418), 52, 57, 62; marker 8754 at
@@ -97,7 +97,8 @@ Any other situation (e.g. started mid-prep) logs "start at the Hunllef barrier" 
 
 ### Snapshot (`FightSnapshot`, one per game tick)
 
-Built from: `/player` (hp, prayer, instX, instY, plane, animation, interacting), `/npcs`
+Built from: `/player` (hp, prayer, instX, instY, plane, animation), `/combat` (`targetId`,
+`targetName`, `inCombat` -- whether we are attacking the Hunllef), `/npcs`
 (`fresh=True`; the Hunllef entry by id in `HUNLLEF`, every 9039 tornado), `/objects`
 (`fresh=True`, radius 12, filtered to 36047/36048, keyed by instX/instY), `/prayers`
 (`active`), `/equipment` (weapon name), `/inventory` (paddlefish, corrupted paddlefish,
@@ -105,17 +106,19 @@ egniol doses, bow, staff). ~5 HTTP calls, measured against the 0.6 s tick in the
 session; if it does not fit, `/prayers`, `/equipment`, `/inventory` drop to every other tick
 (they only change when we act on them).
 
-### Attack-slot counter
+### Attack counter and style
 
-`SlotCounter` consumes the Hunllef's animation changes -- from `NPC_TRACKED_ANIMATION_CHANGED`
+`StyleTracker` consumes the Hunllef's animation changes -- from `NPC_TRACKED_ANIMATION_CHANGED`
 when present, confirmed against the snapshot's `animationId` transitions each tick (HTTP is the
-truth; the event only shortens the reaction). Rules: `ANIM_ATTACK_LIKE = {8419, 8418, 8755}`
-each add one slot; `style = RANGED if (slots // 4) % 2 == 0 else MAGIC`; 8420 ignored. The
-counter starts at 0 at the first slot seen after entering; `expected_prayer()` returns the
-prayer for the CURRENT style, and `switch_due()` is true from the moment the 4th slot of a style
-plays until the switch has been made -- the next attack lands 5 ticks (3 s) later. 8754 is
-logged with the slot count at which it fired; if the live checklist shows it marks every switch
-it becomes a resync (`slots = next multiple of 4`), otherwise it stays a log line.
+truth; the event only shortens the reaction). Rules, from the measured sequence: `ANIM_ATTACK_LIKE
+= {8419, 8418}` each add one to `attacks_since_marker`; `ANIM_MARKER = {8754, 8755}` flip
+`style` (RANGED <-> MAGIC) and reset the count to 0; 8420 (stomp) is ignored. `style` starts
+RANGED. `next_style_due()` is true from the 4th attack-like animation after the last marker
+until the marker arrives -- the moment the routine switches protection prayer for the coming
+style (5 ticks before its first attack). A marker arriving with a count other than 4 logs a
+resync line and still flips. `expected_prayer()` returns Protect from Missiles for RANGED and
+Protect from Magic for MAGIC, for the style that is current or, while `next_style_due()`, the
+one coming.
 
 ### Hunllef prayer and weapon
 
@@ -138,7 +141,7 @@ inventory or equipped is used.
    distance to us). Click: `get_ground_walk_point(inst=True)` + shift-click via
    `travel._click_walk_point`, no arrival wait (the next tick re-evaluates). Off-screen point:
    minimap via `get_minimap_walk_point(inst=True)`.
-2. **Protection prayer** when `switch_due()` or the expected protection prayer is not active
+2. **Protection prayer** when `next_style_due()` or the expected protection prayer is not active
    (the prayer-disable attack; also detected early by `CHAT_MESSAGE` "Your prayers have been
    disabled!"): open the prayer tab (F-key), click the protection icon, then the weapon's
    offensive prayer if it is off. Clicks use `simulate_mistakes=False` and
@@ -151,7 +154,7 @@ inventory or equipped is used.
    equivalent; one per tick -- the game's 3-tick eat delay wastes the human's spam). When
    `prayer <= egniol_at` (15) or (`hp <= eat_at` and no fish): egniol. Inventory clicks open
    the inventory tab first (the pouch-repair lesson).
-5. **Attack** when `/player.interacting` is not the Hunllef: `click_entity` on the Hunllef with
+5. **Attack** when `/combat.targetId` is not a Hunllef id: `click_entity` on the Hunllef with
    `npc_index_refresh_target`, `expected_action="Attack"`, `expected_target="Corrupted Hunllef"`;
    a withheld click escalates to `click_menu_action("Attack")`.
 6. **Reposition** when Chebyshev distance to the centre > `ATTACK_RANGE + 2` or < 3 (it walked
@@ -161,7 +164,7 @@ inventory or equipped is used.
 
 Every click's outcome is awaited with `bridge_events.await_outcome` (a listed signal confirmed
 by one HTTP read, budget one tick): prayer -> `/prayers.active`; wield -> `/equipment`;
-eat -> `INVENTORY_CHANGED` + `/player.hp`; attack -> `/player.interacting`.
+eat -> `INVENTORY_CHANGED` + `/player.hp`; attack -> `/combat.targetId`.
 
 ### Stomp guard (user requirement)
 
@@ -200,8 +203,8 @@ name lists), `melee_weapon` ("bow"), `fight_max_s`. `VARBIT_SUBSCRIPTIONS = [917
 ## Testing
 
 Pure, hermetic (`no_live_bridge`-style autouse stub):
-- `SlotCounter`: 4 slots per style, ranged first, tornado counts, stomp ignored, `switch_due`
-  window; a **replay test** feeding the recording's Hunllef animation sequence (copied into the
+- `StyleTracker`: 4 attacks then a marker, ranged first, both markers flip, stomp ignored,
+  `next_style_due` window, resync on a short count; a **replay test** feeding the recording's Hunllef animation sequence (copied into the
   test as `(t, anim)` pairs) and asserting each predicted switch falls within 5 ticks of the
   human's real prayer click times (the list above).
 - `hunllef_prayer`, `desired_weapon`, `offensive_prayer_for`.
@@ -227,6 +230,6 @@ Pure, hermetic (`no_live_bridge`-style autouse stub):
 ## Files touched
 
 New: `ControllerAddon/routines/corrupted_gauntlet.py`, `ControllerAddon/hunllef.py` (the pure
-logic: `SlotCounter`, `FightSnapshot`, `pick_safe_tile`, decisions), `tests/test_hunllef.py`.
+logic: `StyleTracker`, `FightSnapshot`, `pick_safe_tile`, decisions), `tests/test_hunllef.py`.
 Modified: `gauntlet_ids.py` (add `HUNLLEF_PRAYER_BY_ID`, `ANIM_SLOT`), `controller.py`
 (`ROUTINE_FILES`), `RoutineChoice.java`, CLAUDE.md (new "Current state" section).
