@@ -29,13 +29,18 @@ prep 6:38), the OSRS Wiki (Corrupted Hunllef, rev 15301498), the game cache (osr
 
 - **Attack cadence: one attack slot every 5 ticks** (88 of 93 measured gaps exactly 5.0 ticks;
   the lone 10-tick gap had a tornado cast in it, so a tornado occupies a slot).
-- **Style alternates every 4 slots, ranged first** (wiki: "any combination of 4 standard,
-  prayer-disabling, or tornado attacks"). The human's protection switches came at 14.5, 27.2,
-  39.5, 52.0, 62.7, 75.3, 86.8, 98.9, 110.9, 122.8, 136.2 s: 12 s apart, i.e. 20 ticks, i.e. 4
-  slots, through tornado casts -- confirming tornadoes count. Slot animations: 8419 standard,
-  8418 prayer-disabling, 8755 tornado. 8420 stomp does NOT count (wiki). 8754 ("switch style")
-  fired every 24 s (14.4, 38.4, 62.4, ...), i.e. every OTHER style switch -- its exact meaning
-  is a live-checklist item; the counter, not this animation, is the primary signal.
+- **Style alternates at a MARKER animation after every 4 attacks, ranged first.** Measured in
+  ticks from the fight start: attacks 8419 at 7, 12, 17, 22; marker 8754 at 24; attacks at 27,
+  32, 37, 42; marker 8755 (tornado cast) at 44; attacks 47 (8418), 52, 57, 62; marker 8754 at
+  64; ... for the whole kill. So: four attack-like animations (8419 standard, 8418
+  prayer-disabling), then two ticks later a marker -- 8754 (the "switch style" animation) and
+  8755 (the tornado cast) ALTERNATE as the marker -- then the next style's first attack three
+  ticks after the marker. The tornado cast does not consume one of the four; it IS the
+  boundary. The human clicked the new protection prayer 0.1-1.7 ticks after each marker (24.1,
+  45.3, 65.7, 86.5, 104.4, 125.4, ...). 8420 (stomp) appears once, mid-sequence, and shifts
+  nothing. Predictive rule: after the 4th attack-like animation since the last marker, the
+  next style is known and the switch can be made 5 ticks before it lands; the marker confirms
+  and resyncs (a marker arriving with a count other than 4 resets the count).
 - **The NPC id IS the overhead prayer.** Cache symbols: 9035 `crystal_hunllef_melee_hm`, 9036
   `crystal_hunllef_ranged_hm`, 9037 `crystal_hunllef_magic_hm`, 9038 `crystal_hunllef_death_hm`.
   Its prayer changes every 6th off-prayer player attack (wiki). In the recording each of the
