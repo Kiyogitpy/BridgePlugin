@@ -74,12 +74,17 @@ public class ObjectProvider extends BridgeProvider
 			return notFound;
 		}
 
-		String kx = InstanceCoords.wantsInstance(query) ? "instX" : "x";
-		String ky = InstanceCoords.wantsInstance(query) ? "instY" : "y";
+		boolean inst = InstanceCoords.wantsInstance(query);
+		String kx = inst ? "instX" : "x";
+		String ky = inst ? "instY" : "y";
 		Integer radius = parseIntParam(query.get("radius"));
+		// I2 (2026-09-05, final-fix-brief.md): a Target is built for the inst=true case too, not
+		// just the ordinary one -- an unfiltered scan pays the clickbox-hull cost (47-194ms
+		// measured in this file's own Target comment) for every object in the radius, exactly the
+		// cost that comment exists to avoid. See matchesTarget for the instance-space comparison.
 		List<Map<String, Object>> objects = computeObjects(
 			radius != null ? radius : OBJECT_AT_DEFAULT_RADIUS,
-			InstanceCoords.wantsInstance(query) ? null : new Target(x, y, plane, id));
+			new Target(x, y, plane, id, inst));
 		for (Map<String, Object> obj : objects)
 		{
 			if (id.equals(obj.get("id")) && x.equals(obj.get(kx)) && y.equals(obj.get(ky))
@@ -393,7 +398,7 @@ public class ObjectProvider extends BridgeProvider
 				{
 					if (obj != null)
 					{
-						if (matchesTarget(want, obj))
+						if (matchesTarget(want, obj, plane))
 					{
 						addIfBuilt(out, obj, "GameObject", plane);
 					}
@@ -406,7 +411,7 @@ public class ObjectProvider extends BridgeProvider
 				WallObject wallObj = tile.getWallObject();
 				if (wallObj != null)
 				{
-					if (matchesTarget(want, wallObj))
+					if (matchesTarget(want, wallObj, plane))
 				{
 					addIfBuilt(out, wallObj, "WallObject", plane);
 				}
@@ -415,7 +420,7 @@ public class ObjectProvider extends BridgeProvider
 				GroundObject groundObj = tile.getGroundObject();
 				if (groundObj != null)
 				{
-					if (matchesTarget(want, groundObj))
+					if (matchesTarget(want, groundObj, plane))
 				{
 					addIfBuilt(out, groundObj, "GroundObject", plane);
 				}
@@ -424,7 +429,7 @@ public class ObjectProvider extends BridgeProvider
 				DecorativeObject decorativeObj = tile.getDecorativeObject();
 				if (decorativeObj != null)
 				{
-					if (matchesTarget(want, decorativeObj))
+					if (matchesTarget(want, decorativeObj, plane))
 				{
 					addIfBuilt(out, decorativeObj, "DecorativeObject", plane);
 				}
@@ -478,18 +483,22 @@ public class ObjectProvider extends BridgeProvider
 	private static final class Target
 	{
 		private final int x, y, plane, id;
+		// I2 (2026-09-05): x/y are instance-space (instX/instY) when true, ordinary top-level
+		// world coordinates otherwise -- see matchesTarget.
+		private final boolean inst;
 
-		private Target(int x, int y, int plane, int id)
+		private Target(int x, int y, int plane, int id, boolean inst)
 		{
 			this.x = x;
 			this.y = y;
 			this.plane = plane;
 			this.id = id;
+			this.inst = inst;
 		}
 	}
 
 	/** id first: a free field read that rejects essentially everything. */
-	private boolean matchesTarget(Target want, TileObject obj)
+	private boolean matchesTarget(Target want, TileObject obj, int plane)
 	{
 		if (want == null)
 		{
@@ -499,7 +508,15 @@ public class ObjectProvider extends BridgeProvider
 		{
 			return false;
 		}
-		WorldPoint wp = worldPointOf(obj);
+		// I2 (2026-09-05, final-fix-brief.md): compare in whichever space the caller asked for.
+		// instX/instY (base + scene arithmetic, InstanceCoords) for inst=true -- the same space
+		// getObjectAt compares its result against below -- else the ordinary top-level world
+		// point. Both need the top-level-corrected point for a nested WorldView (a boat's own
+		// fixtures), same guard as worldPointOf/buildObjectData use everywhere else.
+		LocalPoint local = obj.getLocalLocation();
+		WorldPoint wp = want.inst && local.getWorldView() <= WorldView.TOPLEVEL
+			? InstanceCoords.instancePoint(client, local, plane)
+			: worldPointOf(obj);
 		return wp != null && wp.getX() == want.x && wp.getY() == want.y
 			&& wp.getPlane() == want.plane;
 	}
