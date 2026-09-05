@@ -735,7 +735,28 @@ that function's own docstring). First live session's worklist is the spec's chec
 `instX/instY` centre-vs-corner for a size-5 NPC, 8754's meaning, the ranged/magic projectile
 ids, snapshot cost per tick.
 
-Sub-project 3 adds `explore_gather` / `craft` / `upgrade` in front of `enter`; the route is the user's (relative to the start side, three border reveals from the middle ring, full inner-ring circle); rooms are addressed in instance space as (right, outward) offsets from the start room with a configurable pitch (16, unverified); the bowl is driven by widget TEXT in group 270; time gates 270/330/360/420 s; **not yet run live** -- the spec's live checklist is the first session's worklist, starting with whether `/objects` lists unopened rooms and the real room pitch.
+Sub-project 3 adds `explore_gather` / `craft` / `upgrade` in front of `enter`; the route is the user's (relative to the start side, three border reveals from the middle ring, full inner-ring circle); rooms are addressed in instance space as (right, outward) offsets from the start room with a configurable pitch (16, unverified); the bowl is driven by widget TEXT+NAME in group 270; time gates 270/330/360/420 s; **not yet run live** -- the spec's live checklist is the first session's worklist, starting with whether `/objects` lists unopened rooms and the real room pitch.
+
+**Final-review fix wave, 2026-09-05** (`.superpowers/sdd/2026-09-05-gauntlet-prep/final-fix-brief.md`),
+still not run live -- every fact below is reasoned from the recording and the code, not measured
+against a live client:
+- `craft_plan` is now idempotent (a deficit against each stage of the vial/dust/potion/cfish
+  pipeline, not a running total), so a re-plan every tick no longer re-queues a step whose effect
+  is already sitting in the inventory.
+- **Post-craft fishing pass**: `prep_state`/`explore_gather_phase` remember every Corrupt Fishing
+  Spot tile seen while exploring; once cook has run and the kit's higher fish target (20, vs the
+  fight's own `min_fish` 10) isn't met, `craft_phase` makes one bounded (`FISH_PASS_MAX_S` 60s)
+  trip back to the nearest recorded spot before falling back to its normal plan.
+- **Timer chat resync**: `on_event` matches the game's own "Time remaining: M:SS" chat line and
+  resets `cg_t0` so `time_left` agrees with it, closing any HTTP-latency drift between our own
+  clock (started from the first `REGION_CORRUPTED` read) and the game's.
+- **The cached instance map (`cg_imap`) is dropped on every scene change, not only leaving the
+  fight**: after a successful `light_node` (the recording shows LOADING/LOGGED_IN ~1.2s later),
+  after `teleport_home`, and on every phase change in `tick()` -- a stale grid answers
+  `maze.edge_open`/`component` questions against a scene that no longer exists.
+- **`/objects` room coverage is still the first live question to settle** (unverified whether the
+  bulk scan actually lists rooms not yet entered, and the real room pitch) -- everything above
+  assumes the original design's answer to it.
 
 ## Current state of routines/guardians_of_the_rift.py
 

@@ -1860,3 +1860,126 @@ def test_stuck_watch_fires_even_when_ensure_tools_fails(monkeypatch):
     # Call tick() again with same state - should trigger safety stop
     cg.tick(ctx)
     assert ctx.state.safety_stopped is True
+
+
+# ---- M (minor fixes, final-fix-brief.md) ----
+
+def test_craft_by_s_is_gone():
+    assert "craft_by_s" not in cg.DEFAULT_CONFIG
+
+
+def test_objects_radius_default_is_16():
+    assert cg.DEFAULT_CONFIG["objects_radius"] == 16
+
+
+def test_reveal_skips_npcs_with_no_resolvable_position(monkeypatch):
+    """M: an npc with instX/instY None (a fresh spawn, per the instancing gotchas) must not reach
+    _room's arithmetic -- it used to raise a TypeError there."""
+    ctx = _Ctx(); data = ctx.state.data; data["cg_t0"] = 0.0
+    S = (13056 + 30, 5632 + 30)
+    pitch = cg.DEFAULT_CONFIG["room_pitch"]
+    # route step 1 is ((1, 1), "enter", (1, 2)) -- the first step with a non-None reveal.
+    st = {"start_centre": S, "barrier": (S[0], S[1] - 8), "outward": (0, 1), "pitch": pitch,
+          "step": 1, "sub": "reveal", "revealed": set(), "entered": {(0, 0)}, "node_fails": 0,
+          "prev_centre": S, "fishing_spots": set()}
+    data["cg_prep"] = st
+    target = cg._centre(st, (1, 1))
+    rc = cg._centre(st, (1, 2))
+    mid = ((target[0] + rc[0]) // 2, (target[1] + rc[1]) // 2)
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*mid))
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [_obj(35999, "Node", *mid)])
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False:
+                        [{"id": next(iter(g.DEMI_BOSS_DROP)), "instX": None, "instY": None}])
+    monkeypatch.setattr(cg, "light_node", lambda ctx, node, cfg: True)
+    monkeypatch.setattr(cg, "gather_ladder", lambda ctx, cfg: "none")
+    # Must not raise.
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)
+    assert (1, 2) in st["revealed"]
+
+
+def test_pick_up_drops_confirms_on_the_specific_item_rising(monkeypatch):
+    """M: the old confirm rule (count(name) > 0) trivially passes when we already hold ANY of
+    this item, so a click that missed entirely was still reported as taken. Confirm must require
+    the SPECIFIC item's count to rise (or a brand-new inventory slot)."""
+    ctx = _Ctx()
+    me = (100, 100)
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*me))
+    item = {"name": g.ITEM_SHARDS, "instX": 101, "instY": 100, "screenX": 5, "screenY": 5}
+    monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [item])
+    # Already holding one Corrupted shards stack -- the click below never actually lands another.
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.ITEM_SHARDS, "qty": 50}])
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: check())
+    taken = cg.pick_up_drops(ctx, cg.DEFAULT_CONFIG)
+    assert taken == 0
+
+
+def test_pick_up_drops_confirms_when_the_count_actually_rises(monkeypatch):
+    ctx = _Ctx()
+    me = (100, 100)
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*me))
+    item = {"name": g.ITEM_SHARDS, "instX": 101, "instY": 100, "screenX": 5, "screenY": 5}
+    monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [item])
+    state = {"taken": False}
+    def get_inventory_mock():
+        return [{"name": g.ITEM_SHARDS, "qty": 60}] if state["taken"] else [{"name": g.ITEM_SHARDS, "qty": 50}]
+    monkeypatch.setattr(controller, "get_inventory", get_inventory_mock)
+    def click(ser, entity, option, **kw):
+        state["taken"] = True
+        return True
+    monkeypatch.setattr(controller, "click_menu_action", click)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: check())
+    taken = cg.pick_up_drops(ctx, cg.DEFAULT_CONFIG)
+    assert taken == 1
+
+
+def test_bowl_make_returns_walking_sentinel_when_far(monkeypatch):
+    """M: _near returns the falsy WALKING sentinel (not plain False) when it issues a walk --
+    bowl_make must propagate it so craft_phase can tell "still approaching" from "genuinely
+    failed"."""
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(0, 0))
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [_obj(g.OBJ_SINGING_BOWL, "Singing Bowl", 100, 100)])   # far away
+    monkeypatch.setattr(cg.instance_nav, "walk_to", lambda ctx, x, y, **kw: True)
+    result = cg.bowl_make(ctx, "helm", cg.DEFAULT_CONFIG)
+    assert result is cg.WALKING
+    assert not result   # still falsy for any ordinary boolean check
+
+
+def test_craft_phase_does_not_count_a_walk_in_progress_as_a_failure(monkeypatch):
+    """M: a craft step that is still walking toward its object must not spend the 3-strike
+    failure budget -- it should simply be retried, unchanged, on the next call."""
+    ctx = _Ctx(); ctx.state.data.update({"cg_t0": 0.0, "cg_home": True})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(cg.kit, "craft_plan", lambda inv, eq, cfg: [("cook", None)])
+    monkeypatch.setattr(cg, "cook_all", lambda ctx, cfg: cg.WALKING)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    assert ctx.state.data.get("cg_craft_fails", {}).get("cook", 0) == 0
+    assert ctx.state.data.get("cg_crafted") is None
+
+
+def test_light_node_throttles_its_own_objects_poll(monkeypatch):
+    """M: light_node's lit() must not read /objects on every single _confirm poll (every 0.1s) --
+    throttled to at most once per LIGHT_NODE_POLL_S (0.5s)."""
+    ctx = _Ctx()
+    node = _obj(35999, "Node", 100, 100)
+    reads = {"n": 0}
+
+    def objects(radius=None, fresh=False, interactable=False):
+        reads["n"] += 1
+        return [_obj(35999, "Node", 100, 100)]   # never actually lights -- same id forever
+    monkeypatch.setattr(controller, "get_objects", objects)
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
+    t = {"v": 1000.0}
+    monkeypatch.setattr(cg.time, "time", lambda: t["v"])
+    monkeypatch.setattr(cg.time, "sleep", lambda s: t.__setitem__("v", t["v"] + 0.1))
+    cg.light_node(ctx, node, cg.DEFAULT_CONFIG)
+    # NODE_BUDGET_S (6.0) / LIGHT_NODE_POLL_S (0.5) = 12 throttled reads at most, plus one for the
+    # very first poll -- nowhere near the ~60 a 0.1s-per-poll rate would cost.
+    assert reads["n"] <= 14

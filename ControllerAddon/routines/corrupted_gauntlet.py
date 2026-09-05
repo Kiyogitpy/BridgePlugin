@@ -45,10 +45,10 @@ DEFAULT_CONFIG = {
     "tornado_danger": 2,
     "tornado_avoid": 3,
     "fight_max_s": 480.0,
-    "objects_radius": 12,
+    "objects_radius": 16,        # (M, final-fix-brief.md) was 12 -- room_pitch is 16, so a
+                                  # room-crossing prep scan at 12 could miss its own far wall
     "gather_deadline_s": 270,
     "gather_hard_deadline_s": 330,
-    "craft_by_s": 360,
     "upgrade_min_left_s": 90,
     "enter_by_s": 420,
     "timer_s": 450,
@@ -67,6 +67,7 @@ ENTER_MAX_ATTEMPTS = 3         # barrier quick-pass ceiling before safety stop
 LOOT_MAX_ATTEMPTS = 5          # chest open ceiling before safety stop
 LOOT_CONFIRM_S = 4.0           # (I2) budget to confirm the chest actually opened after the click
 NODE_BUDGET_S = 6.0
+LIGHT_NODE_POLL_S = 0.5        # (M) light_node's own /objects poll throttle, below _confirm's 0.1s
 GATHER_BUDGET_S = 8.0
 NODE_MAX_FAILS = 2
 DROP_SLOT_RESERVE = 2          # (C3a) slots kept free of raw fish for other loot to land in
@@ -239,10 +240,20 @@ def light_node(ctx, node, cfg):
     refresh = controller.object_refresh_target(node.get("x"), node.get("y"), node.get("plane"), node.get("id"))
     controller.click_menu_action(ctx.ser, node, "Light", target_hint="Node", offset=(0, 0), refresh_target=refresh)
 
+    # (M, final-fix-brief.md) _confirm polls every 0.1s -- an /objects?fresh=true scan on every
+    # single poll is needless HTTP load for a check that only ever changes once. Throttle the
+    # actual bridge read to at most once per LIGHT_NODE_POLL_S, reusing the last result between
+    # reads; the chat-event half of the check is cheap (local buffer) and still runs every poll.
+    poll_state = {"at": 0.0, "lit": False}
+
     def lit():
-        for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True):
-            if (o.get("instX"), o.get("instY")) == before[1:] and o.get("id") != before[0]:
-                return True
+        now = time.time()
+        if not poll_state["lit"] and now - poll_state["at"] >= LIGHT_NODE_POLL_S:
+            poll_state["at"] = now
+            poll_state["lit"] = any((o.get("instX"), o.get("instY")) == before[1:] and o.get("id") != before[0]
+                                    for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True))
+        if poll_state["lit"]:
+            return True
         if ctx.events is not None:
             for t, p in ctx.events.since(mark):
                 if t == "CHAT_MESSAGE" and "light the nodes" in str((p or {}).get("message", "")):
@@ -328,9 +339,19 @@ def pick_up_drops(ctx, cfg):
     for item in controller.get_ground_items(fresh=True) or []:
         if item.get("name") not in wanted or h.cheb((item.get("instX"), item.get("instY")), me) > DROP_RANGE:
             continue
-        before = len(controller.get_inventory())
+        # (M, final-fix-brief.md) Confirm on the SPECIFIC item's count rising (or a brand-new
+        # inventory slot), not "any change" -- the old `count(name) > 0` check trivially passes
+        # whenever we already carry any of this item, so a click that missed entirely (or was
+        # hijacked) was reported as a success as long as we happened to already hold one.
+        before_len = len(controller.get_inventory())
+        before_count = kit.count(controller.get_inventory(), item.get("name"))
         controller.click_menu_action(ctx.ser, item, "Take", target_hint=item.get("name"), offset=(0, 0))
-        if _confirm(ctx, lambda: len(controller.get_inventory()) != before or kit.count(controller.get_inventory(), item.get("name")) > 0, 4.0):
+        name = item.get("name")
+
+        def confirmed(bl=before_len, bc=before_count, name=name):
+            inv = controller.get_inventory()
+            return len(inv) != bl or kit.count(inv, name) > bc
+        if _confirm(ctx, confirmed, 4.0):
             taken += 1
     return taken
 
@@ -590,6 +611,11 @@ def explore_gather_phase(ctx, cfg):
             return
         light_node(ctx, node, cfg)
         for n in controller.get_npcs(fresh=True):
+            # (M, final-fix-brief.md) An npc with no resolvable position (instX/instY None --
+            # per the instancing gotchas, a fresh spawn can report this for a tick or two) must
+            # not reach _room/maze.room_of, which does arithmetic on the tile and would raise.
+            if n.get("instX") is None or n.get("instY") is None:
+                continue
             if n.get("id") in g.DEMI_BOSS_DROP and _room(st, (n.get("instX"), n.get("instY"))) == reveal:
                 data["cg_demi_bosses"][reveal] = n["id"]
                 debug_log.log("cg", f"revealed {n.get('name')} ({n['id']}) in {reveal}")
@@ -910,12 +936,27 @@ def _find_object(cfg, obj_id):
     return next((o for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True) if o.get("id") == obj_id), None)
 
 
+class _Approaching:
+    """(M, final-fix-brief.md) Falsy sentinel `_near` returns instead of plain `False` when it
+    issued a walk (still approaching, not yet a failure) -- craft_phase's per-op fail counter
+    checks `is WALKING` to skip counting these; every other caller (ensure_tools) only ever does
+    `and`/`not` on the result, which still treats this as "not near", so nothing else changes."""
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return "WALKING"
+
+
+WALKING = _Approaching()
+
+
 def _near(ctx, obj, tiles):
     me, _ = _me()
     pos = (obj.get("instX"), obj.get("instY"))
     if h.cheb(me, pos) > tiles:
         instance_nav.walk_to(ctx, pos[0], pos[1], tolerance=tiles, goal_adjacent=True)
-        return False
+        return WALKING
     return True
 
 
@@ -954,8 +995,11 @@ def _bowl_widget(key):
 
 def bowl_make(ctx, key, cfg):
     bowl = _find_object(cfg, g.OBJ_SINGING_BOWL)
-    if bowl is None or not _near(ctx, bowl, 3):
+    if bowl is None:
         return False
+    near = _near(ctx, bowl, 3)
+    if near is not True:
+        return near
     # (I6) The Singing Bowl interface stays open across Makes -- skip the Sing-crystal click
     # (and the walk/near check it re-triggers) when the widget for this key is already visible.
     if _bowl_widget(key) is None:
@@ -990,8 +1034,11 @@ def use_on(ctx, name_a, name_b, confirm=None):
 
 def cook_all(ctx, cfg):
     rng = _find_object(cfg, g.OBJ_RANGE)
-    if rng is None or not _near(ctx, rng, 3):
+    if rng is None:
         return False
+    near = _near(ctx, rng, 3)
+    if near is not True:
+        return near
     controller.click_entity(ctx.ser, rng, expected_action="Cook")
     last = kit.count(controller.get_inventory(), g.ITEM_RAW_FISH)
     stall = time.time() + COOK_STALL_S
@@ -1007,8 +1054,11 @@ def cook_all(ctx, cfg):
 
 def pump_fill(ctx, cfg):
     pump = _find_object(cfg, g.OBJ_WATER_PUMP)
-    if pump is None or not _near(ctx, pump, 3):
+    if pump is None:
         return False
+    near = _near(ctx, pump, 3)
+    if near is not True:
+        return near
     vials = kit.count(controller.get_inventory(), g.ITEM_VIAL)
     controller.click_entity(ctx.ser, pump, expected_action="Fill-from")
     return _confirm(ctx, lambda: kit.count(controller.get_inventory(), g.ITEM_WATER_VIAL) >= vials, 6.0)
@@ -1152,6 +1202,12 @@ def craft_phase(ctx, cfg):
     ok = {"bowl": lambda: bowl_make(ctx, arg, cfg), "pump": lambda: pump_fill(ctx, cfg),
           "pestle": lambda: _pestle(ctx), "potion": lambda: _potion(ctx),
           "cook": lambda: cook_all(ctx, cfg), "wear": lambda: wear(ctx, arg)}[op]()
+    if ok is WALKING:
+        # (M, final-fix-brief.md) Still walking toward the object this step needs -- not a
+        # failure, just not there yet. Re-run the same step next call without touching the
+        # per-op fail counter, so a legitimately far-off bowl/range/pump never eats into the
+        # 3-strike budget that is meant for clicks that actually failed.
+        return
     if "cg_craft_fails" not in data:
         data["cg_craft_fails"] = {}
     fails = data["cg_craft_fails"]
