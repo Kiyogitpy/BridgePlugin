@@ -3111,6 +3111,7 @@ ROUTINE_FILES = {
     "RAID_SCOUTER": "routines/raid_scouter.py",
     "GIANTS_FOUNDRY": "routines/giants_foundry.py",
     "GUARDIANS_OF_THE_RIFT": "routines/guardians_of_the_rift.py",
+    "CORRUPTED_GAUNTLET": "routines/corrupted_gauntlet.py",
     "AGILITY": "routines/agility.py",
 }
 

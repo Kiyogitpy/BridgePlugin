@@ -28,6 +28,7 @@ public enum RoutineChoice
 	RAID_SCOUTER("Raid Scouter (CoX)"),
 	GIANTS_FOUNDRY("Giants' Foundry"),
 	GUARDIANS_OF_THE_RIFT("Guardians of the Rift"),
+	CORRUPTED_GAUNTLET("Corrupted Gauntlet"),
 	AGILITY("Agility (course runner)");
 
 	private final String label;

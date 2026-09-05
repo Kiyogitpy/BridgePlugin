@@ -704,6 +704,26 @@ steps above.
   from ordinary walking never change it at all. Dropped events past the cap are intentional — the
   Python mirror is an accelerator with an HTTP fallback.
 
+## Current state of routines/corrupted_gauntlet.py
+
+Sub-project 2 of the Corrupted Gauntlet (spec `docs/superpowers/specs/2026-09-05-hunllef-fight-
+design.md`), written 2026-09-05 from the human recording
+`recordings/2026-09-05_014024_corrupted-gauntlet-humanrun1.*` and the cache. **Door-start mode,
+not yet run live**: start it in front of the Hunllef's Barrier with both perfected weapons, fish
+and an egniol; it quick-passes, fights, opens the chest, stops. The prep (sub-project 3) does
+not exist yet. Facts that shape it, all MEASURED: the Hunllef attacks every 5 ticks; four
+attacks then a marker animation (8754 "switch style" / 8755 tornado cast, alternating) flip the
+style, ranged first -- `hunllef.StyleTracker`, replay-tested against every prayer click in the
+recording; its NPC id IS its overhead prayer (9035 melee / 9036 ranged / 9037 magic / 9038
+death, cache symbols); size 5, so every walk target is filtered against centre +-2 plus one
+margin tile (`hunllef.forbidden_near_hunllef` -- the user's stomp concern); floor tiles are
+GroundObjects 36047 warning / 36048 hit, polled from `/objects`; "Your prayers have been
+disabled!" is the prayer-disable tell. The fight loop holds `tick()` on `wait_ticks(1)` and
+reads events with `EventStream.since(mark)` because `on_event` is dispatched by the engine loop
+and never runs while a routine holds the tick. First live session's worklist is the spec's
+checklist: `instX/instY` centre-vs-corner for a size-5 NPC, 8754's meaning, the ranged/magic
+projectile ids, snapshot cost per tick.
+
 ## Current state of routines/guardians_of_the_rift.py
 
 - **Outcome-driven since 2026-09-04 (not yet run live in this form).** Every `_commit` window
