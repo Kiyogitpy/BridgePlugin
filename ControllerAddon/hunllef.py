@@ -218,3 +218,59 @@ def pick_safe_tile(snap, imap, cfg, require_in_range=False):
         if best_key is None or key < best_key:
             best, best_key = tile, key
     return best
+
+
+def desired_weapon(hunllef_id, cfg):
+    prayer = g.HUNLLEF_PRAYER_BY_ID.get(hunllef_id)
+    if prayer == "RANGED":
+        return "staff"
+    if prayer == "MAGIC":
+        return "bow"
+    return cfg.get("melee_weapon", "bow")
+
+
+def offensive_prayer_for(kind, cfg, unusable):
+    for name in cfg.get("offensive_prayers", {}).get(kind, []):
+        if name not in unusable:
+            return name
+    return None
+
+
+def eat_due(snap, cfg):
+    return snap.hp <= cfg["eat_at"] and bool(snap.fish())
+
+
+def drink_due(snap, cfg):
+    if not snap.egniol():
+        return False
+    return snap.prayer <= cfg["egniol_at"] or (snap.hp <= cfg["eat_at"] and not snap.fish())
+
+
+def ladder(snap, tracker, cfg, unusable_prayers=frozenset()):
+    """The one action for this tick. Order is the spec's: escape > protection prayer > weapon >
+    offensive prayer > eat/drink > attack > reposition > idle."""
+    if snap.hunllef is None:
+        return ("no_hunllef", None)
+    if in_danger(snap, cfg):
+        return ("escape", in_danger(snap, cfg))
+    expected = tracker.expected_prayer()
+    if not snap.prayers_active.get(expected):
+        return ("prayer", expected)
+    want = desired_weapon(snap.hunllef["id"], cfg)
+    if snap.weapon_kind() != want and snap.inventory_weapon(want) is not None:
+        return ("wield", want)
+    offensive = offensive_prayer_for(snap.weapon_kind() or want, cfg, unusable_prayers)
+    if offensive and not snap.prayers_active.get(offensive):
+        return ("prayer", offensive)
+    if eat_due(snap, cfg):
+        return ("eat", None)
+    if drink_due(snap, cfg):
+        return ("drink", None)
+    if snap.target_id not in g.HUNLLEF:
+        return ("attack", None)
+    centre = snap.hunllef_centre()
+    if centre is not None:
+        d = cheb(snap.me, centre)
+        if d <= FOOTPRINT_RADIUS + FOOTPRINT_MARGIN or not in_attack_range(snap.me, centre, cfg["attack_range"]):
+            return ("reposition", None)
+    return ("idle", None)

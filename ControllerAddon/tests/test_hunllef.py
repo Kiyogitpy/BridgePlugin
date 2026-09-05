@@ -201,3 +201,70 @@ def test_require_in_range_filters():
     snap = _fight(me=G(2, 2), hun=G(30, 30))
     assert h.pick_safe_tile(snap, imap, CFG, require_in_range=True) is None
     assert h.pick_safe_tile(snap, imap, CFG) is not None
+
+
+# Task 6: decisions and the ladder
+FULL_CFG = dict(CFG, eat_at=45, egniol_at=15, melee_weapon="bow",
+                offensive_prayers={"bow": ["RIGOUR", "DEADEYE", "EAGLE_EYE"], "staff": ["AUGURY", "MYSTIC_MIGHT", "MYSTIC_LORE"]})
+
+
+def _ready(**kw):
+    """A snapshot where nothing needs doing: praying right, right weapon, fed, attacking, in range."""
+    base = dict(player=_player(hp=80, prayer=50, instX=BX + 10, instY=BY + 10),
+                npcs=[_npc(9036, BX + 16, BY + 10, 8419)],
+                prayers={"active": {"PROTECT_FROM_MISSILES": True, "AUGURY": True}},
+                equipment={"weapon": {"name": "Corrupted staff (perfected)"}},
+                inventory=_inv("Corrupted bow (perfected)", "Paddlefish", "Egniol potion (2)"),
+                combat={"targetId": 9036}, objects=[])
+    base.update(kw)
+    return h.FightSnapshot.from_bridge(**base)
+
+
+def test_desired_weapon_is_the_style_it_is_not_praying_against():
+    assert h.desired_weapon(9036, FULL_CFG) == "staff"     # praying ranged -> hit it with magic
+    assert h.desired_weapon(9037, FULL_CFG) == "bow"
+    assert h.desired_weapon(9035, FULL_CFG) == "bow"       # melee prayer: config default
+    assert h.desired_weapon(9038, FULL_CFG) == "bow"
+
+
+def test_offensive_prayer_skips_unusable_ones():
+    assert h.offensive_prayer_for("bow", FULL_CFG, set()) == "RIGOUR"
+    assert h.offensive_prayer_for("bow", FULL_CFG, {"RIGOUR"}) == "DEADEYE"
+    assert h.offensive_prayer_for("staff", FULL_CFG, {"AUGURY", "MYSTIC_MIGHT", "MYSTIC_LORE"}) is None
+
+
+def test_ladder_order():
+    t = h.StyleTracker()                                   # RANGED -> expects PROTECT_FROM_MISSILES
+    assert h.ladder(_ready(), t, FULL_CFG)[0] == "idle"
+    assert h.ladder(_ready(npcs=[]), t, FULL_CFG)[0] == "no_hunllef"
+    assert h.ladder(_ready(objects=[_obj(36048, BX + 10, BY + 10)]), t, FULL_CFG)[0] == "escape"
+    assert h.ladder(_ready(prayers={"active": {"AUGURY": True}}), t, FULL_CFG) == ("prayer", "PROTECT_FROM_MISSILES")
+    assert h.ladder(_ready(npcs=[_npc(9037, BX + 16, BY + 10)]), t, FULL_CFG) == ("wield", "bow")
+    assert h.ladder(_ready(prayers={"active": {"PROTECT_FROM_MISSILES": True}}), t, FULL_CFG) == ("prayer", "AUGURY")
+    assert h.ladder(_ready(player=_player(hp=40, instX=BX + 10, instY=BY + 10)), t, FULL_CFG)[0] == "eat"
+    assert h.ladder(_ready(player=_player(prayer=10, instX=BX + 10, instY=BY + 10)), t, FULL_CFG)[0] == "drink"
+    assert h.ladder(_ready(combat={"targetId": None}), t, FULL_CFG)[0] == "attack"
+    assert h.ladder(_ready(player=_player(instX=BX + 13, instY=BY + 10)), t, FULL_CFG)[0] == "reposition"   # margin ring
+    assert h.ladder(_ready(player=_player(instX=BX + 30, instY=BY + 10)), t, FULL_CFG)[0] == "reposition"   # out of range
+
+
+def test_ladder_escape_beats_everything_and_prayer_beats_weapon():
+    t = h.StyleTracker()
+    s = _ready(objects=[_obj(36048, BX + 10, BY + 10)], prayers={"active": {}}, npcs=[_npc(9037, BX + 16, BY + 10)],
+               player=_player(hp=20, instX=BX + 10, instY=BY + 10), combat={"targetId": None})
+    assert h.ladder(s, t, FULL_CFG)[0] == "escape"
+
+
+def test_ladder_predictive_prayer_switch():
+    t = h.StyleTracker()
+    for _ in range(4):
+        t.observe(8419)
+    assert h.ladder(_ready(), t, FULL_CFG) == ("prayer", "PROTECT_FROM_MAGIC")
+
+
+def test_eat_and_drink_fallbacks():
+    assert not h.eat_due(_ready(inventory=_inv("Corrupted bow (perfected)")), FULL_CFG)          # no fish
+    low = _ready(player=_player(hp=30, instX=BX + 10, instY=BY + 10), inventory=_inv("Egniol potion (1)"))
+    assert h.drink_due(low, FULL_CFG)                                                             # hp low, no fish -> egniol
+    assert not h.drink_due(_ready(), FULL_CFG)
+    assert h.ladder(_ready(inventory=_inv("Corrupted bow (perfected)"), player=_player(hp=30, instX=BX + 10, instY=BY + 10)), h.StyleTracker(), FULL_CFG)[0] == "idle"
