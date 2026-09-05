@@ -643,9 +643,8 @@ public class ObjectProvider extends BridgeProvider
 		data.put("y", wp.getY());
 		data.put("plane", wp.getPlane());
 
-		LocalPoint objLocal = obj.getLocalLocation();
-		WorldPoint inst = objLocal != null
-			? InstanceCoords.instancePoint(client, objLocal, wp.getPlane())
+		WorldPoint inst = local != null && local.getWorldView() <= WorldView.TOPLEVEL
+			? InstanceCoords.instancePoint(client, local, wp.getPlane())
 			: wp;
 		data.put("instX", inst.getX());
 		data.put("instY", inst.getY());

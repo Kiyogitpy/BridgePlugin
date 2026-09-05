@@ -6,6 +6,7 @@ import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
 import net.runelite.api.NPC;
 import net.runelite.api.Player;
+import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
@@ -239,7 +240,7 @@ public class NPCProvider extends BridgeProvider
 		data.put("y", wp.getY());
 		data.put("plane", wp.getPlane());
 		// Instance-space twin of x/y (2026-09-05, InstanceCoords). Equal outside an instance.
-		WorldPoint inst = npcLocal != null
+		WorldPoint inst = npcLocal != null && npcLocal.getWorldView() <= WorldView.TOPLEVEL
 			? InstanceCoords.instancePoint(client, npcLocal, plane)
 			: wp;
 		data.put("instX", inst.getX());

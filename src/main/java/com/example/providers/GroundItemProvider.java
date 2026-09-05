@@ -154,7 +154,7 @@ public class GroundItemProvider extends BridgeProvider
 					data.put("x", wp.getX());
 					data.put("y", wp.getY());
 					data.put("plane", wp.getPlane());
-					WorldPoint inst = tileLocal != null
+					WorldPoint inst = tileLocal != null && tileLocal.getWorldView() <= WorldView.TOPLEVEL
 						? InstanceCoords.instancePoint(client, tileLocal, wp.getPlane())
 						: wp;
 					data.put("instX", inst.getX());
