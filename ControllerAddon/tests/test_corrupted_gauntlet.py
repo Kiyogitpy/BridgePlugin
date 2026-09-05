@@ -333,6 +333,65 @@ def test_enter_phase_has_attempt_ceiling(monkeypatch):
     assert any("barrier quick-pass did not start" in s for s in ctx.state.stops)
 
 
+def test_enter_phase_refuses_to_quick_pass_when_a_break_is_due():
+    """I6: enter_phase must not click at all when ctx.state.break_due() exists and reports True --
+    guarded via getattr so a state object without the method (an older engine build) behaves
+    exactly as before. No bridge stub is needed here: the guard must fire before read_snapshot
+    (or any other bridge call) ever runs."""
+    ctx = _Ctx()
+    ctx.state.break_due = lambda: True
+    cg.enter_phase(ctx, cg.DEFAULT_CONFIG)
+    assert ctx.state.safety_stopped is False
+
+
+def test_enter_phase_proceeds_when_break_due_is_absent_or_false(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"hp": 70, "prayer": 40, "instX": 1, "instY": 2, "plane": 1, "animation": -1})
+    monkeypatch.setattr(controller, "get_prayers", lambda: {"tabOpen": True, "active": {"PROTECT_FROM_MISSILES": True}, "icons": {}})
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": "Corrupted bow (perfected)"}})
+    inv = [{"name": "Corrupted paddlefish", "screenX": 1, "screenY": 1} for _ in range(10)]
+    inv.append({"name": "Egniol potion", "screenX": 2, "screenY": 2})
+    inv.append({"name": "Corrupted staff (perfected)", "screenX": 3, "screenY": 3})
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [{"id": g.OBJ_BARRIER, "screenX": 500, "screenY": 400}])
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_combat", lambda: {"targetId": -1})
+    clicks = []
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: clicks.append(option) or True)
+    monkeypatch.setattr(controller, "open_prayer_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: False)
+
+    ctx = _Ctx()   # no break_due attribute at all
+    cg.enter_phase(ctx, cg.DEFAULT_CONFIG)
+    assert clicks == [g.BARRIER_QUICK_PASS]
+
+    ctx2 = _Ctx()
+    ctx2.state.break_due = lambda: False
+    cg.enter_phase(ctx2, cg.DEFAULT_CONFIG)
+    assert clicks == [g.BARRIER_QUICK_PASS, g.BARRIER_QUICK_PASS]
+
+
+def test_before_break_plays_out_an_active_fight(monkeypatch):
+    """I6: the GOTR shape -- a break due mid-fight must not start until fight_loop has run to
+    completion (bounded by fight_max_s), since that is the only thing defending the player."""
+    calls = []
+    monkeypatch.setattr(cg, "fight_loop", lambda ctx, cfg: calls.append(cfg))
+    ctx = _Ctx()
+    ctx.state.data["cg_phase"] = "fight"
+    cg.before_break(ctx)
+    assert len(calls) == 1
+
+
+def test_before_break_is_a_no_op_outside_the_fight_phase(monkeypatch):
+    monkeypatch.setattr(cg, "fight_loop", lambda ctx, cfg: pytest.fail("fight_loop must not run outside the fight phase"))
+    for phase in (None, "enter", "loot", "done", "unknown"):
+        ctx = _Ctx()
+        if phase is not None:
+            ctx.state.data["cg_phase"] = phase
+        cg.before_break(ctx)   # must not raise / must not call fight_loop
+
+
 def _loot_setup(monkeypatch):
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
                         [{"id": g.OBJ_REWARD_CHEST, "screenX": 500, "screenY": 400}])

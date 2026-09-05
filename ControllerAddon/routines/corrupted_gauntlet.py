@@ -372,6 +372,14 @@ def fight_loop(ctx, cfg):
 
 
 def enter_phase(ctx, cfg):
+    """(I6, final-fix-brief.md) A break must not interrupt a barrier quick-pass mid-flight --
+    ctx.state.break_due() (added after this routine; guarded via getattr so an older engine build
+    that lacks it behaves exactly as before) refuses the whole phase, not just the click, so
+    nothing (loadout check included) happens on a tick where a break is imminent."""
+    break_due = getattr(ctx.state, "break_due", None)
+    if break_due is not None and break_due():
+        debug_log.log("cg", "cg: break due -- holding at the barrier without quick-passing")
+        return
     snap = read_snapshot(cfg, ctx)
     if snap is None:
         return
@@ -451,6 +459,17 @@ def loot_phase(ctx, cfg):
         ctx.state.data["cg_loot_attempts"] = attempts
         if attempts >= LOOT_MAX_ATTEMPTS:
             ctx.state.trigger_safety_stop("cg: could not open the reward chest")
+
+
+def before_break(ctx):
+    """(I6, final-fix-brief.md) The GOTR shape: a break must not start mid-fight, since fight_loop
+    is the only thing defending against the Hunllef's attacks (the panic key and safety stops keep
+    working independently the whole time it runs). If the routine is currently in the fight, play
+    it out to completion -- fight_loop is naturally bounded by cfg["fight_max_s"], so this cannot
+    hang forever even if the fight never ends on its own. Every other phase (enter/loot/done) is
+    safe to interrupt as-is, so this is a no-op there."""
+    if ctx.state.data.get("cg_phase") == "fight":
+        fight_loop(ctx, get_config(None))
 
 
 def tick(ctx):
