@@ -1983,3 +1983,63 @@ def test_light_node_throttles_its_own_objects_poll(monkeypatch):
     # NODE_BUDGET_S (6.0) / LIGHT_NODE_POLL_S (0.5) = 12 throttled reads at most, plus one for the
     # very first poll -- nowhere near the ~60 a 0.1s-per-poll rate would cost.
     assert reads["n"] <= 14
+
+
+def test_before_break_paces_ticks_and_overrides_the_enter_gate(monkeypatch):
+    """Parked finding 1 (prep final review): a break due during `enter` used to make before_break
+    busy-spin -- enter_phase's own break gate returned instantly every tick and the loop had no
+    pacing. Now the loop marks the run as playing out (which the gate honours) and sleeps a tick
+    whenever a tick made no phase progress."""
+    ctx = _Ctx()
+    ctx.state.data["cg_t0"] = 1000.0
+    ctx.state.data["cg_phase"] = "enter"
+    ctx.state.break_due = lambda: True
+    clock = {"t": 1000.0}
+    sleeps = []
+    monkeypatch.setattr(cg.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(cg.time, "sleep", lambda s: sleeps.append(s) or clock.__setitem__("t", clock["t"] + s))
+    seen_flag = []
+
+    def fake_tick(ctx):
+        seen_flag.append(ctx.state.data.get("cg_playing_out"))
+        if len(seen_flag) >= 3:
+            ctx.state.data["cg_phase"] = "done"
+    monkeypatch.setattr(cg, "tick", fake_tick)
+    cg.before_break(ctx)
+    assert seen_flag == [True, True, True]
+    assert ctx.state.data.get("cg_playing_out") is False
+    assert len(sleeps) == 2 and all(s == cg.TICK_S for s in sleeps)   # the two no-progress ticks paced
+
+
+def test_enter_gate_is_ignored_while_playing_out():
+    ctx = _Ctx()
+    assert cg._holding_for_break(ctx) is False                   # engine without break_due
+    ctx.state.break_due = lambda: True
+    assert cg._holding_for_break(ctx) is True
+    ctx.state.data["cg_playing_out"] = True
+    assert cg._holding_for_break(ctx) is False
+    ctx.state.data["cg_playing_out"] = False
+    ctx.state.break_due = lambda: False
+    assert cg._holding_for_break(ctx) is False
+
+
+def test_upgrade_phase_craft_walking_is_not_a_failure(monkeypatch):
+    """Parked finding 2: bowl_make's WALKING sentinel (still approaching the bowl) was counted as
+    a craft failure, forfeiting the perfected weapon after three walking ticks."""
+    ctx = _Ctx(); data = ctx.state.data
+    data.update({"cg_t0": 0.0, "cg_demi_bosses": {(0, 2): 9047}, "cg_upgrade": {"sub": "craft"}})
+    S = (13056 + 30, 5632 + 30); pitch = cg.DEFAULT_CONFIG["room_pitch"]
+    data["cg_prep"] = {"start_centre": S, "barrier": (S[0], S[1] - 8), "outward": (0, 1), "pitch": pitch,
+                       "step": 10, "sub": "to_node", "revealed": {(0, 2)}, "entered": set(), "node_fails": 0, "prev_centre": S}
+    monkeypatch.setattr(cg.time, "time", lambda: 100.0)
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*S))
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.ITEM_ORB, "qty": 1}])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": "Corrupted bow (attuned)"}})
+    monkeypatch.setattr(cg, "teleport_home", lambda ctx, cfg: True)
+    monkeypatch.setattr(cg, "wear", lambda ctx, name: True)
+    monkeypatch.setattr(cg, "bowl_make", lambda ctx, key, cfg: cg.WALKING)
+    for _ in range(5):
+        cg.upgrade_phase(ctx, cg.DEFAULT_CONFIG)
+    assert data.get("cg_upgrade_done") is not True
+    assert data["cg_upgrade"].get("craft_fails", 0) == 0

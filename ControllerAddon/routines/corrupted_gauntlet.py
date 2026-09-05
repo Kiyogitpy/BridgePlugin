@@ -453,11 +453,14 @@ def upgrade_phase(ctx, cfg):
         # staff, a bowstring crafts the bow, and BOTH craft if both components are on hand (a
         # single demi-boss trip can in principle yield either, per the wiki rule above).
         inv = controller.get_inventory()
-        crafted_any = False
+        results = []
         if kit.count(inv, g.ITEM_ORB):
-            crafted_any = bowl_make(ctx, "staff", cfg) or crafted_any
+            results.append(bowl_make(ctx, "staff", cfg))
         if kit.count(inv, g.ITEM_BOWSTRING):
-            crafted_any = bowl_make(ctx, "bow", cfg) or crafted_any
+            results.append(bowl_make(ctx, "bow", cfg))
+        if any(r is WALKING for r in results):
+            return                      # still approaching the bowl: not a failure (parked finding 2)
+        crafted_any = any(bool(r) for r in results)
         if crafted_any:
             eq = controller.get_equipment()
             inv = controller.get_inventory()
@@ -1310,13 +1313,23 @@ def fight_loop(ctx, cfg):
         _wait_tick(ctx)
 
 
+def _holding_for_break(ctx):
+    """True when a break is due and the routine should hold at the barrier. Ignored while
+    before_break is playing the run out (data["cg_playing_out"]): the break is already due for
+    the whole play-out, so honouring the gate then would make before_break's loop spin on an
+    enter_phase that returns instantly (parked finding 1, prep final review)."""
+    break_due = getattr(ctx.state, "break_due", None)
+    if break_due is None or ctx.state.data.get("cg_playing_out"):
+        return False
+    return bool(break_due())
+
+
 def enter_phase(ctx, cfg):
     """(I6, final-fix-brief.md) A break must not interrupt a barrier quick-pass mid-flight --
     ctx.state.break_due() (added after this routine; guarded via getattr so an older engine build
     that lacks it behaves exactly as before) refuses the whole phase, not just the click, so
     nothing (loadout check included) happens on a tick where a break is imminent."""
-    break_due = getattr(ctx.state, "break_due", None)
-    if break_due is not None and break_due():
+    if _holding_for_break(ctx):
         debug_log.log("cg", "cg: break due -- holding at the barrier without quick-passing")
         return
     snap = read_snapshot(cfg, ctx)
@@ -1438,8 +1451,18 @@ def before_break(ctx):
         return
     cfg = get_config(None)
     deadline = data["cg_t0"] + cfg["timer_s"] + cfg["fight_max_s"] + BREAK_DEFER_MARGIN_S
-    while data.get("cg_phase") != "done" and not ctx.state.safety_stopped and time.time() < deadline:
-        tick(ctx)
+    # Mark the play-out so enter_phase's break gate does not refuse every tick, and pace the loop:
+    # a tick that made no phase progress sleeps one game tick before the next (the engine loop
+    # would have paced it; this loop replaces the engine loop for the duration).
+    data["cg_playing_out"] = True
+    try:
+        while data.get("cg_phase") != "done" and not ctx.state.safety_stopped and time.time() < deadline:
+            before = data.get("cg_phase")
+            tick(ctx)
+            if data.get("cg_phase") == before and data.get("cg_phase") != "done" and not ctx.state.safety_stopped:
+                time.sleep(TICK_S)
+    finally:
+        data["cg_playing_out"] = False
 
 
 def tick(ctx):
