@@ -143,3 +143,59 @@ def test_do_attack_escalates_a_withheld_click_to_the_menu(monkeypatch):
     snap = h.FightSnapshot.from_bridge({"instX": 1, "instY": 2}, [_npc(9036)], [], {}, {}, [], {})
     assert cg.do_attack(_Ctx(), snap, None, cg.DEFAULT_CONFIG)
     assert calls == ["click", ("menu", "Attack")]
+
+
+def test_enter_phase_has_attempt_ceiling(monkeypatch):
+    clicks = []
+    inv = [{"name": f"Corrupted paddlefish", "screenX": 1, "screenY": 1} for _ in range(10)]
+    inv.append({"name": "Egniol potion", "screenX": 2, "screenY": 2})
+    inv.append({"name": "Corrupted staff (perfected)", "screenX": 3, "screenY": 3})  # staff in inventory
+    monkeypatch.setattr(controller, "get_player", lambda: {"hp": 70, "prayer": 40, "instX": 1, "instY": 2, "plane": 1, "animation": -1})
+    monkeypatch.setattr(controller, "get_prayers", lambda: {"tabOpen": True, "active": {"PROTECT_FROM_MISSILES": True}, "icons": {}})
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": "Corrupted bow (perfected)"}})
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [{"id": g.OBJ_BARRIER, "screenX": 500, "screenY": 400}])
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])  # no Hunllef spawned
+    monkeypatch.setattr(controller, "get_combat", lambda: {"targetId": -1})
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: clicks.append(option) or True)
+    monkeypatch.setattr(controller, "open_prayer_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    def fake_confirm(ctx, check, budget_s=None):
+        return False  # never confirms Hunllef spawn
+    monkeypatch.setattr(cg, "_confirm", fake_confirm)
+    ctx = _Ctx()
+    # Call enter_phase three times: should click the barrier three times
+    cg.enter_phase(ctx, cg.DEFAULT_CONFIG)
+    assert len(clicks) == 1 and clicks[0] == g.BARRIER_QUICK_PASS
+    cg.enter_phase(ctx, cg.DEFAULT_CONFIG)
+    assert len(clicks) == 2
+    cg.enter_phase(ctx, cg.DEFAULT_CONFIG)
+    assert len(clicks) == 3
+    # Fourth call should not click and should safety-stop
+    cg.enter_phase(ctx, cg.DEFAULT_CONFIG)
+    assert len(clicks) == 3  # no new click
+    assert ctx.state.safety_stopped is True
+    assert any("barrier quick-pass did not start" in s for s in ctx.state.stops)
+
+
+def test_loot_phase_has_attempt_ceiling(monkeypatch):
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [{"id": g.OBJ_REWARD_CHEST, "screenX": 500, "screenY": 400}])
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    # Test: click_entity returns False 5 times -> no flag set, safety stop
+    click_count = [0]
+    def fake_click(ser, entity, **kw):
+        click_count[0] += 1
+        return False
+    monkeypatch.setattr(controller, "click_entity", fake_click)
+    ctx = _Ctx()
+    for i in range(5):
+        cg.loot_phase(ctx, cg.DEFAULT_CONFIG)
+    assert ctx.state.data.get("cg_chest_opened") is None
+    assert ctx.state.safety_stopped is True
+    assert any("could not open the reward chest" in s for s in ctx.state.stops)
+    # Test: click_entity returns True once -> flag set after one call
+    ctx2 = _Ctx()
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    cg.loot_phase(ctx2, cg.DEFAULT_CONFIG)
+    assert ctx2.state.data.get("cg_chest_opened") is True
+    assert ctx2.state.safety_stopped is False

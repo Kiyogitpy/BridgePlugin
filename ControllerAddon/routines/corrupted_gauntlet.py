@@ -44,6 +44,8 @@ NO_SNAPSHOT_TICKS = 20         # consecutive unreadable snapshots before a safet
 TICK_S = 0.6
 ACTION_BUDGET_S = 1.2          # confirm window for a prayer/wield/eat click (two ticks)
 ENTER_BUDGET_S = 8.0
+ENTER_MAX_ATTEMPTS = 3         # barrier quick-pass ceiling before safety stop
+LOOT_MAX_ATTEMPTS = 5          # chest open ceiling before safety stop
 
 
 def get_config(bridge_config):
@@ -296,6 +298,13 @@ def enter_phase(ctx, cfg):
                     if o.get("id") == g.OBJ_BARRIER), None)
     if barrier is None:
         return
+    # Check if we've exceeded the attempt limit
+    attempts = ctx.state.data.get("cg_enter_attempts", 0)
+    if attempts >= ENTER_MAX_ATTEMPTS:
+        ctx.state.trigger_safety_stop("cg: barrier quick-pass did not start the fight after 3 attempts")
+        return
+    attempts += 1
+    ctx.state.data["cg_enter_attempts"] = attempts
     debug_log.log("cg", "quick-passing the barrier")
     controller.click_menu_action(ctx.ser, barrier, g.BARRIER_QUICK_PASS, target_hint="Barrier", offset=(0, 0))
     _confirm(ctx, lambda: any(n.get("id") in g.HUNLLEF for n in controller.get_npcs(fresh=True)), ENTER_BUDGET_S)
@@ -306,9 +315,16 @@ def loot_phase(ctx, cfg):
                   if o.get("id") == g.OBJ_REWARD_CHEST), None)
     if chest is None:
         return
-    controller.click_entity(ctx.ser, chest, expected_action="Open")
-    ctx.state.data["cg_chest_opened"] = True
-    controller.human_delay(2.0, 3.0)
+    result = controller.click_entity(ctx.ser, chest, expected_action="Open")
+    if result:
+        ctx.state.data["cg_chest_opened"] = True
+        controller.human_delay(2.0, 3.0)
+    else:
+        attempts = ctx.state.data.get("cg_loot_attempts", 0)
+        attempts += 1
+        ctx.state.data["cg_loot_attempts"] = attempts
+        if attempts >= LOOT_MAX_ATTEMPTS:
+            ctx.state.trigger_safety_stop("cg: could not open the reward chest")
 
 
 def tick(ctx):
@@ -320,6 +336,8 @@ def tick(ctx):
     if phase != data.get("cg_phase"):
         debug_log.log("cg", f"phase {data.get('cg_phase')} -> {phase}")
         data["cg_phase"] = phase
+        if phase == "fight":
+            data["cg_enter_attempts"] = 0
     if phase == "enter":
         enter_phase(ctx, cfg)
     elif phase == "fight":
