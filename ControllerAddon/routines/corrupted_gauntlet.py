@@ -292,9 +292,21 @@ def fight_loop(ctx, cfg):
         if ctx.events is not None:
             events_since = ctx.events.since(mark)
             mark = ctx.events.mark()
+            # (I3, final-fix-brief.md) UDP can carry death before the next HTTP poll notices
+            # hp<=0 above -- same stop, same message, just a faster signal for it.
+            if any(event_type == "PLAYER_DIED" for event_type, _ in events_since):
+                ctx.state.trigger_safety_stop("cg: died to the Hunllef (nothing lost -- read the log)")
+                return
         else:
             events_since = None
         feed_tracker(tracker, snap, events_since)
+        # (I3) A Hunllef id that maps to "DEAD" is a corpse -- skip the ladder entirely for this
+        # tick so nothing (attack included) clicks on it while it's down.
+        if snap.hunllef is not None and g.HUNLLEF_PRAYER_BY_ID.get(snap.hunllef["id"]) == "DEAD":
+            _log_rung(data, "kill_pending", None, snap, tracker)
+            no_hunllef = 0
+            _wait_tick(ctx)
+            continue
         rung, arg = h.ladder(snap, tracker, cfg, _unusable(ctx))
         _log_rung(data, rung, arg, snap, tracker)
         if rung == "no_hunllef":

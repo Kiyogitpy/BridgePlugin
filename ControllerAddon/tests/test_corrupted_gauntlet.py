@@ -377,3 +377,61 @@ def test_fight_loop_mark_since_placement_does_not_drop_events(monkeypatch):
     assert calls["n"] == 3
     tracker = ctx.state.data["cg_tracker"]
     assert tracker.attacks == 4, "not every event fed during the waits reached the tracker"
+
+
+def test_fight_loop_safety_stops_on_player_died_event(monkeypatch):
+    """I3: a PLAYER_DIED event scanned from since(mark) safety-stops the fight loop, alongside the
+    existing hp<=0 HTTP check -- UDP can carry this before the next HTTP poll notices hp==0.
+    The ladder must never run once death is detected."""
+    events = _FakeFightEvents([])
+    ctx = _Ctx(events=events)
+    snap = h.FightSnapshot.from_bridge({"instX": 1, "instY": 2, "hp": 80, "prayer": 50},
+                                       [_npc(9036, anim=-1)], [], {"active": {}}, {}, [],
+                                       {"targetId": 9036})
+
+    def fake_read_snapshot(cfg):
+        events._absorb([("PLAYER_DIED", None)])   # arrives after this iteration's mark
+        return snap
+
+    monkeypatch.setattr(cg, "read_snapshot", fake_read_snapshot)
+    monkeypatch.setattr(cg.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(h, "ladder", lambda snap, tracker, cfg, unusable:
+                        pytest.fail("ladder must not run once PLAYER_DIED is seen"))
+
+    cg.fight_loop(ctx, cg.DEFAULT_CONFIG)
+
+    assert ctx.state.safety_stopped is True
+    assert any("died to the Hunllef" in s for s in ctx.state.stops)
+
+
+class _StopLoop(Exception):
+    """Ends a fight_loop test after exactly one iteration without going through
+    ctx.state.trigger_safety_stop -- so 'no safety stop happened' stays a meaningful assertion."""
+
+
+def test_fight_loop_skips_the_ladder_for_a_dead_hunllef(monkeypatch):
+    """I3: HUNLLEF_PRAYER_BY_ID[id] == 'DEAD' (id 9038) is a corpse -- the ladder (and therefore
+    every ACTIONS click, including attack) must be skipped for that tick entirely, with no
+    safety stop triggered by the skip itself."""
+    snap = h.FightSnapshot.from_bridge({"instX": 1, "instY": 2, "hp": 80, "prayer": 50},
+                                       [_npc(9038, anim=-1)], [], {"active": {}}, {}, [],
+                                       {"targetId": 9038})
+    ctx = _Ctx()
+    monkeypatch.setattr(cg, "read_snapshot", lambda cfg: snap)
+    monkeypatch.setattr(cg.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(h, "ladder", lambda snap, tracker, cfg, unusable:
+                        pytest.fail("ladder must not run against a dead Hunllef"))
+    actions_called = []
+    monkeypatch.setattr(cg, "ACTIONS",
+                        {k: (lambda *a, _k=k, **kw: actions_called.append(_k)) for k in cg.ACTIONS})
+
+    def fake_wait_tick(ctx):
+        raise _StopLoop()
+    monkeypatch.setattr(cg, "_wait_tick", fake_wait_tick)
+
+    with pytest.raises(_StopLoop):
+        cg.fight_loop(ctx, cg.DEFAULT_CONFIG)
+
+    assert actions_called == []
+    assert ctx.state.safety_stopped is False
+    assert ctx.state.stops == []
