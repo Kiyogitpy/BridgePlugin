@@ -735,6 +735,8 @@ that function's own docstring). First live session's worklist is the spec's chec
 `instX/instY` centre-vs-corner for a size-5 NPC, 8754's meaning, the ranged/magic projectile
 ids, snapshot cost per tick.
 
+Sub-project 3 adds `explore_gather` / `craft` / `upgrade` in front of `enter`; the route is the user's (relative to the start side, three border reveals from the middle ring, full inner-ring circle); rooms are addressed in instance space as (right, outward) offsets from the start room with a configurable pitch (16, unverified); the bowl is driven by widget TEXT in group 270; time gates 270/330/360/420 s; **not yet run live** -- the spec's live checklist is the first session's worklist, starting with whether `/objects` lists unopened rooms and the real room pitch.
+
 ## Current state of routines/guardians_of_the_rift.py
 
 - **Outcome-driven since 2026-09-04 (not yet run live in this form).** Every `_commit` window

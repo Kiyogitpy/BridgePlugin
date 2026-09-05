@@ -1096,3 +1096,45 @@ def test_potion_returns_true_on_successful_egniol_increase(monkeypatch):
     monkeypatch.setattr(cg, "use_on", lambda ctx, name_a, name_b: True)  # Success
     result = cg._potion(ctx)
     assert result is True  # Egniol dose count rose
+
+
+def test_tick_dispatches_prep_phases(monkeypatch):
+    ctx = _Ctx(); ctx.state.data["cg_t0"] = 0.0
+    monkeypatch.setattr(cg.time, "time", lambda: 10.0)
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(100, 100))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [{"id": g.OBJ_BARRIER}])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.ITEM_AXE}, {"name": g.ITEM_PICKAXE}, {"name": g.ITEM_HARPOON}, {"name": g.ITEM_PESTLE}])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    called = []
+    monkeypatch.setattr(cg, "explore_gather_phase", lambda ctx, cfg: called.append("explore"))
+    cg.tick(ctx)
+    assert called == ["explore"] and ctx.state.data["cg_phase"] == "explore_gather"
+
+
+def test_ensure_tools_takes_from_storage(monkeypatch):
+    ctx = _Ctx()
+    calls = []
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"slot": 0, "name": g.ITEM_SCEPTRE, "qty": 1}])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {})
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(100, 100))
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_obj(g.OBJ_TOOL_STORAGE, "Tool Storage", 101, 100)])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: calls.append(kw.get("expected_action")) or True)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=1.0: True)
+    assert cg.ensure_tools(ctx, cg.DEFAULT_CONFIG)
+    assert calls == ["Take"]
+
+
+def test_stuck_watch_stops_after_no_progress(monkeypatch):
+    ctx = _Ctx(); data = ctx.state.data
+    monkeypatch.setattr(cg.time, "time", lambda: 1000.0)
+    cg.stuck_watch(ctx, ("explore_gather", (100, 100), 5))
+    monkeypatch.setattr(cg.time, "time", lambda: 1000.0 + cg.STUCK_STOP_S + 1)
+    cg.stuck_watch(ctx, ("explore_gather", (100, 100), 5))
+    assert ctx.state.safety_stopped
+    ctx2 = _Ctx()
+    monkeypatch.setattr(cg.time, "time", lambda: 1000.0)
+    cg.stuck_watch(ctx2, ("explore_gather", (100, 100), 5))
+    monkeypatch.setattr(cg.time, "time", lambda: 1000.0 + cg.STUCK_STOP_S + 1)
+    cg.stuck_watch(ctx2, ("explore_gather", (101, 100), 5))     # moved: no stop
+    assert not ctx2.state.safety_stopped

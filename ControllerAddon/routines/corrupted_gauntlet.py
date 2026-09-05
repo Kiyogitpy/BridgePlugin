@@ -70,6 +70,8 @@ NODE_MAX_FAILS = 2
 ATTACKER_RANGE = 4
 DROP_RANGE = 8
 ROOM_ARRIVAL_TOLERANCE = 4
+STUCK_WARN_S = 20.0            # log [!] after no progress for this many seconds
+STUCK_STOP_S = 60.0            # safety-stop after no progress for this many seconds (prep phases only)
 
 
 def get_config(bridge_config):
@@ -90,6 +92,38 @@ def time_left(data, now=None, cfg=DEFAULT_CONFIG):
         return None
     now = time.time() if now is None else now
     return cfg["timer_s"] - (now - t0)
+
+
+def ensure_tools(ctx, cfg):
+    """Sceptre, axe, pickaxe, harpoon, pestle -- all given at entry; a missing one is re-taken
+    from the Tool Storage before leaving the start room."""
+    names = {g.ITEM_SCEPTRE, g.ITEM_AXE, g.ITEM_PICKAXE, g.ITEM_HARPOON, g.ITEM_PESTLE}
+    have = {i.get("name") for i in controller.get_inventory()} | {((controller.get_equipment() or {}).get("weapon") or {}).get("name")}
+    if names <= have:
+        return True
+    storage = _find_object(cfg, g.OBJ_TOOL_STORAGE)
+    if storage is None or not _near(ctx, storage, 3):
+        return False
+    controller.click_entity(ctx.ser, storage, expected_action="Take")
+    return _confirm(ctx, lambda: names <= {i.get("name") for i in controller.get_inventory()}, 4.0)
+
+
+def stuck_watch(ctx, signature):
+    """signature = (phase, player tile, inventory size). No change for STUCK_WARN_S logs [!];
+    STUCK_STOP_S safety-stops -- except in enter/fight/loot, which have their own ceilings."""
+    data = ctx.state.data
+    now = time.time()
+    if signature != data.get("cg_stuck_sig"):
+        data["cg_stuck_sig"] = signature
+        data["cg_stuck_since"] = now
+        data["cg_stuck_warned"] = False
+        return
+    idle = now - data.get("cg_stuck_since", now)
+    if idle >= STUCK_STOP_S and signature[0] in ("explore_gather", "craft", "upgrade"):
+        ctx.state.trigger_safety_stop(f"cg: no progress for {int(idle)}s in {signature[0]}")
+    elif idle >= STUCK_WARN_S and not data.get("cg_stuck_warned"):
+        debug_log.log("cg", f"[!] cg: STUCK? {int(idle)}s without progress in {signature[0]}")
+        data["cg_stuck_warned"] = True
 
 
 def prep_phase(data, inventory, equipment, cfg, now=None):
@@ -1033,9 +1067,13 @@ def before_break(ctx):
     working independently the whole time it runs). If the routine is currently in the fight, play
     it out to completion -- fight_loop is naturally bounded by cfg["fight_max_s"], so this cannot
     hang forever even if the fight never ends on its own. Every other phase (enter/loot/done) is
-    safe to interrupt as-is, so this is a no-op there."""
-    if ctx.state.data.get("cg_phase") == "fight":
+    safe to interrupt as-is, so this is a no-op there. For prep phases, teleport home first so
+    the break happens in the start room."""
+    phase = ctx.state.data.get("cg_phase")
+    if phase == "fight":
         fight_loop(ctx, get_config(None))
+    elif phase in ("explore_gather", "craft", "upgrade"):
+        teleport_home(ctx, get_config(None))
 
 
 def tick(ctx):
@@ -1063,12 +1101,24 @@ def tick(ctx):
         loot_phase(ctx, cfg)
     elif phase == "done":
         ctx.state.trigger_safety_stop("cg: chest opened -- run complete")
-    elif phase == "explore_gather":
-        explore_gather_phase(ctx, cfg)
-    elif phase == "craft":
-        craft_phase(ctx, cfg)
-    elif phase == "upgrade":
-        upgrade_phase(ctx, cfg)
+    elif phase in ("explore_gather", "craft", "upgrade"):
+        # Ensure tools once per run when starting prep phases
+        if not data.get("cg_tools_ok"):
+            if ensure_tools(ctx, cfg):
+                data["cg_tools_ok"] = True
+            else:
+                debug_log.log("cg", "ensure_tools failed")
+                return
+        # Dispatch the appropriate prep phase
+        if phase == "explore_gather":
+            explore_gather_phase(ctx, cfg)
+        elif phase == "craft":
+            craft_phase(ctx, cfg)
+        elif phase == "upgrade":
+            upgrade_phase(ctx, cfg)
+        # Watch for stalls
+        me, _ = _me()
+        stuck_watch(ctx, (phase, me, len(inventory)))
     else:
         if not data.get("cg_unknown_logged"):
             debug_log.log("cg", "not at the Hunllef barrier, in the fight, or at the chest -- start at the barrier")
