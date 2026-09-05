@@ -1089,7 +1089,7 @@ def _click_walk_point(ctx, point: dict, shift: bool) -> None:
         controller.key_up(ctx.ser, "SHIFT")
 
 
-def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
+def _hop_to(ctx, x: int, y: int, plane: int, inst: bool = False) -> bool:
     """Click the hop point and wait for arrival (or timeout) before
     returning. False only if the point isn't projectable onto the minimap
     at all; a timed-out wait still returns True so the caller just
@@ -1117,7 +1117,12 @@ def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
     # too-ambitious hop into a shorter one instead of a failed trip -- which is what makes the
     # measured WALK_HOP_MAX_TILES above safe to run near its real limit rather than far under it.
     origin = controller.get_player()
-    ox, oy = origin.get("x"), origin.get("y")
+    # inst=True (2026-09-05, instance_nav): x/y and the origin are INSTANCE-SPACE, and every
+    # point lookup carries the flag through to the bridge. Nothing else about the hop changes.
+    if inst:
+        ox, oy = origin.get("instX"), origin.get("instY")
+    else:
+        ox, oy = origin.get("x"), origin.get("y")
     point = None
     on_ground = False        # viewport click (needs SHIFT) vs minimap click (does not)
     aim_x, aim_y = x, y
@@ -1134,13 +1139,13 @@ def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
         short = (ox is not None
                  and max(abs(aim_x - ox), abs(aim_y - oy)) <= HOP_VIEWPORT_MAX_TILES)
         if short:
-            ground_point = controller.get_ground_walk_point(aim_x, aim_y, plane)
+            ground_point = controller.get_ground_walk_point(aim_x, aim_y, plane, inst=inst)
             if ground_point.get("onScreen"):
                 point = ground_point
                 on_ground = True
                 break
 
-        minimap_point = controller.get_minimap_walk_point(aim_x, aim_y, plane)
+        minimap_point = controller.get_minimap_walk_point(aim_x, aim_y, plane, inst=inst)
         if minimap_point.get("onMinimap"):
             point = minimap_point
             break
@@ -1148,7 +1153,7 @@ def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
         # Off the minimap (its reach is a user setting -- zooming in shrinks it) and too far for
         # the short-hop rule: a rendered tile still beats giving up on the walk.
         if not short:
-            ground_point = controller.get_ground_walk_point(aim_x, aim_y, plane)
+            ground_point = controller.get_ground_walk_point(aim_x, aim_y, plane, inst=inst)
             if ground_point.get("onScreen"):
                 point = ground_point
                 on_ground = True
@@ -1185,7 +1190,10 @@ def _hop_to(ctx, x: int, y: int, plane: int) -> bool:
         time.sleep(0.6)
         waited += 0.6
         player = controller.get_player()
-        px, py = player.get("x"), player.get("y")
+        if inst:
+            px, py = player.get("instX"), player.get("instY")
+        else:
+            px, py = player.get("x"), player.get("y")
         # Against the point actually clicked, not the one asked for -- otherwise a pulled-in hop
         # would always wait out the full timeout instead of returning on arrival.
         if px is not None and max(abs(px - aim_x), abs(py - aim_y)) <= release:

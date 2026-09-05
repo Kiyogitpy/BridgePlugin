@@ -96,3 +96,72 @@ def test_load_reads_the_bridge_grid(monkeypatch):
     assert imap.flags_at(2, 2) == 5
     monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: None)
     assert instance_nav.InstanceMap.load(1) is None
+
+
+class _Ctx:
+    def __init__(self):
+        self.ser = object()
+        self.state = type("S", (), {"data": {}})()
+
+
+def _fake_world(monkeypatch, imap, start, hop_effect):
+    """Stub the bridge: the player stands at `start` (instance space) and every _hop_to call
+    moves it per hop_effect(target) -> new position."""
+    pos = {"p": start}
+    monkeypatch.setattr(controller, "get_collision_grid",
+                        lambda plane=None: {"baseX": imap.base_x, "baseY": imap.base_y, "plane": imap.plane,
+                                            "size": imap.size, "flags": imap.flags})
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"instX": pos["p"][0], "instY": pos["p"][1], "plane": imap.plane,
+                                 "x": -1, "y": -1})
+    hops = []
+
+    def fake_hop(ctx, x, y, plane, inst=False):
+        assert inst is True
+        hops.append((x, y))
+        pos["p"] = hop_effect((x, y))
+        return True
+
+    monkeypatch.setattr(instance_nav.travel, "_hop_to", fake_hop)
+    return hops
+
+
+def test_walk_to_hops_along_the_route_and_arrives(monkeypatch):
+    imap = make_map(size=40)
+    hops = _fake_world(monkeypatch, imap, P(0, 0), lambda t: t)
+    assert instance_nav.walk_to(_Ctx(), *P(30, 0))
+    assert hops and hops[-1] == P(30, 0)
+    assert all(max(abs(b[0] - a[0]), abs(b[1] - a[1])) <= instance_nav.travel.WALK_HOP_MAX_TILES
+               for a, b in zip([P(0, 0)] + hops, hops))
+
+
+def test_walk_to_returns_false_without_a_map_or_route(monkeypatch):
+    imap = make_map(walls={(3, y): BLOCK_MOVEMENT_EAST for y in range(8)})
+    hops = _fake_world(monkeypatch, imap, P(0, 0), lambda t: t)
+    assert not instance_nav.walk_to(_Ctx(), *P(7, 0))
+    assert hops == []
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: None)
+    assert not instance_nav.walk_to(_Ctx(), *P(7, 0))
+
+
+def test_walk_to_reroutes_around_a_tile_that_refuses(monkeypatch):
+    # The map says (1,0) is fine; the "game" never moves us when we aim through it.
+    imap = make_map()
+    refused = P(1, 0)
+
+    def effect(target):
+        return P(0, 0) if target == refused else target
+
+    hops = _fake_world(monkeypatch, imap, P(0, 0), effect)
+    monkeypatch.setattr(instance_nav.travel, "WALK_HOP_MAX_TILES", 1)
+    assert instance_nav.walk_to(_Ctx(), *P(2, 0), tolerance=0)
+    assert refused in hops                       # tried it once
+    assert hops[-1] == P(2, 0)
+
+
+def test_walk_to_gives_up_after_the_hop_ceiling(monkeypatch):
+    imap = make_map(size=40)
+    hops = _fake_world(monkeypatch, imap, P(0, 0), lambda t: P(0, 0))   # never moves
+    monkeypatch.setattr(instance_nav, "WALK_MAX_HOPS", 3)
+    assert not instance_nav.walk_to(_Ctx(), *P(30, 0))
+    assert len(hops) <= 3 + instance_nav.travel.WALK_MAX_REROUTES

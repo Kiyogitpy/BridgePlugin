@@ -75,7 +75,7 @@ def _stub_walk_click(monkeypatch, player_tile, arrival_tile=None):
 
     monkeypatch.setattr(controller, "get_player", fake_get_player)
     monkeypatch.setattr(controller, "get_ground_walk_point",
-                        lambda x, y, p: {"onScreen": True, "screenX": 100, "screenY": 100})
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 100, "screenY": 100})
     monkeypatch.setattr(controller, "get_ground_walk_screen_pos", lambda x, y, p: (100, 100))
     monkeypatch.setattr(controller, "key_down", lambda ser, k: None)
     monkeypatch.setattr(controller, "key_up", lambda ser, k: None)
@@ -117,7 +117,7 @@ def test_the_non_blocking_walk_still_reports_an_unprojectable_tile(monkeypatch):
     hop-closer fallback key off -- that contract must not change with the new mode."""
     _stub_walk_click(monkeypatch, {"x": 10, "y": 10, "plane": 0})
     monkeypatch.setattr(controller, "get_ground_walk_point",
-                        lambda x, y, p: {"onScreen": False})
+                        lambda x, y, p, inst=False: {"onScreen": False})
 
     assert travel.walk_to_exact_tile(None, 12, 12, 0, wait_for_arrival=False) is False
 
@@ -167,10 +167,10 @@ def test_an_unreachable_hop_point_is_pulled_in_rather_than_abandoning_the_walk(m
     alive, so a zoomed-in minimap degrades to shorter hops instead of a failed trip."""
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})
     monkeypatch.setattr(controller, "get_ground_walk_point",
-                        lambda x, y, p: {"onScreen": False})
+                        lambda x, y, p, inst=False: {"onScreen": False})
     seen = []
 
-    def minimap(x, y, p):
+    def minimap(x, y, p, inst=False):
         seen.append((x, y))
         # Only points within 12 tiles of the player are on this (zoomed-in) minimap.
         near = max(abs(x - 3000), abs(y - 3000)) <= 12
@@ -187,9 +187,9 @@ def test_an_unreachable_hop_point_is_pulled_in_rather_than_abandoning_the_walk(m
 def test_a_hop_point_that_is_unreachable_at_every_distance_still_gives_up(monkeypatch):
     """The pull-in must stay bounded -- an unreachable target has to fail, not loop."""
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})
-    monkeypatch.setattr(controller, "get_ground_walk_point", lambda x, y, p: {"onScreen": False})
+    monkeypatch.setattr(controller, "get_ground_walk_point", lambda x, y, p, inst=False: {"onScreen": False})
     monkeypatch.setattr(controller, "get_minimap_walk_point",
-                        lambda x, y, p: {"onMinimap": False})
+                        lambda x, y, p, inst=False: {"onMinimap": False})
     monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
 
     assert travel._hop_to(_Ctx(), 3024, 3000, 0) is False
@@ -211,9 +211,9 @@ def _hop_harness(monkeypatch, on_screen=True):
     keys = []
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})
     monkeypatch.setattr(controller, "get_ground_walk_point",
-                        lambda x, y, p: {"onScreen": on_screen, "screenX": 10, "screenY": 10})
+                        lambda x, y, p, inst=False: {"onScreen": on_screen, "screenX": 10, "screenY": 10})
     monkeypatch.setattr(controller, "get_minimap_walk_point",
-                        lambda x, y, p: {"onMinimap": True, "screenX": 20, "screenY": 20})
+                        lambda x, y, p, inst=False: {"onMinimap": True, "screenX": 20, "screenY": 20})
     monkeypatch.setattr(controller, "key_down", lambda ser, k: keys.append(("down", k)))
     monkeypatch.setattr(controller, "key_up", lambda ser, k: keys.append(("up", k)))
     monkeypatch.setattr(controller, "click_entity",
@@ -252,9 +252,9 @@ def test_a_long_hop_prefers_the_minimap_even_when_the_tile_is_rendered(monkeypat
     asked = []
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})
     monkeypatch.setattr(controller, "get_ground_walk_point",
-                        lambda x, y, p: asked.append("ground") or {"onScreen": True, "screenX": 1, "screenY": 1})
+                        lambda x, y, p, inst=False: asked.append("ground") or {"onScreen": True, "screenX": 1, "screenY": 1})
     monkeypatch.setattr(controller, "get_minimap_walk_point",
-                        lambda x, y, p: asked.append("minimap") or {"onMinimap": True, "screenX": 2, "screenY": 2})
+                        lambda x, y, p, inst=False: asked.append("minimap") or {"onMinimap": True, "screenX": 2, "screenY": 2})
     clicked = []
     monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: clicked.append(e) or True)
     monkeypatch.setattr(controller, "key_down", lambda ser, k: clicked.append(("down", k)))
@@ -271,9 +271,9 @@ def test_a_long_hop_prefers_the_minimap_even_when_the_tile_is_rendered(monkeypat
 def test_a_short_hop_still_uses_the_viewport_for_precision(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})
     monkeypatch.setattr(controller, "get_ground_walk_point",
-                        lambda x, y, p: {"onScreen": True, "screenX": 1, "screenY": 1})
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 1, "screenY": 1})
     monkeypatch.setattr(controller, "get_minimap_walk_point",
-                        lambda x, y, p: {"onMinimap": True, "screenX": 2, "screenY": 2})
+                        lambda x, y, p, inst=False: {"onMinimap": True, "screenX": 2, "screenY": 2})
     seq = []
     monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: seq.append(("click", e)) or True)
     monkeypatch.setattr(controller, "key_down", lambda ser, k: seq.append(("down", k)))
@@ -291,8 +291,8 @@ def test_a_long_hop_falls_back_to_the_viewport_off_the_minimap(monkeypatch):
     # A zoomed-in minimap shrinks its reach; a rendered tile is still better than giving up.
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})
     monkeypatch.setattr(controller, "get_ground_walk_point",
-                        lambda x, y, p: {"onScreen": True, "screenX": 1, "screenY": 1})
-    monkeypatch.setattr(controller, "get_minimap_walk_point", lambda x, y, p: {"onMinimap": False})
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 1, "screenY": 1})
+    monkeypatch.setattr(controller, "get_minimap_walk_point", lambda x, y, p, inst=False: {"onMinimap": False})
     seq = []
     monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: seq.append(("click", e)) or True)
     monkeypatch.setattr(controller, "key_down", lambda ser, k: seq.append(("down", k)))
@@ -1094,9 +1094,9 @@ def _hop_wait_harness(monkeypatch, start, aim, step=2):
         return {"x": x, "y": y, "plane": 0}
 
     monkeypatch.setattr(controller, "get_player", get_player)
-    monkeypatch.setattr(controller, "get_ground_walk_point", lambda x, y, p: {"onScreen": False})
+    monkeypatch.setattr(controller, "get_ground_walk_point", lambda x, y, p, inst=False: {"onScreen": False})
     monkeypatch.setattr(controller, "get_minimap_walk_point",
-                        lambda x, y, p: {"onMinimap": True, "screenX": 20, "screenY": 20})
+                        lambda x, y, p, inst=False: {"onMinimap": True, "screenX": 20, "screenY": 20})
     monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
     monkeypatch.setattr(time, "sleep", lambda s: None)
     return polled
@@ -1339,9 +1339,9 @@ def test_a_minimap_hop_click_skips_the_ui_blocker_check(monkeypatch):
     kwargs = []
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})
     monkeypatch.setattr(controller, "get_ground_walk_point",
-                        lambda x, y, p: {"onScreen": False, "screenX": 10, "screenY": 10})
+                        lambda x, y, p, inst=False: {"onScreen": False, "screenX": 10, "screenY": 10})
     monkeypatch.setattr(controller, "get_minimap_walk_point",
-                        lambda x, y, p: {"onMinimap": True, "screenX": 20, "screenY": 20})
+                        lambda x, y, p, inst=False: {"onMinimap": True, "screenX": 20, "screenY": 20})
     monkeypatch.setattr(controller, "key_down", lambda ser, k: None)
     monkeypatch.setattr(controller, "key_up", lambda ser, k: None)
     monkeypatch.setattr(controller, "click_entity",
@@ -1352,7 +1352,29 @@ def test_a_minimap_hop_click_skips_the_ui_blocker_check(monkeypatch):
 
     kwargs.clear()
     monkeypatch.setattr(controller, "get_ground_walk_point",
-                        lambda x, y, p: {"onScreen": True, "screenX": 10, "screenY": 10})
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 10, "screenY": 10})
     travel._hop_to(_Ctx(), 3203, 3200, 0)
     assert kwargs and kwargs[0].get("check_ui_blockers", True) is True
 
+
+
+def test_hop_to_inst_reads_inst_position_and_forwards_the_flag(monkeypatch):
+    calls = []
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 1900, "y": 5600, "instX": 13060, "instY": 5640, "plane": 1})
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, plane, inst=False: (calls.append(("mm", x, y, inst)) or
+                                                          {"onMinimap": True, "screenX": 5, "screenY": 5}))
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, plane, inst=False: (calls.append(("gd", x, y, inst)) or
+                                                          {"onScreen": False}))
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: calls.append(("click", shift)))
+    monkeypatch.setattr(travel.time, "sleep", lambda s: None)
+    monkeypatch.setattr(travel, "WALK_HOP_TIMEOUT_S", 0.0)
+
+    assert travel._hop_to(_Ctx(), 13080, 5640, 1, inst=True)
+    # The origin for the short-hop test and pull-in is the INSTANCE position (20 tiles away =>
+    # minimap), and every lookup carries inst=True.
+    assert ("mm", 13080, 5640, True) in calls
+    assert all(c[3] is True for c in calls if c[0] in ("mm", "gd"))
+    assert ("click", False) in calls

@@ -19,6 +19,7 @@ from collections import deque
 
 import controller
 import debug_log
+import travel
 from travel import (BLOCK_MOVEMENT_EAST, BLOCK_MOVEMENT_NORTH, BLOCK_MOVEMENT_SOUTH,
                     BLOCK_MOVEMENT_WEST, TILE_BLOCKING_FLAGS)
 
@@ -127,3 +128,64 @@ def find_path(imap: InstanceMap, start: tuple, goal: tuple, goal_adjacent: bool 
                 return path
             queue.append(nxt)
     return None
+
+WALK_MAX_HOPS = 40           # a Gauntlet room-to-room walk is 2-4 hops; 40 is a wedge, not a walk
+
+
+def player_inst():
+    """(instX, instY, plane) from /player, or None when the bridge cannot say."""
+    p = controller.get_player() or {}
+    x, y = p.get("instX"), p.get("instY")
+    if x is None or y is None:
+        return None
+    return int(x), int(y), int(p.get("plane") or 0)
+
+
+def walk_to(ctx, x: int, y: int, tolerance: float = travel.WALK_ARRIVAL_TOLERANCE) -> bool:
+    """Walk to an instance-space tile: reload the map, route from the player's instX/instY,
+    hop along the route through travel._hop_to(inst=True) (minimap beyond
+    HOP_VIEWPORT_MAX_TILES, shift-clicked viewport inside it, the lead-click release, the
+    blocker opt-outs -- all inherited). A hop that leaves the player on the same tile marks the
+    route's next tile as refused and re-routes (`avoid`, bounded by travel.WALK_MAX_REROUTES).
+    False when there is no map, no route, or WALK_MAX_HOPS is spent."""
+    goal = (int(x), int(y))
+    avoid: set = set()
+    reroutes = 0
+    hops = 0
+    while hops < WALK_MAX_HOPS:
+        here = player_inst()
+        if here is None:
+            debug_log.log("inav", "no instance position from /player -- cannot walk")
+            return False
+        px, py, plane = here
+        if max(abs(px - goal[0]), abs(py - goal[1])) <= tolerance:
+            return True
+        imap = InstanceMap.load(plane)
+        if imap is None:
+            debug_log.log("inav", "no collision grid from the bridge -- cannot route")
+            return False
+        path = find_path(imap, (px, py), goal, avoid=avoid)
+        if path is None:
+            debug_log.log("inav", f"no route from {(px, py)} to {goal} (avoiding {len(avoid)} tiles)")
+            return False
+        # Farthest route point within one hop, so a long room crossing is 1-2 minimap clicks.
+        idx = min(len(path) - 1, travel.WALK_HOP_MAX_TILES)
+        while idx > 1 and max(abs(path[idx][0] - px), abs(path[idx][1] - py)) > travel.WALK_HOP_MAX_TILES:
+            idx -= 1
+        target = path[idx]
+        hops += 1
+        if not travel._hop_to(ctx, target[0], target[1], plane, inst=True):
+            return False
+        after = player_inst()
+        if after is not None and (after[0], after[1]) == (px, py) and len(path) > 1:
+            # Did not move at all: the first step is refused by something the map cannot see
+            # (another player, a live blocker). Same rule as travel.walk_to's reroute, and a
+            # shut door cannot be the cause here -- instances handled here have none.
+            reroutes += 1
+            if reroutes > travel.WALK_MAX_REROUTES:
+                debug_log.log("inav", f"still on {(px, py)} after {reroutes} reroutes -- giving up")
+                return False
+            avoid.add(path[1])
+            debug_log.log("inav", f"hop to {target} did not move us; avoiding {path[1]} and re-routing")
+    debug_log.log("inav", f"spent {WALK_MAX_HOPS} hops without reaching {goal}")
+    return False
