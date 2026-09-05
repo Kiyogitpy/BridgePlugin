@@ -1,6 +1,7 @@
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
+import com.example.util.InstanceCoords;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
@@ -118,6 +119,28 @@ public class PlayerProvider extends BridgeProvider
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
 		data.put("regionId", wp.getRegionID());
+
+		// Instance-space position (2026-09-05, see InstanceCoords): the coordinate the walk
+		// endpoints accept with inst=true. Equal to x/y outside an instance.
+		WorldView topLevel = client.getTopLevelWorldView();
+		boolean inInstance = topLevel != null && topLevel.isInstance();
+		data.put("inInstance", inInstance);
+		if (topLevel != null)
+		{
+			data.put("baseX", topLevel.getBaseX());
+			data.put("baseY", topLevel.getBaseY());
+		}
+		if (local != null && local.getWorldView() <= WorldView.TOPLEVEL)
+		{
+			WorldPoint inst = InstanceCoords.instancePoint(client, local, wp.getPlane());
+			data.put("instX", inst.getX());
+			data.put("instY", inst.getY());
+		}
+		else
+		{
+			data.put("instX", wp.getX());
+			data.put("instY", wp.getY());
+		}
 
 		if (local != null)
 		{
