@@ -197,16 +197,21 @@ def flood(imap, start, max_steps, blocked):
 def pick_safe_tile(snap, imap, cfg, require_in_range=False):
     """The tile to run to: reachable within escape_radius, off hazards, outside the footprint and
     its margin, at least tornado_avoid from every tornado; preferring distance from tornadoes,
-    then being in attack range, then nearness to us. None when nothing qualifies."""
+    then being in attack range, then nearness to us. None when nothing qualifies.
+
+    (C1, final-fix-brief.md) The footprint+margin square is a DESTINATION filter only, applied in
+    the selection loop below via `forbidden_near_hunllef` -- it must NEVER be passed to flood()'s
+    `blocked`, which refuses to enter a blocked tile at all. From any tile with Chebyshev <=
+    FOOTPRINT_RADIUS+FOOTPRINT_MARGIN of the centre (exactly `in_danger`'s under_hunllef case,
+    i.e. every tile this function is ever asked to escape FROM), blocking the whole square trapped
+    the flood on its own start tile and this returned None unconditionally -- the fight's escape
+    action could never actually escape a stomp."""
     centre = snap.hunllef_centre()
     blocked = set(snap.hazards)
-    if centre is not None:
-        r = FOOTPRINT_RADIUS + FOOTPRINT_MARGIN
-        blocked |= {(centre[0] + dx, centre[1] + dy) for dx in range(-r, r + 1) for dy in range(-r, r + 1)}
     reach = flood(imap, snap.me, cfg["escape_radius"], blocked)
     best, best_key = None, None
     for tile, steps in reach.items():
-        if tile == snap.me or tile in blocked:
+        if tile == snap.me or tile in blocked or forbidden_near_hunllef(tile, centre):
             continue
         tor = min((cheb(tile, t) for t in snap.tornadoes), default=99)
         if tor < cfg["tornado_avoid"]:
@@ -270,7 +275,7 @@ def ladder(snap, tracker, cfg, unusable_prayers=frozenset()):
         return ("attack", None)
     centre = snap.hunllef_centre()
     if centre is not None:
-        d = cheb(snap.me, centre)
-        if d <= FOOTPRINT_RADIUS + FOOTPRINT_MARGIN or not in_attack_range(snap.me, centre, cfg["attack_range"]):
+        if (forbidden_near_hunllef(snap.me, centre)
+                or not in_attack_range(snap.me, centre, cfg["attack_range"])):
             return ("reposition", None)
     return ("idle", None)

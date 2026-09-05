@@ -190,10 +190,55 @@ def test_pick_safe_tile_prefers_distance_from_tornadoes_then_nearness():
     assert t[1] < G(10, 10)[1]          # moved away from the tornado (north of us), not toward it
 
 
+def test_pick_safe_tile_escapes_from_under_the_hunllef():
+    """C1: the stomp guard (forbidden_near_hunllef) must be a DESTINATION filter only -- flood
+    itself must still be able to LEAVE the start tile even when the start tile is inside the
+    footprint+margin square, or every tile with Chebyshev <= FOOTPRINT_RADIUS+FOOTPRINT_MARGIN of
+    the centre (exactly `in_danger`'s under_hunllef case) would return None from pick_safe_tile
+    and the routine could never escape a stomp."""
+    imap = _grid(size=32)
+    centre = G(16, 16)
+    for d in (0, 1, 2):
+        snap = _fight(me=(centre[0] + d, centre[1]), hun=centre)
+        t = h.pick_safe_tile(snap, imap, CFG)
+        assert t is not None, f"Chebyshev {d} from the centre: no escape tile found"
+        assert h.cheb(t, centre) >= 4
+
+
+def test_pick_safe_tile_finds_the_one_gap_in_a_hazard_ring():
+    """C1: standing inside the footprint with the whole margin-ring hazarded except one gap tile,
+    the flood must route THROUGH the (non-hazard) footprint/margin tiles to reach the gap -- the
+    old code blocked the entire footprint+margin square from traversal, so it could never reach
+    the gap at all."""
+    imap = _grid(size=32)
+    centre = G(16, 16)
+    gap = (centre[0] + 4, centre[1])       # first non-forbidden tile straight east (Chebyshev 4)
+    ring = [(centre[0] + dx, centre[1] + dy)
+            for dx in range(-4, 5) for dy in range(-4, 5)
+            if max(abs(dx), abs(dy)) == 4 and (centre[0] + dx, centre[1] + dy) != gap]
+    snap = _fight(me=centre, hun=centre, hazards=ring)
+    t = h.pick_safe_tile(snap, imap, CFG)
+    assert t == gap, t
+
+
 def test_pick_safe_tile_returns_none_when_everything_is_forbidden():
-    imap = _grid(size=8)
-    snap = _fight(me=G(3, 3), hun=G(3, 3))          # standing under it, and its footprint+margin covers the grid
+    # A 7x7 grid centred on (3,3) genuinely has no tile at Chebyshev >= 4 from it: the farthest
+    # local coordinate the grid holds is a corner at (0,0)/(0,6)/(6,0)/(6,6), each exactly
+    # Chebyshev 3 away, one short of clearing FOOTPRINT_RADIUS+FOOTPRINT_MARGIN (3) -- so EVERY
+    # tile the grid can offer is forbidden, independent of C1's fix (verified: max(|x-3|,|y-3|)
+    # over the whole 7x7 grid is 3). This is NOT a claim that the whole footprint+margin blocks
+    # traversal (see C1, final-fix-brief.md: it must not) -- it is a claim about this grid's
+    # extent. NOTE: the brief names an 8x8 grid for this fixture, but a size-8 grid's corner (at
+    # local (7,3) etc.) is Chebyshev 4 from (3,3) and IS reachable/unforbidden -- confirmed live
+    # against the fixed pick_safe_tile, which returns a real tile on a size-8 grid. 7 is the
+    # largest size for which the claimed fact ("no tile at Chebyshev >= 4") actually holds; the
+    # size-32 assertion below is what proves the same me/hun setup escapes once the grid is not
+    # the thing constraining it.
+    imap = _grid(size=7)
+    snap = _fight(me=G(3, 3), hun=G(3, 3))
     assert h.pick_safe_tile(snap, imap, CFG) is None
+    imap32 = _grid(size=32)
+    assert h.pick_safe_tile(snap, imap32, CFG) is not None
 
 
 def test_require_in_range_filters():
