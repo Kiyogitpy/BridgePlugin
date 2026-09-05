@@ -49,3 +49,42 @@ REGION_NORMAL = 7512
 OBJ_BARRIER = 37337
 OBJ_ENTRANCE = 37340              # "The Gauntlet"
 OBJ_REWARD_CHEST = 37341
+
+# --- Arena utility objects (REC summary "object ids seen"; singular, no depleted counterpart) ---
+OBJ_SINGING_BOWL = 35966          # "Sing-crystal" -- crafts weapons/armour from crystal shards
+OBJ_TOOL_STORAGE = 35977          # "Take" -- pickaxe/axe/harpoon
+OBJ_RANGE = 35980                 # "Cook"
+OBJ_WATER_PUMP = 35981            # "Fill-from" -- fills a vial with water
+OBJ_ILLUMINATED_SYMBOL = 35992    # maze crystal-lighting puzzle (sub-project 3), not a resource
+OBJ_INACTIVE_SYMBOL = 35994       #   node -- kept as its own pair of constants rather than folded
+                                   #   into RESOURCE_NODES/_DEPLETED, which are for gathering only
+
+# --- Resource nodes (REC summary; the wiki's own name for this object group -- Corrupt Deposit/
+#     Phren Roots/Fishing Spot/Grym Root/Linum Tirinum are the Gauntlet's five gatherable-resource
+#     types). Deliberately id: name DICTS rather than individual OBJ_<NAME> ints for these ten
+#     (plus the two Node ids below) -- a routine's actual question is "is this object I'm looking
+#     at ACTIVE or DEPLETED", i.e. set/dict membership, not a single hardcoded id; see
+#     tests/test_gauntlet_ids.py's completeness test for why this keeps every recorded id in
+#     exactly one place (an OBJ_<NAME> constant here too would double-count them). "Depleted" is
+#     decided from the summary's own "(Depleted)" name suffix. ---
+RESOURCE_NODES = {
+    35967: "Corrupt Deposit",
+    35969: "Corrupt Phren Roots",
+    35971: "Corrupt Fishing Spot",
+    35973: "Corrupt Grym Root",
+    35975: "Corrupt Linum Tirinum",
+    # 35998/35999 ("Node", the "Light" action): the summary gives BOTH ids the identical name
+    # "Node" with no "(Depleted)" suffix on either -- unlike every resource pair above, it does
+    # not say which is the active state and which is exhausted. Per this task's own fallback
+    # rule, both live in RESOURCE_NODES rather than guessing one into RESOURCE_NODES_DEPLETED.
+    # WHICH IS DEPLETED: VERIFY LIVE.
+    35998: "Node",
+    35999: "Node",
+}
+RESOURCE_NODES_DEPLETED = {
+    35968: "Corrupt Deposit (Depleted)",
+    35970: "Corrupt Phren Roots (Depleted)",
+    35972: "Corrupt Fishing Spot (Depleted)",
+    35974: "Corrupt Grym Root (Depleted)",
+    35976: "Corrupt Linum Tirinum (Depleted)",
+}
