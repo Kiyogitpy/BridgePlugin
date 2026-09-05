@@ -950,3 +950,55 @@ def test_upgrade_phase_walks_fights_loots_and_crafts(monkeypatch):
     assert state["walks"][0] == (S[0], S[1] + pitch)          # the middle-ring room below the dragon's
     assert state["walks"][1] == (S[0], S[1] + 2 * pitch)      # then into the dragon's room
     assert data.get("cg_upgrade_done") is True
+
+
+# ---- craft phase fix: _potion and failure tracking ----
+
+def test_potion_breaks_on_use_on_failure(monkeypatch):
+    ctx = _Ctx()
+    use_on_calls = [0]
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"slot": 0, "name": g.ITEM_GRYM, "qty": 1}, {"slot": 1, "name": g.ITEM_WATER_VIAL, "qty": 1}])
+    def fake_use_on(ctx, name_a, name_b):
+        use_on_calls[0] += 1
+        return False  # Simulate failure (missed/withheld click)
+    monkeypatch.setattr(cg, "use_on", fake_use_on)
+    result = cg._potion(ctx)
+    assert result is False
+    assert use_on_calls[0] == 1  # Should stop after first failure
+
+
+def test_craft_phase_tracks_failures_per_op(monkeypatch):
+    ctx = _Ctx(); ctx.state.data.update({"cg_t0": 0.0, "cg_home": True})
+    steps = []
+    # Plan: always return one cook step
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(cg.kit, "craft_plan", lambda inv, eq, cfg: [("cook", None)])
+    monkeypatch.setattr(cg, "cook_all", lambda ctx, cfg: False)  # Always fail
+    # Call craft_phase three times
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    # After 3 failures of cook, should be marked as crafted
+    assert ctx.state.data.get("cg_crafted") is True
+    # Failure dict should track "cook": 3
+    assert ctx.state.data.get("cg_craft_fails", {}).get("cook") == 3
+
+
+def test_craft_phase_tracks_different_ops_separately(monkeypatch):
+    ctx = _Ctx(); ctx.state.data.update({"cg_t0": 0.0, "cg_home": True})
+    plans = [[("cook", None)], [("wear", "body")], [("cook", None)]]
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(cg.kit, "craft_plan", lambda inv, eq, cfg: plans.pop(0) if plans else [])
+    monkeypatch.setattr(cg, "cook_all", lambda ctx, cfg: False)  # cook always fails
+    monkeypatch.setattr(cg, "wear", lambda ctx, name: False)     # wear always fails
+    # Three calls with alternating ops: cook, wear, cook
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    # Failure dict should have cook: 2, wear: 1 (not yet 3 for any one)
+    fails = ctx.state.data.get("cg_craft_fails", {})
+    assert fails.get("cook") == 2
+    assert fails.get("wear") == 1
+    assert ctx.state.data.get("cg_crafted") is None or ctx.state.data.get("cg_crafted") is False

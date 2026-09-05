@@ -696,6 +696,7 @@ def _wait_tick(ctx):
 BOWL_BUDGET_S = 4.0
 HOME_BUDGET_S = 8.0
 COOK_STALL_S = 5.0
+POTION_MAX_STEPS = 6
 
 
 def _find_object(cfg, obj_id):
@@ -798,12 +799,20 @@ def _pestle(ctx):
 
 
 def _potion(ctx):
-    ok = True
-    while kit.count(controller.get_inventory(), g.ITEM_WATER_VIAL) and kit.count(controller.get_inventory(), g.ITEM_GRYM):
-        ok = use_on(ctx, g.ITEM_GRYM, g.ITEM_WATER_VIAL) and ok
-    while kit.count(controller.get_inventory(), g.ITEM_GRYM_UNF) and kit.count(controller.get_inventory(), g.ITEM_DUST) >= 10:
-        ok = use_on(ctx, g.ITEM_DUST, g.ITEM_GRYM_UNF) and ok
-    return ok
+    before_egniol = sum(kit.count(controller.get_inventory(), dose) for dose in g.EGNIOL_DOSES)
+    steps = 0
+    # First loop: Grym leaf + water vial
+    while steps < POTION_MAX_STEPS and kit.count(controller.get_inventory(), g.ITEM_WATER_VIAL) and kit.count(controller.get_inventory(), g.ITEM_GRYM):
+        if not use_on(ctx, g.ITEM_GRYM, g.ITEM_WATER_VIAL):
+            break  # Stop immediately if use_on fails
+        steps += 1
+    # Second loop: Egniol dose + dust
+    while steps < POTION_MAX_STEPS and kit.count(controller.get_inventory(), g.ITEM_GRYM_UNF) and kit.count(controller.get_inventory(), g.ITEM_DUST) >= 10:
+        if not use_on(ctx, g.ITEM_DUST, g.ITEM_GRYM_UNF):
+            break  # Stop immediately if use_on fails
+        steps += 1
+    after_egniol = sum(kit.count(controller.get_inventory(), dose) for dose in g.EGNIOL_DOSES)
+    return after_egniol > before_egniol or (not kit.count(controller.get_inventory(), g.ITEM_WATER_VIAL) and not kit.count(controller.get_inventory(), g.ITEM_GRYM))
 
 
 def craft_phase(ctx, cfg):
@@ -820,8 +829,14 @@ def craft_phase(ctx, cfg):
     ok = {"bowl": lambda: bowl_make(ctx, arg, cfg), "pump": lambda: pump_fill(ctx, cfg),
           "pestle": lambda: _pestle(ctx), "potion": lambda: _potion(ctx),
           "cook": lambda: cook_all(ctx, cfg), "wear": lambda: wear(ctx, arg)}[op]()
-    data["cg_craft_fails"] = 0 if ok else data.get("cg_craft_fails", 0) + 1
-    if data["cg_craft_fails"] >= 3:
+    if "cg_craft_fails" not in data:
+        data["cg_craft_fails"] = {}
+    fails = data["cg_craft_fails"]
+    if ok:
+        fails[op] = 0
+    else:
+        fails[op] = fails.get(op, 0) + 1
+    if any(count >= 3 for count in fails.values()):
         debug_log.log("cg", f"[!] craft step {op} {arg} failed 3 times -- skipping the rest")
         data["cg_crafted"] = True
 
