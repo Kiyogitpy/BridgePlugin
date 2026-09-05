@@ -467,3 +467,18 @@ def test_wait_for_event_still_matches_an_event_wait_any_ignores(monkeypatch):
     s = _stream(monkeypatch, [[("NPC_SPAWNED", {"id": 5, "index": 9})]])
     got = s.wait_for_event("NPC_SPAWNED", timeout_s=1.0, now_fn=clk.now, sleep_fn=clk.sleep)
     assert got == {"id": 5, "index": 9}
+
+
+def test_since_returns_everything_after_the_mark_oldest_first(monkeypatch):
+    s = _stream(monkeypatch, [
+        [("TICK", {"tick": 1}), ("NPC_SPAWNED", {"id": 9039})],
+        [("NPC_TRACKED_ANIMATION_CHANGED", {"animationId": 8419}),
+         ("CHAT_MESSAGE", {"message": "Your prayers have been disabled!"})],
+    ])
+    s.pump(now=1000.0)
+    m = s.mark()
+    s.pump(now=1000.0)
+    got = s.since(m)
+    assert [t for t, _ in got] == ["NPC_TRACKED_ANIMATION_CHANGED", "CHAT_MESSAGE"]
+    assert got[0][1]["animationId"] == 8419
+    assert s.since(s.mark()) == []

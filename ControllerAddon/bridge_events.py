@@ -295,6 +295,15 @@ class EventStream:
         discarding anything on_event still needs (the reason this replaced clear())."""
         return self._seq
 
+    def since(self, seq):
+        """Every buffered event with a sequence number after `seq` (from mark()), oldest first,
+        as (event_type, payload). Pumps once so the answer is current. Non-destructive: main()'s
+        drain() still dispatches these to on_event/handle_generic_events later. Added 2026-09-05
+        for the Hunllef fight loop, which holds tick() for the whole fight and therefore never
+        receives on_event, but must see every tracked-animation event of the last tick."""
+        self.pump()
+        return [(event_type, payload) for s, event_type, payload in self._recent if s > seq]
+
     def await_outcome(self, signals, budget_s, confirm=None, since=None, reaction=True,
                       shorten=None, now_fn=time.time, sleep_fn=time.sleep):
         """Block until a listed signal lands (after `since`) AND `confirm()` -- one HTTP read --
