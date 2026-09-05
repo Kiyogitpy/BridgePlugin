@@ -101,11 +101,18 @@ def ensure_tools(ctx, cfg):
     have = {i.get("name") for i in controller.get_inventory()} | {((controller.get_equipment() or {}).get("weapon") or {}).get("name")}
     if names <= have:
         return True
+    missing = names - have
     storage = _find_object(cfg, g.OBJ_TOOL_STORAGE)
-    if storage is None or not _near(ctx, storage, 3):
+    storage_found = storage is not None
+    storage_near = storage_found and _near(ctx, storage, 3)
+    if not storage_near:
+        debug_log.log("cg", f"[!] ensure_tools: missing {missing}; storage found={storage_found} near={storage_near}")
         return False
     controller.click_entity(ctx.ser, storage, expected_action="Take")
-    return _confirm(ctx, lambda: names <= {i.get("name") for i in controller.get_inventory()}, 4.0)
+    result = _confirm(ctx, lambda: names <= {i.get("name") for i in controller.get_inventory()}, 4.0)
+    if not result:
+        debug_log.log("cg", f"[!] ensure_tools: missing {missing}; storage found={storage_found} near={storage_near} -- take did not confirm")
+    return result
 
 
 def stuck_watch(ctx, signature):
@@ -1104,11 +1111,12 @@ def tick(ctx):
     elif phase in ("explore_gather", "craft", "upgrade"):
         # Ensure tools once per run when starting prep phases
         if not data.get("cg_tools_ok"):
-            if ensure_tools(ctx, cfg):
-                data["cg_tools_ok"] = True
-            else:
-                debug_log.log("cg", "ensure_tools failed")
+            if not ensure_tools(ctx, cfg):
+                # Tool check failed, but still watch for stalls (might recover next tick)
+                me, _ = _me()
+                stuck_watch(ctx, (phase, me, len(inventory)))
                 return
+            data["cg_tools_ok"] = True
         # Dispatch the appropriate prep phase
         if phase == "explore_gather":
             explore_gather_phase(ctx, cfg)

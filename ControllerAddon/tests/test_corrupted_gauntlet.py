@@ -1138,3 +1138,31 @@ def test_stuck_watch_stops_after_no_progress(monkeypatch):
     monkeypatch.setattr(cg.time, "time", lambda: 1000.0 + cg.STUCK_STOP_S + 1)
     cg.stuck_watch(ctx2, ("explore_gather", (101, 100), 5))     # moved: no stop
     assert not ctx2.state.safety_stopped
+
+
+def test_stuck_watch_fires_even_when_ensure_tools_fails(monkeypatch):
+    """Ensure that when ensure_tools fails, stuck_watch still runs and can trigger a safety stop
+    after STUCK_STOP_S with no progress. This prevents a tool loop from freezing forever."""
+    ctx = _Ctx(); data = ctx.state.data
+    data["cg_t0"] = 0.0
+    # Set up time to start at 100.0
+    time_value = [100.0]
+    def mock_time():
+        return time_value[0]
+    monkeypatch.setattr(cg.time, "time", mock_time)
+    # Stub all bridge calls
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(100, 100))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [{"id": g.OBJ_BARRIER}])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.ITEM_SCEPTRE}])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {})
+    # Stub ensure_tools to always return False
+    monkeypatch.setattr(cg, "ensure_tools", lambda ctx, cfg: False)
+    # Call tick() - should set up stuck_watch
+    cg.tick(ctx)
+    assert ctx.state.safety_stopped is False
+    # Advance time past STUCK_STOP_S
+    time_value[0] = 100.0 + cg.STUCK_STOP_S + 1
+    # Call tick() again with same state - should trigger safety stop
+    cg.tick(ctx)
+    assert ctx.state.safety_stopped is True
