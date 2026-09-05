@@ -78,6 +78,118 @@ def test_craft_plan_never_overspends():
     assert plan.count(("bowl", "bow")) == 1 and plan.count(("bowl", "staff")) == 1
 
 
+def _inv_from_dict(d):
+    return [{"slot": i, "name": n, "qty": q, "screenX": 1, "screenY": 1}
+            for i, (n, q) in enumerate(d.items()) if q]
+
+
+def _reverse_armour(name):
+    for kind in g.ARMOUR_KINDS:
+        for tier in (1, 2, 3):
+            if name == g.armour_name(kind, tier):
+                return kind, tier
+    return None
+
+
+def _reverse_weapon(name):
+    for kind in ("bow", "staff"):
+        for tier in (1, 2, 3):
+            if name == g.weapon_name(kind, tier):
+                return kind, tier
+    return None
+
+
+def _apply_step(inv, eq, step):
+    """Mirrors the real game effect of one craft_plan step on a plain {name: qty} inventory
+    dict, per the brief's spec (C1, final-fix-brief.md). Used to drive craft_plan repeatedly and
+    assert it terminates -- a stand-in for craft_phase only ever executing plan[0] and re-planning
+    from the live inventory every call."""
+    op, arg = step
+
+    def take(name, n=1):
+        inv[name] = inv.get(name, 0) - n
+
+    def give(name, n=1):
+        inv[name] = inv.get(name, 0) + n
+
+    if op == "bowl" and arg == "vial":
+        take(g.ITEM_SHARDS, k.VIAL_SHARDS); give(g.ITEM_VIAL)
+    elif op == "pump":
+        n = inv.get(g.ITEM_VIAL, 0)
+        inv[g.ITEM_VIAL] = 0
+        give(g.ITEM_WATER_VIAL, n)
+    elif op == "pestle":
+        take(g.ITEM_SHARDS, k.DUST_SHARDS); give(g.ITEM_DUST, 10)
+    elif op == "potion":
+        while inv.get(g.ITEM_GRYM, 0) > 0 and inv.get(g.ITEM_WATER_VIAL, 0) > 0:
+            take(g.ITEM_GRYM); take(g.ITEM_WATER_VIAL); give(g.ITEM_GRYM_UNF)
+        while inv.get(g.ITEM_GRYM_UNF, 0) > 0 and inv.get(g.ITEM_DUST, 0) >= 10:
+            take(g.ITEM_GRYM_UNF); take(g.ITEM_DUST, 10); give("Egniol potion (3)")
+    elif op == "cook":
+        n = inv.get(g.ITEM_RAW_FISH, 0)
+        inv[g.ITEM_RAW_FISH] = 0
+        give(g.ITEM_FISH, n)
+    elif op == "bowl" and arg == "cfish":
+        take(g.ITEM_SHARDS, k.CFISH_SHARDS); take(g.ITEM_FISH); give(g.ITEM_CFISH)
+    elif op == "bowl" and arg in g.ARMOUR_KINDS:
+        inv_list = _inv_from_dict(inv)
+        tier = k.owned_tier(arg, inv_list, eq) + 1
+        o, b, l, s = k.ARMOUR_COST[(arg, tier)]
+        take(g.ITEM_ORE, o); take(g.ITEM_BARK, b); take(g.ITEM_LINUM, l); take(g.ITEM_SHARDS, s)
+        if tier > 1:
+            take(g.armour_name(arg, tier - 1))
+        give(g.armour_name(arg, tier))
+    elif op == "bowl" and arg in ("bow", "staff"):
+        inv_list = _inv_from_dict(inv)
+        tier = k.owned_tier(arg, inv_list, eq) + 1
+        if tier == 1:
+            take(g.ITEM_FRAME)
+        elif tier == 2:
+            take(g.ITEM_SHARDS, k.ATTUNE_SHARDS); take(g.weapon_name(arg, 1))
+        elif tier == 3:
+            take(g.ITEM_ORB if arg == "staff" else g.ITEM_BOWSTRING)
+            take(g.weapon_name(arg, 2))
+        give(g.weapon_name(arg, tier))
+    elif op == "wear":
+        pair = _reverse_armour(arg) or _reverse_weapon(arg)
+        assert pair is not None, f"apply_step: unrecognised wear target {arg}"
+        kind, tier = pair
+        assert inv.get(arg, 0) > 0, f"apply_step: wearing {arg} we don't hold"
+        take(arg)
+        eq[k.EQUIP_SLOT[kind]] = {"name": arg}
+    else:
+        raise AssertionError(f"apply_step: unhandled op {step}")
+
+
+def test_craft_plan_is_idempotent_and_terminates(monkeypatch):
+    """C1: craft_phase only ever acts on plan[0] and re-plans from the live inventory every call
+    -- so craft_plan must never keep re-issuing a step whose effect is already sitting in the
+    inventory (the vial/cfish bug). Drives craft_plan/apply_step exactly the way craft_phase
+    does, starting from the recording's ~160s inventory."""
+    inv = {g.ITEM_ORE: 7, g.ITEM_BARK: 7, g.ITEM_LINUM: 7, g.ITEM_RAW_FISH: 20,
+           g.ITEM_GRYM: 2, g.ITEM_FRAME: 2, g.ITEM_SHARDS: 590, g.ITEM_PESTLE: 1}
+    eq = dict(EQ_NONE)
+    steps_taken = []
+    for _ in range(40):
+        plan = k.craft_plan(_inv_from_dict(inv), eq, CFG)
+        if not plan:
+            break
+        step = plan[0]
+        steps_taken.append(step)
+        _apply_step(inv, eq, step)
+    else:
+        raise AssertionError(f"craft_plan did not terminate within 40 steps: {steps_taken}")
+
+    final_inv = _inv_from_dict(inv)
+    assert sum(inv.get(dose, 0) for dose in g.EGNIOL_DOSES) == 2
+    for kind in g.ARMOUR_KINDS:
+        assert k.owned_tier(kind, final_inv, eq) >= 1, f"{kind} never reached T1"
+    for kind in ("bow", "staff"):
+        assert k.owned_tier(kind, final_inv, eq) >= 2, f"{kind} never reached attuned"
+    assert inv.get(g.ITEM_CFISH, 0) <= 4
+    assert inv.get(g.ITEM_VIAL, 0) == 0
+
+
 def test_gather_value_scores_deficit_only():
     d = k.Deficit(ore=3, bark=0, linum=1, shards=0, frames=1, fish=0, grym=0, orb=0, bowstring=0)
     deposit = next(n for n in g.RESOURCE_NODES.values() if "Deposit" in n)

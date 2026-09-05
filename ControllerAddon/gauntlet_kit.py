@@ -105,17 +105,37 @@ def craft_plan(inventory, equipment, cfg):
     """Ordered bowl/pump/pestle/potion/cook/wear steps from what is in the bag, within the shards
     held: potions' vials first (they need the pump trip), the T1 set, both weapons to attuned,
     then the potion chain, then T2 pieces cheapest first, then corrupted paddlefish, then
-    wearing everything crafted."""
+    wearing everything crafted.
+
+    (C1, final-fix-brief.md) `craft_phase` only ever executes `plan[0]` and re-plans from the
+    live inventory every call, so every step here must be judged against what is ACTUALLY held
+    right now, not against a running target that ignores partial progress -- the old version
+    computed `potions` from `grym`/`egniol_target` alone and queued one `("bowl", "vial")` per
+    potion on every single call regardless of how many vials/water-filled vials/grym (unf)
+    already existed, so it never stopped bowling vials once the shard budget allowed it. Every
+    quantity below is instead a DEFICIT: how many more of this item the pipeline still needs,
+    given what is already sitting in each of its stages."""
     shards = count(inventory, g.ITEM_SHARDS) - cfg.get("shard_reserve", 0)
     ore, bark, linum = count(inventory, g.ITEM_ORE), count(inventory, g.ITEM_BARK), count(inventory, g.ITEM_LINUM)
     frames = count(inventory, g.ITEM_FRAME)
     grym = count(inventory, g.ITEM_GRYM)
+    vial = count(inventory, g.ITEM_VIAL)
+    water_vial = count(inventory, g.ITEM_WATER_VIAL)
+    grym_unf = count(inventory, g.ITEM_GRYM_UNF)
+    dust = count(inventory, g.ITEM_DUST)
     plan = []
-    potions = min(grym, max(0, cfg["egniol_target"] - _potions(inventory)))
-    vials = 0
-    for _ in range(potions):
+
+    # Potions: how many complete pipelines we still want (capped by grym leaf on hand), minus
+    # whatever is already sitting at any stage of the pipeline (vial/water vial/grym unf all
+    # represent a potion already "claimed" -- bowling another vial for it would be wasted shards
+    # and, worse, would never terminate since the deficit would never reach zero).
+    potions_wanted = max(0, cfg["egniol_target"] - _potions(inventory))
+    potions = min(grym, potions_wanted)
+    vials_needed = max(0, potions - vial - water_vial - grym_unf)
+    for _ in range(vials_needed):
         if shards >= VIAL_SHARDS + DUST_SHARDS:
-            plan.append(("bowl", "vial")); shards -= VIAL_SHARDS; vials += 1
+            plan.append(("bowl", "vial")); shards -= VIAL_SHARDS; vial += 1
+
     tiers = {k: owned_tier(k, inventory, equipment) for k in ("helm", "body", "legs", "bow", "staff")}
 
     def armour_step(kind, tier):
@@ -136,16 +156,39 @@ def craft_plan(inventory, equipment, cfg):
     for kind, item in (("staff", g.ITEM_ORB), ("bow", g.ITEM_BOWSTRING)):
         if tiers[kind] == 2 and count(inventory, item):
             tiers[kind] = 3; plan.append(("bowl", kind))
-    if vials:
+
+    # Pump only makes sense while an un-filled vial actually exists; once queued, treat every
+    # vial as if it were already water-filled for the dust/potion accounting below (pump is a
+    # single action that fills the whole stack in one go per the recording).
+    if vial > 0:
         plan.append(("pump", None))
-        for _ in range(vials):
-            plan.append(("pestle", None)); shards -= DUST_SHARDS
+        water_vial += vial
+        vial = 0
+
+    # Dust: enough for every unf already made plus every water vial about to become one (bounded
+    # by remaining grym leaf, since stage 1 consumes one leaf per water vial).
+    stage1_pending = min(water_vial, grym)
+    needed_dust = max(0, 10 * (grym_unf + stage1_pending) - dust)
+    for _ in range(needed_dust // 10):
+        if shards >= DUST_SHARDS:
+            plan.append(("pestle", None)); shards -= DUST_SHARDS; dust += 10
+        else:
+            break
+
+    # One potion step whenever a stage-1 or stage-2 pair actually exists -- `_potion` itself
+    # loops over every pair it can process in a single call, so one plan entry is enough.
+    if (water_vial > 0 and grym > 0) or (grym_unf > 0 and dust >= 10):
         plan.append(("potion", None))
+
     for kind, tier in (("helm", 2), ("legs", 2), ("body", 2)):
         armour_step(kind, tier)
     if count(inventory, g.ITEM_RAW_FISH):
         plan.append(("cook", None))
-    cfish = min(count(inventory, g.ITEM_RAW_FISH) + count(inventory, g.ITEM_FISH), shards // CFISH_SHARDS, 4)
+    # cfish: never more than 4 held, never more than the cooked (not raw -- cook runs first)
+    # paddlefish on hand, and the count already crafted must be subtracted or this repeats
+    # forever exactly like the vial bug above.
+    cfish_room = max(0, 4 - count(inventory, g.ITEM_CFISH))
+    cfish = min(count(inventory, g.ITEM_FISH), shards // CFISH_SHARDS, cfish_room)
     for _ in range(cfish):
         plan.append(("bowl", "cfish")); shards -= CFISH_SHARDS
     for kind in ("helm", "body", "legs"):
