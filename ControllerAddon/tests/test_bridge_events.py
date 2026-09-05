@@ -440,3 +440,30 @@ def test_wait_any_times_out_quietly(monkeypatch):
     s = _stream(monkeypatch, [])
     assert s.wait_any(0.1, now_fn=clk.now, sleep_fn=clk.sleep) is False
     assert clk.t == pytest.approx(1000.1, abs=0.03)
+
+
+def test_wait_any_ignores_steady_state_npc_and_projectile_chatter(monkeypatch):
+    """I4 (final-fix-brief.md): NPC spawn/despawn and projectile events fire continuously while a
+    routine walks around, and waking the engine loop's own sleep on every one of them collapses
+    it back into a busy poll. wait_any must not wake on them -- but wait_for_event, which reads
+    the buffer rather than the wake, still has to match one when a caller actually wants it."""
+    clk = _Clock()
+    s = _stream(monkeypatch, [
+        [("NPC_SPAWNED", {"id": 1, "index": 1})],
+        [("NPC_DESPAWNED", {"id": 1, "index": 1})],
+        [("PROJECTILE_SPAWNED", {"id": 2})],
+        [],
+        [("XP_GAINED", {"skill": "Mining"})],
+    ])
+    assert s.wait_any(5.0, now_fn=clk.now, sleep_fn=clk.sleep) is True
+    # Woke only on the real (non-ignored) event, not on any of the three chatter events ahead of
+    # it -- five pumps happened, but only the last one satisfied wait_any.
+    assert len(clk.sleeps) == 4
+    assert [t for t, _ in s.drain()] == ["NPC_SPAWNED", "NPC_DESPAWNED", "PROJECTILE_SPAWNED", "XP_GAINED"]
+
+
+def test_wait_for_event_still_matches_an_event_wait_any_ignores(monkeypatch):
+    clk = _Clock()
+    s = _stream(monkeypatch, [[("NPC_SPAWNED", {"id": 5, "index": 9})]])
+    got = s.wait_for_event("NPC_SPAWNED", timeout_s=1.0, now_fn=clk.now, sleep_fn=clk.sleep)
+    assert got == {"id": 5, "index": 9}

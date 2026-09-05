@@ -30,8 +30,15 @@ STALE_AFTER_MS = GAME_TICK_MS * 2  # (I2, 2026-08-21) how long since the last TI
 
 
 FALLBACK_POLL_S = settings.FALLBACK_POLL_S
-WAKE_IGNORED_TYPES = ("TICK",)   # wait_any never wakes the engine loop on a tick boundary --
-                                 # a loop aligned to the server tick aligns every click to it too
+WAKE_IGNORED_TYPES = ("TICK", "NPC_SPAWNED", "NPC_DESPAWNED", "PROJECTILE_SPAWNED")
+# wait_any never wakes the engine loop on a tick boundary -- a loop aligned to the server tick
+# aligns every click to it too. NPC_SPAWNED/NPC_DESPAWNED/PROJECTILE_SPAWNED joined this list
+# 2026-09-05 (I4, final-fix-brief.md): they fire continuously while a routine merely walks
+# around (every NPC entering/leaving view range, every projectile in flight), and the engine
+# loop waking its own sleep on each one collapses it back into a busy poll -- exactly the
+# steady-state chatter this ignore-list exists to filter, same rationale as TICK. This is a
+# WAKE filter only: wait_for_event/await_outcome read the buffer, not the wake, so a caller that
+# actually wants one of these three still matches it normally.
 
 
 class Outcome:
