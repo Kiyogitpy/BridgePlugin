@@ -199,3 +199,69 @@ def test_loot_phase_has_attempt_ceiling(monkeypatch):
     cg.loot_phase(ctx2, cg.DEFAULT_CONFIG)
     assert ctx2.state.data.get("cg_chest_opened") is True
     assert ctx2.state.safety_stopped is False
+
+
+class _FakeFightEvents:
+    """Models exactly the two properties of the real EventStream that C2 depends on: mark() does
+    NOT pump (it only returns the current sequence number), while since() and wait_ticks() DO --
+    wait_ticks() here simulates a pump during the tick wait by absorbing the next queued batch of
+    animation events into the log, the same way the real ctx.events.wait_ticks() drains the UDP
+    socket mid-wait."""
+
+    def __init__(self, wait_batches):
+        self._seq = 0
+        self._log = []                          # (seq, event_type, payload)
+        self._wait_batches = list(wait_batches)  # one batch "arrives" per wait_ticks() call
+
+    def _absorb(self, batch):
+        for event_type, payload in batch:
+            self._seq += 1
+            self._log.append((self._seq, event_type, payload))
+
+    def mark(self):
+        return self._seq
+
+    def since(self, seq):
+        return [(t, p) for s, t, p in self._log if s > seq]
+
+    def wait_ticks(self, n):
+        if self._wait_batches:
+            self._absorb(self._wait_batches.pop(0))
+
+
+def _anim_event(anim, npc_id=9036):
+    return ("NPC_TRACKED_ANIMATION_CHANGED", {"id": npc_id, "animationId": anim})
+
+
+def test_fight_loop_mark_since_placement_does_not_drop_events(monkeypatch):
+    """C2: mark() does not pump; since() and wait_ticks() do. Taking a fresh `mark =
+    ctx.events.mark()` at the TOP of every iteration reads a sequence number that the PREVIOUS
+    iteration's own `_wait_tick` call (which calls wait_ticks(), which pumps) already advanced --
+    so every event that arrived during that action/tick wait sits behind the new mark and
+    `since(mark)` can never see it. Two batches of Hunllef attack-animation events are queued to
+    arrive during the first two `_wait_tick` calls; every one of the 4 events must still reach the
+    tracker by the time the loop ends. FAILS against the old per-iteration mark placement (0
+    attacks counted instead of 4) -- this failure IS the proof C2 existed."""
+    events = _FakeFightEvents([[_anim_event(8419), _anim_event(8419)],
+                              [_anim_event(8419), _anim_event(8419)]])
+    ctx = _Ctx(events=events)
+    snap = h.FightSnapshot.from_bridge({"instX": 1, "instY": 2, "hp": 80, "prayer": 50},
+                                       [_npc(9036, anim=-1)], [], {"active": {}}, {}, [],
+                                       {"targetId": 9036})
+    calls = {"n": 0}
+
+    def fake_read_snapshot(cfg):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            ctx.state.safety_stopped = True
+        return snap
+
+    monkeypatch.setattr(cg, "read_snapshot", fake_read_snapshot)
+    monkeypatch.setattr(cg.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(h, "ladder", lambda snap, tracker, cfg, unusable: ("idle", None))
+
+    cg.fight_loop(ctx, cg.DEFAULT_CONFIG)
+
+    assert calls["n"] == 3
+    tracker = ctx.state.data["cg_tracker"]
+    assert tracker.attacks == 4, "not every event fed during the waits reached the tracker"

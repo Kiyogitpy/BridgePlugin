@@ -234,6 +234,16 @@ def _log_rung(data, rung, arg, snap, tracker):
 
 
 def fight_loop(ctx, cfg):
+    """Holds tick() for the whole fight (see the module docstring).
+
+    (C2, final-fix-brief.md) `mark` is taken ONCE, before the loop, not fresh every iteration.
+    `EventStream.mark()` does NOT pump -- it only reports the current sequence number -- while
+    `since()` and `wait_ticks()` both DO. A mark refreshed at the top of every iteration therefore
+    reads a sequence number the PREVIOUS iteration's own `_wait_tick` call (wait_ticks(), which
+    pumps) had already advanced past, so every event that arrived during that action's and tick's
+    wait sat behind the new mark and `since(mark)` could never see it -- every animation event was
+    silently dropped. `mark` is now updated to `ctx.events.mark()` immediately after each
+    `since(mark)` call, which has just pumped, so that is exactly "the last event consumed"."""
     data = ctx.state.data
     tracker = data.get("cg_tracker")
     if tracker is None:
@@ -241,11 +251,11 @@ def fight_loop(ctx, cfg):
     deadline = time.time() + cfg["fight_max_s"]
     misses = 0
     no_hunllef = 0
+    mark = ctx.events.mark() if ctx.events is not None else None
     while not ctx.state.safety_stopped:
         if time.time() >= deadline:
             ctx.state.trigger_safety_stop("cg: fight ran past fight_max_s")
             return
-        mark = ctx.events.mark() if ctx.events is not None else None
         snap = read_snapshot(cfg)
         if snap is None:
             misses += 1
@@ -258,7 +268,12 @@ def fight_loop(ctx, cfg):
         if snap.hp <= 0:
             ctx.state.trigger_safety_stop("cg: died to the Hunllef (nothing lost -- read the log)")
             return
-        feed_tracker(tracker, snap, ctx.events.since(mark) if ctx.events is not None else None)
+        if ctx.events is not None:
+            events_since = ctx.events.since(mark)
+            mark = ctx.events.mark()
+        else:
+            events_since = None
+        feed_tracker(tracker, snap, events_since)
         rung, arg = h.ladder(snap, tracker, cfg, _unusable(ctx))
         _log_rung(data, rung, arg, snap, tracker)
         if rung == "no_hunllef":
