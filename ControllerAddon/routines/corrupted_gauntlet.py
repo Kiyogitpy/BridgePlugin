@@ -209,6 +209,11 @@ def light_node(ctx, node, cfg):
                     return True
         return False
     ok = _confirm(ctx, lit, NODE_BUDGET_S)
+    if ok:
+        # (I5, final-fix-brief.md) The recording shows LOADING/LOGGED_IN ~1.2s after each Light --
+        # lighting a node opens up new scene, so the cached collision grid used for maze.edge_open/
+        # component checks is stale the instant this succeeds.
+        ctx.state.data.pop("cg_imap", None)
     debug_log.log("cg", f"light node at {before[1:]}: {'ok' if ok else 'no change'}")
     return ok
 
@@ -404,8 +409,17 @@ def explore_gather_phase(ctx, cfg):
             st["sub"] = "to_room"
             # Fall through to to_room logic
         elif node is None:
-            instance_nav.walk_to(ctx, target[0], target[1], tolerance=ROOM_ARRIVAL_TOLERANCE)
-            return
+            # (I5, final-fix-brief.md) The static map can call an edge closed while a stale
+            # cached grid disagrees with reality (see the imap-staleness fix above) with no
+            # lighting node found either -- if we are ALREADY within arrival tolerance of the
+            # target, there is nothing left to walk toward, so fall through to to_room instead of
+            # silently wedging here forever re-issuing the same walk.
+            if h.cheb(me, target) <= ROOM_ARRIVAL_TOLERANCE:
+                st["sub"] = "to_room"
+                # Fall through to to_room logic
+            else:
+                instance_nav.walk_to(ctx, target[0], target[1], tolerance=ROOM_ARRIVAL_TOLERANCE)
+                return
         elif h.cheb(me, (node["instX"], node["instY"])) > 2:
             instance_nav.walk_to(ctx, node["instX"], node["instY"], tolerance=2)
             return
@@ -786,9 +800,14 @@ def teleport_home(ctx, cfg):
     if crystal is not None:
         _click_item(ctx, crystal, "Activate")
         if _confirm(ctx, lambda: _find_object(cfg, g.OBJ_SINGING_BOWL) is not None, HOME_BUDGET_S):
+            # (I5) A teleport crosses the scene the same way a node light does.
+            ctx.state.data.pop("cg_imap", None)
             return True
     if st.get("start_centre"):
-        return instance_nav.walk_to(ctx, st["start_centre"][0], st["start_centre"][1], tolerance=3)
+        ok = instance_nav.walk_to(ctx, st["start_centre"][0], st["start_centre"][1], tolerance=3)
+        if ok:
+            ctx.state.data.pop("cg_imap", None)
+        return ok
     return False
 
 
@@ -1225,8 +1244,10 @@ def tick(ctx):
     phase = derive_phase(data, npcs, objects, inventory=inventory, equipment=equipment, cfg=cfg, now=time.time())
     if phase != data.get("cg_phase"):
         debug_log.log("cg", f"phase {data.get('cg_phase')} -> {phase}")
-        if data.get("cg_phase") == "fight" and phase != "fight":
-            data.pop("cg_imap", None)      # (I4) static per instance -- drop it once the fight ends
+        # (I5, final-fix-brief.md) Widened from "only when leaving fight" (I4) -- EVERY phase
+        # change can follow a scene reload (a node light, a teleport, entering/leaving the fight),
+        # so the cached collision grid is stale on any of them, not just the fight boundary.
+        data.pop("cg_imap", None)
         data["cg_phase"] = phase
         if phase == "fight":
             data["cg_enter_attempts"] = 0

@@ -859,6 +859,72 @@ def test_gather_node_loops_until_depleted(monkeypatch):
     assert ore["n"] == 3
 
 
+def test_light_node_success_clears_the_cached_instance_map(monkeypatch):
+    """I5: lighting a node opens up scene (LOADING/LOGGED_IN ~1.2s later, per the recording), so a
+    successful light must drop the cached collision grid -- a stale cg_imap would keep answering
+    maze.edge_open/component questions against the pre-light scene."""
+    ctx = _Ctx()
+    ctx.state.data["cg_imap"] = object()
+    node = _obj(35999, "Node", 100, 100)
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: True)
+    assert cg.light_node(ctx, node, cg.DEFAULT_CONFIG)
+    assert "cg_imap" not in ctx.state.data
+
+
+def test_light_node_failure_keeps_the_cached_instance_map(monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data["cg_imap"] = object()
+    node = _obj(35999, "Node", 100, 100)
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: False)
+    assert not cg.light_node(ctx, node, cg.DEFAULT_CONFIG)
+    assert "cg_imap" in ctx.state.data
+
+
+def test_teleport_home_via_crystal_clears_the_cached_instance_map(monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data["cg_imap"] = object()
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.ITEM_TELEPORT, "screenX": 1, "screenY": 1}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [_obj(g.OBJ_SINGING_BOWL, "Singing Bowl", 1, 1)])
+    assert cg.teleport_home(ctx, cg.DEFAULT_CONFIG)
+    assert "cg_imap" not in ctx.state.data
+
+
+def test_to_node_wedge_advances_to_to_room_when_already_close_enough(monkeypatch):
+    """I5: when no maze node can be found between here and the target AND the static map's
+    edge_open call disagrees with reality (both false), a player who is ALREADY within
+    ROOM_ARRIVAL_TOLERANCE of the target must fall through to to_room instead of re-issuing the
+    same walk_to forever."""
+    ctx = _Ctx(); data = ctx.state.data; data["cg_t0"] = 0.0
+    S = (13056 + 30, 5632 + 30)
+    pitch = cg.DEFAULT_CONFIG["room_pitch"]
+    st = {"start_centre": S, "barrier": (S[0], S[1] - 8), "outward": (0, 1), "pitch": pitch,
+          "step": 0, "sub": "to_node", "revealed": set(), "entered": {(0, 0)}, "node_fails": 0,
+          "prev_centre": S, "fishing_spots": set()}
+    data["cg_prep"] = st
+    target = cg._centre(st, (1, 0))
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*target))     # already AT the target
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(cg.maze, "edge_open", lambda imap, a, b: False)   # the map disagrees
+    monkeypatch.setattr(cg, "gather_ladder", lambda ctx, cfg: "none")
+    monkeypatch.setattr(cg, "pick_up_drops", lambda ctx, cfg: 0)
+    walks = []
+    monkeypatch.setattr(cg.instance_nav, "walk_to", lambda ctx, x, y, **kw: walks.append((x, y)) or True)
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)
+    # Fell through to_node -> to_room -> gather -> (nothing to gather, no reveal) -> advance, all
+    # in this one call, instead of re-issuing the identical walk_to(target) forever.
+    assert walks == []
+    assert st["step"] == 1
+
+
 def test_explore_gather_phase_lights_then_enters_then_gathers(monkeypatch):
     ctx = _Ctx(); data = ctx.state.data; data["cg_t0"] = 0.0
     S = (13056 + 30, 5632 + 30)
