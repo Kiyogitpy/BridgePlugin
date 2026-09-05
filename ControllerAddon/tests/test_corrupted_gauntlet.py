@@ -861,6 +861,109 @@ def test_explore_gather_phase_lights_then_enters_then_gathers(monkeypatch):
     assert state["gathered"] == [linum]
 
 
+def test_gather_caps_raw_fish_want_by_free_inventory_slots(monkeypatch):
+    """C3a: raw fish are not stackable -- with only 1 free inventory slot (minus the 2-slot drop
+    reserve, i.e. no room at all), the fishing node must be excluded from the gather candidates
+    even though the kit's fish deficit is large; an ore node with room in its deficit is still
+    picked."""
+    ctx = _Ctx(); data = ctx.state.data; data["cg_t0"] = 0.0
+    S = (13056 + 30, 5632 + 30)
+    pitch = cg.DEFAULT_CONFIG["room_pitch"]
+    st = {"start_centre": S, "barrier": (S[0], S[1] - 8), "outward": (0, 1), "pitch": pitch,
+          "step": 0, "sub": "gather", "revealed": set(), "entered": {(0, 0), (1, 0)}, "node_fails": 0,
+          "prev_centre": S, "fishing_spots": set()}
+    data["cg_prep"] = st
+    target = cg._centre(st, (1, 0))
+    fish_id = next(i for i, n in g.RESOURCE_NODES.items() if "Fishing" in n)
+    fish_name = g.RESOURCE_NODES[fish_id]
+    ore_id = next(i for i, n in g.RESOURCE_NODES.items() if "Deposit" in n)
+    ore_name = g.RESOURCE_NODES[ore_id]
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*target))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": f"Junk{i}", "qty": 1} for i in range(27)])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [_obj(fish_id, fish_name, target[0], target[1]),
+                         _obj(ore_id, ore_name, target[0] + 1, target[1])])
+    gathered = []
+    monkeypatch.setattr(cg, "gather_node", lambda ctx, obj, cfg: gathered.append(obj["name"]) or True)
+    monkeypatch.setattr(cg, "gather_ladder", lambda ctx, cfg: "none")
+    monkeypatch.setattr(cg, "pick_up_drops", lambda ctx, cfg: 0)
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)
+    assert gathered == [ore_name]
+
+
+def test_gather_node_failure_memory_skips_a_tile_after_max_fails(monkeypatch):
+    """C3b: a resource node whose gather_node keeps returning False is excluded from the
+    candidate list after NODE_GATHER_MAX_FAILS failures, tracked per-tile in cg_node_fails."""
+    ctx = _Ctx(); data = ctx.state.data; data["cg_t0"] = 0.0
+    S = (13056 + 30, 5632 + 30)
+    pitch = cg.DEFAULT_CONFIG["room_pitch"]
+    st = {"start_centre": S, "barrier": (S[0], S[1] - 8), "outward": (0, 1), "pitch": pitch,
+          "step": 0, "sub": "gather", "revealed": set(), "entered": {(0, 0), (1, 0)}, "node_fails": 0,
+          "prev_centre": S, "fishing_spots": set()}
+    data["cg_prep"] = st
+    target = cg._centre(st, (1, 0))
+    ore_id = next(i for i, n in g.RESOURCE_NODES.items() if "Deposit" in n)
+    ore_name = g.RESOURCE_NODES[ore_id]
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*target))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [_obj(ore_id, ore_name, target[0], target[1])])
+    attempts = []
+    monkeypatch.setattr(cg, "gather_node", lambda ctx, obj, cfg: attempts.append(obj["name"]) or False)
+    monkeypatch.setattr(cg, "gather_ladder", lambda ctx, cfg: "none")
+    monkeypatch.setattr(cg, "pick_up_drops", lambda ctx, cfg: 0)
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)
+    assert len(attempts) == cg.NODE_GATHER_MAX_FAILS
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)   # third call: tile excluded, no new attempt
+    assert len(attempts) == cg.NODE_GATHER_MAX_FAILS
+
+
+def test_craft_phase_fish_pass_walks_to_recorded_spot_when_short(monkeypatch):
+    """C3c: after cook has run (no raw fish left), short of the fish target, with time left and a
+    recorded fishing spot -- craft_phase must walk to the spot instead of falling through to the
+    normal craft plan."""
+    ctx = _Ctx(); data = ctx.state.data
+    data.update({"cg_t0": 0.0, "cg_home": True})
+    spot = (13100, 5700)
+    data["cg_prep"] = {"fishing_spots": {spot}}
+    monkeypatch.setattr(cg.time, "time", lambda: 100.0)
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(13000, 5600))
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.ITEM_FISH, "qty": 12}])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    walks = []
+    monkeypatch.setattr(cg.instance_nav, "walk_to", lambda ctx, x, y, **kw: walks.append(((x, y), kw)) or True)
+    monkeypatch.setattr(cg.kit, "craft_plan", lambda inv, eq, cfg: pytest.fail("must not fall through to the normal plan"))
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    assert len(walks) == 1
+    (xy, kw) = walks[0]
+    assert xy == spot and kw.get("goal_adjacent") is True
+
+
+def test_craft_phase_fish_pass_skipped_when_fish_target_met(monkeypatch):
+    """C3c: with the fish target already met, craft_phase must not enter the fish pass at all."""
+    ctx = _Ctx(); data = ctx.state.data
+    data.update({"cg_t0": 0.0, "cg_home": True})
+    data["cg_prep"] = {"fishing_spots": {(13100, 5700)}}
+    monkeypatch.setattr(cg.time, "time", lambda: 100.0)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.ITEM_FISH, "qty": 20}])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    walks = []
+    monkeypatch.setattr(cg.instance_nav, "walk_to", lambda ctx, x, y, **kw: walks.append((x, y)) or True)
+    monkeypatch.setattr(cg.kit, "craft_plan", lambda inv, eq, cfg: [])
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    assert walks == []
+    assert data.get("cg_crafted") is True
+
+
 # ---- craft phase tests ----
 
 def test_bowl_make_clicks_the_widget_by_text(monkeypatch):

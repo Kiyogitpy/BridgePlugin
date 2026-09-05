@@ -67,6 +67,8 @@ LOOT_CONFIRM_S = 4.0           # (I2) budget to confirm the chest actually opene
 NODE_BUDGET_S = 6.0
 GATHER_BUDGET_S = 8.0
 NODE_MAX_FAILS = 2
+DROP_SLOT_RESERVE = 2          # (C3a) slots kept free of raw fish for other loot to land in
+NODE_GATHER_MAX_FAILS = 2      # (C3b) a resource node this many gather_node failures is skipped
 ATTACKER_RANGE = 4
 DROP_RANGE = 8
 ROOM_ARRIVAL_TOLERANCE = 4
@@ -177,7 +179,7 @@ def prep_state(ctx, cfg):
     bpos = (barrier["instX"], barrier["instY"])
     st = {"start_centre": centre, "barrier": bpos, "outward": maze.outward_from(bpos, centre),
           "pitch": cfg["room_pitch"], "step": 0, "sub": "to_node", "revealed": set(), "entered": {(0, 0)},
-          "node_fails": 0, "prev_centre": centre}
+          "node_fails": 0, "prev_centre": centre, "fishing_spots": set()}
     data["cg_prep"] = st
     data.setdefault("cg_demi_bosses", {})
     debug_log.log("cg", f"prep: start centre {centre}, barrier {bpos}, outward {st['outward']}")
@@ -360,6 +362,16 @@ def _nodes(objects):
     return [o for o in objects if o.get("id") in g.NODE_IDS]
 
 
+def _record_fishing_spots(st, objects):
+    """(C3c, final-fix-brief.md) Every Corrupt Fishing Spot seen while exploring is remembered
+    by instance tile, so craft_phase's post-craft fishing pass has somewhere to walk back to
+    without re-scanning the whole maze."""
+    spots = st.setdefault("fishing_spots", set())
+    for o in objects:
+        if o.get("id") in g.RESOURCE_NODES and g.RESOURCE_ITEM.get(o.get("name")) == g.ITEM_RAW_FISH:
+            spots.add((o.get("instX"), o.get("instY")))
+
+
 def explore_gather_phase(ctx, cfg):
     data = ctx.state.data
     st = prep_state(ctx, cfg)
@@ -377,6 +389,7 @@ def explore_gather_phase(ctx, cfg):
     me, _ = _me()
     imap = _cached_imap(ctx)
     objects = controller.get_objects(radius=cfg["objects_radius"], fresh=True)
+    _record_fishing_spots(st, objects)
     here_centre = _centre(st, _room(st, me))
 
     def advance():
@@ -415,14 +428,28 @@ def explore_gather_phase(ctx, cfg):
 
     if st["sub"] == "gather":
         pick_up_drops(ctx, cfg)
-        deficit = kit.kit_deficit(controller.get_inventory(), controller.get_equipment(), cfg)
+        inventory = controller.get_inventory()
+        deficit = kit.kit_deficit(inventory, controller.get_equipment(), cfg)
+        # (C3a, final-fix-brief.md) Raw fish are NOT stackable -- capping fish deficit by the
+        # kit target alone can plan to fish past a full inventory. Cap by free slots (minus a
+        # reserve so pick_up_drops/other loot still has somewhere to land) rather than the fish
+        # target; the other wanted items are all stackable and need no such cap.
+        free_slots = max(0, 28 - len(inventory) - DROP_SLOT_RESERVE)
         want = {g.ITEM_ORE: deficit.ore, g.ITEM_BARK: deficit.bark, g.ITEM_LINUM: deficit.linum,
-                g.ITEM_GRYM: deficit.grym, g.ITEM_RAW_FISH: deficit.fish}
+                g.ITEM_GRYM: deficit.grym, g.ITEM_RAW_FISH: min(deficit.fish, free_slots)}
+        # (C3b) A node whose gather_node has already failed NODE_GATHER_MAX_FAILS times this run
+        # is excluded from the candidate list -- without this, a node that can never be gathered
+        # (blocked line of sight, permanently contested) is re-picked and re-failed every call.
+        node_fails = data.setdefault("cg_node_fails", {})
         nodes = [o for o in objects if o.get("id") in g.RESOURCE_NODES and _room(st, (o["instX"], o["instY"])) == offset
-                 and want.get(g.RESOURCE_ITEM.get(o.get("name")), 0) > 0]
+                 and want.get(g.RESOURCE_ITEM.get(o.get("name")), 0) > 0
+                 and node_fails.get((o["instX"], o["instY"]), 0) < NODE_GATHER_MAX_FAILS]
         if nodes:
             nodes.sort(key=lambda o: h.cheb((o["instX"], o["instY"]), me))
-            gather_node(ctx, nodes[0], cfg)
+            picked = nodes[0]
+            if not gather_node(ctx, picked, cfg):
+                tile = (picked["instX"], picked["instY"])
+                node_fails[tile] = node_fails.get(tile, 0) + 1
             return
         if reveal and reveal not in st["revealed"]:
             st["sub"] = "reveal"
@@ -883,11 +910,79 @@ def _potion(ctx):
     return after_egniol > before_egniol or (not failed and no_stage1_pairs and no_stage2_pairs)
 
 
+FISH_PASS_MIN_LEFT_S = 120      # (C3c) don't spend the digression once the timer is tight
+FISH_PASS_MAX_S = 60            # wall-clock budget for the whole pass, win or lose
+
+
+def _fish_pass_due(ctx, cfg, inventory):
+    """(C3c, final-fix-brief.md) A one-off trip back to a recorded fishing spot when the kit's
+    fish target isn't met even after cooking everything on hand -- the fight only needs
+    min_fish (10), so this exists to close the gap toward the higher kit target (20) rather than
+    to guarantee it. Gated on cook having already run (no raw fish left uncooked) so it never
+    races the normal craft plan's own cook step."""
+    data = ctx.state.data
+    if data.get("cg_fish_pass_done"):
+        return False
+    if kit.count(inventory, g.ITEM_RAW_FISH) != 0:
+        return False
+    fish_total = kit.count(inventory, g.ITEM_FISH) + kit.count(inventory, g.ITEM_CFISH)
+    if fish_total >= cfg["fish_target"]:
+        return False
+    left = time_left(data, cfg=cfg)
+    if left is None or left <= FISH_PASS_MIN_LEFT_S:
+        return False
+    st = data.get("cg_prep") or {}
+    return bool(st.get("fishing_spots"))
+
+
+def _fish_pass_step(ctx, cfg):
+    """One tick of the post-craft fishing pass: walk to the nearest recorded spot, gather it,
+    then let craft_phase fall back onto its normal plan (which will queue a cook step once raw
+    fish are on hand again)."""
+    data = ctx.state.data
+    if time.time() >= data.get("cg_fish_pass_deadline", 0):
+        debug_log.log("cg", "[!] fish pass: out of time -- moving on")
+        data["cg_craft_sub"] = None
+        data["cg_fish_pass_done"] = True
+        return
+    st = data.get("cg_prep") or {}
+    spots = st.get("fishing_spots") or set()
+    if not spots:
+        data["cg_craft_sub"] = None
+        data["cg_fish_pass_done"] = True
+        return
+    me, _ = _me()
+    spot = min(spots, key=lambda p: h.cheb(p, me))
+    if h.cheb(me, spot) > 1:
+        instance_nav.walk_to(ctx, spot[0], spot[1], tolerance=1, goal_adjacent=True)
+        return
+    obj = next((o for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True)
+                if (o.get("instX"), o.get("instY")) == spot and o.get("id") in g.RESOURCE_NODES), None)
+    if obj is not None:
+        gather_node(ctx, obj, cfg)
+    inventory = controller.get_inventory()
+    fish_total = kit.count(inventory, g.ITEM_FISH) + kit.count(inventory, g.ITEM_CFISH)
+    if fish_total >= cfg["fish_target"] or kit.count(inventory, g.ITEM_RAW_FISH) > 0:
+        # Either the target is met, or there is raw fish to go cook -- either way this pass is
+        # done for now; craft_phase's normal plan takes it from here.
+        data["cg_craft_sub"] = None
+        data["cg_fish_pass_done"] = True
+
+
 def craft_phase(ctx, cfg):
     data = ctx.state.data
     if not data.get("cg_home"):
         if teleport_home(ctx, cfg):
             data["cg_home"] = True
+        return
+    if data.get("cg_craft_sub") == "fish":
+        _fish_pass_step(ctx, cfg)
+        return
+    inventory = controller.get_inventory()
+    if _fish_pass_due(ctx, cfg, inventory):
+        data["cg_craft_sub"] = "fish"
+        data["cg_fish_pass_deadline"] = time.time() + FISH_PASS_MAX_S
+        _fish_pass_step(ctx, cfg)
         return
     plan = kit.craft_plan(controller.get_inventory(), controller.get_equipment(), cfg)
     if not plan:
