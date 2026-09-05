@@ -78,6 +78,31 @@ def test_on_event_mirrors_only_the_fight_varbit():
     assert ctx.state.data["cg_varbit_fight"] == 0
 
 
+def test_on_event_resyncs_the_clock_from_the_timer_chat(monkeypatch):
+    """I13: a CHAT_MESSAGE matching 'Time remaining: M:SS' resets cg_t0 so time_left reads M*60+SS
+    at that moment -- but only when the drift from our own timer exceeds the tolerance, so a
+    routine chat re-render of the same value does not keep nudging cg_t0 by rounding error."""
+    ctx = _Ctx()
+    monkeypatch.setattr(cg.time, "time", lambda: 1000.0)
+    ctx.state.data["cg_t0"] = 1000.0 - 100.0   # elapsed 100s -> time_left = 450 - 100 = 350
+    cg.on_event(ctx, "CHAT_MESSAGE", {"message": "Time remaining: 6:00"})   # 360s, diff 10s -- resync
+    assert cg.time_left(ctx.state.data, now=1000.0, cfg=cg.DEFAULT_CONFIG) == 360
+
+    before_t0 = ctx.state.data["cg_t0"]
+    cg.on_event(ctx, "CHAT_MESSAGE", {"message": "Time remaining: 5:59"})   # 359s, diff 1s -- no resync
+    assert ctx.state.data["cg_t0"] == before_t0
+
+    cg.on_event(ctx, "CHAT_MESSAGE", {"message": "hi"})   # no match -- no crash, no change
+    assert ctx.state.data["cg_t0"] == before_t0
+
+
+def test_on_event_timer_chat_sets_cg_t0_when_unset(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(cg.time, "time", lambda: 500.0)
+    cg.on_event(ctx, "CHAT_MESSAGE", {"message": "Time remaining: 7:00"})   # 420s
+    assert cg.time_left(ctx.state.data, now=500.0, cfg=cg.DEFAULT_CONFIG) == 420
+
+
 def test_read_snapshot_composes_the_seven_reads(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {"hp": 70, "prayer": 40, "instX": 1, "instY": 2, "plane": 1, "animation": -1})
     monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [_npc(9036)])

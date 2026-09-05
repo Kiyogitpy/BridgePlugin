@@ -18,6 +18,7 @@ exactly that gap.
 """
 from __future__ import annotations
 
+import re
 import time
 
 import controller
@@ -645,12 +646,30 @@ def derive_phase(data, npcs, objects, inventory=None, equipment=None, cfg=None, 
     return "unknown"
 
 
+TIMER_CHAT_RE = re.compile(r"Time remaining:\s*(\d+):(\d{2})")
+TIMER_RESYNC_TOLERANCE_S = 2.0   # (I13) only resync when the drift exceeds this
+
+
 def on_event(ctx, event_type, payload):
-    """Mirrors VARBIT_FIGHTING_HUNLLEF for derive_phase (see its own comment). Nothing else is
-    recorded here -- VARBIT_SUBSCRIPTIONS already asks the engine to post this varbit on load and
-    after every login, so the very first read arrives without waiting for it to actually change."""
+    """Mirrors VARBIT_FIGHTING_HUNLLEF for derive_phase (see its own comment), and (I13,
+    final-fix-brief.md) resyncs cg_t0 from the game's own "Time remaining: M:SS" chat message --
+    our own cg_t0 is set from the first REGION_CORRUPTED read (note_entry), which can lag the
+    game's own timer start by up to a tick or two of HTTP latency; this keeps the two from
+    drifting apart over a whole run."""
     if event_type == "VARBIT_CHANGED" and payload and payload.get("varbitId") == g.VARBIT_FIGHTING_HUNLLEF:
         ctx.state.data["cg_varbit_fight"] = payload.get("value")
+        return
+    if event_type == "CHAT_MESSAGE" and payload:
+        m = TIMER_CHAT_RE.search(str(payload.get("message", "")))
+        if m:
+            data = ctx.state.data
+            cfg = get_config(None)
+            now = time.time()
+            game_left = int(m.group(1)) * 60 + int(m.group(2))
+            current_left = time_left(data, now=now, cfg=cfg)
+            if current_left is None or abs(current_left - game_left) > TIMER_RESYNC_TOLERANCE_S:
+                data["cg_t0"] = now - (cfg["timer_s"] - game_left)
+                debug_log.log("cg", f"clock resync from chat: time_left {current_left} -> {game_left}")
 
 
 def feed_tracker(tracker, snap, events_since):
