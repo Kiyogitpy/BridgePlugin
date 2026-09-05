@@ -218,27 +218,99 @@ def test_enter_phase_has_attempt_ceiling(monkeypatch):
     assert any("barrier quick-pass did not start" in s for s in ctx.state.stops)
 
 
-def test_loot_phase_has_attempt_ceiling(monkeypatch):
-    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [{"id": g.OBJ_REWARD_CHEST, "screenX": 500, "screenY": 400}])
+def _loot_setup(monkeypatch):
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [{"id": g.OBJ_REWARD_CHEST, "screenX": 500, "screenY": 400}])
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
-    # Test: click_entity returns False 5 times -> no flag set, safety stop
-    click_count = [0]
-    def fake_click(ser, entity, **kw):
-        click_count[0] += 1
-        return False
-    monkeypatch.setattr(controller, "click_entity", fake_click)
+    # Bypass real timing: _confirm's budget/sleep loop is exercised by test_hunllef.py-adjacent
+    # machinery elsewhere; here the interesting behaviour is entirely in what `check()` decides,
+    # so it is called exactly once.
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: check())
+
+
+def test_loot_phase_click_alone_does_not_confirm_the_chest_opened(monkeypatch):
+    """I2: a click that merely REGISTERED (result truthy) is not proof the chest opened -- only
+    an inventory delta or a "You open the chest" chat message is. No delta, no chat -> the flag
+    stays unset and the attempt is counted toward the ceiling."""
+    _loot_setup(monkeypatch)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    inv = [{"name": "Bones", "qty": 1}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)   # identical before and after
     ctx = _Ctx()
-    for i in range(5):
+    cg.loot_phase(ctx, cg.DEFAULT_CONFIG)
+    assert ctx.state.data.get("cg_chest_opened") is None
+    assert ctx.state.data.get("cg_loot_attempts") == 1
+    assert ctx.state.safety_stopped is False
+
+
+def test_loot_phase_confirms_on_an_inventory_delta(monkeypatch):
+    _loot_setup(monkeypatch)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    invs = iter([[{"name": "Bones", "qty": 1}],
+                [{"name": "Bones", "qty": 1}, {"name": "Gold ore", "qty": 5}]])
+    monkeypatch.setattr(controller, "get_inventory", lambda: next(invs))
+    ctx = _Ctx()
+    cg.loot_phase(ctx, cg.DEFAULT_CONFIG)
+    assert ctx.state.data.get("cg_chest_opened") is True
+    assert ctx.state.data.get("cg_loot_attempts", 0) == 0
+
+
+def test_loot_phase_confirms_on_a_qty_delta_with_the_same_item_count(monkeypatch):
+    """A stacked item (e.g. coins) can change qty without changing the inventory's length --
+    'item count OR any qty delta' per the brief, so this must also confirm."""
+    _loot_setup(monkeypatch)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    invs = iter([[{"name": "Coins", "qty": 100}], [{"name": "Coins", "qty": 250}]])
+    monkeypatch.setattr(controller, "get_inventory", lambda: next(invs))
+    ctx = _Ctx()
+    cg.loot_phase(ctx, cg.DEFAULT_CONFIG)
+    assert ctx.state.data.get("cg_chest_opened") is True
+
+
+def test_loot_phase_confirms_via_chat_message_when_no_inventory_delta(monkeypatch):
+    """The reward chest can legitimately give nothing new to carry (or something already fully
+    covered by the pre-click snapshot's own item), so the chat line is a second, independent
+    confirmation path -- via ctx.events.since(mark), where mark is taken before the click."""
+    _loot_setup(monkeypatch)
+    inv = [{"name": "Bones", "qty": 1}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)   # never changes
+    ctx = _Ctx(events=_FakeFightEvents([]))
+
+    def fake_click(ser, entity, **kw):
+        # The chat line arrives as a RESULT of the click -- after mark() was already taken.
+        ctx.events._absorb([("CHAT_MESSAGE", {"message": "You open the chest."})])
+        return True
+    monkeypatch.setattr(controller, "click_entity", fake_click)
+    cg.loot_phase(ctx, cg.DEFAULT_CONFIG)
+    assert ctx.state.data.get("cg_chest_opened") is True
+
+
+def test_loot_phase_ceiling_on_unconfirmed_attempts(monkeypatch):
+    """I2: the ceiling still bounds the loop, now on UNCONFIRMED attempts (a click that registers
+    but never proves the chest opened) rather than on a bare falsy click."""
+    _loot_setup(monkeypatch)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Bones", "qty": 1}])
+    ctx = _Ctx()
+    for _ in range(cg.LOOT_MAX_ATTEMPTS - 1):
+        cg.loot_phase(ctx, cg.DEFAULT_CONFIG)
+    assert ctx.state.data.get("cg_chest_opened") is None
+    assert ctx.state.safety_stopped is False
+    cg.loot_phase(ctx, cg.DEFAULT_CONFIG)
+    assert ctx.state.safety_stopped is True
+    assert any("could not open the reward chest" in s for s in ctx.state.stops)
+
+
+def test_loot_phase_ceiling_still_counts_an_outright_click_failure(monkeypatch):
+    _loot_setup(monkeypatch)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Bones", "qty": 1}])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: False)
+    ctx = _Ctx()
+    for _ in range(cg.LOOT_MAX_ATTEMPTS):
         cg.loot_phase(ctx, cg.DEFAULT_CONFIG)
     assert ctx.state.data.get("cg_chest_opened") is None
     assert ctx.state.safety_stopped is True
     assert any("could not open the reward chest" in s for s in ctx.state.stops)
-    # Test: click_entity returns True once -> flag set after one call
-    ctx2 = _Ctx()
-    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
-    cg.loot_phase(ctx2, cg.DEFAULT_CONFIG)
-    assert ctx2.state.data.get("cg_chest_opened") is True
-    assert ctx2.state.safety_stopped is False
 
 
 class _FakeFightEvents:

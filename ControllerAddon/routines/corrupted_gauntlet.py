@@ -51,6 +51,7 @@ ACTION_BUDGET_S = 1.2          # confirm window for a prayer/wield/eat click (tw
 ENTER_BUDGET_S = 8.0
 ENTER_MAX_ATTEMPTS = 3         # barrier quick-pass ceiling before safety stop
 LOOT_MAX_ATTEMPTS = 5          # chest open ceiling before safety stop
+LOOT_CONFIRM_S = 4.0           # (I2) budget to confirm the chest actually opened after the click
 
 
 def get_config(bridge_config):
@@ -345,13 +346,41 @@ def enter_phase(ctx, cfg):
     _confirm(ctx, lambda: any(n.get("id") in g.HUNLLEF for n in controller.get_npcs(fresh=True)), ENTER_BUDGET_S)
 
 
+def _inventory_delta(before, after):
+    """True on any change: a different item count, or the same items with a different qty (a
+    stacked reward like coins can change qty with the slot count unchanged)."""
+    def _sig(items):
+        return sorted((i.get("name"), i.get("qty")) for i in items)
+    return _sig(before) != _sig(after)
+
+
 def loot_phase(ctx, cfg):
+    """(I2, final-fix-brief.md) A click that merely REGISTERED is not proof the reward chest
+    opened -- `click_entity` truthy only means the menu action resolved, same as any other click.
+    Confirm against the inventory (a delta versus the pre-click snapshot) or, when ctx.events
+    exists, a "You open the chest" chat message seen since the mark taken before the click, within
+    LOOT_CONFIRM_S. Only a confirmed open sets cg_chest_opened; anything else -- a falsy click or
+    a truthy one that never confirms -- counts toward the existing attempt ceiling."""
     chest = next((o for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True)
                   if o.get("id") == g.OBJ_REWARD_CHEST), None)
     if chest is None:
         return
+    before = controller.get_inventory()
+    mark = ctx.events.mark() if ctx.events is not None else None
     result = controller.click_entity(ctx.ser, chest, expected_action="Open")
+    opened = False
     if result:
+        def check():
+            if _inventory_delta(before, controller.get_inventory()):
+                return True
+            if ctx.events is not None:
+                for event_type, payload in ctx.events.since(mark):
+                    if event_type == "CHAT_MESSAGE" and payload \
+                            and "You open the chest" in str(payload.get("message", "")):
+                        return True
+            return False
+        opened = _confirm(ctx, check, budget_s=LOOT_CONFIRM_S)
+    if opened:
         ctx.state.data["cg_chest_opened"] = True
         controller.human_delay(2.0, 3.0)
     else:
