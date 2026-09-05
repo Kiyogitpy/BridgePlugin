@@ -195,19 +195,3 @@ def craft_plan(inventory, equipment, cfg):
         if tiers[kind] > owned_tier(kind, [], equipment):
             plan.append(("wear", g.armour_name(kind, tiers[kind])))
     return plan
-
-
-def gather_value(objects, npcs, deficit):
-    want = {g.ITEM_ORE: deficit.ore, g.ITEM_BARK: deficit.bark, g.ITEM_LINUM: deficit.linum,
-            g.ITEM_GRYM: deficit.grym, g.ITEM_RAW_FISH: deficit.fish}
-    value = 0
-    for o in objects or []:
-        name = o.get("name")
-        if name in g.RESOURCE_ITEM:
-            item = g.RESOURCE_ITEM[name]
-            take = min(g.RESOURCE_YIELD[name], want.get(item, 0))
-            want[item] = want.get(item, 0) - take
-            value += take * 3
-    if deficit.frames:
-        value += sum(1 for n in npcs or [] if n.get("id") in g.WEAK_MONSTERS)
-    return value

@@ -519,13 +519,26 @@ def explore_gather_phase(ctx, cfg):
     if st["sub"] == "gather":
         pick_up_drops(ctx, cfg)
         inventory = controller.get_inventory()
-        deficit = kit.kit_deficit(inventory, controller.get_equipment(), cfg)
+        equipment = controller.get_equipment()
+        # (I12, final-fix-brief.md) T2 armour/attuned weapons were unreachable in practice: the
+        # explore phase only ever gathered toward the plain KIT deficit, so ore/bark/linum ran out
+        # right at the T1/basic-weapon numbers and craft_phase had nothing left to build the
+        # UPGRADES tier from. While there is still time before the gather deadline, ore/bark/linum
+        # are gathered toward KIT + UPGRADES combined; fish/grym/frames stay KIT-only regardless
+        # (the fight only ever needs the KIT amount of those). After the deadline, fall back to
+        # KIT alone so explore_gather_phase can actually finish and hand off to craft.
+        deficit = kit.kit_deficit(inventory, equipment, cfg)
+        elapsed = time.time() - data["cg_t0"]
+        if elapsed < cfg["gather_deadline_s"]:
+            wide = kit.kit_deficit(inventory, equipment, cfg, targets=kit.KIT + kit.UPGRADES)
+        else:
+            wide = deficit
         # (C3a, final-fix-brief.md) Raw fish are NOT stackable -- capping fish deficit by the
         # kit target alone can plan to fish past a full inventory. Cap by free slots (minus a
         # reserve so pick_up_drops/other loot still has somewhere to land) rather than the fish
         # target; the other wanted items are all stackable and need no such cap.
         free_slots = max(0, 28 - len(inventory) - DROP_SLOT_RESERVE)
-        want = {g.ITEM_ORE: deficit.ore, g.ITEM_BARK: deficit.bark, g.ITEM_LINUM: deficit.linum,
+        want = {g.ITEM_ORE: wide.ore, g.ITEM_BARK: wide.bark, g.ITEM_LINUM: wide.linum,
                 g.ITEM_GRYM: deficit.grym, g.ITEM_RAW_FISH: min(deficit.fish, free_slots)}
         # (C3b) A node whose gather_node has already failed NODE_GATHER_MAX_FAILS times this run
         # is excluded from the candidate list -- without this, a node that can never be gathered
@@ -1080,6 +1093,11 @@ def craft_phase(ctx, cfg):
         if teleport_home(ctx, cfg):
             data["cg_home"] = True
         return
+    if not data.get("cg_craft_shards_logged"):
+        # (I12, final-fix-brief.md) Visibility into how much shard budget craft_phase actually
+        # started with -- useful for reading a live log after a T2/attune plan came up short.
+        data["cg_craft_shards_logged"] = True
+        debug_log.log("cg", f"craft: shards held = {kit.count(controller.get_inventory(), g.ITEM_SHARDS)}")
     if data.get("cg_craft_sub") == "fish":
         _fish_pass_step(ctx, cfg)
         return

@@ -188,11 +188,3 @@ def test_craft_plan_is_idempotent_and_terminates(monkeypatch):
         assert k.owned_tier(kind, final_inv, eq) >= 2, f"{kind} never reached attuned"
     assert inv.get(g.ITEM_CFISH, 0) <= 4
     assert inv.get(g.ITEM_VIAL, 0) == 0
-
-
-def test_gather_value_scores_deficit_only():
-    d = k.Deficit(ore=3, bark=0, linum=1, shards=0, frames=1, fish=0, grym=0, orb=0, bowstring=0)
-    deposit = next(n for n in g.RESOURCE_NODES.values() if "Deposit" in n)
-    phren = next(n for n in g.RESOURCE_NODES.values() if "Phren" in n)
-    objs = [{"name": deposit, "id": 1}, {"name": deposit, "id": 1}, {"name": phren, "id": 1}]
-    assert k.gather_value(objs, [{"id": 9040}], d) == 3 * 3 + 1

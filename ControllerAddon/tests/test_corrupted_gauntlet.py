@@ -1121,6 +1121,92 @@ def test_gather_caps_raw_fish_want_by_free_inventory_slots(monkeypatch):
     assert gathered == [ore_name]
 
 
+def _upgrade_kit_met_inventory():
+    """KIT is fully met (0 deficit) but KIT+UPGRADES still wants ore/bark/linum -- see
+    test_deficit_after_the_recordings_gather_phase in test_gauntlet_kit.py for the same numbers."""
+    return [{"name": g.ITEM_ORE, "qty": 3}, {"name": g.ITEM_BARK, "qty": 3}, {"name": g.ITEM_LINUM, "qty": 3},
+            {"name": g.ITEM_FRAME, "qty": 2}, {"name": g.ITEM_SHARDS, "qty": 290},
+            {"name": g.ITEM_RAW_FISH, "qty": 20}, {"name": g.ITEM_GRYM, "qty": 2}]
+
+
+def test_gather_targets_upgrades_before_the_gather_deadline(monkeypatch):
+    """I12: T2 armour/attuned weapons were unreachable because explore_gather_phase only ever
+    gathered toward the plain KIT deficit -- with KIT already met but UPGRADES still wanting ore,
+    an ore node must still be picked while there is time before gather_deadline_s."""
+    ctx = _Ctx(); data = ctx.state.data
+    data["cg_t0"] = 0.0   # elapsed 0s -- well before gather_deadline_s (270)
+    S = (13056 + 30, 5632 + 30)
+    pitch = cg.DEFAULT_CONFIG["room_pitch"]
+    st = {"start_centre": S, "barrier": (S[0], S[1] - 8), "outward": (0, 1), "pitch": pitch,
+          "step": 0, "sub": "gather", "revealed": set(), "entered": {(0, 0), (1, 0)}, "node_fails": 0,
+          "prev_centre": S, "fishing_spots": set()}
+    data["cg_prep"] = st
+    target = cg._centre(st, (1, 0))
+    ore_id = next(i for i, n in g.RESOURCE_NODES.items() if "Deposit" in n)
+    ore_name = g.RESOURCE_NODES[ore_id]
+    monkeypatch.setattr(cg.time, "time", lambda: 10.0)
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*target))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_inventory", _upgrade_kit_met_inventory)
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [_obj(ore_id, ore_name, target[0], target[1])])
+    gathered = []
+    monkeypatch.setattr(cg, "gather_node", lambda ctx, obj, cfg: gathered.append(obj["name"]) or True)
+    monkeypatch.setattr(cg, "gather_ladder", lambda ctx, cfg: "none")
+    monkeypatch.setattr(cg, "pick_up_drops", lambda ctx, cfg: 0)
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)
+    assert gathered == [ore_name]
+
+
+def test_gather_ignores_upgrades_after_the_gather_deadline(monkeypatch):
+    """I12: past gather_deadline_s, only the plain KIT deficit matters -- with KIT already met,
+    the same ore node must NOT be picked (explore_gather_phase must be free to finish and hand
+    off to craft rather than chase the UPGRADES tier forever)."""
+    ctx = _Ctx(); data = ctx.state.data
+    data["cg_t0"] = 0.0
+    S = (13056 + 30, 5632 + 30)
+    pitch = cg.DEFAULT_CONFIG["room_pitch"]
+    st = {"start_centre": S, "barrier": (S[0], S[1] - 8), "outward": (0, 1), "pitch": pitch,
+          "step": 0, "sub": "gather", "revealed": set(), "entered": {(0, 0), (1, 0)}, "node_fails": 0,
+          "prev_centre": S, "fishing_spots": set()}
+    data["cg_prep"] = st
+    target = cg._centre(st, (1, 0))
+    ore_id = next(i for i, n in g.RESOURCE_NODES.items() if "Deposit" in n)
+    ore_name = g.RESOURCE_NODES[ore_id]
+    monkeypatch.setattr(cg.time, "time", lambda: cg.DEFAULT_CONFIG["gather_deadline_s"] + 10.0)
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*target))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_inventory", _upgrade_kit_met_inventory)
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [_obj(ore_id, ore_name, target[0], target[1])])
+    gathered = []
+    monkeypatch.setattr(cg, "gather_node", lambda ctx, obj, cfg: gathered.append(obj["name"]) or True)
+    monkeypatch.setattr(cg, "gather_ladder", lambda ctx, cfg: "none")
+    monkeypatch.setattr(cg, "pick_up_drops", lambda ctx, cfg: 0)
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)
+    assert gathered == []
+
+
+def test_craft_phase_logs_shards_held_once(monkeypatch):
+    """I12: craft_phase logs the shards held at the start of crafting, once."""
+    ctx = _Ctx(); ctx.state.data.update({"cg_t0": 0.0, "cg_home": True})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.ITEM_SHARDS, "qty": 321}])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(cg.kit, "craft_plan", lambda inv, eq, cfg: [])
+    logged = []
+    monkeypatch.setattr(cg.debug_log, "log", lambda cat, msg: logged.append(msg))
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    shard_logs = [m for m in logged if "shards held" in m]
+    assert len(shard_logs) == 1 and "321" in shard_logs[0]
+
+
 def test_gather_node_failure_memory_skips_a_tile_after_max_fails(monkeypatch):
     """C3b: a resource node whose gather_node keeps returning False is excluded from the
     candidate list after NODE_GATHER_MAX_FAILS failures, tracked per-tile in cg_node_fails."""
