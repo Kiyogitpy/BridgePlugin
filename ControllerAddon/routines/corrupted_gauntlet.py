@@ -344,16 +344,43 @@ def upgrade_phase(ctx, cfg):
             up["sub"] = "loot"; return
         fight_npc_step(ctx, npc, cfg); return
     if up["sub"] == "loot":
-        pick_up_drops(ctx, cfg); up["sub"] = "home"; return
+        # (I7, final-fix-brief.md) The wiki: the primary component (orb/bowstring) drops only if
+        # not already owned, otherwise ANY un-owned component drops instead -- the recording's
+        # second dragon dropped a bowstring, not the orb DEMI_BOSS_DROP[nid] would have assumed.
+        # Confirm a component actually landed (up to 3 pick_up_drops attempts) rather than moving
+        # on after exactly one, and log when none did so a missed drop is visible in the log.
+        before = kit.count(controller.get_inventory(), g.ITEM_ORB) + kit.count(controller.get_inventory(), g.ITEM_BOWSTRING)
+        pick_up_drops(ctx, cfg)
+        after = kit.count(controller.get_inventory(), g.ITEM_ORB) + kit.count(controller.get_inventory(), g.ITEM_BOWSTRING)
+        if after > before:
+            up["sub"] = "home"; return
+        attempts = up.get("loot_attempts", 0) + 1
+        up["loot_attempts"] = attempts
+        if attempts >= 3:
+            debug_log.log("cg", "[!] upgrade loot: no orb/bowstring landed after 3 pick-up attempts")
+            up["sub"] = "home"
+        return
     if up["sub"] == "home":
         if teleport_home(ctx, cfg):
             up["sub"] = "craft"; return
         return
     if up["sub"] == "craft":
-        drop = g.DEMI_BOSS_DROP[nid]
-        key = "staff" if drop == g.ITEM_ORB else "bow"
-        if bowl_make(ctx, key, cfg):
-            wear(ctx, g.weapon_name(key, 3))
+        # (I7) Craft whichever perfected weapon the inventory actually allows -- an orb crafts the
+        # staff, a bowstring crafts the bow, and BOTH craft if both components are on hand (a
+        # single demi-boss trip can in principle yield either, per the wiki rule above).
+        inv = controller.get_inventory()
+        crafted_any = False
+        if kit.count(inv, g.ITEM_ORB):
+            crafted_any = bowl_make(ctx, "staff", cfg) or crafted_any
+        if kit.count(inv, g.ITEM_BOWSTRING):
+            crafted_any = bowl_make(ctx, "bow", cfg) or crafted_any
+        if crafted_any:
+            eq = controller.get_equipment()
+            inv = controller.get_inventory()
+            best = max(("bow", "staff"), key=lambda k: kit.owned_tier(k, inv, eq))
+            tier = kit.owned_tier(best, inv, eq)
+            if tier:
+                wear(ctx, g.weapon_name(best, tier))
             data["cg_upgrade_done"] = True
         else:
             up.setdefault("craft_fails", 0)
