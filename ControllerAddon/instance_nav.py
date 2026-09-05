@@ -12,6 +12,14 @@ carrying TILE_BLOCKING_FLAGS cannot be stood on). A diagonal step needs BOTH ort
 routes fully open -- the game's own rule, and the conservative reading of it. No doors, no
 transports: the Gauntlet has neither. Empty answers mean "cannot tell", never "blocked":
 InstanceMap.load returns None and find_path returns None, and walk_to then declines to click.
+
+ADJACENCY IS NOT INTERACTABILITY (M, final-fix-brief.md; see CLAUDE.md's mahogany_homes.py
+section for the overworld version of this same lesson). `goal_adjacent` stops the route on ANY
+cardinal neighbour of the goal -- it says nothing about whether that neighbour actually has an
+open EDGE to the goal, so it can land beside a target behind a wall the walker never crossed.
+There is no `travel.interaction_tiles` equivalent here yet to pick a tile with a genuinely open
+edge; a caller that needs true interactability, not just adjacency, has to verify it itself
+(e.g. against live `/collision`) after walk_to returns.
 """
 from __future__ import annotations
 
@@ -145,13 +153,21 @@ def player_inst():
     return int(x), int(y), int(p.get("plane") or 0)
 
 
-def walk_to(ctx, x: int, y: int, tolerance: float = travel.WALK_ARRIVAL_TOLERANCE) -> bool:
+def walk_to(ctx, x: int, y: int, tolerance: float = travel.WALK_ARRIVAL_TOLERANCE,
+            goal_adjacent: bool = False) -> bool:
     """Walk to an instance-space tile: reload the map, route from the player's instX/instY,
     hop along the route through travel._hop_to(inst=True) (minimap beyond
     HOP_VIEWPORT_MAX_TILES, shift-clicked viewport inside it, the lead-click release, the
     blocker opt-outs -- all inherited). A hop that leaves the player on the same tile marks the
     route's next tile as refused and re-routes (`avoid`, bounded by travel.WALK_MAX_REROUTES).
-    False when there is no map, no route, or WALK_MAX_HOPS is spent."""
+    False when there is no map, no route, or WALK_MAX_HOPS is spent.
+
+    `goal_adjacent` (M, final-fix-brief.md) is passed straight through to find_path -- the goal
+    itself is usually furniture (see the module docstring's ADJACENCY caveat) and this is the
+    only knob to route to a tile beside it instead. It affects ROUTING only: the arrival check
+    just above stays "within `tolerance` of the exact goal tile", unchanged either way -- with
+    the default tolerance (3 tiles) that already covers a cardinally-adjacent stop, so this is
+    additive over the plain case rather than a second, competing arrival rule."""
     goal = (int(x), int(y))
     avoid: set = set()
     reroutes = 0
@@ -173,7 +189,7 @@ def walk_to(ctx, x: int, y: int, tolerance: float = travel.WALK_ARRIVAL_TOLERANC
             debug_log.log("inav", "no collision grid from the bridge -- cannot route")
             return False
         plane = imap.plane
-        path = find_path(imap, (px, py), goal, avoid=avoid)
+        path = find_path(imap, (px, py), goal, goal_adjacent=goal_adjacent, avoid=avoid)
         if path is None:
             debug_log.log("inav", f"no route from {(px, py)} to {goal} (avoiding {len(avoid)} tiles)")
             return False

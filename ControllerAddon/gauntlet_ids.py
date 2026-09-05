@@ -6,6 +6,16 @@ Sources:
         (NpcId, AnimationId, ProjectileId, RegionId) and plugins/gauntlet/GauntletPlugin.java
         (hazard tiles, tornado lifespan, varbit 9177) and npcs/Hunllef.java (attack cadence).
   REC = recordings/2026-09-05_014024_corrupted-gauntlet-humanrun1.summary (object/npc ids seen).
+
+UDP event payload shapes (M, final-fix-brief.md; ControllerPlugin.java's sendNpcSpawnEvent /
+onProjectileMoved are the senders, bridge_events.py's EventStream the reader):
+  PROJECTILE_SPAWNED: {id, remainingCycles, targetIndex, x, y, instX, instY, plane, tick}
+    -- targetIndex is the NPC index being aimed at (-2 = local player, -1 = none); x/y/instX/instY
+    are the projectile's own position, not the target's.
+  NPC_SPAWNED / NPC_DESPAWNED: {id, index, name, x, y, instX, instY, plane, tick}
+    -- id/index are the npc's own (see NPCProvider's /npcs for what these mean generally); x/y is
+    the template-corrected WorldPoint (WorldPoint.fromLocalInstance), instX/instY the instance-
+    space twin (equal outside an instance; see instance_nav.py's own module docstring).
 """
 
 # --- NPCs (ZL NpcId; REC confirms 9035-9038 as "Corrupted Hunllef", 9039 as the tornado) ---

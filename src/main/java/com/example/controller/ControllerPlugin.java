@@ -703,6 +703,11 @@ public class ControllerPlugin extends Plugin
 	 * and correct, not a bug to "fix" later: the Python-side mirror this feeds is an accelerator
 	 * with an HTTP (/objects, /ground-items) fallback, so a dropped spawn costs latency, never
 	 * correctness.
+	 * <p>
+	 * Same budget, same reasoning, also guards sendNpcSpawnEvent (NPC_SPAWNED/NPC_DESPAWNED) and
+	 * onProjectileMoved (PROJECTILE_SPAWNED), added 2026-09-05 for Gauntlet sub-project 1 -- a
+	 * scene load or a busy fight replays/produces just as many of these as the object/ground-item
+	 * case, and the Python-side fallback there is /npcs and /object/at's own poll, same contract.
 	 */
 	private boolean spawnEventBudgetAvailable()
 	{

@@ -9,7 +9,10 @@ import java.util.Set;
  * client tick for the projectile's whole flight. A PROJECTILE_SPAWNED event must fire once per
  * projectile, so the first sighting is what matters. Identity semantics on purpose (two attacks
  * with the same projectile id are two objects), weak so a finished projectile is collected
- * without bookkeeping. Not thread-safe: called from the client thread only.
+ * without bookkeeping. Called from the client thread only (M, final-fix-brief.md: the
+ * underlying Guava MapMaker map is itself a ConcurrentMap and thread-safe -- "client thread
+ * only" is a design constraint of this class's one caller, not a limitation of the data
+ * structure it wraps).
  */
 public final class ProjectileSeen
 {

@@ -1,8 +1,14 @@
 package com.example.util;
 
+import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 public class InstanceCoordsTest
 {
@@ -42,5 +48,50 @@ public class InstanceCoordsTest
 		assertEquals(true, InstanceCoords.wantsInstance(q));
 		q.put("inst", "no");
 		assertEquals(false, InstanceCoords.wantsInstance(q));
+	}
+
+	// M (2026-09-05, final-fix-brief.md): fromInstance's own null branches, mocked rather than
+	// exercised through a real client -- this class has no live-client harness like the
+	// providers do.
+	@Test
+	public void fromInstanceIsNullWithoutAWorldView()
+	{
+		assertNull(InstanceCoords.fromInstance(null, 13056, 5632));
+	}
+
+	@Test
+	public void fromInstanceIsNullOffSceneOnX()
+	{
+		WorldView wv = mock(WorldView.class);
+		when(wv.getBaseX()).thenReturn(13056);
+		when(wv.getBaseY()).thenReturn(5632);
+		// x resolves off-scene (toScene returns -1); y would be in-scene on its own, so this
+		// pins that EITHER coordinate failing is enough to refuse the whole point, not just both.
+		assertNull(InstanceCoords.fromInstance(wv, 13055, 5632));
+	}
+
+	@Test
+	public void fromInstanceIsNullOffSceneOnY()
+	{
+		WorldView wv = mock(WorldView.class);
+		when(wv.getBaseX()).thenReturn(13056);
+		when(wv.getBaseY()).thenReturn(5632);
+		assertNull(InstanceCoords.fromInstance(wv, 13056, 5631));
+	}
+
+	// In-scene case: LocalPoint.fromScene(sx, sy, WorldView) may call other WorldView methods
+	// (e.g. getPlane()) that a bare Mockito mock answers with harmless defaults (0/false/null),
+	// so this is expected to succeed against the mock -- if LocalPoint.fromScene instead throws
+	// against it (e.g. NPEs on something a mock can't stand in for), this test is the one to
+	// delete, and the three null-branch tests above are the ones this task is actually asking
+	// for; see the final-fix-report for which happened.
+	@Test
+	public void fromInstanceResolvesAnInSceneTile()
+	{
+		WorldView wv = mock(WorldView.class);
+		when(wv.getBaseX()).thenReturn(13056);
+		when(wv.getBaseY()).thenReturn(5632);
+		LocalPoint lp = InstanceCoords.fromInstance(wv, 13056 + 10, 5632 + 20);
+		assertNotNull(lp);
 	}
 }

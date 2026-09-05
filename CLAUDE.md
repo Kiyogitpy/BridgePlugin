@@ -362,6 +362,10 @@ steps above.
   view is null) is the LIVE one, and `instance_nav.walk_to` loads `InstanceMap` with no plane
   argument at all so `CollisionProvider` defaults to the LIVE plane and hops on the grid's own
   `plane`, never `/player`'s.
+  `/npcs`/`/npc/*` also carry `overheadPrayer`/`overheadPrayerId`/`overheadArchiveId` (the
+  Hunllef's protection-prayer overhead, decoded only once a live check has paired an archive id
+  with each of its states -- see NPCProvider's own comment); `gauntlet_ids.py`'s module docstring
+  documents the `NPC_SPAWNED`/`NPC_DESPAWNED`/`PROJECTILE_SPAWNED` UDP event payload shapes.
 - **Windows HiDPI scaling**: RuneLite's own AWT windows report `screenX`/`screenY` at 96 DPI
   under a bare `java.exe` launch (no DPI-aware manifest), regardless of the display's actual
   scaling. `controller.py` compensates by scaling every bridge response through

@@ -171,6 +171,18 @@ def test_walk_to_returns_false_without_a_map_or_route(monkeypatch):
     assert not instance_nav.walk_to(_Ctx(), *P(7, 0))
 
 
+def test_walk_to_passes_goal_adjacent_through_to_find_path(monkeypatch):
+    # M (final-fix-brief.md): the goal tile itself is blocked (furniture) -- unreachable at all
+    # without goal_adjacent, reachable (to a tile beside it) with it. The arrival check (default
+    # tolerance) stays "within tolerance of the exact goal tile", unaffected by the flag.
+    imap = make_map(size=8, blocked={(4, 4)})
+    hops, _grid_calls, _hop_planes = _fake_world(monkeypatch, imap, P(0, 0), lambda t: t)
+    assert not instance_nav.walk_to(_Ctx(), *P(4, 4))
+    hops2, _grid_calls2, _hop_planes2 = _fake_world(monkeypatch, imap, P(0, 0), lambda t: t)
+    assert instance_nav.walk_to(_Ctx(), *P(4, 4), goal_adjacent=True)
+    assert hops2 and abs(hops2[-1][0] - P(4, 4)[0]) + abs(hops2[-1][1] - P(4, 4)[1]) == 1
+
+
 def test_walk_to_reroutes_around_a_tile_that_refuses(monkeypatch):
     # The map says (1,0) is fine; the "game" never moves us when we aim through it.
     imap = make_map()

@@ -41,7 +41,7 @@ def no_live_bridge(monkeypatch):
     result as "cannot tell" rather than "blocked". Tests that want a populated grid override it,
     exactly as several already do."""
     monkeypatch.setattr(controller, "get_collision",
-                        lambda x, y, plane, radius=2: [])
+                        lambda x, y, plane, radius=2, inst=False: [])
 
 
 class _Ctx:
