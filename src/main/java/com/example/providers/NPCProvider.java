@@ -253,10 +253,26 @@ public class NPCProvider extends BridgeProvider
 		// public getOverheadSpriteIds() has exposed it since 1.12.x. Whether the element is a
 		// HeadIcon ORDINAL or a sprite id is settled live against the Hunllef -- the raw value
 		// is reported alongside so a mismatch is diagnosable instead of reading as "no prayer".
+		//
+		// I3 (2026-09-05, final-fix-brief.md): overheadSpriteIds[0] is only a HeadIcon ordinal
+		// for sprites drawn from the PRAYER icon archive -- NPC.getOverheadArchiveIds() (verified
+		// via javap against runelite-api-1.12.38.jar: `public abstract int[]
+		// getOverheadArchiveIds()`) says which archive each element actually came from, and this
+		// codebase has not yet recorded what that archive id is for the Hunllef's three overhead
+		// states. So `overheadPrayer` (the decoded HeadIcon name) is trusted only once the live
+		// checklist (docs/superpowers/specs/2026-09-05-gauntlet-instance-plumbing-design.md) has
+		// paired an observed archive id with each state; `overheadArchiveId` is reported alongside
+		// specifically so that check can be made, and is -1 when the array is null/empty rather
+		// than absent, so "no archive info" and "id 0" are never confused for each other.
+		int[] archives = npc.getOverheadArchiveIds();
+		data.put("overheadArchiveId", archives != null && archives.length > 0 ? archives[0] : -1);
 		short[] overhead = npc.getOverheadSpriteIds();
 		int overheadId = overhead != null && overhead.length > 0 ? overhead[0] : -1;
 		data.put("overheadPrayerId", overheadId);
 		HeadIcon[] icons = HeadIcon.values();
+		// Gson omits a null value entirely rather than serializing a null -- so on the wire,
+		// `overheadPrayer` being an ABSENT key (not a JSON null) is what "could not decode" looks
+		// like to a Python caller doing data.get("overheadPrayer").
 		data.put("overheadPrayer", overheadId >= 0 && overheadId < icons.length
 			? icons[overheadId].name()
 			: null);
