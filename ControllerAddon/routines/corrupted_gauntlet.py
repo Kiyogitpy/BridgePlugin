@@ -232,11 +232,27 @@ def _cached_imap(ctx):
 
 
 def do_escape(ctx, snap, reason, cfg, require_in_range=False):
+    """(I5, final-fix-brief.md) Sticks to the previously-picked escape target
+    (ctx.state.data["cg_escape_target"]) instead of re-aiming every tick, as long as it is still
+    safe under hunllef.tile_is_safe -- without this, two ticks with the same danger could pick two
+    different, equally-scored tiles (pick_safe_tile's key ties are broken by dict iteration
+    order, which is stable per snapshot but not guaranteed stable across snapshots a tornado or
+    hazard tick apart) and the routine would flick the cursor between them instead of committing
+    to one walk. Cleared once the player reaches it (Chebyshev <= 1) or it stops being safe."""
     imap = _cached_imap(ctx)
     if imap is None:
         debug_log.log("cg", "[!] no collision grid -- cannot pick an escape tile")
         return False
-    tile = h.pick_safe_tile(snap, imap, cfg, require_in_range=require_in_range)
+    prev = ctx.state.data.get("cg_escape_target")
+    if prev is not None and (h.cheb(snap.me, prev) <= 1 or not h.tile_is_safe(snap, prev, cfg)):
+        prev = None
+        ctx.state.data.pop("cg_escape_target", None)
+    if prev is not None:
+        tile = prev
+    else:
+        tile = h.pick_safe_tile(snap, imap, cfg, require_in_range=require_in_range)
+        if tile is not None:
+            ctx.state.data["cg_escape_target"] = tile
     if tile is None:
         debug_log.log("cg", f"[!] no safe tile ({reason})")
         return False

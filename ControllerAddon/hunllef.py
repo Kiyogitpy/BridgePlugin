@@ -209,28 +209,43 @@ def flood(imap, start, max_steps, blocked):
     return dist
 
 
+def tile_is_safe(snap, tile, cfg):
+    """Whether `tile` passes pick_safe_tile's DESTINATION filters -- off hazards, outside the
+    footprint+margin, at least tornado_avoid from every tornado -- against the CURRENT snapshot.
+
+    (I5, final-fix-brief.md) Deliberately does not check attack range or flood reachability: this
+    exists so a previously-picked escape target can be judged "still good enough to keep walking
+    to" cheaply, every tick, without re-running the flood -- see do_escape's target stickiness."""
+    if tile in snap.hazards:
+        return False
+    if forbidden_near_hunllef(tile, snap.hunllef_centre()):
+        return False
+    tor = min((cheb(tile, t) for t in snap.tornadoes), default=99)
+    if tor < cfg["tornado_avoid"]:
+        return False
+    return True
+
+
 def pick_safe_tile(snap, imap, cfg, require_in_range=False):
     """The tile to run to: reachable within escape_radius, off hazards, outside the footprint and
     its margin, at least tornado_avoid from every tornado; preferring distance from tornadoes,
     then being in attack range, then nearness to us. None when nothing qualifies.
 
     (C1, final-fix-brief.md) The footprint+margin square is a DESTINATION filter only, applied in
-    the selection loop below via `forbidden_near_hunllef` -- it must NEVER be passed to flood()'s
-    `blocked`, which refuses to enter a blocked tile at all. From any tile with Chebyshev <=
-    FOOTPRINT_RADIUS+FOOTPRINT_MARGIN of the centre (exactly `in_danger`'s under_hunllef case,
-    i.e. every tile this function is ever asked to escape FROM), blocking the whole square trapped
-    the flood on its own start tile and this returned None unconditionally -- the fight's escape
-    action could never actually escape a stomp."""
+    the selection loop below via `forbidden_near_hunllef` (through `tile_is_safe`) -- it must
+    NEVER be passed to flood()'s `blocked`, which refuses to enter a blocked tile at all. From any
+    tile with Chebyshev <= FOOTPRINT_RADIUS+FOOTPRINT_MARGIN of the centre (exactly `in_danger`'s
+    under_hunllef case, i.e. every tile this function is ever asked to escape FROM), blocking the
+    whole square trapped the flood on its own start tile and this returned None unconditionally --
+    the fight's escape action could never actually escape a stomp."""
     centre = snap.hunllef_centre()
     blocked = set(snap.hazards)
     reach = flood(imap, snap.me, cfg["escape_radius"], blocked)
     best, best_key = None, None
     for tile, steps in reach.items():
-        if tile == snap.me or tile in blocked or forbidden_near_hunllef(tile, centre):
+        if tile == snap.me or not tile_is_safe(snap, tile, cfg):
             continue
         tor = min((cheb(tile, t) for t in snap.tornadoes), default=99)
-        if tor < cfg["tornado_avoid"]:
-            continue
         ranged = in_attack_range(tile, centre, cfg["attack_range"]) if centre is not None else True
         if require_in_range and not ranged:
             continue

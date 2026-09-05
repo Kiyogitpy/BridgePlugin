@@ -165,6 +165,84 @@ def test_do_escape_returns_false_without_a_map(monkeypatch):
     assert not cg.do_escape(_Ctx(), snap, "tornado", cg.DEFAULT_CONFIG)
 
 
+def _escape_click_setup(monkeypatch):
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None:
+                        {"baseX": 13056, "baseY": 5632, "plane": 1, "size": 32, "flags": [0] * 1024})
+    clicks = []
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, plane, inst=False: {"onScreen": True, "screenX": 5, "screenY": 6, "_t": (x, y)})
+    monkeypatch.setattr(cg.travel, "_click_walk_point", lambda ctx, point, shift: clicks.append(point["_t"]))
+    return clicks
+
+
+def test_do_escape_sticks_to_the_previous_target_across_calls(monkeypatch):
+    """I5: two consecutive do_escape calls against the same snapshot geometry must click the same
+    tile -- and, more precisely, the SECOND call must not re-run pick_safe_tile at all, reusing
+    ctx.state.data['cg_escape_target'] because it is still safe under hunllef.tile_is_safe.
+
+    Uses a tornado (not the Hunllef's own footprint) to force the picked tile at least two steps
+    from the player -- a tile picked only one step away is trivially "reached" (Chebyshev <= 1)
+    the instant it is picked, which would clear it immediately and hide the real stickiness this
+    test exists to prove; a Hunllef far away keeps the footprint/margin filter out of the way."""
+    clicks = _escape_click_setup(monkeypatch)
+    calls = [0]
+    real_pick = h.pick_safe_tile
+
+    def spy_pick(*a, **kw):
+        calls[0] += 1
+        return real_pick(*a, **kw)
+    monkeypatch.setattr(h, "pick_safe_tile", spy_pick)
+    snap = h.FightSnapshot.from_bridge(
+        {"instX": 13066, "instY": 5642, "plane": 1, "hp": 50, "prayer": 30},
+        [_npc(9036, 13166, 5642, 8419), _npc(9039, 13066, 5643, index=2)], [], {}, {}, [], {})
+    ctx = _Ctx()
+    assert cg.do_escape(ctx, snap, "tornado", cg.DEFAULT_CONFIG)
+    first_target = ctx.state.data["cg_escape_target"]
+    assert h.cheb(snap.me, first_target) > 1, "test setup did not force a non-adjacent pick"
+    assert cg.do_escape(ctx, snap, "tornado", cg.DEFAULT_CONFIG)
+    assert calls[0] == 1, "pick_safe_tile ran again instead of keeping the sticky target"
+    assert clicks[0] == clicks[1]
+
+
+def test_do_escape_repicks_once_the_previous_target_is_reached(monkeypatch):
+    clicks = _escape_click_setup(monkeypatch)
+    ctx = _Ctx()
+    ctx.state.data["cg_escape_target"] = (13066, 5642)   # == snap.me below: Chebyshev 0 -- reached
+    calls = [0]
+    real_pick = h.pick_safe_tile
+
+    def spy_pick(*a, **kw):
+        calls[0] += 1
+        return real_pick(*a, **kw)
+    monkeypatch.setattr(h, "pick_safe_tile", spy_pick)
+    snap = h.FightSnapshot.from_bridge({"instX": 13066, "instY": 5642, "plane": 1, "hp": 50, "prayer": 30},
+                                       [_npc(9036, 13072, 5642, 8419)],
+                                       [{"id": 36048, "instX": 13066, "instY": 5642}], {}, {}, [], {})
+    assert cg.do_escape(ctx, snap, "hazard", cg.DEFAULT_CONFIG)
+    assert calls[0] == 1
+    assert ctx.state.data["cg_escape_target"] != (13066, 5642)
+
+
+def test_do_escape_repicks_when_previous_target_becomes_unsafe(monkeypatch):
+    clicks = _escape_click_setup(monkeypatch)
+    ctx = _Ctx()
+    stale = (13066, 5642 + 6)     # far from the player -- not "reached" -- but about to be a hazard
+    ctx.state.data["cg_escape_target"] = stale
+    calls = [0]
+    real_pick = h.pick_safe_tile
+
+    def spy_pick(*a, **kw):
+        calls[0] += 1
+        return real_pick(*a, **kw)
+    monkeypatch.setattr(h, "pick_safe_tile", spy_pick)
+    snap = h.FightSnapshot.from_bridge({"instX": 13066, "instY": 5642, "plane": 1, "hp": 50, "prayer": 30},
+                                       [_npc(9036, 13072, 5642, 8419)],
+                                       [{"id": 36047, "instX": stale[0], "instY": stale[1]}], {}, {}, [], {})
+    assert cg.do_escape(ctx, snap, "hazard", cg.DEFAULT_CONFIG)
+    assert calls[0] == 1
+    assert ctx.state.data["cg_escape_target"] != stale
+
+
 def test_do_escape_caches_the_instance_map_across_calls(monkeypatch):
     """I4: the InstanceMap is static for the whole fight -- do_escape must load it once and reuse
     ctx.state.data['cg_imap'], not hit /collision?all=true on every escape/reposition click."""

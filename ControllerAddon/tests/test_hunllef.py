@@ -207,6 +207,16 @@ def test_pick_safe_tile_avoids_hazards_footprint_and_tornadoes_and_stays_in_rang
     assert h.cheb(t, G(10, 10)) <= CFG["escape_radius"]
 
 
+def test_tile_is_safe_checks_hazard_forbidden_and_tornado_avoid():
+    """I5: the candidate test do_escape reuses to decide whether to keep a previous escape target
+    -- deliberately just the three DESTINATION filters, no attack-range or reachability check."""
+    snap = _fight(me=G(10, 10), hun=G(16, 10), tornadoes=[G(8, 10)], hazards=[G(9, 9)])
+    assert not h.tile_is_safe(snap, G(9, 9), CFG)                  # hazard
+    assert not h.tile_is_safe(snap, G(16, 10), CFG)                 # under the Hunllef itself
+    assert not h.tile_is_safe(snap, G(8, 12), CFG)                  # Chebyshev 2 from the tornado
+    assert h.tile_is_safe(snap, G(30, 30), CFG)                     # clear of all three
+
+
 def test_pick_safe_tile_prefers_distance_from_tornadoes_then_nearness():
     imap = _grid()
     snap = _fight(me=G(10, 10), hun=G(20, 10), tornadoes=[G(10, 12)])
