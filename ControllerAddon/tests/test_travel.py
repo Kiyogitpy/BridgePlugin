@@ -1404,7 +1404,8 @@ def test_hop_to_inst_short_hop_uses_ground_point_and_waits_in_instance_space(mon
                         lambda x, y, plane, inst=False: (calls.append(("mm", x, y, inst)) or
                                                           {"onMinimap": False}))
     monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: calls.append(("click", shift)))
-    monkeypatch.setattr(travel.time, "sleep", lambda s: None)
+    sleeps = []
+    monkeypatch.setattr(travel.time, "sleep", lambda s: sleeps.append(s))
     monkeypatch.setattr(travel, "WALK_HOP_TIMEOUT_S", 6.0)
 
     assert travel._hop_to(_Ctx(), 13065, 5640, 1, inst=True)
@@ -1413,6 +1414,8 @@ def test_hop_to_inst_short_hop_uses_ground_point_and_waits_in_instance_space(mon
     assert ("gd", 13065, 5640, True) in calls
     assert ("click", True) in calls
     assert not any(c[0] == "mm" for c in calls)
-    # The arrival wait read instX/instY: it released on the third player read (13064 is within
-    # WALK_ARRIVAL_TOLERANCE of 13065) rather than running to the timeout.
+    # Correct wait: poll 1 reads instX 13061 (still walking), poll 2 reads 13064 (within
+    # WALK_ARRIVAL_TOLERANCE of 13065) and releases -- exactly two 0.6s sleeps. A wait that read
+    # x/y (1900, never within tolerance) would run all ten sleeps to the 6.0s timeout.
+    assert len(sleeps) == 2, sleeps
     assert last["p"]["instX"] == 13064
