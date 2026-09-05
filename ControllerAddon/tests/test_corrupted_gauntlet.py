@@ -450,6 +450,40 @@ def test_before_break_is_a_no_op_outside_the_fight_phase(monkeypatch):
         cg.before_break(ctx)   # must not raise / must not call fight_loop
 
 
+def test_before_break_plays_a_mid_run_prep_phase_out_to_done(monkeypatch):
+    """C4: before_break must not hand the scheduler a mid-run instance -- for a prep phase
+    (explore_gather here) it now keeps calling tick(ctx), the same dispatcher the engine loop
+    itself uses, until the phase reaches "done" (or a safety stop, or the run's own worst-case
+    deadline), instead of just teleporting home and abandoning the run's progress."""
+    ctx = _Ctx()
+    ctx.state.data["cg_t0"] = cg.time.time()
+    ctx.state.data["cg_phase"] = "explore_gather"
+    calls = [0]
+
+    def fake_tick(ctx):
+        calls[0] += 1
+        if calls[0] >= 3:
+            ctx.state.data["cg_phase"] = "done"
+    monkeypatch.setattr(cg, "tick", fake_tick)
+    cg.before_break(ctx)
+    assert calls[0] == 3
+
+
+def test_before_break_stops_looping_on_a_safety_stop(monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data["cg_t0"] = cg.time.time()
+    ctx.state.data["cg_phase"] = "craft"
+    calls = [0]
+
+    def fake_tick(ctx):
+        calls[0] += 1
+        if calls[0] >= 2:
+            ctx.state.trigger_safety_stop("cg: test stop")
+    monkeypatch.setattr(cg, "tick", fake_tick)
+    cg.before_break(ctx)
+    assert calls[0] == 2
+
+
 def _loot_setup(monkeypatch):
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
                         [{"id": g.OBJ_REWARD_CHEST, "screenX": 500, "screenY": 400}])

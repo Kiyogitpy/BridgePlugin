@@ -1184,19 +1184,33 @@ def loot_phase(ctx, cfg):
             ctx.state.trigger_safety_stop("cg: could not open the reward chest")
 
 
+BREAK_DEFER_MARGIN_S = 60.0     # (C4) extra wall-clock slack past the run's own worst-case length
+
+
 def before_break(ctx):
-    """(I6, final-fix-brief.md) The GOTR shape: a break must not start mid-fight, since fight_loop
-    is the only thing defending against the Hunllef's attacks (the panic key and safety stops keep
-    working independently the whole time it runs). If the routine is currently in the fight, play
-    it out to completion -- fight_loop is naturally bounded by cfg["fight_max_s"], so this cannot
-    hang forever even if the fight never ends on its own. Every other phase (enter/loot/done) is
-    safe to interrupt as-is, so this is a no-op there. For prep phases, teleport home first so
-    the break happens in the start room."""
-    phase = ctx.state.data.get("cg_phase")
+    """The GOTR shape (C4, final-fix-brief.md): a break must not hand the scheduler a mid-run
+    instance. If the routine is currently in the fight, play it out to completion -- fight_loop is
+    naturally bounded by cfg["fight_max_s"], so this cannot hang forever even if the fight never
+    ends on its own. For every prep phase (explore_gather/craft/upgrade), teleporting home used to
+    be the whole story -- but that abandons the run's own state (crafted gear, revealed demi-bosses,
+    the maze route) mid-instance, exactly the transitional-snapshot family of bug GOTR's own
+    before_break was rewritten to avoid. Instead, keep calling tick(ctx) -- the same dispatcher the
+    engine loop itself uses -- until the phase reaches "done", a safety stop fires, or
+    cg_t0 + timer_s + fight_max_s + BREAK_DEFER_MARGIN_S has elapsed (the run's own worst-case
+    length plus slack), whichever comes first. This naturally hands off to fight_loop's own
+    ceiling once tick() derives the fight phase, and to loot_phase's own attempt ceiling once the
+    chest phase is reached, so the loop can never actually hang."""
+    data = ctx.state.data
+    phase = data.get("cg_phase")
     if phase == "fight":
         fight_loop(ctx, get_config(None))
-    elif phase in ("explore_gather", "craft", "upgrade"):
-        teleport_home(ctx, get_config(None))
+        return
+    if data.get("cg_t0") is None or phase == "done":
+        return
+    cfg = get_config(None)
+    deadline = data["cg_t0"] + cfg["timer_s"] + cfg["fight_max_s"] + BREAK_DEFER_MARGIN_S
+    while data.get("cg_phase") != "done" and not ctx.state.safety_stopped and time.time() < deadline:
+        tick(ctx)
 
 
 def tick(ctx):
