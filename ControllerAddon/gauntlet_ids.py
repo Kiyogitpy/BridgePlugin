@@ -98,3 +98,31 @@ RESOURCE_NODES_DEPLETED = {
     35974: "Corrupt Grym Root (Depleted)",
     35976: "Corrupt Linum Tirinum (Depleted)",
 }
+
+# --- Hunllef prayer state = NPC id (cache symbols crystal_hunllef_{melee,ranged,magic,death}_hm
+#     for 9035-9038; the crystalline 9021-9024 are ASSUMED to follow the same order -- verify on a
+#     regular-Gauntlet run before relying on them). REC: every weapon swap followed an id flip. ---
+HUNLLEF_PRAYER_BY_ID = {
+    9021: "MELEE", 9022: "RANGED", 9023: "MAGIC", 9024: "DEAD",
+    9035: "MELEE", 9036: "RANGED", 9037: "MAGIC", 9038: "DEAD",
+}
+HUNLLEF_SIZE = 5                  # cache size=5: footprint is centre +-2
+
+# --- Style-cycle markers (REC, measured in ticks): four ANIM_ATTACK_LIKE, then two ticks later
+#     one of these, then the next style's first attack three ticks after it. 8754 ("switch
+#     style") and 8755 (tornado cast) alternate as the marker. ---
+ANIM_MARKER = {ANIM_SWITCH_STYLE, ANIM_SPECIAL_TORNADO}
+
+# --- Floor (cache loc symbols prif_gauntlet_floor_tile_01_{warning,hit}_hm) ---
+FLOOR_WARNING = 36047             # crimson: about to hurt
+FLOOR_HIT = 36048                 # orange: 10-20 per tick while stood on
+
+# --- Items (REC inventory deltas: bow 23857, staff 23854, paddlefish 23874, corrupted 25958,
+#     egniol 23883/23884) -- matched by NAME, perfected first ---
+FISH_NAMES = ("Corrupted paddlefish", "Paddlefish")
+EGNIOL_PREFIX = "Egniol potion"
+BOW_NAMES = ("Corrupted bow (perfected)", "Corrupted bow (attuned)", "Corrupted bow (basic)",
+             "Crystal bow (perfected)", "Crystal bow (attuned)", "Crystal bow (basic)")
+STAFF_NAMES = ("Corrupted staff (perfected)", "Corrupted staff (attuned)", "Corrupted staff (basic)",
+               "Crystal staff (perfected)", "Crystal staff (attuned)", "Crystal staff (basic)")
+BARRIER_QUICK_PASS = "Quick-pass"  # REC: the menu option on OBJ_BARRIER that starts the fight

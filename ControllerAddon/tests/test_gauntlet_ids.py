@@ -58,3 +58,23 @@ def test_every_recorded_object_id_is_classified_exactly_once():
     all_known = obj_star_ids | resource_ids | depleted_ids | ignored_ids
     for oid in RECORDING_OBJECT_IDS:
         assert oid in all_known, f"{oid} is not an OBJ_* constant, in RESOURCE_NODES(_DEPLETED), or in IGNORED_OBJECT_IDS"
+
+
+def test_hunllef_prayer_by_id_covers_both_variants():
+    assert g.HUNLLEF_PRAYER_BY_ID[9035] == "MELEE"
+    assert g.HUNLLEF_PRAYER_BY_ID[9036] == "RANGED"
+    assert g.HUNLLEF_PRAYER_BY_ID[9037] == "MAGIC"
+    assert g.HUNLLEF_PRAYER_BY_ID[9038] == "DEAD"
+    assert set(g.HUNLLEF_PRAYER_BY_ID) == g.HUNLLEF
+    assert g.HUNLLEF_PRAYER_BY_ID[9022] == "RANGED"
+
+
+def test_fight_constants():
+    assert g.ANIM_MARKER == {g.ANIM_SWITCH_STYLE, g.ANIM_SPECIAL_TORNADO}
+    assert not (g.ANIM_MARKER & g.ANIM_ATTACK_LIKE)
+    assert g.HUNLLEF_SIZE == 5
+    assert g.FLOOR_WARNING == 36047 and g.FLOOR_HIT == 36048
+    assert g.HAZARD_TILES == {g.FLOOR_WARNING, g.FLOOR_HIT}
+    assert g.FISH_NAMES[0] == "Corrupted paddlefish"
+    assert g.BOW_NAMES[0] == "Corrupted bow (perfected)"
+    assert g.STAFF_NAMES[0] == "Corrupted staff (perfected)"
