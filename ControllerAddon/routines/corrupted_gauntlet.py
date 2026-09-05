@@ -633,6 +633,141 @@ def _wait_tick(ctx):
         time.sleep(TICK_S)
 
 
+# ----------------------------------------------------------------------------- craft phase
+
+BOWL_BUDGET_S = 4.0
+HOME_BUDGET_S = 8.0
+COOK_STALL_S = 5.0
+
+
+def _find_object(cfg, obj_id):
+    return next((o for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True) if o.get("id") == obj_id), None)
+
+
+def _near(ctx, obj, tiles):
+    me, _ = _me()
+    pos = (obj.get("instX"), obj.get("instY"))
+    if h.cheb(me, pos) > tiles:
+        instance_nav.walk_to(ctx, pos[0], pos[1], tolerance=tiles, goal_adjacent=True)
+        return False
+    return True
+
+
+def teleport_home(ctx, cfg):
+    st = ctx.state.data.get("cg_prep") or {}
+    crystal = next((i for i in controller.get_inventory() if i.get("name") == g.ITEM_TELEPORT), None)
+    if crystal is not None:
+        _click_item(ctx, crystal, "Activate")
+        if _confirm(ctx, lambda: _find_object(cfg, g.OBJ_SINGING_BOWL) is not None, HOME_BUDGET_S):
+            return True
+    if st.get("start_centre"):
+        return instance_nav.walk_to(ctx, st["start_centre"][0], st["start_centre"][1], tolerance=3)
+    return False
+
+
+def _bowl_widget(key):
+    want = g.BOWL_TEXT[key]
+    for w in controller.get_widgets_dump():
+        if w.get("group") == g.BOWL_GROUP and want in str(w.get("text") or "") and w.get("screenX") is not None:
+            return w
+    return None
+
+
+def bowl_make(ctx, key, cfg):
+    bowl = _find_object(cfg, g.OBJ_SINGING_BOWL)
+    if bowl is None or not _near(ctx, bowl, 3):
+        return False
+    controller.click_entity(ctx.ser, bowl, expected_action="Sing-crystal")
+    if not _confirm(ctx, lambda: _bowl_widget(key) is not None, BOWL_BUDGET_S):
+        debug_log.log("cg", f"bowl: no widget for {key}")
+        return False
+    widget = _bowl_widget(key)
+    before = [(i.get("name"), i.get("qty")) for i in controller.get_inventory()]
+    controller.click_entity(ctx.ser, widget, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
+    ok = _confirm(ctx, lambda: [(i.get("name"), i.get("qty")) for i in controller.get_inventory()] != before, BOWL_BUDGET_S)
+    debug_log.log("cg", f"bowl {key}: {'ok' if ok else 'no inventory change'}")
+    return ok
+
+
+def use_on(ctx, name_a, name_b):
+    inv = controller.get_inventory()
+    a = next((i for i in inv if i.get("name") == name_a), None)
+    b = next((i for i in inv if i.get("name") == name_b), None)
+    if a is None or b is None:
+        return False
+    controller.open_inventory_tab(ctx.ser)
+    controller.click_entity(ctx.ser, a, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False, expected_action="Use")
+    controller.click_entity(ctx.ser, b, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
+    return _confirm(ctx, lambda: kit.count(controller.get_inventory(), name_a) < kit.count(inv, name_a), 3.0)
+
+
+def cook_all(ctx, cfg):
+    rng = _find_object(cfg, g.OBJ_RANGE)
+    if rng is None or not _near(ctx, rng, 3):
+        return False
+    controller.click_entity(ctx.ser, rng, expected_action="Cook")
+    last = kit.count(controller.get_inventory(), g.ITEM_RAW_FISH)
+    stall = time.time() + COOK_STALL_S
+    while time.time() < stall:
+        _wait_tick(ctx)
+        raw = kit.count(controller.get_inventory(), g.ITEM_RAW_FISH)
+        if raw == 0:
+            return True
+        if raw < last:
+            last, stall = raw, time.time() + COOK_STALL_S
+    return last == 0
+
+
+def pump_fill(ctx, cfg):
+    pump = _find_object(cfg, g.OBJ_WATER_PUMP)
+    if pump is None or not _near(ctx, pump, 3):
+        return False
+    vials = kit.count(controller.get_inventory(), g.ITEM_VIAL)
+    controller.click_entity(ctx.ser, pump, expected_action="Fill-from")
+    return _confirm(ctx, lambda: kit.count(controller.get_inventory(), g.ITEM_WATER_VIAL) >= vials, 6.0)
+
+
+def wear(ctx, name):
+    item = next((i for i in controller.get_inventory() if i.get("name") == name), None)
+    if item is None:
+        return False
+    _click_item(ctx, item, ("Wear", "Wield"))
+    return _confirm(ctx, lambda: any((v or {}).get("name") == name for v in (controller.get_equipment() or {}).values() if isinstance(v, dict)), 3.0)
+
+
+def _pestle(ctx):
+    return use_on(ctx, g.ITEM_PESTLE, g.ITEM_SHARDS)
+
+
+def _potion(ctx):
+    ok = True
+    while kit.count(controller.get_inventory(), g.ITEM_WATER_VIAL) and kit.count(controller.get_inventory(), g.ITEM_GRYM):
+        ok = use_on(ctx, g.ITEM_GRYM, g.ITEM_WATER_VIAL) and ok
+    while kit.count(controller.get_inventory(), g.ITEM_GRYM_UNF) and kit.count(controller.get_inventory(), g.ITEM_DUST) >= 10:
+        ok = use_on(ctx, g.ITEM_DUST, g.ITEM_GRYM_UNF) and ok
+    return ok
+
+
+def craft_phase(ctx, cfg):
+    data = ctx.state.data
+    if not data.get("cg_home"):
+        if teleport_home(ctx, cfg):
+            data["cg_home"] = True
+        return
+    plan = kit.craft_plan(controller.get_inventory(), controller.get_equipment(), cfg)
+    if not plan:
+        data["cg_crafted"] = True
+        return
+    op, arg = plan[0]
+    ok = {"bowl": lambda: bowl_make(ctx, arg, cfg), "pump": lambda: pump_fill(ctx, cfg),
+          "pestle": lambda: _pestle(ctx), "potion": lambda: _potion(ctx),
+          "cook": lambda: cook_all(ctx, cfg), "wear": lambda: wear(ctx, arg)}[op]()
+    data["cg_craft_fails"] = 0 if ok else data.get("cg_craft_fails", 0) + 1
+    if data["cg_craft_fails"] >= 3:
+        debug_log.log("cg", f"[!] craft step {op} {arg} failed 3 times -- skipping the rest")
+        data["cg_crafted"] = True
+
+
 # ----------------------------------------------------------------------------- phases
 
 def _log_rung(data, rung, arg, snap, tracker):
@@ -851,7 +986,9 @@ def tick(ctx):
         ctx.state.trigger_safety_stop("cg: chest opened -- run complete")
     elif phase == "explore_gather":
         explore_gather_phase(ctx, cfg)
-    elif phase in ("craft", "upgrade"):
+    elif phase == "craft":
+        craft_phase(ctx, cfg)
+    elif phase == "upgrade":
         # Prep phases - for now, just idle with a human delay
         controller.human_delay(1.0, 2.0)
     else:

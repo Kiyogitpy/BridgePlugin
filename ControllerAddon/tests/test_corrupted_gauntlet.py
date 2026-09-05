@@ -859,3 +859,67 @@ def test_explore_gather_phase_lights_then_enters_then_gathers(monkeypatch):
     assert state["walks"][-1] == right_room
     cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)            # gather the linum (deficit: yes)
     assert state["gathered"] == [linum]
+
+
+# ---- craft phase tests ----
+
+def test_bowl_make_clicks_the_widget_by_text(monkeypatch):
+    ctx = _Ctx()
+    calls = []
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(100, 100))
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_obj(g.OBJ_SINGING_BOWL, "Singing Bowl", 101, 100)])
+    inv = {"n": 0}
+    def get_inventory_mock():
+        if inv["n"] == 0:
+            return []
+        elif inv["n"] == 1:
+            return [{"slot": 0, "name": "Corrupted helm (basic)", "qty": 1}]
+        else:  # inv["n"] == 2 or higher: inventory changes after click
+            return []
+    monkeypatch.setattr(controller, "get_inventory", get_inventory_mock)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: calls.append((entity.get("name") or entity.get("text"), kw.get("expected_action"))) or True)
+    monkeypatch.setattr(controller, "get_widgets_dump", lambda scan=False: [
+        {"group": 270, "child": 17, "text": "Corrupted helm", "screenX": 3, "screenY": 3, "actions": ["Make"]},
+        {"group": 270, "child": 18, "text": "Corrupted body", "screenX": 4, "screenY": 3, "actions": ["Make"]},
+        {"group": 162, "child": 1, "text": "Corrupted helm", "screenX": 9, "screenY": 9, "actions": []}])
+    calls_to_confirm = [0]
+    def confirm(ctx, check, budget_s=1.0):
+        calls_to_confirm[0] += 1
+        if calls_to_confirm[0] == 1:
+            inv["n"] = 1
+        else:
+            inv["n"] = 2  # Make inventory appear different
+        return check()
+    monkeypatch.setattr(cg, "_confirm", confirm)
+    assert cg.bowl_make(ctx, "helm", cg.DEFAULT_CONFIG)
+    assert calls[0] == ("Singing Bowl", "Sing-crystal")
+    assert calls[1][0] == "Corrupted helm"           # the group-270 widget, not the chatbox line
+
+
+def test_craft_phase_runs_the_plan_and_marks_crafted(monkeypatch):
+    ctx = _Ctx(); ctx.state.data.update({"cg_t0": 0.0, "cg_home": True})
+    steps = []
+    plans = [[("bowl", "helm"), ("cook", None)], [("cook", None)], []]
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(cg.kit, "craft_plan", lambda inv, eq, cfg: plans.pop(0))
+    monkeypatch.setattr(cg, "bowl_make", lambda ctx, key, cfg: steps.append(("bowl", key)) or True)
+    monkeypatch.setattr(cg, "cook_all", lambda ctx, cfg: steps.append(("cook", None)) or True)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    assert steps == [("bowl", "helm"), ("cook", None)]
+    assert ctx.state.data["cg_crafted"] is True
+
+
+def test_use_on_clicks_both_items(monkeypatch):
+    ctx = _Ctx()
+    calls = []
+    inv = [{"slot": 0, "name": g.ITEM_GRYM, "qty": 1, "screenX": 1, "screenY": 1},
+           {"slot": 1, "name": g.ITEM_WATER_VIAL, "qty": 1, "screenX": 2, "screenY": 1}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: calls.append((entity["name"], kw.get("expected_action"))) or True)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=1.0: True)
+    assert cg.use_on(ctx, g.ITEM_GRYM, g.ITEM_WATER_VIAL)
+    assert calls == [(g.ITEM_GRYM, "Use"), (g.ITEM_WATER_VIAL, None)]
