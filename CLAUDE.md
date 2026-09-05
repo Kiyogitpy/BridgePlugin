@@ -15,7 +15,7 @@ RuneLite client (Java plugin, src/main/java/com/example/)
   └─ UDP event stream on port 50555 (PLAYER_DIED, NPC_DIED, LEVEL_UP, HP_CHANGED, CHAT_MESSAGE,
         TICK, OBJECT_SPAWNED/DESPAWNED, GROUND_ITEM_SPAWNED/DESPAWNED, XP_GAINED, and since
         2026-09-04: VARBIT_CHANGED (subscribed ids only), WIDGET_LOADED/CLOSED, MENU_CLICKED,
-        GRAPHIC_CHANGED, HITSPLAT, PLAYER_MOVING/STOPPED (per-frame), ...)
+        GRAPHIC_CHANGED, HITSPLAT, PLAYER_MOVING/STOPPED (per-frame), NPC_SPAWNED/DESPAWNED, PROJECTILE_SPAWNED (2026-09-05), ...)
         ↕
 Python controller (ControllerAddon/)
   └─ controller.py     — engine: bridge polling, Arduino serial driving, panic key,
@@ -347,6 +347,16 @@ steps above.
   neither of those patterns fits, that forward-direction fix is still an open problem, not a
   solved one. `/players` (`PvpProvider`) hasn't been checked for this bug yet — assume it has the
   same gap until verified, same as every other provider not in the four already fixed.
+  **RESOLVED for the Gauntlet 2026-09-05 (sub-project 1): the bridge now carries a second,
+  INSTANCE-SPACE coordinate pair.** `instX`/`instY` (base + scene, `InstanceCoords.java`) on
+  `/player` (+ `inInstance`, `baseX`, `baseY`), `/npcs`, `/npc/*`, `/objects`, `/object/at`,
+  `/ground-items`, `/ground-item/at` and `/collision` tiles; `inst=true` on `/ground/walk`,
+  `/minimap/walk`, `/object/at`, `/ground-item/at`, `/collision` resolves x/y by ARITHMETIC
+  against the world view's base (never `LocalPoint.fromWorld`); `/collision?all=true` is the
+  whole plane as one grid. `ControllerAddon/instance_nav.py` (`InstanceMap`, `find_path`,
+  `walk_to`) is the instance routing engine; `worldmap.py` stays the overworld one. Template
+  `x`/`y` keep their meaning and are still what a hardcoded tile in a routine matches. Live
+  status: see the spec's checklist -- fill in what was verified here.
 - **Windows HiDPI scaling**: RuneLite's own AWT windows report `screenX`/`screenY` at 96 DPI
   under a bare `java.exe` launch (no DPI-aware manifest), regardless of the display's actual
   scaling. `controller.py` compensates by scaling every bridge response through
