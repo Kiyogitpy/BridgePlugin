@@ -1059,3 +1059,40 @@ def test_craft_phase_tracks_different_ops_separately(monkeypatch):
     assert fails.get("cook") == 2
     assert fails.get("wear") == 1
     assert ctx.state.data.get("cg_crafted") is None or ctx.state.data.get("cg_crafted") is False
+
+
+# ---- craft phase fix round 2: _potion return logic ----
+
+def test_potion_returns_false_on_stage2_use_on_failure(monkeypatch):
+    ctx = _Ctx()
+    use_on_calls = [0]
+    # Inventory: no stage 1 (no water vial/grym), but has stage 2 items
+    monkeypatch.setattr(controller, "get_inventory", lambda: [
+        {"slot": 0, "name": g.ITEM_GRYM_UNF, "qty": 1},
+        {"slot": 1, "name": g.ITEM_DUST, "qty": 10}
+    ])
+    def fake_use_on(ctx, name_a, name_b):
+        use_on_calls[0] += 1
+        return False  # Failure on stage 2
+    monkeypatch.setattr(cg, "use_on", fake_use_on)
+    result = cg._potion(ctx)
+    assert result is False  # Failed stage 2 should return False
+    assert use_on_calls[0] == 1  # Only one use_on call (stage 2)
+
+
+def test_potion_returns_true_on_successful_egniol_increase(monkeypatch):
+    ctx = _Ctx()
+    inv_state = {"call": 0}
+    def get_inventory_mock():
+        inv_state["call"] += 1
+        # First call (before): no doses
+        if inv_state["call"] == 1:
+            return [{"slot": 0, "name": g.ITEM_GRYM_UNF, "qty": 1}, {"slot": 1, "name": g.ITEM_DUST, "qty": 20}]
+        # Later calls: doses have been created
+        if inv_state["call"] >= 5:
+            return [{"slot": 0, "name": g.EGNIOL_DOSES[0], "qty": 1}]
+        return [{"slot": 0, "name": g.ITEM_GRYM_UNF, "qty": 1}, {"slot": 1, "name": g.ITEM_DUST, "qty": 20}]
+    monkeypatch.setattr(controller, "get_inventory", get_inventory_mock)
+    monkeypatch.setattr(cg, "use_on", lambda ctx, name_a, name_b: True)  # Success
+    result = cg._potion(ctx)
+    assert result is True  # Egniol dose count rose

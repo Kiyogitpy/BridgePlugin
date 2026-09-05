@@ -801,18 +801,24 @@ def _pestle(ctx):
 def _potion(ctx):
     before_egniol = sum(kit.count(controller.get_inventory(), dose) for dose in g.EGNIOL_DOSES)
     steps = 0
+    failed = False
     # First loop: Grym leaf + water vial
     while steps < POTION_MAX_STEPS and kit.count(controller.get_inventory(), g.ITEM_WATER_VIAL) and kit.count(controller.get_inventory(), g.ITEM_GRYM):
         if not use_on(ctx, g.ITEM_GRYM, g.ITEM_WATER_VIAL):
+            failed = True
             break  # Stop immediately if use_on fails
         steps += 1
     # Second loop: Egniol dose + dust
     while steps < POTION_MAX_STEPS and kit.count(controller.get_inventory(), g.ITEM_GRYM_UNF) and kit.count(controller.get_inventory(), g.ITEM_DUST) >= 10:
         if not use_on(ctx, g.ITEM_DUST, g.ITEM_GRYM_UNF):
+            failed = True
             break  # Stop immediately if use_on fails
         steps += 1
     after_egniol = sum(kit.count(controller.get_inventory(), dose) for dose in g.EGNIOL_DOSES)
-    return after_egniol > before_egniol or (not kit.count(controller.get_inventory(), g.ITEM_WATER_VIAL) and not kit.count(controller.get_inventory(), g.ITEM_GRYM))
+    # Return True only if doses increased OR (no failure AND no pairs left in either stage)
+    no_stage1_pairs = not (kit.count(controller.get_inventory(), g.ITEM_WATER_VIAL) and kit.count(controller.get_inventory(), g.ITEM_GRYM))
+    no_stage2_pairs = not (kit.count(controller.get_inventory(), g.ITEM_GRYM_UNF) and kit.count(controller.get_inventory(), g.ITEM_DUST) >= 10)
+    return after_egniol > before_egniol or (not failed and no_stage1_pairs and no_stage2_pairs)
 
 
 def craft_phase(ctx, cfg):
