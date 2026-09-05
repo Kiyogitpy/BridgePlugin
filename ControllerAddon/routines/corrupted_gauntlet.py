@@ -357,7 +357,7 @@ def explore_gather_phase(ctx, cfg):
             return
         elif light_node(ctx, node, cfg):
             st["sub"] = "to_room"
-            # Fall through to to_room logic
+            return
         else:
             st["node_fails"] += 1
             if st["node_fails"] >= NODE_MAX_FAILS:
@@ -371,7 +371,6 @@ def explore_gather_phase(ctx, cfg):
             return
         st["entered"].add(offset)
         st["sub"] = "gather"
-        return
 
     if st["sub"] == "gather":
         pick_up_drops(ctx, cfg)
