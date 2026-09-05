@@ -141,3 +141,98 @@ class FightSnapshot:
                 if item.get("name") == name:
                     return item
         return None
+
+
+FOOTPRINT_RADIUS = g.HUNLLEF_SIZE // 2   # 2: the 5x5 is centre +-2
+FOOTPRINT_MARGIN = 1                     # one tile more, so it can step toward us without a stomp
+STEPS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+
+
+def cheb(a, b):
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+
+def forbidden_near_hunllef(tile, centre):
+    """The stomp guard: inside the footprint OR on the margin ring. Every walk target the routine
+    ever picks passes through here (user requirement 2026-09-05: a stomp is up to 68)."""
+    return centre is not None and cheb(tile, centre) <= FOOTPRINT_RADIUS + FOOTPRINT_MARGIN
+
+
+def in_attack_range(tile, centre, attack_range):
+    return centre is not None and cheb(tile, centre) - FOOTPRINT_RADIUS <= attack_range
+
+
+def in_danger(snap, cfg):
+    """Why we must move THIS tick, or None."""
+    if snap.me in snap.hazards:
+        return "hazard"
+    for t in snap.tornadoes:
+        if cheb(snap.me, t) <= cfg["tornado_danger"]:
+            return "tornado"
+    c = snap.hunllef_centre()
+    if c is not None and cheb(snap.me, c) <= FOOTPRINT_RADIUS:
+        return "under_hunllef"
+    return None
+
+
+def flood(imap, start, max_steps, blocked):
+    """Tiles reachable from start in <= max_steps 8-way steps over the live grid, never entering
+    `blocked`. Returns {tile: steps}. The Hunllef room is small; this is a few hundred tiles."""
+    dist = {start: 0}
+    queue = deque([start])
+    while queue:
+        x, y = queue.popleft()
+        d = dist[(x, y)]
+        if d >= max_steps:
+            continue
+        for dx, dy in STEPS:
+            nxt = (x + dx, y + dy)
+            if nxt in dist or nxt in blocked:
+                continue
+            # For diagonals, apply OR logic: only ONE corner route must be open (game's own rule).
+            # step_ok uses AND which is too strict, so we reimplement the check here.
+            if dx != 0 and dy != 0:  # diagonal step
+                nx, ny = nxt
+                if not imap.standable(nx, ny):
+                    continue
+                cx, cy = x + dx, y      # corner via x
+                kx, ky = x, y + dy      # corner via y
+                via_x = (imap.standable(cx, cy) and imap.edge_open(x, y, dx, 0)
+                        and imap.edge_open(cx, cy, 0, dy))
+                via_y = (imap.standable(kx, ky) and imap.edge_open(x, y, 0, dy)
+                        and imap.edge_open(kx, ky, dx, 0))
+                if not (via_x or via_y):
+                    continue
+            else:  # cardinal step
+                if not imap.step_ok(x, y, dx, dy):
+                    continue
+
+            dist[nxt] = d + 1
+            queue.append(nxt)
+    return dist
+
+
+def pick_safe_tile(snap, imap, cfg, require_in_range=False):
+    """The tile to run to: reachable within escape_radius, off hazards, outside the footprint and
+    its margin, at least tornado_avoid from every tornado; preferring distance from tornadoes,
+    then being in attack range, then nearness to us. None when nothing qualifies."""
+    centre = snap.hunllef_centre()
+    blocked = set(snap.hazards)
+    if centre is not None:
+        r = FOOTPRINT_RADIUS + FOOTPRINT_MARGIN
+        blocked |= {(centre[0] + dx, centre[1] + dy) for dx in range(-r, r + 1) for dy in range(-r, r + 1)}
+    reach = flood(imap, snap.me, cfg["escape_radius"], blocked)
+    best, best_key = None, None
+    for tile, steps in reach.items():
+        if tile == snap.me or tile in blocked:
+            continue
+        tor = min((cheb(tile, t) for t in snap.tornadoes), default=99)
+        if tor < cfg["tornado_avoid"]:
+            continue
+        ranged = in_attack_range(tile, centre, cfg["attack_range"]) if centre is not None else True
+        if require_in_range and not ranged:
+            continue
+        key = (-min(tor, 6), 0 if ranged else 1, steps)
+        if best_key is None or key < best_key:
+            best, best_key = tile, key
+    return best

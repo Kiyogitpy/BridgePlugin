@@ -1,6 +1,8 @@
 """hunllef.py: pure Hunllef-fight logic. Spec: docs/superpowers/specs/2026-09-05-hunllef-fight-design.md."""
 import hunllef as h
 import gauntlet_ids as g
+import instance_nav
+from travel import BLOCK_MOVEMENT_OBJECT
 
 # The Corrupted Hunllef's animation sequence from recordings/2026-09-05_014024_corrupted-gauntlet-
 # humanrun1 (ticks since varbit 9177 went to 1, animation id), and the human's protection-prayer
@@ -116,3 +118,85 @@ def test_snapshot_without_hunllef_and_with_dead_id():
 def test_snapshot_sw_origin_shifts_the_centre():
     s = _snap()
     assert s.hunllef_centre(origin="sw") == (13107, 5702)
+
+
+# Task 5: footprint, danger, flood, pick_safe_tile
+CFG = {"escape_radius": 6, "attack_range": 7, "tornado_danger": 2, "tornado_avoid": 3}
+BX, BY = 13056, 5632
+
+
+def _grid(size=32, blocked=()):
+    flags = [0] * (size * size)
+    for gx, gy in blocked:
+        flags[gy * size + gx] |= BLOCK_MOVEMENT_OBJECT
+    return instance_nav.InstanceMap(BX, BY, 1, size, flags)
+
+
+def G(gx, gy):
+    return (BX + gx, BY + gy)
+
+
+def _fight(me=G(10, 10), hun=G(16, 10), tornadoes=(), hazards=()):
+    npcs = [_npc(9036, *hun, 8419)] + [_npc(9039, x, y, index=100 + i) for i, (x, y) in enumerate(tornadoes)]
+    objs = [_obj(36048, x, y) for x, y in hazards]
+    return _snap(player=_player(instX=me[0], instY=me[1]), npcs=npcs, objects=objs)
+
+
+def test_footprint_and_margin_are_forbidden():
+    c = G(16, 10)
+    assert h.forbidden_near_hunllef(G(16, 10), c) and h.forbidden_near_hunllef(G(18, 12), c)
+    assert h.forbidden_near_hunllef(G(19, 10), c)          # margin tile, Chebyshev 3
+    assert not h.forbidden_near_hunllef(G(20, 10), c)      # Chebyshev 4: allowed
+
+
+def test_in_danger_reasons():
+    assert h.in_danger(_fight(), CFG) is None
+    assert h.in_danger(_fight(hazards=[G(10, 10)]), CFG) == "hazard"
+    assert h.in_danger(_fight(tornadoes=[G(11, 11)]), CFG) == "tornado"
+    assert h.in_danger(_fight(tornadoes=[G(13, 13)]), CFG) is None
+    assert h.in_danger(_fight(me=G(15, 10)), CFG) == "under_hunllef"     # inside the 5x5
+    assert h.in_danger(_fight(me=G(13, 10)), CFG) is None                # margin tile: not danger
+
+
+def test_flood_respects_blocked_tiles_and_max_steps():
+    # A 3-tall wall of blocked tiles at x=11, y=9..11, directly east of the start.
+    imap = _grid(blocked=[(11, 9), (11, 10), (11, 11)])
+    d = h.flood(imap, G(10, 10), 3, blocked=set())
+    assert d[G(10, 10)] == 0
+    assert G(11, 10) not in d                 # blocked tile never entered
+    assert d[G(10, 13)] == 3                  # three straight steps north
+    assert G(10, 14) not in d                 # four steps: past max_steps
+    assert G(12, 10) not in d                 # rounding the wall takes four steps
+    assert G(12, 12) in d                     # (10,10)->(10,11)->(11,12)->(12,12) is 3 (open corners)
+
+
+def test_pick_safe_tile_avoids_hazards_footprint_and_tornadoes_and_stays_in_range():
+    imap = _grid()
+    snap = _fight(me=G(10, 10), hun=G(16, 10), tornadoes=[G(8, 10)], hazards=[G(10, 10), G(11, 10), G(9, 10)])
+    t = h.pick_safe_tile(snap, imap, CFG)
+    assert t is not None
+    assert t not in snap.hazards
+    assert not h.forbidden_near_hunllef(t, snap.hunllef_centre())
+    assert h.cheb(t, G(8, 10)) >= CFG["tornado_avoid"]
+    assert h.in_attack_range(t, snap.hunllef_centre(), CFG["attack_range"])
+    assert h.cheb(t, G(10, 10)) <= CFG["escape_radius"]
+
+
+def test_pick_safe_tile_prefers_distance_from_tornadoes_then_nearness():
+    imap = _grid()
+    snap = _fight(me=G(10, 10), hun=G(20, 10), tornadoes=[G(10, 12)])
+    t = h.pick_safe_tile(snap, imap, CFG)
+    assert t[1] < G(10, 10)[1]          # moved away from the tornado (north of us), not toward it
+
+
+def test_pick_safe_tile_returns_none_when_everything_is_forbidden():
+    imap = _grid(size=8)
+    snap = _fight(me=G(3, 3), hun=G(3, 3))          # standing under it, and its footprint+margin covers the grid
+    assert h.pick_safe_tile(snap, imap, CFG) is None
+
+
+def test_require_in_range_filters():
+    imap = _grid()
+    snap = _fight(me=G(2, 2), hun=G(30, 30))
+    assert h.pick_safe_tile(snap, imap, CFG, require_in_range=True) is None
+    assert h.pick_safe_tile(snap, imap, CFG) is not None
