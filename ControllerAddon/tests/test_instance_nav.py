@@ -104,40 +104,67 @@ class _Ctx:
         self.state = type("S", (), {"data": {}})()
 
 
-def _fake_world(monkeypatch, imap, start, hop_effect):
+def _fake_world(monkeypatch, imap, start, hop_effect, player_plane=None):
     """Stub the bridge: the player stands at `start` (instance space) and every _hop_to call
-    moves it per hop_effect(target) -> new position."""
+    moves it per hop_effect(target) -> new position. `player_plane` lets a test give /player a
+    different (TEMPLATE) plane than the grid's (LIVE) one -- see C1: walk_to must route and hop
+    on the grid's plane, never /player's. Returns (hops, grid_plane_calls, hop_planes): the
+    (x, y) tuples clicked, the `plane` kwarg passed to get_collision_grid on each call, and the
+    plane passed to each _hop_to call."""
     pos = {"p": start}
-    monkeypatch.setattr(controller, "get_collision_grid",
-                        lambda plane=None: {"baseX": imap.base_x, "baseY": imap.base_y, "plane": imap.plane,
-                                            "size": imap.size, "flags": imap.flags})
+    grid_plane_calls = []
+
+    def fake_grid(plane=None):
+        grid_plane_calls.append(plane)
+        return {"baseX": imap.base_x, "baseY": imap.base_y, "plane": imap.plane,
+                "size": imap.size, "flags": imap.flags}
+
+    monkeypatch.setattr(controller, "get_collision_grid", fake_grid)
     monkeypatch.setattr(controller, "get_player",
-                        lambda: {"instX": pos["p"][0], "instY": pos["p"][1], "plane": imap.plane,
+                        lambda: {"instX": pos["p"][0], "instY": pos["p"][1],
+                                 "plane": imap.plane if player_plane is None else player_plane,
                                  "x": -1, "y": -1})
     hops = []
+    hop_planes = []
 
     def fake_hop(ctx, x, y, plane, inst=False):
         assert inst is True
         hops.append((x, y))
+        hop_planes.append(plane)
         pos["p"] = hop_effect((x, y))
         return True
 
     monkeypatch.setattr(instance_nav.travel, "_hop_to", fake_hop)
-    return hops
+    return hops, grid_plane_calls, hop_planes
 
 
 def test_walk_to_hops_along_the_route_and_arrives(monkeypatch):
     imap = make_map(size=40)
-    hops = _fake_world(monkeypatch, imap, P(0, 0), lambda t: t)
+    hops, grid_calls, _hop_planes = _fake_world(monkeypatch, imap, P(0, 0), lambda t: t)
     assert instance_nav.walk_to(_Ctx(), *P(30, 0))
     assert hops and hops[-1] == P(30, 0)
     assert all(max(abs(b[0] - a[0]), abs(b[1] - a[1])) <= instance_nav.travel.WALK_HOP_MAX_TILES
                for a, b in zip([P(0, 0)] + hops, hops))
+    # C1: InstanceMap.load() must be called with NO plane -- CollisionProvider then defaults to
+    # the LIVE plane (view.getWorldLocation().getPlane()), never /player's TEMPLATE plane.
+    assert grid_calls and all(p is None for p in grid_calls)
+
+
+def test_walk_to_uses_the_grids_plane_not_players_template_plane(monkeypatch):
+    # /player's plane is WorldPoint.fromLocalInstance's TEMPLATE plane; the collision grid (built
+    # from the LIVE WorldView) can legitimately disagree. walk_to must hop on the grid's plane.
+    imap = make_map(size=8)
+    hops, _grid_calls, hop_planes = _fake_world(monkeypatch, imap, P(0, 0), lambda t: t,
+                                                player_plane=2)
+    assert instance_nav.walk_to(_Ctx(), *P(5, 0), tolerance=0)
+    assert hops
+    assert hop_planes and all(p == imap.plane for p in hop_planes)
+    assert imap.plane != 2
 
 
 def test_walk_to_returns_false_without_a_map_or_route(monkeypatch):
     imap = make_map(walls={(3, y): BLOCK_MOVEMENT_EAST for y in range(8)})
-    hops = _fake_world(monkeypatch, imap, P(0, 0), lambda t: t)
+    hops, _grid_calls, _hop_planes = _fake_world(monkeypatch, imap, P(0, 0), lambda t: t)
     assert not instance_nav.walk_to(_Ctx(), *P(7, 0))
     assert hops == []
     monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: None)
@@ -152,7 +179,7 @@ def test_walk_to_reroutes_around_a_tile_that_refuses(monkeypatch):
     def effect(target):
         return P(0, 0) if target == refused else target
 
-    hops = _fake_world(monkeypatch, imap, P(0, 0), effect)
+    hops, _grid_calls, _hop_planes = _fake_world(monkeypatch, imap, P(0, 0), effect)
     monkeypatch.setattr(instance_nav.travel, "WALK_HOP_MAX_TILES", 1)
     assert instance_nav.walk_to(_Ctx(), *P(2, 0), tolerance=0)
     assert refused in hops                       # tried it once
@@ -161,7 +188,7 @@ def test_walk_to_reroutes_around_a_tile_that_refuses(monkeypatch):
 
 def test_walk_to_gives_up_after_the_hop_ceiling(monkeypatch):
     imap = make_map(size=40)
-    hops = _fake_world(monkeypatch, imap, P(0, 0), lambda t: P(0, 0))   # never moves
+    hops, _grid_calls, _hop_planes = _fake_world(monkeypatch, imap, P(0, 0), lambda t: P(0, 0))
     monkeypatch.setattr(instance_nav, "WALK_MAX_HOPS", 3)
     assert not instance_nav.walk_to(_Ctx(), *P(30, 0))
     assert len(hops) <= 3 + instance_nav.travel.WALK_MAX_REROUTES

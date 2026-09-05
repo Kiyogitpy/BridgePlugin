@@ -133,7 +133,11 @@ WALK_MAX_HOPS = 40           # a Gauntlet room-to-room walk is 2-4 hops; 40 is a
 
 
 def player_inst():
-    """(instX, instY, plane) from /player, or None when the bridge cannot say."""
+    """(instX, instY, plane) from /player, or None when the bridge cannot say. The plane here is
+    WorldPoint.fromLocalInstance's TEMPLATE plane (see PlayerProvider.java / CLAUDE.md's
+    instancing gotcha) -- it is NOT necessarily the plane the player actually stands on, and
+    walk_to below must not route or hop on it (see C1,
+    docs/superpowers/sdd/2026-09-05-gauntlet-instance-plumbing/final-fix-brief.md)."""
     p = controller.get_player() or {}
     x, y = p.get("instX"), p.get("instY")
     if x is None or y is None:
@@ -157,13 +161,18 @@ def walk_to(ctx, x: int, y: int, tolerance: float = travel.WALK_ARRIVAL_TOLERANC
         if here is None:
             debug_log.log("inav", "no instance position from /player -- cannot walk")
             return False
-        px, py, plane = here
+        px, py, tpl_plane = here
         if max(abs(px - goal[0]), abs(py - goal[1])) <= tolerance:
             return True
-        imap = InstanceMap.load(plane)
+        # No plane passed here on purpose: /player's plane is the TEMPLATE chunk's plane, not
+        # necessarily the plane the player stands on. Loading with no plane lets
+        # CollisionProvider default to the LIVE plane (view.getWorldLocation().getPlane()) --
+        # tpl_plane above is for logging only, never for routing/hopping. See C1.
+        imap = InstanceMap.load()
         if imap is None:
             debug_log.log("inav", "no collision grid from the bridge -- cannot route")
             return False
+        plane = imap.plane
         path = find_path(imap, (px, py), goal, avoid=avoid)
         if path is None:
             debug_log.log("inav", f"no route from {(px, py)} to {goal} (avoiding {len(avoid)} tiles)")

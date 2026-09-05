@@ -1641,3 +1641,17 @@ def test_get_collision_grid_returns_body_or_none(monkeypatch):
     assert controller.get_collision_grid(1) is None
     monkeypatch.setattr(controller, "api_get", lambda *a, **kw: None)
     assert controller.get_collision_grid(1) is None
+
+    # C1: no `plane` key on the wire when none is passed (CollisionProvider then defaults to the
+    # LIVE plane), and `plane` forwarded verbatim when one is given.
+    seen = {}
+
+    def capture(path, params=None, timeout=None, **kw):
+        seen["params"] = params
+        return {"baseX": 0, "baseY": 0, "plane": 0, "size": 2, "flags": [0, 0, 0, 0]}
+
+    monkeypatch.setattr(controller, "api_get", capture)
+    controller.get_collision_grid()
+    assert "plane" not in seen["params"]
+    controller.get_collision_grid(3)
+    assert seen["params"]["plane"] == 3

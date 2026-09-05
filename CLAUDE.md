@@ -357,6 +357,11 @@ steps above.
   `walk_to`) is the instance routing engine; `worldmap.py` stays the overworld one. Template
   `x`/`y` keep their meaning and are still what a hardcoded tile in a routine matches. Live
   status: see the spec's checklist -- fill in what was verified here.
+  **Fixed 2026-09-05 (final-review C1): `/player`'s `plane` is the TEMPLATE plane, not
+  necessarily the plane the player stands on** -- `instPlane` (`topLevel.getPlane()`, 0 when the
+  view is null) is the LIVE one, and `instance_nav.walk_to` loads `InstanceMap` with no plane
+  argument at all so `CollisionProvider` defaults to the LIVE plane and hops on the grid's own
+  `plane`, never `/player`'s.
 - **Windows HiDPI scaling**: RuneLite's own AWT windows report `screenX`/`screenY` at 96 DPI
   under a bare `java.exe` launch (no DPI-aware manifest), regardless of the display's actual
   scaling. `controller.py` compensates by scaling every bridge response through

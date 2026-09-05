@@ -142,6 +142,15 @@ public class PlayerProvider extends BridgeProvider
 			data.put("instY", wp.getY());
 		}
 
+		// C1 (2026-09-05, docs/superpowers/sdd/2026-09-05-gauntlet-instance-plumbing/
+		// final-fix-brief.md): the LIVE plane, as opposed to `plane` below (wp.getPlane(),
+		// WorldPoint.fromLocalInstance's TEMPLATE plane inside an instance -- see CLAUDE.md's
+		// instancing gotcha). instance_nav.walk_to must route/hop on the collision grid's own
+		// plane, never on /player's -- this is the direct read for anything that needs the true
+		// plane without going through the grid at all. 0 when the view is null, same convention
+		// as `inInstance` above.
+		data.put("instPlane", topLevel != null ? topLevel.getPlane() : 0);
+
 		if (local != null)
 		{
 			data.put("localX", local.getX());
