@@ -218,7 +218,14 @@ def _room(st, tile):
 def light_node(ctx, node, cfg):
     before = (node.get("id"), node.get("instX"), node.get("instY"))
     mark = ctx.events.mark() if ctx.events is not None else None
-    controller.click_menu_action(ctx.ser, node, "Light", target_hint="Node", offset=(0, 0))
+    # (I9, final-fix-brief.md) The player may still be walking toward the node when this click is
+    # decided -- object_refresh_target(x, y, plane, obj_id) re-resolves the node's current screen
+    # projection at each leg of the flight, the same way every other moving-target click site in
+    # this codebase does (see CLAUDE.md's "A click's DEPARTURE is aimed too"). Note it compares in
+    # ORDINARY world coordinates (no `inst` support), so this passes the node's own "x"/"y" fields,
+    # not "instX"/"instY".
+    refresh = controller.object_refresh_target(node.get("x"), node.get("y"), node.get("plane"), node.get("id"))
+    controller.click_menu_action(ctx.ser, node, "Light", target_hint="Node", offset=(0, 0), refresh_target=refresh)
 
     def lit():
         for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True):

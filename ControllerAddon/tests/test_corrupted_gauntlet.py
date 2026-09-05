@@ -781,8 +781,13 @@ def _grid(size=64, room=None):
     return {"baseX": 13056, "baseY": 5632, "plane": 1, "size": size, "flags": flags}
 
 
-def _obj(id_, name, x, y):
-    return {"id": id_, "name": name, "instX": x, "instY": y, "objectType": "GameObject", "screenX": 5, "screenY": 5, "actions": []}
+def _obj(id_, name, x, y, plane=1):
+    # "x"/"y"/"plane" are the ordinary (non-instance) world coordinates ObjectProvider also
+    # reports alongside instX/instY -- defaulted equal to the instance coords here since these
+    # tests never run inside a template-remapped scene; object_refresh_target (I9,
+    # final-fix-brief.md) reads these, not instX/instY, since it has no `inst` support.
+    return {"id": id_, "name": name, "instX": x, "instY": y, "x": x, "y": y, "plane": plane,
+            "objectType": "GameObject", "screenX": 5, "screenY": 5, "actions": []}
 
 
 def test_prep_state_derives_geometry_once(monkeypatch):
@@ -880,6 +885,29 @@ def test_light_node_failure_keeps_the_cached_instance_map(monkeypatch):
     monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: False)
     assert not cg.light_node(ctx, node, cg.DEFAULT_CONFIG)
     assert "cg_imap" in ctx.state.data
+
+
+def test_light_node_passes_a_refresh_target_using_ordinary_world_coordinates(monkeypatch):
+    """I9: light_node must re-aim mid-flight (the player may still be walking toward the node),
+    via controller.object_refresh_target -- which has no `inst` support, so it must be built from
+    the node's ordinary "x"/"y"/"plane" fields, not "instX"/"instY"."""
+    ctx = _Ctx()
+    node = _obj(35999, "Node", 13100, 5700)   # instX/instY == x/y here (helper default)
+    seen = {}
+
+    def fake_refresh_target(x, y, plane, obj_id, **kw):
+        seen["args"] = (x, y, plane, obj_id)
+        return lambda: None
+    monkeypatch.setattr(controller, "object_refresh_target", fake_refresh_target)
+
+    def fake_click_menu_action(ser, entity, option, **kw):
+        seen["refresh_target"] = kw.get("refresh_target")
+        return True
+    monkeypatch.setattr(controller, "click_menu_action", fake_click_menu_action)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: True)
+    cg.light_node(ctx, node, cg.DEFAULT_CONFIG)
+    assert seen["args"] == (node["x"], node["y"], node["plane"], node["id"])
+    assert seen["refresh_target"] is not None
 
 
 def test_teleport_home_via_crystal_clears_the_cached_instance_map(monkeypatch):
