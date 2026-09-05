@@ -103,7 +103,12 @@ public class CollisionProvider extends BridgeProvider
 		}
 
 		int centreSceneX = -1, centreSceneY = -1;
-		if (wantX != null && wantY != null)
+		if (wantX != null && wantY != null && InstanceCoords.wantsInstance(query))
+		{
+			centreSceneX = InstanceCoords.toScene(view.getBaseX(), wantX);
+			centreSceneY = InstanceCoords.toScene(view.getBaseY(), wantY);
+		}
+		else if (wantX != null && wantY != null)
 		{
 			for (int sx = 0; sx < tiles[plane].length && centreSceneX < 0; sx++)
 			{

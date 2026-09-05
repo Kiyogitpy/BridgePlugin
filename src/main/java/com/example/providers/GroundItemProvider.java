@@ -63,9 +63,11 @@ public class GroundItemProvider extends BridgeProvider
 			return notFound;
 		}
 
+		String kx = InstanceCoords.wantsInstance(query) ? "instX" : "x";
+		String ky = InstanceCoords.wantsInstance(query) ? "instY" : "y";
 		for (Map<String, Object> item : computeGroundItems())
 		{
-			if (id.equals(item.get("id")) && x.equals(item.get("x")) && y.equals(item.get("y"))
+			if (id.equals(item.get("id")) && x.equals(item.get(kx)) && y.equals(item.get(ky))
 				&& plane.equals(item.get("plane")))
 			{
 				Map<String, Object> found = new HashMap<>(item);

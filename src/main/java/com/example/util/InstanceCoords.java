@@ -62,4 +62,11 @@ public final class InstanceCoords
 		}
 		return LocalPoint.fromScene(sx, sy, wv);
 	}
+
+	/** True for inst=true / inst=1 (case-insensitive); false when absent or anything else. */
+	public static boolean wantsInstance(java.util.Map<String, String> query)
+	{
+		String v = query.get("inst");
+		return v != null && ("true".equalsIgnoreCase(v) || "1".equals(v));
+	}
 }

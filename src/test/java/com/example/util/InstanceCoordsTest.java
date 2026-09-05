@@ -30,4 +30,17 @@ public class InstanceCoordsTest
 		assertEquals(InstanceCoords.SCENE_SIZE * InstanceCoords.SCENE_SIZE - 1,
 			InstanceCoords.sceneIndex(103, 103));
 	}
+
+	@Test
+	public void wantsInstanceReadsTheFlag()
+	{
+		java.util.Map<String, String> q = new java.util.HashMap<>();
+		assertEquals(false, InstanceCoords.wantsInstance(q));
+		q.put("inst", "true");
+		assertEquals(true, InstanceCoords.wantsInstance(q));
+		q.put("inst", "1");
+		assertEquals(true, InstanceCoords.wantsInstance(q));
+		q.put("inst", "no");
+		assertEquals(false, InstanceCoords.wantsInstance(q));
+	}
 }

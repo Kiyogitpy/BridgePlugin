@@ -1,6 +1,7 @@
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
+import com.example.util.InstanceCoords;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
@@ -200,8 +201,11 @@ public class CombatProvider extends BridgeProvider
 			int y = Integer.parseInt(query.get("y"));
 			int plane = query.containsKey("plane") ? Integer.parseInt(query.get("plane")) : client.getPlane();
 
-			WorldPoint wp = new WorldPoint(x, y, plane);
-			LocalPoint lp = LocalPoint.fromWorld(client, wp);
+			// inst=true (2026-09-05): x/y are instance-space, resolved by arithmetic against the
+			// scene base -- the one direction that works inside an instance (see InstanceCoords).
+			LocalPoint lp = InstanceCoords.wantsInstance(query)
+				? InstanceCoords.fromInstance(client.getTopLevelWorldView(), x, y)
+				: LocalPoint.fromWorld(client, new WorldPoint(x, y, plane));
 			if (lp == null)
 			{
 				return data;
@@ -242,8 +246,11 @@ public class CombatProvider extends BridgeProvider
 			int y = Integer.parseInt(query.get("y"));
 			int plane = query.containsKey("plane") ? Integer.parseInt(query.get("plane")) : client.getPlane();
 
-			WorldPoint wp = new WorldPoint(x, y, plane);
-			LocalPoint lp = LocalPoint.fromWorld(client, wp);
+			// inst=true (2026-09-05): x/y are instance-space, resolved by arithmetic against the
+			// scene base -- the one direction that works inside an instance (see InstanceCoords).
+			LocalPoint lp = InstanceCoords.wantsInstance(query)
+				? InstanceCoords.fromInstance(client.getTopLevelWorldView(), x, y)
+				: LocalPoint.fromWorld(client, new WorldPoint(x, y, plane));
 			if (lp == null)
 			{
 				return data;

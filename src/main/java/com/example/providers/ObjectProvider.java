@@ -74,13 +74,15 @@ public class ObjectProvider extends BridgeProvider
 			return notFound;
 		}
 
+		String kx = InstanceCoords.wantsInstance(query) ? "instX" : "x";
+		String ky = InstanceCoords.wantsInstance(query) ? "instY" : "y";
 		Integer radius = parseIntParam(query.get("radius"));
 		List<Map<String, Object>> objects = computeObjects(
 			radius != null ? radius : OBJECT_AT_DEFAULT_RADIUS,
-			new Target(x, y, plane, id));
+			InstanceCoords.wantsInstance(query) ? null : new Target(x, y, plane, id));
 		for (Map<String, Object> obj : objects)
 		{
-			if (id.equals(obj.get("id")) && x.equals(obj.get("x")) && y.equals(obj.get("y"))
+			if (id.equals(obj.get("id")) && x.equals(obj.get(kx)) && y.equals(obj.get(ky))
 				&& plane.equals(obj.get("plane")))
 			{
 				Map<String, Object> found = new HashMap<>(obj);
