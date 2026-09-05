@@ -11,6 +11,7 @@ import controller
 import hunllef as h
 import gauntlet_ids as g
 import corrupted_gauntlet as cg
+import travel
 
 
 @pytest.fixture(autouse=True)
@@ -728,8 +729,22 @@ def _player_at(x, y, hp=80, prayer=40):
     return {"hp": hp, "prayer": prayer, "instX": x, "instY": y, "plane": 1, "regionId": g.REGION_CORRUPTED, "animation": -1}
 
 
-def _grid(size=64):
-    return {"baseX": 13056, "baseY": 5632, "plane": 1, "size": size, "flags": [0] * (size * size)}
+def _grid(size=64, room=None):
+    flags = [0] * (size * size)
+    if room is not None:
+        # room is (x0, y0, w, h) in instance coords
+        # Set BLOCK_MOVEMENT_OBJECT flag for all tiles OUTSIDE the room
+        x0, y0, w, h = room
+        base_x, base_y = 13056, 5632
+        for y in range(size):
+            for x in range(size):
+                inst_x = base_x + x
+                inst_y = base_y + y
+                # Block if outside the room rectangle
+                if not (x0 <= inst_x < x0 + w and y0 <= inst_y < y0 + h):
+                    idx = y * size + x
+                    flags[idx] = travel.BLOCK_MOVEMENT_OBJECT
+    return {"baseX": 13056, "baseY": 5632, "plane": 1, "size": size, "flags": flags}
 
 
 def _obj(id_, name, x, y):
@@ -738,11 +753,13 @@ def _obj(id_, name, x, y):
 
 def test_prep_state_derives_geometry_once(monkeypatch):
     ctx = _Ctx(); ctx.state.data["cg_t0"] = 0.0
-    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
-    monkeypatch.setattr(controller, "get_player", lambda: _player_at(13056 + 30, 5632 + 30))
-    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_obj(g.OBJ_BARRIER, "Barrier", 13056 + 30, 5632 + 22)])
+    S = (13056 + 30, 5632 + 30)
+    # 15x15 room centred on S: x0=S[0]-7 to S[0]+8, y0=S[1]-7 to S[1]+8
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid(room=(S[0] - 7, S[1] - 7, 15, 15)))
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*S))
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_obj(g.OBJ_BARRIER, "Barrier", S[0], S[1] - 8)])
     st = cg.prep_state(ctx, cg.DEFAULT_CONFIG)
-    assert st["outward"] == (0, 1) and st["barrier"] == (13086, 5654) and st["step"] == 0 and st["sub"] == "to_node"
+    assert st["outward"] == (0, 1) and st["barrier"] == (S[0], S[1] - 8) and st["step"] == 0 and st["sub"] == "to_node" and st["start_centre"] == S
     monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: pytest.fail("grid re-read"))
     assert cg.prep_state(ctx, cg.DEFAULT_CONFIG) is st
 
@@ -815,7 +832,8 @@ def test_explore_gather_phase_lights_then_enters_then_gathers(monkeypatch):
     node_xy = (S[0] + pitch // 2, S[1])                  # between S and the room to the right (outward north)
     right_room = (S[0] + pitch, S[1])
     state = {"pos": S, "lit": False, "walks": [], "gathered": []}
-    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    # 15x15 room centred on S
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid(room=(S[0] - 7, S[1] - 7, 15, 15)))
     monkeypatch.setattr(controller, "get_player", lambda: _player_at(*state["pos"]))
     monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
     monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [])
@@ -825,7 +843,7 @@ def test_explore_gather_phase_lights_then_enters_then_gathers(monkeypatch):
     linum_id = next(i for i, n in g.RESOURCE_NODES.items() if n == linum)
     def objects(radius=None, fresh=False, interactable=False):
         return [_obj(g.OBJ_BARRIER, "Barrier", S[0], S[1] - 8), _obj(35999, "Node", *node_xy),
-                _obj(linum_id, linum, right_room[0] + 2, right_room[1])]
+                _obj(linum_id, linum, *right_room)]
     monkeypatch.setattr(controller, "get_objects", objects)
     monkeypatch.setattr(cg.maze, "edge_open", lambda imap, a, b: state["lit"])
     monkeypatch.setattr(cg.instance_nav, "walk_to", lambda ctx, x, y, **kw: (state["walks"].append((x, y)), state.__setitem__("pos", (x, y)))[1] or True)
