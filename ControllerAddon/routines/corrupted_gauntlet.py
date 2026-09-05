@@ -228,7 +228,7 @@ def pick_up_drops(ctx, cfg):
 
 
 def gather_ladder(ctx, cfg):
-    me, player = _me()
+    me, _ = _me()
     npcs = controller.get_npcs(fresh=True)
     foe = attacker(npcs, me)
     if foe is None:
@@ -289,30 +289,30 @@ def upgrade_phase(ctx, cfg):
                 data["cg_upgrade_done"] = True; return
         if h.cheb(me, room) > ROOM_ARRIVAL_TOLERANCE:
             instance_nav.walk_to(ctx, room[0], room[1], tolerance=ROOM_ARRIVAL_TOLERANCE); return
-        up["sub"] = "fight"
-        # Fall through to fight logic
+        up["sub"] = "fight"; return
     if up["sub"] == "fight":
         npc = next((n for n in controller.get_npcs(fresh=True) if n.get("id") == nid), None)
         if npc is None:
-            up["sub"] = "loot"
-            # Fall through to loot logic
-        else:
-            fight_npc_step(ctx, npc, cfg); return
+            up["sub"] = "loot"; return
+        fight_npc_step(ctx, npc, cfg); return
     if up["sub"] == "loot":
-        pick_up_drops(ctx, cfg); up["sub"] = "home"
-        # Fall through to home logic
+        pick_up_drops(ctx, cfg); up["sub"] = "home"; return
     if up["sub"] == "home":
         if teleport_home(ctx, cfg):
-            up["sub"] = "craft"
-            # Fall through to craft logic
-        else:
-            return
+            up["sub"] = "craft"; return
+        return
     if up["sub"] == "craft":
         drop = g.DEMI_BOSS_DROP[nid]
         key = "staff" if drop == g.ITEM_ORB else "bow"
-        bowl_make(ctx, key, cfg)
-        wear(ctx, g.weapon_name(key, 3))
-        data["cg_upgrade_done"] = True
+        if bowl_make(ctx, key, cfg):
+            wear(ctx, g.weapon_name(key, 3))
+            data["cg_upgrade_done"] = True
+        else:
+            up.setdefault("craft_fails", 0)
+            up["craft_fails"] += 1
+            if up["craft_fails"] >= 3:
+                debug_log.log("cg", f"[!] bowl_make failed {up['craft_fails']} times -- giving up")
+                data["cg_upgrade_done"] = True
 
 
 def _nodes(objects):
