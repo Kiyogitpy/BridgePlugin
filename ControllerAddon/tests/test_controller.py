@@ -1611,3 +1611,33 @@ def test_loop_stats_logs_slow_iterations_and_a_periodic_summary():
     summary = [l for l in lines if "iterations" in l]
     assert summary and "3 iterations" in summary[0] and "mean 0.83s" in summary[0]
     assert stats.record(0.5, 0.3) == []       # window reset after the summary
+
+
+def test_inst_flag_is_forwarded_to_the_bridge(monkeypatch):
+    calls = []
+
+    def fake_api_get(path, params=None, timeout=None, **kw):
+        calls.append((path, dict(params or {})))
+        return {"onScreen": True, "onMinimap": True, "found": True, "tiles": [], "flags": [1]}
+
+    monkeypatch.setattr(controller, "api_get", fake_api_get)
+    controller.get_ground_walk_point(1, 2, 0, inst=True)
+    controller.get_minimap_walk_point(1, 2, 0, inst=True)
+    controller.get_object_at(1, 2, 0, 99, inst=True)
+    controller.get_ground_item_at(1, 2, 0, 7, inst=True)
+    controller.get_collision(1, 2, 0, radius=3, inst=True)
+    controller.get_ground_walk_point(1, 2, 0)   # default: no flag on the wire
+    assert [p.get("inst") for _, p in calls[:5]] == ["true"] * 5
+    assert "inst" not in calls[5][1]
+
+
+def test_get_collision_grid_returns_body_or_none(monkeypatch):
+    monkeypatch.setattr(controller, "api_get",
+                        lambda path, params=None, timeout=None, **kw:
+                        {"baseX": 13056, "baseY": 5632, "plane": 1, "size": 104, "flags": [0] * 10816})
+    grid = controller.get_collision_grid(1)
+    assert grid["baseX"] == 13056 and len(grid["flags"]) == 10816
+    monkeypatch.setattr(controller, "api_get", lambda *a, **kw: {"flags": []})
+    assert controller.get_collision_grid(1) is None
+    monkeypatch.setattr(controller, "api_get", lambda *a, **kw: None)
+    assert controller.get_collision_grid(1) is None

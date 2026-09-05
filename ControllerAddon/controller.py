@@ -488,14 +488,14 @@ def get_objects(radius=None, fresh=False, interactable=False):
     return api_get("/objects", params=params or None, timeout=1.0) or []
 
 
-def get_object_at(x: int, y: int, plane: int, obj_id: int, radius=None):
+def get_object_at(x: int, y: int, plane: int, obj_id: int, radius=None, inst: bool = False):
     """Exact lookup by tile position + object id (uncached, unlike get_objects) -- the object
     equivalent of get_npc_by_index, for re-checking/re-aiming at a specific object already
     committed to mid-approach (e.g. while the player is still moving toward it). Matches by
     position+id rather than a live coordinate-to-LocalPoint conversion -- see
     ObjectProvider.java's getObjectAt for why. Same generous timeout as get_objects -- this
     walks the same scene."""
-    params = {"x": x, "y": y, "plane": plane, "id": obj_id}
+    params = _inst_params({"x": x, "y": y, "plane": plane, "id": obj_id}, inst)
     if radius is not None:
         params["radius"] = radius
     data = api_get("/object/at", params=params, timeout=1.0)
@@ -704,12 +704,12 @@ def get_ground_items(fresh=False):
     return api_get("/ground-items", params=params) or []
 
 
-def get_ground_item_at(x: int, y: int, plane: int, item_id: int):
+def get_ground_item_at(x: int, y: int, plane: int, item_id: int, inst: bool = False):
     """Exact lookup by tile position + item id (uncached, unlike get_ground_items) -- the
     ground-item equivalent of get_object_at/get_npc_by_index, for re-checking/re-aiming at a
     specific item already committed to looting mid-approach (e.g. while the player is still
     moving toward it). See GroundItemProvider.java's getGroundItemAt for the matching logic."""
-    data = api_get("/ground-item/at", params={"x": x, "y": y, "plane": plane, "id": item_id})
+    data = api_get("/ground-item/at", params=_inst_params({"x": x, "y": y, "plane": plane, "id": item_id}, inst))
     if not data or not data.get("found"):
         return None
     return data
@@ -943,22 +943,44 @@ def get_golem():
     return api_get("/golem")
 
 
-def get_minimap_walk_point(x: int, y: int, plane: int):
-    return api_get("/minimap/walk", params={"x": x, "y": y, "plane": plane}) or {"onMinimap": False}
+def _inst_params(params: dict, inst: bool) -> dict:
+    """Add the inst=true flag (instance-space x/y, see InstanceCoords.java) only when asked, so
+    a pre-2026-09-05 bridge sees exactly the old query."""
+    if inst:
+        params["inst"] = "true"
+    return params
 
 
-def get_collision(x: int, y: int, plane: int, radius: int = 6):
+def get_minimap_walk_point(x: int, y: int, plane: int, inst: bool = False):
+    return api_get("/minimap/walk", params=_inst_params({"x": x, "y": y, "plane": plane}, inst)) or {"onMinimap": False}
+
+
+def get_collision(x: int, y: int, plane: int, radius: int = 6, inst: bool = False):
     """The client's own CollisionData for a square of tiles around (x, y) -- see
     CollisionProvider. Returns a list of {x, y, plane, flags}, empty when the client cannot
     answer (older build, or the tile is outside the loaded scene). Unlike the per-object
     `collisionFlags` field this covers ARBITRARY tiles, including empty ones, which is what a
     walker needs: the doorway or the goal tile usually has no object on our side of it."""
-    data = api_get("/collision", params={"x": x, "y": y, "plane": plane, "radius": radius})
+    data = api_get("/collision", params=_inst_params({"x": x, "y": y, "plane": plane, "radius": radius}, inst))
     return (data or {}).get("tiles", [])
 
 
-def get_ground_walk_point(x: int, y: int, plane: int):
-    return api_get("/ground/walk", params={"x": x, "y": y, "plane": plane}) or {"onScreen": False}
+def get_collision_grid(plane: int | None = None):
+    """The whole loaded plane's collision flags in one request: {baseX, baseY, plane, size,
+    flags} with flags row-major by y (index = sy * size + sx, CollisionGrid.java). None when
+    the bridge cannot answer -- an older build, or no scene loaded. This is instance_nav's map
+    source; worldmap.py is useless inside an instance."""
+    params = {"all": "true"}
+    if plane is not None:
+        params["plane"] = plane
+    data = api_get("/collision", params=params, timeout=2.0)
+    if not data or not data.get("flags"):
+        return None
+    return data
+
+
+def get_ground_walk_point(x: int, y: int, plane: int, inst: bool = False):
+    return api_get("/ground/walk", params=_inst_params({"x": x, "y": y, "plane": plane}, inst)) or {"onScreen": False}
 
 
 def get_ground_walk_screen_pos(x: int, y: int, plane: int):
