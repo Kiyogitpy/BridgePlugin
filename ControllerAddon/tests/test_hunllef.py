@@ -167,7 +167,8 @@ def test_flood_respects_blocked_tiles_and_max_steps():
     assert d[G(10, 13)] == 3                  # three straight steps north
     assert G(10, 14) not in d                 # four steps: past max_steps
     assert G(12, 10) not in d                 # rounding the wall takes four steps
-    assert G(12, 12) in d                     # (10,10)->(10,11)->(11,12)->(12,12) is 3 (open corners)
+    assert G(12, 12) not in d                 # (10,11)->(11,12) would cut the blocked corner (11,11): refused
+    assert d[G(11, 12)] == 3                  # (10,10)->(10,11)->(10,12)->(11,12): three cardinal steps
 
 
 def test_pick_safe_tile_avoids_hazards_footprint_and_tornadoes_and_stays_in_range():

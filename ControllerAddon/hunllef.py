@@ -187,26 +187,8 @@ def flood(imap, start, max_steps, blocked):
             continue
         for dx, dy in STEPS:
             nxt = (x + dx, y + dy)
-            if nxt in dist or nxt in blocked:
+            if nxt in dist or nxt in blocked or not imap.step_ok(x, y, dx, dy):
                 continue
-            # For diagonals, apply OR logic: only ONE corner route must be open (game's own rule).
-            # step_ok uses AND which is too strict, so we reimplement the check here.
-            if dx != 0 and dy != 0:  # diagonal step
-                nx, ny = nxt
-                if not imap.standable(nx, ny):
-                    continue
-                cx, cy = x + dx, y      # corner via x
-                kx, ky = x, y + dy      # corner via y
-                via_x = (imap.standable(cx, cy) and imap.edge_open(x, y, dx, 0)
-                        and imap.edge_open(cx, cy, 0, dy))
-                via_y = (imap.standable(kx, ky) and imap.edge_open(x, y, 0, dy)
-                        and imap.edge_open(kx, ky, dx, 0))
-                if not (via_x or via_y):
-                    continue
-            else:  # cardinal step
-                if not imap.step_ok(x, y, dx, dy):
-                    continue
-
             dist[nxt] = d + 1
             queue.append(nxt)
     return dist
