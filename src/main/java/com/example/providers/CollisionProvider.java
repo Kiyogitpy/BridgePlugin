@@ -1,6 +1,7 @@
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
+import com.example.util.InstanceCoords;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
@@ -167,6 +168,9 @@ public class CollisionProvider extends BridgeProvider
 				tile.put("y", wp.getY());
 				tile.put("plane", plane);
 				tile.put("flags", flags[sx][sy]);
+				WorldPoint inst = InstanceCoords.instancePoint(client, t.getLocalLocation(), plane);
+				tile.put("instX", inst.getX());
+				tile.put("instY", inst.getY());
 				out.add(tile);
 			}
 		}

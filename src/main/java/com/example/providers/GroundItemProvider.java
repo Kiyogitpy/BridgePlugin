@@ -1,6 +1,7 @@
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
+import com.example.util.InstanceCoords;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
@@ -153,6 +154,11 @@ public class GroundItemProvider extends BridgeProvider
 					data.put("x", wp.getX());
 					data.put("y", wp.getY());
 					data.put("plane", wp.getPlane());
+					WorldPoint inst = tileLocal != null
+						? InstanceCoords.instancePoint(client, tileLocal, wp.getPlane())
+						: wp;
+					data.put("instX", inst.getX());
+					data.put("instY", inst.getY());
 					// 2 == belongs to another player and isn't takeable by us yet (their private
 					// kill-loot timer hasn't expired) -- same field RuneLite's own bundled Ground
 					// Items plugin reads for its "Takeable" filter (GroundItemsPlugin

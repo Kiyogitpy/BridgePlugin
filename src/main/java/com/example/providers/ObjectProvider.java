@@ -1,6 +1,7 @@
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
+import com.example.util.InstanceCoords;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.*;
 import net.runelite.api.coords.LocalPoint;
@@ -641,6 +642,13 @@ public class ObjectProvider extends BridgeProvider
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
 		data.put("plane", wp.getPlane());
+
+		LocalPoint objLocal = obj.getLocalLocation();
+		WorldPoint inst = objLocal != null
+			? InstanceCoords.instancePoint(client, objLocal, wp.getPlane())
+			: wp;
+		data.put("instX", inst.getX());
+		data.put("instY", inst.getY());
 
 		// Prefer the object's actual on-screen clickable area (its model's real convex hull) over
 		// a plain ground-tile projection -- TileObject.getClickbox()'s own javadoc says as much

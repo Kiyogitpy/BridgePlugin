@@ -1,6 +1,7 @@
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
+import com.example.util.InstanceCoords;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
 import net.runelite.api.NPC;
@@ -237,6 +238,12 @@ public class NPCProvider extends BridgeProvider
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
 		data.put("plane", wp.getPlane());
+		// Instance-space twin of x/y (2026-09-05, InstanceCoords). Equal outside an instance.
+		WorldPoint inst = npcLocal != null
+			? InstanceCoords.instancePoint(client, npcLocal, plane)
+			: wp;
+		data.put("instX", inst.getX());
+		data.put("instY", inst.getY());
 		// Aim at a point inside the npc's actual on-screen model (Actor.getConvexHull()), not at
 		// the ground-tile projection under its feet -- the same correction ObjectProvider has made
 		// via TileObject.getClickbox() since 2026-08-01. Added 2026-08-24 after bench_hover.py
