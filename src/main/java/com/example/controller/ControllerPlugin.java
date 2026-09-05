@@ -7,6 +7,7 @@ import com.example.tracker.NpcTrackerRegistry;
 import com.example.util.EventSubscriptions;
 import com.example.util.InstanceCoords;
 import com.example.util.PlayerMotionTracker;
+import com.example.util.ProjectileSeen;
 import com.example.util.UdpEventSender;
 import com.google.inject.Provides;
 import net.runelite.api.*;
@@ -109,6 +110,7 @@ public class ControllerPlugin extends Plugin
 	// (opt-in via GET /events/subscribe) and the per-frame PLAYER_MOVING/STOPPED tracker.
 	private final EventSubscriptions eventSubscriptions = new EventSubscriptions();
 	private final PlayerMotionTracker motionTracker = new PlayerMotionTracker();
+	private final ProjectileSeen projectileSeen = new ProjectileSeen();
 	private final Map<Skill, Integer> lastRealLevels = new HashMap<>();
 	// Tracks raw XP per skill (not level) so XP_GAINED can report every gain, including ones
 	// too small to bump a level -- CLAUDE.md's "sub-tick data" note identifies StatChanged's XP
@@ -771,6 +773,48 @@ public class ControllerPlugin extends Plugin
 			lastInventoryHash = hash;
 			udpSender.send("INVENTORY_CHANGED");
 		}
+	}
+
+	/**
+	 * Fire PROJECTILE_SPAWNED on the first ProjectileMoved event for each distinct projectile.
+	 * targetIndex convention: an NPC's index, -2 for the local player (the Hunllef fight case),
+	 * -1 for none. Same LOGGED_IN / udpSender guards and spawn budget as NPC/object events.
+	 */
+	@Subscribe
+	public void onProjectileMoved(ProjectileMoved event)
+	{
+		Projectile projectile = event.getProjectile();
+		if (!projectileSeen.firstSighting(projectile))
+		{
+			return;
+		}
+		if (client.getGameState() != GameState.LOGGED_IN || udpSender == null)
+		{
+			return;
+		}
+		if (!spawnEventBudgetAvailable())
+		{
+			return;
+		}
+		Map<String, Object> payload = new HashMap<>();
+		payload.put("id", projectile.getId());
+		payload.put("remainingCycles", projectile.getRemainingCycles());
+		Actor target = projectile.getTargetActor();
+		payload.put("targetIndex", target instanceof NPC ? ((NPC) target).getIndex()
+			: target == client.getLocalPlayer() ? -2 : -1);
+		LocalPoint pos = event.getPosition();
+		if (pos != null)
+		{
+			WorldPoint wp = WorldPoint.fromLocalInstance(client, pos);
+			WorldPoint inst = InstanceCoords.instancePoint(client, pos, client.getPlane());
+			payload.put("x", wp.getX());
+			payload.put("y", wp.getY());
+			payload.put("plane", wp.getPlane());
+			payload.put("instX", inst.getX());
+			payload.put("instY", inst.getY());
+		}
+		payload.put("tick", tickClock.get());
+		udpSender.send("PROJECTILE_SPAWNED", payload);
 	}
 
 	@Subscribe
