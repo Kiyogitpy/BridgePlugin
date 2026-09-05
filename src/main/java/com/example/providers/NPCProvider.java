@@ -4,6 +4,7 @@ import com.example.bridge.BridgeHttpServer;
 import com.example.util.InstanceCoords;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
+import net.runelite.api.HeadIcon;
 import net.runelite.api.NPC;
 import net.runelite.api.Player;
 import net.runelite.api.WorldView;
@@ -245,6 +246,20 @@ public class NPCProvider extends BridgeProvider
 			: wp;
 		data.put("instX", inst.getX());
 		data.put("instY", inst.getY());
+		// Overhead protection prayer (2026-09-05, Gauntlet sub-project 1). The Hunllef cycles
+		// its protection prayer and a hit with the protected style does nothing, so the fight
+		// routine needs this. ZombieLite reads the same short[] by reflection into the injected
+		// client and indexes HeadIcon.values() with element 0 (NpcsHook.getOldHeadIcon); the
+		// public getOverheadSpriteIds() has exposed it since 1.12.x. Whether the element is a
+		// HeadIcon ORDINAL or a sprite id is settled live against the Hunllef -- the raw value
+		// is reported alongside so a mismatch is diagnosable instead of reading as "no prayer".
+		short[] overhead = npc.getOverheadSpriteIds();
+		int overheadId = overhead != null && overhead.length > 0 ? overhead[0] : -1;
+		data.put("overheadPrayerId", overheadId);
+		HeadIcon[] icons = HeadIcon.values();
+		data.put("overheadPrayer", overheadId >= 0 && overheadId < icons.length
+			? icons[overheadId].name()
+			: null);
 		// Aim at a point inside the npc's actual on-screen model (Actor.getConvexHull()), not at
 		// the ground-tile projection under its feet -- the same correction ObjectProvider has made
 		// via TileObject.getClickbox() since 2026-08-01. Added 2026-08-24 after bench_hover.py
