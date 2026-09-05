@@ -67,11 +67,15 @@ public class CollisionProvider extends BridgeProvider
 	{
 		Map<String, Object> data = new LinkedHashMap<>();
 
+		// all=true (2026-09-05): the whole plane in one compact grid.
+		String all = query.get("all");
+		boolean wantAll = all != null && ("true".equalsIgnoreCase(all) || "1".equals(all));
+
 		WorldView view = client.getTopLevelWorldView();
 		Player local = client.getLocalPlayer();
 		if (view == null || local == null)
 		{
-			data.put("tiles", new ArrayList<>());
+			data.put(wantAll ? "flags" : "tiles", new ArrayList<>());
 			return data;
 		}
 
@@ -90,13 +94,30 @@ public class CollisionProvider extends BridgeProvider
 		CollisionData[] maps = view.getCollisionMaps();
 		if (maps == null || plane < 0 || plane >= maps.length || maps[plane] == null)
 		{
-			data.put("tiles", new ArrayList<>());
+			data.put(wantAll ? "flags" : "tiles", new ArrayList<>());
 			return data;
 		}
 		int[][] flags = maps[plane].getFlags();
+		if (flags == null)
+		{
+			data.put(wantAll ? "flags" : "tiles", new ArrayList<>());
+			return data;
+		}
+
+		// all=true (2026-09-05): the whole plane in one compact grid. See CollisionGrid.
+		if (wantAll)
+		{
+			data.put("baseX", view.getBaseX());
+			data.put("baseY", view.getBaseY());
+			data.put("plane", plane);
+			data.put("size", InstanceCoords.SCENE_SIZE);
+			data.put("flags", CollisionGrid.encode(flags));
+			return data;
+		}
+
 		Scene scene = view.getScene();
 		Tile[][][] tiles = scene != null ? scene.getTiles() : null;
-		if (flags == null || tiles == null || plane >= tiles.length || tiles[plane] == null)
+		if (tiles == null || plane >= tiles.length || tiles[plane] == null)
 		{
 			data.put("tiles", new ArrayList<>());
 			return data;
