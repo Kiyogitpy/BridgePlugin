@@ -72,8 +72,10 @@ def test_craft_plan_never_overspends():
     inv_ = named([(g.ITEM_ORE, 3), (g.ITEM_BARK, 3), (g.ITEM_LINUM, 3), (g.ITEM_FRAME, 2), (g.ITEM_SHARDS, 120)])
     plan = k.craft_plan(inv_, EQ_NONE, CFG)
     bowl = [a for o, a in plan if o == "bowl"]
-    assert bowl == ["helm", "body"]               # 120 shards: two T1 pieces, nothing else
+    assert bowl == ["helm", "body", "bow", "staff"]     # 120 shards: 2x T1 armour + basic weapons only (basic = frame, no shards)
     assert ("bowl", "vial") not in plan           # no grym -> no potions
+    # Basic weapons cost frames only; insufficient shards (20 left) prevents attune (need 50 each)
+    assert plan.count(("bowl", "bow")) == 1 and plan.count(("bowl", "staff")) == 1
 
 
 def test_gather_value_scores_deficit_only():

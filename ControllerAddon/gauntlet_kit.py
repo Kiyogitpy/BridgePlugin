@@ -101,10 +101,6 @@ def kit_minimum_met(inventory, equipment, cfg):
     return not any((d.ore, d.bark, d.linum, d.shards, d.frames, d.fish, d.grym))
 
 
-def _affordable(shards, cost):
-    return shards >= cost
-
-
 def craft_plan(inventory, equipment, cfg):
     """Ordered bowl/pump/pestle/potion/cook/wear steps from what is in the bag, within the shards
     held: potions' vials first (they need the pump trip), the T1 set, both weapons to attuned,
@@ -133,10 +129,9 @@ def craft_plan(inventory, equipment, cfg):
     for kind in ("helm", "body", "legs"):
         armour_step(kind, 1)
     for kind in ("bow", "staff"):
-        if tiers[kind] == 0 and frames > 0 and shards >= ATTUNE_SHARDS:
+        if tiers[kind] == 0 and frames > 0:
             frames -= 1; tiers[kind] = 1; plan.append(("bowl", kind))
-            shards -= ATTUNE_SHARDS; tiers[kind] = 2; plan.append(("bowl", kind))
-        elif tiers[kind] == 1 and shards >= ATTUNE_SHARDS:
+        if tiers[kind] == 1 and shards >= ATTUNE_SHARDS:
             shards -= ATTUNE_SHARDS; tiers[kind] = 2; plan.append(("bowl", kind))
     for kind, item in (("staff", g.ITEM_ORB), ("bow", g.ITEM_BOWSTRING)):
         if tiers[kind] == 2 and count(inventory, item):
