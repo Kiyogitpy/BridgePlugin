@@ -1378,3 +1378,41 @@ def test_hop_to_inst_reads_inst_position_and_forwards_the_flag(monkeypatch):
     assert ("mm", 13080, 5640, True) in calls
     assert all(c[3] is True for c in calls if c[0] in ("mm", "gd"))
     assert ("click", False) in calls
+
+
+def test_hop_to_inst_short_hop_uses_ground_point_and_waits_in_instance_space(monkeypatch):
+    calls = []
+    positions = iter([
+        {"x": 1900, "y": 5600, "instX": 13060, "instY": 5640, "plane": 1},   # origin read
+        {"x": 1900, "y": 5600, "instX": 13061, "instY": 5640, "plane": 1},   # first wait poll: still walking
+        {"x": 1900, "y": 5600, "instX": 13064, "instY": 5640, "plane": 1},   # second poll: arrived (within tolerance)
+    ])
+    last = {"p": None}
+
+    def fake_player():
+        try:
+            last["p"] = next(positions)
+        except StopIteration:
+            pass
+        return last["p"]
+
+    monkeypatch.setattr(controller, "get_player", fake_player)
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, plane, inst=False: (calls.append(("gd", x, y, inst)) or
+                                                          {"onScreen": True, "screenX": 5, "screenY": 5}))
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, plane, inst=False: (calls.append(("mm", x, y, inst)) or
+                                                          {"onMinimap": False}))
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: calls.append(("click", shift)))
+    monkeypatch.setattr(travel.time, "sleep", lambda s: None)
+    monkeypatch.setattr(travel, "WALK_HOP_TIMEOUT_S", 6.0)
+
+    assert travel._hop_to(_Ctx(), 13065, 5640, 1, inst=True)
+    # 5 tiles in instance space => the SHORT branch: a ground (viewport) point, shift-clicked,
+    # and the lookup carries inst=True.
+    assert ("gd", 13065, 5640, True) in calls
+    assert ("click", True) in calls
+    assert not any(c[0] == "mm" for c in calls)
+    # The arrival wait read instX/instY: it released on the third player read (13064 is within
+    # WALK_ARRIVAL_TOLERANCE of 13065) rather than running to the timeout.
+    assert last["p"]["instX"] == 13064

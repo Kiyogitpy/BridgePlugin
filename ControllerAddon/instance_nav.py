@@ -169,9 +169,9 @@ def walk_to(ctx, x: int, y: int, tolerance: float = travel.WALK_ARRIVAL_TOLERANC
             debug_log.log("inav", f"no route from {(px, py)} to {goal} (avoiding {len(avoid)} tiles)")
             return False
         # Farthest route point within one hop, so a long room crossing is 1-2 minimap clicks.
+        # BFS steps one tile at a time, so the Chebyshev distance to path[idx] is always <= idx,
+        # which is already capped at WALK_HOP_MAX_TILES -- no pull-back loop needed.
         idx = min(len(path) - 1, travel.WALK_HOP_MAX_TILES)
-        while idx > 1 and max(abs(path[idx][0] - px), abs(path[idx][1] - py)) > travel.WALK_HOP_MAX_TILES:
-            idx -= 1
         target = path[idx]
         hops += 1
         if not travel._hop_to(ctx, target[0], target[1], plane, inst=True):
