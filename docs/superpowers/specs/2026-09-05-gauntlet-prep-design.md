@@ -104,9 +104,8 @@ beast -> bowstring -> perfected bow; bear -> not wanted).
 
 ### Room model
 
-`gauntlet_maze.py` (new, pure) builds the room grid from instance space: the boss room is the
-component containing the Barrier's far side... simpler and robust: the start room is the
-component the player stands in at t=0; its centre is the mean of its walkable tiles; the room
+`gauntlet_maze.py` (new, pure) builds the room grid from instance space. The start room is the
+walkable component the player stands in at t=0; its centre is the mean of its walkable tiles; the room
 pitch P is measured live (the distance between the start room's centre and the first opened
 room's centre, expected ~16 tiles; pinned as a constant once measured). Room (i, j) =
 `start_centre + i*P*RIGHT + j*P*OUTWARD`; the boss room is (0, -1). OUTWARD is the unit vector
