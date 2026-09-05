@@ -289,18 +289,23 @@ def explore_gather_phase(ctx, cfg):
         node = maze.node_between(_nodes(objects), here_centre, target, st["pitch"])
         if maze.edge_open(imap, here_centre, target):
             st["sub"] = "to_room"
+            # Fall through to to_room logic
         elif node is None:
             instance_nav.walk_to(ctx, target[0], target[1], tolerance=ROOM_ARRIVAL_TOLERANCE)
+            return
         elif h.cheb(me, (node["instX"], node["instY"])) > 2:
             instance_nav.walk_to(ctx, node["instX"], node["instY"], tolerance=2)
+            return
         elif light_node(ctx, node, cfg):
             st["sub"] = "to_room"
+            # Fall through to to_room logic
         else:
             st["node_fails"] += 1
             if st["node_fails"] >= NODE_MAX_FAILS:
                 debug_log.log("cg", f"[!] node toward {offset} will not light -- skipping the step")
                 advance()
-        return
+            return
+
     if st["sub"] == "to_room":
         if h.cheb(me, target) > ROOM_ARRIVAL_TOLERANCE:
             instance_nav.walk_to(ctx, target[0], target[1], tolerance=ROOM_ARRIVAL_TOLERANCE)
@@ -308,6 +313,7 @@ def explore_gather_phase(ctx, cfg):
         st["entered"].add(offset)
         st["sub"] = "gather"
         return
+
     if st["sub"] == "gather":
         pick_up_drops(ctx, cfg)
         deficit = kit.kit_deficit(controller.get_inventory(), controller.get_equipment(), cfg)
@@ -321,9 +327,11 @@ def explore_gather_phase(ctx, cfg):
             return
         if reveal and reveal not in st["revealed"]:
             st["sub"] = "reveal"
+            # Fall through to reveal logic
+        else:
+            advance()
             return
-        advance()
-        return
+
     if st["sub"] == "reveal":
         rc = _centre(st, reveal)
         node = maze.node_between(_nodes(objects), target, rc, st["pitch"])
