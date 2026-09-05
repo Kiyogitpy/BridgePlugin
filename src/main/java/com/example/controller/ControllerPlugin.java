@@ -5,6 +5,7 @@ import com.example.providers.*;
 import com.example.tracker.CurrentTargetTrackerFactory;
 import com.example.tracker.NpcTrackerRegistry;
 import com.example.util.EventSubscriptions;
+import com.example.util.InstanceCoords;
 import com.example.util.PlayerMotionTracker;
 import com.example.util.UdpEventSender;
 import com.google.inject.Provides;
@@ -551,6 +552,18 @@ public class ControllerPlugin extends Plugin
 		sendGroundItemEvent("GROUND_ITEM_DESPAWNED", event.getTile(), event.getItem());
 	}
 
+	@Subscribe
+	public void onNpcSpawned(NpcSpawned event)
+	{
+		sendNpcSpawnEvent("NPC_SPAWNED", event.getNpc());
+	}
+
+	@Subscribe
+	public void onNpcDespawned(NpcDespawned event)
+	{
+		sendNpcSpawnEvent("NPC_DESPAWNED", event.getNpc());
+	}
+
 	private void sendObjectEvent(String type, GameObject obj)
 	{
 		// Cheap first filter -- excludes the logged-out case -- but NOT sufficient alone to guard
@@ -626,6 +639,46 @@ public class ControllerPlugin extends Plugin
 		payload.put("x", wp.getX());
 		payload.put("y", wp.getY());
 		payload.put("plane", wp.getPlane());
+		payload.put("tick", tickClock.get());
+		udpSender.send(type, payload);
+	}
+
+	/**
+	 * Same shape and guards as sendObjectEvent: LOGGED_IN filter, the shared per-tick spawn
+	 * budget (a scene load replays EVERY npc as a spawn, the same flood the object events hit),
+	 * and the udpSender null-check for the shutDown race. Added 2026-09-05 for Gauntlet
+	 * sub-project 1 -- a tornado is an NPC (9025 / 9039) and the fight routine wants to hear it
+	 * appear without polling /npcs. Accelerator only: the routine confirms on HTTP before acting.
+	 */
+	private void sendNpcSpawnEvent(String type, NPC npc)
+	{
+		if (client.getGameState() != GameState.LOGGED_IN || npc == null)
+		{
+			return;
+		}
+		if (!spawnEventBudgetAvailable())
+		{
+			return;
+		}
+		if (udpSender == null)
+		{
+			return;
+		}
+		LocalPoint lp = npc.getLocalLocation();
+		Map<String, Object> payload = new HashMap<>();
+		payload.put("id", npc.getId());
+		payload.put("index", npc.getIndex());
+		payload.put("name", npc.getName());
+		if (lp != null)
+		{
+			WorldPoint wp = WorldPoint.fromLocalInstance(client, lp);
+			WorldPoint inst = InstanceCoords.instancePoint(client, lp, client.getPlane());
+			payload.put("x", wp.getX());
+			payload.put("y", wp.getY());
+			payload.put("plane", wp.getPlane());
+			payload.put("instX", inst.getX());
+			payload.put("instY", inst.getY());
+		}
 		payload.put("tick", tickClock.get());
 		udpSender.send(type, payload);
 	}
