@@ -10,6 +10,11 @@ Every decision is in hunllef.py (pure, unit-tested, replay-tested). This file on
 bridge, performs the top rung with the existing click primitives, and waits for the next game
 tick. The fight loop holds tick() for the whole fight: the engine loop's ~1.1 s per iteration
 would eat the 3 s prayer window; the panic key lives on its own thread and keeps working.
+
+`NPC_TRACKED_ANIMATION_CHANGED` (the event feed_tracker prefers) only flows while the Hunllef is
+our interaction target, so every weapon wield away from it opens a 2-3 tick event blind spot --
+`feed_tracker`'s snapshot cross-check (C3, final-fix-brief.md, `/npcs`' `animationId` field) covers
+exactly that gap.
 """
 from __future__ import annotations
 
@@ -82,17 +87,32 @@ def derive_phase(data, npcs, objects):
 
 
 def feed_tracker(tracker, snap, events_since):
-    """Events (every Hunllef animation change of the last tick) when the stream exists; the
-    snapshot's animation transition otherwise. HTTP stays the truth for everything acted on --
-    the tracker only decides WHEN to switch prayer, and a wrong switch costs one 40+ hit, which
-    the marker resync then corrects."""
+    """Feeds BOTH sources every tick when the event stream exists (C3, final-fix-brief.md):
+    events first (tracker.observe per Hunllef animation-change event), then the snapshot's own
+    `/npcs` animation read via tracker.observe_snapshot -- but only when that snapshot animation
+    id is an attack-like or marker id that none of this tick's events already carried for the
+    Hunllef. `NPC_TRACKED_ANIMATION_CHANGED` only fires while the Hunllef is our interaction
+    target, so every weapon wield away from it opens a 2-3 tick event blind spot; the snapshot
+    cross-check covers exactly that gap without double-counting an animation the events already
+    reported. HTTP stays the truth for everything acted on -- the tracker only decides WHEN to
+    switch prayer, and a wrong switch costs one 40+ hit, which the marker resync then corrects.
+
+    Without an event stream, the snapshot is the only source and every distinct animation
+    transition counts, same as before."""
     if events_since is None:
         if snap.hunllef is not None:
             tracker.observe_snapshot(snap.hunllef["anim"])
         return
+    seen = set()
     for event_type, payload in events_since:
         if event_type == "NPC_TRACKED_ANIMATION_CHANGED" and payload and payload.get("id") in g.HUNLLEF:
-            tracker.observe(payload.get("animationId"))
+            anim = payload.get("animationId")
+            seen.add(anim)
+            tracker.observe(anim)
+    if snap.hunllef is not None:
+        anim = snap.hunllef["anim"]
+        if anim not in seen and (anim in g.ANIM_ATTACK_LIKE or anim in g.ANIM_MARKER):
+            tracker.observe_snapshot(anim)
 
 
 # ----------------------------------------------------------------------------- actions

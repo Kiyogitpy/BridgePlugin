@@ -240,6 +240,11 @@ public class NPCProvider extends BridgeProvider
 		data.put("x", wp.getX());
 		data.put("y", wp.getY());
 		data.put("plane", wp.getPlane());
+		// Added 2026-09-05 (C3, final-fix-brief.md) for the Hunllef style tracker's HTTP
+		// cross-check: the plan invented an `animationId` field on /npcs and the tests pinned it,
+		// but buildNpcData never emitted one, so that HTTP fallback path was dead code. Same
+		// one-liner pattern as PlayerProvider's `animation`.
+		data.put("animationId", npc.getAnimation());
 		// Instance-space twin of x/y (2026-09-05, InstanceCoords). Equal outside an instance.
 		WorldPoint inst = npcLocal != null && npcLocal.getWorldView() <= WorldView.TOPLEVEL
 			? InstanceCoords.instancePoint(client, npcLocal, plane)

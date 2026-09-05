@@ -86,6 +86,46 @@ def test_feed_tracker_prefers_events_and_falls_back_to_snapshot_transitions():
     assert t2.attacks == 1                                  # same animation again: no new attack
 
 
+class _SpyTracker:
+    """Records exactly which raw observations feed_tracker makes, so the C3 cross-check test can
+    assert on the CALL PATTERN (events vs. the snapshot fallback) without going through
+    StyleTracker's own attack/marker/resync bookkeeping, which would conflate the two."""
+
+    def __init__(self):
+        self.observed = []
+        self.observed_snapshot = []
+
+    def observe(self, anim):
+        self.observed.append(anim)
+
+    def observe_snapshot(self, anim):
+        self.observed_snapshot.append(anim)
+
+
+def test_feed_tracker_cross_checks_events_against_the_snapshot_animation():
+    """C3: /npcs now reports animationId (NPCProvider.buildNpcData), so both sources are fed every
+    tick -- events first, then the snapshot's own animation ONLY when it is an attack-like/marker
+    id that none of this tick's Hunllef events already carried."""
+    # events carry 8419, snapshot also shows 8419 -> a duplicate of the event, counted once.
+    spy = _SpyTracker()
+    snap = h.FightSnapshot.from_bridge({"instX": 1, "instY": 2}, [_npc(9036, anim=8419)], [], {}, {}, [], {})
+    cg.feed_tracker(spy, snap, [("NPC_TRACKED_ANIMATION_CHANGED", {"id": 9036, "animationId": 8419})])
+    assert spy.observed == [8419] and spy.observed_snapshot == []
+
+    # events carry nothing, snapshot shows a marker id -> counted as a marker via the snapshot.
+    spy2 = _SpyTracker()
+    snap_marker = h.FightSnapshot.from_bridge({"instX": 1, "instY": 2}, [_npc(9036, anim=8754)], [], {}, {}, [], {})
+    cg.feed_tracker(spy2, snap_marker, [])
+    assert spy2.observed == [] and spy2.observed_snapshot == [8754]
+
+    # events carry 8419 (an attack), snapshot shows 8754 (a marker the events did not carry) ->
+    # both observations happen.
+    spy3 = _SpyTracker()
+    snap_both = h.FightSnapshot.from_bridge({"instX": 1, "instY": 2}, [_npc(9036, anim=8754)], [], {}, {}, [], {})
+    cg.feed_tracker(spy3, snap_both, [("NPC_TRACKED_ANIMATION_CHANGED", {"id": 9036, "animationId": 8419})])
+    assert spy3.observed == [8419] and spy3.observed_snapshot == [8754]
+
+
 def test_do_prayer_opens_the_tab_and_clicks_the_icon(monkeypatch):
     clicks = []
     monkeypatch.setattr(controller, "open_prayer_tab", lambda ser: True)
