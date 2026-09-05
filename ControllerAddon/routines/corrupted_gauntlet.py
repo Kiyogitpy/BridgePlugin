@@ -246,30 +246,50 @@ def light_node(ctx, node, cfg):
     return ok
 
 
+GATHER_NODE_MAX_S = 20.0       # (I10) whole-gather wall-clock ceiling, one click, no re-click loop
+GATHER_POLL_S = 0.3            # (I10) how often the poll checks for depletion/a new yield
+GATHER_ATTACKER_CHECK_S = 1.0  # (I10) how often the poll checks for an attacker, inside the wait
+
+
 def gather_node(ctx, obj, cfg):
+    """(I10, final-fix-brief.md) Click ONCE, then poll for the depleted id on the tile or a yield
+    item count rising -- the old version re-clicked once per expected yield and, worse, blocked
+    the whole tick (no attacker check) between the click and the next poll, so an attacker
+    appearing mid-swing could not be reacted to until the WHOLE multi-click gather finished. The
+    poll checks for an attacker every GATHER_ATTACKER_CHECK_S and returns early (with whatever was
+    already gathered) the moment one appears. A re-click only fires once, and only if no yield
+    landed within GATHER_BUDGET_S of the first click (the first click missed the object
+    entirely -- a genuine miss, not merely a slow swing)."""
     name = obj.get("name")
     action = g.RESOURCE_ACTION.get(name)
     item = g.RESOURCE_ITEM.get(name)
     if action is None:
         return False
     pos = (obj.get("instX"), obj.get("instY"))
-    got = 0
-    for _ in range(g.RESOURCE_YIELD[name] + 2):
+    before = kit.count(controller.get_inventory(), item)
+    controller.click_entity(ctx.ser, obj, expected_action=action)
+    got = False
+    reclicked = False
+    start = time.time()
+    last_attacker_check = start
+    while time.time() - start < GATHER_NODE_MAX_S:
+        now = time.time()
         live = next((o for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True)
                      if (o.get("instX"), o.get("instY")) == pos), None)
+        if kit.count(controller.get_inventory(), item) > before:
+            got = True
         if live is None or live.get("id") in g.RESOURCE_NODES_DEPLETED:
-            break
-        me, _ = _me()
-        if cg_attacker_present(me):
-            return got > 0
-        before = kit.count(controller.get_inventory(), item)
-        controller.click_entity(ctx.ser, live, expected_action=action)
-        if _confirm(ctx, lambda: kit.count(controller.get_inventory(), item) > before, GATHER_BUDGET_S):
-            got += 1
-        else:
-            break
-        _wait_tick(ctx)
-    return got > 0
+            return got
+        if now - last_attacker_check >= GATHER_ATTACKER_CHECK_S:
+            last_attacker_check = now
+            me, _ = _me()
+            if cg_attacker_present(me):
+                return got
+        if not got and not reclicked and now - start >= GATHER_BUDGET_S:
+            controller.click_entity(ctx.ser, live, expected_action=action)
+            reclicked = True
+        time.sleep(GATHER_POLL_S)
+    return got
 
 
 def cg_attacker_present(me):

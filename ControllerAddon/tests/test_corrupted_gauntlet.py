@@ -837,31 +837,64 @@ def test_gather_ladder_flees_a_demi_boss(monkeypatch):
     assert walks == [(90, 90)]
 
 
-def test_gather_node_loops_until_depleted(monkeypatch):
+def test_gather_node_clicks_once_and_waits_for_depletion(monkeypatch):
+    """I10: gather_node clicks ONCE, then polls for the depleted id on the tile (or a yield
+    count rising) instead of re-clicking once per expected yield -- the old version's own click
+    count WAS the yield count; now the object's own depletion is the signal, achieved here with
+    no re-click at all."""
     ctx = _Ctx()
     deposit = next(n for n in g.RESOURCE_NODES.values() if "Deposit" in n)
     dep_id = next(i for i, n in g.RESOURCE_NODES.items() if n == deposit)
     depleted_id = next(i for i, n in g.RESOURCE_NODES_DEPLETED.items() if "Deposit" in n)
     node = _obj(dep_id, deposit, 100, 100)
-    ore = {"n": 0}
     reads = {"k": 0}
+
     def objects(radius=None, fresh=False, interactable=False):
         reads["k"] += 1
-        return [_obj(depleted_id if ore["n"] >= 3 else dep_id, deposit, 100, 100)]
+        return [_obj(depleted_id if reads["k"] >= 3 else dep_id, deposit, 100, 100)]
     monkeypatch.setattr(controller, "get_objects", objects)
-    monkeypatch.setattr(controller, "get_inventory", lambda: [{"slot": 0, "name": g.ITEM_ORE, "qty": ore["n"]}] if ore["n"] else [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"slot": 0, "name": g.ITEM_ORE, "qty": 3}] if reads["k"] >= 2 else [])
     monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
     monkeypatch.setattr(controller, "get_player", lambda: _player_at(101, 100))
+    clicks = []
+
     def click(ser, entity, **kw):
         assert kw.get("expected_action") == "Mine"
-        ore["n"] += 1
+        clicks.append(1)
         return True
     monkeypatch.setattr(controller, "click_entity", click)
-    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **kw: (lambda: None), raising=False)
-    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=1.0: check())
-    monkeypatch.setattr(cg, "_wait_tick", lambda ctx: None)
+    t = {"v": 1000.0}
+    monkeypatch.setattr(cg.time, "time", lambda: t["v"])
+    monkeypatch.setattr(cg.time, "sleep", lambda s: t.__setitem__("v", t["v"] + s))
     assert cg.gather_node(ctx, node, cg.DEFAULT_CONFIG)
-    assert ore["n"] == 3
+    assert len(clicks) == 1   # no re-click needed -- ore rose, then the node depleted on its own
+
+
+def test_gather_node_returns_early_when_an_attacker_appears(monkeypatch):
+    """I10: the old version blocked the whole tick (no attacker check) between the click and its
+    single confirmation wait, so an attacker appearing mid-gather could not be reacted to until
+    the entire multi-click gather finished. The poll now checks for one every
+    GATHER_ATTACKER_CHECK_S and returns early the moment one appears."""
+    ctx = _Ctx()
+    deposit = next(n for n in g.RESOURCE_NODES.values() if "Deposit" in n)
+    dep_id = next(i for i, n in g.RESOURCE_NODES.items() if n == deposit)
+    node = _obj(dep_id, deposit, 100, 100)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [node])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])   # no yield ever arrives
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(101, 100))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    attacker = {"id": 9046, "index": 1, "instX": 102, "instY": 100, "interactingPlayer": True}
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [attacker])
+    t = {"v": 1000.0}
+    polls = {"n": 0}
+    monkeypatch.setattr(cg.time, "time", lambda: t["v"])
+
+    def fake_sleep(s):
+        polls["n"] += 1
+        t["v"] += cg.GATHER_ATTACKER_CHECK_S   # advance past the attacker-check interval every poll
+    monkeypatch.setattr(cg.time, "sleep", fake_sleep)
+    assert cg.gather_node(ctx, node, cg.DEFAULT_CONFIG) is False
+    assert polls["n"] <= 2   # returned within the first couple of polls, not the full 20s budget
 
 
 def test_light_node_success_clears_the_cached_instance_map(monkeypatch):
