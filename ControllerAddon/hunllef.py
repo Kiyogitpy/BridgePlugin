@@ -70,3 +70,74 @@ class StyleTracker:
 
     def expected_prayer(self) -> str:
         return PROTECT_FOR[self.upcoming_style()]
+
+
+FOOTPRINT_ORIGIN = "centre"   # what /npcs instX/instY is for a size-5 NPC; live checklist item 1
+
+
+@dataclass
+class FightSnapshot:
+    """One game tick's worth of bridge reads, in instance space."""
+    hp: int
+    prayer: int
+    me: tuple
+    plane: int
+    my_anim: int
+    hunllef: dict | None
+    tornadoes: list
+    hazards: dict
+    prayers_active: dict
+    weapon: str | None
+    inventory: list
+    target_id: int | None
+
+    @classmethod
+    def from_bridge(cls, player, npcs, objects, prayers, equipment, inventory, combat):
+        hun = None
+        tornadoes = []
+        for n in npcs or []:
+            nid = n.get("id")
+            if nid in g.HUNLLEF and hun is None:
+                hun = {"id": nid, "index": n.get("index"), "x": n.get("instX"), "y": n.get("instY"),
+                       "anim": n.get("animationId"), "hp_ratio": n.get("hpRatio"), "entity": n}
+            elif nid in g.TORNADO:
+                tornadoes.append((n.get("instX"), n.get("instY")))
+        hazards = {(o.get("instX"), o.get("instY")): o.get("id")
+                   for o in objects or [] if o.get("id") in g.HAZARD_TILES}
+        weapon = (equipment or {}).get("weapon") or {}
+        return cls(
+            hp=int(player.get("hp") or 0), prayer=int(player.get("prayer") or 0),
+            me=(player.get("instX"), player.get("instY")), plane=int(player.get("plane") or 0),
+            my_anim=player.get("animation", -1), hunllef=hun, tornadoes=tornadoes, hazards=hazards,
+            prayers_active=(prayers or {}).get("active") or {}, weapon=weapon.get("name") or None,
+            inventory=list(inventory or []), target_id=(combat or {}).get("targetId"))
+
+    def hunllef_centre(self, origin=None):
+        if self.hunllef is None or self.hunllef["x"] is None:
+            return None
+        x, y = self.hunllef["x"], self.hunllef["y"]
+        if (origin or FOOTPRINT_ORIGIN) == "sw":
+            half = g.HUNLLEF_SIZE // 2
+            return (x + half, y + half)
+        return (x, y)
+
+    def fish(self):
+        return [i for i in self.inventory if i.get("name") in g.FISH_NAMES]
+
+    def egniol(self):
+        return [i for i in self.inventory if str(i.get("name", "")).startswith(g.EGNIOL_PREFIX)]
+
+    def weapon_kind(self):
+        if self.weapon in g.BOW_NAMES:
+            return "bow"
+        if self.weapon in g.STAFF_NAMES:
+            return "staff"
+        return None
+
+    def inventory_weapon(self, kind):
+        names = g.BOW_NAMES if kind == "bow" else g.STAFF_NAMES
+        for name in names:                       # perfected first
+            for item in self.inventory:
+                if item.get("name") == name:
+                    return item
+        return None

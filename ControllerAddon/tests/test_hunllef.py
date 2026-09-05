@@ -64,3 +64,55 @@ def test_predictive_window_opens_on_the_fourth_attack():
             assert t.next_style_due() and t.upcoming_style() == h.MAGIC
             assert t.expected_prayer() == "PROTECT_FROM_MAGIC"
             break
+
+
+def _player(**kw):
+    p = {"hp": 80, "prayer": 50, "instX": 13100, "instY": 5700, "plane": 1, "animation": -1}
+    p.update(kw); return p
+
+def _npc(id_, x, y, anim=-1, index=61584):
+    return {"id": id_, "index": index, "instX": x, "instY": y, "animationId": anim, "hpRatio": 90,
+            "name": "Corrupted Hunllef" if id_ in g.HUNLLEF else "x", "screenX": 500, "screenY": 400}
+
+def _obj(id_, x, y):
+    return {"id": id_, "instX": x, "instY": y, "objectType": "GroundObject", "x": 1900, "y": 5600}
+
+def _inv(*names):
+    return [{"slot": i, "id": 1, "name": n, "qty": 1, "screenX": 10 * i, "screenY": 5} for i, n in enumerate(names)]
+
+def _snap(**kw):
+    args = dict(player=_player(), npcs=[_npc(9036, 13105, 5700, 8419)], objects=[], prayers={"active": {}},
+                equipment={"weapon": {"name": "Corrupted bow (perfected)"}},
+                inventory=_inv("Corrupted staff (perfected)", "Paddlefish", "Egniol potion (2)"),
+                combat={"targetId": 9036})
+    args.update(kw)
+    return h.FightSnapshot.from_bridge(**args)
+
+
+def test_snapshot_reads_the_hunllef_tornadoes_and_hazards_in_instance_space():
+    s = _snap(npcs=[_npc(9036, 13105, 5700, 8419), _npc(9039, 13098, 5701, index=7), _npc(9040, 13110, 5710, index=8)],
+              objects=[_obj(36048, 13100, 5700), _obj(36047, 13101, 5700), _obj(12345, 13102, 5700)])
+    assert s.hunllef["id"] == 9036 and s.hunllef["anim"] == 8419 and s.hunllef_centre() == (13105, 5700)
+    assert s.tornadoes == [(13098, 5701)]
+    assert s.hazards == {(13100, 5700): 36048, (13101, 5700): 36047}
+    assert s.me == (13100, 5700) and s.target_id == 9036
+
+
+def test_snapshot_item_helpers():
+    s = _snap()
+    assert [i["name"] for i in s.fish()] == ["Paddlefish"]
+    assert [i["name"] for i in s.egniol()] == ["Egniol potion (2)"]
+    assert s.weapon_kind() == "bow"
+    assert s.inventory_weapon("staff")["name"] == "Corrupted staff (perfected)"
+    assert s.inventory_weapon("bow") is None
+    assert _snap(equipment={"weapon": None}).weapon_kind() is None
+
+
+def test_snapshot_without_hunllef_and_with_dead_id():
+    assert _snap(npcs=[]).hunllef is None
+    assert _snap(npcs=[_npc(9038, 1, 1)]).hunllef["id"] == 9038
+
+
+def test_snapshot_sw_origin_shifts_the_centre():
+    s = _snap()
+    assert s.hunllef_centre(origin="sw") == (13107, 5702)
