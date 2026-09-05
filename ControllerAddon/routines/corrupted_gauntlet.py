@@ -812,9 +812,16 @@ def teleport_home(ctx, cfg):
 
 
 def _bowl_widget(key):
+    """(I6, final-fix-brief.md) Match against name+text, the same group-270 matcher
+    routines/giants_foundry.py's crucible Fill interface uses (`_fill_via_crucible`'s
+    `label = f"{w.get('name') or ''} {w.get('text') or ''}"`) -- a widget carrying the item's
+    name in the `name` field with an empty `text` (or vice versa) still matches."""
     want = g.BOWL_TEXT[key]
     for w in controller.get_widgets_dump():
-        if w.get("group") == g.BOWL_GROUP and want in str(w.get("text") or "") and w.get("screenX") is not None:
+        if w.get("group") != g.BOWL_GROUP or w.get("screenX") is None:
+            continue
+        label = f"{w.get('name') or ''} {w.get('text') or ''}"
+        if want in label:
             return w
     return None
 
@@ -823,10 +830,13 @@ def bowl_make(ctx, key, cfg):
     bowl = _find_object(cfg, g.OBJ_SINGING_BOWL)
     if bowl is None or not _near(ctx, bowl, 3):
         return False
-    controller.click_entity(ctx.ser, bowl, expected_action="Sing-crystal")
-    if not _confirm(ctx, lambda: _bowl_widget(key) is not None, BOWL_BUDGET_S):
-        debug_log.log("cg", f"bowl: no widget for {key}")
-        return False
+    # (I6) The Singing Bowl interface stays open across Makes -- skip the Sing-crystal click
+    # (and the walk/near check it re-triggers) when the widget for this key is already visible.
+    if _bowl_widget(key) is None:
+        controller.click_entity(ctx.ser, bowl, expected_action="Sing-crystal")
+        if not _confirm(ctx, lambda: _bowl_widget(key) is not None, BOWL_BUDGET_S):
+            debug_log.log("cg", f"bowl: no widget for {key}")
+            return False
     widget = _bowl_widget(key)
     before = [(i.get("name"), i.get("qty")) for i in controller.get_inventory()]
     controller.click_entity(ctx.ser, widget, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)

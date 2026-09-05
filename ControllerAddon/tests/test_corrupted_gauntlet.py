@@ -1072,6 +1072,7 @@ def test_bowl_make_clicks_the_widget_by_text(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: _player_at(100, 100))
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_obj(g.OBJ_SINGING_BOWL, "Singing Bowl", 101, 100)])
     inv = {"n": 0}
+    state = {"bowl_open": False}
     def get_inventory_mock():
         if inv["n"] == 0:
             return []
@@ -1080,11 +1081,21 @@ def test_bowl_make_clicks_the_widget_by_text(monkeypatch):
         else:  # inv["n"] == 2 or higher: inventory changes after click
             return []
     monkeypatch.setattr(controller, "get_inventory", get_inventory_mock)
-    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: calls.append((entity.get("name") or entity.get("text"), kw.get("expected_action"))) or True)
-    monkeypatch.setattr(controller, "get_widgets_dump", lambda scan=False: [
-        {"group": 270, "child": 17, "text": "Corrupted helm", "screenX": 3, "screenY": 3, "actions": ["Make"]},
-        {"group": 270, "child": 18, "text": "Corrupted body", "screenX": 4, "screenY": 3, "actions": ["Make"]},
-        {"group": 162, "child": 1, "text": "Corrupted helm", "screenX": 9, "screenY": 9, "actions": []}])
+    def click_entity_mock(ser, entity, **kw):
+        name = entity.get("name") or entity.get("text")
+        calls.append((name, kw.get("expected_action")))
+        if kw.get("expected_action") == "Sing-crystal":
+            state["bowl_open"] = True
+        return True
+    monkeypatch.setattr(controller, "click_entity", click_entity_mock)
+    def widgets_dump(scan=False):
+        if not state["bowl_open"]:
+            return []
+        return [
+            {"group": 270, "child": 17, "text": "Corrupted helm", "screenX": 3, "screenY": 3, "actions": ["Make"]},
+            {"group": 270, "child": 18, "text": "Corrupted body", "screenX": 4, "screenY": 3, "actions": ["Make"]},
+            {"group": 162, "child": 1, "text": "Corrupted helm", "screenX": 9, "screenY": 9, "actions": []}]
+    monkeypatch.setattr(controller, "get_widgets_dump", widgets_dump)
     calls_to_confirm = [0]
     def confirm(ctx, check, budget_s=1.0):
         calls_to_confirm[0] += 1
@@ -1096,7 +1107,38 @@ def test_bowl_make_clicks_the_widget_by_text(monkeypatch):
     monkeypatch.setattr(cg, "_confirm", confirm)
     assert cg.bowl_make(ctx, "helm", cg.DEFAULT_CONFIG)
     assert calls[0] == ("Singing Bowl", "Sing-crystal")
-    assert calls[1][0] == "Corrupted helm"           # the group-270 widget, not the chatbox line
+
+
+def test_bowl_widget_matches_name_field_with_empty_text(monkeypatch):
+    """I6: the substring match must consider `name` too, not just `text` -- a widget carrying
+    the item's name in `name` with an empty `text` still matches."""
+    monkeypatch.setattr(controller, "get_widgets_dump", lambda scan=False: [
+        {"group": g.BOWL_GROUP, "child": 17, "name": "Corrupted helm", "text": "", "screenX": 3, "screenY": 3}])
+    w = cg._bowl_widget("helm")
+    assert w is not None and w["child"] == 17
+
+
+def test_bowl_make_skips_the_sing_crystal_click_when_already_open(monkeypatch):
+    """I6: the Singing Bowl interface stays open across Makes -- if the widget for this key is
+    already visible, bowl_make must not re-click Sing-crystal (and re-trigger the walk/near
+    check that click implies)."""
+    ctx = _Ctx()
+    calls = []
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(100, 100))
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [_obj(g.OBJ_SINGING_BOWL, "Singing Bowl", 101, 100)])
+    monkeypatch.setattr(controller, "get_widgets_dump", lambda scan=False: [
+        {"group": g.BOWL_GROUP, "child": 18, "text": "Corrupted body", "screenX": 4, "screenY": 3}])
+    inv = {"n": 0}
+    monkeypatch.setattr(controller, "get_inventory", lambda: [] if inv["n"] == 0 else [{"name": "Corrupted body (basic)", "qty": 1}])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: calls.append(kw.get("expected_action")) or True)
+
+    def confirm(ctx, check, budget_s=1.0):
+        inv["n"] = 1
+        return check()
+    monkeypatch.setattr(cg, "_confirm", confirm)
+    assert cg.bowl_make(ctx, "body", cg.DEFAULT_CONFIG)
+    assert "Sing-crystal" not in calls
 
 
 def test_craft_phase_runs_the_plan_and_marks_crafted(monkeypatch):
