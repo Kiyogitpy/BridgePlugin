@@ -1630,6 +1630,15 @@ precondition or retry in the eventual routine.
 Records are append-only with monotonic `seq` (the `?since=` cursor depends on it) — actions are
 *not* held back until their window closes; `recorder.py` does the grouping at render time.
 
+**`dropped` means records evicted BEFORE the reader took them, since 2026-09-05.** The first
+Corrupted Gauntlet recording (26695 records, seq 0..26694 verified gap-free, the whole Hunllef
+fight present) ended with `!! 6695 records were dropped` -- exactly 26695 minus the 20000-slot
+ring, because eviction counted whether or not recorder.py had already drained the record. Any
+recording longer than the ring raised a false "this recording has a gap". `RecordRing` (extracted
+from `RecorderProvider`, pinned by `RecordRingTest`) tracks the highest seq handed out and only
+counts an eviction past it. **Before believing a drop warning, check `seq` continuity in the
+`.jsonl`** -- a real hole is a gap there, nothing else is.
+
 **Every record carries `t` (ms since arm), `wall` (absolute epoch ms), `tick`, and `tickAge`.**
 `tick` is a mirror of `client.getTickCount()` refreshed on GameTick, because records are also
 created on the AWT thread (mouse/key listeners) where touching the client isn't safe — so it can be

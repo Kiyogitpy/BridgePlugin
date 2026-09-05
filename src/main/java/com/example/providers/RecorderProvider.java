@@ -46,10 +46,8 @@ import net.runelite.client.util.Text;
 
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseEvent;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -132,7 +130,9 @@ import java.util.Set;
  *   <li>{@code GET /recorder/events?since=<seq>&limit=<n>} -- drain records after {@code seq}.
  *       Returns {@code nextSeq} to pass as the next {@code since}, and {@code dropped} (records
  *       evicted by the ring buffer before anyone read them -- nonzero means the reader is too slow
- *       or the buffer is too small, and the recording has a hole in it).</li>
+ *       or the buffer is too small, and the recording has a hole in it. Records the reader has
+ *       already drained are evicted silently; see {@link RecordRing} for the false alarm that
+ *       distinction fixed).</li>
  *   <li>{@code GET /recorder/status} -- armed state, label, buffered count, dropped count.</li>
  * </ul>
  */
@@ -176,10 +176,7 @@ public class RecorderProvider extends BridgeProvider
 	private final MouseManager mouseManager;
 	private final KeyManager keyManager;
 
-	private final Deque<Map<String, Object>> buffer = new ArrayDeque<>();
-	private final Object bufferLock = new Object();
-	private long nextSeq = 0;
-	private long dropped = 0;
+	private final RecordRing ring = new RecordRing(MAX_BUFFER);
 
 	private volatile boolean armed = false;
 	private volatile String label = null;
@@ -270,12 +267,7 @@ public class RecorderProvider extends BridgeProvider
 		String on = query.get("on");
 		boolean wantOn = on == null || on.isEmpty() || "1".equals(on) || "true".equalsIgnoreCase(on);
 
-		synchronized (bufferLock)
-		{
-			buffer.clear();
-			nextSeq = 0;
-			dropped = 0;
-		}
+		ring.reset();
 		synchronized (mouseLock)
 		{
 			mouseBatch.clear();
@@ -383,36 +375,13 @@ public class RecorderProvider extends BridgeProvider
 			limit = DEFAULT_LIMIT;
 		}
 
-		List<Map<String, Object>> out = new ArrayList<>();
-		long next = since;
-		long droppedSnapshot;
-		long bufferedSnapshot;
-
-		synchronized (bufferLock)
-		{
-			for (Map<String, Object> record : buffer)
-			{
-				long seq = ((Number) record.get("seq")).longValue();
-				if (seq <= since)
-				{
-					continue;
-				}
-				out.add(record);
-				next = seq;
-				if (out.size() >= limit)
-				{
-					break;
-				}
-			}
-			droppedSnapshot = dropped;
-			bufferedSnapshot = buffer.size();
-		}
+		RecordRing.Drain drain = ring.drain(since, limit);
 
 		Map<String, Object> result = new HashMap<>();
-		result.put("events", out);
-		result.put("nextSeq", next);
-		result.put("dropped", droppedSnapshot);
-		result.put("buffered", bufferedSnapshot);
+		result.put("events", drain.events);
+		result.put("nextSeq", drain.nextSeq);
+		result.put("dropped", ring.dropped());
+		result.put("buffered", ring.size());
 		result.put("armed", armed);
 		result.put("label", label);
 		return result;
@@ -421,12 +390,9 @@ public class RecorderProvider extends BridgeProvider
 	private Object handleStatus()
 	{
 		Map<String, Object> result = new HashMap<>();
-		synchronized (bufferLock)
-		{
-			result.put("buffered", buffer.size());
-			result.put("nextSeq", nextSeq);
-			result.put("dropped", dropped);
-		}
+		result.put("buffered", ring.size());
+		result.put("nextSeq", ring.nextSeq());
+		result.put("dropped", ring.dropped());
 		result.put("armed", armed);
 		result.put("label", label);
 		result.put("epochMs", epochMs);
@@ -490,18 +456,7 @@ public class RecorderProvider extends BridgeProvider
 
 	private long add(Map<String, Object> record)
 	{
-		synchronized (bufferLock)
-		{
-			long seq = nextSeq++;
-			record.put("seq", seq);
-			buffer.addLast(record);
-			while (buffer.size() > MAX_BUFFER)
-			{
-				buffer.removeFirst();
-				dropped++;
-			}
-			return seq;
-		}
+		return ring.add(record);
 	}
 
 	/**
