@@ -1469,6 +1469,7 @@ def test_tick_dispatches_prep_phases(monkeypatch):
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [{"id": g.OBJ_BARRIER}])
     monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.ITEM_AXE}, {"name": g.ITEM_PICKAXE}, {"name": g.ITEM_HARPOON}, {"name": g.ITEM_PESTLE}])
     monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(controller, "get_combat", lambda: {})
     called = []
     monkeypatch.setattr(cg, "explore_gather_phase", lambda ctx, cfg: called.append("explore"))
     cg.tick(ctx)
@@ -1503,6 +1504,58 @@ def test_stuck_watch_stops_after_no_progress(monkeypatch):
     assert not ctx2.state.safety_stopped
 
 
+def test_stuck_watch_never_stops_an_upgrade_fight_with_a_falling_target_hp(monkeypatch):
+    """I8: an upgrade-phase fight against a demi-boss can hold the same tile and inventory size
+    for many ticks while genuinely working -- stuck_watch's signature now includes the target's
+    hp (and the player's), so a falling target hp keeps changing the signature and the fight is
+    never mistaken for a stall, even past STUCK_STOP_S of wall clock."""
+    ctx = _Ctx()
+    t = {"v": 1000.0}
+    monkeypatch.setattr(cg.time, "time", lambda: t["v"])
+    hp = 100
+    for _ in range(int(cg.STUCK_STOP_S) + 5):
+        cg.stuck_watch(ctx, ("upgrade", (100, 100), 5, hp, 80))
+        t["v"] += 1.0
+        hp -= 1
+    assert ctx.state.safety_stopped is False
+
+
+def test_target_hp_reads_combat_ratio_first(monkeypatch):
+    monkeypatch.setattr(controller, "get_combat", lambda: {"targetHpRatio": 42})
+    assert cg._target_hp([]) == 42
+
+
+def test_target_hp_falls_back_to_the_tracked_npc(monkeypatch):
+    monkeypatch.setattr(controller, "get_combat", lambda: {"targetId": 9047})
+    npcs = [{"id": 9047, "hpRatio": 17}]
+    assert cg._target_hp(npcs) == 17
+
+
+def test_tick_wires_falling_target_hp_into_stuck_watch_so_an_upgrade_fight_never_stops(monkeypatch):
+    """I8 integration: tick() must actually thread _target_hp(npcs) into stuck_watch's signature
+    for the upgrade phase -- a fight held on the same tile with the same inventory size for many
+    ticks, but a target hp falling every tick (read from /combat), must never safety-stop."""
+    ctx = _Ctx(); data = ctx.state.data
+    data["cg_t0"] = 0.0
+    data["cg_tools_ok"] = True
+    t = {"v": 100.0}
+    hp = {"v": 100}
+    monkeypatch.setattr(cg.time, "time", lambda: t["v"])
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(100, 100))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [{"id": 9047, "hpRatio": hp["v"]}])
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(controller, "get_combat", lambda: {"targetId": 9047})
+    monkeypatch.setattr(cg, "derive_phase", lambda *a, **kw: "upgrade")
+    monkeypatch.setattr(cg, "upgrade_phase", lambda ctx, cfg: None)
+    for _ in range(int(cg.STUCK_STOP_S) + 5):
+        cg.tick(ctx)
+        t["v"] += 1.0
+        hp["v"] -= 1
+    assert ctx.state.safety_stopped is False
+
+
 def test_stuck_watch_fires_even_when_ensure_tools_fails(monkeypatch):
     """Ensure that when ensure_tools fails, stuck_watch still runs and can trigger a safety stop
     after STUCK_STOP_S with no progress. This prevents a tool loop from freezing forever."""
@@ -1519,6 +1572,7 @@ def test_stuck_watch_fires_even_when_ensure_tools_fails(monkeypatch):
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [{"id": g.OBJ_BARRIER}])
     monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.ITEM_SCEPTRE}])
     monkeypatch.setattr(controller, "get_equipment", lambda: {})
+    monkeypatch.setattr(controller, "get_combat", lambda: {})
     # Stub ensure_tools to always return False
     monkeypatch.setattr(cg, "ensure_tools", lambda ctx, cfg: False)
     # Call tick() - should set up stuck_watch

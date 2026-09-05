@@ -117,9 +117,30 @@ def ensure_tools(ctx, cfg):
     return result
 
 
+def _target_hp(npcs):
+    """(I8, final-fix-brief.md) The combat target's HP ratio -- from /combat's own
+    `targetHpRatio` when present, else the tracked npc's `hpRatio` looked up by id/index from the
+    already-fetched npcs list. Used only to widen stuck_watch's signature so a demi-boss fight
+    that IS making progress (falling target HP, same tile, same inventory) is never mistaken for
+    a stall."""
+    combat = controller.get_combat() or {}
+    hp = combat.get("targetHpRatio")
+    if hp is not None:
+        return hp
+    target_id = combat.get("targetId")
+    if target_id is None:
+        return None
+    npc = next((n for n in npcs or [] if n.get("id") == target_id or n.get("index") == target_id), None)
+    return (npc or {}).get("hpRatio")
+
+
 def stuck_watch(ctx, signature):
-    """signature = (phase, player tile, inventory size). No change for STUCK_WARN_S logs [!];
-    STUCK_STOP_S safety-stops -- except in enter/fight/loot, which have their own ceilings."""
+    """signature = (phase, player tile, inventory size, target hp, player hp) (I8,
+    final-fix-brief.md -- widened from (phase, tile, inventory size) so an upgrade-phase fight
+    against a demi-boss, which can hold the same tile and inventory for many ticks while
+    genuinely working, is not mistaken for a stall: a falling target hp or player hp still
+    changes the signature every tick). No change for STUCK_WARN_S logs [!]; STUCK_STOP_S
+    safety-stops -- except in enter/fight/loot, which have their own ceilings."""
     data = ctx.state.data
     now = time.time()
     if signature != data.get("cg_stuck_sig"):
@@ -1302,7 +1323,7 @@ def tick(ctx):
             if not ensure_tools(ctx, cfg):
                 # Tool check failed, but still watch for stalls (might recover next tick)
                 me, _ = _me()
-                stuck_watch(ctx, (phase, me, len(inventory)))
+                stuck_watch(ctx, (phase, me, len(inventory), _target_hp(npcs), (player or {}).get("hp")))
                 return
             data["cg_tools_ok"] = True
         # Dispatch the appropriate prep phase
@@ -1314,7 +1335,7 @@ def tick(ctx):
             upgrade_phase(ctx, cfg)
         # Watch for stalls
         me, _ = _me()
-        stuck_watch(ctx, (phase, me, len(inventory)))
+        stuck_watch(ctx, (phase, me, len(inventory), _target_hp(npcs), (player or {}).get("hp")))
     else:
         if not data.get("cg_unknown_logged"):
             debug_log.log("cg", "not at the Hunllef barrier, in the fight, or at the chest -- start at the barrier")
