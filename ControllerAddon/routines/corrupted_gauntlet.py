@@ -55,6 +55,7 @@ DEFAULT_CONFIG = {
     "fish_target": 20,
     "egniol_target": 2,
     "shard_reserve": 0,
+    "stop_on_short_loadout": False,   # (I11) safety-stop instead of quick-passing on a short loadout
 }
 NO_HUNLLEF_TICKS = 10          # consecutive fight ticks without a Hunllef before re-deriving the phase
 NO_SNAPSHOT_TICKS = 20         # consecutive unreadable snapshots before a safety stop
@@ -1210,6 +1211,14 @@ def enter_phase(ctx, cfg):
     snap = read_snapshot(cfg, ctx)
     if snap is None:
         return
+    # (I11, final-fix-brief.md) Prayers FIRST, loadout check second. The timer forces the fight
+    # to start regardless (enter_by_s), so a stop here bought nothing but an unprotected wait --
+    # getting protection on before ever risking a safety-stop-and-abandon is strictly better.
+    if not snap.prayers_active.get("PROTECT_FROM_MISSILES"):
+        do_prayer(ctx, snap, "PROTECT_FROM_MISSILES", cfg)          # the first style is ranged
+    offensive = h.offensive_prayer_for(snap.weapon_kind() or "bow", cfg, _unusable(ctx))
+    if offensive and not snap.prayers_active.get(offensive):
+        do_prayer(ctx, snap, offensive, cfg)
     missing = []
     if snap.inventory_weapon("bow") is None and snap.weapon_kind() != "bow":
         missing.append("bow")
@@ -1220,16 +1229,21 @@ def enter_phase(ctx, cfg):
     if len(snap.egniol()) < cfg["min_egniol"]:
         missing.append("egniol")
     if missing:
-        ctx.state.trigger_safety_stop("cg: loadout missing " + ", ".join(missing))
-        return
-    if not snap.prayers_active.get("PROTECT_FROM_MISSILES"):
-        do_prayer(ctx, snap, "PROTECT_FROM_MISSILES", cfg)          # the first style is ranged
-    offensive = h.offensive_prayer_for(snap.weapon_kind() or "bow", cfg, _unusable(ctx))
-    if offensive and not snap.prayers_active.get(offensive):
-        do_prayer(ctx, snap, offensive, cfg)
+        msg = "cg: loadout short -- " + ", ".join(missing)
+        if cfg.get("stop_on_short_loadout"):
+            ctx.state.trigger_safety_stop(msg)
+            return
+        # Quick-pass anyway: the timer forces the fight regardless of what we do here, and
+        # protected-but-short beats stopped-in-the-lobby.
+        debug_log.log("cg", "[!] " + msg + " -- quick-passing anyway (protected beats stopped)")
     barrier = next((o for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True)
                     if o.get("id") == g.OBJ_BARRIER), None)
     if barrier is None:
+        # (I11) The Barrier can be out of the scan radius or behind us -- walk toward the last
+        # known position instead of silently doing nothing every tick.
+        st = ctx.state.data.get("cg_prep") or {}
+        if st.get("barrier"):
+            instance_nav.walk_to(ctx, st["barrier"][0], st["barrier"][1], tolerance=ROOM_ARRIVAL_TOLERANCE)
         return
     # Check if we've exceeded the attempt limit
     attempts = ctx.state.data.get("cg_enter_attempts", 0)

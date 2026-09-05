@@ -430,6 +430,71 @@ def test_enter_phase_proceeds_when_break_due_is_absent_or_false(monkeypatch):
     assert clicks == [g.BARRIER_QUICK_PASS, g.BARRIER_QUICK_PASS]
 
 
+def test_enter_phase_prays_before_checking_the_loadout(monkeypatch):
+    """I11: protection + offensive prayers must fire even with a short loadout -- the old order
+    stopped (or, with the flag set, would stop) before ever praying, leaving the player unprotected
+    the moment the timer forces the fight anyway."""
+    prayer_clicks = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"hp": 70, "prayer": 40, "instX": 1, "instY": 2, "plane": 1, "animation": -1})
+    monkeypatch.setattr(controller, "get_prayers", lambda: {"tabOpen": True, "active": {},
+                                                             "icons": {"PROTECT_FROM_MISSILES": {"screenX": 1, "screenY": 2},
+                                                                      "RIGOUR": {"screenX": 3, "screenY": 4}}})
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": "Corrupted bow (perfected)"}})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])   # nothing -- loadout is short
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [{"id": g.OBJ_BARRIER, "screenX": 500, "screenY": 400}])
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_combat", lambda: {"targetId": -1})
+    monkeypatch.setattr(controller, "open_prayer_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: prayer_clicks.append(entity.get("screenX")) or True)
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: True)
+    ctx = _Ctx()
+    cg.enter_phase(ctx, cg.DEFAULT_CONFIG)
+    assert 1 in prayer_clicks and 3 in prayer_clicks     # both prayer icons were clicked
+    assert ctx.state.safety_stopped is False             # short loadout does not stop by default
+
+
+def test_enter_phase_stops_on_short_loadout_when_flag_is_set(monkeypatch):
+    """I11: cfg['stop_on_short_loadout'] restores the old stop-instead-of-quick-pass behaviour."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"hp": 70, "prayer": 40, "instX": 1, "instY": 2, "plane": 1, "animation": -1})
+    monkeypatch.setattr(controller, "get_prayers", lambda: {"tabOpen": True, "active": {"PROTECT_FROM_MISSILES": True, "RIGOUR": True}, "icons": {}})
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": "Corrupted bow (perfected)"}})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [{"id": g.OBJ_BARRIER, "screenX": 500, "screenY": 400}])
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_combat", lambda: {"targetId": -1})
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: pytest.fail("must not quick-pass when stopped for a short loadout"))
+    ctx = _Ctx()
+    cfg = dict(cg.DEFAULT_CONFIG)
+    cfg["stop_on_short_loadout"] = True
+    cg.enter_phase(ctx, cfg)
+    assert ctx.state.safety_stopped is True
+
+
+def test_enter_phase_walks_toward_the_known_barrier_when_not_visible(monkeypatch):
+    """I11: with no Barrier in /objects, enter_phase must walk toward the remembered barrier
+    position instead of silently doing nothing every tick."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"hp": 70, "prayer": 40, "instX": 1, "instY": 2, "plane": 1, "animation": -1})
+    monkeypatch.setattr(controller, "get_prayers", lambda: {"tabOpen": True, "active": {"PROTECT_FROM_MISSILES": True, "RIGOUR": True}, "icons": {}})
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": "Corrupted bow (perfected)"}})
+    inv = [{"name": "Corrupted paddlefish", "screenX": 1, "screenY": 1} for _ in range(10)]
+    inv.append({"name": "Egniol potion", "screenX": 2, "screenY": 2})
+    inv.append({"name": "Corrupted staff (perfected)", "screenX": 3, "screenY": 3})
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [])   # not visible
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_combat", lambda: {"targetId": -1})
+    walks = []
+    monkeypatch.setattr(cg.instance_nav, "walk_to", lambda ctx, x, y, **kw: walks.append((x, y)) or True)
+    ctx = _Ctx()
+    ctx.state.data["cg_prep"] = {"barrier": (500, 600)}
+    cg.enter_phase(ctx, cg.DEFAULT_CONFIG)
+    assert walks == [(500, 600)]
+
+
 def test_before_break_plays_out_an_active_fight(monkeypatch):
     """I6: the GOTR shape -- a break due mid-fight must not start until fight_loop has run to
     completion (bounded by fight_max_s), since that is the only thing defending the player."""
