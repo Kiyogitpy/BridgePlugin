@@ -26,7 +26,11 @@ class StyleTracker:
     8755 tornado cast, alternating), then the next style's first attack three ticks after that.
     Ranged first. The stomp (8420) sits outside the count. So:
       observe(attack)  -> attacks += 1
-      observe(marker)  -> style flips, attacks = 0 (a count other than 4 is logged as a resync)
+      observe(marker)  -> style flips PARITY TIMES (I1, final-fix-brief.md), attacks = 0 (a count
+                          other than 4 is logged as a resync)
+    A marker's flip is not unconditional: attacks/ATTACKS_PER_STYLE elapsed periods (rounded, at
+    least 1) means that many flips actually happened since the tracker last saw a marker, and an
+    even count of missed markers cancels back to no net change -- see observe()'s own comment.
     next_style_due() is true from the 4th attack until the marker: the coming style is known
     five ticks before its first attack lands, which is when the routine switches prayer.
     """
@@ -45,7 +49,18 @@ class StyleTracker:
         if anim in g.ANIM_MARKER:
             if self.attacks != ATTACKS_PER_STYLE:
                 self.resyncs += 1
-            self.style = MAGIC if self.style == RANGED else RANGED
+            # I1, final-fix-brief.md: a marker that arrives after MORE than one style period's
+            # worth of attacks means one or more PREVIOUS markers were missed (lossy UDP, or a
+            # snapshot read landing between two attacks) -- style flips once per elapsed period,
+            # so an unconditional single flip here is only correct when exactly one period
+            # elapsed. An EVEN number of missed periods must net to NO flip (two flips cancel
+            # out), or the tracker ends up inverted from the real game state until the next
+            # marker inverts it back (or doesn't, depending on parity) -- i.e. wrong roughly half
+            # the time after any missed marker. flips is never 0 (max(1, ...)): a marker with
+            # attacks == 0 still means at least the flip it is itself announcing.
+            flips = max(1, round(self.attacks / ATTACKS_PER_STYLE))
+            if flips % 2 == 1:
+                self.style = MAGIC if self.style == RANGED else RANGED
             self.attacks = 0
             self.markers += 1
             return "marker"

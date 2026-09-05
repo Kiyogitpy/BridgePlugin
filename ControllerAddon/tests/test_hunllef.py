@@ -33,6 +33,30 @@ def test_stomp_and_idle_are_ignored_and_short_counts_resync():
     assert t.style == h.MAGIC and t.resyncs == 1 and t.attacks == 0
 
 
+def test_marker_resync_uses_parity_of_missed_style_periods():
+    """I1: a missed marker (attacks silently accumulating past ATTACKS_PER_STYLE because the
+    marker event that would have reset it never arrived) must not always apply a single
+    unconditional flip -- that inverts the tracker's style whenever an EVEN number of style
+    periods were actually missed. flips = max(1, round(attacks / ATTACKS_PER_STYLE)); only
+    flips % 2 == 1 applies a flip. Per final-fix-brief.md's own formula: attacks=8 (two periods)
+    is even -> no net flip; attacks=3 or 5 (one period, rounded) is odd -> one flip; attacks=12
+    (three periods) is odd -> one flip.
+
+    NOTE: the brief's own worked-example parenthetical says "12 -> none", which contradicts the
+    formula it states in the same sentence (max(1, round(12/4)) = 3, and 3 %% 2 == 1 -- confirmed
+    by direct computation). Implemented per the formula, which also matches the physical model
+    (one flip per elapsed 4-attack period, so 3 periods is an odd, net-flipping count) --
+    flagged as a brief inconsistency rather than guessed around."""
+    for attacks, expect_flip in ((3, True), (5, True), (8, False), (12, True)):
+        t = h.StyleTracker()
+        t.attacks = attacks
+        style_before = t.style
+        t.observe(8754)
+        flipped = t.style != style_before
+        assert flipped == expect_flip, (attacks, t.style, style_before)
+        assert t.resyncs == 1 and t.attacks == 0     # every one of these counts is != 4
+
+
 def test_observe_snapshot_counts_transitions_only():
     t = h.StyleTracker()
     t.observe_snapshot(8419); t.observe_snapshot(8419)     # same value twice: one attack
