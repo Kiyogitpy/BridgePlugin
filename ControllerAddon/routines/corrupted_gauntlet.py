@@ -60,18 +60,36 @@ def get_config(bridge_config):
 
 # ----------------------------------------------------------------------------- reads
 
-def read_snapshot(cfg=DEFAULT_CONFIG):
+SNAPSHOT_LOG_INTERVAL_S = 10.0   # (I4) how often read_snapshot logs its own wall-clock cost
+
+
+def read_snapshot(cfg=DEFAULT_CONFIG, ctx=None):
+    """Same return contract as before (a FightSnapshot, or None when the bridge can't say where
+    the player is): `ctx` is optional and purely additive, added (I4, final-fix-brief.md) so this
+    can log its own wall-clock duration into ctx.state.data for `_log_rung` to report and for a
+    live session to see whether the per-tick budget is bridge-bound."""
+    t0 = time.time()
     player = controller.get_player()
     if not player or player.get("instX") is None:
-        return None
-    return h.FightSnapshot.from_bridge(
-        player=player,
-        npcs=controller.get_npcs(fresh=True),
-        objects=controller.get_objects(radius=cfg["objects_radius"], fresh=True),
-        prayers=controller.get_prayers(),
-        equipment=controller.get_equipment(),
-        inventory=controller.get_inventory(),
-        combat=controller.get_combat())
+        snap = None
+    else:
+        snap = h.FightSnapshot.from_bridge(
+            player=player,
+            npcs=controller.get_npcs(fresh=True),
+            objects=controller.get_objects(radius=cfg["objects_radius"], fresh=True),
+            prayers=controller.get_prayers(),
+            equipment=controller.get_equipment(),
+            inventory=controller.get_inventory(),
+            combat=controller.get_combat())
+    if ctx is not None:
+        now = time.time()
+        ms = (now - t0) * 1000.0
+        data = ctx.state.data
+        data["cg_last_snapshot_ms"] = ms
+        if now - data.get("cg_snapshot_log_at", 0) >= SNAPSHOT_LOG_INTERVAL_S:
+            data["cg_snapshot_log_at"] = now
+            debug_log.log("cg", f"snapshot {ms:.0f} ms")
+    return snap
 
 
 def derive_phase(data, npcs, objects):
@@ -199,8 +217,22 @@ def _walk_to_tile(ctx, tile, plane):
     return False
 
 
-def do_escape(ctx, snap, reason, cfg, require_in_range=False):
+def _cached_imap(ctx):
+    """(I4, final-fix-brief.md) The instance's collision grid is static for the whole fight (only
+    hazards -- read separately, per snapshot -- move), so load it once per fight and reuse it
+    instead of paying a fresh /collision?all=true HTTP round-trip on every escape/reposition
+    click. tick() drops ctx.state.data["cg_imap"] the moment the phase leaves "fight"."""
+    imap = ctx.state.data.get("cg_imap")
+    if imap is not None:
+        return imap
     imap = instance_nav.InstanceMap.load()
+    if imap is not None:
+        ctx.state.data["cg_imap"] = imap
+    return imap
+
+
+def do_escape(ctx, snap, reason, cfg, require_in_range=False):
+    imap = _cached_imap(ctx)
     if imap is None:
         debug_log.log("cg", "[!] no collision grid -- cannot pick an escape tile")
         return False
@@ -248,10 +280,12 @@ def _log_rung(data, rung, arg, snap, tracker):
         data["cg_last_rung"] = key
         data["cg_last_rung_log"] = now
         hun = snap.hunllef
+        snapshot_ms = data.get("cg_last_snapshot_ms")
+        snapshot_str = f"{snapshot_ms:.0f}" if snapshot_ms is not None else "?"
         debug_log.log("cg", f"rung={rung} arg={arg} hp={snap.hp} pray={snap.prayer} style={tracker.style} "
                             f"attacks={tracker.attacks} hunllef={hun['id'] if hun else None} "
                             f"hpRatio={hun['hp_ratio'] if hun else None} tornadoes={len(snap.tornadoes)} "
-                            f"hazards={len(snap.hazards)}")
+                            f"hazards={len(snap.hazards)} snapshot_ms={snapshot_str}")
 
 
 def fight_loop(ctx, cfg):
@@ -277,7 +311,7 @@ def fight_loop(ctx, cfg):
         if time.time() >= deadline:
             ctx.state.trigger_safety_stop("cg: fight ran past fight_max_s")
             return
-        snap = read_snapshot(cfg)
+        snap = read_snapshot(cfg, ctx)
         if snap is None:
             misses += 1
             if misses >= NO_SNAPSHOT_TICKS:
@@ -322,7 +356,7 @@ def fight_loop(ctx, cfg):
 
 
 def enter_phase(ctx, cfg):
-    snap = read_snapshot(cfg)
+    snap = read_snapshot(cfg, ctx)
     if snap is None:
         return
     missing = []
@@ -411,6 +445,8 @@ def tick(ctx):
     phase = derive_phase(data, npcs, objects)
     if phase != data.get("cg_phase"):
         debug_log.log("cg", f"phase {data.get('cg_phase')} -> {phase}")
+        if data.get("cg_phase") == "fight" and phase != "fight":
+            data.pop("cg_imap", None)      # (I4) static per instance -- drop it once the fight ends
         data["cg_phase"] = phase
         if phase == "fight":
             data["cg_enter_attempts"] = 0

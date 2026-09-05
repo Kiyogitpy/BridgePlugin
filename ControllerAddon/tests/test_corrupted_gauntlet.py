@@ -165,6 +165,43 @@ def test_do_escape_returns_false_without_a_map(monkeypatch):
     assert not cg.do_escape(_Ctx(), snap, "tornado", cg.DEFAULT_CONFIG)
 
 
+def test_do_escape_caches_the_instance_map_across_calls(monkeypatch):
+    """I4: the InstanceMap is static for the whole fight -- do_escape must load it once and reuse
+    ctx.state.data['cg_imap'], not hit /collision?all=true on every escape/reposition click."""
+    load_calls = [0]
+
+    def fake_get_collision_grid(plane=None):
+        load_calls[0] += 1
+        return {"baseX": 13056, "baseY": 5632, "plane": 1, "size": 32, "flags": [0] * 1024}
+
+    monkeypatch.setattr(controller, "get_collision_grid", fake_get_collision_grid)
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, plane, inst=False: {"onScreen": True, "screenX": 5, "screenY": 6})
+    monkeypatch.setattr(cg.travel, "_click_walk_point", lambda ctx, point, shift: None)
+    snap = h.FightSnapshot.from_bridge({"instX": 13066, "instY": 5642, "plane": 1, "hp": 50, "prayer": 30},
+                                       [_npc(9036, 13072, 5642, 8419)],
+                                       [{"id": 36048, "instX": 13066, "instY": 5642}], {}, {}, [], {})
+    ctx = _Ctx()
+    assert cg.do_escape(ctx, snap, "hazard", cg.DEFAULT_CONFIG)
+    assert cg.do_escape(ctx, snap, "hazard", cg.DEFAULT_CONFIG)
+    assert load_calls[0] == 1
+    assert "cg_imap" in ctx.state.data
+
+
+def test_tick_drops_the_cached_instance_map_when_leaving_the_fight_phase(monkeypatch):
+    """I4: ctx.state.data['cg_imap'] must not survive into a phase where the static grid no
+    longer applies -- tick() drops it the moment derive_phase reports leaving "fight"."""
+    ctx = _Ctx()
+    ctx.state.data.update({"cg_phase": "fight", "cg_imap": object(), "cg_fight_seen": True,
+                          "cg_chest_opened": True})
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [{"id": g.OBJ_REWARD_CHEST}])
+    cg.tick(ctx)
+    assert "cg_imap" not in ctx.state.data
+    assert ctx.state.safety_stopped is True   # phase derives to "done" -- incidental to this test
+
+
 def test_do_eat_clicks_a_fish_after_opening_the_inventory(monkeypatch):
     calls = []
     monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: calls.append("inv") or True)
@@ -362,7 +399,7 @@ def test_fight_loop_mark_since_placement_does_not_drop_events(monkeypatch):
                                        {"targetId": 9036})
     calls = {"n": 0}
 
-    def fake_read_snapshot(cfg):
+    def fake_read_snapshot(cfg, ctx=None):
         calls["n"] += 1
         if calls["n"] >= 3:
             ctx.state.safety_stopped = True
@@ -389,7 +426,7 @@ def test_fight_loop_safety_stops_on_player_died_event(monkeypatch):
                                        [_npc(9036, anim=-1)], [], {"active": {}}, {}, [],
                                        {"targetId": 9036})
 
-    def fake_read_snapshot(cfg):
+    def fake_read_snapshot(cfg, ctx=None):
         events._absorb([("PLAYER_DIED", None)])   # arrives after this iteration's mark
         return snap
 
@@ -417,7 +454,7 @@ def test_fight_loop_skips_the_ladder_for_a_dead_hunllef(monkeypatch):
                                        [_npc(9038, anim=-1)], [], {"active": {}}, {}, [],
                                        {"targetId": 9038})
     ctx = _Ctx()
-    monkeypatch.setattr(cg, "read_snapshot", lambda cfg: snap)
+    monkeypatch.setattr(cg, "read_snapshot", lambda cfg, ctx=None: snap)
     monkeypatch.setattr(cg.time, "time", lambda: 1000.0)
     monkeypatch.setattr(h, "ladder", lambda snap, tracker, cfg, unusable:
                         pytest.fail("ladder must not run against a dead Hunllef"))
