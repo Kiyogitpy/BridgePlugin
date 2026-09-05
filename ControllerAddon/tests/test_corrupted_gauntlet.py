@@ -925,6 +925,60 @@ def test_use_on_clicks_both_items(monkeypatch):
     assert calls == [(g.ITEM_GRYM, "Use"), (g.ITEM_WATER_VIAL, None)]
 
 
+def test_use_on_default_rule_still_confirms_on_name_a_falling(monkeypatch):
+    """C2: use_on(confirm=None) must keep its old behaviour -- confirming stage 1 (grym leaf +
+    water vial) on the grym leaf count falling, exercised with the real _confirm poll loop
+    rather than a stubbed-True one."""
+    ctx = _Ctx()
+    reads = {"n": 0}
+
+    def get_inventory_mock():
+        reads["n"] += 1
+        items = [{"slot": 1, "name": g.ITEM_WATER_VIAL, "qty": 1}]
+        if reads["n"] < 4:
+            items.append({"slot": 0, "name": g.ITEM_GRYM, "qty": 1})
+        return items
+    monkeypatch.setattr(controller, "get_inventory", get_inventory_mock)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    assert cg.use_on(ctx, g.ITEM_GRYM, g.ITEM_WATER_VIAL)
+
+
+def test_pestle_confirms_on_dust_rising(monkeypatch):
+    """C2: the pestle is a tool -- it is never consumed, so use_on's default rule (count(name_a)
+    falling) can never confirm a pestle click. _pestle must instead watch Corrupted dust rising
+    (via its own confirm= predicate)."""
+    ctx = _Ctx()
+    reads = {"n": 0}
+
+    def get_inventory_mock():
+        reads["n"] += 1
+        items = [{"slot": 0, "name": g.ITEM_PESTLE, "qty": 1}, {"slot": 1, "name": g.ITEM_SHARDS, "qty": 590}]
+        if reads["n"] >= 5:      # dust rises on the second _confirm poll
+            items.append({"slot": 2, "name": g.ITEM_DUST, "qty": 10})
+        return items
+    monkeypatch.setattr(controller, "get_inventory", get_inventory_mock)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    assert cg._pestle(ctx)
+
+
+def test_pestle_confirms_on_shards_falling_when_dust_lags(monkeypatch):
+    """The fallback half of _pestle's confirm predicate: shards falling by DUST_SHARDS also
+    counts, in case a stacked dust item lags one HTTP read behind."""
+    ctx = _Ctx()
+    reads = {"n": 0}
+
+    def get_inventory_mock():
+        reads["n"] += 1
+        shards = 580 if reads["n"] >= 4 else 590
+        return [{"slot": 0, "name": g.ITEM_PESTLE, "qty": 1}, {"slot": 1, "name": g.ITEM_SHARDS, "qty": shards}]
+    monkeypatch.setattr(controller, "get_inventory", get_inventory_mock)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    assert cg._pestle(ctx)
+
+
 def test_upgrade_phase_walks_fights_loots_and_crafts(monkeypatch):
     ctx = _Ctx(); data = ctx.state.data
     data.update({"cg_t0": 0.0, "cg_demi_bosses": {(0, 2): 9047}})
@@ -1071,7 +1125,7 @@ def test_potion_returns_false_on_stage2_use_on_failure(monkeypatch):
         {"slot": 0, "name": g.ITEM_GRYM_UNF, "qty": 1},
         {"slot": 1, "name": g.ITEM_DUST, "qty": 10}
     ])
-    def fake_use_on(ctx, name_a, name_b):
+    def fake_use_on(ctx, name_a, name_b, **kw):
         use_on_calls[0] += 1
         return False  # Failure on stage 2
     monkeypatch.setattr(cg, "use_on", fake_use_on)
@@ -1093,7 +1147,7 @@ def test_potion_returns_true_on_successful_egniol_increase(monkeypatch):
             return [{"slot": 0, "name": g.EGNIOL_DOSES[0], "qty": 1}]
         return [{"slot": 0, "name": g.ITEM_GRYM_UNF, "qty": 1}, {"slot": 1, "name": g.ITEM_DUST, "qty": 20}]
     monkeypatch.setattr(controller, "get_inventory", get_inventory_mock)
-    monkeypatch.setattr(cg, "use_on", lambda ctx, name_a, name_b: True)  # Success
+    monkeypatch.setattr(cg, "use_on", lambda ctx, name_a, name_b, **kw: True)  # Success
     result = cg._potion(ctx)
     assert result is True  # Egniol dose count rose
 

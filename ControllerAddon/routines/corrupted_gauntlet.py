@@ -789,7 +789,11 @@ def bowl_make(ctx, key, cfg):
     return ok
 
 
-def use_on(ctx, name_a, name_b):
+def use_on(ctx, name_a, name_b, confirm=None):
+    """(C2, final-fix-brief.md) `confirm`, when given, is a zero-arg predicate used instead of the
+    default "count(name_a) fell" rule -- needed for `_pestle`, whose A item (the Pestle and
+    mortar) is a TOOL that is never consumed, so the default rule can never confirm even when the
+    click genuinely worked."""
     inv = controller.get_inventory()
     a = next((i for i in inv if i.get("name") == name_a), None)
     b = next((i for i in inv if i.get("name") == name_b), None)
@@ -798,7 +802,8 @@ def use_on(ctx, name_a, name_b):
     controller.open_inventory_tab(ctx.ser)
     controller.click_entity(ctx.ser, a, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False, expected_action="Use")
     controller.click_entity(ctx.ser, b, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
-    return _confirm(ctx, lambda: kit.count(controller.get_inventory(), name_a) < kit.count(inv, name_a), 3.0)
+    check = confirm if confirm is not None else (lambda: kit.count(controller.get_inventory(), name_a) < kit.count(inv, name_a))
+    return _confirm(ctx, check, 3.0)
 
 
 def cook_all(ctx, cfg):
@@ -836,7 +841,19 @@ def wear(ctx, name):
 
 
 def _pestle(ctx):
-    return use_on(ctx, g.ITEM_PESTLE, g.ITEM_SHARDS)
+    """(C2, final-fix-brief.md) The default use_on rule watches name_a (the Pestle and mortar)
+    falling, which never happens -- it's a tool, not a consumable. Confirm on the Corrupted dust
+    rising, or the shards falling by DUST_SHARDS as a fallback in case dust itself isn't visible
+    on the same poll (a stacked item can lag one HTTP read behind a qty bump elsewhere)."""
+    before_dust = kit.count(controller.get_inventory(), g.ITEM_DUST)
+    before_shards = kit.count(controller.get_inventory(), g.ITEM_SHARDS)
+
+    def confirm():
+        inv = controller.get_inventory()
+        return (kit.count(inv, g.ITEM_DUST) > before_dust
+                or kit.count(inv, g.ITEM_SHARDS) <= before_shards - kit.DUST_SHARDS)
+
+    return use_on(ctx, g.ITEM_PESTLE, g.ITEM_SHARDS, confirm=confirm)
 
 
 def _potion(ctx):
@@ -849,9 +866,13 @@ def _potion(ctx):
             failed = True
             break  # Stop immediately if use_on fails
         steps += 1
-    # Second loop: Egniol dose + dust
+    # Second loop: Egniol dose + dust -- (C2) confirm on the Grym potion (unf) falling, not the
+    # default rule's name_a (dust) falling, since dust is the item being spent in bulk (10 at a
+    # time) and the unf item is the one this step is actually meant to consume one of.
     while steps < POTION_MAX_STEPS and kit.count(controller.get_inventory(), g.ITEM_GRYM_UNF) and kit.count(controller.get_inventory(), g.ITEM_DUST) >= 10:
-        if not use_on(ctx, g.ITEM_DUST, g.ITEM_GRYM_UNF):
+        before_unf = kit.count(controller.get_inventory(), g.ITEM_GRYM_UNF)
+        if not use_on(ctx, g.ITEM_DUST, g.ITEM_GRYM_UNF,
+                      confirm=lambda bu=before_unf: kit.count(controller.get_inventory(), g.ITEM_GRYM_UNF) < bu):
             failed = True
             break  # Stop immediately if use_on fails
         steps += 1
