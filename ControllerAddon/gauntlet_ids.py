@@ -72,24 +72,18 @@ OBJ_INACTIVE_SYMBOL = 35994       #   node -- kept as its own pair of constants 
 # --- Resource nodes (REC summary; the wiki's own name for this object group -- Corrupt Deposit/
 #     Phren Roots/Fishing Spot/Grym Root/Linum Tirinum are the Gauntlet's five gatherable-resource
 #     types). Deliberately id: name DICTS rather than individual OBJ_<NAME> ints for these ten
-#     (plus the two Node ids below) -- a routine's actual question is "is this object I'm looking
-#     at ACTIVE or DEPLETED", i.e. set/dict membership, not a single hardcoded id; see
-#     tests/test_gauntlet_ids.py's completeness test for why this keeps every recorded id in
-#     exactly one place (an OBJ_<NAME> constant here too would double-count them). "Depleted" is
-#     decided from the summary's own "(Depleted)" name suffix. ---
+#     -- a routine's actual question is "is this object I'm looking at ACTIVE or DEPLETED", i.e.
+#     set/dict membership, not a single hardcoded id; see tests/test_gauntlet_ids.py's
+#     completeness test for why this keeps every recorded id in exactly one place (an OBJ_<NAME>
+#     constant here too would double-count them). "Depleted" is decided from the summary's own
+#     "(Depleted)" name suffix. The Node ids (35998/35999, "Light" action) are handled separately
+#     in NODE_IDS since they are not gatherable resources. ---
 RESOURCE_NODES = {
     35967: "Corrupt Deposit",
     35969: "Corrupt Phren Roots",
     35971: "Corrupt Fishing Spot",
     35973: "Corrupt Grym Root",
     35975: "Corrupt Linum Tirinum",
-    # 35998/35999 ("Node", the "Light" action): the summary gives BOTH ids the identical name
-    # "Node" with no "(Depleted)" suffix on either -- unlike every resource pair above, it does
-    # not say which is the active state and which is exhausted. Per this task's own fallback
-    # rule, both live in RESOURCE_NODES rather than guessing one into RESOURCE_NODES_DEPLETED.
-    # WHICH IS DEPLETED: VERIFY LIVE.
-    35998: "Node",
-    35999: "Node",
 }
 RESOURCE_NODES_DEPLETED = {
     35968: "Corrupt Deposit (Depleted)",
@@ -126,3 +120,97 @@ BOW_NAMES = ("Corrupted bow (perfected)", "Corrupted bow (attuned)", "Corrupted 
 STAFF_NAMES = ("Corrupted staff (perfected)", "Corrupted staff (attuned)", "Corrupted staff (basic)",
                "Crystal staff (perfected)", "Crystal staff (attuned)", "Crystal staff (basic)")
 BARRIER_QUICK_PASS = "Quick-pass"  # REC: the menu option on OBJ_BARRIER that starts the fight
+
+# --- Resource gathering and crafting items (REC inventory names) ---
+ITEM_ORE = "Corrupted ore"
+ITEM_BARK = "Phren bark"
+ITEM_LINUM = "Linum tirinum"
+ITEM_GRYM = "Grym leaf"
+ITEM_RAW_FISH = "Raw paddlefish"
+ITEM_FISH = "Paddlefish"
+ITEM_CFISH = "Corrupted paddlefish"
+ITEM_SHARDS = "Corrupted shards"
+ITEM_FRAME = "Weapon frame"
+ITEM_ORB = "Corrupted orb"
+ITEM_BOWSTRING = "Corrupted bowstring"
+ITEM_SPIKE = "Corrupted spike"
+ITEM_VIAL = "Vial"
+ITEM_WATER_VIAL = "Water-filled vial"
+ITEM_GRYM_UNF = "Grym potion (unf)"
+ITEM_DUST = "Corrupted dust"
+ITEM_PESTLE = "Pestle and mortar"
+ITEM_SCEPTRE = "Corrupted sceptre"
+ITEM_TELEPORT = "Corrupted teleport crystal"
+ITEM_AXE = "Corrupted axe"
+ITEM_PICKAXE = "Corrupted pickaxe"
+ITEM_HARPOON = "Corrupted harpoon"
+
+EGNIOL_DOSES = ("Egniol potion (1)", "Egniol potion (2)", "Egniol potion (3)", "Egniol potion (4)")
+
+TIER_NAMES = {1: "basic", 2: "attuned", 3: "perfected"}
+ARMOUR_KINDS = ("helm", "body", "legs")
+
+
+def armour_name(kind, tier):
+    """Return the display name for armour of the given kind and tier."""
+    return f"Corrupted {kind} ({TIER_NAMES[tier]})"
+
+
+def weapon_name(kind, tier):
+    """Return the display name for a weapon of the given kind and tier."""
+    return f"Corrupted {kind} ({TIER_NAMES[tier]})"
+
+
+# --- Singing Bowl (REC: group 270; children matched by TEXT, never index) ---
+BOWL_GROUP = 270
+BOWL_TEXT = {
+    "helm": "Corrupted helm",
+    "body": "Corrupted body",
+    "legs": "Corrupted legs",
+    "bow": "Corrupted bow",
+    "staff": "Corrupted staff",
+    "cfish": "Corrupted paddlefish",
+    "vial": "Vial",
+    "teleport": "Corrupted teleport crystal"
+}
+
+# --- Resource nodes (wiki yields; REC action names) keyed by the live node NAME ---
+def _node(sub):
+    """Find the live node name containing the given substring."""
+    return next(n for n in RESOURCE_NODES.values() if sub in n)
+
+RESOURCE_ACTION = {
+    _node("Deposit"): "Mine",
+    _node("Phren"): "Chop",
+    _node("Linum"): "Pick",
+    _node("Grym"): "Pick",
+    _node("Fishing"): "Fish"
+}
+RESOURCE_ITEM = {
+    _node("Deposit"): ITEM_ORE,
+    _node("Phren"): ITEM_BARK,
+    _node("Linum"): ITEM_LINUM,
+    _node("Grym"): ITEM_GRYM,
+    _node("Fishing"): ITEM_RAW_FISH
+}
+RESOURCE_YIELD = {
+    _node("Deposit"): 3,
+    _node("Phren"): 3,
+    _node("Linum"): 3,
+    _node("Grym"): 1,
+    _node("Fishing"): 4
+}
+NODE_IDS = {35998, 35999}
+
+# --- Monsters: attack style -> the protection prayer to hold while it hits us ---
+ATTACK_STYLE_BY_NPC_ID = {
+    9040: "MELEE", 9041: "MELEE", 9042: "MELEE", 9043: "MELEE", 9044: "MELEE",
+    9045: "MELEE", 9046: "MELEE", 9047: "MAGIC"
+}
+DEMI_BOSS_DROP = {9046: ITEM_SPIKE, 9047: ITEM_ORB}
+DEMI_BOSS_WANTED = {9047}
+PROTECT_FOR_STYLE = {
+    "MELEE": "PROTECT_FROM_MELEE",
+    "RANGED": "PROTECT_FROM_MISSILES",
+    "MAGIC": "PROTECT_FROM_MAGIC"
+}

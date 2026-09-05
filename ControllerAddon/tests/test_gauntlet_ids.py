@@ -47,17 +47,18 @@ def test_every_recorded_object_id_is_classified_exactly_once():
     resource_ids = set(g.RESOURCE_NODES)
     depleted_ids = set(g.RESOURCE_NODES_DEPLETED)
     ignored_ids = set(IGNORED_OBJECT_IDS)
+    node_ids = g.NODE_IDS
 
-    # The four buckets must not overlap -- an id counted twice would hide a real ambiguity the
+    # The five buckets must not overlap -- an id counted twice would hide a real ambiguity the
     # same way "exactly one" below is meant to catch.
-    buckets = [obj_star_ids, resource_ids, depleted_ids, ignored_ids]
+    buckets = [obj_star_ids, resource_ids, depleted_ids, ignored_ids, node_ids]
     for i, a in enumerate(buckets):
         for b in buckets[i + 1:]:
             assert not (a & b), f"ids counted in more than one bucket: {a & b}"
 
-    all_known = obj_star_ids | resource_ids | depleted_ids | ignored_ids
+    all_known = obj_star_ids | resource_ids | depleted_ids | ignored_ids | node_ids
     for oid in RECORDING_OBJECT_IDS:
-        assert oid in all_known, f"{oid} is not an OBJ_* constant, in RESOURCE_NODES(_DEPLETED), or in IGNORED_OBJECT_IDS"
+        assert oid in all_known, f"{oid} is not an OBJ_* constant, in RESOURCE_NODES(_DEPLETED), NODE_IDS, or IGNORED_OBJECT_IDS"
 
 
 def test_hunllef_prayer_by_id_covers_both_variants():
@@ -78,3 +79,28 @@ def test_fight_constants():
     assert g.FISH_NAMES[0] == "Corrupted paddlefish"
     assert g.BOW_NAMES[0] == "Corrupted bow (perfected)"
     assert g.STAFF_NAMES[0] == "Corrupted staff (perfected)"
+
+
+def test_item_and_tier_names():
+    assert g.armour_name("helm", 2) == "Corrupted helm (attuned)"
+    assert g.weapon_name("staff", 3) == "Corrupted staff (perfected)"
+    assert g.weapon_name("bow", 1) == "Corrupted bow (basic)"
+    assert g.EGNIOL_DOSES[2] == "Egniol potion (3)"
+    assert g.ITEM_SHARDS == "Corrupted shards" and g.ITEM_FRAME == "Weapon frame"
+
+
+def test_resource_tables_cover_every_live_node():
+    live = {name for name in g.RESOURCE_NODES.values()}
+    assert live == set(g.RESOURCE_ACTION) == set(g.RESOURCE_ITEM) == set(g.RESOURCE_YIELD)
+    assert g.RESOURCE_ACTION[[n for n in live if "Deposit" in n][0]] == "Mine"
+    assert g.RESOURCE_YIELD[[n for n in live if "Fishing" in n][0]] == 4
+
+
+def test_monster_styles_and_demi_boss_drops():
+    assert set(g.WEAK_MONSTERS) <= set(g.ATTACK_STYLE_BY_NPC_ID)
+    assert g.ATTACK_STYLE_BY_NPC_ID[9047] == "MAGIC" and g.ATTACK_STYLE_BY_NPC_ID[9046] == "MELEE"
+    assert g.DEMI_BOSS_DROP[9047] == g.ITEM_ORB and 9047 in g.DEMI_BOSS_WANTED and 9046 not in g.DEMI_BOSS_WANTED
+    assert g.PROTECT_FOR_STYLE["MAGIC"] == "PROTECT_FROM_MAGIC"
+    assert g.BOWL_GROUP == 270 and g.BOWL_TEXT["cfish"] == "Corrupted paddlefish"
+    for c in (g.OBJ_SINGING_BOWL, g.OBJ_TOOL_STORAGE, g.OBJ_RANGE, g.OBJ_WATER_PUMP):
+        assert isinstance(c, int)
