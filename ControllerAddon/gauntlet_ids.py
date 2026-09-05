@@ -200,15 +200,18 @@ RESOURCE_YIELD = {
     _node("Grym"): 1,
     _node("Fishing"): 4
 }
+# Node ids 35998/35999 ("Node", the "Light" action): the recording's summary gives BOTH ids
+# the identical name "Node" with no "(Depleted)" suffix -- it does not say which is the lit
+# state and which is unlit. WHICH IS LIT: VERIFY LIVE.
 NODE_IDS = {35998, 35999}
 
 # --- Monsters: attack style -> the protection prayer to hold while it hits us ---
 ATTACK_STYLE_BY_NPC_ID = {
     9040: "MELEE", 9041: "MELEE", 9042: "MELEE", 9043: "MELEE", 9044: "MELEE",
     9045: "MELEE", 9046: "MELEE", 9047: "MAGIC"
-}
-DEMI_BOSS_DROP = {9046: ITEM_SPIKE, 9047: ITEM_ORB}
-DEMI_BOSS_WANTED = {9047}
+}  # dark beast: RANGED, id unknown -- add when seen
+DEMI_BOSS_DROP = {9046: ITEM_SPIKE, 9047: ITEM_ORB}      # dark beast -> ITEM_BOWSTRING once its id is known
+DEMI_BOSS_WANTED = {9047}                                # orb -> perfected staff; dark beast added with its id (bowstring -> perfected bow); bear's spike never wanted
 PROTECT_FOR_STYLE = {
     "MELEE": "PROTECT_FROM_MELEE",
     "RANGED": "PROTECT_FROM_MISSILES",
