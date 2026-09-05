@@ -104,7 +104,7 @@ def prep_phase(data, inventory, equipment, cfg, now=None):
     if not data.get("cg_crafted"):
         return "craft"
     wanted = {off: nid for off, nid in (data.get("cg_demi_bosses") or {}).items() if nid in g.DEMI_BOSS_WANTED}
-    if wanted and time_left(data, now, cfg) > cfg["upgrade_min_left_s"]:
+    if wanted and not data.get("cg_upgrade_done") and time_left(data, now, cfg) > cfg["upgrade_min_left_s"]:
         d = kit.kit_deficit(inventory, equipment, cfg, targets=kit.UPGRADES)
         if d.orb or d.bowstring:
             return "upgrade"
@@ -239,21 +239,80 @@ def gather_ladder(ctx, cfg):
             debug_log.log("cg", f"[!] demi-boss {foe.get('name')} attacking -- leaving toward {prev}")
             instance_nav.walk_to(ctx, prev[0], prev[1])
         return "flee_demi"
-    style = g.ATTACK_STYLE_BY_NPC_ID.get(foe.get("id"), "MELEE")
+    return fight_npc_step(ctx, foe, cfg)
+
+
+def fight_npc_step(ctx, npc, cfg):
+    """One tick of fighting an ordinary npc or demi-boss: prayer for its style, best weapon, eat,
+    attack. Returns the rung taken."""
+    style = g.ATTACK_STYLE_BY_NPC_ID.get(npc.get("id"), "MELEE")
     prayer = g.PROTECT_FOR_STYLE[style]
+    player = controller.get_player() or {}
     if not (controller.get_prayers().get("active") or {}).get(prayer):
-        do_prayer(ctx, None, prayer, cfg)
-        return "prayer"
+        do_prayer(ctx, None, prayer, cfg); return "prayer"
+    inv = controller.get_inventory(); eq = controller.get_equipment()
+    best = max((("bow", kit.owned_tier("bow", inv, eq)), ("staff", kit.owned_tier("staff", inv, eq))), key=lambda t: t[1])
+    if best[1] > 0 and kit.owned_tier(best[0], [], eq) < best[1]:
+        wear(ctx, g.weapon_name(best[0], best[1])); return "wield"
     if int(player.get("hp") or 0) <= cfg["eat_at"]:
-        inv = controller.get_inventory()
         fish = [i for i in inv if i.get("name") in (g.ITEM_FISH, g.ITEM_CFISH)]
         if fish:
-            _click_item(ctx, fish[0], "Eat")
-            return "eat"
-    if (controller.get_combat() or {}).get("targetId") != foe.get("id"):
-        controller.click_entity(ctx.ser, foe, refresh_target=controller.npc_index_refresh_target(foe.get("index")),
+            _click_item(ctx, fish[0], "Eat"); return "eat"
+    if (controller.get_combat() or {}).get("targetId") != npc.get("id"):
+        controller.click_entity(ctx.ser, npc, refresh_target=controller.npc_index_refresh_target(npc.get("index")),
                                 refresh_legs=2, expected_action="Attack")
     return "attack"
+
+
+def upgrade_phase(ctx, cfg):
+    data = ctx.state.data
+    st = data.get("cg_prep")
+    up = data.setdefault("cg_upgrade", {"sub": "go"})
+    left = time_left(data, cfg=cfg)
+    if st is None or left is None or (left < cfg["upgrade_min_left_s"] - 30 and up["sub"] in ("go", "fight")):
+        debug_log.log("cg", "[!] upgrade abandoned -- out of time")
+        teleport_home(ctx, cfg); data["cg_upgrade_done"] = True; return
+    wanted = [(off, nid) for off, nid in data.get("cg_demi_bosses", {}).items() if nid in g.DEMI_BOSS_WANTED]
+    if not wanted:
+        data["cg_upgrade_done"] = True; return
+    offset, nid = wanted[0]
+    room = _centre(st, offset)
+    below = _centre(st, (offset[0], offset[1] - 1))
+    me, _ = _me()
+    imap = _cached_imap(ctx)
+    if up["sub"] == "go":
+        if h.cheb(me, below) > ROOM_ARRIVAL_TOLERANCE and h.cheb(me, room) > ROOM_ARRIVAL_TOLERANCE:
+            instance_nav.walk_to(ctx, below[0], below[1], tolerance=ROOM_ARRIVAL_TOLERANCE); return
+        if not maze.edge_open(imap, below, room):
+            node = maze.node_between(_nodes(controller.get_objects(radius=cfg["objects_radius"], fresh=True)), below, room, st["pitch"])
+            if node is None or not light_node(ctx, node, cfg):
+                data["cg_upgrade_done"] = True; return
+        if h.cheb(me, room) > ROOM_ARRIVAL_TOLERANCE:
+            instance_nav.walk_to(ctx, room[0], room[1], tolerance=ROOM_ARRIVAL_TOLERANCE); return
+        up["sub"] = "fight"
+        # Fall through to fight logic
+    if up["sub"] == "fight":
+        npc = next((n for n in controller.get_npcs(fresh=True) if n.get("id") == nid), None)
+        if npc is None:
+            up["sub"] = "loot"
+            # Fall through to loot logic
+        else:
+            fight_npc_step(ctx, npc, cfg); return
+    if up["sub"] == "loot":
+        pick_up_drops(ctx, cfg); up["sub"] = "home"
+        # Fall through to home logic
+    if up["sub"] == "home":
+        if teleport_home(ctx, cfg):
+            up["sub"] = "craft"
+            # Fall through to craft logic
+        else:
+            return
+    if up["sub"] == "craft":
+        drop = g.DEMI_BOSS_DROP[nid]
+        key = "staff" if drop == g.ITEM_ORB else "bow"
+        bowl_make(ctx, key, cfg)
+        wear(ctx, g.weapon_name(key, 3))
+        data["cg_upgrade_done"] = True
 
 
 def _nodes(objects):
@@ -989,8 +1048,7 @@ def tick(ctx):
     elif phase == "craft":
         craft_phase(ctx, cfg)
     elif phase == "upgrade":
-        # Prep phases - for now, just idle with a human delay
-        controller.human_delay(1.0, 2.0)
+        upgrade_phase(ctx, cfg)
     else:
         if not data.get("cg_unknown_logged"):
             debug_log.log("cg", "not at the Hunllef barrier, in the fight, or at the chest -- start at the barrier")

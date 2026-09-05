@@ -923,3 +923,30 @@ def test_use_on_clicks_both_items(monkeypatch):
     monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=1.0: True)
     assert cg.use_on(ctx, g.ITEM_GRYM, g.ITEM_WATER_VIAL)
     assert calls == [(g.ITEM_GRYM, "Use"), (g.ITEM_WATER_VIAL, None)]
+
+
+def test_upgrade_phase_walks_fights_loots_and_crafts(monkeypatch):
+    ctx = _Ctx(); data = ctx.state.data
+    data.update({"cg_t0": 0.0, "cg_demi_bosses": {(0, 2): 9047}})
+    S = (13056 + 30, 5632 + 30); pitch = cg.DEFAULT_CONFIG["room_pitch"]
+    data["cg_prep"] = {"start_centre": S, "barrier": (S[0], S[1] - 8), "outward": (0, 1), "pitch": pitch,
+                       "step": 10, "sub": "to_node", "revealed": {(0, 2)}, "entered": set(), "node_fails": 0, "prev_centre": S}
+    state = {"pos": S, "dragon": True, "walks": [], "t": 100.0}
+    monkeypatch.setattr(cg.time, "time", lambda: state["t"])
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*state["pos"]))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [{"id": 9047, "index": 9, "name": "Corrupted Dragon", "instX": S[0], "instY": S[1] + 2 * pitch, "interactingPlayer": True, "screenX": 5, "screenY": 5}] if state["dragon"] else [])
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": "Corrupted bow (attuned)"}})
+    monkeypatch.setattr(cg.maze, "edge_open", lambda imap, a, b: True)
+    monkeypatch.setattr(cg.instance_nav, "walk_to", lambda ctx, x, y, **kw: (state["walks"].append((x, y)), state.__setitem__("pos", (x, y)))[1] or True)
+    monkeypatch.setattr(cg, "fight_npc_step", lambda ctx, npc, cfg: state.__setitem__("dragon", False) or "attack")
+    monkeypatch.setattr(cg, "pick_up_drops", lambda ctx, cfg: 1)
+    monkeypatch.setattr(cg, "teleport_home", lambda ctx, cfg: True)
+    monkeypatch.setattr(cg, "bowl_make", lambda ctx, key, cfg: True)
+    for _ in range(6):
+        cg.upgrade_phase(ctx, cg.DEFAULT_CONFIG)
+    assert state["walks"][0] == (S[0], S[1] + pitch)          # the middle-ring room below the dragon's
+    assert state["walks"][1] == (S[0], S[1] + 2 * pitch)      # then into the dragon's room
+    assert data.get("cg_upgrade_done") is True
