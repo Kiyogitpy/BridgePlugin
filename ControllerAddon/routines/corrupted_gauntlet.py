@@ -93,9 +93,14 @@ def read_snapshot(cfg=DEFAULT_CONFIG, ctx=None):
 
 
 def derive_phase(data, npcs, objects):
-    """Phase from live state, never from a remembered default (the mahogany_homes lesson)."""
+    """Phase from live state, never from a remembered default (the mahogany_homes lesson).
+
+    (M, final-fix-brief.md) VARBIT_FIGHTING_HUNLLEF (varbit 9177, "1 while in the boss room") is a
+    second, faster "we are in the fight" signal alongside the Hunllef's presence in /npcs --
+    on_event mirrors it into data["cg_varbit_fight"] as soon as it changes, which can beat the
+    next bulk /npcs scan by a tick or two."""
     ids = {o.get("id") for o in objects or []}
-    if any(n.get("id") in g.HUNLLEF for n in npcs or []):
+    if any(n.get("id") in g.HUNLLEF for n in npcs or []) or data.get("cg_varbit_fight") == 1:
         data["cg_fight_seen"] = True
         return "fight"
     if g.OBJ_BARRIER in ids and not data.get("cg_fight_seen"):
@@ -103,6 +108,14 @@ def derive_phase(data, npcs, objects):
     if g.OBJ_REWARD_CHEST in ids and data.get("cg_fight_seen"):
         return "done" if data.get("cg_chest_opened") else "loot"
     return "unknown"
+
+
+def on_event(ctx, event_type, payload):
+    """Mirrors VARBIT_FIGHTING_HUNLLEF for derive_phase (see its own comment). Nothing else is
+    recorded here -- VARBIT_SUBSCRIPTIONS already asks the engine to post this varbit on load and
+    after every login, so the very first read arrives without waiting for it to actually change."""
+    if event_type == "VARBIT_CHANGED" and payload and payload.get("varbitId") == g.VARBIT_FIGHTING_HUNLLEF:
+        ctx.state.data["cg_varbit_fight"] = payload.get("value")
 
 
 def feed_tracker(tracker, snap, events_since):
@@ -195,8 +208,11 @@ def do_drink(ctx, snap, arg, cfg):
 def do_attack(ctx, snap, arg, cfg):
     npc = snap.hunllef["entity"]
     refresh = controller.npc_index_refresh_target(snap.hunllef["index"])
+    # (M, final-fix-brief.md) "Hunllef" substring-matches both "Corrupted Hunllef" and
+    # "Crystalline Hunllef" -- the old literal "Corrupted Hunllef" withheld every click against
+    # the crystalline (regular Gauntlet) variant.
     result = controller.click_entity(ctx.ser, npc, refresh_target=refresh, refresh_legs=2,
-                                     expected_action="Attack", expected_target="Corrupted Hunllef")
+                                     expected_action="Attack", expected_target="Hunllef")
     if getattr(result, "withheld", False) or not result:
         debug_log.log("cg", "attack click withheld/failed -- right-click menu")
         result = controller.click_menu_action(ctx.ser, npc, "Attack", target_hint="Hunllef", offset=(0, 0),
@@ -260,8 +276,32 @@ def do_escape(ctx, snap, reason, cfg, require_in_range=False):
     return _walk_to_tile(ctx, tile, imap.plane)
 
 
+REPOSITION_FALLBACK_CHEB = 5   # (M) how close to walk toward an out-of-range Hunllef
+
+
+def _tile_toward_centre(centre, me, distance):
+    """The tile at Chebyshev `distance` from `centre`, on the straight line toward `me`."""
+    dx, dy = me[0] - centre[0], me[1] - centre[1]
+    if dx == 0 and dy == 0:
+        return (centre[0] + distance, centre[1])
+    scale = distance / max(abs(dx), abs(dy))
+    return (round(centre[0] + dx * scale), round(centre[1] + dy * scale))
+
+
 def do_reposition(ctx, snap, arg, cfg):
-    return do_escape(ctx, snap, "reposition", cfg, require_in_range=True)
+    """(M, final-fix-brief.md) When pick_safe_tile(require_in_range=True) finds nothing reachable
+    at all -- almost always because the player is too FAR from the Hunllef, not too close --
+    do_escape's own "no safe tile" log line would otherwise repeat every tick with no progress.
+    Fall back to walking straight toward the Hunllef (instance_nav.walk_to, one call, no wait) to
+    a tile just outside its footprint, rather than sitting there logging forever."""
+    if do_escape(ctx, snap, "reposition", cfg, require_in_range=True):
+        return True
+    centre = snap.hunllef_centre()
+    if centre is None:
+        return False
+    target = _tile_toward_centre(centre, snap.me, REPOSITION_FALLBACK_CHEB)
+    debug_log.log("cg", f"reposition: no in-range escape tile -- walking toward the Hunllef {snap.me} -> {target}")
+    return instance_nav.walk_to(ctx, target[0], target[1])
 
 
 ACTIONS = {"escape": do_escape, "prayer": do_prayer, "wield": do_wield, "eat": do_eat,
@@ -319,6 +359,12 @@ def fight_loop(ctx, cfg):
     tracker = data.get("cg_tracker")
     if tracker is None:
         tracker = data["cg_tracker"] = h.StyleTracker()
+        # (M, final-fix-brief.md) A fresh tracker always starts RANGED/0 -- correct only when the
+        # round is genuinely starting; a mid-fight restart (a relogin, a crash) resumes here with
+        # no idea what the Hunllef's real style is, and is wrong roughly half the time until the
+        # first marker resyncs it. Worth calling out in the log, not silently assumed correct.
+        debug_log.log("cg", f"tracker starts {tracker.style}/{tracker.attacks} -- wrong half the "
+                            "time on a mid-fight restart until the first marker")
     deadline = time.time() + cfg["fight_max_s"]
     misses = 0
     no_hunllef = 0

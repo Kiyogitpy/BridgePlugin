@@ -144,6 +144,15 @@ def test_snapshot_sw_origin_shifts_the_centre():
     assert s.hunllef_centre(origin="sw") == (13107, 5702)
 
 
+def test_hunllef_centre_guards_a_missing_y_too():
+    """M: hunllef_centre only guarded x being None; a snapshot where instY came back missing
+    (instX present) must also read as 'cannot tell', not crash on `x + half` with y=None."""
+    s = _snap(npcs=[{"id": 9036, "index": 1, "instX": 13105, "instY": None, "animationId": 8419,
+                    "hpRatio": 90, "name": "Corrupted Hunllef", "screenX": 500, "screenY": 400}])
+    assert s.hunllef_centre() is None
+    assert s.hunllef_centre(origin="sw") is None
+
+
 # Task 5: footprint, danger, flood, pick_safe_tile
 CFG = {"escape_radius": 6, "attack_range": 7, "tornado_danger": 2, "tornado_avoid": 3}
 BX, BY = 13056, 5632

@@ -717,12 +717,23 @@ style, ranged first -- `hunllef.StyleTracker`, replay-tested against every praye
 recording; its NPC id IS its overhead prayer (9035 melee / 9036 ranged / 9037 magic / 9038
 death, cache symbols); size 5, so every walk target is filtered against centre +-2 plus one
 margin tile (`hunllef.forbidden_near_hunllef` -- the user's stomp concern); floor tiles are
-GroundObjects 36047 warning / 36048 hit, polled from `/objects`; "Your prayers have been
-disabled!" is the prayer-disable tell. The fight loop holds `tick()` on `wait_ticks(1)` and
-reads events with `EventStream.since(mark)` because `on_event` is dispatched by the engine loop
-and never runs while a routine holds the tick. First live session's worklist is the spec's
-checklist: `instX/instY` centre-vs-corner for a size-5 NPC, 8754's meaning, the ranged/magic
-projectile ids, snapshot cost per tick.
+GroundObjects 36047 warning / 36048 hit, polled from `/objects`. **The prayer-disable tell is
+`/prayers.active` on the NEXT snapshot, not chat** -- `ladder()` only ever reads
+`snap.prayers_active` (`FightSnapshot.from_bridge`'s `prayers.get("active")`); nothing in this
+routine parses "Your prayers have been disabled!" or any other chat line, so a prayer dropping
+is noticed the same tick `expected_prayer()` next disagrees with `prayers_active`, one tick
+after the disabling hit lands. The fight loop holds `tick()` on `wait_ticks(1)` and reads events
+with `EventStream.since(mark)` because `on_event` is dispatched by the engine loop and never
+runs while a routine holds the tick -- **`mark` is taken ONCE before the loop and advanced to
+`ctx.events.mark()` immediately after every `since(mark)` read** (C2, final-fix-brief.md): taking
+a fresh `mark()` at the top of each iteration instead reads a sequence number the previous
+iteration's own tick wait had already pumped past, silently dropping every event that arrived
+during that wait. **`/npcs`/`/npc/by-index` carry `animationId`** (`NPCProvider.buildNpcData`,
+added 2026-09-05, C3) -- requires a client rebuild before it shows up; `feed_tracker` cross-checks
+it against the tick's own animation-change events rather than trusting either source alone (see
+that function's own docstring). First live session's worklist is the spec's checklist:
+`instX/instY` centre-vs-corner for a size-5 NPC, 8754's meaning, the ranged/magic projectile
+ids, snapshot cost per tick.
 
 ## Current state of routines/guardians_of_the_rift.py
 

@@ -57,6 +57,26 @@ def test_derive_phase():
     assert cg.derive_phase({}, npcs=[], objects=[]) == "unknown"
 
 
+def test_derive_phase_also_treats_the_fight_varbit_as_fight():
+    """M: VARBIT_FIGHTING_HUNLLEF (mirrored into data['cg_varbit_fight'] by on_event) is a second
+    'we are in the fight' signal alongside the Hunllef actually showing up in /npcs."""
+    data = {"cg_varbit_fight": 1}
+    assert cg.derive_phase(data, npcs=[], objects=[]) == "fight"
+    assert data["cg_fight_seen"] is True
+
+
+def test_on_event_mirrors_only_the_fight_varbit():
+    ctx = _Ctx()
+    cg.on_event(ctx, "VARBIT_CHANGED", {"varbitId": g.VARBIT_FIGHTING_HUNLLEF, "value": 1})
+    assert ctx.state.data["cg_varbit_fight"] == 1
+    cg.on_event(ctx, "VARBIT_CHANGED", {"varbitId": 99999, "value": 1})   # a different varbit
+    assert ctx.state.data["cg_varbit_fight"] == 1                        # unchanged
+    cg.on_event(ctx, "CHAT_MESSAGE", {"message": "hi"})                  # a different event type
+    assert ctx.state.data["cg_varbit_fight"] == 1
+    cg.on_event(ctx, "VARBIT_CHANGED", {"varbitId": g.VARBIT_FIGHTING_HUNLLEF, "value": 0})
+    assert ctx.state.data["cg_varbit_fight"] == 0
+
+
 def test_read_snapshot_composes_the_seven_reads(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {"hp": 70, "prayer": 40, "instX": 1, "instY": 2, "plane": 1, "animation": -1})
     monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [_npc(9036)])
@@ -298,6 +318,40 @@ def test_do_attack_escalates_a_withheld_click_to_the_menu(monkeypatch):
     snap = h.FightSnapshot.from_bridge({"instX": 1, "instY": 2}, [_npc(9036)], [], {}, {}, [], {})
     assert cg.do_attack(_Ctx(), snap, None, cg.DEFAULT_CONFIG)
     assert calls == ["click", ("menu", "Attack")]
+
+
+def test_do_attack_uses_a_substring_target_matching_either_hunllef_variant(monkeypatch):
+    """M: 'Hunllef' substring-matches both 'Corrupted Hunllef' and 'Crystalline Hunllef' -- the
+    old literal 'Corrupted Hunllef' withheld every click against the crystalline variant."""
+    seen = {}
+    monkeypatch.setattr(controller, "npc_index_refresh_target", lambda index: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: seen.setdefault("expected_target", kw.get("expected_target")) or True)
+    snap = h.FightSnapshot.from_bridge({"instX": 1, "instY": 2}, [_npc(9036)], [], {}, {}, [], {})
+    assert cg.do_attack(_Ctx(), snap, None, cg.DEFAULT_CONFIG)
+    assert seen["expected_target"] == "Hunllef"
+
+
+def test_do_reposition_uses_the_in_range_escape_path_when_it_works(monkeypatch):
+    monkeypatch.setattr(cg, "do_escape", lambda ctx, snap, reason, cfg, require_in_range=False:
+                        require_in_range is True)
+    assert cg.do_reposition(_Ctx(), None, None, cg.DEFAULT_CONFIG) is True
+
+
+def test_do_reposition_falls_back_to_walking_toward_the_hunllef_when_out_of_range(monkeypatch):
+    """M: when pick_safe_tile(require_in_range=True) finds nothing at all, do_reposition must
+    walk toward the Hunllef instead of repeating "no safe tile" forever -- to a tile exactly
+    REPOSITION_FALLBACK_CHEB (5) Chebyshev from its centre, on the line toward the player."""
+    monkeypatch.setattr(cg, "do_escape", lambda ctx, snap, reason, cfg, require_in_range=False: False)
+    calls = []
+    monkeypatch.setattr(cg.instance_nav, "walk_to", lambda ctx, x, y: calls.append((x, y)) or True)
+    snap = h.FightSnapshot.from_bridge({"instX": 13060, "instY": 5632, "plane": 1},
+                                       [_npc(9036, 13072, 5642, 8419)], [], {}, {}, [], {})
+    ctx = _Ctx()
+    assert cg.do_reposition(ctx, snap, None, cg.DEFAULT_CONFIG) is True
+    assert len(calls) == 1
+    target = calls[0]
+    assert h.cheb(target, snap.hunllef_centre()) == cg.REPOSITION_FALLBACK_CHEB
 
 
 def test_enter_phase_has_attempt_ceiling(monkeypatch):

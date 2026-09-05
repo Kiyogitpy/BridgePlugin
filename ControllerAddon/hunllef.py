@@ -8,7 +8,7 @@ this module is where the fight is TESTED.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import gauntlet_ids as g
 
@@ -128,7 +128,7 @@ class FightSnapshot:
             inventory=list(inventory or []), target_id=(combat or {}).get("targetId"))
 
     def hunllef_centre(self, origin=None):
-        if self.hunllef is None or self.hunllef["x"] is None:
+        if self.hunllef is None or self.hunllef["x"] is None or self.hunllef["y"] is None:
             return None
         x, y = self.hunllef["x"], self.hunllef["y"]
         if (origin or FOOTPRINT_ORIGIN) == "sw":
