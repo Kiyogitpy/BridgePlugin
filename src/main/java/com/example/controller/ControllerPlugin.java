@@ -674,7 +674,13 @@ public class ControllerPlugin extends Plugin
 		if (lp != null)
 		{
 			WorldPoint wp = WorldPoint.fromLocalInstance(client, lp);
-			WorldPoint inst = InstanceCoords.instancePoint(client, lp, client.getPlane());
+			// I6 (2026-09-05, final-fix-brief.md): mirror the providers' own nested-WorldView
+			// guard (see PlayerProvider/ObjectProvider/NPCProvider) -- instancePoint's base+scene
+			// arithmetic is only meaningful for the top-level view; an npc living in a nested one
+			// (e.g. a Sailing boat's own deck) falls back to the already-corrected wp instead.
+			WorldPoint inst = lp.getWorldView() <= WorldView.TOPLEVEL
+				? InstanceCoords.instancePoint(client, lp, client.getPlane())
+				: wp;
 			payload.put("x", wp.getX());
 			payload.put("y", wp.getY());
 			payload.put("plane", wp.getPlane());
@@ -806,7 +812,13 @@ public class ControllerPlugin extends Plugin
 		if (pos != null)
 		{
 			WorldPoint wp = WorldPoint.fromLocalInstance(client, pos);
-			WorldPoint inst = InstanceCoords.instancePoint(client, pos, client.getPlane());
+			// I6 (2026-09-05, final-fix-brief.md): same nested-WorldView guard as
+			// sendNpcSpawnEvent -- a projectile flying inside a nested view (e.g. a Sailing
+			// boat's own deck) falls back to the already-corrected wp instead of a meaningless
+			// base+scene arithmetic result.
+			WorldPoint inst = pos.getWorldView() <= WorldView.TOPLEVEL
+				? InstanceCoords.instancePoint(client, pos, client.getPlane())
+				: wp;
 			payload.put("x", wp.getX());
 			payload.put("y", wp.getY());
 			payload.put("plane", wp.getPlane());
