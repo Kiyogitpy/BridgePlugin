@@ -570,12 +570,15 @@ def test_in_danger_reasons():
 
 
 def test_flood_respects_blocked_tiles_and_max_steps():
+    # A 3-tall wall of blocked tiles at x=11, y=9..11, directly east of the start.
     imap = _grid(blocked=[(11, 9), (11, 10), (11, 11)])
     d = h.flood(imap, G(10, 10), 3, blocked=set())
-    assert d[G(10, 10)] == 0 and G(11, 10) not in d and d[G(10, 13)] == 3 and G(10, 14) not in d
-    assert G(12, 10) in d                                    # around the wall in 3 steps? (10,10)->(10,11)->(11,12)->(12,11) is 3 but (12,10) is 4
-    # (12,10) needs 4 steps around a 3-tall wall; not reachable within 3
-    assert d.get(G(12, 10)) is None or d[G(12, 10)] <= 3
+    assert d[G(10, 10)] == 0
+    assert G(11, 10) not in d                 # blocked tile never entered
+    assert d[G(10, 13)] == 3                  # three straight steps north
+    assert G(10, 14) not in d                 # four steps: past max_steps
+    assert G(12, 10) not in d                 # rounding the wall takes four steps
+    assert G(12, 12) in d                     # (10,10)->(10,11)->(11,12)->(12,12) is 3 (open corners)
 
 
 def test_pick_safe_tile_avoids_hazards_footprint_and_tornadoes_and_stays_in_range():
@@ -609,8 +612,6 @@ def test_require_in_range_filters():
     assert h.pick_safe_tile(snap, imap, CFG, require_in_range=True) is None
     assert h.pick_safe_tile(snap, imap, CFG) is not None
 ```
-
-Fix `test_flood_respects_blocked_tiles_and_max_steps` to assert only what the geometry guarantees: replace its last three lines with `assert G(12, 10) not in d` (a 3-tall wall at x=11 needs 4 steps to round: (10,10)->(10,12)? no -- (10,10)->(10,11)->(10,12)->(11,12)->(12,11) is already 4). Keep the test honest: assert `G(11, 10) not in d`, `d[G(10, 13)] == 3`, `G(12, 10) not in d`.
 
 - [ ] **Step 2: Run to verify it fails** -- `python -m pytest tests/test_hunllef.py -q -k "footprint or danger or flood or safe_tile or in_range"`; expected `AttributeError`.
 
