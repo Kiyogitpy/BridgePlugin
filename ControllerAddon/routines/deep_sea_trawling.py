@@ -145,3 +145,82 @@ def derive_phase(snap: TrawlSnapshot, cfg: dict) -> str:
         return "lower"
 
     return "trawl"
+
+
+# --------------------------------------------------------------------------- reading the world
+
+
+def find_net(objects):
+    """The trawling net facility on our own deck. Matched by ID first: /objects reports
+    ObjectComposition.getName() raw, so a name can carry a <col=...> tag (the shoal's does), and
+    the 12 net variants (4 tiers x 2x5 / 3x8-port / 3x8-starboard) are all tabulated. The name
+    fragment is only a fallback for a variant the cache dump did not have."""
+    for obj in objects or []:
+        if obj.get("id") in NET_OBJECT_IDS:
+            return obj
+    for obj in objects or []:
+        if NET_NAME_FRAGMENT in (obj.get("name") or "").lower():
+            return obj
+    return None
+
+
+def find_shoal(objects, cfg, px, py):
+    """The nearest shoal of the configured type, plus its distance from the player. Returns
+    (None, None) when none is in the scene -- the shoal is a 6x6 loc out on the ocean and
+    /objects walks the top-level scene as well as the boat's nested WorldView, so both the net
+    and the shoal come out of one call in comparable top-level world coordinates."""
+    wanted = shoal_ids(cfg)
+    best = None
+    best_dist = None
+    for obj in objects or []:
+        if obj.get("id") not in wanted:
+            continue
+        if px is None or obj.get("x") is None:
+            continue
+        dist = ((obj["x"] - px) ** 2 + (obj["y"] - py) ** 2) ** 0.5
+        if best_dist is None or dist < best_dist:
+            best, best_dist = obj, dist
+    return best, best_dist
+
+
+def _built_net_depth(trawling):
+    """The depth of the net slot that is actually built. `nets` reports both facility slots and
+    an unbuilt one reads hotspotId 0 -- reading slot 0 blindly would call a built starboard net
+    'raised' forever."""
+    for entry in (trawling.get("nets") or []):
+        if entry.get("hotspotId"):
+            return entry.get("depth")
+    return None
+
+
+def read_snapshot(ctx, cfg, ticks_since_sailing_xp: float = 0.0) -> TrawlSnapshot:
+    player = controller.get_player() or {}
+    px, py, plane = player.get("x"), player.get("y"), player.get("plane")
+
+    sail = controller.api_get("/sailing") or {}
+    objects = controller.get_objects() or []
+    trawling = controller.get_trawling() or {}
+
+    net = find_net(objects)
+    shoal, shoal_dist = find_shoal(objects, cfg, px, py)
+    cargo = trawling.get("cargo") or {}
+
+    return TrawlSnapshot(
+        px=px, py=py, plane=plane,
+        boat_speed=float(sail.get("boatSpeed") or 0.0),
+        navigating=bool(sail.get("navigating")),
+        net=net,
+        net_depth=_built_net_depth(trawling),
+        shoal=shoal, shoal_distance=shoal_dist,
+        net_fish=trawling.get("netFish"),
+        cargo_used=cargo.get("used"), cargo_capacity=cargo.get("capacity"),
+        ticks_since_sailing_xp=ticks_since_sailing_xp,
+        in_route_area=(px is not None and trawling_routes.in_route_area(
+            cfg["shoal"], cfg["route"], px, py)),
+    )
+
+
+def net_refresh_target(net):
+    """A refresh_target for the net. The boat is stopped while trawling, so the net's top-level
+    world tile is stable and /object/at can re-resolve its projection as the camera moves."""
+    return controller.object_refresh_target(net["x"], net["y"], net.get("plane", 0), net["id"])
