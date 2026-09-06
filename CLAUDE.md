@@ -1145,7 +1145,8 @@ Routine dropdown entry are both Java).
   Sailing XP drop (a successful one also grants Fishing XP), so a pushed `XP_GAINED` proves the
   net is operating in range; `RANGE_LOST_TICKS` (6) without one means the shoal has moved.
   Distance to a moving 6x6 object only ever *aims* the boat.
-- **The burst holds `tick()` for up to 90s, so `on_event` never runs during it** -- it reads
+- **The burst holds `tick()` for up to 120s (`BURST_MAX_S`), so `on_event` never runs during
+  it** -- it reads
   `ctx.events.since(mark)` and advances `mark` after every read (the Hunllef C2 rule; re-taking
   `mark()` per iteration drops everything the tick wait pumped past, i.e. the whole heartbeat).
   With `ctx.events is None` there is no pushed heartbeat, so the burst falls back to

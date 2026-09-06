@@ -28,11 +28,21 @@
 #
 # Preconditions (checked by _startup_checks, each with its own one-line stop reason):
 #   - standing on your boat, which has a trawling net built
-#   - a CREWMATE on the helm. Helmsmanship lets a crewmate hold the helm so the player can stand
-#     at another facility while the player still clicks the heading (Wiki, Crew Management).
-#     Without one the player must stand at the helm to steer and cannot trawl at the same time.
+#   - the boat is in STEERING mode (/sailing.navigating). In the setup this routine needs, that
+#     is a crewmate holding the helm -- Helmsmanship lets one hold it so the player can stand at
+#     another facility while still clicking the heading (Wiki, Crew Management). NOTE the bridge
+#     cannot actually see a crewmate; see the comment at that check.
 #   - Fishing level >= the configured shoal's requirement
 #   - the boat is on the configured route
+#
+# HOW LONG ONE tick() CAN RUN, and what is suspended while it does (F-M8): trawl_burst holds the
+# tick for up to BURST_MAX_S (120s), and tick() chains up to TICK_CHAIN_MAX (4) phases -- so a
+# single tick() can be four bursts plus their blocking sailing.sail_to legs, realistically
+# several minutes. For that whole window the ENGINE is not running: check_safety,
+# check_pvp_threat, handle_generic_events (PLAYER_DIED included), check_stray_dialog,
+# maybe_idle_mouse_move, the login gate and the focus gate are all suspended. The burst
+# compensates for pause / safety stop / break_due (_interrupted, every tick) and for a stray
+# dialogue (_dismiss_dialogue_if_open) -- and for NONE of the rest.
 #
 # Run with:
 #     python controller.py routines/deep_sea_trawling.py
@@ -322,12 +332,20 @@ CHECK_TICKS = 5              # how often _dismiss_dialogue_if_open is polled -- 
 CLICK_PHASE_S = (0.02, 0.12)  # jitter after the tick boundary so clicks are not all at +0ms
 
 
-def _walk_to_net(ctx, net):
-    """Stand at the net. The deck of a sloop is a few tiles across, so this is one short click,
-    not a route. Returns True once the click was issued -- the game queues the interaction and
-    performs it on arrival, so the burst's first Operate can follow immediately."""
+def _click_net_to_stand_at_it(ctx, net):
+    """The burst's first click on the net.
+
+    NOT a walk (F-M7 -- the old name said "_walk_to_net" and was wrong): op1 on the net loc is
+    Operate, i.e. the left-click default, so this both sends the player to the net and starts
+    the first operation. The game queues the interaction and performs it on arrival, so the
+    burst's cadence can start immediately.
+
+    expected_action="Operate" gates it on /hover: a sloop deck is a few tiles across with
+    another facility on every neighbouring pixel, so a stale pre-walk aim could otherwise land
+    silently on the helm. A withheld click returns the falsy CLICK_WITHHELD sentinel; the caller
+    counts that (see trawl_phase / NET_CLICK_TRIES) rather than looping on it."""
     return bool(controller.click_entity(ctx.ser, net, refresh_target=net_refresh_target(net),
-                                        simulate_mistakes=False))
+                                        simulate_mistakes=False, expected_action="Operate"))
 
 
 def _dismiss_dialogue_if_open(ctx):
@@ -603,13 +621,15 @@ def approach_phase(ctx, cfg, snap) -> bool:
     when the shoal is not visible at all (travel_phase)."""
     idx, _point, dist = trawling_routes.nearest_stop(cfg["shoal"], cfg["route"],
                                                      snap.shoal["x"], snap.shoal["y"])
-    if dist <= cfg["trawlRange"]:
+    # STOP_MATCH_TILES, not cfg["trawlRange"] (F-M12): this is "is the shoal sitting AT that
+    # route stop", a shoal->marker distance, not the boat->shoal parking hysteresis.
+    if dist <= STOP_MATCH_TILES:
         ctx.state.data["dst_last_stop_index"] = idx
     target = {"x": snap.shoal["x"], "y": snap.shoal["y"], "plane": snap.plane or 0}
-    return _sail(ctx, cfg, target)
+    return _sail(ctx, cfg, target, snap)
 
 
-def _sail(ctx, cfg, target) -> bool:
+def _sail(ctx, cfg, target, snap=None) -> bool:
     data = ctx.state.data
     if sailing.sail_to(ctx, target):
         data["dst_sail_fails"] = 0
@@ -618,7 +638,7 @@ def _sail(ctx, cfg, target) -> bool:
     debug_log.log("trawling",
                   f"couldn't sail to {target} ({data['dst_sail_fails']}/{SAIL_MAX_TRIES})")
     if data["dst_sail_fails"] >= SAIL_MAX_TRIES:
-        _stop(ctx, "the boat couldn't reach the shoal after repeated attempts")
+        _stop(ctx, "the boat couldn't reach the shoal after repeated attempts", snap)
     return False
 
 
@@ -802,7 +822,7 @@ def _stuck_watch(ctx, cfg, snap, phase):
         return
     stalled = _now() - data.get("dst_sig_at", _now())
     if stalled >= STALL_STOP_S:
-        _stop(ctx, f"nothing has changed for {int(stalled)}s in phase {phase}")
+        _stop(ctx, f"nothing has changed for {int(stalled)}s in phase {phase}", snap)
     elif stalled >= STALL_WARN_S and not data.get("dst_warned"):
         data["dst_warned"] = True
         debug_log.log("trawling", f"[!] trawling: STUCK? {int(stalled)}s in phase {phase}")

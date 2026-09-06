@@ -138,7 +138,10 @@ Following the event-driven-outcomes contract (`docs/.../2026-09-04-event-driven-
 `VARBIT_SUBSCRIPTIONS = [19206, 19208, 19134]`. Every consumer tolerates `ctx.events is None`
 and falls back to polling.
 
-**The C2 rule applies here and is load-bearing.** The trawl burst holds `tick()` for up to 90 s,
+**The C2 rule applies here and is load-bearing.** The trawl burst holds `tick()` for up to 120 s
+(`BURST_MAX_S`; the 90 s figure this said before was the *shoal stop* length, not the burst
+ceiling — F-M8), and `tick()` chains up to `TICK_CHAIN_MAX` (4) of them plus their blocking
+`sail_to` legs, so one `tick()` can realistically run for minutes,
 and `on_event` is dispatched by the engine loop, so it never runs during a burst. The burst
 therefore reads events with `ctx.events.since(mark)` and **advances `mark` to
 `ctx.events.mark()` immediately after every read** — taking a fresh `mark()` at the top of each
@@ -212,7 +215,7 @@ Because `get_config` ignores `bridge_config`, wiring is only the two required st
 DEFAULT_CONFIG = {
     "shoal": "giant_krill",
     "route": "great_sound",
-    "trawlRange": 8,          # tiles boat->shoal centre we aim to park within  (UNVERIFIED)
+    "trawlRange": 8,          # re-approach HYSTERESIS, not a parking distance (UNVERIFIED, F-I7)
     "netFullAt": 240,         # collect at this many fish, not at 250
     "collectTo": "cargo",     # "cargo" | "inventory"
     "stopWhenCargoFull": True,
@@ -352,7 +355,16 @@ Nothing below has been measured. These are ordered so that the earliest failure 
 2. **How does a moving shoal appear** — one object that changes tile, or a despawn/spawn pair
    per tick? If the latter, does it flood `SPAWN_EVENT_CAP_PER_TICK` (40)?
 3. **What is "in range"** — park at increasing distances and find the largest boat→shoal centre
-   distance that still produces the Sailing XP heartbeat. Sets `trawlRange`.
+   distance that still produces the Sailing XP heartbeat. That measurement calibrates
+   `trawlRange`, but note what `trawlRange` actually does (F-I7): it is **the distance past
+   which `derive_phase` decides to re-approach — a hysteresis threshold, NOT a parking
+   distance**. `approach_phase` sails at the shoal's own tile and `sailing.sail_to` returns as
+   soon as it is inside `_dynamic_brake_tiles()`, floored at `SAIL_ARRIVAL_TOLERANCE` (5), so
+   the boat parks 0–5 tiles from the shoal centre whatever this is set to. Failure mode if the
+   guess is too LARGE: `derive_phase` keeps answering `trawl` while the heartbeat says we are
+   out of range, so the approach recovery that `APPROACH_MAX_TRIES`' stop message names is
+   never actually attempted. Steering to a deliberate stand-off distance is a separate change
+   and needs this measurement first.
 4. **Does the heartbeat really arrive every 2 ticks under a 1-per-tick click**, and 3 ticks
    without? Measure both; this is the entire premise.
 5. **Net depth varbit 19206**: its value raised vs lowered, and whether it is populated with the
@@ -365,6 +377,26 @@ Nothing below has been measured. These are ordered so that the earliest failure 
 9. **Boat speed vs 1.18 tiles/tick** — confirm the boat arrives at the next stop before or with
    the shoal.
 10. Chat lines for a full net / full cargo hold (nothing is parsed today; add them if they exist).
+11. **Does `navigating` actually discriminate the crewmate case?** (F-I3.) `SailingProvider`
+    defines it as `WorldView.getYellowClickAction() == CLICK_ACTION_SET_HEADING` — "a tile click
+    currently resolves to steering", a property of THIS player's click mode. It is not a crew
+    readout, and the bridge has none. So: does it read **true** while the player stands AWAY
+    from the helm with a crewmate assigned, and **false** without one? If it does not
+    discriminate, this precondition needs a real signal (a new provider field), and the startup
+    check as written passes in the one configuration the routine cannot work in.
+12. **`sailing.use_helm`'s confirmation is vacuous here.** It clicks the helm and then polls
+    `/sailing.navigating` — which this routine has already asserted is true — so it returns True
+    on its first poll whether or not the click did anything. Every `sail_to` in this routine
+    therefore has an unverified helm step; watch for a leg that never moves.
+13. **Which dialogue does Collect-from open, and does `/state.dialogOpen` see it?** CLAUDE.md
+    records that neither `/state.dialogOpen` nor the m8aq dialogue reader sees widget group 270
+    — the skill-select modal family that Giants' Foundry's crucible and the Blast Furnace
+    dispenser both use. `_dismiss_dialogue_if_open` keys on `dialogOpen`, so if Collect-from is
+    a 270-family modal the detector is blind to it and the burst will keep clicking behind it.
+14. **How long after the Collect-from click does its interface appear?** `_answer_collect_
+    dialogue` presses its number key immediately. The one measured analogue in this repo (the
+    Blast Furnace dispenser's Take) opens the modal ~1.5 s after the click. Once measured, gate
+    the press on the interface actually being up rather than pressing blind.
 
 ---
 
