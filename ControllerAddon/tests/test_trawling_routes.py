@@ -54,8 +54,8 @@ def test_leg_ticks_is_the_lap_minus_the_stops():
 def test_every_stored_route_is_traversable_at_a_plausible_boat_speed():
     """The evidence that the Wiki's label 1..7 really is the VISITING order: with the stops in
     that order, every leg's implied speed lands in a tight, plausible band (Great Sound 1.18
-    tiles/tick average and 1.57 worst leg, Simian Sea 1.47/1.77, Turtle Belt 1.26/1.56). A wrong
-    ordering would scatter these well past any real boat speed."""
+    tiles/tick average and 1.57 worst leg, Simian Sea 1.47/1.78, Sunset Bay 1.49/2.52, Turtle Belt
+    1.27/1.58). A wrong ordering would scatter these well past any real boat speed."""
     for (shoal, route) in tr.ROUTES:
         stops = tr.stops_world(shoal, route)
         budget = tr.leg_ticks(shoal, route) * tr.MAX_BOAT_TILES_PER_TICK
