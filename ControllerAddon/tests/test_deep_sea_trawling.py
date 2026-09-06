@@ -183,7 +183,12 @@ def _burst_ctx(monkeypatch, tick_events):
     return ctx
 
 
-def _stub_burst_io(monkeypatch, clicks, net_fish=lambda: 10, moved=lambda: False):
+def _stub_burst_io(monkeypatch, clicks, net_fish=lambda: 10, moved=lambda: False,
+                   pump_on_wait=False):
+    """pump_on_wait=True installs a tick_pause stub that also pumps the real EventStream before
+    advancing the fake clock -- i.e. it behaves like the real wait_ticks() (which pumps mid-wait)
+    instead of the bare-sleep default. Only the mark/since regression test needs this; every
+    other test's plain bare-sleep stub is faithful enough (see that test's own docstring)."""
     monkeypatch.setattr(controller, "click_human", lambda ser: clicks.append(1))
     monkeypatch.setattr(controller, "hover_entity", lambda *a, **k: True)
     monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
@@ -192,8 +197,29 @@ def _stub_burst_io(monkeypatch, clicks, net_fish=lambda: 10, moved=lambda: False
                         lambda: {"x": 1581 if moved() else 1580, "y": 3365, "plane": 0})
     monkeypatch.setattr(dst, "_walk_to_net", lambda ctx, net: True)
     monkeypatch.setattr(dst, "_dismiss_dialogue_if_open", lambda ctx: False)
-    monkeypatch.setattr(outcome_waits, "tick_pause",
-                        lambda ctx, n=1, phase=None, **kw: dst._sleep(0.6 * n))
+
+    if pump_on_wait:
+        def _tick_pause_pumping(ctx, n=1, phase=None, **kw):
+            events = getattr(ctx, "events", None)
+            if events is not None:
+                events.pump()
+            dst._sleep(0.6 * n)
+        monkeypatch.setattr(outcome_waits, "tick_pause", _tick_pause_pumping)
+    else:
+        monkeypatch.setattr(outcome_waits, "tick_pause",
+                            lambda ctx, n=1, phase=None, **kw: dst._sleep(0.6 * n))
+
+
+def _no_events_ctx(monkeypatch):
+    """A burst context with NO EventStream at all -- the fallback mode Critical 1's review
+    found had zero coverage."""
+    monkeypatch.setattr(controller, "sample_human_delay", lambda a, b: 0.0)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "fidget_once", lambda: None)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(dst, "_now", lambda: clock["t"])
+    monkeypatch.setattr(dst, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    return _Ctx(None)
 
 
 XP_SAIL = ("XP_GAINED", {"skill": "Sailing", "xp": 7})
@@ -225,14 +251,49 @@ def test_burst_returns_net_full_at_the_configured_threshold(monkeypatch):
 def test_burst_advances_its_event_mark_and_so_never_reads_the_same_drop_twice(monkeypatch):
     """The C2 rule: mark is taken ONCE before the loop and advanced after every read. If it were
     re-taken at the top of each iteration the events delivered during the tick wait would be
-    skipped and the heartbeat would look dead on the very first idle poll."""
+    skipped and the heartbeat would look dead on the very first idle poll.
+
+    Uses pump_on_wait=True so tick_pause pumps the stream mid-wait, the same as the real
+    wait_ticks() does -- a bare-sleep tick_pause stub (the default) never pumps between
+    iterations at all, so it cannot exercise the "event arrived during the wait" case this test
+    exists to pin (see the review finding this test was rewritten for)."""
     ctx = _burst_ctx(monkeypatch, [[XP_SAIL, XP_SAIL], [XP_SAIL]] + [[]] * 20)
     clicks = []
-    _stub_burst_io(monkeypatch, clicks)
+    _stub_burst_io(monkeypatch, clicks, pump_on_wait=True)
     monkeypatch.setattr(dst, "RANGE_LOST_TICKS", 3)
     dst.trawl_burst(ctx, CFG, NET_OBJ)
     # Three Sailing drops were delivered; each must have been counted exactly once.
     assert ctx.state.data["dst_rolls"] == 3
+
+
+def test_burst_with_no_event_stream_uses_stalled_net_count_as_out_of_range(monkeypatch):
+    """Critical 1: with ctx.events is None the Sailing-xp heartbeat never arrives at all, so the
+    burst needs its OWN out-of-range signal -- a net count that stops growing. Without this the
+    no-events branch was a dead end that could only run to BURST_MAX_S and return "budget"."""
+    ctx = _no_events_ctx(monkeypatch)
+    clicks = []
+    _stub_burst_io(monkeypatch, clicks, net_fish=lambda: 10)   # never grows
+    monkeypatch.setattr(dst, "NO_EVENTS_STALL_TICKS", 24)
+    result = dst.trawl_burst(ctx, CFG, NET_OBJ)
+    assert result == "out_of_range"
+    assert len(clicks) >= 24
+
+
+def test_burst_with_no_event_stream_and_a_growing_net_count_keeps_going(monkeypatch):
+    ctx = _no_events_ctx(monkeypatch)
+    clicks = []
+    count = {"n": 9}
+
+    def growing():
+        count["n"] += 1
+        return count["n"]
+
+    _stub_burst_io(monkeypatch, clicks, net_fish=growing)
+    monkeypatch.setattr(dst, "NO_EVENTS_STALL_TICKS", 16)
+    monkeypatch.setattr(dst, "BURST_MAX_S", 24.0)
+    result = dst.trawl_burst(ctx, CFG, NET_OBJ)
+    assert result == "budget"          # never falsely declared out_of_range
+    assert len(clicks) >= 16
 
 
 def test_burst_stops_for_a_safety_stop(monkeypatch):
@@ -251,11 +312,18 @@ def test_burst_stops_for_a_safety_stop(monkeypatch):
 
 
 def test_burst_reaims_when_the_player_has_moved(monkeypatch):
+    """Records the CLICK COUNT at the moment of each hover call, not just a tally -- a bare
+    `len(hovers) >= 2` also passes for the brief's original buggy `(None, None)` sentinel, which
+    fires a spurious extra re-aim on the very first iteration (tile != (None, None) is always
+    true). Pinning the exact sequence [0, 3] -- the pre-loop aim, then the one re-aim on the
+    tick the tile is first observed to have changed -- fails against that buggy version and
+    passes against the current code."""
     ctx = _burst_ctx(monkeypatch, [[XP_SAIL]] * 60)
     clicks = []
     hovers = []
     _stub_burst_io(monkeypatch, clicks, moved=lambda: len(clicks) >= 3)
-    monkeypatch.setattr(controller, "hover_entity", lambda *a, **k: hovers.append(1) or True)
+    monkeypatch.setattr(controller, "hover_entity",
+                        lambda *a, **k: hovers.append(len(clicks)) or True)
     monkeypatch.setattr(dst, "BURST_MAX_S", 6.0)
     dst.trawl_burst(ctx, CFG, NET_OBJ)
-    assert len(hovers) >= 2                 # the initial aim plus at least one re-aim
+    assert hovers == [0, 3]

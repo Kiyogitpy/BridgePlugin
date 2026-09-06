@@ -232,10 +232,17 @@ def net_refresh_target(net):
 # ticks unclicked and every 2 clicked, so 6 is two missed rolls' worth of slack -- tight enough
 # to start chasing within ~4s of the shoal moving, loose enough to ride a dropped UDP packet.
 RANGE_LOST_TICKS = 6
+# With no pushed heartbeat, "still catching" is the net count growing. Catches are stochastic
+# (~10.5% per roll at Fishing 75, one roll per 2 ticks), so this window has to be much wider
+# than RANGE_LOST_TICKS: 100 ticks is ~50 rolls, and the chance of a genuine catch drought that
+# long is under 0.5%.
+NO_EVENTS_STALL_TICKS = 100
 BURST_MAX_S = 120.0          # longer than any shoal's stop (krill 90s); a ceiling, not a timer
 AIM_REFRESH_TICKS = 12       # re-aim on a schedule even if nothing looks like it moved
 NET_POLL_TICKS = 8           # how often the burst spends an HTTP read on /trawling.netFish
-CHECK_TICKS = 5              # how often pause / safety / break_due are re-checked
+CHECK_TICKS = 5              # how often _dismiss_dialogue_if_open is polled -- _interrupted
+                              # (pause / safety stop / break_due) itself runs every tick, not
+                              # gated by this
 CLICK_PHASE_S = (0.02, 0.12)  # jitter after the tick boundary so clicks are not all at +0ms
 
 
@@ -263,7 +270,11 @@ def _interrupted(ctx, cfg):
     if getattr(state, "safety_stopped", False) or getattr(state, "paused", False):
         return True
     try:
-        return bool(state.break_due(cfg.get("breaks")))
+        # cfg has no "breaks" key (this routine never reads GET /config -- see get_config), so
+        # cfg.get("breaks") is None here. ControllerState.break_due(None) raises AttributeError
+        # rather than treating "no breaks configured" as falsy -- the `or {}` is load-bearing,
+        # not decorative; do not simplify it away.
+        return bool(state.break_due(cfg.get("breaks") or {}))
     except Exception:
         return False
 
@@ -304,6 +315,8 @@ def trawl_burst(ctx, cfg, net) -> str:
     ticks_since_roll = 0
     last_tile = None
     last_aim_tick = 0
+    last_net_fish = None     # last polled /trawling.netFish, for the no-events stall fallback
+    last_growth_tick = 0     # tick at which netFish last went up (or was first observed)
 
     while _now() - started < BURST_MAX_S:
         outcome_waits.tick_pause(ctx, 1, phase=CLICK_PHASE_S, now_fn=_now, sleep_fn=_sleep)
@@ -348,12 +361,26 @@ def trawl_burst(ctx, cfg, net) -> str:
             if fish is not None and fish >= cfg["netFullAt"]:
                 debug_log.log("trawling", f"nets at {fish} -- collecting")
                 return "net_full"
+            # A None read (bridge hiccup mid-burst) must not manufacture a false stall -- only
+            # a REAL count that fails to grow counts against the no-events fallback below.
+            if fish is not None:
+                if last_net_fish is None or fish > last_net_fish:
+                    last_growth_tick = ticks
+                last_net_fish = fish
 
+        # Two independent modes, each with its own out-of-range signal -- deliberately not an
+        # if/elif chain sharing one condition. With no pushed heartbeat the Sailing XP drop
+        # (ticks_since_roll) never arrives at all, so it can never fire "out_of_range" on its
+        # own; the net-growth stall is that mode's own equivalent signal, not a fallback bolted
+        # onto the same branch.
         if events is None:
-            # No pushed heartbeat: fall back on the net count as the "still catching" signal.
-            if ticks % NET_POLL_TICKS == 0:
-                ticks_since_roll = 0
-        elif ticks_since_roll >= RANGE_LOST_TICKS:
+            if ticks - last_growth_tick >= NO_EVENTS_STALL_TICKS:
+                debug_log.log(
+                    "trawling",
+                    f"no net-count growth for {ticks - last_growth_tick} ticks -- "
+                    "the shoal has moved")
+                return "out_of_range"
+        if events is not None and ticks_since_roll >= RANGE_LOST_TICKS:
             debug_log.log("trawling",
                           f"no Sailing xp for {ticks_since_roll} ticks -- the shoal has moved")
             return "out_of_range"
