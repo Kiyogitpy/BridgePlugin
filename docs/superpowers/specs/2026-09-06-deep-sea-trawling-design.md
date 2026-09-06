@@ -216,9 +216,13 @@ DEFAULT_CONFIG = {
     "netFullAt": 240,         # collect at this many fish, not at 250
     "collectTo": "cargo",     # "cargo" | "inventory"
     "stopWhenCargoFull": True,
-    "maxRunS": 0,             # 0 = until the panic key / cargo full
+    "safety": {},             # get_config forces stopOnInventoryFull off -- see below
 }
 ```
+
+`get_config` forces `safety.stopOnInventoryFull` **off**: the engine's safety check runs before
+`tick()`, so it would win the race against our own `collect` phase. Same reason `mining.py`
+forces it off for its banking trip.
 
 ### 5.2 Phases — derived from live state every tick, never from stored state
 
