@@ -44,14 +44,34 @@ def test_derive_phase_truth_table():
     assert d(_snap(net_fish=CFG["netFullAt"], shoal_distance=30.0), CFG) == "collect"
     # Cargo hold full and nothing left in the nets -> done.
     assert d(_snap(cargo_used=240, net_fish=0), CFG) == "done"
-    # Cargo hold full but fish still in the nets -> collect them first; the collect itself
-    # discovers the hold is full and the next tick reads done.
-    assert d(_snap(cargo_used=240, net_fish=10), CFG) == "collect"
 
 
-def test_derive_phase_travel_outside_the_route_area_is_lost():
+def test_derive_phase_routes_a_full_cargo_hold_to_done_not_to_a_collect_that_cannot_work():
+    """F-I1. With collectTo "cargo" a Collect-from into a FULL hold moves nothing, so the
+    collect can NEVER confirm -- the old truth table sent it to "collect" anyway, which burned
+    COLLECT_TRIES and stopped the run on "couldn't empty the trawling nets" with the net still
+    down and up to 239 fish aboard. done_phase is the terminal path and must be reachable.
+    Collecting to the INVENTORY is the one destination a full hold does not block, so that
+    config keeps its collect."""
+    d = dst.derive_phase
+    assert d(_snap(cargo_used=240, net_fish=10), CFG) == "done"
+    to_inventory = dict(CFG, collectTo="inventory")
+    assert d(_snap(cargo_used=240, net_fish=10), to_inventory) == "collect"
+    assert d(_snap(cargo_used=240, net_fish=0), to_inventory) == "done"
+
+
+def test_derive_phase_outside_the_route_area_is_travel_not_lost():
+    """F-M4: "off the route" is not "not aboard a boat". Routing it to lost gave the user the
+    wrong message AND made travel_phase's own (correct) branch unreachable."""
     assert dst.derive_phase(_snap(shoal=None, shoal_distance=None, in_route_area=False),
-                            CFG) == "lost"
+                            CFG) == "travel"
+
+
+def test_derive_phase_treats_an_unreadable_boat_speed_as_moving():
+    """F-M6: float(sail.get("boatSpeed") or 0.0) read an unreadable /sailing as "stopped", so
+    the ladder could pick trawl on a boat that is actually still under way. Approach is the safe
+    direction -- it re-parks rather than trawling adrift."""
+    assert dst.derive_phase(_snap(boat_speed=None), CFG) == "approach"
 
 
 def test_get_config_ignores_the_bridge_config_and_forces_the_inventory_safety_off():
@@ -71,13 +91,33 @@ SHOAL_OBJ = {"id": 59734, "name": "<col=FFFF00>Giant krill shoal</col>",
              "x": 1583, "y": 3367, "plane": 0, "screenX": 900, "screenY": 300}
 
 
-def test_find_net_matches_by_id_not_by_name():
+def test_find_net_matches_by_id_before_name():
     """The name carries a colour tag on the shoal and could carry one anywhere, so ids come
-    first; the name fragment is only the fallback for a net variant we have not tabulated."""
+    first; the name fragment is only the fallback for a net variant we have not tabulated. Note
+    this no longer asserts anything about SCAN ORDER -- see the nearest-net test below."""
     assert dst.find_net([{"id": 1}, NET_OBJ]) is NET_OBJ
     odd = {"id": 99999, "name": "Driftwood trawling net", "x": 1, "y": 2, "plane": 0}
     assert dst.find_net([odd]) is odd
     assert dst.find_net([{"id": 1, "name": "Helm"}]) is None
+    # An untabulated net right next to us still loses to a tabulated one further away: the id
+    # pass is exhausted before the name pass is considered at all.
+    near_by_name = dict(odd, distance=1)
+    assert dst.find_net([near_by_name, NET_OBJ]) is NET_OBJ
+
+
+def test_find_net_takes_the_nearest_net_not_the_first_in_scan_order():
+    """F-I2. ObjectProvider.walkWorldViewRecursively iterates every WorldEntity in the loaded
+    scene -- i.e. EVERY boat, not just ours -- and deep sea trawling is a shared ocean where
+    other players park at the same shoal. First-match-wins hands back THEIR net, and then the
+    burst, lower_phase and collect_phase all aim at their boat with nothing erroring: it
+    presents as "the heartbeat never starts"."""
+    theirs = dict(NET_OBJ, x=1600, y=3390, distance=21)
+    ours = dict(NET_OBJ, distance=2)
+    assert dst.find_net([theirs, ours]) is ours
+    # A missing distance is +inf ("cannot tell"), never 0 -- otherwise an unmeasurable object
+    # would beat every real one.
+    no_distance = {k: v for k, v in theirs.items() if k != "distance"}
+    assert dst.find_net([no_distance, ours]) is ours
 
 
 def test_find_shoal_picks_the_nearest_matching_id_and_reports_its_distance():
@@ -420,6 +460,78 @@ def test_collect_phase_takes_collect_from_and_confirms_the_net_emptied(monkeypat
     assert dst.collect_phase(ctx, CFG, _snap(net_fish=240)) is True
     assert seen == ["Collect-from"]
     assert fish["n"] == 0
+
+
+def test_collect_phase_hands_back_instead_of_burning_its_tries_on_a_full_hold(monkeypatch):
+    """F-I1. A Collect-from into a FULL hold moves nothing, so the netFish == 0 confirm can
+    never hold. The old loop spent COLLECT_TRIES right-click menus on it and then stopped with
+    "couldn't empty the trawling nets" -- naming the wrong cause, leaving the net down and up to
+    239 fish stranded. This is the intended end of every successful run."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    attempts = []
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **kw: attempts.append(option) or True)
+    monkeypatch.setattr(dst, "_answer_collect_dialogue", lambda ctx_, cfg, dest=None: None)
+    monkeypatch.setattr(controller, "get_trawling",
+                        lambda: {"netFish": 137, "cargo": {"used": 240, "capacity": 240}})
+
+    assert dst.collect_phase(ctx, CFG, _snap(net_fish=137, cargo_used=240)) is True
+    assert attempts == ["Collect-from"]              # ONE attempt, not COLLECT_TRIES
+    assert ctx.state.safety_stopped is False
+    # ...and the next phase derivation is the terminal one.
+    assert dst.derive_phase(_snap(net_fish=137, cargo_used=240), CFG) == "done"
+
+
+def test_done_phase_takes_what_the_inventory_can_hold_then_raises_the_net(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    clicks = []
+    keys = []
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **kw: clicks.append(option) or True)
+    monkeypatch.setattr(dst, "_answer_collect_dialogue",
+                        lambda ctx_, cfg, dest=None: keys.append(dest))
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"id": 1}] * 10)
+    monkeypatch.setattr(controller, "get_trawling",
+                        lambda: {"netFish": 137, "cargo": {"used": 240, "capacity": 240}})
+
+    assert dst.done_phase(ctx, CFG, _snap(net_fish=137, cargo_used=240)) is False
+    assert clicks == ["Collect-from", "Raise"]
+    assert keys == ["inventory"]                     # NOT the configured (full) cargo hold
+    assert ctx.state.safety_stopped
+    reason = ctx.state.safety_reason.lower()
+    assert "cargo hold is full" in reason
+    assert "137 fish are still in the nets" in reason   # F-M9
+
+
+def test_done_phase_raises_the_net_with_no_inventory_room(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    clicks = []
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **kw: clicks.append(option) or True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"id": 1}] * 28)
+    monkeypatch.setattr(controller, "get_trawling",
+                        lambda: {"netFish": 137, "cargo": {"used": 240, "capacity": 240}})
+    dst.done_phase(ctx, CFG, _snap(net_fish=137, cargo_used=240))
+    assert clicks == ["Raise"]
+    assert ctx.state.safety_stopped
+
+
+def test_every_stop_names_the_fish_left_in_the_nets(monkeypatch):
+    """F-M9: fish in the nets are discarded on disembark/teleport/hop/forced logout, so a stop
+    that does not mention them can silently cost up to 240 fish. Appended in _stop itself so a
+    new call site cannot forget it."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    dst._stop(ctx, "something went wrong", _snap(net_fish=41))
+    assert "41 fish are still in the nets" in ctx.state.safety_reason
+    ctx2 = _burst_ctx(monkeypatch, [[]])
+    dst._stop(ctx2, "something went wrong", _snap(net_fish=0))
+    assert "still in the nets" not in ctx2.state.safety_reason
+    ctx3 = _burst_ctx(monkeypatch, [[]])
+    dst._stop(ctx3, "something went wrong", _snap(net_fish=None))
+    assert "still in the nets" not in ctx3.state.safety_reason
 
 
 def test_approach_phase_sails_at_the_live_shoal_when_it_is_sitting_still(monkeypatch):
@@ -795,36 +907,124 @@ def test_sail_failure_counter_resets_on_a_success(monkeypatch):
     assert ctx.state.safety_stopped is False
 
 
+def _stub_skills(monkeypatch, fishing_level=99):
+    """Keep the startup checks hermetic: without this the Fishing-level check would reach the
+    live bridge."""
+    monkeypatch.setattr(controller, "get_skills",
+                        lambda: {"Fishing": {"level": fishing_level,
+                                             "boosted": fishing_level, "xp": 1}})
+
+
 def test_startup_checks_defers_when_the_scene_has_not_loaded_yet(monkeypatch):
     """px is None (the first logged-in tick after an auto-login) must DEFER, not stop -- this is
     the GOTR 'no pickaxe with a pickaxe equipped' bug shape. net=None too, on purpose: without
     the early return this would fall through to the next check and stop for the wrong reason,
-    so this test fails if that early return is ever removed."""
+    so this test fails if that early return is ever removed. It also returns False, which is
+    what keeps the tick-side latch unset so a later tick retries (F-I4)."""
     ctx = _burst_ctx(monkeypatch, [[]])
+    _stub_skills(monkeypatch)
     monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg: _snap(px=None, py=None, net=None))
-    dst._startup_checks(ctx, CFG)
+    assert dst._startup_checks(ctx, CFG) is False
     assert ctx.state.safety_stopped is False
 
 
 def test_startup_checks_stops_without_a_net(monkeypatch):
     ctx = _burst_ctx(monkeypatch, [[]])
+    _stub_skills(monkeypatch)
     monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg: _snap(net=None))
-    dst._startup_checks(ctx, CFG)
+    assert dst._startup_checks(ctx, CFG) is True
     assert ctx.state.safety_stopped is True
     assert "boat" in ctx.state.safety_reason.lower()
 
 
-def test_startup_checks_stops_without_a_crewmate_on_the_helm(monkeypatch):
+def test_startup_checks_stops_when_the_boat_is_not_in_steering_mode(monkeypatch):
+    """F-I3: the reason names what /sailing.navigating can actually establish (a click-mode
+    flag) and only SUGGESTS the crewmate as the cause -- SailingProvider defines it as
+    getYellowClickAction() == CLICK_ACTION_SET_HEADING, which is a property of this player's
+    click mode and says nothing at all about a crewmate."""
     ctx = _burst_ctx(monkeypatch, [[]])
+    _stub_skills(monkeypatch)
     monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg: _snap(navigating=False))
     dst._startup_checks(ctx, CFG)
     assert ctx.state.safety_stopped is True
+    assert "steering" in ctx.state.safety_reason.lower()
     assert "helm" in ctx.state.safety_reason.lower()
+
+
+def test_startup_checks_stop_below_the_shoals_fishing_level(monkeypatch):
+    """Spec 6.3, implemented at last: ShoalSpec.fishing_level was written in trawling_routes and
+    read nowhere."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    _stub_skills(monkeypatch, fishing_level=60)     # Giant krill needs 69
+    monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg: _snap())
+    dst._startup_checks(ctx, CFG)
+    assert ctx.state.safety_stopped is True
+    assert "69" in ctx.state.safety_reason
+
+
+def test_an_unreadable_fishing_level_does_not_stop_the_run(monkeypatch):
+    """The shipwreck lesson: that level check once defaulted to 0 on an unreadable /skills,
+    which failed every requirement and idled the routine until it was restarted by hand.
+    Unreadable means "cannot tell -- do not filter"."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(controller, "get_skills", lambda: {})
+    monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg: _snap())
+    assert dst._startup_checks(ctx, CFG) is True
+    assert ctx.state.safety_stopped is False
 
 
 def test_startup_checks_stops_outside_the_route_area(monkeypatch):
     ctx = _burst_ctx(monkeypatch, [[]])
+    _stub_skills(monkeypatch)
     monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg: _snap(in_route_area=False))
     dst._startup_checks(ctx, CFG)
     assert ctx.state.safety_stopped is True
     assert CFG["route"] in ctx.state.safety_reason
+
+
+def test_startup_checks_run_from_tick_and_retry_after_deferring(monkeypatch):
+    """F-I4. The engine calls setup() the instant the routine loads -- BEFORE
+    login.is_fully_logged_in() and before the focus gate -- so at the login screen every read is
+    empty, _startup_checks correctly deferred, and being called only from setup() meant it was
+    never called again: every precondition was silently skipped for the life of the process."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    runs = []
+    snaps = [_snap(px=None, py=None, net=None), _snap(), _snap()]
+    reads = {"n": 0}
+
+    def _read(c, cfg, **kw):
+        snap = snaps[min(reads["n"], len(snaps) - 1)]
+        reads["n"] += 1
+        return snap
+    monkeypatch.setattr(dst, "read_snapshot", _read)
+    monkeypatch.setattr(dst, "tick_with_snapshot", lambda c, cfg, s: False)
+
+    real_checks = dst._startup_checks
+
+    def counting(c, cfg):
+        runs.append(1)
+        return real_checks(c, cfg)
+    monkeypatch.setattr(dst, "_startup_checks", counting)
+    _stub_skills(monkeypatch)
+
+    dst.tick(ctx)                                    # deferred -- nothing readable yet
+    assert len(runs) == 1
+    assert ctx.state.data.get("dst_checked") is None
+    assert ctx.state.safety_stopped is False
+
+    dst.tick(ctx)                                    # real data: the checks run and latch
+    assert len(runs) == 2
+    assert ctx.state.data["dst_checked"] is True
+
+    dst.tick(ctx)                                    # and never run again
+    assert len(runs) == 2
+
+
+def test_setup_does_not_run_the_checks_itself(monkeypatch):
+    """The other half of F-I4: setup() must not judge a client that has not logged in yet."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(dst, "_startup_checks",
+                        lambda c, cfg: (_ for _ in ()).throw(AssertionError("ran in setup")))
+    dst.setup(ctx)
+    assert ctx.state.data["dst_started_at"] is not None

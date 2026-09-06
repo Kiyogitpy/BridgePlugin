@@ -151,15 +151,27 @@ def derive_phase(snap: TrawlSnapshot, cfg: dict) -> str:
 
     if snap.cargo_used is not None and snap.cargo_capacity is not None \
             and snap.cargo_used >= snap.cargo_capacity and cfg["stopWhenCargoFull"]:
-        return "collect" if snap.net_fish > 0 else "done"
+        # F-I1: a Collect-from into a FULL hold moves NOTHING, so with collectTo == "cargo" the
+        # collect can never confirm -- it would burn COLLECT_TRIES and stop with the wrong
+        # reason while up to 239 fish sat in the nets. The hold being full is the end of the
+        # run: done_phase collects what the INVENTORY can still take, raises the net and stops.
+        # Collecting to the inventory is the one destination a full hold does not block.
+        if snap.net_fish > 0 and cfg["collectTo"] == "inventory":
+            return "collect"
+        return "done"
 
     if snap.net_fish >= cfg["netFullAt"]:
         return "collect"
 
     if snap.shoal is None:
-        return "travel" if snap.in_route_area else "lost"
+        # F-M4: being outside the route area is NOT "we are not aboard a boat" -- travel_phase
+        # owns that case and has the message that names the route. Routing it to "lost" here
+        # made travel_phase's own branch dead code AND told the user the wrong thing.
+        return "travel"
 
-    if snap.boat_speed > BOAT_MOVING_SPEED:
+    if snap.boat_speed is None or snap.boat_speed > BOAT_MOVING_SPEED:
+        # F-M6: an unreadable /sailing must not read as "stopped". Preferring approach is the
+        # safe direction -- it re-parks rather than trawling while the boat drifts.
         return "approach"
     if snap.shoal_distance is None or snap.shoal_distance > cfg["trawlRange"]:
         return "approach"
@@ -173,17 +185,32 @@ def derive_phase(snap: TrawlSnapshot, cfg: dict) -> str:
 # --------------------------------------------------------------------------- reading the world
 
 
+def _obj_distance(obj):
+    """An object's reported distance, or +inf when it carries none -- never 0, which would make
+    an unmeasurable object beat every real one."""
+    dist = (obj or {}).get("distance")
+    return float(dist) if isinstance(dist, (int, float)) else float("inf")
+
+
 def find_net(objects):
-    """The trawling net facility on our own deck. Matched by ID first: /objects reports
-    ObjectComposition.getName() raw, so a name can carry a <col=...> tag (the shoal's does), and
-    the 12 net variants (4 tiers x 2x5 / 3x8-port / 3x8-starboard) are all tabulated. The name
-    fragment is only a fallback for a variant the cache dump did not have."""
-    for obj in objects or []:
-        if obj.get("id") in NET_OBJECT_IDS:
-            return obj
-    for obj in objects or []:
-        if NET_NAME_FRAGMENT in (obj.get("name") or "").lower():
-            return obj
+    """The trawling net facility on our own deck: the NEAREST match, ids before names.
+
+    Matched by ID first because /objects reports ObjectComposition.getName() raw, so a name can
+    carry a <col=...> tag (the shoal's does), and the 12 net variants (4 tiers x 2x5 /
+    3x8-port / 3x8-starboard) are all tabulated; the name fragment is only a fallback for a
+    variant the cache dump did not have.
+
+    NEAREST, not first-in-scan-order (F-I2): ObjectProvider.walkWorldViewRecursively iterates
+    every WorldEntity in the loaded scene, i.e. EVERY boat, not just ours. Deep sea trawling is
+    a shared ocean and other players park at the same shoal, so a first-match pick can return
+    THEIR net -- and then the whole burst, lower_phase and collect_phase aim at their boat with
+    nothing erroring, presenting as "the heartbeat never starts". Mirrors find_shoal below."""
+    by_id = [o for o in objects or [] if o.get("id") in NET_OBJECT_IDS]
+    if by_id:
+        return min(by_id, key=_obj_distance)
+    by_name = [o for o in objects or [] if NET_NAME_FRAGMENT in (o.get("name") or "").lower()]
+    if by_name:
+        return min(by_name, key=_obj_distance)
     return None
 
 
@@ -785,26 +812,63 @@ def _stuck_watch(ctx, cfg, snap, phase):
 
 
 def setup(ctx):
+    """Bookkeeping only. The preconditions deliberately do NOT run here (F-I4): the engine calls
+    setup() the instant the routine loads -- BEFORE login.is_fully_logged_in() and before the
+    focus gate -- so at the login screen or mid-LOADING every read is empty, _startup_checks
+    correctly defers, and it would never be called again for the life of the process, silently
+    skipping every precondition. tick() runs it behind the dst_checked latch instead, the same
+    shape as guardians_of_the_rift."""
     ctx.state.data.setdefault("dst_started_at", _now())
-    _startup_checks(ctx, ctx.state.config or DEFAULT_CONFIG)
+    debug_log.log("trawling", "setup -- preconditions deferred to the first tick")
 
 
-def _startup_checks(ctx, cfg):
-    """Deferred until the client answers with real data -- the first logged-in tick after an
-    auto-login can serve an empty scene, and stopping on that is the GOTR 'no pickaxe with a
-    pickaxe equipped' bug."""
+def _fishing_level():
+    """Boosted (else base) Fishing level from /skills, or None when it cannot be read.
+
+    None means "cannot tell -- do not filter", never 0: shipwreck_salvaging's level check once
+    failed CLOSED on an unreadable /skills, turned every wreck into "above my level" and idled
+    the routine until it was restarted by hand."""
+    fishing = (controller.get_skills() or {}).get("Fishing") or {}
+    for key in ("boosted", "level"):
+        value = fishing.get(key)
+        if isinstance(value, (int, float)):
+            return value
+    return None
+
+
+def _startup_checks(ctx, cfg) -> bool:
+    """The preconditions. Returns True once they have actually RUN (whether or not they passed),
+    False while the client is still answering with nothing.
+
+    Deferred on an unreadable read -- the first logged-in tick after an auto-login can serve an
+    empty scene, and stopping on that is the GOTR 'no pickaxe with a pickaxe equipped' bug."""
     snap = read_snapshot(ctx, cfg)
     if snap.px is None:
-        return
+        return False
     if snap.net is None:
-        _stop(ctx, "start this routine standing on your boat, which needs a trawling net built")
-        return
+        _stop(ctx, "start this routine standing on your boat, which needs a trawling net built",
+              snap)
+        return True
     if not snap.navigating:
-        _stop(ctx, "no crewmate is holding the helm -- assign one so the boat can be steered "
-                   "from the net")
-        return
+        # NOTE what this can and cannot establish (F-I3). SailingProvider defines `navigating`
+        # as WorldView.getYellowClickAction() == CLICK_ACTION_SET_HEADING -- "a tile click
+        # currently resolves to steering", a property of THIS player's click mode. It is NOT a
+        # crewmate readout; the bridge has no such field, and a real crewmate check would need a
+        # new provider field. So the reason names what was OBSERVED and only suggests the cause.
+        # Spec live-verify #11 asks whether this flag discriminates the case at all.
+        _stop(ctx, "the boat is not in steering mode; assign a crewmate to the helm so the boat "
+                   "can be steered while you stand at the net", snap)
+        return True
+    spec = trawling_routes.SHOALS[cfg["shoal"]]
+    level = _fishing_level()
+    if level is not None and level < spec.fishing_level:
+        _stop(ctx, f"Fishing {int(level)} is below the {spec.fishing_level} a "
+                   f"{spec.name} needs", snap)
+        return True
     if not snap.in_route_area:
-        _stop(ctx, f"not on the {cfg['route']} route -- start this routine with the boat there")
+        _stop(ctx, f"not on the {cfg['route']} route -- start this routine with the boat there",
+              snap)
+    return True
 
 
 def on_event(ctx, event_type, payload):
@@ -816,6 +880,16 @@ def on_event(ctx, event_type, payload):
 
 def tick(ctx):
     cfg = ctx.state.config or DEFAULT_CONFIG
+    data = ctx.state.data
+    if not data.get("dst_checked"):
+        # The latch is set only once the checks actually RAN (F-I4) -- an attempt that deferred
+        # on an unreadable read must be retried on a later tick, not silently skipped forever.
+        if not _startup_checks(ctx, cfg):
+            controller.human_delay(0.4, 0.8)
+            return
+        data["dst_checked"] = True
+        if getattr(ctx.state, "safety_stopped", False):
+            return
     for _ in range(TICK_CHAIN_MAX):
         snap = read_snapshot(ctx, cfg, ticks_since_sailing_xp=_ticks_since_heartbeat(ctx))
         if not tick_with_snapshot(ctx, cfg, snap):

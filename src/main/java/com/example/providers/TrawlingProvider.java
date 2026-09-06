@@ -40,7 +40,14 @@ import java.util.Map;
 public class TrawlingProvider extends BridgeProvider
 {
 	private static final int NET_CAPACITY = 250;       // inv 968 sailing_trawling_net size
-	private static final int CARGO_CAPACITY = 240;     // inv 963..967 size
+	// The DECLARED max of the cargo-hold item containers (inv 963..967, decoded cache size 240).
+	// It is NOT necessarily a given boat's real built hold: a smaller hull can hold fewer, and
+	// nothing here measures that. So `cargo.capacity` is a ceiling, not a promise, and the Python
+	// side must treat "a Collect-from that moved nothing" as the AUTHORITATIVE full signal --
+	// see routines/deep_sea_trawling.py's collect_phase / _cargo_is_full. `cargo.slots` below is
+	// served alongside it as the container's own raw length, so a live session can tell the two
+	// numbers apart without a rebuild.
+	private static final int CARGO_CAPACITY = 240;     // inv 963..967 declared size
 
 	private static final int[] CARGO_CONTAINERS = {
 		InventoryID.SAILING_BOAT_1_CARGOHOLD,
@@ -94,6 +101,9 @@ public class TrawlingProvider extends BridgeProvider
 			cargo.put("containerId", id);
 			cargo.put("used", usedSlots(hold));
 			cargo.put("capacity", CARGO_CAPACITY);
+			// The container's own raw length, next to the declared max above -- the two can
+			// disagree, and only this one comes from the client.
+			cargo.put("slots", hold.getItems().length);
 			cargo.put("items", describe(hold));
 			break;
 		}
