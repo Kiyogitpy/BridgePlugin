@@ -131,3 +131,131 @@ def test_read_snapshot_reports_none_not_zero_when_the_net_container_is_missing(m
     assert snap.net_fish is None
     assert snap.net is None
     assert dst.derive_phase(snap, CFG) == "lost"
+
+
+# --------------------------------------------------------------------------- trawl_burst
+
+import bridge_events
+import outcome_waits
+
+
+class _State:
+    def __init__(self):
+        self.data = {}
+        self.config = dict(dst.DEFAULT_CONFIG)
+        self.safety_stopped = False
+        self.safety_reason = None
+        self.paused = False
+
+    def trigger_safety_stop(self, reason):
+        self.safety_stopped = True
+        self.safety_reason = reason
+
+    def break_due(self, breaks_cfg):
+        return False
+
+
+class _Ctx:
+    def __init__(self, events):
+        self.events = events
+        self.ser = object()
+        self.state = _State()
+
+
+def _burst_ctx(monkeypatch, tick_events):
+    """A real EventStream fed by a scripted poll_udp: tick_events[i] is the list of
+    (type, payload) delivered on the i-th poll. A real stream is used so await/since/mark
+    semantics are what gets exercised, not a stand-in."""
+    queue = list(tick_events)
+
+    def poll_udp(_sock):
+        return list(queue.pop(0)) if queue else []
+
+    monkeypatch.setattr(controller, "poll_udp", poll_udp)
+    monkeypatch.setattr(controller, "sample_human_delay", lambda a, b: 0.0)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "fidget_once", lambda: None)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(dst, "_now", lambda: clock["t"])
+    monkeypatch.setattr(dst, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    ctx = _Ctx(bridge_events.EventStream(sock=None))
+    ctx.clock = clock
+    return ctx
+
+
+def _stub_burst_io(monkeypatch, clicks, net_fish=lambda: 10, moved=lambda: False):
+    monkeypatch.setattr(controller, "click_human", lambda ser: clicks.append(1))
+    monkeypatch.setattr(controller, "hover_entity", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "get_trawling", lambda: {"netFish": net_fish()})
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 1581 if moved() else 1580, "y": 3365, "plane": 0})
+    monkeypatch.setattr(dst, "_walk_to_net", lambda ctx, net: True)
+    monkeypatch.setattr(dst, "_dismiss_dialogue_if_open", lambda ctx: False)
+    monkeypatch.setattr(outcome_waits, "tick_pause",
+                        lambda ctx, n=1, phase=None, **kw: dst._sleep(0.6 * n))
+
+
+XP_SAIL = ("XP_GAINED", {"skill": "Sailing", "xp": 7})
+XP_FISH = ("XP_GAINED", {"skill": "Fishing", "xp": 112})
+
+
+def test_burst_clicks_once_per_tick_while_the_heartbeat_keeps_arriving(monkeypatch):
+    # Sailing xp every other poll -- the 2-tick roll cadence a 1-tick click produces.
+    ctx = _burst_ctx(monkeypatch, [[XP_SAIL], [], [XP_SAIL, XP_FISH], [], [XP_SAIL], []] +
+                     [[]] * 20)
+    clicks = []
+    _stub_burst_io(monkeypatch, clicks)
+    monkeypatch.setattr(dst, "RANGE_LOST_TICKS", 6)
+
+    result = dst.trawl_burst(ctx, CFG, NET_OBJ)
+
+    assert result == "out_of_range"          # the heartbeat stops once the script runs dry
+    assert len(clicks) >= 6                  # one per tick until then, not one per roll
+    assert ctx.state.data["dst_catches"] >= 1
+
+
+def test_burst_returns_net_full_at_the_configured_threshold(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[XP_SAIL]] * 60)
+    clicks = []
+    _stub_burst_io(monkeypatch, clicks, net_fish=lambda: CFG["netFullAt"])
+    assert dst.trawl_burst(ctx, CFG, NET_OBJ) == "net_full"
+
+
+def test_burst_advances_its_event_mark_and_so_never_reads_the_same_drop_twice(monkeypatch):
+    """The C2 rule: mark is taken ONCE before the loop and advanced after every read. If it were
+    re-taken at the top of each iteration the events delivered during the tick wait would be
+    skipped and the heartbeat would look dead on the very first idle poll."""
+    ctx = _burst_ctx(monkeypatch, [[XP_SAIL, XP_SAIL], [XP_SAIL]] + [[]] * 20)
+    clicks = []
+    _stub_burst_io(monkeypatch, clicks)
+    monkeypatch.setattr(dst, "RANGE_LOST_TICKS", 3)
+    dst.trawl_burst(ctx, CFG, NET_OBJ)
+    # Three Sailing drops were delivered; each must have been counted exactly once.
+    assert ctx.state.data["dst_rolls"] == 3
+
+
+def test_burst_stops_for_a_safety_stop(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[XP_SAIL]] * 60)
+    clicks = []
+    _stub_burst_io(monkeypatch, clicks)
+
+    def stop_soon(ser):
+        clicks.append(1)
+        if len(clicks) == 4:
+            ctx.state.trigger_safety_stop("test")
+    monkeypatch.setattr(controller, "click_human", stop_soon)
+
+    assert dst.trawl_burst(ctx, CFG, NET_OBJ) == "interrupted"
+    assert len(clicks) <= 6
+
+
+def test_burst_reaims_when_the_player_has_moved(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[XP_SAIL]] * 60)
+    clicks = []
+    hovers = []
+    _stub_burst_io(monkeypatch, clicks, moved=lambda: len(clicks) >= 3)
+    monkeypatch.setattr(controller, "hover_entity", lambda *a, **k: hovers.append(1) or True)
+    monkeypatch.setattr(dst, "BURST_MAX_S", 6.0)
+    dst.trawl_burst(ctx, CFG, NET_OBJ)
+    assert len(hovers) >= 2                 # the initial aim plus at least one re-aim

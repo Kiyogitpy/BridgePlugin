@@ -224,3 +224,138 @@ def net_refresh_target(net):
     """A refresh_target for the net. The boat is stopped while trawling, so the net's top-level
     world tile is stable and /object/at can re-resolve its projection as the camera moves."""
     return controller.object_refresh_target(net["x"], net["y"], net.get("plane", 0), net["id"])
+
+
+# --------------------------------------------------------------------------- the burst
+
+# Ticks without a Sailing XP drop before we conclude the shoal has left. The game rolls every 3
+# ticks unclicked and every 2 clicked, so 6 is two missed rolls' worth of slack -- tight enough
+# to start chasing within ~4s of the shoal moving, loose enough to ride a dropped UDP packet.
+RANGE_LOST_TICKS = 6
+BURST_MAX_S = 120.0          # longer than any shoal's stop (krill 90s); a ceiling, not a timer
+AIM_REFRESH_TICKS = 12       # re-aim on a schedule even if nothing looks like it moved
+NET_POLL_TICKS = 8           # how often the burst spends an HTTP read on /trawling.netFish
+CHECK_TICKS = 5              # how often pause / safety / break_due are re-checked
+CLICK_PHASE_S = (0.02, 0.12)  # jitter after the tick boundary so clicks are not all at +0ms
+
+
+def _walk_to_net(ctx, net):
+    """Stand at the net. The deck of a sloop is a few tiles across, so this is one short click,
+    not a route. Returns True once the click was issued -- the game queues the interaction and
+    performs it on arrival, so the burst's first Operate can follow immediately."""
+    return bool(controller.click_entity(ctx.ser, net, refresh_target=net_refresh_target(net),
+                                        simulate_mistakes=False))
+
+
+def _dismiss_dialogue_if_open(ctx):
+    """The engine's own stray-dialogue check cannot run while the burst holds the tick, and a
+    level-up ('click here to continue') swallows every click behind it. Returns True if one was
+    dismissed."""
+    state = controller.get_state() or {}
+    if state.get("dialogOpen"):
+        controller.key_tap(ctx.ser, "SPACE")
+        return True
+    return False
+
+
+def _interrupted(ctx, cfg):
+    state = ctx.state
+    if getattr(state, "safety_stopped", False) or getattr(state, "paused", False):
+        return True
+    try:
+        return bool(state.break_due(cfg.get("breaks")))
+    except Exception:
+        return False
+
+
+def trawl_burst(ctx, cfg, net) -> str:
+    """Operate the net once per game tick for as long as the shoal stays in range.
+
+    Returns "out_of_range" (the heartbeat stopped -- the shoal has moved on), "net_full",
+    "interrupted" (pause / safety stop / a break came due) or "budget".
+
+    Three deliberate choices, each of which a previous routine paid for the hard way:
+      - Aim ONCE, then click IN PLACE. The boat is stopped and the player is standing at the
+        net, so its projection is static; a fresh click_entity flight per tick costs ~1s and
+        cannot hold a 0.6s cadence (the mahogany-homes hotspot-burst lesson).
+      - NO simulated misclick. A sloop deck is a few tiles across and MISCLICK_OFFSET_PX
+        (20-45px) is wider than the net, so a "miss" lands on another facility or walks the
+        player off the net -- the same rule banker.py's bank buttons and
+        sailing._FIXTURE_CLICK_KWARGS follow.
+      - The HEARTBEAT is the range test, not distance. Distance to a moving 6x6 object is a
+        guess; a Sailing XP drop is the game's own answer to "is this net catching".
+    """
+    if not _walk_to_net(ctx, net):
+        debug_log.log("trawling", "couldn't click the net to stand at it")
+        return "interrupted"
+
+    refresh = net_refresh_target(net)
+    controller.hover_entity(ctx.ser, net, refresh_target=refresh)
+
+    data = ctx.state.data
+    data.setdefault("dst_rolls", 0)
+    data.setdefault("dst_catches", 0)
+
+    events = getattr(ctx, "events", None)
+    mark = events.mark() if events is not None else None
+
+    started = _now()
+    ticks = 0
+    ticks_since_roll = 0
+    last_tile = None
+    last_aim_tick = 0
+
+    while _now() - started < BURST_MAX_S:
+        outcome_waits.tick_pause(ctx, 1, phase=CLICK_PHASE_S, now_fn=_now, sleep_fn=_sleep)
+        controller.click_human(ctx.ser)
+        ticks += 1
+
+        rolled = False
+        if events is not None:
+            batch = events.since(mark)
+            mark = events.mark()
+            for ev_type, payload in batch:
+                if ev_type != "XP_GAINED":
+                    continue
+                skill = (payload or {}).get("skill") or ""
+                if skill.lower() == "sailing":
+                    rolled = True
+                    data["dst_rolls"] += 1
+                elif skill.lower() == "fishing":
+                    data["dst_catches"] += 1
+        ticks_since_roll = 0 if rolled else ticks_since_roll + 1
+
+        if _interrupted(ctx, cfg):
+            return "interrupted"
+
+        if ticks % CHECK_TICKS == 0 and _dismiss_dialogue_if_open(ctx):
+            controller.hover_entity(ctx.ser, net, refresh_target=refresh)
+            last_aim_tick = ticks
+
+        player = controller.get_player() or {}
+        tile = (player.get("x"), player.get("y"))
+        # Re-aim whenever the tile changes from the previously OBSERVED tile, and on a fixed
+        # schedule regardless -- but never on the very first iteration, when there is no prior
+        # tile to compare against and the initial hover_entity() above already aimed us.
+        due_for_refresh = (ticks - last_aim_tick) >= AIM_REFRESH_TICKS
+        if last_tile is not None and (tile != last_tile or due_for_refresh):
+            controller.hover_entity(ctx.ser, net, refresh_target=refresh)
+            last_aim_tick = ticks
+        last_tile = tile
+
+        if ticks % NET_POLL_TICKS == 0:
+            fish = (controller.get_trawling() or {}).get("netFish")
+            if fish is not None and fish >= cfg["netFullAt"]:
+                debug_log.log("trawling", f"nets at {fish} -- collecting")
+                return "net_full"
+
+        if events is None:
+            # No pushed heartbeat: fall back on the net count as the "still catching" signal.
+            if ticks % NET_POLL_TICKS == 0:
+                ticks_since_roll = 0
+        elif ticks_since_roll >= RANGE_LOST_TICKS:
+            debug_log.log("trawling",
+                          f"no Sailing xp for {ticks_since_roll} ticks -- the shoal has moved")
+            return "out_of_range"
+
+    return "budget"
