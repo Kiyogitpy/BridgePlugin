@@ -438,9 +438,94 @@ def test_before_break_collects_the_nets_first(monkeypatch):
 
 
 def test_stuck_watch_warns_then_stops(monkeypatch):
+    """Exercises BOTH windows: a warn at STALL_WARN_S that does not stop, then a stop once
+    STALL_STOP_S is crossed. (Fix round 1: the original version of this test jumped the clock
+    straight past STALL_STOP_S and never actually drove the warn-only window or dst_warned.)"""
     ctx = _burst_ctx(monkeypatch, [[]])
     snap = _snap()
     dst._stuck_watch(ctx, CFG, snap, "trawl")
-    ctx.clock["t"] += dst.STALL_STOP_S + 1
+    assert ctx.state.safety_stopped is False
+
+    ctx.clock["t"] += dst.STALL_WARN_S + 1
+    dst._stuck_watch(ctx, CFG, snap, "trawl")
+    assert ctx.state.safety_stopped is False
+    assert ctx.state.data.get("dst_warned") is True
+
+    ctx.clock["t"] += (dst.STALL_STOP_S - dst.STALL_WARN_S) + 1
     dst._stuck_watch(ctx, CFG, snap, "trawl")
     assert ctx.state.safety_stopped
+
+
+def test_stuck_watch_never_stops_while_progress_keeps_changing(monkeypatch):
+    """A changing signature must reset the stall clock every time, however long the routine
+    runs in total. Mutating net_fish between calls while jumping the clock by more than half
+    STALL_STOP_S each time: if _stuck_watch ever compared on anything narrower than the full
+    signature (e.g. phase alone), the unmatched jumps would accumulate past STALL_STOP_S and
+    this would incorrectly stop."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    for i in range(6):
+        ctx.clock["t"] += dst.STALL_STOP_S * 0.6
+        dst._stuck_watch(ctx, CFG, _snap(net_fish=i), "trawl")
+        assert ctx.state.safety_stopped is False
+
+
+def test_sail_failure_cap_triggers_a_safety_stop(monkeypatch):
+    """No test previously drove sail_to to fail repeatedly and checked the cap actually fires --
+    this is the ceiling most likely to matter on the first live run (an unreachable shoal)."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(sailing, "sail_to", lambda c, t: False)
+    snap = _snap(shoal_distance=30.0, shoal={"id": 59734, "x": 1574, "y": 3338, "plane": 0})
+    for _ in range(dst.SAIL_MAX_TRIES - 1):
+        dst.approach_phase(ctx, CFG, snap)
+        assert ctx.state.safety_stopped is False
+    dst.approach_phase(ctx, CFG, snap)
+    assert ctx.state.safety_stopped is True
+
+
+def test_sail_failure_counter_resets_on_a_success(monkeypatch):
+    """The property that stops a healthy long run from accumulating its way into a false stop:
+    an occasional failed sail followed by a successful one must not carry the failure count
+    forward. Without the reset, this sequence (2 fails, 1 success, 2 fails) would total 4
+    failures against a cap of 3 and stop wrongly."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    results = iter([False, False, True, False, False])
+    monkeypatch.setattr(sailing, "sail_to", lambda c, t: next(results))
+    snap = _snap(shoal_distance=30.0, shoal={"id": 59734, "x": 1574, "y": 3338, "plane": 0})
+    for _ in range(5):
+        dst.approach_phase(ctx, CFG, snap)
+    assert ctx.state.safety_stopped is False
+
+
+def test_startup_checks_defers_when_the_scene_has_not_loaded_yet(monkeypatch):
+    """px is None (the first logged-in tick after an auto-login) must DEFER, not stop -- this is
+    the GOTR 'no pickaxe with a pickaxe equipped' bug shape. net=None too, on purpose: without
+    the early return this would fall through to the next check and stop for the wrong reason,
+    so this test fails if that early return is ever removed."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg: _snap(px=None, py=None, net=None))
+    dst._startup_checks(ctx, CFG)
+    assert ctx.state.safety_stopped is False
+
+
+def test_startup_checks_stops_without_a_net(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg: _snap(net=None))
+    dst._startup_checks(ctx, CFG)
+    assert ctx.state.safety_stopped is True
+    assert "boat" in ctx.state.safety_reason.lower()
+
+
+def test_startup_checks_stops_without_a_crewmate_on_the_helm(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg: _snap(navigating=False))
+    dst._startup_checks(ctx, CFG)
+    assert ctx.state.safety_stopped is True
+    assert "helm" in ctx.state.safety_reason.lower()
+
+
+def test_startup_checks_stops_outside_the_route_area(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg: _snap(in_route_area=False))
+    dst._startup_checks(ctx, CFG)
+    assert ctx.state.safety_stopped is True
+    assert CFG["route"] in ctx.state.safety_reason

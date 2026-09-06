@@ -599,6 +599,10 @@ def tick(ctx):
 
 
 def _ticks_since_heartbeat(ctx):
+    """DIAGNOSTIC ONLY -- trawl_burst owns the real out-of-range heartbeat (its own Sailing-xp
+    tick count / net-growth stall, scoped to a single burst). This one only feeds
+    TrawlSnapshot.ticks_since_sailing_xp for a human reading the phase-change log line between
+    bursts; nothing here should ever wire it into a phase or safety decision."""
     at = ctx.state.data.get("dst_last_sailing_xp_at")
     return 0.0 if at is None else (_now() - at) / 0.6
 
@@ -607,7 +611,8 @@ def tick_with_snapshot(ctx, cfg, snap) -> bool:
     phase = derive_phase(snap, cfg)
     if phase != ctx.state.data.get("dst_phase"):
         debug_log.log("trawling", f"phase={phase} netFish={snap.net_fish} "
-                                  f"shoalDist={snap.shoal_distance}")
+                                  f"shoalDist={snap.shoal_distance} "
+                                  f"ticksSinceXp={snap.ticks_since_sailing_xp:.0f}")
         ctx.state.data["dst_phase"] = phase
     _stuck_watch(ctx, cfg, snap, phase)
     if getattr(ctx.state, "safety_stopped", False):
