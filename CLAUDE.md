@@ -55,6 +55,16 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   Prayer automation and the hopper's auto-teleport/logout were deleted 2026-09-05 so nothing in
   the merged client can inject input -- keep it that way; the "physical Arduino, never
   software-injected" rule in "What this is" applies to every plugin loaded next to the bridge.
+  **Taking upstream ZombieLite commits (2026-09-05):** the checkout's `origin` is
+  StephanBijzitter's repo and `fork` is the user's; fetch `origin`, `git cherry-pick` onto
+  `no-packets`, push to `fork` ONLY. Skip any upstream commit that touches `com.salvation.packets`
+  or re-adds an input-sending plugin, and run `checkZombieLite` after. Two were taken that day:
+  `39120eb` (graphics-object tick counters) and `3fe479f` (Lowerniel Drakan). The Drakan one is
+  the answer to USER's "feel like it just keeps piling on but should reset after his combo is
+  done": the overlay's telegraph `TreeMap` is only drained in `onAnimationChanged`, and the plugin
+  had registered only the IDLE animation, so a combo's telegraphs accumulated until the boss
+  idled; upstream registers all seven combo animations. If the pile-up is still visible live, the
+  remaining fix is pruning by expiry tick rather than by animation.
 - **A routine**: `python -u controller.py routines/<name>.py` (from `ControllerAddon/`). Runs
   until the panic key (F1) is pressed, a safety stop triggers, or the process is killed.
 - **MCP debug server** (`osrs-debug` in `.mcp.json`): read-only bridge queries
@@ -710,8 +720,8 @@ Sub-project 2 of the Corrupted Gauntlet (spec `docs/superpowers/specs/2026-09-05
 design.md`), written 2026-09-05 from the human recording
 `recordings/2026-09-05_014024_corrupted-gauntlet-humanrun1.*` and the cache. **Door-start mode,
 not yet run live**: start it in front of the Hunllef's Barrier with both perfected weapons, fish
-and an egniol; it quick-passes, fights, opens the chest, stops. The prep (sub-project 3) does
-not exist yet. Facts that shape it, all MEASURED: the Hunllef attacks every 5 ticks; four
+and an egniol; it quick-passes, fights, opens the chest, stops. Sub-project 3 (below) put the
+prep in front of it. Facts that shape it, all MEASURED: the Hunllef attacks every 5 ticks; four
 attacks then a marker animation (8754 "switch style" / 8755 tornado cast, alternating) flip the
 style, ranged first -- `hunllef.StyleTracker`, replay-tested against every prayer click in the
 recording; its NPC id IS its overhead prayer (9035 melee / 9036 ranged / 9037 magic / 9038
@@ -735,7 +745,51 @@ that function's own docstring). First live session's worklist is the spec's chec
 `instX/instY` centre-vs-corner for a size-5 NPC, 8754's meaning, the ranged/magic projectile
 ids, snapshot cost per tick.
 
-Sub-project 3 adds `explore_gather` / `craft` / `upgrade` in front of `enter`; the route is the user's (relative to the start side, three border reveals from the middle ring, full inner-ring circle); rooms are addressed in instance space as (right, outward) offsets from the start room with a configurable pitch (16, unverified); the bowl is driven by widget TEXT+NAME in group 270; time gates 270/330/360/420 s; **not yet run live** -- the spec's live checklist is the first session's worklist, starting with whether `/objects` lists unopened rooms and the real room pitch.
+**Two walking rules that look alike and are not (settled 2026-09-05, `e3eff2f`).** A diagonal
+STEP needs BOTH orthogonal corner tiles standable and open (`instance_nav.InstanceMap.step_ok`,
+which `hunllef.flood` uses unchanged); a diagonal INTERACTION needs only ONE of the two corner
+routes open (`travel.can_reach`, the JEFF's-upstairs measurement in the mahogany section). An
+implementer read the mahogany note as the movement rule and relaxed `flood` to OR-logic to make a
+plan-authored test pass; the test was the wrong one. Do not "unify" the two.
+
+Sub-project 3 (spec `docs/superpowers/specs/2026-09-05-gauntlet-prep-design.md`, plan
+`docs/superpowers/plans/2026-09-05-gauntlet-prep.md`, 32 commits 91bf1cc..84ed4eb) adds
+`explore_gather` / `craft` / `upgrade` in front of `enter`, all dispatched by `derive_phase`
+from live state plus the run clock, never from a stored phase alone. **Not yet run live**; the
+spec's live checklist is the first session's worklist, starting with whether `/objects` lists
+unopened rooms and the real room pitch. The shape:
+- **Route** (USER's, `gauntlet_maze.ROUTE`, relative to the start side): from S to the
+  inner-ring corner on the RIGHT, one room OUTWARD, reveal (light, do not enter) the border room
+  there, walk the middle ring LEFT two rooms revealing each border room, then back in and a full
+  circle of the inner ring. USER: the demi-bosses are "in the 3 center tiles of the 7x7 on each
+  cardinal, at the border". Rooms are `(right, outward)` offsets from the start room's centre in
+  INSTANCE space (`room_centre`/`room_of`; template x/y repeat between rooms, so they cannot
+  identify one); `outward` is the unit vector Barrier -> start centre; `room_pitch` (config, 16)
+  is UNVERIFIED and is the second live question.
+- **Kit** (`gauntlet_kit.KIT` then `UPGRADES`, a priority ladder with a time budget, USER's
+  choice): T1 helm/body/legs, attuned bow + attuned staff, 20 fish, 2 egniol; then T2 pieces and a
+  perfected weapon when the route's reveal found a dragon (orb) or dark beast (bowstring).
+  `kit_deficit`/`kit_minimum_met`/`craft_plan` are pure functions of inventory + equipment, so
+  every plan is a re-derivation and nothing depends on remembered progress. A basic weapon costs a
+  frame and NO shards (wiki; an implementer gated it on 50 shards, reverted in `9e1c9ff`).
+- **Time gates** (`DEFAULT_CONFIG`, seconds from the first `REGION_CORRUPTED` read, resynced from
+  the game's "Time remaining" chat): gathering stops at `gather_deadline_s` 270 once the minimum
+  kit is met, unconditionally at `gather_hard_deadline_s` 330; `enter_by_s` 420 forces the
+  barrier regardless of kit; `timer_s` 450 is the game's own 7:30.
+- **`WALKING` is a falsy sentinel meaning "still approaching, not a failure"** returned by
+  `bowl_make` and friends. Check it by IDENTITY (`is WALKING`) before any failure accounting
+  (`craft_phase` at its `if ok is WALKING: return`). The upgrade phase accumulated it with `or`
+  and counted three walking ticks as three failed crafts, forfeiting the perfected weapon
+  (`7f055e0`). Any future "in progress" sentinel needs the same treatment at every caller.
+- **`before_break` plays the run out, and a play-out loop must override the phase gates it
+  drives** (`7f055e0`): `enter_phase` refuses the whole tick while `break_due()` is true (so a
+  break cannot interrupt a quick-pass), and `before_break` calls `tick()` until `done` -- with the
+  break due for the entire play-out, the two spun against each other with no pacing.
+  `data["cg_playing_out"]` tells `_holding_for_break` to stand down, and a tick that made no
+  phase progress sleeps `TICK_S`. Same family as GOTR's "a break must start at the round end".
+- The bowl is driven by widget TEXT + NAME in group 270 (`_bowl_widget`, one `Make` per tier
+  step); `use_on(confirm=)` is what lets the pestle step confirm; `cook_all` is one click;
+  `stuck_watch` stops the run on a tile/inventory/phase stall but not during a demi-boss fight.
 
 **Final-review fix wave, 2026-09-05** (`.superpowers/sdd/2026-09-05-gauntlet-prep/final-fix-brief.md`),
 still not run live -- every fact below is reasoned from the recording and the code, not measured
@@ -1803,6 +1857,42 @@ wiped on restart while the character's position is not, so a counter desyncs exa
 cloak and Dramen staff must be in the **inventory**, not worn. The human used the worn-equipment
 interface; this uses `click_menu_action` (right-click → read `/menu` → pick by name), the pattern
 already proven live here, which needs a screen position that `/equipment` does not provide.
+
+## Building a routine with a subagent-driven plan (the Gauntlet, 2026-09-05)
+
+The Corrupted Gauntlet was built in one day as three spec -> plan -> subagent-executed
+sub-projects (~85 commits), Haiku implementers, Sonnet per-task reviews, Fable whole-branch
+final reviews (USER: "do fable final review"). What the process itself taught, so the next one
+does not re-learn it:
+
+- **Plan-authored tests were wrong more often than the code they tested.** Every one of these
+  was a test asserting a plausible fact the spec's sources contradicted: OR-logic diagonals for
+  walking (`e3eff2f`), 50 shards for a basic weapon (`9e1c9ff`), a flood-fill claim about an
+  8x8 corner (`39da441`), a start-centre fixture that was not walled and so flooded the whole
+  grid (`92d2872`), a hop test that passed with the walker doing nothing, and a bowl order the
+  code never promised. **When a test and a MEASURED fact disagree, check the wiki/recording/cache
+  before changing the code to satisfy the test**, and record the ruling in the plan's ledger.
+- **Implementers deviate in patterned ways; the task review is what catches them.** Seen here:
+  relaxing a geometry rule to make a test pass; "efficiency" cascades that run several sub-state
+  transitions in one call (`3b0181f` restored one transition per call -- the cascade executed
+  `bowl_make` before the player reached the bowl); adding a plausible precondition the spec never
+  stated (the shard gate); an `IdentityHashMap` that kept every projectile alive for the process
+  lifetime (`b19ea69`, Guava `MapMaker().weakKeys()` instead). Brief the reviewer on the spec's
+  facts, not just the diff.
+- **Never run two implementers in the same checkout, and commit before dispatching one.** Two
+  agents share one git index; and an implementer told to "leave the tree clean" reverted an
+  UNCOMMITTED edit of mine to the recorder ("restored to committed state"), which then had to be
+  redone (`8b0a7cc`). Uncommitted work in the tree while an implementer runs is work at risk.
+- **Final whole-branch reviews found what task reviews structurally cannot**: every Critical in
+  the three final reviews was a cross-task interaction (the `mark`/`since` event loss between
+  the tick wait and the read, `pick_safe_tile`'s stomp guard blocking traversal, `craft_plan`
+  re-queueing done steps every tick, `before_break` teleporting a mid-run instance home). Budget
+  a final review per sub-project and a fix wave after it; the fix wave itself introduced two
+  bugs (`7f055e0`), so re-review the fix wave too.
+- **Everything here was reasoned from a recording and the cache, none of it run live.** The
+  first live session is the three specs' checklists in order, and the expected outcome is that
+  geometry facts (room pitch, size-5 NPC centre-vs-corner) and widget fields are wrong before any
+  logic is.
 
 ## Live-debugging workflow
 
