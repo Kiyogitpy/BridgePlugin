@@ -183,7 +183,7 @@ def _burst_ctx(monkeypatch, tick_events):
     return ctx
 
 
-def _stub_burst_io(monkeypatch, clicks, net_fish=lambda: 10, moved=lambda: False,
+def _stub_burst_io(monkeypatch, clicks, net_fish=lambda: 10, player_reads=None,
                    pump_on_wait=False):
     """pump_on_wait=True installs a tick_pause stub that also pumps the real EventStream before
     advancing the fake clock -- i.e. it behaves like the real wait_ticks() (which pumps mid-wait)
@@ -193,9 +193,14 @@ def _stub_burst_io(monkeypatch, clicks, net_fish=lambda: 10, moved=lambda: False
     monkeypatch.setattr(controller, "hover_entity", lambda *a, **k: True)
     monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
     monkeypatch.setattr(controller, "get_trawling", lambda: {"netFish": net_fish()})
-    monkeypatch.setattr(controller, "get_player",
-                        lambda: {"x": 1581 if moved() else 1580, "y": 3365, "plane": 0})
-    monkeypatch.setattr(dst, "_walk_to_net", lambda ctx, net: True)
+
+    def _get_player():
+        if player_reads is not None:
+            player_reads.append(1)
+        return {"x": 1580, "y": 3365, "plane": 0}
+
+    monkeypatch.setattr(controller, "get_player", _get_player)
+    monkeypatch.setattr(dst, "_click_net_to_stand_at_it", lambda ctx, net: True)
     monkeypatch.setattr(dst, "_dismiss_dialogue_if_open", lambda ctx: False)
 
     if pump_on_wait:
@@ -224,6 +229,7 @@ def _no_events_ctx(monkeypatch):
 
 XP_SAIL = ("XP_GAINED", {"skill": "Sailing", "xp": 7})
 XP_FISH = ("XP_GAINED", {"skill": "Fishing", "xp": 112})
+MOVING = ("PLAYER_MOVING", {})
 
 
 def test_burst_clicks_once_per_tick_while_the_heartbeat_keeps_arriving(monkeypatch):
@@ -313,20 +319,58 @@ def test_burst_stops_for_a_safety_stop(monkeypatch):
 
 def test_burst_reaims_when_the_player_has_moved(monkeypatch):
     """Records the CLICK COUNT at the moment of each hover call, not just a tally -- a bare
-    `len(hovers) >= 2` also passes for the brief's original buggy `(None, None)` sentinel, which
-    fires a spurious extra re-aim on the very first iteration (tile != (None, None) is always
-    true). Pinning the exact sequence [0, 3] -- the pre-loop aim, then the one re-aim on the
-    tick the tile is first observed to have changed -- fails against that buggy version and
-    passes against the current code."""
-    ctx = _burst_ctx(monkeypatch, [[XP_SAIL]] * 60)
+    `len(hovers) >= 2` passes for far too much. The exact sequence [0, 3] is the pre-loop aim,
+    then the ONE re-aim on the iteration whose event batch carried PLAYER_MOVING; iterations
+    either side must not re-aim, and AIM_REFRESH_TICKS (12) is not reached inside this burst.
+
+    The movement trigger is the PLAYER_MOVING / PLAYER_STOPPED event now, not a /player poll
+    (F-I8) -- see the read-budget test below for why."""
+    ctx = _burst_ctx(monkeypatch,
+                     [[XP_SAIL], [XP_SAIL], [XP_SAIL, MOVING]] + [[XP_SAIL]] * 20)
     clicks = []
     hovers = []
-    _stub_burst_io(monkeypatch, clicks, moved=lambda: len(clicks) >= 3)
+    _stub_burst_io(monkeypatch, clicks)
     monkeypatch.setattr(controller, "hover_entity",
                         lambda *a, **k: hovers.append(len(clicks)) or True)
     monkeypatch.setattr(dst, "BURST_MAX_S", 6.0)
     dst.trawl_burst(ctx, CFG, NET_OBJ)
     assert hovers == [0, 3]
+
+
+def test_burst_reaims_on_the_schedule_even_with_nothing_moving(monkeypatch):
+    """The other half of the re-aim contract: with no movement event at all the camera can still
+    drift, so AIM_REFRESH_TICKS re-aims regardless. Pinned exactly (pre-loop, then every 4th
+    tick with AIM_REFRESH_TICKS forced to 4) so removing the schedule -- or making it fire every
+    tick -- both fail."""
+    ctx = _burst_ctx(monkeypatch, [[XP_SAIL]] * 60)
+    clicks = []
+    hovers = []
+    _stub_burst_io(monkeypatch, clicks)
+    monkeypatch.setattr(controller, "hover_entity",
+                        lambda *a, **k: hovers.append(len(clicks)) or True)
+    monkeypatch.setattr(dst, "AIM_REFRESH_TICKS", 4)
+    monkeypatch.setattr(dst, "BURST_MAX_S", 6.0)
+    dst.trawl_burst(ctx, CFG, NET_OBJ)
+    assert hovers == [0, 4, 8]
+
+
+def test_burst_does_not_spend_an_http_player_read_every_tick(monkeypatch):
+    """F-I8. The spec's own choice #4 is "the burst must not spend its tick budget on HTTP", and
+    the burst then called /player (15-120ms measured) on EVERY iteration on top of the ~92ms
+    click and its phase pad. Cross the 600ms boundary and wait_ticks(1) aligns to the NEXT one,
+    skipping a click -- which drops that window's roll cadence from 2 ticks back toward 3, i.e.
+    exactly the +50% this routine exists to capture.
+
+    Ten ticks with the old per-iteration read made ten calls; the bound here is deliberately
+    generous (one per AIM_REFRESH_TICKS boundary plus one) and still fails against that."""
+    ctx = _burst_ctx(monkeypatch, [[XP_SAIL]] * 60)
+    clicks = []
+    reads = []
+    _stub_burst_io(monkeypatch, clicks, player_reads=reads)
+    monkeypatch.setattr(dst, "BURST_MAX_S", 6.0)      # 10 ticks
+    dst.trawl_burst(ctx, CFG, NET_OBJ)
+    assert len(clicks) == 10
+    assert len(reads) <= len(clicks) // dst.AIM_REFRESH_TICKS + 1
 
 
 # --------------------------------------------------------------------------- phases / tick / break
@@ -367,7 +411,8 @@ def test_collect_phase_takes_collect_from_and_confirms_the_net_emptied(monkeypat
     fish = {"n": 240}
     monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
     monkeypatch.setattr(controller, "get_trawling", lambda: {"netFish": fish["n"]})
-    monkeypatch.setattr(dst, "_answer_collect_dialogue", lambda ctx, cfg: fish.__setitem__("n", 0))
+    monkeypatch.setattr(dst, "_answer_collect_dialogue",
+                        lambda ctx, cfg, dest=None: fish.__setitem__("n", 0))
     seen = []
     monkeypatch.setattr(controller, "click_menu_action",
                         lambda ser, ent, option, **kw: seen.append(option) or True)
@@ -406,20 +451,202 @@ def test_travel_phase_with_no_history_aims_at_the_nearest_stop(monkeypatch):
     assert targets == [{"x": 1574, "y": 3338, "plane": 0}]
 
 
-def test_a_lost_snapshot_is_a_safety_stop_naming_the_boat(monkeypatch):
+def test_travel_phase_stops_off_the_route_with_the_message_that_names_it(monkeypatch):
+    """F-M4's other half: this branch used to be DEAD, because derive_phase sent the off-route
+    case to "lost" and its message talked about not being aboard a boat."""
     ctx = _burst_ctx(monkeypatch, [[]])
     monkeypatch.setattr(sailing, "sail_to", lambda c, t: True)
+    assert dst.travel_phase(ctx, CFG, _snap(shoal=None, shoal_distance=None,
+                                            in_route_area=False)) is False
+    assert ctx.state.safety_stopped
+    assert CFG["route"] in ctx.state.safety_reason
+
+
+def test_travel_phase_moves_on_once_it_reaches_a_stop_with_no_shoal(monkeypatch):
+    """F-M10: travel_phase never advanced dst_last_stop_index and had no target of its own, so
+    with the wrong ids or route it re-sailed to the SAME already-reached stop forever -- camping
+    one stop instead of walking the lap -- and only _stuck_watch's 420s caught it, and only
+    because the boat happened to sit still."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    targets = []
+    monkeypatch.setattr(sailing, "sail_to", lambda c, t: targets.append(t) or True)
+    ctx.state.data["dst_travel_target"] = 3            # heading for (1574, 3338)
+    # ...and we are standing on it, with still no shoal in the scene.
+    dst.travel_phase(ctx, CFG, _snap(shoal=None, shoal_distance=None, px=1574, py=3338))
+    assert targets == [{"x": 1580, "y": 3379, "plane": 0}]     # stop 4, the next one round
+    assert ctx.state.data["dst_travel_target"] == 4
+
+
+def test_travel_phase_gives_up_after_a_full_lap_with_no_shoal(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(sailing, "sail_to", lambda c, t: True)
+    stops = trawling_routes.stops_world(CFG["shoal"], CFG["route"])
+    for _ in range(dst.TRAVEL_MAX_STOPS * 2):
+        if ctx.state.safety_stopped:
+            break
+        target = ctx.state.data.get("dst_travel_target")
+        px, py = stops[target] if target is not None else (1576, 3340)
+        dst.travel_phase(ctx, CFG, _snap(shoal=None, shoal_distance=None, px=px, py=py))
+    assert ctx.state.safety_stopped
+    assert CFG["route"] in ctx.state.safety_reason
+    assert "Giant krill shoal" in ctx.state.safety_reason
+
+
+def test_finding_a_shoal_clears_the_travel_lap_counter(monkeypatch):
+    """Otherwise a run that legitimately travels between stops all day accumulates its way into
+    the lap ceiling."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(dst, "trawl_burst", lambda c, cfg, net: "budget")
+    ctx.state.data["dst_travel_stops"] = dst.TRAVEL_MAX_STOPS - 1
+    ctx.state.data["dst_travel_target"] = 3
+    dst.tick_with_snapshot(ctx, CFG, _snap())
+    assert ctx.state.data["dst_travel_stops"] == 0
+    assert ctx.state.data["dst_travel_target"] is None
+
+
+def test_a_single_lost_read_does_not_stop_the_run(monkeypatch):
+    """F-C2. controller.api_get has a 0.3s timeout and returns None on ANY failure, so ONE
+    dropped /trawling or /objects response makes the world look empty and reads as "lost" --
+    and "lost" used to be an unconditional, irreversible first-read safety stop, ending an
+    eight-hour unattended run (and discarding the nets with the forced logout that follows).
+    The standing doctrine here is the opposite: ride network drops out."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(sailing, "sail_to", lambda c, t: True)
+    assert dst.tick_with_snapshot(ctx, CFG, _snap(net=None)) is False
+    assert ctx.state.safety_stopped is False
+
+
+def test_three_consecutive_lost_reads_stop_the_run_naming_the_boat(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(sailing, "sail_to", lambda c, t: True)
+    for _ in range(dst.LOST_CONFIRM_READS - 1):
+        dst.tick_with_snapshot(ctx, CFG, _snap(net=None))
+        assert ctx.state.safety_stopped is False
     assert dst.tick_with_snapshot(ctx, CFG, _snap(net=None)) is False
     assert ctx.state.safety_stopped
     assert "boat" in ctx.state.safety_reason.lower()
 
 
-def test_repeated_out_of_range_bursts_eventually_stop_the_run(monkeypatch):
+def test_a_good_read_between_lost_reads_resets_the_streak(monkeypatch):
+    """The property that keeps a long run alive: occasional dropped responses must not
+    accumulate their way into a stop. Without the reset this sequence (1 lost, 1 good, 2 lost)
+    totals three and would stop."""
+    ctx = _burst_ctx(monkeypatch, [[XP_SAIL]] * 60)
+    monkeypatch.setattr(dst, "trawl_burst", lambda c, cfg, net: "budget")
+    dst.tick_with_snapshot(ctx, CFG, _snap(net=None))
+    dst.tick_with_snapshot(ctx, CFG, _snap())            # a healthy read
+    dst.tick_with_snapshot(ctx, CFG, _snap(net=None))
+    dst.tick_with_snapshot(ctx, CFG, _snap(net=None))
+    assert ctx.state.safety_stopped is False
+
+
+def test_an_unreadable_snapshot_neither_stops_nor_counts_as_lost(monkeypatch):
+    """px is None means the CLIENT told us nothing (a LOADING frame, a dropped /player) -- it is
+    "cannot tell", not a fact about the world, so it must not dispatch a phase and must not
+    consume any of the lost budget."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(sailing, "sail_to", lambda c, t: True)
+    blank = _snap(px=None, py=None, net=None, net_fish=None, shoal=None, shoal_distance=None,
+                  in_route_area=False)
+    for _ in range(dst.LOST_CONFIRM_READS + 3):
+        assert dst.tick_with_snapshot(ctx, CFG, blank) is False
+    assert ctx.state.safety_stopped is False
+    assert ctx.state.data.get("dst_lost_reads", 0) == 0
+
+
+def test_out_of_range_bursts_that_are_catching_never_stop_the_run(monkeypatch):
+    """F-C1 -- the finding that replaced a test which PINNED THE BUG.
+
+    "out_of_range" is the DESIGNED, correct end of every single shoal stop: a Giant krill stop
+    is 150 ticks (90s) and BURST_MAX_S is 120s, so the burst's normal exit is the shoal moving
+    off and the heartbeat stopping. Counting those as failed approaches safety-stopped a healthy
+    run after six stops (~10 minutes) claiming "the boat couldn't get back to the shoal" while
+    it had been catching fish the whole time. The ceiling must count bursts that produced NO
+    ROLLS, which is what its stop message actually claims."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+
+    def catching_burst(c, cfg, net):
+        c.state.data["dst_rolls"] = c.state.data.get("dst_rolls", 0) + 40
+        return "out_of_range"
+
+    monkeypatch.setattr(dst, "trawl_burst", catching_burst)
+    for _ in range(dst.APPROACH_MAX_TRIES * 3):
+        assert dst.trawl_phase(ctx, CFG, _snap()) is True
+        assert ctx.state.safety_stopped is False
+
+
+def test_out_of_range_bursts_with_no_rolls_stop_at_the_ceiling(monkeypatch):
     ctx = _burst_ctx(monkeypatch, [[]])
     monkeypatch.setattr(dst, "trawl_burst", lambda c, cfg, net: "out_of_range")
-    for _ in range(dst.APPROACH_MAX_TRIES):
+    for _ in range(dst.APPROACH_MAX_TRIES - 1):
         dst.trawl_phase(ctx, CFG, _snap())
+        assert ctx.state.safety_stopped is False       # and not one attempt earlier
+    dst.trawl_phase(ctx, CFG, _snap())
     assert ctx.state.safety_stopped
+
+
+def test_the_no_events_burst_reports_progress_by_the_net_count_growing(monkeypatch):
+    """The ctx.events is None mode can never grow dst_rolls (there are no XP events at all), so
+    keying the ceiling on rolls alone would re-create F-C1 for exactly that mode. trawl_burst
+    records dst_burst_progress from the polled net count instead."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+
+    def growing_but_out_of_range(c, cfg, net):
+        c.state.data["dst_burst_progress"] = True
+        return "out_of_range"
+
+    monkeypatch.setattr(dst, "trawl_burst", growing_but_out_of_range)
+    for _ in range(dst.APPROACH_MAX_TRIES * 2):
+        dst.trawl_phase(ctx, CFG, _snap())
+    assert ctx.state.safety_stopped is False
+
+
+def test_burst_records_progress_when_the_net_count_grows_with_no_event_stream(monkeypatch):
+    """The producer side of the flag above, driven through the real trawl_burst."""
+    ctx = _no_events_ctx(monkeypatch)
+    clicks = []
+    count = {"n": 9}
+
+    def growing():
+        count["n"] += 1
+        return count["n"]
+
+    _stub_burst_io(monkeypatch, clicks, net_fish=growing)
+    monkeypatch.setattr(dst, "NO_EVENTS_STALL_TICKS", 16)
+    monkeypatch.setattr(dst, "BURST_MAX_S", 24.0)
+    dst.trawl_burst(ctx, CFG, NET_OBJ)
+    assert ctx.state.data["dst_burst_progress"] is True
+
+
+def test_burst_records_no_progress_when_nothing_is_caught(monkeypatch):
+    ctx = _no_events_ctx(monkeypatch)
+    clicks = []
+    _stub_burst_io(monkeypatch, clicks, net_fish=lambda: 10)     # never grows
+    monkeypatch.setattr(dst, "NO_EVENTS_STALL_TICKS", 24)
+    assert dst.trawl_burst(ctx, CFG, NET_OBJ) == "out_of_range"
+    assert ctx.state.data["dst_burst_progress"] is False
+
+
+def test_a_net_that_cannot_be_clicked_stops_at_its_own_ceiling(monkeypatch):
+    """F-M11: a refused/withheld opening click used to return "interrupted", which trawl_phase
+    neither counted nor acted on -- so a persistently unclickable net looped at ~1s an iteration
+    until the 420s stall watch, under a message about nothing in particular."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    clicks = []
+    _stub_burst_io(monkeypatch, clicks)
+    monkeypatch.setattr(dst, "_click_net_to_stand_at_it", lambda ctx_, net: False)
+    for _ in range(dst.NET_CLICK_TRIES - 1):
+        assert dst.trawl_phase(ctx, CFG, _snap()) is False
+        assert ctx.state.safety_stopped is False
+    dst.trawl_phase(ctx, CFG, _snap())
+    assert ctx.state.safety_stopped
+    assert "net" in ctx.state.safety_reason.lower()
+    # ...and a single failure among healthy bursts must not accumulate.
+    ctx2 = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(dst, "trawl_burst", lambda c, cfg, net: "budget")
+    for _ in range(dst.NET_CLICK_TRIES * 2):
+        dst.trawl_phase(ctx2, CFG, _snap())
+    assert ctx2.state.safety_stopped is False
 
 
 def test_before_break_collects_the_nets_first(monkeypatch):
@@ -435,6 +662,78 @@ def test_before_break_collects_the_nets_first(monkeypatch):
     monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg, **kw: _snap(net_fish=0))
     dst.before_break(ctx)
     assert collected == []
+
+    # F-I6: netFish None is "cannot tell", not 0. Skipping the collect is the expensive
+    # direction -- the fish are discarded if the break's idle logout fires -- so try it anyway.
+    collected.clear()
+    monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg, **kw: _snap(net_fish=None))
+    dst.before_break(ctx)
+    assert collected == [1]
+
+
+def test_the_default_config_carries_a_breaks_block_the_engine_can_read():
+    """F-C3. The engine does `config.get("breaks", {})`, and both ControllerState.break_due and
+    maybe_toggle_break return at their first line on an empty dict -- so with no "breaks" key
+    this routine took NO breaks at all (an anti-detection regression on an hours-long activity)
+    and before_break, the whole answer to the discard-on-forced-logout hazard, could never be
+    called: its test guarded unreachable code. The key NAMES are the contract, not just the
+    presence of the block."""
+    breaks = dst.get_config({})["breaks"]
+    assert breaks
+    assert breaks["enabled"] is True
+    for key in ("everyMinMinutes", "everyMaxMinutes",
+                "durationMinMinutes", "durationMaxMinutes"):
+        assert isinstance(breaks[key], (int, float)), key
+    assert breaks["everyMinMinutes"] <= breaks["everyMaxMinutes"]
+    assert breaks["durationMinMinutes"] <= breaks["durationMaxMinutes"]
+
+    # And the engine's own predicate must actually be able to fire on it.
+    class _S:
+        break_until = None
+        next_break_at = 0.0
+    assert controller.ControllerState.break_due(_S(), breaks) is True
+
+
+def test_the_collect_confirm_treats_a_missing_net_count_as_unconfirmed(monkeypatch):
+    """F-I6: `(... or {}).get("netFish") or 0) == 0` collapsed None into 0 -- exactly the
+    distinction TrawlingProvider preserves and controller.get_trawling's docstring warns about
+    -- so one bridge hiccup inside the 6s window reported "nets emptied" with nothing moved."""
+    monkeypatch.setattr(controller, "get_trawling", lambda: {"netFish": None})
+    assert dst._net_emptied() is False
+    monkeypatch.setattr(controller, "get_trawling", lambda: {})
+    assert dst._net_emptied() is False
+    monkeypatch.setattr(controller, "get_trawling", lambda: {"netFish": 0})
+    assert dst._net_emptied() is True
+    monkeypatch.setattr(controller, "get_trawling", lambda: {"netFish": 3})
+    assert dst._net_emptied() is False
+
+
+def test_click_confirms_budget_the_walk_to_the_net_and_cap(monkeypatch):
+    """F-I5. The game performs a queued interaction ON ARRIVAL, and NET_OBJECT_IDS includes the
+    3x8 port/starboard variants where the net is most of a deck away: at 0.6s/tile an 8-tile
+    walk is 4.8s, past the old flat LOWER_CONFIRM_S of 4.0 -- so a click that lowered the net
+    first time read as a failure, burned LOWER_TRIES and stopped the run."""
+    near = dst._confirm_budget(dst.LOWER_CONFIRM_S, dst.LOWER_CONFIRM_MAX_S, {"distance": 1})
+    far = dst._confirm_budget(dst.LOWER_CONFIRM_S, dst.LOWER_CONFIRM_MAX_S, {"distance": 8})
+    assert far >= near + 4.0
+    assert far > dst.LOWER_CONFIRM_S
+    huge = dst._confirm_budget(dst.LOWER_CONFIRM_S, dst.LOWER_CONFIRM_MAX_S, {"distance": 500})
+    assert huge == dst.LOWER_CONFIRM_MAX_S
+
+
+def test_lower_phase_actually_passes_the_walk_budgeted_wait(monkeypatch):
+    """The guard that the constant above is wired in, not just defined."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    budgets = []
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_trawling",
+                        lambda: {"nets": [{"slot": 0, "depth": 0, "hotspotId": 3}]})
+    monkeypatch.setattr(outcome_waits, "await_pre",
+                        lambda ctx_, sig, budget, **kw: budgets.append(budget) or False)
+    far_net = dict(NET_OBJ, distance=8)
+    dst.lower_phase(ctx, CFG, _snap(net=far_net, net_depth=0))
+    assert budgets and min(budgets) > dst.LOWER_CONFIRM_S
 
 
 def test_stuck_watch_warns_then_stops(monkeypatch):
