@@ -30,7 +30,8 @@ public enum RoutineChoice
 	GUARDIANS_OF_THE_RIFT("Guardians of the Rift"),
 	CORRUPTED_GAUNTLET("Corrupted Gauntlet"),
 	AGILITY("Agility (course runner)"),
-	KARAMBWAN_FISHING("Karambwan Fishing (DKP + fish barrel)");
+	KARAMBWAN_FISHING("Karambwan Fishing (DKP + fish barrel)"),
+	DEEP_SEA_TRAWLING("Deep Sea Trawling");
 
 	private final String label;
 

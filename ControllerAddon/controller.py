@@ -3165,6 +3165,7 @@ ROUTINE_FILES = {
     "CORRUPTED_GAUNTLET": "routines/corrupted_gauntlet.py",
     "AGILITY": "routines/agility.py",
     "KARAMBWAN_FISHING": "routines/karambwan_fishing.py",
+    "DEEP_SEA_TRAWLING": "routines/deep_sea_trawling.py",
 }
 
 

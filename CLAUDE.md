@@ -1126,6 +1126,55 @@ MEASURED; the shape most of them share is the transitional-snapshot family.**
   Place-cell -> portal trip -> craft, repeating; the round ended at 100% with the bot in
   the portal pocket, and the exit + prep walk ran under the settle guard.
 
+## Current state of routines/deep_sea_trawling.py
+
+Written 2026-09-06 from the OSRS Wiki (Deep sea trawling rev 15297127, Giant krill shoal rev
+15237362, Crew Management rev 15290062), the decoded cache (dump `5bc2ff1e`) and
+`runelite-api-1.12.38`. Design: `docs/superpowers/specs/2026-09-06-deep-sea-trawling-design.md`,
+whose "Live-verification checklist" is the first session's worklist. **There is no human
+recording and NOTHING has been run live.** Needs a client rebuild (`GET /trawling` and the
+Routine dropdown entry are both Java).
+
+- **The point of the routine is one click per game tick.** The game rolls for a catch every 3
+  ticks while a net operates in range; clicking the net every tick makes it roll every 2 -- a
+  flat +50%. `trawl_burst` therefore aims once and then calls `click_human` (in place, ~92ms) on
+  the tick clock; a fresh `click_entity` flight per tick costs ~1s and cannot hold the cadence.
+  No simulated misclick in the burst: a sloop deck is a few tiles across and
+  `MISCLICK_OFFSET_PX` is wider than the net.
+- **The range test is the game's own Sailing XP drop, not distance.** Every roll grants a small
+  Sailing XP drop (a successful one also grants Fishing XP), so a pushed `XP_GAINED` proves the
+  net is operating in range; `RANGE_LOST_TICKS` (6) without one means the shoal has moved.
+  Distance to a moving 6x6 object only ever *aims* the boat.
+- **The burst holds `tick()` for up to 90s, so `on_event` never runs during it** -- it reads
+  `ctx.events.since(mark)` and advances `mark` after every read (the Hunllef C2 rule; re-taking
+  `mark()` per iteration drops everything the tick wait pumped past, i.e. the whole heartbeat).
+  With `ctx.events is None` there is no pushed heartbeat, so the burst falls back to
+  `NO_EVENTS_STALL_TICKS` (100) ticks without the net's fish COUNT growing.
+- **Target is Giant krill / Great Sound, and that is a level decision.** At Fishing 75 /
+  Sailing 64 the account can reach only shallow shoals (krill 69, haddock 73) and only the Rope
+  net, so **v1 has no depth management at all**. Great Sound's 7 stops fit in ~56x49 tiles, i.e.
+  inside one loaded 104x104 scene, so the shoal is essentially always in `/objects`; Haddock's
+  routes span five regions and the shoal leaves the scene.
+- **`trawling_routes.py` holds the Wiki's stop tables as raw `(regionId, rx, ry)` markers.** It
+  is an ACCELERATOR, never truth -- the live shoal object decides where the shoal is; the table
+  only says where to sail when none is visible. The stored order is the Wiki's own `label`
+  field, and the pinned test that every leg is traversable at <= 3.0 tiles/tick is the evidence
+  that label order *is* visiting order (max implied speeds 1.57 / 1.78 / 2.52 / 1.58 across
+  great_sound / simian_sea / sunset_bay / turtle_belt).
+- **`GET /trawling` (TrawlingProvider.java) exists for exactly two things**: item container 968
+  (`sailing_trawling_net`, size 250, the per-player fish count) and 963..967 (the cargo hold).
+  Nothing else on the bridge can read them and no m8aq reader covers sailing. `netFish` is
+  `None`, not 0, when the container is missing -- that is "not aboard a boat with a net".
+- **Hard precondition: a crewmate on the helm.** Helmsmanship lets a crewmate hold the helm so
+  the player can stand at another facility while still clicking the heading (Wiki, Crew
+  Management); without one the player must stand at the helm and cannot trawl at the same time.
+  `_startup_checks` reads `/sailing.navigating` for this.
+- **Never world-hop, never teleport, never disembark with fish in the nets** -- they are
+  discarded without a warning. `before_break` empties the nets before a break starts.
+- Out of scope for v1, deliberately: banking at a bank boat (the 240-slot hold lasts many hours
+  at ~5 fish/min), chum-station baiting (+20% fish, but the station's `Operate` interface is
+  unseen), depth management, fish crates, and a second net.
+
 ## Current state of routines/blast_furnace.py
 
 **Live gold session 2026-09-04 (bf_live3-9), the first routine converted to event-driven
