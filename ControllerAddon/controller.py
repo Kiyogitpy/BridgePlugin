@@ -287,6 +287,14 @@ def get_varbit(varbit_id: int):
     return resp.get("value")
 
 
+def get_trawling():
+    """GET /trawling (TrawlingProvider.java, added 2026-09-06): the deep-sea-trawling item
+    containers and varbits. netFish is None (not 0) when the container does not exist, i.e. the
+    player is not aboard a boat with a trawling net -- routines/deep_sea_trawling.py branches on
+    that difference, so do not collapse it with `or 0`."""
+    return api_get("/trawling") or {}
+
+
 def _player_activity_snapshot():
     """(localX, localY) -- the player's own local position, sampled multiple times a tick while
     walking (RuneLite interpolates it smoothly, not just once per game tick) and held exactly

@@ -146,6 +146,7 @@ public class ControllerPlugin extends Plugin
 		new InventoryProvider(client, clientThread, server).register();
 		new BankProvider(client, clientThread, server, tickClock).register();
 		new SailingProvider(client, clientThread, server, eventBus).register();
+		new TrawlingProvider(client, clientThread, server, itemManager).register();
 		new NPCProvider(client, clientThread, server, tickClock).register();
 		new ObjectProvider(client, clientThread, server, tickClock).register();
 		new GroundItemProvider(client, clientThread, server, itemManager, tickClock).register();

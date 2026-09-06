@@ -1670,3 +1670,13 @@ def test_fidget_serial_is_shared_across_module_copies(monkeypatch):
     monkeypatch.setattr(controller, "_fidget_ser", None)     # the OTHER copy never saw main()
     assert controller._fidget_serial() is token
     assert input_state.fidget_ser is token
+
+
+def test_get_trawling_passes_through_and_tolerates_an_unreachable_bridge(monkeypatch):
+    payload = {"netFish": 137, "netCapacity": 250, "cargo": None, "nets": []}
+    monkeypatch.setattr(controller, "api_get", lambda path, params=None: payload
+                        if path == "/trawling" else None)
+    assert controller.get_trawling() is payload
+
+    monkeypatch.setattr(controller, "api_get", lambda path, params=None: None)
+    assert controller.get_trawling() == {}
