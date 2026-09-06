@@ -20,6 +20,8 @@ def no_live_bridge(monkeypatch):
                  "get_combat", "get_ground_walk_point", "get_minimap_walk_point", "get_collision_grid"):
         monkeypatch.setattr(controller, name, lambda *a, _n=name, **kw: pytest.fail(f"live bridge call {_n}"))
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: None)   # unreadable unless a test says otherwise
+    monkeypatch.setattr(controller, "get_prayers", lambda: {"active": {}, "icons": {}})   # nothing on unless a test says so
 
 
 class _State:
@@ -46,16 +48,96 @@ def _npc(id_, x=13105, y=5700, anim=-1, index=1):
 
 
 def test_derive_phase():
+    """MEASURED live 2026-09-06 (cg_live2) and in both recordings: the Hunllef wanders in and out
+    of /npcs from the START room (it is in the loaded scene before the barrier is passed), so its
+    presence is NOT the fight signal -- varbit 9177 (1 from +0.6s after Quick-pass until the kill)
+    is. The first live run quick-passed nothing, turned prayers on in the start room and spammed
+    attack clicks at a Hunllef behind the wall."""
     data = {}
     assert cg.derive_phase(data, npcs=[], objects=[{"id": g.OBJ_BARRIER}]) == "enter"
+    assert cg.derive_phase(data, npcs=[_npc(9036)], objects=[{"id": g.OBJ_BARRIER}]) == "enter"   # seen from the start room
+    assert "cg_fight_seen" not in data
+    data["cg_varbit_fight"] = 1
     assert cg.derive_phase(data, npcs=[_npc(9036)], objects=[]) == "fight"
     assert data["cg_fight_seen"] is True
     assert cg.derive_phase(data, npcs=[_npc(9038)], objects=[]) == "fight"         # dying, still the fight phase
+    data["cg_varbit_fight"] = 0
     assert cg.derive_phase(data, npcs=[], objects=[{"id": g.OBJ_REWARD_CHEST}]) == "loot"
     data["cg_chest_opened"] = True
     assert cg.derive_phase(data, npcs=[], objects=[{"id": g.OBJ_REWARD_CHEST}]) == "done"
     assert cg.derive_phase({}, npcs=[], objects=[{"id": g.OBJ_REWARD_CHEST}]) == "unknown"   # no fight seen this run
     assert cg.derive_phase({}, npcs=[], objects=[]) == "unknown"
+
+
+def test_drop_prayers_when_nothing_attacks(monkeypatch):
+    """cg_live2: prayer 77 -> 50 with nothing to pray against. The Gauntlet has no altar, so a
+    protection prayer the gather ladder turned on must come off once the attacker is gone."""
+    clicks = []
+    active = {"PROTECT_FROM_MISSILES": True, "DEADEYE": True, "PROTECT_FROM_MELEE": False}
+    icons = {"PROTECT_FROM_MISSILES": {"screenX": 1, "screenY": 1}, "DEADEYE": {"screenX": 2, "screenY": 2}}
+    monkeypatch.setattr(controller, "get_prayers", lambda: {"active": dict(active), "icons": icons})
+    monkeypatch.setattr(controller, "get_player", lambda: {"instX": 5, "instY": 5})
+    monkeypatch.setattr(controller, "open_prayer_tab", lambda ser: True)
+    def click(ser, entity, **kw):
+        clicks.append(entity)
+        for k, v in icons.items():
+            if v is entity:
+                active[k] = False
+        return True
+    monkeypatch.setattr(controller, "click_entity", click)
+    ctx = _Ctx()
+    attacker = {"id": 9045, "interactingPlayer": True, "instX": 6, "instY": 5}
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [attacker])
+    assert cg.drop_prayers_if_safe(ctx) is False
+    assert clicks == []
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    assert cg.drop_prayers_if_safe(ctx) is True
+    assert clicks == [icons["PROTECT_FROM_MISSILES"], icons["DEADEYE"]]
+    assert cg.drop_prayers_if_safe(ctx) is False        # nothing left on: no tab open, no click
+    assert len(clicks) == 2
+
+
+def test_derive_phase_lobby_only_before_a_run():
+    """The Gauntlet entrance (37340) is visible in the lobby before AND after a run; only the
+    before case is the lobby phase -- after the fight the chest is what matters."""
+    assert cg.derive_phase({}, npcs=[], objects=[{"id": g.OBJ_ENTRANCE}]) == "lobby"
+    assert cg.derive_phase({}, npcs=[], objects=[{"id": g.OBJ_ENTRANCE}, {"id": g.OBJ_REWARD_CHEST}]) == "lobby"
+    data = {"cg_fight_seen": True}
+    assert cg.derive_phase(data, npcs=[], objects=[{"id": g.OBJ_ENTRANCE}, {"id": g.OBJ_REWARD_CHEST}]) == "loot"
+    # a clock already running means we are mid-run; the entrance being in the scan is not the lobby
+    assert cg.derive_phase({"cg_t0": 1.0}, npcs=[], objects=[{"id": g.OBJ_ENTRANCE}], inventory=[], equipment={}) != "lobby"
+
+
+def test_lobby_phase_enters_the_corrupted_gauntlet_with_a_ceiling(monkeypatch):
+    clicks = []
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [{"id": g.OBJ_ENTRANCE, "name": "The Gauntlet", "screenX": 500, "screenY": 400}])
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: clicks.append(option) or True)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: False)
+    ctx = _Ctx()
+    for _ in range(cg.LOBBY_MAX_ATTEMPTS):
+        cg.lobby_phase(ctx, cg.DEFAULT_CONFIG)
+    assert clicks == [g.ENTRANCE_ENTER_CORRUPTED] * cg.LOBBY_MAX_ATTEMPTS
+    assert ctx.state.safety_stopped is False
+    cg.lobby_phase(ctx, cg.DEFAULT_CONFIG)
+    assert len(clicks) == cg.LOBBY_MAX_ATTEMPTS
+    assert ctx.state.safety_stopped is True
+
+
+def test_lobby_phase_confirms_on_the_corrupted_region(monkeypatch):
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [{"id": g.OBJ_ENTRANCE, "name": "The Gauntlet", "screenX": 500, "screenY": 400}])
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"regionId": g.REGION_CORRUPTED})
+    checks = []
+    def fake_confirm(ctx, check, budget_s=None):
+        checks.append(check())
+        return checks[-1]
+    monkeypatch.setattr(cg, "_confirm", fake_confirm)
+    ctx = _Ctx()
+    cg.lobby_phase(ctx, cg.DEFAULT_CONFIG)
+    assert checks == [True]
+    assert ctx.state.data.get("cg_lobby_attempts", 0) == 0     # a confirmed entry resets the ceiling
 
 
 def test_derive_phase_also_treats_the_fight_varbit_as_fight():
@@ -312,6 +394,28 @@ def test_do_escape_caches_the_instance_map_across_calls(monkeypatch):
     assert "cg_imap" in ctx.state.data
 
 
+def test_tick_reads_the_fight_varbit_over_http_every_tick(monkeypatch):
+    """The UDP mirror (on_event) only sees CHANGES; a process started inside the boss room, or a
+    lost packet, would never learn the value. tick() reads /varbit 9177 itself and stores it
+    where derive_phase looks; an unreadable value (None) leaves the mirror alone."""
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_player", lambda: {"regionId": 7768})
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {})
+    monkeypatch.setattr(cg, "fight_loop", lambda ctx, cfg: None)
+    asked = []
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: asked.append(vid) or 1)
+    cg.tick(ctx)
+    assert asked == [g.VARBIT_FIGHTING_HUNLLEF]
+    assert ctx.state.data["cg_varbit_fight"] == 1
+    assert ctx.state.data["cg_phase"] == "fight"
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: None)
+    cg.tick(ctx)
+    assert ctx.state.data["cg_varbit_fight"] == 1          # unreadable keeps the last known value
+
+
 def test_tick_drops_the_cached_instance_map_when_leaving_the_fight_phase(monkeypatch):
     """I4: ctx.state.data['cg_imap'] must not survive into a phase where the static grid no
     longer applies -- tick() drops it the moment derive_phase reports leaving "fight"."""
@@ -422,7 +526,7 @@ def test_enter_phase_refuses_to_quick_pass_when_a_break_is_due():
     exactly as before. No bridge stub is needed here: the guard must fire before read_snapshot
     (or any other bridge call) ever runs."""
     ctx = _Ctx()
-    ctx.state.break_due = lambda: True
+    ctx.state.break_due = lambda breaks_cfg: True
     cg.enter_phase(ctx, cg.DEFAULT_CONFIG)
     assert ctx.state.safety_stopped is False
 
@@ -450,7 +554,7 @@ def test_enter_phase_proceeds_when_break_due_is_absent_or_false(monkeypatch):
     assert clicks == [g.BARRIER_QUICK_PASS]
 
     ctx2 = _Ctx()
-    ctx2.state.break_due = lambda: False
+    ctx2.state.break_due = lambda breaks_cfg: False
     cg.enter_phase(ctx2, cg.DEFAULT_CONFIG)
     assert clicks == [g.BARRIER_QUICK_PASS, g.BARRIER_QUICK_PASS]
 
@@ -843,7 +947,9 @@ def test_derive_phase_prefers_prep_before_the_fight():
     objects = [{"id": g.OBJ_BARRIER}]
     assert cg.derive_phase(data, [], objects, inventory=[], equipment=EQ0, cfg=cg.DEFAULT_CONFIG, now=10.0) == "explore_gather"
     assert cg.derive_phase(data, [], objects, inventory=[], equipment=EQ0, cfg=cg.DEFAULT_CONFIG, now=425.0) == "enter"
-    assert cg.derive_phase(data, [_npc(9036)], objects) == "fight"       # fight still wins
+    data["cg_varbit_fight"] = 1
+    assert cg.derive_phase(data, [_npc(9036)], objects) == "fight"       # fight still wins (varbit, not npc presence)
+    data["cg_varbit_fight"] = 0
     assert cg.derive_phase({}, [], objects) == "enter"                    # no t0 (started at the barrier by hand): old behaviour
 
 
@@ -900,8 +1006,8 @@ def test_prep_state_refuses_an_oversized_start_component(monkeypatch):
     whatever the runaway flood-fill happened to compute."""
     ctx = _Ctx(); ctx.state.data["cg_t0"] = 0.0
     S = (13056 + 30, 5632 + 30)
-    # Fully passable 64x64 grid -- 4096 tiles, well over START_COMPONENT_MAX (600).
-    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid(size=64))
+    # Fully passable 104x104 grid -- 10816 tiles, well over START_COMPONENT_MAX (2000).
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid(size=104))
     monkeypatch.setattr(controller, "get_player", lambda: _player_at(*S))
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
                         [_obj(g.OBJ_BARRIER, "Barrier", S[0], S[1] - 8)])
@@ -922,7 +1028,8 @@ def test_attacker_and_gather_ladder_prayer_then_attack(monkeypatch):
     monkeypatch.setattr(controller, "get_prayers", lambda: {"active": {}, "tabOpen": True, "icons": {"PROTECT_FROM_MELEE": {"screenX": 1, "screenY": 1}}})
     monkeypatch.setattr(controller, "get_combat", lambda: {"targetId": None})
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
-    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    # a wielded bow: USER 2026-09-06, a wolf is only fought with a proper weapon
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.weapon_name("bow", 1)}})
     monkeypatch.setattr(controller, "open_prayer_tab", lambda ser: True)
     monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: calls.append(("click", entity.get("name") or "icon")) or True)
     monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=1.0: True)
@@ -965,7 +1072,8 @@ def test_gather_node_clicks_once_and_waits_for_depletion(monkeypatch):
     clicks = []
 
     def click(ser, entity, **kw):
-        assert kw.get("expected_action") == "Mine"
+        # verify=False: no hover gate (it would withhold while walking up); tracked instead
+        assert "expected_action" not in kw and callable(kw.get("refresh_target"))
         clicks.append(1)
         return True
     monkeypatch.setattr(controller, "click_entity", click)
@@ -974,6 +1082,36 @@ def test_gather_node_clicks_once_and_waits_for_depletion(monkeypatch):
     monkeypatch.setattr(cg.time, "sleep", lambda s: t.__setitem__("v", t["v"] + s))
     assert cg.gather_node(ctx, node, cg.DEFAULT_CONFIG)
     assert len(clicks) == 1   # no re-click needed -- ore rose, then the node depleted on its own
+
+
+def test_gather_node_withheld_click_falls_through_to_the_menu_at_once(monkeypatch):
+    """cg_live4 (2026-09-06): the first Chop was withheld (hover saw nothing under the cursor while
+    the player was still walking) and gather_node then sat the whole GATHER_BUDGET_S before its one
+    re-click -- 9s per node lost. A withheld or failed click now goes straight to the right-click
+    menu, and that menu click counts as the click (the re-click budget is not spent twice)."""
+    ctx = _Ctx()
+    roots = next(n for n in g.RESOURCE_NODES.values() if "Phren" in n)
+    rid = next(i for i, n in g.RESOURCE_NODES.items() if n == roots)
+    depleted_id = next(i for i, n in g.RESOURCE_NODES_DEPLETED.items() if "Phren" in n)
+    node = _obj(rid, roots, 100, 100)
+    reads = {"k": 0}
+
+    def objects(radius=None, fresh=False, interactable=False):
+        reads["k"] += 1
+        return [_obj(depleted_id if reads["k"] >= 3 else rid, roots, 100, 100)]
+    monkeypatch.setattr(controller, "get_objects", objects)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"slot": 0, "name": g.ITEM_BARK, "qty": 3}] if reads["k"] >= 2 else [])
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(101, 100))
+    menu = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: controller.CLICK_WITHHELD)
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: menu.append(option) or True)
+    t = {"v": 1000.0}
+    monkeypatch.setattr(cg.time, "time", lambda: t["v"])
+    monkeypatch.setattr(cg.time, "sleep", lambda s: t.__setitem__("v", t["v"] + s))
+    assert cg.gather_node(ctx, node, cg.DEFAULT_CONFIG)
+    assert menu == ["Chop"]
+    assert t["v"] - 1000.0 < cg.GATHER_BUDGET_S      # no 8s wait before the menu click
 
 
 def test_gather_node_returns_early_when_an_attacker_appears(monkeypatch):
@@ -1008,8 +1146,10 @@ def test_light_node_success_clears_the_cached_instance_map(monkeypatch):
     successful light must drop the cached collision grid -- a stale cg_imap would keep answering
     maze.edge_open/component questions against the pre-light scene."""
     ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(101, 100))   # light_node budgets the walk
     ctx.state.data["cg_imap"] = object()
     node = _obj(35999, "Node", 100, 100)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)   # Light is a left-click now
     monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
     monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: True)
     assert cg.light_node(ctx, node, cg.DEFAULT_CONFIG)
@@ -1018,35 +1158,83 @@ def test_light_node_success_clears_the_cached_instance_map(monkeypatch):
 
 def test_light_node_failure_keeps_the_cached_instance_map(monkeypatch):
     ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(101, 100))   # light_node budgets the walk
     ctx.state.data["cg_imap"] = object()
     node = _obj(35999, "Node", 100, 100)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)   # Light is a left-click now
     monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
     monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: False)
     assert not cg.light_node(ctx, node, cg.DEFAULT_CONFIG)
     assert "cg_imap" in ctx.state.data
 
 
-def test_light_node_passes_a_refresh_target_using_ordinary_world_coordinates(monkeypatch):
-    """I9: light_node must re-aim mid-flight (the player may still be walking toward the node),
-    via controller.object_refresh_target -- which has no `inst` support, so it must be built from
-    the node's ordinary "x"/"y"/"plane" fields, not "instX"/"instY"."""
+def test_light_node_left_clicks_with_an_instance_refresh_target(monkeypatch):
+    """USER 2026-09-06: Light is a LEFT click (REC: GAME_OBJECT_FIRST_OPTION), re-aimed through
+    the node's INSTANCE tile (template x/y repeat between rooms); the menu only as the fallback."""
     ctx = _Ctx()
-    node = _obj(35999, "Node", 13100, 5700)   # instX/instY == x/y here (helper default)
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(101, 100))   # light_node budgets the walk
+    node = _obj(35999, "Node", 13100, 5700)
+    node["instX"], node["instY"] = 20100, 20200      # differ from the template x/y on purpose
     seen = {}
 
     def fake_refresh_target(x, y, plane, obj_id, **kw):
-        seen["args"] = (x, y, plane, obj_id)
+        seen["args"] = (x, y, plane, obj_id, kw.get("inst"))
         return lambda: None
     monkeypatch.setattr(controller, "object_refresh_target", fake_refresh_target)
 
-    def fake_click_menu_action(ser, entity, option, **kw):
-        seen["refresh_target"] = kw.get("refresh_target")
+    def fake_click(ser, entity, **kw):
+        seen["kw"] = kw
         return True
-    monkeypatch.setattr(controller, "click_menu_action", fake_click_menu_action)
+    monkeypatch.setattr(controller, "click_entity", fake_click)
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **kw: pytest.fail("menu used for a landed left-click"))
     monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: True)
     cg.light_node(ctx, node, cg.DEFAULT_CONFIG)
-    assert seen["args"] == (node["x"], node["y"], node["plane"], node["id"])
-    assert seen["refresh_target"] is not None
+    assert seen["args"] == (20100, 20200, node["plane"], node["id"], True)
+    # verify=False: tracked by refresh_target, no hover gate that would withhold while walking
+    assert "expected_action" not in seen["kw"] and seen["kw"]["refresh_target"] is not None
+
+
+def test_gather_ladder_prays_but_does_not_fight_a_strong_monster_without_a_weapon(monkeypatch):
+    """USER 2026-09-06: "tier two monsters like scorpion, horse, wolf etc shouldnt be fought
+    without a proper weapon" -- with only the sceptre, put the prayer up and keep gathering."""
+    me = (100, 100)
+    wolf = {"id": 9045, "index": 3, "name": "Corrupted Wolf", "instX": 102, "instY": 100,
+            "interactingPlayer": True, "screenX": 5, "screenY": 5}
+    ctx = _Ctx()
+    prayed = []
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*me))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [wolf])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(controller, "get_prayers", lambda: {"active": {"PROTECT_FROM_MELEE": bool(prayed)}, "icons": {}})
+    monkeypatch.setattr(cg, "do_prayer", lambda ctx, snap, name, cfg: prayed.append(name) or True)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **kw: pytest.fail("attacked a strong monster with the sceptre"))
+    assert cg.gather_ladder(ctx, cg.DEFAULT_CONFIG) == "prayer"
+    assert prayed == ["PROTECT_FROM_MELEE"]
+    assert cg.gather_ladder(ctx, cg.DEFAULT_CONFIG) == "none"      # prayer up: carry on gathering
+    assert cg.fightable_attacker_present(me) is False              # and gather_node is not interrupted
+    # a bow in the bag makes it worth fighting
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.weapon_name("bow", 1), "qty": 1}])
+    assert cg.should_fight(wolf, controller.get_inventory(), controller.get_equipment()) is True
+    assert cg.should_fight({"id": 9040}, [], {}) is True            # a rat is always fought
+
+
+def test_prep_state_teleports_home_when_the_barrier_is_out_of_view(monkeypatch):
+    """A restart mid-run (every F1) starts in some other room; geometry needs the start room."""
+    ctx = _Ctx(); ctx.state.data["cg_t0"] = 0.0
+    S = (13056 + 30, 5632 + 30)
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid(room=(S[0] - 7, S[1] - 7, 15, 15)))
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*S))
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [])   # no Barrier
+    crystal = {"name": g.ITEM_TELEPORT, "screenX": 1, "screenY": 1}
+    monkeypatch.setattr(controller, "get_inventory", lambda: [crystal])
+    clicked = []
+    monkeypatch.setattr(cg, "_click_item", lambda ctx, item, action: clicked.append((item["name"], action)))
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: False)
+    assert cg.prep_state(ctx, cg.DEFAULT_CONFIG) is None
+    assert clicked == [(g.ITEM_TELEPORT, "Activate")]
+    assert cg.prep_state(ctx, cg.DEFAULT_CONFIG) is None
+    assert len(clicked) == 1                                        # the crystal is spent once, not every tick
 
 
 def test_teleport_home_via_crystal_clears_the_cached_instance_map(monkeypatch):
@@ -1142,14 +1330,66 @@ def test_explore_gather_phase_lights_then_enters_then_gathers(monkeypatch):
     monkeypatch.setattr(cg, "gather_node", lambda ctx, obj, cfg: state["gathered"].append(obj["name"]) or True)
     monkeypatch.setattr(cg, "gather_ladder", lambda ctx, cfg: "none")
     monkeypatch.setattr(cg, "pick_up_drops", lambda ctx, cfg: 0)
-    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)            # walk to the node
-    assert state["walks"] and h.cheb(state["walks"][-1], node_xy) <= 2
-    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)            # light it
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)            # light it from 8 tiles (NODE_CLICK_RANGE):
+    assert state["walks"] == []                                #   no walk first -- the click walks us
     assert state["lit"] and data["cg_prep"]["sub"] == "to_room"
     cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)            # walk into the room
     assert state["walks"][-1] == right_room
     cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)            # gather the linum (deficit: yes)
     assert state["gathered"] == [linum]
+
+
+def test_gather_chains_several_nodes_inside_one_tick(monkeypatch):
+    """2026-09-06: one node per engine tick paid the loop's ~1s gap three times per room."""
+    ctx = _Ctx(); data = ctx.state.data; data["cg_t0"] = 0.0
+    S = (13056 + 30, 5632 + 30)
+    pitch = cg.DEFAULT_CONFIG["room_pitch"]
+    st = {"start_centre": S, "barrier": (S[0], S[1] - 8), "outward": (0, 1), "pitch": pitch,
+          "step": 0, "sub": "gather", "revealed": set(), "entered": {(0, 0), (1, 0)}, "node_fails": 0,
+          "prev_centre": S, "fishing_spots": set()}
+    data["cg_prep"] = st
+    target = cg._centre(st, (1, 0))
+    ore_id = next(i for i, n in g.RESOURCE_NODES.items() if "Deposit" in n)
+    ore_name = g.RESOURCE_NODES[ore_id]
+    live = {"nodes": [_obj(ore_id, ore_name, target[0] + 1, target[1]), _obj(ore_id, ore_name, target[0] + 3, target[1]),
+                      _obj(ore_id, ore_name, target[0] + 5, target[1])]}
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: _grid())
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(*target))
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: list(live["nodes"]))
+    gathered = []
+    def gather(ctx, obj, cfg):
+        gathered.append((obj["instX"], obj["instY"]))
+        live["nodes"] = [n for n in live["nodes"] if (n["instX"], n["instY"]) != (obj["instX"], obj["instY"])]
+        return True
+    monkeypatch.setattr(cg, "gather_node", gather)
+    monkeypatch.setattr(cg, "gather_ladder", lambda ctx, cfg: "none")
+    monkeypatch.setattr(cg, "pick_up_drops", lambda ctx, cfg: 0)
+    cg.explore_gather_phase(ctx, cg.DEFAULT_CONFIG)
+    assert len(gathered) == 3                        # all three in one tick, nearest first
+    assert gathered[0] == (target[0] + 1, target[1])
+
+
+def test_craft_phase_chains_steps_inside_one_tick(monkeypatch):
+    ctx = _Ctx(); data = ctx.state.data
+    data["cg_t0"] = 0.0; data["cg_home"] = True; data["cg_craft_shards_logged"] = True
+    data["cg_prep"] = {"fishing_spots": set()}
+    plans = [[("bowl", "helm")], [("bowl", "body")], [("wear", "x")], []]
+    monkeypatch.setattr(cg.kit, "craft_plan", lambda inv, eq, cfg: list(plans.pop(0)))
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {})
+    monkeypatch.setattr(controller, "get_prayers", lambda: {"active": {}, "icons": {}})
+    monkeypatch.setattr(cg, "drop_prayers_if_safe", lambda ctx: False)
+    monkeypatch.setattr(cg, "_fish_pass_due", lambda ctx, cfg, inv: False)
+    done = []
+    monkeypatch.setattr(cg, "bowl_make", lambda ctx, key, cfg: done.append(("bowl", key)) or True)
+    monkeypatch.setattr(cg, "wear", lambda ctx, name: done.append(("wear", name)) or True)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    assert done == [("bowl", "helm"), ("bowl", "body"), ("wear", "x")]
+    assert data["cg_crafted"] is True                # the empty plan ended the chain in the same tick
 
 
 def test_gather_caps_raw_fish_want_by_free_inventory_slots(monkeypatch):
@@ -1361,7 +1601,7 @@ def test_bowl_make_clicks_the_widget_by_text(monkeypatch):
     def click_entity_mock(ser, entity, **kw):
         name = entity.get("name") or entity.get("text")
         calls.append((name, kw.get("expected_action")))
-        if kw.get("expected_action") == "Sing-crystal":
+        if name == "Singing Bowl":          # the Sing-crystal open click (verify=False now, no hover gate)
             state["bowl_open"] = True
         return True
     monkeypatch.setattr(controller, "click_entity", click_entity_mock)
@@ -1383,7 +1623,7 @@ def test_bowl_make_clicks_the_widget_by_text(monkeypatch):
         return check()
     monkeypatch.setattr(cg, "_confirm", confirm)
     assert cg.bowl_make(ctx, "helm", cg.DEFAULT_CONFIG)
-    assert calls[0] == ("Singing Bowl", "Sing-crystal")
+    assert calls[0][0] == "Singing Bowl"          # bowl opened first, then the widget clicked
 
 
 def test_bowl_widget_matches_name_field_with_empty_text(monkeypatch):
@@ -1424,14 +1664,14 @@ def test_craft_phase_runs_the_plan_and_marks_crafted(monkeypatch):
     plans = [[("bowl", "helm"), ("cook", None)], [("cook", None)], []]
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
     monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": g.ITEM_SCEPTRE}})
-    monkeypatch.setattr(cg.kit, "craft_plan", lambda inv, eq, cfg: plans.pop(0))
+    monkeypatch.setattr(cg.kit, "craft_plan", lambda inv, eq, cfg: plans.pop(0) if plans else [])
     monkeypatch.setattr(cg, "bowl_make", lambda ctx, key, cfg: steps.append(("bowl", key)) or True)
     monkeypatch.setattr(cg, "cook_all", lambda ctx, cfg: steps.append(("cook", None)) or True)
-    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
-    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
-    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)          # the whole plan chains inside one tick (2026-09-06)
     assert steps == [("bowl", "helm"), ("cook", None)]
     assert ctx.state.data["cg_crafted"] is True
+    cg.craft_phase(ctx, cg.DEFAULT_CONFIG)          # a later tick re-plans and finds nothing to do
+    assert steps == [("bowl", "helm"), ("cook", None)]
 
 
 def test_use_on_clicks_both_items(monkeypatch):
@@ -1760,10 +2000,10 @@ def test_ensure_tools_takes_from_storage(monkeypatch):
     monkeypatch.setattr(controller, "get_equipment", lambda: {})
     monkeypatch.setattr(controller, "get_player", lambda: _player_at(100, 100))
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_obj(g.OBJ_TOOL_STORAGE, "Tool Storage", 101, 100)])
-    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: calls.append(kw.get("expected_action")) or True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: calls.append((entity.get("name"), callable(kw.get("refresh_target")))) or True)
     monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=1.0: True)
     assert cg.ensure_tools(ctx, cg.DEFAULT_CONFIG)
-    assert calls == ["Take"]
+    assert calls == [("Tool Storage", True)]      # left-click the storage, tracked, no hover gate
 
 
 def test_stuck_watch_stops_after_no_progress(monkeypatch):
@@ -1910,7 +2150,7 @@ def test_pick_up_drops_confirms_on_the_specific_item_rising(monkeypatch):
     monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [item])
     # Already holding one Corrupted shards stack -- the click below never actually lands another.
     monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.ITEM_SHARDS, "qty": 50}])
-    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
     monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: check())
     taken = cg.pick_up_drops(ctx, cg.DEFAULT_CONFIG)
     assert taken == 0
@@ -1926,13 +2166,34 @@ def test_pick_up_drops_confirms_when_the_count_actually_rises(monkeypatch):
     def get_inventory_mock():
         return [{"name": g.ITEM_SHARDS, "qty": 60}] if state["taken"] else [{"name": g.ITEM_SHARDS, "qty": 50}]
     monkeypatch.setattr(controller, "get_inventory", get_inventory_mock)
-    def click(ser, entity, option, **kw):
+    kws = []
+    def click(ser, entity, **kw):
+        kws.append(kw)
         state["taken"] = True
         return True
-    monkeypatch.setattr(controller, "click_menu_action", click)
+    monkeypatch.setattr(controller, "click_entity", click)
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **kw: pytest.fail("menu used for a landed left-click"))
     monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: check())
     taken = cg.pick_up_drops(ctx, cg.DEFAULT_CONFIG)
     assert taken == 1
+    assert kws[0]["expected_action"] == "Take" and callable(kws[0]["refresh_target"])   # left-click, re-aimed
+
+
+def test_pick_up_drops_withheld_left_click_falls_back_to_the_menu(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(100, 100))
+    item = {"name": g.ITEM_FRAME, "instX": 101, "instY": 100, "screenX": 5, "screenY": 5}
+    monkeypatch.setattr(controller, "get_ground_items", lambda fresh=False: [item])
+    state = {"taken": False}
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": g.ITEM_FRAME, "qty": 1}] if state["taken"] else [])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: controller.CLICK_WITHHELD)
+    def menu(ser, entity, option, **kw):
+        assert option == "Take"
+        state["taken"] = True
+        return True
+    monkeypatch.setattr(controller, "click_menu_action", menu)
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: check())
+    assert cg.pick_up_drops(ctx, cg.DEFAULT_CONFIG) == 1
 
 
 def test_bowl_make_returns_walking_sentinel_when_far(monkeypatch):
@@ -1964,10 +2225,68 @@ def test_craft_phase_does_not_count_a_walk_in_progress_as_a_failure(monkeypatch)
     assert ctx.state.data.get("cg_crafted") is None
 
 
+def test_light_node_waits_for_the_scene_reload_before_dropping_the_map(monkeypatch):
+    """cg_live5/7: the walk issued right after a confirmed Light routed against a grid that still
+    showed the new room unloaded ("no route ..."), one wasted tick per node. light_node now waits
+    (bounded) for /collision?all=true to differ from the grid cached before the click."""
+    ctx = _Ctx()
+    class _Map:
+        flags = [0] * 16
+    ctx.state.data["cg_imap"] = _Map()
+    node = _obj(35999, "Node", 100, 100)
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(101, 100))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [_obj(36001, "null", 100, 100)])   # already re-id'd: lit
+    grids = [{"flags": [0] * 16}, {"flags": [0] * 16}, {"flags": [0] * 15 + [1]}]
+    monkeypatch.setattr(controller, "get_collision_grid", lambda plane=None: grids.pop(0))
+    t = {"v": 1000.0}
+    monkeypatch.setattr(cg.time, "time", lambda: t["v"])
+    monkeypatch.setattr(cg.time, "sleep", lambda s: t.__setitem__("v", t["v"] + s))
+    assert cg.light_node(ctx, node, cg.DEFAULT_CONFIG)
+    assert grids == []                              # polled until the grid changed
+    assert "cg_imap" not in ctx.state.data
+    assert t["v"] - 1000.0 < cg.SCENE_RELOAD_WAIT_S   # returned on the change, not the budget
+
+
+def test_light_node_budgets_the_walk_to_a_far_node(monkeypatch):
+    ctx = _Ctx()
+    node = _obj(35999, "Node", 100, 100)
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(108, 100))   # 8 tiles off
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [node])
+    seen = {}
+    monkeypatch.setattr(cg, "_confirm", lambda ctx, check, budget_s=None: seen.__setitem__("budget", budget_s) or False)
+    cg.light_node(ctx, node, cg.DEFAULT_CONFIG)
+    assert seen["budget"] == cg.NODE_BUDGET_S + 8 * cg.NODE_WALK_S_PER_TILE
+
+
+def test_gather_node_scans_objects_less_often_than_it_polls_the_inventory(monkeypatch):
+    ctx = _Ctx()
+    deposit = next(n for n in g.RESOURCE_NODES.values() if "Deposit" in n)
+    dep_id = next(i for i, n in g.RESOURCE_NODES.items() if n == deposit)
+    node = _obj(dep_id, deposit, 100, 100)
+    scans = {"objects": 0, "inventory": 0}
+    def objects(radius=None, fresh=False, interactable=False):
+        scans["objects"] += 1
+        return [node]                          # never depletes
+    monkeypatch.setattr(controller, "get_objects", objects)
+    monkeypatch.setattr(controller, "get_inventory", lambda: scans.__setitem__("inventory", scans["inventory"] + 1) or [])
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [])
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(101, 100))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    t = {"v": 1000.0}
+    monkeypatch.setattr(cg.time, "time", lambda: t["v"])
+    monkeypatch.setattr(cg.time, "sleep", lambda s: t.__setitem__("v", t["v"] + s))
+    assert cg.gather_node(ctx, node, cg.DEFAULT_CONFIG) is False
+    assert scans["objects"] * 2 < scans["inventory"]     # 0.9s object scans vs 0.3s inventory polls
+
+
 def test_light_node_throttles_its_own_objects_poll(monkeypatch):
     """M: light_node's lit() must not read /objects on every single _confirm poll (every 0.1s) --
     throttled to at most once per LIGHT_NODE_POLL_S (0.5s)."""
     ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_player", lambda: _player_at(101, 100))   # light_node budgets the walk
     node = _obj(35999, "Node", 100, 100)
     reads = {"n": 0}
 
@@ -1975,6 +2294,7 @@ def test_light_node_throttles_its_own_objects_poll(monkeypatch):
         reads["n"] += 1
         return [_obj(35999, "Node", 100, 100)]   # never actually lights -- same id forever
     monkeypatch.setattr(controller, "get_objects", objects)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)   # Light is a left-click now
     monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
     t = {"v": 1000.0}
     monkeypatch.setattr(cg.time, "time", lambda: t["v"])
@@ -1993,7 +2313,7 @@ def test_before_break_paces_ticks_and_overrides_the_enter_gate(monkeypatch):
     ctx = _Ctx()
     ctx.state.data["cg_t0"] = 1000.0
     ctx.state.data["cg_phase"] = "enter"
-    ctx.state.break_due = lambda: True
+    ctx.state.break_due = lambda breaks_cfg: True
     clock = {"t": 1000.0}
     sleeps = []
     monkeypatch.setattr(cg.time, "time", lambda: clock["t"])
@@ -2014,12 +2334,12 @@ def test_before_break_paces_ticks_and_overrides_the_enter_gate(monkeypatch):
 def test_enter_gate_is_ignored_while_playing_out():
     ctx = _Ctx()
     assert cg._holding_for_break(ctx) is False                   # engine without break_due
-    ctx.state.break_due = lambda: True
+    ctx.state.break_due = lambda breaks_cfg: True
     assert cg._holding_for_break(ctx) is True
     ctx.state.data["cg_playing_out"] = True
     assert cg._holding_for_break(ctx) is False
     ctx.state.data["cg_playing_out"] = False
-    ctx.state.break_due = lambda: False
+    ctx.state.break_due = lambda breaks_cfg: False
     assert cg._holding_for_break(ctx) is False
 
 

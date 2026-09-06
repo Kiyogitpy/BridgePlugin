@@ -24,6 +24,9 @@ HUNLLEF_CORRUPTED = {9035, 9036, 9037, 9038}
 HUNLLEF = HUNLLEF_CRYSTALLINE | HUNLLEF_CORRUPTED
 TORNADO = {9025, 9039}                       # crystalline / corrupted
 WEAK_MONSTERS = {9040, 9041, 9042, 9043, 9044, 9045}   # REC: rat, spider, bat, unicorn, scorpion, wolf
+STRONG_MONSTERS = {9043, 9044, 9045}   # unicorn, scorpion, wolf -- USER 2026-09-06: "tier two monsters
+                                       # ... shouldnt be fought without a proper weapon they take too
+                                       # much time"; pray against them and keep gathering instead
 DEMI_BOSSES = {9046: "Corrupted Bear", 9047: "Corrupted Dragon"}   # REC; Dark Beast id: read off a
                                                                      # recording that meets one
 
@@ -58,6 +61,8 @@ REGION_NORMAL = 7512
 # --- Lobby objects (REC summary) ---
 OBJ_BARRIER = 37337
 OBJ_ENTRANCE = 37340              # "The Gauntlet"
+ENTRANCE_ENTER_CORRUPTED = "Enter-corrupted"   # REC: GAME_OBJECT_SECOND_OPTION on OBJ_ENTRANCE;
+                                               #   "You enter the Gauntlet." +1.9s, LOADING +2.7s
 OBJ_REWARD_CHEST = 37341
 
 # --- Arena utility objects (REC summary "object ids seen"; singular, no depleted counterpart) ---

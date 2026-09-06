@@ -504,8 +504,8 @@ def get_object_at(x: int, y: int, plane: int, obj_id: int, radius=None, inst: bo
     return data
 
 
-def get_object_screen_pos_at(x: int, y: int, plane: int, obj_id: int, radius=None):
-    data = get_object_at(x, y, plane, obj_id, radius=radius)
+def get_object_screen_pos_at(x: int, y: int, plane: int, obj_id: int, radius=None, inst: bool = False):
+    data = get_object_at(x, y, plane, obj_id, radius=radius, inst=inst)
     if data is None:
         return None
     sx, sy = data.get("screenX"), data.get("screenY")
@@ -715,8 +715,8 @@ def get_ground_item_at(x: int, y: int, plane: int, item_id: int, inst: bool = Fa
     return data
 
 
-def get_ground_item_screen_pos_at(x: int, y: int, plane: int, item_id: int):
-    data = get_ground_item_at(x, y, plane, item_id)
+def get_ground_item_screen_pos_at(x: int, y: int, plane: int, item_id: int, inst: bool = False):
+    data = get_ground_item_at(x, y, plane, item_id, inst=inst)
     if data is None:
         return None
     sx, sy = data.get("screenX"), data.get("screenY")
@@ -1131,24 +1131,28 @@ def ground_tile_refresh_target(x: int, y: int, plane: int):
     return lambda: get_ground_walk_screen_pos(x, y, plane)
 
 
-def object_refresh_target(x: int, y: int, plane: int, obj_id: int, radius=None):
+def object_refresh_target(x: int, y: int, plane: int, obj_id: int, radius=None, inst: bool = False):
     """refresh_target factory for tracking a specific world object's current screen projection
     through a click's flight -- added 2026-08-14 alongside /object/at (ObjectProvider.java) so a
     routine clicking an object (a bank booth, a tree, a plinth, ...) can be moving at the same
     time, the same way npc_index_refresh_target already covers NPCs. Objects don't move, but
     their screen position shifts with the camera exactly like a ground tile's does, and a
     multiloc object's clickbox/name can change between the click's decision and the moment the
-    cursor actually arrives (see buildObjectData's own comment on impostor variants)."""
-    return lambda: get_object_screen_pos_at(x, y, plane, obj_id, radius=radius)
+    cursor actually arrives (see buildObjectData's own comment on impostor variants).
+
+    `inst=True` (2026-09-06, Corrupted Gauntlet live session): x/y are INSTANCE-space tiles
+    (`instX`/`instY`), resolved by /object/at?inst=true. Template x/y repeat between Gauntlet
+    rooms, so a template lookup there can answer with another room's twin of the object."""
+    return lambda: get_object_screen_pos_at(x, y, plane, obj_id, radius=radius, inst=inst)
 
 
-def ground_item_refresh_target(x: int, y: int, plane: int, item_id: int):
+def ground_item_refresh_target(x: int, y: int, plane: int, item_id: int, inst: bool = False):
     """refresh_target factory for tracking a specific ground item's current screen projection
     through a click's flight -- added 2026-08-14 alongside /ground-item/at
     (GroundItemProvider.java), same role object_refresh_target plays for objects. Items don't
     move, but their screen position shifts with the camera exactly like an object's or ground
-    tile's does."""
-    return lambda: get_ground_item_screen_pos_at(x, y, plane, item_id)
+    tile's does. `inst=True`: instance-space x/y, see object_refresh_target."""
+    return lambda: get_ground_item_screen_pos_at(x, y, plane, item_id, inst=inst)
 
 
 def is_logged_in():
@@ -1505,6 +1509,8 @@ def type_text(ser: serial.Serial, text: str) -> None:
 
 INVENTORY_TAB_KEY = "w"
 PRAYER_TAB_KEY = "r"
+EQUIPMENT_TAB_KEY = "e"         # this account's keybind (falconry/giants_foundry tap "E")
+EQUIPMENT_WIDGET_GROUP = 387    # wornitems.if3: slot children 15 head, 16 cape, 18 weapon, 20 shield, 22 gloves, 24 ring
 
 
 def open_inventory_tab(ser: serial.Serial) -> bool:
@@ -1515,6 +1521,17 @@ def open_inventory_tab(ser: serial.Serial) -> bool:
     return ensure_ui_state(
         lambda: key_tap(ser, INVENTORY_TAB_KEY),
         lambda: get_state().get("inventoryTabOpen"),
+    )
+
+
+def open_equipment_tab(ser: serial.Serial) -> bool:
+    """Tap the worn-equipment hotkey unless the tab is already up, retrying until the interface
+    (group 387; child 1 is the always-present "View equipment stats" button) is clickable.
+    Added 2026-09-06 for karambwan_fishing's worn-item teleports (Karamja gloves "Gem Mine",
+    Quest point cape "Teleport") -- falconry.py and giants_foundry.py tapped the key blind."""
+    return ensure_ui_state(
+        lambda: key_tap(ser, EQUIPMENT_TAB_KEY),
+        lambda: bool(get_widget(EQUIPMENT_WIDGET_GROUP, 1).get("clickable")),
     )
 
 
@@ -1724,6 +1741,32 @@ def register_fidget_serial(ser) -> None:
     human_delay stays a plain sleep for them."""
     global _fidget_ser
     _fidget_ser = ser
+    # Mirrored into input_state (2026-09-06): controller.py exists twice in a running process
+    # (see input_state's module docstring) and main() registers on __main__'s copy, so every
+    # routine-side human_delay saw None here and never fidgeted -- the CLAUDE.md caveat.
+    input_state.fidget_ser = ser
+
+
+def _fidget_serial():
+    """The fidgeter's serial connection from WHICHEVER copy of this module was registered."""
+    if _fidget_ser is not None:
+        return _fidget_ser
+    return getattr(input_state, "fidget_ser", None)
+
+
+def fidget_once() -> None:
+    """One resting-hand fidget, for a routine that chunks a long EVENT wait (bridge_events'
+    20ms poll loop never passes through human_delay, so nothing else keeps the cursor alive
+    through a 30s station wait). Position-invariant, same guards as _maybe_fidget_during_wait,
+    honours IDLE_FIDGET_CHANCE; a no-op with no serial registered."""
+    global _fidgeting
+    if _fidgeting:
+        return
+    _fidgeting = True
+    try:
+        _maybe_fidget_during_wait()
+    finally:
+        _fidgeting = False
 
 
 def _maybe_fidget_during_wait() -> None:
@@ -1733,7 +1776,7 @@ def _maybe_fidget_during_wait() -> None:
     it could interfere: unfocused window, an open right-click menu (moving off one closes it),
     a movement abort, or a target outside the window. Never raises -- a fidget must not be
     able to break the wait it decorates."""
-    ser = _fidget_ser
+    ser = _fidget_serial()
     if ser is None or _movement_abort.is_set():
         return
     if random.random() > IDLE_FIDGET_CHANCE:
@@ -1790,7 +1833,7 @@ def human_delay(min_s: float, max_s: float) -> None:
     parked cursor are unaffected. Short draws -- including every down/up hold inside a click --
     stay a plain sleep."""
     delay = sample_human_delay(min_s, max_s)
-    if delay < IDLE_FIDGET_MIN_SLEEP_S or _fidget_ser is None or _fidgeting:
+    if delay < IDLE_FIDGET_MIN_SLEEP_S or _fidget_serial() is None or _fidgeting:
         time.sleep(delay)
         return
     _sleep_with_fidgets(delay)
@@ -3113,6 +3156,7 @@ ROUTINE_FILES = {
     "GUARDIANS_OF_THE_RIFT": "routines/guardians_of_the_rift.py",
     "CORRUPTED_GAUNTLET": "routines/corrupted_gauntlet.py",
     "AGILITY": "routines/agility.py",
+    "KARAMBWAN_FISHING": "routines/karambwan_fishing.py",
 }
 
 

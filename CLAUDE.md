@@ -15,7 +15,8 @@ RuneLite client (Java plugin, src/main/java/com/example/)
   └─ UDP event stream on port 50555 (PLAYER_DIED, NPC_DIED, LEVEL_UP, HP_CHANGED, CHAT_MESSAGE,
         TICK, OBJECT_SPAWNED/DESPAWNED, GROUND_ITEM_SPAWNED/DESPAWNED, XP_GAINED, and since
         2026-09-04: VARBIT_CHANGED (subscribed ids only), WIDGET_LOADED/CLOSED, MENU_CLICKED,
-        GRAPHIC_CHANGED, HITSPLAT, PLAYER_MOVING/STOPPED (per-frame), NPC_SPAWNED/DESPAWNED, PROJECTILE_SPAWNED (2026-09-05), ...)
+        GRAPHIC_CHANGED, HITSPLAT, PLAYER_MOVING/STOPPED (per-frame), NPC_SPAWNED/DESPAWNED, PROJECTILE_SPAWNED (2026-09-05),
+        GRAPHICS_OBJECT_CREATED (2026-09-06, ground spotanims: id/x/y/plane/tick, spawn-budgeted), ...)
         ↕
 Python controller (ControllerAddon/)
   └─ controller.py     — engine: bridge polling, Arduino serial driving, panic key,
@@ -55,6 +56,20 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   Prayer automation and the hopper's auto-teleport/logout were deleted 2026-09-05 so nothing in
   the merged client can inject input -- keep it that way; the "physical Arduino, never
   software-injected" rule in "What this is" applies to every plugin loaded next to the bridge.
+  **Zombie Prayer came BACK as indicators-only on 2026-09-06.** The 2026-09-05 removal deleted the
+  whole plugin, and its `PrayerOverlay` was the ONLY reader of `TrackerPlugin.getIncomingDamages()`
+  -- the set every boss plugin's projectile/NPC trackers queue `Damage` into -- so the Whisperer,
+  Cerberus, Jad, Muspah and Mad Angel silently stopped showing what to pray (the Hunllef kept
+  working only because the gauntlet plugin draws its own swap text). USER: "when i said i wanted
+  packet removed i meant packets that simulate clicks"; "take it from upstream". So
+  `plugins/prayer/*`, `audio/PrayerMuter.java` and `TrackerConfig`'s click-pattern enum are
+  upstream's files verbatim, EXCEPT `ZombiePrayerPlugin`, which lost only the three things that
+  acted -- the onGameTick `Prayer.activate()/deactivate()` loop, the Attack-click activation
+  handler, and the Gaussian click-pattern call -- each marked with a `no-packets:` comment.
+  `Prayer.setActive/flick/toggle` and `Widgets.click` stay deleted. Audit of the removal commit
+  (`bc41f45`, 22 files) found nothing else read-only lost; the AoE warning plugin was untouched.
+  Read-only-ness is judged per FILE when taking an upstream commit, not per plugin: an upstream
+  plugin that both draws and clicks is kept with its clicking methods removed, not dropped.
   **Taking upstream ZombieLite commits (2026-09-05):** the checkout's `origin` is
   StephanBijzitter's repo and `fork` is the user's; fetch `origin`, `git cherry-pick` onto
   `no-packets`, push to `fork` ONLY. Skip any upstream commit that touches `com.salvation.packets`
@@ -65,6 +80,12 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   had registered only the IDLE animation, so a combo's telegraphs accumulated until the boss
   idled; upstream registers all seven combo animations. If the pile-up is still visible live, the
   remaining fix is pruning by expiry tick rather than by animation.
+  **Kiyo's own Weapon Tracker addon lives in ZombieLite since 2026-09-06** (`com.WeaponTracker`,
+  commit `75d5515` on `no-packets`): the ZombieLite copy is the CANONICAL one, not
+  `IdeaProjects/weapon_tracker_rs` -- its classifier defers to `com.salvation.data.WeaponDamageType`
+  for melee/ranged/magic (SPEC stays a name check; unarmed -1 is answered UNKNOWN before the table,
+  whose NONE entry maps -1 to MELEE), so it no longer compiles standalone. The per-line file logger
+  was dropped on import (USER: "remove logger from my addon").
 - **A routine**: `python -u controller.py routines/<name>.py` (from `ControllerAddon/`). Runs
   until the panic key (F1) is pressed, a safety stop triggers, or the process is killed.
 - **MCP debug server** (`osrs-debug` in `.mcp.json`): read-only bridge queries
@@ -716,6 +737,68 @@ steps above.
 
 ## Current state of routines/corrupted_gauntlet.py
 
+**First live session 2026-09-06 (cg_live1-8, recorder `cg-bot1`). Reached lobby entry ->
+geometry -> node lighting -> gathering unattended; craft/enter/fight NOT yet reached live. Nine
+fixes, all MEASURED and pinned in tests -- read these before the next session:**
+- **The fight signal is varbit 9177, NOT a Hunllef in `/npcs`.** The Hunllef is in the loaded
+  scene from the START room and wanders in and out of `/npcs` there, so `derive_phase`/
+  `enter_phase`'s old "a Hunllef id is present" test quick-passed nothing, prayed in the start
+  room and spammed Attack at a Hunllef behind the wall (cg_live2). `tick()` reads
+  `/varbit?id=9177` over HTTP every tick (`cg_varbit_fight`); `on_event` still mirrors the change
+  faster. 9177 is 1 from +0.6s after Quick-pass until the kill.
+- **`/collision?all=true` marks unlit rooms `0x40000000` and the scene border `0xFFFFFF`**
+  (RuneLite's `CollisionDataFlag` names neither; they are "no data here" markers, not walls).
+  `instance_nav.standable` now refuses both -- before, the start-room flood leaked through the
+  corridor gap into 9092 unloaded tiles and prep never derived geometry (cg_live3). This also
+  killed the reason for the old 600-tile `START_COMPONENT_MAX` cap (now 2000, only to catch a
+  genuine runaway); a resumed instance with corridors already lit legitimately measures ~700.
+- **Room pitch 16 CONFIRMED**; each doorway has a PAIR of Nodes (35998 + 35999 flank it, not
+  lit/unlit); a lit Node becomes a "null" object 36000/36001; `Light` is the Node's LEFT option.
+- **`ControllerState.break_due(breaks_cfg)` takes the breaks config** -- the routine's no-arg call
+  crashed the process on the first `enter_phase` tick (cg_live4); the tests had faked it no-arg.
+- **Every prep world click re-aims through the object's INSTANCE tile** (`_obj_refresh` ->
+  `object_refresh_target(..., inst=True)`, and `_item_refresh` for drops). Template x/y repeat
+  between rooms, so a template `/object/at` there resolves another room's twin; and a click at a
+  pre-walk projection lands on bare floor (cg_live5).
+- **Prep/gather/light/bowl clicks carry NO `expected_action` hover gate** (`_click_object(...,
+  verify=False)`, the default). The gate reads `/hover` and withholds whenever the cursor is not
+  yet over the target -- i.e. every click issued while walking up to a node -- so gathering
+  withheld, fell to a menu with no option yet, pressed ESC and waited ~8s per node (cg_live5/6).
+  These clicks track the moving target and confirm on their own outcome instead; `verify=True`
+  keeps the gate for hijack-sensitive clicks (the Hunllef Attack still uses it).
+- **Pickups spam LEFT-clicks** (`pick_up_drops`), nearest first, re-aimed, menu only on a
+  withheld click (USER: "we dont have time to right click each individual item just spam click it
+  up"). The human loots with the ground item's own left option.
+- **Room hops use the VIEWPORT, not the minimap** (`travel._hop_to(prefer_viewport=True)`, used by
+  `instance_nav.walk_to`) -- USER: "doing minimap hops between rooms is also not needed since we
+  can see it in the viewport". A rendered, un-occluded tile is shift-clicked in the viewport at
+  any hop length; the minimap stays the fallback for an off-screen or panel-covered tile.
+- **Strong monsters (unicorn 9043 / scorpion 9044 / wolf 9045, `g.STRONG_MONSTERS`) are prayed
+  against and left alone until a bow or staff exists** (`should_fight`) -- USER: "tier two
+  monsters ... shouldnt be fought without a proper weapon they take too much time". A strong
+  monster we won't fight does not interrupt `gather_node` (`fightable_attacker_present`); a
+  demi-boss still does (`gather_ladder` flees it). Weak monsters (rat/spider/bat) always fought.
+- **`prep_state` teleports home when no Barrier is in view** (a mid-run restart lands in some
+  other room; geometry can only be derived in the start room), once, via the teleport crystal.
+- **`drop_prayers_if_safe`** turns every prayer off when nothing is attacking (the Gauntlet has
+  no altar; prayer 77 -> 50 in two minutes with protection left on, cg_live2).
+- **Offline pass after the runs (not yet measured live):** a Node is lit from up to
+  `NODE_CLICK_RANGE` (10) tiles with a per-tile confirm budget (the human clicked Light from
+  3-11 tiles; the old "walk within 2 tiles first" was a whole extra walk per node);
+  `_await_scene_reload` waits (<= 2.5s) for `/collision?all=true` to change after a confirmed
+  Light before the caller routes (cg_live5/7: "no route ..." on the tick after EVERY light, the
+  reload lands ~1.2s after the click); gathering chains up to `GATHER_CHAIN_MAX` (4) nodes and
+  `craft_phase` up to `CRAFT_CHAIN_MAX` (12) steps inside one tick, since the engine loop cost
+  ~1s between every single node/bowl click before; `gather_node` re-scans `/objects` only every
+  `GATHER_OBJECT_POLL_S` (0.9s) while polling the cheap `/inventory` every 0.3s.
+- The lobby is entered by the routine itself: `derive_phase` returns `lobby` when The Gauntlet
+  (37340) is in view before a run (`cg_t0` unset), `lobby_phase` clicks `Enter-corrupted` and
+  confirms on `regionId == REGION_CORRUPTED`. Wired so a plain launch from the LOBBY runs the
+  whole thing.
+See `MEMORY.md` -> gauntlet-live-session-2026-09-06 for the operational notes. First-session
+worklist for the UNRUN half: craft (bowl group-270 widgets by text, pump/pestle/potion chain,
+cook), the barrier quick-pass, and the fight ladder itself.
+
 Sub-project 2 of the Corrupted Gauntlet (spec `docs/superpowers/specs/2026-09-05-hunllef-fight-
 design.md`), written 2026-09-05 from the human recording
 `recordings/2026-09-05_014024_corrupted-gauntlet-humanrun1.*` and the cache. **Door-start mode,
@@ -1255,6 +1338,73 @@ MEASURED that day, and the quality work is where the session ended.
   stock inside the open bank, held inventory outside), cap a metal's need by the crucible's
   free space, top up a short held plan with the primary item so the restock fetches it,
   then trim overflow smallest-item-first (later equal-size steps first) to an exact 28.
+
+## Current state of routines/mastering_mixology.py
+
+Live-debugged to a working state 2026-08-12/13 (every MEASURED fact from those sessions is in the
+module docstring and the per-function comments), then **converted to event-driven outcomes
+2026-09-06 (USER: "make it as tick perfect as can be with our new events"). Not yet run live in
+this form**; the module docstring's numbered worklist is the first session's checklist. Shape:
+
+- **Every wait is `_await`** (`bridge_events.await_outcome` on the module clock with a pre-check,
+  same as blast_furnace): a subscribed `VARBIT_CHANGED` (`VARBIT_SUBSCRIPTIONS`: mixer slots
+  11324-11326, vessel 11339, station potions 11340-11342, station progress 11327-11329,
+  skillshots 11337-11338, order-1 type 11315, digweed 11330-11333 -- runelite-api 1.12.38
+  `VarbitID`, javap-verified), `MENU_CLICKED`, `INVENTORY_CHANGED`, `CHAT_MESSAGE` or the new
+  `GRAPHICS_OBJECT_CREATED` decides WHEN to look; `/varbit`, `/inventory`, `/mixology-state` or
+  `/last-action` decide WHAT happened. `ctx.events is None` keeps polling behaviour everywhere.
+- **The wait-for-stillness gate is gone**: `_click_object`/`_hover_object` aim through
+  `object_refresh_target` (uncached `/object/at`, keyed on the multiloc BASE id) so a click tracks
+  the projection while the player walks and the lab's ever-retargeting camera moves.
+- **Lever pull = two signals**: `MENU_CLICKED` target names the lever the click actually hit
+  (three stand side by side), then a mixer-slot varbit change says the pull LANDED (budget
+  includes the walk). Vessel content is the vessel varbit (`vessel_potion_name`, 1-indexed into
+  the game's potion order), `impostorId` only as the fallback. All three bases chain inside one
+  `tick()` under `CHAIN_MAX_S`, re-checking pause/safety between bases.
+- **`_choose_orders` puts Retort orders LAST.** This is the structural fix for the 2026-08-13
+  wrong-station bug (an extra Retort click after the potion finished auto-starts the NEXT
+  unprocessed potion at the Retort): processing is positional, so with the Retort at the end
+  nothing unprocessed remains when it finishes. The Retort loop's strictly-increasing-progress
+  gate stays as the belt.
+- **The Retort's clock is its progress varbit** (exactly +1 per tick, measured): one
+  `click_human` per `VARBIT_CHANGED` on 11327, `RETORT_CLICK_PHASE_S` after it, stopped the
+  instant 11341 reads 0, with a `/mixology-state` re-read every `RETORT_HTTP_CONFIRM_S` for a lost
+  packet. The old loop slept 0.55-0.75s wall-clock per click and polled chat.
+- **Agitator/Alembic click on `GRAPHICS_OBJECT_CREATED`** (2954/2955 within `FLASH_CUE_RADIUS`
+  of the station's tile) after a station-specific reaction draw (`FLASH_REACTION_S`; the
+  Alembic window is ONE tick), the Agitator takes its second in-window click on the next progress
+  tick (wiki: double bonus), and a hit is a CHANGE of the skillshot varbit from its pre-cue value
+  (noots-mixology). The deliberate first-flash miss (`SPEEDUP_MISS_CHANCE`, user directive) stays.
+  Needs the 2026-09-06 client rebuild for the event; polls `/graphics-objects` otherwise -- the
+  old Alembic path polled a FRESH scan 33 times a second.
+- Refiner: one click per tick on `_tick_pause` (was 4-16 clicks/s); the first herb leaving the
+  inventory is the arrival signal before the hover. Deposit/hopper/bank waits confirm on
+  `INVENTORY_CHANGED`. `on_event` flags a digweed herb-ready varbit so `maybe_collect_digweed`
+  reads `/mixology-state` only then or every `DIGWEED_STATE_POLL_S`.
+- `process_phase` with more unprocessed potions than known orders (a restart wiped
+  `mm_chosen_orders`) now routes to orders -> the leftover flush instead of returning forever.
+- **Second pass the same day (USER: "keep finding improvements"):** phase transitions CHAIN
+  inside one `tick()` (`TICK_CHAIN_MAX`, deposit -> orders -> mix in one go, digweed checked
+  before every chained phase and before every station, since a tick now spans a cycle); the
+  belt deposit waits for the game to WRITE the new orders (order-1 type non-zero) so the chained
+  orders read is not the transitional empty set; the NEXT target is pre-hovered while the
+  current action lands (next lever / the vessel / the next station / the belt -- the human aims
+  ahead); a wrong-target `MENU_CLICKED` shortens the lever verdict wait to `MENU_VERDICT_SHORTEN_S`;
+  `_await_long` chunks any long wait into measured human still segments with `controller.fidget_once`
+  between them and a `stop` predicate (a cue wait ends when the potion finishes), fidget-free
+  while the FIRST cue is due; `STATION_RANK` orders Alembic -> Agitator -> Retort (shortest walk
+  from the vessel, AlchemyObject tiles); digweed also targets a FINISHED Liplack (wiki: before or
+  after processing); a refused click returns the entity so the outcome confirm retries instead of
+  a "not found" safety stop; `_stuck_watch` logs `[!] mixology: STUCK?` at `STALL_WARN_S` and
+  stops at `STALL_STOP_S` on an unchanged progress signature.
+  **Engine fix that fell out of it:** the in-wait fidget serial is now mirrored into
+  `input_state.fidget_ser` (`controller._fidget_serial()`), closing the CLAUDE.md caveat that
+  routine-side `human_delay` had never once fidgeted -- every routine gains that, not just this one.
+- Tests (`tests/test_mastering_mixology.py`) drive a REAL `EventStream` through a scripted
+  `controller.poll_udp`, so `await_outcome`'s own mark/since/rejected-seq semantics are what is
+  exercised. Lesson from writing them: **feed each event from the click that causes it** -- a
+  script that queues a later click's verdict up front delivers it during the earlier click's wait,
+  which cannot happen live, and the "failure" it produced was the test's.
 
 ## Current state of routines/mining.py
 
@@ -1814,8 +1964,10 @@ recording. Note this does *not* cover a bank PIN typed while already logged in.
 clickable screen position for **any** interface element by group/child id. Before it, the only
 reachable interface elements were the handful `BankProvider` hard-codes — and `/equipment` reports
 what is *worn* but carries **no screen position**, so a routine physically could not click a worn
-item. That blocked `routines/falconry.py`, which must un-wield a Dramen staff after a fairy-ring
-hop because the falconry glove needs the same weapon slot.
+item. That blocked `routines/falconry.py`, which at the time had to un-wield a Dramen staff after
+a fairy-ring hop because the falconry glove needs the same weapon slot (the staff requirement is
+gone from the game and from the code since 2026-09-06; worn-item clicks through this endpoint are
+now what `karambwan_fishing.py` uses for its two worn teleports).
 
 The intended workflow is: **record yourself doing the thing, read the decoded `group.child` out of
 `recorder.py`'s log, address it here.** That is why this is generic rather than more named buttons.
@@ -1853,10 +2005,21 @@ Signals it keys off, all established from the recording rather than assumed:
 The bank trip dispatches on **current region**, not a stored step counter — `ctx.state.data` is
 wiped on restart while the character's position is not, so a counter desyncs exactly mid-trip.
 
-**Loadout requirement (a deliberate deviation from the recording):** ring of dueling, Ardougne
-cloak and Dramen staff must be in the **inventory**, not worn. The human used the worn-equipment
-interface; this uses `click_menu_action` (right-click → read `/menu` → pick by name), the pattern
-already proven live here, which needs a screen position that `/equipment` does not provide.
+**Loadout requirement (a deliberate deviation from the recording):** ring of dueling and Ardougne
+cloak must be in the **inventory**, not worn. The human used the worn-equipment interface; this
+clicks the inventory item, which needs a screen position that `/equipment` does not provide.
+**No Dramen staff any more (USER 2026-09-06: "dramen staff isnt needed to take fairy rings
+anymore")** -- the wield/unwield legs, `_has_return_loadout`'s staff check and golem_crafting's
+`KIT_ITEMS` entry are all gone. **Inventory teleports are a LEFT-click (USER 2026-09-06: "for
+inventory teleports ive changed them so we just click the item and we teleport to the right
+spot")**: `_use_teleport` left-clicks with `expected_action=<option>` so `/hover` proves the
+account's menu-entry swap is in place on THAT item, and only a withheld click falls back to the
+right-click menu; golem_crafting's `_teleport_home` (slayer ring) does the same and then answers
+the destination dialogue if one opens. **2026-09-06 event-driven rewrite (not run live):** the
+throw/retrieve/hire primitives await the falcon varbit 14192 and INVENTORY_CHANGED through
+`outcome_waits`, `hunt_step`/`hands_free`/`_ensure_hands_free`/`_use_teleport(expect_region=)`
+are exported for golem_crafting's fur trip (see that section), and the teleport landing is
+confirmed on `/player.regionId` after PLAYER_STOPPED instead of a 3s sleep.
 
 ## Building a routine with a subagent-driven plan (the Gauntlet, 2026-09-05)
 
@@ -1932,6 +2095,33 @@ process is DPI-aware (already handled by `mcp_debug_server.py`/`controller.py` a
 
 ## Current state of routines/golem_crafting.py
 
+**2026-09-06 event-driven pass + falconry fur trip (spec `docs/superpowers/specs/2026-09-06-golem-
+crafting-events-and-falconry-design.md`, plan `docs/superpowers/plans/2026-09-06-golem-crafting-
+events-and-falconry.md`; NOT yet run live).** Every measured wait below (side ~11.8s, first
+progress bump +2.1s, chisel cadence, bank confirms) is kept as the BUDGET but is now awaited on
+the pushed signal: `VARBIT_SUBSCRIPTIONS` covers the golem varbits 15728-15746 and the falcon's
+14192, `_await_side_done`/`_await_golem_complete`/`_await_click_echo` take `ctx`+`since` and
+return on VARBIT_CHANGED/MENU_CLICKED confirmed by `/golem`, chisel clicks chain inside one tick
+(`CHISEL_CHAIN_MAX_S`), `tick` chains phases (`TICK_CHAIN_FROM`/`TICK_CHAIN_MAX`, `break_due`
+checked between them -- pass it the breaks config, it takes one) and `_stuck_watch`
+(`STALL_WARN_S`/`STALL_STOP_S`) keys on `_progress_signature`. The shared helpers live in
+`ControllerAddon/outcome_waits.py` (`await_pre`, `await_long` with fidgets, `tick_pause`,
+`varbit_in`, `chat_has`, `walk_budget`), lifted from mastering_mixology.
+**The Goat Pit is gone; fur comes from falconry.** `hunt_phase` and every goat/Telekinetic-Grab
+helper were deleted; `_run_bank_trip` routes to `fur_trip_phase` when the bank holds no usable
+fur (skipping the fur search entirely when the pouch is stocked). The trip is dispatched on LIVE
+position (`trip_leg`), user decisions: kit (`KIT_ITEMS` = Ardougne cloak, plus the configured
+return teleport, default slayer ring; coins up to `furTrip.hireCoins`) withdrawn at the open bank
+and deposited on return; out via the cloak to the monastery then the fairy ring's
+Last-destination (AKQ) and falconry.py's own legs; hunt with `falconry.hunt_step` until the fur
+pouch reads full (28); home via the slayer ring's Wyrmscraig entry, which lands in the
+**cavern** (y = surface + 6400, `CAVERN_MIN_Y`), so `_leave_cavern` clicks loc 62220 "Cave"/Exit
+-- its tile is unknown offline, recorded into `gc_cavern_exit` on first sight, and
+`CAVERN_SCAN_LIMIT` bounds the search. `get_config` forces `safety.stopOnInventoryFull` off.
+First live session worklist: the cavern exit tile, the slayer ring's dialogue option text, the
+fur pouch "(open)" name, and whether `Last-destination (AKQ)` is what the ring offers on this
+account. Everything below this paragraph predates the rewrite and is kept for its measurements.
+
 As of the last session, this routine was extensively live-debugged and left in a working state:
 mines Sunstone rocks to a budget, chisels cores, crafts golems on either of Wyrmscraig's two
 plinths (tracked by object id, not position — see that file's own comments for why), inserts
@@ -2004,7 +2194,8 @@ it by reasoning:
   the first hijack after each success rather than one per side. The fix is to key the counter by
   side, or clear it when the planned side changes — deliberately not done unsupervised, since the
   budget cap is the thing standing between this and the 20-click spin it replaced.
-- **A Goat Pit fur run legitimately stops golem production for ~15 minutes.** MEASURED
+- **HISTORICAL (goat machinery deleted 2026-09-06, see the top of this section): a Goat Pit fur
+  run legitimately stopped golem production for ~15 minutes.** MEASURED
   2026-08-23 22:23-22:38: bank fur exhausted -> `hunt_phase` -> 166 Telekinetic Grab casts before
   "pit is now filled with goats -- harvesting", then a 46-tile Shortest Path walk back to the
   mine. Nothing is wrong during that window and the routine recovers on its own. Worth knowing
@@ -2071,6 +2262,66 @@ it by reasoning:
   plinth's `insertSide` as `north` (core consumed 0.3s after the click, too fast to have walked).
   Either the insert side is not a standing requirement or `insertSide` means something else. Not
   resolved.
+
+## Current state of routines/karambwan_fishing.py
+
+Written 2026-09-06 from the user's recording of ONE full loop
+(`recordings/2026-09-06_083723_karamwan-fishing.*`, 3m56s, 19 actions) -- read its narrative
+before changing a budget here; every id, option text and landing time in the module header is
+from it. **Not yet run live.** USER's loop, verbatim: "click fishspot -> wait for full inventory
+-> load up fishing barrel -> click fishingspot wait until full again -> go into equiped item and
+right click karamja gloves -> use the gem mine teleport -> deposit all fish and empty barrel ->
+right click equiped quest point cape -> teleport -> take fairy ring DKP -> click fishspot".
+- **Phases are derived from live state every tick (`derive_phase`, pure, table-tested)**:
+  underground (y >= 9000) is the gem mine -> `bank` until no fish and the barrel was emptied this
+  trip, then `cape`; region 10804 is the Legends' Guild -> `ring`; region 11568 is DKP -> `fish`
+  or `to_bank`; anything else safety-stops as lost. Nothing load-bearing lives in
+  `ctx.state.data` beyond `kf_trip_emptied`.
+- **There is no Fill leg -- the barrel stores every catch on its own** (USER 2026-09-06, after
+  the recording: "we no longer have to fill the barrel it will automaticly pick up all the fish
+  so when we have full inventory we go to deposit as per usual"). So a full inventory means the
+  barrel filled up first, and the trip banks straight away; the recording's Fill click and its
+  mid-inventory top-up, `barrel_phase` and the `kf_barrel_count` running estimate are all gone.
+  The barrel is still **emptied at the deposit chest** -- that is where its fish are banked --
+  and `barrel_room()` survives only as the secondary confirm that the Empty-to-bank landed.
+- **Full inventory = the game's own "You can't carry any more Karambwan." chat line** or 0 free
+  slots on INVENTORY_CHANGED; `fish_wait` holds the tick between catches in human-length still
+  segments with a fidget, dismisses a level-up dialogue itself (the engine's stray-dialog check
+  cannot run while the tick is held), re-clicks the spot after `IDLE_RECLICK_S` of sustained
+  `/combat.isIdle`, and safety-stops after `IDLE_STOP_AFTER` re-clicks that caught nothing.
+- **Worn teleports go through the equipment interface** (`controller.open_equipment_tab`, new,
+  confirmed on widget 387.1; `EQUIPMENT_TAB_KEY` "e" is this account's bind) and the right-click
+  menu: gloves 387.22 "Gem Mine" (landed +3.2s), cape 387.16 "Teleport" (landed +2.4s), each
+  awaited on PLAYER_STOPPED + the destination region/plane. A worn item's LEFT-click is Remove,
+  so these are the one place the "inventory teleports are a left-click" rule does not apply.
+- **Deposit chest** loc 10530 at (2842,9382), 6 tiles from the landing: interface 192, the fish
+  are one right-click **"Deposit-All"** on the karambwan in grid 192.24 (-24 fish +0.3s), the
+  barrel one **"Empty-to-bank"** on it ("You empty the barrel." +0.2s), ESC closes (192.1 is the
+  recorded Close button, the fallback). Item names come from `/widget/children`'s `itemName`.
+- **Fairy ring**: matched by name, "Last-destination (DKP)" clicked from up to 16 tiles (the
+  human clicked from 12 and let the game walk; LOADING +6.5s); when that entry is missing,
+  `_dial_dkp` Configures and turns the three dials on varbits 3985/3986/3987 to (1, 2, 0) =
+  D-K-P via interface 398 children 19-24, learning which arrow increments from the first click
+  that changes a value, then confirms on 398.26. The dial fallback is reasoned from the cache,
+  not recorded.
+- Wired into `ROUTINE_FILES` and `RoutineChoice` (`KARAMBWAN_FISHING`) -- client rebuild
+  needed before it appears in the panel. The human also fired a harpoon special attack (widget
+  160.36) once; not implemented.
+- **First live run 2026-09-06 (kf_live1, ~5 min, one full loop + a second trip, stopped by F1):
+  the loop WORKS end to end.** MEASURED: fish to full 110s (24 fish), Fill 0.4s, the 4-fish
+  top-up then 28s more fishing, gloves click -> deposit phase 4.6s, deposit-all + empty + close
+  3.4s (6.3s when the chest still had to be walked to), ring click -> DKP 8s. Three fixes came
+  out of it: (1) `controller.get_widget_children` returns a LIST -- the first cut read a dict and
+  crashed on the first deposit; (2) **a teleport's landing signals (busy varbit 12393 -> 0, the
+  animation ending) fire on the same tick the LOADING screen starts, when the bridge answers
+  nothing** -- the one HTTP confirm they trigger fails and `await_outcome` then sleeps to its full
+  budget (5.4s lost on every cape teleport), so `_await_landing` chunks the wait at one game tick
+  and re-reads `/player` at each chunk start; this applies to EVERY teleport wait in the codebase
+  that confirms on `/player` -- `[!] bridge unreachable: GET /player` right after a teleport click
+  is the tell; (3) the first barrel Fill was withheld (hover saw nothing under the cursor) and its
+  menu fallback found no menu either -- the blind inventory-tab tap after a teleport can be eaten
+  by LOADING, so `_ensure_inventory_tab` confirms on `/widget/active-tab` (3 = inventory) and a
+  withheld Fill re-asserts the tab and left-clicks once more before the menu.
 
 ## Current state of routines/chinchompa_hunting.py
 

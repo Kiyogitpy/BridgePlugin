@@ -1655,3 +1655,18 @@ def test_get_collision_grid_returns_body_or_none(monkeypatch):
     assert "plane" not in seen["params"]
     controller.get_collision_grid(3)
     assert seen["params"]["plane"] == 3
+
+
+def test_fidget_serial_is_shared_across_module_copies(monkeypatch):
+    """controller.py is loaded twice (see input_state's docstring); main() registers the fidget
+    serial on __main__'s copy, so a routine-side human_delay must find it through input_state,
+    not this module's own _fidget_ser -- otherwise routine waits never fidget (2026-09-06)."""
+    import input_state
+    token = object()
+    monkeypatch.setattr(controller, "_fidget_ser", None)
+    monkeypatch.setattr(input_state, "fidget_ser", None)
+    assert controller._fidget_serial() is None
+    controller.register_fidget_serial(token)
+    monkeypatch.setattr(controller, "_fidget_ser", None)     # the OTHER copy never saw main()
+    assert controller._fidget_serial() is token
+    assert input_state.fidget_ser is token

@@ -25,11 +25,9 @@ def _no_live_last_action(monkeypatch):
                         lambda: {"tick": 1, "option": "Walk here", "target": "", "id": 0})
     # Same reasoning: the menu-escalation route would otherwise right-click through a real bridge.
     monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: False)
-    # And the same again for the inventory. _shed_pit_junk runs at the top of BOTH mine_phase and
-    # craft_phase and reads the inventory to decide whether to drop leftover pit spikes -- so
-    # every craft test that never needed get_inventory suddenly reached the live client through
-    # it, and blew up on key_tap once the real character happened to be carrying spikes
-    # (2026-08-24). Tests that care about inventory contents override this.
+    # And the same again for the inventory: several phases read it, and a test that never needed
+    # get_inventory would otherwise reach the live client through it (2026-08-24). Tests that
+    # care about inventory contents override this.
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
 
 
@@ -888,24 +886,6 @@ def test_gem_pickup_menu_click_passes_refresh_target(monkeypatch):
     monkeypatch.setattr(controller, "click_menu_action", _fake_click_menu_action)
 
     gc._collect_golem_gift(_ctx(), station, "Uncut sapphire")
-    assert seen.get("refresh_target") is not None
-
-
-def test_spikes_supply_menu_click_passes_refresh_target(monkeypatch):
-    """_ensure_wooden_spikes's Take-5 click should re-resolve the supply's live screen
-    position."""
-    supply = {"x": 100, "y": 200, "plane": 0, "id": 42, "name": "Spikes supply"}
-    monkeypatch.setattr(gc, "find_item", lambda name: None if name == gc.WOODEN_SPIKES_NAME
-                         else {"name": name})
-    monkeypatch.setattr(gc, "find_object", lambda name: supply)
-    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
-    seen = {}
-    def _fake_click_menu_action(ser, entity, option, **kw):
-        seen.update(kw)
-        return True
-    monkeypatch.setattr(controller, "click_menu_action", _fake_click_menu_action)
-
-    gc._ensure_wooden_spikes(_ctx(), gc.DEFAULT_CONFIG)
     assert seen.get("refresh_target") is not None
 
 
@@ -1978,77 +1958,6 @@ def test_a_hijacked_insert_core_click_escalates_the_same_way_a_carve_does(monkey
         "a second consecutive hijacked Insert-core must escalate to the right-click menu"
 
 
-def test_mine_phase_drops_pit_spikes_it_is_still_carrying(monkeypatch):
-    """Wooden spikes are pit-only -- _ensure_wooden_spikes takes them from the supply AT the pit,
-    and nothing outside hunt_phase ever uses them. Carrying leftovers into mining costs slots the
-    20-sunstone batch needs.
-
-    OBSERVED live 2026-08-24 02:27: 4 undropped spikes left the inventory at 28/28, so mine_phase
-    hit its `len(inventory) >= INVENTORY_SIZE` cap at 15 sunstone instead of the 20 budget. The
-    hunt-exit drop pass is the primary cleanup (see _drop_all); this is the backstop for whatever
-    survived it, since that pass is a one-shot and the routine may not hunt again for an hour."""
-    inv = [{"name": "Wooden spikes", "screenX": 1, "screenY": 1},
-           {"name": "Sunstone", "screenX": 2, "screenY": 2}]
-    dropped = []
-
-    def fake_click(ser, item, **kw):
-        dropped.append(item)
-        if item in inv:
-            inv.remove(item)
-        return True
-
-    monkeypatch.setattr(controller, "get_inventory", lambda: list(inv))
-    monkeypatch.setattr(controller, "click_entity", fake_click)
-    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
-    monkeypatch.setattr(controller, "key_tap", lambda *a, **k: None)
-    monkeypatch.setattr(gc, "find_mining_target", lambda committed_pos=None: None)
-    monkeypatch.setattr(gc, "handle_missing_target", lambda *a, **k: True)
-
-    ctx = _ctx()
-    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
-
-    assert any((d.get("name") or "") == "Wooden spikes" for d in dropped), \
-        "leftover pit spikes must be dropped before mining"
-    assert not [i for i in inv if i["name"] == "Wooden spikes"]
-    assert any(i["name"] == "Sunstone" for i in inv), "must never drop the ore"
-
-
-def test_craft_phase_also_sheds_leftover_pit_spikes(monkeypatch):
-    """The mine_phase cleanup is not enough on its own: craft_phase is reachable WITHOUT passing
-    through mine_phase at all (has_start_materials only needs 4 raw + 1 core, which a part-used
-    batch already satisfies), so leftovers ride straight into crafting.
-
-    OBSERVED live 2026-08-24 02:30-02:34: restarted, banked, went straight to craft with 15
-    sunstone + 4 cores + 4 leftover spikes = 28/28, and every Start-golem attempt failed with a
-    menu offering no golem option at all -- plinth correctly rendered and correctly aimed at
-    (verified by a frame dump), materials present, no other player nearby. A full inventory is the
-    one condition distinguishing those attempts from the successful ones. NOTE: hypothesis under
-    test, not a confirmed cause -- shedding pit-only junk before crafting is justified on
-    inventory-budget grounds either way."""
-    inv = [{"name": "Wooden spikes", "screenX": 1, "screenY": 1},
-           {"name": "Sunstone core", "screenX": 2, "screenY": 2}]
-    dropped = []
-
-    def fake_click(ser, item, **kw):
-        dropped.append(item)
-        if item in inv:
-            inv.remove(item)
-        return True
-
-    monkeypatch.setattr(controller, "get_inventory", lambda: list(inv))
-    monkeypatch.setattr(controller, "click_entity", fake_click)
-    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
-    monkeypatch.setattr(controller, "key_tap", lambda *a, **k: None)
-    monkeypatch.setattr(controller, "get_golem", lambda: None)   # bail right after the cleanup
-
-    ctx = _ctx()
-    gc.craft_phase(ctx, gc.DEFAULT_CONFIG)
-
-    assert any((d.get("name") or "") == "Wooden spikes" for d in dropped), \
-        "pit spikes must be shed before crafting too"
-    assert any(i["name"] == "Sunstone core" for i in inv), "must never drop crafting materials"
-
-
 # --- a plinth that won't start is backed off from, not fatal (2026-08-24) --------------
 #
 # SEVEN hypotheses were killed by measurement for the "starting golem ... never registered" halts
@@ -2237,37 +2146,6 @@ def test_a_start_refusal_with_materials_in_hand_is_treated_as_out_of_fur(monkeyp
         "the stale local fur estimate must be corrected, or bank_phase will think it is stocked"
 
 
-def test_hunt_stops_promptly_and_precisely_when_the_spellbook_will_not_open(monkeypatch):
-    """LIVE HALT 2026-08-24 04:38: 60 Grab casts over ~7 minutes, then the generic "Grab may not
-    be resolving as expected". The real state was unambiguous and available the whole time --
-    /spellbook reported visible:false and the inventory tab was open, i.e. the Magic tab never
-    opened, so every "cast" clicked a spell icon that was not on screen.
-
-    cast_telekinetic_grab ALREADY returns False for exactly this ("spellbook not open/wrong
-    spellbook active"); hunt_phase simply discarded the return value. Checking it turns seven
-    minutes of futile casting plus a misleading diagnosis into an immediate, accurate one."""
-    monkeypatch.setattr(controller, "cast_telekinetic_grab", lambda ser, target: False)
-    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
-
-    ctx = _ctx()
-    for _ in range(gc.SPELL_FAILURE_LIMIT + 1):
-        if ctx.state.safety_stopped:
-            break
-        gc._note_cast_failed(ctx)
-
-    assert ctx.state.safety_stopped, "an unopenable spellbook must stop quickly, not burn 60 casts"
-    assert "spellbook" in (ctx.state.safety_reason or "").lower(), \
-        f"the reason must name the real cause, got: {ctx.state.safety_reason!r}"
-
-
-def test_a_single_failed_cast_does_not_stop_the_hunt():
-    """One False can be a transient miss or a tab still animating -- only a run of them means the
-    spellbook is genuinely unreachable."""
-    ctx = _ctx()
-    gc._note_cast_failed(ctx)
-    assert not ctx.state.safety_stopped
-
-
 def test_menu_escalation_plinth_click_passes_refresh_target(monkeypatch):
     """The use_menu=True escalation right-clicks the plinth via click_menu_action -- now that
     click_menu_action can re-aim mid-flight (2026-08-27), the escalation should hand it a
@@ -2292,10 +2170,640 @@ def test_menu_escalation_plinth_click_passes_refresh_target(monkeypatch):
         "menu escalation must re-resolve the plinth's live screen position"
 
 
-def test_a_landed_cast_clears_the_failure_streak():
+# --- Event-driven outcomes (2026-09-06, docs/superpowers/specs/2026-09-06-golem-crafting-events-
+# and-falconry-design.md). A REAL bridge_events.EventStream fed by a scripted controller.poll_udp,
+# so await_outcome's mark/since semantics are what is exercised. The fake clock patches the
+# `time` module's time/sleep, which gc and outcome_waits both read at call time.
+
+import bridge_events
+
+
+class _EvCtx:
+    def __init__(self, events):
+        self.events = events
+        self.ser = object()
+        self.state = None
+
+
+def _event_stream(monkeypatch, batches):
+    """batches: list of lists of (type, payload, then) -- one batch per poll_udp call."""
+    queue = list(batches)
+
+    def poll_udp(_sock):
+        if not queue:
+            return []
+        out = []
+        for ev in queue.pop(0):
+            if len(ev) > 2 and ev[2] is not None:
+                ev[2]()
+            out.append((ev[0], ev[1]))
+        return out
+    monkeypatch.setattr(controller, "poll_udp", poll_udp)
+    monkeypatch.setattr(controller, "sample_human_delay", lambda a, b: 0.0)
+    monkeypatch.setattr(controller, "fidget_once", lambda: None)
+    return _EvCtx(bridge_events.EventStream(sock=None))
+
+
+def _fake_clock(monkeypatch):
+    state = {"t": 5000.0}
+    monkeypatch.setattr(gc.time, "time", lambda: state["t"])
+    monkeypatch.setattr(gc.time, "sleep", lambda s: state.__setitem__("t", state["t"] + s))
+    return state
+
+
+def test_varbit_subscriptions_cover_both_plinths_and_the_falcon():
+    subs = set(gc.VARBIT_SUBSCRIPTIONS)
+    for vid in range(15728, 15747):
+        assert vid in subs
+    assert 14192 in subs
+    assert gc.VB_SIDE_STATE["south"]["west"] == 15737
+    assert gc.VB_SIDE_PROGRESS["north"]["east"] == 15740
+
+
+def test_await_side_done_reads_golem_the_instant_the_side_varbit_lands(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    done = {"v": False}
+    reads = []
+
+    def get_golem():
+        reads.append(clock["t"])
+        return {"stations": [_station("north", done=("east",) if done["v"] else ())]}
+    monkeypatch.setattr(controller, "get_golem", get_golem)
+    ctx = _event_stream(monkeypatch, [
+        [("VARBIT_CHANGED", {"varbitId": 15730, "value": 1, "tick": 3},
+          lambda: done.__setitem__("v", True))],
+    ])
+    start = clock["t"]
+
+    assert gc._await_side_done("north", "east", gc.GOLEM_SIDE_TIMEOUT_S, already_done=False,
+                               ctx=ctx) is True
+    # The event arrived on the first pump, so the confirming read happened without spending a
+    # whole GOLEM_CONFIRM_POLL_S first.
+    assert reads and reads[0] - start < gc.GOLEM_CONFIRM_POLL_S
+
+
+def test_await_side_done_without_events_still_polls_exactly_as_before(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    monkeypatch.setattr(controller, "get_golem",
+                        lambda: {"stations": [_station("north", done=("east",))]})
+    start = clock["t"]
+    assert gc._await_side_done("north", "east", gc.GOLEM_SIDE_TIMEOUT_S, already_done=False) is True
+    assert abs((clock["t"] - start) - gc.GOLEM_CONFIRM_POLL_S) < 1e-9
+
+
+def test_await_click_echo_takes_the_menu_clicked_verdict(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    monkeypatch.setattr(gc, "GOLEM_CLICK_ECHO_TIMEOUT_S", 1.5)
+    before = {"tick": 1, "option": "Walk here", "target": "", "id": 0}
+    after = {"tick": 1, "option": "Walk here", "target": "", "id": 0}
+    monkeypatch.setattr(controller, "get_last_action", lambda: dict(after))
+    ctx = _event_stream(monkeypatch, [
+        [("MENU_CLICKED", {"option": "Shape-golem", "target": "Unfinished golem", "id": 62351, "tick": 7},
+          lambda: after.update({"tick": 7, "option": "Shape-golem", "id": 62351}))],
+    ])
+    start = clock["t"]
+
+    assert gc._await_click_echo(before, 62351, ctx=ctx) is False       # provably RIGHT
+    assert clock["t"] - start < gc.GOLEM_CLICK_ECHO_POLL_S
+
+
+def test_await_click_echo_still_returns_none_at_the_budget_with_events(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    monkeypatch.setattr(gc, "GOLEM_CLICK_ECHO_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(controller, "get_last_action",
+                        lambda: {"tick": 1, "option": "Walk here", "target": "", "id": 0})
+    ctx = _event_stream(monkeypatch, [])
+    assert gc._await_click_echo({"tick": 1, "option": "Walk here", "target": "", "id": 0}, 62351,
+                                ctx=ctx) is None
+    assert clock["t"] >= 5001.0
+
+
+def test_await_golem_complete_reads_on_the_count_varbit(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    total = {"v": 5}
+    monkeypatch.setattr(controller, "get_golem",
+                        lambda: {"totalCrafted": total["v"], "stations": [_station("north", progress=4)]})
+    ctx = _event_stream(monkeypatch, [
+        [("VARBIT_CHANGED", {"varbitId": 15738, "value": 6, "tick": 9},
+          lambda: total.__setitem__("v", 6))],
+    ])
+    start = clock["t"]
+    assert gc._await_golem_complete("north", 6.0, before_total_crafted=5, before_progress=4,
+                                    ctx=ctx) is True
+    assert clock["t"] - start < gc.GOLEM_CONFIRM_POLL_S
+
+
+# --- Task 3: chisel chain, bank confirm, player-stopped await ------------------------------
+
+def _chisel_world(monkeypatch, raw=20, pause_after=None):
+    """Inventory of raw sunstone plus a chisel; a click on the raw sunstone converts one into a
+    core (the game does it on the next tick; the INVENTORY_CHANGED confirm is what the routine
+    waits for, and here the conversion is visible on the very next read)."""
+    inventory = [{"name": "Sunstone", "screenX": 10, "screenY": 10} for _ in range(raw)]
+    inventory.append({"name": "Chisel", "screenX": 50, "screenY": 50})
+    clicks = []
     ctx = _ctx()
-    for _ in range(gc.SPELL_FAILURE_LIMIT - 1):
-        gc._note_cast_failed(ctx)
-    gc._note_cast_landed(ctx)
-    gc._note_cast_failed(ctx)
-    assert not ctx.state.safety_stopped, "a successful cast must reset the streak"
+
+    def click_entity(ser, entity, **kw):
+        clicks.append(entity.get("name"))
+        if entity.get("name") == "Sunstone":
+            idx = next(i for i, it in enumerate(inventory) if it.get("name") == "Sunstone")
+            inventory[idx] = {"name": "Sunstone core", "screenX": 10, "screenY": 10}
+            cores = sum(1 for it in inventory if it.get("name") == "Sunstone core")
+            if pause_after is not None and cores >= pause_after:
+                ctx.state.paused = True
+        return True
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inventory))
+    monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": True})
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "sample_human_delay", lambda a, b: 0.0)
+    monkeypatch.setattr(controller, "click_entity", click_entity)
+    return ctx, inventory, clicks
+
+
+def test_chisel_phase_chisels_the_whole_batch_in_one_call(monkeypatch):
+    _fake_clock(monkeypatch)
+    ctx, inventory, clicks = _chisel_world(monkeypatch)
+    gc.chisel_phase(ctx, gc.DEFAULT_CONFIG)
+    assert sum(1 for it in inventory if it.get("name") == "Sunstone core") == gc.CORES_PER_TRIP
+    assert clicks.count("Sunstone") == gc.CORES_PER_TRIP
+    assert ctx.state.data["gc_phase"] == "craft"
+
+
+def test_chisel_phase_stops_chaining_when_paused(monkeypatch):
+    _fake_clock(monkeypatch)
+    ctx, inventory, clicks = _chisel_world(monkeypatch, pause_after=1)
+    gc.chisel_phase(ctx, gc.DEFAULT_CONFIG)
+    assert clicks.count("Sunstone") == 1
+    assert ctx.state.data.get("gc_phase") != "craft"
+
+
+def test_chisel_phase_retries_next_tick_when_a_core_does_not_appear(monkeypatch):
+    _fake_clock(monkeypatch)
+    ctx, inventory, clicks = _chisel_world(monkeypatch)
+    # A misclick: the raw click lands but converts nothing.
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicks.append(entity.get("name")) or True)
+    gc.chisel_phase(ctx, gc.DEFAULT_CONFIG)
+    assert clicks.count("Sunstone") == 1
+    assert ctx.state.data.get("gc_phase") != "craft"
+
+
+def test_bank_trip_confirms_the_fur_withdrawal_on_the_inventory_event(monkeypatch):
+    _fake_clock(monkeypatch)
+    inventory = []
+    fur_slot = {"name": "Dashing kebbit fur", "qty": 17, "screenX": 300, "screenY": 300}
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inventory))
+    monkeypatch.setattr(controller, "get_bank", lambda **kw: {"items": [fur_slot]})
+    import banker
+    monkeypatch.setattr(banker, "deposit_inventory", lambda ctx, cfg: None)
+    monkeypatch.setattr(banker, "search_bank", lambda ctx, q: True)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda ctx, mode: True)
+    monkeypatch.setattr(controller, "sample_human_delay", lambda a, b: 0.0)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+
+    def click_entity(ser, entity, **kw):
+        inventory.append({"name": "Dashing kebbit fur", "qty": 17})
+        return True
+    monkeypatch.setattr(controller, "click_entity", click_entity)
+
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+
+    assert ctx.state.data["gc_fur_stock"] == 17
+    assert ctx.state.data["gc_phase"] == "mine"
+
+
+def test_await_player_stopped_uses_the_pushed_event_when_the_client_reports_moving(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    moving = {"v": True}
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1, "y": 1, "moving": moving["v"]})
+    monkeypatch.setattr(controller, "wait_until_player_idle",
+                        lambda **kw: (_ for _ in ()).throw(AssertionError("polled instead of awaiting")))
+    ctx = _event_stream(monkeypatch, [
+        [("PLAYER_STOPPED", {"tick": 4}, lambda: moving.__setitem__("v", False))],
+    ])
+    assert gc._await_player_stopped(ctx, 2.0) is True
+    assert clock["t"] - 5000.0 < 0.5
+
+
+def test_await_player_stopped_falls_back_to_the_stillness_poll_on_an_old_client(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1, "y": 1})   # no `moving`
+    calls = []
+    monkeypatch.setattr(controller, "wait_until_player_idle",
+                        lambda **kw: calls.append(kw) or True)
+    ctx = _event_stream(monkeypatch, [])
+    assert gc._await_player_stopped(ctx, 2.0) is True
+    assert calls and calls[0]["timeout_s"] == 2.0
+
+
+# --- Task 4: stall watch and phase chaining ------------------------------------------------
+
+def _quiet_world(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Chisel"}])
+    monkeypatch.setattr(controller, "get_golem",
+                        lambda: {"totalCrafted": 5, "inArea": True, "stations": [_station("north")]})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2595, "y": 2253, "regionId": 10275})
+
+
+def test_stuck_watch_stops_a_run_with_no_progress(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    _quiet_world(monkeypatch)
+    ctx = _ctx()
+    ctx.state.data["gc_phase"] = "craft"
+    gc._stuck_watch(ctx)
+    clock["t"] += gc.STALL_STOP_S + 1
+    gc._stuck_watch(ctx)
+    assert ctx.state.safety_stopped
+    assert "no progress" in (ctx.state.safety_reason or ctx.state.stop_reason or "no progress")
+
+
+def test_stuck_watch_counts_a_golem_progress_change_as_progress(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    _quiet_world(monkeypatch)
+    ctx = _ctx()
+    ctx.state.data["gc_phase"] = "craft"
+    gc._stuck_watch(ctx)
+    clock["t"] += gc.STALL_STOP_S - 1
+    monkeypatch.setattr(controller, "get_golem",
+                        lambda: {"totalCrafted": 5, "inArea": True,
+                                 "stations": [_station("north", progress=2)]})
+    gc._stuck_watch(ctx)
+    clock["t"] += gc.STALL_STOP_S - 1
+    gc._stuck_watch(ctx)
+    assert not ctx.state.safety_stopped
+
+
+def test_stuck_watch_counts_walking_as_progress(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    _quiet_world(monkeypatch)
+    ctx = _ctx()
+    ctx.state.data["gc_phase"] = "fur_trip"
+    gc._stuck_watch(ctx)
+    clock["t"] += gc.STALL_STOP_S - 1
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2600, "y": 2253, "regionId": 10275})
+    gc._stuck_watch(ctx)
+    clock["t"] += gc.STALL_STOP_S - 1
+    gc._stuck_watch(ctx)
+    assert not ctx.state.safety_stopped
+
+
+def _tick_world(monkeypatch, handlers):
+    _quiet_world(monkeypatch)
+    monkeypatch.setattr(gc, "PHASES", handlers)
+    monkeypatch.setattr(gc, "_stuck_watch", lambda ctx: None)
+    ctx = _ctx()
+    ctx.state.config = gc.DEFAULT_CONFIG
+    ctx.state.data["gc_level_checked"] = True
+    return ctx
+
+
+def test_tick_chains_chisel_into_craft(monkeypatch):
+    calls = []
+
+    def chisel(c, cfg):
+        calls.append("chisel")
+        c.state.data["gc_phase"] = "craft"
+
+    def craft(c, cfg):
+        calls.append("craft")
+    ctx = _tick_world(monkeypatch, {"chisel": chisel, "craft": craft})
+    ctx.state.data["gc_phase"] = "chisel"
+    gc.tick(ctx)
+    assert calls == ["chisel", "craft"]
+
+
+def test_tick_chains_bank_into_its_successor(monkeypatch):
+    calls = []
+
+    def bank(c, cfg):
+        calls.append("bank")
+        c.state.data["gc_phase"] = "mine"
+
+    def mine(c, cfg):
+        calls.append("mine")
+    ctx = _tick_world(monkeypatch, {"bank": bank, "mine": mine})
+    ctx.state.data["gc_phase"] = "bank"
+    gc.tick(ctx)
+    assert calls == ["bank", "mine"]
+
+
+def test_tick_never_chains_out_of_mine(monkeypatch):
+    calls = []
+
+    def mine(c, cfg):
+        calls.append("mine")
+        c.state.data["gc_phase"] = "chisel"
+
+    def chisel(c, cfg):
+        calls.append("chisel")
+    ctx = _tick_world(monkeypatch, {"mine": mine, "chisel": chisel})
+    ctx.state.data["gc_phase"] = "mine"
+    gc.tick(ctx)
+    assert calls == ["mine"]
+
+
+def test_tick_chain_stops_when_paused(monkeypatch):
+    calls = []
+
+    def chisel(c, cfg):
+        calls.append("chisel")
+        c.state.data["gc_phase"] = "craft"
+        c.state.paused = True
+
+    def craft(c, cfg):
+        calls.append("craft")
+    ctx = _tick_world(monkeypatch, {"chisel": chisel, "craft": craft})
+    ctx.state.data["gc_phase"] = "chisel"
+    gc.tick(ctx)
+    assert calls == ["chisel"]
+
+
+# --- Task 6: the falconry fur trip (2026-09-06) ------------------------------------------
+
+import falconry
+
+
+def _player_at(region, x=0, y=0):
+    return {"regionId": region, "x": x, "y": y, "plane": 0}
+
+
+def test_trip_leg_dispatch_table():
+    fresh = {}
+    kitted = {"kit": True}
+    done = {"kit": True, "done": True}
+    W = 10275
+    assert gc.trip_leg(_player_at(W, 2587, 2260), fresh) == "kit"
+    assert gc.trip_leg(_player_at(W, 2587, 2260), kitted) == "depart"
+    assert gc.trip_leg(_player_at(W, 2587, 2260), done) == "home"
+    assert gc.trip_leg(_player_at(falconry.REGION_MONASTERY), kitted) == "fairy_ring"
+    assert gc.trip_leg(_player_at(falconry.REGION_FAIRY_RING), kitted) == "fairy_ring"
+    assert gc.trip_leg(_player_at(falconry.REGION_FAIRY_LANDING), kitted) == "walk_in"
+    assert gc.trip_leg(_player_at(falconry.REGION_FALCONRY, 2370, 3622), kitted) == "walk_in"
+    assert gc.trip_leg(_player_at(falconry.REGION_FALCONRY, 2388, 3590), kitted) == "hunt"
+    assert gc.trip_leg(_player_at(falconry.REGION_FALCONRY, 2388, 3590), done) == "return"
+    assert gc.trip_leg(_player_at(10374, 2590, 8615), done) == "cavern"
+    assert gc.trip_leg(_player_at(10374, 2590, 8615), fresh) == "cavern"   # restart underground
+    assert gc.trip_leg(_player_at(falconry.REGION_FALCONRY, 2388, 3590), fresh) == "hunt"  # restart mid-hunt
+    assert gc.trip_leg(_player_at(9776), kitted) == "unknown"
+
+
+def test_default_config_has_no_goat_pit_and_a_fur_trip_block():
+    assert "goatPit" not in gc.DEFAULT_CONFIG["locations"]
+    assert "spikesSupply" not in gc.DEFAULT_CONFIG["locations"]
+    assert gc.DEFAULT_CONFIG["locations"]["cavernExit"] is None
+    assert gc.DEFAULT_CONFIG["furTrip"]["returnTeleport"] == "slayer ring"
+    assert "fur_trip" in gc.PHASES and "hunt" not in gc.PHASES
+    assert not hasattr(gc, "hunt_phase")
+
+
+def test_get_config_forces_the_full_inventory_stop_off(monkeypatch):
+    monkeypatch.setattr(controller, "get_golem_crafting_config",
+                        lambda: {"enabled": True, "safety": {"stopOnInventoryFull": True}})
+    cfg = gc.get_config(None)
+    assert cfg["safety"]["stopOnInventoryFull"] is False
+    assert cfg["furTrip"]["hireCoins"] == 2000
+
+
+def test_withdraw_kit_stops_naming_a_missing_item(monkeypatch):
+    _fake_clock(monkeypatch)
+    import banker
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Ardougne cloak 4"}, {"name": "Coins", "qty": 5000}])
+    monkeypatch.setattr(banker, "search_and_withdraw", lambda ctx, name, qty, contains=False: False)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    assert gc._withdraw_kit(ctx, gc.DEFAULT_CONFIG) is False
+    assert ctx.state.safety_stopped
+    assert "slayer ring" in ctx.state.safety_reason
+
+
+def test_withdraw_kit_confirms_each_item_and_tops_up_coins(monkeypatch):
+    _fake_clock(monkeypatch)
+    import banker
+    inventory = [{"name": "Coins", "qty": 100}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inventory))
+
+    def search_and_withdraw(ctx, name, qty, contains=False):
+        inventory.append({"name": name.title(), "qty": 1})
+        return True
+    monkeypatch.setattr(banker, "search_and_withdraw", search_and_withdraw)
+    monkeypatch.setattr(banker, "search_bank", lambda ctx, q: True)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+    monkeypatch.setattr(controller, "get_bank", lambda **kw: {"items": [{"name": "Coins", "qty": 100000, "screenX": 1, "screenY": 1}]})
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, e, option, **kw: True)
+    typed = []
+
+    def type_digits(ser, text):
+        typed.append(text)
+        inventory[0] = {"name": "Coins", "qty": 100 + int(text)}
+    monkeypatch.setattr(controller, "type_digits_and_enter", type_digits)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+
+    assert gc._withdraw_kit(ctx, gc.DEFAULT_CONFIG) is True
+    names = {i["name"].lower() for i in inventory}
+    assert "ardougne cloak" in names and "slayer ring" in names
+    assert "dramen staff" not in names      # fairy rings need no staff (USER 2026-09-06)
+    assert typed == ["1900"]
+
+
+def test_hunt_done_on_spilled_fur_sets_a_full_pouch(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Dashing kebbit fur"}])
+    ctx = _ctx()
+    trip = {"started": 0.0, "catches": 3}
+    assert gc._hunt_done(ctx, gc.DEFAULT_CONFIG["furTrip"], trip) is True
+    assert ctx.state.data["gc_fur_stock"] == gc.FUR_POUCH_CAPACITY
+
+
+def test_hunt_done_on_the_time_cap_keeps_the_catch_count(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    ctx = _ctx()
+    trip = {"started": clock["t"] - 26 * 60, "catches": 9}
+    assert gc._hunt_done(ctx, gc.DEFAULT_CONFIG["furTrip"], trip) is True
+    assert ctx.state.data["gc_fur_stock"] == 9
+    trip = {"started": clock["t"] - 60, "catches": 2}
+    assert gc._hunt_done(ctx, gc.DEFAULT_CONFIG["furTrip"], trip) is False
+
+
+def test_teleport_home_picks_the_wyrmscraig_dialogue_option(monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Slayer ring (8)", "screenX": 1, "screenY": 1}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    # The left-click is withheld (hover says "Wear": no swap on this ring) -> menu fallback.
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: controller.CLICK_WITHHELD)
+    options_seen = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, e, option, **kw: options_seen.append(option) or option != "Wyrmscraig")
+    dialogue = {"options": ["Select an Option", "Stronghold Slayer Cave", "Slayer Tower",
+                            "Fremennik Slayer Dungeon", "Tarn's Lair", "Dark Beasts",
+                            "Wyrmscraig Cavern", "", ""]}
+    monkeypatch.setattr(controller, "get_api", lambda group, reader: dialogue)
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
+    player = {"regionId": 9528, "x": 2388, "y": 3590}
+    monkeypatch.setattr(controller, "get_player", lambda: dict(player))
+    ctx = _event_stream(monkeypatch, [
+        [("PLAYER_STOPPED", {"tick": 1}, lambda: player.update({"regionId": 10374, "x": 2590, "y": 8615}))],
+    ])
+    ctx.state = controller.ControllerState()
+
+    assert gc._teleport_home(ctx, gc.DEFAULT_CONFIG["furTrip"]) is True
+    assert keys == ["6"]
+    assert options_seen[-1] == ("Teleport", "Rub")
+
+
+def _menu_forbidden(*a, **kw):
+    raise AssertionError("the right-click menu must not be used here")
+
+
+def test_teleport_home_left_clicks_a_swapped_ring_and_answers_the_dialogue(monkeypatch):
+    """USER 2026-09-06: inventory teleports are a plain left-click now. The hover-verified
+    left-click opens the destination dialogue; no right-click menu is read at all."""
+    _fake_clock(monkeypatch)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Slayer ring (8)", "screenX": 1, "screenY": 1}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: clicks.append(kw.get("expected_action")) or True)
+    monkeypatch.setattr(controller, "click_menu_action", _menu_forbidden)
+    dialogue = {"options": ["Select an Option", "Stronghold Slayer Cave", "Wyrmscraig Cavern", ""]}
+    monkeypatch.setattr(controller, "get_api", lambda group, reader: dialogue)
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
+    player = {"regionId": 9528, "x": 2388, "y": 3590}
+    monkeypatch.setattr(controller, "get_player", lambda: dict(player))
+    ctx = _event_stream(monkeypatch, [
+        [("PLAYER_STOPPED", {"tick": 1}, lambda: player.update({"regionId": 10374, "x": 2590, "y": 8615}))],
+    ])
+    ctx.state = controller.ControllerState()
+
+    assert gc._teleport_home(ctx, gc.DEFAULT_CONFIG["furTrip"]) is True
+    assert keys == ["2"]
+    assert clicks and "Wyrmscraig" in clicks[0]
+
+
+def test_leave_cavern_clicks_the_exit_and_records_its_tile(monkeypatch):
+    _fake_clock(monkeypatch)
+    exit_obj = {"name": "Cave", "actions": ["Exit"], "id": 62220, "x": 2600, "y": 8640, "plane": 0,
+                "distance": 6, "screenX": 400, "screenY": 300}
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda radius=None, fresh=False, interactable=False: [exit_obj, {"name": "Cave", "actions": [], "id": 1}])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    player = {"regionId": 10374, "x": 2590, "y": 8615}
+    monkeypatch.setattr(controller, "get_player", lambda: dict(player))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    ctx = _event_stream(monkeypatch, [
+        [("PLAYER_STOPPED", {"tick": 1}, lambda: player.update({"regionId": 10275, "x": 2600, "y": 2240}))],
+    ])
+    ctx.state = controller.ControllerState()
+    trip = {}
+    assert gc._leave_cavern(ctx, gc.DEFAULT_CONFIG, trip) is True
+    assert ctx.state.data["gc_cavern_exit"] == {"x": 2600, "y": 8640, "plane": 0}
+
+
+def test_leave_cavern_walks_to_a_recorded_exit_when_none_is_visible(monkeypatch):
+    _fake_clock(monkeypatch)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [])
+    walks = []
+    import travel
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, **kw: walks.append(target) or True)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    ctx.state.data["gc_cavern_exit"] = {"x": 2600, "y": 8640, "plane": 0}
+    assert gc._leave_cavern(ctx, gc.DEFAULT_CONFIG, {}) is False
+    assert walks == [{"x": 2600, "y": 8640, "plane": 0}]
+
+
+def test_leave_cavern_gives_up_after_the_scan_limit(monkeypatch):
+    _fake_clock(monkeypatch)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [])
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    trip = {}
+    for _ in range(gc.CAVERN_SCAN_LIMIT):
+        gc._leave_cavern(ctx, gc.DEFAULT_CONFIG, trip)
+    assert ctx.state.safety_stopped
+
+
+def test_run_bank_trip_with_no_fur_kits_up_and_starts_the_trip(monkeypatch):
+    _fake_clock(monkeypatch)
+    import banker
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_bank", lambda **kw: {"items": []})
+    deposits = []
+    monkeypatch.setattr(banker, "deposit_inventory", lambda ctx, cfg: deposits.append(cfg))
+    monkeypatch.setattr(banker, "search_bank", lambda ctx, q: True)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+    monkeypatch.setattr(gc, "_withdraw_kit", lambda ctx, config: True)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+
+    assert ctx.state.data["gc_phase"] == "fur_trip"
+    assert ctx.state.data["gc_trip"]["kit"] is True
+    assert "sunstone" not in deposits[-1]["keepItems"]
+
+
+def test_run_bank_trip_skips_the_fur_search_when_the_pouch_is_stocked(monkeypatch):
+    _fake_clock(monkeypatch)
+    import banker
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(banker, "deposit_inventory", lambda ctx, cfg: None)
+    searched = []
+    monkeypatch.setattr(banker, "search_bank", lambda ctx, q: searched.append(q) or True)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    ctx.state.data["gc_fur_stock"] = gc.FUR_POUCH_CAPACITY
+
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+
+    assert searched == []
+    assert ctx.state.data["gc_phase"] == "mine"
+
+
+def test_bank_phase_underground_resumes_the_cavern_leg(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"regionId": 10374, "x": 2590, "y": 8615})
+    ctx = _ctx()
+    gc.bank_phase(ctx, gc.DEFAULT_CONFIG)
+    assert ctx.state.data["gc_phase"] == "fur_trip"
+    assert ctx.state.data["gc_trip"]["done"] is True
+
+
+def test_fur_trip_hunt_leg_counts_retrieves_and_ends_on_spill(monkeypatch):
+    _fake_clock(monkeypatch)
+    inventory = [{"name": "Large fur pouch (open)"}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inventory))
+    monkeypatch.setattr(controller, "get_player", lambda: {"regionId": falconry.REGION_FALCONRY, "x": 2388, "y": 3590})
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": "Falconer's glove"}, "shield": None, "gloves": None})
+    steps = iter(["retrieved", "missed", "retrieved"])
+    monkeypatch.setattr(falconry, "hunt_step", lambda ctx, cfg, drop_meat=False: next(steps))
+    ctx = _ctx()
+    ctx.state.data["gc_phase"] = "fur_trip"
+    ctx.state.data["gc_trip"] = {"kit": True, "done": False, "started": 5000.0, "catches": 0}
+    for _ in range(3):
+        gc.fur_trip_phase(ctx, gc.DEFAULT_CONFIG)
+    assert ctx.state.data["gc_trip"]["catches"] == 2
+    inventory.append({"name": "Dashing kebbit fur"})
+    gc.fur_trip_phase(ctx, gc.DEFAULT_CONFIG)
+    assert ctx.state.data["gc_trip"]["done"] is True
+    assert ctx.state.data["gc_fur_stock"] == gc.FUR_POUCH_CAPACITY
+
+
+def test_fur_trip_home_leg_hands_back_to_the_bank_when_one_is_near(monkeypatch):
+    import banker
+    monkeypatch.setattr(controller, "get_player", lambda: {"regionId": 10275, "x": 2587, "y": 2262})
+    monkeypatch.setattr(banker, "find_nearby_bank", lambda cfg: {"name": "Bank chest"})
+    ctx = _ctx()
+    ctx.state.data["gc_phase"] = "fur_trip"
+    ctx.state.data["gc_trip"] = {"kit": True, "done": True}
+    gc.fur_trip_phase(ctx, gc.DEFAULT_CONFIG)
+    assert ctx.state.data["gc_phase"] == "bank"
+    assert ctx.state.data["gc_trip"] == {}

@@ -33,6 +33,19 @@ def test_flags_at_maps_instance_space_onto_the_grid():
     assert imap.flags_at(BASE_X + 8, BASE_Y) is None
 
 
+def test_unloaded_and_border_tiles_are_not_standable():
+    """MEASURED live 2026-09-06 (cg_live3, Corrupted Gauntlet start room): tiles of rooms not yet
+    lit read 0x40000000 (9092 of 10816) and the scene border 0xFFFFFF (1212); neither carries a
+    TILE_BLOCKING bit, so the start-room flood fill leaked through the corridor gap into the
+    unloaded sea (9247 tiles) and prep refused to derive its geometry for the whole run."""
+    imap = make_map(walls={(2, 0): instance_nav.UNLOADED_TILE, (3, 0): 0xFFFFFF})
+    assert imap.standable(*P(1, 0))
+    assert not imap.standable(*P(2, 0))
+    assert not imap.standable(*P(3, 0))
+    assert not imap.step_ok(BASE_X + 1, BASE_Y, 1, 0)
+    assert instance_nav.find_path(imap, P(1, 0), P(3, 0)) is None
+
+
 def test_straight_corridor():
     imap = make_map()
     path = instance_nav.find_path(imap, P(0, 0), P(5, 0))
@@ -127,8 +140,9 @@ def _fake_world(monkeypatch, imap, start, hop_effect, player_plane=None):
     hops = []
     hop_planes = []
 
-    def fake_hop(ctx, x, y, plane, inst=False):
+    def fake_hop(ctx, x, y, plane, inst=False, prefer_viewport=False):
         assert inst is True
+        assert prefer_viewport is True     # USER 2026-09-06: instance hops click the viewport
         hops.append((x, y))
         hop_planes.append(plane)
         pos["p"] = hop_effect((x, y))

@@ -1089,7 +1089,7 @@ def _click_walk_point(ctx, point: dict, shift: bool) -> None:
         controller.key_up(ctx.ser, "SHIFT")
 
 
-def _hop_to(ctx, x: int, y: int, plane: int, inst: bool = False) -> bool:
+def _hop_to(ctx, x: int, y: int, plane: int, inst: bool = False, prefer_viewport: bool = False) -> bool:
     """Click the hop point and wait for arrival (or timeout) before
     returning. False only if the point isn't projectable onto the minimap
     at all; a timed-out wait still returns True so the caller just
@@ -1127,7 +1127,27 @@ def _hop_to(ctx, x: int, y: int, plane: int, inst: bool = False) -> bool:
     on_ground = False        # viewport click (needs SHIFT) vs minimap click (does not)
     aim_x, aim_y = x, y
 
-    for fraction in HOP_PULL_IN_FRACTIONS:
+    # prefer_viewport (USER 2026-09-06, Corrupted Gauntlet: "doing minimap hops between rooms is
+    # also not needed since we can see it in the viewport"): a rendered, un-occluded tile is
+    # clicked in the viewport at ANY hop length, pulled in by the same fractions when the far
+    # point is off screen or under a UI panel; the minimap stays the fallback below. The hijack
+    # risk that made the minimap the default for the overworld is covered by the SHIFT
+    # force-walk every viewport hop already carries.
+    if prefer_viewport and ox is not None:
+        for fraction in HOP_PULL_IN_FRACTIONS:
+            ax = int(round(ox + (x - ox) * fraction))
+            ay = int(round(oy + (y - oy) * fraction))
+            if (ax, ay) == (ox, oy):
+                break
+            ground_point = controller.get_ground_walk_point(ax, ay, plane, inst=inst)
+            if ground_point.get("onScreen") and not controller.is_point_blocked_by_ui(
+                    ground_point.get("screenX", -1), ground_point.get("screenY", -1)):
+                point = ground_point
+                on_ground = True
+                aim_x, aim_y = ax, ay
+                break
+
+    for fraction in (() if point is not None else HOP_PULL_IN_FRACTIONS):
         if fraction < 1.0:
             if ox is None:
                 break

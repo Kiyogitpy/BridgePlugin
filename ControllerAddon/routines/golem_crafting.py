@@ -3,8 +3,15 @@
 # Golem Crafting routine, overall loop (CORRECTED 2026-08-08, live session, user-specified):
 #   bank (stock fur, pouched) -> mine a batch of sunstone -> chisel PART of it into cores ->
 #   craft up to one golem per core (auto-consumes fur too) -> bank again only once the tracked
-#   fur stock actually runs low, otherwise straight back to mining -- with a detour to the Goat
-#   Pit if the bank itself has no usable fur left at all.
+#   fur stock actually runs low, otherwise straight back to mining -- with a FUR TRIP (falconry at
+#   Piscatoris, see fur_trip_phase) if the bank itself has no usable fur left at all.
+#
+# REPLACED 2026-09-06 (USER: "instead of doing goat hunting to get furs merge falconry as the
+# method of furs"): the Wyrmscraig Goat Pit hunt (Telekinetic Grab, spikes, a pit to line and
+# clear) is gone. Dashing kebbit fur is 2720 XP per golem against goat fur's lower value, and the
+# wiki's own guide for this method is: pouch empty -> fairy ring AKQ -> catch kebbits -> teleport
+# back. The measured goat-pit facts live in git history (see CLAUDE.md's golem_crafting section).
+# Every wait in this file is event-driven since the same day -- see the constants block below.
 #
 # Fur is withdrawn in FULL and kept compacted in the fur pouch throughout -- mining, chiselling,
 # AND crafting -- so it never competes with raw sunstone for inventory slots (CONFIRMED live this
@@ -55,7 +62,7 @@
 #
 # Deliberately NOT implemented: the XP-drop tick-timing speed-up trick for plinth carving
 # (always uses the safe, un-optimized cadence); acquiring a fur pouch; sourcing fur from
-# anywhere but the bank or the Goat Pit.
+# anywhere but the bank or a falconry trip.
 #
 # Run with:
 #     python controller.py routines/golem_crafting.py
@@ -66,7 +73,16 @@ import time
 import banker
 import controller
 import debug_log
+import outcome_waits
 import travel
+
+# routines/falconry.py supplies the Piscatoris travel legs and the hunting primitives the fur trip
+# reuses. controller.py loads a routine by file path, so its siblings are reachable either as a
+# bare module (routines/ on sys.path, the tests' arrangement) or through the routines package.
+try:
+    import falconry
+except ImportError:  # pragma: no cover
+    from routines import falconry
 
 # Highest fur-quality first (routines/golem_crafting.py-design.md's "Fur table"). A pure module
 # constant, not read from bridge config -- ConfigExporter.exportGolemCrafting deliberately
@@ -97,6 +113,84 @@ MAX_OBJECT_DISTANCE = 15
 MAX_CONSECUTIVE_MISSES = 5
 
 CRAFTING_LEVEL_REQUIRED = 60
+
+# --- Event-driven outcomes (2026-09-06, docs/superpowers/specs/2026-09-06-golem-crafting-events-
+# and-falconry-design.md). The golem varbits GolemProvider reads (runelite-api 1.12.38 VarbitID,
+# javap-verified): a side's state varbit flips when it is carved, its progress varbit climbs while
+# it carves, the station varbit is the plinth's overall progress, GOLEM_CRAFTING_COUNT the total.
+# Subscribed so each is pushed as VARBIT_CHANGED; every await below still confirms on /golem.
+VB_STATION = {"north": 15728, "south": 15733}
+VB_SIDE_STATE = {
+    "north": {"north": 15729, "east": 15730, "south": 15731, "west": 15732},
+    "south": {"north": 15734, "east": 15735, "south": 15736, "west": 15737},
+}
+VB_SIDE_PROGRESS = {
+    "north": {"north": 15739, "east": 15740, "south": 15741, "west": 15742},
+    "south": {"north": 15743, "east": 15744, "south": 15745, "west": 15746},
+}
+VB_CRAFTING_COUNT = 15738
+VB_FALCON_HAS_CATCH = 14192     # falconry.VARBIT_FALCON_HAS_CATCH, for the fur trip
+VARBIT_SUBSCRIPTIONS = (
+    tuple(VB_STATION.values())
+    + tuple(v for sides in VB_SIDE_STATE.values() for v in sides.values())
+    + tuple(v for sides in VB_SIDE_PROGRESS.values() for v in sides.values())
+    + (VB_CRAFTING_COUNT, VB_FALCON_HAS_CATCH)
+)
+# How long an event-driven await blocks for a pushed signal before re-reading HTTP anyway (UDP
+# is lossy): the click echo and the golem confirms keep their old poll cadence as the ceiling,
+# so a lost packet costs the same latency it did before events existed, never more.
+EVENT_SLICE_S = 0.3
+
+# Stall watch (2026-09-06, same shape as mastering_mixology/GOTR): once per tick() an unchanged
+# progress signature for STALL_WARN_S logs a `[!]` line, for STALL_STOP_S safety-stops. The
+# longest legitimate silence is a walk leg of the fur trip, which moves the player -- and the
+# signature includes the player's tile, so walking counts as progress.
+STALL_WARN_S = 120.0
+STALL_STOP_S = 300.0
+# Phases whose handler may run the NEXT phase inside the same tick() once it flips gc_phase.
+# chisel -> craft and bank -> mine/fur_trip used to cost an engine-loop iteration each with the
+# player standing still. mine and craft are one bounded action per call BY DESIGN (the engine's
+# safety/break/PvP gates keep their cadence between swings and carves) and never chain.
+TICK_CHAIN_FROM = ("chisel", "bank")
+TICK_CHAIN_MAX = 2
+
+
+def _events_of(ctx):
+    return getattr(ctx, "events", None) if ctx is not None else None
+
+
+def _await_player_stopped(ctx, timeout_s: float) -> bool:
+    """True once the player is standing still, within `timeout_s`.
+
+    2026-09-06: PLAYER_STOPPED is pushed per frame by the bridge's motion tracker and /player
+    carries the same tracker's `moving` flag, so with both available this is an event-driven
+    await confirmed on that flag. A client whose /player has no `moving` key (pre-2026-09-04
+    build) falls back to controller.wait_until_player_idle, the local-position poll the
+    pre-hover shipped with -- same result, just 0.15s-quantised."""
+    events = _events_of(ctx)
+    player = controller.get_player() or {}
+    if events is None or "moving" not in player:
+        return controller.wait_until_player_idle(timeout_s=timeout_s)
+    if player.get("moving") is False:
+        return True
+    out = outcome_waits.await_pre(
+        ctx, "PLAYER_STOPPED", timeout_s,
+        confirm=lambda: (controller.get_player() or {}).get("moving") is False,
+        reaction=False, now_fn=time.time, sleep_fn=time.sleep,
+    )
+    return bool(out)
+
+
+def _wait_slice(events, since, signals, slice_s):
+    """Block up to `slice_s` for a signal newer than `since` (an EventStream mark), then hand
+    back the new mark. With no stream: sleep the slice, return None. The caller re-reads HTTP
+    after every slice regardless -- the signal only makes that read happen SOONER."""
+    if events is None:
+        time.sleep(slice_s)
+        return None
+    events.await_outcome(signals, slice_s, confirm=None, since=since, reaction=False,
+                         now_fn=time.time, sleep_fn=time.sleep)
+    return events.mark()
 
 # CORRECTED 2026-08-08 (live session, user request): mine_phase used to target the ~22
 # "Sunstone rocks" spots scattered around the monolith, deliberately switching between whichever
@@ -146,20 +240,6 @@ CHISEL_NAME = "Chisel"
 # and "chisel" (CHISEL_NAME.lower(), already in that list) is itself a substring of this name.
 JEWELLERS_CHISEL_NAME = "Jeweller's chisel"
 
-# CONFIRMED LIVE 2026-08-08 (MCP debug session): a "Spikes supply" GameObject stands right next
-# to Geoff at the Goat Pit -- a plain click resolves to "Take" (confirmed via /menu:
-# Take/Take-5/Take-10/Take-X, with "Take" as the default/top entry), handing over one wooden
-# spike per click. This replaces the original design's bank-withdrawal path for spikes (see
-# _ensure_wooden_spikes below) -- there's no reason to walk all the way back to the bank for
-# something sitting right at the pit.
-SPIKES_SUPPLY_NAME = "Spikes supply"
-
-# ASSUMPTION, NOT YET VERIFIED LIVE -- exact item/object names for the Goat Pit hunting loop
-# (the inventory item name spikes actually show up as, the pit object itself, and goat NPCs).
-WOODEN_SPIKES_NAME = "Wooden spikes"
-GOAT_PIT_NAME = "Goat pit"
-GOAT_NAME = "goat"
-
 # Used only if a Controller plugin build predating this routine's wiring is running (so
 # GET /golem-crafting-config 404s and get_golem_crafting_config() returns None) -- keeps this
 # routine runnable standalone, same as every other routine's DEFAULT_CONFIG fallback.
@@ -173,6 +253,14 @@ DEFAULT_CONFIG = {
 
     "bank": {"teleportFallback": False},
 
+    # The falconry fur trip (see fur_trip_phase). hireCoins: Quick-falcon is 500gp per falcon and
+    # a lost falcon needs a re-hire. tripMaxMinutes: the safety cap on a trip whose pouch never
+    # fills (a crowded world). returnTeleport: "slayer ring" (lands in the Wyrmscraig Cavern,
+    # exit via the Cave object) or "necklace of passage" (lands on the surface east of the
+    # cathedral). dropMeat: no meat pouch is carried, so raw kebbit would fill the inventory.
+    "furTrip": {"hireCoins": 2000, "tripMaxMinutes": 25, "returnTeleport": "slayer ring",
+                "dropMeat": True},
+
     # World-tile anchors ({"x", "y", "plane"}, same shape as travel.save_location()'s output)
     # near each area -- this is what lets handle_missing_target (see below) walk the player back
     # to an area on its own whenever the relevant object isn't found nearby, e.g. after banking,
@@ -183,9 +271,9 @@ DEFAULT_CONFIG = {
     #     to be depleted/others-in-use when the routine arrives.
     #   plinth: one of Wyrmscraig's two Empty plinths (id 62352); the other (id 62351, ~4 tiles
     #     away at 2596,2257) works just as well -- picked arbitrarily.
-    #   goatPit / spikesSupply: the Goat Pit itself and the Spikes supply object beside Geoff,
-    #     ~60 tiles south of the mining/plinth cluster -- travel.walk_to covers this in multiple
-    #     hops (WALK_HOP_MIN/MAX_TILES), same as any other multi-hop route in this codebase.
+    #   cavernExit: the Wyrmscraig Cavern's "Cave"/Exit object (loc 62220), where the slayer
+    #     ring's return leg has to walk to. UNKNOWN until the first live trip (not in the offline
+    #     spawn data); fur_trip_phase records it in ctx.state.data the first time it is seen.
     #   bank: the Bank chest (id 62390) near the mining/plinth cluster -- ADDED because the
     #     Goat Pit sits ~65 tiles from it, well outside banker.find_nearby_bank's default
     #     40-tile radius, so a hunt trip needed an anchor to actually get back to it. Safe to
@@ -194,8 +282,7 @@ DEFAULT_CONFIG = {
     "locations": {
         "mining": {"x": 2599, "y": 2248, "plane": 0},
         "plinth": {"x": 2595, "y": 2253, "plane": 0},
-        "goatPit": {"x": 2572, "y": 2195, "plane": 0},
-        "spikesSupply": {"x": 2578, "y": 2202, "plane": 0},
+        "cavernExit": None,
         "bank": {"x": 2587, "y": 2260, "plane": 0},
     },
 
@@ -227,6 +314,13 @@ def get_config(bridge_config):
     # tormented_demon.py's get_config re-injecting DEFAULT_NPC_IDS.
     config = dict(config)
     config["locations"] = DEFAULT_CONFIG["locations"]
+    # Same reasoning: the fur-trip block is not exported by the Java panel either.
+    config.setdefault("furTrip", DEFAULT_CONFIG["furTrip"])
+    # The fur trip fills the inventory by design (bones, meat, spilled fur) and check_safety runs
+    # BEFORE tick(), so the engine's full-inventory stop would win the race -- same as falconry.py.
+    safety = dict(config.get("safety") or {})
+    safety["stopOnInventoryFull"] = False
+    config["safety"] = safety
     return config
 
 
@@ -457,23 +551,6 @@ def find_object(name: str):
 
     candidates.sort(key=lambda o: o.get("distance", 9999))
     return candidates[0]
-
-
-def is_valid_grab_target(pit: dict, goat: dict) -> bool:
-    """South, east, or west of the pit only -- north is the player's own fixed standing side
-    (CONFIRMED live, account owner), so a goat there can never be a valid Grab target no matter
-    how close it is."""
-    return goat.get("y", 0) <= pit.get("y", 0)
-
-
-def goat_in_grab_range(player: dict, goat: dict) -> bool:
-    """Telekinetic Grab's cast range is 10 tiles (CONFIRMED live, account owner) -- a target
-    beyond that makes the character auto-walk toward it instead of just casting in place, which
-    would pull the player off the fixed north tile hunt_phase depends on for is_valid_grab_
-    target's own north-side exclusion to keep meaning anything."""
-    dx = abs(goat.get("x", 0) - player.get("x", 0))
-    dy = abs(goat.get("y", 0) - player.get("y", 0))
-    return max(dx, dy) <= GRAB_RANGE_TILES
 
 
 def find_mining_target(committed_pos=None, exclude_pos=None):
@@ -762,7 +839,7 @@ def _hop_toward_point(ctx, x: int, y: int, plane: int) -> bool:
         if not point.get("onMinimap"):
             return False
 
-    controller.click_entity(ctx.ser, point, offset=(0, 0))
+    controller.click_entity(ctx.ser, point, offset=(0, 0), check_ui_blockers=False)
     return True
 
 
@@ -776,29 +853,6 @@ def _step_toward_plinth(ctx, config: dict) -> None:
     if target is None:
         return
     _hop_toward_point(ctx, target["x"], target["y"], target.get("plane", 0))
-
-
-def _shed_pit_junk(ctx, phase_label: str) -> None:
-    """Drop leftover Wooden spikes -- they are pit-only and useless anywhere else.
-
-    _ensure_wooden_spikes takes them from the supply AT the pit and nothing outside hunt_phase
-    uses them, so any still carried are leftovers from a drop pass that did not fully land
-    (_drop_all at hunt exit is the primary cleanup, but it is one-shot and the routine may not
-    hunt again for an hour).
-
-    Called from BOTH mine_phase and craft_phase, because craft_phase is reachable without passing
-    through mine_phase at all -- has_start_materials only needs 4 raw + 1 core, which a part-used
-    batch already satisfies. OBSERVED live 2026-08-24: 4 leftover spikes left the inventory at
-    28/28, which both capped mining at 15 sunstone against the 20 budget AND rode into a craft
-    phase where every Start-golem attempt failed with a menu offering no golem option -- plinth
-    correctly rendered and aimed at, materials present, nobody else nearby. Whether the full
-    inventory CAUSES that is unproven; shedding pit-only junk is justified on budget grounds
-    regardless."""
-    if not _count_named(WOODEN_SPIKES_NAME):
-        return
-    controller.open_inventory_tab(ctx.ser)   # verified switch, see controller.ensure_ui_state
-    debug_log.log("golem crafting", f"dropping leftover pit spikes before {phase_label}")
-    _drop_all(ctx, WOODEN_SPIKES_NAME)
 
 
 def mine_phase(ctx, config: dict) -> None:
@@ -845,8 +899,6 @@ def mine_phase(ctx, config: dict) -> None:
     just flipping gc_phase and hoping for the best: the movement itself breaks the mining
     animation immediately, same as a player manually walking off would, and it's a step in a
     direction the routine needs to cover anyway before craft_phase can do anything."""
-    _shed_pit_junk(ctx, "mining")
-
     raw_count = _count_named(RAW_SUNSTONE_NAME)
     cores_have = _count_named(SUNSTONE_CORE_NAME)
     if raw_count + cores_have >= SUNSTONE_PER_TRIP or len(controller.get_inventory()) >= controller.INVENTORY_SIZE:
@@ -980,7 +1032,7 @@ def mine_phase(ctx, config: dict) -> None:
     # Waiting costs nothing here: the swing this hover is meant to overlap lasts seconds AFTER
     # the player arrives, so the window it exploits is still wide open. The rock is re-resolved
     # after the wait because the position read before the walk is stale by definition.
-    if not controller.wait_until_player_idle(timeout_s=HOVER_IDLE_TIMEOUT_S):
+    if not _await_player_stopped(ctx, HOVER_IDLE_TIMEOUT_S):
         return  # still moving -- any position resolved now is already stale; next tick clicks normally
 
     next_rock = find_mining_target(exclude_pos=(rock.get("x"), rock.get("y")))
@@ -1019,6 +1071,11 @@ CORES_PER_TRIP = 4
 # increase before returning closes this instead of hoping a fixed delay was long enough.
 CHISEL_CONFIRM_TIMEOUT_S = 3.0
 
+# chisel_phase chains every core of the batch inside ONE tick() call (2026-09-06): the human
+# chisels four in a row without a pause, and the engine loop's ~1s between ticks was the only
+# thing spacing them. Bounded so the engine's pause/safety gates stay responsive.
+CHISEL_CHAIN_MAX_S = 12.0
+
 
 def _count_named(name: str) -> int:
     name_lower = name.lower()
@@ -1035,35 +1092,49 @@ def chisel_phase(ctx, config: dict) -> None:
 
     controller.open_inventory_tab(ctx.ser)
 
-    cores_have = _count_named(SUNSTONE_CORE_NAME)
-    if cores_have >= CORES_PER_TRIP:
-        debug_log.log("golem crafting", f"chiselled {cores_have} cores -- moving to craft phase")
-        ctx.state.data["gc_phase"] = "craft"
-        return
-
-    raw = find_item(RAW_SUNSTONE_NAME)
-    if raw is None:
-        debug_log.log("golem crafting", f"no raw sunstone left ({cores_have}/{CORES_PER_TRIP} cores chiselled) -- moving to craft phase")
-        ctx.state.data["gc_phase"] = "craft"
-        return
-
-    chisel = find_item(JEWELLERS_CHISEL_NAME) or find_item(CHISEL_NAME)
-    if chisel is None:
-        ctx.state.trigger_safety_stop("no chisel in inventory")
-        return
-
-    debug_log.log("golem crafting", f"chiselling sunstone into a core ({cores_have}/{CORES_PER_TRIP})")
-    controller.human_delay(0.15, 0.35)
-    controller.click_entity(ctx.ser, chisel, check_ui_blockers=False)
-    controller.human_delay(0.1, 0.25)
-    controller.click_entity(ctx.ser, raw, check_ui_blockers=False)
-
-    deadline = time.time() + CHISEL_CONFIRM_TIMEOUT_S
-    while time.time() < deadline:
-        time.sleep(0.2)
-        if _count_named(SUNSTONE_CORE_NAME) > cores_have:
+    # 2026-09-06: every core of the batch in one call, each confirmed on INVENTORY_CHANGED (the
+    # core appearing is the truth, the event only says when to look). Pause/safety re-checked
+    # between cores, same as process_phase-style loops elsewhere.
+    deadline = time.time() + CHISEL_CHAIN_MAX_S
+    while True:
+        if ctx.state.safety_stopped or ctx.state.paused:
             return
-    debug_log.log("golem crafting", "chisel click didn't register within timeout -- retrying next tick")
+
+        cores_have = _count_named(SUNSTONE_CORE_NAME)
+        if cores_have >= CORES_PER_TRIP:
+            debug_log.log("golem crafting", f"chiselled {cores_have} cores -- moving to craft phase")
+            ctx.state.data["gc_phase"] = "craft"
+            return
+
+        raw = find_item(RAW_SUNSTONE_NAME)
+        if raw is None:
+            debug_log.log("golem crafting", f"no raw sunstone left ({cores_have}/{CORES_PER_TRIP} cores chiselled) -- moving to craft phase")
+            ctx.state.data["gc_phase"] = "craft"
+            return
+
+        chisel = find_item(JEWELLERS_CHISEL_NAME) or find_item(CHISEL_NAME)
+        if chisel is None:
+            ctx.state.trigger_safety_stop("no chisel in inventory")
+            return
+
+        if time.time() >= deadline:
+            return  # hand the tick back; re-enters here next tick
+
+        debug_log.log("golem crafting", f"chiselling sunstone into a core ({cores_have}/{CORES_PER_TRIP})")
+        mark = outcome_waits.mark(ctx)
+        controller.human_delay(0.15, 0.35)
+        controller.click_entity(ctx.ser, chisel, check_ui_blockers=False)
+        controller.human_delay(0.1, 0.25)
+        controller.click_entity(ctx.ser, raw, check_ui_blockers=False)
+
+        landed = outcome_waits.await_pre(
+            ctx, "INVENTORY_CHANGED", CHISEL_CONFIRM_TIMEOUT_S,
+            confirm=lambda before=cores_have: _count_named(SUNSTONE_CORE_NAME) > before,
+            since=mark, now_fn=time.time, sleep_fn=time.sleep,
+        )
+        if not landed:
+            debug_log.log("golem crafting", "chisel click didn't register within timeout -- retrying next tick")
+            return
 
 
 # CHAT_MESSAGE substring (lowercased) this routine still reacts to. REWRITTEN 2026-08-20: every
@@ -1095,37 +1166,10 @@ GOLEM_LOOT_GROUND_MARKER = "leaves a gift on the ground"
 # each attempt, rather than firing a single click and trusting it landed.
 GOLEM_GEM_PICKUP_ATTEMPTS = 3
 
-# CONFIRMED live (user session) -- Goat Pit hunting mechanic, replacing the original wrong
-# plain-click-lures/harvests assumption. See docs/superpowers/specs/2026-08-08-goat-pit-
-# telekinetic-grab-design.md for the full mechanic writeup.
-GOAT_CHAT_PIT_FULL = "the pit is now filled with goats."
-# Rune name varies (law/air), so this matches on the stable surrounding text rather than a
-# single fixed string -- both substrings must be present.
-GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS = ("you do not have enough", "to cast this spell")
-# ROOT-CAUSED 2026-08-09 (autonomous session, hunt_test17.log diagnostic logging): the lining
-# applied once at the start of a hunt visit wears out well before the pit fills -- every Grab
-# cast after the first couple came back with this exact chat line, CONFIRMED live as the actual
-# reason hunt_phase's 60-cast cap kept getting exhausted with zero fills (cast_telekinetic_grab
-# itself was returning True the whole time; the click lands, the game just rejects the catch).
-# The plan's original edge-case question ("if we don't get 28 furs within those 5 spikes, do we
-# recognize this and grab new spikes to line with?") was never actually wired to a mid-cycle
-# reline -- only the pre-hunt and post-harvest relining paths existed.
-GOAT_CHAT_NEED_NEW_SPIKES = "you need to replace the spikes in the pit."
-GOAT_HORN_NAME = "Goat horn"  # always drops per trapped goat, never useful -- dropped on harvest
-FUR_POUCH_CAPACITY = 28  # large fur pouch's capacity -- once hit, further fur spills into loose
-                         # inventory instead of the pouch, which is exactly the signal used below
-                         # to know the pouch is full without any dedicated capacity-check action
-GRAB_RANGE_TILES = 10  # Telekinetic Grab's cast range -- a farther target makes the character
-                       # auto-walk toward it, pulling the player off the fixed standing tile the
-                       # whole north-side-only geometry below depends on
-# ADDED 2026-08-09 (user request): a goat that was just cast on keeps traveling toward the pit
-# for a few seconds, not vanishing instantly -- without a cooldown it stayed the closest
-# candidate and got re-targeted over and over instead of spreading casts across the several
-# goats that can be en route to the pit at once.
-# CORRECTED 2026-08-09 (user report, live): 4s still let some goats get re-clicked before
-# actually reaching the pit -- bumped to 8s, then to 10s (perfect for a goat cast at max range,
-# GRAB_RANGE_TILES, which takes the longest to actually reach the pit).
-GOAT_GRAB_COOLDOWN_S = 10.0
+# Large fur pouch's capacity -- once hit, further fur spills into loose inventory instead of the
+# pouch, which is exactly the signal the fur trip uses to know the pouch is full without any
+# dedicated capacity-check action (CONFIRMED live at the goat pit, 2026-08-09).
+FUR_POUCH_CAPACITY = 28
 
 
 def on_event(ctx, event_type, payload) -> None:
@@ -1144,12 +1188,7 @@ def on_event(ctx, event_type, payload) -> None:
     checks itself, rather than a generic chat channel with nothing left to read it now that every
     other golem-crafting chat message this used to watch for is superseded by a varbit read.
 
-    ADDED 2026-08-08 (Goat Pit hunting redesign): also captures hunt_phase's own two chat
-    signals (pit-full, rune-shortage) into a SEPARATE gc_last_hunt_chat/_seq pair, not the
-    golem-crafting fur flag above -- controller.py only ever calls one on_event per routine module
-    (see its own dispatch, `hasattr(routine, "on_event")`), so both concerns have to live in
-    this one function, but craft_phase and hunt_phase are mutually exclusive via gc_phase and
-    keeping their chat state in separate keys avoids any future ambiguity if that ever changes."""
+    The goat-pit chat capture that used to live here went with hunt_phase (2026-09-06)."""
     if event_type != "CHAT_MESSAGE" or not payload:
         return
     message = (payload.get("message") or "").lower()
@@ -1180,13 +1219,6 @@ def on_event(ctx, event_type, payload) -> None:
         if marker_idx != -1:
             item_name = message[marker_idx + 3:].rstrip(".").strip()
         ctx.state.data["gc_gem_bag_full_item"] = item_name
-
-    is_pit_full = GOAT_CHAT_PIT_FULL in message
-    is_rune_short = all(part in message for part in GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS)
-    is_spikes_worn = GOAT_CHAT_NEED_NEW_SPIKES in message
-    if is_pit_full or is_rune_short or is_spikes_worn:
-        ctx.state.data["gc_last_hunt_chat"] = message
-        ctx.state.data["gc_last_hunt_chat_seq"] = ctx.state.data.get("gc_last_hunt_chat_seq", 0) + 1
 
 
 # How long to wait for a side's `done` varbit to flip after a Shape-golem click, PROVIDED the
@@ -1298,16 +1330,27 @@ def _click_resolved_wrongly(before: dict, after: dict, object_id: int):
     return True
 
 
-def _await_click_echo(before: dict, object_id: int):
+def _await_click_echo(before: dict, object_id: int, ctx=None, since=None):
     """Poll /last-action briefly for the game's own verdict on the plinth click just issued.
     Returns _click_resolved_wrongly's tri-state; None on timeout, which hands control back to the
-    ordinary confirmation path unchanged."""
+    ordinary confirmation path unchanged.
+
+    2026-09-06: with `ctx.events`, MENU_CLICKED -- the same MenuOptionClicked pushed as an event
+    -- wakes the read instead of a 0.1s poll; /last-action stays the truth (the tri-state and
+    "None is not failure" rule are unchanged). `since` is the mark the caller took BEFORE the
+    click, so an echo from an earlier click never counts."""
+    events = _events_of(ctx)
+    mark = since if since is not None else (events.mark() if events is not None else None)
     deadline = time.time() + GOLEM_CLICK_ECHO_TIMEOUT_S
     while time.time() < deadline:
         verdict = _click_resolved_wrongly(before, controller.get_last_action(), object_id)
         if verdict is not None:
             return verdict
-        time.sleep(GOLEM_CLICK_ECHO_POLL_S)
+        if events is None:
+            time.sleep(GOLEM_CLICK_ECHO_POLL_S)
+        else:
+            mark = _wait_slice(events, mark, {"MENU_CLICKED": None},
+                               min(EVENT_SLICE_S, max(0.0, deadline - time.time())))
     return None
 
 
@@ -1613,7 +1656,8 @@ def _handle_approach_exhausted(ctx, station: dict, fresh_golem: bool) -> None:
     ctx.state.trigger_safety_stop(reason)
 
 
-def _await_side_done(station_name: str, side: str, timeout_s: float, already_done: bool = False) -> bool:
+def _await_side_done(station_name: str, side: str, timeout_s: float, already_done: bool = False,
+                     ctx=None, since=None) -> bool:
     """Poll /golem until `side` shows a genuine False -> True TRANSITION on its `done` varbit, or
     timeout. True only on that transition.
 
@@ -1647,11 +1691,23 @@ def _await_side_done(station_name: str, side: str, timeout_s: float, already_don
     actually succeeded."""
     if already_done:
         return False
+    # 2026-09-06: the side's own state and progress varbits are pushed as VARBIT_CHANGED, so
+    # each poll slice ends the instant one lands and /golem is read right then; without a
+    # stream the slice is the old GOLEM_CONFIRM_POLL_S sleep, byte for byte. Fidgets between
+    # slices (position-invariant) keep an ~11.8s carve from being a frozen cursor.
+    events = _events_of(ctx)
+    signals = {"VARBIT_CHANGED": outcome_waits.varbit_in(
+        (VB_SIDE_STATE[station_name][side], VB_SIDE_PROGRESS[station_name][side]))}
+    mark = since if since is not None else (events.mark() if events is not None else None)
     hard_deadline = time.time() + GOLEM_SIDE_MAX_WAIT_S
     deadline = min(time.time() + timeout_s, hard_deadline)
     last_progress = None
+    next_fidget = time.time() + outcome_waits.still_segment_s()
     while time.time() < deadline:
-        time.sleep(GOLEM_CONFIRM_POLL_S)
+        if events is None:
+            time.sleep(GOLEM_CONFIRM_POLL_S)
+        else:
+            mark = _wait_slice(events, mark, signals, GOLEM_CONFIRM_POLL_S)
         state = controller.get_golem()
         if state is None:
             continue
@@ -1668,11 +1724,15 @@ def _await_side_done(station_name: str, side: str, timeout_s: float, already_don
             # forever without ever finishing still terminates.
             deadline = min(time.time() + timeout_s, hard_deadline)
         last_progress = progress
+        if events is not None and time.time() >= next_fidget and deadline - time.time() > 1.0:
+            controller.fidget_once()
+            next_fidget = time.time() + outcome_waits.still_segment_s()
     return False
 
 
 def _await_golem_complete(
-    station_name: str, timeout_s: float, before_total_crafted: int, before_progress: int
+    station_name: str, timeout_s: float, before_total_crafted: int, before_progress: int,
+    ctx=None, since=None
 ) -> bool:
     """Poll /golem until a genuine completion TRANSITION is observed -- `totalCrafted`
     incrementing past `before_total_crafted`, or the station's own `progress` going from
@@ -1692,9 +1752,17 @@ def _await_golem_complete(
 
     See _await_side_done's docstring for why a None from get_golem() mid-poll continues polling
     (IMPORTANT FIX 2026-08-20) rather than returning False immediately."""
+    # 2026-09-06: GOLEM_CRAFTING_COUNT and the station's own progress varbit are the pushed
+    # signals; the two-transition rule on /golem stays the truth (see _await_side_done).
+    events = _events_of(ctx)
+    signals = {"VARBIT_CHANGED": outcome_waits.varbit_in((VB_CRAFTING_COUNT, VB_STATION[station_name]))}
+    mark = since if since is not None else (events.mark() if events is not None else None)
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        time.sleep(GOLEM_CONFIRM_POLL_S)
+        if events is None:
+            time.sleep(GOLEM_CONFIRM_POLL_S)
+        else:
+            mark = _wait_slice(events, mark, signals, GOLEM_CONFIRM_POLL_S)
         state = controller.get_golem()
         if state is None:
             continue
@@ -1804,7 +1872,6 @@ def craft_phase(ctx, config: dict) -> None:
     blowing under load -- now tolerates GOLEM_STATE_MISS_LIMIT consecutive misses before
     safety-stopping, the same tolerance handle_missing_target's own poll layer gives every other
     lookup in this file, rather than asserting "rebuild the client" off a single transient blip."""
-    _shed_pit_junk(ctx, "crafting")
     state = controller.get_golem()
     if state is None:
         misses = ctx.state.data.get("gc_golem_state_misses", 0) + 1
@@ -1956,6 +2023,9 @@ def craft_phase(ctx, config: dict) -> None:
         verb = "starting golem" if fresh_golem else "shaping golem"
         debug_log.log("golem crafting", f"{verb} from {side} side of {station['name']} plinth ({4 - len(plan)}/4 done)")
         controller.human_delay(*GOLEM_WALK_TO_CLICK_GAP_S)
+        # The mark precedes the click so the side's own varbit event (and the MENU_CLICKED echo)
+        # are the ones matched, never a previous side's.
+        mark = outcome_waits.mark(ctx)
         before_action = controller.get_last_action()
         # A side whose bare click already got hijacked once goes straight to the menu route --
         # the cheap click has been shown not to work against whatever is sitting on that pixel.
@@ -1981,7 +2051,7 @@ def craft_phase(ctx, config: dict) -> None:
         # again (the option genuinely absent -- the out-of-fur shape) the flow drops into
         # _await_side_done's timeout exactly as before, so gc_side_misses still climbs toward
         # the out-of-fur recovery instead of spinning.
-        hijacked = withheld or _await_click_echo(before_action, station["objectId"]) is True
+        hijacked = withheld or _await_click_echo(before_action, station["objectId"], ctx=ctx, since=mark) is True
         already_retried = ctx.state.data.get("gc_side_hijacks", 0) >= GOLEM_FAST_RETRY_BUDGET
         if hijacked and not already_retried:
             ctx.state.data["gc_side_hijacks"] = ctx.state.data.get("gc_side_hijacks", 0) + 1
@@ -2007,7 +2077,8 @@ def craft_phase(ctx, config: dict) -> None:
             )
         else:
             ctx.state.data["gc_side_hijacks"] = 0
-        if not _await_side_done(station["name"], side, GOLEM_SIDE_TIMEOUT_S, already_done=station["sides"][side]["done"]):
+        if not _await_side_done(station["name"], side, GOLEM_SIDE_TIMEOUT_S,
+                                already_done=station["sides"][side]["done"], ctx=ctx, since=mark):
             debug_log.log("golem crafting", f"{side} side didn't register within {GOLEM_SIDE_TIMEOUT_S}s -- retrying next tick")
             # Remember WHICH side failed, so a start side we cannot actually click from stops
             # being chosen (see choose_start_side's `avoid`). Three live halts came from
@@ -2106,6 +2177,7 @@ def craft_phase(ctx, config: dict) -> None:
         debug_log.log("golem crafting",
                       "insert click was hijacked -- selecting Insert-core from the right-click "
                       "menu instead")
+    mark = outcome_waits.mark(ctx)
     before_action = controller.get_last_action()
     res = _click_station_tracked(ctx, station, "gc_insert_click_misses", objects,
                                  use_menu=insert_escalate)
@@ -2116,7 +2188,7 @@ def craft_phase(ctx, config: dict) -> None:
     # the click by hover verification, so it spends the same budget -- and past the budget it
     # falls through to _await_golem_complete's timeout and the existing miss counting, bounded
     # exactly as before.
-    if (insert_withheld or _await_click_echo(before_action, station["objectId"]) is True) \
+    if (insert_withheld or _await_click_echo(before_action, station["objectId"], ctx=ctx, since=mark) is True) \
             and not insert_escalate:
         ctx.state.data["gc_insert_hijacks"] = ctx.state.data.get("gc_insert_hijacks", 0) + 1
         debug_log.log("golem crafting",
@@ -2124,7 +2196,8 @@ def craft_phase(ctx, config: dict) -> None:
         return
     ctx.state.data["gc_insert_hijacks"] = 0
     if not _await_golem_complete(
-        station["name"], GOLEM_INSERT_TIMEOUT_S, before_total_crafted, before_progress
+        station["name"], GOLEM_INSERT_TIMEOUT_S, before_total_crafted, before_progress,
+        ctx=ctx, since=mark
     ):
         if ctx.state.data.get("gc_fur_exhausted"):
             # IMPORTANT FIX 2026-08-20 (code review): this branch cannot actually fire under the
@@ -2167,11 +2240,7 @@ def craft_phase(ctx, config: dict) -> None:
 
 # Never deposited during a golem-crafting bank trip -- the pouch/tools are needed for the next
 # mine/chisel/craft cycle, and leftover raw sunstone/cores (if fur ran out before either did)
-# need to survive the trip so the next craft_phase call can still use them. Wooden spikes
-# specifically CONFIRMED LIVE 2026-08-08 (MCP debug session): the bank won't even accept a
-# deposit of them at all (not just "we'd rather keep them") -- consistent with spikes now being
-# sourced from the Spikes supply object next to Geoff (see SPIKES_SUPPLY_NAME) rather than the
-# bank, since a bank-unstorable item was never going to be a bankable supply to begin with.
+# need to survive the trip so the next craft_phase call can still use them.
 #
 # CORRECTED 2026-08-08 (live session, user report): the Hammer and the open gem bag were
 # getting deposited every bank trip along with the raw sunstone -- CONFIRMED live, both are
@@ -2192,7 +2261,7 @@ def craft_phase(ctx, config: dict) -> None:
 # much unused -- depositing them there would strand a half-supplied batch and force mining a
 # fresh 20 from scratch next trip for no reason. Kept unconditionally now, the same as cores.
 BANK_KEEP_ITEMS = [
-    banker.FUR_POUCH_NAME, CHISEL_NAME.lower(), WOODEN_SPIKES_NAME.lower(),
+    banker.FUR_POUCH_NAME, CHISEL_NAME.lower(),
     RAW_SUNSTONE_NAME.lower(), SUNSTONE_CORE_NAME.lower(),
     "hammer", "gem bag", "fur", "rune pouch",
 ]
@@ -2258,6 +2327,15 @@ def _run_bank_trip(ctx, config: dict) -> None:
     searches for it fresh -- not needed here since "fur" already surfaces all of them)."""
     banker.deposit_inventory(ctx, {"keepItems": BANK_KEEP_ITEMS})
 
+    # 2026-09-06: a fur trip comes home with the pouch full (gc_fur_stock 28) and the fur in the
+    # POUCH, not the bank -- searching the bank then would find nothing and start another trip.
+    # bank_phase reached with fur already stocked (a fur trip's return, a gem-bag-full visit)
+    # deposits and goes straight back to mining.
+    if ctx.state.data.get("gc_fur_stock", 0) >= CORES_PER_TRIP:
+        debug_log.log("golem crafting", f"fur already stocked ({ctx.state.data.get('gc_fur_stock')}) -- banking done, moving to mine phase")
+        ctx.state.data["gc_phase"] = "mine"
+        return
+
     if not banker.search_bank(ctx, "fur"):
         debug_log.log("golem crafting", "bank search for fur failed -- moving to mine phase")
         ctx.state.data["gc_phase"] = "mine"
@@ -2270,14 +2348,19 @@ def _run_bank_trip(ctx, config: dict) -> None:
         # ADDED 2026-08-09 (user request): raw sunstone/cores are normally kept through a bank
         # trip (see BANK_KEEP_ITEMS's own comment -- protects a half-supplied mining batch), but
         # that protection stops being worth the inventory space once there's genuinely no fur
-        # anywhere and a hunt trip is starting: hunt_phase needs room for Goat horns, and we're
-        # already standing at the open bank right now, so banking them (not dropping -- still
-        # fully recoverable next mine_phase visit) costs nothing extra.
-        debug_log.log("golem crafting", "bank has none of the usable fur types -- banking spare sunstone/cores before hunting")
-        hunt_keep_items = [k for k in BANK_KEEP_ITEMS
-                            if k not in (RAW_SUNSTONE_NAME.lower(), SUNSTONE_CORE_NAME.lower())]
-        banker.deposit_inventory(ctx, {"keepItems": hunt_keep_items})
-        ctx.state.data["gc_phase"] = "hunt"
+        # anywhere and a trip is starting: the hunt needs the slots, and we're already standing
+        # at the open bank right now, so banking them (not dropping -- still fully recoverable
+        # next mine_phase visit) costs nothing extra.
+        debug_log.log("golem crafting", "bank has none of the usable fur types -- banking spare sunstone/cores and kitting up for a falconry trip")
+        trip_keep_items = [k for k in BANK_KEEP_ITEMS
+                           if k not in (RAW_SUNSTONE_NAME.lower(), SUNSTONE_CORE_NAME.lower())]
+        banker.deposit_inventory(ctx, {"keepItems": trip_keep_items})
+        # The travel kit is withdrawn HERE, while the bank is open (fur_trip_phase's "kit" leg
+        # only ever routes back to bank_phase to get here).
+        if not _withdraw_kit(ctx, config):
+            return
+        _start_trip(ctx)
+        ctx.state.data["gc_phase"] = "fur_trip"
         return
 
     slot = next((s for s in bank.get("items", []) if (s.get("name") or "").lower() == fur_name.lower()), None)
@@ -2286,6 +2369,7 @@ def _run_bank_trip(ctx, config: dict) -> None:
     if qty > 0:
         debug_log.log("golem crafting", f"withdrawing all {qty}x {fur_name}")
         banker.set_quantity_mode(ctx, "all")
+        mark = outcome_waits.mark(ctx)
         controller.click_entity(ctx.ser, slot)
         # ADDED 2026-08-08 (live session, user report): used to trust click_entity's return value
         # alone and set gc_fur_stock = qty unconditionally -- CONFIRMED live this isn't reliable
@@ -2298,13 +2382,13 @@ def _run_bank_trip(ctx, config: dict) -> None:
         # surfacing only as "no 'empty' entry in menu" once craft_phase finally tried to use it --
         # several minutes and a wasted mining trip later. Polling inventory for the fur to
         # actually show up closes that gap at the source instead.
-        deadline = time.time() + WITHDRAW_CONFIRM_TIMEOUT_S
-        landed = False
-        while time.time() < deadline:
-            if any((i.get("name") or "").lower() == fur_name.lower() for i in controller.get_inventory()):
-                landed = True
-                break
-            time.sleep(0.2)
+        # 2026-09-06: INVENTORY_CHANGED is the signal, the fur in the inventory the truth.
+        landed = bool(outcome_waits.await_pre(
+            ctx, "INVENTORY_CHANGED", WITHDRAW_CONFIRM_TIMEOUT_S,
+            confirm=lambda: any((i.get("name") or "").lower() == fur_name.lower()
+                                for i in controller.get_inventory()),
+            since=mark, reaction=False, now_fn=time.time, sleep_fn=time.sleep,
+        ))
         if landed:
             ctx.state.data["gc_fur_stock"] = qty
         else:
@@ -2358,6 +2442,16 @@ def bank_phase(ctx, config: dict) -> None:
     entirely (if teleportFallback is enabled) or safety-stop (if not), even with the bank
     genuinely reachable on foot.
     """
+    player = controller.get_player() or {}
+    if (player.get("y") or 0) >= CAVERN_MIN_Y:
+        # A restart (gc_phase defaults to "bank") while still underground after a slayer-ring
+        # return: the bank anchor is on the surface, 6400 tiles of y away, and the collision map
+        # cannot route across that. Finish the trip's cavern leg instead.
+        debug_log.log("golem crafting", "in the Wyrmscraig Cavern -- resuming the fur trip's exit leg")
+        _trip(ctx)["done"] = True
+        ctx.state.data["gc_phase"] = "fur_trip"
+        return
+
     bank_obj = banker.find_nearby_bank({})
     if bank_obj is None:
         if handle_missing_target(ctx, config, "bank", "gc_bank_misses", "gc_bank_walks"):
@@ -2381,7 +2475,7 @@ def bank_phase(ctx, config: dict) -> None:
                 if point.get("onMinimap"):
                     ctx.state.data["gc_bank_minimap_hops"] = hops + 1
                     debug_log.log("golem crafting", f"bank found but off-screen -- minimap-clicking toward it (hop {hops + 1}/{MAX_BANK_MINIMAP_HOPS})")
-                    controller.click_entity(ctx.ser, point, offset=(0, 0))
+                    controller.click_entity(ctx.ser, point, offset=(0, 0), check_ui_blockers=False)
                     controller.human_delay(0.6, 1.0)
                     return
             if handle_missing_target(ctx, config, "bank", "gc_bank_misses", "gc_bank_walks"):
@@ -2421,55 +2515,6 @@ def bank_phase(ctx, config: dict) -> None:
     ctx.state.trigger_safety_stop("no bank found near Wyrmscraig, and Teleport If No Bank Nearby is off")
 
 
-def _ensure_wooden_spikes(ctx, config: dict) -> bool:
-    """Take wooden spikes from the Spikes supply object next to Geoff if not already carried.
-    CORRECTED 2026-08-08 (MCP live debug session): the original design assumed spikes had to be
-    withdrawn from the bank, same as any other supply -- live testing found a "Spikes supply"
-    object standing right next to Geoff at the Goat Pit itself, whose default left-click
-    resolves to "Take" (see SPIKES_SUPPLY_NAME's comment). Walking back to the bank for
-    something sitting right at the pit made no sense once that was confirmed, so this now takes
-    directly from the supply instead.
-
-    Same handle_missing_target retry/walk pattern as mine_phase/craft_phase/hunt_phase's own
-    object lookups (not a bespoke bank-or-bust check like the old version), since hunt_phase can
-    call this before the player has actually reached the pit area. Returns True once wooden
-    spikes are confirmed in inventory; returns False either to tell the caller to just retry
-    next tick, or because handle_missing_target gave up and this already called
-    trigger_safety_stop -- callers don't need to distinguish the two, same as every other
-    handle_missing_target call site in this module."""
-    if find_item(WOODEN_SPIKES_NAME) is not None:
-        return True
-
-    supply = find_object(SPIKES_SUPPLY_NAME)
-    if supply is None:
-        if handle_missing_target(ctx, config, "spikesSupply", "gc_spikes_misses", "gc_spikes_walks"):
-            return False
-        ctx.state.trigger_safety_stop("out of wooden spikes and no Spikes supply found nearby")
-        return False
-    ctx.state.data["gc_spikes_misses"] = 0
-    ctx.state.data["gc_spikes_walks"] = 0
-
-    # CORRECTED 2026-08-09 (user request): "Take-5" instead of a plain click -- a plain click's
-    # default action only ever gave 1 spike at a time (CONFIRMED live: hunt_phase's own relining
-    # consumes 1 per cycle, so a 1-at-a-time take meant a Spikes supply round trip every single
-    # cycle). Taking 5 at once covers 5 relining cycles per visit instead of 1.
-    debug_log.log("golem crafting", "taking 5 wooden spikes from the Spikes supply")
-    refresh = controller.object_refresh_target(
-        supply.get("x"), supply.get("y"), supply.get("plane", 0), supply.get("id"),
-    )
-    controller.click_menu_action(ctx.ser, supply, "take-5", refresh_target=refresh,
-                                  refresh_legs=GOLEM_CLICK_REFRESH_LEGS)
-    controller.human_delay(0.4, 0.7)
-    return find_item(WOODEN_SPIKES_NAME) is not None
-
-
-# How long to wait for the Goat Pit's menu to switch from "Clear" to "Line" before giving up and
-# proceeding anyway -- ADDED 2026-08-09 (user request). Generous margin: the collection animation
-# was observed to "take a while", and proceeding too early is exactly the bug this guards against,
-# so this errs toward patience over a tight bound.
-PIT_CLEAR_TIMEOUT_S = 20.0
-
-
 # How many drop passes to make over a junk item before accepting whatever is left. Bounded
 # because this runs unattended and an item that genuinely cannot be dropped must not spin.
 DROP_MAX_PASSES = 3
@@ -2507,344 +2552,374 @@ def _drop_all(ctx, name: str) -> None:
             controller.human_delay(0.2, 0.4)
 
 
-def _pit_ready_to_reline(ctx, pit: dict) -> bool:
-    """Right-click the Goat Pit and check whether its menu currently offers "Line" (collection
-    finished) rather than "Clear" (still processing) -- CONFIRMED live (user observation) this
-    is the pit's own authoritative done-collecting signal. Peeks only: never selects an entry,
-    dismissing the menu the same move-away-then-ESC way controller.click_menu_action does when
-    nothing matches, so checking never risks accidentally triggering whatever IS on the menu."""
-    if not controller.click_entity(ctx.ser, pit, simulate_mistakes=False, button="right"):
-        return False
-    deadline = time.time() + controller.MENU_POLL_TIMEOUT_S
-    menu = controller.get_menu()
-    while not menu.get("open") and time.time() < deadline:
-        time.sleep(controller.MENU_POLL_INTERVAL_S)
-        menu = controller.get_menu()
-    if not menu.get("open"):
-        return False
-    ready = any("line" == (e.get("option") or "").lower() for e in menu.get("entries", []))
-    cx, cy = controller.get_cursor_pos()
-    controller.move_to_human(ctx.ser, *controller.pick_dismiss_point(cx, cy), aim_radius=10)
-    controller.key_tap(ctx.ser, "ESC")
-    return ready
+
+# =============================================================================================
+# The fur trip: falconry at Piscatoris (2026-09-06)
+# docs/superpowers/specs/2026-09-06-golem-crafting-events-and-falconry-design.md, section 3.
+#
+# Entered from _run_bank_trip when the bank holds no usable fur (the kit is withdrawn there, at the
+# open bank). Dispatched on LIVE position every call -- trip_leg() -- so a restart resumes wherever
+# the character actually is; ctx.state.data["gc_trip"] holds only hints (kit withdrawn, start time,
+# catches). The Piscatoris legs and the hunting primitives are routines/falconry.py's own (recorded
+# 2026-08-23); the return leg is the slayer ring into the Wyrmscraig Cavern and the Cave/Exit
+# object back to the surface. NONE of the new legs has run live -- the spec's worklist is the first
+# session's checklist.
+# =============================================================================================
+
+KIT_ITEMS = ("ardougne cloak",)          # + the configured return teleport (no Dramen staff:
+                                          # fairy rings stopped needing one, USER 2026-09-06)
+RETURN_TELEPORT_ITEMS = {"slayer ring": "slayer ring", "necklace of passage": "necklace of passage"}
+# Wyrmscraig's SURFACE regions (x 2540-2640 -> region x 39-41, y 2180-2290 -> region y 34-35).
+WYRMSCRAIG_REGIONS = frozenset({10018, 10019, 10274, 10275, 10530, 10531})
+# The cavern is the surface plus 6400 in y (Broken golem at 2573,8650; cavern centre 2590,8615).
+CAVERN_MIN_Y = 8000
+CAVERN_EXIT_NAME = "cave"       # loc 62220 wyrmscraig_cave_exit: name "Cave", op1 "Exit" (cache)
+CAVERN_EXIT_ACTION = "exit"
+CAVERN_SCAN_LIMIT = 12          # full-scene scans with no exit and no known anchor before stopping
+KIT_CONFIRM_S = 3.0             # a bank withdraw click -> the item in the inventory
+DIALOGUE_S = 3.0                # slayer ring Teleport -> the destination dialogue
+LEAVE_CAVERN_S = 6.0            # Cave/Exit click -> surface (plus the walk to it)
+POUCH_OPEN_MARKER = "(open)"    # "Large fur pouch (open)" (cache obj 29470) vs "Large fur pouch"
 
 
-# Consecutive empty-goat polls required before treating the pit as genuinely cleared -- guards
-# against declaring "cleared" off a single early poll taken right after lining, before any wild
-# goat has registered in the bridge's NPC list yet. ADDED 2026-08-08 (final whole-branch
-# review).
-GOAT_NO_GOAT_CLEAR_STREAK = 3
-
-# Hard cap on hunt-phase actions (originally lure/harvest clicks; now Telekinetic Grab casts --
-# see hunt_phase's own docstring for the 2026-08-08 rewrite) per activation -- guards the
-# opposite failure: if a cast/click never actually resolves as expected, this phase would
-# repeat forever with no progress. ADDED 2026-08-08 (final whole-branch review).
-MAX_HUNT_ACTIONS = 60
+def _trip(ctx) -> dict:
+    return ctx.state.data.setdefault("gc_trip", {})
 
 
-# Consecutive Telekinetic Grab casts that never went out before treating the spellbook as
-# genuinely unreachable. cast_telekinetic_grab returns False for exactly this case ("spellbook not
-# open/wrong spellbook active"); hunt_phase used to DISCARD that return, so an unopenable
-# spellbook burned all MAX_HUNT_ACTIONS casts over ~7 minutes and then reported the generic "Grab
-# may not be resolving as expected" -- LIVE 2026-08-24 04:38, where /spellbook said visible:false
-# and the inventory tab was open the entire time. Small but not 1: a single False can be a
-# transient miss or a tab still animating.
-SPELL_FAILURE_LIMIT = 4
+def _fur_trip_cfg(config: dict) -> dict:
+    merged = dict(DEFAULT_CONFIG["furTrip"])
+    merged.update((config or {}).get("furTrip") or {})
+    return merged
 
 
-def _note_cast_failed(ctx) -> None:
-    """Record a Grab cast that never actually went out, and stop with the REAL reason once it is
-    clearly not transient. Named separately from the generic hunt-action budget so the safety-stop
-    message can say "the spellbook will not open" instead of guessing at rune costs or goat
-    behaviour."""
-    streak = ctx.state.data.get("gc_cast_failures", 0) + 1
-    ctx.state.data["gc_cast_failures"] = streak
-    if streak >= SPELL_FAILURE_LIMIT:
-        ctx.state.trigger_safety_stop(
-            f"Telekinetic Grab could not be cast {SPELL_FAILURE_LIMIT} times in a row -- the "
-            f"spellbook will not open (GET /spellbook reports visible:false). Check the Magic-tab "
-            f"keybind: open_spellbook_if_needed taps 'T'."
-        )
+def _start_trip(ctx) -> None:
+    ctx.state.data["gc_trip"] = {"kit": True, "done": False, "started": time.time(),
+                                 "catches": 0, "cavern_scans": 0}
 
 
-def _note_cast_landed(ctx) -> None:
-    ctx.state.data["gc_cast_failures"] = 0
+def trip_leg(player: dict, trip: dict) -> str:
+    """Which leg of the fur trip the character is on, from LIVE position alone (plus the trip's
+    two hints): "kit" | "depart" | "fairy_ring" | "walk_in" | "hunt" | "return" | "cavern" |
+    "home" | "unknown". Pure, so the whole dispatch table is unit-tested."""
+    region = player.get("regionId")
+    y = player.get("y") or 0
+    if y >= CAVERN_MIN_Y:
+        return "cavern"
+    if region == falconry.REGION_FALCONRY:
+        if trip.get("done"):
+            return "return"
+        if y >= falconry.SOUTH_OF_STILE_Y:
+            return "walk_in"     # north of the fence: the stile is still ahead (falconry's own rule)
+        return "hunt"
+    if region in (falconry.REGION_MONASTERY, falconry.REGION_FAIRY_RING):
+        return "fairy_ring"
+    if region == falconry.REGION_FAIRY_LANDING:
+        return "walk_in"
+    if region in WYRMSCRAIG_REGIONS:
+        if trip.get("done"):
+            return "home"
+        if trip.get("kit"):
+            return "depart"
+        return "kit"
+    return "unknown"
 
 
-def hunt_phase(ctx, config: dict) -> None:
-    """Entered only when bank_phase finds no usable fur at all. Traps Wyrmscraig goats by
-    casting Telekinetic Grab on them (not by clicking them directly -- see this function's own
-    history below for the wrong assumption this replaces), harvests the pit once full, and
-    repeats (relining every single cycle) until either no valid goats remain nearby or the fur
-    pouch hits capacity. One bounded action per call, same shape as mine_phase/chisel_phase.
+def _item(sub: str):
+    sub = sub.lower()
+    return next((i for i in controller.get_inventory() if sub in (i.get("name") or "").lower()), None)
 
-    CORRECTED 2026-08-08 (user session, live-verified): replaces this function's entire
-    original model. The original assumed a plain left-click on a wild goat resolves to "Lure"
-    (and the same click on a trapped goat resolves to "Harvest") -- CONFIRMED WRONG live. The
-    real mechanic (see docs/superpowers/specs/2026-08-08-goat-pit-telekinetic-grab-design.md
-    for the full writeup):
-      1. Line the pit with wooden spikes (unchanged mechanically, now happens after walking to
-         the fixed standing tile rather than before, so lining always happens from the same
-         spot the whole cycle depends on).
-      2. Stand on the tile 2 tiles north of the pit -- the player's own fixed side. Only goats
-         to the south, east, or west (is_valid_grab_target) within 10 tiles
-         (goat_in_grab_range) are ever valid Grab targets; a farther target would make the
-         character auto-walk toward it, abandoning the fixed tile.
-      3. Cast Telekinetic Grab (controller.cast_telekinetic_grab) on the nearest valid goat,
-         repeatedly, until the chat message "The pit is now filled with goats." arrives
-         (captured by on_event into gc_last_hunt_chat/_seq, same chat-driven-confirmation
-         idiom craft_phase already uses for golem-crafting messages).
-      4. Click the pit to harvest (not individual goats) -- always yields a Goat horn (useless,
-         dropped) and a 1/4-per-trapped-goat chance of Wyrmscraig goat fur (routed into the
-         already-open fur pouch, same as before).
-      5. Relines every single cycle (not once per hunt visit) before repeating from step 3.
-         ROOT-CAUSED 2026-08-09 (autonomous session): a single lining also wears out mid-visit,
-         well before the pit fills -- "You need to replace the spikes in the pit." (chat, caught
-         via GOAT_CHAT_NEED_NEW_SPIKES) means every subsequent cast lands but is rejected by the
-         game, not that the cast itself is broken. This clears gc_pit_lined so the very next call
-         re-lines from the same standing tile (no re-walk) before resuming casts -- this, not the
-         click mechanics, was the real reason MAX_HUNT_ACTIONS kept exhausting with zero fills.
-      6. If the fur pouch is at capacity (28), any further fur spills into loose inventory
-         instead of the pouch -- CONFIRMED live this is the signal used to know it's full,
-         rather than any dedicated capacity-check action. Once seen, drops any leftover wooden
-         spikes (no longer needed this trip) and skips bank_phase entirely, going straight to
-         mine_phase (fully re-stocked already -- nothing to deposit or withdraw for fur).
 
-    Rune handling: no pre-check of the rune pouch's contents (it isn't inventory-visible the
-    way find_item can see loose runes -- see the spec's Research method section for why).
-    Instead, casting is attempted and the "you do not have enough ... to cast this spell"
-    rejection (GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS) safety-stops immediately, same pattern as the
-    fur/sunstone shortage handling in craft_phase.
+def _has_item(sub: str) -> bool:
+    return _item(sub) is not None
 
-    Still bounded by MAX_HUNT_ACTIONS/gc_hunt_actions, same safety net the original click-based
-    version had -- a Grab cast that never actually resolves is the same "clicks forever with no
-    progress" risk class a bad click resolution always was, so the cap carries over unchanged.
-    """
-    if not _ensure_wooden_spikes(ctx, config):
-        return
 
-    pit = find_object(GOAT_PIT_NAME)
-    if pit is None:
-        if handle_missing_target(ctx, config, "goatPit", "gc_pit_misses", "gc_pit_walks"):
-            return
-        ctx.state.trigger_safety_stop("Goat Pit not found nearby")
-        return
-    ctx.state.data["gc_pit_misses"] = 0
-    ctx.state.data["gc_pit_walks"] = 0
+def _coins() -> int:
+    coins = _item("coins")
+    return coins.get("qty", 0) if coins else 0
 
-    if not ctx.state.data.get("gc_hunt_standing"):
-        target = {"x": pit["x"], "y": pit["y"] + 2, "plane": pit.get("plane", 0)}
-        if not walk_to_exact_tile(ctx, target["x"], target["y"], target["plane"]):
-            debug_log.log("golem crafting", "couldn't walk to the hunt standing tile -- retrying next tick")
-            return
-        ctx.state.data["gc_hunt_standing"] = True
-        # CORRECTED 2026-08-09 (user report: "didn't press the pit to line it"): `pit` was
-        # captured BEFORE the walk above, so its screenX/screenY were stale by the time the
-        # lining click below used them -- walk_to_exact_tile's own polling loop takes real time
-        # and can pan the camera, so a click against the pre-walk position landed nowhere near
-        # the pit's actual on-screen spot post-walk. Re-fetching fresh here, same "always
-        # re-check before a critical click" pattern craft_phase already uses after its own
-        # walk_to_exact_tile calls.
-        pit = find_object(GOAT_PIT_NAME)
-        if pit is None:
-            debug_log.log("golem crafting", "pit no longer found after walking to the standing tile -- retrying next tick")
-            return
 
-    if not ctx.state.data.get("gc_pit_lined"):
-        # CORRECTED 2026-08-09 (user correction): lining doesn't need "use spikes on pit" --
-        # merely carrying wooden spikes (already guaranteed by _ensure_wooden_spikes above) is
-        # enough; a plain click on the Goat Pit itself does the lining. The previous click-
-        # spikes-then-click-pit sequence was never actually needed and, combined with the stale
-        # `pit` reference above, was why the pit click wasn't visibly landing.
-        debug_log.log("golem crafting", "lining the Goat Pit")
-        if not controller.click_entity(ctx.ser, pit):
-            debug_log.log("golem crafting", "lining click missed/blocked -- retrying next tick")
-            return
-        controller.human_delay(0.6, 1.0)
-        ctx.state.data["gc_pit_lined"] = True
-        ctx.state.data["gc_pit_filled"] = False
-
-        if banker.has_fur_pouch() and not ctx.state.data.get("gc_pouch_opened_this_hunt"):
-            pouch = find_item(banker.FUR_POUCH_NAME.title()) or next(
-                (i for i in controller.get_inventory() if banker.FUR_POUCH_NAME in (i.get("name") or "").lower()),
-                None,
-            )
-            if pouch is not None:
-                debug_log.log("golem crafting", "opening fur pouch so catches route straight in")
-                controller.click_entity(ctx.ser, pouch, check_ui_blockers=False)
-                controller.human_delay(0.3, 0.5)
-            ctx.state.data["gc_pouch_opened_this_hunt"] = True
-        return
-
-    if not ctx.state.data.get("gc_pit_filled"):
-        player = controller.get_player()
-        # ADDED 2026-08-09 (user report: "sent a spell on a goat behind a tree and ran away from
-        # our designated tile... creates an endless loop"): a goat blocked by scenery (a tree,
-        # here) apparently isn't a valid Grab target even within range -- CONFIRMED live the
-        # character auto-walked toward it instead of casting in place, the same failure mode
-        # goat_in_grab_range's own docstring already flags for an out-of-range target, just
-        # triggered by line-of-sight instead of distance. Once off the standing tile, every
-        # subsequent goat looked "closest" from the wrong spot and casting kept silently failing
-        # there forever. Re-asserting position here, every single call (not just once via
-        # gc_hunt_standing), makes getting back the top priority over casting anything -- this
-        # check runs before goat selection, so a drifted player never even attempts a cast from
-        # the wrong tile.
-        expected_x, expected_y = pit["x"], pit["y"] + 2
-        if player.get("x") != expected_x or player.get("y") != expected_y:
-            debug_log.log("golem crafting", "drifted off the hunt standing tile -- walking back before casting again")
-            walk_to_exact_tile(ctx, expected_x, expected_y, pit.get("plane", 0))
-            return
-
-        # ADDED 2026-08-09 (user request): a goat that was just Grab-cast on doesn't vanish or
-        # move out of range instantly -- it's still the closest candidate for a few seconds while
-        # it travels toward the pit, so without this the very next cast re-targeted the SAME goat
-        # over and over instead of spreading casts across the several goats that can be traveling
-        # toward the pit at once (CONFIRMED live: id=16298 targeted repeatedly in a row).
-        # Short-lived cooldown by NPC index, not identity/position (a goat's own position changes
-        # every tick while it's being pulled in, so anything position-keyed would never actually
-        # match the same goat twice).
-        cooldowns = ctx.state.data.get("gc_hunt_grab_cooldowns", {})
-        now = time.time()
-        cooldowns = {idx: expiry for idx, expiry in cooldowns.items() if expiry > now}
-        ctx.state.data["gc_hunt_grab_cooldowns"] = cooldowns
-        valid_goats = [
-            n for n in controller.get_npcs()
-            if GOAT_NAME in (n.get("name") or "").lower()
-            and n.get("visible", True)
-            and is_valid_grab_target(pit, n)
-            and goat_in_grab_range(player, n)
-        ]
-        # "Area genuinely cleared" is judged against valid_goats (ignores cooldown) -- a goat
-        # that's merely on cooldown while it travels toward the pit is still there, not cleared,
-        # and must never count toward this streak (it would otherwise falsely trigger "no valid
-        # goats left -- moving to bank phase" every time several goats got Grab-cast in a row).
-        if not valid_goats:
-            streak = ctx.state.data.get("gc_hunt_no_goat_streak", 0) + 1
-            ctx.state.data["gc_hunt_no_goat_streak"] = streak
-            if streak < GOAT_NO_GOAT_CLEAR_STREAK:
-                debug_log.log("golem crafting", f"no valid goats visible ({streak}/{GOAT_NO_GOAT_CLEAR_STREAK}) -- confirming the area is actually cleared")
-                return
-            debug_log.log("golem crafting", "no valid goats left nearby -- moving to bank phase")
-            ctx.state.data["gc_phase"] = "bank"
-            ctx.state.data["gc_pit_lined"] = False
-            ctx.state.data["gc_pit_filled"] = False
-            ctx.state.data["gc_hunt_standing"] = False
-            ctx.state.data["gc_pouch_opened_this_hunt"] = False
-            ctx.state.data["gc_hunt_no_goat_streak"] = 0
-            ctx.state.data["gc_hunt_actions"] = 0
-            ctx.state.data["gc_hunt_grab_cooldowns"] = {}
-            return
-        ctx.state.data["gc_hunt_no_goat_streak"] = 0
-
-        goats = [n for n in valid_goats if n.get("index") not in cooldowns]
-        if not goats:
-            # Every currently-valid goat is on cooldown (all recently cast on, still traveling
-            # toward the pit) -- not "cleared", just nothing new to cast on yet this tick.
-            debug_log.log("golem crafting", "all nearby goats on cooldown -- waiting for one to become castable again")
-            return
-
-        # Same safety net the original click-based version had (MAX_HUNT_ACTIONS/gc_hunt_actions
-        # existed to guard "a click that never actually resolves clicks forever with no
-        # progress") -- a Grab cast that never actually lands (spellbook not opening, wrong
-        # widget, etc.) is the exact same risk class for this mechanic, so the cap carries over
-        # unchanged rather than being dropped along with the click-based approach it originally
-        # guarded.
-        actions = ctx.state.data.get("gc_hunt_actions", 0) + 1
-        ctx.state.data["gc_hunt_actions"] = actions
-        if actions > MAX_HUNT_ACTIONS:
+def _withdraw_kit(ctx, config: dict) -> bool:
+    """Withdraw the travel kit at the OPEN bank: Ardougne cloak, the configured
+    return teleport, and coins up to hireCoins. Each withdrawal is confirmed on INVENTORY_CHANGED
+    + the item in the inventory; a kit item the bank does not hold is a safety stop naming it (a
+    trip without it strands the character)."""
+    cfg = _fur_trip_cfg(config)
+    return_item = RETURN_TELEPORT_ITEMS.get(cfg.get("returnTeleport"), "slayer ring")
+    for sub in KIT_ITEMS + (return_item,):
+        if _has_item(sub):
+            continue
+        mark = outcome_waits.mark(ctx)
+        ok = banker.search_and_withdraw(ctx, sub, 1, contains=True)
+        landed = ok and outcome_waits.await_pre(
+            ctx, "INVENTORY_CHANGED", KIT_CONFIRM_S, confirm=lambda sub=sub: _has_item(sub),
+            since=mark, reaction=False, now_fn=time.time, sleep_fn=time.sleep)
+        if not landed:
             ctx.state.trigger_safety_stop(
-                f"hunt phase exceeded {MAX_HUNT_ACTIONS} Grab-cast attempts without the pit "
-                "filling -- Telekinetic Grab may not be resolving as expected (see hunt_phase's "
-                "docstring)"
-            )
-            return
+                f"fur trip: '{sub}' is not in the bank -- needed to reach Piscatoris and back")
+            return False
 
-        goats.sort(key=lambda n: n.get("distance", 9999))
-        target = goats[0]
-        debug_log.log("golem crafting", f"casting Telekinetic Grab on {target.get('name')} (dist={target.get('distance')})")
-        if controller.cast_telekinetic_grab(ctx.ser, target):
-            _note_cast_landed(ctx)
-        else:
-            # The clicks never went out -- almost always the spellbook not being open. Counting
-            # this as an ordinary hunt action would spend the whole budget before saying so.
-            _note_cast_failed(ctx)
-            if ctx.state.safety_stopped:
-                return
-        if target.get("index") is not None:
-            cooldowns[target["index"]] = now + GOAT_GRAB_COOLDOWN_S
-        controller.human_delay(0.6, 1.0)
+    need = int(cfg.get("hireCoins", 2000)) - _coins()
+    if need > 0 and not _withdraw_coins(ctx, need):
+        ctx.state.trigger_safety_stop(
+            f"fur trip: could not withdraw {need} coins for Quick-falcon (500gp per falcon)")
+        return False
+    return True
 
-        seq = ctx.state.data.get("gc_last_hunt_chat_seq", 0)
-        if seq > ctx.state.data.get("gc_hunt_chat_seen_seq", 0):
-            ctx.state.data["gc_hunt_chat_seen_seq"] = seq
-            message = ctx.state.data.get("gc_last_hunt_chat", "")
-            if all(part in message for part in GOAT_CHAT_NOT_ENOUGH_RUNES_PARTS):
-                # CORRECTED 2026-08-09 (user report): this fired once over "not enough Earth
-                # runes" -- traced to a misclick on the spell icon landing on a different spell
-                # entirely (now fixed, see cast_telekinetic_grab's simulate_mistakes=False). The
-                # rune actually named in the game's own message is included here rather than
-                # assumed to be law/air, so a repeat of this (or any other unexpected cause)
-                # says exactly what the game said instead of a guess that could be wrong again.
-                ctx.state.trigger_safety_stop(f"can't cast Telekinetic Grab: {message.strip()}")
-                return
-            if GOAT_CHAT_PIT_FULL in message:
-                debug_log.log("golem crafting", "pit is now filled with goats -- harvesting")
-                ctx.state.data["gc_pit_filled"] = True
-                ctx.state.data["gc_hunt_actions"] = 0
-            elif GOAT_CHAT_NEED_NEW_SPIKES in message:
-                # ROOT-CAUSED 2026-08-09 (autonomous session, hunt_test17.log): a single lining
-                # only lasts a handful of catches before wearing out mid-visit -- CONFIRMED live
-                # this was the actual reason hunt_phase kept exhausting MAX_HUNT_ACTIONS with zero
-                # pit fills (every cast after the first couple landed fine but was rejected by the
-                # game with this exact message). Clearing gc_pit_lined re-enters the lining branch
-                # above on the very next call -- no re-walk needed, gc_hunt_standing stays True and
-                # the player is still on the fixed tile, so this only re-clicks the pit (guarded by
-                # _ensure_wooden_spikes at the top of hunt_phase already keeping spikes stocked).
-                debug_log.log("golem crafting", "pit's spikes wore out mid-hunt -- relining before casting again")
-                ctx.state.data["gc_pit_lined"] = False
-        return
 
-    # Pit is full -- harvest.
-    pit = find_object(GOAT_PIT_NAME)  # fresh lookup, same idiom as craft_phase's re-checks
-    if pit is None:
-        debug_log.log("golem crafting", "pit no longer found before harvesting -- retrying next tick")
-        return
-    controller.click_entity(ctx.ser, pit)
-    controller.human_delay(0.6, 1.0)
+def _withdraw_coins(ctx, amount: int) -> bool:
+    """Withdraw-X `amount` coins from the open bank (search, right-click, typed amount) --
+    mastering_mixology's Withdraw-X shape; search_and_withdraw would click once per coin."""
+    if not banker.search_bank(ctx, "coins"):
+        return False
+    slot = next((i for i in controller.get_bank().get("items", [])
+                 if "coins" in (i.get("name") or "").lower() and i.get("qty", 0) > 0), None)
+    if slot is None:
+        banker.clear_bank_search(ctx)
+        return False
+    before = _coins()
+    if not controller.click_menu_action(ctx.ser, slot, "Withdraw-X", check_ui_blockers=False):
+        banker.clear_bank_search(ctx)
+        return False
+    # The "Enter amount" chatbox needs a moment to take keyboard focus (CONFIRMED live in the
+    # mixology bank, 2026-08-12: digits typed immediately were dropped).
+    controller.human_delay(0.4, 0.6)
+    mark = outcome_waits.mark(ctx)
+    controller.type_digits_and_enter(ctx.ser, str(amount))
+    landed = outcome_waits.await_pre(
+        ctx, "INVENTORY_CHANGED", KIT_CONFIRM_S, confirm=lambda: _coins() > before,
+        since=mark, reaction=False, now_fn=time.time, sleep_fn=time.sleep)
+    banker.clear_bank_search(ctx)
+    return bool(landed)
 
-    # ADDED 2026-08-09 (user report: "we still try to catch goats while the animation is going"):
-    # collecting the trapped goats isn't instant -- CONFIRMED live the pit's own right-click menu
-    # still offers "Clear" while that's in progress, only switching to "Line" once it's actually
-    # done, which is the authoritative "finished collecting" signal (more reliable than a fixed
-    # guess at how long the animation takes). Blocks here -- nothing else in hunt_phase runs
-    # again until this returns, so no further Grab casts or inventory handling can overlap with
-    # the collection animation.
-    debug_log.log("golem crafting", "waiting for the pit to finish collecting")
-    deadline = time.time() + PIT_CLEAR_TIMEOUT_S
-    while time.time() < deadline and not _pit_ready_to_reline(ctx, pit):
-        time.sleep(1.0)
 
-    # Switch to Inventory -- CONFIRMED live needed before clicking inventory items; a still-open
-    # Magic tab from Grab-casting would otherwise leave Goat horns unclickable. Verified switch
-    # (see controller.ensure_ui_state), not a blind tap -- a still-open Magic tab is exactly a
-    # case a dropped keypress here would silently leave unresolved.
-    controller.open_inventory_tab(ctx.ser)
-    _drop_all(ctx, GOAT_HORN_NAME)   # "Drop" -- confirmed live Forced Action
-
-    spilled_fur = any(
-        (i.get("name") or "").lower() in {f.lower() for f in FUR_PRIORITY}
-        for i in controller.get_inventory()
-    )
-    ctx.state.data["gc_pit_lined"] = False
-    ctx.state.data["gc_pit_filled"] = False
-    if spilled_fur:
-        debug_log.log("golem crafting", "fur pouch full -- skipping bank, heading to mine phase")
-        _drop_all(ctx, WOODEN_SPIKES_NAME)
+def _hunt_done(ctx, cfg: dict, trip: dict) -> bool:
+    """The trip's end: LOOSE dashing kebbit fur in the inventory means the pouch holds its 28
+    (the same spill signal the goat pit used, CONFIRMED live 2026-08-09), or the time cap. Sets
+    gc_fur_stock either way -- 28 on a full pouch, the retrieve count otherwise."""
+    if _has_item(falconry.FUR_NAME):
+        debug_log.log("golem crafting", "fur spilled into the inventory -- the fur pouch is full, trip done")
         ctx.state.data["gc_fur_stock"] = FUR_POUCH_CAPACITY
-        ctx.state.data["gc_hunt_standing"] = False
-        ctx.state.data["gc_pouch_opened_this_hunt"] = False
-        ctx.state.data["gc_hunt_actions"] = 0
-        ctx.state.data["gc_phase"] = "mine"
+        return True
+    started = trip.get("started")
+    if started is None:
+        trip["started"] = time.time()
+        return False
+    if time.time() - started > float(cfg.get("tripMaxMinutes", 25)) * 60.0:
+        catches = int(trip.get("catches", 0))
+        debug_log.log("golem crafting", f"fur trip time cap reached with {catches} catches -- heading home")
+        ctx.state.data["gc_fur_stock"] = catches
+        return True
+    return False
+
+
+def _ensure_pouch_open(ctx) -> bool:
+    """Fur only routes into an OPEN fur pouch (wiki; the goat pit hunt opened it the same way).
+    The open state is the item's own name ("... fur pouch (open)", cache obj 29470). Returns
+    True if it acted this tick."""
+    pouch = _item(banker.FUR_POUCH_NAME)
+    if pouch is None or POUCH_OPEN_MARKER in (pouch.get("name") or "").lower():
+        return False
+    debug_log.log("golem crafting", "opening the fur pouch so catches route straight in")
+    controller.open_inventory_tab(ctx.ser)
+    mark = outcome_waits.mark(ctx)
+    if not controller.click_menu_action(ctx.ser, pouch, "Open", check_ui_blockers=False):
+        return True
+    outcome_waits.await_pre(
+        ctx, "INVENTORY_CHANGED", KIT_CONFIRM_S,
+        confirm=lambda: POUCH_OPEN_MARKER in ((_item(banker.FUR_POUCH_NAME) or {}).get("name") or "").lower(),
+        since=mark, reaction=False, now_fn=time.time, sleep_fn=time.sleep)
+    return True
+
+
+def _dialogue_options() -> list:
+    """The REAL options of the open chat menu, in number-key order (key = position + 1) -- the
+    m8aq Dialogue reader returns the TITLE as child 0 then blank trailing children (MEASURED
+    live in Giants' Foundry 2026-09-03; see giants_foundry._dialogue_options)."""
+    d = controller.get_api("ui", "dialogue")
+    if not d or d.get("error"):
+        return []
+    raw = [o if isinstance(o, str) else (o.get("text") or "") for o in (d.get("options") or [])]
+    raw = raw[1:] if raw else raw
+    return [o for o in raw if o.strip()]
+
+
+def _choose_dialogue_option(ctx, needle: str, budget_s: float = DIALOGUE_S) -> bool:
+    """Wait for a chat menu whose options contain `needle` and press its number key."""
+    deadline = time.time() + budget_s
+    while time.time() < deadline:
+        options = _dialogue_options()
+        for i, text in enumerate(options):
+            if needle.lower() in text.lower():
+                controller.key_tap(ctx.ser, str(i + 1))
+                return True
+        time.sleep(0.1)
+    debug_log.log("golem crafting", f"no dialogue option containing '{needle}' appeared within {budget_s}s")
+    return False
+
+
+def _at_wyrmscraig() -> bool:
+    player = controller.get_player() or {}
+    return (player.get("y") or 0) >= CAVERN_MIN_Y or player.get("regionId") in WYRMSCRAIG_REGIONS
+
+
+def _teleport_home(ctx, cfg: dict) -> bool:
+    """Slayer ring / necklace of passage home to Wyrmscraig.
+
+    LEFT-click first (USER 2026-09-06: "for inventory teleports ive changed them so we just
+    click the item and we teleport to the right spot"), verified through GET /hover so an
+    un-swapped item (default "Wear") withholds instead of being worn; the right-click menu
+    ("Wyrmscraig" direct, else `Teleport`/`Rub` -- cache obj 11866 iop3) is the fallback. Either
+    path may open the numbered destination dialogue, whose "Wyrmscraig" entry is picked by
+    number key. Confirmed on the player standing in the cavern band or a surface Wyrmscraig
+    region."""
+    return_item = RETURN_TELEPORT_ITEMS.get(cfg.get("returnTeleport"), "slayer ring")
+    item = _item(return_item)
+    if item is None:
+        ctx.state.trigger_safety_stop(f"fur trip: no '{return_item}' in the inventory to get home with")
+        return False
+    controller.open_inventory_tab(ctx.ser)
+    mark = outcome_waits.mark(ctx)
+    debug_log.log("golem crafting", f"teleporting home with the {return_item}")
+    clicked = controller.click_entity(ctx.ser, item, check_ui_blockers=False, simulate_mistakes=False,
+                                      expected_action=("Wyrmscraig", "Teleport", "Rub"))
+    if clicked:
+        # A swapped left-click either lands directly or opens the destination dialogue.
+        deadline = time.time() + DIALOGUE_S
+        while time.time() < deadline and not _at_wyrmscraig():
+            options = _dialogue_options()
+            hit = next((i for i, t in enumerate(options) if "wyrmscraig" in t.lower()), None)
+            if hit is not None:
+                controller.key_tap(ctx.ser, str(hit + 1))
+                break
+            time.sleep(0.1)
+    elif not controller.click_menu_action(ctx.ser, item, "Wyrmscraig", check_ui_blockers=False):
+        if not controller.click_menu_action(ctx.ser, item, ("Teleport", "Rub"), check_ui_blockers=False):
+            debug_log.log("golem crafting", f"{return_item}: no Teleport/Rub entry in its menu -- retrying next tick")
+            return False
+        if not _choose_dialogue_option(ctx, "wyrmscraig"):
+            return False
+    landed = outcome_waits.await_pre(
+        ctx, ("PLAYER_STOPPED", "PLAYER_MOVING"), falconry.TELEPORT_BUDGET_S, confirm=_at_wyrmscraig,
+        since=mark, reaction=False, now_fn=time.time, sleep_fn=time.sleep)
+    if not landed:
+        debug_log.log("golem crafting", "the return teleport did not land at Wyrmscraig within the budget -- retrying next tick")
+    return bool(landed)
+
+
+def _find_cavern_exit():
+    """The Cave/Exit object anywhere in the LOADED SCENE (no radius: the cavern is one scene and
+    this runs once per trip), nearest first. None when not loaded/visible."""
+    candidates = [
+        o for o in controller.get_objects(interactable=True)
+        if (o.get("name") or "").lower() == CAVERN_EXIT_NAME
+        and any(CAVERN_EXIT_ACTION == (a or "").lower() for a in (o.get("actions") or []))
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda o: o.get("distance", 9999))
+    return candidates[0]
+
+
+def _leave_cavern(ctx, config: dict, trip: dict) -> bool:
+    """Walk to and click the cavern's Cave/Exit object; True once the player is back on the
+    surface. Records the exit's tile (ctx.state.data["gc_cavern_exit"]) the first time it is
+    seen so later trips walk there before scanning; with nothing visible and no anchor, the
+    scan count is bounded by CAVERN_SCAN_LIMIT."""
+    exit_obj = _find_cavern_exit()
+    known = ctx.state.data.get("gc_cavern_exit") or (config.get("locations") or {}).get("cavernExit")
+    if exit_obj is not None:
+        tile = {"x": exit_obj.get("x"), "y": exit_obj.get("y"), "plane": exit_obj.get("plane", 0)}
+        ctx.state.data["gc_cavern_exit"] = tile
+        refresh = controller.object_refresh_target(tile["x"], tile["y"], tile["plane"], exit_obj.get("id"))
+        mark = outcome_waits.mark(ctx)
+        if not controller.click_entity(ctx.ser, exit_obj, refresh_target=refresh):
+            # Off-screen (the exit can be 40+ tiles from the ring's landing): walk toward it, the
+            # next call clicks it once it projects.
+            debug_log.log("golem crafting", f"cavern exit at ({tile['x']}, {tile['y']}) is off-screen -- walking to it")
+            travel.walk_to(ctx, tile, goal_adjacent=True)
+            return False
+        left = outcome_waits.await_pre(
+            ctx, ("PLAYER_STOPPED", "PLAYER_MOVING"),
+            LEAVE_CAVERN_S + outcome_waits.walk_budget(exit_obj),
+            confirm=lambda: ((controller.get_player() or {}).get("y") or 0) < CAVERN_MIN_Y,
+            since=mark, reaction=False, now_fn=time.time, sleep_fn=time.sleep)
+        return bool(left)
+    if known:
+        debug_log.log("golem crafting", f"cavern exit not in view -- walking to the recorded exit at ({known.get('x')}, {known.get('y')})")
+        travel.walk_to(ctx, known, goal_adjacent=True)
+        return False
+    scans = int(trip.get("cavern_scans", 0)) + 1
+    trip["cavern_scans"] = scans
+    debug_log.log("golem crafting", f"no Cave/Exit object in the loaded scene ({scans}/{CAVERN_SCAN_LIMIT}) and no recorded exit")
+    if scans >= CAVERN_SCAN_LIMIT:
+        ctx.state.trigger_safety_stop(
+            "fur trip: cannot find the Wyrmscraig Cavern exit (no 'Cave'/'Exit' object in the "
+            "loaded scene) -- set locations.cavernExit from a live read")
+    return False
+
+
+def fur_trip_phase(ctx, config: dict) -> None:
+    """One bounded action per call on whichever leg trip_leg() says we are on (see the block
+    comment above). Legs 1-4 reuse falconry.py's own travel functions; the hunt is
+    falconry.hunt_step; the end condition and the return are this routine's."""
+    cfg = _fur_trip_cfg(config)
+    trip = _trip(ctx)
+    player = controller.get_player() or {}
+    leg = trip_leg(player, trip)
+    if leg != ctx.state.data.get("gc_trip_leg"):
+        ctx.state.data["gc_trip_leg"] = leg
+        debug_log.log("golem crafting", f"fur trip: leg={leg} region={player.get('regionId')} tile=({player.get('x')}, {player.get('y')})")
+
+    if leg == "kit":
+        # The kit is withdrawn by _run_bank_trip at the open bank; bank_phase gets us there.
+        ctx.state.data["gc_phase"] = "bank"
+        return
+    if leg == "depart":
+        falconry._use_teleport(ctx, falconry.ARDOUGNE_CLOAK, falconry.OPT_KANDARIN_MONASTERY,
+                               expect_region=falconry.REGION_MONASTERY)
+        return
+    if leg == "fairy_ring":
+        falconry._leg_fairy_ring(ctx)
+        return
+    if leg == "walk_in":
+        if falconry._ensure_hands_free(ctx):
+            return
+        falconry._leg_walk_home(ctx)
+        return
+    if leg == "hunt":
+        if _hunt_done(ctx, cfg, trip):
+            trip["done"] = True
+            return
+        if not falconry.hands_free():
+            falconry._ensure_hands_free(ctx)
+            return
+        if _ensure_pouch_open(ctx):
+            return
+        result = falconry.hunt_step(ctx, falconry.DEFAULT_CONFIG, drop_meat=bool(cfg.get("dropMeat", True)))
+        if result == "retrieved":
+            trip["catches"] = int(trip.get("catches", 0)) + 1
+        return
+    if leg == "return":
+        _teleport_home(ctx, cfg)
+        return
+    if leg == "cavern":
+        _leave_cavern(ctx, config, trip)
+        return
+    if leg == "home":
+        if banker.find_nearby_bank({}) is not None:
+            debug_log.log("golem crafting", "fur trip complete -- back at the Wyrmscraig bank")
+            ctx.state.data["gc_trip"] = {}
+            ctx.state.data["gc_phase"] = "bank"
+            return
+        target = (config.get("locations") or {}).get("bank")
+        if target is None:
+            ctx.state.trigger_safety_stop("fur trip: no bank anchor configured to walk home to")
+            return
+        travel.walk_to(ctx, _nearest_walkable_tile(target), goal_adjacent=False)
+        return
+    ctx.state.trigger_safety_stop(
+        f"fur trip: unexpected position (region {player.get('regionId')}, tile "
+        f"({player.get('x')}, {player.get('y')})) -- not on any known leg")
 
 
 PHASES = {
@@ -2852,8 +2927,56 @@ PHASES = {
     "chisel": chisel_phase,
     "craft": craft_phase,
     "bank": bank_phase,
-    "hunt": hunt_phase,
+    "fur_trip": fur_trip_phase,
 }
+
+
+def _progress_signature(ctx):
+    """Everything that moves while the routine is making progress: the phase, the inventory
+    (names and counts), the plinths' progress/side/total varbits, the fur estimate and the
+    player's tile (a fur-trip walk leg changes nothing else for a minute at a time)."""
+    inventory = {}
+    for item in controller.get_inventory() or []:
+        name = item.get("name") or ""
+        inventory[name] = inventory.get(name, 0) + 1
+    golem = controller.get_golem() or {}
+    stations = tuple(
+        (st.get("name"), st.get("progress"),
+         tuple(sorted((side, bool(v.get("done"))) for side, v in (st.get("sides") or {}).items())))
+        for st in golem.get("stations") or []
+    )
+    player = controller.get_player() or {}
+    return (
+        ctx.state.data.get("gc_phase"),
+        tuple(sorted(inventory.items())),
+        golem.get("totalCrafted"),
+        stations,
+        ctx.state.data.get("gc_fur_stock"),
+        (player.get("x"), player.get("y")),
+    )
+
+
+def _stuck_watch(ctx) -> None:
+    """Once per tick(): log `[!]` at STALL_WARN_S of an unchanged progress signature, stop at
+    STALL_STOP_S. A handler that returns every tick with nothing happening (a plinth that never
+    projects, an object that never appears, a trip leg whose teleport never lands) used to look
+    exactly like a healthy run in the log."""
+    data = ctx.state.data
+    sig = _progress_signature(ctx)
+    now = time.time()
+    if sig != data.get("gc_stall_sig"):
+        data["gc_stall_sig"] = sig
+        data["gc_stall_since"] = now
+        data["gc_stall_warned"] = False
+        return
+    still = now - data.get("gc_stall_since", now)
+    if still >= STALL_STOP_S:
+        ctx.state.trigger_safety_stop(
+            f"golem crafting: no progress for {int(still)}s in phase '{data.get('gc_phase')}'"
+        )
+    elif still >= STALL_WARN_S and not data.get("gc_stall_warned"):
+        data["gc_stall_warned"] = True
+        debug_log.log("!", f"golem crafting: STUCK? no progress for {int(still)}s in phase '{data.get('gc_phase')}'")
 
 
 def tick(ctx):
@@ -2865,14 +2988,29 @@ def tick(ctx):
         if ctx.state.safety_stopped:
             return
 
+    _stuck_watch(ctx)
+    if ctx.state.safety_stopped:
+        return
+
     # CORRECTED 2026-08-08 (live session, user request): starts at "bank" rather than "mine" --
     # a fresh activation should stock fur FIRST (withdrawn in full and pouched, see
     # _run_bank_trip's docstring), so mine_phase never has to compete with loose fur for
     # inventory slots even on the very first mining trip of a session.
-    phase = ctx.state.data.get("gc_phase", "bank")
-    handler = PHASES.get(phase)
-    if handler is None:
-        ctx.state.trigger_safety_stop(f"unknown golem crafting phase '{phase}'")
-        return
+    #
+    # 2026-09-06: a handler in TICK_CHAIN_FROM that flips gc_phase hands straight on to the new
+    # phase inside this same tick (bounded by TICK_CHAIN_MAX and the pause/safety/break flags).
+    for _ in range(TICK_CHAIN_MAX + 1):
+        phase = ctx.state.data.get("gc_phase", "bank")
+        handler = PHASES.get(phase)
+        if handler is None:
+            ctx.state.trigger_safety_stop(f"unknown golem crafting phase '{phase}'")
+            return
 
-    handler(ctx, config)
+        handler(ctx, config)
+        if ctx.state.safety_stopped or ctx.state.paused:
+            return
+        break_due = getattr(ctx.state, "break_due", None)
+        if callable(break_due) and break_due((config or {}).get("breaks") or {}):
+            return
+        if phase not in TICK_CHAIN_FROM or ctx.state.data.get("gc_phase", "bank") == phase:
+            return

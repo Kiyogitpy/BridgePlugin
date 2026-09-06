@@ -251,3 +251,39 @@ def test_bank_ui_buttons_never_simulate_a_misclick(monkeypatch):
     banker.set_quantity_mode(_Ctx(), "one")
     assert seen == [False, False, False]
 
+
+
+# MEASURED live 2026-09-05 at the Grand Exchange: two booth ids share the name "Grand Exchange
+# booth"; 10061 offers Exchange/Collect (the clerk), 10060 offers Bank/Collect. Name-only
+# matching picked the nearer Exchange booth and open_bank clicked "Exchange" forever.
+def test_find_nearby_bank_skips_exchange_booth(monkeypatch):
+    objs = [
+        {"name": "Grand Exchange booth", "id": 10061, "distance": 2, "visible": True,
+         "actions": ["Exchange", "Collect"]},
+        {"name": "Grand Exchange booth", "id": 10060, "distance": 5, "visible": True,
+         "actions": ["Bank", "Collect"]},
+    ]
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: objs)
+    assert banker.find_nearby_bank({})["id"] == 10060
+
+
+def test_find_nearby_bank_keeps_chest_and_actionless(monkeypatch):
+    objs = [
+        {"name": "Bank chest", "distance": 3, "visible": True, "actions": ["Use"]},
+        {"name": "Bank booth", "distance": 1, "visible": True},
+    ]
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: objs)
+    assert banker.find_nearby_bank({})["name"] == "Bank booth"
+    objs.pop()
+    assert banker.find_nearby_bank({})["name"] == "Bank chest"
+
+
+# {"all": True} withdraw entries (2026-09-05, firemaking): one shift-click instead of a click
+# per unit, and no quantity-mode click when every entry is shift-withdrawn.
+def test_withdraw_loadout_all_entry_shift_withdraws_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(banker, "withdraw_all_shift", lambda ctx, name, fresh=False: calls.append(name) or True)
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda ctx, mode: pytest.fail("quantity mode not expected"))
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: pytest.fail("per-unit click not expected"))
+    banker.withdraw_loadout(None, {"withdraw": [{"name": "Willow logs", "quantity": 27, "all": True}]})
+    assert calls == ["Willow logs"]

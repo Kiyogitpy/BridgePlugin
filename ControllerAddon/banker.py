@@ -74,6 +74,23 @@ FEROX_MAX_BANK_DISTANCE = 20
 BANK_APPROACH_TILES = 12
 
 
+# A name match is not enough: the Grand Exchange has TWO booth objects both named "Grand
+# Exchange booth" -- 10060/30389 offer Bank + Collect, 10061 (exchange_bank_wall_exchange in
+# the cache) offers Exchange + Collect and opens the GE clerk interface. MEASURED live
+# 2026-09-05 (firemaking at the GE): the nearest by name was a 10061 and open_bank clicked
+# "Exchange" on it over and over (USER: "thats not a banker"). Bank chests report "Use" rather
+# than "Bank", so both count. An object that reports no actions at all is kept -- absent means
+# "cannot tell", never "no", same as collisionFlags elsewhere in this codebase.
+BANK_OPEN_ACTIONS = ("bank", "use")
+
+
+def _offers_banking(obj: dict) -> bool:
+    actions = obj.get("actions")
+    if not actions:
+        return True
+    return any((a or "").lower() in BANK_OPEN_ACTIONS for a in actions)
+
+
 def find_nearby_bank(config: dict):
     """Return the closest matching bank object within range, or None."""
     names = {n.lower() for n in config.get("bankNames", DEFAULT_BANK_NAMES)}
@@ -94,6 +111,8 @@ def find_nearby_bank(config: dict):
         if name not in names:
             continue
         if not obj.get("visible", True):
+            continue
+        if not _offers_banking(obj):
             continue
 
         dist = obj.get("distance", 9999)
@@ -227,7 +246,7 @@ def open_bank(ctx, bank_obj, timeout_s: float = 20.0) -> bool:
                 if point.get("onMinimap"):
                     why = "off-screen" if off_screen else f"{fresh.get('distance')} tiles away"
                     debug_log.log("bank", f"bank object {why} -- minimap-walking toward it first")
-                    controller.click_entity(ctx.ser, point, offset=(0, 0))
+                    controller.click_entity(ctx.ser, point, offset=(0, 0), check_ui_blockers=False)
                     controller.wait_until_player_idle(timeout_s=max(1.0, deadline - time.time()))
                     continue
             if off_screen:
@@ -678,14 +697,22 @@ def withdraw_loadout(ctx, config: dict, fresh: bool = False) -> None:
     withdraw_loadout call for a different item immediately before this one) and waiting out a
     full game tick for the cache to reflect it isn't acceptable. See controller.get_bank's own
     fresh kwarg."""
-    entries = [e for e in config.get("withdraw", []) if e.get("name") and e.get("quantity", 1) > 0]
+    entries = [e for e in config.get("withdraw", []) if e.get("name")
+               and (e.get("all") or e.get("quantity", 1) > 0)]
 
-    if entries:
+    if any(not e.get("all") for e in entries):
         set_quantity_mode(ctx, "one")
 
     for entry in entries:
         name = entry["name"].lower()
-        quantity = entry["quantity"]
+        quantity = entry.get("quantity", 1)
+
+        # {"name": ..., "all": True} (USER 2026-09-05, firemaking): one shift-click withdraws
+        # as much as fits instead of one click per unit -- 27 log clicks was the alternative.
+        # Same "as much of this single item as fits" contract as withdraw_all_shift itself.
+        if entry.get("all"):
+            withdraw_all_shift(ctx, entry["name"], fresh=True)
+            continue
 
         # Always fresh: see withdraw_all_shift's find_slot for the one-slot-off stale read
         # that withdrew the wrong item live (2026-09-04). `fresh` is kept for callers.

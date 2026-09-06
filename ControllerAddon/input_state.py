@@ -70,3 +70,10 @@ def reset() -> None:
 # controller.py is loaded twice (as __main__ and as `controller`) and the routine-side copy
 # never sees main()'s module-level assignment. Read via controller._firmware_protocol().
 firmware_protocol = 2
+
+# The serial connection the in-wait fidgeter drives (controller.register_fidget_serial). Mirrored
+# here for the same two-copies reason as firmware_protocol: main() registers it on __main__'s
+# copy of controller.py, and until 2026-09-06 a routine-side controller.human_delay read the
+# OTHER copy's None -- so in-wait fidgeting had never once fired for a routine's own wait (the
+# CLAUDE.md caveat). Read via controller._fidget_serial().
+fidget_ser = None

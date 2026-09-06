@@ -248,6 +248,48 @@ def test_a_minimap_hop_click_needs_no_shift(monkeypatch):
 # scenery -- see the "Chop down" / "Cook" hijacks measured the same day. The minimap has nothing
 # on it to hijack a click; precision is what it lacks, and precision is only wanted at the end.
 
+def test_prefer_viewport_clicks_a_rendered_far_tile_in_the_viewport(monkeypatch):
+    """USER 2026-09-06 (Corrupted Gauntlet): rooms are in view, so an instance hop clicks the
+    viewport at any length; the minimap is only the fallback for a tile off screen or under a
+    UI panel."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 1, "screenY": 1})
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, p, inst=False: {"onMinimap": True, "screenX": 2, "screenY": 2})
+    monkeypatch.setattr(controller, "is_point_blocked_by_ui", lambda x, y: None)
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: clicked.append(e) or True)
+    monkeypatch.setattr(controller, "key_down", lambda ser, k: clicked.append(("down", k)))
+    monkeypatch.setattr(controller, "key_up", lambda ser, k: clicked.append(("up", k)))
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    travel._hop_to(_Ctx(), 3220, 3200, 0, prefer_viewport=True)
+
+    points = [c for c in clicked if isinstance(c, dict)]
+    assert points and points[0].get("onScreen"), f"viewport expected: {clicked[:3]}"
+    assert ("down", "SHIFT") in clicked                     # a viewport walk is always shift-clicked
+
+
+def test_prefer_viewport_falls_back_to_the_minimap_when_the_tile_is_under_a_panel(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 1, "screenY": 1})
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, p, inst=False: {"onMinimap": True, "screenX": 2, "screenY": 2})
+    monkeypatch.setattr(controller, "is_point_blocked_by_ui", lambda x, y: {"x": 0, "y": 0})
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: clicked.append(e) or True)
+    monkeypatch.setattr(controller, "key_down", lambda ser, k: None)
+    monkeypatch.setattr(controller, "key_up", lambda ser, k: None)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    travel._hop_to(_Ctx(), 3220, 3200, 0, prefer_viewport=True)
+
+    points = [c for c in clicked if isinstance(c, dict)]
+    assert points and points[0].get("onMinimap")
+
+
 def test_a_long_hop_prefers_the_minimap_even_when_the_tile_is_rendered(monkeypatch):
     asked = []
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})

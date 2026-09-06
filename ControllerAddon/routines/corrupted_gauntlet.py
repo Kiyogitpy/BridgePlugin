@@ -63,19 +63,34 @@ NO_SNAPSHOT_TICKS = 20         # consecutive unreadable snapshots before a safet
 TICK_S = 0.6
 ACTION_BUDGET_S = 1.2          # confirm window for a prayer/wield/eat click (two ticks)
 ENTER_BUDGET_S = 8.0
+LOBBY_BUDGET_S = 8.0           # Enter-corrupted -> region 7768 (REC: chat +1.9s, LOADING +2.7s)
+LOBBY_MAX_ATTEMPTS = 3         # entrance click ceiling before safety stop
 ENTER_MAX_ATTEMPTS = 3         # barrier quick-pass ceiling before safety stop
 LOOT_MAX_ATTEMPTS = 5          # chest open ceiling before safety stop
 LOOT_CONFIRM_S = 4.0           # (I2) budget to confirm the chest actually opened after the click
-NODE_BUDGET_S = 6.0
+NODE_BUDGET_S = 6.0            # light confirm, plus NODE_WALK_S_PER_TILE per tile still to walk
+NODE_WALK_S_PER_TILE = 0.6
+NODE_CLICK_RANGE = 10          # click Light from this far (REC: the human clicked from 3-11 tiles and
+                               # let the game walk); only walk first when the node is farther
+SCENE_RELOAD_WAIT_S = 2.5      # a Light reloads the scene ~1.2s later (REC LOADING); the grid read
+SCENE_RELOAD_POLL_S = 0.3      # before that still shows the new room unloaded (cg_live5/7 "no route")
 LIGHT_NODE_POLL_S = 0.5        # (M) light_node's own /objects poll throttle, below _confirm's 0.1s
 GATHER_BUDGET_S = 8.0
 NODE_MAX_FAILS = 2
 DROP_SLOT_RESERVE = 2          # (C3a) slots kept free of raw fish for other loot to land in
+GATHER_CHAIN_MAX = 4           # nodes gathered inside ONE tick before handing back to the engine loop
+CRAFT_CHAIN_MAX = 12           # craft steps chained inside one tick (the bowl stays open between Makes)
+CRAFT_CHAIN_MAX_S = 25.0       # wall-clock ceiling on that chain
 NODE_GATHER_MAX_FAILS = 2      # (C3b) a resource node this many gather_node failures is skipped
 ATTACKER_RANGE = 4
 DROP_RANGE = 8
 ROOM_ARRIVAL_TOLERANCE = 4
-START_COMPONENT_MAX = 600      # (I14) start-room flood-fill ceiling -- see prep_state's own comment
+START_COMPONENT_MAX = 2000     # start-room flood-fill ceiling. Was 600 to catch a 9247-tile
+                               # leak into the unloaded sea; that leak is now impossible
+                               # (instance_nav.standable rejects the 0x40000000 unloaded flag,
+                               # measured cg_live3). A resumed instance with corridors already
+                               # lit legitimately measures ~700 (cg_live7), so the cap only
+                               # needs to reject a genuine runaway now.
 STUCK_WARN_S = 20.0            # log [!] after no progress for this many seconds
 STUCK_STOP_S = 60.0            # safety-stop after no progress for this many seconds (prep phases only)
 
@@ -100,6 +115,46 @@ def time_left(data, now=None, cfg=DEFAULT_CONFIG):
     return cfg["timer_s"] - (now - t0)
 
 
+def _obj_refresh(obj):
+    """refresh_target for a scene object, keyed on its INSTANCE tile (template x/y repeat between
+    rooms). MEASURED cg_live5 (2026-09-06): every first click on a resource, a drop or a node
+    after a walk hop landed on bare floor (`hover never matched`, menus of Cancel/Mark Safespot/
+    Walk here), because the aim was the projection read before the player's last hop; 8-9s of
+    standing still per node. Passing a refresh_target is the whole fix at a call site (CLAUDE.md,
+    "A click's DEPARTURE is aimed too")."""
+    return controller.object_refresh_target(obj.get("instX"), obj.get("instY"), obj.get("plane"), obj.get("id"), inst=True)
+
+
+def _item_refresh(item):
+    """Ground-item twin of _obj_refresh."""
+    return controller.ground_item_refresh_target(item.get("instX"), item.get("instY"), item.get("plane"), item.get("id"), inst=True)
+
+
+def _click_object(ctx, obj, action, verify=False, **kw):
+    """Left-click a scene object, re-aimed mid-flight through the object's INSTANCE tile; a
+    falsy/withheld click falls back to the right-click menu (same re-aim).
+
+    `verify=False` (the default, MEASURED cg_live5/6): NO `expected_action` hover gate. The gate
+    reads `/hover` and withholds when the cursor is not yet over the target -- which is EVERY
+    click issued while the player is still walking up to a resource/node, so gathering withheld,
+    fell to a menu that also had no option yet (Cancel/Walk here), pressed ESC and waited ~8s per
+    node. A resource/light/bowl click carries no hijack risk worth that cost in a solo instance,
+    and the game queues the interaction and performs it on arrival, so it is fired to track the
+    moving target and confirmed on its own outcome (yield/depletion/inventory delta) by the
+    caller. `verify=True` keeps the hover gate for the few clicks where hijacking is a real
+    concern."""
+    kwargs = {"refresh_target": _obj_refresh(obj), "refresh_legs": 2}
+    if verify:
+        kwargs["expected_action"] = action
+    kwargs.update(kw)
+    result = controller.click_entity(ctx.ser, obj, **kwargs)
+    if getattr(result, "withheld", False) or not result:
+        debug_log.log("cg", f"{action} click withheld/failed -- right-click menu")
+        result = controller.click_menu_action(ctx.ser, obj, action, target_hint=obj.get("name"), offset=(0, 0),
+                                              refresh_target=_obj_refresh(obj))
+    return bool(result)
+
+
 def ensure_tools(ctx, cfg):
     """Sceptre, axe, pickaxe, harpoon, pestle -- all given at entry; a missing one is re-taken
     from the Tool Storage before leaving the start room."""
@@ -114,7 +169,7 @@ def ensure_tools(ctx, cfg):
     if not storage_near:
         debug_log.log("cg", f"[!] ensure_tools: missing {missing}; storage found={storage_found} near={storage_near}")
         return False
-    controller.click_entity(ctx.ser, storage, expected_action="Take")
+    _click_object(ctx, storage, "Take")
     result = _confirm(ctx, lambda: names <= {i.get("name") for i in controller.get_inventory()}, 4.0)
     if not result:
         debug_log.log("cg", f"[!] ensure_tools: missing {missing}; storage found={storage_found} near={storage_near} -- take did not confirm")
@@ -198,6 +253,17 @@ def prep_state(ctx, cfg):
     objects = controller.get_objects(radius=cfg["objects_radius"], fresh=True)
     barrier = next((o for o in objects if o.get("id") == g.OBJ_BARRIER), None)
     if barrier is None:
+        # A restart mid-run (every F1 in a live session) lands here from some other room: the
+        # geometry can only be derived in the start room, so use the teleport crystal to get
+        # there (2026-09-06). craft_phase's own teleport home walks instead when the crystal is
+        # spent; the run clock resyncs from the next "Time remaining" chat.
+        crystal = next((i for i in controller.get_inventory() if i.get("name") == g.ITEM_TELEPORT), None)
+        if crystal is not None and not data.get("cg_prep_teleported"):
+            data["cg_prep_teleported"] = True
+            debug_log.log("cg", "prep: no Barrier in view -- teleporting home to derive the geometry")
+            _click_item(ctx, crystal, "Activate")
+            _confirm(ctx, lambda: _find_object(cfg, g.OBJ_BARRIER) is not None, HOME_BUDGET_S)
+            data.pop("cg_imap", None)
         return None
     comp = maze.component(imap, me)
     debug_log.log("cg", f"prep: start component size {len(comp)} tiles")
@@ -228,8 +294,28 @@ def _room(st, tile):
     return maze.room_of(tile, st["start_centre"], st["pitch"], st["outward"])
 
 
+def _await_scene_reload(ctx, before_flags):
+    """After a confirmed Light, wait (bounded) until /collision?all=true differs from the grid
+    cached before the click -- the reload lands ~1.2s after the Light and a walk issued before it
+    routes against a grid that still shows the new room unloaded (cg_live5/7: "no route ..." on
+    the tick after every light, one wasted tick each). No cached grid means nothing to compare:
+    return at once."""
+    if before_flags is None:
+        return False
+    deadline = time.time() + SCENE_RELOAD_WAIT_S
+    while time.time() < deadline:
+        grid = controller.get_collision_grid()
+        if grid and grid.get("flags") != before_flags:
+            return True
+        time.sleep(SCENE_RELOAD_POLL_S)
+    return False
+
+
 def light_node(ctx, node, cfg):
     before = (node.get("id"), node.get("instX"), node.get("instY"))
+    before_flags = getattr(ctx.state.data.get("cg_imap"), "flags", None)
+    me, _ = _me()
+    tiles = h.cheb(me, before[1:]) if me[0] is not None and before[1] is not None else 0
     mark = ctx.events.mark() if ctx.events is not None else None
     # (I9, final-fix-brief.md) The player may still be walking toward the node when this click is
     # decided -- object_refresh_target(x, y, plane, obj_id) re-resolves the node's current screen
@@ -237,8 +323,9 @@ def light_node(ctx, node, cfg):
     # this codebase does (see CLAUDE.md's "A click's DEPARTURE is aimed too"). Note it compares in
     # ORDINARY world coordinates (no `inst` support), so this passes the node's own "x"/"y" fields,
     # not "instX"/"instY".
-    refresh = controller.object_refresh_target(node.get("x"), node.get("y"), node.get("plane"), node.get("id"))
-    controller.click_menu_action(ctx.ser, node, "Light", target_hint="Node", offset=(0, 0), refresh_target=refresh)
+    # USER 2026-09-06: "no need to right click the lighting up node" -- Light is the node's own
+    # left option (REC: GAME_OBJECT_FIRST_OPTION); _click_object keeps the menu as the fallback.
+    _click_object(ctx, node, "Light")
 
     # (M, final-fix-brief.md) _confirm polls every 0.1s -- an /objects?fresh=true scan on every
     # single poll is needless HTTP load for a check that only ever changes once. Throttle the
@@ -259,19 +346,30 @@ def light_node(ctx, node, cfg):
                 if t == "CHAT_MESSAGE" and "light the nodes" in str((p or {}).get("message", "")):
                     return True
         return False
-    ok = _confirm(ctx, lit, NODE_BUDGET_S)
+    ok = _confirm(ctx, lit, NODE_BUDGET_S + NODE_WALK_S_PER_TILE * tiles)
     if ok:
         # (I5, final-fix-brief.md) The recording shows LOADING/LOGGED_IN ~1.2s after each Light --
         # lighting a node opens up new scene, so the cached collision grid used for maze.edge_open/
-        # component checks is stale the instant this succeeds.
+        # component checks is stale the instant this succeeds. Wait for the reload before the
+        # caller routes, or its first walk fails on the pre-reload grid.
+        _await_scene_reload(ctx, before_flags)
         ctx.state.data.pop("cg_imap", None)
     debug_log.log("cg", f"light node at {before[1:]}: {'ok' if ok else 'no change'}")
     return ok
 
 
 GATHER_NODE_MAX_S = 20.0       # (I10) whole-gather wall-clock ceiling, one click, no re-click loop
-GATHER_POLL_S = 0.3            # (I10) how often the poll checks for depletion/a new yield
+GATHER_POLL_S = 0.3            # (I10) how often the poll checks for a new yield (/inventory, cheap)
+GATHER_OBJECT_POLL_S = 0.9     # how often it re-scans /objects for the depleted id (~140ms a scan)
 GATHER_ATTACKER_CHECK_S = 1.0  # (I10) how often the poll checks for an attacker, inside the wait
+
+
+def _gather_click(ctx, obj, action):
+    """A resource click, escalated to the right-click menu the moment the verified left-click is
+    withheld or fails. MEASURED cg_live4 (2026-09-06): the first Chop was withheld (`hover never
+    matched action='Chop'` -- the player was still walking up, nothing under the cursor yet) and
+    the only re-click sat GATHER_BUDGET_S away, so every such node cost ~9s of standing still."""
+    return _click_object(ctx, obj, action)
 
 
 def gather_node(ctx, obj, cfg):
@@ -290,15 +388,19 @@ def gather_node(ctx, obj, cfg):
         return False
     pos = (obj.get("instX"), obj.get("instY"))
     before = kit.count(controller.get_inventory(), item)
-    controller.click_entity(ctx.ser, obj, expected_action=action)
+    _gather_click(ctx, obj, action)
     got = False
     reclicked = False
     start = time.time()
     last_attacker_check = start
+    last_object_scan = None
+    live = obj
     while time.time() - start < GATHER_NODE_MAX_S:
         now = time.time()
-        live = next((o for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True)
-                     if (o.get("instX"), o.get("instY")) == pos), None)
+        if last_object_scan is None or now - last_object_scan >= GATHER_OBJECT_POLL_S:
+            last_object_scan = now
+            live = next((o for o in controller.get_objects(radius=cfg["objects_radius"], fresh=True)
+                         if (o.get("instX"), o.get("instY")) == pos), None)
         if kit.count(controller.get_inventory(), item) > before:
             got = True
         if live is None or live.get("id") in g.RESOURCE_NODES_DEPLETED:
@@ -306,10 +408,10 @@ def gather_node(ctx, obj, cfg):
         if now - last_attacker_check >= GATHER_ATTACKER_CHECK_S:
             last_attacker_check = now
             me, _ = _me()
-            if cg_attacker_present(me):
+            if fightable_attacker_present(me):     # a strong monster we will not fight does not stop the gather
                 return got
         if not got and not reclicked and now - start >= GATHER_BUDGET_S:
-            controller.click_entity(ctx.ser, live, expected_action=action)
+            _gather_click(ctx, live, action)
             reclicked = True
         time.sleep(GATHER_POLL_S)
     return got
@@ -317,6 +419,29 @@ def gather_node(ctx, obj, cfg):
 
 def cg_attacker_present(me):
     return attacker(controller.get_npcs(fresh=True), me) is not None
+
+
+def should_fight(npc, inventory, equipment):
+    """USER 2026-09-06: unicorn/scorpion/wolf are not worth fighting with the sceptre -- pray
+    against them and keep gathering until a bow or staff exists. Weak monsters (rat/spider/bat)
+    are always fought; demi-bosses never here (upgrade_phase owns those)."""
+    nid = npc.get("id")
+    if nid in g.DEMI_BOSSES or nid in g.DEMI_BOSS_DROP:
+        return False
+    if nid in g.STRONG_MONSTERS:
+        return kit.owned_tier("bow", inventory, equipment) > 0 or kit.owned_tier("staff", inventory, equipment) > 0
+    return True
+
+
+def fightable_attacker_present(me):
+    """An attacker gather_node must stop for: one we will fight, or a demi-boss (gather_ladder
+    flees those). A strong monster we only pray against does not interrupt the gather."""
+    foe = attacker(controller.get_npcs(fresh=True), me)
+    if foe is None:
+        return False
+    if foe.get("id") in g.DEMI_BOSSES or foe.get("id") in g.DEMI_BOSS_DROP:
+        return True
+    return should_fight(foe, controller.get_inventory(), controller.get_equipment())
 
 
 def attacker(npcs, me):
@@ -332,26 +457,44 @@ def attacker(npcs, me):
     return best
 
 
+PICKUP_BASE_S = 1.2            # one Take lands the tick after the click when standing on the tile
+PICKUP_WALK_S_PER_TILE = 0.6   # plus the walk to the drop's tile
+
+
 def pick_up_drops(ctx, cfg):
+    """USER 2026-09-06: "when picking from floor we dont have time to right click each individual
+    item just spam click it up". The human recording's 22 Takes are all the ground item's own
+    LEFT option (GROUND_ITEM_THIRD_OPTION), several within a second. So: left-click each wanted
+    drop, nearest first, re-aimed through _item_refresh (cg_live5: the old right-click at a
+    pre-walk projection found bare floor and paid 4s per miss), and confirm each on the
+    SPECIFIC item's count rising or a new slot, with a budget that covers only the walk to the
+    tile -- on the tile a Take lands the next tick. A withheld left-click (a monster standing on
+    the pile makes Attack the default) falls back to the menu, still re-aimed."""
     wanted = {g.ITEM_FRAME, g.ITEM_SHARDS, g.ITEM_GRYM, g.ITEM_RAW_FISH, g.ITEM_TELEPORT, g.ITEM_ORB, g.ITEM_BOWSTRING}
     me, _ = _me()
+    items = [i for i in controller.get_ground_items(fresh=True) or []
+             if i.get("name") in wanted and h.cheb((i.get("instX"), i.get("instY")), me) <= DROP_RANGE]
+    items.sort(key=lambda i: h.cheb((i.get("instX"), i.get("instY")), me))
     taken = 0
-    for item in controller.get_ground_items(fresh=True) or []:
-        if item.get("name") not in wanted or h.cheb((item.get("instX"), item.get("instY")), me) > DROP_RANGE:
-            continue
-        # (M, final-fix-brief.md) Confirm on the SPECIFIC item's count rising (or a brand-new
-        # inventory slot), not "any change" -- the old `count(name) > 0` check trivially passes
-        # whenever we already carry any of this item, so a click that missed entirely (or was
-        # hijacked) was reported as a success as long as we happened to already hold one.
-        before_len = len(controller.get_inventory())
-        before_count = kit.count(controller.get_inventory(), item.get("name"))
-        controller.click_menu_action(ctx.ser, item, "Take", target_hint=item.get("name"), offset=(0, 0))
+    for item in items:
         name = item.get("name")
+        # (M, final-fix-brief.md) Confirm on the SPECIFIC item's count rising (or a brand-new
+        # inventory slot), not "any change" -- `count(name) > 0` trivially passes when we already
+        # carry any of this item.
+        inv0 = controller.get_inventory()
+        before_len, before_count = len(inv0), kit.count(inv0, name)
+        result = controller.click_entity(ctx.ser, item, offset=(0, 0), expected_action="Take",
+                                         refresh_target=_item_refresh(item), refresh_legs=2)
+        if getattr(result, "withheld", False) or not result:
+            controller.click_menu_action(ctx.ser, item, "Take", target_hint=name, offset=(0, 0),
+                                         refresh_target=_item_refresh(item))
 
         def confirmed(bl=before_len, bc=before_count, name=name):
             inv = controller.get_inventory()
             return len(inv) != bl or kit.count(inv, name) > bc
-        if _confirm(ctx, confirmed, 4.0):
+        me, _ = _me()
+        budget = PICKUP_BASE_S + PICKUP_WALK_S_PER_TILE * h.cheb((item.get("instX"), item.get("instY")), me)
+        if _confirm(ctx, confirmed, budget):
             taken += 1
     return taken
 
@@ -370,7 +513,43 @@ def gather_ladder(ctx, cfg):
             # tile beside it rather than demanding the exact (often unroutable) centre tile.
             instance_nav.walk_to(ctx, prev[0], prev[1], goal_adjacent=True)
         return "flee_demi"
+    if not should_fight(foe, controller.get_inventory(), controller.get_equipment()):
+        # Pray against it and get on with gathering (the human prayed Melee while gathering near
+        # wolves); drop_prayers_if_safe leaves the prayer up while anything is attacking.
+        prayer = g.PROTECT_FOR_STYLE[g.ATTACK_STYLE_BY_NPC_ID.get(foe.get("id"), "MELEE")]
+        if not (controller.get_prayers().get("active") or {}).get(prayer):
+            do_prayer(ctx, None, prayer, cfg)
+            return "prayer"
+        return "none"
     return fight_npc_step(ctx, foe, cfg)
+
+
+def drop_prayers_if_safe(ctx):
+    """Turn every active prayer OFF when no npc is attacking us. MEASURED cg_live2 (2026-09-06):
+    prayer 77 -> 50 in under two minutes with prayers left on and nothing to pray against; the
+    Gauntlet has no altar, egniol is the only restore, and nothing else in the prep ever turns a
+    prayer off once gather_ladder/fight_npc_step turned one on. Returns True when it clicked."""
+    prayers = controller.get_prayers() or {}
+    on = [name for name, active in (prayers.get("active") or {}).items() if active]
+    if not on:
+        return False
+    me, _ = _me()
+    if me[0] is None or cg_attacker_present(me):
+        return False
+    if not controller.open_prayer_tab(ctx.ser):
+        return False
+    icons = prayers.get("icons") or {}
+    clicked = False
+    for name in on:
+        icon = icons.get(name)
+        if not icon:
+            continue
+        controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
+        clicked = True
+        _confirm(ctx, lambda n=name: not (controller.get_prayers().get("active") or {}).get(n))
+    if clicked:
+        debug_log.log("cg", f"prayers off (nothing attacking): {on}")
+    return clicked
 
 
 def fight_npc_step(ctx, npc, cfg):
@@ -503,6 +682,7 @@ def explore_gather_phase(ctx, cfg):
         return
     if gather_ladder(ctx, cfg) != "none":
         return
+    drop_prayers_if_safe(ctx)
     offset, _, reveal = steps[st["step"]]
     target = _centre(st, offset)
     me, _ = _me()
@@ -535,9 +715,10 @@ def explore_gather_phase(ctx, cfg):
                 # (I14) target is a room CENTRE -- usually furniture.
                 instance_nav.walk_to(ctx, target[0], target[1], tolerance=ROOM_ARRIVAL_TOLERANCE, goal_adjacent=True)
                 return
-        elif h.cheb(me, (node["instX"], node["instY"])) > 2:
-            # (I14) a lighting node's own tile can be furniture too.
-            instance_nav.walk_to(ctx, node["instX"], node["instY"], tolerance=2, goal_adjacent=True)
+        elif h.cheb(me, (node["instX"], node["instY"])) > NODE_CLICK_RANGE:
+            # (I14) a lighting node's own tile can be furniture too. Within NODE_CLICK_RANGE the
+            # click itself walks us there (tracked by _obj_refresh, budgeted per tile).
+            instance_nav.walk_to(ctx, node["instX"], node["instY"], tolerance=NODE_CLICK_RANGE, goal_adjacent=True)
             return
         elif light_node(ctx, node, cfg):
             st["sub"] = "to_room"
@@ -589,12 +770,41 @@ def explore_gather_phase(ctx, cfg):
                  and want.get(g.RESOURCE_ITEM.get(o.get("name")), 0) > 0
                  and node_fails.get((o["instX"], o["instY"]), 0) < NODE_GATHER_MAX_FAILS]
         if nodes:
-            nodes.sort(key=lambda o: h.cheb((o["instX"], o["instY"]), me))
-            picked = nodes[0]
-            if not gather_node(ctx, picked, cfg):
-                tile = (picked["instX"], picked["instY"])
-                node_fails[tile] = node_fails.get(tile, 0) + 1
-            return
+            # Chain up to GATHER_CHAIN_MAX nodes inside this tick (2026-09-06): the engine loop
+            # costs ~1s between ticks and a room has 3-4 nodes, so one node per tick paid that
+            # gap three times per room. Each gather re-reads live state; a failure, a returned-
+            # early gather (an attacker -- gather_ladder handles it next tick) or an empty
+            # candidate list ends the chain.
+            chained = 0
+            done_tiles = set()      # never re-pick a tile gathered this tick (mining.py's exclude= lesson)
+            while nodes and chained < GATHER_CHAIN_MAX:
+                nodes.sort(key=lambda o: h.cheb((o["instX"], o["instY"]), me))
+                picked = nodes[0]
+                done_tiles.add((picked["instX"], picked["instY"]))
+                ok = gather_node(ctx, picked, cfg)
+                chained += 1
+                if not ok:
+                    tile = (picked["instX"], picked["instY"])
+                    node_fails[tile] = node_fails.get(tile, 0) + 1
+                    return
+                me, _ = _me()
+                if fightable_attacker_present(me):
+                    return
+                inventory = controller.get_inventory()
+                free_slots = max(0, 28 - len(inventory) - DROP_SLOT_RESERVE)
+                deficit = kit.kit_deficit(inventory, equipment, cfg)
+                wide = kit.kit_deficit(inventory, equipment, cfg, targets=kit.KIT + kit.UPGRADES) \
+                    if time.time() - data["cg_t0"] < cfg["gather_deadline_s"] else deficit
+                want = {g.ITEM_ORE: wide.ore, g.ITEM_BARK: wide.bark, g.ITEM_LINUM: wide.linum,
+                        g.ITEM_GRYM: deficit.grym, g.ITEM_RAW_FISH: min(deficit.fish, free_slots)}
+                objects = controller.get_objects(radius=cfg["objects_radius"], fresh=True)
+                nodes = [o for o in objects if o.get("id") in g.RESOURCE_NODES and _room(st, (o["instX"], o["instY"])) == offset
+                         and want.get(g.RESOURCE_ITEM.get(o.get("name")), 0) > 0
+                         and (o["instX"], o["instY"]) not in done_tiles
+                         and node_fails.get((o["instX"], o["instY"]), 0) < NODE_GATHER_MAX_FAILS]
+            if nodes:
+                return                          # more to do here; next tick
+            pick_up_drops(ctx, cfg)
         if reveal and reveal not in st["revealed"]:
             st["sub"] = "reveal"
             # Fall through to reveal logic
@@ -608,9 +818,9 @@ def explore_gather_phase(ctx, cfg):
         if node is None:
             debug_log.log("cg", f"[!] no node toward the reveal room {reveal}")
             st["revealed"].add(reveal); advance(); return
-        if h.cheb(me, (node["instX"], node["instY"])) > 2:
-            # (I14) a lighting node's own tile can be furniture too.
-            instance_nav.walk_to(ctx, node["instX"], node["instY"], tolerance=2, goal_adjacent=True)
+        if h.cheb(me, (node["instX"], node["instY"])) > NODE_CLICK_RANGE:
+            # (I14) a lighting node's own tile can be furniture too; see to_node above.
+            instance_nav.walk_to(ctx, node["instX"], node["instY"], tolerance=NODE_CLICK_RANGE, goal_adjacent=True)
             return
         light_node(ctx, node, cfg)
         for n in controller.get_npcs(fresh=True):
@@ -668,7 +878,13 @@ def derive_phase(data, npcs, objects, inventory=None, equipment=None, cfg=None, 
     on_event mirrors it into data["cg_varbit_fight"] as soon as it changes, which can beat the
     next bulk /npcs scan by a tick or two."""
     ids = {o.get("id") for o in objects or []}
-    if any(n.get("id") in g.HUNLLEF for n in npcs or []) or data.get("cg_varbit_fight") == 1:
+    # MEASURED live 2026-09-06 (cg_live2) and in both recordings: the Hunllef is in the loaded
+    # scene from the START room and wanders in and out of /npcs there, so "a Hunllef id in
+    # /npcs" is NOT the fight -- the first live run quick-passed nothing, turned prayers on in
+    # the start room and spammed attack clicks at a Hunllef behind the wall. Varbit 9177 is 1
+    # from +0.6s after Quick-pass until the kill; tick() reads it over HTTP every tick and
+    # on_event mirrors it faster. `npcs` stays a parameter for the ladder's own use.
+    if data.get("cg_varbit_fight") == 1:
         data["cg_fight_seen"] = True
         return "fight"
     if g.OBJ_BARRIER in ids and not data.get("cg_fight_seen"):
@@ -682,6 +898,11 @@ def derive_phase(data, npcs, objects, inventory=None, equipment=None, cfg=None, 
         return "enter"
     if g.OBJ_REWARD_CHEST in ids and data.get("cg_fight_seen"):
         return "done" if data.get("cg_chest_opened") else "loot"
+    if g.OBJ_ENTRANCE in ids and not data.get("cg_fight_seen") and data.get("cg_t0") is None:
+        # The lobby before a run (added live 2026-09-06: the first run sat idle in the lobby
+        # waiting for a manual entry). The entrance is visible after a run too, when the chest
+        # branch above has already answered.
+        return "lobby"
     # Outside the arena (no barrier visible) but in prep phase
     if data.get("cg_t0") is not None and inventory is not None and not data.get("cg_fight_seen"):
         if cfg is None:
@@ -1006,7 +1227,7 @@ def bowl_make(ctx, key, cfg):
     # (I6) The Singing Bowl interface stays open across Makes -- skip the Sing-crystal click
     # (and the walk/near check it re-triggers) when the widget for this key is already visible.
     if _bowl_widget(key) is None:
-        controller.click_entity(ctx.ser, bowl, expected_action="Sing-crystal")
+        _click_object(ctx, bowl, "Sing-crystal")
         if not _confirm(ctx, lambda: _bowl_widget(key) is not None, BOWL_BUDGET_S):
             debug_log.log("cg", f"bowl: no widget for {key}")
             return False
@@ -1042,7 +1263,7 @@ def cook_all(ctx, cfg):
     near = _near(ctx, rng, 3)
     if near is not True:
         return near
-    controller.click_entity(ctx.ser, rng, expected_action="Cook")
+    _click_object(ctx, rng, "Cook")
     last = kit.count(controller.get_inventory(), g.ITEM_RAW_FISH)
     stall = time.time() + COOK_STALL_S
     while time.time() < stall:
@@ -1063,7 +1284,7 @@ def pump_fill(ctx, cfg):
     if near is not True:
         return near
     vials = kit.count(controller.get_inventory(), g.ITEM_VIAL)
-    controller.click_entity(ctx.ser, pump, expected_action="Fill-from")
+    _click_object(ctx, pump, "Fill-from")
     return _confirm(ctx, lambda: kit.count(controller.get_inventory(), g.ITEM_WATER_VIAL) >= vials, 6.0)
 
 
@@ -1188,6 +1409,7 @@ def craft_phase(ctx, cfg):
         # started with -- useful for reading a live log after a T2/attune plan came up short.
         data["cg_craft_shards_logged"] = True
         debug_log.log("cg", f"craft: shards held = {kit.count(controller.get_inventory(), g.ITEM_SHARDS)}")
+    drop_prayers_if_safe(ctx)
     if data.get("cg_craft_sub") == "fish":
         _fish_pass_step(ctx, cfg)
         return
@@ -1197,30 +1419,40 @@ def craft_phase(ctx, cfg):
         data["cg_fish_pass_deadline"] = time.time() + FISH_PASS_MAX_S
         _fish_pass_step(ctx, cfg)
         return
-    plan = kit.craft_plan(controller.get_inventory(), controller.get_equipment(), cfg)
-    if not plan:
-        data["cg_crafted"] = True
-        return
-    op, arg = plan[0]
-    ok = {"bowl": lambda: bowl_make(ctx, arg, cfg), "pump": lambda: pump_fill(ctx, cfg),
-          "pestle": lambda: _pestle(ctx), "potion": lambda: _potion(ctx),
-          "cook": lambda: cook_all(ctx, cfg), "wear": lambda: wear(ctx, arg)}[op]()
-    if ok is WALKING:
-        # (M, final-fix-brief.md) Still walking toward the object this step needs -- not a
-        # failure, just not there yet. Re-run the same step next call without touching the
-        # per-op fail counter, so a legitimately far-off bowl/range/pump never eats into the
-        # 3-strike budget that is meant for clicks that actually failed.
-        return
-    if "cg_craft_fails" not in data:
-        data["cg_craft_fails"] = {}
-    fails = data["cg_craft_fails"]
-    if ok:
-        fails[op] = 0
-    else:
-        fails[op] = fails.get(op, 0) + 1
-    if any(count >= 3 for count in fails.values()):
-        debug_log.log("cg", f"[!] craft step {op} {arg} failed 3 times -- skipping the rest")
-        data["cg_crafted"] = True
+    # Chain craft steps inside this tick (2026-09-06): the bowl interface stays open between
+    # Makes (REC: the human's Makes are 0.5s apart) and every step re-plans from the live
+    # inventory, so there is nothing to wait for between them but the engine loop's own ~1s.
+    # A walk in progress, a failure or the ceilings end the chain; the per-op fail accounting is
+    # unchanged.
+    chain_start = time.time()
+    for _ in range(CRAFT_CHAIN_MAX):
+        if time.time() - chain_start > CRAFT_CHAIN_MAX_S or ctx.state.safety_stopped:
+            return
+        plan = kit.craft_plan(controller.get_inventory(), controller.get_equipment(), cfg)
+        if not plan:
+            data["cg_crafted"] = True
+            return
+        op, arg = plan[0]
+        ok = {"bowl": lambda: bowl_make(ctx, arg, cfg), "pump": lambda: pump_fill(ctx, cfg),
+              "pestle": lambda: _pestle(ctx), "potion": lambda: _potion(ctx),
+              "cook": lambda: cook_all(ctx, cfg), "wear": lambda: wear(ctx, arg)}[op]()
+        if ok is WALKING:
+            # (M, final-fix-brief.md) Still walking toward the object this step needs -- not a
+            # failure, just not there yet. Re-run the same step next call without touching the
+            # per-op fail counter, so a legitimately far-off bowl/range/pump never eats into the
+            # 3-strike budget that is meant for clicks that actually failed.
+            return
+        if "cg_craft_fails" not in data:
+            data["cg_craft_fails"] = {}
+        fails = data["cg_craft_fails"]
+        if ok:
+            fails[op] = 0
+        else:
+            fails[op] = fails.get(op, 0) + 1
+            if any(count >= 3 for count in fails.values()):
+                debug_log.log("cg", f"[!] craft step {op} {arg} failed 3 times -- skipping the rest")
+                data["cg_crafted"] = True
+            return
 
 
 # ----------------------------------------------------------------------------- phases
@@ -1321,7 +1553,12 @@ def _holding_for_break(ctx):
     break_due = getattr(ctx.state, "break_due", None)
     if break_due is None or ctx.state.data.get("cg_playing_out"):
         return False
-    return bool(break_due())
+    # ControllerState.break_due(breaks_cfg) takes the breaks config (same call golem_crafting and
+    # mastering_mixology make). CRASHED live 2026-09-06 (cg_live4): the no-arg call raised
+    # TypeError on the first enter-phase tick and the process died at the barrier; the tests had
+    # faked it as a no-arg lambda, which is why they passed.
+    breaks_cfg = ((getattr(ctx.state, "config", None) or {}).get("breaks")) or {}
+    return bool(break_due(breaks_cfg))
 
 
 def enter_phase(ctx, cfg):
@@ -1377,8 +1614,31 @@ def enter_phase(ctx, cfg):
     attempts += 1
     ctx.state.data["cg_enter_attempts"] = attempts
     debug_log.log("cg", "quick-passing the barrier")
-    controller.click_menu_action(ctx.ser, barrier, g.BARRIER_QUICK_PASS, target_hint="Barrier", offset=(0, 0))
-    _confirm(ctx, lambda: any(n.get("id") in g.HUNLLEF for n in controller.get_npcs(fresh=True)), ENTER_BUDGET_S)
+    controller.click_menu_action(ctx.ser, barrier, g.BARRIER_QUICK_PASS, target_hint="Barrier", offset=(0, 0),
+                                 refresh_target=_obj_refresh(barrier))
+    # Same rule as derive_phase: the varbit, not the Hunllef's presence (visible from here already).
+    _confirm(ctx, lambda: controller.get_varbit(g.VARBIT_FIGHTING_HUNLLEF) == 1, ENTER_BUDGET_S)
+
+
+def lobby_phase(ctx, cfg):
+    """Enter-corrupted on The Gauntlet (37340) in the lobby, confirmed on /player.regionId
+    reading REGION_CORRUPTED (the same fact note_entry starts the run clock from), with an
+    attempt ceiling. The game walks us to the entrance itself (REC: clicked from dist 1)."""
+    entrance = _find_object(cfg, g.OBJ_ENTRANCE)
+    if entrance is None:
+        return
+    data = ctx.state.data
+    attempts = data.get("cg_lobby_attempts", 0)
+    if attempts >= LOBBY_MAX_ATTEMPTS:
+        ctx.state.trigger_safety_stop(f"cg: could not enter the Corrupted Gauntlet after {attempts} attempts")
+        return
+    data["cg_lobby_attempts"] = attempts + 1
+    debug_log.log("cg", "entering the Corrupted Gauntlet")
+    controller.click_menu_action(ctx.ser, entrance, g.ENTRANCE_ENTER_CORRUPTED, target_hint="The Gauntlet", offset=(0, 0))
+    if _confirm(ctx, lambda: (controller.get_player() or {}).get("regionId") == g.REGION_CORRUPTED, LOBBY_BUDGET_S):
+        data["cg_lobby_attempts"] = 0
+    else:
+        debug_log.log("cg", "[!] entrance click did not land us in the Gauntlet")
 
 
 def _inventory_delta(before, after):
@@ -1474,6 +1734,9 @@ def tick(ctx):
     objects = controller.get_objects(radius=cfg["objects_radius"], fresh=True)
     inventory = controller.get_inventory()
     equipment = controller.get_equipment()
+    fight_varbit = controller.get_varbit(g.VARBIT_FIGHTING_HUNLLEF)   # HTTP truth; on_event's mirror is the accelerator
+    if fight_varbit is not None:
+        data["cg_varbit_fight"] = fight_varbit
     phase = derive_phase(data, npcs, objects, inventory=inventory, equipment=equipment, cfg=cfg, now=time.time())
     if phase != data.get("cg_phase"):
         debug_log.log("cg", f"phase {data.get('cg_phase')} -> {phase}")
@@ -1484,7 +1747,9 @@ def tick(ctx):
         data["cg_phase"] = phase
         if phase == "fight":
             data["cg_enter_attempts"] = 0
-    if phase == "enter":
+    if phase == "lobby":
+        lobby_phase(ctx, cfg)
+    elif phase == "enter":
         enter_phase(ctx, cfg)
     elif phase == "fight":
         fight_loop(ctx, cfg)

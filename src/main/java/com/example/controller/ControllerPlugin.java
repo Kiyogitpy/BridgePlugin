@@ -566,6 +566,51 @@ public class ControllerPlugin extends Plugin
 		sendNpcSpawnEvent("NPC_DESPAWNED", event.getNpc());
 	}
 
+	/**
+	 * A ground-anchored spotanim appearing -- pushed so a routine can react to a timing cue the
+	 * instant it is created instead of polling /graphics-objects (Mastering Mixology's
+	 * Agitator/Alembic flash, ids 2954/2955, whose Alembic window is ONE game tick; the old
+	 * routine polled a fresh scan 33 times a second for it). Payload: id, x, y, plane, tick.
+	 * Same LOGGED_IN filter, shared per-tick spawn budget and udpSender null-check as
+	 * sendObjectEvent -- a boss fight or a crowded bank can create dozens of these per tick.
+	 * Accelerator only: the routine confirms on a /graphics-objects read before acting.
+	 * Added 2026-09-06.
+	 */
+	@Subscribe
+	public void onGraphicsObjectCreated(GraphicsObjectCreated event)
+	{
+		GraphicsObject obj = event.getGraphicsObject();
+		if (client.getGameState() != GameState.LOGGED_IN || obj == null)
+		{
+			return;
+		}
+		if (!spawnEventBudgetAvailable())
+		{
+			return;
+		}
+		if (udpSender == null)
+		{
+			return;
+		}
+		LocalPoint lp = obj.getLocation();
+		if (lp == null)
+		{
+			return;
+		}
+		WorldPoint wp = WorldPoint.fromLocalInstance(client, lp);
+		if (wp == null)
+		{
+			return;
+		}
+		Map<String, Object> payload = new HashMap<>();
+		payload.put("id", obj.getId());
+		payload.put("x", wp.getX());
+		payload.put("y", wp.getY());
+		payload.put("plane", obj.getLevel());
+		payload.put("tick", tickClock.get());
+		udpSender.send("GRAPHICS_OBJECT_CREATED", payload);
+	}
+
 	private void sendObjectEvent(String type, GameObject obj)
 	{
 		// Cheap first filter -- excludes the logged-out case -- but NOT sufficient alone to guard

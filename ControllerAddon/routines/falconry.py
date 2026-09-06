@@ -52,6 +52,7 @@ import time
 import banker
 import controller
 import debug_log
+import outcome_waits
 import travel
 
 # --------------------------------------------------------------------------- ids and waypoints
@@ -59,7 +60,7 @@ import travel
 KEBBIT_NAME = "Dashing kebbit"
 FALCON_NAME = "Gyr Falcon"
 FALCONER_NAME = "Matthias"
-# Worn in the WEAPON slot (see _leg_fairy_ring's/_unequip_dramen_staff's own comments -- CONFIRMED
+# Worn in the WEAPON slot (CONFIRMED
 # live, not a hands slot) for as long as an active falcon is out. No "wear" code exists anywhere
 # in this file because none is needed: the game puts it there automatically once Matthias grants a
 # falcon and clears it automatically once the falcon is gone, so checking for it is a direct read
@@ -72,7 +73,8 @@ MEAT_NAME = "Raw dashing kebbit"
 
 RING_OF_DUELING = "ring of dueling"
 ARDOUGNE_CLOAK = "ardougne cloak"
-DRAMEN_STAFF = "dramen staff"
+# No Dramen/Lunar staff anywhere in this file: USER 2026-09-06 "dramen staff isnt needed to take
+# fairy rings anymore" (the game dropped the requirement) -- the staff wield/unwield legs are gone.
 
 # varbit 14192: 5 = the falcon is sitting on a caught kebbit and must be retrieved, 0 = it is with
 # us and can be thrown. Established by frequency and pairing, not by guessing at its meaning: it
@@ -114,6 +116,38 @@ OPT_KANDARIN_MONASTERY = "Monastery Teleport"
 OPT_LAST_DESTINATION = "Last-destination"
 OPT_QUICK_FALCON = "Quick-falcon"
 
+# --- Event-driven outcomes (2026-09-06, docs/superpowers/specs/2026-09-06-golem-crafting-events-
+# and-falconry-design.md). The falcon varbit is pushed as VARBIT_CHANGED, so a throw's result and
+# a retrieve are awaited on it and confirmed on /varbit; a teleport is awaited on the region the
+# recording says it lands in. Everything a caller acts on is still an HTTP read. These primitives
+# are shared with routines/golem_crafting.py's fur trip through hunt_step().
+VARBIT_SUBSCRIPTIONS = (VARBIT_FALCON_HAS_CATCH,)
+THROW_RESOLVE_S = 2.6          # catch or miss both report ~1.6s after the click (recording)
+RETRIEVE_S = 2.5               # retrieval resolved in ~0.3s; generous headroom
+HIRE_S = 3.0                   # Quick-falcon -> glove worn / coins gone landed 0.2s after the click
+TELEPORT_BUDGET_S = 8.0        # teleport animation + region load (3.0-3.6s measured)
+# Worn-equipment interface (group 387) children. cape 16 / weapon 18 / ring 24 are read straight
+# out of the recording; shield 20 and gloves 22 follow the interface's standard layout and are
+# UNVERIFIED live (fur-trip worklist item 3). Falconry needs all three hands slots empty (wiki).
+EQUIPMENT_GROUP = 387
+EQUIPMENT_WEAPON_CHILD = 18
+EQUIPMENT_SHIELD_CHILD = 20
+EQUIPMENT_GLOVES_CHILD = 22
+
+
+def _now():
+    return time.time()
+
+
+def _sleep(s):
+    if s > 0:
+        time.sleep(s)
+
+
+def _await(ctx, signals, budget_s, confirm, since=None, reaction=True):
+    return outcome_waits.await_pre(ctx, signals, budget_s, confirm, since=since,
+                                   reaction=reaction, now_fn=_now, sleep_fn=_sleep)
+
 DEFAULT_CONFIG = {
     "enabled": True,
 
@@ -122,6 +156,10 @@ DEFAULT_CONFIG = {
     "bankAtFreeSlots": 3,
 
     "dropBones": True,
+    # Raw dashing kebbit only ever costs slots when no meat pouch is carried; the recorded human
+    # had one (meat went to the pouch), so the standalone routine keeps it. golem_crafting's fur
+    # trip passes drop_meat=True to hunt_step instead.
+    "dropMeat": False,
     "maxKebbitDistance": 12,
 
     # Quick-falcon costs 500gp per falcon; below this we cannot re-hire and must stop.
@@ -225,46 +263,57 @@ def _shift_click(ctx, item) -> bool:
         controller.key_up(ctx.ser, "SHIFT")
 
 
-def _use_teleport(ctx, item_substring: str, option: str, left_click: bool = False) -> bool:
+def _use_teleport(ctx, item_substring: str, option: str, left_click: bool = None,
+                  expect_region=None) -> bool:
     """Use a teleport item in the INVENTORY to reach `option`'s destination.
 
-    Inventory, not worn: the recorded human used the worn-equipment interface, but a right-click
-    menu read back through GET /menu (controller.click_menu_action) is the pattern this codebase
-    already has working, and it needs a clickable screen position -- which /equipment does not
-    provide for worn items. Keeping the teleports in the inventory avoids the whole problem.
-    See the module docstring's loadout note.
+    Inventory, not worn: /equipment carries no screen positions, so a worn item cannot be
+    clicked from here (see the module docstring's loadout note).
 
-    left_click, if True, skips the right-click + GET /menu selection entirely and just left-clicks
-    the item -- ADDED 2026-08-24 (user directive) for the ring of dueling's Castle Wars hop: the
-    user has Castle Wars set as that ring's own left-click default action (client-side menu-entry
-    swap, same idea as routines/chinchompa_hunting.py's swapped trap options -- see CLAUDE.md),
-    so drilling into the right-click menu is unnecessary there. `option` is still passed for the
-    debug log message even on this path; it plays no role in what actually gets clicked. Default
-    False (unchanged right-click-menu behavior) for every other teleport until confirmed the same
-    way -- see _leg_bank's ardougne cloak call, which is NOT confirmed to have this swap."""
+    2026-09-06, USER: "for inventory teleports ive changed them so we just click the item and we
+    teleport to the right spot" -- every inventory teleport is a LEFT-click first, verified
+    through GET /hover (expected_action=`option`, so a swap that is not in place on this item
+    withholds the click instead of, say, wearing the ring), and only a withheld/failed left-click
+    falls back to the right-click menu read back through GET /menu. `left_click` is kept for
+    old callers: True skips the hover verification, False forces the menu path."""
     item = _first_inventory_item(item_substring)
     if item is None:
         debug_log.log("falconry", f"no {item_substring} in inventory -- cannot teleport")
         return False
 
     debug_log.log("falconry", f"teleporting: {option}")
-    if left_click:
+    ok = False
+    if left_click is not False:
         controller.human_delay(0.05, 0.12)
-        ok = controller.click_entity(ctx.ser, item, check_ui_blockers=False, simulate_mistakes=False)
-    else:
+        ok = controller.click_entity(ctx.ser, item, check_ui_blockers=False, simulate_mistakes=False,
+                                     expected_action=None if left_click else option)
+    if not ok:
+        if getattr(ok, "withheld", False):
+            debug_log.log("falconry", f"{item_substring}: left-click is not '{option}' here -- using the menu")
         ok = controller.click_menu_action(ctx.ser, item, option, check_ui_blockers=False)
     if not ok:
         return False
 
-    controller.human_delay(3.0, 3.6)  # teleport animation + region load
-    return True
+    if expect_region is None:
+        controller.human_delay(3.0, 3.6)  # teleport animation + region load
+        return True
+    # 2026-09-06: the landing is awaited, not slept off -- /player.regionId is the truth, and the
+    # per-frame PLAYER_STOPPED/PLAYER_MOVING stream says when to look (a teleport ends with the
+    # player standing still in the new region).
+    landed = _await(ctx, ("PLAYER_STOPPED", "PLAYER_MOVING"), TELEPORT_BUDGET_S,
+                    confirm=lambda: (controller.get_player() or {}).get("regionId") == expect_region,
+                    reaction=False)
+    if not landed:
+        debug_log.log("falconry", f"teleport '{option}' did not land in region {expect_region} "
+                                  f"within {TELEPORT_BUDGET_S}s")
+    return bool(landed)
 
 
 def _has_return_loadout() -> bool:
     """Everything needed to get BACK from the bank. Checked before leaving the hunting area, not
-    at the bank -- being short of a Dramen staff at Castle Wars strands the character, whereas
+    at the bank -- being short of the cloak at Castle Wars strands the character, whereas
     noticing here just means we keep hunting."""
-    missing = [name for name in (RING_OF_DUELING, ARDOUGNE_CLOAK, DRAMEN_STAFF)
+    missing = [name for name in (RING_OF_DUELING, ARDOUGNE_CLOAK)
                if _first_inventory_item(name) is None]
     if missing:
         debug_log.log("falconry", f"missing return items: {', '.join(missing)}")
@@ -294,15 +343,13 @@ def _hunt(ctx, config, player, region):
         return
 
     # 1. A falcon sitting on a kill blocks everything else -- it cannot be thrown again until
-    #    retrieved, so this is unconditionally first.
+    #    retrieved, so this is unconditionally first (inside hunt_step).
+    # 3. Full enough to be worth a trip? Checked here, between the retrieve/drop and the hire/
+    #    throw, so a landing catch is still collected before we leave.
     if _retrieve_falcon(ctx, config):
         return
-
-    # 2. Bones only ever cost us inventory space.
-    if config.get("dropBones", True) and _drop_bones(ctx):
+    if config.get("dropBones", True) and _drop_loose(ctx, BONES_NAME):
         return
-
-    # 3. Full enough to be worth a trip?
     free = _free_slots()
     if free <= config.get("bankAtFreeSlots", 3):
         if not _has_return_loadout():
@@ -314,23 +361,73 @@ def _hunt(ctx, config, player, region):
         ctx.state.data["banking"] = True
         return
 
-    # 4. Make sure we actually have an active falcon before trying to hunt with it -- ADDED
-    #    2026-08-24 (user directive, CORRECTED same day: an NPC lookup for the Gyr Falcon was
-    #    tried first and rejected -- the falcon can be legitimately out of view mid-hunt, e.g.
-    #    off attacking a kebbit, making that check unreliable). The Falconer's glove is what
-    #    Matthias hands over with an active falcon (see FALCONER_GLOVE_NAME's own comment) and
-    #    disappears again once it is gone, so equipment is the direct, unambiguous signal here --
-    #    proactive rather than _throw_falcon's reactive "N failed throws" counter, which only
-    #    notices a missing falcon after several wasted throw attempts against nothing.
-    equipment = controller.get_equipment()
+    hunt_step(ctx, config, drop_meat=config.get("dropMeat", False))
+
+
+def glove_worn() -> bool:
+    """Whether the falconer's glove is in the WEAPON slot -- Matthias hands it over with an active
+    falcon and the game clears it once the falcon is gone, so this is a direct read of "do we
+    currently have a usable falcon" (ADDED 2026-08-24; an NPC lookup for the Gyr Falcon was tried
+    first and rejected, the falcon is legitimately out of view mid-hunt)."""
+    equipment = controller.get_equipment() or {}
     weapon = (equipment.get("weapon") or {}).get("name") or ""
-    if FALCONER_GLOVE_NAME not in weapon.lower():
+    return FALCONER_GLOVE_NAME in weapon.lower()
+
+
+def hunt_step(ctx, config, drop_meat: bool = False) -> str:
+    """ONE bounded hunting action, in priority order, and what it did:
+    "retrieved" (a falcon sitting on a kill blocks everything else), "dropped" (a bone, or raw
+    meat when `drop_meat`), "hired" (no glove worn), "threw" / "missed" (a throw that landed /
+    did not), "walked" (no kebbit in range, walking to the hunt tile). Shared by this routine's
+    own tick and golem_crafting's fur trip, which owns its own end condition."""
+    if _retrieve_falcon(ctx, config):
+        return "retrieved"
+    if config.get("dropBones", True) and _drop_loose(ctx, BONES_NAME):
+        return "dropped"
+    if drop_meat and _drop_loose(ctx, MEAT_NAME):
+        return "dropped"
+    if not glove_worn():
         debug_log.log("falconry", "no falconer's glove equipped -- hiring a falcon from Matthias")
         _hire_falcon(ctx)
-        return
+        return "hired"
+    outcome = _throw_falcon(ctx, config)
+    if outcome is None:
+        return "walked"
+    return "threw" if outcome else "missed"
 
-    # 5. Throw at a kebbit.
-    _throw_falcon(ctx, config)
+
+def hands_free() -> bool:
+    """Falconry needs the weapon, shield and glove slots empty (wiki) -- except the falconer's
+    glove itself, which the game puts in the weapon slot while a falcon is out."""
+    equipment = controller.get_equipment() or {}
+    for slot in ("weapon", "shield", "gloves"):
+        name = ((equipment.get(slot) or {}).get("name") or "").lower()
+        if name and FALCONER_GLOVE_NAME not in name:
+            return False
+    return True
+
+
+def _ensure_hands_free(ctx) -> bool:
+    """Remove whatever occupies the weapon, shield or glove slot through the worn-equipment
+    interface (WidgetProvider, group 387 -- /equipment carries no screen positions). Returns
+    True if it acted this tick; the caller re-checks hands_free() next tick. One slot per call."""
+    equipment = controller.get_equipment() or {}
+    for slot, child in (("weapon", EQUIPMENT_WEAPON_CHILD), ("shield", EQUIPMENT_SHIELD_CHILD),
+                        ("gloves", EQUIPMENT_GLOVES_CHILD)):
+        name = ((equipment.get(slot) or {}).get("name") or "").lower()
+        if not name or FALCONER_GLOVE_NAME in name:
+            continue
+        widget = controller.get_widget(EQUIPMENT_GROUP, child)
+        if not widget.get("clickable"):
+            debug_log.log("falconry", f"opening the equipment tab to remove the {slot} ({name})")
+            controller.key_tap(ctx.ser, "E")
+            controller.human_delay(0.6, 1.0)
+            return True
+        debug_log.log("falconry", f"removing the {slot} ({name}) -- falconry needs both hands free")
+        controller.click_entity(ctx.ser, widget, check_ui_blockers=False, simulate_mistakes=False)
+        controller.human_delay(0.6, 1.0)
+        return True
+    return False
 
 
 def _retrieve_falcon(ctx, config) -> bool:
@@ -348,41 +445,50 @@ def _retrieve_falcon(ctx, config) -> bool:
 
     debug_log.log("falconry", f"retrieving the falcon (dist={falcon.get('distance')})")
     controller.human_delay(0.15, 0.4)
+    mark = outcome_waits.mark(ctx)
     controller.click_entity(
         ctx.ser, falcon,
         refresh_target=controller.npc_index_refresh_target(falcon.get("index")),
     )
 
-    # Retrieval resolved in ~0.3s in the recording; 2.5s is generous headroom. Waiting on the
-    # varbit rather than a fixed sleep means a slow tick costs nothing and a fast one is not
-    # padded.
-    _wait_until(lambda: not _falcon_has_catch(), timeout_s=2.5)
+    # Retrieval resolved in ~0.3s in the recording; RETRIEVE_S is generous headroom. The varbit
+    # flipping to 0 is pushed as VARBIT_CHANGED and confirmed on /varbit (2026-09-06).
+    _await(ctx, {"VARBIT_CHANGED": outcome_waits.varbit_in((VARBIT_FALCON_HAS_CATCH,))}, RETRIEVE_S,
+           confirm=lambda: not _falcon_has_catch(), since=mark)
     return True
 
 
-def _drop_bones(ctx) -> bool:
-    bones = _inventory_items(BONES_NAME)
-    if not bones:
+def _drop_loose(ctx, name: str) -> bool:
+    """Shift-drop ONE loose `name` item (bones; raw meat when no meat pouch is carried)."""
+    items = _inventory_items(name)
+    if not items:
         return False
 
     # One per tick rather than a burst: the recorded human dropped at roughly 0.6-0.9s intervals,
     # and a tight loop of 11 drops is both unlike a person and a long window in which a falcon
     # could land unattended.
-    debug_log.log("falconry", f"dropping {BONES_NAME} ({len(bones)} held)")
-    _shift_click(ctx, bones[0])
+    debug_log.log("falconry", f"dropping {name} ({len(items)} held)")
+    _shift_click(ctx, items[0])
     controller.human_delay(0.3, 0.7)
     return True
 
 
-def _throw_falcon(ctx, config) -> bool:
+def _drop_bones(ctx) -> bool:
+    return _drop_loose(ctx, BONES_NAME)
+
+
+def _throw_falcon(ctx, config):
+    """True: the throw landed (varbit 14192 -> 5). False: it resolved without a catch (a miss,
+    ~40% of throws, or a click that never registered). None: no kebbit in range, walked instead."""
     kebbit = _nearest_npc(KEBBIT_NAME, config.get("maxKebbitDistance", 12))
     if kebbit is None:
         debug_log.log("falconry", "no kebbit in range -- walking to the hunting spot")
         travel.walk_to(ctx, TILE_HUNT, goal_adjacent=False)
-        return False
+        return None
 
     debug_log.log("falconry", f"throwing at a kebbit (dist={kebbit.get('distance')})")
     controller.human_delay(0.15, 0.4)
+    mark = outcome_waits.mark(ctx)
     if not controller.click_entity(
         ctx.ser, kebbit,
         refresh_target=controller.npc_index_refresh_target(kebbit.get("index")),
@@ -391,8 +497,10 @@ def _throw_falcon(ctx, config) -> bool:
 
     # Wait for the throw to RESOLVE, not merely for the click to land. A catch takes ~1.6s and a
     # miss reports at about the same time, so this settles either way; without it the next tick
-    # would re-throw into a falcon already in flight.
-    landed = _wait_until(_falcon_has_catch, timeout_s=2.6)
+    # would re-throw into a falcon already in flight. The varbit is pushed (2026-09-06), so a
+    # catch is seen the tick it lands; a miss still costs the full THROW_RESOLVE_S.
+    landed = bool(_await(ctx, {"VARBIT_CHANGED": outcome_waits.varbit_in((VARBIT_FALCON_HAS_CATCH,))},
+                         THROW_RESOLVE_S, confirm=_falcon_has_catch, since=mark))
 
     if landed:
         ctx.state.data["failed_throws"] = 0
@@ -432,11 +540,16 @@ def _hire_falcon(ctx) -> bool:
 
     debug_log.log("falconry", "hiring a falcon from Matthias")
     refresh = controller.npc_index_refresh_target(matthias["index"])
+    mark = outcome_waits.mark(ctx)
     if not controller.click_menu_action(ctx.ser, matthias, OPT_QUICK_FALCON, refresh_target=refresh):
         return False
 
-    controller.human_delay(1.5, 2.2)
-    return True
+    # The -500 coins (INVENTORY_CHANGED) and the glove landed 0.2s after the click in the
+    # recording; the glove in the weapon slot is the truth (2026-09-06, was a 1.5-2.2s sleep).
+    hired = _await(ctx, "INVENTORY_CHANGED", HIRE_S, confirm=glove_worn, since=mark)
+    if not hired:
+        debug_log.log("falconry", "Quick-falcon did not put a glove on within the budget -- will re-check next tick")
+    return bool(hired)
 
 
 def _wait_until(predicate, timeout_s: float, poll_interval_s: float = 0.1) -> bool:
@@ -539,21 +652,7 @@ def _restock_ring_of_dueling(ctx) -> None:
 
 
 def _leg_fairy_ring(ctx):
-    # The Dramen staff must be WIELDED for the fairy ring. It is removed again after the hop
-    # because the falconry glove occupies the same weapon slot.
-    equipment = controller.get_equipment()
-    weapon = (equipment.get("weapon") or {}).get("name") or ""
-    if DRAMEN_STAFF not in weapon.lower():
-        staff = _first_inventory_item(DRAMEN_STAFF)
-        if staff is None:
-            debug_log.log("falconry", "no Dramen staff -- cannot use the fairy ring")
-            ctx.state.trigger_safety_stop("falconry: no Dramen staff for the fairy ring")
-            return
-        debug_log.log("falconry", "wielding the Dramen staff")
-        controller.click_entity(ctx.ser, staff, check_ui_blockers=False, simulate_mistakes=False)
-        controller.human_delay(0.8, 1.3)
-        return
-
+    # No staff to wield: fairy rings need no Dramen/Lunar staff any more (USER 2026-09-06).
     ring = next((o for o in controller.get_objects(radius=20)
                  if o.get("id") == FAIRY_RING_ID and o.get("visible", True)), None)
     if ring is None:
@@ -572,10 +671,6 @@ def _leg_fairy_ring(ctx):
 
 
 def _leg_walk_home(ctx):
-    # Glove needs the weapon slot, so the staff comes off before we reach Matthias.
-    if _unequip_dramen_staff(ctx):
-        return
-
     player = controller.get_player()
     if player.get("y", 0) < TILE_STILE["y"]:
         # CONFIRMED live 2026-08-24: this used to compare against SOUTH_OF_STILE_Y (3615) here
@@ -612,27 +707,3 @@ def _leg_walk_home(ctx):
     if controller.click_entity(ctx.ser, stile, refresh_target=refresh_target):
         controller.human_delay(2.0, 3.0)
 
-
-def _unequip_dramen_staff(ctx) -> bool:
-    """Take the Dramen staff off via the equipment interface. Returns True if it acted this tick.
-
-    Worn items have no screen position on /equipment, so this goes through WidgetProvider: group
-    387 is the worn-equipment interface and child 18 is the weapon slot, both read directly out of
-    the recording (recorder.py decodes the packed id into group.child for exactly this). `E` opens
-    the equipment tab."""
-    equipment = controller.get_equipment()
-    weapon = (equipment.get("weapon") or {}).get("name") or ""
-    if DRAMEN_STAFF not in weapon.lower():
-        return False
-
-    slot = controller.get_widget(387, 18)
-    if not slot.get("clickable"):
-        debug_log.log("falconry", "opening the equipment tab to remove the Dramen staff")
-        controller.key_tap(ctx.ser, "E")
-        controller.human_delay(0.6, 1.0)
-        return True
-
-    debug_log.log("falconry", "removing the Dramen staff")
-    controller.click_entity(ctx.ser, slot, check_ui_blockers=False, simulate_mistakes=False)
-    controller.human_delay(0.6, 1.0)
-    return True

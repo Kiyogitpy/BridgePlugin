@@ -303,7 +303,7 @@ def maybe_dodge_fireball(ctx, player: dict) -> bool:
     for dx, dy in ((2, 0), (-2, 0), (0, 2), (0, -2)):
         point = controller.get_minimap_walk_point(px + dx, py + dy, plane)
         if point.get("onMinimap"):
-            controller.click_entity(ctx.ser, point, offset=(0, 0), simulate_mistakes=False)
+            controller.click_entity(ctx.ser, point, offset=(0, 0), simulate_mistakes=False, check_ui_blockers=False)
             return True
 
     debug_log.log("td", "couldn't find a dodge tile on the minimap")

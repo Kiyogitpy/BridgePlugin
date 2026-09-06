@@ -31,6 +31,13 @@ import travel
 from travel import (BLOCK_MOVEMENT_EAST, BLOCK_MOVEMENT_NORTH, BLOCK_MOVEMENT_SOUTH,
                     BLOCK_MOVEMENT_WEST, TILE_BLOCKING_FLAGS)
 
+# MEASURED live 2026-09-06 (Corrupted Gauntlet start room, /collision?all=true): tiles of rooms
+# not yet lit read 0x40000000 and the scene border 0xFFFFFF. Neither carries a TILE_BLOCKING bit
+# (they are the client's own "no collision data here" markers, not walls), so the first live run's
+# start-room flood fill walked out through the corridor gap into 9092 unloaded tiles. A tile
+# with no data cannot be stood on as far as routing is concerned.
+UNLOADED_TILE = 0x40000000
+BORDER_TILE = 0xFFFFFF
 CARDINALS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 DIAGONALS = ((1, 1), (1, -1), (-1, 1), (-1, -1))
 
@@ -62,7 +69,9 @@ class InstanceMap:
 
     def standable(self, x: int, y: int) -> bool:
         f = self.flags_at(x, y)
-        return f is not None and not (f & TILE_BLOCKING_FLAGS)
+        if f is None or f & UNLOADED_TILE or f == BORDER_TILE:
+            return False
+        return not (f & TILE_BLOCKING_FLAGS)
 
     def edge_open(self, x: int, y: int, dx: int, dy: int) -> bool:
         """Cardinal edge from (x, y) toward (dx, dy): refused if EITHER tile records the wall."""
@@ -199,7 +208,8 @@ def walk_to(ctx, x: int, y: int, tolerance: float = travel.WALK_ARRIVAL_TOLERANC
         idx = min(len(path) - 1, travel.WALK_HOP_MAX_TILES)
         target = path[idx]
         hops += 1
-        if not travel._hop_to(ctx, target[0], target[1], plane, inst=True):
+        # USER 2026-09-06: rooms are in view, so hop through the viewport, minimap as the fallback.
+        if not travel._hop_to(ctx, target[0], target[1], plane, inst=True, prefer_viewport=True):
             return False
         after = player_inst()
         if after is not None and (after[0], after[1]) == (px, py) and len(path) > 1:
