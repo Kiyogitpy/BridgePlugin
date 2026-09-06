@@ -327,3 +327,120 @@ def test_burst_reaims_when_the_player_has_moved(monkeypatch):
     monkeypatch.setattr(dst, "BURST_MAX_S", 6.0)
     dst.trawl_burst(ctx, CFG, NET_OBJ)
     assert hovers == [0, 3]
+
+
+# --------------------------------------------------------------------------- phases / tick / break
+
+import sailing
+
+
+def test_lower_phase_clicks_the_menu_option_and_confirms_on_the_depth_varbit(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[("VARBIT_CHANGED", {"varbitId": 19206, "value": 1})]])
+    calls = []
+    depth = {"v": 0}
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "get_trawling",
+                        lambda: {"nets": [{"slot": 0, "depth": depth["v"], "hotspotId": 3}]})
+
+    def lower(ser, ent, option, **kw):
+        calls.append(option)
+        depth["v"] = 1
+        return True
+    monkeypatch.setattr(controller, "click_menu_action", lower)
+
+    assert dst.lower_phase(ctx, CFG, _snap(net_depth=0)) is True
+    assert calls == ["Lower"]
+
+
+def test_lower_phase_stops_when_the_net_never_goes_down(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]] * 20)
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_trawling",
+                        lambda: {"nets": [{"slot": 0, "depth": 0, "hotspotId": 3}]})
+    assert dst.lower_phase(ctx, CFG, _snap(net_depth=0)) is False
+    assert ctx.state.safety_stopped
+
+
+def test_collect_phase_takes_collect_from_and_confirms_the_net_emptied(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[("INVENTORY_CHANGED", {})]])
+    fish = {"n": 240}
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "get_trawling", lambda: {"netFish": fish["n"]})
+    monkeypatch.setattr(dst, "_answer_collect_dialogue", lambda ctx, cfg: fish.__setitem__("n", 0))
+    seen = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **kw: seen.append(option) or True)
+
+    assert dst.collect_phase(ctx, CFG, _snap(net_fish=240)) is True
+    assert seen == ["Collect-from"]
+    assert fish["n"] == 0
+
+
+def test_approach_phase_sails_at_the_live_shoal_when_it_is_sitting_still(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    targets = []
+    monkeypatch.setattr(sailing, "sail_to", lambda c, t: targets.append(t) or True)
+    snap = _snap(shoal_distance=30.0, shoal={"id": 59734, "x": 1574, "y": 3338, "plane": 0})
+    assert dst.approach_phase(ctx, CFG, snap) is True
+    assert targets == [{"x": 1574, "y": 3338, "plane": 0}]
+
+
+def test_travel_phase_aims_at_the_stop_after_the_one_we_last_fished(monkeypatch):
+    """The route table is an ACCELERATOR: with the shoal out of sight we head for where it is
+    going next, so we arrive with it instead of trailing it."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    ctx.state.data["dst_last_stop_index"] = 3
+    targets = []
+    monkeypatch.setattr(sailing, "sail_to", lambda c, t: targets.append(t) or True)
+    assert dst.travel_phase(ctx, CFG, _snap(shoal=None, shoal_distance=None)) is True
+    assert targets == [{"x": 1580, "y": 3379, "plane": 0}]   # Great Sound stop index 4
+
+
+def test_travel_phase_with_no_history_aims_at_the_nearest_stop(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    targets = []
+    monkeypatch.setattr(sailing, "sail_to", lambda c, t: targets.append(t) or True)
+    assert dst.travel_phase(ctx, CFG, _snap(shoal=None, shoal_distance=None,
+                                            px=1576, py=3340)) is True
+    assert targets == [{"x": 1574, "y": 3338, "plane": 0}]
+
+
+def test_a_lost_snapshot_is_a_safety_stop_naming_the_boat(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(sailing, "sail_to", lambda c, t: True)
+    assert dst.tick_with_snapshot(ctx, CFG, _snap(net=None)) is False
+    assert ctx.state.safety_stopped
+    assert "boat" in ctx.state.safety_reason.lower()
+
+
+def test_repeated_out_of_range_bursts_eventually_stop_the_run(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(dst, "trawl_burst", lambda c, cfg, net: "out_of_range")
+    for _ in range(dst.APPROACH_MAX_TRIES):
+        dst.trawl_phase(ctx, CFG, _snap())
+    assert ctx.state.safety_stopped
+
+
+def test_before_break_collects_the_nets_first(monkeypatch):
+    """Fish in the nets are discarded on a forced logout, and a break is minutes long."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    collected = []
+    monkeypatch.setattr(dst, "collect_phase", lambda c, cfg, s: collected.append(1) or True)
+    monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg, **kw: _snap(net_fish=17))
+    dst.before_break(ctx)
+    assert collected == [1]
+
+    collected.clear()
+    monkeypatch.setattr(dst, "read_snapshot", lambda c, cfg, **kw: _snap(net_fish=0))
+    dst.before_break(ctx)
+    assert collected == []
+
+
+def test_stuck_watch_warns_then_stops(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    snap = _snap()
+    dst._stuck_watch(ctx, CFG, snap, "trawl")
+    ctx.clock["t"] += dst.STALL_STOP_S + 1
+    dst._stuck_watch(ctx, CFG, snap, "trawl")
+    assert ctx.state.safety_stopped

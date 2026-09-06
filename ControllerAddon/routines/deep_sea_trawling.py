@@ -386,3 +386,243 @@ def trawl_burst(ctx, cfg, net) -> str:
             return "out_of_range"
 
     return "budget"
+
+
+# --------------------------------------------------------------------------- phases
+
+SAIL_MAX_TRIES = 3
+APPROACH_MAX_TRIES = 6
+LOWER_TRIES = 3
+COLLECT_TRIES = 3
+NET_DEPTH_VARBIT = 19206
+STALL_WARN_S = 180.0
+STALL_STOP_S = 420.0
+TICK_CHAIN_MAX = 4
+COLLECT_CONFIRM_S = 6.0
+LOWER_CONFIRM_S = 4.0
+
+
+def _stop(ctx, reason):
+    # trigger_safety_stop appends its own ". Automation paused -- fix the issue and restart."
+    ctx.state.trigger_safety_stop(reason)
+
+
+def travel_phase(ctx, cfg, snap) -> bool:
+    """No shoal in the loaded scene. Head for a route stop -- the next one after the one we last
+    fished if we know it (the table is an accelerator: we arrive with the shoal rather than
+    behind it), otherwise the nearest."""
+    if not snap.in_route_area:
+        _stop(ctx, f"not on the {cfg['route']} route -- start this routine with the boat there")
+        return False
+
+    last = ctx.state.data.get("dst_last_stop_index")
+    if last is None:
+        idx, point, _dist = trawling_routes.nearest_stop(cfg["shoal"], cfg["route"],
+                                                         snap.px, snap.py)
+    else:
+        idx, point = trawling_routes.next_stop(cfg["shoal"], cfg["route"], last)
+    ctx.state.data["dst_heading_for"] = idx
+    debug_log.log("trawling", f"no shoal in sight -- sailing to stop {idx} {point}")
+    return _sail(ctx, cfg, {"x": point[0], "y": point[1], "plane": snap.plane or 0})
+
+
+def approach_phase(ctx, cfg, snap) -> bool:
+    """The shoal is in the scene but we are out of range, or the boat is still moving. Sail at
+    the shoal's LIVE tile -- the object in /objects is the truth, the route table only fills in
+    when the shoal is not visible at all (travel_phase)."""
+    idx, _point, dist = trawling_routes.nearest_stop(cfg["shoal"], cfg["route"],
+                                                     snap.shoal["x"], snap.shoal["y"])
+    if dist <= cfg["trawlRange"]:
+        ctx.state.data["dst_last_stop_index"] = idx
+    target = {"x": snap.shoal["x"], "y": snap.shoal["y"], "plane": snap.plane or 0}
+    return _sail(ctx, cfg, target)
+
+
+def _sail(ctx, cfg, target) -> bool:
+    data = ctx.state.data
+    if sailing.sail_to(ctx, target):
+        data["dst_sail_fails"] = 0
+        return True
+    data["dst_sail_fails"] = data.get("dst_sail_fails", 0) + 1
+    debug_log.log("trawling",
+                  f"couldn't sail to {target} ({data['dst_sail_fails']}/{SAIL_MAX_TRIES})")
+    if data["dst_sail_fails"] >= SAIL_MAX_TRIES:
+        _stop(ctx, "the boat couldn't reach the shoal after repeated attempts")
+    return False
+
+
+def lower_phase(ctx, cfg, snap) -> bool:
+    """Put the net in the water. The net loc's op3 is Lower, so this is a named menu entry, not
+    the left-click default (which is Operate)."""
+    net = snap.net
+    for _ in range(LOWER_TRIES):
+        controller.click_menu_action(ctx.ser, net, "Lower",
+                                     refresh_target=net_refresh_target(net), offset=(0, 0))
+        out = outcome_waits.await_pre(
+            ctx, ("VARBIT_CHANGED",), LOWER_CONFIRM_S,
+            confirm=lambda: bool(_built_net_depth(controller.get_trawling() or {})),
+            now_fn=_now, sleep_fn=_sleep)
+        if out:
+            debug_log.log("trawling", "net lowered")
+            return True
+    _stop(ctx, "the trawling net never went down")
+    return False
+
+
+COLLECT_KEYS = {"inventory": "1", "cargo": "2"}
+
+
+def _answer_collect_dialogue(ctx, cfg):
+    """Collect-from asks where the fish should go. Press the number key for the configured
+    destination; a Space also advances the plain 'you collect N fish' line that follows.
+
+    LIVE-VERIFY (spec checklist #7): the interface and the exact option text are UNCONFIRMED.
+    Option 1 is assumed to be the inventory and option 2 the cargo hold; if the live dialogue
+    disagrees, fix COLLECT_KEYS, not the caller."""
+    key = COLLECT_KEYS.get(cfg["collectTo"], "2")
+    controller.key_tap(ctx.ser, key)
+    _sleep(controller.sample_human_delay(0.3, 0.5))
+    controller.key_tap(ctx.ser, "SPACE")
+
+
+def collect_phase(ctx, cfg, snap) -> bool:
+    net = snap.net
+    for _ in range(COLLECT_TRIES):
+        controller.click_menu_action(ctx.ser, net, "Collect-from",
+                                     refresh_target=net_refresh_target(net), offset=(0, 0))
+        _answer_collect_dialogue(ctx, cfg)
+        out = outcome_waits.await_pre(
+            ctx, ("INVENTORY_CHANGED", "VARBIT_CHANGED"), COLLECT_CONFIRM_S,
+            confirm=lambda: ((controller.get_trawling() or {}).get("netFish") or 0) == 0,
+            now_fn=_now, sleep_fn=_sleep)
+        if out:
+            debug_log.log("trawling", "nets emptied")
+            return True
+    _stop(ctx, "couldn't empty the trawling nets")
+    return False
+
+
+def trawl_phase(ctx, cfg, snap) -> bool:
+    result = trawl_burst(ctx, cfg, snap.net)
+    data = ctx.state.data
+    if result == "out_of_range":
+        data["dst_approaches"] = data.get("dst_approaches", 0) + 1
+        if data["dst_approaches"] >= APPROACH_MAX_TRIES:
+            _stop(ctx, "the nets stopped catching and the boat couldn't get back to the shoal")
+            return False
+    else:
+        data["dst_approaches"] = 0
+    return result in ("net_full", "out_of_range", "budget")
+
+
+def done_phase(ctx, cfg, snap) -> bool:
+    controller.click_menu_action(ctx.ser, snap.net, "Raise",
+                                 refresh_target=net_refresh_target(snap.net), offset=(0, 0))
+    _stop(ctx, f"the cargo hold is full -- {ctx.state.data.get('dst_catches', 0)} catches this run")
+    return False
+
+
+PHASES = {
+    "travel": travel_phase,
+    "approach": approach_phase,
+    "lower": lower_phase,
+    "trawl": trawl_phase,
+    "collect": collect_phase,
+    "done": done_phase,
+}
+
+
+# --------------------------------------------------------------------------- watchdog
+
+
+def _progress_signature(snap, phase):
+    return (phase, snap.net_fish, snap.cargo_used, snap.px, snap.py)
+
+
+def _stuck_watch(ctx, cfg, snap, phase):
+    data = ctx.state.data
+    sig = _progress_signature(snap, phase)
+    if data.get("dst_sig") != sig:
+        data["dst_sig"] = sig
+        data["dst_sig_at"] = _now()
+        data["dst_warned"] = False
+        return
+    stalled = _now() - data.get("dst_sig_at", _now())
+    if stalled >= STALL_STOP_S:
+        _stop(ctx, f"nothing has changed for {int(stalled)}s in phase {phase}")
+    elif stalled >= STALL_WARN_S and not data.get("dst_warned"):
+        data["dst_warned"] = True
+        debug_log.log("trawling", f"[!] trawling: STUCK? {int(stalled)}s in phase {phase}")
+
+
+# --------------------------------------------------------------------------- routine contract
+
+
+def setup(ctx):
+    ctx.state.data.setdefault("dst_started_at", _now())
+    _startup_checks(ctx, ctx.state.config or DEFAULT_CONFIG)
+
+
+def _startup_checks(ctx, cfg):
+    """Deferred until the client answers with real data -- the first logged-in tick after an
+    auto-login can serve an empty scene, and stopping on that is the GOTR 'no pickaxe with a
+    pickaxe equipped' bug."""
+    snap = read_snapshot(ctx, cfg)
+    if snap.px is None:
+        return
+    if snap.net is None:
+        _stop(ctx, "start this routine standing on your boat, which needs a trawling net built")
+        return
+    if not snap.navigating:
+        _stop(ctx, "no crewmate is holding the helm -- assign one so the boat can be steered "
+                   "from the net")
+        return
+    if not snap.in_route_area:
+        _stop(ctx, f"not on the {cfg['route']} route -- start this routine with the boat there")
+
+
+def on_event(ctx, event_type, payload):
+    """Only used between bursts -- the engine never dispatches this while tick() is held, which
+    is why trawl_burst reads ctx.events.since(mark) itself."""
+    if event_type == "XP_GAINED" and (payload or {}).get("skill", "").lower() == "sailing":
+        ctx.state.data["dst_last_sailing_xp_at"] = _now()
+
+
+def tick(ctx):
+    cfg = ctx.state.config or DEFAULT_CONFIG
+    for _ in range(TICK_CHAIN_MAX):
+        snap = read_snapshot(ctx, cfg, ticks_since_sailing_xp=_ticks_since_heartbeat(ctx))
+        if not tick_with_snapshot(ctx, cfg, snap):
+            return
+        if _interrupted(ctx, cfg):
+            return
+
+
+def _ticks_since_heartbeat(ctx):
+    at = ctx.state.data.get("dst_last_sailing_xp_at")
+    return 0.0 if at is None else (_now() - at) / 0.6
+
+
+def tick_with_snapshot(ctx, cfg, snap) -> bool:
+    phase = derive_phase(snap, cfg)
+    if phase != ctx.state.data.get("dst_phase"):
+        debug_log.log("trawling", f"phase={phase} netFish={snap.net_fish} "
+                                  f"shoalDist={snap.shoal_distance}")
+        ctx.state.data["dst_phase"] = phase
+    _stuck_watch(ctx, cfg, snap, phase)
+    if getattr(ctx.state, "safety_stopped", False):
+        return False
+    if phase == "lost":
+        _stop(ctx, "start this routine standing on your boat, which needs a trawling net built")
+        return False
+    return bool(PHASES[phase](ctx, cfg, snap))
+
+
+def before_break(ctx):
+    """Empty the nets before a break: fish left in them are DISCARDED on a forced logout or a
+    disconnect, and a break is minutes long (same reason chinchompa_hunting picks its traps up
+    here)."""
+    cfg = ctx.state.config or DEFAULT_CONFIG
+    snap = read_snapshot(ctx, cfg)
+    if snap.net is not None and (snap.net_fish or 0) > 0:
+        collect_phase(ctx, cfg, snap)
