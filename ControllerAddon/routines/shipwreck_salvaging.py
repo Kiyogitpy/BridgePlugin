@@ -509,7 +509,7 @@ def drop_items(ctx, predicate):
             controller.click_entity(ctx.ser, item, check_ui_blockers=False,
                                     simulate_mistakes=False)
             dropped += 1
-            controller.human_delay(0.06, 0.12)
+            controller.human_delay(0.06, 0.12)  # 40% faster still, on top of the earlier 2x (original 0.2-0.4s)
     return dropped
 
 

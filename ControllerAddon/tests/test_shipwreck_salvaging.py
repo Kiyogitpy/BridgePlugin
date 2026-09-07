@@ -513,7 +513,7 @@ def test_the_inert_amulet_is_matched_without_relying_on_the_apostrophe():
     "amulet (inert)" precisely so a differing apostrophe cannot silently drop it."""
     assert "amulet (inert)" in ss.DEFAULT_CONFIG["keepItems"]
     assert ss.keep_item("Sailors' amulet (inert)", ss.DEFAULT_CONFIG["keepItems"]) is True
-    assert ss.keep_item("Sailors' amulet (inert)", ss.DEFAULT_CONFIG["keepItems"]) is True
+    assert ss.keep_item("Sailors’ amulet (inert)", ss.DEFAULT_CONFIG["keepItems"]) is True
 
 
 def test_the_default_keep_list_drops_what_the_user_asked_to_toss():
