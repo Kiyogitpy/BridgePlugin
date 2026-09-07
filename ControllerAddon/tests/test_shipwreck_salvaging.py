@@ -126,22 +126,62 @@ def _inventory(n, name="Small salvage"):
     return [{"name": name, "screenX": 1900 + i, "screenY": 900, "slot": i} for i in range(n)]
 
 
-def test_tick_drops_before_the_inventory_is_completely_full(monkeypatch):
+def test_tick_stows_before_the_inventory_is_completely_full(monkeypatch):
+    """Task 8 update of the old test_tick_drops_before_the_inventory_is_completely_full: with
+    stowSalvage defaulting True, a nearly-full salvage inventory now derives phase "stow" (see
+    derive_phase's bullet 3) and tick() dispatches to the real stow_phase instead of dropping
+    on the deck directly. sortWhenIdle is turned off so derive_phase's higher-ranked "idle gap
+    -> sort" bullet (which fires whenever there is salvage to sort and no wreck in range,
+    regardless of how full the inventory is) does not pre-empt the stow this test is checking."""
     ctx = _Ctx()
+    ctx.state.config = _cfg(sortWhenIdle=False)
+    monkeypatch.setattr(controller, "get_inventory", lambda: _inventory(controller.INVENTORY_SIZE - 1))
+    calls = []
+    monkeypatch.setattr(ss, "stow_phase", lambda c: calls.append(True) or True)
+    ss.tick(ctx)
+    assert calls, "one free slot left of salvage should stow, not drop, once stowSalvage is on"
+
+
+def test_tick_still_drops_before_the_inventory_is_completely_full_when_stow_salvage_is_off(monkeypatch):
+    """Companion to the test above: stowSalvage=False must still reach drop_salvage in the end,
+    which is the pre-2026-09-07 behaviour and is what stow_phase's own documented fallback does
+    (see test_stow_salvage_off_drops_instead). derive_phase's own "stow" bullet requires
+    stowSalvage=True to fire at all (test_stow_salvage_off_never_stows pins this -- with stowing
+    configured off a full inventory near a wreck just keeps hooking, and with no wreck it is
+    "wait"), so there is no live combination of tick()'s inputs that reaches "stow" when
+    stowSalvage is off. This test forces the dispatch (as derive_phase.stub) to prove tick()'s
+    "stow" branch composes correctly with stow_phase's real fallback -- i.e. that tick() calls
+    the REAL stow_phase rather than shortcutting around it, and stow_phase (unmocked here) then
+    genuinely reaches drop_salvage because config says not to stow."""
+    ctx = _Ctx()
+    ctx.state.config = _cfg(stowSalvage=False)
+    monkeypatch.setattr(ss, "derive_phase", lambda *a, **k: "stow")
     monkeypatch.setattr(controller, "get_inventory", lambda: _inventory(controller.INVENTORY_SIZE - 1))
     calls = []
     monkeypatch.setattr(ss, "drop_salvage", lambda c: calls.append(True))
     ss.tick(ctx)
-    assert calls, "one free slot left should already trigger the drop"
+    assert calls, "stow_phase must still fall back to dropping when stowSalvage is off"
 
 
-def test_tick_does_not_drop_with_plenty_of_room(monkeypatch):
+def test_tick_does_not_drop_or_stow_with_plenty_of_room(monkeypatch):
+    """Task 8 update of the old test_tick_does_not_drop_with_plenty_of_room, which protected a
+    comfortable inventory from triggering any disposal path. Under the new derive_phase
+    dispatch a 20/28 inventory alone is not "wait" by default (sortWhenIdle's idle-sort bullet
+    would claim it, since 20 items of salvage is still "something to sort"), so this pins the
+    config/state that makes "wait" the actually-correct phase for a comfortable inventory:
+    sortWhenIdle off, no wreck in range (default get_objects stub), and a hold already known
+    empty. Neither drop_salvage nor stow_phase must fire."""
     ctx = _Ctx()
+    ctx.state.config = _cfg(sortWhenIdle=False)
+    ctx.state.data["hold_has_salvage"] = False
     monkeypatch.setattr(controller, "get_inventory", lambda: _inventory(20))
-    calls = []
-    monkeypatch.setattr(ss, "drop_salvage", lambda c: calls.append(True))
+    drop_calls = []
+    stow_calls = []
+    monkeypatch.setattr(ss, "drop_salvage", lambda c: drop_calls.append(True))
+    monkeypatch.setattr(ss, "stow_phase", lambda c: stow_calls.append(True) or True)
     ss.tick(ctx)
-    assert not calls
+    assert not drop_calls
+    assert not stow_calls
 
 
 def test_drop_salvage_never_simulates_a_misclick(monkeypatch):
@@ -188,7 +228,13 @@ def test_unrelated_chat_is_ignored():
 # --- far branch: a landing outside hook range repositions instead of re-deploying ----------
 
 def test_far_branch_repositions_when_landing_is_out_of_hook_range(monkeypatch):
+    """This is legacy far-wreck-reposition machinery, predating Task 8's massWorld gate --
+    massWorld now defaults True and skips the far-wreck branch entirely (see the massWorld
+    gating tests below), and with no wreck yet in hook range the default sortWhenIdle=True
+    would otherwise pre-empt with the sort phase. Opt out of both to keep exercising the
+    branch this test is actually about."""
     ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=False, sortWhenIdle=False)
     player = _boat_player(3000, 3000)
     far = _wreck(3030, 3000)
     monkeypatch.setattr(controller, "get_player", lambda: player)
@@ -205,7 +251,9 @@ def test_far_branch_repositions_when_landing_is_out_of_hook_range(monkeypatch):
 
 
 def test_far_branch_deploys_when_landing_is_in_hook_range(monkeypatch):
+    """Same massWorld/sortWhenIdle opt-out as the test above -- see its docstring."""
     ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=False, sortWhenIdle=False)
     far = _wreck(3030, 3000)
     # get_player answers "far away" until the sail happens, then "in range".
     boat = {"pos": _boat_player(3000, 3000)}
@@ -813,3 +861,77 @@ def test_sort_reports_a_missing_station(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [{"name": "Plundered salvage", "screenX": 1, "screenY": 1}])
     assert ss.sort_phase(_Ctx()) is False
+
+
+# --- massWorld gating --------------------------------------------------------------------
+
+def _explode(*a, **k):
+    raise AssertionError("massWorld must never sail")
+
+
+def test_mass_world_never_sails_to_a_far_wreck(monkeypatch):
+    monkeypatch.setattr(sailing, "sail_to", _explode)
+    monkeypatch.setattr(ss, "sail_to_pair", _explode)
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player(3000, 3000))
+    # A far wreck exists and nothing is in hook range.
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_wreck(3040, 3000)])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=True, sortWhenIdle=False)
+    ss.tick(ctx)   # must not raise
+
+
+def test_mass_world_off_still_sails(monkeypatch):
+    called = []
+    monkeypatch.setattr(ss, "sail_to_pair", lambda ctx, cfg, w: called.append(True) or False)
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player(3000, 3000))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_wreck(3040, 3000)])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=False, sortWhenIdle=False, stowSalvage=False)
+    ss.tick(ctx)
+    assert called == [True]
+
+
+def test_mass_world_does_not_reposition_when_the_hook_will_not_engage(monkeypatch):
+    monkeypatch.setattr(sailing, "sail_to", _explode)
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player(3000, 3000))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_wreck(3000, 3000)])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_combat", lambda: {"animation": -1})
+    deployed = []
+    monkeypatch.setattr(sailing, "deploy_hook",
+                        lambda ctx, name: deployed.append(True) or True)
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=True, sortWhenIdle=False)
+    # Force the engage timeout to have already expired.
+    ctx.state.data["hook_engage_attempt_at"] = 0.0
+    ss.tick(ctx)   # must not raise
+    assert deployed
+
+
+def test_tick_dispatches_to_the_sort_phase_when_idle(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player())
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    called = []
+    monkeypatch.setattr(ss, "sort_phase", lambda ctx: called.append(True) or True)
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=True, sortWhenIdle=True)
+    ctx.state.data["hold_has_salvage"] = True
+    ss.tick(ctx)
+    assert called == [True]
+
+
+def test_tick_dispatches_to_the_stow_phase_when_the_inventory_fills(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player())
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_wreck(3000, 3000)])
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Plundered salvage"}] * 27)
+    called = []
+    monkeypatch.setattr(ss, "stow_phase", lambda ctx: called.append(True) or True)
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=True, sortWhenIdle=False)
+    ctx.state.data["hold_has_salvage"] = False
+    ss.tick(ctx)
+    assert called == [True]

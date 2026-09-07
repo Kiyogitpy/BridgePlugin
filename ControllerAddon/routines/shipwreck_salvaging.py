@@ -398,20 +398,10 @@ def tick(ctx):
     data = ctx.state.data
     now = time.time()
 
-    # Drop BEFORE the inventory is completely full (default: one slot left). A completely full
-    # inventory makes the game pop its blue "click here to continue" dialogue, which interrupts
-    # the channel and needed the Space workaround in drop_salvage -- that path is kept as the
-    # fallback, but dropping a slot early avoids it on most fills. dropAtFreeSlots=0 restores the
-    # original drop-only-when-full behaviour.
     inventory = controller.get_inventory()
     free_slots = controller.INVENTORY_SIZE - len(inventory)
-    if inventory and free_slots <= config.get("dropAtFreeSlots", 1):
-        if _holds_salvage(inventory):
-            drop_salvage(ctx)
-            return
-        if now - data.get("last_no_salvage_message_at", 0) > WAITING_MESSAGE_INTERVAL_S:
-            debug_log.log("salvage", "inventory is full of things that are not salvage -- nothing to drop")
-            data["last_no_salvage_message_at"] = now
+    inventory_salvage = sum(1 for i in inventory
+                            if (i.get("name") or "").lower().endswith("salvage"))
 
     # A wreck this routine already gave up repositioning for (see HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS
     # below) is skipped for HOOK_ENGAGE_GIVEUP_COOLDOWN_S -- keyed by its own tile position, NOT
@@ -421,6 +411,29 @@ def tick(ctx):
     # than nulling its result afterwards, so a second in-range wreck is still found.
     near_exclude = _active_giveup(data, "hook_engage_giveup_key", "hook_engage_giveup_until", now)
     near_wreck = find_wreck_in_hook_range(config, exclude=near_exclude)
+
+    phase = derive_phase(
+        config,
+        wreck_in_range=near_wreck is not None,
+        hold_full=bool(data.get("hold_full")),
+        inventory_salvage=inventory_salvage,
+        free_slots=free_slots,
+        hold_has_salvage=data.get("hold_has_salvage"),
+    )
+    if phase != data.get("salvage_phase"):
+        debug_log.log("salvage", f"phase -> {phase}")
+        data["salvage_phase"] = phase
+
+    if phase == "sort":
+        sort_phase(ctx)
+        return
+    if phase == "stow":
+        if inventory_salvage:
+            stow_phase(ctx)
+        elif now - data.get("last_no_salvage_message_at", 0) > WAITING_MESSAGE_INTERVAL_S:
+            debug_log.log("salvage", "inventory is full of things that are not salvage")
+            data["last_no_salvage_message_at"] = now
+        return
 
     if near_wreck is not None:
         data["salvage_current_wreck_key"] = _wreck_key(near_wreck)
@@ -483,8 +496,16 @@ def tick(ctx):
                 # boat somewhere it was never stuck getting to before -- observed live 2026-08-04
                 # running the boat aground trying to reach that new point right after sitting fine
                 # at near_wreck.
-                approach_point = _approach_point_from_here(near_wreck)
-                if approach_point is not None:
+                approach_point = (None if config.get("massWorld", True)
+                                  else _approach_point_from_here(near_wreck))
+                if config.get("massWorld", True):
+                    # massWorld: never move. The reposition BUDGET still counts, so a wreck
+                    # whose hook genuinely never engages is still given up for the usual
+                    # cooldown -- it just is not approached first.
+                    debug_log.log("salvage", "hook isn't engaging -- waiting rather than "
+                                              f"repositioning (attempt {reposition_count}/"
+                                              f"{HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS})")
+                elif approach_point is not None:
                     debug_log.log("salvage", "hook isn't engaging after repeated clicks -- repositioning closer "
                                               f"(attempt {reposition_count}/{HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS})")
                     sailing.sail_to(ctx, approach_point)
@@ -504,6 +525,15 @@ def tick(ctx):
     data.pop("salvage_current_wreck_key", None)
     data.pop("hook_engage_attempt_at", None)
     data.pop("hook_engage_reposition_count", None)
+
+    if config.get("massWorld", True):
+        # An area's wrecks share a spawn pool and one rises as another sinks (wiki, Shipwreck
+        # salvaging rev 15290733), so on a busy world waiting beats sailing. derive_phase has
+        # already decided this tick is "wait" -- there is nothing else to do.
+        if now - data.get("last_waiting_message_at", 0) > WAITING_MESSAGE_INTERVAL_S:
+            debug_log.log("salvage", "no shipwreck in range -- waiting for a respawn")
+            data["last_waiting_message_at"] = now
+        return
 
     far_exclude = _active_giveup(data, "far_wreck_giveup_key", "far_wreck_giveup_until", now)
 
