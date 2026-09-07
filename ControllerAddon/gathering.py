@@ -130,6 +130,21 @@ def target_tile(obj):
     return obj.get("x"), obj.get("y"), obj.get("plane")
 
 
+# EVERY bulk scan here passes interactable=True. USER 2026-09-07, minutes after a client
+# rebuild: "whatever we did recently has slowed down the client drasticly stutters is happening".
+# MEASURED in the Motherlode Mine: the scene holds 8,794 objects and only 275 of them offer any
+# menu action, and the full scan costs 36ms median / 261ms MAX of CLIENT THREAD time against
+# 1ms for the filtered one. ObjectProvider's own comment says exactly why -- "skipping them
+# BEFORE the per-object work is what makes the bulk scan cheap" -- and this module simply never
+# opted in, which went unnoticed until a scene this dense.
+#
+# Safe by construction: pick_target only ever returns an object that offers `profile.action`, so
+# an object with no actions at all could never have been chosen. The one thing it changes is the
+# "actions is None means an older client build" tolerance below, which cannot trigger when the
+# server has already filtered on actions -- against such a build this would idle rather than
+# misbehave.
+
+
 def pick_target(profile, objects, config, exclude=()):
     names = {n.lower() for n in config.get(profile.names_key, [])}
     max_dist = config.get(profile.distance_key, 10)
@@ -191,12 +206,20 @@ def _outcome(profile, target, xp_base):
     return None
 
 
-def gather(profile, ctx, target, config, exclude=()):
+def gather(profile, ctx, target, config, exclude=(), pick_next=None):
     """Click `target`, pre-hover the next candidate, then wait on the pushed signals until the
     object is confirmed gone. Returns (outcome, next_target) with outcome one of
     depleted | idle | timeout | no_click. `exclude` lists tiles the pre-hover must not pick:
     the bulk /objects scan is tick-cached, so an object spent a moment ago can still appear in
-    it under its old id, and without this the cursor went straight back to it."""
+    it under its old id, and without this the cursor went straight back to it.
+
+    `pick_next(exclude) -> obj | None` overrides WHICH object is pre-hovered. It exists because
+    a routine that chooses its own next target must pre-hover the SAME one: motherlode_mine
+    discards this function's `next_target` and re-picks through its own floor/anchor/blacklist
+    filters, so the default chooser was parking the cursor on a different vein entirely --
+    MEASURED live 2026-09-07, the default would have hovered (3753,5684) while the routine went
+    on to click (3752,5684), and 19 of the 66 veins in its pre-hover pool were on the FLOOR
+    BELOW. A hover aimed at the wrong object buys nothing and costs a cursor flight."""
     since = ctx.events.mark() if ctx.events is not None else None
     xp_base = skill_xp(profile)
     if not controller.click_entity(ctx.ser, target, refresh_target=_refresh(target)):
@@ -207,15 +230,58 @@ def gather(profile, ctx, target, config, exclude=()):
     debug_log.log(profile.key, f"working {target.get('name')} at {target_tile(target)} "
                                f"(dist={tiles}, xp={xp_base})")
 
-    # Rest the cursor on the next target while this one is being worked.
-    nxt = pick_target(profile, controller.get_objects(), config,
-                      exclude=[target_tile(target), *exclude])
-    if nxt is not None:
-        controller.hover_entity(ctx.ser, nxt, refresh_target=_refresh(nxt))
-
     match = _signal_match(profile, target)
     signals = {"XP_GAINED": match, "OBJECT_DESPAWNED": match, "PLAYER_STOPPED": None}
     walking = walk_s > 0
+
+    # Rest the cursor on the next target while this one is being worked -- but ONLY ONCE THE
+    # PLAYER IS STANDING STILL.
+    #
+    # USER 2026-09-07: "the hover function isnt doing anything if we hover before movement is
+    # finished". This used to fire the instant the click was issued, and the click is issued
+    # from a distance on purpose (the game queues the interaction and performs it on arrival),
+    # so the player was still WALKING -- MEASURED in the same run at 0.58s, 1.08s, 1.25s, 1.31s,
+    # 1.70s, 2.16s and 2.22s of walking after the click. refresh_target keeps the few hundred ms
+    # of FLIGHT honest, but nothing tracks the target after the cursor lands: the player keeps
+    # walking, the projection slides out from under it, and by the time the hover matters (the
+    # current object depletes 40s later) the cursor is nowhere near. The park is only stable
+    # once the player has stopped, which is exactly the giants-foundry lesson already in
+    # CLAUDE.md -- USER, then: "hover after the move, otherwise the mouse moves away from the
+    # object".
+    #
+    # Standing still at the object also means the candidate is picked from a FRESHER scan than
+    # the one at click time, so this is not merely later, it is better informed.
+    hovered = False
+
+    def prehover():
+        nonlocal nxt, hovered
+        if hovered:
+            return
+        hovered = True
+        chooser = pick_next or (lambda excl: pick_target(profile,
+                                                 controller.get_objects(interactable=True),
+                                                         config, exclude=excl))
+        fresh = chooser([target_tile(target), *exclude])
+        if fresh is not None:
+            nxt = fresh
+        if nxt is None:
+            return
+        ok = controller.hover_entity(ctx.ser, nxt, refresh_target=_refresh(nxt))
+        # LOGGED for the same reason the idle drift is: a hover moves the cursor with no click,
+        # so one that silently no-ops (off-window, or behind a UI panel -- hover_entity's own
+        # documented behaviour) is invisible in a log full of clicks. That is exactly why this
+        # bug survived: nothing in the log could show the cursor was not where we thought.
+        debug_log.log(profile.key, f"pre-hover {'->' if ok else 'SKIPPED for'} the next "
+                                   f"{profile.noun} at {target_tile(nxt)}")
+
+    # The candidate is resolved UP FRONT so the return value is exactly what it always was;
+    # only the CURSOR MOVE is deferred. prehover() re-picks from a fresher scan when it finally
+    # runs, since by then the player is standing at the object.
+    nxt = (pick_next or (lambda excl: pick_target(profile, controller.get_objects(interactable=True),
+                                                  config, exclude=excl)))(
+        [target_tile(target), *exclude])
+    if not walking:
+        prehover()
 
     def confirm():
         out = _outcome(profile, target, xp_base)
@@ -253,6 +319,7 @@ def gather(profile, ctx, target, config, exclude=()):
                 walking = False
                 debug_log.log(profile.key, f"arrived at {target.get('name')} "
                                            f"({now - t_click:.2f}s after the click)")
+                prehover()
             else:
                 # A resource landed but the object stands (gem rocks, amethyst, a tree that has
                 # not fallen yet): the player keeps swinging. Re-arm on the SAME target; a slow
@@ -260,6 +327,10 @@ def gather(profile, ctx, target, config, exclude=()):
                 debug_log.log(profile.key, f"+{value[1] - xp_base} {profile.skill} xp, "
                                            f"{profile.noun} still up")
                 xp_base = value[1]
+                # A resource landed, so the player is demonstrably standing at the object --
+                # the belt to arrival's braces, for an arrival signal we missed.
+                walking = False
+                prehover()
             deadline = now + GATHER_BUDGET_S
             idle_deadline = now + IDLE_GRACE_S
             idle_since = None
@@ -389,7 +460,7 @@ def tick(profile, ctx):
     if not controller.get_combat().get("isIdle", True):
         return  # already mid-action or walking to a target (e.g. after a restart) -- don't reclick
 
-    target = pick_target(profile, controller.get_objects(), config)
+    target = pick_target(profile, controller.get_objects(interactable=True), config)
     if target is None:
         return
 
@@ -416,5 +487,7 @@ def tick(profile, ctx):
         if target is None:
             # The bulk list is tick-cached and may still show the object we just spent under
             # its old id, so exclude every tile worked this chain rather than trusting it.
-            target = pick_target(profile, controller.get_objects(fresh=True), config,
+            target = pick_target(profile,
+                                 controller.get_objects(fresh=True, interactable=True),
+                                 config,
                                  exclude=worked)

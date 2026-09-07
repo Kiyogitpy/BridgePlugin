@@ -193,8 +193,10 @@ def test_gather_depleted_on_xp_event_confirmed_by_http(scene):
     outcome, nxt = gathering.gather(P, ctx, a, ctx.state.config)
     assert outcome == "depleted"
     assert scene.clicks == [(1, 1, 11364)]
-    assert scene.hovers == [(2, 2)]           # pre-hovered the next rock while mining
-    assert nxt["x"] == 2
+    assert nxt["x"] == 2                      # the next target is still resolved up front
+    # ...but NOT pre-hovered: this rock was still being walked to and then went straight to
+    # depleted, so the player never stood still. See test_the_prehover_waits_for_stillness.
+    assert scene.hovers == []
     assert scene.now - 1000.0 < 1.0           # reacted on the event, not a poll cadence
 
 
@@ -291,7 +293,9 @@ def test_tick_chains_onto_the_prehovered_target(scene):
     ctx = make_ctx(scene.events([_xp(), _xp(), None]))
     mining.tick(ctx)
     assert scene.clicks == [(1, 1, 11364), (2, 2, 11364)]
-    assert scene.hovers == [(2, 2)]            # nothing left to pre-hover after b
+    # The chain still runs off the resolved next target; neither rock was ever stood at long
+    # enough to pre-hover (both deplete while the walk is still budgeted).
+    assert scene.hovers == []
 
 
 def test_tick_idle_when_nothing_is_selected(scene):
@@ -502,3 +506,43 @@ def test_sustained_idle_is_still_a_failed_click(scene):
     # ...and it costs the grace plus the confirmation window, no more.
     elapsed = scene.now - 1000.0
     assert gathering.IDLE_CONFIRM_S <= elapsed < gathering.GATHER_BUDGET_S
+
+
+def test_the_prehover_waits_for_stillness(scene):
+    """USER 2026-09-07: "the hover function isnt doing anything if we hover before movement is
+    finished".
+
+    The click is issued from a distance on purpose -- the game queues the interaction and
+    performs it on arrival -- so hovering the moment the click goes out parks the cursor while
+    the player is still walking, and the projection then slides out from under it. MEASURED in
+    that run: 0.58s to 2.22s of walking after each click, against a hover that has to still be
+    valid ~40s later.
+
+    Here the rock takes an XP drop while still standing, which proves the player has arrived:
+    the pre-hover fires then, and not before.
+    """
+    a, b = _rock(1, 1, dist=4), _rock(2, 2, dist=3)
+    scene.objects = [a, b]
+    scene.readings = [(True, 5000, False),     # walking to a
+                      (True, 5035, False),     # first ore: we are standing at it now
+                      (False, 5070, False)]    # a depletes
+    ctx = make_ctx(scene.events([_xp(), _xp()]))
+    outcome, nxt = gathering.gather(P, ctx, a, ctx.state.config)
+    assert outcome == "depleted"
+    assert scene.hovers == [(2, 2)]            # exactly once, and only once standing still
+    assert nxt["x"] == 2
+
+
+def test_the_prehover_uses_the_callers_chooser(scene):
+    """motherlode_mine picks its next vein through its own floor/anchor/blacklist filters and
+    discards this function's, so without pick_next the cursor parked on a DIFFERENT object --
+    MEASURED live, and 19 of the 66 veins in the default pool were on the floor below."""
+    a, b, c = _rock(1, 1, dist=4), _rock(2, 2, dist=3), _rock(3, 3, dist=5)
+    scene.objects = [a, b, c]
+    scene.readings = [(True, 5000, False), (True, 5035, False), (False, 5070, False)]
+    ctx = make_ctx(scene.events([_xp(), _xp()]))
+    outcome, nxt = gathering.gather(P, ctx, a, ctx.state.config,
+                                    pick_next=lambda excl: c)
+    assert outcome == "depleted"
+    assert scene.hovers == [(3, 3)]            # the caller's pick, not the nearest
+    assert nxt["x"] == 3

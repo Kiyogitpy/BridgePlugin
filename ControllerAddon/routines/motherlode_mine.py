@@ -330,7 +330,9 @@ def _player_tile():
 
 def _objects(ids=None, action=None, fresh=False):
     out = []
-    for obj in controller.get_objects(fresh=fresh) or []:
+    # interactable=True: see gathering.pick_target's note -- 8,794 objects in this scene,
+    # 275 of them clickable, and every fixture below is matched by its ACTION anyway.
+    for obj in controller.get_objects(fresh=fresh, interactable=True) or []:
         if ids is not None and obj.get("id") not in ids:
             continue
         if action is not None:
@@ -629,7 +631,8 @@ def pick_vein(ctx, reach, flags, exclude=(), objects=None):
     blocked = _blocked_veins(ctx)
     upper = _upstairs()
     best = None
-    for obj in (controller.get_objects() if objects is None else objects) or []:
+    for obj in (controller.get_objects(interactable=True) if objects is None
+                else objects) or []:
         if (obj.get("name") or "").lower() != VEIN_NAME.lower():
             continue
         actions = obj.get("actions")
@@ -710,7 +713,16 @@ def mine_phase(ctx):
     while target is not None and not ctx.state.safety_stopped:
         if _now() - started >= CHAIN_MAX_S:
             return
-        outcome, _next = gathering.gather(PROFILE, ctx, target, _vein_config(ctx), exclude=worked)
+        # pick_next: gathering must pre-hover the vein WE will click next, not the one its own
+        # unfiltered nearest-first pick would choose. Without this the cursor parked on a
+        # different vein -- and 19 of the 66 in its pool were on the floor below (see
+        # gathering.gather's own note).
+        def _choose_next(excl, _ctx=ctx):
+            reach2, flags2 = snapshot(_ctx)
+            return pick_vein(_ctx, reach2, flags2, exclude=excl)
+
+        outcome, _next = gathering.gather(PROFILE, ctx, target, _vein_config(ctx),
+                                          exclude=worked, pick_next=_choose_next)
         note_vein_failure(ctx, target, outcome)
         if outcome != "depleted":
             return          # hand back so the engine gets its safety/break turn
@@ -720,7 +732,7 @@ def mine_phase(ctx):
         controller.human_delay(*gathering.NEXT_CLICK_DELAY)
         reach, flags = snapshot(ctx)
         target = pick_vein(ctx, reach, flags, exclude=worked,
-                           objects=controller.get_objects(fresh=True))
+                           objects=controller.get_objects(fresh=True, interactable=True))
 
 
 # --- ladders -------------------------------------------------------------------------------------------

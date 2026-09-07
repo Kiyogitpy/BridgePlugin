@@ -714,9 +714,16 @@ public class ObjectProvider extends BridgeProvider
 		// this provider's -- routines/motherlode_mine.py owns the constant, alongside its other
 		// measured ids.
 		//
-		// Cheap: a couple of array lookups and a bilinear interpolation per object, against the
-		// clickbox hulls that dominate this method.
-		if (local != null)
+		// GATED ON `interactable`, exactly like the clickbox hull above, and that gate is the
+		// whole point. The first cut computed this for EVERY object and USER reported the client
+		// stuttering within minutes of the rebuild: MEASURED in the Motherlode Mine, 8,754
+		// objects in the scene and only 211 of them interactable, so 97.6% of the calls were
+		// spent on scenery nothing can ever click -- a new per-object cost on the CLIENT THREAD,
+		// added to the one method this file already documents as dominating the tick budget
+		// (see the clickbox comment above: 4,045 objects cost ~450-500ms there, felt as exactly
+		// this stutter). An object with no menu actions cannot be clicked, so no routine can
+		// ever need to know which floor it is on.
+		if (local != null && interactable)
 		{
 			data.put("tileHeight", Perspective.getTileHeight(client, local, plane));
 		}
