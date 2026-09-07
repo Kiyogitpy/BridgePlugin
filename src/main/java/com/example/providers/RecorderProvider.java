@@ -25,6 +25,7 @@ import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.AnimationChanged;
 import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.FocusChanged;
 import net.runelite.api.events.GameObjectDespawned;
 import net.runelite.api.events.GameObjectSpawned;
 import net.runelite.api.events.GameStateChanged;
@@ -1275,6 +1276,19 @@ public class RecorderProvider extends BridgeProvider
 	}
 
 	@Subscribe
+	public void onFocusChanged(FocusChanged event)
+	{
+		// EVENT_APPLET_FOCUS: the client sends 1/0 on every gain/loss (spec V7).
+		if (!armed)
+		{
+			return;
+		}
+		Map<String, Object> record = base("focus");
+		record.put("gained", event.isFocused());
+		add(record);
+	}
+
+	@Subscribe
 	public void onStatChanged(StatChanged event)
 	{
 		if (!armed)
@@ -1522,6 +1536,38 @@ public class RecorderProvider extends BridgeProvider
 		{
 			button(event, "up");
 			return event;
+		}
+
+		@Override
+		public MouseEvent mouseEntered(MouseEvent event)
+		{
+			edge("canvasenter", event);
+			return event;
+		}
+
+		@Override
+		public MouseEvent mouseExited(MouseEvent event)
+		{
+			edge("canvasexit", event);
+			return event;
+		}
+
+		/**
+		 * The client's own EVENT_MOUSE_MOVE encodes an off-canvas cursor as -1, so when the cursor
+		 * leaves and returns is server-visible (spec V2). The open mouse batch is flushed first so
+		 * the polyline ENDS at the edge and the off-canvas gap is measurable in the .jsonl.
+		 */
+		private void edge(String kind, MouseEvent event)
+		{
+			if (!armed)
+			{
+				return;
+			}
+			flushMouseBatch();
+			Map<String, Object> record = base(kind);
+			record.put("x", event.getX());
+			record.put("y", event.getY());
+			add(record);
 		}
 
 		private void sample(MouseEvent event)

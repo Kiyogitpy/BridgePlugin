@@ -511,3 +511,17 @@ def test_build_summary_handles_an_empty_recording():
 
     assert "SUMMARY" in text
     assert "records           0" in text
+
+
+def test_describe_renders_canvas_edge_and_focus_records():
+    # New 2026-09-07 kinds for the telemetry metrics: the client sends the cursor leaving the
+    # canvas (-1 in EVENT_MOUSE_MOVE) and every focus gain/loss (EVENT_APPLET_FOCUS).
+    assert r.describe({"kind": "canvasexit", "x": 764, "y": 12}) == "cursor LEFT the canvas at (764, 12)"
+    assert r.describe({"kind": "canvasenter", "x": 3, "y": 400}) == "cursor back on the canvas at (3, 400)"
+    assert r.describe({"kind": "focus", "gained": True}) == "-- window FOCUSED --"
+    assert r.describe({"kind": "focus", "gained": False}) == "-- window UNFOCUSED --"
+
+
+def test_canvas_edge_and_focus_records_are_loose_narrative_kinds():
+    for kind in ("canvasexit", "canvasenter", "focus"):
+        assert kind in r.LOOSE_NARRATIVE_KINDS
