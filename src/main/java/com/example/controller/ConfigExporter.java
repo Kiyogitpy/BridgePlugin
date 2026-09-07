@@ -99,6 +99,7 @@ public final class ConfigExporter
 		safespot.put("plane", config.safespotPlane());
 		data.put("safespot", safespot);
 
+		data.put("poh", sharedPoh(config));
 		data.put("taskLocations", resolveTaskLocations(config));
 
 		data.put("eatAt", config.eatAtHp());
@@ -114,6 +115,23 @@ public final class ConfigExporter
 		data.put("enabled", config.miningEnabled());
 		data.put("rockNames", parseList(config.rockNames()));
 		data.put("maxRockDistance", config.maxRockDistance());
+		data.put("fullInventory", config.miningFullInventory().name().toLowerCase(Locale.ROOT));
+		data.put("breaks", sharedBreaks(config));
+		data.put("safety", sharedSafetyWithInventoryFull(config));
+		return data;
+	}
+
+	/**
+	 * The twin of exportMining -- routines/woodcutting.py is the same gathering.py loop under a
+	 * different Profile, so the shape of this dict has to match key-for-key in meaning.
+	 */
+	public static Map<String, Object> exportWoodcutting(ControllerConfig config)
+	{
+		Map<String, Object> data = new LinkedHashMap<>();
+		data.put("enabled", config.woodcuttingEnabled());
+		data.put("treeNames", parseList(config.treeNames()));
+		data.put("maxTreeDistance", config.maxTreeDistance());
+		data.put("fullInventory", config.woodcuttingFullInventory().name().toLowerCase(Locale.ROOT));
 		data.put("breaks", sharedBreaks(config));
 		data.put("safety", sharedSafetyWithInventoryFull(config));
 		return data;
@@ -259,6 +277,20 @@ public final class ConfigExporter
 
 	/** Breaks shape shared by every routine's export -- read from ControllerConfig's shared
 	 * Breaks section rather than a routine-specific duplicate (see this plan's Collision Table). */
+	/** What is built in the player's POH. Shared by every routine that plans travel, because
+	 * the client cannot see inside a house -- see ControllerAddon/teleports.py's PohConfig, and
+	 * the Shortest Path plugin's own sectionPoh, whose option names these mirror. */
+	private static Map<String, Object> sharedPoh(ControllerConfig config)
+	{
+		Map<String, Object> poh = new LinkedHashMap<>();
+		poh.put("enabled", config.usePoh());
+		poh.put("boxTier", config.pohJewelleryBoxTier().name());
+		poh.put("portals", config.usePohPortals());
+		poh.put("mountedItems", config.usePohMountedItems());
+		poh.put("fairyRing", config.usePohFairyRing());
+		return poh;
+	}
+
 	private static Map<String, Object> sharedBreaks(ControllerConfig config)
 	{
 		Map<String, Object> breaks = new LinkedHashMap<>();

@@ -57,18 +57,33 @@ public class SettingsPanel extends PluginPanel
 	// controllerEnabled/targetNpcNames/taskLocationChoices are all editable from both.
 	private final JCheckBox enabledBox = new JCheckBox("Controller Enabled");
 
-	// Mining section (added 2026-09-03): every object in the loaded scene offering a "Mine"
-	// action, listed by name on Refresh, filtered by the search field, and persisted to the
-	// "rockNames" config key that routines/mining.py reads through GET /mining-config. Same
-	// shape as the nearby-monster list above, so a name chosen here and one typed into the
-	// wrench-icon Rock Names field are the one setting.
-	private final JPanel rockListPanel = new JPanel();
-	private final Map<String, JCheckBox> rockCheckboxes = new LinkedHashMap<>();
-	private final Set<String> selectedRocks = new LinkedHashSet<>();
-	private final JTextField rockSearchField = new JTextField();
-	private final PluginErrorPanel rockErrorPanel = new PluginErrorPanel();
-	private final JLabel rockStatusLabel = new JLabel();
-	private Map<String, Integer> nearbyRocks = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+	// Gathering section (added 2026-09-03 as Mining; generalized 2026-09-07): every object in
+	// the loaded scene offering the SELECTED action, listed by name on Refresh, filtered by the
+	// search field, and persisted to that action's config key -- "rockNames" for Mine (read by
+	// routines/mining.py through GET /mining-config), "treeNames" for Chop down
+	// (routines/woodcutting.py, GET /woodcutting-config). Same shape as the nearby-monster list
+	// above, so a name chosen here and one typed into the wrench-icon Rock/Tree Names field are
+	// the one setting.
+	//
+	// The action is the ONLY thing that differs between the two: gathering.py is one loop under
+	// two Profiles, and this panel is one list under two actions.
+	private static final Map<String, String> GATHER_ACTION_KEYS = new LinkedHashMap<>();
+
+	static
+	{
+		GATHER_ACTION_KEYS.put("Mine", "rockNames");
+		GATHER_ACTION_KEYS.put("Chop down", "treeNames");
+	}
+
+	private final JComboBox<String> gatherActionBox =
+		new JComboBox<>(GATHER_ACTION_KEYS.keySet().toArray(new String[0]));
+	private final JPanel gatherListPanel = new JPanel();
+	private final Map<String, JCheckBox> gatherCheckboxes = new LinkedHashMap<>();
+	private final Set<String> selectedGather = new LinkedHashSet<>();
+	private final JTextField gatherSearchField = new JTextField();
+	private final PluginErrorPanel gatherErrorPanel = new PluginErrorPanel();
+	private final JLabel gatherStatusLabel = new JLabel();
+	private Map<String, Integer> nearbyGatherables = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
 
 	@Inject
 	SettingsPanel(Client client, ClientThread clientThread, ConfigManager configManager, ControllerConfig config)
@@ -80,7 +95,7 @@ public class SettingsPanel extends PluginPanel
 
 		selectedTargets.addAll(ConfigExporter.parseList(config.targetNpcNames()));
 		categoryLocationChoice.putAll(ConfigExporter.parseLocationChoices(config.taskLocationChoices()));
-		selectedRocks.addAll(ConfigExporter.parseList(config.rockNames()));
+		selectedGather.addAll(ConfigExporter.parseList(config.rockNames()));
 
 		setLayout(new BorderLayout());
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -96,7 +111,7 @@ public class SettingsPanel extends PluginPanel
 		title.setAlignmentX(Component.LEFT_ALIGNMENT);
 		header.add(title);
 
-		JLabel hint = new JLabel("<html>Search any slayer task monster, pick from nearby monsters, or both.<br>Mining: walk near the rocks and Refresh the Mining section.<br>Settings are exposed at <b>/config</b>.</html>");
+		JLabel hint = new JLabel("<html>Search any slayer task monster, pick from nearby monsters, or both.<br>Gathering: pick Mine or Chop down, walk to them, and Refresh.<br>Settings are exposed at <b>/config</b>.</html>");
 		hint.setForeground(Color.WHITE);
 		hint.setBorder(new EmptyBorder(6, 0, 8, 0));
 		hint.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -136,7 +151,7 @@ public class SettingsPanel extends PluginPanel
 		body.add(collapsibleSection("Add Slayer Task Monster", buildSearchSection(), true));
 		body.add(collapsibleSection("Selected Targets", buildSelectedSection(), true));
 		body.add(collapsibleSection("Monsters In Current Area", buildNearbySection(), true));
-		body.add(collapsibleSection("Mining: Rocks In Current Area", buildMiningSection(), false));
+		body.add(collapsibleSection("Gathering: Rocks / Trees In Current Area", buildGatheringSection(), false));
 
 		JScrollPane bodyScroll = new JScrollPane(body);
 		bodyScroll.setBorder(BorderFactory.createEmptyBorder());
@@ -623,9 +638,9 @@ public class SettingsPanel extends PluginPanel
 		configManager.setConfiguration(ControllerConfig.GROUP, "taskLocationChoices", sb.toString());
 	}
 
-	// ---- Mining section -------------------------------------------------------------------
+	// ---- Gathering section (Mine / Chop down) ---------------------------------------------
 
-	private JPanel buildMiningSection()
+	private JPanel buildGatheringSection()
 	{
 		JPanel section = new JPanel(new BorderLayout(0, 4));
 		section.setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -636,58 +651,70 @@ public class SettingsPanel extends PluginPanel
 		top.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		top.setAlignmentX(Component.LEFT_ALIGNMENT);
 
-		rockSearchField.putClientProperty("JTextField.placeholderText", "Filter, e.g. \"iron\"");
-		rockSearchField.getDocument().addDocumentListener((SimpleDocumentListener) e -> rebuildRockCheckboxes());
-		rockSearchField.setAlignmentX(Component.LEFT_ALIGNMENT);
-		rockSearchField.setMaximumSize(new Dimension(Integer.MAX_VALUE, rockSearchField.getPreferredSize().height));
-		top.add(rockSearchField);
+		JPanel actionRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+		actionRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		actionRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+		JLabel actionLabel = new JLabel("Action:");
+		actionLabel.setForeground(Color.WHITE);
+		actionRow.add(actionLabel);
+		gatherActionBox.addActionListener(e -> onGatherActionChanged());
+		actionRow.add(gatherActionBox);
+		top.add(actionRow);
+
+		gatherSearchField.putClientProperty("JTextField.placeholderText", "Filter, e.g. \"iron\"");
+		gatherSearchField.getDocument().addDocumentListener((SimpleDocumentListener) e -> rebuildGatherCheckboxes());
+		gatherSearchField.setAlignmentX(Component.LEFT_ALIGNMENT);
+		gatherSearchField.setMaximumSize(new Dimension(Integer.MAX_VALUE, gatherSearchField.getPreferredSize().height));
+		top.add(gatherSearchField);
 
 		JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
 		buttons.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
 
 		JButton refreshBtn = new JButton("Refresh");
-		refreshBtn.addActionListener(e -> refreshRockList());
+		refreshBtn.addActionListener(e -> refreshGatherList());
 		buttons.add(refreshBtn);
 
 		JButton selectAllBtn = new JButton("All");
-		selectAllBtn.addActionListener(e -> setAllRocksSelected(true));
+		selectAllBtn.addActionListener(e -> setAllGatherSelected(true));
 		buttons.add(selectAllBtn);
 
 		JButton clearBtn = new JButton("None");
-		clearBtn.addActionListener(e -> setAllRocksSelected(false));
+		clearBtn.addActionListener(e -> setAllGatherSelected(false));
 		buttons.add(clearBtn);
 		top.add(buttons);
 
-		rockStatusLabel.setForeground(Color.WHITE);
-		rockStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		top.add(rockStatusLabel);
+		gatherStatusLabel.setForeground(Color.WHITE);
+		gatherStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		top.add(gatherStatusLabel);
 
 		section.add(top, BorderLayout.NORTH);
 
-		rockListPanel.setLayout(new BoxLayout(rockListPanel, BoxLayout.Y_AXIS));
-		rockListPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		gatherListPanel.setLayout(new BoxLayout(gatherListPanel, BoxLayout.Y_AXIS));
+		gatherListPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
 
-		JScrollPane scroll = new JScrollPane(rockListPanel);
+		JScrollPane scroll = new JScrollPane(gatherListPanel);
 		scroll.setPreferredSize(new Dimension(0, 200));
 		scroll.setBorder(BorderFactory.createLineBorder(ColorScheme.MEDIUM_GRAY_COLOR));
 		scroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
 		scroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER);
 		section.add(scroll, BorderLayout.CENTER);
 
-		rockErrorPanel.setContent("Mining", "Walk near the rocks and click Refresh to list everything mineable here.");
-		section.add(rockErrorPanel, BorderLayout.SOUTH);
+		gatherErrorPanel.setContent("Gathering",
+			"Pick an action, walk to the rocks or trees, and click Refresh to list everything here that offers it.");
+		section.add(gatherErrorPanel, BorderLayout.SOUTH);
 
-		updateRockStatusLabel();
+		updateGatherStatusLabel();
 		return section;
 	}
 
 	/** Scans the whole loaded scene (every plane) for GameObjects whose impostor-resolved
-	 * composition offers a "Mine" action -- rocks, ore veins, mineral deposits -- and lists
-	 * each distinct display name once. Runs on the client thread like refreshNpcList: object
-	 * compositions are only safe to read there. */
-	void refreshRockList()
+	 * composition offers the SELECTED action -- "Mine" for rocks, ore veins and mineral
+	 * deposits, "Chop down" for trees -- and lists each distinct display name once. Runs on the
+	 * client thread like refreshNpcList: object compositions are only safe to read there. */
+	void refreshGatherList()
 	{
+		final String wanted = gatherAction();
 		@SuppressWarnings("unchecked")
 		Map<String, Integer> found = (Map<String, Integer>) RuneLiteUtil.runOnClientThread(client, clientThread, () -> {
 			Map<String, Integer> result = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
@@ -733,7 +760,7 @@ public class SettingsPanel extends PluginPanel
 							}
 							for (String action : comp.getActions())
 							{
-								if ("Mine".equalsIgnoreCase(action))
+								if (wanted.equalsIgnoreCase(action))
 								{
 									result.putIfAbsent(comp.getName(), obj.getId());
 									break;
@@ -746,20 +773,20 @@ public class SettingsPanel extends PluginPanel
 			return result;
 		});
 
-		nearbyRocks = found != null ? found : new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-		rebuildRockCheckboxes();
+		nearbyGatherables = found != null ? found : new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+		rebuildGatherCheckboxes();
 	}
 
 	/** Rebuilds the checkbox list from the last scan, showing only names containing the
-	 * search field's text. Selection state lives in selectedRocks, not in the boxes, so
+	 * search field's text. Selection state lives in selectedGather, not in the boxes, so
 	 * filtering never loses a tick. */
-	private void rebuildRockCheckboxes()
+	private void rebuildGatherCheckboxes()
 	{
-		rockListPanel.removeAll();
-		rockCheckboxes.clear();
+		gatherListPanel.removeAll();
+		gatherCheckboxes.clear();
 
-		String filter = rockSearchField.getText().trim().toLowerCase();
-		for (Map.Entry<String, Integer> entry : nearbyRocks.entrySet())
+		String filter = gatherSearchField.getText().trim().toLowerCase();
+		for (Map.Entry<String, Integer> entry : nearbyGatherables.entrySet())
 		{
 			String name = entry.getKey();
 			if (!filter.isEmpty() && !name.toLowerCase().contains(filter))
@@ -767,70 +794,101 @@ public class SettingsPanel extends PluginPanel
 				continue;
 			}
 			JCheckBox box = new JCheckBox(name + "  (id " + entry.getValue() + ")");
-			box.setSelected(selectedRocks.contains(name));
+			box.setSelected(selectedGather.contains(name));
 			box.setBackground(ColorScheme.DARKER_GRAY_COLOR);
 			box.setForeground(Color.WHITE);
 			box.setAlignmentX(Component.LEFT_ALIGNMENT);
 			box.addActionListener(e -> {
 				if (box.isSelected())
 				{
-					selectedRocks.add(name);
+					selectedGather.add(name);
 				}
 				else
 				{
-					selectedRocks.remove(name);
+					selectedGather.remove(name);
 				}
-				persistRocks();
+				persistGather();
 			});
-			rockCheckboxes.put(name, box);
-			rockListPanel.add(box);
+			gatherCheckboxes.put(name, box);
+			gatherListPanel.add(box);
 		}
 
-		if (nearbyRocks.isEmpty())
+		if (nearbyGatherables.isEmpty())
 		{
-			rockErrorPanel.setContent("No Rocks Found", "Nothing mineable is loaded. Make sure you are logged in and near the rocks, then click Refresh.");
-			rockErrorPanel.setVisible(true);
+			gatherErrorPanel.setContent("Nothing Found", "Nothing here offers \"" + gatherAction()
+				+ "\". Make sure you are logged in and standing near them, then click Refresh.");
+			gatherErrorPanel.setVisible(true);
 		}
 		else
 		{
-			rockErrorPanel.setVisible(false);
+			gatherErrorPanel.setVisible(false);
 		}
 
-		rockListPanel.revalidate();
-		rockListPanel.repaint();
-		updateRockStatusLabel();
+		gatherListPanel.revalidate();
+		gatherListPanel.repaint();
+		updateGatherStatusLabel();
 	}
 
-	private void setAllRocksSelected(boolean selected)
+	private void setAllGatherSelected(boolean selected)
 	{
-		for (String name : rockCheckboxes.keySet())
+		for (String name : gatherCheckboxes.keySet())
 		{
 			if (selected)
 			{
-				selectedRocks.add(name);
+				selectedGather.add(name);
 			}
 			else
 			{
-				selectedRocks.remove(name);
+				selectedGather.remove(name);
 			}
 		}
-		persistRocks();
+		persistGather();
 	}
 
-	private void persistRocks()
+	/** The action the list is currently showing, e.g. "Mine". */
+	private String gatherAction()
 	{
-		configManager.setConfiguration(ControllerConfig.GROUP, "rockNames", String.join(", ", selectedRocks));
-		for (Map.Entry<String, JCheckBox> entry : rockCheckboxes.entrySet())
+		Object sel = gatherActionBox.getSelectedItem();
+		return sel == null ? "Mine" : sel.toString();
+	}
+
+	/** Which config key the current action's selection is stored under. */
+	private String gatherConfigKey()
+	{
+		return GATHER_ACTION_KEYS.getOrDefault(gatherAction(), "rockNames");
+	}
+
+	private String gatherConfigValue()
+	{
+		return "treeNames".equals(gatherConfigKey()) ? config.treeNames() : config.rockNames();
+	}
+
+	/** Switching action swaps BOTH the selection and the list: the two skills keep separate
+	 * config keys, so showing Mine's checkboxes against treeNames would persist rocks into the
+	 * woodcutting setting on the next click. The scene is re-scanned rather than re-filtered --
+	 * a tree offers no Mine action, so the previous scan's names are simply the wrong list. */
+	private void onGatherActionChanged()
+	{
+		selectedGather.clear();
+		selectedGather.addAll(ConfigExporter.parseList(gatherConfigValue()));
+		refreshGatherList();
+	}
+
+	private void persistGather()
+	{
+		configManager.setConfiguration(ControllerConfig.GROUP, gatherConfigKey(), String.join(", ", selectedGather));
+		for (Map.Entry<String, JCheckBox> entry : gatherCheckboxes.entrySet())
 		{
-			entry.getValue().setSelected(selectedRocks.contains(entry.getKey()));
+			entry.getValue().setSelected(selectedGather.contains(entry.getKey()));
 		}
-		updateRockStatusLabel();
+		updateGatherStatusLabel();
 	}
 
-	private void updateRockStatusLabel()
+	private void updateGatherStatusLabel()
 	{
-		rockStatusLabel.setText(nearbyRocks.size() + " mineable here · selected: "
-			+ (selectedRocks.isEmpty() ? "none" : String.join(", ", selectedRocks)));
+		gatherStatusLabel.setText(nearbyGatherables.size() + " here offering \"" + gatherAction()
+			+ "\" · selected: "
+			+ (selectedGather.isEmpty() ? "none" : String.join(", ", selectedGather)));
 	}
 
 	/** Re-syncs every control here from the current config -- called by ControllerPlugin whenever
@@ -854,13 +912,13 @@ public class SettingsPanel extends PluginPanel
 			entry.getValue().setSelected(selectedTargets.contains(entry.getKey()));
 		}
 
-		selectedRocks.clear();
-		selectedRocks.addAll(ConfigExporter.parseList(config.rockNames()));
-		for (Map.Entry<String, JCheckBox> entry : rockCheckboxes.entrySet())
+		selectedGather.clear();
+		selectedGather.addAll(ConfigExporter.parseList(gatherConfigValue()));
+		for (Map.Entry<String, JCheckBox> entry : gatherCheckboxes.entrySet())
 		{
-			entry.getValue().setSelected(selectedRocks.contains(entry.getKey()));
+			entry.getValue().setSelected(selectedGather.contains(entry.getKey()));
 		}
-		updateRockStatusLabel();
+		updateGatherStatusLabel();
 
 		refreshSelectedTargetsPanel();
 		updateStatusLabel(npcCheckboxes.size());

@@ -5,9 +5,9 @@ wait seconds live expires instantly here (the test_blast_furnace fixture pattern
 
 The facts pinned below are the MEASURED ones from the design spec
 (docs/superpowers/specs/2026-09-07-motherlode-mine-design.md): a depleted vein offers no
-actions, /objects carries both floors so reachability is the floor filter, the conveyor lags so
-the sack has to be read as varbit + pending, and a broken machine is left alone until it costs
-us.
+actions; the mine's upper level sits directly above the lower one so TILE HEIGHT is the only
+floor test that works; the conveyor lags so the sack has to be read as varbit + pending; and a
+broken machine is left alone until it costs us.
 """
 
 import os
@@ -63,7 +63,8 @@ def _hermetic(monkeypatch):
     monkeypatch.setattr(controller, "get_varbit", lambda vid: 0)
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3752, "y": 5680, "plane": 0,
                                                            "regionId": mlm.REGION,
-                                                           "weaponName": "Rune pickaxe"})
+                                                           "weaponName": "Rune pickaxe",
+                                                           "tileHeight": -600})
     monkeypatch.setattr(controller, "get_collision", lambda x, y, p, radius=6, **kw: [])
     monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
     monkeypatch.setattr(controller, "sample_human_delay", lambda *a, **k: 0.0)
@@ -283,33 +284,37 @@ def test_kit_and_paydirt_are_not_ore():
 
 # --- the hopper ----------------------------------------------------------------------
 
+UPSTAIRS_H = -600      # any height below UPPER_FLOOR_HEIGHT (-490)
+DOWNSTAIRS_H = 0
+
 UPPER_HOPPER = {"id": mlm.HOPPER_ID, "name": "Hopper", "x": 3755, "y": 5677, "plane": 0,
-                "distance": 3, "actions": ["Deposit"], "screenX": 1, "screenY": 1}
+                "distance": 3, "actions": ["Deposit"], "screenX": 1, "screenY": 1,
+                "tileHeight": UPSTAIRS_H}
 LOWER_HOPPER = {"id": mlm.HOPPER_ID, "name": "Hopper", "x": 3748, "y": 5672, "plane": 0,
-                "distance": 2, "actions": ["Deposit"], "screenX": 1, "screenY": 1}
+                "distance": 2, "actions": ["Deposit"], "screenX": 1, "screenY": 1,
+                "tileHeight": DOWNSTAIRS_H}
 
 
-def _standing_by(monkeypatch, obj):
-    """A flood that contains the tiles around `obj` -- i.e. we are on its floor."""
-    reach = {(obj["x"] + dx, obj["y"] + dy): 0 for dx in (-1, 1) for dy in (-1, 1)}
-    monkeypatch.setattr(mlm, "snapshot", lambda ctx, force=False: (reach, None))
-    return reach
+def _standing(monkeypatch, height, **player):
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 3752, "y": 5680, "plane": 0, "regionId": mlm.REGION,
+                                 "weaponName": "Rune pickaxe", "tileHeight": height, **player})
 
 
 def test_the_upper_hopper_is_not_touched_until_it_is_unlocked(monkeypatch):
     # USER 2026-09-07: "need to unlock that hopper we cant use it yet" -- the shipped default is
     # "never", so a run today spends no click on it and goes straight for the ladder.
     ctx = _Ctx()
-    _standing_by(monkeypatch, UPPER_HOPPER)
+    _standing(monkeypatch, UPSTAIRS_H)
     monkeypatch.setattr(controller, "get_varbit",
                         lambda vid: 1 if vid == mlm.VARBIT_UPSTAIRS else 0)
     monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [UPPER_HOPPER])
-    assert mlm._hopper_candidates(ctx, _standing_by(monkeypatch, UPPER_HOPPER)) == []
+    assert mlm._hopper_candidates(ctx) == []
 
 
 def test_a_locked_upper_hopper_latches_and_falls_back_to_the_ladder(monkeypatch):
     ctx = _Ctx({**mlm.DEFAULT_CONFIG, "upperHopper": "auto"})
-    _standing_by(monkeypatch, UPPER_HOPPER)
+    _standing(monkeypatch, UPSTAIRS_H)
     monkeypatch.setattr(controller, "get_inventory", lambda: _paydirt(27))
     monkeypatch.setattr(controller, "get_varbit",
                         lambda vid: 1 if vid == mlm.VARBIT_UPSTAIRS else 0)
@@ -320,22 +325,31 @@ def test_a_locked_upper_hopper_latches_and_falls_back_to_the_ladder(monkeypatch)
     assert mlm.hopper_phase(ctx) is False        # the pay-dirt never left the inventory
     assert ctx.state.data["mlm_upper_locked"] is True
     # Latched: nothing upstairs is offered any more, so the next call takes the ladder.
-    assert mlm._hopper_candidates(ctx, _standing_by(monkeypatch, UPPER_HOPPER)) == []
+    assert mlm._hopper_candidates(ctx) == []
 
 
 def test_a_hopper_on_the_other_floor_is_never_offered(monkeypatch):
-    # /objects reports the lower hopper 8 tiles away while we stand upstairs.
+    # /objects reports the lower hopper while we stand one storey above it, at nearly the same
+    # x/y. Only tile height separates them.
     ctx = _Ctx({**mlm.DEFAULT_CONFIG, "upperHopper": "auto"})
+    _standing(monkeypatch, UPSTAIRS_H)
     monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [LOWER_HOPPER])
-    upstairs_pocket = {(3752, 5680): 0, (3753, 5680): 0, (3754, 5677): 0}
-    assert mlm._hopper_candidates(ctx, upstairs_pocket) == []
+    assert mlm._hopper_candidates(ctx) == []
+
+
+def test_the_lower_hopper_is_offered_once_we_are_downstairs(monkeypatch):
+    ctx = _Ctx({**mlm.DEFAULT_CONFIG, "upperHopper": "auto"})
+    _standing(monkeypatch, DOWNSTAIRS_H)
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda fresh=False, **kw: [LOWER_HOPPER, UPPER_HOPPER])
+    assert [h["y"] for h in mlm._hopper_candidates(ctx)] == [LOWER_HOPPER["y"]]
 
 
 def test_a_successful_hopper_deposit_books_the_paydirt_as_pending(monkeypatch):
     ctx = _Ctx()
     inventory = {"items": _paydirt(27)}
     monkeypatch.setattr(controller, "get_inventory", lambda: inventory["items"])
-    _standing_by(monkeypatch, LOWER_HOPPER)
+    _standing(monkeypatch, DOWNSTAIRS_H)
     monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [LOWER_HOPPER])
     monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
 
@@ -469,3 +483,72 @@ def test_before_break_does_nothing_with_an_empty_inventory(monkeypatch):
     ctx = _Ctx()
     monkeypatch.setattr(mlm, "hopper_phase", lambda c: pytest.fail("no pay-dirt to deposit"))
     mlm.before_break(ctx)
+
+
+# --- which floor (the first live run's bug) -------------------------------------------
+
+def test_is_upper_uses_runelites_own_threshold():
+    assert mlm.is_upper(-600) is True
+    assert mlm.is_upper(-490) is False      # strictly below, as MotherlodePlugin has it
+    assert mlm.is_upper(0) is False
+    assert mlm.is_upper(None) is False
+
+
+def test_a_vein_one_storey_below_is_never_offered(monkeypatch):
+    """THE bug from the first live run (2026-09-07).
+
+    The routine stood at (3749,5684) upstairs and clicked the vein at (3749,5685) for 90
+    seconds; /last-action confirmed "Mine Ore vein" every single time and nothing happened,
+    because that vein is on the floor BELOW. USER: "clicking lower level ore from highground".
+    Coordinates cannot tell these apart -- only the render height can.
+    """
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    _standing(monkeypatch, UPSTAIRS_H)
+    monkeypatch.setattr(travel, "can_reach", lambda *a, **k: True)
+    downstairs = _vein(3749, 5685, obj_id=26661, dist=1, tileHeight=DOWNSTAIRS_H)
+    upstairs = _vein(3750, 5682, dist=3, tileHeight=UPSTAIRS_H)
+    assert mlm.pick_vein(ctx, _reach((3752, 5680)), None,
+                         objects=[downstairs, upstairs]) is upstairs
+
+
+def test_the_run_stops_when_the_client_cannot_report_tile_height(monkeypatch):
+    # An un-rebuilt client must not quietly fall back to mining through the floor.
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 3752, "y": 5680, "plane": 0, "regionId": mlm.REGION,
+                                 "weaponName": "Rune pickaxe"})
+    assert mlm._floor_ready(ctx) is False
+    assert "tileHeight" in ctx.state.stop_reason
+
+
+# --- veins that swallow clicks ---------------------------------------------------------
+
+def test_a_vein_that_gives_nothing_twice_is_set_aside(_hermetic, monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    _standing(monkeypatch, UPSTAIRS_H)
+    monkeypatch.setattr(travel, "can_reach", lambda *a, **k: True)
+    bad = _vein(3749, 5685, dist=1, tileHeight=UPSTAIRS_H)
+    good = _vein(3750, 5682, dist=3, tileHeight=UPSTAIRS_H)
+
+    mlm.note_vein_failure(ctx, bad, "idle")
+    assert mlm.pick_vein(ctx, _reach((3752, 5680)), None, objects=[bad, good]) is bad
+    mlm.note_vein_failure(ctx, bad, "idle")
+    assert mlm.pick_vein(ctx, _reach((3752, 5680)), None, objects=[bad, good]) is good
+
+    _hermetic.t += mlm.VEIN_BLOCK_S + 1
+    assert mlm.pick_vein(ctx, _reach((3752, 5680)), None, objects=[bad, good]) is bad
+
+
+def test_a_vein_that_depletes_clears_its_failure_count(_hermetic, monkeypatch):
+    # A vein that merely took a while must not be penalised for it.
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    _standing(monkeypatch, UPSTAIRS_H)
+    monkeypatch.setattr(travel, "can_reach", lambda *a, **k: True)
+    vein = _vein(3750, 5682, dist=1, tileHeight=UPSTAIRS_H)
+    mlm.note_vein_failure(ctx, vein, "idle")
+    mlm.note_vein_failure(ctx, vein, "depleted")
+    mlm.note_vein_failure(ctx, vein, "idle")
+    assert mlm.pick_vein(ctx, _reach((3752, 5680)), None, objects=[vein]) is vein

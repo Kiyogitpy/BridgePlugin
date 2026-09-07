@@ -155,6 +155,12 @@ public class PlayerProvider extends BridgeProvider
 		{
 			data.put("localX", local.getX());
 			data.put("localY", local.getY());
+			// The tile's RENDER HEIGHT -- see ObjectProvider's own tileHeight comment. The pair
+			// is what tells the Motherlode Mine's two floors apart: the mine's upper level sits
+			// directly above the lower one at the same x/y, so this is the only field on the
+			// bridge that separates them, and a routine compares an object's against ours.
+			data.put("tileHeight", Perspective.getTileHeight(client, local, local.getWorldView() >= 0
+				? client.getTopLevelWorldView().getPlane() : 0));
 		}
 
 		// ADDED 2026-08-28 (user request): indoors/outdoors, which `plane` alone cannot answer --
@@ -279,6 +285,7 @@ public class PlayerProvider extends BridgeProvider
 		data.put("smithingXp", client.getSkillExperience(Skill.SMITHING));
 		data.put("runecraftXp", client.getSkillExperience(Skill.RUNECRAFT));
 		data.put("miningXp", client.getSkillExperience(Skill.MINING));
+		data.put("woodcuttingXp", client.getSkillExperience(Skill.WOODCUTTING));
 
 		data.put("runEnergy", client.getEnergy() / 100);
 		data.put("specialAttackPercent", client.getVarpValue(VarPlayer.SPECIAL_ATTACK_PERCENT) / 10);

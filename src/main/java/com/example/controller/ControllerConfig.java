@@ -61,6 +61,9 @@ public interface ControllerConfig extends Config
 	@ConfigSection(name = "Mining", description = "Mining routine settings", position = 8)
 	String miningSection = "mining";
 
+	@ConfigSection(name = "Woodcutting", description = "Woodcutting routine settings", position = 17)
+	String woodcuttingSection = "woodcutting";
+
 	@ConfigSection(name = "Gemstone Crab", description = "Gemstone Crab routine settings", position = 9)
 	String gemstoneCrabSection = "gemstoneCrab";
 
@@ -78,6 +81,9 @@ public interface ControllerConfig extends Config
 
 	@ConfigSection(name = "Mastering Mixology", description = "Mastering Mixology routine settings", position = 14)
 	String masteringMixologySection = "masteringMixology";
+
+	@ConfigSection(name = "Player-Owned House", description = "What is built in your POH. The client cannot see inside a house, so travel planning has to be told.", position = 16, closedByDefault = true)
+	String pohSection = "poh";
 
 	@ConfigSection(name = "Mahogany Homes", description = "Mahogany Homes routine settings", position = 15)
 	String mahoganyHomesSection = "mahoganyHomes";
@@ -787,6 +793,75 @@ public interface ControllerConfig extends Config
 		return 10;
 	}
 
+	@ConfigItem(
+		keyName = "miningFullInventory",
+		name = "When Full",
+		description = "What routines/mining.py does with a full inventory: bank it at a bank within 40 tiles, " +
+			"drop everything but the pickaxe, or stop the run.",
+		section = miningSection,
+		position = 3
+	)
+	default FullInventoryChoice miningFullInventory()
+	{
+		return FullInventoryChoice.BANK;
+	}
+
+	// ============================================================
+	// Woodcutting
+	// ============================================================
+
+	@ConfigItem(
+		keyName = "woodcuttingEnabled",
+		name = "Woodcutting Enabled",
+		description = "Secondary switch on top of launching controller.py with routines/woodcutting.py.",
+		section = woodcuttingSection,
+		position = 0
+	)
+	default boolean woodcuttingEnabled()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "treeNames",
+		name = "Tree Names",
+		description = "Comma-separated tree names to chop, closest first (e.g. Yew tree, Magic tree). Also managed by " +
+			"the Controller Settings sidebar panel's Gathering section with its action set to Chop down, which lists " +
+			"whatever is choppable nearby. Note the game's own name is \"Yew tree\", not \"Yew\".",
+		section = woodcuttingSection,
+		position = 1
+	)
+	default String treeNames()
+	{
+		return "Tree";
+	}
+
+	@ConfigItem(
+		keyName = "maxTreeDistance",
+		name = "Max Tree Distance",
+		description = "Only chop trees within this many tiles.",
+		section = woodcuttingSection,
+		position = 2
+	)
+	@Range(min = 1, max = 30)
+	default int maxTreeDistance()
+	{
+		return 10;
+	}
+
+	@ConfigItem(
+		keyName = "woodcuttingFullInventory",
+		name = "When Full",
+		description = "What routines/woodcutting.py does with a full inventory. Power-chopping (drop) is the normal " +
+			"woodcutting loop; bank uses the same banking path mining does.",
+		section = woodcuttingSection,
+		position = 3
+	)
+	default FullInventoryChoice woodcuttingFullInventory()
+	{
+		return FullInventoryChoice.DROP;
+	}
+
 	// ============================================================
 	// Gemstone Crab
 	// ============================================================
@@ -1186,5 +1261,69 @@ public interface ControllerConfig extends Config
 	default boolean mahoganyHomesEnabled()
 	{
 		return true;
+	}
+
+	@ConfigItem(
+		keyName = "usePoh",
+		name = "Use POH teleports",
+		description = "Master switch for every Player-Owned House transport. Off means travel " +
+			"planning never routes through your house, whatever the settings below say.",
+		section = pohSection,
+		position = 0
+	)
+	default boolean usePoh()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "pohJewelleryBoxTier",
+		name = "Jewellery box tier",
+		description = "The jewellery box built in your house. Tiers are cumulative -- an Ornate " +
+			"box offers everything Basic does. None disables it.",
+		section = pohSection,
+		position = 1
+	)
+	default JewelleryBoxTier pohJewelleryBoxTier()
+	{
+		return JewelleryBoxTier.NONE;
+	}
+
+	@ConfigItem(
+		keyName = "usePohPortals",
+		name = "Portal nexus / portals",
+		description = "Whether to route through the teleport portals built in your house.",
+		section = pohSection,
+		position = 2
+	)
+	default boolean usePohPortals()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "usePohMountedItems",
+		name = "Mounted items",
+		description = "Mounted glory, Xeric's talisman, digsite pendant, mythical cape. Note an " +
+			"Ornate jewellery box supersedes a mounted glory, so the glory is skipped when you " +
+			"have one.",
+		section = pohSection,
+		position = 3
+	)
+	default boolean usePohMountedItems()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "usePohFairyRing",
+		name = "Fairy ring",
+		description = "Whether to route through a fairy ring built in your house.",
+		section = pohSection,
+		position = 4
+	)
+	default boolean usePohFairyRing()
+	{
+		return false;
 	}
 }

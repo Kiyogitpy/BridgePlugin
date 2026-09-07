@@ -9,6 +9,23 @@ import banker
 import controller
 
 
+@pytest.fixture(autouse=True)
+def _no_live_bridge(monkeypatch):
+    """Hermetic by default (same posture as test_blast_furnace / test_mahogany_homes).
+
+    ADDED 2026-09-07: banker's _owned_item_ids reads bank_memory.load(), which reaches the
+    RUNNING CLIENT -- ~929 real items that change as the account is played, so planning
+    outcomes drifted run to run and three unrelated tests failed once and passed on a verbatim
+    re-run. A suite whose result depends on where the player is standing is not a suite.
+    Tests that care re-patch these themselves.
+    """
+    import bank_memory
+    monkeypatch.setattr(bank_memory, "load",
+                        lambda names=None: bank_memory.BankMemory({"seen": False, "items": None}))
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: None)
+    monkeypatch.setattr(controller, "get_equipment", lambda: {})
+
+
 class _Ctx:
     def __init__(self, ser=None):
         self.ser = ser
@@ -287,3 +304,415 @@ def test_withdraw_loadout_all_entry_shift_withdraws_once(monkeypatch):
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: pytest.fail("per-unit click not expected"))
     banker.withdraw_loadout(None, {"withdraw": [{"name": "Willow logs", "quantity": 27, "all": True}]})
     assert calls == ["Willow logs"]
+
+
+# --- bank trip return-to-spot -------------------------------------------------------------
+#
+# USER-REPORTED 2026-09-07: slayer "ends up stuck at Ferox" and never gets back to the spot it
+# was fighting at. Three separate defects fed that, all traced statically before any fix:
+#   1. bank_up's nearby-bank branch never recorded or restored a location at all -- the only
+#      save/restore machinery in the file lived inside _bank_via_ferox.
+#   2. FEROX_BANK_NAMES is a strict subset of DEFAULT_BANK_NAMES and the Java panel exports
+#      neither bankNames nor maxBankDistance, so once a trip aborted AFTER the teleport landed
+#      (no bank found yet, or open_bank failed), the next tick's bank_up matched the Ferox chest
+#      on its FIRST branch -- skipping use_fountain and the walk home, and orphaning the saved
+#      location forever.
+#   3. the saved location was popped BEFORE the walk was attempted, so a walk that gave up
+#      partway (WALK_MAX_STALLS is a cumulative budget of 4 across a whole cross-map route)
+#      discarded the destination with no possibility of a retry.
+
+
+class _State:
+    def __init__(self, config=None):
+        self.config = config or {}
+        self.data = {}
+        self.stops = []
+
+    def trigger_safety_stop(self, reason):
+        self.stops.append(reason)
+
+
+class _TripCtx:
+    def __init__(self, config=None):
+        self.ser = None
+        self.state = _State(config)
+
+
+def _stub_trip(monkeypatch, *, walk_results=None, teleport_ok=True):
+    """Stub out every moving part of a bank trip, recording what it was asked to do."""
+    import travel
+
+    calls = {"walks": [], "teleports": 0, "fountains": 0, "deposits": 0, "opened": []}
+    walk_results = list(walk_results or [])
+
+    def fake_walk_to(ctx, target, **kw):
+        calls["walks"].append(dict(target))
+        return walk_results.pop(0) if walk_results else True
+
+    def fake_teleport(ctx):
+        calls["teleports"] += 1
+        return teleport_ok
+
+    monkeypatch.setattr(travel, "save_location", lambda: {"x": 3200, "y": 3200, "plane": 0})
+    monkeypatch.setattr(travel, "walk_to", fake_walk_to)
+    monkeypatch.setattr(travel, "teleport_to_ferox", fake_teleport)
+    monkeypatch.setattr(travel, "use_fountain", lambda ctx: calls.__setitem__("fountains", calls["fountains"] + 1))
+    monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **kw: calls["opened"].append(obj) or True)
+    monkeypatch.setattr(banker, "deposit_inventory",
+                        lambda ctx, cfg: calls.__setitem__("deposits", calls["deposits"] + 1))
+    monkeypatch.setattr(banker, "withdraw_loadout", lambda ctx, cfg, **kw: None)
+    monkeypatch.setattr(banker, "close_bank", lambda ctx: None)
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 3300, "y": 3300, "plane": 0})
+    return calls
+
+
+def test_bank_up_walks_back_to_the_tile_it_left_from_after_a_nearby_bank_trip(monkeypatch):
+    """Defect 1: a bank inside maxBankDistance (40) was walked to and never walked back from,
+    so the routine simply carried on fighting next to the bank."""
+    calls = _stub_trip(monkeypatch)
+    monkeypatch.setattr(banker, "_find_nearby_bank_retrying",
+                        lambda cfg, **kw: {"name": "Bank booth", "distance": 22})
+    # This test is about the WALK home, so no teleport is planned -- otherwise the graph
+    # (correctly) finds a chain and there is no walk left to assert on.
+    monkeypatch.setattr(banker, "_withdraw_return_teleport", lambda ctx, cfg: None)
+
+    ctx = _TripCtx()
+    assert banker.bank_up(ctx, {"enabled": True, "returnToSpot": True})
+    assert calls["walks"] == [{"x": 3200, "y": 3200, "plane": 0}]
+
+
+def test_bank_up_keeps_the_return_tile_when_the_walk_back_gives_up_partway(monkeypatch):
+    """Defect 3: the tile was popped before the walk, so one failed walk lost it forever."""
+    calls = _stub_trip(monkeypatch, walk_results=[False])
+    monkeypatch.setattr(banker, "_find_nearby_bank_retrying",
+                        lambda cfg, **kw: {"name": "Bank booth", "distance": 22})
+
+    ctx = _TripCtx()
+    banker.bank_up(ctx, {"enabled": True, "returnToSpot": True})
+    assert ctx.state.data.get(banker.RETURN_LOCATION_KEY) == {"x": 3200, "y": 3200, "plane": 0}
+
+    # ...and a later tick retries it, rather than the routine fighting on from wherever it stopped.
+    assert banker.return_to_spot(ctx)
+    assert calls["walks"][-1] == {"x": 3200, "y": 3200, "plane": 0}
+    assert banker.RETURN_LOCATION_KEY not in ctx.state.data
+
+
+def test_return_to_spot_gives_up_loudly_rather_than_retrying_the_walk_home_forever(monkeypatch):
+    """Every loop needs a ceiling (CLAUDE.md). Being stranded is the reported bug, so the
+    ceiling surfaces as a safety stop, not a silent shrug."""
+    _stub_trip(monkeypatch, walk_results=[False] * 20)
+    ctx = _TripCtx()
+    ctx.state.data[banker.RETURN_LOCATION_KEY] = {"x": 3200, "y": 3200, "plane": 0}
+
+    for _ in range(banker.RETURN_WALK_MAX_ATTEMPTS):
+        assert not banker.return_to_spot(ctx)
+    assert ctx.state.data.get(banker.RETURN_LOCATION_KEY) is None
+    assert ctx.state.stops
+
+
+def test_bank_up_stays_on_the_ferox_path_after_a_teleport_has_already_landed(monkeypatch):
+    """Defect 2: the Ferox chest matches DEFAULT_BANK_NAMES, so a trip that aborted after the
+    teleport landed got hijacked by bank_up's own nearby-bank branch on the next tick --
+    banking without ever using the fountain or walking home."""
+    calls = _stub_trip(monkeypatch)
+
+    # First tick: nothing in range, teleport lands, but the chest isn't visible yet -> abort.
+    monkeypatch.setattr(banker, "_find_nearby_bank_retrying", lambda cfg, **kw: None)
+    ctx = _TripCtx()
+    assert not banker.bank_up(ctx, {"enabled": True})
+    assert calls["teleports"] == 1
+
+    # Second tick: the chest is visible now, and it matches BOTH name lists.
+    monkeypatch.setattr(banker, "_find_nearby_bank_retrying",
+                        lambda cfg, **kw: {"name": "Bank chest", "distance": 4})
+    assert banker.bank_up(ctx, {"enabled": True})
+
+    assert calls["teleports"] == 1, "must not burn a second ring charge -- already at Ferox"
+    assert calls["fountains"] == 1, "the Ferox path's fountain step was skipped by the hijack"
+    assert calls["walks"][-1] == {"x": 3200, "y": 3200, "plane": 0}
+
+
+def test_bank_up_does_not_add_a_walk_home_for_callers_that_never_had_one(monkeypatch):
+    """routines/firemaking.py banks every inventory and then walks to a fixed starter tile of
+    its own (advance_starter), so a walk back to the end of the last burn line would be pure
+    waste. The nearby-bank walk home is therefore opt-in, and the default leaves every
+    pre-2026-09-07 caller's trip exactly as it was."""
+    calls = _stub_trip(monkeypatch)
+    monkeypatch.setattr(banker, "_find_nearby_bank_retrying",
+                        lambda cfg, **kw: {"name": "Bank booth", "distance": 22})
+
+    ctx = _TripCtx()
+    assert banker.bank_up(ctx, {"enabled": True})
+    assert calls["walks"] == []
+    assert banker.RETURN_LOCATION_KEY not in ctx.state.data
+
+
+def test_the_ferox_path_still_walks_home_without_anyone_opting_in(monkeypatch):
+    """The teleport path always walked back, and golem_crafting's own comment depends on it
+    ("it walks the player straight back afterward"). Opting in must not have become a
+    precondition for that."""
+    calls = _stub_trip(monkeypatch)
+    seen = {"n": 0}
+
+    def fake_find(cfg, **kw):
+        # 1: bank_up's own nearby check. 2: _bank_via_ferox's "are we already there" check.
+        # 3: the post-teleport look for the chest.
+        seen["n"] += 1
+        return None if seen["n"] <= 2 else {"name": "Bank chest", "distance": 4}
+
+    monkeypatch.setattr(banker, "_find_nearby_bank_retrying", fake_find)
+
+    ctx = _TripCtx()
+    assert banker.bank_up(ctx, {"enabled": True})
+    assert calls["teleports"] == 1
+    assert calls["walks"] == [{"x": 3200, "y": 3200, "plane": 0}]
+
+
+# --- teleporting home from a bank trip ----------------------------------------------------
+#
+# USER 2026-09-07: "make sure slayer is using this to decide what method of teleportation is
+# best to get back". The choice is made INSIDE the bank, because that is the only moment the
+# winning item can be withdrawn; return_to_spot then uses it and walks whatever is left.
+
+
+def _stub_teleport_planning(monkeypatch, *, bank_items=(), inventory=(), route_lens=None,
+                            walk_len=400):
+    """Everything _plan_return_teleport reads, so the choice is exercised and nothing else is."""
+    import bank_memory
+    import worldmap
+
+    monkeypatch.setattr(bank_memory, "load",
+                        lambda names=None: bank_memory.BankMemory(
+                            {"seen": True, "items": list(bank_items), "itemCount": len(bank_items)}))
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inventory))
+    monkeypatch.setattr(controller, "get_equipment", lambda: [])
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 3300, "y": 3300, "plane": 0, "wildernessLevel": 0})
+
+    route_lens = route_lens or {}
+
+    def fake_find_path(sx, sy, plane, gx, gy, **kw):
+        # The walk-the-whole-way case is keyed by the start tile; a teleport's remaining walk by
+        # its landing tile.
+        length = walk_len if (sx, sy) == (3300, 3300) else route_lens.get((sx, sy))
+        return [None] * length if length is not None else None
+
+    monkeypatch.setattr(worldmap, "find_path", fake_find_path)
+
+    # The planner asks ONE flood from the goal for landing-spot distances (see
+    # GOAL_FLOOD_RADIUS) and uses find_path only for approach-to-origin questions, so the two
+    # stubs must agree or the test is measuring the real collision map.
+    def fake_reachable_from(gx, gy, plane, **kw):
+        reach = {(x, y): d for (x, y), d in route_lens.items()}
+        if walk_len is not None:
+            reach[(3300, 3300)] = walk_len
+        return reach
+
+    monkeypatch.setattr(worldmap, "reachable_from", fake_reachable_from)
+
+
+def test_plan_return_teleport_picks_the_one_landing_nearest_the_anchor(monkeypatch):
+    _stub_teleport_planning(
+        monkeypatch,
+        bank_items=[{"id": 2552, "name": "Ring of dueling(8)", "quantity": 1}],
+        route_lens={(3151, 3635): 30},
+        walk_len=400)
+
+    ctx = _TripCtx()
+    ctx.state.data[banker.RETURN_LOCATION_KEY] = {"x": 3151, "y": 3640, "plane": 0}
+
+    legs = banker._plan_return_teleport(ctx, {"returnToSpot": True})
+    assert legs, "expected a route home"
+    # One hop is enough here, and chaining must not make the simple case worse.
+    assert len(legs) == 1
+    assert legs[0].display == "Ring of dueling: Ferox Enclave"
+
+
+def test_plan_return_teleport_declines_when_walking_is_already_close(monkeypatch):
+    """A tablet is worth more than a short walk -- no plan means the existing walk home runs
+    exactly as it does today."""
+    _stub_teleport_planning(
+        monkeypatch,
+        bank_items=[{"id": 2552, "name": "Ring of dueling(8)", "quantity": 1}],
+        route_lens={(3151, 3635): 30},
+        walk_len=45)
+
+    ctx = _TripCtx()
+    ctx.state.data[banker.RETURN_LOCATION_KEY] = {"x": 3151, "y": 3640, "plane": 0}
+    assert banker._plan_return_teleport(ctx, {"returnToSpot": True}) is None
+
+
+def test_plan_return_teleport_needs_an_anchor_and_an_opted_in_caller(monkeypatch):
+    _stub_teleport_planning(monkeypatch,
+                            bank_items=[{"id": 2552, "name": "Ring of dueling(8)", "quantity": 1}],
+                            route_lens={(3151, 3635): 30})
+
+    # No anchor recorded -> nothing to aim at.
+    assert banker._plan_return_teleport(_TripCtx(), {"returnToSpot": True}) is None
+
+    # Opted out (firemaking, blast_furnace) -> must not start withdrawing teleports.
+    ctx = _TripCtx()
+    ctx.state.data[banker.RETURN_LOCATION_KEY] = {"x": 3151, "y": 3640, "plane": 0}
+    assert banker._plan_return_teleport(ctx, {}) is None
+
+
+def test_plan_return_teleport_ignores_an_item_we_do_not_own(monkeypatch):
+    _stub_teleport_planning(monkeypatch, bank_items=[], inventory=[],
+                            route_lens={(3151, 3635): 30}, walk_len=400)
+    ctx = _TripCtx()
+    ctx.state.data[banker.RETURN_LOCATION_KEY] = {"x": 3151, "y": 3640, "plane": 0}
+    assert not banker._plan_return_teleport(ctx, {"returnToSpot": True})
+
+
+def test_a_teleport_that_does_not_fire_falls_back_to_walking(monkeypatch):
+    """The whole safety argument for executing teleports we have never driven live: a failed
+    teleport costs latency, never the trip. The anchor survives, so the walk still happens."""
+    calls = _stub_trip(monkeypatch)
+    monkeypatch.setattr(banker, "_use_return_teleport", lambda ctx: False)
+
+    ctx = _TripCtx()
+    ctx.state.data[banker.RETURN_LOCATION_KEY] = {"x": 3200, "y": 3200, "plane": 0}
+    ctx.state.data[banker.RETURN_TELEPORT_KEY] = {
+        "legs": [{"kind": "item", "item": "Ring of dueling", "option": "Ferox Enclave",
+                  "display": "Ring of dueling: Ferox Enclave", "dest": [3151, 3635, 0]}]}
+
+    assert banker.return_to_spot(ctx)
+    assert calls["walks"] == [{"x": 3200, "y": 3200, "plane": 0}]
+
+
+def test_return_to_spot_actually_reaches_the_teleport_it_planned(monkeypatch):
+    """Regression: return_to_spot used to POP the plan before calling _use_return_teleport,
+    which reads that same key -- so the teleport silently never happened. The fallback test
+    above could not catch it, because it stubs the very function the bug was in."""
+    calls = _stub_trip(monkeypatch)
+    used = []
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"id": 2552, "name": "Ring of dueling(8)",
+                                  "screenX": 10, "screenY": 10}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: None)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, item, **kw: used.append(kw.get("expected_action")) or True)
+    # Landed on the first poll.
+    monkeypatch.setattr(banker.time, "sleep", lambda s: None)
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 3151, "y": 3635, "plane": 0})
+
+    ctx = _TripCtx()
+    ctx.state.data[banker.RETURN_LOCATION_KEY] = {"x": 3151, "y": 3640, "plane": 0}
+    ctx.state.data[banker.RETURN_TELEPORT_KEY] = {
+        "legs": [{"kind": "item", "item": "Ring of dueling", "option": "Ferox Enclave",
+                  "display": "Ring of dueling: Ferox Enclave", "dest": [3151, 3635, 0]}]}
+
+    assert banker.return_to_spot(ctx)
+    assert used == ["Ferox Enclave"], "the planned teleport was never clicked"
+    # Consumed exactly once, so a later tick cannot re-fire it.
+    assert banker.RETURN_TELEPORT_KEY not in ctx.state.data
+
+
+# --- multi-leg teleport chains ------------------------------------------------------------
+#
+# USER 2026-09-07: "go ahead to 1+2+3" -- wire the transport graph into banker, execute a
+# non-item leg, and read the POH config. A chain's first leg is normally an inventory item
+# (withdrawn while the bank is open); later legs are objects standing in the POH.
+
+
+def _leg(kind="item", **kw):
+    d = {"kind": kind, "display": "Teleport to House tablet", "item": "Teleport to House",
+         "option": None, "dest": [1923, 5709, 0], "origin": None, "object_id": None,
+         "object_info": ""}
+    d.update(kw)
+    return d
+
+
+def test_the_plan_stores_every_leg_not_just_the_first(monkeypatch):
+    """The single-hop version stored one item name. A chain has to survive into
+    return_to_spot intact or the second hop simply never happens."""
+    import teleports
+    calls = _stub_trip(monkeypatch)
+    monkeypatch.setattr(controller, "get_varbit", lambda i: 0)
+    monkeypatch.setattr(banker, "_owned_item_ids", lambda cfg: {8013})
+    monkeypatch.setattr(banker, "_route_length", lambda *a: None)
+
+    chain = [
+        teleports.Transport("item", None, (1923, 5709, 0), frozenset({8013}), (), "",
+                            "Teleport to House tablet", "Teleport to House tablet", None, 4, 20, True),
+        teleports.Transport("box", (1870, 5698, 0), (3151, 3635, 0), frozenset(), (),
+                            "Teleport Menu Ornate Jewellery Box 37520", "3: Ferox Enclave",
+                            "3", "Ferox Enclave", 4, None, False),
+    ]
+    monkeypatch.setattr(teleports, "plan", lambda *a, **k: chain)
+    monkeypatch.setattr(banker, "search_and_withdraw", lambda ctx, name, qty: True)
+
+    ctx = _TripCtx()
+    ctx.state.data[banker.RETURN_LOCATION_KEY] = {"x": 3151, "y": 3635, "plane": 0}
+    banker._withdraw_return_teleport(ctx, {"returnToSpot": True, "poh": {"enabled": True,
+                                                                        "boxTier": "ORNATE"}})
+
+    stored = ctx.state.data.get(banker.RETURN_TELEPORT_KEY)
+    assert stored and len(stored["legs"]) == 2
+    assert stored["legs"][0]["kind"] == "item"
+    assert stored["legs"][1]["kind"] == "box"
+    assert stored["legs"][1]["object_id"] == 37520, "the object id must survive for the click"
+    assert stored["legs"][1]["option"] == "Ferox Enclave"
+
+
+def test_poh_config_comes_off_the_bridge_config_not_a_hardcoded_default():
+    """The client can't see inside a house, so this is config. Reading it wrong means the graph
+    silently never plans a POH route."""
+    poh = banker._poh_config({"poh": {"enabled": True, "boxTier": "ORNATE", "portals": True,
+                                      "mountedItems": True, "fairyRing": True}})
+    assert poh.enabled and poh.box_tier == "ORNATE" and poh.portals and poh.mounted_items
+
+    # Absent block = everything off, so an unconfigured account never routes through a house
+    # it may not have.
+    off = banker._poh_config({})
+    assert not off.enabled and off.box_tier == "NONE"
+
+
+def test_a_failed_leg_aborts_the_chain_and_leaves_the_walk_to_recover(monkeypatch):
+    """Same safety argument as the single-hop version, extended: a chain that dies halfway
+    must not keep clicking. The anchor survives, so return_to_spot still walks."""
+    calls = _stub_trip(monkeypatch)
+    used = []
+    monkeypatch.setattr(banker, "_run_leg", lambda ctx, leg: used.append(leg["kind"]) or False)
+
+    ctx = _TripCtx()
+    ctx.state.data[banker.RETURN_LOCATION_KEY] = {"x": 3151, "y": 3635, "plane": 0}
+    ctx.state.data[banker.RETURN_TELEPORT_KEY] = {"legs": [_leg(), _leg(kind="box")]}
+
+    assert banker.return_to_spot(ctx)
+    assert used == ["item"], "the second leg must not run after the first failed"
+    assert calls["walks"] == [{"x": 3151, "y": 3635, "plane": 0}]
+
+
+def test_every_leg_runs_in_order_when_they_succeed(monkeypatch):
+    calls = _stub_trip(monkeypatch)
+    used = []
+    monkeypatch.setattr(banker, "_run_leg", lambda ctx, leg: used.append(leg["kind"]) or True)
+
+    ctx = _TripCtx()
+    ctx.state.data[banker.RETURN_LOCATION_KEY] = {"x": 3151, "y": 3635, "plane": 0}
+    ctx.state.data[banker.RETURN_TELEPORT_KEY] = {"legs": [_leg(), _leg(kind="box")]}
+
+    banker.return_to_spot(ctx)
+    assert used == ["item", "box"]
+
+
+def test_only_the_varbits_the_candidates_actually_reference_are_read(monkeypatch):
+    """A /varbit read per candidate row would be ~300 HTTP calls. Only the ids that appear in a
+    requirement are worth asking about."""
+    asked = []
+    # get_varbit returns the VALUE, not an envelope. A dict-returning stub is what let the
+    # real "reads nothing" bug through on 2026-09-07 -- a stub that lies about a shape is
+    # worse than no stub.
+    monkeypatch.setattr(controller, "get_varbit",
+                        lambda i: asked.append(i) or (3 if i == 2187 else 0))
+    # Narrowed to rows whose items we hold: a house tablet, so 2187/4744 and little else.
+    # Unnarrowed the whole table references 86 distinct varbits (~1.7s of round trips).
+    values = banker._referenced_varbits(owned_ids={8013})
+    assert 2187 in asked and 4744 in asked
+    assert len(asked) < 20, f"read {len(asked)} varbits -- should only be the ones we could use"
+    assert values[2187] == 3
+
+    assert len(banker._referenced_varbits()) > len(values),         "unnarrowed must read strictly more, or the narrowing is a no-op"

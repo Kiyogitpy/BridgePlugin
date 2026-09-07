@@ -31,8 +31,6 @@
 # Run with:
 #     python controller.py routines/nmz.py
 
-import time
-
 import controller
 import debug_log
 
@@ -80,7 +78,7 @@ def tick(ctx):
     click_inventory_item(ctx, config["potionName"], wait_range=POTION_COOLDOWN_WAIT)
     sip_absorption(ctx, config)
 
-    alt_tab(ctx.ser)
+    controller.alt_tab(ctx.ser)
     debug_log.log("nmz", "tabbed out, waiting")
     controller.human_delay(config["waitMinS"], config["waitMaxS"])
 
@@ -94,22 +92,13 @@ def tick(ctx):
     # while unfocused. So verify focus here, before returning, and retry/bail out loudly
     # rather than silently stalling forever.
     for attempt in range(3):
-        alt_tab(ctx.ser)
-        if wait_for_focus():
+        controller.alt_tab(ctx.ser)
+        if controller.wait_for_focus():
             debug_log.log("nmz", "tabbed back in")
             return
         debug_log.log("nmz", f"tab-back-in attempt {attempt + 1} didn't regain focus, retrying")
 
     ctx.state.trigger_safety_stop("Alt+Tab back into RuneLite failed after 3 attempts")
-
-
-def wait_for_focus(timeout_s: float = 5.0, poll_interval_s: float = 0.3) -> bool:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if controller.get_state().get("windowFocused"):
-            return True
-        time.sleep(poll_interval_s)
-    return False
 
 
 # Drinking a (non-barbarian) potion imposes a hard 3-tick (1.8s) cooldown before the next
@@ -169,12 +158,3 @@ def click_inventory_item(ctx, name_substring: str, wait_range=DEFAULT_CLICK_WAIT
     return True
 
 
-def alt_tab(ser) -> None:
-    # "ALT" and "TAB" are both explicitly supported key names in the Arduino firmware
-    # (data/Firmware.c's keyFromToken -- KEY_LEFT_ALT / KEY_TAB), same as "SHIFT"/"ESC"/
-    # "SPACE" used elsewhere in this codebase.
-    controller.key_down(ser, "ALT")
-    controller.human_delay(0.05, 0.12)
-    controller.key_tap(ser, "TAB")
-    controller.human_delay(0.05, 0.12)
-    controller.key_up(ser, "ALT")

@@ -489,6 +489,21 @@ IDLE_FIDGET_RADIUS_PX = (15, 80)   # out-leg distance from the resting position
 IDLE_FIDGET_STILL_MEDIAN_S = 1.5   # lognormal still-segment length between fidgets (measured)
 IDLE_FIDGET_STILL_SIGMA = 0.33     # ln(2.3/1.5)/1.2816, from the human's median -> p90
 IDLE_FIDGET_MAX_STILL_S = 4.0      # the human's longest observed active still was 4.5s
+# The return leg's aim radius. It was 0 -- a mathematically exact snap back to the origin --
+# until 2026-09-06, which made the cursor tether to ONE pixel and oscillate about it. MEASURED
+# live that day against the human recording of the SAME activity (karambwan fishing,
+# recordings/2026-09-06_090950_cg-bot1 vs ..._083723_karamwan-fishing): consecutive
+# out-and-backs about one anchor 19/17/14 for the bot against the human's single chain of 10,
+# and 11 rests on the identical pixel against the human's 3. Pre-change bot runs sat at 5-12%
+# tethered bursts, the human at 26%, this run at 33% -- the fidgeter had gone past the human it
+# was fitted to, in the one dimension a human cannot imitate: pixel-exact repetition.
+# 3px keeps the position-invariance contract intact (hover-parked call sites click IN PLACE,
+# and every real click's own aim radius is far wider than this).
+IDLE_FIDGET_RETURN_JITTER_PX = 3
+# Further than this from the remembered anchor means something OTHER than a fidget moved the
+# cursor (a click, a walk, the idle drift), so the next fidget re-takes the anchor there.
+# Comfortably above the return jitter's own soft cap (pick_aim_point clamps at 2.5x radius).
+IDLE_FIDGET_ANCHOR_RESET_PX = 15
 
 # ---------------- Approach-tile humanization ----------------
 # See travel.maybe_approach_before_click -- occasionally walk partway toward

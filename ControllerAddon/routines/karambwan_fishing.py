@@ -27,6 +27,18 @@
 #   Teleport -> widget 387.16, landed at the Legends' Guild (2730,3348) +2.4s.
 #   Last-destination (DKP) -> loc 29495 "Fairy ring" at (2740,3351) clicked from 10-12 tiles,
 #     the game walks, LOADING +6.5s, landed (2900,3111).
+# USER 2026-09-06 has menu-swapped every one of those to the LEFT click (the worn gloves and
+# cape, Deposit-All, Empty-to-bank, and the ring's Last-destination), so each is one click via
+# _click_option -- hover-gated, with the old right-click menu kept only as the fallback.
+# The fishing wait itself is spent TABBED OUT (USER 2026-09-06: "any human doing this would
+# just be watching youtube or something"): fish_wait Alt+Tabs away, sends nothing at all while
+# unfocused, and comes back a drawn notice_delay_s later -- usually a glance, sometimes USER's
+# 10-40s of genuine lateness. See tab_out/tab_back_in for why the tab back in is verified.
+# One consequence, same as routines/nmz.py's: the engine's own check_safety/check_pvp_threat
+# and break scheduling sit behind that focus gate too, so none of them fire while we are away.
+# Accepted -- the window is one inventory (FISH_MAX_S 300s, not nmz's 20 minutes), and standing
+# at a fishing spot in Karamja is not a situation any of them would have to act on.
+#
 # Every phase is derived from LIVE state (position, inventory, the fish barrel), never from a
 # stored step, so a restart anywhere on the loop resumes in place (CLAUDE.md: ctx.state.data is
 # wiped on restart, the character's position is not).
@@ -41,6 +53,7 @@
 # Run with:
 #     python controller.py routines/karambwan_fishing.py
 
+import random
 import time
 
 import controller
@@ -133,6 +146,30 @@ DEPOSIT_TRIES = 3
 RING_BUDGET_S = 8.0             # confirm/Last-destination -> standing at DKP
 DIAL_CLICK_S = 0.5              # one dial rotation
 TICK_CHAIN_MAX = 6              # phases chained inside one tick() before handing back
+
+# --- AFK tab-out (USER 2026-09-06: "want to change karambwan to be tabbed out while fishing
+# since it is such a long fishing time any human doing this would just be watching youtube or
+# something ... we can be late tabbing back in sometimes like variance 10-40 sec").
+# An inventory of karambwan is 90-110s of standing still with nothing to click, so the routine
+# physically Alt+Tabs away for it (controller.alt_tab, the primitive routines/nmz.py has used
+# since 2026-08-15) and sends NOTHING at all until it has tabbed back in -- a level-up SPACE or
+# a fidget while unfocused lands in whatever window is now in front.
+AFK_MIN_FREE_SLOTS = 8          # below this the wait is ~20s: not worth tabbing away for
+AFK_POLL_S = 2.5                # how often a tabbed-out wait re-reads the bridge (no input)
+AFK_LATE_CHANCE = 0.33          # ... of returns are a properly distracted one
+AFK_LATE_RANGE_S = (10.0, 40.0)  # USER's number: sometimes we are this late noticing
+AFK_PROMPT_RANGE_S = (2.0, 6.0)  # otherwise a normal glance at the corner of the screen
+AFK_FOCUS_TRIES = 3             # tab-back-in attempts before a safety stop (nmz's number)
+AFK_FOCUS_WAIT_S = 5.0          # per attempt
+AFK_UNFOCUS_WAIT_S = 2.0        # confirming we actually LEFT the window
+DIALOG_DISMISS_TRIES = 4        # SPACEs before giving up on a "click here to continue" box
+
+# The PLAIN message box, which /state's dialogOpen does NOT report -- MEASURED live 2026-09-06
+# (see _continue_box_open). 229.3 carries the line, 229.4 the prompt. Same group blast_furnace
+# meets after a dispenser Take.
+CONTINUE_GROUP = 229
+CONTINUE_CHILD = 4
+CONTINUE_TEXT = "click here to continue"
 STALL_WARN_S = 150.0
 STALL_STOP_S = 420.0
 
@@ -221,6 +258,7 @@ def _ensure_inventory_tab(ctx) -> bool:
     not on the inventory widget's hidden flag alone. kf_live1: the blind "w" tap after a
     teleport was eaten by the LOADING screen and the first barrel Fill was withheld because the
     hover saw no item under the cursor -- the panel showing was not the inventory."""
+    _dismiss_dialog(ctx)                # a dialogue swallows "w" -- see _dismiss_dialog
     for _ in range(3):
         tab = controller.get_active_tab()
         if tab is None:
@@ -301,19 +339,97 @@ def _nearest_spot():
     return best
 
 
-def _dismiss_dialog(ctx) -> None:
-    """A level-up (or any "click here to continue") interrupts fishing; the engine's own
-    check_stray_dialog cannot run while fish_wait holds the tick."""
+def _click_option(ctx, target, option, what: str, refresh_target=None,
+                  interface: bool = True) -> bool:
+    """Take `option` on `target` with ONE left click, the right-click menu only as a fallback.
+
+    USER 2026-09-06: "basicly all things we do in karam fishing ive custom menu swapped so a
+    simple left click will do, even the fairy ring will default to last destination. both
+    teleports in inventory left clicks and deposit all and empty barrel both left clicks."
+    A menu costs an open, a /menu read and a second click (~1s each), and CLAUDE.md records
+    live "Menu never opened" failures -- so the swap is worth taking.
+
+    The left click is GATED on /hover reporting `option` as the live left-click action on this
+    exact target, and a withheld click falls back to the menu -- so a swap that is missing, or
+    reset by a game update, costs a menu rather than firing the wrong action. That gate is
+    load-bearing on the two WORN items: an un-swapped worn item's left click is **Remove**,
+    i.e. unequipping the gloves mid-run. Same shape as falconry._use_teleport.
+
+    `simulate_mistakes=False` throughout, for the reason banker.py never misclicks a bank
+    button: a deliberate miss beside an item in the deposit grid, plus its corrective reclick,
+    lands on the neighbouring slot -- and the neighbour of the karambwan there is the barrel.
+    `interface=False` is the fairy ring, a world object: it keeps the UI-blocker check and the
+    default aim offset."""
+    kwargs = {"simulate_mistakes": False}
+    if interface:
+        kwargs["check_ui_blockers"] = False
+        kwargs["offset"] = (0, 0)
+    if refresh_target is not None:
+        kwargs["refresh_target"] = refresh_target
+
+    ok = controller.click_entity(ctx.ser, target, expected_action=option, **kwargs)
+    if ok:
+        return True
+    if getattr(ok, "withheld", False):
+        debug_log.log("karambwan", f"{what}: left-click is not '{option}' here -- using the menu")
+    kwargs.pop("simulate_mistakes", None)
+    return bool(controller.click_menu_action(ctx.ser, target, option, **kwargs))
+
+
+def _continue_box_open() -> bool:
+    """True while the plain "Click here to continue" message box is up.
+
+    MEASURED live 2026-09-06, with the box on screen and the routine stuck: /state reported
+    dialogOpen **FALSE**, because GameStateProvider only counts the NPC/player/sprite dialogue
+    widgets. /widgets/dump at that same moment carried group 229 -- 229.3 "You can't carry any
+    more Karambwan.", 229.4 "Click here to continue" -- and /widget?group=229&child=4 answered
+    clickable. So this box is invisible to dialogOpen and to the engine's own
+    check_stray_dialog, and it SWALLOWS the tab hotkeys ("e"/"w"): USER, live, "there is a
+    dialog in the way so we cant press e".
+
+    The text is matched as well as the id, so a message box that is not this prompt (229 is
+    reused) is not mistaken for one."""
+    widget = controller.get_widget(CONTINUE_GROUP, CONTINUE_CHILD) or {}
+    return bool(widget.get("clickable")) and CONTINUE_TEXT in (widget.get("text") or "").lower()
+
+
+def _blocking_dialog() -> bool:
+    """Anything on screen that swallows a keypress -- either kind of box."""
     if (controller.get_state() or {}).get("dialogOpen"):
+        return True
+    return _continue_box_open()
+
+
+def _dismiss_dialog(ctx) -> bool:
+    """A level-up (or any "click here to continue") interrupts fishing; the engine's own
+    check_stray_dialog cannot run while fish_wait holds the tick.
+
+    CONFIRMED, not blind, and it returns whether the way is actually clear -- MEASURED live
+    2026-09-06: an open dialogue SWALLOWS the tab hotkeys ("e", "w"), so open_equipment_tab
+    tapped "e" three times a tick and logged "could not open the equipment tab" for the rest
+    of the run. A dialogue can also have more than one stage, so one blind SPACE is not
+    enough. _blocking_dialog, not dialogOpen alone: the box that actually did this is the one
+    dialogOpen cannot see (see _continue_box_open)."""
+    for _ in range(DIALOG_DISMISS_TRIES):
+        if not _blocking_dialog():
+            return True
         controller.key_tap(ctx.ser, "SPACE")
         controller.human_delay(0.3, 0.6)
+    return not _blocking_dialog()
 
 
-def fish_wait(ctx) -> str:
+def _fish_loop(ctx, afk: bool = False) -> str:
     """Hold the tick while the player fishes. Returns "full" (no free slot), "idle" (the player
     stood still IDLE_RECLICK_S with room left -- re-click the spot), "no_bait", or "timeout".
     INVENTORY_CHANGED wakes the check on every catch; between catches the wait is spent in
-    human-length still segments with a resting-hand fidget, like every other long wait here."""
+    human-length still segments with a resting-hand fidget, like every other long wait here.
+
+    `afk=True` is the tabbed-out variant and sends NO INPUT: no SPACE for a stray dialogue and
+    no fidget, because RuneLite is not the focused window -- both would land somewhere else.
+    Whatever box appears meanwhile is cleared by the next _dismiss_dialog on the way to a tab
+    hotkey -- NOT by the engine's check_stray_dialog, which cannot help here: tick() chains the
+    next phase inside the same tick, so it does not run in between. The poll also slows to
+    AFK_POLL_S, which is what someone watching a video is doing anyway."""
     deadline = _now() + FISH_MAX_S
     idle_since = None
     while _now() < deadline:
@@ -322,21 +438,80 @@ def fish_wait(ctx) -> str:
             return "full"
         if not _exact(inv, BAIT_NAME):
             return "no_bait"
-        _dismiss_dialog(ctx)
+        if not afk:
+            _dismiss_dialog(ctx)
         if _idle():
             idle_since = idle_since or _now()
             if _now() - idle_since >= IDLE_RECLICK_S:
                 return "idle"
         else:
             idle_since = None
-        chunk = min(outcome_waits.still_segment_s(), max(0.1, deadline - _now()))
+        segment = AFK_POLL_S if afk else outcome_waits.still_segment_s()
+        chunk = min(segment, max(0.1, deadline - _now()))
         signals = {"INVENTORY_CHANGED": None, "CHAT_MESSAGE": outcome_waits.chat_has(FULL_CHAT),
                    "ANIMATION_CHANGED": lambda p: p.get("animation") == -1}
         outcome_waits.await_pre(ctx, signals, chunk, confirm=lambda: _free_slots() <= 0,
                                 reaction=False, now_fn=_now, sleep_fn=_sleep)
-        if deadline - _now() > 1.0:
+        if not afk and deadline - _now() > 1.0:
             controller.fidget_once()
     return "timeout"
+
+
+def notice_delay_s(rng=random) -> float:
+    """How long after the fishing ends before the player notices and tabs back in.
+
+    Mostly a glance at the corner of the screen (AFK_PROMPT_RANGE_S); AFK_LATE_CHANCE of the
+    time properly distracted, and USER's 10-40s late. A full inventory sitting at the spot
+    costs nothing -- the game just idles -- so the lateness is pure realism."""
+    lo, hi = AFK_LATE_RANGE_S if rng.random() < AFK_LATE_CHANCE else AFK_PROMPT_RANGE_S
+    return rng.uniform(lo, hi)
+
+
+def tab_out(ctx) -> bool:
+    """Alt+Tab away, CONFIRMED by /state going unfocused. False means we are still looking at
+    the game (a machine with nothing else open swallows Alt+Tab entirely) -- the caller then
+    fishes focused rather than sitting there believing it is away."""
+    controller.alt_tab(ctx.ser)
+    if controller.wait_for_focus(timeout_s=AFK_UNFOCUS_WAIT_S, focused=False):
+        return True
+    debug_log.log("karambwan", "Alt+Tab didn't unfocus the game -- fishing focused")
+    return False
+
+
+def tab_back_in(ctx) -> bool:
+    """Alt+Tab back, verified, up to AFK_FOCUS_TRIES times; safety-stops otherwise.
+
+    This verification is not optional: the engine loop does not call tick() again while
+    unfocused (controller.py's "Don't blind-click into a backgrounded window" gate), so a
+    tab-back-in that lands on some OTHER window -- one that came to the foreground while we
+    were away -- would stall the whole run silently, with nothing in the log. Same reasoning,
+    same shape as routines/nmz.py's."""
+    for attempt in range(AFK_FOCUS_TRIES):
+        controller.alt_tab(ctx.ser)
+        if controller.wait_for_focus(timeout_s=AFK_FOCUS_WAIT_S):
+            return True
+        debug_log.log("karambwan", f"tab-back-in attempt {attempt + 1}/{AFK_FOCUS_TRIES} "
+                                   f"didn't regain focus")
+    ctx.state.trigger_safety_stop(
+        f"karambwan: Alt+Tab back into RuneLite failed {AFK_FOCUS_TRIES} times")
+    return False
+
+
+def fish_wait(ctx) -> str:
+    """_fish_loop, tabbed out for the wait when it is long enough to be worth it.
+
+    Returns _fish_loop's own result, plus "unfocused" when the tab back in failed -- which
+    fish_phase must NOT chain a bank trip onto, since those clicks would land in another
+    window."""
+    if _free_slots() < AFK_MIN_FREE_SLOTS or not tab_out(ctx):
+        return _fish_loop(ctx)
+    result = _fish_loop(ctx, afk=True)
+    late = notice_delay_s()
+    debug_log.log("karambwan", f"fishing done ({result}) -- tabbing back in {late:.0f}s later")
+    _sleep(late)
+    if not tab_back_in(ctx):
+        return "unfocused"
+    return result
 
 
 def fish_phase(ctx, config: dict) -> bool:
@@ -383,6 +558,9 @@ def fish_phase(ctx, config: dict) -> bool:
             return False
         debug_log.log("karambwan", f"player idle with room left -- re-clicking the spot ({n}/{IDLE_STOP_AFTER})")
         return True
+    # "timeout", or "unfocused" -- the tab back in failed and tab_back_in already safety-
+    # stopped. Either way hand back to the engine (whose own focus gate then holds the loop):
+    # chaining the bank trip onto an unfocused window would click into whatever is in front.
     return False
 
 
@@ -409,11 +587,41 @@ def _await_landing(ctx, mark, landed, budget_s: float) -> bool:
             return True
 
 
+def _open_equipment(ctx) -> bool:
+    """The worn-equipment tab, with a blind SPACE and one retry when the hotkey does not take.
+
+    MEASURED live 2026-09-06 (USER: "there is a dialog in the way so we cant press e ...
+    inventory full dialog pops up, we have to press space to confirm to use keyboard
+    shortcut"): an open dialogue swallows the tab hotkeys, so this tapped "e" three times a
+    tick and logged "could not open the equipment tab" for the rest of the run. Nothing else
+    clears that box -- _fish_loop returns "full" BEFORE it reaches its own _dismiss_dialog,
+    and tick() chains the next phase inside the same tick, so the engine's check_stray_dialog
+    does not run in between either.
+
+    _dismiss_dialog handles the box that caused this (group 229, MEASURED live -- see
+    _continue_box_open). The blind SPACE below stays as a second layer for the NEXT box that
+    neither check knows about: from here an unread box is indistinguishable from a dropped
+    keypress, and a SPACE with nothing open does nothing at all. The log line names what the
+    two checks saw, so the next occurrence says which case it was."""
+    _dismiss_dialog(ctx)
+    if controller.open_equipment_tab(ctx.ser):
+        return True
+    debug_log.log("karambwan", f"equipment tab hotkey didn't take (dialogOpen="
+                               f"{(controller.get_state() or {}).get('dialogOpen')}, "
+                               f"continueBox={_continue_box_open()}) -- SPACE and retrying")
+    controller.key_tap(ctx.ser, "SPACE")
+    controller.human_delay(0.3, 0.6)
+    if controller.open_equipment_tab(ctx.ser):
+        return True
+    debug_log.log("karambwan", "could not open the equipment tab")
+    return False
+
+
 def worn_teleport(ctx, child: int, option: str, landed, what: str) -> bool:
-    """Right-click a worn item through the equipment interface and pick `option`; True once
-    `landed()` holds (awaited on PLAYER_STOPPED/MOVING, TELEPORT_BUDGET_S)."""
-    if not controller.open_equipment_tab(ctx.ser):
-        debug_log.log("karambwan", "could not open the equipment tab")
+    """Click a worn item's `option` through the equipment interface; True once `landed()` holds
+    (awaited on PLAYER_STOPPED/MOVING, TELEPORT_BUDGET_S). One left click when the account's
+    swap is in place, the menu otherwise -- see _click_option."""
+    if not _open_equipment(ctx):
         return False
     widget = controller.get_widget(EQUIP_GROUP, child)
     if not widget.get("clickable"):
@@ -421,8 +629,8 @@ def worn_teleport(ctx, child: int, option: str, landed, what: str) -> bool:
         return False
     mark = outcome_waits.mark(ctx)
     debug_log.log("karambwan", f"{what}: {option}")
-    if not controller.click_menu_action(ctx.ser, widget, option, check_ui_blockers=False, offset=(0, 0)):
-        debug_log.log("karambwan", f"{what}: no '{option}' entry on the worn item's menu")
+    if not _click_option(ctx, widget, option, what):
+        debug_log.log("karambwan", f"{what}: neither the left click nor the menu took '{option}'")
         return False
     t0 = _now()
     out = _await_landing(ctx, mark, landed, TELEPORT_BUDGET_S)
@@ -510,8 +718,8 @@ def _open_deposit(ctx) -> bool:
 
 
 def _deposit_fish(ctx) -> bool:
-    """Right-click a karambwan in the deposit grid -> Deposit-All (the recorded human's one
-    click, -24 fish 0.3s later). Repeats up to DEPOSIT_TRIES while fish remain."""
+    """Deposit-All a karambwan in the deposit grid (the recorded human's one click, -24 fish
+    0.3s later). Repeats up to DEPOSIT_TRIES while fish remain."""
     for _ in range(DEPOSIT_TRIES):
         if _fish_count() == 0:
             return True
@@ -520,9 +728,8 @@ def _deposit_fish(ctx) -> bool:
             debug_log.log("karambwan", "karambwan not found in the deposit grid")
             return False
         mark = outcome_waits.mark(ctx)
-        if not controller.click_menu_action(ctx.ser, child, DEPOSIT_ALL_ACTION, check_ui_blockers=False,
-                                            offset=(0, 0)):
-            debug_log.log("karambwan", "no Deposit-All entry on the karambwan -- retrying")
+        if not _click_option(ctx, child, DEPOSIT_ALL_ACTION, "deposit"):
+            debug_log.log("karambwan", "Deposit-All did not land on the karambwan -- retrying")
             continue
         outcome_waits.await_pre(ctx, "INVENTORY_CHANGED", DEPOSIT_BUDGET_S,
                                 confirm=lambda: _fish_count() == 0, since=mark, reaction=False,
@@ -531,7 +738,7 @@ def _deposit_fish(ctx) -> bool:
 
 
 def _empty_barrel(ctx) -> bool:
-    """Right-click the barrel in the deposit grid -> Empty-to-bank ("You empty the barrel."
+    """Empty-to-bank the barrel in the deposit grid ("You empty the barrel."
     0.2s later in the recording). Confirmed on that chat line, or on the reader when it can
     tell; the inventory itself does not change."""
     child = _deposit_child(BARREL_NAMES)
@@ -539,9 +746,8 @@ def _empty_barrel(ctx) -> bool:
         debug_log.log("karambwan", "fish barrel not found in the deposit grid")
         return False
     mark = outcome_waits.mark(ctx)
-    if not controller.click_menu_action(ctx.ser, child, BARREL_EMPTY_ACTIONS, check_ui_blockers=False,
-                                        offset=(0, 0)):
-        debug_log.log("karambwan", "no Empty-to-bank entry on the barrel here")
+    if not _click_option(ctx, child, BARREL_EMPTY_ACTIONS, "empty barrel"):
+        debug_log.log("karambwan", "Empty-to-bank did not land on the barrel")
         return False
     emptied = outcome_waits.await_pre(
         ctx, {"CHAT_MESSAGE": outcome_waits.chat_has("empty the barrel")}, INTERFACE_BUDGET_S,
@@ -672,7 +878,8 @@ def ring_phase(ctx, config: dict) -> bool:
     refresh = controller.object_refresh_target(ring.get("x"), ring.get("y"), ring.get("plane", 0), ring.get("id"))
     mark = outcome_waits.mark(ctx)
     debug_log.log("karambwan", "fairy ring -> DKP")
-    clicked = controller.click_menu_action(ctx.ser, ring, OPT_LAST_DEST_DKP, refresh_target=refresh)
+    clicked = _click_option(ctx, ring, OPT_LAST_DEST_DKP, "fairy ring",
+                            refresh_target=refresh, interface=False)
     if not clicked:
         debug_log.log("karambwan", "no Last-destination (DKP) entry -- dialling it")
         if not _dial_dkp(ctx, ring):

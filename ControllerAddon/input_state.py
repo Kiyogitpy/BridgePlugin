@@ -77,3 +77,11 @@ firmware_protocol = 2
 # OTHER copy's None -- so in-wait fidgeting had never once fired for a routine's own wait (the
 # CLAUDE.md caveat). Read via controller._fidget_serial().
 fidget_ser = None
+
+# Where the in-wait fidgeter returns to: the cursor's resting position for the current wait,
+# as (x, y), or None until the first fidget takes one. Held across fidgets so the return
+# jitter (settings.IDLE_FIDGET_RETURN_JITTER_PX) cannot compound into a random walk that
+# carries a hover-parked cursor off its target. Shared here for the same two-copies reason as
+# fidget_ser: the engine fidgets through human_delay on __main__'s copy of controller.py and a
+# routine through fidget_once on the other, and they must agree on one anchor.
+fidget_anchor = None

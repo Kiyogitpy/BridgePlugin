@@ -4,6 +4,8 @@ recordings/2026-09-06_083723_karamwan-fishing.* -- widget ids, option texts, cha
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "routines"))
 
@@ -60,6 +62,7 @@ def _stream(monkeypatch, batches):
     clock = {"t": 1000.0}
     monkeypatch.setattr(kf, "_now", lambda: clock["t"])
     monkeypatch.setattr(kf, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(kf, "_continue_box_open", lambda: False, raising=False)
     ctx = _Ctx(bridge_events.EventStream(sock=None))
     ctx.clock = clock
     return ctx
@@ -146,7 +149,7 @@ def test_fish_wait_reports_a_sustained_idle_player(monkeypatch):
     monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": True})
     monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": False})
     ctx = _stream(monkeypatch, [])
-    assert kf.fish_wait(ctx) == "idle"
+    assert kf._fish_loop(ctx) == "idle"
     assert kf.IDLE_RECLICK_S <= ctx.clock["t"] - 1000.0 < kf.IDLE_RECLICK_S + 2.0
 
 
@@ -157,7 +160,7 @@ def test_fish_wait_dismisses_a_level_up_dialogue_and_notices_no_bait(monkeypatch
     monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
     monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": True})
     ctx = _stream(monkeypatch, [])
-    assert kf.fish_wait(ctx) == "no_bait"
+    assert kf._fish_loop(ctx) == "no_bait"
     assert keys == []                       # bait check comes first; nothing to fish with anyway
 
 
@@ -174,6 +177,7 @@ def test_repeated_idle_clicks_that_catch_nothing_are_a_safety_stop(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory", lambda: _kit(fish=10))
     monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": True})
     monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": False})
+    _afk(monkeypatch)
     spot = {"id": kf.SPOT_NPC_ID, "index": 21107, "distance": 1}
     monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [spot])
     monkeypatch.setattr(controller, "npc_index_refresh_target", lambda idx: (lambda: None))
@@ -186,6 +190,247 @@ def test_repeated_idle_clicks_that_catch_nothing_are_a_safety_stop(monkeypatch):
     assert ctx.state.safety_stopped
 
 
+# --- tabbing out while the fishing runs ----------------------------------------------------------
+
+def _afk(monkeypatch, tabs_out=True, tabs_back=True):
+    """Stub the Alt+Tab primitives; returns the list of alt_tab calls."""
+    tabs = []
+    monkeypatch.setattr(controller, "alt_tab", lambda ser: tabs.append(ser))
+    monkeypatch.setattr(controller, "wait_for_focus",
+                        lambda *a, **kw: tabs_out if kw.get("focused") is False else tabs_back)
+    return tabs
+
+
+class _Rng:
+    def __init__(self, roll):
+        self.roll = roll
+
+    def random(self):
+        return self.roll
+
+    def uniform(self, lo, hi):
+        return (lo + hi) / 2.0
+
+
+def test_notice_delay_is_usually_prompt():
+    assert kf.notice_delay_s(_Rng(0.99)) == pytest.approx(sum(kf.AFK_PROMPT_RANGE_S) / 2.0)
+
+
+def test_notice_delay_is_sometimes_a_proper_10_to_40s_lateness():
+    late = kf.notice_delay_s(_Rng(0.0))
+    assert kf.AFK_LATE_RANGE_S[0] <= late <= kf.AFK_LATE_RANGE_S[1]
+    assert late > kf.AFK_PROMPT_RANGE_S[1]
+
+
+def test_fish_wait_tabs_out_for_a_long_wait_and_back_in_once_it_is_full(monkeypatch):
+    inv = {"items": _kit(fish=0)}
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inv["items"]))
+    monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": False})
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": False})
+    ctx = _stream(monkeypatch, [
+        [("INVENTORY_CHANGED", {"tick": 5}, lambda: inv.__setitem__("items", _kit(fish=24)))],
+    ])
+    tabs = _afk(monkeypatch)
+    monkeypatch.setattr(kf, "notice_delay_s", lambda *a: 31.0)
+    assert kf.fish_wait(ctx) == "full"
+    assert len(tabs) == 2                                    # out, then back in
+    assert ctx.clock["t"] - 1000.0 >= 31.0                   # the lateness was actually spent
+
+
+def test_a_tabbed_out_wait_sends_no_input_at_all(monkeypatch):
+    """SPACE for a level-up dialogue, or a fidget, would land in whatever window is focused
+    now -- not RuneLite. Nothing may be sent between the tab out and the tab back in."""
+    inv = {"items": _kit(fish=0)}
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inv["items"]))
+    monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": False})
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": True})
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    fidgets = []
+    ctx = _stream(monkeypatch, [
+        [("INVENTORY_CHANGED", {"tick": 5}, lambda: inv.__setitem__("items", _kit(fish=24)))],
+    ])
+    monkeypatch.setattr(controller, "fidget_once", lambda: fidgets.append(1))
+    _afk(monkeypatch)
+    monkeypatch.setattr(kf, "notice_delay_s", lambda *a: 3.0)
+    assert kf.fish_wait(ctx) == "full"
+    assert keys == []
+    assert fidgets == []
+
+
+def test_the_last_few_slots_are_fished_without_tabbing_out(monkeypatch):
+    inv = {"items": _kit(fish=23)}
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inv["items"]))
+    monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": False})
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": False})
+    ctx = _stream(monkeypatch, [
+        [("INVENTORY_CHANGED", {"tick": 5}, lambda: inv.__setitem__("items", _kit(fish=24)))],
+    ])
+    tabs = _afk(monkeypatch)
+    assert kf.fish_wait(ctx) == "full"
+    assert tabs == []
+
+
+def test_an_alt_tab_that_never_unfocuses_just_fishes_focused(monkeypatch):
+    """A machine with only RuneLite open swallows Alt+Tab; fish normally rather than sit
+    there believing we are away."""
+    inv = {"items": _kit(fish=0)}
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inv["items"]))
+    monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": False})
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": False})
+    ctx = _stream(monkeypatch, [
+        [("INVENTORY_CHANGED", {"tick": 5}, lambda: inv.__setitem__("items", _kit(fish=24)))],
+    ])
+    tabs = _afk(monkeypatch, tabs_out=False)
+    assert kf.fish_wait(ctx) == "full"
+    assert len(tabs) == 1                       # tried once, then gave up on the idea
+    assert not ctx.state.safety_stopped
+
+
+def test_a_tab_back_in_that_never_regains_focus_is_a_safety_stop(monkeypatch):
+    inv = {"items": _kit(fish=0)}
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inv["items"]))
+    monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": False})
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": False})
+    ctx = _stream(monkeypatch, [
+        [("INVENTORY_CHANGED", {"tick": 5}, lambda: inv.__setitem__("items", _kit(fish=24)))],
+    ])
+    tabs = _afk(monkeypatch, tabs_back=False)
+    monkeypatch.setattr(kf, "notice_delay_s", lambda *a: 3.0)
+    assert kf.fish_wait(ctx) == "unfocused"
+    assert len(tabs) == 1 + kf.AFK_FOCUS_TRIES
+    assert ctx.state.safety_stopped
+
+
+def test_fish_phase_hands_back_to_the_engine_when_the_tab_back_in_failed(monkeypatch):
+    """An "unfocused" result must never chain into the bank trip -- those clicks would land in
+    another window. fish_phase returns False; the engine's own focus gate then holds the loop."""
+    inv = {"items": _kit(fish=0)}
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inv["items"]))
+    monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": False})
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": False})
+    spot = {"id": kf.SPOT_NPC_ID, "index": 21107, "distance": 1}
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: [spot])
+    monkeypatch.setattr(controller, "npc_index_refresh_target", lambda idx: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    ctx = _stream(monkeypatch, [
+        [("INVENTORY_CHANGED", {"tick": 5}, lambda: inv.__setitem__("items", _kit(fish=24)))],
+    ])
+    _afk(monkeypatch, tabs_back=False)
+    monkeypatch.setattr(kf, "notice_delay_s", lambda *a: 3.0)
+    assert kf.fish_phase(ctx, kf.DEFAULT_CONFIG) is False
+
+
+# --- dialogues swallow the tab hotkeys -----------------------------------------------------------
+
+def test_the_inventory_full_box_is_seen_even_though_dialogopen_reads_false(monkeypatch):
+    """MEASURED live 2026-09-06 with the box on screen: /state said dialogOpen FALSE, because
+    GameStateProvider only counts the NPC/player/sprite dialogues. /widgets/dump at that same
+    moment carried 229.3 "You can't carry any more Karambwan." and 229.4 "Click here to
+    continue" -- the PLAIN message box, which /widget reports as clickable."""
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda g, c, index=None: {"found": True, "hidden": False,
+                                                  "clickable": True,
+                                                  "text": "Click here to continue"}
+                        if (g, c) == (kf.CONTINUE_GROUP, kf.CONTINUE_CHILD) else {})
+    assert kf._continue_box_open() is True
+
+
+def test_a_message_box_that_is_not_the_continue_prompt_is_not_one(monkeypatch):
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda g, c, index=None: {"clickable": True, "text": "Slayer master"})
+    assert kf._continue_box_open() is False
+
+
+def test_dismiss_dialog_clears_the_message_box_that_dialogopen_cannot_see(monkeypatch):
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": False})
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    ctx = _stream(monkeypatch, [])
+    boxes = iter([True, False, False])
+    monkeypatch.setattr(kf, "_continue_box_open", lambda: next(boxes, False))
+    assert kf._dismiss_dialog(ctx) is True
+    assert keys == ["SPACE"]
+
+
+def test_dismiss_dialog_presses_space_until_the_box_is_actually_gone(monkeypatch):
+    flags = iter([True, True, False])
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": next(flags)})
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    ctx = _stream(monkeypatch, [])
+    assert kf._dismiss_dialog(ctx) is True
+    assert keys == ["SPACE", "SPACE"]
+
+
+def test_dismiss_dialog_gives_up_on_a_box_that_will_not_close(monkeypatch):
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": True})
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    ctx = _stream(monkeypatch, [])
+    assert kf._dismiss_dialog(ctx) is False
+    assert len(keys) == kf.DIALOG_DISMISS_TRIES
+
+
+def test_a_swallowed_tab_hotkey_is_answered_with_a_blind_space_and_one_retry(monkeypatch):
+    """The human recording shows NO dialogue when the inventory fills, so the box USER hit
+    live may be one /state's dialogOpen does not report -- from here that is indistinguishable
+    from a dropped keypress. A failed tab tap therefore gets the SPACE anyway (harmless with
+    no dialogue open) and one more attempt, rather than giving up for the rest of the run."""
+    calls = []
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": False})
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: calls.append(k))
+    taps = iter([False, True])
+    monkeypatch.setattr(controller, "open_equipment_tab",
+                        lambda ser: calls.append("equipment-tab") or next(taps))
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda group, child, index=None: {"clickable": True, "screenX": 9,
+                                                          "screenY": 9})
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: calls.append(kw.get("expected_action")) or True)
+    monkeypatch.setattr(controller, "get_player", lambda: dict(MINE))
+    ctx = _stream(monkeypatch, [[("PLAYER_STOPPED", {"tick": 3}, None)]])
+    assert kf.worn_teleport(ctx, kf.EQUIP_GLOVES_CHILD, kf.OPT_GEM_MINE,
+                            lambda: True, "gem mine") is True
+    assert calls[:3] == ["equipment-tab", "SPACE", "equipment-tab"]
+
+
+def test_worn_teleport_clears_a_blocking_dialogue_before_the_tab_hotkey(monkeypatch):
+    """MEASURED live 2026-09-06: the inventory-full dialogue is still up when the fishing wait
+    ends -- _fish_loop returns "full" before it reaches its own _dismiss_dialog, and tick()
+    chains into to_bank in the SAME tick, so the engine's check_stray_dialog never runs. A
+    dialogue swallows the tab hotkeys, so open_equipment_tab tapped "e" three times a tick and
+    logged "could not open the equipment tab" for the rest of the run."""
+    calls = []
+    flags = iter([True, False, False, False])
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": next(flags, False)})
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: calls.append(k))
+    monkeypatch.setattr(controller, "open_equipment_tab",
+                        lambda ser: calls.append("equipment-tab") or True)
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda group, child, index=None: {"clickable": True, "screenX": 9,
+                                                          "screenY": 9})
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: calls.append(kw.get("expected_action")) or True)
+    monkeypatch.setattr(controller, "get_player", lambda: dict(MINE))
+    ctx = _stream(monkeypatch, [[("PLAYER_STOPPED", {"tick": 3}, None)]])
+    assert kf.worn_teleport(ctx, kf.EQUIP_GLOVES_CHILD, kf.OPT_GEM_MINE,
+                            lambda: True, "gem mine") is True
+    assert calls[:2] == ["SPACE", "equipment-tab"]
+
+
+def test_ensure_inventory_tab_clears_a_blocking_dialogue_first(monkeypatch):
+    """Same swallowed hotkey, the other tab: "w" after the gem-mine landing."""
+    calls = []
+    flags = iter([True, False, False])
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": next(flags, False)})
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: calls.append(k))
+    monkeypatch.setattr(controller, "get_active_tab", lambda: kf.INVENTORY_TAB_INDEX)
+    ctx = _stream(monkeypatch, [])
+    assert kf._ensure_inventory_tab(ctx) is True
+    assert calls == ["SPACE"]
+
+
 # --- worn-item teleports ------------------------------------------------------------------------
 
 def _equipment_setup(monkeypatch, player):
@@ -196,9 +441,13 @@ def _equipment_setup(monkeypatch, player):
                                                           "group": group, "child": child})
     menu = []
     monkeypatch.setattr(controller, "click_menu_action",
-                        lambda ser, e, option, **kw: menu.append((e["group"], e["child"], option)) or True)
+                        lambda ser, e, option, **kw: menu.append(("menu", e["group"], e["child"], option)) or True)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: menu.append(("left", e["group"], e["child"],
+                                                          kw.get("expected_action"))) or True)
     monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
     monkeypatch.setattr(controller, "get_active_tab", lambda: kf.INVENTORY_TAB_INDEX)
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": False})
     return menu
 
 
@@ -211,12 +460,14 @@ def test_ensure_inventory_tab_taps_until_the_active_tab_varc_agrees(monkeypatch)
     keys = []
     monkeypatch.setattr(controller, "key_tap", lambda ser, k: (keys.append(k), tab.__setitem__("v", 3)))
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": False})
+    monkeypatch.setattr(kf, "_continue_box_open", lambda: False)     # hermetic: no live bridge
     ctx = _Ctx(None)
     assert kf._ensure_inventory_tab(ctx) is True
     assert keys == [controller.INVENTORY_TAB_KEY]
 
 
-def test_to_bank_right_clicks_the_worn_gloves_for_gem_mine(monkeypatch):
+def test_to_bank_left_clicks_the_worn_gloves_for_gem_mine(monkeypatch):
     player = dict(DKP)
     menu = _equipment_setup(monkeypatch, player)
     ctx = _stream(monkeypatch, [
@@ -226,11 +477,11 @@ def test_to_bank_right_clicks_the_worn_gloves_for_gem_mine(monkeypatch):
     ctx.state.data["kf_trip_emptied"] = True
     assert kf.to_bank_phase(ctx, kf.DEFAULT_CONFIG) is True
     assert ctx.clock["t"] - 1000.0 < 1.0          # landed on the pushed varbit, not the budget
-    assert menu == [(387, kf.EQUIP_GLOVES_CHILD, kf.OPT_GEM_MINE)]
+    assert menu == [("left", 387, kf.EQUIP_GLOVES_CHILD, kf.OPT_GEM_MINE)]
     assert ctx.state.data["kf_trip_emptied"] is False
 
 
-def test_cape_phase_right_clicks_the_worn_cape_and_resets_the_trip(monkeypatch):
+def test_cape_phase_left_clicks_the_worn_cape_and_resets_the_trip(monkeypatch):
     player = dict(MINE)
     menu = _equipment_setup(monkeypatch, player)
     ctx = _stream(monkeypatch, [
@@ -238,7 +489,7 @@ def test_cape_phase_right_clicks_the_worn_cape_and_resets_the_trip(monkeypatch):
     ])
     ctx.state.data["kf_trip_emptied"] = True
     assert kf.cape_phase(ctx, kf.DEFAULT_CONFIG) is True
-    assert menu == [(387, kf.EQUIP_CAPE_CHILD, kf.OPT_CAPE_TELEPORT)]
+    assert menu == [("left", 387, kf.EQUIP_CAPE_CHILD, kf.OPT_CAPE_TELEPORT)]
     assert ctx.state.data["kf_trip_emptied"] is False
 
 
@@ -284,17 +535,21 @@ def test_bank_phase_deposits_all_empties_the_barrel_and_closes(monkeypatch):
     monkeypatch.setattr(controller, "get_api", lambda g, r: None)
     menu = []
     monkeypatch.setattr(controller, "click_menu_action",
-                        lambda ser, e, option, **kw: menu.append((e.get("itemName"), option)) or True)
+                        lambda ser, e, option, **kw: menu.append(("menu", e.get("itemName"), option)) or True)
     keys = []
     monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
-    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    monkeypatch.setattr(
+        controller, "click_entity",
+        lambda ser, e, **kw: (menu.append(("left", e.get("itemName"), kw["expected_action"]))
+                              if kw.get("expected_action") else None) or True)
     ctx = _stream(monkeypatch, [
         [("INVENTORY_CHANGED", {"tick": 1}, lambda: inv.__setitem__("items", _kit(fish=0)))],
         [("CHAT_MESSAGE", {"message": "You empty the barrel."}, None)],
         [("WIDGET_CLOSED", {"groupId": kf.DEPOSIT_GROUP}, lambda: ui.__setitem__("open", False))],
     ])
     assert kf.bank_phase(ctx, kf.DEFAULT_CONFIG) is True
-    assert menu == [("Raw karambwan", kf.DEPOSIT_ALL_ACTION), ("Fish barrel", kf.BARREL_EMPTY_ACTIONS)]
+    assert menu == [("left", "Raw karambwan", kf.DEPOSIT_ALL_ACTION),
+                    ("left", "Fish barrel", kf.BARREL_EMPTY_ACTIONS)]
     assert keys == ["ESC"]
     assert ctx.state.data["kf_trip_emptied"] is True
 
@@ -329,6 +584,74 @@ def test_bank_phase_walks_to_the_chest_when_it_is_not_in_view(monkeypatch):
     assert walked == [kf.TILE_DEPOSIT]
 
 
+# --- one left click instead of a menu ------------------------------------------------------------
+#
+# USER 2026-09-06: "basicly all things we do in karam fishing ive custom menu swapped so a simple
+# left click will do, even the fairy ring will default to last destination. both teleports in
+# inventory left clicks and deposit all and empty barrel both left clicks."
+
+def test_click_option_takes_the_swapped_left_click_and_never_opens_a_menu(monkeypatch):
+    calls = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: calls.append(("left", kw.get("expected_action"),
+                                                           kw.get("simulate_mistakes"))) or True)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, e, option, **kw: calls.append(("menu", option)) or True)
+    ctx = _stream(monkeypatch, [])
+    assert kf._click_option(ctx, {"screenX": 1, "screenY": 1}, "Deposit-All", "fish") is True
+    assert calls == [("left", "Deposit-All", False)]
+
+
+def test_click_option_falls_back_to_the_menu_when_the_hover_disagrees(monkeypatch):
+    """A swap that is missing (or reset by a game update) must cost a menu, never a wrong
+    action -- the two WORN items' un-swapped left click is Remove, i.e. unequipping the gloves
+    mid-run."""
+    calls = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: calls.append(("left", kw.get("expected_action")))
+                        or controller.CLICK_WITHHELD)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, e, option, **kw: calls.append(("menu", option)) or True)
+    ctx = _stream(monkeypatch, [])
+    assert kf._click_option(ctx, {"screenX": 1, "screenY": 1}, "Gem Mine", "gem mine") is True
+    assert calls == [("left", "Gem Mine"), ("menu", "Gem Mine")]
+
+
+def test_click_option_reports_failure_when_neither_path_lands(monkeypatch):
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: False)
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, e, option, **kw: False)
+    ctx = _stream(monkeypatch, [])
+    assert kf._click_option(ctx, {"screenX": 1, "screenY": 1}, "Teleport", "cape") is False
+
+
+def test_worn_teleport_falls_back_to_the_menu_when_the_swap_is_missing(monkeypatch):
+    player = dict(DKP)
+    monkeypatch.setattr(controller, "get_player", lambda: dict(player))
+    monkeypatch.setattr(controller, "open_equipment_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda group, child, index=None: {"clickable": True, "screenX": 9,
+                                                          "screenY": 9, "group": group,
+                                                          "child": child})
+    monkeypatch.setattr(controller, "get_state", lambda: {"dialogOpen": False})
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
+    monkeypatch.setattr(controller, "get_active_tab", lambda: kf.INVENTORY_TAB_INDEX)
+    calls = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: calls.append("left") or controller.CLICK_WITHHELD)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, e, option, **kw: calls.append(("menu", option)) or True)
+    ctx = _stream(monkeypatch, [
+        [("VARBIT_CHANGED", {"varbitId": kf.VARBIT_BUSY, "value": 0}, lambda: player.update(MINE))],
+    ])
+    assert kf.worn_teleport(ctx, kf.EQUIP_GLOVES_CHILD, kf.OPT_GEM_MINE,
+                            lambda: _player_region(player) == kf.REGION_GEM_MINE, "gem mine") is True
+    assert calls == ["left", ("menu", kf.OPT_GEM_MINE)]
+
+
+def _player_region(player):
+    return player.get("regionId")
+
+
 # --- the fairy ring -----------------------------------------------------------------------------
 
 def _ring_setup(monkeypatch, player):
@@ -345,13 +668,15 @@ def test_ring_phase_takes_last_destination_dkp_in_one_click(monkeypatch):
     _ring_setup(monkeypatch, player)
     menu = []
     monkeypatch.setattr(controller, "click_menu_action",
-                        lambda ser, e, option, **kw: menu.append(option) or True)
+                        lambda ser, e, option, **kw: menu.append(("menu", option)) or True)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: menu.append(("left", kw.get("expected_action"))) or True)
     ctx = _stream(monkeypatch, [
         [("PLAYER_MOVING", {"tick": 2}, None)],
         [("PLAYER_STOPPED", {"tick": 12}, lambda: player.update(DKP))],
     ])
     assert kf.ring_phase(ctx, kf.DEFAULT_CONFIG) is True
-    assert menu == [kf.OPT_LAST_DEST_DKP]
+    assert menu == [("left", kf.OPT_LAST_DEST_DKP)]        # no menu at all: the swap is enough
 
 
 def test_ring_phase_dials_dkp_when_last_destination_is_not_offered(monkeypatch):
@@ -369,6 +694,8 @@ def test_ring_phase_dials_dkp_when_last_destination_is_not_offered(monkeypatch):
     clicks = []
 
     def click_entity(ser, e, **kw):
+        if kw.get("expected_action") == kf.OPT_LAST_DEST_DKP:
+            return controller.CLICK_WITHHELD      # the swap is not on this ring
         child = e.get("child")
         clicks.append(child)
         if child in arrows:

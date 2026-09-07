@@ -33,10 +33,13 @@
 import re
 import time
 
+import bank_memory
 import bridge_events
 import controller
 import debug_log
+import teleports
 import travel
+import worldmap
 
 # Event-driven waits (2026-09-04, docs/superpowers/specs/2026-09-04-event-driven-outcomes-
 # design.md): the bank interface is group 12 (InterfaceID.Bankmain); its WIDGET_LOADED /
@@ -999,35 +1002,529 @@ def withdraw_best_prayer_restore(ctx, quantity: int = 1) -> bool:
     return search_and_withdraw(ctx, best.get("name"), quantity)
 
 
+# Where a bank trip records the tile it left from, so it can walk back to it afterwards.
+# USER-REPORTED 2026-09-07 ("ends up stuck at Ferox"): before this, the ONLY save/restore
+# machinery in the file lived inside _bank_via_ferox, so a trip to a bank within
+# maxBankDistance (40) walked there and simply carried on fighting next to it -- and the Ferox
+# path's own restore was popped BEFORE the walk was attempted, so one walk that gave up partway
+# (WALK_MAX_STALLS is a cumulative budget of 4 across a whole cross-map route) discarded the
+# destination with no possibility of a retry. The anchor is now recorded once at the top of
+# every trip, whichever branch it takes, and survives a failed walk so a later tick retries.
+RETURN_LOCATION_KEY = "bank_return_location"
+RETURN_ATTEMPTS_KEY = "bank_return_attempts"
+
+# Set the moment travel.teleport_to_ferox succeeds, cleared when the trip completes.
+# FEROX_BANK_NAMES is a strict SUBSET of DEFAULT_BANK_NAMES, and the Java panel exports neither
+# bankNames nor maxBankDistance (so both defaults always apply) -- meaning that once a trip
+# aborted after the teleport had already landed (chest not visible yet, or open_bank failed),
+# the next tick's bank_up matched the Ferox chest on its own nearby-bank branch and banked
+# there, skipping use_fountain AND the walk home. This latch keeps a trip that has teleported
+# on the Ferox path until it finishes.
+TELEPORTED_KEY = "bank_teleported_to_ferox"
+
+# Walks home attempted before giving up. A ceiling, because a stranded routine is exactly the
+# reported bug and CLAUDE.md's standing lesson is that a silent loop is worse than a crash --
+# so the ceiling surfaces as a safety stop rather than a shrug.
+RETURN_WALK_MAX_ATTEMPTS = 3
+
+
+RETURN_TELEPORT_KEY = "bank_return_teleport"
+
+# How long to wait for a teleport to land before giving up on it and walking. A teleport is
+# ~4 game ticks of animation plus a region load; falconry measured its own landings at 2.4-3.2s.
+RETURN_TELEPORT_BUDGET_S = 6.0
+RETURN_TELEPORT_POLL_S = 0.3
+
+# Close enough to the landing tile to call the teleport landed. Generous: several teleports drop
+# you on a small spread of tiles, and the walk home covers the rest either way.
+RETURN_TELEPORT_ARRIVAL_TILES = 12
+
+# How long a transport's destination picker has to appear and be answered.
+PICKER_BUDGET_S = 4.0
+
+# One flood from the anchor replaces a cross-map search per candidate teleport. The radius
+# doubles as the rule "a landing further than this from home is not worth teleporting to".
+GOAL_FLOOD_RADIUS = 200
+GOAL_FLOOD_MAX_NODES = 400000
+
+# An "approach" is the short walk from where a hop lands to the object that makes the NEXT hop
+# (arrival tile -> jewellery box, a few dozen tiles inside a house). Bounded hard, because the
+# static map treats missing data as PASSABLE and so joins every dungeon, instance and POH
+# template into one giant connected VOID -- MEASURED 2026-09-07: unbounded, the planner spent
+# 78s inventing hundreds-of-tiles routes between unrelated underground coordinates, and the
+# nonsense outranked a ring of dueling that teleported straight home. A real approach is short;
+# anything long is the void, not a walk.
+APPROACH_MAX_TILES = 60
+# Bounds the SEARCH as well as the answer: a short approach resolves well inside this, while a
+# void crawl gives up in milliseconds instead of minutes.
+APPROACH_MAX_NODES = 20000
+
+
+def _item_rows(payload):
+    """Item dicts out of either bridge shape.
+
+    /inventory is a LIST of items; /equipment is a DICT KEYED BY SLOT whose values are the
+    items. Iterating the dict yields slot NAMES, so treating them alike silently contributed
+    nothing from equipment -- caught 2026-09-07 when a worn-item lookup raised on a str.
+    """
+    if isinstance(payload, dict):
+        return [v for v in payload.values() if isinstance(v, dict)]
+    return [i for i in (payload or []) if isinstance(i, dict)]
+
+
+def _owned_item_ids(config):
+    """Every item id we could get our hands on this trip: banked, carried, or worn.
+
+    Bank memory is what makes the banked half answerable at all -- /bank can only report what
+    the interface is currently drawing, so an active search or a non-active tab would hide the
+    very teleport we are looking for (see BankMemoryProvider's header).
+    """
+    ids = set()
+
+    memory = bank_memory.load()
+    if memory.seen:
+        for item in memory.items:
+            try:
+                ids.add(int(item.get("id")))
+            except (TypeError, ValueError):
+                continue
+
+    for source in (controller.get_inventory(), controller.get_equipment()):
+        for item in _item_rows(source):
+            try:
+                ids.add(int(item.get("id")))
+            except (TypeError, ValueError):
+                continue
+
+    return ids
+
+
+def _route_length(sx, sy, plane, gx, gy, max_nodes=None):
+    """Walk length in tiles, or None when there is no route. Same-plane only, like the map.
+
+    `max_nodes` bounds the SEARCH, not just the answer. That matters because the static map
+    treats missing data as passable, so a search between two unrelated underground coordinates
+    crawls an enormous connected void before failing -- capping the node budget makes that give
+    up in milliseconds while a genuine short approach still resolves.
+    """
+    try:
+        if max_nodes is None:
+            route = worldmap.find_path(sx, sy, plane, gx, gy, goal_adjacent=True)
+        else:
+            route = worldmap.find_path(sx, sy, plane, gx, gy, goal_adjacent=True,
+                                       max_nodes=max_nodes)
+    except Exception:
+        return None
+    return len(route) if route else None
+
+
+def _poh_config(config):
+    """What is built in the player's house, off the bridge config's `poh` block.
+
+    Absent means everything OFF -- an unconfigured account must never route through a house it
+    may not have. The client cannot see inside a POH, which is why this is configuration at all
+    (Shortest Path does the same; see ControllerConfig's Player-Owned House section).
+    """
+    poh = (config or {}).get("poh") or {}
+    return teleports.PohConfig(
+        enabled=bool(poh.get("enabled")),
+        box_tier=poh.get("boxTier", "NONE"),
+        portals=bool(poh.get("portals")),
+        fairy_ring=bool(poh.get("fairyRing")),
+        mounted_items=bool(poh.get("mountedItems")),
+    )
+
+
+def _referenced_varbits(owned_ids=None):
+    """Live values for the varbits that rows we could ACTUALLY take depend on.
+
+    One read per row would be ~450 HTTP calls, and the whole table references 86 distinct
+    varbits -- still ~1.7s of round trips for gates on teleports we do not own. Narrowing to
+    rows whose items we hold cuts it to a handful. Every row that needs a varbit needs it
+    ANSWERED or it is rejected (teleports.varbits_satisfied -- unknown FAILS, deliberately),
+    so under-reading here can only lose a route, never invent one.
+    """
+    have = set(owned_ids) if owned_ids is not None else None
+    wanted = set()
+    for t in teleports.load_all():
+        if have is not None and t.item_ids and not (t.item_ids & have):
+            continue
+        for vid, _op, _val in t.varbits:
+            wanted.add(vid)
+
+    values = {}
+    for vid in sorted(wanted):
+        # get_varbit returns the VALUE, not a {"value": n} envelope -- and None means "could
+        # not read", never zero (its own docstring says so). An earlier cut checked for a dict
+        # here and so silently read nothing, which rejected every varbit-gated row.
+        value = controller.get_varbit(vid)
+        if value is not None:
+            values[vid] = value
+    return values
+
+
+def _leg_dict(t):
+    """A transport edge, flattened to something that survives in ctx.state.data across ticks."""
+    return {
+        "kind": t.kind,
+        "display": t.display,
+        "item": t.item_name,
+        "option": t.destination_name,
+        "dest": list(t.dest),
+        "origin": list(t.origin) if t.origin else None,
+        "object_id": _trailing_int(t.object_info),
+        "object_info": t.object_info,
+    }
+
+
+def _trailing_int(text):
+    """`Teleport Menu Ornate Jewellery Box 37520` -> 37520.
+
+    The column is `menuOption menuTarget objectID` with both names multi-word, so it cannot be
+    split reliably -- but the object id is always the trailing integer, and an id is all we need
+    to find the thing in /objects.
+    """
+    if not text:
+        return None
+    tail = text.strip().split()[-1]
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+
+
+def _plan_return_teleport(ctx, config):
+    """The cheapest chain of transports home, or None to just walk.
+
+    Called INSIDE the bank, because that is the only moment an item leg can be withdrawn.
+    """
+    if not config.get("returnToSpot"):
+        return None
+
+    anchor = ctx.state.data.get(RETURN_LOCATION_KEY)
+    if not anchor:
+        return None
+
+    player = controller.get_player() or {}
+    px, py, plane = player.get("x"), player.get("y"), player.get("plane", 0)
+    if px is None:
+        return None
+
+    owned = _owned_item_ids(config)
+    goal = (anchor["x"], anchor["y"], anchor.get("plane", 0))
+
+    # ONE flood from the goal, not N cross-map searches. MEASURED 2026-09-07: with a 913-item
+    # bank unlocking dozens of candidate teleports, one find_path per candidate cost 106s for a
+    # single decision. reachable_from answers {(x, y): steps} for the whole neighbourhood in a
+    # single pass, so "how far is this landing spot from home" becomes a dict lookup.
+    #
+    # The radius therefore doubles as the product rule: a teleport landing further than
+    # GOAL_FLOOD_RADIUS from the anchor is not worth taking, and simply reads as no route.
+    try:
+        goal_reach = worldmap.reachable_from(goal[0], goal[1], goal[2],
+                                             radius=GOAL_FLOOD_RADIUS,
+                                             max_nodes=GOAL_FLOOD_MAX_NODES)
+    except Exception:
+        goal_reach = {}
+
+    approach_cache = {}
+
+    def route_len(a, b):
+        if b[:2] == goal[:2] and b[2] == goal[2]:
+            return goal_reach.get((a[0], a[1])) if a[2] == goal[2] else None
+        # The only other question asked is "can I walk from here to this edge's origin", and
+        # origins are few and shared (every jewellery box row has the same one), so a plain
+        # cache over real searches is enough.
+        key = (a[:2], b[:2])
+        if key not in approach_cache:
+            n = (_route_length(a[0], a[1], a[2], b[0], b[1],
+                               max_nodes=APPROACH_MAX_NODES) if a[2] == b[2] else None)
+            approach_cache[key] = n if (n is not None and n <= APPROACH_MAX_TILES) else None
+        return approach_cache[key]
+
+    return teleports.plan(
+        (px, py, plane), goal,
+        owned_ids=owned,
+        route_len=route_len,
+        varbit_values=_referenced_varbits(owned),
+        poh=_poh_config(config),
+        wilderness_level=player.get("wildernessLevel", 0) or 0,
+    )
+
+
+def _withdraw_return_teleport(ctx, config):
+    """Plan the way home and make sure the FIRST leg's item is carried before the bank closes.
+
+    Later legs are objects standing in the world (a jewellery box, a portal) and need nothing
+    withdrawn. Never fatal: any failure here just means we walk, exactly as before this existed.
+    """
+    try:
+        legs = _plan_return_teleport(ctx, config)
+    except Exception as exc:
+        debug_log.log("bank", f"couldn't plan a route home ({exc}) -- will walk")
+        return
+
+    if not legs:
+        return
+
+    first = legs[0]
+    if first.kind == "item" and first.item_name:
+        carried = {(i.get("name") or "").lower() for i in _item_rows(controller.get_inventory())}
+        worn = {(i.get("name") or "").lower() for i in _item_rows(controller.get_equipment())}
+        name = first.item_name.lower()
+        if not (any(name in n for n in carried) or any(name in n for n in worn)):
+            debug_log.log("bank", f"withdrawing {first.item_name} to travel home")
+            if not search_and_withdraw(ctx, first.item_name, 1):
+                debug_log.log("bank", f"couldn't withdraw {first.item_name} -- walking instead")
+                return
+
+    debug_log.log("bank", "route home: " + " -> ".join(l.display for l in legs))
+    ctx.state.data[RETURN_TELEPORT_KEY] = {"legs": [_leg_dict(l) for l in legs]}
+
+
+def _await_arrival(dest, budget_s=RETURN_TELEPORT_BUDGET_S):
+    """True once we are standing near `dest`. Polled, never slept off -- karambwan_fishing
+    MEASURED that a teleport's own signals fire on the tick the LOADING screen starts, when the
+    bridge answers nothing at all."""
+    waited = 0.0
+    while waited < budget_s:
+        time.sleep(RETURN_TELEPORT_POLL_S)
+        waited += RETURN_TELEPORT_POLL_S
+        player = controller.get_player() or {}
+        px, py = player.get("x"), player.get("y")
+        if px is None:
+            continue
+        if (player.get("plane", 0) == dest[2]
+                and abs(px - dest[0]) <= RETURN_TELEPORT_ARRIVAL_TILES
+                and abs(py - dest[1]) <= RETURN_TELEPORT_ARRIVAL_TILES):
+            return True
+    return False
+
+
+def _run_leg(ctx, leg):
+    """Execute one hop. False means the chain stops and the caller walks from here."""
+    dest = leg.get("dest") or []
+    if len(dest) != 3:
+        return False
+    return (_run_item_leg(ctx, leg) if leg.get("kind") == "item"
+            else _run_object_leg(ctx, leg)) and _await_arrival(dest)
+
+
+def _run_item_leg(ctx, leg):
+    """An inventory teleport: LEFT-click verified through /hover, menu only as the fallback.
+
+    The pattern falconry/karambwan already prove live (USER 2026-09-06: "for inventory teleports
+    ive changed them so we just click the item and we teleport to the right spot").
+    """
+    name = (leg.get("item") or "").lower()
+    item = next((i for i in (controller.get_inventory() or [])
+                 if name and name in (i.get("name") or "").lower()), None)
+    if item is None:
+        debug_log.log("bank", f"no {leg.get('item')} in inventory -- walking instead")
+        return False
+
+    option = leg.get("option")
+    debug_log.log("bank", f"leg: {leg.get('display')}")
+    controller.open_inventory_tab(ctx.ser)
+    ok = controller.click_entity(ctx.ser, item, check_ui_blockers=False,
+                                 simulate_mistakes=False,
+                                 expected_action=option if option else None)
+    if not ok:
+        if getattr(ok, "withheld", False):
+            debug_log.log("bank", f"{leg.get('item')}: left-click isn't the teleport here "
+                                  f"-- using the menu")
+        ok = controller.click_menu_action(ctx.ser, item, option or "Teleport",
+                                          check_ui_blockers=False)
+    return bool(ok)
+
+
+def _run_object_leg(ctx, leg):
+    """A world-object hop: a POH jewellery box or portal.
+
+    NOT YET VERIFIED LIVE -- it has never run inside a house. Every step confirms, and any
+    failure returns False so the caller falls back to walking rather than clicking blindly.
+    """
+    obj_id = leg.get("object_id")
+    origin = leg.get("origin")
+    if obj_id is None or not origin:
+        return False
+
+    # Walk to the object first: the game accepts a click on anything visible and then silently
+    # does nothing when it cannot path there (CLAUDE.md's standing invariant).
+    if not travel.walk_to(ctx, {"x": origin[0], "y": origin[1], "plane": origin[2]},
+                          goal_adjacent=True):
+        debug_log.log("bank", f"couldn't reach {leg.get('display')}'s object -- walking instead")
+        return False
+
+    obj = controller.get_object_at(origin[0], origin[1], origin[2], obj_id, radius=16)
+    if obj is None:
+        obj = next((o for o in (controller.get_objects(radius=16) or [])
+                    if o.get("id") == obj_id), None)
+    if obj is None:
+        debug_log.log("bank", f"object {obj_id} not found for {leg.get('display')}")
+        return False
+
+    debug_log.log("bank", f"leg: {leg.get('display')} (object {obj_id})")
+    if not controller.click_entity(
+            ctx.ser, obj, simulate_mistakes=False,
+            refresh_target=controller.object_refresh_target(origin[0], origin[1], origin[2],
+                                                            obj_id, radius=16)):
+        return False
+
+    option = leg.get("option")
+    if not option:
+        return True
+    return _pick_destination(ctx, option)
+
+
+def _pick_destination(ctx, option):
+    """Answer a transport's destination picker by the TSV's own destination name.
+
+    The box's `Display info` is "3: Ferox Enclave" -- the digit is the interface's own shortcut
+    and the text is the entry. Both are tried: the widget carrying that text, else the digit.
+    UNVERIFIED live; this is the assumption the whole chain rests on.
+    """
+    deadline = _now() + PICKER_BUDGET_S
+    while _now() < deadline:
+        dump = controller.get_widgets_dump() or {}
+        widgets = dump.get("widgets") if isinstance(dump, dict) else dump
+        for w in (widgets or []):
+            text = (w.get("text") or "").strip()
+            if option.lower() in text.lower() and w.get("screenX") is not None:
+                debug_log.log("bank", f"picking '{text}' from the destination menu")
+                return bool(controller.click_entity(ctx.ser, w, check_ui_blockers=False,
+                                                    simulate_mistakes=False))
+        time.sleep(RETURN_TELEPORT_POLL_S)
+
+    debug_log.log("bank", f"destination menu never offered '{option}' -- walking instead")
+    return False
+
+
+def _use_return_teleport(ctx):
+    """Run the planned chain, leg by leg. True only if every leg landed.
+
+    The plan is popped HERE, not by the caller: consumed exactly once whether or not it fires,
+    so a dud can never be retried into an empty inventory -- and a caller that popped it first
+    would leave this reading nothing at all (the 2026-09-07 regression, pinned by test).
+    """
+    plan = ctx.state.data.pop(RETURN_TELEPORT_KEY, None)
+    if not plan:
+        return False
+
+    for leg in plan.get("legs") or []:
+        if not _run_leg(ctx, leg):
+            debug_log.log("bank", f"leg '{leg.get('display')}' didn't land "
+                                  f"-- walking home from here")
+            return False
+    return True
+
+
+def return_to_spot(ctx) -> bool:
+    """Walk back to the tile the current bank trip left from, if one is still pending.
+
+    True when there is nothing left to do (no anchor recorded, or we made it back). False while
+    a retry is still owed -- the anchor stays in ctx.state.data so the caller's next tick tries
+    again, rather than fighting on from wherever the walk happened to stop. Cheap and safe to
+    call every tick: with no anchor recorded it does nothing at all.
+    """
+    target = ctx.state.data.get(RETURN_LOCATION_KEY)
+    if target is None:
+        return True
+
+    attempts = ctx.state.data.get(RETURN_ATTEMPTS_KEY, 0) + 1
+    ctx.state.data[RETURN_ATTEMPTS_KEY] = attempts
+
+    # A teleport planned at the bank shortens the walk; it is consumed once, whether or not it
+    # fires, so a dud cannot be retried into an empty inventory. Failing is not fatal by design:
+    # the anchor survives and the walk below runs exactly as it did before teleports existed.
+    if ctx.state.data.get(RETURN_TELEPORT_KEY) is not None:
+        _use_return_teleport(ctx)
+    debug_log.log("bank", f"walking back to where we left from "
+                          f"({target['x']},{target['y']},{target.get('plane', 0)}) "
+                          f"-- attempt {attempts}/{RETURN_WALK_MAX_ATTEMPTS}")
+
+    if travel.walk_to(ctx, target, goal_adjacent=False):
+        ctx.state.data.pop(RETURN_LOCATION_KEY, None)
+        ctx.state.data.pop(RETURN_ATTEMPTS_KEY, None)
+        return True
+
+    if attempts >= RETURN_WALK_MAX_ATTEMPTS:
+        ctx.state.data.pop(RETURN_LOCATION_KEY, None)
+        ctx.state.data.pop(RETURN_ATTEMPTS_KEY, None)
+        ctx.state.trigger_safety_stop(
+            f"banked, but couldn't walk back to ({target['x']},{target['y']}) after "
+            f"{attempts} attempts -- stranded somewhere the routine didn't choose"
+        )
+        return False
+
+    debug_log.log("bank", "couldn't walk all the way back -- retrying next tick")
+    return False
+
+
 def bank_up(ctx, config: dict) -> bool:
     """
     Full cycle: bank at whatever's within walking distance if anything is,
     otherwise teleport to Ferox Enclave via the ring of dueling, bank and
-    use the fountain there, then walk back. Either way: deposit per
-    keepItems, withdraw the configured loadout, close.
+    use the fountain there. Either way: deposit per keepItems, withdraw the
+    configured loadout, close, and -- for the Ferox path, or for any caller passing
+    returnToSpot -- walk back to the tile we left from.
     """
     if not config.get("enabled", True):
         return False
 
-    # Retried, not a single check -- see _find_nearby_bank_retrying's own docstring (a transient
-    # /objects timeout here would otherwise wrongly fall through to the teleport-to-Ferox path
-    # below even when a real bank is right there).
-    bank_obj = _find_nearby_bank_retrying(config)
-    if bank_obj is not None:
-        debug_log.log("bank", f"walking to {bank_obj.get('name')} (dist={bank_obj.get('distance')})")
-        if not open_bank(ctx, bank_obj):
-            debug_log.log("bank", "failed to open bank")
+    # Recorded once per trip, BEFORE anything moves the player, and kept across ticks so a trip
+    # spanning several of them (or one that aborts and re-enters) still knows where it started.
+    if RETURN_LOCATION_KEY not in ctx.state.data:
+        saved_location = travel.save_location()
+        if saved_location is not None:
+            ctx.state.data[RETURN_LOCATION_KEY] = saved_location
+            ctx.state.data[RETURN_ATTEMPTS_KEY] = 0
+        else:
+            debug_log.log("bank", "couldn't record current location -- banking without a way back")
+
+    if ctx.state.data.get(TELEPORTED_KEY):
+        # Already teleported this trip: stay on the Ferox path, so neither the fountain step nor
+        # the ring-charge reasoning is skipped by the nearby-bank branch matching the very chest
+        # we teleported to. See TELEPORTED_KEY.
+        if not _bank_via_ferox(ctx, config):
+            return False
+    else:
+        # Retried, not a single check -- see _find_nearby_bank_retrying's own docstring (a
+        # transient /objects timeout here would otherwise wrongly fall through to the
+        # teleport-to-Ferox path below even when a real bank is right there).
+        bank_obj = _find_nearby_bank_retrying(config)
+        if bank_obj is not None:
+            debug_log.log("bank", f"walking to {bank_obj.get('name')} (dist={bank_obj.get('distance')})")
+            if not open_bank(ctx, bank_obj):
+                debug_log.log("bank", "failed to open bank")
+                return False
+
+            deposit_inventory(ctx, config)
+            withdraw_loadout(ctx, config)
+            # Chosen and withdrawn HERE because an open bank is the only moment we can take the
+            # item; return_to_spot uses it and walks whatever is left.
+            _withdraw_return_teleport(ctx, config)
+            close_bank(ctx)
+        elif not config.get("teleportFallback", True):
+            return False
+        elif not _bank_via_ferox(ctx, config):
             return False
 
-        deposit_inventory(ctx, config)
-        withdraw_loadout(ctx, config)
-        close_bank(ctx)
+    teleported = bool(ctx.state.data.pop(TELEPORTED_KEY, None))
+
+    # Default preserves every pre-2026-09-07 caller exactly: the Ferox path always walked back
+    # (golem_crafting's own comment depends on it), the nearby-bank path never did. Opting in
+    # extends the walk home to the nearby-bank path too -- which routines/slayer.py wants and
+    # routines/firemaking.py must NOT have, since it banks every inventory and then walks to a
+    # fixed starter tile of its own (advance_starter), so a walk back to the end of the last
+    # burn line would be pure waste.
+    if not config.get("returnToSpot", teleported):
+        ctx.state.data.pop(RETURN_LOCATION_KEY, None)
+        ctx.state.data.pop(RETURN_ATTEMPTS_KEY, None)
         return True
 
-    if not config.get("teleportFallback", True):
-        return False
-
-    return _bank_via_ferox(ctx, config)
+    return_to_spot(ctx)
+    return True
 
 
 def _bank_via_ferox(ctx, config: dict) -> bool:
@@ -1041,9 +1538,7 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
     # unconditionally teleport on every single call. A ring of dueling that ran out mid-cycle
     # (charges are finite) then failed forever with "no ring of dueling in inventory" -- even
     # once the player was already standing right next to the Ferox bank and could just walk up
-    # and use it normally. bank_ferox_return_location persists across calls within one trip so a
-    # retry after a mid-trip failure doesn't re-save "already at Ferox" as the place to walk back
-    # to, and gets popped (not just read) once actually used, below.
+    # and use it normally.
     #
     # find_nearby_bank retried a few times (not a single check) before concluding "not there,
     # need to teleport" -- CONFIRMED live 2026-08-06: get_objects() fails-safe to an empty list
@@ -1055,13 +1550,6 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
     # resource on what was just a slow poll.
     bank_obj = _find_nearby_bank_retrying(ferox_search_config)
     if bank_obj is None:
-        if "bank_ferox_return_location" not in ctx.state.data:
-            saved_location = travel.save_location()
-            if saved_location is None:
-                debug_log.log("bank", "couldn't record current location, aborting teleport bank trip")
-                return False
-            ctx.state.data["bank_ferox_return_location"] = saved_location
-
         if not travel.teleport_to_ferox(ctx):
             if not any(
                 travel.RING_OF_DUELING_NAME in (i.get("name") or "").lower()
@@ -1075,6 +1563,11 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
                 ctx.state.trigger_safety_stop("out of supplies, no bank in range, and no ring "
                                                "of dueling left to reach one")
             return False
+
+        # Latched the moment the teleport lands, so an abort below can't leave the next tick's
+        # bank_up believing it is still standing at the task and free to use its nearby-bank
+        # branch on the Ferox chest itself.
+        ctx.state.data[TELEPORTED_KEY] = True
 
         bank_obj = _find_nearby_bank_retrying(ferox_search_config)
         if bank_obj is None:
@@ -1094,14 +1587,8 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
     ]
     deposit_inventory(ctx, deposit_config)
     withdraw_loadout(ctx, config)
+    _withdraw_return_teleport(ctx, config)
     close_bank(ctx)
 
     travel.use_fountain(ctx)
-
-    saved_location = ctx.state.data.pop("bank_ferox_return_location", None)
-    if saved_location is not None:
-        debug_log.log("bank", "walking back to the previous location")
-        if not travel.walk_to(ctx, saved_location, goal_adjacent=False):
-            debug_log.log("bank", "couldn't walk all the way back -- continuing from here")
-
     return True

@@ -56,20 +56,45 @@ Two facts that shape everything below:
   them through the floor is the exact failure CLAUDE.md records at JEFF's and ROSS's, so every
   candidate is filtered by reachability before it is ever clicked (below).
 
-## Floor and pocket: one flood, no coordinate tables
+## Which floor: tile height, and nothing else works
 
-`tictac7x` hand-lists the upstairs tiles in a `Sectors` table. We do not need it:
-`worldmap.reachable_from(player)` already answers this, because **the static collision map models
-the two floors as disconnected**. MEASURED from the pocket behind Mercy at (3752,5680):
+**CORRECTED after the first live run, 2026-09-07.** The section this replaces claimed the two
+floors were separable by coordinates, on the evidence that the static collision map answers
+`find_path(upstairs -> sack) -> None` and that a `reachable_from` flood from the pocket behind
+Mercy returns 45 tiles that exclude the sack, the deposit box and the struts. That evidence was
+real and the conclusion was wrong.
 
-    reachable tiles: 45  (y 5668-5685)  -- the NW pocket plus the SE corridor
-    upstairs-adjacent (3755,5675) IN    -- the ladder-down approach
-    lower hopper / sack / deposit box / struts / far NE upstairs: all OUT
-    find_path(upstairs -> sack) -> None
+**The Motherlode Mine's upper level sits DIRECTLY ABOVE the lower one at the same x/y.** It is
+not a plane, it is not a separate part of the map, and no coordinate test separates them --
+world x/y, the static map and a reachability flood all answer "same floor" about two tiles a
+storey apart. The flood *looked* like a floor test because the pocket it happens to cover is
+mostly upstairs.
 
-So one `reachable_from` per tick plus `travel.can_reach` is both the floor test and the "am I
-still in the right pocket" test, using machinery this repo already trusts, and it degrades the
-way that machinery already degrades (an empty flood means "cannot tell", never "refuse to work").
+MEASURED, the hard way: the routine mined correctly for a minute, then spent 90 seconds clicking
+the vein at (3749,5685) from (3749,5684) with nothing happening at all. Everything a log can
+check said it was working -- `/last-action` reported `Mine / Ore vein / id 26661` on every
+attempt, `/hover` agreed, `can_reach` agreed, the player was adjacent and stationary. USER,
+watching the screen: *"clicking lower level ore from highground"*.
+
+RuneLite's own `MotherlodePlugin` has exactly this problem and answers it with **render height**:
+
+    boolean isUpstairs(LocalPoint p) { return Perspective.getTileHeight(client, p, 0) < -490; }
+
+and its scene overlay hides any vein whose `isUpstairs` disagrees with the player's. So the
+bridge now reports **`tileHeight`** on `/objects` and `/player` (ObjectProvider, PlayerProvider
+-- client rebuild required), `motherlode_mine.same_floor` is the floor test everywhere, and
+`_floor_ready` **safety-stops** a run against a client that does not report the field rather
+than guessing. The `-490` constant lives in the routine, not the provider: it is that mine's
+fact, not a general one.
+
+The reachability flood stays, for the one question it can actually answer -- is a wall in the
+way of this particular vein (`travel.can_reach`, and veins are `WallObject`s, so the edge test
+is the right tool) -- plus the anchor distance bound that keeps the routine in one pocket.
+
+**And a belt to go with those braces:** `note_vein_failure` sets a vein aside for 60s after two
+clicks that produce nothing. That is empirical where the rest is predictive, and on its own it
+would have escaped the 90-second loop above whatever the cause -- a wall object's wrong side, a
+stale scene, another player, or a floor test that has gone wrong again.
 
 ## The loop
 
@@ -165,15 +190,19 @@ than mined — mining one costs ~4s and the pocket does not need it.
 
 ## What is Java, and what needs a rebuild
 
-Only the wiring: `RoutineChoice.MOTHERLODE_MINE` and the `ROUTINE_FILES` entry. Everything else
-is Python over endpoints that already exist (`/objects`, `/object/at`, `/varbit`, `/inventory`,
+`tileHeight` on `/objects` and `/player` (see the floor section -- the routine refuses to run
+without it), plus the wiring: `RoutineChoice.MOTHERLODE_MINE` and the `ROUTINE_FILES` entry.
+Everything else is Python over endpoints that already exist (`/objects`, `/object/at`, `/varbit`, `/inventory`,
 `/player`, `/widget`, `/widget/children`). The routine is runnable from the command line
 immediately; the panel dropdown needs the client rebuild.
 
 ## Live-verification checklist (the first session's worklist)
 
+0. **DONE 2026-09-07, and it cost the first run:** the floor test. See the floor section --
+   tile height, not coordinates.
 1. Does `Deposit` on the upper hopper (3755,5677) leave the pay-dirt in the inventory while
-   locked, and is that the only tell? (The `auto` latch depends on it.)
+   locked, and is that the only tell? (The `auto` latch depends on it; `upperHopper` ships as
+   `never` until the 50 nuggets are paid, so this is not exercised today.)
 2. Real conveyor latency — fit `PENDING_MAX_S` from the gap between the hopper deposit and 5558
    rising. The recording's one sample is contaminated by a strut repair.
 3. Does the ladder-down/up pair really flip 2086 within the budget, and does the walk back to

@@ -79,6 +79,12 @@ def tick(ctx):
             config.get("prayer", {}).get("enabled", False)
             and config.get("potions", {}).get("prayerEnabled", False)
         )
+        # Walk back to the tile we left from -- USER-REPORTED 2026-09-07 ("ends up stuck at
+        # Ferox"). Opt-in because banker's default only walks home from the Ferox teleport
+        # path, which left a trip to a bank inside maxBankDistance (40) simply fighting on
+        # next to the bank. A slayer task is a place; every other bank_up caller re-derives
+        # its own position afterwards and must not pay for this walk.
+        merged_bank_cfg["returnToSpot"] = True
         banker.bank_up(ctx, merged_bank_cfg)
 
         if was_critical and out_of_critical_supplies(ctx):
@@ -104,6 +110,19 @@ def tick(ctx):
     maintain_defensive_prayer(ctx, combat)
     maintain_offensive_prayer(ctx, combat)
     maintain_supplies(ctx)
+
+    # Still owed a walk home from a bank trip -- USER-REPORTED 2026-09-07 ("ends up stuck at
+    # Ferox"). banker.bank_up walks back itself, but a walk that gives up partway (a long
+    # cross-map return is exactly where WALK_MAX_STALLS' cumulative budget of 4 runs out) now
+    # KEEPS the anchor instead of discarding it, and this is what spends the retry. Placed after
+    # the prayer/food maintenance above so a return trip can't starve eating or prayer, and
+    # before loot/safespot/engage so we don't commit to a fight at the bank we were about to
+    # walk away from. Costs nothing on a normal tick: with no anchor recorded return_to_spot
+    # returns immediately.
+    if ctx.state.data.get(banker.RETURN_LOCATION_KEY) is not None:
+        ctx.state.data["current_target_index"] = None
+        banker.return_to_spot(ctx)
+        return
 
     if config.get("loot", {}).get("enabled"):
         maybe_loot(ctx)

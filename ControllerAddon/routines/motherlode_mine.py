@@ -26,12 +26,17 @@
 #     (26665-26668) offering NO ACTIONS AT ALL. So gathering's existing "must offer the action"
 #     filter already skips spent veins, and its "done when the id no longer stands on its tile"
 #     is already the right depletion test.
-#   * /objects lists the WHOLE loaded scene, BOTH FLOORS. Standing upstairs the bridge reports
-#     the lower hopper 8 tiles away, the sack at 21 and the struts at 11. Clicking one of those
-#     through the floor is CLAUDE.md's JEFF/ROSS failure, so every candidate is filtered through
-#     worldmap.reachable_from + travel.can_reach BEFORE it is ever clicked. The static map models
-#     the two floors as disconnected (find_path upstairs -> sack answers None), so that one flood
-#     is both the floor test and the "still in the right pocket" test.
+#   * THE UPPER LEVEL SITS DIRECTLY ABOVE THE LOWER ONE AT THE SAME x/y, and /objects lists
+#     both. It is not a plane and it is not a separate part of the map, so NO coordinate test
+#     separates them -- world x/y, the static collision map and a reachability flood all answer
+#     "same floor" about two tiles a storey apart. MEASURED the hard way on the first live run:
+#     the routine mined happily upstairs, then spent 90s clicking a DOWNSTAIRS vein at
+#     (3749,5685) from (3749,5684) with /last-action confirming a perfect "Mine Ore vein" every
+#     time and nothing happening. USER, watching: "clicking lower level ore from highground".
+#     RuneLite's own MotherlodePlugin has the same problem and answers it with TILE HEIGHT
+#     (isUpstairs: Perspective.getTileHeight(...) < -490), so the bridge now reports tileHeight
+#     on /objects and /player and that is the floor test here. The reachability flood stays, but
+#     only for what it can actually answer: whether a wall is in the way.
 #   * The conveyor is SLOW: pay-dirt leaves the inventory on the hopper click but reaches varbit
 #     5558 seconds later. Deciding "is the sack full" off the raw varbit starts a trip whose
 #     pay-dirt has nowhere to go, which is exactly what mlm-qol's SackTracker exists for.
@@ -84,6 +89,9 @@ VARBIT_SUBSCRIPTIONS = [VARBIT_SACK, VARBIT_SACK_UPGRADED, VARBIT_UPSTAIRS]
 SACK_SIZE = 108
 SACK_SIZE_LARGE = 189
 
+# RuneLite's MotherlodePlugin, verbatim: a tile rendered below this height is on the upper level.
+UPPER_FLOOR_HEIGHT = -490
+
 # The bank deposit box interface (group 192): 24 the inventory grid, 31 "Deposit inventory".
 DEPOSIT_GROUP = 192
 DEPOSIT_INV_CHILD = 24
@@ -113,6 +121,8 @@ CHAIN_MAX_S = 40.0          # hand back to the engine loop at least this often
 COLLECT_MAX_ROUNDS = 12     # a 189 sack is 7 fills; the rest is slack
 DEPOSIT_MAX_STACKS = 10
 NO_VEIN_STOP = 40
+VEIN_FAIL_LIMIT = 2         # clicks on one vein that produce nothing before it is set aside
+VEIN_BLOCK_S = 60.0         # ...and for how long
 STALL_WARN_S = 90.0
 STALL_STOP_S = 240.0
 WALK_S_PER_TILE = 0.6
@@ -340,27 +350,40 @@ def _reachable(obj, reach, flags) -> bool:
     return travel.can_reach(obj, reach, flags) is not False
 
 
-def _on_floor(obj, reach) -> bool:
-    """Is this fixture on OUR floor (and in our pocket)? Plain adjacency against the flood, no
-    edge test.
+def is_upper(height) -> bool:
+    """RuneLite's MotherlodePlugin.isUpstairs, verbatim: a tile rendered below
+    UPPER_FLOOR_HEIGHT is on the upper level."""
+    return height is not None and height < UPPER_FLOOR_HEIGHT
 
-    can_reach is deliberately NOT used here. MEASURED live 2026-09-07: it answers False for the
-    upper hopper at (3755,5677) even standing three tiles away with (3754,5677) and (3756,5677)
-    both in the flood, because the hopper's own tile is solid and carries more than
-    BLOCK_MOVEMENT_OBJECT, so neither the edge test nor its multi-tile fallback applies. That
-    precision is what we want for a vein and is simply wrong for a thing you walk up to and
-    click. The question these fixtures actually pose is the floor question -- /objects lists
-    both floors, and the two are disconnected in the flood -- and adjacency answers exactly
-    that."""
-    if not reach:
+
+def same_floor(obj_height, player_height) -> bool:
+    """Is this object on the floor we are standing on?
+
+    THE ONLY WORKING FLOOR TEST IN THIS MINE. Coordinates cannot answer it -- the upper level is
+    directly above the lower one -- and the first live run proved what happens without it: 90
+    seconds of perfectly aimed, perfectly resolved "Mine Ore vein" clicks at a vein one storey
+    below, with /last-action reporting success every time.
+
+    An unknown height is treated as "same floor" only so a single missing field cannot make the
+    routine refuse to work; _floor_ready stops the run up front when the client is not reporting
+    heights at all, because guessing here is precisely the bug this replaced."""
+    if obj_height is None or player_height is None:
         return True
-    x, y = obj.get("x"), obj.get("y")
-    if x is None:
+    return is_upper(obj_height) == is_upper(player_height)
+
+
+def _player_height():
+    return (controller.get_player() or {}).get("tileHeight")
+
+
+def _floor_ready(ctx) -> bool:
+    """The bridge has to be reporting tileHeight before anything here is clicked."""
+    if _player_height() is not None:
         return True
-    for dx in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            if (x + dx, y + dy) in reach:
-                return True
+    ctx.state.trigger_safety_stop(
+        "motherlode: this client does not report tileHeight on /player -- rebuild it with "
+        "./gradlew.bat run. Without it the mine's two floors cannot be told apart and the "
+        "routine mines through the floor")
     return False
 
 
@@ -463,16 +486,53 @@ def _vein_config(ctx):
     return {"veinNames": [VEIN_NAME], "veinDistance": max(4, int(distance) + 6)}
 
 
-def pick_vein(ctx, reach, flags, exclude=(), objects=None):
-    """The nearest live vein that is BOTH reachable from where we stand AND inside
-    `veinDistance` of the anchor.
+def _blocked_veins(ctx):
+    """Veins that took a click and did nothing, and when they come back into play."""
+    blocked = _d(ctx).setdefault("mlm_blocked", {})
+    now = _now()
+    for tile, until in list(blocked.items()):
+        if until <= now:
+            blocked.pop(tile, None)
+    return blocked
 
-    The anchor bound is what keeps us in the pocket behind Mercy; the reachability bound is what
-    stops us clicking a vein through a wall or through the floor (/objects carries both)."""
+
+def note_vein_failure(ctx, target, outcome):
+    """A vein that swallows clicks is set aside rather than re-picked forever.
+
+    The belt to the floor test's braces, and on its own enough to have escaped the first live
+    run's 90-second loop: whatever the reason a particular vein will not be mined from where we
+    can stand -- wrong side of a wall object, a stale scene, another floor on an un-rebuilt
+    client -- two dead clicks is proof enough to go and mine a different one. Any progress at
+    all clears the count, so a vein that simply took a while is not penalised."""
+    data = _d(ctx)
+    fails = data.setdefault("mlm_vein_fails", {})
+    tile = gathering.target_tile(target)
+    key = str(tile)
+    if outcome == "depleted":
+        fails.pop(key, None)
+        return
+    n = fails.get(key, 0) + 1
+    fails[key] = n
+    if n >= VEIN_FAIL_LIMIT:
+        fails.pop(key, None)
+        _blocked_veins(ctx)[key] = _now() + VEIN_BLOCK_S
+        debug_log.log(LOG, f"the vein at {tile} took {n} clicks and gave nothing -- leaving it "
+                           f"for {VEIN_BLOCK_S:.0f}s")
+
+
+def pick_vein(ctx, reach, flags, exclude=(), objects=None):
+    """The nearest live vein that is on OUR FLOOR, not set aside, reachable from where we stand,
+    and inside `veinDistance` of the anchor.
+
+    The floor test is the load-bearing one and it is tile height, not coordinates -- see
+    same_floor and this module's header. The anchor bound keeps us in the pocket behind Mercy;
+    the reachability bound answers only whether a wall is in the way."""
     config = ctx.state.config or {}
     anchor = _d(ctx).get("mlm_anchor")
     limit = int(config.get("veinDistance", DEFAULT_CONFIG["veinDistance"]))
     excluded = set(exclude)
+    blocked = _blocked_veins(ctx)
+    height = _player_height()
     best = None
     for obj in (controller.get_objects() if objects is None else objects) or []:
         if (obj.get("name") or "").lower() != VEIN_NAME.lower():
@@ -484,7 +544,10 @@ def pick_vein(ctx, reach, flags, exclude=(), objects=None):
             continue
         if not obj.get("visible", True):
             continue
-        if (obj.get("x"), obj.get("y"), obj.get("plane")) in excluded:
+        tile = (obj.get("x"), obj.get("y"), obj.get("plane"))
+        if tile in excluded or str(tile) in blocked:
+            continue
+        if not same_floor(obj.get("tileHeight"), height):
             continue
         if anchor is not None and max(abs(obj.get("x", 0) - anchor["x"]),
                                       abs(obj.get("y", 0) - anchor["y"])) > limit:
@@ -524,6 +587,7 @@ def mine_phase(ctx):
         if _now() - started >= CHAIN_MAX_S:
             return
         outcome, _next = gathering.gather(PROFILE, ctx, target, _vein_config(ctx), exclude=worked)
+        note_vein_failure(ctx, target, outcome)
         if outcome != "depleted":
             return          # hand back so the engine gets its safety/break turn
         worked.append(gathering.target_tile(target))
@@ -544,10 +608,9 @@ def climb(ctx, up) -> bool:
     from, so the id plus the action tells them apart with no geometry."""
     if _upstairs() == bool(up):
         return True
-    reach, _flags = snapshot(ctx)
     wanted = LADDER_UP_ID if up else LADDER_DOWN_ID
     ladder = next((o for o in _objects(ids={wanted}, action=LADDER_ACTION)
-                   if _on_floor(o, reach)), None)
+                   if same_floor(o.get("tileHeight"), _player_height())), None)
     if ladder is None:
         debug_log.log(LOG, f"no {'up' if up else 'down'} ladder in view -- walking to it")
         travel.walk_to(ctx, TILE_LADDER, goal_adjacent=True)
@@ -570,7 +633,7 @@ def climb(ctx, up) -> bool:
 
 # --- the hopper ------------------------------------------------------------------------------------------
 
-def _hopper_candidates(ctx, reach):
+def _hopper_candidates(ctx):
     """Reachable hoppers, nearest first, honouring the upperHopper policy.
 
     Default "auto": whatever is reachable on our own floor is tried first, and a deposit that
@@ -579,8 +642,9 @@ def _hopper_candidates(ctx, reach):
     it is bought, every ladder trip disappears with no change here."""
     policy = str((ctx.state.config or {}).get("upperHopper",
                                               DEFAULT_CONFIG["upperHopper"])).lower()
+    height = _player_height()
     hoppers = [h for h in _objects(ids={HOPPER_ID}, action=HOPPER_ACTION)
-               if _on_floor(h, reach)]
+               if same_floor(h.get("tileHeight"), height)]
     if policy != "always" and (policy == "never" or _d(ctx).get("mlm_upper_locked")):
         # Anything reachable from upstairs IS the upper hopper; the lower one needs the ladder.
         return [] if _upstairs() else hoppers
@@ -592,8 +656,7 @@ def hopper_phase(ctx) -> bool:
     held = _held_paydirt()
     if held <= 0:
         return True
-    reach, _flags = snapshot(ctx)
-    hopper = next(iter(_hopper_candidates(ctx, reach)), None)
+    hopper = next(iter(_hopper_candidates(ctx)), None)
     if hopper is None:
         if _upstairs():
             climb(ctx, up=False)
@@ -643,9 +706,8 @@ def _deposit_children():
 
 def search_sack(ctx) -> bool:
     """Search the sack: the game hands over min(free slots, sack) ore."""
-    reach, _flags = snapshot(ctx)
     sack = next((o for o in _objects(ids={SACK_ID}, action=SACK_ACTION)
-                 if _on_floor(o, reach)), None)
+                 if same_floor(o.get("tileHeight"), _player_height())), None)
     if sack is None:
         debug_log.log(LOG, "the sack is not in view -- walking to it")
         travel.walk_to(ctx, TILE_SACK, goal_adjacent=True)
@@ -667,9 +729,8 @@ def search_sack(ctx) -> bool:
 def _open_deposit_box(ctx) -> bool:
     if _deposit_open():
         return True
-    reach, _flags = snapshot(ctx)
     box = next((o for o in _objects(ids={DEPOSIT_BOX_ID}, action=DEPOSIT_BOX_ACTION)
-                if _on_floor(o, reach)), None)
+                if same_floor(o.get("tileHeight"), _player_height())), None)
     if box is None:
         debug_log.log(LOG, "the deposit box is not in view -- walking to it")
         travel.walk_to(ctx, TILE_DEPOSIT_BOX, goal_adjacent=True)
@@ -810,9 +871,8 @@ def _maybe_repair(ctx) -> bool:
                       float(config.get("repairPatienceS", DEFAULT_CONFIG["repairPatienceS"])),
                       _now()):
         return False
-    reach, _flags = snapshot(ctx)
     strut = next((o for o in _objects(ids={BROKEN_STRUT_ID}, action=STRUT_ACTION)
-                  if _on_floor(o, reach)), None)
+                  if same_floor(o.get("tileHeight"), _player_height())), None)
     if strut is None:
         _d(ctx).pop("mlm_broken_since", None)       # someone else got there first
         return False
@@ -875,7 +935,7 @@ def phase_of(ctx):
 
 
 def tick(ctx):
-    if not _startup_ok(ctx):
+    if not _startup_ok(ctx) or not _floor_ready(ctx):
         return
     phase = phase_of(ctx)
     _stuck_watch(ctx, phase)

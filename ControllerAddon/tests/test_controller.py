@@ -1144,25 +1144,72 @@ def test_long_waits_are_split_into_human_length_still_segments(monkeypatch):
     assert len(fidgets) >= 1
 
 
-def test_fidget_returns_the_cursor_exactly_to_its_origin(monkeypatch):
-    """Position-invariance is the safety contract: hover-parking call sites rest the cursor on
-    a future click target through a wait, so the return leg must land exactly on the origin."""
+def _fidget_env(monkeypatch, cursor):
+    """Everything _maybe_fidget_during_wait touches, with the cursor tracking its own moves."""
+    import input_state
+
     moves = []
-    monkeypatch.setattr(controller, "move_to_human",
-                        lambda ser, x, y, **k: moves.append((x, y, k.get("aim_radius"))))
-    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (500, 400))
+
+    def move(ser, x, y, **k):
+        # The real move_to_human lands on pick_aim_point(x, y, aim_radius), not on (x, y) --
+        # which is the whole point of the return leg's jitter, so the fake must do it too.
+        moves.append((x, y, k.get("aim_radius")))
+        cursor[0], cursor[1] = controller.pick_aim_point(x, y, k.get("aim_radius") or 0)
+    monkeypatch.setattr(controller, "move_to_human", move)
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (cursor[0], cursor[1]))
     monkeypatch.setattr(controller, "get_state", lambda: {"windowFocused": True})
     monkeypatch.setattr(controller, "get_menu", lambda: {"open": False})
     monkeypatch.setattr(controller, "is_point_within_window", lambda x, y: True)
     monkeypatch.setattr(controller.random, "random", lambda: 0.0)     # always fidget
     monkeypatch.setattr(controller.time, "sleep", lambda s: None)
     monkeypatch.setattr(controller, "_fidget_ser", object())
+    monkeypatch.setattr(input_state, "fidget_anchor", None)
     controller._movement_abort.clear()
+    return moves
+
+
+def test_fidget_returns_near_its_anchor_but_not_onto_the_identical_pixel(monkeypatch):
+    """MEASURED live 2026-09-06 (karambwan, recordings/2026-09-06_090950_cg-bot1): with the
+    return leg at aim_radius=0 the cursor snapped to a mathematically identical pixel every
+    time, so it tethered to one point -- chains of 19/17/14 consecutive out-and-backs about one
+    anchor and 11 rests on the exact same pixel, against the human recording of the SAME
+    activity at 10 and 3. A resting hand does not land twice on one pixel. The return leg keeps
+    the cursor parked (that is the safety contract) but jitters within a few px."""
+    import settings
+
+    cursor = [500, 400]
+    moves = _fidget_env(monkeypatch, cursor)
+    rests = []
+    for _ in range(12):
+        controller._maybe_fidget_during_wait()
+        rests.append(tuple(cursor))          # where the cursor actually came to rest
+    assert len(moves) == 24
+    for out, back in zip(moves[0::2], moves[1::2]):
+        assert (out[0], out[1]) != (500, 400)                    # actually went somewhere
+        assert back[2] == settings.IDLE_FIDGET_RETURN_JITTER_PX  # jittered, not pixel-exact
+        assert math.dist((back[0], back[1]), (500, 400)) <= settings.IDLE_FIDGET_ANCHOR_RESET_PX
+    landings = {tuple(p) for p in rests}
+    assert len(landings) > 1, "every return landed on the identical pixel -- the live signature"
+
+
+def test_fidget_holds_one_anchor_instead_of_random_walking_off_the_target(monkeypatch):
+    """The jitter must not compound: each return aims at the REMEMBERED anchor, so a hundred
+    fidgets through a long wait leave the cursor where the wait started (mixology and
+    golem_crafting park it on the next click target and then click IN PLACE). The anchor is
+    re-taken only when something else has moved the cursor away from it."""
+    import input_state
+    import settings
+
+    cursor = [500, 400]
+    _fidget_env(monkeypatch, cursor)
+    for _ in range(50):
+        controller._maybe_fidget_during_wait()
+    assert input_state.fidget_anchor == (500, 400)
+    assert math.dist(cursor, (500, 400)) <= settings.IDLE_FIDGET_ANCHOR_RESET_PX
+
+    cursor[0], cursor[1] = 900, 700          # a real click moved the cursor
     controller._maybe_fidget_during_wait()
-    assert len(moves) == 2
-    assert (moves[0][0], moves[0][1]) != (500, 400)   # actually went somewhere
-    assert (moves[1][0], moves[1][1]) == (500, 400)   # and came exactly back
-    assert moves[1][2] == 0                            # no jitter on the return leg
+    assert input_state.fidget_anchor == (900, 700)
 
 
 def test_fidget_skips_when_a_menu_is_open(monkeypatch):
@@ -1680,3 +1727,101 @@ def test_get_trawling_passes_through_and_tolerates_an_unreachable_bridge(monkeyp
 
     monkeypatch.setattr(controller, "api_get", lambda path, params=None: None)
     assert controller.get_trawling() == {}
+
+
+# --------------------------------------------------------------------------- Alt+Tab / focus
+#
+# Lifted out of routines/nmz.py 2026-09-06 so routines/karambwan_fishing.py can tab out for its
+# 90-110s fishing waits without a second copy. See nmz's own comment for why a routine that
+# unfocuses itself MUST verify the tab back in: the engine loop won't call tick() again while
+# unfocused, so a tab-back-in that lands on some other window stalls forever with nothing in the
+# log.
+
+def test_alt_tab_holds_alt_down_across_the_tab(monkeypatch):
+    lines = []
+    monkeypatch.setattr(controller, "send_line", lambda ser, s: lines.append(s))
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    controller.alt_tab(object())
+    assert lines == ["KD ALT", "KT TAB", "KU ALT"]
+
+
+def test_wait_for_focus_returns_as_soon_as_the_window_reports_focused(monkeypatch):
+    reads = iter([{"windowFocused": False}, {"windowFocused": False}, {"windowFocused": True}])
+    monkeypatch.setattr(controller, "get_state", lambda: next(reads))
+    monkeypatch.setattr(controller.time, "sleep", lambda s: None)
+    assert controller.wait_for_focus(timeout_s=5.0, poll_interval_s=0.0) is True
+
+
+def test_wait_for_focus_gives_up_and_says_so(monkeypatch):
+    monkeypatch.setattr(controller, "get_state", lambda: {"windowFocused": False})
+    monkeypatch.setattr(controller.time, "sleep", lambda s: None)
+    assert controller.wait_for_focus(timeout_s=0.0, poll_interval_s=0.0) is False
+
+
+def test_wait_for_focus_can_wait_for_the_window_to_GO_AWAY(monkeypatch):
+    """The tab-OUT half: a machine with only RuneLite open swallows Alt+Tab entirely, and a
+    routine that thinks it tabbed out would then fish with no input for two minutes."""
+    reads = iter([{"windowFocused": True}, {"windowFocused": False}])
+    monkeypatch.setattr(controller, "get_state", lambda: next(reads))
+    monkeypatch.setattr(controller.time, "sleep", lambda s: None)
+    assert controller.wait_for_focus(timeout_s=5.0, poll_interval_s=0.0, focused=False) is True
+
+
+# --------------------------------------------------------------------------- drop_items
+#
+# Shift-dropping an inventory (added 2026-09-07 for gathering.py's power-chopping path). Two
+# things make this more than a click loop: shift-drop is a GAME SETTING the account may not
+# have on, so the first drop is verified and the rest fall back to the right-click menu; and
+# these are inventory clicks, where a simulated misclick plus its corrective reclick drops the
+# NEIGHBOURING item -- the axe (banker.py's rule).
+
+def _drop_env(monkeypatch, inventory_after):
+    """Records what drop_items does. `inventory_after` is what get_inventory reports from the
+    first drop onward -- shorter than the starting inventory means shift-drop worked."""
+    calls = []
+    start = [{"name": "Yew logs", "screenX": 10, "screenY": 20},
+             {"name": "Yew logs", "screenX": 30, "screenY": 20}]
+    reads = {"n": 0}
+
+    def _inv():
+        reads["n"] += 1
+        return list(start) if reads["n"] == 1 else list(inventory_after)
+    monkeypatch.setattr(controller, "get_inventory", _inv)
+    monkeypatch.setattr(controller, "open_inventory_tab",
+                        lambda ser: calls.append(("tab",)) or True)
+    monkeypatch.setattr(controller, "send_line", lambda ser, s: calls.append(("line", s)))
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **kw: calls.append(("click", ent["screenX"], kw)) or True)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, opt, **kw: calls.append(("menu", ent["screenX"], opt)) or True)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    return calls, start
+
+
+def test_drop_items_opens_the_inventory_tab_and_shift_drops_each_item(monkeypatch):
+    calls, items = _drop_env(monkeypatch, inventory_after=[])
+    assert controller.drop_items(object(), items) is True
+    assert calls[0] == ("tab",)
+    kinds = [c[0] for c in calls]
+    assert kinds.count("click") == 2 and "menu" not in kinds
+    # SHIFT is held around every click and released again, so a crash mid-loop can't leave it down.
+    assert [c[1] for c in calls if c[0] == "line"] == ["KD SHIFT", "KU SHIFT"] * 2
+
+
+def test_drop_items_never_simulates_a_misclick_on_an_inventory_slot(monkeypatch):
+    calls, items = _drop_env(monkeypatch, inventory_after=[])
+    controller.drop_items(object(), items)
+    for kind, _, kw in [c for c in calls if c[0] == "click"]:
+        assert kw["simulate_mistakes"] is False
+        assert kw["check_ui_blockers"] is False
+
+
+def test_drop_items_falls_back_to_the_menu_when_shift_drop_is_off(monkeypatch):
+    # The inventory never shrinks: the account has shift-click drop disabled, so the first
+    # click did nothing and every drop from here on is a named menu action.
+    calls, items = _drop_env(monkeypatch, inventory_after=[{"name": "Yew logs"}] * 2)
+    assert controller.drop_items(object(), items) is False
+    menus = [c for c in calls if c[0] == "menu"]
+    assert [m[1] for m in menus] == [10, 30]      # the first item is retried, then the second
+    assert all(m[2] == "Drop" for m in menus)
+    assert len([c for c in calls if c[0] == "click"]) == 1   # only the one probing shift-click

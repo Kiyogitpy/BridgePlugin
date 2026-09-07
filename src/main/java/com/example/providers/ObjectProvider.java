@@ -4,6 +4,7 @@ import com.example.bridge.BridgeHttpServer;
 import com.example.util.InstanceCoords;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.*;
+import net.runelite.api.Perspective;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.callback.ClientThread;
@@ -698,6 +699,27 @@ public class ObjectProvider extends BridgeProvider
 		// Pre-existing field name, kept so anything already reading it doesn't break; shapeCoords
 		// reports the same fact as "usedClickbox".
 		data.put("debugHasClickbox", coords.get("usedClickbox"));
+
+		// The tile's RENDER HEIGHT, and the only thing that can tell the Motherlode Mine's two
+		// floors apart. ADDED 2026-09-07 after a live run mined a DOWNSTAIRS vein from the upper
+		// level (USER: "clicking lower level ore from highground"): the upper level is not a
+		// plane and it is not a separate part of the map -- it sits DIRECTLY ABOVE the lower one
+		// at the same x/y, so world coordinates, the collision map and a reachability flood all
+		// answer "same floor" about two tiles a storey apart, and /objects lists both.
+		//
+		// RuneLite's own MotherlodePlugin has the same problem and solves it exactly this way
+		// (isUpstairs: `Perspective.getTileHeight(client, localPoint, 0) < -490`), and its scene
+		// overlay hides a vein whose isUpstairs disagrees with the player's. Reported here as the
+		// raw height rather than a boolean because the -490 threshold is that mine's fact, not
+		// this provider's -- routines/motherlode_mine.py owns the constant, alongside its other
+		// measured ids.
+		//
+		// Cheap: a couple of array lookups and a bilinear interpolation per object, against the
+		// clickbox hulls that dominate this method.
+		if (local != null)
+		{
+			data.put("tileHeight", Perspective.getTileHeight(client, local, plane));
+		}
 
 		data.put("distance", RuneLiteUtil.distanceToPlayer(client, wp));
 		return data;

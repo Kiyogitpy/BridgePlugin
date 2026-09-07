@@ -100,6 +100,7 @@ public class ControllerPlugin extends Plugin
 	private NpcTrackerRegistry npcTrackerRegistry;
 	private TickClock tickClock;
 	private RecorderProvider recorderProvider;
+	private BankMemoryProvider bankMemoryProvider;
 
 	private int lastHp = -1;
 	private int lastPrayer = -1;
@@ -145,6 +146,12 @@ public class ControllerPlugin extends Plugin
 		new EquipmentProvider(client, clientThread, server).register();
 		new InventoryProvider(client, clientThread, server).register();
 		new BankProvider(client, clientThread, server, tickClock).register();
+		// A remembered copy of the bank, so a routine can ask what it owns while nowhere near
+		// one -- and, unlike /bank, one that a bank search or a non-active tab cannot truncate.
+		// Held in a field because it owns an EventBus subscription and a writer thread that
+		// shutDown has to release (see RecorderProvider, and TickClock's own leak).
+		bankMemoryProvider = new BankMemoryProvider(client, clientThread, server, eventBus, itemManager);
+		bankMemoryProvider.register();
 		new SailingProvider(client, clientThread, server, eventBus).register();
 		new TrawlingProvider(client, clientThread, server, itemManager).register();
 		new NPCProvider(client, clientThread, server, tickClock).register();
@@ -190,6 +197,7 @@ public class ControllerPlugin extends Plugin
 		recorderProvider.register();
 
 		server.register("/mining-config", () -> ConfigExporter.exportMining(config));
+		server.register("/woodcutting-config", () -> ConfigExporter.exportWoodcutting(config));
 		server.register("/gemstone-crab-config", () -> ConfigExporter.exportGemstoneCrab(config));
 		server.register("/tormented-demon-config", () -> ConfigExporter.exportTormentedDemon(config));
 		server.register("/firemaking-config", () -> ConfigExporter.exportFiremaking(config));
@@ -229,6 +237,12 @@ public class ControllerPlugin extends Plugin
 		{
 			recorderProvider.unregister();
 			recorderProvider = null;
+		}
+
+		if (bankMemoryProvider != null)
+		{
+			bankMemoryProvider.unregister();
+			bankMemoryProvider = null;
 		}
 
 		if (server != null)
