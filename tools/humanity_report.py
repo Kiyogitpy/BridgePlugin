@@ -124,3 +124,49 @@ def busy_fraction(records: list[dict], windows: list[tuple[int, int]]) -> Option
             if lo < len(samples) and samples[lo] < b + BUSY_BIN_MS:
                 busy += 1
     return (busy / total) if total else None
+
+
+# ---------------------------------------------------------------- off-canvas and focus
+
+def _spans(records: list[dict], open_kind: str, close_kind: str) -> list[tuple[int, int]]:
+    """[open_t, close_t] pairs; an open with no close runs to the recording's last t."""
+    end = max((r["t"] for r in records if "t" in r), default=0)
+    spans, open_t = [], None
+    for r in sorted((r for r in records if r.get("kind") in (open_kind, close_kind)), key=lambda r: r["t"]):
+        if r["kind"] == open_kind and open_t is None:
+            open_t = r["t"]
+        elif r["kind"] == close_kind and open_t is not None:
+            spans.append((open_t, r["t"]))
+            open_t = None
+    if open_t is not None:
+        spans.append((open_t, end))
+    return spans
+
+
+def excursions(records: list[dict]) -> dict:
+    """Times the cursor left the canvas (the client encodes this as -1 in EVENT_MOUSE_MOVE)."""
+    spans = _spans(records, "canvasexit", "canvasenter")
+    total = duration_ms(records)
+    lengths = [b - a for a, b in spans]
+    hours = total / 3_600_000 if total else 0
+    return {"count": len(spans), "per_hour": (len(spans) / hours) if hours else None,
+            "lengths_ms": lengths, "off_fraction": (sum(lengths) / total) if total else None}
+
+
+def focus_stats(records: list[dict]) -> dict:
+    """Window focus changes (EVENT_APPLET_FOCUS) and the share of time spent unfocused."""
+    events = sorted((r for r in records if r.get("kind") == "focus"), key=lambda r: r["t"])
+    total = duration_ms(records)
+    unfocused = 0
+    lost_at = None
+    for r in events:
+        if not r.get("gained") and lost_at is None:
+            lost_at = r["t"]
+        elif r.get("gained") and lost_at is not None:
+            unfocused += r["t"] - lost_at
+            lost_at = None
+    if lost_at is not None:
+        unfocused += max((r["t"] for r in records if "t" in r), default=lost_at) - lost_at
+    hours = total / 3_600_000 if total else 0
+    return {"changes": len(events), "per_hour": (len(events) / hours) if hours else None,
+            "unfocused_fraction": (unfocused / total) if total else None}

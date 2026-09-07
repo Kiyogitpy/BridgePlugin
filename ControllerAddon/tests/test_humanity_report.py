@@ -68,3 +68,27 @@ def test_load_skips_malformed_lines(tmp_path):
     p = tmp_path / "r.jsonl"
     p.write_text('{"kind":"click","t":1}\nnot json\n{"kind":"mouse","t":2,"points":[]}\n', encoding="utf-8")
     assert [r["kind"] for r in h.load(p)] == ["click", "mouse"]
+
+
+def test_excursions_pair_exit_with_the_next_enter():
+    recs = [click(0), canvas(1_000, "canvasexit"), canvas(4_000, "canvasenter"),
+            canvas(10_000, "canvasexit"), canvas(11_000, "canvasenter"), click(3_600_000)]
+    ex = h.excursions(recs)
+    assert ex["count"] == 2
+    assert ex["lengths_ms"] == [3_000, 1_000]
+    assert abs(ex["per_hour"] - 2.0) < 1e-6            # 1 hour of recording
+    assert abs(ex["off_fraction"] - 4_000 / 3_600_000) < 1e-9
+
+
+def test_excursion_still_open_at_the_end_counts_to_the_end():
+    recs = [click(0), canvas(1_000, "canvasexit"), click(5_000)]
+    ex = h.excursions(recs)
+    assert ex["count"] == 1 and ex["lengths_ms"] == [4_000]
+
+
+def test_focus_stats_integrate_unfocused_time():
+    recs = [click(0), focus(1_000, False), focus(3_000, True), focus(8_000, False), click(10_000)]
+    fs = h.focus_stats(recs)
+    assert fs["changes"] == 3
+    assert abs(fs["unfocused_fraction"] - (2_000 + 2_000) / 10_000) < 1e-9
+    assert h.focus_stats([click(0), click(10)])["changes"] == 0
