@@ -120,3 +120,19 @@ def test_typing_ignores_modifiers_and_function_keys_and_long_pauses():
     assert t["p50"] == 180
     assert t["log_sigma"] is not None and t["log_sigma"] > 0
     assert h.typing([key(0, "A")])["p50"] is None
+
+
+def test_metrics_table_has_every_key_in_order_and_tolerates_an_empty_recording():
+    m = h.metrics([])
+    assert list(m) == list(h.METRIC_ORDER)
+    assert all(v is None for v in m.values())
+
+
+def test_render_prints_two_recordings_side_by_side():
+    a = h.metrics([click(0), mouse(100, 1, 1), mouse(600, 2, 2), click(1_000)])
+    b = h.metrics([click(0), click(300), click(5_000)])
+    out = h.render(["human", "bot"], [a, b])
+    assert "human" in out and "bot" in out
+    assert "still_p90_ms" in out
+    lines = out.splitlines()
+    assert len(lines) >= len(h.METRIC_ORDER) + 1

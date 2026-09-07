@@ -377,6 +377,8 @@ sends the OS / Java / launcher-version strings and a "is a Jagex account" boolea
 **Rules that fall out of this for future development:**
 1. Treat every cursor sample as transmitted. "No click happened" never means "nothing was
    sent"; between-click motion, idle stillness and off-canvas excursions are the signal.
+   Measure it with tools/humanity_report.py <human.jsonl> <bot.jsonl> -- the same metrics over
+   both, which is the only way this class of signature is visible (the routine log cannot see it).
 2. Timing that is drawn from a fitted human distribution (`settings.py`) is on the wire; timing
    that is a constant is a fingerprint. That applies to key presses as much as clicks.
 3. Keep the login fingerprint constant per machine (same UUID, cores, heap, Windows build, JDK).

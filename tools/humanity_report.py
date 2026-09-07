@@ -208,3 +208,76 @@ def typing(records: list[dict]) -> dict:
     intervals = [b - a for a, b in zip(downs, downs[1:]) if 0 < b - a <= TYPING_MAX_GAP_MS]
     log_sigma = statistics.pstdev(math.log(i) for i in intervals) if len(intervals) >= 2 else None
     return {"intervals_ms": intervals, "p50": percentile(intervals, 0.5), "log_sigma": log_sigma}
+
+
+# ---------------------------------------------------------------- the table
+
+METRIC_ORDER = (
+    "duration_min", "active_min",
+    "still_p50_ms", "still_p90_ms", "still_max_ms", "busy_fraction",
+    "excursions_per_hour", "excursion_p50_ms", "excursion_p90_ms", "off_canvas_fraction",
+    "burst_gap_p25_ms", "burst_gap_p50_ms", "burst_gap_p75_ms", "burst_len_mean", "burst_share",
+    "shift_per_walk", "typing_p50_ms", "typing_log_sigma",
+    "focus_changes_per_hour", "unfocused_fraction",
+)
+
+
+def metrics(records: list[dict]) -> dict:
+    windows = active_windows(records)
+    still = still_segments(records, windows)
+    ex = excursions(records)
+    b = bursts(records)
+    s = shift_per_walk(records)
+    ty = typing(records)
+    fs = focus_stats(records)
+    total = duration_ms(records)
+    active = sum(e - a for a, e in windows)
+    m = {
+        "duration_min": (total / 60_000) if total else None,
+        "active_min": (active / 60_000) if active else None,
+        "still_p50_ms": percentile(still, 0.5), "still_p90_ms": percentile(still, 0.9),
+        "still_max_ms": (max(still) if still else None), "busy_fraction": busy_fraction(records, windows),
+        "excursions_per_hour": ex["per_hour"], "excursion_p50_ms": percentile(ex["lengths_ms"], 0.5),
+        "excursion_p90_ms": percentile(ex["lengths_ms"], 0.9), "off_canvas_fraction": ex["off_fraction"],
+        "burst_gap_p25_ms": percentile(b["intra_gaps_ms"], 0.25), "burst_gap_p50_ms": percentile(b["intra_gaps_ms"], 0.5),
+        "burst_gap_p75_ms": percentile(b["intra_gaps_ms"], 0.75),
+        "burst_len_mean": (statistics.mean(b["lengths"]) if b["lengths"] else None), "burst_share": b["burst_share"],
+        "shift_per_walk": s["ratio"], "typing_p50_ms": ty["p50"], "typing_log_sigma": ty["log_sigma"],
+        "focus_changes_per_hour": fs["per_hour"], "unfocused_fraction": fs["unfocused_fraction"],
+    }
+    return {k: m[k] for k in METRIC_ORDER}
+
+
+def _fmt(v) -> str:
+    if v is None:
+        return "-"
+    if isinstance(v, float):
+        return f"{v:.3f}" if abs(v) < 10 else f"{v:.1f}"
+    return str(v)
+
+
+def render(labels: list[str], tables: list[dict]) -> str:
+    w = max(len(k) for k in METRIC_ORDER)
+    head = f"{'metric':{w}}  " + "  ".join(f"{l:>14}" for l in labels)
+    rows = [head, "-" * len(head)]
+    for k in METRIC_ORDER:
+        rows.append(f"{k:{w}}  " + "  ".join(f"{_fmt(t.get(k)):>14}" for t in tables))
+    return "\n".join(rows)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    if not args:
+        print(__doc__.strip().splitlines()[2])
+        return 2
+    labels, tables = [], []
+    for p in args:
+        recs = load(p)
+        labels.append(Path(p).stem[:14])
+        tables.append(metrics(recs))
+    print(render(labels, tables))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
