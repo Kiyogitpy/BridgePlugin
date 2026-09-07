@@ -19,8 +19,9 @@ USER's decisions, verbatim where they matter:
 
 ## The geometry, all MEASURED live 2026-09-07
 
-Region 14936, everything on **plane 0** — the upper level is not a plane, it is a geographically
-separate part of the same plane, reached by ladders.
+Region 14936, everything on **plane 0** — the upper level is not a plane. It is reached by
+ladders and it sits **directly above** the lower level at the same world x/y, which is why the
+floor section below exists and why the tile coordinates in this table repeat between floors.
 
 | Thing | id | tile | action |
 |---|---|---|---|
@@ -52,9 +53,10 @@ Two facts that shape everything below:
   already skips spent veins, and `gathering.gather`'s "done when the id no longer stands on its
   tile" is already the right depletion test. Nothing in `gathering.py` needs to change.
 - **`/objects` lists the WHOLE loaded scene, both floors.** Standing upstairs the bridge happily
-  reports the lower hopper 8 tiles away, the sack at 21 and the struts at 11. Clicking any of
-  them through the floor is the exact failure CLAUDE.md records at JEFF's and ROSS's, so every
-  candidate is filtered by reachability before it is ever clicked (below).
+  reports the lower hopper 8 tiles away, the sack at 21 and the struts at 11 — at coordinates
+  that are *also* valid upstairs coordinates. Clicking one of them through the floor is the
+  failure CLAUDE.md records at JEFF's and ROSS's, made worse here because the usual defence
+  (reachability) cannot see it. See the floor section below.
 
 ## Which floor: tile height, and nothing else works
 
