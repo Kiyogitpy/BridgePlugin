@@ -52,8 +52,8 @@ public class LoginFingerprintTest
 	public void uuidFromWmicTakesTheSecondLineAndFallsBackToThePlaceholder()
 	{
 		// wmic prints a header line, the value, then blank lines.
-		assertEquals("1EBB33E4-2B90-8093-433F-50EBF62C698A",
-			LoginFingerprint.uuidFromWmic("UUID\r\n1EBB33E4-2B90-8093-433F-50EBF62C698A\r\n\r\n"));
+		assertEquals("A1B2C3D4-5E6F-7A8B-9C0D-1E2F3A4B5C6D",
+			LoginFingerprint.uuidFromWmic("UUID\r\nA1B2C3D4-5E6F-7A8B-9C0D-1E2F3A4B5C6D\r\n\r\n"));
 		assertEquals(LoginFingerprint.PLACEHOLDER_UUID, LoginFingerprint.uuidFromWmic(""));
 		assertEquals(LoginFingerprint.PLACEHOLDER_UUID, LoginFingerprint.uuidFromWmic("UUID\n\n"));
 		assertEquals(LoginFingerprint.PLACEHOLDER_UUID, LoginFingerprint.uuidFromWmic(null));

@@ -157,10 +157,10 @@ def test_format_fingerprint_lists_every_field_the_client_sends_in_a_fixed_order(
     fp = {"processCommand": "java.exe", "parentProcessCommand": "java.exe", "javaAgent": None,
           "osName": "windows 10", "osVersion": "10.0", "osArch": "amd64",
           "javaVendor": "Eclipse Adoptium", "javaVersion": "11.0.30", "maxMemoryMb": 8147,
-          "availableProcessors": 32, "smbiosUuid": "1EBB33E4-2B90-8093-433F-50EBF62C698A"}
+          "availableProcessors": 32, "smbiosUuid": "A1B2C3D4-5E6F-7A8B-9C0D-1E2F3A4B5C6D"}
     lines = d.format_fingerprint(fp)
     assert lines[0].startswith("processCommand")
-    assert any(l.startswith("smbiosUuid") and "1EBB33E4" in l for l in lines)
+    assert any(l.startswith("smbiosUuid") and "A1B2C3D4" in l for l in lines)
     assert any("javaAgent" in l and "(none)" in l for l in lines)
     assert len(lines) == 11
     assert d.format_fingerprint({}) == []          # un-rebuilt client: nothing to print, no crash

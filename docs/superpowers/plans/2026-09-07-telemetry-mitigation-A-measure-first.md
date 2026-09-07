@@ -108,8 +108,8 @@ public class LoginFingerprintTest
 	public void uuidFromWmicTakesTheSecondLineAndFallsBackToThePlaceholder()
 	{
 		// wmic prints a header line, the value, then blank lines.
-		assertEquals("1EBB33E4-2B90-8093-433F-50EBF62C698A",
-			LoginFingerprint.uuidFromWmic("UUID\r\n1EBB33E4-2B90-8093-433F-50EBF62C698A\r\n\r\n"));
+		assertEquals("A1B2C3D4-5E6F-7A8B-9C0D-1E2F3A4B5C6D",
+			LoginFingerprint.uuidFromWmic("UUID\r\nA1B2C3D4-5E6F-7A8B-9C0D-1E2F3A4B5C6D\r\n\r\n"));
 		assertEquals(LoginFingerprint.PLACEHOLDER_UUID, LoginFingerprint.uuidFromWmic(""));
 		assertEquals(LoginFingerprint.PLACEHOLDER_UUID, LoginFingerprint.uuidFromWmic("UUID\n\n"));
 		assertEquals(LoginFingerprint.PLACEHOLDER_UUID, LoginFingerprint.uuidFromWmic(null));
@@ -321,10 +321,10 @@ def test_format_fingerprint_lists_every_field_the_client_sends_in_a_fixed_order(
     fp = {"processCommand": "java.exe", "parentProcessCommand": "java.exe", "javaAgent": None,
           "osName": "windows 10", "osVersion": "10.0", "osArch": "amd64",
           "javaVendor": "Eclipse Adoptium", "javaVersion": "11.0.30", "maxMemoryMb": 8147,
-          "availableProcessors": 32, "smbiosUuid": "1EBB33E4-2B90-8093-433F-50EBF62C698A"}
+          "availableProcessors": 32, "smbiosUuid": "A1B2C3D4-5E6F-7A8B-9C0D-1E2F3A4B5C6D"}
     lines = d.format_fingerprint(fp)
     assert lines[0].startswith("processCommand")
-    assert any(l.startswith("smbiosUuid") and "1EBB33E4" in l for l in lines)
+    assert any(l.startswith("smbiosUuid") and "A1B2C3D4" in l for l in lines)
     assert any("javaAgent" in l and "(none)" in l for l in lines)
     assert len(lines) == 11
     assert d.format_fingerprint({}) == []          # un-rebuilt client: nothing to print, no crash
@@ -1250,7 +1250,7 @@ Run: `./gradlew.bat run` (host). Wait for the login screen.
 - [ ] **Step 2: A3 -- the fingerprint block is served and looks like the launch**
 
 Run: `python tools/deobfuscate.py --status`
-Expected: `login fingerprint (what the server will see):` followed by 11 lines. Under a Gradle launch, `processCommand = java.exe` and `parentProcessCommand = java.exe` (the Gradle worker), `javaAgent = (none)`, `availableProcessors = 32`, `maxMemoryMb` near 8147, `smbiosUuid = 1EBB33E4-2B90-8093-433F-50EBF62C698A`. Paste these into the CLAUDE.md telemetry section as the MEASURED host values (they are the parity targets sub-project E compares against).
+Expected: `login fingerprint (what the server will see):` followed by 11 lines. Under a Gradle launch, `processCommand = java.exe` and `parentProcessCommand = java.exe` (the Gradle worker), `javaAgent = (none)`, `availableProcessors = 32`, `maxMemoryMb` near 8147, `smbiosUuid = A1B2C3D4-5E6F-7A8B-9C0D-1E2F3A4B5C6D`. Paste these into the CLAUDE.md telemetry section as the MEASURED host values (they are the parity targets sub-project E compares against).
 
 - [ ] **Step 3: A4 -- the bridge is loopback-only on the host**
 
