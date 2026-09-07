@@ -405,6 +405,12 @@ of the feature is worth having without it.
    its tier-specific wording.
 7. **Whether the hold's item grid distinguishes salvage tiers** the routine should sort in a
    particular order.
+7b. **The default `keepItems` list against real drops.** It is derived from the money-making
+   guide's output table plus a single live 12-salvage sort (which produced only Rune scimitar and
+   Rune cannonball); a 7-minute capture aimed at collecting more caught no sorting at all. So the
+   exact item NAMES the game hands back are wiki-sourced, not measured -- a name that differs even
+   slightly (plurals, "(empty)" suffixes) silently drops an item the user meant to keep. Log every
+   dropped item name on the first run and diff it against the list.
 8. **`sortWhenIdle` genuinely fits a respawn gap** -- measure the real gap on a mass world against
    the 1.79s-per-salvage batch length, and confirm the interrupt returns to the hook fast enough
    not to lose a wreck.
