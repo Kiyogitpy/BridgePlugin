@@ -405,6 +405,53 @@ def stop_boat(ctx, target: dict = None, brake_started_at: float = None) -> bool:
     return True
 
 
+def find_facility(name: str, action: str = None, player: dict = None):
+    """The named facility ON OUR OWN BOAT, or None.
+
+    MEASURED live 2026-09-07 on a mass world: /objects listed 26 "Salvaging station" objects
+    from roughly 13 overlapping boats within a few tiles, three of them on the player's exact
+    tile, every one reporting clickable:true, with screen positions about 20px apart.
+    ObjectProvider recurses through every WorldEntity's WorldView by design (a boat's own
+    fixtures live in nested views), so the neighbours' decks are genuinely in the scan and
+    POSITION CANNOT SEPARATE THEM. Picking the nearest match -- what deploy_hook did until now
+    -- is a coin flip between our hook and a stranger's on exactly the worlds this routine runs
+    on.
+
+    boatViewId (ObjectProvider/PlayerProvider, 2026-09-07) is the outermost non-top-level
+    WorldView id, i.e. the boat. Matching it is exact.
+
+    Falls back to nearest-by-name when either side lacks the field -- an un-rebuilt client must
+    behave exactly as it did before, not refuse to work. That fallback keeps the neighbour-boat
+    bug it already had; it does not introduce a new one.
+    """
+    needle = (name or "").lower()
+    player = player if player is not None else controller.get_player()
+    our_view = player.get("boatViewId")
+
+    origin_x = player.get("boatX", player.get("x"))
+    origin_y = player.get("boatY", player.get("y"))
+
+    best, best_dist = None, None
+    for obj in controller.get_objects(radius=BOAT_OBJECT_SEARCH_RADIUS):
+        if needle not in (obj.get("name") or "").lower():
+            continue
+        if not obj.get("visible", True):
+            continue
+        if action is not None and action not in (obj.get("actions") or []):
+            continue
+        if our_view is not None and obj.get("boatViewId") is not None:
+            if obj.get("boatViewId") != our_view:
+                continue
+
+        if origin_x is None or origin_y is None:
+            return obj
+        dist = max(abs((obj.get("x") or 0) - origin_x), abs((obj.get("y") or 0) - origin_y))
+        if best_dist is None or dist < best_dist:
+            best, best_dist = obj, dist
+
+    return best
+
+
 def deploy_hook(ctx, hook_name: str) -> bool:
     """Click the boat's own salvaging hook facility object by name (e.g. "Bronze salvaging
     hook") -- this is the actual salvaging interaction; the shipwreck object itself only has an
@@ -418,11 +465,9 @@ def deploy_hook(ctx, hook_name: str) -> bool:
     pointInsideShape (a point verified to be inside the actual clickbox, not a bounding-box
     corner), so no extra offset is needed here -- same reasoning as stop_boat's own sail-toggle
     click, which already used offset=(0, 0) for the same reason."""
-    hook = next(
-        (o for o in controller.get_objects(radius=BOAT_OBJECT_SEARCH_RADIUS)
-         if hook_name.lower() in (o.get("name") or "").lower() and o.get("visible", True)),
-        None,
-    )
+    # find_facility, not a bare nearest-by-name scan: on a mass world the neighbours' hooks are
+    # in the scan too, at the same coordinates (see find_facility's own docstring).
+    hook = find_facility(hook_name, action="Deploy")
     if hook is None:
         debug_log.log("sailing", f"{hook_name} not found nearby")
         return False

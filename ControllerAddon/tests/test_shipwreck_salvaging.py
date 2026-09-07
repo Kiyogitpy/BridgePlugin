@@ -270,8 +270,11 @@ def test_stop_boat_waits_for_two_consecutive_still_reads(monkeypatch):
 
 def test_deploy_hook_and_helm_clicks_skip_simulated_misclick(monkeypatch):
     ctx = _Ctx()
-    hook = {"name": "Steel salvaging hook", "visible": True, "screenX": 1, "screenY": 1}
-    helm = {"name": "Helm", "visible": True, "screenX": 2, "screenY": 2}
+    hook = {"name": "Steel salvaging hook", "visible": True, "screenX": 1, "screenY": 1,
+            "actions": ["Deploy", "Modify"]}
+    helm = {"name": "Helm", "visible": True, "screenX": 2, "screenY": 2,
+            "actions": ["Navigate", "Escape"]}
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player())
     monkeypatch.setattr(controller, "get_objects", lambda **kw: [hook, helm])
     seen = []
     monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **kw: seen.append(kw) or True)
@@ -411,3 +414,67 @@ def test_sailing_xp_gain_resets_the_stall_clock(monkeypatch):
     xp["v"] = 1010
     ss.tick(ctx)
     assert not deploys
+
+
+# --- find_facility: our own boat vs. the neighbours' -------------------------------------
+# Geometry MEASURED live 2026-09-07 on a mass world: 26 "Salvaging station" objects from ~13
+# overlapping boats, three of them on the player's exact tile, all clickable, screen positions
+# ~20px apart. Distance cannot separate them; boatViewId can.
+
+def _station(boat_view_id, x=2681, y=2545, screen=(1209, 652)):
+    return {"id": 59701, "name": "Salvaging station", "x": x, "y": y, "plane": 0,
+            "visible": True, "clickable": True, "distance": 0,
+            "screenX": screen[0], "screenY": screen[1],
+            "actions": ["Sort-salvage", "Modify"], "boatViewId": boat_view_id}
+
+
+def test_find_facility_picks_our_own_boats_station(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: dict(_boat_player(2681, 2545),
+                                                               boatViewId=1036))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [
+        _station(2001, screen=(1214, 672)),
+        _station(1036, screen=(1209, 652)),
+        _station(2002, screen=(1191, 648)),
+    ])
+    found = sailing.find_facility("salvaging station", action="Sort-salvage")
+    assert found is not None
+    assert found["boatViewId"] == 1036
+    assert found["screenX"] == 1209
+
+
+def test_find_facility_returns_none_when_only_other_boats_have_one(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: dict(_boat_player(),
+                                                               boatViewId=1036))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_station(2001), _station(2002)])
+    assert sailing.find_facility("salvaging station") is None
+
+
+def test_find_facility_filters_on_the_action_when_given(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: dict(_boat_player(),
+                                                               boatViewId=1036))
+    hold = {"id": 60279, "name": "Mahogany cargo hold", "x": 2680, "y": 2545, "plane": 0,
+            "visible": True, "screenX": 100, "screenY": 100,
+            "actions": ["Open", "Deposit-all", "Modify"], "boatViewId": 1036}
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_station(1036), hold])
+    assert sailing.find_facility("cargo hold", action="Open")["id"] == 60279
+    assert sailing.find_facility("cargo hold", action="Sort-salvage") is None
+
+
+def test_find_facility_falls_back_to_nearest_when_boat_view_id_is_absent(monkeypatch):
+    """An un-rebuilt client serves no boatViewId. Behave exactly as before rather than
+    refusing to work -- degrade gracefully, never fail closed."""
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player(2681, 2545))
+    near = {"id": 59701, "name": "Salvaging station", "x": 2681, "y": 2545, "plane": 0,
+            "visible": True, "screenX": 1, "screenY": 1, "actions": ["Sort-salvage"]}
+    far = {"id": 59701, "name": "Salvaging station", "x": 2690, "y": 2560, "plane": 0,
+           "visible": True, "screenX": 2, "screenY": 2, "actions": ["Sort-salvage"]}
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [far, near])
+    assert sailing.find_facility("salvaging station")["screenX"] == 1
+
+
+def test_find_facility_ignores_invisible_objects(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: dict(_boat_player(),
+                                                               boatViewId=1036))
+    hidden = dict(_station(1036), visible=False)
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [hidden])
+    assert sailing.find_facility("salvaging station") is None
