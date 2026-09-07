@@ -327,6 +327,27 @@ Not traced through the obfuscation: which static wrapper calls the UUID getter o
 path; the method sits in the login class in the 1.12.14, 1.12.37 and 1.12.38 sources, so treat
 it as sent.
 
+**MEASURED on this host 2026-09-07** via `GET /client-version`'s `fingerprint` block
+(`LoginFingerprint.java` computes it exactly as the client does; `python tools/deobfuscate.py
+--status` prints it). These are the parity targets a different launch or a VM guest must match:
+
+| field | host value under `./gradlew.bat run` |
+|---|---|
+| `processCommand` / `parentProcessCommand` | `java.exe` / `java.exe` (the Gradle worker -- a launcher-run client would report `RuneLite.e`) |
+| `javaAgent` | none |
+| `osName` / `osVersion` / `osArch` | `windows 10` / `10.0` / `amd64` |
+| `javaVendor` / `javaVersion` | `Eclipse Adoptium` / `11.0.30` |
+| `maxMemoryMb` / `availableProcessors` | 8147 / 32 |
+| `smbiosUuid` | `1EBB33E4-2B90-8093-433F-50EBF62C698A` |
+
+The endpoint reads these; it never sends anything. It is served on **loopback only** since
+2026-09-07 -- VERIFIED the same day: `Bridge running on http://127.0.0.1:8080` in the log, a
+LAN request to `192.168.50.240:8080` and `192.168.56.1:8080` refused, `127.0.0.1:8080` 200.
+The bridge has no auth and serves game state, screenshots, recorder keystrokes and the bank
+memory, which is why the default moved; `bridgeBindAll` (Controller Settings) or
+`BRIDGE_BIND_ALL=1` restores all-interfaces, and the VM guest NEEDS the env one because a
+VirtualBox NAT forward lands on the guest's NAT adapter, never on its loopback.
+
 **Continuous, during play -- this is the half that matters to us:**
 - **`EVENT_MOUSE_MOVE`: the whole cursor trajectory, at 20 Hz.** A dedicated thread samples
   `(x, y, lastPressedTime)` every **50 ms** into a 500-slot buffer; the game loop flushes it
@@ -379,6 +400,18 @@ sends the OS / Java / launcher-version strings and a "is a Jagex account" boolea
    sent"; between-click motion, idle stillness and off-canvas excursions are the signal.
    Measure it with tools/humanity_report.py <human.jsonl> <bot.jsonl> -- the same metrics over
    both, which is the only way this class of signature is visible (the routine log cannot see it).
+   **The recorder captures the two things that were previously invisible** (added 2026-09-07):
+   `canvasexit`/`canvasenter` (the cursor leaving the window, which the client encodes as the
+   -1 in `EVENT_MOUSE_MOVE`) and `focus` (its `EVENT_APPLET_FOCUS`), plus a `recorder` stamp
+   record naming the schema. The stamp is load-bearing: a recording made BEFORE it exists
+   reports those metrics as `-` (unmeasurable), never as 0, so an old capture can never be
+   mistaken for "this bot never left the canvas". **Reading a recording out of the ring means
+   reading it BEFORE disarming** -- `handleArm` calls `ring.reset()` unconditionally, so
+   `arm?on=false` wipes the buffer (cost me one live run). VERIFIED live 2026-09-07: a scripted
+   Arduino excursion above the canvas top plus one Alt+Tab produced `recorder` 1, `canvasexit`
+   4, `canvasenter` 5, `focus` 2, and the report tool turned them into real numbers
+   (`off_canvas_fraction` 0.266, `unfocused_fraction` 0.130). Note a maximized window has no
+   left/right edge to leave by -- the cursor clamps inside the canvas; go UP into the title bar.
 2. Timing that is drawn from a fitted human distribution (`settings.py`) is on the wire; timing
    that is a constant is a fingerprint. That applies to key presses as much as clicks.
 3. Keep the login fingerprint constant per machine (same UUID, cores, heap, Windows build, JDK).
