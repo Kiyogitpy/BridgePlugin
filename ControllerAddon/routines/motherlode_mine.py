@@ -145,6 +145,7 @@ INTERFACE_BUDGET_S = 4.0
 DEPOSIT_BUDGET_S = 3.0
 CLIMB_BUDGET_S = 6.0
 CLIMB_MAX_TRIES = 8         # a ladder that never registers is a stop, not a loop
+CLIMB_BUDGET_MAX_S = 25.0   # ...but a climb still walking is waited on, up to this
 CLICK_RANGE = 10            # further than this, or off screen, and we walk before clicking
 SEARCH_BUDGET_S = 5.0
 REPAIR_BUDGET_S = 12.0
@@ -750,11 +751,24 @@ def climb(ctx, up) -> bool:
     mark = outcome_waits.mark(ctx)
     if not controller.click_entity(ctx.ser, ladder, refresh_target=_refresh(ladder)):
         return False
-    arrived = outcome_waits.await_pre(
-        ctx, {"VARBIT_CHANGED": outcome_waits.varbit_in([VARBIT_UPSTAIRS])},
-        CLIMB_BUDGET_S + _walk_budget(ladder),
-        confirm=lambda: (_upstairs() == bool(up)) or None,
-        since=mark, reaction=False, now_fn=_now, sleep_fn=_sleep)
+    # The wait EXTENDS WHILE THE PLAYER IS STILL MOVING, and only stillness past the budget
+    # spends it. MEASURED live 2026-09-07 (mlm_live9): a climb reported "did not register" at
+    # 11.4s and had plainly worked -- the next tick was already upstairs and mining. A
+    # tiles * 0.6s estimate assumes RUNNING, and at low run energy the same walk takes twice as
+    # long, which would make slow climbs count toward CLIMB_MAX_TRIES and stop a healthy run.
+    # Same fix, same reason, as travel._open_door's motion-aware door confirmation.
+    started = _now()
+    while True:
+        arrived = outcome_waits.await_pre(
+            ctx, {"VARBIT_CHANGED": outcome_waits.varbit_in([VARBIT_UPSTAIRS])},
+            CLIMB_BUDGET_S + _walk_budget(ladder),
+            confirm=lambda: (_upstairs() == bool(up)) or None,
+            since=mark, reaction=False, now_fn=_now, sleep_fn=_sleep)
+        if arrived or _now() - started >= CLIMB_BUDGET_MAX_S:
+            break
+        if (controller.get_player() or {}).get("moving") is not True:
+            break
+        debug_log.log(LOG, f"still walking to the {'up' if up else 'down'} ladder -- waiting on")
     data = _d(ctx)
     if arrived:
         debug_log.log(LOG, f"climbed {'up' if up else 'down'}")

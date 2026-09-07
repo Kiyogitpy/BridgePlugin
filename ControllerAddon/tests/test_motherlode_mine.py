@@ -794,3 +794,30 @@ def test_mining_will_not_start_with_the_deposit_box_open(monkeypatch):
     monkeypatch.setattr(mlm, "_close_deposit_box", lambda c: closed.append(True) or True)
     mlm.mine_phase(ctx)
     assert closed == [True]
+
+
+def test_a_climb_still_walking_is_waited_on(monkeypatch):
+    """mlm_live9: a climb reported "did not register" at 11.4s and had plainly worked -- the next
+    tick was already upstairs and mining. A tiles*0.6s budget assumes RUNNING, and at low run
+    energy the same walk takes twice as long, which would count healthy climbs toward
+    CLIMB_MAX_TRIES."""
+    ctx = _Ctx()
+    clock = _Clock()
+    monkeypatch.setattr(mlm, "_now", clock.now)
+    monkeypatch.setattr(mlm, "_sleep", clock.sleep)
+    down = {"id": mlm.LADDER_UP_ID, "name": "Ladder", "x": 3755, "y": 5673, "plane": 0,
+            "distance": 9, "actions": ["Climb"], "onScreen": True, "screenX": 1, "screenY": 1}
+    monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [down])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    start = clock.t
+    # Downstairs and walking until well past the plain budget, then upstairs.
+    monkeypatch.setattr(controller, "get_varbit",
+                        lambda vid: (1 if clock.t - start > 18 else 0)
+                        if vid == mlm.VARBIT_UPSTAIRS else 0)
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 3755, "y": 5670, "plane": 0, "regionId": mlm.REGION,
+                                 "weaponName": "Rune pickaxe", "tileHeight": 0,
+                                 "moving": clock.t - start <= 18})
+    assert mlm.climb(ctx, up=True) is True
+    assert ctx.state.data.get("mlm_climb_fails") == 0
