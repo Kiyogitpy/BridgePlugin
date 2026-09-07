@@ -8,6 +8,7 @@ Shipwreck salvaging wiki page (revision 15290733).
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "routines"))
@@ -190,12 +191,20 @@ def test_tick_does_not_drop_or_stow_with_plenty_of_room(monkeypatch):
 
 
 def test_drop_salvage_never_simulates_a_misclick(monkeypatch):
+    """I6 changed drop_items to verify the FIRST click against a shrinking inventory (see the
+    dedicated I6 tests below for the not-shrinking/fallback case) -- so the mock inventory here
+    must actually shrink in response to a click, or drop_works reads False on item 0 and every
+    later item goes through click_menu_action instead, which this test isn't about."""
     ctx = _Ctx()
-    monkeypatch.setattr(controller, "get_inventory",
-                        lambda: _inventory(3) + [{"name": "Chisel", "screenX": 1, "screenY": 1}])
+    inv = _inventory(3) + [{"name": "Chisel", "screenX": 1, "screenY": 1}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inv))
     seen = []
-    monkeypatch.setattr(controller, "click_entity",
-                        lambda ser, ent, **kw: seen.append((ent["name"], kw)) or True)
+
+    def _click(ser, ent, **kw):
+        seen.append((ent["name"], kw))
+        inv.remove(ent)
+        return True
+    monkeypatch.setattr(controller, "click_entity", _click)
     ss.drop_salvage(ctx)
     assert [n for n, _ in seen] == ["Small salvage"] * 3
     assert all(kw.get("simulate_mistakes") is False for _, kw in seen)
@@ -622,6 +631,54 @@ def test_drop_items_never_simulates_a_misclick(monkeypatch):
     ss.drop_items(_Ctx(), lambda name: True)
     assert seen.get("simulate_mistakes") is False
     assert seen.get("check_ui_blockers") is False
+
+
+# --- I6: drop_items verifies the first drop and falls back to the menu ---------------------
+
+def test_drop_items_falls_back_to_the_menu_when_the_first_drop_frees_nothing(monkeypatch):
+    """A forced-Drop swap that has gone missing or is mis-set on a ring/bracelet/scimitar would
+    otherwise leave click_entity resolving to Wear/Wield -- a truthful-looking 'dropped' count
+    with nothing actually leaving the inventory, which drives straight into the C2 deadlock."""
+    inv = [{"name": "Gold ring", "screenX": 1, "screenY": 1},
+           {"name": "Sapphire ring", "screenX": 2, "screenY": 2}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)   # static: nothing ever drops
+    entity_clicks = []
+    menu_clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **kw: entity_clicks.append(ent["name"]) or True)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **kw: menu_clicks.append((ent["name"], option)) or True)
+    dropped = ss.drop_items(_Ctx(), lambda name: True)
+    # Only the (failed) first attempt goes through click_entity -- everything after the verify
+    # fails, including the retry of item 0 itself, goes through the menu.
+    assert entity_clicks == ["Gold ring"]
+    assert menu_clicks == [("Gold ring", "Drop"), ("Sapphire ring", "Drop")]
+    assert dropped == 2
+
+
+def test_drop_items_logs_the_names_it_dropped(monkeypatch):
+    inv = [{"name": "Gold ring", "screenX": 1, "screenY": 1},
+           {"name": "Gold ring", "screenX": 2, "screenY": 2}]
+    calls = list(inv)
+    def _click(ser, ent, **kw):
+        calls.remove(ent)
+        return True
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(calls))
+    monkeypatch.setattr(controller, "click_entity", _click)
+    logged = []
+    monkeypatch.setattr(ss.debug_log, "log", lambda cat, msg: logged.append((cat, msg)))
+    ss.drop_items(_Ctx(), lambda name: True)
+    assert any("Gold ring" in msg and "dropped:" in msg for _, msg in logged)
+
+
+def test_drop_items_dismisses_a_stray_continue_box_on_entry(monkeypatch):
+    """Minor fix: drop_items' own blind spot -- a continue box already up when it's ENTERED,
+    not only one raised by a click issued from inside this call."""
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    calls = []
+    monkeypatch.setattr(controller, "dismiss_continue_box", lambda ser: calls.append(True) or True)
+    ss.drop_items(_Ctx(), lambda name: True)
+    assert calls == [True]
 
 
 # --- derive_phase ------------------------------------------------------------------------
@@ -1107,3 +1164,371 @@ def test_a_deployed_hook_is_recorded_so_it_can_be_set_aside_later(monkeypatch):
     ctx.state.config = _cfg(massWorld=True, sortWhenIdle=False)
     ss.tick(ctx)
     assert ctx.state.data.get("last_hook_key") == (3002, 3000, 0)
+
+
+# --- minor: ALL_SKIPPED never starts the reclick cooldown, a miss clears last_hook_key ------
+
+def test_all_skipped_does_not_set_the_deploy_cooldown(monkeypatch):
+    """No click was actually issued on the ALL_SKIPPED branch -- starting the cooldown there
+    would just delay the very next retry after the skip list is cleared, for nothing."""
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player(3000, 3000))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_wreck(3000, 3000)])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_combat", lambda: {"animation": -1})
+    monkeypatch.setattr(sailing, "deploy_hook", lambda ctx, name, skip=(): sailing.ALL_SKIPPED)
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=True, sortWhenIdle=False)
+    ss.tick(ctx)
+    assert "last_deploy_click_at" not in ctx.state.data
+
+
+def test_a_missed_deploy_clears_last_hook_key(monkeypatch):
+    """A miss (or nothing matching) must not leave a STALE last_hook_key from an earlier
+    successful click sitting around for a later engage timeout to wrongly blame."""
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player(3000, 3000))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_wreck(3000, 3000)])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_combat", lambda: {"animation": -1})
+    monkeypatch.setattr(sailing, "deploy_hook", lambda ctx, name, skip=(): None)
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=True, sortWhenIdle=False)
+    ctx.state.data["last_hook_key"] = (9, 9, 0)   # stale, from an earlier successful click
+    ss.tick(ctx)
+    assert "last_hook_key" not in ctx.state.data
+    assert "last_deploy_click_at" in ctx.state.data, "a miss still starts the reclick cooldown"
+
+
+# --- I5: non-hook phases clear the hook trackers --------------------------------------------
+
+def test_non_hook_phases_clear_the_hook_trackers(monkeypatch):
+    """A stale engage timer must not survive a sort/stow gap and fire on the FIRST tick of a
+    newly-risen wreck, setting aside a hook that was WORKING -- the sort/stow early returns in
+    tick() used to bypass the near_wreck branch's own cleanup entirely."""
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=True, sortWhenIdle=True)
+    ctx.state.data.update({
+        "hook_engage_attempt_at": 12345.0,
+        "hook_engage_reposition_count": 2,
+        "salvage_current_wreck_key": (1, 2, 0),
+        "hold_has_salvage": True,
+    })
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player())
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])   # nothing in hook range
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(ss, "sort_phase", lambda c: True)
+    ss.tick(ctx)
+    assert "hook_engage_attempt_at" not in ctx.state.data
+    assert "hook_engage_reposition_count" not in ctx.state.data
+    assert "salvage_current_wreck_key" not in ctx.state.data
+
+
+def test_hook_phase_keeps_the_hook_trackers(monkeypatch):
+    """The mirror case: while phase == "hook", the near_wreck branch owns these keys and I5
+    must not interfere with its own management of them. hook_engage_attempt_at is seeded with a
+    timestamp taken JUST before tick() so the branch's own HOOK_ENGAGE_TIMEOUT_S logic (which
+    legitimately pops it once genuinely stale) does not fire and confound the assertion -- what
+    is being tested is I5's unconditional pop, not the timeout."""
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=True, sortWhenIdle=False)
+    ctx.state.data["hook_engage_attempt_at"] = time.time()
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player(3000, 3000))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_wreck(3000, 3000)])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_combat", lambda: {"animation": -1})
+    monkeypatch.setattr(sailing, "deploy_hook", lambda ctx, name, skip=(): None)
+    ss.tick(ctx)
+    assert "hook_engage_attempt_at" in ctx.state.data
+    # salvage_current_wreck_key is unconditionally SET by the near_wreck branch -- the positive
+    # signal that phase == "hook" actually took the "keep going" path, not the "clear and bail"
+    # one I5 added.
+    assert ctx.state.data.get("salvage_current_wreck_key") == (3000, 3000, 0)
+
+
+# --- I3: a hold that never opens safety-stops rather than dropping forever -----------------
+
+def test_hold_open_failure_drops_for_the_first_few_attempts(monkeypatch):
+    fake = _FakeHold()
+    fake.open_hold = lambda ctx: False
+    _install_hold(monkeypatch, fake)
+    dropped = []
+    monkeypatch.setattr(ss, "drop_salvage", lambda ctx: dropped.append(True) or 1)
+    ctx = _Ctx()
+    stops = []
+    ctx.state.trigger_safety_stop = lambda reason: stops.append(reason)
+    for _ in range(ss.HOLD_OPEN_FAIL_LIMIT - 1):
+        ss.stow_phase(ctx)
+    assert len(dropped) == ss.HOLD_OPEN_FAIL_LIMIT - 1
+    assert not stops, "must not stop before the limit is reached"
+
+
+def test_hold_open_failure_reaching_the_limit_safety_stops(monkeypatch):
+    fake = _FakeHold()
+    fake.open_hold = lambda ctx: False
+    _install_hold(monkeypatch, fake)
+    dropped = []
+    monkeypatch.setattr(ss, "drop_salvage", lambda ctx: dropped.append(True) or 1)
+    ctx = _Ctx()
+    stops = []
+    ctx.state.trigger_safety_stop = lambda reason: stops.append(reason)
+    for _ in range(ss.HOLD_OPEN_FAIL_LIMIT):
+        ss.stow_phase(ctx)
+    assert stops, "must safety-stop once the hold has failed to open HOLD_OPEN_FAIL_LIMIT times"
+    assert len(dropped) == ss.HOLD_OPEN_FAIL_LIMIT - 1, "the limit tick itself must not drop -- stop instead"
+
+
+def test_hold_open_success_resets_the_fail_counter(monkeypatch):
+    fake = _FakeHold()
+    calls = {"n": 0}
+
+    def _open(ctx):
+        calls["n"] += 1
+        return calls["n"] >= 2   # fails once, then succeeds
+    fake.open_hold = _open
+    _install_hold(monkeypatch, fake)
+    monkeypatch.setattr(ss, "drop_salvage", lambda ctx: 1)
+    ctx = _Ctx()
+    ctx.state.trigger_safety_stop = lambda reason: (_ for _ in ()).throw(
+        AssertionError("must not stop -- the hold recovered before the limit"))
+    ss.stow_phase(ctx)   # fails (1)
+    ss.stow_phase(ctx)   # succeeds (2), resets the counter
+    for _ in range(ss.HOLD_OPEN_FAIL_LIMIT):
+        # open_hold's own fake always returns True from here on (calls["n"] stays >= 3), so this
+        # loop is only here to prove no stale counter lingers and cause a stop of its own.
+        ss.stow_phase(ctx)
+    assert ctx.state.data.get("hold_open_fail_count") == 0
+
+
+# --- C1: the sort rung parks after SORT_FAIL_LIMIT no-progress passes ----------------------
+
+def test_derive_phase_sort_parked_skips_both_sort_clauses():
+    """Both the full-hold clause and the idle-sort clause must be skipped while parked -- a
+    wreck in range goes to hook, no wreck goes to wait, never sort."""
+    assert ss.derive_phase(
+        _cfg(),
+        wreck_in_range=True, hold_full=True, inventory_salvage=0, free_slots=20,
+        hold_has_salvage=True, sort_parked=True,
+    ) == "hook"
+    assert ss.derive_phase(
+        _cfg(),
+        wreck_in_range=False, hold_full=True, inventory_salvage=0, free_slots=20,
+        hold_has_salvage=True, sort_parked=True,
+    ) == "wait"
+
+
+def test_derive_phase_sort_parked_still_allows_stow():
+    """Parked only skips the SORT clauses -- a salvage-laden near-full inventory must still
+    stow so the routine keeps earning."""
+    assert ss.derive_phase(
+        ss.DEFAULT_CONFIG,
+        wreck_in_range=True, hold_full=True, inventory_salvage=27, free_slots=1,
+        hold_has_salvage=True, sort_parked=True,
+    ) == "stow"
+
+
+def test_sort_parks_after_the_fail_limit_of_no_progress_passes(monkeypatch):
+    """Every pass here achieves nothing at all: no salvage anywhere, disposal drops nothing."""
+    _install_hold(monkeypatch, _FakeHold(rows=()))
+    monkeypatch.setattr(ss.cargo_hold, "withdraw_salvage", lambda ctx: False)
+    monkeypatch.setattr(ss, "drop_items", lambda ctx, pred: 0)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    ctx = _Ctx()
+    for _ in range(ss.SORT_FAIL_LIMIT):
+        ss.sort_phase(ctx)
+    assert ctx.state.data.get("sort_parked_until", 0) > time.time()
+    assert ctx.state.data.get("sort_fail_count") == 0, "resets once the park fires"
+
+
+def test_progress_resets_the_fail_counter(monkeypatch):
+    """A withdraw that DOES move salvage in counts as progress and must not let the counter
+    creep toward the park threshold across an otherwise-unproductive run."""
+    _install_hold(monkeypatch, _FakeHold(rows=()))
+    monkeypatch.setattr(ss, "drop_items", lambda ctx, pred: 0)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    withdraw_results = iter([False, False, True, False, False])
+    monkeypatch.setattr(ss.cargo_hold, "withdraw_salvage", lambda ctx: next(withdraw_results))
+    ctx = _Ctx()
+    for _ in range(5):
+        ss.sort_phase(ctx)
+    # Three no-progress passes total (1, 2, 4/5 counted separately), never SORT_FAIL_LIMIT (4)
+    # in a row -- the counter must never reach the park threshold.
+    assert "sort_parked_until" not in ctx.state.data
+
+
+def test_a_parked_sort_rung_falls_through_to_hook(monkeypatch):
+    """End-to-end: once parked, tick() must dispatch to hook (a wreck in range) rather than
+    calling sort_phase again."""
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=True, sortWhenIdle=True)
+    ctx.state.data["sort_parked_until"] = time.time() + 60
+    ctx.state.data["hold_has_salvage"] = True
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player(3000, 3000))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_wreck(3000, 3000)])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_combat", lambda: {"animation": -1})
+    sort_calls = []
+    monkeypatch.setattr(ss, "sort_phase", lambda c: sort_calls.append(True) or True)
+    deploys = []
+    monkeypatch.setattr(sailing, "deploy_hook",
+                        lambda ctx, name, skip=(): deploys.append(True) or {"x": 1, "y": 1, "plane": 0})
+    ss.tick(ctx)
+    assert not sort_calls, "parked -- sort_phase must not be called"
+    assert deploys, "must fall through to hooking instead"
+
+
+# --- C2: keepers are stowed into the hold, HARD_KEEP is never selected, and a full inventory
+#         of keepers the hold refuses safety-stops rather than looping ---------------------
+
+def test_keeper_names_excludes_hard_keep_even_when_it_matches_keepitems():
+    """A pathological keepItems entry that happens to overlap a HARD_KEEP word must still be
+    excluded -- the exclusion is by HARD_KEEP membership, not by whether keepItems asked for it."""
+    inv = [{"name": "Chisel"}, {"name": "Rune pouch"}, {"name": "Coins"},
+           {"name": "Rune scimitar"}]
+    names = ss._keeper_names(inv, ["chisel", "rune", "coins", "scimitar"])
+    assert names == {"Rune scimitar"}
+
+
+def test_stow_keepers_never_calls_deposit_item_with_a_hard_keep_name(monkeypatch):
+    inv = [{"name": "Chisel"}, {"name": "Rune pouch"}, {"name": "Coins"},
+           {"name": "Gem bag"}, {"name": "Plank sack"}, {"name": "Log basket"},
+           {"name": "Rune scimitar"}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    monkeypatch.setattr(ss.cargo_hold, "open_hold", lambda ctx: True)
+    monkeypatch.setattr(ss.cargo_hold, "close_hold", lambda ctx: True)
+    deposited = []
+    monkeypatch.setattr(ss.cargo_hold, "deposit_item",
+                        lambda ctx, name: deposited.append(name) or True)
+    ctx = _Ctx()
+    freed = ss.stow_keepers(ctx)
+    assert deposited == ["Rune scimitar"]
+    for hard in ["Chisel", "Rune pouch", "Coins", "Gem bag", "Plank sack", "Log basket"]:
+        assert hard not in deposited
+    assert freed == 1
+
+
+def test_stow_keepers_returns_zero_when_nothing_qualifies(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Chisel"}])
+
+    def _fail_open(ctx):
+        raise AssertionError("must not open the hold with nothing to deposit")
+    monkeypatch.setattr(ss.cargo_hold, "open_hold", _fail_open)
+    assert ss.stow_keepers(_Ctx()) == 0
+
+
+def test_sort_phase_stows_keepers_when_free_slots_run_low(monkeypatch):
+    """C2 step 2: sort_phase itself must call stow_keepers once free slots fall below
+    KEEPER_STOW_FREE_SLOTS, before it tries to withdraw more salvage."""
+    inv = ([{"name": "Rune scimitar", "screenX": i, "screenY": i}
+            for i in range(controller.INVENTORY_SIZE - 2)]
+           + [{"name": "Plundered salvage", "screenX": 900, "screenY": 900}])
+    assert controller.INVENTORY_SIZE - len(inv) < ss.KEEPER_STOW_FREE_SLOTS
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    monkeypatch.setattr(ss, "drop_items", lambda ctx, pred: 0)
+    stow_calls = []
+    monkeypatch.setattr(ss, "stow_keepers", lambda ctx: stow_calls.append(True) or 0)
+    monkeypatch.setattr(sailing, "find_facility", lambda *a, **k: _station_obj())
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(ss, "_await_sort_done", lambda ctx, count: True)
+    ss.sort_phase(_Ctx())
+    assert stow_calls
+
+
+def test_withdraw_is_skipped_with_zero_free_slots_and_hold_has_salvage_is_untouched(monkeypatch):
+    """The free-slot guard (C2, mandatory): must not attempt a withdraw with no room, and must
+    NOT record hold_has_salvage=False over it -- a full INVENTORY says nothing about the hold."""
+    full_inv = [{"name": "Rune scimitar", "screenX": i, "screenY": i}
+                for i in range(controller.INVENTORY_SIZE)]
+    monkeypatch.setattr(controller, "get_inventory", lambda: full_inv)
+    monkeypatch.setattr(ss, "drop_items", lambda ctx, pred: 0)
+    withdraw_calls = []
+    monkeypatch.setattr(ss.cargo_hold, "withdraw_salvage",
+                        lambda ctx: withdraw_calls.append(True) or True)
+    monkeypatch.setattr(ss.cargo_hold, "open_hold", lambda ctx: True)
+    monkeypatch.setattr(ss.cargo_hold, "close_hold", lambda ctx: True)
+    monkeypatch.setattr(ss.cargo_hold, "deposit_item", lambda ctx, name: False)  # can't free room
+    ctx = _Ctx()
+    ctx.state.data["hold_has_salvage"] = True   # a prior read said the hold DOES have salvage
+    ctx.state.trigger_safety_stop = lambda reason: None
+    ss.sort_phase(ctx)
+    assert not withdraw_calls, "must not attempt a withdraw with zero free slots"
+    assert ctx.state.data.get("hold_has_salvage") is True
+
+
+def test_terminal_stop_fires_when_the_inventory_is_full_of_keepers_the_hold_wont_take(monkeypatch):
+    inv = [{"name": "Rune scimitar", "screenX": i, "screenY": i}
+           for i in range(controller.INVENTORY_SIZE)]
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    monkeypatch.setattr(ss, "drop_items", lambda ctx, pred: 0)  # every item is a keeper
+    monkeypatch.setattr(ss.cargo_hold, "open_hold", lambda ctx: True)
+    monkeypatch.setattr(ss.cargo_hold, "close_hold", lambda ctx: True)
+    monkeypatch.setattr(ss.cargo_hold, "deposit_item", lambda ctx, name: False)
+    ctx = _Ctx()
+    stopped = []
+    ctx.state.trigger_safety_stop = lambda reason: stopped.append(reason)
+    ss.sort_phase(ctx)
+    assert stopped, "a full inventory of keepers the hold refuses must safety-stop, not loop"
+    assert "kept items" in stopped[0]
+
+
+def test_no_terminal_stop_when_the_inventory_is_full_but_still_has_something_droppable(monkeypatch):
+    """A full inventory alone is not the stuck condition -- only "full AND nothing left to
+    sort/stow/drop" is."""
+    inv = ([{"name": "Rune scimitar", "screenX": i, "screenY": i}
+            for i in range(controller.INVENTORY_SIZE - 1)]
+           + [{"name": "Gold ring", "screenX": 900, "screenY": 900}])   # droppable, not kept
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    monkeypatch.setattr(ss, "drop_items", lambda ctx, pred: 0)   # disposal itself failed/no-oped
+    monkeypatch.setattr(ss.cargo_hold, "open_hold", lambda ctx: True)
+    monkeypatch.setattr(ss.cargo_hold, "close_hold", lambda ctx: True)
+    monkeypatch.setattr(ss.cargo_hold, "deposit_item", lambda ctx, name: False)
+    ctx = _Ctx()
+    stopped = []
+    ctx.state.trigger_safety_stop = lambda reason: stopped.append(reason)
+    ss.sort_phase(ctx)
+    assert not stopped
+
+
+# --- I7: stow_phase's forced_full must not fold HOLD_UNKNOWN into "full" -------------------
+
+def test_deposit_unknown_does_not_force_the_hold_full(monkeypatch):
+    fake = _FakeHold(usage=(12, 160))
+    _install_hold(monkeypatch, fake)
+    monkeypatch.setattr(ss.cargo_hold, "deposit_salvage", lambda ctx: ss.cargo_hold.HOLD_UNKNOWN)
+    ctx = _Ctx()
+    ss.stow_phase(ctx)
+    assert ctx.state.data["hold_full"] is False
+
+
+# --- minor: a close_hold failure is logged, not silently swallowed -------------------------
+
+def test_stow_phase_logs_when_the_hold_does_not_close(monkeypatch):
+    fake = _FakeHold()
+    fake.close_hold = lambda ctx: False
+    _install_hold(monkeypatch, fake)
+    logged = []
+    monkeypatch.setattr(ss.debug_log, "log", lambda cat, msg: logged.append(msg))
+    ss.stow_phase(_Ctx())
+    assert any("did not close" in m for m in logged)
+
+
+def test_stow_keepers_logs_when_the_hold_does_not_close(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Rune scimitar"}])
+    monkeypatch.setattr(ss.cargo_hold, "open_hold", lambda ctx: True)
+    monkeypatch.setattr(ss.cargo_hold, "deposit_item", lambda ctx, name: True)
+    monkeypatch.setattr(ss.cargo_hold, "close_hold", lambda ctx: False)
+    logged = []
+    monkeypatch.setattr(ss.debug_log, "log", lambda cat, msg: logged.append(msg))
+    ss.stow_keepers(_Ctx())
+    assert any("did not close" in m for m in logged)
+
+
+def test_sort_phase_logs_when_the_hold_does_not_close_after_withdrawing(monkeypatch):
+    fake = _FakeHold()
+    fake.close_hold = lambda ctx: False
+    _install_hold(monkeypatch, fake)
+    monkeypatch.setattr(ss.cargo_hold, "withdraw_salvage", lambda ctx: False)
+    monkeypatch.setattr(ss, "drop_items", lambda ctx, pred: 0)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    logged = []
+    monkeypatch.setattr(ss.debug_log, "log", lambda cat, msg: logged.append(msg))
+    ss.sort_phase(_Ctx())
+    assert any("did not close" in m for m in logged)

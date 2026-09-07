@@ -207,6 +207,23 @@ public class PlayerProvider extends BridgeProvider
 		// player's own foot position -- e.g. sailing.py's hop-based steering math wants that, not
 		// this. null (both fields omitted) when not aboard a WorldEntity at all.
 		WorldPoint boatWp = RuneLiteUtil.getBoatOrActorWorldLocation(client, p);
+
+		// I4 (shipwreck salvaging final-review fix wave, 2026-09-07): resolved and emitted
+		// UNCONDITIONALLY, independent of the boatWp/wp tile comparison below. boatViewId used to
+		// sit inside that `if`, so it vanished on exactly the tick the player's own tile happened
+		// to equal the boat's reference tile -- which the player crosses constantly just walking
+		// the deck. sailing.find_facilities keys its own-boat-vs-neighbour filter on boatViewId,
+		// so that tick silently fell back to nearest-by-name, indistinguishable on a crowded mass
+		// world from a neighbouring boat's identical fixture. Everything else in this block
+		// (boatX/Y/Plane, hull width/height) stays gated on the tile comparison -- those describe
+		// a boat position DISTINCT from the player's own foot position, which is meaningless to
+		// report when the two tiles coincide, unlike boatViewId which identifies the boat itself.
+		WorldEntity boat = RuneLiteUtil.findTopLevelWorldEntityContaining(client, p.getWorldView());
+		if (boat != null && boat.getWorldView() != null)
+		{
+			data.put("boatViewId", boat.getWorldView().getId());
+		}
+
 		if (!boatWp.equals(wp))
 		{
 			data.put("boatX", boatWp.getX());
@@ -221,18 +238,11 @@ public class PlayerProvider extends BridgeProvider
 			// the boat's WorldEntity or its config isn't resolvable.
 			// UNVERIFIED live as of 2026-08-02 -- values not yet cross-checked against an actual
 			// boat's known size class in-game.
-			WorldEntity boat = RuneLiteUtil.findTopLevelWorldEntityContaining(client, p.getWorldView());
 			WorldEntityConfig boatConfig = boat != null ? boat.getConfig() : null;
 			if (boatConfig != null)
 			{
 				data.put("boatWidth", boatConfig.getBoundsWidth() / 128.0);
 				data.put("boatHeight", boatConfig.getBoundsHeight() / 128.0);
-			}
-			// The boat's own WorldView id, matching ObjectProvider's boatViewId stamp -- this is
-			// how the Python side tells OUR fixtures from a neighbouring boat's on a mass world.
-			if (boat != null && boat.getWorldView() != null)
-			{
-				data.put("boatViewId", boat.getWorldView().getId());
 			}
 		}
 

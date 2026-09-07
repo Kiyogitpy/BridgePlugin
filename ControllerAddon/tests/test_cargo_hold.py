@@ -105,6 +105,7 @@ def test_deposit_salvage_clicks_the_salvage_button_not_the_inventory_one(monkeyp
 def test_deposit_salvage_reports_failure_when_salvage_remains(monkeypatch):
     """The authoritative full signal: a Deposit Salvage that leaves salvage behind means the
     hold would not take it, whatever 943.4/943.5 say."""
+    monkeypatch.setattr(cargo_hold, "HOLD_ACTION_BUDGET_S", 0.02)   # I7 poll -- keep the test fast
     monkeypatch.setattr(controller, "get_widget", _widgets({
         (943, 1): {"found": True, "clickable": True, "text": "Cargo Hold: X",
                    "screenX": 1, "screenY": 1},
@@ -113,6 +114,60 @@ def test_deposit_salvage_reports_failure_when_salvage_remains(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [{"name": "Plundered salvage"}])
     assert cargo_hold.deposit_salvage(_Ctx()) is False
+
+
+# --- I7: poll instead of sleep-then-read-once ------------------------------------------------
+
+def test_deposit_salvage_polls_and_succeeds_once_the_inventory_actually_clears(monkeypatch):
+    """An early read must not be trusted -- the inventory takes a couple of polls to clear."""
+    monkeypatch.setattr(controller, "get_widget", _widgets({
+        (943, 1): {"found": True, "clickable": True, "text": "Cargo Hold: X",
+                   "screenX": 1, "screenY": 1},
+        (943, 14): {"found": True, "clickable": True, "screenX": 14, "screenY": 14},
+    }))
+    reads = {"n": 0}
+
+    def _inv():
+        reads["n"] += 1
+        return [{"name": "Plundered salvage"}] if reads["n"] < 3 else []
+    monkeypatch.setattr(controller, "get_inventory", _inv)
+    assert cargo_hold.deposit_salvage(_Ctx()) is True
+    assert reads["n"] >= 3
+
+
+def test_deposit_salvage_returns_hold_unknown_when_the_interface_is_not_open():
+    """'Cannot tell', never 'full' -- see stow_phase's own forced_full computation."""
+    assert cargo_hold.deposit_salvage(_Ctx()) is cargo_hold.HOLD_UNKNOWN
+    assert bool(cargo_hold.deposit_salvage(_Ctx())) is False   # still falsy
+
+
+def test_deposit_salvage_returns_hold_unknown_when_the_button_never_registers(monkeypatch):
+    monkeypatch.setattr(controller, "get_widget", _widgets({
+        (943, 1): {"found": True, "clickable": True, "text": "Cargo Hold: X",
+                   "screenX": 1, "screenY": 1},
+        (943, 14): {"found": True, "clickable": False},   # not clickable -- _click returns False
+    }))
+    assert cargo_hold.deposit_salvage(_Ctx()) is cargo_hold.HOLD_UNKNOWN
+
+
+def test_hold_unknown_is_distinct_from_a_real_false():
+    """The whole point of the sentinel: `is False` must not match it."""
+    assert cargo_hold.HOLD_UNKNOWN is not False
+    assert (cargo_hold.HOLD_UNKNOWN is False) is False
+
+
+def test_withdraw_salvage_polls_before_giving_up(monkeypatch):
+    monkeypatch.setattr(cargo_hold, "HOLD_ACTION_BUDGET_S", 0.02)   # keep the "never arrives" path fast
+    monkeypatch.setattr(controller, "get_widget", _widgets({(943, 1): _OPEN_TITLE}))
+    monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [
+        {"index": 0, "itemName": "Plundered salvage", "itemQty": 14,
+         "clickable": True, "screenX": 7, "screenY": 7},
+    ])
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
+    reads = []
+    monkeypatch.setattr(controller, "get_inventory", lambda: reads.append(1) or [])
+    assert cargo_hold.withdraw_salvage(_Ctx()) is False
+    assert len(reads) >= 2, "must poll more than once before giving up"
 
 
 def test_interface_clicks_skip_the_ui_blocker_check_and_misclicks(monkeypatch):
@@ -210,6 +265,7 @@ def test_withdraw_salvage_returns_true_when_salvage_actually_arrives(monkeypatch
 def test_withdraw_salvage_returns_false_when_nothing_arrives(monkeypatch):
     """A menu click that registered but moved nothing (e.g. the inventory was already full)
     must not be reported as a success."""
+    monkeypatch.setattr(cargo_hold, "HOLD_ACTION_BUDGET_S", 0.02)   # I7 poll -- keep the test fast
     monkeypatch.setattr(controller, "get_widget", _widgets({(943, 1): _OPEN_TITLE}))
     monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [
         {"index": 0, "itemName": "Plundered salvage", "itemQty": 14,
@@ -263,3 +319,96 @@ def test_close_hold_returns_true_immediately_when_already_closed(monkeypatch):
     monkeypatch.setattr(controller, "key_tap", lambda *a, **k: key_taps.append(a))
     assert cargo_hold.close_hold(_Ctx()) is True
     assert key_taps == []
+
+
+def test_click_null_checks_both_screen_coordinates(monkeypatch):
+    """Minor fix: _click used to check screenX only -- a widget carrying one but not the other
+    (a malformed/partial read) would still be clicked at whatever garbage screenY it had."""
+    monkeypatch.setattr(controller, "get_widget", _widgets({
+        (943, 1): {"found": True, "clickable": True, "text": "Cargo Hold: X",
+                   "screenX": 1, "screenY": 1},
+        (943, 14): {"found": True, "clickable": True, "screenX": 14},   # no screenY
+    }))
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, w, **kw: clicked.append(w) or True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    cargo_hold.deposit_salvage(_Ctx())
+    assert not clicked
+
+
+# --- C2: deposit_item -- the sink for KEEPERS (943.14 only ever deposits salvage) -----------
+
+def test_deposit_item_deposits_the_named_item_and_confirms_it_dropped(monkeypatch):
+    monkeypatch.setattr(controller, "get_widget", _widgets({(943, 1): _OPEN_TITLE}))
+    monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [
+        {"index": 0, "itemName": "Rune scimitar", "itemQty": 1,
+         "clickable": True, "screenX": 9, "screenY": 9},
+    ])
+    calls = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: calls.append((option, kw)) or True)
+    reads = {"n": 0}
+
+    def _inv():
+        reads["n"] += 1
+        return [{"name": "Rune scimitar"}] if reads["n"] < 2 else []
+    monkeypatch.setattr(controller, "get_inventory", _inv)
+    assert cargo_hold.deposit_item(_Ctx(), "Rune scimitar") is True
+    assert calls == [("Deposit-All", {"offset": (0, 0), "check_ui_blockers": False})]
+
+
+def test_deposit_item_matches_exact_name_not_substring(monkeypatch):
+    """A substring match here could pick up a DIFFERENT item that merely shares a keepItems
+    substring with the intended one -- deposit_item must never do that."""
+    monkeypatch.setattr(controller, "get_widget", _widgets({(943, 1): _OPEN_TITLE}))
+    monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [
+        {"index": 0, "itemName": "Rune scimitar", "clickable": True, "screenX": 1, "screenY": 1},
+        {"index": 1, "itemName": "Rune cannonball", "clickable": True, "screenX": 2, "screenY": 2},
+    ])
+    clicked = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, entity, option, **kw: clicked.append(entity["itemName"]) or True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Rune scimitar"}])
+    cargo_hold.deposit_item(_Ctx(), "rune")   # would substring-match BOTH if not exact
+    assert clicked == []
+
+
+def test_deposit_item_returns_false_when_the_item_is_not_in_the_side_panel(monkeypatch):
+    monkeypatch.setattr(controller, "get_widget", _widgets({(943, 1): _OPEN_TITLE}))
+    monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [])
+    assert cargo_hold.deposit_item(_Ctx(), "Rune scimitar") is False
+
+
+def test_deposit_item_returns_false_when_the_hold_is_not_open():
+    # _no_live_bridge's default get_widget means is_open() is False -- deposit_item must bail
+    # before ever touching the side panel.
+    assert cargo_hold.deposit_item(_Ctx(), "Rune scimitar") is False
+
+
+def test_deposit_item_returns_false_with_an_empty_name():
+    assert cargo_hold.deposit_item(_Ctx(), "") is False
+    assert cargo_hold.deposit_item(_Ctx(), None) is False
+
+
+def test_deposit_item_does_not_splat_click_kwargs_into_click_menu_action(monkeypatch):
+    """The same regression guard as withdraw_salvage's: click_menu_action has no
+    simulate_mistakes parameter, so **_CLICK_KWARGS would raise TypeError if splatted here."""
+    monkeypatch.setattr(cargo_hold, "HOLD_ACTION_BUDGET_S", 0.02)   # the inventory never
+                                                                     # shrinks in this fixture --
+                                                                     # only the call shape matters
+    monkeypatch.setattr(controller, "get_widget", _widgets({(943, 1): _OPEN_TITLE}))
+    monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [
+        {"index": 0, "itemName": "Rune scimitar", "clickable": True, "screenX": 1, "screenY": 1},
+    ])
+    calls = []
+
+    def fake_click_menu_action(ser, entity, option, **kwargs):
+        calls.append((option, kwargs))
+        return True
+    monkeypatch.setattr(controller, "click_menu_action", fake_click_menu_action)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Rune scimitar"}])
+    cargo_hold.deposit_item(_Ctx(), "Rune scimitar")
+    assert len(calls) == 1
+    option, kwargs = calls[0]
+    assert option == "Deposit-All"
+    assert "simulate_mistakes" not in kwargs

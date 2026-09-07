@@ -237,6 +237,26 @@ HAZARD_GIVEUP_S = 30 * 60  # a hazardous-waters refusal is about the BOAT's fitt
                             # not the approach -- no reposition fixes it, so the wreck is
                             # blacklisted for far longer than an ordinary engage failure.
 
+# --- C1 (final-review fix wave, 2026-09-07): the sort rung must not be able to spin forever ---
+# Consecutive sort passes that achieve nothing before the rung is parked. A sort that cannot
+# progress (no station reachable, the hold will not open, the channel never starts) otherwise
+# repeats forever -- and because the full-hold clause outranks a wreck in range, it blocks
+# hooking too. This codebase's own standing lesson: a silent loop is worse than a crash, because
+# it looks like it is working.
+SORT_FAIL_LIMIT = 4
+SORT_PARK_S = 300.0
+
+# --- C2: keepers have no sink but the hold, so sort_phase stows them once the inventory is
+# getting tight -- see stow_keepers/cargo_hold.deposit_item. Enough room left afterward to
+# withdraw a useful salvage batch, without immediately tripping the same threshold again next
+# tick.
+KEEPER_STOW_FREE_SLOTS = 4
+
+# --- I3: a hold that never opens must not silently drop every fill for hours with the user
+# away. Drop as a fallback for the first couple of failures (a transient miss, camera drift,
+# ...); at the limit, stop instead of continuing to throw salvage over the side unwatched.
+HOLD_OPEN_FAIL_LIMIT = 3
+
 
 def _wreck_key(wreck: dict):
     return (wreck.get("x"), wreck.get("y"), wreck.get("plane"))
@@ -270,12 +290,83 @@ def keep_item(name: str, keep_items) -> bool:
     return any((needle or "").lower() in lowered for needle in (keep_items or []))
 
 
-def _holds_salvage(inventory) -> bool:
-    return any((item.get("name") or "").lower().endswith("salvage") for item in inventory)
+def _keeper_names(inventory, keep_items) -> set:
+    """Distinct item names present that the CONFIGURED keep-list selects and HARD_KEEP does NOT
+    already cover -- the exclusion IS the safety property (see stow_keepers's own docstring).
+    Deliberately does NOT call keep_item(), which folds HARD_KEEP in as a keeper too -- that is
+    exactly right for post-sort disposal (never drop the chisel) and exactly wrong here (never
+    let a typo in keepItems select the chisel for a hold deposit either)."""
+    names = set()
+    for item in inventory:
+        name = item.get("name") or ""
+        if not name:
+            continue
+        lowered = name.lower()
+        if any(needle in lowered for needle in HARD_KEEP):
+            continue
+        if any((needle or "").lower() in lowered for needle in (keep_items or [])):
+            names.add(name)
+    return names
+
+
+def stow_keepers(ctx) -> int:
+    """C2 (final-review fix wave, 2026-09-07): deposit every kept, non-hard-keep item currently
+    in the inventory into our own boat's cargo hold. 943.14 (deposit_salvage) deposits SALVAGE
+    only, deliberately (see cargo_hold's own docstring) -- so a keeper (a diamond ring, a rune
+    scimitar, ...) has NO OTHER SINK, and a long run fills the inventory with sorted output and
+    deadlocks: a withdraw into a full inventory moves nothing, sort_phase concludes there is
+    nothing to sort, and hooking has nowhere to put a catch either.
+
+    Opens the hold once, deposits each DISTINCT kept item name via cargo_hold.deposit_item,
+    closes it, and returns how many distinct names were confirmed freed (cargo_hold.deposit_item
+    itself confirms the count actually dropped -- a declared success here is never assumed).
+
+    The HARD_KEEP exclusion in _keeper_names is the safety property that makes this acceptable
+    at all: selection is by EXACT item name drawn from keepItems matches MINUS HARD_KEEP, so the
+    chisel, rune pouch, coins and unsorted salvage itself can never be selected here, whatever a
+    typo in keepItems does."""
+    config = ctx.state.config
+    names = _keeper_names(controller.get_inventory(), config.get("keepItems", []))
+    if not names:
+        return 0
+
+    if not cargo_hold.open_hold(ctx):
+        debug_log.log("salvage", "could not open the cargo hold to stow keepers")
+        return 0
+
+    freed = 0
+    for name in sorted(names):
+        if cargo_hold.deposit_item(ctx, name):
+            freed += 1
+        else:
+            debug_log.log("salvage", f"could not deposit '{name}' into the hold")
+    if not cargo_hold.close_hold(ctx):
+        # Minor fix (final review): an interface left open eats the NEXT world click, which is
+        # the hook deploy -- worth a log line, not silent.
+        debug_log.log("salvage", "the cargo hold did not close after stowing keepers")
+    return freed
+
+
+def _sort_progress_tick(data: dict, made_progress: bool) -> None:
+    """C1: update sort_fail_count/sort_parked_until off whether one sort_phase pass achieved
+    anything. "Progress" (per the final-review brief) is: salvage left the inventory during this
+    pass, OR a withdraw moved salvage in, OR items were dropped -- every return path in
+    sort_phase routes through this, because an untracked early return is exactly the shape that
+    spun forever with a wreck sitting in range (see SORT_FAIL_LIMIT's own comment)."""
+    if made_progress:
+        data["sort_fail_count"] = 0
+        return
+    count = data.get("sort_fail_count", 0) + 1
+    data["sort_fail_count"] = count
+    if count >= SORT_FAIL_LIMIT:
+        debug_log.log("!", f"sort: {count} consecutive passes made no progress -- parking the "
+                            f"sort rung for {SORT_PARK_S:.0f}s so hooking/waiting can carry on")
+        data["sort_parked_until"] = time.time() + SORT_PARK_S
+        data["sort_fail_count"] = 0
 
 
 def derive_phase(config, *, wreck_in_range, hold_full, inventory_salvage, free_slots,
-                 hold_has_salvage):
+                 hold_has_salvage, sort_parked=False):
     """Which phase this tick should run, derived ENTIRELY from live state.
 
     Never from a stored phase: ctx.state.data is wiped on restart while the boat's real state
@@ -306,13 +397,20 @@ def derive_phase(config, *, wreck_in_range, hold_full, inventory_salvage, free_s
     contradicting the spec's own "stowSalvage: False restores today's behaviour exactly:
     drop_salvage on the deck." The phase name "stow" is about the SLOT (a salvage-laden
     inventory is at or below dropAtFreeSlots free), not about which disposal method is used --
-    stow_phase alone decides deposit-to-hold vs. drop-on-the-deck."""
+    stow_phase alone decides deposit-to-hold vs. drop-on-the-deck.
+
+    sort_parked (C1, final-review fix wave, 2026-09-07): True while sort_phase has failed to
+    make progress SORT_FAIL_LIMIT times in a row (see _sort_progress_tick). Skips BOTH clauses
+    that return "sort" -- not just the idle one -- so the routine falls through to stow / hook /
+    wait and keeps earning instead of spinning on a sort rung that cannot progress (no station
+    reachable, the hold will not open, ...). Does not touch clause order or any other clause."""
     something_to_sort = bool(inventory_salvage) or hold_has_salvage is not False
 
-    if hold_full and something_to_sort:
-        return "sort"
-    if config.get("sortWhenIdle", True) and not wreck_in_range and something_to_sort:
-        return "sort"
+    if not sort_parked:
+        if hold_full and something_to_sort:
+            return "sort"
+        if config.get("sortWhenIdle", True) and not wreck_in_range and something_to_sort:
+            return "sort"
     if inventory_salvage and free_slots <= config.get("dropAtFreeSlots", 1):
         return "stow"
     if wreck_in_range:
@@ -323,7 +421,11 @@ def derive_phase(config, *, wreck_in_range, hold_full, inventory_salvage, free_s
 def _record_hold(data, used, capacity, has_salvage, config, forced_full=False):
     """Record what the open hold reported. Unreadable numbers mean "cannot tell" -- they must
     never make the hold LOOK full or LOOK empty, so hold_full only goes True on a real reading
-    or on the empirical forced_full signal."""
+    or on the empirical forced_full signal.
+
+    Re-checkable by design (C1): while the sort rung is parked, this is still called by every
+    successful stow_phase deposit, so hold_full clears itself the moment the hold actually has
+    room again -- nothing about being parked latches the OLD hold_full reading."""
     data["hold_used"] = used
     data["hold_capacity"] = capacity
     data["hold_has_salvage"] = has_salvage
@@ -341,7 +443,14 @@ def stow_phase(ctx) -> bool:
     while the interface is open (the only place it is readable -- see cargo_hold's docstring).
 
     Falls back to dropping on the deck whenever the hold cannot be opened, so a broken or
-    missing hold degrades to the pre-2026-09-07 behaviour instead of stalling the run."""
+    missing hold degrades to the pre-2026-09-07 behaviour instead of stalling the run.
+
+    I3 (final-review fix wave, 2026-09-07): CONSECUTIVE open_hold failures are counted. A
+    fallback drop is fine for the first couple -- a camera hiccup, a transient miss -- but on
+    the pre-rebuild fallback path (no boatViewId) the hold cannot be found AT ALL, and that is
+    the LIKELY outcome, not a rare one, with the user away for hours. Past HOLD_OPEN_FAIL_LIMIT
+    this stops dropping salvage blind and safety-stops instead. Any successful open resets the
+    counter."""
     config = ctx.state.config
     data = ctx.state.data
 
@@ -349,19 +458,39 @@ def stow_phase(ctx) -> bool:
         return bool(drop_salvage(ctx))
 
     if not cargo_hold.open_hold(ctx):
-        debug_log.log("salvage", "could not open the cargo hold -- dropping salvage instead")
+        fails = data.get("hold_open_fail_count", 0) + 1
+        data["hold_open_fail_count"] = fails
+        if fails >= HOLD_OPEN_FAIL_LIMIT:
+            ctx.state.trigger_safety_stop(
+                f"the cargo hold has not opened in {fails} consecutive attempts -- every fill "
+                f"would have been dropped on the deck with no one watching")
+            return False
+        debug_log.log("salvage", f"could not open the cargo hold (attempt {fails}/"
+                                  f"{HOLD_OPEN_FAIL_LIMIT}) -- dropping salvage instead")
         return bool(drop_salvage(ctx))
+
+    data["hold_open_fail_count"] = 0
 
     deposited = cargo_hold.deposit_salvage(ctx)
     used, capacity = cargo_hold.read_usage()
     has_salvage = bool(cargo_hold.salvage_rows())
-    _record_hold(data, used, capacity, has_salvage, config, forced_full=not deposited)
+    # I7: forced_full only on a DEFINITE "full" (deposited is exactly False -- the interface was
+    # open, the click landed, and salvage is still in the inventory). HOLD_UNKNOWN ("cannot
+    # tell" -- the interface was never open, or the click never registered) is also falsy but
+    # must NOT be folded into forced_full, or a single dropped bridge request latches a
+    # near-empty hold as full for the rest of the session.
+    _record_hold(data, used, capacity, has_salvage, config, forced_full=(deposited is False))
 
-    if not deposited:
+    if deposited is False:
         debug_log.log("salvage", f"salvage left in the inventory after Deposit Salvage "
                                   f"(hold {used}/{capacity}) -- treating the hold as full")
-    cargo_hold.close_hold(ctx)
-    return deposited
+    elif deposited is cargo_hold.HOLD_UNKNOWN:
+        debug_log.log("salvage", "could not confirm the Deposit Salvage click -- will retry")
+    if not cargo_hold.close_hold(ctx):
+        # Minor fix (final review): an interface left open eats the NEXT world click, which is
+        # the hook deploy -- worth a log line, not silent.
+        debug_log.log("salvage", "the cargo hold did not close after stowing salvage")
+    return bool(deposited)
 
 
 def _inventory_salvage_count():
@@ -390,38 +519,86 @@ def sort_phase(ctx) -> bool:
     real, reachable state: enter sort holding an inventory full of the PREVIOUS batch's sorted
     output, find no salvage to sort, and try to withdraw into an inventory with no free slots.
     Disposal is idempotent, so running it every pass costs nothing when there is nothing to
-    drop."""
+    drop.
+
+    C2 (final-review fix wave, 2026-09-07): 943.14 deposits salvage ONLY, so a KEPT item
+    (rings, bracelets, cannonballs, ...) has no sink but the hold -- stow_keepers is called once
+    free slots fall below KEEPER_STOW_FREE_SLOTS, before anything tries to withdraw more
+    salvage. The withdraw itself is skipped OUTRIGHT when there is still no free slot afterward
+    (a withdraw into a full inventory moves nothing) -- and critically, that skip must NOT set
+    hold_has_salvage False: a full INVENTORY says nothing about the hold. If nothing droppable
+    remains either (every item is a keeper the hold just refused, or HARD_KEEP), this is a
+    genuine deadlock and the routine safety-stops rather than spin.
+
+    C1: every return path funnels through _sort_progress_tick so a pass that achieves nothing
+    (repeatedly) parks the sort rung instead of spinning forever with a wreck sitting in range."""
     config = ctx.state.config
     data = ctx.state.data
     keep = config.get("keepItems", [])
 
-    drop_items(ctx, lambda name: not keep_item(name, keep))
+    dropped_pre = drop_items(ctx, lambda name: not keep_item(name, keep))
+    progress = dropped_pre > 0
+
+    inventory = controller.get_inventory()
+    free_slots = controller.INVENTORY_SIZE - len(inventory)
+    if free_slots < KEEPER_STOW_FREE_SLOTS:
+        freed = stow_keepers(ctx)
+        if freed:
+            progress = True
+        inventory = controller.get_inventory()
+        free_slots = controller.INVENTORY_SIZE - len(inventory)
 
     if _inventory_salvage_count() == 0:
+        if free_slots <= 0:
+            # Free-slot guard (C2, mandatory): do not even ATTEMPT a withdraw with no room --
+            # and do not touch hold_has_salvage over it. The failure reason here is "no room",
+            # never "the hold is empty".
+            droppable = any(not keep_item(i.get("name") or "", keep) for i in inventory)
+            if not droppable:
+                ctx.state.trigger_safety_stop(
+                    "inventory is full of kept items and the hold would not take them")
+            else:
+                debug_log.log("salvage", "no free inventory slots -- cannot withdraw more "
+                                          "salvage to sort")
+            _sort_progress_tick(data, progress)
+            return False
+
         if not cargo_hold.open_hold(ctx):
+            _sort_progress_tick(data, progress)
             return False
         withdrew = cargo_hold.withdraw_salvage(ctx)
+        if withdrew:
+            progress = True
         used, capacity = cargo_hold.read_usage()
         _record_hold(data, used, capacity, bool(cargo_hold.salvage_rows()), config)
-        cargo_hold.close_hold(ctx)
+        if not cargo_hold.close_hold(ctx):
+            debug_log.log("salvage", "the cargo hold did not close after withdrawing")
         if not withdrew:
             debug_log.log("salvage", "no salvage left in the hold -- nothing to sort")
             data["hold_has_salvage"] = False
+            _sort_progress_tick(data, progress)
             return False
 
     count = _inventory_salvage_count()
     if count == 0:
+        _sort_progress_tick(data, progress)
         return False
 
     station = sailing.find_facility(SALVAGING_STATION_NAME, action=SORT_ACTION)
     if station is None:
         debug_log.log("salvage", "no salvaging station on our own boat")
+        _sort_progress_tick(data, progress)
         return False
 
     debug_log.log("salvage", f"sorting {count} salvage (~{count * SORT_SECONDS_PER_SALVAGE:.0f}s)")
     controller.click_entity(ctx.ser, station, offset=(0, 0), simulate_mistakes=False)
     finished = _await_sort_done(ctx, count)
-    drop_items(ctx, lambda name: not keep_item(name, keep))
+    if finished or _inventory_salvage_count() < count:
+        progress = True
+    dropped_post = drop_items(ctx, lambda name: not keep_item(name, keep))
+    if dropped_post:
+        progress = True
+    _sort_progress_tick(data, progress)
     return finished
 
 
@@ -444,6 +621,7 @@ def tick(ctx):
     near_exclude = _active_giveup(data, "hook_engage_giveup_key", "hook_engage_giveup_until", now)
     near_wreck = find_wreck_in_hook_range(config, exclude=near_exclude)
 
+    sort_parked = now < data.get("sort_parked_until", 0)
     phase = derive_phase(
         config,
         wreck_in_range=near_wreck is not None,
@@ -451,10 +629,23 @@ def tick(ctx):
         inventory_salvage=inventory_salvage,
         free_slots=free_slots,
         hold_has_salvage=data.get("hold_has_salvage"),
+        sort_parked=sort_parked,
     )
     if phase != data.get("salvage_phase"):
         debug_log.log("salvage", f"phase -> {phase}")
         data["salvage_phase"] = phase
+
+    if phase != "hook":
+        # I5 (final-review fix wave, 2026-09-07): the sort/stow early returns just below bypass
+        # the near_wreck branch's own cleanup entirely (it used to live only at the bottom of
+        # this function, reached only via the wait/far-wreck path), so a stale engage timer
+        # survived a sorting gap and fired on the FIRST tick of a newly-risen wreck, setting
+        # aside a hook that was WORKING -- exactly the mass-world hook rotation this was written
+        # to protect. Clear immediately after the phase is derived, whatever the phase turns out
+        # to be, not only once the "wait" path is reached at the bottom.
+        data.pop("salvage_current_wreck_key", None)
+        data.pop("hook_engage_attempt_at", None)
+        data.pop("hook_engage_reposition_count", None)
 
     if phase == "sort":
         sort_phase(ctx)
@@ -568,13 +759,23 @@ def tick(ctx):
                 # hook for an incidental miss, defeating the rotation.
                 debug_log.log("salvage", "every hook is set aside -- clearing and retrying")
                 data.pop("hook_skip", None)
+                # Minor fix (final review): no click was actually issued on this branch -- do
+                # not start the reclick cooldown over nothing.
             elif used is not None:
                 data["last_hook_key"] = (used.get("x"), used.get("y"), used.get("plane"))
-            data["last_deploy_click_at"] = time.time()
+                data["last_deploy_click_at"] = time.time()
+            else:
+                # A deploy WAS attempted (not ALL_SKIPPED) but nothing was actually clicked --
+                # no matching hook was found, or the click itself missed. Clear last_hook_key
+                # rather than leave a STALE value from an earlier successful click: a later
+                # engage timeout must not blame a hook that was never clicked this time (minor
+                # fix, final review 2026-09-07).
+                data.pop("last_hook_key", None)
+                data["last_deploy_click_at"] = time.time()
         return
-    data.pop("salvage_current_wreck_key", None)
-    data.pop("hook_engage_attempt_at", None)
-    data.pop("hook_engage_reposition_count", None)
+    # I5 moved this cleanup to run immediately after the phase is derived (above), so it fires
+    # even when the sort/stow early returns fire -- reaching here (phase == "wait") means it has
+    # already run this tick; nothing left to clear.
 
     if config.get("massWorld", True):
         # An area's wrecks share a spawn pool and one rises as another sinks (wiki, Shipwreck
@@ -729,7 +930,30 @@ def drop_items(ctx, predicate):
     retried (not pressed proactively every call) to avoid the same risk that ruled out Enter --
     a key that isn't actually needed doing something unwanted when nothing was actually blocking
     -- this checks facilitiesTabOpen again first and only falls back once the plain "w" attempt is
-    confirmed to have failed."""
+    confirmed to have failed.
+
+    I6 (final-review fix wave, 2026-09-07): the FIRST drop is now VERIFIED against /inventory
+    before trusting every later one. This mattered less when the targets were only salvage
+    stacks; it matters far more now that a sort pass's disposal targets are rings, bracelets and
+    scimitars, whose default left-click is Wear/Wield -- a forced-Drop swap that has gone missing
+    or is mis-set on one of them would EQUIP the sorted output instead of dropping it, report a
+    truthful-looking "dropped" count, free no inventory slot, and drive straight into the C2
+    deadlock (a keeper the disposal loop believes it already got rid of, still sitting in the
+    inventory). If the first click did not shrink the inventory, that SAME item is retried
+    through the right-click "Drop" menu entry, and every remaining item goes the same way.
+    Modelled on controller.drop_items, which already does exactly this for the SHIFT-click game
+    setting -- reused here as the same verify-then-escalate SHAPE against this routine's own
+    forced-left-click-Drop mechanism (see the docstring paragraph above), not a literal call to
+    it (that would send SHIFT, which is a different mechanism from this account's own swap).
+
+    Logs one line per pass naming every distinct item name dropped and its count -- the spec's
+    live checklist item 7b requires it: the keep-list names are wiki-sourced, not measured, so a
+    near-miss on a name fails silently in the DROP direction and this is the only way to see it
+    without reading the log line by line."""
+    controller.dismiss_continue_box(ctx.ser)   # retires drop_items' own blind spot -- see the
+                                                # "Space fallback" paragraph above: this box can
+                                                # already be up when drop_items is entered, not
+                                                # only after a click issued from inside this call.
     if controller.get_sailing().get("facilitiesTabOpen"):
         controller.key_tap(ctx.ser, controller.INVENTORY_TAB_KEY)
         controller.human_delay(0.2, 0.35)
@@ -740,18 +964,43 @@ def drop_items(ctx, predicate):
             controller.key_tap(ctx.ser, controller.INVENTORY_TAB_KEY)
             controller.human_delay(0.2, 0.35)
     controller.open_inventory_tab(ctx.ser)
+
+    items = [i for i in controller.get_inventory() if predicate(i.get("name") or "")]
+    if not items:
+        return 0
+
+    before = len(controller.get_inventory())
+    drop_works = None
     dropped = 0
-    for item in controller.get_inventory():
+    dropped_names = {}
+    for item in items:
         name = item.get("name") or ""
-        if predicate(name):
+        if drop_works is False:
+            controller.click_menu_action(ctx.ser, item, "Drop", offset=(0, 0),
+                                         check_ui_blockers=False)
+        else:
             # simulate_mistakes=False (2026-09-03): with Drop as the forced left-click, a
             # simulated near-miss lands on the NEIGHBOURING slot -- fine when that is more
             # salvage, but it drops whatever tool happens to sit there (chisel, rune pouch, ...)
             # when it is not. Same reasoning as banker.py's no-misclick rule for bank UI buttons.
             controller.click_entity(ctx.ser, item, check_ui_blockers=False,
                                     simulate_mistakes=False)
-            dropped += 1
-            controller.human_delay(0.06, 0.12)  # 40% faster still, on top of the earlier 2x (original 0.2-0.4s)
+        controller.human_delay(0.06, 0.12)  # 40% faster still, on top of the earlier 2x (original 0.2-0.4s)
+        if drop_works is None:
+            drop_works = len(controller.get_inventory()) < before
+            if not drop_works:
+                debug_log.log("salvage", f"the first drop ('{name}') did nothing -- the forced "
+                                          f"left-click Drop swap may be missing or mis-set; "
+                                          f"using the right-click menu for the rest of this pass")
+                controller.click_menu_action(ctx.ser, item, "Drop", offset=(0, 0),
+                                             check_ui_blockers=False)
+                controller.human_delay(0.06, 0.12)
+        dropped += 1
+        dropped_names[name] = dropped_names.get(name, 0) + 1
+
+    if dropped_names:
+        summary = ", ".join(f"{n} x{c}" if c > 1 else n for n, c in dropped_names.items())
+        debug_log.log("salvage", f"dropped: {summary}")
     return dropped
 
 
