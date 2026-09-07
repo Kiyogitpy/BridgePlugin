@@ -451,7 +451,10 @@ def test_channel_without_sailing_xp_for_too_long_forces_a_reclick(monkeypatch):
     monkeypatch.setattr(controller, "get_combat", lambda: {"animation": 13577})
     monkeypatch.setattr(controller, "get_skills", lambda: {"Sailing": {"boosted": 64, "xp": 1000}})
     deploys = []
-    monkeypatch.setattr(sailing, "deploy_hook", lambda c, n: deploys.append(n) or True)
+    # skip=() default: deploy_hook (Task 9) now takes a skip set and tick() reads .get() off
+    # its return, so the stub must accept the kwarg and return a dict, not a bare True.
+    monkeypatch.setattr(sailing, "deploy_hook",
+                        lambda c, n, skip=(): deploys.append(n) or {"x": 1, "y": 1, "plane": 0})
     ss.tick(ctx)
     assert not deploys, "a channel that is animating is left alone at first"
     ctx.state.data["sailing_xp_changed_at"] -= ss.CHANNEL_XP_STALL_S + 1
@@ -467,7 +470,9 @@ def test_sailing_xp_gain_resets_the_stall_clock(monkeypatch):
     xp = {"v": 1000}
     monkeypatch.setattr(controller, "get_skills", lambda: {"Sailing": {"boosted": 64, "xp": xp["v"]}})
     deploys = []
-    monkeypatch.setattr(sailing, "deploy_hook", lambda c, n: deploys.append(n) or True)
+    # skip=() default -- see the same note in test_channel_without_sailing_xp_for_too_long_forces_a_reclick.
+    monkeypatch.setattr(sailing, "deploy_hook",
+                        lambda c, n, skip=(): deploys.append(n) or {"x": 1, "y": 1, "plane": 0})
     ss.tick(ctx)
     ctx.state.data["sailing_xp_changed_at"] -= ss.CHANNEL_XP_STALL_S + 1
     xp["v"] = 1010
@@ -914,8 +919,10 @@ def test_mass_world_does_not_reposition_when_the_hook_will_not_engage(monkeypatc
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
     monkeypatch.setattr(controller, "get_combat", lambda: {"animation": -1})
     deployed = []
+    # skip=() default and a dict return -- see the note in
+    # test_channel_without_sailing_xp_for_too_long_forces_a_reclick (Task 9 changed both).
     monkeypatch.setattr(sailing, "deploy_hook",
-                        lambda ctx, name: deployed.append(True) or True)
+                        lambda ctx, name, skip=(): deployed.append(True) or {"x": 1, "y": 1, "plane": 0})
     ctx = _Ctx()
     ctx.state.config = _cfg(massWorld=True, sortWhenIdle=False)
     # Force the engage timeout to have already expired.
@@ -949,3 +956,112 @@ def test_tick_dispatches_to_the_stow_phase_when_the_inventory_fills(monkeypatch)
     ctx.state.data["hold_has_salvage"] = False
     ss.tick(ctx)
     assert called == [True]
+
+
+# --- two hooks on one boat, one of them manned by the crewmate ----------------------------
+# MEASURED live 2026-09-07: the user's boat carries TWO Adamant salvaging hooks (60505, 60506)
+# and a crewmate mans one. Nothing in Python can SEE which -- /npcs returns 0 on a sailing world
+# because NPCProvider reads only the top-level WorldView -- so the rotation is empirical.
+
+def _hook(obj_id, x, y, view=1036):
+    return {"id": obj_id, "name": "Adamant salvaging hook", "x": x, "y": y, "plane": 0,
+            "visible": True, "screenX": obj_id, "screenY": obj_id,
+            "actions": ["Deploy", "Modify"], "boatViewId": view}
+
+
+def test_find_facilities_returns_every_matching_hook_nearest_first(monkeypatch):
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: dict(_boat_player(2680, 2546), boatViewId=1036))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [
+        _hook(60505, 2681, 2544),          # distance 2
+        _hook(60506, 2681, 2546),          # distance 1
+        _hook(60505, 2690, 2560, view=99),  # a neighbour's boat
+    ])
+    found = sailing.find_facilities("salvaging hook", action="Deploy")
+    assert [h["id"] for h in found] == [60506, 60505]
+
+
+def test_find_facility_still_returns_the_nearest_one(monkeypatch):
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: dict(_boat_player(2680, 2546), boatViewId=1036))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [
+        _hook(60505, 2681, 2544), _hook(60506, 2681, 2546)])
+    assert sailing.find_facility("salvaging hook", action="Deploy")["id"] == 60506
+
+
+def test_deploy_hook_skips_a_hook_on_the_skip_list(monkeypatch):
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: dict(_boat_player(2680, 2546), boatViewId=1036))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [
+        _hook(60505, 2681, 2544), _hook(60506, 2681, 2546)])
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: clicked.append(e["id"]) or True)
+    nearest_key = (2681, 2546, 0)
+    used = sailing.deploy_hook(_Ctx(), "salvaging hook", skip={nearest_key})
+    assert clicked == [60505]
+    assert used["id"] == 60505
+
+
+def test_deploy_hook_returns_the_hook_it_clicked(monkeypatch):
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: dict(_boat_player(2680, 2546), boatViewId=1036))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_hook(60506, 2681, 2546)])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    used = sailing.deploy_hook(_Ctx(), "salvaging hook")
+    assert used is not None and used["id"] == 60506
+
+
+def test_deploy_hook_returns_none_when_every_hook_is_skipped(monkeypatch):
+    """The caller must be able to tell 'all set aside' from 'none exist' -- it clears the skip
+    list on this answer rather than deadlocking."""
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: dict(_boat_player(2680, 2546), boatViewId=1036))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_hook(60506, 2681, 2546)])
+    assert sailing.deploy_hook(_Ctx(), "salvaging hook",
+                               skip={(2681, 2546, 0)}) is None
+
+
+def test_hook_skip_expires(monkeypatch):
+    data = {"hook_skip": {(1, 2, 0): 100.0, (3, 4, 0): 200.0}}
+    assert ss._hook_skip(data, 150.0) == {(3, 4, 0)}
+    assert ss._hook_skip(data, 250.0) == set()
+
+
+def test_hook_skip_is_empty_when_nothing_was_ever_set_aside():
+    assert ss._hook_skip({}, 100.0) == set()
+
+
+def test_the_engage_timeout_sets_the_failing_hook_aside(monkeypatch):
+    """The whole point: a hook that will not engage is skipped so the OTHER one is tried next.
+    Nothing can see which hook the crewmate is on, so this is decided by outcome."""
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player(3000, 3000))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_wreck(3000, 3000)])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_combat", lambda: {"animation": -1})
+    monkeypatch.setattr(sailing, "deploy_hook",
+                        lambda ctx, name, skip=(): _hook(60506, 3001, 3000))
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=True, sortWhenIdle=False)
+    ctx.state.data["hook_engage_attempt_at"] = 0.0
+    # In real (multi-tick) operation, last_hook_key is already populated by the FIRST tick's
+    # deploy call, long before a 12s timeout can fire -- see the deploy_hook call at the end of
+    # this same branch, which is what sets it. This single-tick test forces the timeout to fire
+    # immediately, so it must seed the precondition that tick would otherwise have built up on
+    # its own: the hook we've been retrying.
+    ctx.state.data["last_hook_key"] = (3001, 3000, 0)
+    ss.tick(ctx)
+    assert (3001, 3000, 0) in ctx.state.data.get("hook_skip", {})
+
+
+def test_a_deployed_hook_is_recorded_so_it_can_be_set_aside_later(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player(3000, 3000))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_wreck(3000, 3000)])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_combat", lambda: {"animation": -1})
+    monkeypatch.setattr(sailing, "deploy_hook",
+                        lambda ctx, name, skip=(): _hook(60505, 3002, 3000))
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=True, sortWhenIdle=False)
+    ss.tick(ctx)
+    assert ctx.state.data.get("last_hook_key") == (3002, 3000, 0)

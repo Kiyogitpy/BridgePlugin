@@ -405,8 +405,8 @@ def stop_boat(ctx, target: dict = None, brake_started_at: float = None) -> bool:
     return True
 
 
-def find_facility(name: str, action: str = None, player: dict = None):
-    """The named facility ON OUR OWN BOAT, or None.
+def find_facilities(name: str, action: str = None, player: dict = None):
+    """Every matching facility ON OUR OWN BOAT, nearest first (may be empty).
 
     MEASURED live 2026-09-07 on a mass world: /objects listed 26 "Salvaging station" objects
     from roughly 13 overlapping boats within a few tiles, three of them on the player's exact
@@ -423,6 +423,12 @@ def find_facility(name: str, action: str = None, player: dict = None):
     Falls back to nearest-by-name when either side lacks the field -- an un-rebuilt client must
     behave exactly as it did before, not refuse to work. That fallback keeps the neighbour-boat
     bug it already had; it does not introduce a new one.
+
+    Plural because a boat can carry more than one of the same facility: the user's carries TWO
+    Adamant salvaging hooks (60505 and 60506, MEASURED live 2026-09-07) with a crewmate manning
+    one of them. Nothing in Python can see WHICH -- /npcs returns 0 NPCs on a sailing world,
+    since NPCProvider reads only the top-level WorldView and crewmates live in the boats' nested
+    views -- so callers rotate between them by outcome instead. See deploy_hook's `skip`.
     """
     needle = (name or "").lower()
     player = player if player is not None else controller.get_player()
@@ -431,7 +437,7 @@ def find_facility(name: str, action: str = None, player: dict = None):
     origin_x = player.get("boatX", player.get("x"))
     origin_y = player.get("boatY", player.get("y"))
 
-    best, best_dist = None, None
+    matches = []
     for obj in controller.get_objects(radius=BOAT_OBJECT_SEARCH_RADIUS):
         if needle not in (obj.get("name") or "").lower():
             continue
@@ -444,15 +450,22 @@ def find_facility(name: str, action: str = None, player: dict = None):
                 continue
 
         if origin_x is None or origin_y is None:
-            return obj
-        dist = max(abs((obj.get("x") or 0) - origin_x), abs((obj.get("y") or 0) - origin_y))
-        if best_dist is None or dist < best_dist:
-            best, best_dist = obj, dist
+            dist = 0
+        else:
+            dist = max(abs((obj.get("x") or 0) - origin_x), abs((obj.get("y") or 0) - origin_y))
+        matches.append((dist, obj))
 
-    return best
+    matches.sort(key=lambda pair: pair[0])
+    return [obj for _, obj in matches]
 
 
-def deploy_hook(ctx, hook_name: str) -> bool:
+def find_facility(name: str, action: str = None, player: dict = None):
+    """The NEAREST matching facility on our own boat, or None. See find_facilities."""
+    found = find_facilities(name, action=action, player=player)
+    return found[0] if found else None
+
+
+def deploy_hook(ctx, hook_name: str, skip=()):
     """Click the boat's own salvaging hook facility object by name (e.g. "Bronze salvaging
     hook") -- this is the actual salvaging interaction; the shipwreck object itself only has an
     Inspect option.
@@ -464,16 +477,25 @@ def deploy_hook(ctx, hook_name: str) -> bool:
     the routine into a cascading fail loop. ObjectProvider's screenX/Y already comes from
     pointInsideShape (a point verified to be inside the actual clickbox, not a bounding-box
     corner), so no extra offset is needed here -- same reasoning as stop_boat's own sail-toggle
-    click, which already used offset=(0, 0) for the same reason."""
-    # find_facility, not a bare nearest-by-name scan: on a mass world the neighbours' hooks are
-    # in the scan too, at the same coordinates (see find_facility's own docstring).
-    hook = find_facility(hook_name, action="Deploy")
-    if hook is None:
-        debug_log.log("sailing", f"{hook_name} not found nearby")
-        return False
+    click, which already used offset=(0, 0) for the same reason.
 
-    debug_log.log("sailing", f"deploying {hook.get('name')}")
-    return controller.click_entity(ctx.ser, hook, **_FIXTURE_CLICK_KWARGS)
+    Returns the hook dict it clicked, or None -- still falsy on failure, so existing truthiness
+    checks keep working. `skip` is a set of (x, y, plane) keys to pass over: the caller sets a
+    hook aside after it repeatedly fails to engage, so the boat's OTHER hook gets tried. That is
+    how the crewmate's hook is avoided, since nothing can see which one they are on (see
+    find_facilities). A skip set that covers every hook returns None rather than falling back to
+    a skipped one -- the caller clears its list on that answer instead of deadlocking.
+    """
+    for hook in find_facilities(hook_name, action="Deploy"):
+        if (hook.get("x"), hook.get("y"), hook.get("plane")) in skip:
+            continue
+        debug_log.log("sailing", f"deploying {hook.get('name')}")
+        if controller.click_entity(ctx.ser, hook, **_FIXTURE_CLICK_KWARGS):
+            return hook
+        return None
+
+    debug_log.log("sailing", f"{hook_name} not found nearby")
+    return None
 
 
 def sail_to(ctx, target: dict) -> bool:

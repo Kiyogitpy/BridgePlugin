@@ -136,6 +136,21 @@ HOOK_ENGAGE_GIVEUP_COOLDOWN_S = 30.0  # how long to leave a given-up-on wreck al
                                         # that a wreck worth salvaging isn't abandoned for good over
                                         # one bad approach.
 
+# How long a salvaging hook that would not engage is set aside so the boat's OTHER hook is tried
+# instead. The user's boat carries TWO Adamant hooks (60505/60506, MEASURED live 2026-09-07) and
+# a crewmate mans one; nothing in Python can see which, because /npcs returns 0 NPCs on a sailing
+# world (NPCProvider reads only the top-level WorldView). So the rotation is decided by OUTCOME:
+# a hook that burns its engage budget is passed over for a while. Longer than
+# HOOK_ENGAGE_GIVEUP_COOLDOWN_S because a crewmate does not move off a hook on their own.
+HOOK_SKIP_S = 180.0
+
+
+def _hook_skip(data: dict, now: float) -> set:
+    """The (x, y, plane) keys currently set aside, dropping any whose cooldown has passed."""
+    skip = data.get("hook_skip") or {}
+    return {key for key, until in skip.items() if now < until}
+
+
 # The player's own salvaging-channel animations, ONE FAMILY PER HOOK SIZE -- pinned against
 # runelite-api 1.12.38's AnimationID (javap over the Gradle-cache jar, 2026-09-03) and matched
 # against what the Plugin Hub's salvaging-afk-timer / distraction-reducer plugins treat as
@@ -495,6 +510,14 @@ def tick(ctx):
             if now - attempt_start > HOOK_ENGAGE_TIMEOUT_S:
                 reposition_count = data.get("hook_engage_reposition_count", 0) + 1
                 data["hook_engage_reposition_count"] = reposition_count
+                # Set THIS hook aside so the next deploy tries the boat's other one. The
+                # crewmate's hook is the common cause and is invisible to us, so this is decided
+                # by outcome rather than by looking (see sailing.find_facilities).
+                failed_key = data.get("last_hook_key")
+                if failed_key is not None:
+                    data.setdefault("hook_skip", {})[failed_key] = now + HOOK_SKIP_S
+                    debug_log.log("salvage", f"setting hook at {failed_key} aside for "
+                                              f"{HOOK_SKIP_S:.0f}s -- trying the other one")
                 if reposition_count > HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS:
                     debug_log.log("salvage", f"giving up on this wreck after {HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS} "
                                               f"reposition attempts -- letting it cool down and looking elsewhere")
@@ -536,7 +559,15 @@ def tick(ctx):
                                               "it's safe to get -- reclicking instead of repositioning "
                                               f"(attempt {reposition_count}/{HOOK_ENGAGE_MAX_REPOSITION_ATTEMPTS})")
                 data.pop("hook_engage_attempt_at", None)
-            sailing.deploy_hook(ctx, config.get("hookName", ""))
+            skip = _hook_skip(data, now)
+            used = sailing.deploy_hook(ctx, config.get("hookName", ""), skip=skip)
+            if used is None and skip:
+                # Every hook is set aside. Clear rather than deadlock -- a stale skip is worse
+                # than re-trying a hook that may since have freed up.
+                debug_log.log("salvage", "every hook is set aside -- clearing and retrying")
+                data.pop("hook_skip", None)
+            elif used is not None:
+                data["last_hook_key"] = (used.get("x"), used.get("y"), used.get("plane"))
             data["last_deploy_click_at"] = time.time()
         return
     data.pop("salvage_current_wreck_key", None)
