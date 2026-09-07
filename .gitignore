@@ -23,3 +23,6 @@ ControllerAddon/.raid_webhook
 *.stackdump
 hs_err_pid*.log
 client_run.log
+
+# client/run logs from a host launch (tools/vm-run-client.ps1 and the Gradle run task)
+logs/
