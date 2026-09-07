@@ -78,6 +78,15 @@ FALLBACK_POLL_S = 0.25    # idle-check cadence past the grace; also the HTTP-onl
 GATHER_BUDGET_S = 12.0    # nothing gained and no depletion for this long (plus the walk) -> re-pick
 WALK_S_PER_TILE = 0.6     # a queued interaction is performed on ARRIVAL: budget the walk
 IDLE_GRACE_S = 1.5        # idle with no progress past this (plus the walk) -> the click failed
+# ...but only if the idle SUSTAINS for this long. An animation trough between two swings is not
+# idleness: MEASURED live 2026-09-07 in the Motherlode Mine over 45s of uninterrupted, XP-earning
+# mining, /combat.isIdle read true in 12 separate troughs -- median 1.2s, p90 1.28s, MAX 2.45s --
+# so IDLE_GRACE_S alone sits inside the normal distribution of a working action and fires
+# spuriously. That cost real throughput there (every spent vein was reported as "the click did
+# not take", which then fed motherlode_mine's failure blacklist and set good veins aside), and
+# the same trough exists for any rock or tree whose swing cycle outlasts the grace. This is the
+# chinchompa_hunting lesson generalised: sustained idle is a signal, an instantaneous -1 is not.
+IDLE_CONFIRM_S = 3.0
 CHAIN_MAX_S = 45.0        # hand control back to the engine loop at least this often
 CHAIN_MAX_TARGETS = 40
 NEXT_CLICK_DELAY = (0.08, 0.2)   # human reaction after the depletion signal (cursor already there)
@@ -220,6 +229,7 @@ def gather(profile, ctx, target, config, exclude=()):
 
     deadline = t_click + GATHER_BUDGET_S + walk_s
     idle_deadline = t_click + IDLE_GRACE_S + walk_s
+    idle_since = None
     while True:
         now = _now()
         if now >= deadline:
@@ -252,13 +262,25 @@ def gather(profile, ctx, target, config, exclude=()):
                 xp_base = value[1]
             deadline = now + GATHER_BUDGET_S
             idle_deadline = now + IDLE_GRACE_S
+            idle_since = None
             since = ctx.events.mark() if ctx.events is not None else None
             continue
 
         now = _now()
-        if now >= idle_deadline and controller.get_combat().get("isIdle", True):
-            debug_log.log(profile.key, f"idle with nothing gained from {target.get('name')} -- "
-                                       f"the click did not take")
+        if now < idle_deadline:
+            continue
+        if not controller.get_combat().get("isIdle", True):
+            idle_since = None       # a swing: whatever we were watching is still working
+            continue
+        # Idle -- but an animation trough reads exactly like this, so require it to LAST (see
+        # IDLE_CONFIRM_S). Timing it from the first idle read rather than resetting the deadline
+        # means a genuinely dead click still costs only IDLE_GRACE_S + IDLE_CONFIRM_S.
+        if idle_since is None:
+            idle_since = now
+            continue
+        if now - idle_since >= IDLE_CONFIRM_S:
+            debug_log.log(profile.key, f"idle with nothing gained from {target.get('name')} for "
+                                       f"{now - idle_since:.1f}s -- the click did not take")
             return "idle", nxt
 
 

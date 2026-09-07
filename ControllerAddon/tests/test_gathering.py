@@ -467,3 +467,38 @@ def test_the_policy_defaults_to_the_profiles_own_when_the_config_omits_it(scene,
     ctx = make_ctx(config=cfg)
     mining.tick(ctx)
     assert looked and ctx.state.safety_stopped
+
+
+def test_an_animation_trough_is_not_a_failed_click(scene, monkeypatch):
+    """MEASURED live 2026-09-07 in the Motherlode Mine: over 45s of uninterrupted, XP-earning
+    mining, /combat.isIdle read true in 12 separate troughs -- median 1.2s, p90 1.28s, MAX
+    2.45s -- so IDLE_GRACE_S (1.5s) sits INSIDE the normal distribution of a working action.
+    Before IDLE_CONFIRM_S every spent vein was reported as "the click did not take", which then
+    fed motherlode_mine's failure blacklist and set good veins aside.
+
+    Driven off the clock rather than the reading list, because the trough is a DURATION."""
+    a = _rock(1, 1, dist=1)
+    scene.objects = [a]
+    scene.readings = [(True, 5000, False)]
+    start = scene.now
+    # Idle for the 2.45s measured worst case, then swinging again; the rock goes at 6s.
+    monkeypatch.setattr(controller, "get_combat",
+                        lambda: {"isIdle": start + 1.0 <= scene.now < start + 3.45})
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda x, y, plane, obj_id, radius=None:
+                        None if scene.now >= start + 6.0 else dict(a))
+    ctx = make_ctx(scene.events([None] * 400))
+    outcome, _ = gathering.gather(P, ctx, a, ctx.state.config)
+    assert outcome == "depleted"
+
+
+def test_sustained_idle_is_still_a_failed_click(scene):
+    a = _rock(1, 1, dist=1)
+    scene.objects = [a]
+    scene.readings = [(True, 5000, True)]
+    ctx = make_ctx(scene.events([None] * 200))
+    outcome, _ = gathering.gather(P, ctx, a, ctx.state.config)
+    assert outcome == "idle"
+    # ...and it costs the grace plus the confirmation window, no more.
+    elapsed = scene.now - 1000.0
+    assert gathering.IDLE_CONFIRM_S <= elapsed < gathering.GATHER_BUDGET_S

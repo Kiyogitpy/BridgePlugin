@@ -703,3 +703,53 @@ def test_a_far_ladder_is_walked_to_before_it_is_clicked(monkeypatch):
     monkeypatch.setattr(travel, "walk_to", lambda c, t, **k: walked.append(t) or True)
     assert mlm.climb(ctx, up=True) is False
     assert walked and walked[0]["x"] == 3755
+
+
+# --- a full sack (mlm_live7) --------------------------------------------------------------
+
+def test_a_full_sack_outranks_a_hopper_trip():
+    """MEASURED live: with the sack at 111/108 the game REFUSES to mine at all and every click
+    dies silently, and pay-dirt deposited into a full sack is thrown away. So collect comes
+    before hopper even with a full inventory in hand."""
+    assert _phase(held_paydirt=27, inventory_full=True, allowance=0,
+                  sack_eff=108, capacity=108) == "collect"
+
+
+def test_the_games_own_refusal_forces_a_collect(monkeypatch):
+    """The arithmetic that should have prevented 111/108 failed because `pending` -- pay-dirt on
+    the conveyor -- lives in ctx.state.data and is wiped by a restart, while the pay-dirt on the
+    belt is not. The chat line is the belt to that brace."""
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_varbit",
+                        lambda vid: 84 if vid == mlm.VARBIT_SACK else 0)   # varbit still lagging
+    assert mlm.phase_of(ctx) == "mine"
+    mlm.on_event(ctx, "CHAT_MESSAGE",
+                 {"message": "Your sack will be full once your current dirt is cleaned."})
+    assert mlm.phase_of(ctx) == "collect"
+
+
+def test_the_refusal_latch_is_cleared_only_by_an_empty_sack(monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data["mlm_sack_full"] = True
+    monkeypatch.setattr(controller, "get_varbit",
+                        lambda vid: 40 if vid == mlm.VARBIT_SACK else 0)
+    assert mlm.phase_of(ctx) == "collect"          # half-drained is not drained
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: 0)
+    assert mlm.phase_of(ctx) == "mine"
+    assert "mlm_sack_full" not in ctx.state.data
+
+
+def test_a_full_sack_is_not_topped_up_before_the_collect(monkeypatch):
+    """collect_phase empties the hands into the hopper first to make room for ore -- but not
+    when the sack cannot take them, because that deposit is pay-dirt thrown away."""
+    ctx = _Ctx()
+    _standing(monkeypatch, DOWNSTAIRS_H)
+    monkeypatch.setattr(controller, "get_inventory", lambda: _paydirt(5))
+    monkeypatch.setattr(controller, "get_varbit",
+                        lambda vid: 108 if vid == mlm.VARBIT_SACK else 0)
+    monkeypatch.setattr(mlm, "hopper_phase",
+                        lambda c: pytest.fail("deposited into a full sack"))
+    monkeypatch.setattr(mlm, "climb", lambda c, up: True)
+    monkeypatch.setattr(mlm, "_maybe_repair", lambda c: False)
+    monkeypatch.setattr(mlm, "search_sack", lambda c: False)
+    mlm.collect_phase(ctx)

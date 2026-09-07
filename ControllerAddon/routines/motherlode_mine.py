@@ -110,6 +110,19 @@ PICKAXE_NAME = "pickaxe"
 KEEP_ITEMS = (PICKAXE_NAME, HAMMER_NAME, GEM_SACK_NAME)
 
 BROKEN_CHAT = "will need to be repaired"
+# The game's own refusal, and the AUTHORITATIVE "stop mining" signal. MEASURED live 2026-09-07
+# (mlm_live7) from a frame dump, after every click had been dying silently for two minutes: a
+# "Click here to continue" box reading "Your sack will be full once your current dirt is
+# cleaned.", with the plugin overlay showing Sack 111/108. WITH A FULL SACK THE GAME REFUSES TO
+# MINE AT ALL -- the click resolves perfectly and nothing happens, exactly like the through-the-
+# floor failure, which is why arithmetic alone was not enough to catch it.
+#
+# The arithmetic that should have prevented it (mining_allowance) failed because `pending` --
+# pay-dirt on the conveyor but not yet in varbit 5558 -- lives in ctx.state.data and is WIPED BY
+# A RESTART, while the pay-dirt on the belt very much is not. Restarting with 84 showing and 27
+# still travelling is how 111/108 happened. So the chat line is the belt to that brace, the same
+# shape as everything else here.
+SACK_FULL_CHAT = ("sack will be full", "sack is full")
 
 # NO expected_action HOVER GATE on the world-object clicks below (ladder, hopper, sack, deposit
 # box, strut). MEASURED live 2026-09-07 (mlm_live4): every ladder click was WITHHELD --
@@ -244,10 +257,12 @@ def derive_phase(*, holding_ore, inventory_full, held_paydirt, allowance, sack_e
         return "bank"
     if collecting and sack_eff > 0:
         return "collect"
+    if sack_eff >= capacity:
+        # BEFORE the hopper branch, and that order is the point: pay-dirt deposited into a full
+        # sack is thrown away, and with a full sack the game will not let us mine either.
+        return "collect"
     if held_paydirt and (inventory_full or allowance <= 0):
         return "hopper"
-    if not held_paydirt and sack_eff >= capacity:
-        return "collect"
     return "mine"
 
 
@@ -548,6 +563,9 @@ def on_event(ctx, event_type, payload):
         _d(ctx)["mlm_broken_since"] = _now()
         debug_log.log(LOG, "the machine is broken -- our pay-dirt still goes in, but the sack "
                            "will stop filling. Leaving it for now.")
+    if any(needle in message for needle in SACK_FULL_CHAT) and not _d(ctx).get("mlm_sack_full"):
+        _d(ctx)["mlm_sack_full"] = True
+        debug_log.log(LOG, "the game says the sack is full -- going to empty it")
 
 
 # --- the vein loop -----------------------------------------------------------------------------------
@@ -947,8 +965,12 @@ def collect_phase(ctx):
     go back up to the veins. USER's choice over a steady drip."""
     data = _d(ctx)
     data["mlm_collecting"] = True
-    if _held_paydirt() and not hopper_phase(ctx):
-        return          # never carry pay-dirt into the sack trip: the ore needs the slots
+    _sack, effective, capacity = sack_state(ctx)
+    room = capacity - effective >= _held_paydirt()
+    if _held_paydirt() and room and not hopper_phase(ctx):
+        # Empty the hands first only while the sack can take it. With a full sack that deposit
+        # is pay-dirt thrown away, and the ore has slots enough without it.
+        return
     if not climb(ctx, up=False):
         return
     if _maybe_repair(ctx):
@@ -1053,13 +1075,21 @@ def _stuck_watch(ctx, phase):
 def phase_of(ctx):
     items = _inventory()
     held = _held_paydirt(items)
-    _sack, effective, capacity = sack_state(ctx)
+    sack, effective, capacity = sack_state(ctx)
+    data = _d(ctx)
+    if data.get("mlm_sack_full"):
+        # The game itself told us. Only an actually-drained sack clears it -- not the arithmetic
+        # that got us here.
+        if sack <= 0:
+            data.pop("mlm_sack_full", None)
+        else:
+            effective = max(effective, capacity)
     allowance = mining_allowance(_free_slots(items), held, effective, capacity)
     return derive_phase(holding_ore=bool(_ore_items(items)),
                         inventory_full=_free_slots(items) <= 0,
                         held_paydirt=held, allowance=allowance,
                         sack_eff=effective, capacity=capacity,
-                        collecting=bool(_d(ctx).get("mlm_collecting")))
+                        collecting=bool(data.get("mlm_collecting")))
 
 
 def tick(ctx):
