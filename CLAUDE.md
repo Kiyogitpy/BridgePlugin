@@ -2069,6 +2069,67 @@ MAX_TILES` are untuned for the 16-point compass, and the engine-level `maybe_mis
 spec's item 9 describes no longer exists in `controller.py` (the stray-click simulation was
 removed), so it needs no re-adding.
 
+**Third pass 2026-09-07: mass-world mode, cargo-hold sorting and a keep-list** (spec
+`docs/superpowers/specs/2026-09-07-shipwreck-salvaging-mass-world-and-sorting-design.md`, plan
+`.../plans/2026-09-07-...md`, 16 commits `e666508..e405b55` on `dev`). **NOT RUN LIVE — and it
+CANNOT be until the client is rebuilt**; run `tools\salvaging-live-run.ps1`, which stops the
+client, rebuilds, relaunches, runs the boatViewId gate and only then starts the routine.
+Everything below was MEASURED live 2026-09-07 unless marked otherwise:
+
+- **`/objects` and `/player` carry `boatViewId`** (the outermost non-top-level `WorldView`, i.e.
+  the boat). Needed because on a mass world **26 `Salvaging station` objects from ~13 overlapping
+  boats** sat within a few tiles, three on the player's exact tile, all `clickable`, screen
+  positions ~20px apart — **position cannot separate them**, and `sailing.deploy_hook`'s old
+  first-match-by-name pick was a coin flip between our hook and a stranger's. `sailing.find_facilities`
+  / `find_facility` filter on it and fall back to nearest-by-name when it is absent.
+- **The salvaging station** is loc `59699/59700/59701` (ports `60462/60463`), op `Sort-salvage`.
+  It opens **NO interface** — a widget watcher across a full sort recorded no new group. Plain
+  channel, **animation 13599** (confirmed on a 3x8 hull despite runelite-api naming it `..._1X3_
+  INTERACT01`), **1.79s per salvage** (3 ticks), and **it ends itself** when the inventory runs
+  dry. `SORT_ANIMATIONS` is deliberately SEPARATE from `SALVAGE_CHANNEL_ANIMATIONS` — merging
+  them makes the hook's idle-reclick logic read sorting as hooking and never redeploy.
+- **The cargo hold is interface 943** (side panel 944): `943.4`/`943.5` = used/capacity,
+  `943.10` = grid with `Withdraw-All`, **`943.14` = `Deposit` SALVAGE only** (never `943.13`
+  Cargo or `943.15` Inventory, both of which would bank the chisel and rune pouch), `943.20..24`
+  = quantity buttons. Salvage does **not** stack in the inventory, so a `Withdraw-All` self-caps
+  at the free slot count. Driven by `ControllerAddon/cargo_hold.py`.
+- **`/trawling` is a DEAD END for the hold.** Its `cargo` block stayed null all session with 12
+  items in the hold, and `carryingCargo` stayed 0 (that varbit is courier cargo). Containers
+  `963..967` are the right ids and simply are not populated. **This also corrects an assumption
+  in the deep-sea-trawling spec**, which has never run live either.
+- **Group 229** ("Your inventory is too full to hold any more plundered salvage") is invisible to
+  `/state`'s `dialogOpen`, same trap `karambwan_fishing` documents. `controller.continue_box_open`
+  / `dismiss_continue_box` detect it **by the CONTINUE widget's presence, never by 229.3's text** —
+  that wording is salvage-tier-specific.
+- **The boat carries TWO hooks and a crewmate mans one** (USER). Nothing in Python can see which:
+  **`GET /npcs` returns 0 NPCs on a sailing world** because `NPCProvider` reads only the
+  top-level `WorldView` and crewmates live in the boats' nested views. So the rotation is
+  EMPIRICAL — a hook that burns its engage budget is set aside for `HOOK_SKIP_S` (180s) and the
+  other tried. `sailing.ALL_SKIPPED` (a falsy sentinel, the `CLICK_WITHHELD` idiom) separates
+  "every hook skipped" from "the click missed", so an incidental miss cannot wipe the skip list.
+- `massWorld` (default True) never sails — an area's wrecks share a spawn pool and one rises as
+  another sinks (wiki rev 15290733), so waiting beats sailing. It suppresses the far-wreck branch
+  AND the won't-engage reposition, while the reposition BUDGET still counts.
+- **The whole-branch review's lesson, worth carrying to the next routine: the branch passed all
+  nine per-task reviews and was still NOT safe to run unattended.** It "added four new ways to
+  make no progress and zero new ceilings" — a failing sort rung could spin forever (and the
+  full-hold clause outranks hooking, so it blocked earning too); kept items had no sink, so the
+  inventory filled within ~an hour and deadlocked in an infinite hook loop; a hold that never
+  opened silently dropped every salvage for hours. All bounded now (`SORT_FAIL_LIMIT`,
+  `HOLD_OPEN_FAIL_LIMIT`, `stow_keepers`, terminal safety stops). **Per-task review cannot see
+  this class of defect; only a whole-branch pass can.**
+- **`drop_items` returns the CONFIRMED inventory delta, not clicks issued**, and polls
+  `DROP_CONFIRM_S` (1.5s) before declaring a drop failed — a verification window shorter than the
+  0.6s server tick reads a good drop as a failure ~3 times in 4, and an attempt count as the
+  progress signal lets a stray interface eating every click defeat the no-progress ceiling
+  entirely.
+- First live session's worklist is the spec's checklist. Its headline unknowns: whether `943.14`
+  really deposits salvage only, whether a respawn gap fits a withdraw-plus-sort cycle, and
+  **whether the keep-list's item NAMES match what the game hands back** — they are wiki-sourced,
+  the user's own `Sailors' amulet (inert)` is absent from the wiki's table entirely, and a
+  near-miss under a substring keep-list fails **silently in the drop direction**. `drop_items`
+  logs every dropped name for exactly this.
+
 ## Current state of routines/agility.py
 
 Written 2026-09-02 from a human recording (`recordings/2026-09-02_032621_wilderness-agility.*`,
