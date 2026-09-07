@@ -402,16 +402,29 @@ Nothing below has been measured. These are ordered so that the earliest failure 
 
 ## 9. Deliberately out of scope for v1
 
-- **Banking.** The cargo hold is 240 slots and the Rope net's expected yield is roughly 5 fish
-  per minute (10.5 % catch chance at Fishing 75, one roll per 2 ticks, up to 2 fish per catch),
-  so a hold lasts many hours. `done` stops cleanly instead. A bank-boat round trip is its own
-  sub-project and needs ocean navigation we have not verified since 2026-08-05.
+- **Banking.** Deferred to sub-project 2:
+  `docs/superpowers/specs/2026-09-07-deep-sea-trawling-banking-design.md`. `done` stops cleanly
+  instead, and remains the fallback there.
+  **CORRECTION (2026-09-07): the arithmetic this deferral was originally justified with was
+  wrong.** It read "the cargo hold is 240 slots and the Rope net's expected yield is roughly 5
+  fish per minute, so a hold lasts many hours" -- 240 / 5 is 48 minutes, and the real yield is
+  ~8 fish/min (10.5% catch chance at Fishing 75, one roll per 2 ticks = 50 rolls/min, 1-2 fish
+  per catch). So an UNCRATED run ends in `done` after about half an hour, not after hours. The
+  deferral still stands, but on the honest reason: a bank round trip ends in a disembark, which
+  discards anything left in the nets, and it needs ocean navigation unverified since 2026-08-05.
+- **Fish crates: the report is IN (2026-09-07), the replenishment is not.** Crates need no
+  interaction -- the game fills them automatically when the net is emptied into the hold -- and
+  an EMPTY crate (obj 32366) is `stackable=yes` while a filled one is not, so a stack costing one
+  cargo slot turns ~240 fish into ~2,390 (~5 hours). `crate_stock` / `_log_crate_stock_once`
+  report the stock once per run and warn when the hold has none, because nothing later in a run
+  can change its length. Acquiring crates is a Crafting loop (filled crate -> Empty -> camphor
+  crate -> ice cooler), deferred with banking.
 - **Chum station baiting** (+20 % fish). The station's `Operate` opens an interface we have not
   seen; guessing at it blind is exactly the kind of thing the golem-crafting notes warn about.
   Worth doing second — it is a large yield gain for ~4 % of a 90 s stop.
 - **Depth management.** No shoal we can reach has more than one depth. The `ShoalSpec.depths`
   field exists so the phase can be added without reshaping the data.
-- **Fish crates** (10 fish per cargo slot). Only matters once banking exists.
+
 - **A second net / a crewmate on the second net.** The MMG's setup; needs crew assignment.
 - **Mixed shoals.** `SHOALS[...].mixed_ids` is matched so a Shimmering shoal that replaces our
   Giant krill shoal is still followed and fished, but nothing is done differently for it.

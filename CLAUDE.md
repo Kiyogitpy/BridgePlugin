@@ -1172,9 +1172,28 @@ Routine dropdown entry are both Java).
   `_startup_checks` reads `/sailing.navigating` for this.
 - **Never world-hop, never teleport, never disembark with fish in the nets** -- they are
   discarded without a warning. `before_break` empties the nets before a break starts.
-- Out of scope for v1, deliberately: banking at a bank boat (the 240-slot hold lasts many hours
-  at ~5 fish/min), chum-station baiting (+20% fish, but the station's `Operate` interface is
-  unseen), depth management, fish crates, and a second net.
+- **A trip's length is set by the FISH CRATES in the hold before it starts, and nothing later can
+  change it -- so `crate_stock`/`_log_crate_stock_once` report it once per run and warn when
+  there are none.** The v1 spec deferred banking on the arithmetic "a 240-slot hold lasts many
+  hours at ~5 fish/min"; that was WRONG (240/5 is 48 minutes, and the real yield is ~8 fish/min:
+  10.5% catch chance at Fishing 75 x 50 rolls/min x 1-2 fish). An UNCRATED run therefore ends in
+  `done_phase` after about half an hour. Crates fix it for free -- the game fills them
+  automatically when the net is emptied into the hold, and the asymmetry is the point: an EMPTY
+  crate (obj 32366) is `stackable=yes` so any number cost ONE cargo slot, while a filled one is
+  not stackable and holds 10 fish in its slot. ~240 fish becomes ~2,390, about five hours.
+- **Banking is sub-project 2**, spec `docs/superpowers/specs/2026-09-07-deep-sea-trawling-
+  banking-design.md`, NOT built. The geography is the favourable part: the Great Sound holds both
+  the krill shoal and Land's End, whose mooring point needs Sailing 5 and has a bank deposit box,
+  so the round trip is tens of tiles inside one sea. The hazard is the whole design: banking via
+  a dock crewmate requires DISEMBARKING, which discards anything left in the nets, so the nets
+  are emptied and `netFish == 0` is CONFIRMED before the boat ever docks -- an unconfirmed read
+  abandons the trip to `done_phase` rather than disembarking. Its first live question is whether
+  a "bank boat" exists that empties cargo without disembarking, which would avoid the hazard
+  entirely. Note Land's End has a deposit BOX, not a bank, so it cannot restock crates: that is a
+  Crafting loop (filled crate -> Empty -> camphor crate -> ice cooler) and its own sub-project.
+- Still out of scope, deliberately: chum-station baiting (+20% fish, and the highest-value
+  unbuilt thing after banking, but the station's `Operate` interface is unseen), depth
+  management, and a second net.
 
 ## Current state of routines/blast_furnace.py
 
