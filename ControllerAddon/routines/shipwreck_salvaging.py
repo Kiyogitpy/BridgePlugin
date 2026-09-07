@@ -30,6 +30,7 @@ import time
 import controller
 import debug_log
 import sailing
+import cargo_hold
 
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -266,6 +267,50 @@ def derive_phase(config, *, wreck_in_range, hold_full, inventory_salvage, free_s
     if wreck_in_range:
         return "hook"
     return "wait"
+
+
+def _record_hold(data, used, capacity, has_salvage, config, forced_full=False):
+    """Record what the open hold reported. Unreadable numbers mean "cannot tell" -- they must
+    never make the hold LOOK full or LOOK empty, so hold_full only goes True on a real reading
+    or on the empirical forced_full signal."""
+    data["hold_used"] = used
+    data["hold_capacity"] = capacity
+    data["hold_has_salvage"] = has_salvage
+    if forced_full:
+        data["hold_full"] = True
+        return
+    if used is None or capacity is None:
+        data["hold_full"] = False
+        return
+    data["hold_full"] = used >= capacity - config.get("holdFullSlots", 4)
+
+
+def stow_phase(ctx) -> bool:
+    """Deposit the inventory's salvage into our own boat's cargo hold, recording its fullness
+    while the interface is open (the only place it is readable -- see cargo_hold's docstring).
+
+    Falls back to dropping on the deck whenever the hold cannot be opened, so a broken or
+    missing hold degrades to the pre-2026-09-07 behaviour instead of stalling the run."""
+    config = ctx.state.config
+    data = ctx.state.data
+
+    if not config.get("stowSalvage", True):
+        return bool(drop_salvage(ctx))
+
+    if not cargo_hold.open_hold(ctx):
+        debug_log.log("salvage", "could not open the cargo hold -- dropping salvage instead")
+        return bool(drop_salvage(ctx))
+
+    deposited = cargo_hold.deposit_salvage(ctx)
+    used, capacity = cargo_hold.read_usage()
+    has_salvage = bool(cargo_hold.salvage_rows())
+    _record_hold(data, used, capacity, has_salvage, config, forced_full=not deposited)
+
+    if not deposited:
+        debug_log.log("salvage", f"salvage left in the inventory after Deposit Salvage "
+                                  f"(hold {used}/{capacity}) -- treating the hold as full")
+    cargo_hold.close_hold(ctx)
+    return deposited
 
 
 def tick(ctx):

@@ -41,6 +41,12 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
     monkeypatch.setattr(controller, "get_hover", lambda: None)
     monkeypatch.setattr(controller, "hover_entity", lambda ser, ent, **kw: True)
+    monkeypatch.setattr(controller, "get_widget", lambda *a, **k: {"found": False})
+    monkeypatch.setattr(controller, "get_widget_children", lambda *a, **k: [])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "continue_box_open", lambda: False)
+    monkeypatch.setattr(controller, "dismiss_continue_box", lambda ser: True)
 
 
 def _boat_player(x=3000, y=3000, w=4, h=6):
@@ -631,3 +637,87 @@ def test_stow_salvage_off_never_stows():
 def test_stow_needs_actual_salvage_not_just_a_full_inventory():
     """An inventory full of sorted output is a disposal problem, not a stow one."""
     assert _phase(wreck_in_range=True, inventory_salvage=0, free_slots=0) == "hook"
+
+
+# --- stow_phase --------------------------------------------------------------------------
+
+class _FakeHold:
+    def __init__(self, usage=(12, 160), deposit=True, rows=("Plundered salvage",)):
+        self.usage, self.deposit_ok, self.rows = usage, deposit, rows
+        self.calls = []
+
+    def open_hold(self, ctx):
+        self.calls.append("open"); return True
+
+    def deposit_salvage(self, ctx):
+        self.calls.append("deposit"); return self.deposit_ok
+
+    def read_usage(self):
+        return self.usage
+
+    def salvage_rows(self):
+        return [{"itemName": n} for n in self.rows]
+
+    def close_hold(self, ctx):
+        self.calls.append("close"); return True
+
+
+def _install_hold(monkeypatch, fake):
+    for name in ("open_hold", "deposit_salvage", "read_usage", "salvage_rows", "close_hold"):
+        monkeypatch.setattr(ss.cargo_hold, name, getattr(fake, name))
+
+
+def test_stow_deposits_and_records_the_hold_usage(monkeypatch):
+    fake = _FakeHold(usage=(40, 160))
+    _install_hold(monkeypatch, fake)
+    ctx = _Ctx()
+    assert ss.stow_phase(ctx) is True
+    assert fake.calls == ["open", "deposit", "close"]
+    assert ctx.state.data["hold_used"] == 40
+    assert ctx.state.data["hold_capacity"] == 160
+    assert ctx.state.data["hold_has_salvage"] is True
+    assert ctx.state.data["hold_full"] is False
+
+
+def test_stow_marks_the_hold_full_at_the_configured_margin(monkeypatch):
+    _install_hold(monkeypatch, _FakeHold(usage=(157, 160)))   # holdFullSlots default 4
+    ctx = _Ctx()
+    ss.stow_phase(ctx)
+    assert ctx.state.data["hold_full"] is True
+
+
+def test_salvage_left_behind_marks_the_hold_full_whatever_the_numbers_say(monkeypatch):
+    """The authoritative signal: a declared capacity is a ceiling, not a promise."""
+    _install_hold(monkeypatch, _FakeHold(usage=(10, 160), deposit=False))
+    ctx = _Ctx()
+    assert ss.stow_phase(ctx) is False
+    assert ctx.state.data["hold_full"] is True
+
+
+def test_an_unreadable_usage_does_not_claim_the_hold_has_room(monkeypatch):
+    """Unreadable means 'cannot tell', never 'empty'."""
+    _install_hold(monkeypatch, _FakeHold(usage=(None, None)))
+    ctx = _Ctx()
+    ss.stow_phase(ctx)
+    assert ctx.state.data.get("hold_full") is False
+    assert ctx.state.data.get("hold_used") is None
+
+
+def test_stow_falls_back_to_dropping_when_the_hold_cannot_be_opened(monkeypatch):
+    fake = _FakeHold()
+    fake.open_hold = lambda ctx: False
+    _install_hold(monkeypatch, fake)
+    dropped = []
+    monkeypatch.setattr(ss, "drop_salvage", lambda ctx: dropped.append(True) or 1)
+    assert ss.stow_phase(_Ctx()) is True
+    assert dropped == [True]
+
+
+def test_stow_salvage_off_drops_instead(monkeypatch):
+    called = []
+    monkeypatch.setattr(ss, "drop_salvage", lambda ctx: called.append(True) or 1)
+    _install_hold(monkeypatch, _FakeHold())
+    ctx = _Ctx()
+    ctx.state.config = _cfg(stowSalvage=False)
+    assert ss.stow_phase(ctx) is True
+    assert called == [True]
