@@ -389,6 +389,19 @@ def fingerprint_and_diff(version: Optional[str], sources: Path) -> tuple[Path, O
     return fp_path, diff_path, bool(substantive)
 
 
+FINGERPRINT_FIELDS = ("processCommand", "parentProcessCommand", "javaAgent", "osName", "osVersion",
+                      "osArch", "javaVendor", "javaVersion", "maxMemoryMb", "availableProcessors",
+                      "smbiosUuid")
+
+
+def format_fingerprint(fp: dict) -> list[str]:
+    """The login fingerprint as the client will send it, one `key = value` line per field in the
+    order the client writes them. Empty for a client that does not serve the block."""
+    if not fp:
+        return []
+    return [f"{k:22} = {'(none)' if fp.get(k) is None else fp.get(k)}" for k in FINGERPRINT_FIELDS]
+
+
 def status(live: Optional[dict]) -> int:
     state = None
     try:
@@ -405,6 +418,10 @@ def status(live: Optional[dict]) -> int:
     print("client : " + (f"RuneLite {live.get('runeliteVersion')} rev {live.get('revision')} "
                          f"sha {live.get('injectedClientSha256', '')[:12]}" if live
                          else "(bridge not answering, or client not rebuilt with /client-version)"))
+    if live and live.get("fingerprint"):
+        print("login fingerprint (what the server will see):")
+        for line in format_fingerprint(live["fingerprint"]):
+            print("         " + line)
     if live and state:
         same = live.get("injectedClientSha256") == state.get("injectedClientSha256")
         print("verdict: " + ("MATCH -- routines may run" if same else "MISMATCH -- run this script"))

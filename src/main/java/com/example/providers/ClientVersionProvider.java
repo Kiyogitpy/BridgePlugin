@@ -42,6 +42,7 @@ public class ClientVersionProvider extends BridgeProvider
 {
 	private volatile String cachedSha256;
 	private volatile String cachedJarPath;
+	private volatile Map<String, Object> cachedFingerprint;
 
 	public ClientVersionProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
 	{
@@ -65,6 +66,14 @@ public class ClientVersionProvider extends BridgeProvider
 		Path jar = jarOf(client.getClass());
 		data.put("injectedClientJar", jar == null ? null : jar.toString());
 		data.put("injectedClientSha256", sha256Cached(jar));
+
+		// What the login packet will carry, computed the client's way (LoginFingerprint). Spawns
+		// wmic once, so cache it -- the guard and --status poll this endpoint.
+		if (cachedFingerprint == null)
+		{
+			cachedFingerprint = com.example.util.LoginFingerprint.collect();
+		}
+		data.put("fingerprint", cachedFingerprint);
 		return data;
 	}
 

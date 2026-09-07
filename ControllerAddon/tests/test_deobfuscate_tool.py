@@ -151,3 +151,16 @@ def test_the_real_1_12_37_snapshot_yields_the_measured_constants():
     assert "wmic csproduct get UUID" in fp["exec_commands"]
     assert fp["client_packets"]["EVENT_MOUSE_CLICK_V2"] == {"id": 40, "length": 7}
     assert len(fp["client_packets"]) == 117
+
+
+def test_format_fingerprint_lists_every_field_the_client_sends_in_a_fixed_order():
+    fp = {"processCommand": "java.exe", "parentProcessCommand": "java.exe", "javaAgent": None,
+          "osName": "windows 10", "osVersion": "10.0", "osArch": "amd64",
+          "javaVendor": "Eclipse Adoptium", "javaVersion": "11.0.30", "maxMemoryMb": 8147,
+          "availableProcessors": 32, "smbiosUuid": "1EBB33E4-2B90-8093-433F-50EBF62C698A"}
+    lines = d.format_fingerprint(fp)
+    assert lines[0].startswith("processCommand")
+    assert any(l.startswith("smbiosUuid") and "1EBB33E4" in l for l in lines)
+    assert any("javaAgent" in l and "(none)" in l for l in lines)
+    assert len(lines) == 11
+    assert d.format_fingerprint({}) == []          # un-rebuilt client: nothing to print, no crash
