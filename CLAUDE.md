@@ -128,7 +128,9 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   plugins; `-SafeMode` is a diagnostic external-plugins-off launch). The client is started
   from the host with `VBoxManage guestcontrol OSRS start ... -- cmd.exe /c "cd /d
   C:\work\Httpbridge && gradlew.bat --no-daemon run"`; a `natpf1` rule forwards guest 8080 to
-  host 127.0.0.1:18080 for read-only host-side bridge probing.
+  host 127.0.0.1:18080 for read-only host-side bridge probing. Since the bridge binds loopback
+  by default (2026-09-07), the guest launch sets BRIDGE_BIND_ALL=1 (vm-run-client.ps1, and
+  --putenv BRIDGE_BIND_ALL=1 on any guestcontrol launch) or the forward dead-ends.
   **SSH into the guest (host VSCode Remote-SSH / a host terminal), 2026-09-07.** OpenSSH server
   installed in the guest (`tools/vm-setup-ssh.ps1`, run ELEVATED -- Kiyo is a local admin but
   UAC hands guestcontrol a FILTERED token, so the install needs a real UAC consent: the

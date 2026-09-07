@@ -37,6 +37,7 @@ if (-not $NoSync) {
 
 $env:JAVA_HOME = $jdk
 $env:BRIDGE_SERIAL_PORT = "COM3"
+$env:BRIDGE_BIND_ALL = "1"       # the host's 18080 -> guest 8080 forward lands on the NAT adapter, not loopback
 $extra = if ($SafeMode) { "--safe-mode" } else { "" }
 
 Write-Host "== launching client ($(if($SafeMode){'safe mode, external plugins OFF'}else{'full / developer mode'}))" -ForegroundColor Cyan

@@ -19,14 +19,27 @@ public class BridgeHttpServer
 {
 	private HttpServer server;
 
+	/** Loopback unless told otherwise -- the bridge has no auth (spec V9, 2026-09-07). */
+	static String bindAddress(boolean bindAll)
+	{
+		return bindAll ? "0.0.0.0" : "127.0.0.1";
+	}
+
 	public void start(int port)
+	{
+		start(port, false);
+	}
+
+	public void start(int port, boolean bindAll)
 	{
 		try
 		{
-			server = HttpServer.create(new InetSocketAddress(port), 0);
+			String host = bindAddress(bindAll);
+			server = HttpServer.create(new InetSocketAddress(host, port), 0);
 			server.setExecutor(Executors.newCachedThreadPool());
 			server.start();
-			System.out.println("Bridge running on http://localhost:" + port);
+			System.out.println("Bridge running on http://" + host + ":" + port
+				+ (bindAll ? "  (ALL interfaces -- reachable from the LAN)" : ""));
 		}
 		catch (Exception e)
 		{

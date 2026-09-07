@@ -131,7 +131,11 @@ public class ControllerPlugin extends Plugin
 		npcTrackerRegistry.register();
 
 		server = new BridgeHttpServer();
-		server.start(HTTP_PORT);
+		// Loopback by default (spec V9). The panel toggle is per PROFILE, which the VM guest copies
+		// from the host, so the guest's need for an all-interfaces bind is an ENV override instead
+		// -- it survives every profile re-copy.
+		boolean bindAll = config.bridgeBindAll() || "1".equals(System.getenv("BRIDGE_BIND_ALL"));
+		server.start(HTTP_PORT, bindAll);
 
 		tickClock = new TickClock();
 

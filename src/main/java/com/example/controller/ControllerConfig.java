@@ -105,6 +105,21 @@ public interface ControllerConfig extends Config
 	}
 
 	@ConfigItem(
+		keyName = "bridgeBindAll",
+		name = "Bridge on all interfaces",
+		description = "Bind the HTTP bridge to 0.0.0.0 instead of 127.0.0.1. It has NO auth and serves "
+			+ "game state, screenshots, recorder keystrokes and the bank memory -- turn on only for a "
+			+ "monitoring PC. The OSRS VM guest uses the BRIDGE_BIND_ALL=1 environment variable instead "
+			+ "(a VirtualBox port-forward reaches the guest's NAT address, not its loopback).",
+		section = generalSection,
+		position = 1
+	)
+	default boolean bridgeBindAll()
+	{
+		return false;
+	}
+
+	@ConfigItem(
 		keyName = "routine",
 		name = "Routine",
 		description = "Which controller.py routine to run. Add new routines to controller.py's "
