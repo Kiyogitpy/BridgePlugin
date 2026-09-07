@@ -412,6 +412,18 @@ sends the OS / Java / launcher-version strings and a "is a Jagex account" boolea
    4, `canvasenter` 5, `focus` 2, and the report tool turned them into real numbers
    (`off_canvas_fraction` 0.266, `unfocused_fraction` 0.130). Note a maximized window has no
    left/right edge to leave by -- the cursor clamps inside the canvas; go UP into the title bar.
+   **COMPARE THE SAME ACTIVITY, or the numbers mean nothing.** MEASURED 2026-09-07 over four
+   real recordings, `still_p90_ms`: human karambwan 2038, human GOTR 608, cg-bot 612,
+   foundry-bot 7493. The metric tracks the ACTIVITY's cadence, not human-vs-bot -- a human
+   waiting on a fishing spot and a bot waiting on a foundry machine both look still, and a
+   human at GOTR and a bot in the Gauntlet both click constantly. So a baseline human
+   recording is only useful against a bot recording of THE SAME activity (the same rule the
+   fidget-anchor fix already states). **The tool's first draft got this wrong in a way worth
+   remembering**: `still_segments` held its anchor across sub-threshold gaps, which turned
+   continuous motion into a fake ~150 ms pause every 150 ms and pinned `still_p50_ms` at
+   152-160 ms on EVERY recording, human and bot alike. Two unit tests and two code reviews
+   passed it; running it over one real recording is what caught it. Run any new metric over a
+   real capture before pinning its expected value.
 2. Timing that is drawn from a fitted human distribution (`settings.py`) is on the wire; timing
    that is a constant is a fingerprint. That applies to key presses as much as clicks.
 3. Keep the login fingerprint constant per machine (same UUID, cores, heap, Windows build, JDK).
