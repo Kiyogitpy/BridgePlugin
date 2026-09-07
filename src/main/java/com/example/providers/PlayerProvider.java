@@ -228,6 +228,12 @@ public class PlayerProvider extends BridgeProvider
 				data.put("boatWidth", boatConfig.getBoundsWidth() / 128.0);
 				data.put("boatHeight", boatConfig.getBoundsHeight() / 128.0);
 			}
+			// The boat's own WorldView id, matching ObjectProvider's boatViewId stamp -- this is
+			// how the Python side tells OUR fixtures from a neighbouring boat's on a mass world.
+			if (boat != null && boat.getWorldView() != null)
+			{
+				data.put("boatViewId", boat.getWorldView().getId());
+			}
 		}
 
 		// General-purpose debug fields: direct visibility into which WorldView the player is

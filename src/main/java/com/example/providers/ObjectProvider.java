@@ -269,9 +269,26 @@ public class ObjectProvider extends BridgeProvider
 	/** See getObjects: only ever read/written on the client thread inside one call. */
 	private boolean interactableOnlyThisCall;
 
+	/** The id of the OUTERMOST non-top-level WorldView currently being walked -- i.e. the boat
+	 *  whose deck these objects are on -- or null while walking the top-level ocean scene.
+	 *
+	 *  Outermost, not innermost, on purpose: walkWorldViewRecursively's own comment records that
+	 *  the helm lives in a WorldEntity nested INSIDE the boat's main view, so keying on the
+	 *  immediate view would split one boat's fixtures across several ids and defeat the whole
+	 *  point. Depth 1 is the boat; anything deeper inherits it.
+	 *
+	 *  MEASURED 2026-09-07: on a mass world 26 "Salvaging station" objects from ~13 overlapping
+	 *  boats appeared within a few tiles, three of them on the player's exact tile, all
+	 *  clickable, with screen positions ~20px apart. Position cannot separate them; this can.
+	 *
+	 *  Only ever read/written on the client thread inside one computeObjects call, same as the
+	 *  two fields above. */
+	private Integer boatViewIdThisWalk;
+
 	private List<Map<String, Object>> computeObjects(Integer radius, Target want, boolean interactableOnly)
 	{
 		interactableOnlyThisCall = interactableOnly;
+		boatViewIdThisWalk = null;
 		List<Map<String, Object>> list = new ArrayList<>();
 
 		WorldView collisionView = client.getTopLevelWorldView();
@@ -342,10 +359,19 @@ public class ObjectProvider extends BridgeProvider
 		for (WorldEntity entity : view.worldEntities())
 		{
 			WorldView childView = entity.getWorldView();
-			if (childView != null)
+			if (childView == null)
 			{
-				walkWorldViewRecursively(childView, false, out, depth + 1, radius, want);
+				continue;
 			}
+			// depth 0 is the top-level ocean scene, so its direct children (depth 1) are the
+			// boats. Deeper views inherit the boat's id rather than overwriting it.
+			Integer previous = boatViewIdThisWalk;
+			if (isTopLevel)
+			{
+				boatViewIdThisWalk = childView.getId();
+			}
+			walkWorldViewRecursively(childView, false, out, depth + 1, radius, want);
+			boatViewIdThisWalk = previous;
 		}
 	}
 
@@ -558,6 +584,10 @@ public class ObjectProvider extends BridgeProvider
 		LocalPoint local = obj.getLocalLocation();
 
 		data.put("id", obj.getId());
+		if (boatViewIdThisWalk != null)
+		{
+			data.put("boatViewId", boatViewIdThisWalk);
+		}
 		data.put("objectType", objectType);
 		ObjectComposition comp = client.getObjectDefinition(obj.getId());
 		boolean multiloc = comp != null && comp.getImpostorIds() != null;
