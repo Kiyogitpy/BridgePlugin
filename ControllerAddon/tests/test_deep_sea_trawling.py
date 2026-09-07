@@ -1028,3 +1028,126 @@ def test_setup_does_not_run_the_checks_itself(monkeypatch):
                         lambda c, cfg: (_ for _ in ()).throw(AssertionError("ran in setup")))
     dst.setup(ctx)
     assert ctx.state.data["dst_started_at"] is not None
+
+
+# --- fish crates ---------------------------------------------------------------------------------
+
+def _cargo(used, capacity=240, items=None):
+    return {"used": used, "capacity": capacity, "items": items or []}
+
+
+EMPTY_CRATES = {"id": 32366, "name": "Fish crate (empty)", "quantity": 250}
+KRILL_CRATES = {"id": 32368, "name": "Fish crate (giant krill)", "quantity": 12}
+LOOSE_KRILL = {"id": 30135, "name": "Raw giant krill", "quantity": 7}
+
+
+def test_crate_stock_admits_when_it_cannot_read_rather_than_reporting_zero():
+    """Same None-vs-0 rule the rest of the routine keeps: a dropped /trawling response must not
+    read as 'you have no crates', which would fire the warning on a perfectly stocked boat."""
+    for cargo in (None, {}, {"used": 3}, {"capacity": 240}):
+        stock = dst.crate_stock(cargo)
+        assert stock["readable"] is False
+        assert stock["empty"] is None and stock["projectedFish"] is None
+
+
+def test_crate_stock_counts_empties_by_quantity_because_they_stack():
+    """Empty crates are obj 32366 `stackable=yes` -- 250 of them are ONE cargo slot. Counting
+    slots instead of quantity would under-report the trip length by ~250x."""
+    stock = dst.crate_stock(_cargo(used=14, items=[EMPTY_CRATES, KRILL_CRATES, LOOSE_KRILL]))
+    assert stock["readable"] is True
+    assert stock["empty"] == 250
+    assert stock["filled"] == 12          # filled crates are NOT stackable: one slot each
+    assert stock["freeSlots"] == 226
+
+
+def test_crate_stock_projects_a_crated_hold_at_ten_fish_per_free_slot():
+    stock = dst.crate_stock(_cargo(used=14, items=[EMPTY_CRATES]))
+    assert stock["freeSlots"] == 226
+    assert stock["projectedFish"] == 2260                     # every free slot becomes a crate
+    assert round(stock["projectedMinutes"]) == round(2260 / dst.ESTIMATED_FISH_PER_MIN)
+
+
+def test_crate_stock_projects_a_bare_hold_at_one_loose_fish_per_slot():
+    """The half-hour run: with no crates a 240-slot hold is 240 fish, not 2,390."""
+    stock = dst.crate_stock(_cargo(used=0, items=[]))
+    assert stock["empty"] == 0
+    assert stock["projectedFish"] == 240
+    assert stock["projectedMinutes"] < 40
+
+
+def test_crate_stock_runs_out_of_crates_before_it_runs_out_of_slots():
+    """Fewer empties than free slots: those slots hold crates, the rest hold loose fish."""
+    stock = dst.crate_stock(_cargo(used=140, items=[dict(EMPTY_CRATES, quantity=20)]))
+    assert stock["freeSlots"] == 100
+    assert stock["projectedFish"] == 20 * dst.FISH_PER_CRATE + 80
+
+
+def test_crate_stock_ignores_items_that_are_not_crates():
+    stock = dst.crate_stock(_cargo(used=1, items=[LOOSE_KRILL, {"name": "Teak repair kit",
+                                                                "quantity": 8}]))
+    assert stock["empty"] == 0 and stock["filled"] == 0
+
+
+def test_the_crate_report_warns_once_when_the_hold_has_no_crates(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    lines = []
+    monkeypatch.setattr(dst.debug_log, "log", lambda cat, msg: lines.append(msg))
+
+    dst._log_crate_stock_once(ctx, {"cargo": _cargo(used=0)})
+    assert len(lines) == 1
+    assert lines[0].startswith("[!]")          # the live monitor keys on [!]
+    assert "Fish crate (empty)" in lines[0]
+
+    dst._log_crate_stock_once(ctx, {"cargo": _cargo(used=0)})
+    assert len(lines) == 1                     # once per run, not once per snapshot
+
+
+def test_the_crate_report_does_not_warn_on_a_stocked_hold(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    lines = []
+    monkeypatch.setattr(dst.debug_log, "log", lambda cat, msg: lines.append(msg))
+    dst._log_crate_stock_once(ctx, {"cargo": _cargo(used=14, items=[EMPTY_CRATES])})
+    assert len(lines) == 1
+    assert not lines[0].startswith("[!]")
+    assert "2260" in lines[0]
+
+
+def test_the_crate_report_stays_silent_and_unlatched_while_the_hold_is_unreadable(monkeypatch):
+    """An unreadable read must not burn the once-per-run latch, or a dropped response on the
+    first snapshot would suppress the report for the whole session."""
+    ctx = _burst_ctx(monkeypatch, [[]])
+    lines = []
+    monkeypatch.setattr(dst.debug_log, "log", lambda cat, msg: lines.append(msg))
+    dst._log_crate_stock_once(ctx, {})
+    assert lines == []
+    assert ctx.state.data.get("dst_crates_logged") is None
+
+    dst._log_crate_stock_once(ctx, {"cargo": _cargo(used=0)})
+    assert len(lines) == 1
+
+
+def test_done_phase_explains_a_short_run_when_no_crates_were_aboard(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
+    monkeypatch.setattr(dst, "_inventory_room", lambda: 0)
+    monkeypatch.setattr(dst, "_fish_in_nets", lambda snap=None: 0)
+    monkeypatch.setattr(controller, "get_trawling", lambda: {"cargo": _cargo(used=240)})
+
+    dst.done_phase(ctx, CFG, _snap(cargo_used=240, net_fish=0))
+    assert ctx.state.safety_stopped
+    assert "no fish crates aboard" in ctx.state.safety_reason
+
+
+def test_done_phase_stays_quiet_about_crates_on_a_crated_run(monkeypatch):
+    ctx = _burst_ctx(monkeypatch, [[]])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
+    monkeypatch.setattr(dst, "_inventory_room", lambda: 0)
+    monkeypatch.setattr(dst, "_fish_in_nets", lambda snap=None: 0)
+    monkeypatch.setattr(controller, "get_trawling",
+                        lambda: {"cargo": _cargo(used=240, items=[KRILL_CRATES])})
+
+    dst.done_phase(ctx, CFG, _snap(cargo_used=240, net_fish=0))
+    assert ctx.state.safety_stopped
+    assert "fish crates aboard" not in ctx.state.safety_reason

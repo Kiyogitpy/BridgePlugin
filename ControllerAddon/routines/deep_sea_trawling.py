@@ -101,6 +101,28 @@ VARBIT_SUBSCRIPTIONS = [19206, 19208, 19134]
 NET_NAME_FRAGMENT = "trawling net"
 NET_OBJECT_IDS = tuple(range(59755, 59767))     # rope/linen/hemp/cotton x 2x5 + 3x8 port/starboard
 
+# --- fish crates -------------------------------------------------------------------------------
+# Empty fish crates stored in the cargo hold are filled AUTOMATICALLY when the net is emptied
+# into it, 10 fish per crate, with any remainder stored loose (Wiki, Deep sea trawling
+# rev 15297127 § Transporting deep sea fish). So crates need no interaction of their own -- they
+# only have to be aboard, which is why this routine reports on them rather than managing them.
+#
+# The asymmetry that makes them worth so much (cache dump 5bc2ff1e): an EMPTY crate
+# (obj 32366 fish_crate_empty) is `stackable=yes`, so however many you carry cost ONE cargo
+# slot; a FILLED one (32368 giant krill, 32371 haddock, ... each +3 for its cert/var ids) is
+# not stackable and costs one slot per 10 fish. A 240-slot hold therefore holds ~240 loose fish
+# with no crates and ~2,390 with them -- a ~10x longer trip for one slot of stock.
+CRATE_EMPTY_NAME = "fish crate (empty)"
+CRATE_NAME_PREFIX = "fish crate ("
+FISH_PER_CRATE = 10
+
+# DERIVED, NOT MEASURED (spec live-verify #15). At Fishing 75 a Giant krill roll succeeds
+# 10.5% of the time (Wiki catch-chance table); a 1-tick-clicked roll fires every 2 ticks
+# (1.2s) = 50 rolls/min; a Rope net catches 1-2 fish, so ~1.5 average. 50 * 0.105 * 1.5 ~= 8.
+# Only ever used to turn a slot count into a human-readable "this trip ends in about N minutes"
+# log line -- nothing decides anything on it.
+ESTIMATED_FISH_PER_MIN = 8.0
+
 # --------------------------------------------------------------------------- clock indirection
 
 def _now():
@@ -271,6 +293,73 @@ def _log_net_entries_once(ctx, trawling):
                               f"netFish={trawling.get('netFish')!r}")
 
 
+def crate_stock(cargo) -> dict:
+    """What the cargo hold's fish crates mean for this trip's length. Pure.
+
+    Returns `readable` False when /trawling could not tell us (a missing container, a dropped
+    response) -- "cannot tell" is not "no crates", the same None-vs-0 distinction the rest of
+    this routine keeps.
+
+    `projectedFish` is an ESTIMATE and deliberately a simple one: each free slot becomes a
+    filled crate (10 fish) while empties last, and holds loose fish (1 each) after they run out.
+    It ignores the one slot the empty stack itself occupies and the part-filled crate at the
+    end, because it exists to print a number a human can act on before launching, not to decide
+    anything."""
+    used, capacity = (cargo or {}).get("used"), (cargo or {}).get("capacity")
+    if used is None or capacity is None:
+        return {"readable": False, "empty": None, "filled": None, "freeSlots": None,
+                "projectedFish": None, "projectedMinutes": None}
+
+    empty = 0
+    filled = 0
+    for item in (cargo.get("items") or []):
+        name = (item.get("name") or "").lower()
+        if not name.startswith(CRATE_NAME_PREFIX):
+            continue
+        qty = item.get("quantity") or 0
+        if name == CRATE_EMPTY_NAME:
+            empty += qty
+        else:
+            filled += qty
+
+    free = max(0, capacity - used)
+    crated = min(empty, free)
+    projected = crated * FISH_PER_CRATE + max(0, free - crated)
+    return {"readable": True, "empty": empty, "filled": filled, "freeSlots": free,
+            "projectedFish": projected,
+            "projectedMinutes": projected / ESTIMATED_FISH_PER_MIN
+            if ESTIMATED_FISH_PER_MIN else None}
+
+
+def _log_crate_stock_once(ctx, trawling):
+    """Say, once per run and before any fishing, how long this trip can possibly last.
+
+    A trip's length is set entirely by what is already in the hold, and nothing later in the run
+    can change it -- so the only useful moment to report it is now. Without crates a 240-slot
+    hold is ~240 fish, about half an hour, and the run ends in done_phase; with a stack of them
+    it is ~2,390, several hours. Warning here turns "why did it stop after 30 minutes" into a
+    line you read before launching."""
+    state = getattr(ctx, "state", None)
+    data = getattr(state, "data", None)
+    if data is None or data.get("dst_crates_logged"):
+        return
+    stock = crate_stock((trawling or {}).get("cargo"))
+    if not stock["readable"]:
+        return
+    data["dst_crates_logged"] = True
+    if stock["empty"]:
+        debug_log.log("trawling",
+                      f"cargo: {stock['empty']} empty crates, {stock['filled']} filled, "
+                      f"{stock['freeSlots']} free slots -- room for about "
+                      f"{stock['projectedFish']} fish (~{stock['projectedMinutes']:.0f} min)")
+    else:
+        debug_log.log("trawling",
+                      f"[!] no empty fish crates in the cargo hold: {stock['freeSlots']} free "
+                      f"slots hold about {stock['projectedFish']} loose fish "
+                      f"(~{stock['projectedMinutes']:.0f} min) and then the run stops. A stack "
+                      f"of Fish crate (empty) costs ONE slot and makes that ~10x longer.")
+
+
 def read_snapshot(ctx, cfg, ticks_since_sailing_xp: float = 0.0) -> TrawlSnapshot:
     """One record of everything a phase decision needs.
 
@@ -285,6 +374,7 @@ def read_snapshot(ctx, cfg, ticks_since_sailing_xp: float = 0.0) -> TrawlSnapsho
     objects = controller.get_objects() or []
     trawling = controller.get_trawling() or {}
     _log_net_entries_once(ctx, trawling)
+    _log_crate_stock_once(ctx, trawling)
 
     net = find_net(objects)
     shoal, shoal_dist = find_shoal(objects, cfg, px, py)
@@ -788,10 +878,19 @@ def done_phase(ctx, cfg, snap) -> bool:
     controller.click_menu_action(ctx.ser, snap.net, "Raise",
                                  refresh_target=net_refresh_target(snap.net), offset=(0, 0))
     catches = ctx.state.data.get("dst_catches", 0)
+    reason = f"the cargo hold is full and the net is raised -- {catches} catches this run"
+
+    # A hold with no crates in it fills in about half an hour, which reads as "the routine
+    # stopped early" unless the message says why. Only add the hint when the hold genuinely had
+    # no crates: on a crated run this is simply a long trip ending normally.
+    stock = crate_stock((controller.get_trawling() or {}).get("cargo"))
+    if stock["readable"] and not stock["empty"] and not stock["filled"]:
+        reason += (". There were no fish crates aboard -- a stack of Fish crate (empty) costs "
+                   "one cargo slot and makes the next trip about 10x longer")
+
     # _stop appends whatever is STILL in the nets, re-read after the inventory collect above --
     # so the one message names both the full hold and the fish that could not be moved.
-    _stop(ctx, f"the cargo hold is full and the net is raised -- {catches} catches this run",
-          snap._replace(net_fish=_fish_in_nets()))
+    _stop(ctx, reason, snap._replace(net_fish=_fish_in_nets()))
     return False
 
 
