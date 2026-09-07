@@ -246,6 +246,13 @@ HAZARD_GIVEUP_S = 30 * 60  # a hazardous-waters refusal is about the BOAT's fitt
 SORT_FAIL_LIMIT = 4
 SORT_PARK_S = 300.0
 
+# I8 (final-review fix wave, 2026-09-07): how long drop_items polls /inventory before concluding
+# a click did nothing. A drop is processed on the next server tick, so a verification window
+# shorter than 0.6s reads a perfectly good drop as a failure. MEASURED consequence of getting
+# this wrong: every pass falsely reports the Drop swap missing and routes ~20 items through the
+# right-click menu at ~1s each instead of ~0.1s.
+DROP_CONFIRM_S = 1.5
+
 # --- C2: keepers have no sink but the hold, so sort_phase stows them once the inventory is
 # getting tight -- see stow_keepers/cargo_hold.deposit_item. Enough room left afterward to
 # withdraw a useful salvage batch, without immediately tripping the same threshold again next
@@ -893,6 +900,22 @@ def _approach_point_from_here(wreck: dict, player: dict = None):
     return _approach_point_clear_of_wreck(origin_x, origin_y, wreck, player)
 
 
+def _poll_drop_confirmed(predicate, poll_s=0.1):
+    """Poll `predicate` (no args) until it returns True or DROP_CONFIRM_S elapses.
+
+    DROP_CONFIRM_S is looked up as a bare module global INSIDE this function, never bound as a
+    default-argument value -- default arguments are evaluated once at def time, which would
+    freeze in the value at import and make it un-patchable by a test. Same shape as
+    cargo_hold._poll_until."""
+    deadline = time.time() + DROP_CONFIRM_S
+    while True:
+        if predicate():
+            return True
+        if time.time() >= deadline:
+            return False
+        controller.human_delay(poll_s, poll_s + 0.05)
+
+
 def drop_items(ctx, predicate):
     """Drop every inventory item `predicate(name)` selects. `predicate` takes the item's name
     as the game reports it (NOT lowercased -- lowercase inside your predicate if you need to).
@@ -946,6 +969,23 @@ def drop_items(ctx, predicate):
     forced-left-click-Drop mechanism (see the docstring paragraph above), not a literal call to
     it (that would send SHIFT, which is a different mechanism from this account's own swap).
 
+    I8 (final-review fix wave, 2026-09-07): two real defects in I6's verification, both found
+    because sort_phase uses this function's RETURN VALUE as its progress signal -- the input to
+    SORT_FAIL_LIMIT, the ceiling that stops the sort rung spinning forever with a wreck in range.
+    First: the verify-then-escalate check above read /inventory a fixed ~100-210ms after the
+    click (human_delay(0.06, 0.12) then one read), which is shorter than the 0-600ms a drop can
+    take to land on the next server tick -- so drop_works read False on a perfectly good drop
+    about three times in four, permanently triggering the "swap may be missing" fallback and its
+    ~10x slowdown (see DROP_CONFIRM_S). Fixed by polling for up to DROP_CONFIRM_S instead of a
+    single read. Second: the old `dropped += 1` counted every item CLICKED, not every item that
+    actually left the inventory -- so if a stray interface ate every click (this codebase records
+    exactly that class of bug for motherlode_mine.py: "an open interface eats the first world
+    click"), drop_items still reported N dropped, sort_phase's progress read True every pass,
+    sort_fail_count never incremented, the park never fired, and sort_phase would right-click 20+
+    full inventory slots once a tick forever with the account unattended -- precisely the loop
+    SORT_FAIL_LIMIT exists to stop. Fixed by returning the CONFIRMED delta
+    (before-count minus the after-loop /inventory length) instead of the attempt count.
+
     Logs one line per pass naming every distinct item name dropped and its count -- the spec's
     live checklist item 7b requires it: the keep-list names are wiki-sourced, not measured, so a
     near-miss on a name fails silently in the DROP direction and this is the only way to see it
@@ -971,13 +1011,13 @@ def drop_items(ctx, predicate):
 
     before = len(controller.get_inventory())
     drop_works = None
-    dropped = 0
     dropped_names = {}
     for item in items:
         name = item.get("name") or ""
         if drop_works is False:
             controller.click_menu_action(ctx.ser, item, "Drop", offset=(0, 0),
                                          check_ui_blockers=False)
+            controller.human_delay(0.06, 0.12)  # 40% faster still, on top of the earlier 2x (original 0.2-0.4s)
         else:
             # simulate_mistakes=False (2026-09-03): with Drop as the forced left-click, a
             # simulated near-miss lands on the NEIGHBOURING slot -- fine when that is more
@@ -985,23 +1025,29 @@ def drop_items(ctx, predicate):
             # when it is not. Same reasoning as banker.py's no-misclick rule for bank UI buttons.
             controller.click_entity(ctx.ser, item, check_ui_blockers=False,
                                     simulate_mistakes=False)
-        controller.human_delay(0.06, 0.12)  # 40% faster still, on top of the earlier 2x (original 0.2-0.4s)
-        if drop_works is None:
-            drop_works = len(controller.get_inventory()) < before
-            if not drop_works:
-                debug_log.log("salvage", f"the first drop ('{name}') did nothing -- the forced "
-                                          f"left-click Drop swap may be missing or mis-set; "
-                                          f"using the right-click menu for the rest of this pass")
-                controller.click_menu_action(ctx.ser, item, "Drop", offset=(0, 0),
-                                             check_ui_blockers=False)
-                controller.human_delay(0.06, 0.12)
-        dropped += 1
+            if drop_works is None:
+                # I8: poll rather than a single ~100ms read -- see DROP_CONFIRM_S's comment.
+                drop_works = _poll_drop_confirmed(lambda: len(controller.get_inventory()) < before)
+                if not drop_works:
+                    debug_log.log("salvage", f"the first drop ('{name}') did nothing -- the forced "
+                                              f"left-click Drop swap may be missing or mis-set; "
+                                              f"using the right-click menu for the rest of this pass")
+                    controller.click_menu_action(ctx.ser, item, "Drop", offset=(0, 0),
+                                                 check_ui_blockers=False)
+                    controller.human_delay(0.06, 0.12)
+            else:
+                controller.human_delay(0.06, 0.12)  # 40% faster still, on top of the earlier 2x (original 0.2-0.4s)
         dropped_names[name] = dropped_names.get(name, 0) + 1
 
+    # I8: the CONFIRMED delta, not the attempt count above -- sort_phase treats this return value
+    # as its progress signal (the input to SORT_FAIL_LIMIT, the ceiling that stops the sort rung
+    # spinning forever with a wreck in range), so it must reflect items actually gone, not clicks
+    # issued into a stray interface that ate every one of them.
+    confirmed = max(before - len(controller.get_inventory()), 0)
     if dropped_names:
         summary = ", ".join(f"{n} x{c}" if c > 1 else n for n, c in dropped_names.items())
-        debug_log.log("salvage", f"dropped: {summary}")
-    return dropped
+        debug_log.log("salvage", f"dropped: {summary} (confirmed {confirmed})")
+    return confirmed
 
 
 def drop_salvage(ctx):

@@ -608,13 +608,19 @@ def test_the_default_keep_list_keeps_what_the_user_asked_to_keep():
 # --- drop_items --------------------------------------------------------------------------
 
 def test_drop_items_drops_only_what_the_predicate_selects(monkeypatch):
+    """I8: the mock inventory must actually shrink in response to a click, or the confirmed-delta
+    return (see the I8 tests below) reads 0 regardless of what the predicate selected -- this
+    test is about the predicate filter, not the confirmation, so give it a working drop."""
     inv = [{"name": "Gold ring", "screenX": 1, "screenY": 1},
            {"name": "Chisel", "screenX": 2, "screenY": 2},
            {"name": "Rune scimitar", "screenX": 3, "screenY": 3}]
-    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inv))
     clicked = []
-    monkeypatch.setattr(controller, "click_entity",
-                        lambda ser, item, **kw: clicked.append(item["name"]) or True)
+    def _click(ser, item, **kw):
+        clicked.append(item["name"])
+        inv.remove(item)
+        return True
+    monkeypatch.setattr(controller, "click_entity", _click)
     ctx = _Ctx()
     dropped = ss.drop_items(ctx, lambda name: name == "Gold ring")
     assert clicked == ["Gold ring"]
@@ -639,6 +645,7 @@ def test_drop_items_falls_back_to_the_menu_when_the_first_drop_frees_nothing(mon
     """A forced-Drop swap that has gone missing or is mis-set on a ring/bracelet/scimitar would
     otherwise leave click_entity resolving to Wear/Wield -- a truthful-looking 'dropped' count
     with nothing actually leaving the inventory, which drives straight into the C2 deadlock."""
+    monkeypatch.setattr(ss, "DROP_CONFIRM_S", 0.02)  # I8 poll -- keep the "never shrinks" path fast
     inv = [{"name": "Gold ring", "screenX": 1, "screenY": 1},
            {"name": "Sapphire ring", "screenX": 2, "screenY": 2}]
     monkeypatch.setattr(controller, "get_inventory", lambda: inv)   # static: nothing ever drops
@@ -653,7 +660,12 @@ def test_drop_items_falls_back_to_the_menu_when_the_first_drop_frees_nothing(mon
     # fails, including the retry of item 0 itself, goes through the menu.
     assert entity_clicks == ["Gold ring"]
     assert menu_clicks == [("Gold ring", "Drop"), ("Sapphire ring", "Drop")]
-    assert dropped == 2
+    # I8: both click_entity and click_menu_action "succeed" (return True) here, but the static
+    # inventory never actually shrinks -- so the CONFIRMED delta sort_phase relies on as its
+    # progress signal must read 0, not the number of clicks issued. This is the regression guard
+    # for SORT_FAIL_LIMIT: a click that lands on nothing (e.g. a stray interface eating it) must
+    # never be reported as progress.
+    assert dropped == 0
 
 
 def test_drop_items_logs_the_names_it_dropped(monkeypatch):
@@ -679,6 +691,55 @@ def test_drop_items_dismisses_a_stray_continue_box_on_entry(monkeypatch):
     monkeypatch.setattr(controller, "dismiss_continue_box", lambda ser: calls.append(True) or True)
     ss.drop_items(_Ctx(), lambda name: True)
     assert calls == [True]
+
+
+# --- I8: drop_items returns the CONFIRMED delta, not the attempt count --------------------
+
+def test_drop_items_returns_the_confirmed_delta_not_the_attempt_count(monkeypatch):
+    """Concrete failure this guards: a stray interface open over the inventory (this codebase
+    records exactly that class of bug for motherlode_mine.py -- 'an open interface eats the
+    first world click') swallows every click. Both click_entity and click_menu_action still
+    report success, but nothing leaves the inventory. sort_phase treats drop_items' return
+    value as its progress signal (the input to SORT_FAIL_LIMIT), so a wrong count here defeats
+    the ceiling that stops the sort rung right-clicking a full inventory forever, unattended."""
+    monkeypatch.setattr(ss, "DROP_CONFIRM_S", 0.02)  # I8 poll -- keep the "never shrinks" path fast
+    inv = [{"name": "Small salvage", "screenX": 1, "screenY": 1},
+           {"name": "Small salvage", "screenX": 2, "screenY": 2},
+           {"name": "Small salvage", "screenX": 3, "screenY": 3}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)  # static: nothing ever leaves
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **kw: True)
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, ent, option, **kw: True)
+    dropped = ss.drop_items(_Ctx(), lambda name: True)
+    assert dropped == 0
+
+
+def test_drop_items_confirmed_after_a_delay_still_counts_as_working(monkeypatch):
+    """A drop is processed on the NEXT server tick (0-600ms), so the inventory shrinking on the
+    third /inventory read rather than the first is a perfectly good drop, not a broken swap --
+    drop_items must not fall back to the right-click menu or log the 'swap may be missing'
+    warning over ordinary tick latency."""
+    inv = [{"name": "Small salvage", "screenX": 1, "screenY": 1},
+           {"name": "Small salvage", "screenX": 2, "screenY": 2}]
+    reads = {"n": 0}
+
+    def _get_inventory():
+        reads["n"] += 1
+        if reads["n"] < 3:
+            return list(inv)          # first two reads: drop hasn't landed on the server yet
+        return list(inv)[1:]          # third read onward: the server processed it
+
+    monkeypatch.setattr(controller, "get_inventory", _get_inventory)
+    entity_clicks = []
+    menu_clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **kw: entity_clicks.append(ent["name"]) or True)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **kw: menu_clicks.append((ent["name"], option)) or True)
+    logged = []
+    monkeypatch.setattr(ss.debug_log, "log", lambda cat, msg: logged.append(msg))
+    ss.drop_items(_Ctx(), lambda name: True)
+    assert menu_clicks == []
+    assert not any("swap may be missing" in msg for msg in logged)
 
 
 # --- derive_phase ------------------------------------------------------------------------
