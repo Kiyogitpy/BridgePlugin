@@ -53,6 +53,18 @@ public class ClientVersionProvider extends BridgeProvider
 	public void register()
 	{
 		server.register("/client-version", this::getVersion);
+
+		// The fingerprint spawns `wmic` (LoginFingerprint.collect()), which used to run inline on
+		// the FIRST request to this endpoint -- an HTTP worker thread -- with no timeout on the
+		// process. A wmic that never exits (its stderr pipe fills with nobody draining it; see
+		// LoginFingerprint.readSmbiosUuid()'s own fix) parked that pooled thread forever. Computed
+		// here instead, once, off the request path entirely: getVersion() just reads the field,
+		// which may be null for the first few ms of the plugin's life -- fine, and strictly better
+		// than blocking a request on it.
+		Thread t = new Thread(() -> cachedFingerprint = com.example.util.LoginFingerprint.collect(),
+			"client-version-fingerprint");
+		t.setDaemon(true);
+		t.start();
 	}
 
 	private Object getVersion()
@@ -67,12 +79,8 @@ public class ClientVersionProvider extends BridgeProvider
 		data.put("injectedClientJar", jar == null ? null : jar.toString());
 		data.put("injectedClientSha256", sha256Cached(jar));
 
-		// What the login packet will carry, computed the client's way (LoginFingerprint). Spawns
-		// wmic once, so cache it -- the guard and --status poll this endpoint.
-		if (cachedFingerprint == null)
-		{
-			cachedFingerprint = com.example.util.LoginFingerprint.collect();
-		}
+		// What the login packet will carry, computed the client's way (LoginFingerprint). Computed
+		// once by a background thread started from register() -- see there for why.
 		data.put("fingerprint", cachedFingerprint);
 		return data;
 	}

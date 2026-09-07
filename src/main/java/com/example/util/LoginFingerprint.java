@@ -103,6 +103,17 @@ public final class LoginFingerprint
 		return s == null ? null : s.toLowerCase(Locale.ROOT);
 	}
 
+	private static final int WMIC_TIMEOUT_SECONDS = 5;
+
+	/**
+	 * Bounded and drained. A bare {@code Runtime.exec} + un-drained stderr can park the caller
+	 * forever if wmic ever writes enough to stderr to fill its pipe buffer with nobody reading it
+	 * -- and this used to run inline on an HTTP worker thread on every uncached request, so that
+	 * hang would take the bridge's client-version endpoint down with it. {@code redirectErrorStream}
+	 * merges stderr into the same stream this already reads, so nothing new needs draining, and
+	 * {@code waitFor(timeout)} + {@code destroyForcibly()} bounds a wmic that never exits at all
+	 * (observed on some hosts once a security product intercepts the process).
+	 */
 	private static String readSmbiosUuid()
 	{
 		String os = System.getProperty("os.name", "");
@@ -112,7 +123,9 @@ public final class LoginFingerprint
 		}
 		try
 		{
-			Process p = Runtime.getRuntime().exec("wmic csproduct get UUID");
+			ProcessBuilder pb = new ProcessBuilder("wmic", "csproduct", "get", "UUID");
+			pb.redirectErrorStream(true);
+			Process p = pb.start();
 			StringBuilder sb = new StringBuilder();
 			try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8)))
 			{
@@ -121,6 +134,11 @@ public final class LoginFingerprint
 				{
 					sb.append(line).append('\n');
 				}
+			}
+			if (!p.waitFor(WMIC_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS))
+			{
+				p.destroyForcibly();
+				return PLACEHOLDER_UUID;
 			}
 			return uuidFromWmic(sb.toString());
 		}

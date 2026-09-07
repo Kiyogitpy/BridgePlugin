@@ -12,8 +12,8 @@ def mouse(t, x, y):
     return {"kind": "mouse", "t": t, "points": [[x, y, t]]}
 
 
-def click(t, x=100, y=100):
-    return {"kind": "click", "t": t, "edge": "down", "button": 1, "x": x, "y": y}
+def click(t, x=100, y=100, button=1, edge="down"):
+    return {"kind": "click", "t": t, "edge": edge, "button": button, "x": x, "y": y}
 
 
 def key(t, name, edge="down"):
@@ -52,13 +52,25 @@ def test_active_windows_are_the_spans_between_clicks_no_further_than_2x_pad_apar
     assert h.active_windows([], pad_ms=30_000) == []
 
 
-def test_still_segments_are_gaps_between_cursor_samples_inside_active_play_only():
-    recs = [click(0), mouse(100, 1, 1), mouse(160, 1, 1),                       # 60ms: NOT still
-            mouse(600, 2, 2), mouse(5_600, 3, 3),                               # gaps 500, 5000
+def test_still_segments_are_gaps_between_consecutive_samples_at_or_above_the_threshold():
+    # 100->160 is 60ms: below STILL_MIN_MS (150), dropped entirely -- it is NOT absorbed into a
+    # held anchor (the old, wrong behaviour); the anchor advances on every sample regardless.
+    # 160->600 is 440ms, 600->5600 is 5000ms: both >= 150ms, both reported.
+    recs = [click(0), mouse(100, 1, 1), mouse(160, 1, 1),
+            mouse(600, 2, 2), mouse(5_600, 3, 3),
             click(6_000),
             mouse(200_000, 4, 4), mouse(203_000, 5, 5)]                         # outside any window
     windows = h.active_windows(recs, pad_ms=30_000)                             # [(0, 6000)]
-    assert h.still_segments(recs, windows) == [500, 5_000]
+    assert h.still_segments(recs, windows) == [440, 5_000]
+
+
+def test_still_segments_reports_nothing_under_continuous_dense_motion():
+    # A dense run of ~10ms samples (a real mouse-move batch) must report ZERO still segments --
+    # this is the finding-1 regression: the old anchor-holding version manufactured a fresh
+    # ~150ms "still segment" out of exactly this kind of continuous motion.
+    recs = [click(0)] + [mouse(t, t, t) for t in range(100, 300, 10)] + [click(6_000)]
+    windows = h.active_windows(recs, pad_ms=30_000)
+    assert h.still_segments(recs, windows) == []
 
 
 def test_busy_fraction_counts_one_second_bins_with_any_cursor_sample():
@@ -99,6 +111,17 @@ def test_focus_stats_integrate_unfocused_time():
     assert h.focus_stats([stamp(), click(0), click(10)])["changes"] == 0
 
 
+def test_focus_stats_counts_the_lead_in_as_unfocused_when_the_first_event_is_a_gain():
+    # recorder.py is armed over HTTP from a terminal, so a session commonly STARTS unfocused --
+    # the client only ever gains focus, never loses it, before this. That [0, 500] lead-in must
+    # count as unfocused, not silently as focused (the bug: the old loop only ever tracked a loss
+    # it had SEEN, so a leading "gained" edge with nothing before it changed nothing).
+    recs = [stamp(), focus(500, True), focus(2_000, False), click(0), click(3_000)]
+    fs = h.focus_stats(recs)
+    assert fs["changes"] == 2
+    assert abs(fs["unfocused_fraction"] - (500 + 1_000) / 3_000) < 1e-9
+
+
 def test_unstamped_recording_reports_excursions_and_focus_as_unmeasured():
     # No "recorder" schema stamp -- this recording predates canvas/focus capture, so a zero
     # excursion/focus count must read as "never measured" (None), not "measured, saw nothing".
@@ -124,12 +147,46 @@ def test_bursts_group_clicks_within_the_gap_and_report_intra_gaps():
     assert abs(b["burst_share"] - 2 / 3) < 1e-9   # 2 of 3 click groups were bursts
 
 
-def test_shift_per_walk_is_shift_downs_over_viewport_walk_actions():
+def test_bursts_excludes_right_clicks():
+    # A right-click (opening a menu) beside a left-click 50ms later must not read as a 2-click
+    # burst -- that conflates menu use with the left-click hotspot-spam cadence bursts() measures.
+    recs = [click(0, button=2), click(50), click(5_400)]
+    b = h.clicks(recs)
+    assert [c["t"] for c in b] == [50, 5_400]          # the button=2 record is gone
+    burst = h.bursts(recs)
+    assert burst["lengths"] == []                       # no 2-click burst survives
+    assert burst["burst_share"] == 0.0
+
+
+def test_shift_per_walk_pairs_shift_holds_with_the_walk_clicks_inside_them():
+    # Two SHIFT holds, each wrapping one click immediately followed by a WALK action -- every
+    # walk click is shifted, and neither click contributes to shifted_other_clicks.
     recs = [key(0, "Shift"), click(50), action(60, "WALK"), key(70, "Shift", "up"),
             key(1_000, "Shift"), click(1_050), action(1_060, "WALK"), key(1_070, "Shift", "up"),
             action(2_000, "GAME_OBJECT_FIRST_OPTION")]
     s = h.shift_per_walk(recs)
-    assert s == {"shift_downs": 2, "walk_clicks": 2, "ratio": 1.0}
+    assert s == {"walk_clicks": 2, "shifted_walk_clicks": 2, "shifted_other_clicks": 0, "ratio": 1.0}
+
+
+def test_shift_per_walk_an_unshifted_walk_click_lowers_the_ratio():
+    # One walk click held under SHIFT, one walk click with no SHIFT anywhere near it.
+    recs = [key(0, "Shift"), click(50), action(60, "WALK"), key(70, "Shift", "up"),
+            click(5_000), action(5_010, "WALK")]
+    s = h.shift_per_walk(recs)
+    assert s["walk_clicks"] == 2
+    assert s["shifted_walk_clicks"] == 1
+    assert s["ratio"] == 0.5
+
+
+def test_shift_per_walk_a_shift_hold_around_a_non_walk_click_only_counts_as_other():
+    # A SHIFT hold around a bank-deposit-shaped click (its resulting action is not WALK) must not
+    # touch walk_clicks/ratio at all -- it shows up only in shifted_other_clicks.
+    recs = [key(0, "Shift"), click(50), action(60, "GAME_OBJECT_FIRST_OPTION"), key(70, "Shift", "up")]
+    s = h.shift_per_walk(recs)
+    assert s == {"walk_clicks": 0, "shifted_walk_clicks": 0, "shifted_other_clicks": 1, "ratio": None}
+
+
+def test_shift_per_walk_no_walk_clicks_gives_ratio_none():
     assert h.shift_per_walk([click(0)])["ratio"] is None
 
 

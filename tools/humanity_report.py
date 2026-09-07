@@ -63,7 +63,13 @@ def duration_ms(records: list[dict]) -> int:
 
 
 def clicks(records: list[dict]) -> list[dict]:
-    return [r for r in records if r.get("kind") == "click" and r.get("edge") == "down"]
+    """LEFT-click ('button' == 1) presses only. A right-click (opening a menu) plus the left-click
+    that resolves the chosen option is two different interactions, not a 2-click burst of the
+    same option -- without this filter bursts() conflated menu use with the ~0.20s hotspot-spam
+    cadence its docstring names. active_windows() also builds its spans from this list; left
+    clicks are the right population there too, since a right-click menu opening does not by
+    itself represent 'active play' the way a resolved action does."""
+    return [r for r in records if r.get("kind") == "click" and r.get("edge") == "down" and r.get("button") == 1]
 
 
 def cursor_samples(records: list[dict]) -> list[tuple[int, int, int]]:
@@ -104,11 +110,17 @@ def _in_windows(t: int, windows: list[tuple[int, int]]) -> Optional[int]:
 
 
 def still_segments(records: list[dict], windows: list[tuple[int, int]]) -> list[int]:
-    """Gaps (ms) of at least STILL_MIN_MS between cursor samples that fall inside the SAME active
-    window -- a genuine pause, not the ~1ms spacing between points inside one mouse-move batch.
-    A sample less than STILL_MIN_MS after the anchor is motion, not stillness: it does NOT reset
-    the anchor, so a burst of closely-spaced samples collapses into one span and the next real
-    gap is still measured from the burst's start, not its last sample."""
+    """Gaps (ms) of at least STILL_MIN_MS between CONSECUTIVE cursor samples that fall inside the
+    SAME active window. Every mouse sample is a real movement event (AWT fires one every ~8-16ms
+    while the cursor moves; `points` timestamps are the real event times), so the gap between two
+    consecutive samples already IS the stillness between them -- there is nothing to collapse.
+    The previous version held the anchor across every sub-threshold gap and only advanced it (and
+    only emitted a gap) once the elapsed time crossed STILL_MIN_MS -- which, under continuous
+    motion, manufactures a fresh ~150ms "still segment" every ~150ms of pure movement (MEASURED:
+    still_p50_ms read 152-160ms on every recording, human and bot alike, with 62-80% of segments
+    under 200ms). The anchor now advances on EVERY sample; a gap is reported only when it is
+    itself >= STILL_MIN_MS, so a dense run of ~10ms samples reports nothing (correct: the cursor
+    never stopped) and only a genuine pause between samples counts."""
     gaps = []
     prev_t, prev_w = None, None
     for t, _, _ in cursor_samples(records):
@@ -117,11 +129,7 @@ def still_segments(records: list[dict], windows: list[tuple[int, int]]) -> list[
             gap = t - prev_t
             if gap >= STILL_MIN_MS:
                 gaps.append(gap)
-                prev_t = t
-            # else: sub-threshold spacing -- leave the anchor where it was.
-        else:
-            prev_t = t
-        prev_w = w
+        prev_t, prev_w = t, w
     return gaps
 
 
@@ -195,6 +203,12 @@ def focus_stats(records: list[dict]) -> dict:
     total = duration_ms(records)
     unfocused = 0
     lost_at = None
+    if events and events[0].get("gained"):
+        # recorder.py is armed over HTTP from a terminal, so a session commonly starts UNFOCUSED
+        # (the terminal has focus, not the game window) -- if the first focus event is a "gained"
+        # edge, the client was unfocused for the whole [0, that t] lead-in, which was previously
+        # silently counted as focused because the loop below only tracks a loss it has SEEN.
+        unfocused += events[0]["t"]
     for r in events:
         if not r.get("gained") and lost_at is None:
             lost_at = r["t"]
@@ -226,13 +240,79 @@ def bursts(records: list[dict]) -> dict:
             "burst_share": (len(multi) / len(groups)) if groups else None}
 
 
+def _shift_holds(records: list[dict]) -> list[tuple[int, int]]:
+    """[down_t, up_t] pairs for each SHIFT key hold; an unclosed hold runs to the recording's
+    last t -- same rule as _spans(), but keyed on keyName rather than a record kind."""
+    end = max((r["t"] for r in records if "t" in r), default=0)
+    events = sorted((r for r in records if r.get("kind") == "key" and r.get("keyName") == "Shift"
+                      and r.get("edge") in ("down", "up")), key=lambda r: r["t"])
+    spans: list[tuple[int, int]] = []
+    open_t = None
+    for r in events:
+        if r["edge"] == "down" and open_t is None:
+            open_t = r["t"]
+        elif r["edge"] == "up" and open_t is not None:
+            spans.append((open_t, r["t"]))
+            open_t = None
+    if open_t is not None:
+        spans.append((open_t, end))
+    return spans
+
+
+def _walk_click_times(records: list[dict]) -> set:
+    """t of every left-click ('kind'=='click', edge=='down') that is immediately followed -- before
+    any other click -- by an 'action' record with menuAction == 'WALK': the click that PRODUCED the
+    walk, as distinct from a click whose next action is something else entirely (a bank deposit, a
+    drop)."""
+    events = sorted((r for r in records if (r.get("kind") == "click" and r.get("edge") == "down")
+                      or r.get("kind") == "action"), key=lambda r: r["t"])
+    walk_ts = set()
+    pending = None
+    for r in events:
+        if r.get("kind") == "click":
+            pending = r["t"]
+        else:  # action
+            if pending is not None and r.get("menuAction") == "WALK":
+                walk_ts.add(pending)
+            pending = None
+    return walk_ts
+
+
 def shift_per_walk(records: list[dict]) -> dict:
-    """SHIFT presses per viewport walk click. The bot presses SHIFT once per walk click (spec V5);
-    a human holds it across a run, or never uses it."""
-    shift = sum(1 for r in records if r.get("kind") == "key" and r.get("edge") == "down"
-                and r.get("keyName") == "Shift")
-    walks = sum(1 for r in records if r.get("kind") == "action" and r.get("menuAction") == "WALK")
-    return {"shift_downs": shift, "walk_clicks": walks, "ratio": (shift / walks) if walks else None}
+    """Pairs SHIFT holds with the walk clicks INSIDE them, so the ratio actually tests CLAUDE.md's
+    "always shift+click a plain ground walk" rule. Redefined 2026-09-07 (final-review finding 2):
+    the previous version divided EVERY SHIFT press in the whole session -- bank shift-deposits and
+    shift-drops dominate that count -- by WALK actions alone, which cannot test the claim it
+    documents (MEASURED on a real bot recording: {'shift_downs': 953, 'walk_clicks': 12,
+    'ratio': 79.4}).
+
+    A SHIFT hold is the span from a 'key' down/'Shift' record to the next 'key' up/'Shift' record
+    (see _shift_holds(); an unclosed hold runs to the recording's last t, like _spans()). A walk
+    click is an 'action' record with menuAction == 'WALK'. `ratio` is the fraction of walk clicks
+    whose own timestamp falls inside a SHIFT hold (None when there are no walk clicks at all).
+    `shifted_other_clicks` separately counts 'click' (edge == 'down') records inside a hold whose
+    own resulting action was NOT a walk, so a shift-deposit/shift-drop burst is visible rather than
+    diluting the walk ratio."""
+    holds = _shift_holds(records)
+
+    def _held(t: int) -> bool:
+        return any(a <= t <= b for a, b in holds)
+
+    walk_ts = [r["t"] for r in records if r.get("kind") == "action" and r.get("menuAction") == "WALK"]
+    walk_clicks = len(walk_ts)
+    shifted_walk_clicks = sum(1 for t in walk_ts if _held(t))
+    walk_click_times = _walk_click_times(records)
+    shifted_other_clicks = sum(
+        1 for r in records
+        if r.get("kind") == "click" and r.get("edge") == "down" and _held(r["t"])
+        and r["t"] not in walk_click_times
+    )
+    return {
+        "walk_clicks": walk_clicks,
+        "shifted_walk_clicks": shifted_walk_clicks,
+        "shifted_other_clicks": shifted_other_clicks,
+        "ratio": (shifted_walk_clicks / walk_clicks) if walk_clicks else None,
+    }
 
 
 def typing(records: list[dict]) -> dict:

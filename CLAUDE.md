@@ -338,7 +338,7 @@ it as sent.
 | `osName` / `osVersion` / `osArch` | `windows 10` / `10.0` / `amd64` |
 | `javaVendor` / `javaVersion` | `Eclipse Adoptium` / `11.0.30` |
 | `maxMemoryMb` / `availableProcessors` | 8147 / 32 |
-| `smbiosUuid` | `1EBB33E4-2B90-8093-433F-50EBF62C698A` |
+| `smbiosUuid` | matches the host's `wmic csproduct get UUID` (printed by `--status`; not committed) |
 
 The endpoint reads these; it never sends anything. It is served on **loopback only** since
 2026-09-07 -- VERIFIED the same day: `Bridge running on http://127.0.0.1:8080` in the log, a
