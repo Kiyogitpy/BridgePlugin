@@ -25,6 +25,10 @@ ACTIVE_PAD_MS = 30_000
 BUSY_BIN_MS = 1_000
 BURST_GAP_MS = 1_500
 TYPING_MAX_GAP_MS = 2_000
+# A still segment is a genuine pause, not the ~1ms spacing between points inside one mouse-move
+# batch record. 150ms is the same threshold the repo's movement-realism fits use for "bursts
+# split on 150ms stillness" -- see CLAUDE.md's reach-segmentation note.
+STILL_MIN_MS = 150
 MODIFIER_KEYS = {"Shift", "Ctrl", "Alt", "Windows", "Caps Lock", "Context Menu"}
 FUNCTION_KEYS = {f"F{i}" for i in range(1, 13)}
 
@@ -100,15 +104,24 @@ def _in_windows(t: int, windows: list[tuple[int, int]]) -> Optional[int]:
 
 
 def still_segments(records: list[dict], windows: list[tuple[int, int]]) -> list[int]:
-    """Gaps (ms) between consecutive cursor samples that fall inside the SAME active window --
-    the stillness the client's 20 Hz recorder reports as 'no sample'."""
+    """Gaps (ms) of at least STILL_MIN_MS between cursor samples that fall inside the SAME active
+    window -- a genuine pause, not the ~1ms spacing between points inside one mouse-move batch.
+    A sample less than STILL_MIN_MS after the anchor is motion, not stillness: it does NOT reset
+    the anchor, so a burst of closely-spaced samples collapses into one span and the next real
+    gap is still measured from the burst's start, not its last sample."""
     gaps = []
     prev_t, prev_w = None, None
     for t, _, _ in cursor_samples(records):
         w = _in_windows(t, windows)
-        if w is not None and prev_w == w:
-            gaps.append(t - prev_t)
-        prev_t, prev_w = t, w
+        if prev_t is not None and w is not None and prev_w == w:
+            gap = t - prev_t
+            if gap >= STILL_MIN_MS:
+                gaps.append(gap)
+                prev_t = t
+            # else: sub-threshold spacing -- leave the anchor where it was.
+        else:
+            prev_t = t
+        prev_w = w
     return gaps
 
 
@@ -128,6 +141,21 @@ def busy_fraction(records: list[dict], windows: list[tuple[int, int]]) -> Option
 
 # ---------------------------------------------------------------- off-canvas and focus
 
+def capabilities(records: list[dict]) -> dict:
+    """What this recording COULD have captured, per the schema stamp RecorderProvider writes on
+    arm (added 2026-09-07, schema 2). A recording made before that stamp existed has neither
+    canvas-edge nor focus records for any reason -- there is nothing to distinguish 'never saw an
+    excursion' from 'could not have recorded one'. Without this, excursions()/focus_stats() read
+    a pre-stamp recording's zero occurrences as a MEASURED zero rather than 'unmeasured'."""
+    canvas_edges = False
+    focus = False
+    for r in records:
+        if r.get("kind") == "recorder":
+            canvas_edges = canvas_edges or bool(r.get("canvasEdges"))
+            focus = focus or bool(r.get("focus"))
+    return {"canvas_edges": canvas_edges, "focus": focus}
+
+
 def _spans(records: list[dict], open_kind: str, close_kind: str) -> list[tuple[int, int]]:
     """[open_t, close_t] pairs; an open with no close runs to the recording's last t."""
     end = max((r["t"] for r in records if "t" in r), default=0)
@@ -144,7 +172,11 @@ def _spans(records: list[dict], open_kind: str, close_kind: str) -> list[tuple[i
 
 
 def excursions(records: list[dict]) -> dict:
-    """Times the cursor left the canvas (the client encodes this as -1 in EVENT_MOUSE_MOVE)."""
+    """Times the cursor left the canvas (the client encodes this as -1 in EVENT_MOUSE_MOVE).
+    Unmeasured (all-None/empty) when this recording predates the recorder's canvas-edge capture
+    -- see capabilities()."""
+    if not capabilities(records)["canvas_edges"]:
+        return {"count": None, "per_hour": None, "lengths_ms": [], "off_fraction": None}
     spans = _spans(records, "canvasexit", "canvasenter")
     total = duration_ms(records)
     lengths = [b - a for a, b in spans]
@@ -154,7 +186,11 @@ def excursions(records: list[dict]) -> dict:
 
 
 def focus_stats(records: list[dict]) -> dict:
-    """Window focus changes (EVENT_APPLET_FOCUS) and the share of time spent unfocused."""
+    """Window focus changes (EVENT_APPLET_FOCUS) and the share of time spent unfocused.
+    Unmeasured (all-None) when this recording predates the recorder's focus capture -- see
+    capabilities()."""
+    if not capabilities(records)["focus"]:
+        return {"changes": None, "per_hour": None, "unfocused_fraction": None}
     events = sorted((r for r in records if r.get("kind") == "focus"), key=lambda r: r["t"])
     total = duration_ms(records)
     unfocused = 0

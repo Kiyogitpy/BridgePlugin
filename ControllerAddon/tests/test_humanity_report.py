@@ -32,6 +32,10 @@ def focus(t, gained):
     return {"kind": "focus", "t": t, "gained": gained}
 
 
+def stamp(t=0):
+    return {"kind": "recorder", "t": t, "schema": 2, "canvasEdges": True, "focus": True}
+
+
 def test_percentile_interpolates_and_handles_empty():
     assert h.percentile([], 0.5) is None
     assert h.percentile([10], 0.9) == 10
@@ -49,7 +53,8 @@ def test_active_windows_are_the_spans_between_clicks_no_further_than_2x_pad_apar
 
 
 def test_still_segments_are_gaps_between_cursor_samples_inside_active_play_only():
-    recs = [click(0), mouse(100, 1, 1), mouse(600, 2, 2), mouse(5_600, 3, 3),   # gaps 500, 5000
+    recs = [click(0), mouse(100, 1, 1), mouse(160, 1, 1),                       # 60ms: NOT still
+            mouse(600, 2, 2), mouse(5_600, 3, 3),                               # gaps 500, 5000
             click(6_000),
             mouse(200_000, 4, 4), mouse(203_000, 5, 5)]                         # outside any window
     windows = h.active_windows(recs, pad_ms=30_000)                             # [(0, 6000)]
@@ -71,7 +76,7 @@ def test_load_skips_malformed_lines(tmp_path):
 
 
 def test_excursions_pair_exit_with_the_next_enter():
-    recs = [click(0), canvas(1_000, "canvasexit"), canvas(4_000, "canvasenter"),
+    recs = [stamp(), click(0), canvas(1_000, "canvasexit"), canvas(4_000, "canvasenter"),
             canvas(10_000, "canvasexit"), canvas(11_000, "canvasenter"), click(3_600_000)]
     ex = h.excursions(recs)
     assert ex["count"] == 2
@@ -81,17 +86,33 @@ def test_excursions_pair_exit_with_the_next_enter():
 
 
 def test_excursion_still_open_at_the_end_counts_to_the_end():
-    recs = [click(0), canvas(1_000, "canvasexit"), click(5_000)]
+    recs = [stamp(), click(0), canvas(1_000, "canvasexit"), click(5_000)]
     ex = h.excursions(recs)
     assert ex["count"] == 1 and ex["lengths_ms"] == [4_000]
 
 
 def test_focus_stats_integrate_unfocused_time():
-    recs = [click(0), focus(1_000, False), focus(3_000, True), focus(8_000, False), click(10_000)]
+    recs = [stamp(), click(0), focus(1_000, False), focus(3_000, True), focus(8_000, False), click(10_000)]
     fs = h.focus_stats(recs)
     assert fs["changes"] == 3
     assert abs(fs["unfocused_fraction"] - (2_000 + 2_000) / 10_000) < 1e-9
-    assert h.focus_stats([click(0), click(10)])["changes"] == 0
+    assert h.focus_stats([stamp(), click(0), click(10)])["changes"] == 0
+
+
+def test_unstamped_recording_reports_excursions_and_focus_as_unmeasured():
+    # No "recorder" schema stamp -- this recording predates canvas/focus capture, so a zero
+    # excursion/focus count must read as "never measured" (None), not "measured, saw nothing".
+    recs = [click(0), canvas(1_000, "canvasexit"), canvas(4_000, "canvasenter"),
+            focus(2_000, False), focus(3_000, True), mouse(100, 1, 1), mouse(600, 2, 2), click(6_000)]
+    ex = h.excursions(recs)
+    assert ex["count"] is None and ex["per_hour"] is None and ex["off_fraction"] is None
+    fs = h.focus_stats(recs)
+    assert fs["changes"] is None and fs["per_hour"] is None and fs["unfocused_fraction"] is None
+    m = h.metrics(recs)
+    for k in ("excursions_per_hour", "excursion_p50_ms", "excursion_p90_ms", "off_canvas_fraction",
+              "focus_changes_per_hour", "unfocused_fraction"):
+        assert m[k] is None
+    assert m["still_p50_ms"] is not None
 
 
 def test_bursts_group_clicks_within_the_gap_and_report_intra_gaps():

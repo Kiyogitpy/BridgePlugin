@@ -525,3 +525,10 @@ def test_describe_renders_canvas_edge_and_focus_records():
 def test_canvas_edge_and_focus_records_are_loose_narrative_kinds():
     for kind in ("canvasexit", "canvasenter", "focus"):
         assert kind in r.LOOSE_NARRATIVE_KINDS
+
+
+def test_describe_renders_the_recorder_schema_stamp():
+    # Written on arm (RecorderProvider.handleArm) so tools/humanity_report.py can tell "this
+    # recording predates canvas/focus capture" apart from "captured it and saw zero".
+    assert r.describe({"kind": "recorder", "schema": 2, "canvasEdges": True, "focus": True}) == "-- recorder schema 2 --"
+    assert "recorder" in r.LOOSE_NARRATIVE_KINDS

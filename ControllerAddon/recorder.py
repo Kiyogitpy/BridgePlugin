@@ -54,7 +54,7 @@ RECORDINGS_DIR = "recordings"
 LOOSE_NARRATIVE_KINDS = {"chat", "xp", "anim", "spotanim", "gfx", "inv", "invstart", "key",
                          "gamestate", "interact", "objspawn", "objdespawn", "varbit",
                          "npcspawn", "npcdespawn", "npcchange", "walkdest",
-                         "canvasexit", "canvasenter", "focus"}
+                         "canvasexit", "canvasenter", "focus", "recorder"}
 
 # Noise classification for varbits/varps. A variable is noise when it changes on a large FRACTION
 # OF TICKS, not when it changes a lot in total -- a fixed count misjudges long recordings and short
@@ -293,6 +293,8 @@ def describe(record):
         return f"cursor back on the canvas at ({record.get('x')}, {record.get('y')})"
     if kind == "focus":
         return "-- window FOCUSED --" if record.get("gained") else "-- window UNFOCUSED --"
+    if kind == "recorder":
+        return f"-- recorder schema {record.get('schema')} --"
     if kind == "key":
         return f"key  {record.get('keyName')}"
 

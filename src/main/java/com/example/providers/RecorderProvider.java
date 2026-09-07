@@ -306,6 +306,18 @@ public class RecorderProvider extends BridgeProvider
 		// into the buffer between the clear and the seed.
 		armed = wantOn;
 
+		if (wantOn)
+		{
+			// Stamps the recording with which ambient kinds it can contain, so tools/humanity_report.py
+			// can tell "never recorded" (a recording predating a given kind) apart from "measured
+			// zero" (a recording that could have captured it but didn't) instead of reading both as zero.
+			Map<String, Object> record = base("recorder");
+			record.put("schema", 2);
+			record.put("canvasEdges", true);
+			record.put("focus", true);
+			add(record);
+		}
+
 		// Suppress the object-spawn burst that a freshly-armed recorder would otherwise catch if
 		// arming happens to coincide with a region load already in flight.
 		objectSuppressUntilMs = System.currentTimeMillis() + OBJECT_SUPPRESS_MS;
