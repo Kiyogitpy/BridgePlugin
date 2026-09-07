@@ -51,6 +51,7 @@ import time
 import controller
 import debug_log
 import gathering
+import mlm_sectors
 import outcome_waits
 import travel
 import worldmap
@@ -356,20 +357,27 @@ def is_upper(height) -> bool:
     return height is not None and height < UPPER_FLOOR_HEIGHT
 
 
-def same_floor(obj_height, player_height) -> bool:
-    """Is this object on the floor we are standing on?
+def object_is_upper(obj) -> bool:
+    """Which floor is this object on?
 
-    THE ONLY WORKING FLOOR TEST IN THIS MINE. Coordinates cannot answer it -- the upper level is
-    directly above the lower one -- and the first live run proved what happens without it: 90
-    seconds of perfectly aimed, perfectly resolved "Mine Ore vein" clicks at a vein one storey
-    below, with /last-action reporting success every time.
+    THE QUESTION THAT COST THE FIRST LIVE RUN. Coordinates cannot answer it -- the upper level
+    is directly above the lower one -- and without it the routine spent 90 seconds on perfectly
+    aimed, perfectly resolved "Mine Ore vein" clicks at a vein one storey below.
 
-    An unknown height is treated as "same floor" only so a single missing field cannot make the
-    routine refuse to work; _floor_ready stops the run up front when the client is not reporting
-    heights at all, because guessing here is precisely the bug this replaced."""
-    if obj_height is None or player_height is None:
-        return True
-    return is_upper(obj_height) == is_upper(player_height)
+    Preferred answer: the tile's RENDER HEIGHT, which is what RuneLite's own MotherlodePlugin
+    uses. Fallback for a client that predates the field: mlm_sectors, the same Plugin Hub
+    plugin's hand-listed upstairs tiles -- advisory, and biased toward reading a tile as
+    downstairs, so its errors cost us a vein rather than a dead click (see that module)."""
+    height = obj.get("tileHeight")
+    if height is not None:
+        return is_upper(height)
+    return mlm_sectors.is_upstairs_tile(obj.get("x"), obj.get("y"))
+
+
+def same_floor(obj, player_upper) -> bool:
+    """Is `obj` on the floor we are standing on? The player's own floor comes from varbit 2086,
+    which is exact and needs no rebuild -- only the OBJECT's floor is ever in question."""
+    return object_is_upper(obj) == bool(player_upper)
 
 
 def _player_height():
@@ -377,14 +385,21 @@ def _player_height():
 
 
 def _floor_ready(ctx) -> bool:
-    """The bridge has to be reporting tileHeight before anything here is clicked."""
-    if _player_height() is not None:
+    """Say once, loudly, which floor test this run is using.
+
+    Never a hard stop: the vendored tile table answers the same question without a client
+    rebuild, and note_vein_failure catches whatever either test gets wrong."""
+    data = _d(ctx)
+    if data.get("mlm_floor_logged"):
         return True
-    ctx.state.trigger_safety_stop(
-        "motherlode: this client does not report tileHeight on /player -- rebuild it with "
-        "./gradlew.bat run. Without it the mine's two floors cannot be told apart and the "
-        "routine mines through the floor")
-    return False
+    data["mlm_floor_logged"] = True
+    if _player_height() is None:
+        debug_log.log(LOG, "[!] this client does not report tileHeight -- falling back to the "
+                           "vendored upstairs-tile table (mlm_sectors). Rebuild the client "
+                           "(./gradlew.bat run) for the real floor test.")
+    else:
+        debug_log.log(LOG, "floor test: tile height (RuneLite's own rule)")
+    return True
 
 
 def _pending(ctx) -> int:
@@ -532,7 +547,7 @@ def pick_vein(ctx, reach, flags, exclude=(), objects=None):
     limit = int(config.get("veinDistance", DEFAULT_CONFIG["veinDistance"]))
     excluded = set(exclude)
     blocked = _blocked_veins(ctx)
-    height = _player_height()
+    upper = _upstairs()
     best = None
     for obj in (controller.get_objects() if objects is None else objects) or []:
         if (obj.get("name") or "").lower() != VEIN_NAME.lower():
@@ -547,17 +562,22 @@ def pick_vein(ctx, reach, flags, exclude=(), objects=None):
         tile = (obj.get("x"), obj.get("y"), obj.get("plane"))
         if tile in excluded or str(tile) in blocked:
             continue
-        if not same_floor(obj.get("tileHeight"), height):
+        if not same_floor(obj, upper):
             continue
         if anchor is not None and max(abs(obj.get("x", 0) - anchor["x"]),
                                       abs(obj.get("y", 0) - anchor["y"])) > limit:
             continue
-        if not _reachable(obj, reach, flags):
-            continue
         distance = obj.get("distance")
         distance = 9999 if distance is None or distance < 0 else distance
-        if best is None or distance < best[0]:
-            best = (distance, obj)
+        # Reachability is a PREFERENCE here, not a veto. In this mine the client's collision
+        # grid has to describe two floors stacked on one set of coordinates, so it is ambiguous
+        # by construction -- MEASURED 2026-09-07, it passed the downstairs vein that cost the
+        # first run 90 seconds AND rejected upstairs veins two tiles away that mine fine. A
+        # walled-off vein now costs two dead clicks and is set aside by note_vein_failure, which
+        # is the empirical answer to a question this data cannot answer in advance.
+        rank = (0 if _reachable(obj, reach, flags) else 1, distance)
+        if best is None or rank < best[0]:
+            best = (rank, obj)
     return best[1] if best else None
 
 
@@ -609,8 +629,12 @@ def climb(ctx, up) -> bool:
     if _upstairs() == bool(up):
         return True
     wanted = LADDER_UP_ID if up else LADDER_DOWN_ID
-    ladder = next((o for o in _objects(ids={wanted}, action=LADDER_ACTION)
-                   if same_floor(o.get("tileHeight"), _player_height())), None)
+    # NO floor filter here, and that is deliberate: a ladder is the one fixture that spans
+    # the two floors, and both of these sit on tiles that read as DOWNSTAIRS whichever test is
+    # in use -- filtering them would make the climb down impossible from upstairs. The ids and
+    # the action already disambiguate: MEASURED live, from upstairs 19045 offers "Climb" and
+    # 19044 offers nothing at all, and the reverse downstairs.
+    ladder = next(iter(_objects(ids={wanted}, action=LADDER_ACTION)), None)
     if ladder is None:
         debug_log.log(LOG, f"no {'up' if up else 'down'} ladder in view -- walking to it")
         travel.walk_to(ctx, TILE_LADDER, goal_adjacent=True)
@@ -642,9 +666,9 @@ def _hopper_candidates(ctx):
     it is bought, every ladder trip disappears with no change here."""
     policy = str((ctx.state.config or {}).get("upperHopper",
                                               DEFAULT_CONFIG["upperHopper"])).lower()
-    height = _player_height()
+    upper = _upstairs()
     hoppers = [h for h in _objects(ids={HOPPER_ID}, action=HOPPER_ACTION)
-               if same_floor(h.get("tileHeight"), height)]
+               if same_floor(h, upper)]
     if policy != "always" and (policy == "never" or _d(ctx).get("mlm_upper_locked")):
         # Anything reachable from upstairs IS the upper hopper; the lower one needs the ladder.
         return [] if _upstairs() else hoppers
@@ -707,7 +731,7 @@ def _deposit_children():
 def search_sack(ctx) -> bool:
     """Search the sack: the game hands over min(free slots, sack) ore."""
     sack = next((o for o in _objects(ids={SACK_ID}, action=SACK_ACTION)
-                 if same_floor(o.get("tileHeight"), _player_height())), None)
+                 if same_floor(o, _upstairs())), None)
     if sack is None:
         debug_log.log(LOG, "the sack is not in view -- walking to it")
         travel.walk_to(ctx, TILE_SACK, goal_adjacent=True)
@@ -730,7 +754,7 @@ def _open_deposit_box(ctx) -> bool:
     if _deposit_open():
         return True
     box = next((o for o in _objects(ids={DEPOSIT_BOX_ID}, action=DEPOSIT_BOX_ACTION)
-                if same_floor(o.get("tileHeight"), _player_height())), None)
+                if same_floor(o, _upstairs())), None)
     if box is None:
         debug_log.log(LOG, "the deposit box is not in view -- walking to it")
         travel.walk_to(ctx, TILE_DEPOSIT_BOX, goal_adjacent=True)
@@ -872,7 +896,7 @@ def _maybe_repair(ctx) -> bool:
                       _now()):
         return False
     strut = next((o for o in _objects(ids={BROKEN_STRUT_ID}, action=STRUT_ACTION)
-                  if same_floor(o.get("tileHeight"), _player_height())), None)
+                  if same_floor(o, _upstairs())), None)
     if strut is None:
         _d(ctx).pop("mlm_broken_since", None)       # someone else got there first
         return False
