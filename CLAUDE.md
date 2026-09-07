@@ -1562,6 +1562,33 @@ hopper/collect half is the next session's worklist.**
   (3761,5666) (**there IS a bank in the mine** -- a future hammer/pickaxe restock, out of scope
   for v1), broken strut 26670 -> 26669 (+126 Smithing), rockfalls 26679/26680 (never cleared --
   the whole point of the pocket behind Mercy is that none is in the way).
+- **Four more live fixes the same day (mlm_live2-6), all MEASURED:**
+  - **The hopper trip works** -- climb down, deposit 27 pay-dirt, ~18s -- **but nothing sent the
+    routine back up afterwards**, so it stood downstairs and mined whatever veins sat near the
+    ladder. `mine_phase` now returns to the anchor before it picks anything, and `at_anchor` is
+    a FLOOR question before it is a distance one: standing directly below the anchor, every
+    coordinate test says "you are here". Only `collect_phase` had a return trip; the far commoner
+    hopper trip did not.
+  - **The anchor was "wherever the run starts"**, so the restart after that wander anchored the
+    whole run on a DOWNSTAIRS tile. It is now the configured pocket behind Mercy
+    (`TILE_ANCHOR_DEFAULT` (3752,5680), three tiles north of Mercy at (3752,5677)) unless the
+    player is already upstairs, which is the only case where "start where I'm standing" is what
+    was meant.
+  - **Every ladder click was WITHHELD by the `expected_action` hover gate** --
+    `hover never matched action='Climb' target=None`. `/hover` reports what is under the cursor
+    RIGHT NOW, and these clicks are issued from across the room; this is the same trap CLAUDE.md
+    already records for the Gauntlet's gather clicks. The gate is gone from every world-object
+    click (ladder, hopper, sack, deposit box, strut), each of which confirms on a real outcome
+    instead. It stays on the `Deposit-All` in the bank grid, where a wrong resolve banks the
+    neighbouring stack.
+  - **WALK FIRST, CLICK CLOSE, and `onScreen` is the load-bearing half.** With the gate gone the
+    routine then clicked the up-ladder from **21 tiles away with `onScreen: false`** -- aiming at
+    a projection that is not on the screen at all, so the click did nothing and `/last-action`
+    still showed the previous Mine. `too_far()` (CLICK_RANGE 10, or `onScreen` false at any
+    distance) walks first. VERIFIED live immediately after: walk -> climb -> walk back to the
+    anchor -> mining the pocket, unattended.
+  - Plus `CLIMB_MAX_TRIES` (8): a ladder that never registers is a safety stop, not a loop.
+
 - **First live session's remaining worklist**: the hopper trip and the ladder round trip, the
   whole collect/bank cycle, the real conveyor latency (fit `PENDING_MAX_S`), and whether a
   `Search` yields exactly `min(free slots, 5558)` ore. None of that half has run yet.
