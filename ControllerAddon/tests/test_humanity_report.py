@@ -92,3 +92,31 @@ def test_focus_stats_integrate_unfocused_time():
     assert fs["changes"] == 3
     assert abs(fs["unfocused_fraction"] - (2_000 + 2_000) / 10_000) < 1e-9
     assert h.focus_stats([click(0), click(10)])["changes"] == 0
+
+
+def test_bursts_group_clicks_within_the_gap_and_report_intra_gaps():
+    # Three quick clicks (200 ms apart), then a lone click 5 s later, then two more.
+    recs = [click(0), click(200), click(400), click(5_400), click(9_000), click(9_300)]
+    b = h.bursts(recs)
+    assert b["lengths"] == [3, 2]              # bursts of >= 2 clicks only
+    assert b["intra_gaps_ms"] == [200, 200, 300]
+    assert abs(b["burst_share"] - 2 / 3) < 1e-9   # 2 of 3 click groups were bursts
+
+
+def test_shift_per_walk_is_shift_downs_over_viewport_walk_actions():
+    recs = [key(0, "Shift"), click(50), action(60, "WALK"), key(70, "Shift", "up"),
+            key(1_000, "Shift"), click(1_050), action(1_060, "WALK"), key(1_070, "Shift", "up"),
+            action(2_000, "GAME_OBJECT_FIRST_OPTION")]
+    s = h.shift_per_walk(recs)
+    assert s == {"shift_downs": 2, "walk_clicks": 2, "ratio": 1.0}
+    assert h.shift_per_walk([click(0)])["ratio"] is None
+
+
+def test_typing_ignores_modifiers_and_function_keys_and_long_pauses():
+    recs = [key(0, "A"), key(120, "D"), key(250, "Shift"), key(300, "A"), key(5_000, "M"), key(5_090, "F1"), key(5_200, "Enter")]
+    t = h.typing(recs)
+    # A->D 120, D->A 180 (Shift skipped), A->M 4700 is > TYPING_MAX_GAP_MS so dropped, M->Enter 200 (F1 skipped)
+    assert t["intervals_ms"] == [120, 180, 200]
+    assert t["p50"] == 180
+    assert t["log_sigma"] is not None and t["log_sigma"] > 0
+    assert h.typing([key(0, "A")])["p50"] is None

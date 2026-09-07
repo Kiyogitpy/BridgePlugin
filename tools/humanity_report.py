@@ -170,3 +170,41 @@ def focus_stats(records: list[dict]) -> dict:
     hours = total / 3_600_000 if total else 0
     return {"changes": len(events), "per_hour": (len(events) / hours) if hours else None,
             "unfocused_fraction": (unfocused / total) if total else None}
+
+
+# ---------------------------------------------------------------- clicks and keys
+
+def bursts(records: list[dict]) -> dict:
+    """Consecutive presses no more than BURST_GAP_MS apart form a burst (the human's 0.20 s
+    hotspot spam; EVENT_MOUSE_CLICK_V2 carries every one of these gaps)."""
+    ts = sorted(c["t"] for c in clicks(records))
+    groups: list[list[int]] = []
+    for t in ts:
+        if groups and t - groups[-1][-1] <= BURST_GAP_MS:
+            groups[-1].append(t)
+        else:
+            groups.append([t])
+    multi = [g for g in groups if len(g) >= 2]
+    gaps = [b - a for g in multi for a, b in zip(g, g[1:])]
+    return {"intra_gaps_ms": gaps, "lengths": [len(g) for g in multi],
+            "burst_share": (len(multi) / len(groups)) if groups else None}
+
+
+def shift_per_walk(records: list[dict]) -> dict:
+    """SHIFT presses per viewport walk click. The bot presses SHIFT once per walk click (spec V5);
+    a human holds it across a run, or never uses it."""
+    shift = sum(1 for r in records if r.get("kind") == "key" and r.get("edge") == "down"
+                and r.get("keyName") == "Shift")
+    walks = sum(1 for r in records if r.get("kind") == "action" and r.get("menuAction") == "WALK")
+    return {"shift_downs": shift, "walk_clicks": walks, "ratio": (shift / walks) if walks else None}
+
+
+def typing(records: list[dict]) -> dict:
+    """Intervals between consecutive character key presses (modifiers and F-keys excluded, gaps
+    over TYPING_MAX_GAP_MS dropped as 'not typing'); the log-sigma is what a fitted cadence
+    draw needs (spec B4)."""
+    downs = sorted((r["t"] for r in records if r.get("kind") == "key" and r.get("edge") == "down"
+                    and r.get("keyName") not in MODIFIER_KEYS and r.get("keyName") not in FUNCTION_KEYS))
+    intervals = [b - a for a, b in zip(downs, downs[1:]) if 0 < b - a <= TYPING_MAX_GAP_MS]
+    log_sigma = statistics.pstdev(math.log(i) for i in intervals) if len(intervals) >= 2 else None
+    return {"intervals_ms": intervals, "p50": percentile(intervals, 0.5), "log_sigma": log_sigma}
