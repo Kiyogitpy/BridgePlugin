@@ -86,6 +86,77 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   for melee/ranged/magic (SPEC stays a name check; unarmed -1 is answered UNKNOWN before the table,
   whose NONE entry maps -1 to MELEE), so it no longer compiles standalone. The per-line file logger
   was dropped on import (USER: "remove logger from my addon").
+- **The VM (2026-09-07)**: USER wanted the physical mouse free for the second screen. One
+  Windows desktop has one cursor and one foreground window, so the client, the bridge,
+  controller.py AND the Arduino live in a VirtualBox guest instead. VirtualBox 7.2.16 +
+  Extension Pack, VM `OSRS` at `C:\VMs\OSRS` (Windows 10 Pro 22H2 from an official ISO at
+  `E:\VM\`, 8 vCPU, 8 GB, 50 GB dynamic disk, EFI, VBoxSVGA with 3D OFF -- the GPU plugin
+  cannot run there), guest user `Kiyo` / password `osrs`. The Leonardo (USB 2341:8036) is
+  captured by a USB filter, so it is the GUEST's mouse and keyboard and the host never sees
+  it while the VM runs (MEASURED: host COM6 disappears; in the guest it is **COM3**, exported
+  as `BRIDGE_SERIAL_PORT`). The host's `C:\Users\Kiyo\Documents` is shared as `Docs`, which
+  Windows mounted at **`Z:`** (D: is the DVD drive), so `Z:\Httpbridge` and `Z:\ZombieLite`
+  keep the `../ZombieLite` layout the build needs. **The guest does NOT build or run from the
+  share**: host and guest Gradle would fight over one `build\`/`.gradle\` on a network drive,
+  so `tools/vm-sync.ps1` (run in the guest) robocopy-mirrors the repo and ZombieLite into
+  `C:\work\` (excluding .git, build, `data\` -- 5.5 GB the guest never needs; the routing map
+  is inside `ControllerAddon\maps`) and copies guest `logs\`/`recordings\` back to the host.
+  So the loop is: edit on the host, `vm-sync.ps1` in the guest, run there.
+  `tools/vm-guest-setup.ps1` provisioned the guest (a fresh 22H2 image has NO winget, so
+  per-user direct installers from `data\vm-installers\`: Python 3.13.7, and Temurin
+  **11.0.30+7 exactly** -- the host's client JVM build, since `java.version` is in the login
+  fingerprint; pip requirements; pointer acceleration off). VirtualBox guest control
+  (`VBoxManage guestcontrol OSRS run --username Kiyo --password osrs ...`) runs commands in
+  the guest from the host without touching the VM window; it needed one guest restart after
+  the Guest Additions install before it answered.
+  **Fingerprint parity (CLAUDE.md "What the game client sends home")**: the VM's SMBIOS UUID
+  is the host's (`--hardware-uuid`, what `wmic csproduct get UUID` answers; VERIFIED identical
+  in the guest); CPU count and heap are matched with `-XX:ActiveProcessorCount=32
+  -Xmx8541700096` (the host's measured default `MaxHeapSize`) in the GUEST's run task rather
+  than by giving the VM 32 vCPUs; Windows build (19045) and Temurin 11.0.30 match the host.
+  All of `controller.py`'s Win32 calls (cursor, panic key, DPI) run inside the guest, so
+  nothing in the Python changes. Running a client in a VM is itself USER's accepted risk.
+  **VERIFIED end to end 2026-09-07**: the guest launched to the logged-in game as "07 Kiyo",
+  bridge answering, ZombieLite + Controller loaded, `/client-version` reporting the same jar
+  SHA as the host, the client JVM carrying `-XX:ActiveProcessorCount=32 -Xmx8541700096`, and
+  the Arduino answering `V -> HB 3` over COM3 from inside the guest. **Login has NO Jagex
+  Launcher**: RuneLite reads `%USERPROFILE%\.runelite\credentials.properties` (the JX_ tokens)
+  at startup and signs in automatically; that file was copied from the host once. The tokens
+  self-refresh into the GUEST's `.runelite`, so keep the host's RuneLite CLOSED while the VM
+  runs or the two sessions fight over one refresh token. `tools/vm-run-client.ps1` launches
+  it (default = full/developer "unsafe" start with the injected client and all builtin
+  plugins; `-SafeMode` is a diagnostic external-plugins-off launch). The client is started
+  from the host with `VBoxManage guestcontrol OSRS start ... -- cmd.exe /c "cd /d
+  C:\work\Httpbridge && gradlew.bat --no-daemon run"`; a `natpf1` rule forwards guest 8080 to
+  host 127.0.0.1:18080 for read-only host-side bridge probing.
+  **SSH into the guest (host VSCode Remote-SSH / a host terminal), 2026-09-07.** OpenSSH server
+  installed in the guest (`tools/vm-setup-ssh.ps1`, run ELEVATED -- Kiyo is a local admin but
+  UAC hands guestcontrol a FILTERED token, so the install needs a real UAC consent: the
+  self-scheduled-`RunLevel Highest` bypass is denied here, so `tools/vm-ssh-elevate.ps1` raises
+  a one-click UAC prompt on the VM screen). A `natpf1` rule forwards host 127.0.0.1:2222 ->
+  guest 22; the host `~/.ssh/config` has an `osrs-vm` block (user kiyo, password osrs, host-key
+  checking off since it is a forwarded localhost). VSCode: Remote-SSH -> Connect to Host ->
+  `osrs-vm`, then open `Z:\Httpbridge` (live host share, Python edits need no sync) or
+  `C:\work\Httpbridge` (the build mirror); its terminal runs IN the guest. Password auth
+  (key auth would need the admin `administrators_authorized_keys` file, another elevation --
+  skipped). VERIFIED to the handshake: the host client got the guest host key and negotiated
+  password auth through the forward.
+  **What persists across a VM power-off vs not.** Durable in the VM/guest: the Arduino USB
+  filter, the Docs share (Z:), the hardware UUID, and inside the guest the RuneLite profile,
+  `credentials.properties`, the OpenSSH server, and `~/.gradle/gradle.properties` (parity JVM
+  flags). NOT durable: the two NAT port-forwards (added at runtime). So start the VM with
+  `tools/vm-up.ps1` (host), which starts it and re-adds both forwards idempotently; a GUI
+  double-click start works too but then run `vm-up.ps1` once to restore the forwards. The
+  client (`vm-run-client.ps1`) and routines never auto-start -- launch them per session.
+  **The RuneLite PROFILE must be copied by hand -- it does NOT transfer.** The active profile
+  (`~/.runelite/profiles2/default-1209788292728200.properties`, ~1.5 MB: every plugin
+  setting, keybind, and the load-bearing Menu Entry Swapper swaps the routines depend on) has
+  `sync=false`, so it lives only on the host and never reaches the guest through RuneLite's
+  cloud sync. Copied once 2026-09-07 by killing the guest client and copying the host's whole
+  `profiles2\` into the guest `~/.runelite\` (its `profiles.json` then makes the host's
+  `default` profile active in the guest). Re-copy after changing plugin settings on the host.
+  A menu-swap mismatch is not cosmetic here: karambwan's worn-teleport clicks, the ice-glove
+  swap and the mahogany withdraws all assume specific left-click swaps (see those sections).
 - **A routine**: `python -u controller.py routines/<name>.py` (from `ControllerAddon/`). Runs
   until the panic key (F1) is pressed, a safety stop triggers, or the process is killed.
 - **MCP debug server** (`osrs-debug` in `.mcp.json`): read-only bridge queries
@@ -215,6 +286,143 @@ check. Do take `curtain`, which our name list was missing.
 
 See `docs/superpowers/specs/2026-08-29-global-collision-pathfinding-design.md` for the design
 this feeds.
+
+## What the game client sends home (read from the rl-suite deobfuscation, 2026-09-07)
+
+Everything below was READ from `data/decompiled/rl-suite-main/semantics/injected-client-1.12.37-sources/`
+(`PlatformInfo.java`, `classVS.java`, `client.java`, `classDK.java`, `classUO.java`,
+`GameEngine.java`) and the rev-240 packet table
+`data/decompiled/rl-suite-main/data/rev-240/mappings/client-packets.tsv` (117 opcodes, 101 named),
+after USER asked how a VM could be hidden from the client. It is the list of what the client can
+SEE, so future work knows which side of the wire a behaviour lands on. Two caveats: rl-suite's
+semantic names are heuristic anchors (a couple of the server-packet names around the recorder
+toggles look mis-anchored), so trust the described BEHAVIOUR over any name here; and this is the
+Java client launched by `./gradlew.bat run`, not the Jagex Launcher, which this setup never runs.
+Reading packet tables is not a licence to send packets -- see the rl-suite caveat above.
+
+**Login fingerprint (`PlatformInfo`, serialised once at login).** On Windows the Java client
+reads exactly: `os.name`, `os.version`, `os.arch`, `java.vendor`, `java.version`, max heap in MB
+(`Runtime.maxMemory`, the JVM default of a quarter of RAM unless `-Xmx` is set), the CPU count,
+and the SMBIOS system UUID by running **`wmic csproduct get UUID`** and taking the second line
+(macOS `system_profiler`, Linux `/etc/machine-id`; on failure the placeholder
+`12345678-0000-0000-0000-123456789012`, which is what a Windows 11 24H2+ guest sends since `wmic`
+is gone there). The GPU / CPU-name / driver / display string fields exist in the class and the
+Java client's constructor call passes them EMPTY -- they belong to the C++ client -- **but a
+separate method fills THREE of the string slots after construction (found 2026-09-07 while
+diffing our own 1.12.38 deobfuscation, and missed by the first read): the process's own
+executable name (`ProcessHandle.current().info().command()`, first 10 chars), the PARENT
+process's executable name (`.parent()`, first 10 chars), and the file name of the first JVM
+argument whose 10-char prefix hashes to `-1094877034`, which is `-javaagent` (up to 22 chars).**
+So the client can tell `java.exe` launched by a Gradle worker (`./gradlew.bat run`) from
+`RuneLite.exe` launched by the launcher, and reports any Java agent by name. Keep the launch
+shape constant per account; do not add a `-javaagent` to the run task. There is NO MAC-address
+read, NO screen-size read and NO hypervisor check anywhere in the sources. So nothing says
+"VMware" by name; a VM leaks only as a DIFFERENT identity from the one the account has always
+logged in with. Three hypervisor-side knobs make the guest byte-identical: the same UUID
+(VMware `uuid.bios` in the .vmx, VirtualBox `--hardware-uuid`), the same core count, and
+`-Xmx` pinned so `maxMemory` matches -- plus the same launch shape, per the paragraph above.
+Not traced through the obfuscation: which static wrapper calls the UUID getter on the Java
+path; the method sits in the login class in the 1.12.14, 1.12.37 and 1.12.38 sources, so treat
+it as sent.
+
+**Continuous, during play -- this is the half that matters to us:**
+- **`EVENT_MOUSE_MOVE`: the whole cursor trajectory, at 20 Hz.** A dedicated thread samples
+  `(x, y, lastPressedTime)` every **50 ms** into a 500-slot buffer; the game loop flushes it
+  when **40 samples** are pending (about every 2 s) or IMMEDIATELY when a button is down.
+  Encoding is delta-from-previous with the time delta in 20 ms units (2 bytes for a step within
+  +-32 px and under 160 ms, 3 bytes within +-128 px and under 640 ms, else absolute), a sample
+  identical to the previous position is SKIPPED, positions are clamped to -1..65534 where
+  **-1 means the cursor is off the canvas**, and a packet is capped at 246 bytes. Server packets
+  switch the recorder on and off (on by default at startup). Consequences: stillness, snap
+  moves, straight lines, an exact-pixel return, a cursor parked for minutes and the cursor
+  LEAVING the window are all server-visible even with no click anywhere near them. This packet
+  is what every measurement in "Movement realism batch" and the fidget anchor fix is aimed at.
+- **`EVENT_MOUSE_CLICK_V2` (7 bytes), every press:** a flag byte, x clamped to the canvas
+  width, `(ms since the previous press, capped 32767) << 1 | right-button`, y clamped to the
+  canvas height. Inter-press timing therefore reaches the server with 1 ms resolution
+  independently of the OP packets. The RELEASE is not sent, so `CLICK_HOLD_RANGE_S` is invisible
+  to this packet (a hold still matters for drag-vs-click on the client).
+- **`EVENT_KEYBOARD`: every key press with ms since the previous key** (24-bit cap). The
+  password typed at login, the SHIFT before every walk click, F-keys, the held UP arrow of
+  `login.setup_camera` -- their rhythm is on the wire. A fixed SHIFT-down-to-click gap is a
+  signature; draw it.
+- **`EVENT_MOUSE_SCROLL`**: the wheel delta per cycle. **`EVENT_CAMERA_POSITION`**: yaw and pitch,
+  sent ONLY after an arrow-key camera move (key codes 96-99), rate-limited; a middle-mouse drag
+  sends nothing.
+- **`EVENT_APPLET_FOCUS`**: 1 / 0 on every window focus gain / loss, so karambwan's Alt+Tab AFK
+  is seen exactly as a human's would be. Focus flapping at machine cadence would not be.
+- **`WINDOW_STATUS`**: window mode plus canvas width and height, on change.
+- **`IDLE`**: sent after 15 000 client cycles (20 ms each, 5 min) with NO mouse AND NO keyboard
+  input -- the AFK-logout signal. **`NO_TIMEOUT`** is a keepalive every ~50 cycles that needs no
+  input, so nothing has to nudge the mouse to hold the connection.
+- **`REFLECTION_CHECK_REPLY`**: the server names classes, fields and methods; the client resolves
+  them by reflection and replies with field values, modifiers and invoke results. RuneLite
+  answers these against the vanilla jar named by `runelite.reflectcheck.jar` (the property is
+  read in `client.java`), which is why an injected client reads as vanilla. We never modify
+  injected classes, so nothing here changes it. **`DETECT_MODIFIED_CLIENT`** is one constant int
+  sent on scene load whenever the client runs inside a top-level `Frame` (every RuneLite
+  instance does), so it is not a differentiator. **`CONNECTION_TELEMETRY`** is login-connection
+  timing counters (three longs, four ints). `SEND_SNAPSHOT` is the abuse report, `BUG_REPORT` and
+  `CLIENT_CHEAT` (`::` commands) are user-initiated.
+
+**What is NOT in any packet:** the plugin list, the sidebar, overlays, ZombieLite, the HTTP
+bridge, the UDP stream, the serial port, other processes, the second monitor. The only channel
+that carries our behaviour is the input stream itself -- which is exactly the channel a physical
+Arduino feeds. Separately, RuneLite's own `TelemetryClient` (`client-1.12.33/.../TelemetryClient.java`)
+sends the OS / Java / launcher-version strings and a "is a Jagex account" boolean to
+**runelite.net**, not Jagex, and the GE plugin submits offers there too.
+
+**Rules that fall out of this for future development:**
+1. Treat every cursor sample as transmitted. "No click happened" never means "nothing was
+   sent"; between-click motion, idle stillness and off-canvas excursions are the signal.
+2. Timing that is drawn from a fitted human distribution (`settings.py`) is on the wire; timing
+   that is a constant is a fingerprint. That applies to key presses as much as clicks.
+3. Keep the login fingerprint constant per machine (same UUID, cores, heap, Windows build, JDK).
+   A VM is fine on this channel once those match; server-side correlation is unknowable from
+   the decompile, so "identical fingerprint" is the ceiling, not "undetectable".
+4. Re-derive this list after a client build bump -- and the tooling below makes that one
+   command, then a diff to read.
+
+**Deobfuscating a new build ourselves, and the guard that forces it (added 2026-09-07).**
+`python tools/deobfuscate.py` (repo root) does the whole thing: finds a JDK 17+ (rl-suite pins
+a 17 toolchain with no foojay resolver, and this machine had only 8 and 11 -- Temurin 17 now
+lives at `~/.jdks/jdk-17.0.20.1+1`, and the script downloads one there from the Adoptium API
+when none exists), takes the jar the running client reports on `GET /client-version` (else the
+newest `injected-client-*.jar` in the Gradle cache, else `--jar`), builds rl-suite's shaded jar
+once, runs the transform, decompiles into
+`data/decompiled/rl-suite-main/semantics/injected-client-<ver>-sources/`, and writes
+`data/decompiled/deob-state.json` keyed on the jar's SHA-256. It answers rl-suite's two
+documented refusals itself: "Expected N packet-handler shapes, found M" is retried with M
+(**1.12.38 has SIX packet readers, MEASURED, where the tool expects five**), and a packet
+fingerprint that matches no bundled profile -- a NEW wire protocol -- is retried with
+`--packet-profile none` and recorded as `protocolKnown: false` (still readable, generic
+`fieldN` packet names). **1.12.38 is still protocol 240**: the osrs-240 profile matched all 252
+names. Our own runs carry no semantic map, so class names are generic (`PlatformInfo` is
+`classVT` in 1.12.38); search by BEHAVIOUR (`wmic csproduct`, `new long[500]`, the packet
+constants, which ARE named) rather than by the class names quoted above.
+- **The guard**: `ControllerAddon/deob_guard.py`, called in `controller.main()` BEFORE the serial
+  port opens and once per engine loop until it settles. `ClientVersionProvider.java`
+  (`GET /client-version`: RuneLite version, `client.getRevision()`, the jar path from the
+  `client` class's code source, its SHA-256 hashed once and cached) is compared with the
+  record: match -> run; mismatch or no record while rl-suite is present -> print the command
+  and exit 2 before any input; endpoint missing (un-rebuilt client), bridge down at startup
+  (re-checked from the loop), or rl-suite absent (`data/` is gitignored, so a fresh clone has no
+  tool) -> warn and drive. `--skip-deob-check` / `SKIP_DEOB_CHECK=1` overrides.
+  `python tools/deobfuscate.py --status` shows record vs client without doing anything.
+- **Every run diffs the telemetry surface against the previous build** (USER: "when we make a
+  new deobfuscate we compare the diff from last rev"). A source diff is noise -- every name
+  changes per build -- so `tools/telemetry_fingerprint.py` extracts the facts this section is
+  built from by their name-independent tells (system properties and env vars read, commands
+  passed to `exec`, the client packet table with ids and lengths, how many places reference
+  each packet constant, the recorder's 500 / 50 ms / 40 constants, the ProcessHandle and
+  `-javaagent` introspection) into `data/decompiled/deob/telemetry-<ver>.json`, and writes
+  `telemetry-diff-<old>-to-<new>.md` beside it. The first run diffs against the author's
+  checked-in 1.12.37 snapshot. **MEASURED 1.12.37 -> 1.12.38: nothing collected changed** --
+  same properties, same three exec commands, same 117-packet table, same recorder constants;
+  only reference counts moved (`CONNECTION_TELEMETRY` 2 -> 3, `EVENT_MOUSE_SCROLL` 3 -> 2, six
+  gameplay packets +-1), which is the obfuscator re-inlining call sites, not new behaviour. A
+  `+ exec`, `+ property`, a packet length change or a recorder constant change in that file is
+  the signal to re-read the sources and amend this section.
 
 ## Vendored m8aq readers (`GET /api/...`)
 
@@ -1841,6 +2049,14 @@ reset (flush including the active segment, release every held button/key), `W <n
 Plus a 60s stuck-input watchdog: if any button/key is held with no serial line arriving for 60s,
 everything is released — the panic path is a hard process kill that cannot send key-ups, so this
 is the only thing standing between that and a button held forever.
+
+**`KT`/`KD`/`KU` UPPERCASE every single letter** (`keyFromName` maps `a-z -> A-Z` before
+`Keyboard.write`), so anything typed through `type_text` arrives uppercase — "adam" -> "ADAM".
+VERIFIED ON HARDWARE 2026-09-07 by typing into Notepad in the OSRS VM (confirmed the whole
+`KT`/single-letter path works, which `type_text`'s docstring had flagged unverified). Harmless
+for the bank search box (case-insensitive) and chat; it would BREAK a case-sensitive field, so
+a typed username/password login must never rely on it (we sign in from credentials.properties
+instead). Fix belongs in the firmware if a case-sensitive need ever arises.
 
 **The contract that matters most: `X` drops queued button/key commands too, not just motion, so
 it is only ever legal from inside `move()`'s flight loop, where nothing but segments are queued.**

@@ -136,6 +136,10 @@ public class ControllerPlugin extends Plugin
 		tickClock = new TickClock();
 
 		new GameStateProvider(client, clientThread, server).register();
+		// Which injected-client jar this process is running (path + SHA-256): deob_guard.py refuses
+		// to drive a build nobody has deobfuscated and read yet (CLAUDE.md, "What the game client
+		// sends home").
+		new ClientVersionProvider(client, clientThread, server).register();
 		new PlayerProvider(client, clientThread, server, motionTracker).register();
 		new EventsProvider(client, clientThread, server, eventSubscriptions).register();
 		new PvpProvider(client, clientThread, server).register();

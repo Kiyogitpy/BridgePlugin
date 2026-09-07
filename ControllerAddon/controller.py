@@ -1559,11 +1559,14 @@ def type_text(ser: serial.Serial, text: str) -> None:
     a live-filtering text field like the bank's search box (see banker.py's search_bank) rather
     than type_digits_and_enter's numeric-chatbox-prompt use case.
 
-    ASSUMPTION, NOT YET VERIFIED LIVE: that the Arduino firmware accepts single-letter key names
-    ("a".."z") the same way it accepts the single-digit key names type_digits_and_enter uses
-    (itself still flagged unverified there) and named keys like "SPACE" elsewhere in this file.
-    Verify live (type something into the bank search box, confirm the right characters actually
-    appear) before trusting this for anything unattended."""
+    VERIFIED ON HARDWARE 2026-09-07 (typed into Notepad in the OSRS VM): single-letter key
+    names ("a".."z"), digits and "SPACE"/"ENTER" all land. **The firmware UPPERCASES every
+    single letter** before Keyboard.write (Firmware.ino keyFromName: a-z -> A-Z), so typed
+    output is ALWAYS uppercase -- "adam" arrives as "ADAM". Harmless for the only current
+    caller (the bank search box is case-insensitive) and for OSRS chat, but it would BREAK any
+    case-sensitive field: a manual username/password login must NOT use this (we log in from
+    credentials.properties instead, so no password is ever typed). If a case-sensitive typing
+    need ever arises, fix it in the firmware, not here."""
     for ch in text:
         key = "SPACE" if ch == " " else ch
         key_tap(ser, key)
@@ -3332,8 +3335,23 @@ def main():
             "Equivalent to setting the DEBUG_LOG=1 environment variable."
         ),
     )
+    parser.add_argument(
+        "--skip-deob-check",
+        action="store_true",
+        help=(
+            "Do not refuse to start when the running client's injected-client jar is not the "
+            "one recorded by tools/deobfuscate.py (deob_guard.py). Same as SKIP_DEOB_CHECK=1."
+        ),
+    )
     args = parser.parse_args()
     debug_log.init(args.debug_log or os.environ.get("DEBUG_LOG") == "1")
+
+    # Before the serial port is even opened: is this a client build somebody has deobfuscated
+    # and READ (CLAUDE.md, "What the game client sends home")? A block exits here; a bridge
+    # that is not up yet is re-checked from the engine loop until it answers.
+    import deob_guard
+    deob = deob_guard.Guard(skip=args.skip_deob_check)
+    deob.ensure()
 
     set_dpi_aware()  # must happen before any cursor/window coordinate queries below,
                       # otherwise Windows silently virtualizes them to 96 DPI while
@@ -3438,6 +3456,8 @@ def main():
                 time.sleep(0.5)
                 continue
             state.config = config
+
+            deob.ensure()          # no-op once settled; a block exits before any input is sent
 
             if not login.is_fully_logged_in():
                 subs_posted_for = None    # a relogin (client restart) drops the subscription set
