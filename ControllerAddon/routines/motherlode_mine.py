@@ -100,6 +100,7 @@ UPPER_FLOOR_HEIGHT = -490
 DEPOSIT_GROUP = 192
 DEPOSIT_INV_CHILD = 24
 DEPOSIT_ALL_CHILD = 31
+DEPOSIT_CLOSE_CHILD = 1
 DEPOSIT_ALL_ACTION = "Deposit-All"
 
 PAYDIRT_NAME = "pay-dirt"
@@ -151,6 +152,7 @@ PENDING_MAX_S = 30.0        # a hopper deposit not reflected in varbit 5558 by n
 CHAIN_MAX_S = 40.0          # hand back to the engine loop at least this often
 COLLECT_MAX_ROUNDS = 12     # a 189 sack is 7 fills; the rest is slack
 DEPOSIT_MAX_STACKS = 10
+CLOSE_TRIES = 3
 NO_VEIN_STOP = 40
 ANCHOR_TOLERANCE = 6        # further than this from the anchor and we walk back before mining
 VEIN_FAIL_LIMIT = 2         # clicks on one vein that produce nothing before it is set aside
@@ -680,6 +682,9 @@ def mine_phase(ctx):
     # sat near the ladder and spent four clicks on ones it could not reach. Only collect_phase
     # returned to the anchor; the far commoner hopper trip did not.
     data = _d(ctx)
+    if _deposit_open():
+        _close_deposit_box(ctx)     # it would eat the first click of the walk back
+        return
     if not at_anchor(_player_tile(), data.get("mlm_anchor"), _upstairs(),
                      data.get("mlm_anchor_upstairs", True)):
         debug_log.log(LOG, "back to the veins")
@@ -939,6 +944,37 @@ def _deposit_each_ore(ctx) -> bool:
     return not _ore_items()
 
 
+def _close_deposit_box(ctx) -> bool:
+    """Shut the deposit box interface, and CONFIRM it shut.
+
+    MEASURED live 2026-09-07 (mlm_live8): leaving it open cost the whole return trip. An open
+    interface EATS THE FIRST WORLD CLICK, so every tick's ladder click merely closed it and the
+    next tick re-opened nothing -- five "the climb up did not register" in a row, the player
+    never moving an inch, and the stuck watch firing at 93s. The click itself was fine; there
+    was a panel in front of it."""
+    for _ in range(CLOSE_TRIES):
+        if not _deposit_open():
+            return True
+        controller.key_tap(ctx.ser, "ESC")
+        outcome_waits.await_pre(ctx, {"WIDGET_CLOSED": lambda p: p.get("groupId") == DEPOSIT_GROUP},
+                                INTERFACE_BUDGET_S, confirm=lambda: (not _deposit_open()) or None,
+                                reaction=False, now_fn=_now, sleep_fn=_sleep)
+        if not _deposit_open():
+            return True
+        button = controller.get_widget(DEPOSIT_GROUP, DEPOSIT_CLOSE_CHILD)
+        if button and button.get("clickable"):
+            controller.click_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False,
+                                    simulate_mistakes=False)
+            outcome_waits.await_pre(ctx, {}, INTERFACE_BUDGET_S,
+                                    confirm=lambda: (not _deposit_open()) or None,
+                                    reaction=False, now_fn=_now, sleep_fn=_sleep)
+    if _deposit_open():
+        debug_log.log(LOG, "[!] the deposit box interface would not close -- it will swallow "
+                           "the next world click")
+        return False
+    return True
+
+
 def bank_phase(ctx) -> bool:
     """Holding ore: get it into the deposit box.
 
@@ -957,6 +993,8 @@ def bank_phase(ctx) -> bool:
     if ok and had_gem_sack and _count(_inventory(), GEM_SACK_NAME) == 0:
         debug_log.log(LOG, "[!] the open gem sack was banked -- the deposit box's Deposit Lock "
                            "is no longer set on it")
+    if ok and not _ore_items():
+        _close_deposit_box(ctx)
     return ok
 
 

@@ -69,6 +69,10 @@ def _hermetic(monkeypatch):
                                                            "weaponName": "Rune pickaxe",
                                                            "tileHeight": -600})
     monkeypatch.setattr(controller, "get_collision", lambda x, y, p, radius=6, **kw: [])
+    # No interface open unless a test says so -- otherwise _deposit_open reaches the live bridge.
+    monkeypatch.setattr(controller, "get_widget", lambda group, child, index=None: {})
+    monkeypatch.setattr(controller, "get_widget_children", lambda group, child: [])
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
     monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
     monkeypatch.setattr(controller, "sample_human_delay", lambda *a, **k: 0.0)
     return clock
@@ -753,3 +757,40 @@ def test_a_full_sack_is_not_topped_up_before_the_collect(monkeypatch):
     monkeypatch.setattr(mlm, "_maybe_repair", lambda c: False)
     monkeypatch.setattr(mlm, "search_sack", lambda c: False)
     mlm.collect_phase(ctx)
+
+
+def test_the_deposit_box_is_closed_after_banking(monkeypatch):
+    """mlm_live8: leaving interface 192 open cost the whole return trip. An open interface EATS
+    THE FIRST WORLD CLICK, so every tick's ladder click merely closed it -- eight "the climb up
+    did not register" in a row with the player never moving, then the climb ceiling stopped the
+    run."""
+    ctx = _Ctx()
+    _standing(monkeypatch, DOWNSTAIRS_H)
+    monkeypatch.setattr(controller, "get_inventory", lambda: _items("Open gem sack", "Coal"))
+    monkeypatch.setattr(mlm, "_open_deposit_box", lambda c: True)
+    closed = []
+    monkeypatch.setattr(mlm, "_close_deposit_box", lambda c: closed.append(True) or True)
+    # ore in hand on the way in, none once the deposit has landed
+    banked = {"done": False}
+
+    def _ore(items=None):
+        return [] if banked["done"] else [{"name": "Coal"}]
+    monkeypatch.setattr(mlm, "_ore_items", _ore)
+    monkeypatch.setattr(mlm, "_deposit_inventory",
+                        lambda c: banked.update(done=True) or True)
+    mlm.bank_phase(ctx)
+    assert closed == [True]
+
+
+def test_mining_will_not_start_with_the_deposit_box_open(monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = ANCHOR
+    ctx.state.data["mlm_anchor_upstairs"] = True
+    _standing(monkeypatch, UPSTAIRS_H)
+    monkeypatch.setattr(mlm, "_deposit_open", lambda: True)
+    monkeypatch.setattr(mlm, "pick_vein",
+                        lambda *a, **k: pytest.fail("clicked the world through an open panel"))
+    closed = []
+    monkeypatch.setattr(mlm, "_close_deposit_box", lambda c: closed.append(True) or True)
+    mlm.mine_phase(ctx)
+    assert closed == [True]

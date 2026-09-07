@@ -1589,9 +1589,33 @@ hopper/collect half is the next session's worklist.**
     anchor -> mining the pocket, unattended.
   - Plus `CLIMB_MAX_TRIES` (8): a ladder that never registers is a safety stop, not a loop.
 
-- **First live session's remaining worklist**: the hopper trip and the ladder round trip, the
-  whole collect/bank cycle, the real conveyor latency (fit `PENDING_MAX_S`), and whether a
-  `Search` yields exactly `min(free slots, 5558)` ore. None of that half has run yet.
+- **A FULL SACK MAKES THE GAME REFUSE TO MINE AT ALL, and only a frame dump found it**
+  (mlm_live7). Every click had been dying silently for two minutes -- perfectly aimed, perfectly
+  resolved, nothing happening -- exactly like the through-the-floor failure. `GET /screenshot`
+  showed a "Click here to continue" box reading **"Your sack will be full once your current dirt
+  is cleaned."** with the plugin overlay at **Sack 111/108**. `/state`'s `dialogOpen` read FALSE
+  throughout (the group-229 box karambwan_fishing already documents as invisible to it).
+  The arithmetic that should have prevented 111/108 (`mining_allowance`) failed for a reason
+  worth remembering: **`pending` -- pay-dirt on the conveyor but not yet in varbit 5558 -- lives
+  in `ctx.state.data`, and a restart wipes it while the belt keeps its load.** Restarting with 84
+  showing and 27 still travelling is how the sack went over. So the chat line is now the
+  authoritative stop (`SACK_FULL_CHAT`, latched until the sack actually reads 0), a full sack
+  outranks the hopper trip in `derive_phase` (pay-dirt deposited into a full sack is thrown
+  away), and `collect_phase` no longer empties the hands first when the sack has no room.
+- **AN OPEN INTERFACE EATS THE FIRST WORLD CLICK** (mlm_live8). The deposit box interface (192)
+  was left open after banking, so every tick's ladder click merely closed it and the next tick
+  found it open again: eight `the climb up did not register` in a row with the player never
+  moving an inch, ended by the climb ceiling. `_close_deposit_box` confirms it shut (ESC, then
+  the 192.1 button), and `mine_phase` refuses to start a walk while it is open.
+- **The whole loop is VERIFIED live 2026-09-07 (mlm_live8/9)**: mine the pocket -> full inventory
+  -> ladder down -> hopper (27 pay-dirt, ~18s round trip) -> ladder up -> back to the anchor ->
+  repeat; and at 108 the collect cycle drained the sack **108 -> 0** across four Search/bank
+  rounds, kept the open gem sack, closed the interface and went back to mining.
+- **Still UNRUN**: every repair path (no hammer was carried), the upper hopper (not bought), and
+  a break (`before_break`). Worth fitting from a longer session: `PENDING_MAX_S` against the real
+  conveyor latency, and `VEIN_BLOCK_S` -- the pocket is CROWDED at peak (ten other players inside
+  eight tiles, measured), and a vein whose approach tile is occupied looks exactly like one that
+  will never be mined.
 
 ## Current state of gathering.py, routines/mining.py and routines/woodcutting.py
 
