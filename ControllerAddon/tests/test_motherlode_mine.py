@@ -597,3 +597,109 @@ def test_a_vein_that_depletes_clears_its_failure_count(_hermetic, monkeypatch):
     mlm.note_vein_failure(ctx, vein, "depleted")
     mlm.note_vein_failure(ctx, vein, "idle")
     assert mlm.pick_vein(ctx, _reach((3752, 5680)), None, objects=[vein]) is vein
+
+
+# --- getting back to the veins ---------------------------------------------------------
+
+ANCHOR = {"x": 3752, "y": 5680, "plane": 0}
+
+
+def test_at_anchor_is_a_floor_question_first():
+    # MEASURED live (mlm_live2): the hopper trip left the routine downstairs directly below the
+    # anchor, where every coordinate test says "you're here".
+    assert mlm.at_anchor(ANCHOR, ANCHOR, upper=True, anchor_upper=True) is True
+    assert mlm.at_anchor(ANCHOR, ANCHOR, upper=False, anchor_upper=True) is False
+
+
+def test_at_anchor_wants_us_near_it_too():
+    far = {"x": ANCHOR["x"] + mlm.ANCHOR_TOLERANCE + 1, "y": ANCHOR["y"], "plane": 0}
+    assert mlm.at_anchor(far, ANCHOR, upper=True, anchor_upper=True) is False
+
+
+def test_mining_returns_to_the_anchor_before_it_picks_a_vein(monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = ANCHOR
+    ctx.state.data["mlm_anchor_upstairs"] = True
+    _standing(monkeypatch, DOWNSTAIRS_H)          # just deposited at the lower hopper
+    monkeypatch.setattr(mlm, "pick_vein",
+                        lambda *a, **k: pytest.fail("mined before going back up"))
+    returned = []
+    monkeypatch.setattr(mlm, "_return_to_anchor", lambda c: returned.append(True))
+    mlm.mine_phase(ctx)
+    assert returned == [True]
+
+
+def test_a_run_started_downstairs_anchors_on_the_configured_pocket(monkeypatch):
+    """mlm_live3: run 2 wandered downstairs chasing veins near the ladder, and run 3 inherited
+    that tile as the place to mine. The anchor is the user's pocket unless we are already
+    upstairs."""
+    ctx = _Ctx()
+    _standing(monkeypatch, DOWNSTAIRS_H)
+    mlm.setup(ctx)
+    assert ctx.state.data["mlm_anchor"]["x"] == mlm.TILE_ANCHOR_DEFAULT["x"]
+    assert ctx.state.data["mlm_anchor"]["y"] == mlm.TILE_ANCHOR_DEFAULT["y"]
+    assert ctx.state.data["mlm_anchor_upstairs"] is True
+
+
+def test_starting_upstairs_anchors_where_we_stand(monkeypatch):
+    ctx = _Ctx()
+    _standing(monkeypatch, UPSTAIRS_H)
+    mlm.setup(ctx)
+    assert ctx.state.data["mlm_anchor"]["x"] == 3752
+    assert ctx.state.data["mlm_anchor_upstairs"] is True
+
+
+def test_world_clicks_carry_no_hover_gate(monkeypatch):
+    """mlm_live4: every ladder click was withheld -- "hover never matched action='Climb'" --
+    because /hover reports what is under the cursor now, and these clicks are issued from
+    across the room. They confirm on their own outcome instead."""
+    ctx = _Ctx()
+    _standing(monkeypatch, UPSTAIRS_H)
+    down = {"id": mlm.LADDER_DOWN_ID, "name": "Ladder", "x": 3755, "y": 5674, "plane": 0,
+            "distance": 9, "actions": ["Climb"], "screenX": 1, "screenY": 1}
+    monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [down])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    seen = {}
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **k: seen.update(k) or True)
+    mlm.climb(ctx, up=False)
+    assert "expected_action" not in seen
+
+
+def test_a_ladder_that_never_registers_stops_the_run(monkeypatch):
+    ctx = _Ctx()
+    _standing(monkeypatch, UPSTAIRS_H)
+    down = {"id": mlm.LADDER_DOWN_ID, "name": "Ladder", "x": 3755, "y": 5674, "plane": 0,
+            "distance": 4, "actions": ["Climb"], "screenX": 1, "screenY": 1}
+    monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [down])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    for _ in range(mlm.CLIMB_MAX_TRIES):
+        mlm.climb(ctx, up=False)
+    assert ctx.state.safety_stopped is True
+    assert "climb" in ctx.state.stop_reason
+
+
+# --- walk first, click close ------------------------------------------------------------
+
+def test_an_off_screen_object_is_walked_to_not_clicked():
+    """mlm_live5: the up-ladder was clicked from 21 tiles with onScreen false -- a projection
+    that is not on the screen -- and the click did nothing at all."""
+    assert mlm.too_far({"distance": 21, "onScreen": False}) is True
+    assert mlm.too_far({"distance": 3, "onScreen": False}) is True     # onScreen decides
+    assert mlm.too_far({"distance": 21, "onScreen": True}) is True
+    assert mlm.too_far({"distance": 9, "onScreen": True}) is False
+
+
+def test_a_far_ladder_is_walked_to_before_it_is_clicked(monkeypatch):
+    ctx = _Ctx()
+    _standing(monkeypatch, DOWNSTAIRS_H)
+    far = {"id": mlm.LADDER_UP_ID, "name": "Ladder", "x": 3755, "y": 5673, "plane": 0,
+           "distance": 21, "actions": ["Climb"], "onScreen": False, "screenX": 1, "screenY": 1}
+    monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [far])
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda *a, **k: pytest.fail("clicked an off-screen ladder"))
+    walked = []
+    monkeypatch.setattr(travel, "walk_to", lambda c, t, **k: walked.append(t) or True)
+    assert mlm.climb(ctx, up=True) is False
+    assert walked and walked[0]["x"] == 3755

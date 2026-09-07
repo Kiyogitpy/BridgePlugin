@@ -80,6 +80,9 @@ TILE_SACK = {"x": 3748, "y": 5659, "plane": 0}
 TILE_DEPOSIT_BOX = {"x": 3759, "y": 5664, "plane": 0}
 TILE_LADDER = {"x": 3755, "y": 5673, "plane": 0}
 TILE_LOWER_HOPPER = {"x": 3748, "y": 5672, "plane": 0}
+# USER's spot: the upstairs pocket behind Mercy, "where we dont have to clear the rockfall".
+# Mercy (npc 5562) stands at (3752,5677); this is three tiles north of her.
+TILE_ANCHOR_DEFAULT = {"x": 3752, "y": 5680, "plane": 0}
 
 # Varbits -- all served today by GET /varbit, no Java change.
 VARBIT_SACK = 5558                          # pay-dirt in the sack
@@ -108,6 +111,18 @@ KEEP_ITEMS = (PICKAXE_NAME, HAMMER_NAME, GEM_SACK_NAME)
 
 BROKEN_CHAT = "will need to be repaired"
 
+# NO expected_action HOVER GATE on the world-object clicks below (ladder, hopper, sack, deposit
+# box, strut). MEASURED live 2026-09-07 (mlm_live4): every ladder click was WITHHELD --
+# "hover never matched action='Climb' target=None" -- because /hover reports what is under the
+# cursor RIGHT NOW, and a click issued from nine tiles away is aimed at something the cursor has
+# not settled on yet. This is the same trap CLAUDE.md records for the Gauntlet's gather clicks.
+# Each of these confirms on a real outcome instead (varbit 2086 for a climb, the pay-dirt
+# leaving the inventory for the hopper, the inventory growing for the sack, the interface
+# opening for the box, the object changing id for a strut), so a click that lands on the wrong
+# thing costs one retry rather than a wrong action. The gate is kept only where a wrong resolve
+# would be destructive -- the Deposit-All in the bank grid, whose neighbour is another stack.
+
+
 # --- budgets -----------------------------------------------------------------------------------
 REACH_RADIUS = 40
 COLLISION_RADIUS = 14       # one /collision read per tick covers every candidate we filter
@@ -115,6 +130,8 @@ SNAPSHOT_MAX_AGE_S = 0.5
 INTERFACE_BUDGET_S = 4.0
 DEPOSIT_BUDGET_S = 3.0
 CLIMB_BUDGET_S = 6.0
+CLIMB_MAX_TRIES = 8         # a ladder that never registers is a stop, not a loop
+CLICK_RANGE = 10            # further than this, or off screen, and we walk before clicking
 SEARCH_BUDGET_S = 5.0
 REPAIR_BUDGET_S = 12.0
 PENDING_MAX_S = 30.0        # a hopper deposit not reflected in varbit 5558 by now is written off
@@ -122,6 +139,7 @@ CHAIN_MAX_S = 40.0          # hand back to the engine loop at least this often
 COLLECT_MAX_ROUNDS = 12     # a 189 sack is 7 fills; the rest is slack
 DEPOSIT_MAX_STACKS = 10
 NO_VEIN_STOP = 40
+ANCHOR_TOLERANCE = 6        # further than this from the anchor and we walk back before mining
 VEIN_FAIL_LIMIT = 2         # clicks on one vein that produce nothing before it is set aside
 VEIN_BLOCK_S = 60.0         # ...and for how long
 STALL_WARN_S = 90.0
@@ -133,6 +151,9 @@ DEFAULT_CONFIG = {
     # Veins within this many tiles of the ANCHOR (the tile the run started on) are ours.
     # Together with the reachability filter this is what keeps the routine in one pocket.
     "veinDistance": 8,
+    # Where we mine from. Defaults to the pocket behind Mercy; set to None to anchor wherever
+    # the run happens to start (only honoured when that is upstairs -- see setup).
+    "anchorTile": dict(TILE_ANCHOR_DEFAULT),
     # auto | never | always -- see _hopper_candidates. "never" until the upstairs hopper is
     # bought (50 golden nuggets from Prospector Percy; USER 2026-09-07: "need to unlock that
     # hopper we cant use it yet"), so the first live session spends no click on a fixture we
@@ -351,6 +372,30 @@ def _reachable(obj, reach, flags) -> bool:
     return travel.can_reach(obj, reach, flags) is not False
 
 
+def too_far(obj, rng=CLICK_RANGE) -> bool:
+    """Should we walk closer before clicking this?
+
+    WALK FIRST, CLICK CLOSE (CLAUDE.md's GOTR lesson, met again here). MEASURED live 2026-09-07
+    (mlm_live5): the routine clicked the up-ladder from 21 tiles away with `onScreen: false`,
+    aiming at a projection that is not on the screen at all -- the click did nothing, and
+    /last-action still showed the previous Mine. `onScreen` is the load-bearing half of this
+    test; the distance is the cheap half. The human recording clicks the sack and the deposit
+    box from ten tiles and lets the game walk, so ten is where the line sits."""
+    if obj is None:
+        return True
+    if obj.get("onScreen") is False:
+        return True
+    distance = obj.get("distance")
+    return distance is not None and distance > rng
+
+
+def _walk_to_object(ctx, obj, fallback_tile):
+    """Head for `obj`, using its own live tile when we have it."""
+    tile = {"x": obj.get("x"), "y": obj.get("y"), "plane": obj.get("plane", 0)} \
+        if obj and obj.get("x") is not None else fallback_tile
+    travel.walk_to(ctx, tile, goal_adjacent=True)
+
+
 def is_upper(height) -> bool:
     """RuneLite's MotherlodePlugin.isUpstairs, verbatim: a tile rendered below
     UPPER_FLOOR_HEIGHT is on the upper level."""
@@ -435,14 +480,28 @@ def sack_state(ctx):
 # --- startup -------------------------------------------------------------------------------------
 
 def setup(ctx):
+    """Fix the anchor -- the tile we mine from and come back to.
+
+    NOT simply "wherever the run starts", which is what it was until mlm_live3 anchored the
+    whole run on a DOWNSTAIRS tile: the previous run had wandered down there chasing veins near
+    the ladder, and a restart inherited that position as the place to mine. The anchor is the
+    user's chosen pocket by default, and the live position is honoured only when it is already
+    upstairs -- which is exactly the case where "start where I'm standing" is what was meant."""
     data = _d(ctx)
     data["mlm_started"] = _now()
+    configured = (ctx.state.config or {}).get("anchorTile", DEFAULT_CONFIG["anchorTile"])
     here = _player_tile()
-    if here is not None:
-        data["mlm_anchor"] = here
-        data["mlm_anchor_upstairs"] = _upstairs()
-        debug_log.log(LOG, f"anchor set to ({here['x']},{here['y']}) "
-                           f"{'upstairs' if data['mlm_anchor_upstairs'] else 'downstairs'}")
+    if here is not None and _upstairs():
+        anchor, why = here, "here"
+    elif configured:
+        anchor, why = dict(configured), "the configured pocket"
+    elif here is not None:
+        anchor, why = here, "here"
+    else:
+        return
+    data["mlm_anchor"] = anchor
+    data["mlm_anchor_upstairs"] = True if configured and why != "here" else _upstairs()
+    debug_log.log(LOG, f"anchor: ({anchor['x']},{anchor['y']}) upstairs -- {why}")
 
 
 def _wielding_pickaxe() -> bool:
@@ -587,7 +646,28 @@ def _allowance(ctx, items=None):
     return mining_allowance(_free_slots(items), _held_paydirt(items), effective, capacity)
 
 
+def at_anchor(here, anchor, upper, anchor_upper) -> bool:
+    """Are we back where we mine? Same FLOOR as the anchor and within ANCHOR_TOLERANCE of it."""
+    if anchor is None or here is None:
+        return True
+    if bool(upper) != bool(anchor_upper):
+        return False
+    return max(abs(here["x"] - anchor["x"]), abs(here["y"] - anchor["y"])) <= ANCHOR_TOLERANCE
+
+
 def mine_phase(ctx):
+    # BACK TO THE ANCHOR FIRST. MEASURED live 2026-09-07 (mlm_live2): the hopper trip works --
+    # climb down, deposit 27 pay-dirt, 18s -- and then the routine was simply DOWNSTAIRS with a
+    # empty inventory and nothing telling it to go back up, so it started mining whatever veins
+    # sat near the ladder and spent four clicks on ones it could not reach. Only collect_phase
+    # returned to the anchor; the far commoner hopper trip did not.
+    data = _d(ctx)
+    if not at_anchor(_player_tile(), data.get("mlm_anchor"), _upstairs(),
+                     data.get("mlm_anchor_upstairs", True)):
+        debug_log.log(LOG, "back to the veins")
+        _return_to_anchor(ctx)
+        return
+
     reach, flags = snapshot(ctx)
     target = pick_vein(ctx, reach, flags)
     data = _d(ctx)
@@ -639,19 +719,31 @@ def climb(ctx, up) -> bool:
         debug_log.log(LOG, f"no {'up' if up else 'down'} ladder in view -- walking to it")
         travel.walk_to(ctx, TILE_LADDER, goal_adjacent=True)
         return False
+    if too_far(ladder):
+        debug_log.log(LOG, f"the {'up' if up else 'down'} ladder is {ladder.get('distance')} "
+                           f"tiles off -- walking to it first")
+        _walk_to_object(ctx, ladder, TILE_LADDER)
+        return False
     mark = outcome_waits.mark(ctx)
-    if not controller.click_entity(ctx.ser, ladder, refresh_target=_refresh(ladder),
-                                   expected_action=LADDER_ACTION):
+    if not controller.click_entity(ctx.ser, ladder, refresh_target=_refresh(ladder)):
         return False
     arrived = outcome_waits.await_pre(
         ctx, {"VARBIT_CHANGED": outcome_waits.varbit_in([VARBIT_UPSTAIRS])},
         CLIMB_BUDGET_S + _walk_budget(ladder),
         confirm=lambda: (_upstairs() == bool(up)) or None,
         since=mark, reaction=False, now_fn=_now, sleep_fn=_sleep)
+    data = _d(ctx)
     if arrived:
         debug_log.log(LOG, f"climbed {'up' if up else 'down'}")
+        data["mlm_climb_fails"] = 0
         return True
-    debug_log.log(LOG, f"the climb {'up' if up else 'down'} did not register -- retrying")
+    n = data.get("mlm_climb_fails", 0) + 1
+    data["mlm_climb_fails"] = n
+    debug_log.log(LOG, f"the climb {'up' if up else 'down'} did not register ({n})")
+    if n >= CLIMB_MAX_TRIES:
+        ctx.state.trigger_safety_stop(
+            f"motherlode: {n} attempts to climb {'up' if up else 'down'} and the floor never "
+            f"changed")
     return False
 
 
@@ -689,10 +781,13 @@ def hopper_phase(ctx) -> bool:
         travel.walk_to(ctx, TILE_LOWER_HOPPER, goal_adjacent=True)
         return False
 
+    if too_far(hopper):
+        debug_log.log(LOG, "walking to the hopper first")
+        _walk_to_object(ctx, hopper, TILE_LOWER_HOPPER)
+        return False
     upper = _upstairs()
     mark = outcome_waits.mark(ctx)
-    if not controller.click_entity(ctx.ser, hopper, refresh_target=_refresh(hopper),
-                                   expected_action=HOPPER_ACTION):
+    if not controller.click_entity(ctx.ser, hopper, refresh_target=_refresh(hopper)):
         return False
     deposited = outcome_waits.await_pre(
         ctx, "INVENTORY_CHANGED", DEPOSIT_BUDGET_S + _walk_budget(hopper),
@@ -736,10 +831,13 @@ def search_sack(ctx) -> bool:
         debug_log.log(LOG, "the sack is not in view -- walking to it")
         travel.walk_to(ctx, TILE_SACK, goal_adjacent=True)
         return False
+    if too_far(sack):
+        debug_log.log(LOG, "walking to the sack first")
+        _walk_to_object(ctx, sack, TILE_SACK)
+        return False
     before = len(_inventory())
     mark = outcome_waits.mark(ctx)
-    if not controller.click_entity(ctx.ser, sack, refresh_target=_refresh(sack),
-                                   expected_action=SACK_ACTION):
+    if not controller.click_entity(ctx.ser, sack, refresh_target=_refresh(sack)):
         return False
     got = outcome_waits.await_pre(
         ctx, "INVENTORY_CHANGED", SEARCH_BUDGET_S + _walk_budget(sack),
@@ -759,9 +857,12 @@ def _open_deposit_box(ctx) -> bool:
         debug_log.log(LOG, "the deposit box is not in view -- walking to it")
         travel.walk_to(ctx, TILE_DEPOSIT_BOX, goal_adjacent=True)
         return False
+    if too_far(box):
+        debug_log.log(LOG, "walking to the deposit box first")
+        _walk_to_object(ctx, box, TILE_DEPOSIT_BOX)
+        return False
     mark = outcome_waits.mark(ctx)
-    if not controller.click_entity(ctx.ser, box, refresh_target=_refresh(box),
-                                   expected_action=DEPOSIT_BOX_ACTION):
+    if not controller.click_entity(ctx.ser, box, refresh_target=_refresh(box)):
         return False
     opened = outcome_waits.await_pre(
         ctx, {"WIDGET_LOADED": lambda p: p.get("groupId") == DEPOSIT_GROUP},
@@ -902,8 +1003,11 @@ def _maybe_repair(ctx) -> bool:
         return False
     tile = (strut.get("x"), strut.get("y"), strut.get("plane", 0))
     mark = outcome_waits.mark(ctx)
-    if not controller.click_entity(ctx.ser, strut, refresh_target=_refresh(strut),
-                                   expected_action=STRUT_ACTION):
+    if too_far(strut):
+        debug_log.log(LOG, "walking to the broken strut first")
+        _walk_to_object(ctx, strut, None)
+        return True
+    if not controller.click_entity(ctx.ser, strut, refresh_target=_refresh(strut)):
         return True
     fixed = outcome_waits.await_pre(
         ctx, {"XP_GAINED": lambda p: p.get("skill") == "Smithing",

@@ -1475,6 +1475,97 @@ this form**; the module docstring's numbered worklist is the first session's che
   script that queues a later click's verdict up front delivers it during the earlier click's wait,
   which cannot happen live, and the "failure" it produced was the test's.
 
+## Current state of routines/motherlode_mine.py
+
+Written 2026-09-07 from the user's recording
+(`recordings/2026-09-07_111533_motherload-mine.*`, a PARTIAL loop), live bridge reads with the
+client standing in the mine, RuneLite's own decompiled `MotherlodePlugin` and the Plugin Hub
+**Motherlode Mine Improved** (`tictac7x-motherlode`) source the user pointed at. Design:
+`docs/superpowers/specs/2026-09-07-motherlode-mine-design.md`. USER's loop: mine the upstairs
+pocket **behind Mercy** ("a spot where we dont have to clear the rockfall"), fill the inventory
+entirely, empty it into the hopper, and once the sack is full run **one big collect/bank cycle**
+at the sack + deposit box. **Run live 2026-09-07 (mlm_live1-2); the mining half works, the
+hopper/collect half is the next session's worklist.**
+
+- **THE UPPER LEVEL SITS DIRECTLY ABOVE THE LOWER ONE AT THE SAME x/y, and no coordinate test
+  can separate them.** This cost the first live run and is the fact to carry forward. The
+  routine mined correctly for a minute, then spent 90 seconds clicking a DOWNSTAIRS vein at
+  (3749,5685) from (3749,5684) with **nothing happening at all** -- while `/last-action`
+  reported a perfect `Mine / Ore vein / id 26661` on every single attempt, `/hover` agreed, and
+  `travel.can_reach` agreed. USER, watching the screen: *"clicking lower level ore from
+  highground"*. **No log line available to me could have caught this**; every diagnostic said
+  the click was landing.
+  The design had concluded the floors were separable because `worldmap.find_path(upstairs ->
+  sack)` answers None and a `reachable_from` flood from the pocket returns 45 tiles that exclude
+  the sack, the box and the struts. That evidence was real and the conclusion was wrong -- the
+  flood was measuring a POCKET, not a floor.
+  RuneLite's own `MotherlodePlugin` has the same problem and answers it with **render height**
+  (`isUpstairs: Perspective.getTileHeight(client, p, 0) < -490`), hiding any vein whose
+  `isUpstairs` disagrees with the player's. So **`tileHeight` is now on `/objects` and
+  `/player`** (ObjectProvider, PlayerProvider -- CLIENT REBUILD REQUIRED) and
+  `motherlode_mine.object_is_upper` is the floor test. The `-490` lives in the routine, not the
+  provider: it is that mine's fact. The player's OWN floor needs none of this -- **varbit 2086
+  is 1 upstairs**, exact and rebuild-free; only an object's floor is ever in question.
+- **`ControllerAddon/mlm_sectors.py` is the fallback for an un-rebuilt client**: the union of
+  `tictac7x-motherlode`'s six `UPSTAIRS_*` sector arrays, transcribed mechanically. It is a
+  hand-authored overlay list, not a survey, and it is biased toward reading a tile as
+  downstairs -- so its errors cost a vein rather than a dead click. MEASURED: it calls
+  (3749,5685) downstairs and every vein that mined fine upstairs. `_floor_ready` logs which of
+  the two tests a run is using; it never stops the run.
+- **LADDERS ARE EXEMPT FROM THE FLOOR FILTER, deliberately.** Both stand on tiles that read as
+  DOWNSTAIRS under either test (19044 at (3755,5673), 19045 at (3755,5674)), so filtering them
+  makes the climb down impossible from upstairs -- caught before it shipped by checking the
+  vendored table against those two tiles. Their ids plus the action already disambiguate:
+  MEASURED live, from upstairs 19045 offers "Climb" and 19044 offers **no actions at all**.
+- **`travel.can_reach` is a PREFERENCE for veins here, never a veto.** In this mine the client's
+  collision grid has to describe two floors stacked on one set of coordinates, so it is
+  ambiguous by construction: MEASURED, it passed the downstairs vein that cost 90 seconds AND
+  rejected upstairs veins two tiles away that mine fine. `pick_vein` ranks reachable first and
+  still returns a doubted vein when that is all there is.
+- **`note_vein_failure` is the empirical belt to those braces**: two clicks on one vein that
+  produce nothing and it is set aside for 60s. On its own it would have escaped the 90-second
+  loop whatever the cause -- a wall object's wrong side, a stale scene, another player, or a
+  floor test that has gone wrong again. Any depletion clears the count.
+- **The mining half is `gathering.py`, UNCHANGED** -- the routine builds a synthetic vein config
+  and calls `gathering.pick_target`/`gathering.gather` directly, inheriting the tick-perfect
+  reaction, the next-vein pre-hover and the walk-budgeted deadlines. It does NOT use
+  `gathering.tick`: a full inventory here means "walk to the hopper", none of that function's
+  three policies. USER: "Can use alot of mining routine" -- correct, and it needed no change.
+  Ore veins are `WallObject`s (26661-26664) and a DEPLETED vein is a different id (26665-26668)
+  offering **no actions**, so gathering's existing action filter skips spent veins and its
+  "gone from its tile" test is already the right depletion test. MEASURED live: one vein mined
+  **42.7s for 11 pay-dirt** before depleting (the wiki's 36-40s upstairs figure), chaining
+  straight onto the next.
+- **The sack is `varbit + pending`, not the varbit.** 5558 is the sack's pay-dirt, 5556 the
+  189-vs-108 upgrade. The conveyor takes seconds, so pay-dirt that has left the inventory is not
+  in 5558 yet -- reading it raw starts a trip whose pay-dirt has nowhere to go (the reason
+  `mlm-qol` has a `SackTracker`). `mining_allowance` also caps a load at the sack's remaining
+  room: with a 108 sack and 27-pay-dirt loads that never bites, but the recording's sack sat at
+  39, where a full load overflows and the excess is simply lost.
+- **A broken machine still ACCEPTS pay-dirt** (the recording deposits 17 into one); what it
+  stops is the sack FILLING. USER: "ONLY repair broken strut if we cant deposit our ore.
+  otherwise leave it broken. if we are lucky another player fixes it" -- so the "will need to be
+  repaired" chat starts a clock, mining and depositing carry on, and only after
+  `repairPatienceS` (180s) AND with a hammer carried does it walk to a strut. No hammer disables
+  repairs with one log line, never a stop.
+- **The upper hopper (3755,5677) costs 50 golden nuggets** and is not bought (USER: "need to
+  unlock that hopper we cant use it yet"), so `upperHopper` ships as **`never`** and every
+  inventory takes the ladder to the lower hopper (3748,5672). Flipping it to `"auto"` the day it
+  is bought removes every ladder trip with no code change -- auto tries a same-floor hopper
+  first and latches back to the ladder if the pay-dirt does not leave the inventory.
+- **Which deposit is used depends on whether a hammer is carried**: without one, the recording's
+  single click on "Deposit inventory" (widget 192.31), with the user's existing Deposit Lock
+  keeping the open gem sack; with one, a `Deposit-All` per ore stack in the 192.24 grid instead,
+  because Deposit-inventory would bank the hammer.
+- Ids, all MEASURED live: hopper 26674, ladders 19044 up / 19045 down, sack 26688 (a
+  **GroundObject**) at (3748,5659), deposit box 25937 at (3759,5664), bank chest 26707 at
+  (3761,5666) (**there IS a bank in the mine** -- a future hammer/pickaxe restock, out of scope
+  for v1), broken strut 26670 -> 26669 (+126 Smithing), rockfalls 26679/26680 (never cleared --
+  the whole point of the pocket behind Mercy is that none is in the way).
+- **First live session's remaining worklist**: the hopper trip and the ladder round trip, the
+  whole collect/bank cycle, the real conveyor latency (fit `PENDING_MAX_S`), and whether a
+  `Search` yields exactly `min(free slots, 5558)` ore. None of that half has run yet.
+
 ## Current state of gathering.py, routines/mining.py and routines/woodcutting.py
 
 **The loop is `ControllerAddon/gathering.py` since 2026-09-07** (USER: "isnt our generic mining.py
