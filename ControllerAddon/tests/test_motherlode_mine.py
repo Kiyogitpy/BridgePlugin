@@ -1,0 +1,471 @@
+"""routines/motherlode_mine.py.
+
+Hermetic: every bridge read is stubbed and the module clock is faked, so a budget that would
+wait seconds live expires instantly here (the test_blast_furnace fixture pattern).
+
+The facts pinned below are the MEASURED ones from the design spec
+(docs/superpowers/specs/2026-09-07-motherlode-mine-design.md): a depleted vein offers no
+actions, /objects carries both floors so reachability is the floor filter, the conveyor lags so
+the sack has to be read as varbit + pending, and a broken machine is left alone until it costs
+us.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "routines"))
+
+import pytest
+
+import controller
+import motherlode_mine as mlm
+import travel
+
+
+class _State:
+    def __init__(self, config=None):
+        self.config = dict(config or mlm.DEFAULT_CONFIG)
+        self.data = {}
+        self.safety_stopped = False
+        self.stop_reason = None
+
+    def trigger_safety_stop(self, reason):
+        self.safety_stopped = True
+        self.stop_reason = reason
+
+
+class _Ctx:
+    def __init__(self, config=None):
+        self.ser = object()
+        self.state = _State(config)
+        self.events = None
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += max(0.0, s)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(mlm, "_now", clock.now)
+    monkeypatch.setattr(mlm, "_sleep", clock.sleep)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [])
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: 0)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3752, "y": 5680, "plane": 0,
+                                                           "regionId": mlm.REGION,
+                                                           "weaponName": "Rune pickaxe"})
+    monkeypatch.setattr(controller, "get_collision", lambda x, y, p, radius=6, **kw: [])
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "sample_human_delay", lambda *a, **k: 0.0)
+    return clock
+
+
+def _vein(x, y, obj_id=26662, name=mlm.VEIN_NAME, dist=3, actions=("Mine",), **over):
+    d = {"id": obj_id, "name": name, "x": x, "y": y, "plane": 0, "distance": dist,
+         "visible": True, "screenX": 100, "screenY": 100}
+    if actions is not None:
+        d["actions"] = list(actions)
+    d.update(over)
+    return d
+
+
+def _items(*names):
+    return [{"name": n} for n in names]
+
+
+def _paydirt(n):
+    return _items(*(["Pay-dirt"] * n))
+
+
+# --- the sack ---------------------------------------------------------------------
+
+def test_sack_capacity_follows_the_upgrade_varbit():
+    assert mlm.sack_capacity(0) == 108
+    assert mlm.sack_capacity(1) == 189
+
+
+def test_sack_effective_counts_paydirt_still_on_the_conveyor():
+    # The whole reason mlm-qol has a SackTracker: 5558 lags a deposit by seconds, and reading it
+    # raw would start a trip whose pay-dirt has nowhere to go.
+    assert mlm.sack_effective(81, 27) == 108
+
+
+def test_pending_is_retired_as_the_conveyor_delivers(monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data.update(mlm_pending=27, mlm_pending_at=mlm._now())
+    monkeypatch.setattr(controller, "get_varbit",
+                        lambda vid: 54 if vid == mlm.VARBIT_SACK else 0)
+    mlm.sack_state(ctx)                       # first read only seeds the baseline
+    monkeypatch.setattr(controller, "get_varbit",
+                        lambda vid: 81 if vid == mlm.VARBIT_SACK else 0)
+    _sack, effective, _capacity = mlm.sack_state(ctx)
+    assert ctx.state.data["mlm_pending"] == 0
+    assert effective == 81
+
+
+def test_a_rising_sack_clears_the_broken_flag(monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data["mlm_broken_since"] = mlm._now()
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: 27 if vid == mlm.VARBIT_SACK else 0)
+    mlm.sack_state(ctx)
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: 54 if vid == mlm.VARBIT_SACK else 0)
+    mlm.sack_state(ctx)
+    assert "mlm_broken_since" not in ctx.state.data
+
+
+def test_pending_expires_so_a_lost_deposit_cannot_wedge_the_run(_hermetic):
+    ctx = _Ctx()
+    ctx.state.data.update(mlm_pending=27, mlm_pending_at=mlm._now())
+    _hermetic.t += mlm.PENDING_MAX_S + 1
+    assert mlm._pending(ctx) == 0
+
+
+# --- how much to mine -------------------------------------------------------------
+
+def test_a_full_load_is_mined_when_the_sack_has_room():
+    # USER: "full inventory, always". 27 free slots, an empty sack -> mine all 27.
+    assert mlm.mining_allowance(27, 0, 0, 108) == 27
+
+
+def test_mining_stops_short_rather_than_overflowing_the_sack():
+    # The recording's sack sat at 39: 39 + 27 + 27 + 27 = 120 > 108, and the excess pay-dirt is
+    # simply lost. Two loads in, the third is capped.
+    assert mlm.mining_allowance(27, 0, 93, 108) == 15
+
+
+def test_allowance_counts_what_we_are_already_holding():
+    assert mlm.mining_allowance(17, 10, 90, 108) == 8
+
+
+def test_allowance_is_never_negative():
+    assert mlm.mining_allowance(27, 0, 200, 108) == 0
+
+
+# --- the phase machine ------------------------------------------------------------
+
+def _phase(**over):
+    args = dict(holding_ore=False, inventory_full=False, held_paydirt=0, allowance=27,
+                sack_eff=0, capacity=108, collecting=False)
+    args.update(over)
+    return mlm.derive_phase(**args)
+
+
+def test_holding_ore_always_banks_first():
+    assert _phase(holding_ore=True, collecting=True, sack_eff=50) == "bank"
+
+
+def test_a_full_inventory_of_paydirt_goes_to_the_hopper():
+    assert _phase(inventory_full=True, held_paydirt=27, allowance=0) == "hopper"
+
+
+def test_a_capped_load_goes_to_the_hopper_before_the_inventory_is_full():
+    assert _phase(held_paydirt=15, allowance=0, sack_eff=93) == "hopper"
+
+
+def test_a_full_sack_starts_the_collect_cycle():
+    assert _phase(sack_eff=108, capacity=108) == "collect"
+
+
+def test_the_collect_latch_survives_the_first_search():
+    # Without the latch the first Search drops the sack below full and the next tick would climb
+    # straight back up holding ore.
+    assert _phase(collecting=True, sack_eff=54) == "collect"
+
+
+def test_the_collect_latch_ends_with_an_empty_sack():
+    assert _phase(collecting=True, sack_eff=0) == "mine"
+
+
+def test_otherwise_we_mine():
+    assert _phase(held_paydirt=5) == "mine"
+
+
+# --- repairs -----------------------------------------------------------------------
+
+def test_a_broken_machine_is_left_alone_at_first():
+    # USER: "otherwise leave it broken. if we are lucky another player fixes it".
+    assert mlm.repair_due(broken_since=100.0, hammer=True, patience_s=180, now=200.0) is False
+
+
+def test_a_broken_machine_is_repaired_once_it_has_cost_us():
+    assert mlm.repair_due(broken_since=100.0, hammer=True, patience_s=180, now=300.0) is True
+
+
+def test_no_hammer_means_no_repair_ever():
+    assert mlm.repair_due(broken_since=100.0, hammer=False, patience_s=180, now=9999.0) is False
+
+
+def test_the_broken_chat_starts_the_clock_once(_hermetic):
+    ctx = _Ctx()
+    mlm.on_event(ctx, "CHAT_MESSAGE",
+                 {"message": "The machine will need to be repaired before your pay- dirt can "
+                             "be cleaned."})
+    first = ctx.state.data["mlm_broken_since"]
+    _hermetic.t += 60
+    mlm.on_event(ctx, "CHAT_MESSAGE", {"message": "The machine will need to be repaired."})
+    assert ctx.state.data["mlm_broken_since"] == first
+
+
+# --- picking a vein ----------------------------------------------------------------
+
+def _reach(*tiles):
+    return {t: 0 for t in tiles}
+
+
+def test_a_depleted_vein_is_skipped_because_it_offers_no_actions(monkeypatch):
+    # MEASURED live: a depleted vein is a different id (26665-26668) with actions == [].
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    monkeypatch.setattr(travel, "can_reach", lambda *a, **k: True)
+    objs = [_vein(3751, 5680, obj_id=26666, name="Depleted vein", dist=1, actions=[]),
+            _vein(3751, 5680, obj_id=26666, dist=1, actions=[]),
+            _vein(3753, 5680, dist=2)]
+    assert mlm.pick_vein(ctx, _reach((3752, 5680)), None, objects=objs)["x"] == 3753
+
+
+def test_a_vein_across_the_floor_is_never_offered(monkeypatch):
+    # /objects lists BOTH floors. Reachability is the floor filter -- CLAUDE.md's JEFF/ROSS rule.
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    downstairs = _vein(3750, 5676, dist=2)
+    upstairs = _vein(3753, 5682, dist=4)
+    monkeypatch.setattr(travel, "can_reach",
+                        lambda goal, reach=None, flags=None, **k: goal is not downstairs)
+    picked = mlm.pick_vein(ctx, _reach((3752, 5680)), None, objects=[downstairs, upstairs])
+    assert picked is upstairs
+
+
+def test_a_vein_outside_the_anchor_pocket_is_never_offered(monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    monkeypatch.setattr(travel, "can_reach", lambda *a, **k: True)
+    far = _vein(3766, 5680, dist=1)
+    near = _vein(3753, 5684, dist=6)
+    assert mlm.pick_vein(ctx, _reach((3752, 5680)), None, objects=[far, near]) is near
+
+
+def test_an_unanswerable_flood_does_not_stop_the_routine_working(monkeypatch):
+    # Empty reach means "cannot tell", never "nothing is reachable".
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    monkeypatch.setattr(travel, "can_reach", lambda *a, **k: False)
+    vein = _vein(3753, 5680, dist=2)
+    assert mlm.pick_vein(ctx, {}, None, objects=[vein]) is vein
+
+
+def test_worked_tiles_are_excluded_so_the_chain_does_not_reclick_a_spent_vein(monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    monkeypatch.setattr(travel, "can_reach", lambda *a, **k: True)
+    spent = _vein(3751, 5681, dist=1)
+    other = _vein(3753, 5680, dist=2)
+    picked = mlm.pick_vein(ctx, _reach((3752, 5680)), None,
+                           exclude=[(3751, 5681, 0)], objects=[spent, other])
+    assert picked is other
+
+
+# --- what counts as ore -------------------------------------------------------------
+
+def test_kit_and_paydirt_are_not_ore():
+    items = _items("Rune pickaxe", "Hammer", "Open gem sack", "Pay-dirt", "Coal", "Gold ore")
+    assert [i["name"] for i in mlm._ore_items(items)] == ["Coal", "Gold ore"]
+
+
+# --- the hopper ----------------------------------------------------------------------
+
+UPPER_HOPPER = {"id": mlm.HOPPER_ID, "name": "Hopper", "x": 3755, "y": 5677, "plane": 0,
+                "distance": 3, "actions": ["Deposit"], "screenX": 1, "screenY": 1}
+LOWER_HOPPER = {"id": mlm.HOPPER_ID, "name": "Hopper", "x": 3748, "y": 5672, "plane": 0,
+                "distance": 2, "actions": ["Deposit"], "screenX": 1, "screenY": 1}
+
+
+def _standing_by(monkeypatch, obj):
+    """A flood that contains the tiles around `obj` -- i.e. we are on its floor."""
+    reach = {(obj["x"] + dx, obj["y"] + dy): 0 for dx in (-1, 1) for dy in (-1, 1)}
+    monkeypatch.setattr(mlm, "snapshot", lambda ctx, force=False: (reach, None))
+    return reach
+
+
+def test_the_upper_hopper_is_not_touched_until_it_is_unlocked(monkeypatch):
+    # USER 2026-09-07: "need to unlock that hopper we cant use it yet" -- the shipped default is
+    # "never", so a run today spends no click on it and goes straight for the ladder.
+    ctx = _Ctx()
+    _standing_by(monkeypatch, UPPER_HOPPER)
+    monkeypatch.setattr(controller, "get_varbit",
+                        lambda vid: 1 if vid == mlm.VARBIT_UPSTAIRS else 0)
+    monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [UPPER_HOPPER])
+    assert mlm._hopper_candidates(ctx, _standing_by(monkeypatch, UPPER_HOPPER)) == []
+
+
+def test_a_locked_upper_hopper_latches_and_falls_back_to_the_ladder(monkeypatch):
+    ctx = _Ctx({**mlm.DEFAULT_CONFIG, "upperHopper": "auto"})
+    _standing_by(monkeypatch, UPPER_HOPPER)
+    monkeypatch.setattr(controller, "get_inventory", lambda: _paydirt(27))
+    monkeypatch.setattr(controller, "get_varbit",
+                        lambda vid: 1 if vid == mlm.VARBIT_UPSTAIRS else 0)
+    monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [UPPER_HOPPER])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+
+    assert mlm.hopper_phase(ctx) is False        # the pay-dirt never left the inventory
+    assert ctx.state.data["mlm_upper_locked"] is True
+    # Latched: nothing upstairs is offered any more, so the next call takes the ladder.
+    assert mlm._hopper_candidates(ctx, _standing_by(monkeypatch, UPPER_HOPPER)) == []
+
+
+def test_a_hopper_on_the_other_floor_is_never_offered(monkeypatch):
+    # /objects reports the lower hopper 8 tiles away while we stand upstairs.
+    ctx = _Ctx({**mlm.DEFAULT_CONFIG, "upperHopper": "auto"})
+    monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [LOWER_HOPPER])
+    upstairs_pocket = {(3752, 5680): 0, (3753, 5680): 0, (3754, 5677): 0}
+    assert mlm._hopper_candidates(ctx, upstairs_pocket) == []
+
+
+def test_a_successful_hopper_deposit_books_the_paydirt_as_pending(monkeypatch):
+    ctx = _Ctx()
+    inventory = {"items": _paydirt(27)}
+    monkeypatch.setattr(controller, "get_inventory", lambda: inventory["items"])
+    _standing_by(monkeypatch, LOWER_HOPPER)
+    monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [LOWER_HOPPER])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+
+    def _click(*a, **k):
+        inventory["items"] = []
+        return True
+    monkeypatch.setattr(controller, "click_entity", _click)
+
+    assert mlm.hopper_phase(ctx) is True
+    assert ctx.state.data["mlm_pending"] == 27
+
+
+# --- banking the ore -------------------------------------------------------------------
+
+def test_a_carried_hammer_switches_to_per_item_deposits(monkeypatch):
+    # Deposit-inventory would bank the hammer; per-item Deposit-All cannot.
+    ctx = _Ctx()
+    ctx.state.data["mlm_hammer"] = True
+    monkeypatch.setattr(controller, "get_inventory", lambda: _items("Hammer", "Coal"))
+    monkeypatch.setattr(mlm, "_open_deposit_box", lambda c: True)
+    called = []
+    monkeypatch.setattr(mlm, "_deposit_each_ore", lambda c: called.append("each") or True)
+    monkeypatch.setattr(mlm, "_deposit_inventory", lambda c: called.append("all") or True)
+    mlm.bank_phase(ctx)
+    assert called == ["each"]
+
+
+def test_without_a_hammer_it_is_one_click(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_inventory", lambda: _items("Open gem sack", "Coal"))
+    monkeypatch.setattr(mlm, "_open_deposit_box", lambda c: True)
+    called = []
+    monkeypatch.setattr(mlm, "_deposit_each_ore", lambda c: called.append("each") or True)
+    monkeypatch.setattr(mlm, "_deposit_inventory", lambda c: called.append("all") or True)
+    mlm.bank_phase(ctx)
+    assert called == ["all"]
+
+
+def test_banking_ore_upstairs_climbs_down_first(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_inventory", lambda: _items("Coal"))
+    monkeypatch.setattr(controller, "get_varbit",
+                        lambda vid: 1 if vid == mlm.VARBIT_UPSTAIRS else 0)
+    climbed = []
+    monkeypatch.setattr(mlm, "climb", lambda c, up: climbed.append(up) or False)
+    monkeypatch.setattr(mlm, "_open_deposit_box", lambda c: pytest.fail("walked to a box "
+                                                                       "through the floor"))
+    assert mlm.bank_phase(ctx) is False
+    assert climbed == [False]
+
+
+# --- startup ---------------------------------------------------------------------------
+
+def test_no_pickaxe_stops_the_run(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 3752, "y": 5680, "plane": 0, "regionId": mlm.REGION,
+                                 "weaponName": "Dragon scimitar"})
+    monkeypatch.setattr(controller, "get_inventory", lambda: _items("Open gem sack"))
+    assert mlm._startup_ok(ctx) is False
+    assert "pickaxe" in ctx.state.stop_reason
+
+
+def test_starting_outside_the_mine_stops_the_run(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 3200, "y": 3200, "plane": 0, "regionId": 12850,
+                                 "weaponName": "Rune pickaxe"})
+    assert mlm._startup_ok(ctx) is False
+    assert "Motherlode Mine" in ctx.state.stop_reason
+
+
+def test_a_missing_hammer_only_turns_repairs_off(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_inventory", lambda: _items("Open gem sack"))
+    assert mlm._startup_ok(ctx) is True
+    assert ctx.state.safety_stopped is False
+    assert ctx.state.data["mlm_hammer"] is False
+
+
+def test_an_empty_first_read_is_retried_rather_than_stopped(monkeypatch):
+    # The first logged-in tick after an auto-login serves nothing -- run 47's GOTR lesson.
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 3752, "y": 5680, "plane": 0, "regionId": mlm.REGION,
+                                 "weaponName": ""})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    assert mlm._startup_ok(ctx) is False
+    assert ctx.state.safety_stopped is False
+
+
+# --- the stuck watch ----------------------------------------------------------------------
+
+def test_the_stuck_watch_stops_a_wedged_run(_hermetic):
+    ctx = _Ctx()
+    mlm._stuck_watch(ctx, "mine")
+    _hermetic.t += mlm.STALL_STOP_S + 1
+    mlm._stuck_watch(ctx, "mine")
+    assert ctx.state.safety_stopped is True
+
+
+def test_progress_resets_the_stuck_watch(_hermetic, monkeypatch):
+    ctx = _Ctx()
+    mlm._stuck_watch(ctx, "mine")
+    _hermetic.t += mlm.STALL_STOP_S - 1
+    monkeypatch.setattr(controller, "get_inventory", lambda: _paydirt(3))
+    mlm._stuck_watch(ctx, "mine")
+    _hermetic.t += 5
+    mlm._stuck_watch(ctx, "mine")
+    assert ctx.state.safety_stopped is False
+
+
+# --- breaks --------------------------------------------------------------------------------
+
+def test_before_break_empties_the_inventory_into_the_hopper(monkeypatch):
+    ctx = _Ctx()
+    held = {"n": 27}
+    monkeypatch.setattr(controller, "get_inventory", lambda: _paydirt(held["n"]))
+    calls = []
+
+    def _hopper(c):
+        calls.append(1)
+        held["n"] = 0
+        return True
+    monkeypatch.setattr(mlm, "hopper_phase", _hopper)
+    mlm.before_break(ctx)
+    assert calls == [1]
+
+
+def test_before_break_does_nothing_with_an_empty_inventory(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(mlm, "hopper_phase", lambda c: pytest.fail("no pay-dirt to deposit"))
+    mlm.before_break(ctx)

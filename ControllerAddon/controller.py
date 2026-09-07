@@ -777,6 +777,21 @@ def rune_pouch_count(name_substring: str):
     return None
 
 
+def get_bank_memory(names=None):
+    """The bridge's remembered copy of the bank (BankMemoryProvider), readable with no bank in
+    sight -- see bank_memory.py, which is what routines should actually use.
+
+    Returns None when the endpoint is missing (a client build predating it) or the request
+    failed. None is NOT an empty bank: bank_memory.BankMemory draws that distinction, and code
+    that collapses the two concludes you own nothing when it has simply never looked.
+
+    Not TickCache-gated on the Java side -- the snapshot is already-resolved plain data, so this
+    is cheap to poll, unlike get_bank().
+    """
+    params = {"names": ",".join(names)} if names else None
+    return api_get("/bank/memory", params=params)
+
+
 def get_bank(fresh=False):
     # fresh=True bypasses the bridge's per-tick cache for this one call -- pass it right after an
     # action that just changed bank state (a withdrawal/deposit) instead of waiting out a full
@@ -1019,6 +1034,13 @@ def get_mining_config():
     """The Mining section of the config panel (ConfigExporter.exportMining), or None when the
     bridge cannot answer -- routines/mining.py keeps its own defaults for that case only."""
     return api_get("/mining-config")
+
+
+def get_woodcutting_config():
+    """The Gathering section of the config panel with its action set to Chop down
+    (ConfigExporter.exportWoodcutting), or None when the bridge cannot answer -- only then does
+    routines/woodcutting.py fall back to its own defaults."""
+    return api_get("/woodcutting-config")
 
 
 def get_npc_screen_pos(npc_id: int):
@@ -1479,6 +1501,40 @@ def key_up(ser: serial.Serial, key: str) -> None:
     send_line(ser, f"KU {key}")
 
 
+def alt_tab(ser: serial.Serial) -> None:
+    """Physically Alt+Tab away from (or back to) the game window.
+
+    "ALT" and "TAB" are both explicit key names in the Arduino firmware's keyFromToken
+    (KEY_LEFT_ALT / KEY_TAB), same as "SHIFT"/"ESC"/"SPACE" elsewhere here. Lived in
+    routines/nmz.py until 2026-09-06; routines/karambwan_fishing.py wanted it too, so it moved
+    here rather than being copied. Stateless, so the "controller.py exists twice" caveat in
+    CLAUDE.md does not bite it.
+    """
+    key_down(ser, "ALT")
+    human_delay(0.05, 0.12)
+    key_tap(ser, "TAB")
+    human_delay(0.05, 0.12)
+    key_up(ser, "ALT")
+
+
+def wait_for_focus(timeout_s: float = 5.0, poll_interval_s: float = 0.3,
+                   focused: bool = True) -> bool:
+    """Poll /state until windowFocused matches `focused`. True if it did, False on timeout.
+
+    `focused=False` is the tab-OUT confirmation: a machine with nothing but RuneLite open
+    swallows Alt+Tab entirely, and a routine that assumed it had tabbed out would then sit
+    there sending no input at all. Checked once before the timeout is consulted, so
+    timeout_s=0 still reads the state once.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if bool(get_state().get("windowFocused")) is focused:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval_s)
+
+
 def type_digits_and_enter(ser: serial.Serial, text: str) -> None:
     """Type each character of `text` (expected to be a plain digit string, e.g. a coin
     amount) via key_tap, then press Enter -- for chatbox "Enter amount" numeric prompts
@@ -1779,11 +1835,20 @@ def fidget_once() -> None:
 
 def _maybe_fidget_during_wait() -> None:
     """One small out-and-back resting-hand drift from wherever the cursor is. Position-
-    invariant on purpose -- the return leg lands exactly on the origin (aim_radius=0) so a
-    cursor parked on a future click target is still parked there afterwards. Skipped whenever
-    it could interfere: unfocused window, an open right-click menu (moving off one closes it),
-    a movement abort, or a target outside the window. Never raises -- a fidget must not be
-    able to break the wait it decorates."""
+    invariant on purpose -- the return leg lands within IDLE_FIDGET_RETURN_JITTER_PX of the
+    ANCHOR (input_state.fidget_anchor, the cursor's resting position for this wait) so a cursor
+    parked on a future click target is still parked there afterwards. Skipped whenever it could
+    interfere: unfocused window, an open right-click menu (moving off one closes it), a movement
+    abort, or a target outside the window. Never raises -- a fidget must not be able to break
+    the wait it decorates.
+
+    The return used to be aim_radius=0, an exact snap onto the origin pixel. MEASURED live
+    2026-09-06 against the human recording of the same activity (karambwan fishing): that
+    tethered the cursor to ONE pixel and oscillated about it -- chains of 19/17/14 consecutive
+    out-and-backs about one anchor and 11 rests on the identical pixel, against the human's 10
+    and 3 -- a signature no hand produces. Jittering the return fixes that; ANCHORING it (rather
+    than returning to wherever the last fidget happened to land) is what stops the jitter
+    compounding into a walk off the target."""
     ser = _fidget_serial()
     if ser is None or _movement_abort.is_set():
         return
@@ -1795,10 +1860,14 @@ def _maybe_fidget_during_wait() -> None:
         if get_menu().get("open"):
             return
         ox, oy = get_cursor_pos()
+        anchor = getattr(input_state, "fidget_anchor", None)
+        if anchor is None or math.dist(anchor, (ox, oy)) > IDLE_FIDGET_ANCHOR_RESET_PX:
+            anchor = (ox, oy)          # a click, a walk or the idle drift moved us: rest here
+            input_state.fidget_anchor = anchor
         angle = random.uniform(0, 2 * math.pi)
         dist = random.uniform(*IDLE_FIDGET_RADIUS_PX)
-        tx = int(round(ox + dist * math.cos(angle)))
-        ty = int(round(oy + dist * math.sin(angle)))
+        tx = int(round(anchor[0] + dist * math.cos(angle)))
+        ty = int(round(anchor[1] + dist * math.sin(angle)))
         if not is_point_within_window(tx, ty):
             return
         scale = random.uniform(1.2, 2.2)      # a resting-hand shift, not a click-speed traverse
@@ -1806,7 +1875,8 @@ def _maybe_fidget_during_wait() -> None:
         if _movement_abort.is_set():
             return
         time.sleep(random.uniform(0.08, 0.35))
-        move_to_human(ser, ox, oy, aim_radius=0, duration_scale=scale)
+        move_to_human(ser, anchor[0], anchor[1], aim_radius=IDLE_FIDGET_RETURN_JITTER_PX,
+                      duration_scale=scale)
     except Exception:
         pass
 
@@ -2804,6 +2874,51 @@ def click_menu_action(ser: serial.Serial, entity: dict, option, target_hint: str
     return True
 
 
+DROP_CLICK_DELAY = (0.12, 0.28)   # between drops; the human recordings' inventory cadence
+
+
+def drop_items(ser: serial.Serial, items) -> bool:
+    """Drop every inventory entry in `items` (dicts from GET /inventory, so each carries its own
+    screenX/screenY). Returns whether the inventory actually shrank.
+
+    Shift+left-click is the fast path, but shift-click-to-drop is a GAME SETTING the account may
+    have off -- in which case the click is an ordinary left-click on a log (nothing happens) and
+    a blind loop would "drop" 27 items while dropping none. So the FIRST drop is verified against
+    the inventory and, if it did nothing, that item is retried through the right-click menu and
+    every remaining one goes the same way. One /inventory read per call, not per item.
+
+    No simulated misclick and no UI-blocker check on these: they are interface clicks (banker.py's
+    rule), and here a misclick plus its corrective reclick would drop the NEIGHBOURING slot --
+    which in a gathering routine is the axe or pickaxe."""
+    items = list(items or [])
+    if not items:
+        return True
+    open_inventory_tab(ser)
+    before = len(get_inventory() or [])
+    shift_works = None
+    for item in items:
+        if shift_works is False:
+            click_menu_action(ser, item, "Drop", offset=(0, 0), check_ui_blockers=False)
+        else:
+            key_down(ser, "SHIFT")
+            try:
+                click_entity(ser, item, offset=(0, 0), check_ui_blockers=False,
+                             simulate_mistakes=False)
+            finally:
+                # Always released, even if the click raises -- a stuck SHIFT turns every later
+                # click in the session into a shift-click.
+                key_up(ser, "SHIFT")
+        human_delay(*DROP_CLICK_DELAY)
+        if shift_works is None:
+            shift_works = len(get_inventory() or []) < before
+            if not shift_works:
+                debug_log.log("action", "shift-drop did nothing (shift-click drop off?) -- "
+                                        "using the right-click menu instead")
+                click_menu_action(ser, item, "Drop", offset=(0, 0), check_ui_blockers=False)
+                human_delay(*DROP_CLICK_DELAY)
+    return len(get_inventory() or []) < before
+
+
 def consume_first(ser: serial.Serial, category: str) -> bool:
     """Click the first inventory item ConsumablesProvider tags as `category` (e.g. "food",
     "prayer"). Only resolves item screen coords while the Inventory tab is open, so switch
@@ -3145,6 +3260,8 @@ def load_routine(path: str):
 ROUTINE_FILES = {
     "SLAYER": "routines/slayer.py",
     "MINING": "routines/mining.py",
+    "WOODCUTTING": "routines/woodcutting.py",
+    "MOTHERLODE_MINE": "routines/motherlode_mine.py",
     "GEMSTONE_CRAB": "routines/gemstone_crab.py",
     "TORMENTED_DEMON": "routines/tormented_demon.py",
     "SHIPWRECK_SALVAGING": "routines/shipwreck_salvaging.py",

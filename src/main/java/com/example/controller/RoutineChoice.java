@@ -11,6 +11,8 @@ public enum RoutineChoice
 	NONE("None"),
 	SLAYER("Slayer / Combat"),
 	MINING("Mining"),
+	WOODCUTTING("Woodcutting"),
+	MOTHERLODE_MINE("Motherlode Mine"),
 	GEMSTONE_CRAB("Gemstone Crab"),
 	TORMENTED_DEMON("Tormented Demon"),
 	SHIPWRECK_SALVAGING("Shipwreck Salvaging"),
