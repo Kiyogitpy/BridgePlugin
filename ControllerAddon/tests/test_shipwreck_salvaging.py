@@ -558,3 +558,76 @@ def test_drop_items_never_simulates_a_misclick(monkeypatch):
     ss.drop_items(_Ctx(), lambda name: True)
     assert seen.get("simulate_mistakes") is False
     assert seen.get("check_ui_blockers") is False
+
+
+# --- derive_phase ------------------------------------------------------------------------
+
+def _cfg(**over):
+    cfg = dict(ss.DEFAULT_CONFIG)
+    cfg.update(over)
+    return cfg
+
+
+def _phase(**kw):
+    args = {"wreck_in_range": False, "hold_full": False, "inventory_salvage": 0,
+            "free_slots": 20, "hold_has_salvage": False}
+    cfg = kw.pop("config", _cfg())
+    args.update(kw)
+    return ss.derive_phase(cfg, **args)
+
+
+def test_a_wreck_in_range_means_hook():
+    assert _phase(wreck_in_range=True) == "hook"
+
+
+def test_nothing_in_range_and_nothing_to_sort_means_wait():
+    assert _phase() == "wait"
+
+
+def test_a_full_inventory_of_salvage_means_stow():
+    assert _phase(wreck_in_range=True, inventory_salvage=27, free_slots=1) == "stow"
+
+
+def test_a_full_hold_outranks_a_wreck_in_range():
+    """With the hold full there is nowhere for new salvage to go, so hooking would only fill
+    the inventory and stall. This is the user's explicit exception to the interrupt rule."""
+    assert _phase(wreck_in_range=True, hold_full=True, hold_has_salvage=True) == "sort"
+
+
+def test_a_wreck_rising_mid_sort_returns_to_the_hook():
+    """The user's interrupt rule: hooking out-earns sorting, so abandon the sort."""
+    assert _phase(wreck_in_range=True, hold_has_salvage=True, hold_full=False) == "hook"
+
+
+def test_an_idle_gap_with_salvage_in_the_hold_means_sort():
+    assert _phase(wreck_in_range=False, hold_has_salvage=True) == "sort"
+
+
+def test_an_idle_gap_with_salvage_in_the_inventory_means_sort():
+    assert _phase(wreck_in_range=False, inventory_salvage=5) == "sort"
+
+
+def test_sort_when_idle_off_leaves_an_idle_gap_as_wait():
+    assert _phase(config=_cfg(sortWhenIdle=False), hold_has_salvage=True) == "wait"
+
+
+def test_sort_when_idle_off_still_sorts_a_full_hold():
+    """A full hold is not an optimisation, it is a blockage -- sortWhenIdle must not gate it."""
+    assert _phase(config=_cfg(sortWhenIdle=False), hold_full=True,
+                  hold_has_salvage=True) == "sort"
+
+
+def test_an_unknown_hold_is_tried_once_rather_than_assumed_empty():
+    """hold_has_salvage None = never read this session. Assuming 'no' means a restart during a
+    respawn gap never sorts until the next stow; one read settles it."""
+    assert _phase(hold_has_salvage=None) == "sort"
+
+
+def test_stow_salvage_off_never_stows():
+    assert _phase(config=_cfg(stowSalvage=False), wreck_in_range=True,
+                  inventory_salvage=27, free_slots=1) == "hook"
+
+
+def test_stow_needs_actual_salvage_not_just_a_full_inventory():
+    """An inventory full of sorted output is a disposal problem, not a stow one."""
+    assert _phase(wreck_in_range=True, inventory_salvage=0, free_slots=0) == "hook"

@@ -231,6 +231,43 @@ def _holds_salvage(inventory) -> bool:
     return any((item.get("name") or "").lower().endswith("salvage") for item in inventory)
 
 
+def derive_phase(config, *, wreck_in_range, hold_full, inventory_salvage, free_slots,
+                 hold_has_salvage):
+    """Which phase this tick should run, derived ENTIRELY from live state.
+
+    Never from a stored phase: ctx.state.data is wiped on restart while the boat's real state
+    is not, so a remembered phase and the world desync exactly when it matters. Same rule
+    karambwan_fishing.derive_phase and corrupted_gauntlet.derive_phase follow.
+
+    hold_has_salvage is True / False / None, where None means "the hold has never been read
+    this session". Unknown is treated as "try once": assuming no would mean a restart during a
+    respawn gap never sorts until the next stow, and assuming yes forever would spin. One read
+    settles it and the answer is recorded.
+
+    Order matters:
+      1. A FULL HOLD outranks everything -- there is nowhere for new salvage to go, so hooking
+         would only fill the inventory and stall. This is the user's stated exception to the
+         interrupt rule, and it is deliberately NOT gated on sortWhenIdle: a full hold is a
+         blockage, not an optimisation.
+      2. An idle gap with something to sort, when sortWhenIdle is on.
+      3. Stowing a salvage-laden inventory.
+      4. Hooking.
+    Because 4 is below 2, a wreck rising mid-sort returns us to the hook -- hooking out-earns
+    sorting (the user's interrupt rule)."""
+    something_to_sort = bool(inventory_salvage) or hold_has_salvage is not False
+
+    if hold_full and something_to_sort:
+        return "sort"
+    if config.get("sortWhenIdle", True) and not wreck_in_range and something_to_sort:
+        return "sort"
+    if (config.get("stowSalvage", True) and inventory_salvage
+            and free_slots <= config.get("dropAtFreeSlots", 1)):
+        return "stow"
+    if wreck_in_range:
+        return "hook"
+    return "wait"
+
+
 def tick(ctx):
     config = ctx.state.config
     data = ctx.state.data
