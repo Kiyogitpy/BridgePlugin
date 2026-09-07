@@ -167,6 +167,25 @@ HELM_ANIMATIONS = frozenset({
     13362, 13363, 13364, 13365, 13366,   # HUMAN_SAILING_HELM_3X8_*
 })
 
+# The on-boat salvaging station (cache locs; port stations are 60462/60463 and behave the same).
+SALVAGING_STATION_IDS = frozenset({59699, 59700, 59701})
+SALVAGING_STATION_NAME = "salvaging station"
+SORT_ACTION = "Sort-salvage"
+
+# The Sort-salvage channel's own animations, DELIBERATELY SEPARATE from
+# SALVAGE_CHANNEL_ANIMATIONS -- merging them would make the hook's idle-reclick logic read
+# sorting as hooking and never redeploy. 13599 CONFIRMED live 2026-09-07 on a 3x8 boat, despite
+# runelite-api naming it ..._KANDARIN_1X3_INTERACT01; 13593 is LARGE01_INTERACT01. RuneLite's
+# own IdleNotifier labels both "Sort-salvage".
+SORT_ANIMATIONS = frozenset({13599, 13593})
+
+# MEASURED live 2026-09-07: 12 salvage sorted in 19.7s, a steady 3 game ticks each. Matches the
+# wiki's "close to 1800 salvages per hour" for the port station. The channel ENDS ITSELF when
+# the inventory runs out, so this is a budget, not a stop signal.
+SORT_SECONDS_PER_SALVAGE = 1.79
+SORT_BUDGET_SLACK_S = 6.0
+SORT_POLL_S = 0.4
+
 FAR_WRECK_GIVEUP_COOLDOWN_S = 60.0  # CONFIRMED live 2026-08-05 (user report): "we just sail around
                                       # in circles even though we have multiple wreck pairs around
                                       # us" -- sail_to_pair failing already means sail_to exhausted
@@ -311,6 +330,67 @@ def stow_phase(ctx) -> bool:
                                   f"(hold {used}/{capacity}) -- treating the hold as full")
     cargo_hold.close_hold(ctx)
     return deposited
+
+
+def _inventory_salvage_count():
+    return sum(1 for i in controller.get_inventory()
+               if (i.get("name") or "").lower().endswith("salvage"))
+
+
+def _await_sort_done(ctx, count) -> bool:
+    """Poll until no salvage is left in the inventory. The channel ends itself, so the budget
+    only bounds a channel that never started (a hijacked click, a station out of reach)."""
+    deadline = time.time() + count * SORT_SECONDS_PER_SALVAGE + SORT_BUDGET_SLACK_S
+    while time.time() < deadline:
+        controller.human_delay(SORT_POLL_S, SORT_POLL_S + 0.2)
+        controller.dismiss_continue_box(ctx.ser)
+        if _inventory_salvage_count() == 0:
+            return True
+    debug_log.log("salvage", f"sorting {count} salvage did not finish inside its budget")
+    return False
+
+
+def sort_phase(ctx) -> bool:
+    """Sort the hold's salvage at our own boat's salvaging station, keeping only what the
+    keep-list selects.
+
+    Step 0 -- disposal -- runs FIRST and unconditionally. Without it the loop deadlocks in a
+    real, reachable state: enter sort holding an inventory full of the PREVIOUS batch's sorted
+    output, find no salvage to sort, and try to withdraw into an inventory with no free slots.
+    Disposal is idempotent, so running it every pass costs nothing when there is nothing to
+    drop."""
+    config = ctx.state.config
+    data = ctx.state.data
+    keep = config.get("keepItems", [])
+
+    drop_items(ctx, lambda name: not keep_item(name, keep))
+
+    if _inventory_salvage_count() == 0:
+        if not cargo_hold.open_hold(ctx):
+            return False
+        withdrew = cargo_hold.withdraw_salvage(ctx)
+        used, capacity = cargo_hold.read_usage()
+        _record_hold(data, used, capacity, bool(cargo_hold.salvage_rows()), config)
+        cargo_hold.close_hold(ctx)
+        if not withdrew:
+            debug_log.log("salvage", "no salvage left in the hold -- nothing to sort")
+            data["hold_has_salvage"] = False
+            return False
+
+    count = _inventory_salvage_count()
+    if count == 0:
+        return False
+
+    station = sailing.find_facility(SALVAGING_STATION_NAME, action=SORT_ACTION)
+    if station is None:
+        debug_log.log("salvage", "no salvaging station on our own boat")
+        return False
+
+    debug_log.log("salvage", f"sorting {count} salvage (~{count * SORT_SECONDS_PER_SALVAGE:.0f}s)")
+    controller.click_entity(ctx.ser, station, offset=(0, 0), simulate_mistakes=False)
+    finished = _await_sort_done(ctx, count)
+    drop_items(ctx, lambda name: not keep_item(name, keep))
+    return finished
 
 
 def tick(ctx):

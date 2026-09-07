@@ -721,3 +721,95 @@ def test_stow_salvage_off_drops_instead(monkeypatch):
     ctx.state.config = _cfg(stowSalvage=False)
     assert ss.stow_phase(ctx) is True
     assert called == [True]
+
+
+# --- sort_phase --------------------------------------------------------------------------
+
+def test_sort_animations_are_separate_from_the_hook_channel():
+    """Merging them would make the hook's idle-reclick logic treat sorting as hooking."""
+    assert 13599 in ss.SORT_ANIMATIONS and 13593 in ss.SORT_ANIMATIONS
+    assert not (ss.SORT_ANIMATIONS & ss.SALVAGE_CHANNEL_ANIMATIONS)
+
+
+def test_sort_rate_is_the_measured_one():
+    assert ss.SORT_SECONDS_PER_SALVAGE == 1.79
+
+
+def _station_obj():
+    return {"id": 59701, "name": "Salvaging station", "x": 1, "y": 1, "plane": 0,
+            "visible": True, "screenX": 9, "screenY": 9,
+            "actions": ["Sort-salvage", "Modify"], "boatViewId": 1036}
+
+
+def test_sort_disposes_before_withdrawing(monkeypatch):
+    """The deadlock: enter sort holding a full inventory of the PREVIOUS batch's output, find
+    no salvage to sort, and try to withdraw into an inventory with no free slots."""
+    order = []
+    _install_hold(monkeypatch, _FakeHold())
+    monkeypatch.setattr(ss.cargo_hold, "withdraw_salvage",
+                        lambda ctx: order.append("withdraw") or True)
+    monkeypatch.setattr(ss, "drop_items",
+                        lambda ctx, pred: order.append("dispose") or 1)
+    monkeypatch.setattr(sailing, "find_facility", lambda *a, **k: _station_obj())
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    ss.sort_phase(_Ctx())
+    assert order[0] == "dispose"
+    assert "withdraw" in order
+
+
+def test_sort_clicks_our_own_stations_sort_salvage(monkeypatch):
+    _install_hold(monkeypatch, _FakeHold())
+    monkeypatch.setattr(ss.cargo_hold, "withdraw_salvage", lambda ctx: True)
+    monkeypatch.setattr(ss, "drop_items", lambda ctx, pred: 0)
+    seen = {}
+    monkeypatch.setattr(sailing, "find_facility",
+                        lambda name, **kw: seen.update({"name": name, **kw}) or _station_obj())
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Plundered salvage", "screenX": 1, "screenY": 1}])
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: clicked.append(e.get("id")) or True)
+    monkeypatch.setattr(ss, "_await_sort_done", lambda ctx, count: True)
+    assert ss.sort_phase(_Ctx()) is True
+    assert seen["action"] == "Sort-salvage"
+    assert clicked == [59701]
+
+
+def test_sort_stops_when_no_salvage_is_anywhere(monkeypatch):
+    _install_hold(monkeypatch, _FakeHold(rows=()))
+    monkeypatch.setattr(ss.cargo_hold, "withdraw_salvage", lambda ctx: False)
+    monkeypatch.setattr(ss, "drop_items", lambda ctx, pred: 0)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    ctx = _Ctx()
+    assert ss.sort_phase(ctx) is False
+    assert ctx.state.data["hold_has_salvage"] is False
+
+
+def test_sort_disposal_respects_the_keep_list(monkeypatch):
+    _install_hold(monkeypatch, _FakeHold())
+    monkeypatch.setattr(ss.cargo_hold, "withdraw_salvage", lambda ctx: True)
+    monkeypatch.setattr(sailing, "find_facility", lambda *a, **k: _station_obj())
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(ss, "_await_sort_done", lambda ctx, count: True)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Plundered salvage", "screenX": 1, "screenY": 1}])
+    predicates = []
+    monkeypatch.setattr(ss, "drop_items",
+                        lambda ctx, pred: predicates.append(pred) or 0)
+    ss.sort_phase(_Ctx())
+    pred = predicates[0]
+    assert pred("Gold ring") is True          # not on the default keep-list
+    assert pred("Rune scimitar") is False     # on it
+    assert pred("Chisel") is False            # hard-keep
+    assert pred("Plundered salvage") is False # never dropped by disposal
+
+
+def test_sort_reports_a_missing_station(monkeypatch):
+    _install_hold(monkeypatch, _FakeHold())
+    monkeypatch.setattr(ss.cargo_hold, "withdraw_salvage", lambda ctx: True)
+    monkeypatch.setattr(ss, "drop_items", lambda ctx, pred: 0)
+    monkeypatch.setattr(sailing, "find_facility", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Plundered salvage", "screenX": 1, "screenY": 1}])
+    assert ss.sort_phase(_Ctx()) is False
