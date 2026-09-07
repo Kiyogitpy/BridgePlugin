@@ -193,6 +193,11 @@ Per-hour output at roughly 279 sorts, with unit values derived from the guide's 
 
 Live confirmation, partial: a 12-salvage sort produced `Rune scimitar` and `Rune cannonball`.
 
+**The table is not exhaustive.** `Sailors' amulet (inert)` (obj `32398`) is a sorting drop the
+money-making guide omits entirely -- the user named it from their own play -- which is direct
+evidence for checklist item 7b: the guide's table cannot be trusted as the complete output list,
+so the first run must log every dropped name.
+
 These values are the guide's alch/GE mix, since it alchs most of the list. **v1 does not alch** --
 the keep-list decides keep-or-drop and nothing else.
 
@@ -212,10 +217,9 @@ entirely, which per CLAUDE.md's routine contract means nothing Java-side is requ
 "sortWhenIdle": True,     # sort while no wreck is in range
 "holdFullSlots": 4,       # treat the hold as full this many slots short of capacity
 "keepItems": [            # case-insensitive SUBSTRING keep-list for sorted output
+    "amulet (inert)",     # Sailors' amulet (inert), obj 32398 -- see the apostrophe note below
     "facility bottle",    # ~34.6k each, the single most valuable drop
-    "casket",             # opens into gems; a gem bag makes these cheap to carry
     "mahogany repair kit",
-    "oyster pearls",
     "diamond",            # Diamond ring + Diamond bracelet, ~2.1-2.3k each
     "ruby",               # Ruby bracelet ~1.4k
     "dragon cannonball",
@@ -224,10 +228,18 @@ entirely, which per CLAUDE.md's routine contract means nothing Java-side is requ
 ],
 ```
 
-Everything not listed -- gold/sapphire/emerald rings, emerald bracelets, mithril scimitars,
-mithril and adamant cannonballs -- is dropped. Those are the alch-fodder rows of the money-making
-guide's table, and v1 does not alch. If the user later wants them banked instead, the change is
-one line in this list, which is precisely why it is a config list rather than code.
+**`"amulet (inert)"` is deliberately not `"sailors' amulet"`.** The cache gives obj **32398**
+`sailors_amulet_empty` the display name `Sailors' amulet (inert)` (untradeable; the charged
+`32399 Sailors' amulet` is the teleport version -- Pandemonium / Port Roberts / Red Rock). An
+apostrophe is exactly the character likely to differ between the cache dump and what RuneLite
+hands back at runtime, and under a substring keep-list a near-miss fails **silently, in the drop
+direction**. `"amulet (inert)"` carries the same discriminating power with no apostrophe in it.
+
+Everything not listed is dropped -- gold/sapphire/emerald rings, emerald bracelets, mithril
+scimitars, mithril and adamant cannonballs (the alch-fodder rows, and v1 does not alch), plus
+**caskets and oyster pearls by explicit user decision**: both need follow-up work to realise their
+value (opening, and chiselling into pearl bolt tips) that this routine does not do. Changing any
+of this is one line in this list, which is precisely why it is config rather than code.
 
 `keepItems` follows `banker.py`'s `keepItems` convention (case-insensitive substring), with that
 convention's known trap recorded in the config comment: `"ring"` matches `Gold ring` **and**
