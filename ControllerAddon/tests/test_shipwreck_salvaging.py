@@ -1012,14 +1012,56 @@ def test_deploy_hook_returns_the_hook_it_clicked(monkeypatch):
     assert used is not None and used["id"] == 60506
 
 
-def test_deploy_hook_returns_none_when_every_hook_is_skipped(monkeypatch):
-    """The caller must be able to tell 'all set aside' from 'none exist' -- it clears the skip
-    list on this answer rather than deadlocking."""
+def test_deploy_hook_returns_all_skipped_when_every_hook_is_skipped(monkeypatch):
+    """The caller must be able to tell 'all set aside' (ALL_SKIPPED) from 'a click missed'
+    (None) -- it clears the skip list on the former, and must NOT on the latter (see the
+    regression guard test below)."""
     monkeypatch.setattr(controller, "get_player",
                         lambda: dict(_boat_player(2680, 2546), boatViewId=1036))
     monkeypatch.setattr(controller, "get_objects", lambda **kw: [_hook(60506, 2681, 2546)])
-    assert sailing.deploy_hook(_Ctx(), "salvaging hook",
-                               skip={(2681, 2546, 0)}) is None
+    result = sailing.deploy_hook(_Ctx(), "salvaging hook", skip={(2681, 2546, 0)})
+    assert result is sailing.ALL_SKIPPED
+    assert not result, "must stay falsy so an existing plain truthiness check is unaffected"
+
+
+def test_deploy_hook_returns_none_not_all_skipped_when_a_click_misses(monkeypatch):
+    """A hook WAS available (nothing to skip) but click_entity itself came back falsy -- an
+    incidental miss (off-screen aim, a withheld click). This must be None, not ALL_SKIPPED, or
+    the caller would wrongly clear its whole skip list over a single missed click."""
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: dict(_boat_player(2680, 2546), boatViewId=1036))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_hook(60506, 2681, 2546)])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: False)
+    result = sailing.deploy_hook(_Ctx(), "salvaging hook")
+    assert result is None
+    assert result is not sailing.ALL_SKIPPED
+
+
+def test_deploy_hook_returns_none_when_nothing_matches(monkeypatch):
+    """No hook at all (nothing skipped, nothing found) is also None, not ALL_SKIPPED."""
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: dict(_boat_player(2680, 2546), boatViewId=1036))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])
+    result = sailing.deploy_hook(_Ctx(), "salvaging hook")
+    assert result is None
+    assert result is not sailing.ALL_SKIPPED
+
+
+def test_a_missed_click_does_not_wipe_the_skip_list(monkeypatch):
+    """Regression guard for the Task 9 review finding: deploy_hook returning None for an
+    incidental click miss must leave hook_skip alone -- clearing it here would discard the
+    cooldown just placed on the crewmate's hook over nothing more than a missed click, defeating
+    the whole rotation."""
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player(3000, 3000))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [_wreck(3000, 3000)])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_combat", lambda: {"animation": -1})
+    monkeypatch.setattr(sailing, "deploy_hook", lambda ctx, name, skip=(): None)
+    ctx = _Ctx()
+    ctx.state.config = _cfg(massWorld=True, sortWhenIdle=False)
+    ctx.state.data["hook_skip"] = {(9001, 9000, 0): 4102444800.0}  # far future (year 2100)
+    ss.tick(ctx)
+    assert (9001, 9000, 0) in ctx.state.data["hook_skip"]
 
 
 def test_hook_skip_expires(monkeypatch):

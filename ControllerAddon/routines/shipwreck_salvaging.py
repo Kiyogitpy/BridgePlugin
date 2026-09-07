@@ -561,9 +561,11 @@ def tick(ctx):
                 data.pop("hook_engage_attempt_at", None)
             skip = _hook_skip(data, now)
             used = sailing.deploy_hook(ctx, config.get("hookName", ""), skip=skip)
-            if used is None and skip:
+            if used is sailing.ALL_SKIPPED:
                 # Every hook is set aside. Clear rather than deadlock -- a stale skip is worse
-                # than re-trying a hook that may since have freed up.
+                # than re-trying a hook that may since have freed up. Deliberately NOT triggered
+                # by a plain click failure: that would discard the cooldown on the crewmate's
+                # hook for an incidental miss, defeating the rotation.
                 debug_log.log("salvage", "every hook is set aside -- clearing and retrying")
                 data.pop("hook_skip", None)
             elif used is not None:

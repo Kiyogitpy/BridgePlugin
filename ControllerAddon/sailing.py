@@ -36,6 +36,25 @@ import controller
 import debug_log
 import ocean_path
 
+
+class _AllSkipped:
+    """Falsy sentinel: every candidate facility was on the caller's skip list.
+
+    Distinct from None ("none found, or the click failed") because the caller acts on the two
+    differently -- it clears its skip list on this answer, and must NOT clear it merely because
+    a single click missed. Same falsy-sentinel idiom as controller.CLICK_WITHHELD."""
+
+    __slots__ = ()
+
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return "ALL_SKIPPED"
+
+
+ALL_SKIPPED = _AllSkipped()
+
 HELM_NAME = "helm"  # CONFIRMED live 2026-08-01 -- see module header
 SAILING_OPTIONS_TAB_KEY = "q"  # TODO verify -- see module header
 
@@ -479,21 +498,36 @@ def deploy_hook(ctx, hook_name: str, skip=()):
     corner), so no extra offset is needed here -- same reasoning as stop_boat's own sail-toggle
     click, which already used offset=(0, 0) for the same reason.
 
-    Returns the hook dict it clicked, or None -- still falsy on failure, so existing truthiness
-    checks keep working. `skip` is a set of (x, y, plane) keys to pass over: the caller sets a
-    hook aside after it repeatedly fails to engage, so the boat's OTHER hook gets tried. That is
-    how the crewmate's hook is avoided, since nothing can see which one they are on (see
-    find_facilities). A skip set that covers every hook returns None rather than falling back to
-    a skipped one -- the caller clears its list on that answer instead of deadlocking.
+    `skip` is a set of (x, y, plane) keys to pass over: the caller sets a hook aside after it
+    repeatedly fails to engage, so the boat's OTHER hook gets tried. That is how the crewmate's
+    hook is avoided, since nothing can see which one they are on (see find_facilities).
+
+    Three possible returns, and a caller that reacts to failure MUST tell them apart rather than
+    treating every falsy answer the same way:
+    - the hook dict it clicked, on success;
+    - ALL_SKIPPED (falsy) when every matching hook was on `skip` -- nothing was even attempted,
+      so a caller clearing its skip list on this answer is safe;
+    - None (falsy) when nothing matched at all, OR a non-skipped hook was found but the click
+      itself came back falsy (an incidental miss -- off-screen aim, a withheld click). Treating
+      this the same as ALL_SKIPPED would discard the caller's whole skip list -- including the
+      cooldown just placed on the crewmate's hook -- over a single missed click, defeating the
+      rotation this exists for.
+    Every one of the three is falsy, so an existing plain `if deploy_hook(...)` truthiness check
+    is unaffected either way.
     """
+    skipped_any = False
     for hook in find_facilities(hook_name, action="Deploy"):
         if (hook.get("x"), hook.get("y"), hook.get("plane")) in skip:
+            skipped_any = True
             continue
         debug_log.log("sailing", f"deploying {hook.get('name')}")
         if controller.click_entity(ctx.ser, hook, **_FIXTURE_CLICK_KWARGS):
             return hook
         return None
 
+    if skipped_any:
+        debug_log.log("sailing", f"every {hook_name} is on the skip list")
+        return ALL_SKIPPED
     debug_log.log("sailing", f"{hook_name} not found nearby")
     return None
 
