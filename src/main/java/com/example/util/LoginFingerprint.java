@@ -146,15 +146,30 @@ public final class LoginFingerprint
 			f.put("processCommand", null);
 			f.put("parentProcessCommand", null);
 		}
-		f.put("javaAgent", javaAgentName(ManagementFactory.getRuntimeMXBean().getInputArguments()));
-		f.put("osName", lower(System.getProperty("os.name")));
-		f.put("osVersion", lower(System.getProperty("os.version")));
-		f.put("osArch", lower(System.getProperty("os.arch")));
-		f.put("javaVendor", System.getProperty("java.vendor"));
-		f.put("javaVersion", System.getProperty("java.version"));
-		f.put("maxMemoryMb", (int) (Runtime.getRuntime().maxMemory() / 1048576L) + 1);
-		f.put("availableProcessors", Runtime.getRuntime().availableProcessors());
-		f.put("smbiosUuid", readSmbiosUuid());
+		try
+		{
+			f.put("javaAgent", javaAgentName(ManagementFactory.getRuntimeMXBean().getInputArguments()));
+			f.put("osName", lower(System.getProperty("os.name")));
+			f.put("osVersion", lower(System.getProperty("os.version")));
+			f.put("osArch", lower(System.getProperty("os.arch")));
+			f.put("javaVendor", System.getProperty("java.vendor"));
+			f.put("javaVersion", System.getProperty("java.version"));
+			f.put("maxMemoryMb", (int) (Runtime.getRuntime().maxMemory() / 1048576L) + 1);
+			f.put("availableProcessors", Runtime.getRuntime().availableProcessors());
+			f.put("smbiosUuid", readSmbiosUuid());
+		}
+		catch (Exception e)
+		{
+			f.put("javaAgent", null);
+			f.put("osName", null);
+			f.put("osVersion", null);
+			f.put("osArch", null);
+			f.put("javaVendor", null);
+			f.put("javaVersion", null);
+			f.put("maxMemoryMb", null);
+			f.put("availableProcessors", null);
+			f.put("smbiosUuid", PLACEHOLDER_UUID);
+		}
 		return f;
 	}
 }

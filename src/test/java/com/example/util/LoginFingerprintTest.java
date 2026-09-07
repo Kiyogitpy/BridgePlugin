@@ -2,11 +2,15 @@ package com.example.util;
 
 import org.junit.Test;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
 public class LoginFingerprintTest
 {
@@ -53,5 +57,40 @@ public class LoginFingerprintTest
 		assertEquals(LoginFingerprint.PLACEHOLDER_UUID, LoginFingerprint.uuidFromWmic(""));
 		assertEquals(LoginFingerprint.PLACEHOLDER_UUID, LoginFingerprint.uuidFromWmic("UUID\n\n"));
 		assertEquals(LoginFingerprint.PLACEHOLDER_UUID, LoginFingerprint.uuidFromWmic(null));
+	}
+
+	@Test
+	public void collectReturnsMapWithExactKeySetInOrder()
+	{
+		// Verify collect() returns a map with exactly 11 keys in the expected order, and
+		// that numeric fields are positive integers. This pins the contract of collect()
+		// without exercising wmic or other system-dependent paths.
+		Map<String, Object> result = LoginFingerprint.collect();
+
+		List<String> expectedKeys = Arrays.asList(
+			"processCommand",
+			"parentProcessCommand",
+			"javaAgent",
+			"osName",
+			"osVersion",
+			"osArch",
+			"javaVendor",
+			"javaVersion",
+			"maxMemoryMb",
+			"availableProcessors",
+			"smbiosUuid"
+		);
+
+		assertEquals("collect() must return exactly 11 keys", 11, result.size());
+		assertEquals("collect() keys must be in expected order", expectedKeys, new ArrayList<>(result.keySet()));
+
+		// Verify numeric fields are positive integers
+		Object maxMemoryMb = result.get("maxMemoryMb");
+		assertTrue("maxMemoryMb must be an integer", maxMemoryMb instanceof Integer);
+		assertTrue("maxMemoryMb must be positive", (Integer) maxMemoryMb > 0);
+
+		Object availableProcessors = result.get("availableProcessors");
+		assertTrue("availableProcessors must be an integer", availableProcessors instanceof Integer);
+		assertTrue("availableProcessors must be positive", (Integer) availableProcessors > 0);
 	}
 }
