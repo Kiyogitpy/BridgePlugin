@@ -44,6 +44,33 @@ DEFAULT_CONFIG = {
     "dropAtFreeSlots": 1,    # drop salvage once this many inventory slots are left (0 = only when
                              # completely full, the pre-2026-09-03 behaviour -- see tick())
 
+    # --- mass-world salvaging + on-boat sorting (2026-09-07) ---------------------------------
+    # See docs/superpowers/specs/2026-09-07-shipwreck-salvaging-mass-world-and-sorting-design.md
+    "massWorld": True,        # never sail: an area's wrecks share a spawn pool and one rises as
+                              # another sinks (wiki, Shipwreck salvaging rev 15290733), so on a
+                              # busy world waiting beats sailing. Disables the far-wreck branch
+                              # AND the won't-engage reposition.
+    "stowSalvage": True,      # deposit salvage into the boat's cargo hold instead of dropping
+                              # it on the deck. False restores the pre-2026-09-07 behaviour.
+    "sortWhenIdle": True,     # spend a respawn gap sorting rather than idling
+    "holdFullSlots": 4,       # treat the hold as full this many slots short of its capacity
+    "keepItems": [            # case-insensitive SUBSTRING keep-list applied to SORTED output.
+                              # Trap inherited from banker.py's same convention: "ring" would
+                              # match Gold/Sapphire/Ruby ring alike, and "rune" would match every
+                              # runite item -- hence the spelled-out entries below.
+        "amulet (inert)",     # Sailors' amulet (inert), cache obj 32398. Keyed WITHOUT the
+                              # apostrophe on purpose: that character is the one most likely to
+                              # differ between the cache dump and the runtime item name, and a
+                              # near-miss here fails silently IN THE DROP DIRECTION.
+        "facility bottle",    # ~34.6k each, the most valuable single drop
+        "mahogany repair kit",
+        "diamond",            # Diamond ring + Diamond bracelet, ~2.1-2.3k each
+        "ruby",               # Ruby bracelet ~1.4k
+        "dragon cannonball",
+        "rune scimitar",
+        "rune cannonball",
+    ],
+
     "breaks": {
         "enabled": True,
         "everyMinMinutes": 45,
@@ -177,6 +204,27 @@ def _active_giveup(data: dict, key_name: str, until_name: str, now: float) -> fr
     if key and now < data.get(until_name, 0):
         return frozenset({key})
     return frozenset()
+
+
+# Items the keep-list can NEVER drop, whatever the config says. keepItems is a list a human
+# edits between sessions, and a typo there must not be able to throw away the chisel or the rune
+# pouch -- same non-negotiable-floor reasoning banker.py applies to bank UI buttons and
+# sailing._FIXTURE_CLICK_KWARGS applies to deck clicks. Lowercase substrings.
+HARD_KEEP = frozenset({
+    "chisel", "rune pouch", "coins", "gem bag", "plank sack", "log basket",
+    "salvage",   # unsorted salvage is the WORK -- it gets stowed or sorted, never dropped here
+})
+
+
+def keep_item(name: str, keep_items) -> bool:
+    """Whether an inventory item survives post-sort disposal.
+
+    Case-insensitive substring match against HARD_KEEP first (non-negotiable), then the
+    configured keep-list. Everything else is dropped."""
+    lowered = (name or "").lower()
+    if any(needle in lowered for needle in HARD_KEEP):
+        return True
+    return any((needle or "").lower() in lowered for needle in (keep_items or []))
 
 
 def _holds_salvage(inventory) -> bool:
@@ -402,8 +450,11 @@ def _approach_point_from_here(wreck: dict, player: dict = None):
     return _approach_point_clear_of_wreck(origin_x, origin_y, wreck, player)
 
 
-def drop_salvage(ctx):
-    """Drop every inventory item whose name ends in "salvage" (covers all 8 tiers -- Small,
+def drop_items(ctx, predicate):
+    """Drop every inventory item `predicate(name)` selects. `predicate` takes the item's name
+    as the game reports it (NOT lowercased -- lowercase inside your predicate if you need to).
+
+    Drop every inventory item whose name ends in "salvage" (covers all 8 tiers -- Small,
     Fishy, Barracuda, Large, Plundered, Martial, Fremennik, Opulent -- without needing a config
     list). Left-click-to-drop needs "Drop" in Controller Settings -> Clicking -> Forced Actions,
     same convention as the looting bag's "Empty" elsewhere in this codebase.
@@ -447,15 +498,25 @@ def drop_salvage(ctx):
             controller.key_tap(ctx.ser, controller.INVENTORY_TAB_KEY)
             controller.human_delay(0.2, 0.35)
     controller.open_inventory_tab(ctx.ser)
+    dropped = 0
     for item in controller.get_inventory():
-        name = (item.get("name") or "").lower()
-        if name.endswith("salvage"):
+        name = item.get("name") or ""
+        if predicate(name):
             # simulate_mistakes=False (2026-09-03): with Drop as the forced left-click, a
-            # simulated near-miss lands on the NEIGHBOURING slot -- fine when that is more salvage,
-            # but it drops whatever tool happens to sit there (chisel, rune pouch, ...) when it is
-            # not. Same reasoning as banker.py's no-misclick rule for bank UI buttons.
-            controller.click_entity(ctx.ser, item, check_ui_blockers=False, simulate_mistakes=False)
-            controller.human_delay(0.06, 0.12)  # 40% faster still, on top of the earlier 2x (original 0.2-0.4s)
+            # simulated near-miss lands on the NEIGHBOURING slot -- fine when that is more
+            # salvage, but it drops whatever tool happens to sit there (chisel, rune pouch, ...)
+            # when it is not. Same reasoning as banker.py's no-misclick rule for bank UI buttons.
+            controller.click_entity(ctx.ser, item, check_ui_blockers=False,
+                                    simulate_mistakes=False)
+            dropped += 1
+            controller.human_delay(0.06, 0.12)
+    return dropped
+
+
+def drop_salvage(ctx):
+    """Drop every inventory item whose name ends in "salvage" -- the pre-2026-09-07 behaviour,
+    still used when stowSalvage is off."""
+    return drop_items(ctx, lambda name: name.lower().endswith("salvage"))
 
 
 # Sinking swaps a wreck's object out entirely for a "stump" variant that keeps the exact same

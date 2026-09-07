@@ -478,3 +478,83 @@ def test_find_facility_ignores_invisible_objects(monkeypatch):
     hidden = dict(_station(1036), visible=False)
     monkeypatch.setattr(controller, "get_objects", lambda **kw: [hidden])
     assert sailing.find_facility("salvaging station") is None
+
+
+# --- keep-list ---------------------------------------------------------------------------
+
+def test_hard_keep_survives_an_empty_keep_list():
+    """keepItems is a list a human edits between sessions; a typo must never be able to drop
+    the tools."""
+    for tool in ["Chisel", "Rune pouch", "Coins", "Gem bag", "Plank sack", "Log basket"]:
+        assert ss.keep_item(tool, []) is True
+
+
+def test_hard_keep_cannot_be_overridden_by_an_empty_config():
+    assert ss.keep_item("Chisel", []) is True
+    assert ss.keep_item("Gold ring", []) is False
+
+
+def test_salvage_is_always_kept():
+    """Unsorted salvage is the routine's WORK -- it gets stowed or sorted, never dropped by the
+    post-sort disposal."""
+    assert ss.keep_item("Plundered salvage", []) is True
+    assert ss.keep_item("Small salvage", []) is True
+
+
+def test_keep_list_matches_case_insensitive_substrings():
+    assert ss.keep_item("Diamond bracelet", ["diamond"]) is True
+    assert ss.keep_item("Diamond ring", ["diamond"]) is True
+    assert ss.keep_item("Ruby bracelet", ["RUBY"]) is True
+    assert ss.keep_item("Emerald ring", ["diamond", "ruby"]) is False
+
+
+def test_the_inert_amulet_is_matched_without_relying_on_the_apostrophe():
+    """Cache obj 32398 is named "Sailors' amulet (inert)". The default list keys on
+    "amulet (inert)" precisely so a differing apostrophe cannot silently drop it."""
+    assert "amulet (inert)" in ss.DEFAULT_CONFIG["keepItems"]
+    assert ss.keep_item("Sailors' amulet (inert)", ss.DEFAULT_CONFIG["keepItems"]) is True
+    assert ss.keep_item("Sailors' amulet (inert)", ss.DEFAULT_CONFIG["keepItems"]) is True
+
+
+def test_the_default_keep_list_drops_what_the_user_asked_to_toss():
+    keep = ss.DEFAULT_CONFIG["keepItems"]
+    for tossed in ["Casket", "Oyster pearls", "Gold ring", "Sapphire ring",
+                   "Emerald bracelet", "Mithril scimitar", "Mithril cannonball",
+                   "Adamant cannonball"]:
+        assert ss.keep_item(tossed, keep) is False, tossed
+
+
+def test_the_default_keep_list_keeps_what_the_user_asked_to_keep():
+    keep = ss.DEFAULT_CONFIG["keepItems"]
+    for kept in ["Facility bottle (empty)", "Mahogany repair kit", "Diamond ring",
+                 "Diamond bracelet", "Ruby bracelet", "Dragon cannonball",
+                 "Rune scimitar", "Rune cannonball", "Sailors' amulet (inert)"]:
+        assert ss.keep_item(kept, keep) is True, kept
+
+
+# --- drop_items --------------------------------------------------------------------------
+
+def test_drop_items_drops_only_what_the_predicate_selects(monkeypatch):
+    inv = [{"name": "Gold ring", "screenX": 1, "screenY": 1},
+           {"name": "Chisel", "screenX": 2, "screenY": 2},
+           {"name": "Rune scimitar", "screenX": 3, "screenY": 3}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, item, **kw: clicked.append(item["name"]) or True)
+    ctx = _Ctx()
+    dropped = ss.drop_items(ctx, lambda name: name == "Gold ring")
+    assert clicked == ["Gold ring"]
+    assert dropped == 1
+
+
+def test_drop_items_never_simulates_a_misclick(monkeypatch):
+    """A simulated near-miss lands on the NEIGHBOURING slot -- which is a tool."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Gold ring", "screenX": 1, "screenY": 1}])
+    seen = {}
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, item, **kw: seen.update(kw) or True)
+    ss.drop_items(_Ctx(), lambda name: True)
+    assert seen.get("simulate_mistakes") is False
+    assert seen.get("check_ui_blockers") is False
