@@ -143,24 +143,29 @@ def test_tick_stows_before_the_inventory_is_completely_full(monkeypatch):
 
 
 def test_tick_still_drops_before_the_inventory_is_completely_full_when_stow_salvage_is_off(monkeypatch):
-    """Companion to the test above: stowSalvage=False must still reach drop_salvage in the end,
-    which is the pre-2026-09-07 behaviour and is what stow_phase's own documented fallback does
-    (see test_stow_salvage_off_drops_instead). derive_phase's own "stow" bullet requires
-    stowSalvage=True to fire at all (test_stow_salvage_off_never_stows pins this -- with stowing
-    configured off a full inventory near a wreck just keeps hooking, and with no wreck it is
-    "wait"), so there is no live combination of tick()'s inputs that reaches "stow" when
-    stowSalvage is off. This test forces the dispatch (as derive_phase.stub) to prove tick()'s
-    "stow" branch composes correctly with stow_phase's real fallback -- i.e. that tick() calls
-    the REAL stow_phase rather than shortcutting around it, and stow_phase (unmocked here) then
-    genuinely reaches drop_salvage because config says not to stow."""
+    """Regression guard for a real bug the reviewer found and ruled on, 2026-09-07:
+    derive_phase used to gate its "stow" clause on stowSalvage too -- a DOUBLE gate, since
+    stow_phase already branches on stowSalvage on its own (falling back to drop_salvage). Because
+    tick() only ever reaches stow_phase (and so only ever reaches drop_salvage) from the
+    phase == "stow" branch, that double gate meant a nearly-full salvage inventory was NEVER
+    disposed of at all with stowSalvage=False -- contradicting the spec's own "stowSalvage:
+    False restores today's behaviour exactly: drop_salvage on the deck."
+
+    Exercises the REAL path end to end, with no derive_phase stub (the previous version of this
+    test had to force the dispatch with a stub, which was itself the tell that something was
+    wrong -- see git history). sortWhenIdle is off so derive_phase's higher-ranked idle-sort
+    clause doesn't pre-empt the stow clause this test is checking (same reasoning as
+    test_tick_stows_before_the_inventory_is_completely_full); with stowSalvage off, the real
+    (unmocked) derive_phase now still returns "stow" (see
+    test_stow_salvage_off_still_reaches_the_stow_phase), and the real (unmocked) stow_phase then
+    falls back to drop_salvage."""
     ctx = _Ctx()
-    ctx.state.config = _cfg(stowSalvage=False)
-    monkeypatch.setattr(ss, "derive_phase", lambda *a, **k: "stow")
+    ctx.state.config = _cfg(sortWhenIdle=False, stowSalvage=False)
     monkeypatch.setattr(controller, "get_inventory", lambda: _inventory(controller.INVENTORY_SIZE - 1))
     calls = []
     monkeypatch.setattr(ss, "drop_salvage", lambda c: calls.append(True))
     ss.tick(ctx)
-    assert calls, "stow_phase must still fall back to dropping when stowSalvage is off"
+    assert calls, "tick() must still reach drop_salvage (via the real stow_phase) when stowSalvage is off"
 
 
 def test_tick_does_not_drop_or_stow_with_plenty_of_room(monkeypatch):
@@ -677,9 +682,18 @@ def test_an_unknown_hold_is_tried_once_rather_than_assumed_empty():
     assert _phase(hold_has_salvage=None) == "sort"
 
 
-def test_stow_salvage_off_never_stows():
+def test_stow_salvage_off_still_reaches_the_stow_phase():
+    """Fixed 2026-09-07 (real regression, ruled by the reviewer): this test used to assert
+    "hook" here, on the theory that stowSalvage should also gate derive_phase's stow clause.
+    That was wrong -- stow_phase ALREADY branches on stowSalvage (falling back to drop_salvage
+    when it's off), and tick() only ever reaches stow_phase/drop_salvage via phase == "stow", so
+    double-gating it here meant a nearly-full inventory with stowSalvage=False was NEVER
+    disposed of at all, contradicting the spec's own "stowSalvage: False restores today's
+    behaviour exactly: drop_salvage on the deck." The phase name "stow" describes the SLOT
+    condition (salvage present, at or below dropAtFreeSlots free) -- not which disposal method
+    is used, which is stow_phase's call alone."""
     assert _phase(config=_cfg(stowSalvage=False), wreck_in_range=True,
-                  inventory_salvage=27, free_slots=1) == "hook"
+                  inventory_salvage=27, free_slots=1) == "stow"
 
 
 def test_stow_needs_actual_salvage_not_just_a_full_inventory():

@@ -42,8 +42,16 @@ DEFAULT_CONFIG = {
                                     # independently of this routine's config -- pinning to one tier
                                     # name broke the moment the boat's hook got upgraded to Steel.
     "maxSailDistance": 60,   # a farther wreck worth repositioning the boat for
-    "dropAtFreeSlots": 1,    # drop salvage once this many inventory slots are left (0 = only when
-                             # completely full, the pre-2026-09-03 behaviour -- see tick())
+    "dropAtFreeSlots": 1,    # stow/drop salvage once this many inventory slots are left (0 = only
+                             # when completely full, the pre-2026-09-03 behaviour). Dispose BEFORE
+                             # the inventory is completely full, on purpose: a completely full
+                             # inventory makes the game pop its blue "click here to continue"
+                             # dialogue, which interrupts the salvaging channel and needs the
+                             # Space workaround (see drop_items's own docstring, "Space fallback
+                             # if 'w' still didn't switch tabs") -- that path is kept as the
+                             # fallback, but disposing a slot early avoids it on most fills. See
+                             # derive_phase's "stow" clause (the slot threshold) and stow_phase
+                             # (deposit-to-hold vs. drop-on-the-deck).
 
     # --- mass-world salvaging + on-boat sorting (2026-09-07) ---------------------------------
     # See docs/superpowers/specs/2026-09-07-shipwreck-salvaging-mass-world-and-sorting-design.md
@@ -273,15 +281,24 @@ def derive_phase(config, *, wreck_in_range, hold_full, inventory_salvage, free_s
       3. Stowing a salvage-laden inventory.
       4. Hooking.
     Because 4 is below 2, a wreck rising mid-sort returns us to the hook -- hooking out-earns
-    sorting (the user's interrupt rule)."""
+    sorting (the user's interrupt rule).
+
+    "stow" is deliberately NOT gated on stowSalvage here -- fixed 2026-09-07 after a real
+    regression: gating it here TOO (stow_phase already branches on it, see stow_phase's own
+    "return bool(drop_salvage(ctx))" fallback) meant tick() would never call stow_phase at all
+    with stowSalvage=False, since tick() only reaches stow_phase (and therefore drop_salvage)
+    from the phase == "stow" branch -- so a double gate silently disabled disposal entirely,
+    contradicting the spec's own "stowSalvage: False restores today's behaviour exactly:
+    drop_salvage on the deck." The phase name "stow" is about the SLOT (a salvage-laden
+    inventory is at or below dropAtFreeSlots free), not about which disposal method is used --
+    stow_phase alone decides deposit-to-hold vs. drop-on-the-deck."""
     something_to_sort = bool(inventory_salvage) or hold_has_salvage is not False
 
     if hold_full and something_to_sort:
         return "sort"
     if config.get("sortWhenIdle", True) and not wreck_in_range and something_to_sort:
         return "sort"
-    if (config.get("stowSalvage", True) and inventory_salvage
-            and free_slots <= config.get("dropAtFreeSlots", 1)):
+    if inventory_salvage and free_slots <= config.get("dropAtFreeSlots", 1):
         return "stow"
     if wreck_in_range:
         return "hook"
