@@ -629,6 +629,33 @@ def get_widget_children(group: int, child: int):
     return body.get("children") or []
 
 
+# The plain "click here to continue" message box. MEASURED live 2026-09-07 during shipwreck
+# salvaging: 229.3 read "Your inventory is too full to hold any more plundered salvage." while
+# GET /state's dialogOpen read FALSE -- GameStateProvider.dialogOpen only ORs the NPC/player/
+# sprite dialogue widgets, so this box is invisible to it AND to the engine's own
+# check_stray_dialog. It also eats tab hotkeys. karambwan_fishing.py documents the same trap.
+CONTINUE_BOX_GROUP = 229
+CONTINUE_BOX_CHILD = 4
+
+
+def continue_box_open() -> bool:
+    """Whether the plain message box is on screen. Detected by the CONTINUE widget's presence,
+    never by 229.3's text -- that wording is tier-specific ("...any more plundered salvage")
+    and would silently stop matching on a different salvage tier."""
+    widget = get_widget(CONTINUE_BOX_GROUP, CONTINUE_BOX_CHILD)
+    return bool(widget.get("found")) and bool(widget.get("clickable"))
+
+
+def dismiss_continue_box(ser) -> bool:
+    """Space the box away, confirming it actually closed. Returns True if nothing was blocking
+    or it closed; False if it is still up."""
+    if not continue_box_open():
+        return True
+    key_tap(ser, "SPACE")
+    human_delay(0.3, 0.5)
+    return not continue_box_open()
+
+
 def get_active_tab():
     """The sidebar tab index currently on screen (WidgetProvider's /widget/active-tab --
     VarClientInt.INVENTORY_TAB), the same authoritative per-tick signal PrayerProvider already
