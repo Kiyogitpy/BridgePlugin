@@ -143,3 +143,123 @@ def test_continue_box_absent_when_the_widget_is_not_clickable(monkeypatch):
         (229, 4): {"found": True, "clickable": False},
     }))
     assert controller.continue_box_open() is False
+
+
+# --- withdraw_salvage / open_hold / close_hold -------------------------------------------
+# Added after code review flagged these three as untested by the brief's own fixed test list
+# (11 tests, Step 5). withdraw_salvage in particular is where _CLICK_KWARGS must NOT be
+# splatted into click_menu_action -- that function has no simulate_mistakes parameter, so
+# splatting is a runtime TypeError. Nothing in the original 11 would have caught a future
+# "cleanup" that reintroduced the splat; the first test below is the regression guard for it.
+
+_OPEN_TITLE = {"found": True, "clickable": True, "text": "Cargo Hold: X",
+               "screenX": 1, "screenY": 1}
+
+
+def test_withdraw_salvage_calls_click_menu_action_correctly(monkeypatch):
+    """The load-bearing regression guard: click_menu_action's signature has no
+    simulate_mistakes parameter, so **_CLICK_KWARGS would raise TypeError if splatted here.
+    Assert the actual option string and kwargs passed, including that key's absence."""
+    monkeypatch.setattr(controller, "get_widget", _widgets({(943, 1): _OPEN_TITLE}))
+    monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [
+        {"index": 0, "itemName": "Plundered salvage", "itemQty": 14,
+         "clickable": True, "screenX": 7, "screenY": 7},
+    ])
+    calls = []
+
+    def fake_click_menu_action(ser, entity, option, **kwargs):
+        calls.append((option, kwargs))
+        return True
+
+    monkeypatch.setattr(controller, "click_menu_action", fake_click_menu_action)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Plundered salvage"}])
+    cargo_hold.withdraw_salvage(_Ctx())
+    assert len(calls) == 1
+    option, kwargs = calls[0]
+    assert option == "Withdraw-All"
+    assert kwargs.get("check_ui_blockers") is False
+    assert "simulate_mistakes" not in kwargs
+
+
+def test_withdraw_salvage_returns_false_with_no_salvage_rows(monkeypatch):
+    monkeypatch.setattr(controller, "get_widget", _widgets({(943, 1): _OPEN_TITLE}))
+    monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [])
+    assert cargo_hold.withdraw_salvage(_Ctx()) is False
+
+
+def test_withdraw_salvage_returns_false_when_interface_not_open():
+    # _no_live_bridge's default get_widget returns {"found": False} for everything, so 943.1
+    # never reads clickable and is_open() is False -- withdraw_salvage must bail before ever
+    # touching the grid or clicking anything.
+    assert cargo_hold.withdraw_salvage(_Ctx()) is False
+
+
+def test_withdraw_salvage_returns_true_when_salvage_actually_arrives(monkeypatch):
+    monkeypatch.setattr(controller, "get_widget", _widgets({(943, 1): _OPEN_TITLE}))
+    monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [
+        {"index": 0, "itemName": "Plundered salvage", "itemQty": 14,
+         "clickable": True, "screenX": 7, "screenY": 7},
+    ])
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Plundered salvage"}])
+    assert cargo_hold.withdraw_salvage(_Ctx()) is True
+
+
+def test_withdraw_salvage_returns_false_when_nothing_arrives(monkeypatch):
+    """A menu click that registered but moved nothing (e.g. the inventory was already full)
+    must not be reported as a success."""
+    monkeypatch.setattr(controller, "get_widget", _widgets({(943, 1): _OPEN_TITLE}))
+    monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [
+        {"index": 0, "itemName": "Plundered salvage", "itemQty": 14,
+         "clickable": True, "screenX": 7, "screenY": 7},
+    ])
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    assert cargo_hold.withdraw_salvage(_Ctx()) is False
+
+
+def test_open_hold_returns_true_immediately_when_already_open(monkeypatch):
+    monkeypatch.setattr(controller, "get_widget", _widgets({(943, 1): _OPEN_TITLE}))
+
+    def fail_find_facility(*a, **k):
+        raise AssertionError("find_facility must not be called when the hold is already open")
+
+    monkeypatch.setattr(cargo_hold.sailing, "find_facility", fail_find_facility)
+    assert cargo_hold.open_hold(_Ctx()) is True
+
+
+def test_open_hold_returns_false_when_no_hold_on_our_boat(monkeypatch):
+    monkeypatch.setattr(cargo_hold.sailing, "find_facility", lambda *a, **k: None)
+    assert cargo_hold.open_hold(_Ctx()) is False
+
+
+def test_open_hold_clicks_the_found_facility_and_confirms_it_opened(monkeypatch):
+    hold_obj = {"screenX": 50, "screenY": 50}
+    monkeypatch.setattr(cargo_hold.sailing, "find_facility", lambda *a, **k: hold_obj)
+    state = {"n": 0}
+
+    def fake_get_widget(group, child, index=None):
+        if (group, child) == (943, 1):
+            state["n"] += 1
+            # Closed on the pre-check (call 1, before find_facility is even consulted);
+            # open from the first poll onward (call 2+), simulating the click landing.
+            return _OPEN_TITLE if state["n"] >= 2 else {"found": False}
+        return {"found": False}
+
+    monkeypatch.setattr(controller, "get_widget", fake_get_widget)
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, w, **kw: clicked.append(w) or True)
+    assert cargo_hold.open_hold(_Ctx()) is True
+    assert clicked == [hold_obj]
+
+
+def test_close_hold_returns_true_immediately_when_already_closed(monkeypatch):
+    # _no_live_bridge's default get_widget means is_open() is False from the start --
+    # close_hold must recognise that and never send a keypress at all.
+    key_taps = []
+    monkeypatch.setattr(controller, "key_tap", lambda *a, **k: key_taps.append(a))
+    assert cargo_hold.close_hold(_Ctx()) is True
+    assert key_taps == []
