@@ -1116,6 +1116,11 @@ def _run_chain(ctx):
     # told it was not at the rocks, and walked back -- never once opening the bank. Whoever is
     # travelling has to be the one deciding where to travel.
     if data.get("g3t_restocking"):
+        # The trip earns no Mining xp by definition, and the stall watch is wall-clock: without
+        # this the walk itself trips "no Mining xp for 157s", which is exactly what happened
+        # live on 2026-09-08. The walk-home and refill paths were already reseeded; this one
+        # was missed, and it is the longest of the three.
+        _reseed_stall(ctx)
         restock_phase(ctx, cfg)
         return
 
