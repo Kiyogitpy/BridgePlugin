@@ -192,7 +192,28 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   (`net use ... & echo > Z:\...`) still failed -- the mapping has to complete on an earlier
   line than the command using it.
 
-  **Host-side bridge reads go through `BRIDGE_API_BASE`** (2026-09-08): `settings.py`'s
+  **A ROUTINE'S TARGETS AND ITS WHEN-FULL POLICY ARE PANEL CONFIG, NOT PYTHON (2026-09-08).**
+  `gathering.get_config` lets the bridge's answer WIN over `DEFAULT_CONFIG` deliberately (a
+  panel with nothing selected must mean an idle routine, never a surprise trip to the rune
+  rocks), so "run woodcutting on yews, banking" cannot be expressed from the host by editing
+  Python at all. `tools/vm-set-controller-config.ps1` (run IN the guest) writes the keys into
+  the guest's active RuneLite profile properties -- `controller.<keyName>=<value>`, the
+  `@ConfigItem` keyName from `ControllerConfig.java` under the `controller` group:
+      python tools\vmexec.py --% "powershell -NoProfile -ExecutionPolicy Bypass -File \\VBOXSVR\Docs\Httpbridge\tools\vm-set-controller-config.ps1 treeNames='Yew tree' woodcuttingFullInventory=BANK"
+  **It refuses while the client is running, and that guard is load-bearing**: RuneLite holds
+  the profile in memory and rewrites the file on change/exit, so an edit made underneath it is
+  silently discarded. It fired on its first real use, catching a client the VM had resumed from
+  SAVED STATE -- note `vm-up.ps1` reporting "guest ready after 12s" means a resume, not a cold
+  boot, so a previous session's client and routine can still be alive.
+  **Two vmexec quoting traps, MEASURED the same day.** The guest's default shell is PowerShell
+  5.1, so `cmd`'s `&` separator is a parse error there; and the HOST PowerShell expands `$_`
+  and eats quotes before the string ever reaches paramiko, which turns a `Where-Object`
+  one-liner into a silent empty result rather than an error. **Put the guest command in a
+  `.ps1` on the share and invoke it by its UNC path** (`\\VBOXSVR\Docs\Httpbridge\...`,
+  which needs no `Z:` mapping and so sidesteps the per-logon-session drive-letter trap
+  entirely); pass arguments with `--%` in front of the whole vmexec invocation.
+
+    **Host-side bridge reads go through `BRIDGE_API_BASE`** (2026-09-08): `settings.py`'s
   `API_BASE` is now `os.environ.get("BRIDGE_API_BASE", "http://localhost:8080")` and
   `.mcp.json` sets it to `http://127.0.0.1:18080` for the `osrs-debug` MCP server, so
   `bridge_get` reads the VM's live game state from the host again. The guest's own
@@ -2016,11 +2037,58 @@ needs a client rebuild** (`woodcuttingXp`, `/woodcutting-config`, the panel's ac
 - Tests: `tests/test_gathering.py` (the loop, through the Mining profile -- was
   `test_mining.py`), `tests/test_woodcutting.py` (only what the second profile changes),
   `tests/test_controller.py` (`drop_items`).
-- **Woodcutting's first live session worklist:** whether a tree's `OBJECT_DESPAWNED` lands on
+- **THE LOG BASKET NEEDS NO DRIVING, ONLY EMPTYING (2026-09-08).** USER: "need to add a option
+  to empty wood basket too since we use that for cutting wood basicly doubling our capacity",
+  then "it fills automaticly all we need to do is right click it in bank". An OPEN log basket
+  absorbs logs as they are cut (cache config/obj 28142 param_1784: "When opened logs will
+  automatically be deposited into it"), so the inventory only reaches 28 once the basket's own
+  28 are full -- the doubling costs no code, and there is no Fill step to drive the way
+  `fill_fur_pouch`/`fill_coal_bag` have one.
+  - **`banker.empty_log_basket` is a NAMED MENU SELECTION, and not because the click is
+    contested.** MEASURED from the cache: NEITHER `log_basket_closed` (28140) NOR
+    `log_basket_open` (28142) has an "Empty" iop at all -- both offer Fill / Wear / Check /
+    Open|Close / Destroy. So the Empty the user right-clicks is a **bank-context** option the
+    interface substitutes in over the item's own, exactly as `fill_fur_pouch`'s docstring
+    already recorded for the fur pouch ("Deposit-1/5/10/X/All/Empty-to-bank instead"). A bare
+    left click would resolve to whichever of Fill / Deposit-1 / Wear won that race, and **Fill
+    is a silent no-op that looks like success**. The option is the SEQUENCE
+    `("empty-to-bank", "empty")` tried against the one menu `click_menu_action` already reads
+    back: the fish barrel next door answers to the first and the fur pouch and looting bag to
+    the second, and the exact wording is not knowable offline. Called from
+    `deposit_inventory` beside `empty_looting_bag`, under the same `skipContainerDeposit`
+    opt-out, so every routine that banks gets it.
+  - **The basket matched nothing on the keep list, so BOTH full-inventory policies destroyed
+    it**: `bank` shift-deposited the basket into the bank immediately after emptying it (no
+    basket next trip), and `drop` threw it on the ground. `keep_items` is `("axe", "log
+    basket")` now -- one substring covers "Log basket" and "Open log basket", which is what the
+    cache says the two states are called. The Forestry basket (28143/28145, the log basket +
+    forestry kit joined by a Log brace) is a DIFFERENT name and is deliberately not matched.
+  - Nothing opens the basket: carry it open, a shut one collects nothing.
+  - **`GET /api/storage/log-basket` CANNOT tell you how full it is.** MEASURED live 2026-09-08
+    with the basket in hand: `present: true`, `open: true`, `itemId: 28142` -- but
+    `contentsLoaded: false`, `storedQuantity: -1`, `remainingCapacity: -1`, because the m8aq
+    reader only populates contents while the basket's own Check dialog is open. So the
+    routine's "is it worth emptying" question is not answerable from the bridge; emptying an
+    already-empty container is a no-op, which is why `empty_log_basket` is called
+    unconditionally whenever one is carried rather than gated on a count.
+  - **A FULL basket is silently indistinguishable from a missing one while chopping.** MEASURED
+    the same run: with an open basket carried, logs arrived LOOSE in the inventory (12 Yew logs
+    in slots 2-13) -- the basket was already full from a previous session, so there was no
+    doubling at all until the first bank trip emptied it. Nothing in the log says so, and the
+    reader above cannot either. If a session's inventory fills at the normal rate with a basket
+    carried, that is the reason; it self-corrects on the first bank trip.
+- **FIRST LIVE RUN 2026-09-08 (VM, `logs/vm_woodcutting_*.log`), and the client rebuild is
+  IN**: chopping Yew trees at (1591,3487) with `woodcuttingXp` reporting real drops
+  (`+180 Woodcutting xp, tree still up`), arrival 0.18s after the click, the next tree
+  pre-hovered. So `xp_field`, `/woodcutting-config` and the panel entry are all confirmed
+  present in the running client.
+- **Woodcutting's remaining live worklist:** whether a tree's `OBJECT_DESPAWNED` lands on
   the tree's own tile the way a rock's does; whether `GATHER_BUDGET_S` (12s) covers a slow
   yew/magic chop at the user's level; whether the account has shift-click drop ON (watch for
-  `shift-drop did nothing (shift-click drop off?)` in the log); and that the panel's Chop down
-  scan lists "Yew tree" rather than a bare "Yew".
+  `shift-drop did nothing (shift-click drop off?)` in the log, `drop` policy only); that the
+  panel's Chop down scan lists "Yew tree" rather than a bare "Yew"; and **the log basket's
+  real bank-context option text** -- watch for `emptying log basket` followed by the logs
+  actually leaving, and for `No 'empty-to-bank' entry in menu` if neither name is right.
 
 - **Rock choice is the sidebar panel's "Gathering" section**
   (`SettingsPanel.java`): Refresh scans every plane of the loaded scene on the client thread
