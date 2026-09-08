@@ -352,12 +352,9 @@ git commit -m "tick_cycle: at_phase, sleeping to a named point inside a game tic
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/test_tick_cycle.py`:
+Append to `tests/test_tick_cycle.py`. **`controller` is already imported by Task 2's header — do not add a second import.**
 
 ```python
-import controller
-
-
 def test_estimate_flight_ms_matches_the_fitted_model_at_its_reference_distance():
     import settings
     assert tick_cycle.estimate_flight_ms(settings.HM2_D_REF) == pytest.approx(
@@ -945,6 +942,8 @@ def test_run_cycle_clicks_the_log_IN_PLACE_then_flies_to_the_rock(monkeypatch):
                         lambda ser, **kw: (order.append("log-in-place"), 92.0)[1])
     monkeypatch.setattr(tick_cycle, "timed_click",
                         lambda ser, pt, **kw: (order.append(("rock", pt)), 255.0)[1])
+    # missChance defaults to 0.03, so an unpatched draw makes this test flake ~3% of runs.
+    monkeypatch.setattr(g.random, "random", lambda: 1.0)
     monkeypatch.setattr(g, "_now", lambda: 1000.0)
 
     ctx = _Ctx()
@@ -972,6 +971,7 @@ def test_run_cycle_ABORTS_the_rock_click_rather_than_letting_it_cross_the_bounda
     monkeypatch.setattr(tick_cycle, "timed_click",
                         lambda ser, pt, **kw: (clicked.append(pt), 255.0)[1])
     monkeypatch.setattr(controller, "request_movement_abort", lambda: aborted.append(True))
+    monkeypatch.setattr(g.random, "random", lambda: 1.0)      # never a deliberate miss here
     times = iter([1000.0, 1000.52, 1000.52, 1000.52])
     monkeypatch.setattr(g, "_now", lambda: next(times))
 
@@ -1213,7 +1213,10 @@ def test_no_mining_xp_for_the_stall_window_safety_stops(monkeypatch):
 
     ctx = _Ctx()
     ctx.events = _FakeEvents()
-    ctx.state.config = _cfg(xpStallStopS=60)
+    # 20s, NOT the 60s default: CHAIN_MAX_S is 45, so with a 10s-per-iteration fake clock the
+    # chain cap would return before a 60s stall could ever fire and the test would pass
+    # vacuously. The constant under test is the comparison, not the shipped number.
+    ctx.state.config = _cfg(xpStallStopS=20)
     ctx.state.data["g3t_index"] = 0
     ctx.state.data["g3t_xp"] = 1000
     ctx.state.data["g3t_xp_at"] = 1000.0
@@ -1223,7 +1226,10 @@ def test_no_mining_xp_for_the_stall_window_safety_stops(monkeypatch):
 
 
 def test_a_rising_xp_reading_resets_the_stall_clock(monkeypatch):
-    xps = iter([1000, 1050, 1100, 1150] * 60)
+    # STRICTLY increasing. A repeating sequence wraps back below its own high-water mark, the
+    # stall clock stops resetting, and the test then passes only because CHAIN_MAX_S returns
+    # first -- i.e. for the wrong reason, proving nothing about the reset.
+    xps = iter(range(1000, 100000, 50))
     monkeypatch.setattr(g, "prepare", lambda *a, **k: (1640, 800))
     monkeypatch.setattr(g, "run_cycle", lambda *a, **k: "ok")
     monkeypatch.setattr(controller, "get_inventory",
@@ -1234,7 +1240,7 @@ def test_a_rising_xp_reading_resets_the_stall_clock(monkeypatch):
 
     ctx = _Ctx()
     ctx.events = _FakeEvents()
-    ctx.state.config = _cfg(xpStallStopS=60)
+    ctx.state.config = _cfg(xpStallStopS=20)
     ctx.state.data["g3t_index"] = 0
     g.tick(ctx)
     assert ctx.state.safety_stopped is False
