@@ -135,8 +135,8 @@ to a follow-up task so that the first live session needs no client rebuild.
 
 ```
 rockTiles:            [(x,y,plane), x4]   # captured once at Cape Conch, cycled in order
-standTile:            (x,y,plane)         # where the rotation is walked back to
-knifeSlot, logSlot:   int                 # fixed inventory slots, adjacent
+rockId:               int                 # the granite rock's object id, for get_object_at
+knifeName, logName:   str                 # substring match, this repo's convention
 maxReachPx:           220                 # startup refuses above this, reporting the measurement
 logClickPhaseMs:      60                  # where in the critical tick the log click lands
 rockClickTickOffset:  0                   # LIVE-VERIFY (see checklist item 2)
@@ -153,8 +153,9 @@ It is a guess; the routine logs measured per-cycle occupancy so it can be fitted
 All of these **refuse to start**, with the measurement in the log, rather than degrading — the
 shape `deob_guard.py` already uses:
 
-1. A knife in `knifeSlot` and **exactly one** teak/mahogany log in `logSlot`. More than one log
-   means a Make-X interface will eat a tick.
+1. A knife matching `knifeName` and **exactly one** log matching `logName`. More than one log
+   means a Make-X interface will eat a tick. Both are found by name; their slots are USER's
+   arrangement and only matter because adjacent slots make the parked-cursor flight short.
 2. All four `rockTiles` resolve to on-screen points.
 3. `max |rock − log|` in pixels is within `maxReachPx`, **reported as a number either way** so a
    refusal tells USER how much to zoom.
@@ -225,8 +226,15 @@ already documents: `check_safety` runs before `tick` and would otherwise win the
   independently of anything else, so a flawless 1.8s cadence for six hours is on the wire.
 - The existing session tempo drift (`HM2_TEMPO_SIGMA`/`HM2_TEMPO_TAU_S`) applies to the flights
   unchanged and supplies further variance for free.
-- The in-wait fidget is **suppressed** during a cycle (it is position-invariant, but the parked
-  cursor must not move at all here) and allowed during the drop and between chains.
+- The in-wait fidget needs **no** suppression, and it is worth saying why rather than adding a
+  guard that does nothing: `controller._maybe_fidget_during_wait` only fires on a `human_delay`
+  draw of 2s or more, and the only `human_delay` inside a cycle is `click_human`'s own 50–145ms
+  hold. So the parked cursor cannot be nudged by it. It remains free to run during the drop and
+  between chains, which is where the stillness it exists to break up actually occurs.
+- **There is no `standTile` and no travel.** The routine assumes the player is standing at the
+  rotation; the startup assertions fail if the rocks do not resolve on screen. Walking back
+  from a drift would be new machinery for a case the four-adjacent-rock rotation does not
+  produce, and the XP stall watch already stops a run that has wandered.
 
 ## Testing
 
@@ -246,11 +254,19 @@ The first session's worklist, in the order the failures would bite:
 
 1. **Does knife-on-teak-log leave the log intact, and set the timer with no Make-X interface?**
    USER says yes; it is item 1 because the entire no-supply-loop scope rests on it. The routine
-   re-counts the log **between chains and at every drop** — never inside a cycle, where an
-   `/inventory` read would spend the tick budget the whole design is built to protect — and
-   safety-stops loudly if the count has fallen, rather than running dry unnoticed. At one log
-   per cycle a consumed log would be gone within seconds, so a between-chain check is early
-   enough to catch it on the first session.
+   re-counts the log **between chains and at every drop**, and safety-stops loudly if the count
+   has fallen rather than running dry unnoticed. At one log per cycle a consumed log would be
+   gone within seconds, so a between-chain check is early enough to catch it on the first
+   session.
+
+**On where HTTP is allowed.** The constraint is the **critical tick**, not the cycle. The two
+dead ticks carry 1200ms of slack, and the routine needs them: the four rocks' screen
+projections change every cycle because the player *moves* between them, so the next rock's
+point is re-resolved with `controller.get_object_at` during tick T+1, alongside the knife
+selection. What must never happen is an HTTP read between the log click and the rock click.
+The knife and log points, by contrast, are resolved once per chain — items fill the inventory
+from low slots upward, so with the knife and log in the first two slots the granite stacks
+above them and their screen positions do not move.
 2. **`rockClickTickOffset`.** The wiki says the action must start "on the same tick as moving to
    the next rock". A click on tick T causes movement on T+1, so "moving" may mean the tick the
    walk executes rather than the tick it is clicked. If the yield rate is poor at offset 0, try
