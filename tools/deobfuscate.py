@@ -63,7 +63,12 @@ DEOB_DIR = DECOMPILED / "deob"
 STATE_PATH = DECOMPILED / "deob-state.json"
 JDKS_DIR = Path.home() / ".jdks"
 ADOPTIUM_17 = "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse"
-BRIDGE = "http://localhost:8080"
+# Honours BRIDGE_API_BASE the way ControllerAddon/settings.py does (2026-09-08), so a HOST
+# run can ask the VM guest's client which jar it loaded -- the guest's bridge reaches the
+# host only through the 18080 NAT forward, and hardcoding 8080 made --status report
+# "bridge not answering" on the very machine the tooling runs on. NOTE the jar PATH it
+# reports is a GUEST path: use it to see the version and sha, and pass --jar for the file.
+BRIDGE = os.environ.get("BRIDGE_API_BASE", "http://localhost:8080")
 MIN_JAVA = 17
 MAX_TRANSFORM_ATTEMPTS = 4
 
