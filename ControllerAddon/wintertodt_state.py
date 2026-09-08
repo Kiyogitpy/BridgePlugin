@@ -78,7 +78,12 @@ def choose_brazier(reader, current=None, preferred="SOUTH_WEST"):
     for key in BRAZIER_KEYS:
         if brazier_operational(braziers.get(key)):
             return key
+    # Prefer the preferred brazier if it's present and not incapacitated.
+    if preferred in braziers and pyromancer_status(reader, preferred) != "INCAPACITATED":
+        return preferred
+    # Otherwise, return the first brazier whose pyromancer is not incapacitated.
     for key in BRAZIER_KEYS:
         if pyromancer_status(reader, key) != "INCAPACITATED":
-            return preferred if preferred in braziers else key
+            return key
+    # All pyromancers incapacitated, return preferred if present as last resort.
     return preferred if preferred in braziers else None

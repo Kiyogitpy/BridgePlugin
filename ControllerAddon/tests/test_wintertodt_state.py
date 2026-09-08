@@ -88,3 +88,39 @@ def test_round_active_is_the_readers_own_field_not_our_guess():
     assert ws.round_active(reader(roundActive=True)) is True
     assert ws.round_active(reader(roundActive=False)) is False
     assert ws.round_active({}) is False
+
+
+def test_choose_brazier_keeps_current_when_unlit_with_alive_pyromancer():
+    # Branch 2 positive case: current is down but fixable (we can light it).
+    snap = reader(braziers={
+        "NORTH_EAST": {"status": "UNLIT", "pyromancerStatus": "ALIVE"},
+        "SOUTH_WEST": {"status": "LIT", "pyromancerStatus": "ALIVE"}
+    })
+    assert ws.choose_brazier(snap, current="NORTH_EAST") == "NORTH_EAST"
+
+
+def test_choose_brazier_prefers_non_first_preferred_over_first_key():
+    # Test hygiene: preferred should be respected even when it's not SOUTH_WEST.
+    snap = reader(braziers={key: {"status": "BROKEN", "pyromancerStatus": "ALIVE"}
+                            for key in ws.BRAZIER_KEYS})
+    assert ws.choose_brazier(snap, current=None, preferred="NORTH_EAST") == "NORTH_EAST"
+
+
+def test_choose_brazier_regression_prefers_alive_over_preferred_incapacitated():
+    # Finding 1 regression: three incapacitated (including preferred), one alive.
+    snap = reader(braziers={
+        "SOUTH_WEST": {"status": "UNLIT", "pyromancerStatus": "INCAPACITATED"},
+        "NORTH_WEST": {"status": "UNLIT", "pyromancerStatus": "INCAPACITATED"},
+        "SOUTH_EAST": {"status": "UNLIT", "pyromancerStatus": "INCAPACITATED"},
+        "NORTH_EAST": {"status": "BROKEN", "pyromancerStatus": "ALIVE"}
+    })
+    # Must return NORTH_EAST (the alive one), not SOUTH_WEST (preferred but incapacitated).
+    assert ws.choose_brazier(snap, current=None, preferred="SOUTH_WEST") == "NORTH_EAST"
+
+
+def test_reward_eligible_uses_the_threshold():
+    assert ws.reward_eligible(reader(points=500)) is True
+    assert ws.reward_eligible(reader(points=501)) is True
+    assert ws.reward_eligible(reader(points=499)) is False
+    assert ws.reward_eligible(reader(points=0)) is False
+    assert ws.reward_eligible({}) is False
