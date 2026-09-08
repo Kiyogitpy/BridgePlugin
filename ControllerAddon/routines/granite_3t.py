@@ -144,7 +144,7 @@ DEFAULT_CONFIG = {
     # from the log slot. At scale 1.0 the budget allows 82px, so nothing passes; the furthest
     # rock needs 0.58 to fit, and 0.55 leaves a little margin (limit 267px) without going
     # further from the fitted model than the practised-reach argument supports.
-    "flightSpeedScale": 0.5,
+    "flightSpeedScale": 0.45,
     # Deliberate imperfection: a drawn fraction of cycles place the rock click one tick late.
     # A machine that never misses a 3-tick cycle is itself the signature -- EVENT_MOUSE_CLICK_V2
     # carries inter-press timing to the server at 1ms resolution (CLAUDE.md, telemetry).
@@ -879,10 +879,26 @@ def run_cycle(ctx, cfg, knife_point, log_point, rock_point, target_tick=None):
         # next mine at the wrong phase and desyncs every cycle after it. The flight is simply
         # NOT STARTED -- there is nothing to abort, and request_movement_abort() is only legal
         # from inside a flight loop anyway (the v3 firmware `X` contract).
+        # ABANDONING IS NOT FREE ANY MORE, SO WE DO NOT ABANDON: WE FIRE LATE.
+        #
+        # The guard was written when a skipped cycle cost a cycle. It does not any more. The log
+        # click has ALREADY fired by this point, so it has started a fletch -- and the rock
+        # click is the only thing that displaces it. Abandon here and the fletch runs to
+        # completion, eats the log, and the routine has to walk 380 tiles to the bank and back
+        # for another one. MEASURED LIVE 2026-09-08: 7 desyncs in 80 cycles, and the log was
+        # gone by the end of them.
+        #
+        # A late rock click forfeits this cycle's tick manipulation, which is cheap. Losing the
+        # log costs an eight-minute round trip. So fire it, mark the cycle a desync so the
+        # caller resyncs, and keep the log.
         debug_log.log(CATEGORY,
-                      f"desync: {window.spent_ms(now):.0f}ms of the tick spent with "
-                      f"~{need:.0f}ms of flight+click still needed -- abandoning the rock click")
-        _log_occupancy(ctx, "desync", phase, in_place_ms, 0.0, window.spent_ms(now))
+                      f"late: {window.spent_ms(now):.0f}ms of the tick spent with "
+                      f"~{need:.0f}ms still needed -- clicking the rock anyway to displace the "
+                      f"fletch (a lost cycle is cheaper than a lost log)")
+        rescue_ms = tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3,
+                                           duration_scale=cfg.get("flightSpeedScale") or 1.0,
+                                           now_fn=_now)
+        _log_occupancy(ctx, "desync", phase, in_place_ms, rescue_ms, window.spent_ms(_now()))
         return "desync"
 
     flight_ms = tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3,

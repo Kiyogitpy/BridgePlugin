@@ -223,7 +223,7 @@ def test_run_cycle_reports_desync_when_the_clock_will_not_answer(monkeypatch):
     assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "no_clock"
 
 
-def test_run_cycle_ABANDONS_the_rock_click_rather_than_letting_it_cross_the_boundary(
+def test_run_cycle_FIRES_LATE_rather_than_leaving_the_fletch_to_complete(
         monkeypatch):
     """A click that slips into the next tick is worse than no click: it starts the NEXT cycle's
     mine at the wrong phase and desyncs everything after it.
@@ -250,7 +250,9 @@ def test_run_cycle_ABANDONS_the_rock_click_rather_than_letting_it_cross_the_boun
     # the flight happens to be configured.
     assert g.run_cycle(ctx, _cfg(flightSpeedScale=1.0),
                        (1700, 800), (1740, 800), (1640, 800)) == "desync"
-    assert clicked == []
+    # The rock IS clicked, just late: the log click has already started a fletch, and this is
+    # the only thing that displaces it. Abandoning would cost the log and an 8-minute bank trip.
+    assert clicked == [(1640, 800)]
     assert aborted == []
 
 
@@ -738,7 +740,9 @@ def test_a_cycle_with_room_for_the_flight_but_not_the_click_is_a_desync(monkeypa
     # the flight happens to be configured.
     assert g.run_cycle(ctx, _cfg(flightSpeedScale=1.0),
                        (1700, 800), (1740, 800), (1640, 800)) == "desync"
-    assert clicked == []
+    # The rock IS clicked, just late: the log click has already started a fletch, and this is
+    # the only thing that displaces it. Abandoning would cost the log and an 8-minute bank trip.
+    assert clicked == [(1640, 800)]
 
 
 # --------------------------------------------------------------------------------------------
