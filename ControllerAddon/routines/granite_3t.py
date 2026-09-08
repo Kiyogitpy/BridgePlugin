@@ -327,9 +327,11 @@ def tick(ctx):
             f"the {cfg['knifeName']!r} or {cfg['logName']!r} is gone from the inventory")
         return
 
-    # Checked between chains, never inside a cycle. USER says teak/mahogany are not consumed by
-    # knife-on-log; if that is wrong, a log lasts one cycle and this catches it in seconds
-    # instead of letting the run go quietly dry (spec live-checklist item 1).
+    # Checked once per chain (so within CHAIN_MAX_S, not "in seconds"), never inside a cycle --
+    # an /inventory read per cycle is precisely the cost this module exists to avoid. USER says
+    # teak/mahogany are not consumed by knife-on-log; if that is wrong, the worst case is one
+    # chain of clicks landing on an empty slot (harmless with a knife selected) before this
+    # stops the run. Spec live-checklist item 1 is the live verification of exactly this.
     logs = log_count(inv, cfg["logName"])
     if logs < (data.get("g3t_logs") or logs):
         ctx.state.trigger_safety_stop(
@@ -341,6 +343,10 @@ def tick(ctx):
     knife_point = (int(knife["screenX"]), int(knife["screenY"]))
     log_point = (int(log["screenX"]), int(log["screenY"]))
     tiles = cfg["rockTiles"]
+
+    if not tiles:
+        ctx.state.trigger_safety_stop("no rockTiles configured -- capture them with the probe")
+        return
 
     started = _now()
     while True:

@@ -397,3 +397,16 @@ def test_the_rotation_advances_one_rock_per_cycle(monkeypatch):
     ctx.state.data["g3t_index"] = 0
     g.tick(ctx)
     assert seen[:4] == [(10, 20, 0), (11, 20, 0), (12, 20, 0), (13, 20, 0)]
+
+
+def test_tick_safety_stops_on_an_empty_rock_rotation(monkeypatch):
+    """setup() refuses this today, but tick() must not crash if it is ever reached --
+    a ZeroDivisionError is the wrong failure mode for an unattended routine."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    ctx.state.config = _cfg(rockTiles=[])
+    g.tick(ctx)
+    assert ctx.state.safety_stopped is True
+    assert "rocktiles" in ctx.state.safety_reason.lower()
