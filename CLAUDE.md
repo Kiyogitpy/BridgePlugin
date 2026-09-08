@@ -1693,6 +1693,41 @@ already committed and fully unit-tested before this task started.
 
 ## Current state of routines/granite_3t.py
 
+**THE MECHANIC, SETTLED LIVE 2026-09-08 AFTER GETTING IT WRONG THREE WAYS.** A cycle is FOUR
+clicks, not three, and every one of them earns its place:
+
+    tick T-2 (dead)  click the knife (a client-side SELECTION, no packet)
+    tick T-1 (dead)  re-resolve the rock over HTTP; park the cursor on the log
+    tick T  (crit)   click the log IN PLACE -> starts a fletch, setting the skilling timer to 3
+                     ...then ONE short flight to the rock and click it -> this is the MOVE, and
+                     being a new action it is what displaces the pending fletch
+    tick T+1         click the rock AGAIN, in place -> THIS is what actually starts mining,
+                     with the skilling timer already sitting at 3
+
+THE LOG IS ONLY CONSUMED WHEN A CYCLE FAILS. USER: "we interrupt the fletching with another
+task therefore it doesnt get consumed". Every log we lost was a cycle that failed to displace
+the fletch, and each failure cost a 380-tile round trip to The Great Conch bank. The three ways
+it failed, in the order they were found and fixed:
+
+1. **Every cycle overran the tick** (occupancy median 644ms) because `click_human` costs a
+   50-145ms hold PLUS a 30-90ms trailing pause. The pause happens after mouse-up, when the game
+   already has the click, so inside a tick it is pure loss. `tick_cycle.fast_click` (35-75ms
+   hold, no tail) cut the in-place log click from ~166ms to ~50ms.
+2. **The rotation required no movement.** The eastern 2x2 cluster has every rock adjacent to
+   the stand tile. The wiki is explicit twice over -- the 3-tick action must start "on the same
+   tick as MOVING to the next rock", and rocks give a second roll only "if moving up to them".
+   With no step there is nothing to displace the fletch, and each rock click merely cancels the
+   previous unfinished mine, which is why xp was near zero. The western line forces a step.
+3. **Only one rock click.** The wiki's powermining recipe names two -- "clicking to MOVE to the
+   next rock, then ... clicking the rock AGAIN" -- and the 1.5-tick woodcutting entry says the
+   same: delay the timer on the same tick as the MOVE, "then, on the next tick, click the tree".
+   Adding the second click is what finally kept the log.
+
+**AND THE DESYNC GUARD HAD TO BE INVERTED.** `Window.room_for` was written when a skipped cycle
+cost a cycle; by the time it refuses, the log click has already started a fletch, so abandoning
+leaves the fletch to complete and eat the log. A late rock click forfeits one cycle's tick
+manipulation; a lost log costs eight minutes. So the routine fires late rather than abandoning.
+
 **FIRST LIVE SESSION 2026-09-08 AT CAPE CONCH. It reached the mine, passed its geometry gate and
 ran real cycles, then stopped on a blocker that invalidates the design's biggest assumption:
 THE TICK ITEM IS CONSUMED, ONE PER CYCLE.** The teak log came back as a **Teak stock** (item
