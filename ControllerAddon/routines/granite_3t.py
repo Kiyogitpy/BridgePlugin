@@ -114,6 +114,9 @@ DEFAULT_CONFIG = {
     # 101-191ms, so at phase 60 the flight had ~390ms against a ~382ms need -- an 8ms margin,
     # i.e. a coin flip per cycle. Every millisecond of phase is a millisecond off the flight.
     "logClickPhaseMs": 25,
+    # See run_cycle: the first rock click moves and clears the fletch, the second
+    # actually mines. Off only for A/B testing the mechanic.
+    "secondRockClick": True,
 
     # WHAT MUST FIT INSIDE THE TICK: both mouse-DOWNs, or both whole clicks?
     #
@@ -619,6 +622,7 @@ def restock_phase(ctx, cfg):
     banker.close_bank(ctx)
 
     debug_log.log(CATEGORY, f"restock: withdrew logs, walking back to {home}")
+    data["g3t_restocking"] = False
     data["g3t_returning"] = True
     return True
 
@@ -886,6 +890,28 @@ def run_cycle(ctx, cfg, knife_point, log_point, rock_point, target_tick=None):
                                        now_fn=_now)
     ctx.state.data["g3t_fired_tick"] = fired
     _log_occupancy(ctx, "ok", phase, in_place_ms, flight_ms, window.spent_ms(_now()))
+
+    # THE SECOND ROCK CLICK, ONE TICK LATER, AND IT IS NOT OPTIONAL.
+    #
+    # The wiki's powermining recipe describes TWO clicks on the rock, not one: "starting the
+    # 3-tick action and clicking to MOVE to the next rock, then both quickly dropping the ore
+    # and clicking the rock AGAIN on the same tick". The 1.5-tick woodcutting entry spells the
+    # same shape out even more plainly -- delay the timer on the same tick as clicking to MOVE,
+    # "then, on the next tick, click the tree".
+    #
+    # So the first rock click is the MOVE: it walks the player and, being a new action, clears
+    # the pending fletch before it can complete. The second click is what actually starts
+    # mining, with the skilling timer already sitting at 3.
+    #
+    # MEASURED LIVE 2026-09-08 without it: cycles fit the tick, the player moved, granite was
+    # mined -- and the teak log was still consumed every cycle, because nothing ever displaced
+    # the fletch. The cursor is already on the rock here, so this costs one in-place click.
+    if cfg.get("secondRockClick", True):
+        if ctx.events is not None:
+            ctx.events.wait_ticks(1, now_fn=_now, sleep_fn=_sleep)
+        else:
+            _sleep(tick_cycle.GAME_TICK_MS / 1000.0)
+        tick_cycle.fast_click(ctx.ser)
     return "ok"
 
 
@@ -1058,13 +1084,24 @@ def _hold_one_log(ctx, cfg):
         # The basket cannot dispense a single log outside a bank (see restock_phase), so the
         # only fix is the trip. Reset so the trip gets a clean slate.
         data["g3t_log_refills"] = 0
-        restock_phase(ctx, cfg)
+        # Hand the trip to restock_phase via a flag rather than calling it here, so the
+        # walk-home leg above stands aside for the whole journey.
+        data["g3t_restocking"] = True
+        debug_log.log(CATEGORY, "no logs and the basket cannot dispense one -- restocking")
     return False
 
 
 def _run_chain(ctx):
     cfg = ctx.state.config
     data = ctx.state.data
+
+    # A RESTOCK OWNS THE MOVEMENT WHILE IT IS RUNNING. MEASURED LIVE 2026-09-08: with the
+    # walk-home check unconditionally first, the routine walked to the bank, was immediately
+    # told it was not at the rocks, and walked back -- never once opening the bank. Whoever is
+    # travelling has to be the one deciding where to travel.
+    if data.get("g3t_restocking"):
+        restock_phase(ctx, cfg)
+        return
 
     # THE WALK HOME COMES BEFORE EVERYTHING, INCLUDING THE STARTUP CHECK. Startup measures the
     # geometry against the rocks, which only resolve at the mine, so a restart at the bank

@@ -42,6 +42,10 @@ def _no_live_bridge(monkeypatch):
                         lambda: {"x": 3249, "y": 2351, "plane": 0})
     monkeypatch.setattr(controller, "get_object_at", lambda *a, **k: None)
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    # run_cycle ends with a second, in-place click on the rock one tick later --
+    # the click that actually starts mining (see run_cycle). It touches the serial
+    # port, so it is stubbed here; tests that care assert on it themselves.
+    monkeypatch.setattr(tick_cycle, "fast_click", lambda ser: None)
     monkeypatch.setattr(controller, "move_to_human", lambda *a, **k: None)
     monkeypatch.setattr(controller, "click_human", lambda *a, **k: None)
     monkeypatch.setattr(controller, "mark_busy", lambda *a, **k: None)
@@ -635,7 +639,11 @@ def test_the_first_cycle_of_a_chain_enters_through_at_phase_and_records_the_TICK
 
     ctx = _Ctx()
     ctx.events = events
-    assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "ok"
+    # secondRockClick off: it waits a further tick at the END of the cycle, which would advance
+    # the model past the tick under test. What is being pinned here is the tick the LOG click
+    # landed in, not where the cycle finishes.
+    assert g.run_cycle(ctx, _cfg(secondRockClick=False),
+                       (1700, 800), (1740, 800), (1640, 800)) == "ok"
 
     events.pump(now=clock.now())
     assert events.ticks.tick == 101         # where the log click really landed
