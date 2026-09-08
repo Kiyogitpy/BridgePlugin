@@ -2,7 +2,8 @@
   "mcpServers": {
     "osrs-debug": {
       "command": "C:\\Users\\Kiyo\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
-      "args": ["ControllerAddon/mcp_debug_server.py"]
+      "args": ["ControllerAddon/mcp_debug_server.py"],
+      "env": { "BRIDGE_API_BASE": "http://127.0.0.1:18080" }
     },
     "osrs-wiki": {
       "command": "C:\\Users\\Kiyo\\Documents\\Httpbridge\\data\\decompiled\\osrs-wiki-cache-utils-main\\osrs-wiki-cache-utils-v0.3.0-x86_64-pc-windows-msvc.exe",

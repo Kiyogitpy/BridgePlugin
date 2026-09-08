@@ -13,7 +13,13 @@
 import os
 
 # ---------------- Bridge connection ----------------
-API_BASE = "http://localhost:8080"
+# BRIDGE_API_BASE overrides this. It exists for ONE case: the client now runs in the OSRS VM
+# (CLAUDE.md, "The VM"), where the guest's own controller.py still wants plain localhost:8080 --
+# but a HOST-side reader (the osrs-debug MCP server in .mcp.json, tools/*.py) has to go through
+# the NAT forward at 127.0.0.1:18080 to see the same bridge. Note the UDP event stream does NOT
+# cross that forward: a natpf1 rule forwards host->guest, while the plugin sends events to the
+# guest's own loopback, so poll_events is guest-only. HTTP reads work from either side.
+API_BASE = os.environ.get("BRIDGE_API_BASE", "http://localhost:8080")
 UDP_PORT = 50555          # controller.py's own event stream -- routine on_event dispatch depends
                            # on this one, only controller.py should ever bind it.
 DEBUG_UDP_PORT = 50556    # mcp_debug_server.py's poll_events -- a SEPARATE port the Java plugin
