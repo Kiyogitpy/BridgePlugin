@@ -92,6 +92,10 @@ CHAIN_MAX_TARGETS = 40
 NEXT_CLICK_DELAY = (0.08, 0.2)   # human reaction after the depletion signal (cursor already there)
 BANK_MAX_DISTANCE = 40    # a bank object this close (tiles) means "deposit when full"
 RETURN_WALK_TILES = 3     # walk back to the stand tile when the bank left us farther than this
+# A deposit lands on the game's own 0.6s tick, so the post-bank check has to outlast one --
+# see _await_inventory_room for the live measurement that forced this.
+BANK_SETTLE_S = 3.0
+BANK_SETTLE_POLL_S = 0.2
 
 
 def _now():
@@ -372,6 +376,30 @@ def _stand_key(profile):
     return f"{profile.key}_stand_tile"
 
 
+def _await_inventory_room(budget_s=BANK_SETTLE_S):
+    """Poll until the inventory is no longer full, up to `budget_s`. True if room appeared.
+
+    MEASURED LIVE 2026-09-08, after 28 minutes of clean running: `_bank_it` read the inventory
+    0.9s after the shift-deposit click and safety-stopped on `inventory still full after
+    banking` -- while the deposit was perfectly fine, the inventory settling to 1/28 moments
+    later. banker.deposit_inventory waits only human_delay(0.2, 0.4) after each shift-click, so
+    with ONE item type to deposit the whole tail is under the game's 0.6s server tick and the
+    re-read is stale. Trips depositing TWO types survived on the extra click flight alone,
+    which is why this looked intermittent rather than broken.
+
+    This is the same rule drop_items already follows with DROP_CONFIRM_S -- a verification
+    window shorter than a server tick reads a good action as a failure -- and it matters more
+    here, because the verdict is a TERMINAL safety stop: losing the race ends an unattended
+    run, where being slow costs a second."""
+    deadline = _now() + budget_s
+    while True:
+        if not _inventory_full():
+            return True
+        if _now() >= deadline:
+            return False
+        _sleep(BANK_SETTLE_POLL_S)
+
+
 def _bank_it(profile, ctx):
     cfg = bank_config(profile)
     bank = banker.find_nearby_bank(cfg)
@@ -387,7 +415,7 @@ def _bank_it(profile, ctx):
         return True
     banker.deposit_inventory(ctx, cfg)
     banker.close_bank(ctx)
-    if _inventory_full():
+    if not _await_inventory_room():
         ctx.state.trigger_safety_stop("inventory still full after banking")
         return True
     here = _player_tile()

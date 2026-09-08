@@ -131,3 +131,69 @@ def test_the_log_basket_is_kept_out_of_the_bank_deposit():
     keep = [k.lower() for k in gathering.bank_config(P)["keepItems"]]
     for name in ("Log basket", "Open log basket"):
         assert any(k in name.lower() for k in keep), name
+
+
+# --- the post-bank check must outlast a server tick (2026-09-08) --------------------------
+
+
+def test_banking_does_not_safety_stop_on_a_deposit_that_lands_a_tick_later(monkeypatch):
+    """MEASURED LIVE 2026-09-08, after 28 minutes of clean running: `Safety stop: inventory
+    still full after banking` fired 0.9s after the shift-deposit click -- while the deposit was
+    in fact fine, the inventory settling to 1/28 (the basket alone) moments later.
+
+    deposit_inventory waits human_delay(0.2, 0.4) after each shift-click, so with ONE item type
+    to deposit the whole tail is under the game's 0.6s server tick and the re-read is stale.
+    The trips that survived earlier deposited TWO types, buying an extra click flight of slack
+    -- which is why this took half an hour to bite and looks intermittent.
+
+    Same family as drop_items' DROP_CONFIRM_S, and worse in consequence: this one is a terminal
+    safety stop, so losing the race ends an unattended run.
+    """
+    calls = {"n": 0}
+
+    def inventory():
+        # Full on the read that used to decide, then settled -- one server tick later.
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return [{"name": "Yew logs"}] * 28
+        return [{"name": "Open log basket"}]
+
+    monkeypatch.setattr(controller, "get_inventory", inventory)
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 1591, "y": 3487, "plane": 0})
+    monkeypatch.setattr(gathering.banker, "find_nearby_bank",
+                        lambda cfg: {"name": "Bank chest", "distance": 5})
+    monkeypatch.setattr(gathering.banker, "open_bank", lambda ctx, bank: True)
+    monkeypatch.setattr(gathering.banker, "deposit_inventory", lambda ctx, cfg: None)
+    monkeypatch.setattr(gathering.banker, "close_bank", lambda ctx: None)
+    monkeypatch.setattr(gathering.travel, "walk_to", lambda *a, **k: True)
+    monkeypatch.setattr(gathering, "_sleep", lambda s: None)
+
+    state = controller.ControllerState()
+    state.config = dict(woodcutting.DEFAULT_CONFIG, treeNames=["Yew tree"],
+                        fullInventory="bank")
+    ctx = types.SimpleNamespace(ser=None, state=state, events=None)
+
+    assert gathering.full_inventory_phase(P, ctx, state.config) is True
+    assert not ctx.state.safety_stopped, "a deposit landing one tick later is not a failure"
+
+
+def test_banking_still_stops_when_the_deposit_genuinely_did_nothing(monkeypatch):
+    """The belt stays on: a bank trip that really frees nothing must not loop forever."""
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Yew logs"}] * 28)
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 1591, "y": 3487, "plane": 0})
+    monkeypatch.setattr(gathering.banker, "find_nearby_bank",
+                        lambda cfg: {"name": "Bank chest", "distance": 5})
+    monkeypatch.setattr(gathering.banker, "open_bank", lambda ctx, bank: True)
+    monkeypatch.setattr(gathering.banker, "deposit_inventory", lambda ctx, cfg: None)
+    monkeypatch.setattr(gathering.banker, "close_bank", lambda ctx: None)
+    monkeypatch.setattr(gathering, "_sleep", lambda s: None)
+
+    state = controller.ControllerState()
+    state.config = dict(woodcutting.DEFAULT_CONFIG, treeNames=["Yew tree"],
+                        fullInventory="bank")
+    ctx = types.SimpleNamespace(ser=None, state=state, events=None)
+
+    assert gathering.full_inventory_phase(P, ctx, state.config) is True
+    assert ctx.state.safety_stopped
