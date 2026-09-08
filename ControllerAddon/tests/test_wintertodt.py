@@ -54,8 +54,21 @@ def hermetic(monkeypatch):
 def test_default_config_carries_every_key_derive_phase_reads():
     for key in ("preferredBrazier", "drinkAtWarmth", "minDoses", "takeConcoctions",
                 "fletch", "feedRootsNearRoundEnd", "feedRootsBelowEnergy", "dodgeSnowfall",
-                "roundEndReads"):
+                "roundEndReads", "notAtArenaReads"):
         assert key in wt.DEFAULT_CONFIG, key
+
+
+def test_min_doses_default_is_below_a_full_potions_worth_of_doses():
+    # Fix round 2 (Critical 2b): must be strictly less than DOSES_PER_POTION, or a single drink
+    # (which removes exactly one dose) always re-crosses the threshold it just relieved.
+    assert wt.DEFAULT_CONFIG["minDoses"] < wt.DOSES_PER_POTION
+
+
+def test_take_concoctions_default_matches_the_typical_one_dose_shortfall():
+    # Fix round 2 (Minor 11): was 10 against a typical need of 1-2 doses (minDoses=2,
+    # DOSES_PER_POTION=4) -- taking a whole Take-10 batch each time leaves several unfinished
+    # potions occupying inventory slots indefinitely.
+    assert wt.DEFAULT_CONFIG["takeConcoctions"] == 1
 
 
 def test_get_config_ignores_the_bridge_because_there_is_no_config_section():
@@ -82,6 +95,38 @@ def test_nearest_picks_the_smallest_distance():
     objs = [{"distance": 7}, {"distance": 2}, {"distance": 5}]
     assert wt._nearest(objs)["distance"] == 2
     assert wt._nearest([]) is None
+
+
+def test_walk_to_calls_travel_walk_to_with_a_target_dict_not_positional_x_y_plane(monkeypatch):
+    """Fix round 2 (Critical 1). travel.walk_to(ctx, target: dict, tolerance=, goal_adjacent=)
+    takes a DICT; the pre-fix code called travel.walk_to(ctx, x, y, plane) POSITIONALLY, so
+    `target` inside walk_to was a bare int and every call raised AttributeError the instant
+    route_to touched `target.get("plane")`. Exercises the REAL travel.walk_to end to end
+    (following tests/test_travel.py's own `walker` fixture pattern: only worldmap.find_path and
+    travel._hop_to are stubbed, plus controller.*, so route selection and the walk loop
+    genuinely run) -- a test that monkeypatched wt._walk_to itself, or travel.walk_to, would be
+    structurally blind to a wrong-arity call, which is exactly how this shipped. This test
+    FAILS against the pre-fix `_walk_to` with an AttributeError."""
+    ctx = _Ctx()
+    state = {"pos": (3200, 3200, 0)}
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": state["pos"][0], "y": state["pos"][1],
+                                 "plane": state["pos"][2]})
+
+    def fake_hop(ctx_, x, y, plane):
+        state["pos"] = (x, y, plane)
+        return True
+
+    route = [(3200 + i, 3200) for i in range(10)]
+    monkeypatch.setattr(wt.travel.worldmap, "find_path", lambda *a, **k: route)
+    monkeypatch.setattr(wt.travel, "_hop_to", fake_hop)
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])
+    monkeypatch.setattr(controller, "get_collision", lambda *a, **k: [])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+
+    obj = {"x": 3209, "y": 3200, "plane": 0}
+    assert wt._walk_to(ctx, obj) is True
+    assert state["pos"][0] >= 3200
 
 
 def test_on_event_records_a_snowfall_spawn_on_our_own_tile(monkeypatch):
@@ -114,7 +159,7 @@ def test_kit_phase_clicks_the_crate_whose_id_hands_out_the_missing_tool(monkeypa
     monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
     clicked = {}
 
-    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None):
+    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None, **kwargs):
         clicked["id"] = obj["id"]
         clicked["action"] = action
         return True
@@ -129,13 +174,16 @@ def test_kit_phase_clicks_the_crate_whose_id_hands_out_the_missing_tool(monkeypa
 
 
 def test_kit_phase_takes_concoctions_in_bulk(monkeypatch):
-    ctx = _Ctx()
+    # Fix round 2 (Minor 11): the default takeConcoctions is now 1 (typical need), so this
+    # test -- which specifically exercises the Take-10 bulk path -- configures it explicitly
+    # rather than relying on the default to pick it.
+    ctx = _Ctx(config=dict(wt.DEFAULT_CONFIG, takeConcoctions=10))
     scene = [{"id": 29320, "name": "Crate", "actions": [w.CRATE_TAKE_10], "distance": 2,
               "x": 1, "y": 1, "plane": 0}]
     monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
     seen = {}
 
-    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None):
+    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None, **kwargs):
         seen["action"] = action
         return True                      # a real True: kit_phase's result is asserted `is True`
 
@@ -152,6 +200,25 @@ def test_kit_phase_stops_the_run_after_too_many_fruitless_takes(monkeypatch):
         wt.kit_phase(ctx, [])
     assert ctx.state.safety_stopped is True
     assert "kit" in ctx.state.stop_reason.lower()
+
+
+def test_kit_phase_defers_the_potion_restock_rather_than_spinning_a_full_inventory(monkeypatch):
+    """Fix round 2 (Critical 2c), defense in depth. between_rounds_phase calls kit_phase
+    DIRECTLY (bypassing derive_phase's own full-inventory defer for a potion-only deficit), so
+    kit_phase itself must not spend its ceiling on a Take-concoction click a full inventory
+    guarantees the game will refuse. This would FAIL pre-fix: the ceiling counter incremented
+    unconditionally before any click was even attempted, so KIT_MAX_TAKES calls with a full
+    inventory would trip a safety stop instead of a harmless no-op."""
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [])  # no crate reachable
+    full_items = [{"id": 0, "name": n} for n in
+                 ("Bronze axe", "Knife", "Tinderbox", "Hammer")] + \
+                [{"id": w.ITEM_ROOT, "name": "Bruma root"}] * 24
+    assert len(full_items) == 28
+    for _ in range(wt.KIT_MAX_TAKES + 1):
+        assert wt.kit_phase(ctx, full_items) is False
+    assert ctx.state.safety_stopped is False
+    assert ctx.state.data.get("wt_kit_takes", 0) == 0
 
 
 def test_warmth_phase_drinks_a_dose_and_confirms_on_warmth_rising(monkeypatch):
@@ -250,7 +317,7 @@ def test_kit_phase_falls_back_to_take_concoction_when_take_10_is_not_offered(mon
     monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
     seen = {}
 
-    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None):
+    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None, **kwargs):
         seen["action"] = action
         return True
 
@@ -269,7 +336,7 @@ def test_chop_phase_confirms_on_the_games_own_inventory_full_line(monkeypatch):
     monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [roots])
     seen = {}
 
-    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None):
+    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None, **kwargs):
         seen["signals"] = signals
         seen["action"] = action
         return True
@@ -288,18 +355,44 @@ def test_chop_phase_with_no_roots_in_view_does_not_stop_the_run(monkeypatch):
     assert ctx.state.safety_stopped is False
 
 
-def test_chop_phase_real_click_path_confirms_on_a_full_inventory(monkeypatch):
-    """Exercises the REAL wt._click_object / outcome_waits.await_pre, mocking only controller.*
-    -- this is what would have caught the Task 6 `.ok` crash, which every mocked-helper test
-    above is structurally blind to."""
+def test_chop_phase_real_click_path_confirms_when_roots_actually_increase(monkeypatch):
+    """Exercises the REAL wt._click_object / outcome_waits.await_long, mocking only
+    controller.* -- this is what would have caught the Task 6 `.ok` crash, which every
+    mocked-helper test above is structurally blind to.
+
+    Fix round 2 (Important 8): confirm now means "we gathered something", so the mocked
+    inventory actually has to grow a root count for this to pass -- unlike the pre-fix
+    `ws.inventory_full()` confirm, which a merely-full inventory (see the next test) already
+    satisfies with no root ever gathered."""
     ctx = _Ctx()
     roots = {"id": w.OBJ_ROOTS, "name": "Bruma roots", "actions": ["Chop"],
              "distance": 2, "x": 5, "y": 5, "plane": 0, "onScreen": True,
              "screenX": 10, "screenY": 10}
     monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [roots])
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
-    monkeypatch.setattr(controller, "get_inventory", lambda *a, **k: [{"id": 0}] * 28)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda *a, **k: [{"id": w.ITEM_ROOT, "name": "Bruma root"}])
+    monkeypatch.setattr(controller, "get_api", lambda *a, **k: {"roundActive": True})
     assert wt.chop_phase(ctx, []) is True
+
+
+def test_chop_phase_does_not_falsely_confirm_when_entered_already_full_of_other_items(monkeypatch):
+    """Fix round 2 (Important 8) regression: the old confirm (`ws.inventory_full`) was already
+    true when entered full of NON-root items (every slot spent on tools/potions, say), so a
+    click that gathered nothing still reported success. This would FAIL against the pre-fix
+    confirm, which is trivially true here from the very first pre-check with zero roots ever
+    chopped. `stop=` (round ended) releases the wait quickly instead of burning the full 90s
+    chop budget in this test."""
+    ctx = _Ctx()
+    roots = {"id": w.OBJ_ROOTS, "name": "Bruma roots", "actions": ["Chop"],
+             "distance": 2, "x": 5, "y": 5, "plane": 0, "onScreen": True,
+             "screenX": 10, "screenY": 10}
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [roots])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    full_non_root_inventory = [{"id": 999, "name": "junk"}] * 28
+    monkeypatch.setattr(controller, "get_inventory", lambda *a, **k: full_non_root_inventory)
+    monkeypatch.setattr(controller, "get_api", lambda *a, **k: {"roundActive": False})
+    assert wt.chop_phase(ctx, full_non_root_inventory) is False
 
 
 def test_fletch_phase_uses_the_knife_on_a_root(monkeypatch):
@@ -319,6 +412,49 @@ def test_fletch_phase_without_a_knife_falls_through_rather_than_looping(monkeypa
     ctx = _Ctx()
     items = [{"id": w.ITEM_ROOT, "name": "Bruma root", "slot": 1}]
     assert wt.fletch_phase(ctx, items) is False
+
+
+def test_use_on_reflects_a_withheld_first_click_instead_of_always_true(monkeypatch):
+    """Fix round 2 (Minor 10). The first click carries the "Use" hover gate and can be withheld
+    (a falsy CLICK_WITHHELD-style return, modelled here as False) -- the pre-fix `_use_on`
+    returned True unconditionally regardless of what either click did."""
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    calls = {"second": 0}
+
+    def fake_click_entity(ser, entity, **kwargs):
+        if kwargs.get("expected_action") == "Use":
+            return False          # withheld
+        calls["second"] += 1
+        return True
+
+    monkeypatch.setattr(controller, "click_entity", fake_click_entity)
+    item_a = {"id": 0, "name": "Knife", "screenX": 1, "screenY": 1}
+    item_b = {"id": w.ITEM_ROOT, "name": "Bruma root", "screenX": 2, "screenY": 2}
+    assert wt._use_on(ctx, item_a, item_b) is False
+    assert calls["second"] == 0     # the second click must never fire after a withheld first
+
+
+def test_use_on_reflects_a_refused_second_click(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+
+    def fake_click_entity(ser, entity, **kwargs):
+        return kwargs.get("expected_action") == "Use"   # first lands, second refused
+
+    monkeypatch.setattr(controller, "click_entity", fake_click_entity)
+    item_a = {"id": 0, "name": "Knife", "screenX": 1, "screenY": 1}
+    item_b = {"id": w.ITEM_ROOT, "name": "Bruma root", "screenX": 2, "screenY": 2}
+    assert wt._use_on(ctx, item_a, item_b) is False
+
+
+def test_use_on_returns_true_only_when_both_clicks_land(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    item_a = {"id": 0, "name": "Knife", "screenX": 1, "screenY": 1}
+    item_b = {"id": w.ITEM_ROOT, "name": "Bruma root", "screenX": 2, "screenY": 2}
+    assert wt._use_on(ctx, item_a, item_b) is True
 
 
 def test_fletch_phase_real_use_on_path_confirms_when_roots_are_gone(monkeypatch):
@@ -344,7 +480,7 @@ def test_feed_phase_clicks_the_lit_brazier_and_never_the_unlit_twin(monkeypatch)
     monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
     seen = {}
 
-    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None):
+    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None, **kwargs):
         seen["id"] = obj["id"]
         return True                      # feed_phase returns this straight through
 
@@ -480,6 +616,36 @@ def test_light_phase_real_bare_click_path_confirms_via_await_pre(monkeypatch):
     assert wt.light_phase(ctx, {}, "SOUTH_WEST") is True
 
 
+def test_light_phase_confirms_against_the_object_actually_clicked_not_just_the_reader_key(
+        monkeypatch):
+    """Fix round 2 (Important 6). `done` is keyed to the CONFIGURED compass slot (SOUTH_WEST
+    here), but the reader (m8aq's Wintertodt.java BrazierState) carries no world tile for any
+    brazier, and `_nearest(_objects(...))` picks whichever matching brazier is closest -- not
+    necessarily the SOUTH_WEST one `done` is watching. Reproduces the mismatch: the reader for
+    SOUTH_WEST never leaves UNLIT (a reader-only confirm could never fire), but the object
+    actually clicked (a fixed id+tile) vanishes from /objects after the click -- proof of a real
+    transition at the brazier that was genuinely worked. This would FAIL against the pre-fix
+    confirm (`done` alone), which can never become true here. Only controller.* is mocked, so
+    the real wt._brazier_action confirm path runs."""
+    ctx = _Ctx()
+    obj = {"id": w.OBJ_BRAZIER_UNLIT, "name": "Brazier", "actions": ["Light"],
+           "distance": 2, "x": 5, "y": 5, "plane": 0, "onScreen": True,
+           "screenX": 10, "screenY": 10}
+    scene = {"objs": [obj]}
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: list(scene["objs"]))
+
+    def fake_click_entity(ser, entity, **kwargs):
+        scene["objs"] = []          # the clicked brazier's own id/tile is gone -- it transitioned
+        return True
+
+    monkeypatch.setattr(controller, "click_entity", fake_click_entity)
+    # The reader for SOUTH_WEST never moves off UNLIT -- proves the pass comes from the
+    # object-tile check, not the HUD.
+    monkeypatch.setattr(controller, "get_api",
+                        lambda *a, **k: {"braziers": {"SOUTH_WEST": {"status": "UNLIT"}}})
+    assert wt.light_phase(ctx, {}, "SOUTH_WEST") is True
+
+
 def test_light_phase_real_menu_escalation_path_confirms_via_await(monkeypatch):
     """The bare click is refused (hijacked by whatever is drawn over the pixel) -- exercises
     the REAL wt._click_menu -> controller.click_menu_action and the REAL wt._await ->
@@ -570,9 +736,43 @@ def test_tick_dispatches_to_the_phase_derive_phase_chose(monkeypatch):
     assert called.get("chop") is True
 
 
-def test_tick_outside_the_arena_safety_stops(monkeypatch):
+def test_tick_outside_the_arena_safety_stops_once_the_streak_is_sustained(monkeypatch):
+    """Fix round 2 (Important 5): outside-the-arena is now a SUSTAINED streak too (see
+    test_tick_tolerates_a_lone_unreadable_read_without_stopping below for the tolerant half).
+    `wt.snapshot` is stubbed here (as it always was), which bypasses the real streak-accumulating
+    logic snapshot() normally does -- so the streak is seeded directly to demonstrate tick()
+    correctly turns a sustained "stop" verdict into an actual safety stop."""
     ctx = _Ctx()
+    ctx.state.data["wt_outside_streak"] = wt.DEFAULT_CONFIG["notAtArenaReads"]
     monkeypatch.setattr(wt, "snapshot", lambda c: ({"atWintertodt": False}, [], None))
+    wt.tick(ctx)
+    assert ctx.state.safety_stopped is True
+
+
+def test_tick_tolerates_a_lone_unreadable_read_without_stopping(monkeypatch):
+    """Fix round 2 (Important 5): a single bridge blip must cost latency, never end an
+    unattended run. `_reader()` collapses an unreachable/None `get_api` reply to `{}` exactly
+    like a genuine "not at Wintertodt" read -- this would FAIL against the pre-fix code, which
+    safety-stopped on the very first such read."""
+    ctx = _Ctx()
+    monkeypatch.setattr(wt, "snapshot", lambda c: ({}, [], None))
+    wt.tick(ctx)
+    assert ctx.state.safety_stopped is False
+
+
+def test_tick_real_path_tolerates_bridge_blips_then_stops_once_sustained(monkeypatch):
+    """The real wt.snapshot -> _reader() -> controller.get_api path, only controller.* mocked.
+    Every read is unreadable (get_api returns None, which `_reader()`'s own `or {}` collapses),
+    so this proves the sustained streak is actually accumulated and consulted end to end, not
+    just plumbed through a stub."""
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_api", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "get_inventory", lambda *a, **k: [])
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [])
+    threshold = int(wt.DEFAULT_CONFIG["notAtArenaReads"])
+    for _ in range(threshold - 1):
+        wt.tick(ctx)
+    assert ctx.state.safety_stopped is False
     wt.tick(ctx)
     assert ctx.state.safety_stopped is True
 
@@ -603,22 +803,30 @@ def test_progress_signature_moves_when_points_move():
 
 
 def test_before_break_plays_an_active_round_out(monkeypatch, hermetic):
-    # Points are all-or-nothing at 500, so a break landing mid-round throws the round away.
+    """Points are all-or-nothing at 500, so a break landing mid-round throws the round away.
+
+    Fix round 2 (Important 3): before_break's own round-over test is now the SUSTAINED
+    `wt_round_over_streak` derive_phase itself uses, maintained by the real snapshot() inside
+    tick() -- not a second, independent _reader() read taken by before_break. This fake_tick
+    plays snapshot's bookkeeping role directly (streak 0 while active, climbing once it is
+    not) so the test can drive it without a real bridge."""
     ctx = _Ctx()
-    rounds = {"active": True}
     ticks = {"n": 0}
 
     def fake_tick(c):
         ticks["n"] += 1
         hermetic["t"] += 1.0
-        if ticks["n"] >= 3:
-            rounds["active"] = False
+        if ticks["n"] < 3:
+            c.state.data["wt_round_over_streak"] = 0
+        else:
+            c.state.data["wt_round_over_streak"] = ticks["n"] - 2
 
     monkeypatch.setattr(wt, "tick", fake_tick)
-    monkeypatch.setattr(wt, "_reader", lambda: {"atWintertodt": True,
-                                                "roundActive": rounds["active"]})
     wt.before_break(ctx)
-    assert ticks["n"] >= 3
+    threshold = wt.DEFAULT_CONFIG["roundEndReads"]
+    # 2 ticks while the round is still active, plus `threshold` more before the sustained
+    # streak clears the gate.
+    assert ticks["n"] == 2 + threshold
 
 
 def test_before_break_gives_up_at_its_ceiling(monkeypatch, hermetic):

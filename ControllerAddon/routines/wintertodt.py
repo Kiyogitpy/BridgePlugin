@@ -38,13 +38,28 @@ SNOW_MEMORY_S = 3.0              # how long a recorded snowfall tile stays belie
 DEFAULT_CONFIG = {
     "preferredBrazier": "SOUTH_WEST",     # the conventional group brazier -- UNVERIFIED
     "drinkAtWarmth": 45,                  # a dose restores 30%, so 45 cannot overheal
-    "minDoses": 4,                        # one potion in reserve
-    "takeConcoctions": 10,                # one Take-10 click per restock
+    # Fix round 2 (Critical 2b): was 4, exactly equal to DOSES_PER_POTION -- so a single drink
+    # (4 doses -> 3) always dropped the held count back below the threshold and put "potion"
+    # straight back in kit_deficit's list, one tick after every drink. 2 is a half-potion
+    # buffer: one drink (4->3, or 3->2) never crosses it, so restocking is no longer re-armed by
+    # the very drink meant to relieve it -- only two consecutive drinks with nothing else held
+    # do. (Critical 2a's fix -- kit only preempts warmth with zero doses held -- is what stops
+    # this from mattering mid-round; this still governs the between-round top-up.)
+    "minDoses": 2,
+    # Fix round 2 (Minor 11): was 10 -- kit_deficit's typical shortfall is 1-2 doses (see
+    # minDoses above), so a Take-10 click leaves 8-9 unfinished potions occupying slots
+    # indefinitely, shrinking every later load and feeding Critical 2's full-inventory spin.
+    # Take what is actually needed: a single Take-concoction click.
+    "takeConcoctions": 1,
     "fletch": True,                       # USER's choice; False = the faster-XP roots method
     "feedRootsNearRoundEnd": True,
     "feedRootsBelowEnergy": 15,           # what "nearly over" means -- a guess, fit it live
     "dodgeSnowfall": True,
     "roundEndReads": 3,                   # SUSTAINED: one inactive read is transitional
+    # Fix round 2 (Important 5): SUSTAINED, the same shape as roundEndReads -- a lone bridge
+    # blip collapses `_reader()` to `{}` exactly like a genuine "not at Wintertodt" read, and
+    # one bad HTTP call must cost latency, never end an unattended run.
+    "notAtArenaReads": 5,
     "safety": {"stopOnInventoryFull": False},   # a full inventory is normal here, not a fault
 }
 
@@ -169,6 +184,13 @@ def snapshot(ctx):
         data["wt_round_over_streak"] = 0
     else:
         data["wt_round_over_streak"] = int(data.get("wt_round_over_streak") or 0) + 1
+    # Fix round 2 (Important 5): the same sustained-streak shape, for whether the reader has
+    # confirmed atWintertodt True. A bridge blip collapses `_reader()` to `{}` exactly like a
+    # genuine "not at Wintertodt" read -- see derive_phase's own comment on `outside_streak`.
+    if (reader or {}).get("atWintertodt"):
+        data["wt_outside_streak"] = 0
+    else:
+        data["wt_outside_streak"] = int(data.get("wt_outside_streak") or 0) + 1
     return reader, items, brazier
 
 
@@ -184,13 +206,20 @@ DRINK_BUDGET_S = 3.0
 TAKE_BUDGET_S = 4.0
 
 
-def _click_object(ctx, obj, action, budget_s, confirm, signals=None):
+def _click_object(ctx, obj, action, budget_s, confirm, signals=None, long=False, stop=None):
     """Click a world object and confirm it on a real outcome.
 
     NO expected_action hover gate. /hover reports what is under the cursor RIGHT NOW, and these
     clicks are issued while the player is still walking up to the target -- the gate withholds
     every one of them. That trap cost the Gauntlet ~8s per node and the Motherlode routine every
-    single ladder click. The outcome confirm is what proves the click landed."""
+    single ladder click. The outcome confirm is what proves the click landed.
+
+    Fix round 2 (Important 7): `long=True` (chop/feed -- both routinely wait tens of seconds)
+    routes through outcome_waits.await_long instead of await_pre, so the wait is spent in
+    human-length still segments with a resting-hand fidget between them rather than a frozen
+    cursor -- await_long's own docstring records that as "the one loud bot signature" a human-
+    vs-bot diff found. `stop` (checked between fidget chunks) is the mechanism for releasing a
+    long wait early; light/fix/kit stay on the short, plain await_pre path."""
     if not obj:
         return False
     if _too_far(obj):
@@ -199,9 +228,13 @@ def _click_object(ctx, obj, action, budget_s, confirm, signals=None):
     if not result:
         debug_log.log(LOG, "click %s on %d was refused or withheld" % (action, obj.get("id")))
         return False
-    outcome = outcome_waits.await_pre(
-        ctx, signals or [], budget_s + _walk_budget(obj), confirm,
-        now_fn=_now, sleep_fn=_sleep)
+    budget = budget_s + _walk_budget(obj)
+    if long:
+        outcome = outcome_waits.await_long(ctx, signals or [], budget, confirm, stop=stop,
+                                           now_fn=_now, sleep_fn=_sleep)
+    else:
+        outcome = outcome_waits.await_pre(ctx, signals or [], budget, confirm,
+                                          now_fn=_now, sleep_fn=_sleep)
     return bool(outcome)
 
 
@@ -217,8 +250,15 @@ def _too_far(obj) -> bool:
 
 
 def _walk_to(ctx, obj) -> bool:
-    import travel
-    return bool(travel.walk_to(ctx, obj.get("x"), obj.get("y"), obj.get("plane", 0)))
+    """Fix round 2 (Critical 1): travel.walk_to(ctx, target: dict, tolerance=, goal_adjacent=)
+    takes a DICT -- the pre-fix call passed (ctx, x, y, plane) positionally, so `target` inside
+    walk_to was a bare int and every call raised AttributeError the moment route_to touched
+    `target.get("plane")`. This fires on every _click_object past CLICK_RANGE / with
+    onScreen:False, and from between_rounds_phase's own walk to the brazier -- i.e. on every
+    walk this routine has ever attempted. `travel` is already imported at module level; the
+    local re-import here was dead weight from the same draft."""
+    return bool(travel.walk_to(ctx, {"x": obj.get("x"), "y": obj.get("y"),
+                                     "plane": obj.get("plane", 0)}))
 
 
 def _click_inventory_item(ctx, item, action, budget_s, confirm):
@@ -245,15 +285,22 @@ def _use_on(ctx, item_a, item_b) -> bool:
     """Use item A on item B: two interface clicks, the first carrying the "Use" hover gate.
 
     Copied from corrupted_gauntlet.use_on -- there is NO controller-level use_on helper, and
-    inventing one mid-task is how two routines end up with different semantics."""
+    inventing one mid-task is how two routines end up with different semantics.
+
+    Fix round 2 (Minor 10): returns whether both clicks actually landed, not True
+    unconditionally -- the first click carries `expected_action="Use"`, a hover gate that can
+    withhold it (returning the falsy CLICK_WITHHELD sentinel), and the pre-fix return discarded
+    that along with a genuinely refused second click."""
     if not item_a or not item_b:
         return False
     controller.open_inventory_tab(ctx.ser)
-    controller.click_entity(ctx.ser, item_a, offset=(0, 0), check_ui_blockers=False,
-                            simulate_mistakes=False, expected_action="Use")
-    controller.click_entity(ctx.ser, item_b, offset=(0, 0), check_ui_blockers=False,
-                            simulate_mistakes=False)
-    return True
+    first = controller.click_entity(ctx.ser, item_a, offset=(0, 0), check_ui_blockers=False,
+                                    simulate_mistakes=False, expected_action="Use")
+    if not first:
+        return False
+    second = controller.click_entity(ctx.ser, item_b, offset=(0, 0), check_ui_blockers=False,
+                                     simulate_mistakes=False)
+    return bool(second)
 
 
 # --- kit / warmth rungs ----------------------------------------------------------------------
@@ -265,10 +312,21 @@ def kit_phase(ctx, items) -> bool:
     unfinished potions are all free from crates a few tiles away."""
     data = _d(ctx)
     config = ctx.state.config or DEFAULT_CONFIG
-    missing = ws.kit_deficit(items, config.get("minDoses", 4))
+    missing = ws.kit_deficit(items, config.get("minDoses", 2))
     if not missing:
         data["wt_kit_takes"] = 0
         return True
+
+    want = missing[0]
+    if want == "potion" and ws.inventory_full(items):
+        # Fix round 2 (Critical 2c), defense in depth: derive_phase already avoids choosing
+        # "kit" for a potion-only deficit with no room, but between_rounds_phase calls this
+        # function DIRECTLY and bypasses that gate -- so the guard belongs here too. A
+        # Take-concoction click is guaranteed refused with no free inventory slot; not spending
+        # a ceiling attempt on it is what stops the between-round top-up from safety-stopping a
+        # perfectly healthy full inventory.
+        debug_log.log(LOG, "kit: inventory full -- deferring the potion restock")
+        return False
 
     data["wt_kit_takes"] = int(data.get("wt_kit_takes") or 0) + 1
     if data["wt_kit_takes"] > KIT_MAX_TAKES:
@@ -277,7 +335,6 @@ def kit_phase(ctx, items) -> bool:
             % (", ".join(missing), KIT_MAX_TAKES))
         return False
 
-    want = missing[0]
     if want == "potion":
         return _take_concoctions(ctx, items)
 
@@ -316,7 +373,7 @@ def _take_concoctions(ctx, items) -> bool:
     stage 1 is skipped so stages 2/3 run instead -- which is also what keeps the inventory
     from ever filling on unf alone, so combining (which frees a slot) stays reachable."""
     config = ctx.state.config or DEFAULT_CONFIG
-    min_doses = int(config.get("minDoses", 4))
+    min_doses = int(config.get("minDoses", 2))
     have_doses = ws.potion_doses(items)
     have_unf = ws.count_item(items, w.ITEM_UNF)
     have_herb = ws.count_item(items, w.ITEM_HERB)
@@ -380,13 +437,27 @@ FLETCH_BUDGET_S = 90.0           # a whole inventory fletched; a guess, fit it l
 FEED_BUDGET_S = 60.0             # a whole inventory fed; a guess, fit it live
 
 
-def _await(ctx, signals, budget_s, confirm, since=None):
+def _round_ended() -> bool:
+    """Fix round 2 (Important 8): the `stop=` predicate for a long wait -- CHOP_BUDGET_S (90s)
+    outlasts the ~60s inter-round gap, so a round ending mid-chop would otherwise sit out the
+    0:00 relight the spec calls the round's single best action. outcome_waits.py is not one of
+    the files this fix wave may touch, and await_long has no `shorten=` of its own (only
+    await_pre/await_outcome do) -- its `stop` predicate, re-checked between fidget chunks, is
+    the closest available substitute for releasing the wait once the round ends."""
+    return not ws.round_active(_reader())
+
+
+def _await(ctx, signals, budget_s, confirm, since=None, long=False, stop=None):
     # `bridge_events.Outcome` has no `.ok` -- its fields are hit/signal/payload/confirmed/
     # latency_s and `__bool__` returns `hit`. An earlier draft wrote `outcome.ok` here and at
     # three sites in Task 6; it crashed on the first genuinely SUCCESSFUL click and was
     # invisible to tests that mock the click helpers. Use plain truthiness.
-    outcome = outcome_waits.await_pre(ctx, signals, budget_s, confirm, since=since,
-                                      now_fn=_now, sleep_fn=_sleep)
+    if long:
+        outcome = outcome_waits.await_long(ctx, signals, budget_s, confirm, stop=stop,
+                                           now_fn=_now, sleep_fn=_sleep)
+    else:
+        outcome = outcome_waits.await_pre(ctx, signals, budget_s, confirm, since=since,
+                                          now_fn=_now, sleep_fn=_sleep)
     return bool(outcome)
 
 
@@ -394,15 +465,24 @@ def chop_phase(ctx, items) -> bool:
     """Chop until the inventory is full.
 
     ONE CLICK, not one per root: chopping is a CONTINUOUS action and the game ends it itself
-    with "Your inventory is too full". Re-clicking mid-action would cancel and restart it."""
+    with "Your inventory is too full". Re-clicking mid-action would cancel and restart it.
+
+    Fix round 2 (Important 8): the confirm means "we gathered something", not "we are full".
+    `ws.inventory_full(_inventory())` was already true the moment this rung is entered with an
+    already-full inventory (a full pack of tools/potions with no roots, say) -- await_pre/
+    await_long's own PRE-CHECK returns success from that stale fact alone, before the click had
+    any chance to do anything, so the rung reported progress while gathering nothing. Root
+    count actually rising is what "gathered something" means; it cannot be trivially true
+    before the click, since it is compared against the inventory this call was handed."""
     roots = _nearest(_objects(ids={w.OBJ_ROOTS}, action="Chop"))
     if not roots:
         debug_log.log(LOG, "chop: no Bruma roots in view")
         return False
+    before = ws.count_item(items, w.ITEM_ROOT)
     return _click_object(
         ctx, roots, "Chop", CHOP_BUDGET_S,
-        lambda: ws.inventory_full(_inventory()),
-        signals=["CHAT_MESSAGE"])
+        lambda: ws.count_item(_inventory(), w.ITEM_ROOT) > before,
+        signals=["CHAT_MESSAGE"], long=True, stop=_round_ended)
 
 
 def _use_knife_on_root(ctx, knife, root) -> bool:
@@ -413,7 +493,10 @@ def fletch_phase(ctx, items) -> bool:
     """Fletch the whole inventory of roots into kindling.
 
     Also CONTINUOUS: one knife-on-root and the game fletches the lot, ending with "You have run
-    out of bruma roots"."""
+    out of bruma roots".
+
+    Fix round 2 (Important 7): long wait -> await_long, same rationale as chop_phase, plus the
+    same round-end `stop=` so a round ending mid-fletch does not sit out the relight either."""
     knife = next((i for i in items if "knife" in (i.get("name") or "").lower()), None)
     root = next((i for i in items if i.get("id") == w.ITEM_ROOT), None)
     if not knife or not root:
@@ -422,7 +505,8 @@ def fletch_phase(ctx, items) -> bool:
     if not _use_knife_on_root(ctx, knife, root):
         return False
     return _await(ctx, ["CHAT_MESSAGE", "INVENTORY_CHANGED"], FLETCH_BUDGET_S,
-                  lambda: ws.count_item(_inventory(), w.ITEM_ROOT) == 0)
+                  lambda: ws.count_item(_inventory(), w.ITEM_ROOT) == 0,
+                  long=True, stop=_round_ended)
 
 
 def feed_phase(ctx, reader, items, brazier) -> bool:
@@ -430,7 +514,9 @@ def feed_phase(ctx, reader, items, brazier) -> bool:
 
     The brazier is found by the LIT id (29314) specifically. Its unlit and broken twins are
     both named "Brazier" and one of them is usually nearer, so a nearest-by-name pick takes the
-    wrong object -- the shut-vs-open door lesson."""
+    wrong object -- the shut-vs-open door lesson.
+
+    Fix round 2 (Important 7): long wait -> await_long, same rationale as chop_phase."""
     lit = _nearest(_objects(ids={w.OBJ_BRAZIER_LIT}, action="Feed"))
     if not lit:
         debug_log.log(LOG, "feed: no burning brazier in view")
@@ -439,7 +525,7 @@ def feed_phase(ctx, reader, items, brazier) -> bool:
         ctx, lit, "Feed", FEED_BUDGET_S,
         lambda: (ws.count_item(_inventory(), w.ITEM_KINDLING) == 0
                  and ws.count_item(_inventory(), w.ITEM_ROOT) == 0),
-        signals=["CHAT_MESSAGE", "INVENTORY_CHANGED"])
+        signals=["CHAT_MESSAGE", "INVENTORY_CHANGED"], long=True, stop=_round_ended)
 
 
 # --- light / fix / dodge rungs ---------------------------------------------------------------
@@ -487,15 +573,39 @@ def _brazier_action(ctx, ctr_key, obj_id, option, done, brazier) -> bool:
             % (option, brazier, data[ctr_key] - 1))
         return False
 
+    # Fix round 2 (Important 6): `done` is keyed to the CONFIGURED compass slot (`brazier`,
+    # read off the HUD), but `obj` above was picked by NEAREST among every brazier offering
+    # `option` -- and nothing here maps a compass key to a world tile to prove they are the
+    # same physical brazier. The reader (m8aq's Wintertodt.java BrazierState) carries no tile
+    # at all, quadrant + sprite id only, so that mapping is not available to build. When they
+    # disagree, a genuinely successful click on some OTHER brazier never satisfies `done` (which
+    # only watches the configured slot), so a real repair/relight never resets the ceiling and
+    # it is eventually spent entirely on productive work. Confirm on the object actually
+    # CLICKED instead: its own (id, tile) no longer appearing in this same action's candidate
+    # list is proof of a real state transition there, whichever compass slot it turns out to
+    # be -- and it can never disagree with what was clicked. `done` is kept as a fast OR: when
+    # the reader and the click happen to agree (the common single-brazier-in-this-state case)
+    # it still resolves immediately with no extra scan.
+    tile = (obj.get("x"), obj.get("y"), obj.get("plane", 0))
+
+    def _this_brazier_transitioned():
+        if done():
+            return True
+        return not any(
+            (o.get("x"), o.get("y"), o.get("plane", 0)) == tile
+            for o in _objects(ids={obj_id}, fresh=True))
+
     signals = ["CHAT_MESSAGE"]
-    if _click_object(ctx, obj, option, BRAZIER_ACTION_BUDGET_S, done, signals=signals):
+    if _click_object(ctx, obj, option, BRAZIER_ACTION_BUDGET_S, _this_brazier_transitioned,
+                     signals=signals):
         data[ctr_key] = 0
         return True
     if _click_menu(ctx, obj, option):
         # fix round 1 (finding 3): reflect the confirm's own outcome, exactly like the
         # bare-click branch above -- returning True unconditionally here is what let a menu
         # click that never actually confirmed masquerade as success.
-        confirmed = _await(ctx, signals, BRAZIER_ACTION_BUDGET_S + _walk_budget(obj), done)
+        confirmed = _await(ctx, signals, BRAZIER_ACTION_BUDGET_S + _walk_budget(obj),
+                           _this_brazier_transitioned)
         if confirmed:
             data[ctr_key] = 0
         return bool(confirmed)
@@ -538,7 +648,9 @@ def _force_walk(ctx, x, y, plane) -> bool:
 
 
 def dodge_phase(ctx) -> bool:
-    """Step one tile out of the 3x3 area attack.
+    """Step two tiles out of the 3x3 area attack (fix round 2, Minor 12: this docstring said
+    "one tile", the code has always stepped two -- correct for clearing a 3x3 attack centred on
+    the tile we were standing on).
 
     An ACCELERATOR: if 29325 never reaches /objects (checklist item 1) this rung simply never
     fires and warmth is healed reactively instead. Nothing else depends on it."""
@@ -602,7 +714,7 @@ def between_rounds_phase(ctx, reader, items) -> bool:
     instant the timer hits 0:00 -- worth 25 points plus Firemaking level * 6 XP, the wiki's
     single best-value action of the round."""
     config = ctx.state.config or DEFAULT_CONFIG
-    if ws.kit_deficit(items, config.get("minDoses", 4)):
+    if ws.kit_deficit(items, config.get("minDoses", 2)):
         return kit_phase(ctx, items)
     seconds = reader.get("secondsUntilRoundStart")
     if seconds is not None and seconds > 5:
@@ -636,6 +748,7 @@ def tick(ctx):
         reader=reader, items=items, config=config, brazier=brazier,
         snow_on_tile=_snow_on_tile(ctx),
         round_over_streak=int(data.get("wt_round_over_streak") or 0),
+        outside_streak=int(data.get("wt_outside_streak") or 0),
     )
 
     if phase != data.get("wt_phase"):
@@ -646,8 +759,9 @@ def tick(ctx):
 
     if phase == "stop":
         ctx.state.trigger_safety_stop(
-            "wintertodt: not in the Wintertodt arena (region %d) -- this routine owns no travel"
-            % w.REGION)
+            "wintertodt: not in the Wintertodt arena (region %d) after %d consecutive reads "
+            "failed to confirm it -- this routine owns no travel"
+            % (w.REGION, int(data.get("wt_outside_streak") or 0)))
         return
 
     # Fix round 1, Finding 3: the watch stands DOWN during "between_rounds". points reads -1
@@ -678,20 +792,40 @@ def before_break(ctx):
     was proven to hammer the bridge with unthrottled HTTP for up to 420s on a completely
     ordinary transient. Termination must not depend on what the callee happened to do.
 
-    Fix round 1, Finding 5 (Minor): the reader is read as defensively as everywhere else in
-    this file -- `_reader()` itself already collapses a bad read to `{}`, but an exception
-    raised getting there (a monkeypatched test double, or a future change to `_reader`) must
-    not escape this hook and crash the engine's break machinery."""
+    Fix round 2 (Important 3): the round-over test is now SUSTAINED, the identical
+    `wt_round_over_streak` / `roundEndReads` shape derive_phase itself uses (maintained by the
+    real snapshot() inside tick(), not a second, independent _reader() read taken here) --
+    pre-fix, one transitional HUD blackout (points -1, exactly the same family GOTR paid for six
+    times) was enough to start a multi-minute break mid-round and forfeit the round's points.
+
+    Fix round 2 (Important 4): checked both before AND after every tick() -- a safety stop
+    fired mid-round must end this loop immediately rather than continuing to drive the mouse.
+    PROVED live: a stop at iteration 13 was followed by 701 more tick() calls over 421s with the
+    stop already set. See routines/guardians_of_the_rift.py's own before_break for the same
+    check.
+
+    Fix round 1, Finding 5 (Minor), carried forward: a bad read must not escape this hook and
+    crash the engine's break machinery. `_reader()` no longer being called directly here does
+    not remove the need -- tick() reaches it via snapshot(), so the guard now wraps tick()
+    itself; every other exception this file could plausibly raise from a bridge blip is
+    likewise something a break should ride out, not propagate."""
     started = _now()
+    config = ctx.state.config or DEFAULT_CONFIG
+    round_end_threshold = int(config.get("roundEndReads", 3))
     while _now() - started < BREAK_DEFER_MAX_S:
-        try:
-            reader = _reader()
-        except Exception:
-            reader = {}
-        if not ws.round_active(reader):
-            debug_log.log(LOG, "before_break: round over, break may start")
+        if getattr(ctx.state, "safety_stopped", False):
             return
-        tick(ctx)
+        try:
+            tick(ctx)
+        except Exception:
+            debug_log.log(LOG, "before_break: tick() raised while playing the round out")
+        if getattr(ctx.state, "safety_stopped", False):
+            debug_log.log(LOG, "before_break: safety-stopped mid-round -- break may start")
+            return
+        streak = int(_d(ctx).get("wt_round_over_streak") or 0)
+        if streak >= round_end_threshold:
+            debug_log.log(LOG, "before_break: round over (streak=%d), break may start" % streak)
+            return
         outcome_waits.tick_pause(ctx, 1, now_fn=_now, sleep_fn=_sleep)
     debug_log.log(LOG, "before_break: gave up waiting for the round to end after %.0fs"
         % BREAK_DEFER_MAX_S)

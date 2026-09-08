@@ -167,7 +167,8 @@ def feed_item(items, *, fletch, energy_percent, feed_roots_near_end, feed_roots_
     return w.ITEM_ROOT if near_end else None
 
 
-def derive_phase(*, reader, items, config, brazier, snow_on_tile, round_over_streak) -> str:
+def derive_phase(*, reader, items, config, brazier, snow_on_tile, round_over_streak,
+                  outside_streak=0) -> str:
     """The ladder, as a pure function of live state. Never reads a stored phase.
 
     Order is the design, and each rung's position has a reason:
@@ -186,19 +187,51 @@ def derive_phase(*, reader, items, config, brazier, snow_on_tile, round_over_str
 
     `round_over_streak` is a SUSTAINED count of consecutive inactive reads, not a boolean: a
     single transitional snapshot (HUD down, points -1) looks exactly like a round end and is
-    the failure family that cost GOTR six live bugs."""
-    if not (reader or {}).get("atWintertodt"):
-        return "stop"
+    the failure family that cost GOTR six live bugs.
 
+    `outside_streak` is the same shape applied to the reader itself (fix round 2, Important 5):
+    `_reader()` collapses BOTH a bridge blip and a genuine "not at Wintertodt" read to the same
+    falsy/`atWintertodt: False` shape, so a single failed HTTP call must not be a terminal stop
+    -- only a SUSTAINED run of reads that fail to confirm `atWintertodt` concludes "stop"."""
     config = config or {}
-    deficit = kit_deficit(items, config.get("minDoses", 4))
-    cold = needs_drink(reader, config.get("drinkAtWarmth", 45))
+    if not (reader or {}).get("atWintertodt"):
+        if outside_streak >= config.get("notAtArenaReads", 5):
+            return "stop"
+        # Ride it out rather than act on a single bad read -- chop_phase touches neither
+        # `reader` nor the arena, so it is a safe no-op when there is truly nothing to click.
+        return "chop"
 
-    # Kit first only when it would otherwise disarm the warmth rung, or when a tool is missing.
-    if deficit and (not cold or "potion" in deficit):
+    deficit = kit_deficit(items, config.get("minDoses", 2))
+    cold = needs_drink(reader, config.get("drinkAtWarmth", 45))
+    have_doses = potion_doses(items)
+    tool_deficit = [d for d in deficit if d != "potion"]
+    potion_only_deficit = bool(deficit) and not tool_deficit
+    full = inventory_full(items)
+
+    # A missing TOOL always idles the whole loop (an axe gates chopping outright) and is worth
+    # restocking regardless of warmth.
+    if tool_deficit and not cold:
         return "kit"
+
+    if potion_only_deficit and not full:
+        # Fix round 2 (Critical 2a): kit preempts warmth only when there is genuinely nothing
+        # left to drink -- holding any dose at all is not an emergency. MEASURED live: warmth
+        # fell 740->220 across 13 ticks with THREE drinkable doses held, because
+        # minDoses==DOSES_PER_POTION meant every single drink dropped the held count below the
+        # threshold and put "potion" back in deficit, re-arming this branch unconditionally on
+        # every drink regardless of how many doses were still in hand.
+        if not cold or have_doses == 0:
+            return "kit"
+    # Fix round 2 (Critical 2c): when the ONLY deficit is "potion" and there is no free slot
+    # (the normal state for most of a round), a Take-concoction click is guaranteed to be
+    # refused -- fall through instead of spending the kit ceiling on it. Whatever frees a slot
+    # (feed/fletch/chop, below) gets a turn instead; a tool deficit is unaffected, since a
+    # missing tool is worth attempting to restock regardless of room.
+
+    if tool_deficit and cold and have_doses == 0:
+        return "kit"          # nothing to drink, and a tool is missing too -- must restock
     if cold:
-        return "warmth"
+        return "warmth"       # warmth_phase itself safety-stops when there is truly no dose
 
     if snow_on_tile and config.get("dodgeSnowfall", True):
         return "dodge"

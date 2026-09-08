@@ -309,7 +309,25 @@ def phase(**over):
 
 
 def test_outside_the_arena_is_a_stop_because_this_routine_owns_no_travel():
-    assert phase(reader=reader(atWintertodt=False)) == "stop"
+    # Sustained: this call supplies the streak already past the threshold, since a single
+    # unconfirmed read is now a transient no-op -- see the two tests below.
+    assert phase(reader=reader(atWintertodt=False), outside_streak=5) == "stop"
+
+
+def test_a_single_unreadable_read_does_not_stop_the_run():
+    """Fix round 2 (Important 5). `_reader()` collapses BOTH a bridge blip and a genuine
+    "not at Wintertodt" read to the same falsy/`atWintertodt: False` shape, so a single failed
+    HTTP call must not be a terminal stop. Pinned to "chop" specifically (not just != "stop"),
+    since chop_phase touches neither `reader` nor the arena and is a safe no-op to ride out an
+    unconfirmed read on."""
+    assert phase(reader={}, outside_streak=0) == "chop"
+    assert phase(reader=reader(atWintertodt=False), outside_streak=1) == "chop"
+
+
+def test_the_outside_arena_streak_honours_its_own_config_threshold():
+    cfg = dict(CFG, notAtArenaReads=2)
+    assert phase(reader=reader(atWintertodt=False), outside_streak=1, config=cfg) == "chop"
+    assert phase(reader=reader(atWintertodt=False), outside_streak=2, config=cfg) == "stop"
 
 
 def test_warmth_outranks_a_full_inventory_and_a_dead_brazier():
@@ -323,6 +341,31 @@ def test_warmth_outranks_a_full_inventory_and_a_dead_brazier():
 def test_kit_outranks_warmth_when_there_is_no_potion_to_drink():
     cold = reader(warmth=200)
     assert phase(reader=cold, items=inv("Bronze axe", "Knife", "Tinderbox", "Hammer")) == "kit"
+
+
+def test_kit_does_not_outrank_warmth_when_a_drinkable_dose_is_still_held():
+    """Fix round 2 (Critical 2a). Holding any dose at all is not an emergency -- kit only
+    preempts warmth when there is genuinely nothing left to drink. MEASURED live: warmth fell
+    740->220 across 13 ticks with THREE drinkable doses held, because minDoses(4 in this test's
+    CFG) == DOSES_PER_POTION(4) meant every single drink dropped the held count below the
+    threshold and re-armed the pre-fix condition (`not cold or "potion" in deficit`) --
+    "potion" is in deficit here (3 < 4) and cold is True, so the pre-fix code returns "kit" and
+    this test FAILS against it."""
+    cold = reader(warmth=220)
+    items = inv("Bronze axe", "Knife", "Tinderbox", "Hammer", "Rejuvenation potion(3)")
+    assert phase(reader=cold, items=items, config=CFG) == "warmth"
+
+
+def test_kit_does_not_spin_the_potion_restock_when_the_inventory_has_no_room():
+    """Fix round 2 (Critical 2c). Not cold, potion-only deficit, inventory full of roots --
+    Take-concoction is guaranteed refused with no free slot, so this must defer to fletch
+    (which frees a slot) rather than spinning. This would FAIL against the pre-fix condition
+    (`deficit and (not cold or "potion" in deficit)`), which returns "kit" here regardless of
+    room: deficit=["potion"] and not cold is True."""
+    items = inv("Bronze axe", "Knife", "Tinderbox", "Hammer", "Rejuvenation potion(1)",
+                *(["root"] * 23))
+    assert len(items) == 28
+    assert phase(items=items, config=CFG) == "fletch"
 
 
 def test_dodge_beats_working_but_only_when_enabled():
