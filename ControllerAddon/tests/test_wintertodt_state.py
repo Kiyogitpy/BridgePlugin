@@ -341,7 +341,9 @@ def test_an_unlit_brazier_is_relit_even_mid_inventory():
 def test_an_unlit_brazier_with_a_downed_pyromancer_is_not_relightable():
     snap = reader(braziers={"SOUTH_WEST": {"status": "UNLIT",
                                            "pyromancerStatus": "INCAPACITATED"}})
-    assert phase(reader=snap, items=inv(*KIT)) != "light"
+    # Pinned to the exact value, not just != "light" -- a regression that returned some
+    # other wrong phase would otherwise slip through unnoticed.
+    assert phase(reader=snap, items=inv(*KIT)) == "chop"
 
 
 def test_a_broken_brazier_is_fixed():
@@ -371,5 +373,21 @@ def test_the_round_end_test_is_sustained_not_a_single_read():
     # The transitional-snapshot family: a teleport/HUD blip reads exactly like a round end for
     # a tick or two. GOTR paid for this six separate times.
     over = reader(roundActive=False, points=-1, energyPercent=-1)
-    assert phase(reader=over, round_over_streak=1) != "between_rounds"
+    # Pinned to the exact value, not just != "between_rounds" -- a regression that returned
+    # some other wrong phase would otherwise slip through unnoticed.
+    assert phase(reader=over, round_over_streak=1) == "chop"
     assert phase(reader=over, round_over_streak=3) == "between_rounds"
+
+
+def test_derive_phase_tolerates_a_none_config():
+    # This module's whole point is being a pure layer callable independently of any
+    # particular caller, so it should not assume the caller normalises config for it.
+    assert phase(config=None) == "chop"
+
+
+def test_cold_with_a_potion_in_hand_but_missing_a_tool_still_goes_to_warmth():
+    # The compound kit-vs-warmth condition, tested in the other direction: an urgent drink
+    # must not be delayed to fetch an axe when a potion is already in hand.
+    cold = reader(warmth=200)
+    items = inv("Knife", "Tinderbox", "Hammer", "Rejuvenation potion(4)")  # no axe
+    assert phase(reader=cold, items=items) == "warmth"

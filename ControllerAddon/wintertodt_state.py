@@ -190,6 +190,7 @@ def derive_phase(*, reader, items, config, brazier, snow_on_tile, round_over_str
     if not (reader or {}).get("atWintertodt"):
         return "stop"
 
+    config = config or {}
     deficit = kit_deficit(items, config.get("minDoses", 4))
     cold = needs_drink(reader, config.get("drinkAtWarmth", 45))
 
@@ -205,6 +206,12 @@ def derive_phase(*, reader, items, config, brazier, snow_on_tile, round_over_str
     if not round_active(reader):
         if round_over_streak >= config.get("roundEndReads", 3):
             return "between_rounds"
+        # Below the streak threshold this is a suspected transitional misread, not a
+        # confirmed round end -- even if a brazier is genuinely broken on this same tick,
+        # we return "chop" rather than falling through to the light/fix checks below.
+        # This self-heals on the next tick once `roundActive` reads true again; acting on
+        # a single inactive read is exactly the failure family the sustained streak exists
+        # to prevent, so don't "fix" this by reordering the branches.
         return "chop"          # ride out a transitional read rather than acting on it
 
     if brazier:
