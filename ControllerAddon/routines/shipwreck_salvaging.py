@@ -300,7 +300,26 @@ def _active_giveup(data: dict, key_name: str, until_name: str, now: float) -> fr
 # edits between sessions, and a typo there must not be able to throw away the chisel or the rune
 # pouch -- same non-negotiable-floor reasoning banker.py applies to bank UI buttons and
 # sailing._FIXTURE_CLICK_KWARGS applies to deck clicks. Lowercase substrings.
-HARD_KEEP = frozenset({
+# The shipwreck-salvaging RARE RELICS (cache objs 32863-32873, all category_2297 /
+# salvaging_rare_*). One-time museum pieces turned in to Curator Haig Halen, tracked by the
+# per-item claim varbits 19593-19600 under sailing_shipwreck_rareitems, plus the Antique lamp.
+#
+# CONFIRMED LIVE 2026-09-08: a Rusty coin (1/3,000 from Plundered salvage) came out of a sort and
+# the disposal tried to drop it, because the keep-list is built from the wiki's money-making
+# table and that table does not list the relics at all. It survived only because these items have
+# NO Drop option -- their ops are Inspect/Destroy -- so the click did nothing; the pass reported
+# "5 attempted / 4 confirmed" and the confirmed-delta return is what made the miss visible rather
+# than silently successful.
+#
+# In HARD_KEEP rather than keepItems for two reasons: they are one-time rares that no config edit
+# should ever be able to target, and since they cannot be dropped at all, listing them here also
+# stops disposal spending a wasted click on them every single pass.
+SALVAGE_RELICS = frozenset({
+    "rusty locket", "mouldy block", "dull knife", "broken compass", "rusty coin",
+    "broken sextant", "mouldy doll", "smashed mirror", "antique lamp",
+})
+
+HARD_KEEP = SALVAGE_RELICS | frozenset({
     "chisel", "rune pouch", "coins", "gem bag", "plank sack", "log basket",
     "salvage",   # unsorted salvage is the WORK -- it gets stowed or sorted, never dropped here
 })

@@ -1610,3 +1610,14 @@ def test_a_salvage_only_deposit_all_does_not_trip_the_guard(monkeypatch):
     ctx = _Ctx()
     assert ss.stow_phase(ctx) is True
     assert ctx.state.data.get("hold_deposit_all_unsafe") is None
+
+
+def test_salvage_relics_are_hard_kept_and_never_dropped():
+    """CONFIRMED LIVE 2026-09-08: a Rusty coin (1/3,000, a one-time museum relic) reached the
+    disposal loop because the wiki money-making table the keep-list was built from does not list
+    the relics at all. It survived only because relics have no Drop option. HARD_KEEP so no
+    config edit can target them -- and so disposal stops wasting a click on them every pass."""
+    for relic in ["Rusty coin", "Rusty locket", "Mouldy block", "Dull knife", "Broken compass",
+                  "Broken sextant", "Mouldy doll", "Smashed mirror", "Antique lamp"]:
+        assert ss.keep_item(relic, []) is True, relic
+        assert ss.keep_item(relic, ss.DEFAULT_CONFIG["keepItems"]) is True, relic
