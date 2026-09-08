@@ -197,3 +197,84 @@ def test_feed_item_holds_roots_back_mid_round_when_fletching():
 def test_feed_item_returns_none_with_nothing_feedable():
     assert ws.feed_item(inv("Knife"), fletch=True, energy_percent=80,
                         feed_roots_near_end=True, feed_roots_below_energy=15) is None
+
+
+# --- Finding A: unfinished potions must be excluded ---
+
+
+def test_potion_doses_excludes_unfinished_potions():
+    # Unfinished potions are crafting ingredients, not drinkable doses.
+    # This matters: counting them would make kit_deficit report warmth satisfied when the routine
+    # has nothing to drink, and running out of warmth forfeits the entire round's points.
+    assert ws.potion_doses(inv("Rejuvenation potion (unf)")) == 0
+    # Mixed inventory: only the finished potion counts as a dose.
+    items = inv("Rejuvenation potion(4)", "Rejuvenation potion (unf)")
+    assert ws.potion_doses(items) == 4
+
+
+# --- Finding B: energy_percent=None or negative must not trigger near_end ---
+
+
+def test_feed_item_returns_none_when_energy_percent_is_none():
+    # Between rounds the HUD is down and energy_percent is None or omitted.
+    # This must NOT satisfy the "near the end" condition, or roots would be fed unfletched
+    # mid-round and lose more than half the points per root.
+    items = inv(*(["root"] * 28))
+    assert ws.feed_item(items, fletch=True, energy_percent=None,
+                        feed_roots_near_end=True, feed_roots_below_energy=15) is None
+
+
+def test_feed_item_returns_none_when_energy_percent_is_negative():
+    # HUD reports -1 for energy when down.
+    items = inv(*(["root"] * 28))
+    assert ws.feed_item(items, fletch=True, energy_percent=-1,
+                        feed_roots_near_end=True, feed_roots_below_energy=15) is None
+
+
+# --- Finding C: boundary for feed_roots_below_energy is inclusive ---
+
+
+def test_feed_item_boundary_at_feed_roots_below_energy():
+    # With feed_roots_below_energy=15:
+    # - energy_percent=15 (AT the boundary) should feed roots
+    # - energy_percent=16 (just above) should NOT feed roots
+    items = inv(*(["root"] * 28))
+    assert ws.feed_item(items, fletch=True, energy_percent=15,
+                        feed_roots_near_end=True, feed_roots_below_energy=15) == ws.w.ITEM_ROOT
+    assert ws.feed_item(items, fletch=True, energy_percent=16,
+                        feed_roots_near_end=True, feed_roots_below_energy=15) is None
+
+
+# --- Finding D: direct tests for named interfaces ---
+
+
+def test_count_item_sums_occurrences():
+    items = inv("root", "root", "kindling", "Knife")
+    assert ws.count_item(items, ws.w.ITEM_ROOT) == 2
+    assert ws.count_item(items, ws.w.ITEM_KINDLING) == 1
+    assert ws.count_item(items, 0) == 1  # the Knife has id 0
+    assert ws.count_item(items, 999) == 0  # not present
+
+
+def test_has_tool_uses_substring_match():
+    # Deliberately loose: "axe" matches any item with "axe" in the name.
+    # This is intentional because any axe chops bruma roots, and the arena
+    # crate hands out a Bronze axe whose exact name is not knowable offline.
+    items = inv("Dragon axe", "Battleaxe", "Bronze axe")
+    assert ws.has_tool(items, "axe") is True
+    assert ws.has_tool(items, "dragon") is True
+    assert ws.has_tool(items, "battle") is True
+    assert ws.has_tool(items, "bronze") is True
+    assert ws.has_tool(items, "spade") is False
+
+
+def test_inventory_full_checks_capacity():
+    # Inventory is full at size 28 (the default).
+    assert ws.inventory_full(inv(*(["root"] * 27))) is False
+    assert ws.inventory_full(inv(*(["root"] * 28))) is True
+    assert ws.inventory_full(inv(*(["root"] * 29))) is True
+    # Empty inventory is not full.
+    assert ws.inventory_full(inv()) is False
+    # Can use a custom size.
+    assert ws.inventory_full(inv("Knife", "Axe"), size=2) is True
+    assert ws.inventory_full(inv("Knife"), size=2) is False
