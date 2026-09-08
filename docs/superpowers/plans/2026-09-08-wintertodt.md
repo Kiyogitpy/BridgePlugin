@@ -1731,9 +1731,15 @@ def light_phase(ctx, reader, brazier) -> bool:
 
 def fix_phase(ctx, reader, brazier) -> bool:
     """25 points. The wiki warns braziers are "fixed extremely quickly on Wintertodt worlds",
-    so losing this race is normal and is a no-op, not a failure."""
+    so losing this race is normal and is a no-op, not a failure.
+
+    Confirms on LEAVING "BROKEN", never on reaching "LIT": repairing a brazier does not light
+    it. The wiki is explicit -- "It can then be relit after it is fixed" -- and the HUD carries
+    three distinct states (unlit / lit / damaged). An earlier draft waited for "LIT" here, so a
+    genuine repair could never satisfy the confirm and ten successful fixes still spent the
+    whole ceiling. The `light` rung does the relight on the next tick."""
     return _brazier_action(ctx, "wt_fix_clicks", w.OBJ_BRAZIER_BROKEN, "Fix",
-                           "LIT", brazier)
+                           "NOT_BROKEN", brazier)
 
 
 def _force_walk(ctx, x, y, plane) -> bool:
