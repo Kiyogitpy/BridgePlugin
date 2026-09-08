@@ -349,9 +349,15 @@ above them and their screen positions do not move.
    click, which is a design change rather than a setting.
 3. **Real click-window occupancy on this hardware.** The routine logs one line per cycle
    (`cycle ok: opened at phase Xms, in-place Yms, flight+click Zms, occupancy Wms of 600ms`)
-   plus a median/max summary every 25 cycles; fit `logClickPhaseMs` from it. If p90 occupancy
-   exceeds ~500ms the arithmetic above has failed, and the honest answer is the 4-tick celastrus
-   variant (2400ms per cycle), not tuning.
+   plus a median/max summary every 25 cycles; fit `logClickPhaseMs` from it.
+   **Note the corrected arithmetic above (~520ms median / ~730ms p90) already exceeds the
+   ~500ms figure this item originally named** — that threshold was written against the earlier,
+   double-charged ~347ms estimate and is stale. Judge the bench against MEASURED occupancy, and
+   read a p90 over 600ms as "expect roughly a tenth of cycles to be abandoned by
+   `Window.room_for`", which is a rate cost rather than a broken mechanic. The 4-tick celastrus
+   variant (2400ms per cycle) becomes the honest answer only if the measured p90 is at or above
+   600ms **and** item 6 answers "release" — settle item 6 first, because it moves the budget by
+   ~235ms and could remove the shortfall entirely.
 4. **Does the second roll actually land?** Compare granite/hour against the wiki's ~116k xp/hr
    at 70. A rotation that is not buying the movement stall will read close to plain mining.
 5. Whether the parked cursor survives a full cycle untouched — i.e. that `mark_busy` and the

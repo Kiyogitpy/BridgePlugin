@@ -1816,10 +1816,26 @@ only wires it into the panel dropdown.
   so the panel's dropdown entry ships with an empty rotation and selecting it stops immediately
   with a clear message. Capture the tiles with `python routines/granite_3t.py --probe` at the
   mine and paste them into `DEFAULT_CONFIG` in the Python file before a first run.
-- **`tick_bench.py` is the go/no-go gate and has NOT been run.** The ~347ms critical-tick figure
-  above is arithmetic over the fitted movement model, not a measurement on this hardware. If p90
-  occupancy exceeds ~540ms live, the answer is the 4-tick celastrus variant (2400ms per cycle),
-  not tuning `logClickPhaseMs` further.
+- **`tick_bench.py` is the go/no-go gate, it has NOT been run, and THE CORRECTED ARITHMETIC
+  ALREADY FAILS ITS OWN OLD GATE.** The honest budget (see the spec's table) is **~520ms median
+  and ~730ms p90** against a 600ms tick, not the ~347ms an earlier draft claimed by charging the
+  click cost two different ways in one sum. The original rule -- "p90 over ~540ms means use the
+  4-tick celastrus variant" -- was written against that wrong number, and the new p90 blows
+  through it. Do not read that as "the design is dead", and do not read it as "the gate is
+  obsolete" either. What it actually means:
+  - the MEDIAN cycle fits, so the method works most of the time;
+  - the p90 cycle does not, and `Window.room_for` is built to ABANDON those rather than let a
+    click cross the boundary -- so the predicted cost is roughly a tenth of cycles abandoned and
+    resynced, i.e. a rate hit, not a broken mechanic;
+  - **the whole shortfall may be an artefact of measuring the wrong thing.** ~235ms of every
+    cycle's booked budget is the click HOLD plus its trailing delay, which only counts if the
+    game acts on mouse-RELEASE. If it acts on mouse-DOWN, the real occupancy is ~285ms median /
+    ~430ms p90 and everything fits comfortably. That question is live-checklist item 6 and it is
+    now the single highest-value thing the first session can answer.
+  So: run the bench, and judge it against MEASURED occupancy rather than against the stale 540
+  figure. If the bench's p90 is near or above 600ms **and** the game turns out to act on
+  release, the 4-tick celastrus variant (2400ms per cycle) is the honest fallback -- and
+  `tick_cycle.py` carries over to it unchanged, since the scheduler is cycle-length-agnostic.
 - **Both once-per-chain gates (the inventory tab, the knife hover) are COUNTED and terminal**
   (`INVENTORY_TAB_STOP` / `KNIFE_HOVER_STOP`, 15 each, same shape as `EMPTY_INVENTORY_STOP`).
   They sit BEFORE `_stall_check` and return from `tick()` without running a cycle, so a gate
