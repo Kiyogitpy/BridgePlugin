@@ -15,6 +15,7 @@ import pytest
 import controller
 import wintertodt as wt
 import wintertodt_ids as w
+import wintertodt_state as ws
 
 
 class _State:
@@ -168,3 +169,92 @@ def test_warmth_phase_with_no_potion_is_a_safety_stop_not_a_silent_loop(monkeypa
     ctx = _Ctx()
     assert wt.warmth_phase(ctx, []) is False
     assert ctx.state.safety_stopped is True
+
+
+# --- fix round 1: Outcome has no .ok, only .hit/__bool__ -----------------------------------
+# These two exercise the REAL _click_object / _click_inventory_item, mocking only controller.*
+# and letting outcome_waits.await_pre / bridge_events.Outcome run for real against the faked
+# clock -- every other test in this file mocks wt._click_object / wt._click_inventory_item
+# themselves, which is exactly why `outcome and outcome.ok` (an AttributeError on every genuine
+# hit, since Outcome's __slots__ are hit/signal/payload/confirmed/latency_s) shipped green.
+
+def test_click_object_real_success_path_does_not_crash_on_a_genuine_hit(monkeypatch):
+    ctx = _Ctx()
+    obj = {"id": 1, "name": "Crate", "x": 1, "y": 1, "plane": 0, "distance": 2,
+           "onScreen": True, "screenX": 10, "screenY": 10}
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    assert wt._click_object(ctx, obj, "Take", 1.0, lambda: True) is True
+
+
+def test_click_inventory_item_real_success_path_does_not_crash_on_a_genuine_hit(monkeypatch):
+    ctx = _Ctx()
+    item = {"id": 0, "name": "Rejuvenation potion(4)", "screenX": 5, "screenY": 5, "slot": 0}
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    assert wt._click_inventory_item(ctx, item, "Drink", 1.0, lambda: True) is True
+
+
+# --- fix round 1: _take_concoctions cold-start deadlock -------------------------------------
+
+def test_take_concoctions_cold_start_reaches_a_drinkable_dose_not_a_pile_of_unf(monkeypatch):
+    """Empty kit, crate available every tick: stage 1 must stop taking unfinished potions once
+    enough are held to cover minDoses, so the chain falls through to picking a herb and
+    combining. Pre-fix, stage 1 is unconditional and always wins (a successful click returns
+    True immediately), so this would spin forever adding unfinished potions and never reach a
+    drinkable dose -- reproducing the reviewer's "28 unf, 0 herb, 0 doses" finding."""
+    ctx = _Ctx()
+    inv = {"items": []}
+
+    def fake_get_objects(*a, **k):
+        return [
+            {"id": 29320, "name": "Crate", "actions": [w.CRATE_TAKE_10], "distance": 2,
+             "x": 1, "y": 1, "plane": 0, "onScreen": True},
+            {"id": w.OBJ_SPROUTING_ROOTS, "name": "Sprouting Roots", "actions": ["Pick"],
+             "distance": 2, "x": 1, "y": 1, "plane": 0, "onScreen": True},
+        ]
+
+    def fake_click_entity(ser, entity, **kwargs):
+        eid = entity.get("id")
+        if eid == 29320:
+            inv["items"].append({"id": w.ITEM_UNF, "name": "Rejuvenation potion (unf)"})
+        elif eid == w.OBJ_SPROUTING_ROOTS:
+            inv["items"].append({"id": w.ITEM_HERB, "name": "Bruma herb"})
+        elif eid == w.ITEM_UNF:
+            # the second _use_on click: consume one herb + one unf, produce a finished dose
+            for target in (w.ITEM_HERB, w.ITEM_UNF):
+                for i, it in enumerate(inv["items"]):
+                    if it.get("id") == target:
+                        del inv["items"][i]
+                        break
+            inv["items"].append({"id": 999, "name": "Rejuvenation potion(4)"})
+        return True
+
+    monkeypatch.setattr(controller, "get_objects", fake_get_objects)
+    monkeypatch.setattr(controller, "get_inventory", lambda *a, **k: list(inv["items"]))
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", fake_click_entity)
+
+    for _ in range(6):
+        wt._take_concoctions(ctx, list(inv["items"]))
+
+    assert w.ITEM_UNF not in [i.get("id") for i in inv["items"]]
+    assert w.ITEM_HERB not in [i.get("id") for i in inv["items"]]
+    assert ws.potion_doses(inv["items"]) >= wt.DEFAULT_CONFIG["minDoses"]
+    assert ws.count_item(inv["items"], w.ITEM_UNF) < 28
+
+
+def test_kit_phase_falls_back_to_take_concoction_when_take_10_is_not_offered(monkeypatch):
+    ctx = _Ctx()
+    scene = [{"id": 29320, "name": "Crate", "actions": ["Take-concoction"], "distance": 2,
+              "x": 1, "y": 1, "plane": 0}]
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
+    seen = {}
+
+    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None):
+        seen["action"] = action
+        return True
+
+    monkeypatch.setattr(wt, "_click_object", fake_click)
+    items = [{"id": 0, "name": n} for n in ("Bronze axe", "Knife", "Tinderbox", "Hammer")]
+    assert wt.kit_phase(ctx, items) is True
+    assert seen["action"] == "Take-concoction"

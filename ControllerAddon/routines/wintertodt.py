@@ -202,7 +202,7 @@ def _click_object(ctx, obj, action, budget_s, confirm, signals=None):
     outcome = outcome_waits.await_pre(
         ctx, signals or [], budget_s + _walk_budget(obj), confirm,
         now_fn=_now, sleep_fn=_sleep)
-    return bool(outcome and outcome.ok)
+    return bool(outcome)
 
 
 def _too_far(obj) -> bool:
@@ -238,7 +238,7 @@ def _click_inventory_item(ctx, item, action, budget_s, confirm):
         return False
     outcome = outcome_waits.await_pre(ctx, ["INVENTORY_CHANGED"], budget_s, confirm,
                                       now_fn=_now, sleep_fn=_sleep)
-    return bool(outcome and outcome.ok)
+    return bool(outcome)
 
 
 def _use_on(ctx, item_a, item_b) -> bool:
@@ -295,35 +295,57 @@ def kit_phase(ctx, items) -> bool:
     return False
 
 
+DOSES_PER_POTION = 4             # a finished Rejuvenation potion is a standard 4-dose potion,
+                                  # matching the (4) suffix ws.potion_doses parses
+
+
 def _take_concoctions(ctx, items) -> bool:
     """Take unfinished potions in bulk, then brew them with a bruma herb.
 
     Herblore 75 on this account means Druidic Ritual is complete, so the Brew'ma NPC fallback
-    (which mixes for players without the quest) is not needed."""
+    (which mixes for players without the quest) is not needed.
+
+    Stage 1 (take from the crate) is GATED on how many more unfinished potions are actually
+    needed to cover the deficit. Fix round 1: an unconditional stage 1 always wins the moment
+    the crate is in view -- a successful click returns True immediately -- so it refills
+    unfinished potions forever and never falls through to picking a herb or combining. Live
+    that deadlocks the whole kit: 28/28 unfinished potions, zero herbs, zero drinkable doses,
+    then no room left to pick a herb either, and KIT_MAX_TAKES safety-stops a run in which
+    every individual click had actually succeeded. Once held unf already covers the deficit
+    (ceil'd to whole potions, since each unf brews into one DOSES_PER_POTION-dose potion),
+    stage 1 is skipped so stages 2/3 run instead -- which is also what keeps the inventory
+    from ever filling on unf alone, so combining (which frees a slot) stays reachable."""
     config = ctx.state.config or DEFAULT_CONFIG
+    min_doses = int(config.get("minDoses", 4))
+    have_doses = ws.potion_doses(items)
+    have_unf = ws.count_item(items, w.ITEM_UNF)
+    have_herb = ws.count_item(items, w.ITEM_HERB)
+    needed_doses = max(0, min_doses - have_doses)
+    potions_needed = -(-needed_doses // DOSES_PER_POTION) if needed_doses else 0
+
     crate = _nearest(_objects(ids={29320}))
-    if crate:
+    if crate and have_unf < potions_needed:
         want = int(config.get("takeConcoctions", 10))
         action = w.CRATE_TAKE_10 if want >= 10 else (
             w.CRATE_TAKE_5 if want >= 5 else "Take-concoction")
         available = [str(a) for a in (crate.get("actions") or []) if a]
         if not any(action.lower() == a.lower() for a in available):
             action = "Take-concoction"
-        before = ws.count_item(items, w.ITEM_UNF)
+        before = have_unf
         if _click_object(ctx, crate, action, TAKE_BUDGET_S,
                          lambda: ws.count_item(_inventory(), w.ITEM_UNF) > before,
                          signals=["INVENTORY_CHANGED"]):
             return True
 
-    if ws.count_item(items, w.ITEM_UNF) and not ws.count_item(items, w.ITEM_HERB):
+    if have_unf and not have_herb:
         roots = _nearest(_objects(ids={w.OBJ_SPROUTING_ROOTS}))
-        before = ws.count_item(items, w.ITEM_HERB)
+        before = have_herb
         return _click_object(ctx, roots, "Pick", TAKE_BUDGET_S,
                              lambda: ws.count_item(_inventory(), w.ITEM_HERB) > before,
                              signals=["INVENTORY_CHANGED"])
 
-    if ws.count_item(items, w.ITEM_UNF) and ws.count_item(items, w.ITEM_HERB):
-        before = ws.potion_doses(items)
+    if have_unf and have_herb:
+        before = have_doses
         herb = next((i for i in items if i.get("id") == w.ITEM_HERB), None)
         unf = next((i for i in items if i.get("id") == w.ITEM_UNF), None)
         if _use_on(ctx, herb, unf):
@@ -331,7 +353,7 @@ def _take_concoctions(ctx, items) -> bool:
                 ctx, ["INVENTORY_CHANGED"], 4.0,
                 lambda: ws.potion_doses(_inventory()) > before,
                 now_fn=_now, sleep_fn=_sleep)
-            return bool(outcome and outcome.ok)
+            return bool(outcome)
     return False
 
 
