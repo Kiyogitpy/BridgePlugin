@@ -155,3 +155,67 @@ def _ctx_only():
             self.config = vtr_routine.get_config(None)
 
     return _Ctx()
+
+
+import skillmulti
+
+
+def test_choose_spirit_presses_the_number_derived_from_the_matched_widget(monkeypatch):
+    monkeypatch.setattr(skillmulti, "showing", lambda t: t == skillmulti.TITLE_CARVE)
+    monkeypatch.setattr(skillmulti, "item_widget",
+                        lambda name: {"child": 17, "screenX": 5, "screenY": 6})
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    assert vtr_routine.choose_spirit(_ctx_only(), "EAGLE") is True
+    assert keys == ["3"], "option 3 == child 17, derived from the widget not from a table"
+
+
+def test_choose_spirit_refuses_when_the_fletch_prompt_is_the_one_on_screen(monkeypatch):
+    # THE trap: both prompts are widget group 270. Pressing a number here would fletch.
+    monkeypatch.setattr(skillmulti, "showing", lambda t: t == skillmulti.TITLE_MAKE)
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    assert vtr_routine.choose_spirit(_ctx_only(), "EAGLE") is False
+    assert keys == []
+
+
+def test_choose_spirit_refuses_when_no_prompt_can_be_read(monkeypatch):
+    monkeypatch.setattr(skillmulti, "showing", lambda t: False)
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    assert vtr_routine.choose_spirit(_ctx_only(), "EAGLE") is False
+    assert keys == []
+
+
+def test_choose_spirit_clicks_the_widget_when_no_number_can_be_derived(monkeypatch):
+    monkeypatch.setattr(skillmulti, "showing", lambda t: t == skillmulti.TITLE_CARVE)
+    monkeypatch.setattr(skillmulti, "item_widget",
+                        lambda name: {"child": 99, "screenX": 5, "screenY": 6})
+    keys = []
+    clicks = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda *a, **k: clicks.append(a) or True)
+    assert vtr_routine.choose_spirit(_ctx_only(), "EAGLE") is True
+    assert keys == [] and clicks
+
+
+def test_carve_rereads_the_spirits_before_choosing(monkeypatch):
+    # The wiki says the trio can rotate mid-carve. carve() must pick from a FRESH read, not
+    # from the site object it was handed.
+    stale = _one_site(baseValue=4, wood="YEW",
+                      nearbySpirits=["BUFFALO", "JAGUAR", "SNAKE"])
+    fresh = _one_site(baseValue=4, wood="YEW",
+                      nearbySpirits=["EAGLE", "SCORPION", "SNAKE"])
+    monkeypatch.setattr(vtr_routine, "read_state",
+                        lambda: type("S", (), {"sites": {6: fresh}})())
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda *a, **k: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    chosen = []
+    monkeypatch.setattr(vtr_routine, "choose_spirit",
+                        lambda ctx, s: chosen.append(s) or True)
+    monkeypatch.setattr(vtr_routine, "_await_menu", lambda ctx: True)
+    vtr_routine.carve(_ctx_only(), stale)
+    assert chosen == ["EAGLE"], "carve used the stale trio instead of re-reading"

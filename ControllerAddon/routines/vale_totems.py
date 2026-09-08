@@ -162,3 +162,88 @@ def build(ctx, site) -> bool:
         return fresh is not None and fresh.base_value != 0
 
     return _click_site(ctx, n, "totem", BUILD_BUDGET_S, done)
+
+
+CARVE_MENU_BUDGET_S = 4.0
+CARVE_BUDGET_S = 6.0
+
+
+def _await_menu(ctx) -> bool:
+    """Wait for the CARVE prompt specifically."""
+    outcome = outcome_waits.await_pre(
+        ctx, ["WIDGET_LOADED"], CARVE_MENU_BUDGET_S,
+        lambda: skillmulti.showing(skillmulti.TITLE_CARVE),
+        now_fn=_now, sleep_fn=_sleep)
+    return bool(outcome)
+
+
+def choose_spirit(ctx, spirit: str) -> bool:
+    """Pick `spirit` off the carve menu.
+
+    TWO SAFEGUARDS, both load-bearing:
+
+    1. The TITLE GATE. The carve prompt and the fletch prompt are the SAME widget group (270),
+       so a number pressed without checking 270.5's text can answer the wrong one -- fletching
+       a bow when we meant to carve, or carving when we meant to fletch. An unreadable title
+       counts as "not the carve prompt" and refuses: withholding costs a tick, guessing costs
+       a wrong carve, and a wrong animal is -25% XP and far fewer offerings for the whole totem.
+
+    2. The number is DERIVED FROM THE MATCHED WIDGET, never from a table. skillmulti.item_widget
+       finds the option by name and option_number turns its child into the digit, so the key
+       stays tied to the animal's NAME. That is fletching.py's own rule ("the human's '3' is
+       only correct for the product they happened to pick") applied to this menu.
+    """
+    if not skillmulti.showing(skillmulti.TITLE_CARVE):
+        debug_log.log(LOG, "carve menu not on screen (title=%r) -- withholding"
+                      % skillmulti.prompt_title())
+        return False
+    widget = skillmulti.item_widget(spirit.capitalize())
+    if not widget:
+        debug_log.log(LOG, "carve menu has no %s option" % spirit)
+        return False
+    option = skillmulti.option_number(widget)
+    if option is not None:
+        controller.key_tap(ctx.ser, str(option))
+        return True
+    return bool(controller.click_entity(ctx.ser, widget, offset=(0, 0),
+                                        check_ui_blockers=False, simulate_mistakes=False))
+
+
+def carve(ctx, site) -> bool:
+    """Carve ONE spirit into the totem.
+
+    Re-reads the site immediately before choosing, because the wiki says the nearby trio can
+    change WHILE the player is carving -- so the spirit picked at build time may already be
+    wrong by the third carve. One carve per call; the caller loops on needs_carve.
+    """
+    n = site.number
+    fresh = _site_now(n) or site
+    missing = vt.missing_spirits(fresh)
+    if not missing:
+        return False
+    spirit = missing[0]
+
+    obj = site_object(n, "totem")
+    if not obj:
+        debug_log.log(LOG, "site %d: totem not in view" % n)
+        return False
+    entry = route.SITES[n]
+    refresh = controller.object_refresh_target(entry["totem"][0], entry["totem"][1],
+                                              route.PLANE, entry["base_id"])
+    if not controller.click_entity(ctx.ser, obj, refresh_target=refresh):
+        return False
+    if not _await_menu(ctx):
+        debug_log.log(LOG, "site %d: carve menu never opened" % n)
+        return False
+    if not choose_spirit(ctx, spirit):
+        return False
+
+    before = set(fresh.segment_values)
+
+    def landed():
+        after = _site_now(n)
+        return after is not None and set(after.segment_values) != before
+
+    return bool(outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"],
+                                        CARVE_BUDGET_S, landed,
+                                        now_fn=_now, sleep_fn=_sleep))
