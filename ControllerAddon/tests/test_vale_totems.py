@@ -28,6 +28,18 @@ def test_parse_state_returns_none_when_the_reader_errored():
     assert vt.parse_state({"reader": "vale-totems", "error": "boom"}) is None
 
 
+def test_parse_state_returns_none_when_sites_is_not_a_list():
+    assert vt.parse_state({"sites": "not a list"}) is None
+
+
+def test_parse_state_returns_none_when_sites_is_empty():
+    assert vt.parse_state({"sites": []}) is None
+
+
+def test_parse_state_returns_none_when_every_site_is_missing_its_number():
+    assert vt.parse_state({"sites": [{"baseValue": 0}]}) is None
+
+
 def test_an_unbuilt_site_needs_a_build_and_nothing_else():
     state = vt.parse_state(_payload(_site()))
     site = state.sites[1]
