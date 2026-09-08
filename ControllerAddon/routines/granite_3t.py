@@ -188,6 +188,76 @@ def setup(ctx):
                             f"{ctx.state.data['g3t_logs']} log(s)")
 
 
+def next_rock_index(index, count):
+    return (index + 1) % count if count else 0
+
+
+def prepare(ctx, cfg, knife_point, log_point, rock_tile):
+    """The DEAD-TICK half of a cycle. Returns the next rock's live screen point, or None.
+
+    Three things happen here and the order is load-bearing:
+      1. Click the knife. In OSRS this is a client-side SELECTION and sends no packet, which is
+         exactly why it can live outside the critical tick.
+      2. Re-resolve the rock's screen point over HTTP. The projection moves every cycle because
+         the PLAYER moves between rocks; the 1200ms of dead time is where that read is
+         affordable.
+      3. Park the cursor on the log, so the critical tick's first click costs no flight.
+    """
+    tick_cycle.timed_click(ctx.ser, knife_point, aim_radius=0, now_fn=_now)
+
+    x, y, plane = rock_tile[0], rock_tile[1], rock_tile[2]
+    obj = controller.get_object_at(x, y, plane, cfg.get("rockId"))
+    if not obj or obj.get("screenX") is None:
+        return None
+
+    controller.move_to_human(ctx.ser, int(log_point[0]), int(log_point[1]), aim_radius=0)
+    return int(obj["screenX"]), int(obj["screenY"])
+
+
+def run_cycle(ctx, cfg, knife_point, log_point, rock_point):
+    """The CRITICAL TICK. "ok" | "desync" | "no_clock".
+
+    No HTTP between the two clicks -- that is the invariant the whole module exists to protect.
+    """
+    phase = tick_cycle.at_phase(ctx.events, cfg["logClickPhaseMs"],
+                                now_fn=_now, sleep_fn=_sleep)
+    if phase is None:
+        return "no_clock"
+
+    window = tick_cycle.Window(opened_at=_now(), phase_ms=phase)
+    tick_cycle.click_in_place(ctx.ser, now_fn=_now)
+
+    # DELIBERATE IMPERFECTION. A human running 3t4g misses cycles and their rate visibly dips
+    # and recovers; a machine that never misses is itself the signature, and per CLAUDE.md's
+    # telemetry notes EVENT_MOUSE_CLICK_V2 carries inter-press timing to the server at 1ms
+    # resolution independently of everything else. This is the honest replacement for the
+    # engine's MISTAKE_MISCLICK_CHANCE, which is turned OFF everywhere in this routine: a
+    # simulated near-miss plus its corrective reclick would wreck the cycle outright, and in the
+    # inventory it would drop the log.
+    if random.random() < cfg.get("missChance", 0.0):
+        debug_log.log(CATEGORY, "deliberate miss -- placing the rock click a tick late")
+        if ctx.events is not None:
+            ctx.events.wait_ticks(1, now_fn=_now, sleep_fn=_sleep)
+        tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3, now_fn=_now)
+        return "miss"
+
+    need = tick_cycle.estimate_flight_ms(
+        math.hypot(rock_point[0] - log_point[0], rock_point[1] - log_point[1]))
+    now = _now()
+    if not window.room_for(need, now):
+        # A click that slips into the NEXT tick is worse than no click at all: it starts the
+        # next mine at the wrong phase and desyncs every cycle after it. Abandon this one and
+        # let the caller resync on a clean boundary.
+        controller.request_movement_abort()
+        debug_log.log(CATEGORY,
+                      f"desync: {window.spent_ms(now):.0f}ms of the tick spent with "
+                      f"~{need:.0f}ms of flight still needed -- abandoning the rock click")
+        return "desync"
+
+    tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3, now_fn=_now)
+    return "ok"
+
+
 def _probe():
     """Read-only geometry probe, for capturing rockTiles and checking the setup without
     launching the routine. Imports controller only -- never the serial port -- so it is safe

@@ -110,3 +110,136 @@ def test_setup_safety_stops_without_a_tick_clock(monkeypatch):
     g.setup(ctx)
     assert ctx.state.safety_stopped is True
     assert "tick" in ctx.state.safety_reason.lower()
+
+
+import tick_cycle
+
+
+class _FakeTicks:
+    def __init__(self, phase=0.0):
+        self.phase = phase
+
+    def is_stale(self, now):
+        return False
+
+
+class _FakeEvents:
+    """Enough EventStream for the cycle: a tick clock that never goes stale."""
+    def __init__(self):
+        self.ticks = _FakeTicks()
+        self._seq = 0
+
+    def pump(self, now=None):
+        return []
+
+    def mark(self):
+        return self._seq
+
+    def since(self, seq):
+        return []
+
+    def wait_ticks(self, n, now_fn=None, sleep_fn=None):
+        return None
+
+
+def test_next_rock_index_wraps_around_the_rotation():
+    assert g.next_rock_index(0, 4) == 1
+    assert g.next_rock_index(3, 4) == 0
+
+
+def test_run_cycle_clicks_the_log_IN_PLACE_then_flies_to_the_rock(monkeypatch):
+    """The whole design: two clicks, ONE flight, and the log click must not move the cursor."""
+    order = []
+    monkeypatch.setattr(tick_cycle, "at_phase", lambda ev, ms, **kw: 60.0)
+    monkeypatch.setattr(tick_cycle, "click_in_place",
+                        lambda ser, **kw: (order.append("log-in-place"), 92.0)[1])
+    monkeypatch.setattr(tick_cycle, "timed_click",
+                        lambda ser, pt, **kw: (order.append(("rock", pt)), 255.0)[1])
+    # missChance defaults to 0.03, so an unpatched draw makes this test flake ~3% of runs.
+    monkeypatch.setattr(g.random, "random", lambda: 1.0)
+    monkeypatch.setattr(g, "_now", lambda: 1000.0)
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    result = g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800))
+    assert result == "ok"
+    assert order == ["log-in-place", ("rock", (1640, 800))]
+
+
+def test_run_cycle_reports_desync_when_the_clock_will_not_answer(monkeypatch):
+    monkeypatch.setattr(tick_cycle, "at_phase", lambda ev, ms, **kw: None)
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "no_clock"
+
+
+def test_run_cycle_ABORTS_the_rock_click_rather_than_letting_it_cross_the_boundary(monkeypatch):
+    """A click that slips into the next tick is worse than no click: it starts the NEXT cycle's
+    mine at the wrong phase and desyncs everything after it."""
+    clicked = []
+    aborted = []
+    monkeypatch.setattr(tick_cycle, "at_phase", lambda ev, ms, **kw: 60.0)
+    # The log click alone eats almost the whole tick -- a stutter, a GC pause, an OS hiccup.
+    monkeypatch.setattr(tick_cycle, "click_in_place", lambda ser, **kw: 520.0)
+    monkeypatch.setattr(tick_cycle, "timed_click",
+                        lambda ser, pt, **kw: (clicked.append(pt), 255.0)[1])
+    monkeypatch.setattr(controller, "request_movement_abort", lambda: aborted.append(True))
+    monkeypatch.setattr(g.random, "random", lambda: 1.0)      # never a deliberate miss here
+    times = iter([1000.0, 1000.52, 1000.52, 1000.52])
+    monkeypatch.setattr(g, "_now", lambda: next(times))
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "desync"
+    assert clicked == []
+
+
+def test_a_deliberate_miss_still_clicks_the_rock_but_a_tick_late(monkeypatch):
+    """The imperfection has to be a LATE click, not a skipped one -- skipping would forfeit the
+    granite as well as the cycle, which is not what a human miss looks like."""
+    waited = []
+    clicked = []
+    monkeypatch.setattr(tick_cycle, "at_phase", lambda ev, ms, **kw: 60.0)
+    monkeypatch.setattr(tick_cycle, "click_in_place", lambda ser, **kw: 92.0)
+    monkeypatch.setattr(tick_cycle, "timed_click",
+                        lambda ser, pt, **kw: (clicked.append(pt), 255.0)[1])
+    monkeypatch.setattr(g.random, "random", lambda: 0.0)      # always miss
+    monkeypatch.setattr(g, "_now", lambda: 1000.0)
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    ctx.events.wait_ticks = lambda n, **kw: waited.append(n)
+    assert g.run_cycle(ctx, _cfg(missChance=1.0), (1700, 800), (1740, 800), (1640, 800)) == "miss"
+    assert waited == [1]
+    assert clicked == [(1640, 800)]
+
+
+def test_no_deliberate_miss_when_the_draw_is_above_the_chance(monkeypatch):
+    monkeypatch.setattr(tick_cycle, "at_phase", lambda ev, ms, **kw: 60.0)
+    monkeypatch.setattr(tick_cycle, "click_in_place", lambda ser, **kw: 92.0)
+    monkeypatch.setattr(tick_cycle, "timed_click", lambda ser, pt, **kw: 255.0)
+    monkeypatch.setattr(g.random, "random", lambda: 0.99)
+    monkeypatch.setattr(g, "_now", lambda: 1000.0)
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    assert g.run_cycle(ctx, _cfg(missChance=0.03), (1700, 800), (1740, 800), (1640, 800)) == "ok"
+
+
+def test_prepare_selects_the_knife_then_parks_on_the_log(monkeypatch):
+    """Order matters: the knife click is the client-side SELECTION, and the cursor must end on
+    the log so the critical tick's click needs no flight."""
+    order = []
+    monkeypatch.setattr(tick_cycle, "timed_click",
+                        lambda ser, pt, **kw: (order.append(("click", pt)), 200.0)[1])
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **kw: order.append(("park", (x, y))))
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda *a, **k: {"screenX": 1640, "screenY": 800, "id": 1})
+    monkeypatch.setattr(tick_cycle, "at_phase", lambda ev, ms, **kw: 0.0)
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    point = g.prepare(ctx, _cfg(), (1700, 800), (1740, 800), [10, 20, 0])
+    assert point == (1640, 800)
+    assert order == [("click", (1700, 800)), ("park", (1740, 800))]
