@@ -281,3 +281,30 @@ def close_hold(ctx) -> bool:
     _click(ctx, controller.get_widget(HOLD_GROUP, TITLE_CHILD))
     controller.human_delay(0.25, 0.4)
     return not is_open()
+
+
+# The DECK object's own right-click "Deposit-all" -- MEASURED live 2026-09-08:
+#     Camphor cargo hold 60281 ['Open', 'Deposit-all', 'Modify']
+# USER: "instead of opening the container hold just right click deposit". This skips the whole
+# open-943 / click-943.14 / ESC cycle, which MEASURED at ~4.5s a stow against roughly 1s here.
+#
+# The 2026-09-07 design deliberately used 943.14 instead, on the reasoning that a button labelled
+# "Deposit Salvage" is provably salvage-only while an object option labelled "Deposit-all" might
+# take the whole inventory including the chisel and rune pouch. That reasoning still stands and
+# is NOT settled -- so the caller guards it (see stow_phase's hard-keep check) and falls back to
+# the interface for the rest of the session the moment the guard trips.
+DEPOSIT_ALL_OPTIONS = ("Deposit-all", "Deposit-All")
+
+
+def deposit_all_on_object(ctx):
+    """Right-click the deck's cargo hold and pick Deposit-all. Returns True once no salvage is
+    left in the inventory, False if some remains (the authoritative hold-is-full signal, same as
+    deposit_salvage), or HOLD_UNKNOWN when the hold object cannot be found at all."""
+    hold = sailing.find_facility("cargo hold", action="Deposit-all")
+    if hold is None:
+        return HOLD_UNKNOWN
+    controller.click_menu_action(ctx.ser, hold, DEPOSIT_ALL_OPTIONS, offset=(0, 0))
+    controller.dismiss_continue_box(ctx.ser)
+    return _poll_until(lambda: not any(
+        (i.get("name") or "").lower().endswith("salvage")
+        for i in (controller.get_inventory() or [])))

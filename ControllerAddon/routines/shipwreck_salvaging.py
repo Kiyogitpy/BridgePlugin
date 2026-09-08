@@ -465,6 +465,24 @@ def _record_hold(data, used, capacity, has_salvage, config, forced_full=False):
     data["hold_full"] = used >= capacity - config.get("holdFullSlots", 4)
 
 
+def _hard_keep_counts(inventory) -> dict:
+    """How many of each HARD_KEEP item the inventory holds, by the substring that matched.
+
+    Only used to guard the hold object's Deposit-all (see stow_phase): if any of these leaves the
+    inventory during a deposit, that option is not salvage-only and must never be used again this
+    session."""
+    counts = {}
+    for item in inventory or []:
+        lowered = (item.get("name") or "").lower()
+        if lowered.endswith("salvage"):
+            continue          # salvage is SUPPOSED to leave; it is not what we are guarding
+        for needle in HARD_KEEP:
+            if needle in lowered:
+                counts[needle] = counts.get(needle, 0) + 1
+                break
+    return counts
+
+
 def stow_phase(ctx) -> bool:
     """Deposit the inventory's salvage into our own boat's cargo hold, recording its fullness
     while the interface is open (the only place it is readable -- see cargo_hold's docstring).
@@ -483,6 +501,36 @@ def stow_phase(ctx) -> bool:
 
     if not config.get("stowSalvage", True):
         return bool(drop_salvage(ctx))
+
+    # FAST PATH (USER 2026-09-08: "instead of opening the container hold just right click
+    # deposit"). The deck object carries its own Deposit-all -- MEASURED live the same day:
+    # Camphor cargo hold 60281 ['Open', 'Deposit-all', 'Modify'] -- so a stow is one right-click
+    # (~1s) instead of open-943 / click-943.14 / ESC (~4.5s MEASURED).
+    #
+    # GUARDED, because the 2026-09-07 design avoided this option for a reason that is still not
+    # settled: a button labelled "Deposit Salvage" is provably salvage-only, while an object
+    # option labelled "Deposit-all" might take the whole inventory including the chisel, rune
+    # pouch and coins. So HARD_KEEP items are counted before and after; if any of them left the
+    # inventory, the fast path is disabled for the rest of the session and every later stow uses
+    # the interface. That converts an unverified assumption into a self-correcting one instead of
+    # a gamble with the user's tools.
+    if not data.get("hold_deposit_all_unsafe"):
+        guarded = _hard_keep_counts(controller.get_inventory())
+        deposited = cargo_hold.deposit_all_on_object(ctx)
+        if deposited is not cargo_hold.HOLD_UNKNOWN:
+            after = _hard_keep_counts(controller.get_inventory())
+            lost = {n: c - after.get(n, 0) for n, c in guarded.items() if c > after.get(n, 0)}
+            if lost:
+                data["hold_deposit_all_unsafe"] = True
+                debug_log.log("salvage", f"[!] the hold object's Deposit-all took {lost} -- it is "
+                                          f"NOT salvage-only; using the 943.14 interface from now on")
+            else:
+                _record_hold(data, None, None, True, config,
+                             forced_full=(deposited is False))
+                if deposited is False:
+                    debug_log.log("salvage", "salvage left in the inventory after the hold "
+                                              "object's Deposit-all -- treating the hold as full")
+                return bool(deposited)
 
     if not cargo_hold.open_hold(ctx):
         fails = data.get("hold_open_fail_count", 0) + 1

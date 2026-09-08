@@ -1548,3 +1548,65 @@ def test_drop_items_waits_for_the_last_drop_before_counting(monkeypatch):
     monkeypatch.setattr(controller, "drop_items", lambda ser, its: True)
     monkeypatch.setattr(ss, "DROP_CONFIRM_POLL_S", 0.0) if hasattr(ss, "DROP_CONFIRM_POLL_S") else None
     assert ss.drop_items(_Ctx(), lambda name: True) == 3
+
+
+# --- the deck object's Deposit-all fast path (USER 2026-09-08) ----------------------------
+
+def test_stow_uses_the_hold_objects_deposit_all_and_skips_the_interface(monkeypatch):
+    """USER: "instead of opening the container hold just right click deposit". MEASURED live:
+    Camphor cargo hold 60281 ['Open', 'Deposit-all', 'Modify'] -- ~1s vs ~4.5s for the
+    open/click/ESC cycle."""
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(ss.cargo_hold, "deposit_all_on_object", lambda ctx: True)
+    monkeypatch.setattr(ss.cargo_hold, "open_hold",
+                        lambda ctx: pytest.fail("must not open 943 when the object worked"))
+    assert ss.stow_phase(_Ctx()) is True
+
+
+def test_stow_falls_back_to_the_interface_when_the_object_option_is_missing(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(ss.cargo_hold, "deposit_all_on_object",
+                        lambda ctx: ss.cargo_hold.HOLD_UNKNOWN)
+    opened = []
+    monkeypatch.setattr(ss.cargo_hold, "open_hold", lambda ctx: opened.append(True) or False)
+    monkeypatch.setattr(ss, "drop_salvage", lambda ctx: 1)
+    ss.stow_phase(_Ctx())
+    assert opened == [True]
+
+
+def test_deposit_all_is_abandoned_forever_if_it_takes_a_hard_keep_item(monkeypatch):
+    """The 2026-09-07 design avoided this option because "Deposit-all" might take the whole
+    inventory including the chisel and rune pouch -- still unverified. So it is guarded: one
+    hard-keep item lost and the fast path is disabled for the session."""
+    state = {"inv": [{"name": "Chisel"}, {"name": "Plundered salvage"}]}
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(state["inv"]))
+
+    def _deposit(ctx):
+        state["inv"] = []          # took the chisel too
+        return True
+
+    monkeypatch.setattr(ss.cargo_hold, "deposit_all_on_object", _deposit)
+    opened = []
+    monkeypatch.setattr(ss.cargo_hold, "open_hold", lambda ctx: opened.append(True) or False)
+    monkeypatch.setattr(ss, "drop_salvage", lambda ctx: 0)
+    ctx = _Ctx()
+    ss.stow_phase(ctx)
+    assert ctx.state.data.get("hold_deposit_all_unsafe") is True
+    assert opened == [True], "it must fall through to the interface on the very same tick"
+
+
+def test_a_salvage_only_deposit_all_does_not_trip_the_guard(monkeypatch):
+    """Salvage leaving is the POINT -- only non-salvage hard-keeps count as a violation."""
+    state = {"inv": [{"name": "Chisel"}, {"name": "Plundered salvage"}]}
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(state["inv"]))
+
+    def _deposit(ctx):
+        state["inv"] = [{"name": "Chisel"}]     # salvage only, chisel untouched
+        return True
+
+    monkeypatch.setattr(ss.cargo_hold, "deposit_all_on_object", _deposit)
+    monkeypatch.setattr(ss.cargo_hold, "open_hold",
+                        lambda ctx: pytest.fail("the guard must not trip on salvage leaving"))
+    ctx = _Ctx()
+    assert ss.stow_phase(ctx) is True
+    assert ctx.state.data.get("hold_deposit_all_unsafe") is None
