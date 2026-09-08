@@ -25,9 +25,7 @@ USER's decisions, and they shape everything:
   answering that it was not consumed.
 
   Everything downstream of the old assumption is therefore wrong: this routine needs a
-  consumable supply model it does not have. The live account had 1 loose log, an unreadable
-  log basket, and **zero teak, mahogany, swamp tar or guam in the bank** — and Cape Conch has
-  no bank object in the scene. See "Supply: the unresolved blocker" below.
+  consumable supply model it does not have. See "Supply: the unresolved blocker" below.
 - **Cape Conch mine**, so there is **no desert heat** and nothing to maintain to stay alive.
 - **A fixed rock rotation captured once into config**, not a per-tick `/objects` scan.
 - **Drop a full inventory at once**, not between mines.
@@ -45,11 +43,22 @@ consumed by its action (herb tar consumes the herb, knife-on-log consumes the lo
 consume the vambraces). The wiki's own advice to carry spares "in a log basket in case of
 mistakes" reads very differently once you know the base rate.
 
-MEASURED on the live account: **1 loose teak log, a log basket whose contents the m8aq reader
-cannot see** (`contentsLoaded: false`, `storedQuantity: -1` — CLAUDE.md already records this
-limitation), and **zero teak logs, mahogany logs, swamp tar or clean guam in a 931-item bank**.
-Cape Conch has **no bank object in the loaded scene**. So the routine cannot run for more than
-~28 cycles (~50 seconds) even in the best case, and cannot restock at all.
+MEASURED on the live account: **1 loose teak log** and a log basket whose contents the m8aq
+reader cannot see (`contentsLoaded: false`, `storedQuantity: -1` — CLAUDE.md already records
+this limitation). Cape Conch has **no bank object in the loaded scene**.
+
+**STOCK IS NOT THE PROBLEM — I briefly recorded that it was, and that was my error.** A first
+`bank_memory` query searched singular names ("teak log") against plural items and returned zero
+for everything; a substring search of the same 931-item bank finds **1,242 Teak logs, 20,727
+Swamp tar, 140 clean Tarromin, 279 Mahogany logs, 5 Pestle and mortar, 6 Chisel**. 1,242 logs is
+~37 minutes of continuous 3-tick mining. Lesson worth keeping: OSRS item names are plural
+("Teak logs", not "Teak log") and a substring filter that guesses the singular silently returns
+nothing rather than failing.
+
+The real blocker is narrower and harder: **the mechanic allows exactly ONE loose log**, because
+a second opens a Make-X interface that eats a tick and turns the 3-tick cycle into a 4-tick one.
+So the carried supply is one log, and the log basket cannot dispense one at a time — emptying it
+puts all 28 loose at once. With no bank at Cape Conch, a restock trip is not available either.
 
 The log basket is not a supply either: emptying it puts 28 loose logs in the inventory, and the
 mechanic requires **exactly one** loose log or a Make-X interface opens and eats a tick. Feeding

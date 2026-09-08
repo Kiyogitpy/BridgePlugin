@@ -1701,9 +1701,14 @@ the cycle burns **~2,000 logs/hour**. The spec had recorded "the log is not cons
 answer and built "no supply loop, no restock, no bank trip" on it. USER reached the same
 correction independently mid-session ("and that means we consume the log").
 
-MEASURED the same session: 1 loose log, a log basket whose contents the reader cannot see, and
-**zero teak / mahogany / swamp tar / guam in a 931-item bank**, with no bank object at Cape
-Conch. Emptying the basket does not help -- the mechanic needs EXACTLY ONE loose log or a Make-X
+MEASURED the same session: 1 loose log and a log basket whose contents the reader cannot see,
+with no bank object at Cape Conch. **STOCK IS NOT THE BLOCKER** -- I first recorded the bank as
+empty of every candidate, which was MY query bug: `bank_memory` was searched for singular names
+("teak log") against plural items, returning zero for everything. The same bank actually holds
+**1,242 Teak logs, 20,727 Swamp tar, 140 clean Tarromin, 279 Mahogany logs**. OSRS item names
+are plural; a substring filter that guesses the singular silently returns nothing.
+The real blocker is that the mechanic allows exactly ONE loose log (a second opens Make-X and
+eats a tick), and a log basket cannot dispense one at a time. Emptying the basket does not help -- the mechanic needs EXACTLY ONE loose log or a Make-X
 interface eats a tick. So the routine is currently correct-but-unrunnable and stops saying so.
 The options (buy in bulk; try a log the account cannot fletch, e.g. redwood at Fletching 77 --
 UNVERIFIED whether a level-failed action still sets the timer; move to a mine with a bank; or
