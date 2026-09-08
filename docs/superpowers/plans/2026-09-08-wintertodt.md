@@ -1259,7 +1259,7 @@ def _click_object(ctx, obj, action, budget_s, confirm, signals=None):
     outcome = outcome_waits.await_pre(
         ctx, signals or [], budget_s + _walk_budget(obj), confirm,
         now_fn=_now, sleep_fn=_sleep)
-    return bool(outcome and outcome.ok)
+    return bool(outcome)
 
 
 def _too_far(obj) -> bool:
@@ -1295,7 +1295,7 @@ def _click_inventory_item(ctx, item, action, budget_s, confirm):
         return False
     outcome = outcome_waits.await_pre(ctx, ["INVENTORY_CHANGED"], budget_s, confirm,
                                       now_fn=_now, sleep_fn=_sleep)
-    return bool(outcome and outcome.ok)
+    return bool(outcome)
 
 
 def _use_on(ctx, item_a, item_b) -> bool:
@@ -1386,7 +1386,7 @@ def _take_concoctions(ctx, items) -> bool:
                 ctx, ["INVENTORY_CHANGED"], 4.0,
                 lambda: ws.potion_doses(_inventory()) > before,
                 now_fn=_now, sleep_fn=_sleep)
-            return bool(outcome and outcome.ok)
+            return bool(outcome)
     return False
 
 
@@ -1522,9 +1522,13 @@ FEED_BUDGET_S = 60.0             # a whole inventory fed; a guess, fit it live
 
 
 def _await(ctx, signals, budget_s, confirm, since=None):
+    # `bridge_events.Outcome` has no `.ok` -- its fields are hit/signal/payload/confirmed/
+    # latency_s and `__bool__` returns `hit`. An earlier draft wrote `outcome.ok` here and at
+    # three sites in Task 6; it crashed on the first genuinely SUCCESSFUL click and was
+    # invisible to tests that mock the click helpers. Use plain truthiness.
     outcome = outcome_waits.await_pre(ctx, signals, budget_s, confirm, since=since,
                                       now_fn=_now, sleep_fn=_sleep)
-    return bool(outcome and outcome.ok)
+    return bool(outcome)
 
 
 def chop_phase(ctx, items) -> bool:
