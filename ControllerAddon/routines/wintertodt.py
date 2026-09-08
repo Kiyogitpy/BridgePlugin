@@ -564,13 +564,17 @@ BREAK_DEFER_MAX_S = 420.0        # a round averages ~5 min including the 60s gap
 
 
 def _progress_signature(reader, items):
-    """Everything that moves when the routine is working. Unchanged for STALL_STOP_S means
-    stuck -- and CLAUDE.md's standing lesson is that a silent loop is worse than a crash."""
+    """Everything WE make move when the routine is working. Unchanged for STALL_STOP_S means
+    stuck -- and CLAUDE.md's standing lesson is that a silent loop is worse than a crash.
+
+    Fix round 1, Finding 2: warmth and energyPercent are deliberately EXCLUDED. Both drift
+    without any action of ours -- warmth regenerates passively (~8%/min, wiki), and energy
+    falls from OTHER players damaging the boss -- so including either lets the signature move
+    straight through a genuine wedge and defeats this watch entirely. points plus inventory
+    composition are the only things that only change because WE did something."""
     reader = reader or {}
     return "|".join(str(x) for x in (
         reader.get("points"),
-        reader.get("energyPercent"),
-        reader.get("warmth"),
         len(items or []),
         ws.count_item(items, w.ITEM_ROOT),
         ws.count_item(items, w.ITEM_KINDLING),
@@ -646,7 +650,13 @@ def tick(ctx):
             % w.REGION)
         return
 
-    _stuck_watch(ctx, _progress_signature(reader, items))
+    # Fix round 1, Finding 3: the watch stands DOWN during "between_rounds". points reads -1
+    # and the inventory is static in that phase, so with warmth/energy already dropped from the
+    # signature (Finding 2) an unusually long gap before the next round starts would trip
+    # STALL_STOP_S against a perfectly healthy run -- a sibling routine in this repo makes its
+    # own stuck watch in-round-only for the same reason.
+    if phase != "between_rounds":
+        _stuck_watch(ctx, _progress_signature(reader, items))
     handler = _PHASES.get(phase)
     if handler:
         handler(ctx, reader, items, brazier)
@@ -658,13 +668,30 @@ def before_break(ctx):
     Points are all-or-nothing at 500 and every point is forfeited by leaving mid-round, so a
     break landing mid-round throws away the whole round. GOTR's own measured lesson, and the
     reason `before_break` exists in the routine contract at all. The break begins the moment
-    this returns, so the ceiling matters as much as the loop."""
+    this returns, so the ceiling matters as much as the loop.
+
+    Fix round 1, Finding 1 (Critical): the loop paces ITSELF every iteration, the same
+    `outcome_waits.tick_pause` between_rounds_phase already uses -- never relying on tick()'s
+    own phase handler to have done any I/O. A phase handler that produces nothing (chop_phase
+    with no roots in view, for one) never calls `_sleep` at all, and the loop used to have
+    nothing else advancing its own clock: live it still terminates at BREAK_DEFER_MAX_S, but it
+    was proven to hammer the bridge with unthrottled HTTP for up to 420s on a completely
+    ordinary transient. Termination must not depend on what the callee happened to do.
+
+    Fix round 1, Finding 5 (Minor): the reader is read as defensively as everywhere else in
+    this file -- `_reader()` itself already collapses a bad read to `{}`, but an exception
+    raised getting there (a monkeypatched test double, or a future change to `_reader`) must
+    not escape this hook and crash the engine's break machinery."""
     started = _now()
     while _now() - started < BREAK_DEFER_MAX_S:
-        reader = _reader()
+        try:
+            reader = _reader()
+        except Exception:
+            reader = {}
         if not ws.round_active(reader):
             debug_log.log(LOG, "before_break: round over, break may start")
             return
         tick(ctx)
+        outcome_waits.tick_pause(ctx, 1, now_fn=_now, sleep_fn=_sleep)
     debug_log.log(LOG, "before_break: gave up waiting for the round to end after %.0fs"
         % BREAK_DEFER_MAX_S)

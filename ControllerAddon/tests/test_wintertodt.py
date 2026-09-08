@@ -630,10 +630,18 @@ def test_before_break_gives_up_at_its_ceiling(monkeypatch, hermetic):
 
 # --- real-path test (the Task 6 `.ok` lesson, restated in this task's own brief): the two
 # tick() tests above stub wt.snapshot / wt.ws.derive_phase / wt.chop_phase for convenience, which
-# means they cannot see a wrong phase string or a wrong-arity lambda inside _PHASES -- the table
-# lookup and the call both happen through names those tests never let run for real. This one
-# mocks only controller.*, so the REAL wintertodt_state.derive_phase and the REAL _PHASES table
-# execute end to end. -------------------------------------------------------------------------
+# means they cannot see a wrong-arity lambda inside _PHASES, or a crash inside the real click
+# chain it calls -- the table lookup and the call both happen through names those tests never
+# let run for real. This one mocks only controller.*, so the REAL wintertodt_state.derive_phase
+# and the REAL _PHASES table execute end to end.
+#
+# Fix round 1, Finding 4: this test's earlier docstring overclaimed that it also catches a
+# WRONG/DEAD phase string in _PHASES -- it does not. `tick()` looks the handler up with `.get`
+# and only calls it `if handler:`, so a phase with no matching key resolves to `handler = None`
+# and is a silent no-op: no exception, `wt_phase` still gets set, `safety_stopped` stays False,
+# every assertion below still passes exactly as it does today. See
+# test_phases_table_covers_every_phase_derive_phase_can_return for the check that actually
+# covers a dead/missing key. -------------------------------------------------------------------
 
 def test_tick_real_dispatch_path_reaches_chop_phase_with_only_controller_mocked(monkeypatch):
     ctx = _Ctx()
@@ -650,9 +658,10 @@ def test_tick_real_dispatch_path_reaches_chop_phase_with_only_controller_mocked(
              "screenX": 10, "screenY": 10}
     monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [roots])
     # click_entity refused rather than mocked to succeed: chop_phase must reach the real click
-    # primitive and come back False with no exception and no safety stop -- a wrong phase name
-    # in _PHASES (KeyError/None) or a wrong-arity lambda (TypeError) would blow up right here,
-    # something none of the mocked-chop_phase tests above can ever exercise.
+    # primitive and come back False with no exception and no safety stop -- a wrong-ARITY lambda
+    # in _PHASES (a TypeError firing right here) or a broken real chop_phase call chain would
+    # blow up right here, something none of the mocked-chop_phase tests above can ever exercise.
+    # (It would NOT catch a dead/missing _PHASES key -- see the docstring above.)
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: False)
     wt.tick(ctx)
     assert ctx.state.data.get("wt_phase") == "chop"
@@ -684,4 +693,107 @@ def test_before_break_real_tick_path_plays_a_round_out_with_only_controller_mock
     monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [])
     wt.before_break(ctx)
     assert calls["n"] >= 2
+    assert ctx.state.safety_stopped is False
+
+
+# --- fix round 1 ---------------------------------------------------------------------------
+
+def test_before_break_paces_itself_even_when_the_phase_handler_does_no_io(monkeypatch, hermetic):
+    """Finding 1 (Critical). A phase handler that never calls _sleep -- chop_phase with no
+    roots in view is exactly this, it returns False with no I/O at all -- must not turn
+    before_break into an unthrottled busy loop hammering the bridge for up to
+    BREAK_DEFER_MAX_S. The loop has to pace ITSELF once per iteration regardless of what
+    tick() did, the same way between_rounds_phase already paces itself with
+    outcome_waits.tick_pause.
+
+    Pre-fix this would hang forever: nothing in the loop body ever touches the fake clock (this
+    fake tick() deliberately doesn't, and neither did the old before_break outside of calling
+    tick()), so `_now() - started < BREAK_DEFER_MAX_S` never becomes false. A hard iteration
+    ceiling turns that into a clean, fast assertion failure instead of a stuck test run --
+    exactly the "loop ran 200,000 iterations with the fake clock never advancing" the reviewer
+    proved live."""
+    ctx = _Ctx()
+    calls = {"n": 0}
+    ITERATION_CEILING = 5000     # comfortably above the ~700 a correctly-paced loop needs
+
+    def fake_tick(c):
+        calls["n"] += 1
+        if calls["n"] > ITERATION_CEILING:
+            raise AssertionError(
+                "before_break ran past %d iterations with a no-op tick() and an unmoving "
+                "clock -- it is not pacing itself" % ITERATION_CEILING)
+        # No _sleep call here on purpose: this is chop_phase-with-no-roots, the ordinary case
+        # that started the busy loop live.
+
+    monkeypatch.setattr(wt, "tick", fake_tick)
+    monkeypatch.setattr(wt, "_reader", lambda: {"atWintertodt": True, "roundActive": True})
+    wt.before_break(ctx)
+    assert calls["n"] < ITERATION_CEILING
+    # It looped for the whole ceiling, paced by its OWN sleep between iterations -- not by
+    # anything tick() did, which this fake_tick deliberately never provides.
+    assert calls["n"] > 100
+
+
+def test_progress_signature_ignores_warmth_and_energy_because_they_move_without_us():
+    """Finding 2 (Important). Warmth regenerates passively (~8%/min, wiki) and energy falls
+    from OTHER players damaging the boss -- neither moves because OUR routine did anything, so
+    either one drifting the signature lets a genuine wedge hide behind it and defeats
+    _stuck_watch entirely. Only points and inventory composition are ours to move."""
+    a = wt._progress_signature({"points": 100, "warmth": 500, "energyPercent": 80}, [])
+    b = wt._progress_signature({"points": 100, "warmth": 900, "energyPercent": 10}, [])
+    assert a == b
+
+
+def test_the_stuck_watch_stands_down_during_between_rounds(monkeypatch, hermetic):
+    """Finding 3 (Important). Between rounds `points` reads -1 and the inventory is static, so
+    with warmth/energy already dropped from the signature (Finding 2) an unusually long gap
+    before the next round starts would trip STALL_STOP_S against a perfectly healthy run,
+    unless the watch itself stands down while the derived phase is "between_rounds" -- the
+    same in-round-only shape a sibling routine in this repo already uses for its own stuck
+    watch. Real wt.tick() dispatch (only wt.ws.derive_phase and wt.between_rounds_phase are
+    stubbed, to hold the phase steady without needing a real between-round HUD read)."""
+    ctx = _Ctx()
+    monkeypatch.setattr(wt, "snapshot",
+                        lambda c: ({"atWintertodt": True, "points": -1, "roundActive": False},
+                                   [], "SOUTH_WEST"))
+    monkeypatch.setattr(wt.ws, "derive_phase", lambda **k: "between_rounds")
+    monkeypatch.setattr(wt, "between_rounds_phase", lambda c, reader, items: True)
+    for _ in range(50):
+        wt.tick(ctx)
+        hermetic["t"] += 5.0            # 250s total, comfortably past STALL_STOP_S (180s)
+    assert ctx.state.safety_stopped is False
+
+
+def test_phases_table_covers_every_phase_derive_phase_can_return():
+    """Finding 4 (Important, test quality). `tick()` records `data['wt_phase']` and logs the
+    phase change BEFORE ever consulting `_PHASES`, and the lookup is `_PHASES.get(phase)` -- a
+    phase string with no matching key resolves to `handler = None`, and `if handler:` just
+    skips it. No exception, no safety stop, no visible symptom at all: a DEAD key is a silent
+    no-op, which is exactly what the reviewer proved by scratch injection against
+    test_tick_real_dispatch_path_reaches_chop_phase_with_only_controller_mocked above (that
+    test only ever drives the "chop" branch, so it cannot see a missing "kit" or "warmth" entry
+    either).
+
+    This is a static check instead, and it derives the expected phase set from
+    ws.derive_phase's OWN source -- every quoted string literal it can `return` -- rather than
+    retyping a second hardcoded list that could silently drift out of step with the first."""
+    import inspect
+    import re
+
+    source = inspect.getsource(ws.derive_phase)
+    returned = set(re.findall(r'return\s+"([a-z_]+)"', source))
+    expected = returned - {"stop"}      # "stop" is handled by tick() itself, before the table
+    assert len(expected) >= 5, "sanity: the regex should have found most of the real ladder"
+    assert set(wt._PHASES.keys()) == expected
+
+
+def test_before_break_reads_defensively_when_the_reader_itself_raises(monkeypatch, hermetic):
+    """Finding 5 (Minor). Everything else in this file treats a bad bridge read as "can't
+    tell" rather than letting the exception fly (_reader() itself already does `or {}`;
+    kit_deficit/needs_drink/etc. all tolerate an empty/partial reader). before_break's own call
+    to _reader() must be just as forgiving -- an exception there must not propagate out of the
+    before_break hook and crash the engine's break machinery."""
+    ctx = _Ctx()
+    monkeypatch.setattr(wt, "_reader", lambda: (_ for _ in ()).throw(RuntimeError("bridge blew up")))
+    wt.before_break(ctx)     # must not raise
     assert ctx.state.safety_stopped is False
