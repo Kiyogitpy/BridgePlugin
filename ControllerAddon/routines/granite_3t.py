@@ -57,11 +57,16 @@ CATEGORY = "granite3t"
 DEFAULT_CONFIG = {
     "enabled": True,
 
-    # Captured once at the mine -- see the probe at the bottom of this file.
-    # CAPTURED LIVE 2026-09-08 at the Cape Conch mine's eastern cluster: four rocks all at
-    # distance 1 from the stand tile (3255,2354), so every hop is one step and the movement
-    # stall that buys the second roll is paid on every cycle. Ordered to walk a square rather
-    # than bounce between two tiles.
+    # CAPTURED LIVE 2026-09-08 at the Cape Conch mine's eastern cluster: four rocks all one step
+    # from the stand tile (3255,2354), ordered to walk the square rather than bounce between two.
+    #
+    # FOUR IS A FLOOR, NOT A PREFERENCE, AND THE RESPAWN SETS IT. Granite respawns in 5s (wiki,
+    # Granite rocks) and a 3-tick cycle is 1.8s, so the rotation must be long enough that a rock
+    # is back by the time we return: 4 rocks = 7.2s (safe), 3 = 5.4s (marginal), 2 = 3.6s and the
+    # rock is simply not there. A two-rock rotation was briefly configured here because only the
+    # two nearest fit the click budget; USER caught it -- "two rocks most likely wont work" --
+    # and the arithmetic agrees. When the budget and the respawn disagree, the respawn wins and
+    # the budget is bought with flightSpeedScale instead.
     "rockTiles": [[3254, 2353, 0], [3256, 2353, 0], [3256, 2354, 0], [3254, 2354, 0]],
     # Granite rocks share one object id per variant; the probe prints it alongside each tile.
     # get_object_at needs it, and matching by id rather than name is what keeps a DEPLETED rock
@@ -91,6 +96,34 @@ DEFAULT_CONFIG = {
     # (60 + 145 + 170 + 145 = 520) does fit. A guess; fit it from the per-cycle occupancy this
     # routine logs.
     "logClickPhaseMs": 60,
+
+    # WHAT MUST FIT INSIDE THE TICK: both mouse-DOWNs, or both whole clicks?
+    #
+    # A click here is a press, a 50-145ms hold, a release, then a 30-90ms trailing pause. The
+    # LOG click's full cost always counts -- the flight cannot start until our own code stops
+    # sleeping. The ROCK click is the open question: if the game acts on mouse-DOWN then only its
+    # press has to land inside the tick and its ~145ms tail is free; if it acts on release, the
+    # tail is on the budget.
+    #
+    # The difference is not marginal -- it is 250ms of flight (82px) versus 395ms (190px), and
+    # MEASURED LIVE 2026-09-08 at Cape Conch it is the difference between a geometry that is
+    # physically impossible to arrange (the log slot would have to sit ON the rocks, covering the
+    # clickboxes -- USER: "i cant put inventory ui in center ill block the clickbox") and one
+    # that is merely tight.
+    #
+    # Default FALSE, the conservative reading. Setting it True is not a fix -- it is running the
+    # experiment, and the evidence is whether cycles actually earn xp at a 3-tick cadence in the
+    # occupancy log. This is live-verification checklist item 6.
+    "assumeClickLandsOnPress": False,
+
+    # Flight-time multiplier for the two clicks this routine makes, passed straight through to
+    # move_to_human's duration_scale -- see tick_cycle.PRACTISED_FLIGHT_SCALE for why a
+    # repeated fixed-target reach is legitimately faster than settings.HM2_*'s general fit.
+    # MEASURED LIVE 2026-09-08 at the live layout: the four rocks sit 157 / 174 / 221 / 234px
+    # from the log slot. At scale 1.0 the budget allows 82px, so nothing passes; the furthest
+    # rock needs 0.58 to fit, and 0.55 leaves a little margin (limit 267px) without going
+    # further from the fitted model than the practised-reach argument supports.
+    "flightSpeedScale": 0.55,
     # Deliberate imperfection: a drawn fraction of cycles place the rock click one tick late.
     # A machine that never misses a 3-tick cycle is itself the signature -- EVENT_MOUSE_CLICK_V2
     # carries inter-press timing to the server at 1ms resolution (CLAUDE.md, telemetry).
@@ -266,17 +299,21 @@ def check_geometry(cfg, inv):
         return False, "at least one rock in rockTiles does not resolve on screen"
 
     reach = max(math.hypot(px - log["screenX"], py - log["screenY"]) for px, py in points)
-    flight = tick_cycle.estimate_flight_ms(reach)
+    flight = tick_cycle.estimate_flight_ms(reach, cfg.get("flightSpeedScale") or 1.0)
 
     # The limit is DERIVED from the tick budget, not hand-picked. MEASURED LIVE 2026-09-08:
     # `maxReachPx` shipped at 220 while the arithmetic only allows 82, so the routine would
     # have accepted a geometry that could not hit a single tick. `maxReachPx` survives only as
     # an optional HARD CAP for a user who wants to be stricter than the budget -- never looser.
+    scale = cfg.get("flightSpeedScale") or 1.0
     budget = (tick_cycle.GAME_TICK_MS
-              - cfg["logClickPhaseMs"]        # the window opens part way into the tick
-              - tick_cycle.CLICK_COST_MEDIAN_MS   # the in-place log click
-              - tick_cycle.CLICK_COST_MEDIAN_MS)  # the rock click after the flight
-    limit = tick_cycle.max_reach_px(budget)
+              - cfg["logClickPhaseMs"]           # the window opens part way into the tick
+              - tick_cycle.CLICK_COST_MEDIAN_MS)  # the in-place log click delays the flight
+    if not cfg.get("assumeClickLandsOnPress"):
+        # The conservative reading: the rock click's hold and trailing pause are on the budget
+        # too, because the game may only act on the RELEASE.
+        budget -= tick_cycle.CLICK_COST_MEDIAN_MS
+    limit = tick_cycle.max_reach_px(budget, scale)
     cap = cfg.get("maxReachPx")
     if cap:
         limit = min(limit, cap)
@@ -372,9 +409,11 @@ def prepare(ctx, cfg, knife_point, log_point, rock_tile):
          the PLAYER moves between rocks; the 1200ms of dead time is where that read is
          affordable.
     """
-    tick_cycle.timed_click(ctx.ser, knife_point, aim_radius=AIM_RADIUS_PX, now_fn=_now)
+    scale = cfg.get("flightSpeedScale") or 1.0
+    tick_cycle.timed_click(ctx.ser, knife_point, aim_radius=AIM_RADIUS_PX,
+                           duration_scale=scale, now_fn=_now)
     controller.move_to_human(ctx.ser, int(log_point[0]), int(log_point[1]),
-                             aim_radius=AIM_RADIUS_PX)
+                             aim_radius=AIM_RADIUS_PX, duration_scale=scale)
 
     x, y, plane = rock_tile[0], rock_tile[1], rock_tile[2]
     obj = controller.get_object_at(x, y, plane, cfg.get("rockId"))
@@ -384,7 +423,7 @@ def prepare(ctx, cfg, knife_point, log_point, rock_tile):
     return int(obj["screenX"]), int(obj["screenY"])
 
 
-def _flight_budget(from_point, to_point):
+def _flight_budget(from_point, to_point, scale=1.0):
     """Median flight PLUS the click that follows it, in ms.
 
     estimate_flight_ms's own docstring says it is a MEDIAN and the caller must add a margin.
@@ -393,7 +432,7 @@ def _flight_budget(from_point, to_point):
     "ok" -- precisely the failure the room_for guard exists to prevent. tick_cycle.CLICK_COST_MS
     is the upper end of that pair, deliberately."""
     dist = math.hypot(to_point[0] - from_point[0], to_point[1] - from_point[1])
-    return tick_cycle.estimate_flight_ms(dist) + tick_cycle.CLICK_COST_MS
+    return tick_cycle.estimate_flight_ms(dist, scale) + tick_cycle.CLICK_COST_MS
 
 
 def _deliberate_miss(cfg):
@@ -487,11 +526,13 @@ def run_cycle(ctx, cfg, knife_point, log_point, rock_point, target_tick=None):
         debug_log.log(CATEGORY, "deliberate miss -- placing the rock click a tick late")
         if ctx.events is not None:
             ctx.events.wait_ticks(1, now_fn=_now, sleep_fn=_sleep)
-        flight_ms = tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3, now_fn=_now)
+        flight_ms = tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3,
+                                           duration_scale=cfg.get("flightSpeedScale") or 1.0,
+                                           now_fn=_now)
         _log_occupancy(ctx, "miss", phase, in_place_ms, flight_ms, window.spent_ms(_now()))
         return "miss"
 
-    need = _flight_budget(log_point, rock_point)
+    need = _flight_budget(log_point, rock_point, cfg.get("flightSpeedScale") or 1.0)
     now = _now()
     if not window.room_for(need, now):
         # A click that slips into the NEXT tick is worse than no click at all: it starts the
@@ -504,7 +545,9 @@ def run_cycle(ctx, cfg, knife_point, log_point, rock_point, target_tick=None):
         _log_occupancy(ctx, "desync", phase, in_place_ms, 0.0, window.spent_ms(now))
         return "desync"
 
-    flight_ms = tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3, now_fn=_now)
+    flight_ms = tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3,
+                                       duration_scale=cfg.get("flightSpeedScale") or 1.0,
+                                       now_fn=_now)
     ctx.state.data["g3t_fired_tick"] = fired
     _log_occupancy(ctx, "ok", phase, in_place_ms, flight_ms, window.spent_ms(_now()))
     return "ok"

@@ -44,7 +44,21 @@ CLICK_COST_MS = (settings.CLICK_HOLD_RANGE_S[1] + 0.09) * 1000.0
 CLICK_COST_MEDIAN_MS = 145.0
 
 
-def max_reach_px(budget_ms):
+# A PRACTISED reach is faster than the fitted model, and this is the one activity where saying
+# so is honest rather than convenient. settings.HM2_* was fitted across general human reaching:
+# varied, unfamiliar targets, where most of the time goes into the corrective submovements that
+# HM2_UNDERSHOOT_* and HM2_LATERAL_ERROR model. 3-tick granite reaches for the SAME two pixels
+# thousands of times an hour; a human doing that for an hour has the movement in muscle memory
+# and the correction phase largely disappears. USER 2026-09-08: "a human with known X Y
+# cordinate most likely speed up too after some practice."
+#
+# So scaling the flight down here imitates the human being imitated MORE closely, not less --
+# but only for a repeated fixed-target reach. Do NOT reach for this to make an ordinary routine
+# faster; there the general fit is the right model and this would be a straightforward tell.
+PRACTISED_FLIGHT_SCALE = 0.65
+
+
+def max_reach_px(budget_ms, scale=1.0):
     """The furthest a flight may travel and still fit `budget_ms`, i.e. the inverse of
     estimate_flight_ms. Returns 0.0 when even the model's floor does not fit.
 
@@ -53,6 +67,7 @@ def max_reach_px(budget_ms):
     said 220px while the arithmetic only allows 82px, so a geometry the routine would have
     accepted could not have hit a single tick. Deriving it means the refusal message can tell
     the user the real target instead of an invented one."""
+    budget_ms = budget_ms / (scale or 1.0)
     if budget_ms <= settings.HM2_MIN_MS:
         return 0.0
     doublings = (budget_ms - settings.HM2_MED_REF_MS) / settings.HM2_SLOPE_MS_PER_BIT
@@ -155,18 +170,22 @@ def at_tick(events, target_tick, target_ms, *, now_fn=time.time, sleep_fn=time.s
         sleep_fn(max(step_ms, 5.0) / 1000.0)
 
 
-def estimate_flight_ms(dist_px):
+def estimate_flight_ms(dist_px, scale=1.0):
     """The fitted HM2 reach model's MEDIAN time for a distance, for budget arithmetic only.
 
     Not a prediction of any individual flight -- HM2_SIGMA is 0.368, so the p90 is ~1.6x this.
     Window.room_for is deliberately fed this median and given a caller-side margin rather than
     a p90, because refusing every cycle whose worst case might overrun would refuse most of
-    them."""
+    them.
+
+    `scale` multiplies the result, matching move_to_human's own `duration_scale`, so a caller
+    that flies faster gets a budget that agrees with what it will actually do. See
+    PRACTISED_FLIGHT_SCALE for when that is legitimate."""
     if dist_px <= 1:
         return 0.0
     doublings = math.log2(max(float(dist_px), 1.0) / settings.HM2_D_REF)
-    return max(settings.HM2_MIN_MS,
-               settings.HM2_MED_REF_MS + doublings * settings.HM2_SLOPE_MS_PER_BIT)
+    return scale * max(settings.HM2_MIN_MS,
+                       settings.HM2_MED_REF_MS + doublings * settings.HM2_SLOPE_MS_PER_BIT)
 
 
 def click_in_place(ser, *, now_fn=time.time):
@@ -179,8 +198,10 @@ def click_in_place(ser, *, now_fn=time.time):
     return (now_fn() - t0) * 1000.0
 
 
-def timed_click(ser, point, *, aim_radius=0, now_fn=time.time):
+def timed_click(ser, point, *, aim_radius=0, duration_scale=1.0, now_fn=time.time):
     """Fly to a PRE-RESOLVED (x, y) and click. Returns elapsed ms.
+
+    `duration_scale` is passed through to move_to_human. See PRACTISED_FLIGHT_SCALE.
 
     NO HTTP ANYWHERE IN THIS CALL, which is why it is not controller.click_entity: that one
     reads the bridge at departure, once per refresh leg and again at the settle -- the ~1s per
@@ -188,7 +209,8 @@ def timed_click(ser, point, *, aim_radius=0, now_fn=time.time):
     room for a single round trip, so the caller resolves the point during the dead ticks and
     hands it here as plain numbers."""
     t0 = now_fn()
-    controller.move_to_human(ser, int(point[0]), int(point[1]), aim_radius=aim_radius)
+    controller.move_to_human(ser, int(point[0]), int(point[1]), aim_radius=aim_radius,
+                             duration_scale=duration_scale)
     controller.click_human(ser)
     return (now_fn() - t0) * 1000.0
 

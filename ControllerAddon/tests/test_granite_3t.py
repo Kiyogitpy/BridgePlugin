@@ -97,7 +97,10 @@ def test_geometry_refuses_when_the_rocks_are_too_far_from_the_log_AND_reports_th
     # ...and the DERIVED limit, not a hand-picked one. MEASURED LIVE 2026-09-08: the config's
     # 220 was three times what the tick budget actually allows, so a geometry that could never
     # hit a tick would have been accepted.
-    assert f"{tick_cycle.max_reach_px(600.0 - 60.0 - 2 * tick_cycle.CLICK_COST_MEDIAN_MS):.0f}px" in msg
+    cfg = _cfg()
+    limit = tick_cycle.max_reach_px(600.0 - 60.0 - 2 * tick_cycle.CLICK_COST_MEDIAN_MS,
+                                    cfg["flightSpeedScale"])
+    assert f"{limit:.0f}px" in msg
 
 
 def test_geometry_passes_and_still_reports_the_measurement(monkeypatch):
@@ -225,7 +228,10 @@ def test_run_cycle_ABANDONS_the_rock_click_rather_than_letting_it_cross_the_boun
 
     ctx = _Ctx()
     ctx.events = _FakeEvents()
-    assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "desync"
+    # scale pinned at 1.0: this test is about the CLICK cost being booked, not about how fast
+    # the flight happens to be configured.
+    assert g.run_cycle(ctx, _cfg(flightSpeedScale=1.0),
+                       (1700, 800), (1740, 800), (1640, 800)) == "desync"
     assert clicked == []
     assert aborted == []
 
@@ -703,7 +709,10 @@ def test_a_cycle_with_room_for_the_flight_but_not_the_click_is_a_desync(monkeypa
     ctx = _Ctx()
     ctx.events = _FakeEvents()
     assert tick_cycle.estimate_flight_ms(100.0) < 440.0     # the flight ALONE would have fitted
-    assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "desync"
+    # scale pinned at 1.0: this test is about the CLICK cost being booked, not about how fast
+    # the flight happens to be configured.
+    assert g.run_cycle(ctx, _cfg(flightSpeedScale=1.0),
+                       (1700, 800), (1740, 800), (1640, 800)) == "desync"
     assert clicked == []
 
 
