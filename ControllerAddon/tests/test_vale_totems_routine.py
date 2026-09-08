@@ -219,3 +219,68 @@ def test_carve_rereads_the_spirits_before_choosing(monkeypatch):
     monkeypatch.setattr(vtr_routine, "_await_menu", lambda ctx: True)
     vtr_routine.carve(_ctx_only(), stale)
     assert chosen == ["EAGLE"], "carve used the stale trio instead of re-reading"
+
+
+def test_count_item_counts_slots_not_distinct_names(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Yew logs"}, {"name": "Yew logs"},
+                                 {"name": "Knife"}])
+    assert vtr_routine.count_item("Yew logs") == 2
+
+
+def test_decorate_confirms_on_the_decoration_count_rising(monkeypatch):
+    site = _one_site(baseValue=4, wood="YEW", baseCarved=True, decorations=1)
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda *a, **k: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(vtr_routine, "read_state",
+                        lambda: type("S", (), {"sites": {6: _one_site(
+                            baseValue=4, wood="YEW", baseCarved=True,
+                            decorations=2)}})())
+    assert vtr_routine.decorate(_ctx_only(), site) is True
+
+
+def test_start_fletching_answers_the_make_prompt_never_the_carve_prompt(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Knife", "screenX": 1, "screenY": 1},
+                                 {"name": "Yew logs", "screenX": 2, "screenY": 2}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(skillmulti, "showing", lambda t: t == skillmulti.TITLE_CARVE)
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    assert vtr_routine.start_fletching(_ctx_only()) is False
+    assert keys == [], "answered the carve prompt as if it were the fletch prompt"
+
+
+def test_start_fletching_derives_the_bow_option_from_the_menu(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Knife", "screenX": 1, "screenY": 1},
+                                 {"name": "Yew logs", "screenX": 2, "screenY": 2}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(skillmulti, "showing", lambda t: t == skillmulti.TITLE_MAKE)
+    monkeypatch.setattr(skillmulti, "item_widget",
+                        lambda name: {"child": 17, "screenX": 5, "screenY": 6})
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    assert vtr_routine.start_fletching(_ctx_only()) is True
+    assert keys == ["3"]
+
+
+def test_start_fletching_never_presses_space(monkeypatch):
+    # Space repeats the LAST CRAFTED item -- session state we do not own. A fresh login or one
+    # manual fletch of something else and it silently makes the wrong thing all run.
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Knife", "screenX": 1, "screenY": 1},
+                                 {"name": "Yew logs", "screenX": 2, "screenY": 2}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(skillmulti, "showing", lambda t: t == skillmulti.TITLE_MAKE)
+    monkeypatch.setattr(skillmulti, "item_widget",
+                        lambda name: {"child": 17, "screenX": 5, "screenY": 6})
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    vtr_routine.start_fletching(_ctx_only())
+    assert "space" not in [k.lower() for k in keys]

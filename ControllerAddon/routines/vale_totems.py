@@ -247,3 +247,75 @@ def carve(ctx, site) -> bool:
     return bool(outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"],
                                         CARVE_BUDGET_S, landed,
                                         now_fn=_now, sleep_fn=_sleep))
+
+
+DECORATE_BUDGET_S = 6.0
+FLETCH_MENU_BUDGET_S = 4.0
+
+
+def count_item(name: str) -> int:
+    """Slots holding `name`. Counts SLOTS, not distinct names -- 11 logs is 11 slots."""
+    want = name.lower()
+    return sum(1 for i in (controller.get_inventory() or [])
+               if (i.get("name") or "").lower() == want)
+
+
+def find_item(name: str):
+    want = name.lower()
+    for item in controller.get_inventory() or []:
+        if (item.get("name") or "").lower() == want:
+            return item
+    return None
+
+
+def decorate(ctx, site) -> bool:
+    """Attach one decoration. Confirmed on the reader's decoration count rising."""
+    n = site.number
+    before = site.decorations
+
+    def landed():
+        fresh = _site_now(n)
+        return fresh is not None and fresh.decorations > before
+
+    return _click_site(ctx, n, "totem", DECORATE_BUDGET_S, landed)
+
+
+def start_fletching(ctx) -> bool:
+    """Knife a log and pick the bow, then RETURN -- the walk overlaps the fletching.
+
+    MEASURED 2026-09-08: fletching continues while running (five bows delivered across a
+    30-tile sprint), one product every 1.8s. So this is fired as the last act at a site and the
+    leg walk runs underneath it; nothing waits here.
+
+    NEVER `Space`: it repeats the last crafted item, which is session state we do not own.
+    The option is matched by NAME and its digit derived from the matched widget, so a wood
+    whose menu differs cannot silently make the wrong thing.
+    """
+    knife = find_item("Knife")
+    log = find_item(ctx.config["log"])
+    if not knife or not log:
+        return False
+    controller.open_inventory_tab(ctx.ser)
+    if not controller.click_entity(ctx.ser, knife, offset=(0, 0), check_ui_blockers=False,
+                                   simulate_mistakes=False, expected_action="Use"):
+        return False
+    if not controller.click_entity(ctx.ser, log, offset=(0, 0), check_ui_blockers=False,
+                                   simulate_mistakes=False):
+        return False
+    outcome = outcome_waits.await_pre(
+        ctx, ["WIDGET_LOADED"], FLETCH_MENU_BUDGET_S,
+        lambda: skillmulti.showing(skillmulti.TITLE_MAKE),
+        now_fn=_now, sleep_fn=_sleep)
+    if not outcome:
+        debug_log.log(LOG, "make menu never opened (title=%r)" % skillmulti.prompt_title())
+        return False
+    widget = skillmulti.item_widget(ctx.config["bow"])
+    if not widget:
+        debug_log.log(LOG, "make menu has no %s option" % ctx.config["bow"])
+        return False
+    option = skillmulti.option_number(widget)
+    if option is not None:
+        controller.key_tap(ctx.ser, str(option))
+        return True
+    return bool(controller.click_entity(ctx.ser, widget, offset=(0, 0),
+                                        check_ui_blockers=False, simulate_mistakes=False))
