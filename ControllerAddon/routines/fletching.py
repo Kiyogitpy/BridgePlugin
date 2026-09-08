@@ -60,6 +60,7 @@ import time
 import banker
 import controller
 import debug_log
+import skillmulti
 
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -92,9 +93,9 @@ DEFAULT_CONFIG = {
     },
 }
 
-SKILLMULTI_GROUP = 270            # cache: skillmulti.if3
-SKILLMULTI_FIRST_ITEM_CHILD = 15  # children 15..32 are the item buttons `a`..`r`
-SKILLMULTI_LAST_ITEM_CHILD = 32
+SKILLMULTI_GROUP = skillmulti.GROUP
+SKILLMULTI_FIRST_ITEM_CHILD = skillmulti.FIRST_ITEM_CHILD
+SKILLMULTI_LAST_ITEM_CHILD = skillmulti.LAST_ITEM_CHILD
 
 MENU_OPEN_BUDGET_S = 4.0        # recording: menu up 0.7s after the use-on
 FIRST_PRODUCT_BUDGET_S = 6.0    # recording: first product 1.3s after the option keypress
@@ -171,93 +172,12 @@ def _find(inv, name):
     return next((i for i in inv if (i.get("name") or "").lower() == name), None)
 
 
-_TAG_RE = re.compile(r"<[^>]*>")
-
-
-def strip_tags(text):
-    """Drop RuneScape colour/format tags. MEASURED live 2026-09-08: the skillmulti buttons
-    carry their label as `<col=ff9040>Maple longbow</col>`, so a raw comparison never matches."""
-    return _TAG_RE.sub("", text or "")
-
-
-def menu_label(product):
-    """The name the MAKE MENU uses for `product`, which is not the name the inventory uses.
-
-    MEASURED live 2026-09-08 by dumping group 270 while the menu was open: the five maple
-    options are `60 arrow shafts`, `Maple shortbow`, `Maple longbow`, `Crossbow stock`,
-    `Maple shield`. The menu names the FINISHED item; the inventory receives the unstrung one
-    (`Maple longbow (u)`). Matching the inventory name against the menu could therefore never
-    succeed -- which is exactly what the first live run showed, falling back to the number key
-    on every batch.
-
-    Config keeps the inventory name because that is what actually has to be counted to confirm
-    the batch; the menu label is derived from it by dropping the unstrung suffix."""
-    label = strip_tags(product).strip()
-    for suffix in (" (u)", " (unstrung)"):
-        if label.lower().endswith(suffix):
-            label = label[: -len(suffix)]
-            break
-    return label.lower()
-
-
-def menu_item_widget(product):
-    """The skillmulti button for `product`, matched on name+text the way the Gauntlet's
-    _bowl_widget and giants_foundry's crucible fill already match this same group -- a widget
-    carrying the item name in `name` with an empty `text` (or the reverse) still matches.
-
-    Matching by NAME rather than trusting the option number is the point: the option list is
-    per-log (a plain log offers shafts / shortbow / longbow / stock) and the human's "3" is
-    only correct for the product they happened to pick."""
-    want = menu_label(product)
-    if not want:
-        return None
-    in_range, anywhere = None, None
-    for w in controller.get_widgets_dump():
-        if w.get("group") != SKILLMULTI_GROUP or w.get("screenX") is None:
-            continue
-        label = strip_tags("{0} {1}".format(w.get("name") or "", w.get("text") or "")).lower()
-        if want not in label:
-            continue
-        child = w.get("child")
-        if child is not None and SKILLMULTI_FIRST_ITEM_CHILD <= child <= SKILLMULTI_LAST_ITEM_CHILD:
-            in_range = in_range or w
-        else:
-            anywhere = anywhere or w
-    # Prefer a real item button, but do not LOSE a match just because the dump numbered it
-    # somewhere unexpected -- the child range is documented by the cache and confirmed by
-    # giants_foundry's 270.19, yet it has never been checked live for THIS menu, and falling
-    # through to the number key would silently pick a row by position instead of by name.
-    # (routines/corrupted_gauntlet.py's _bowl_widget matches this group with no range filter
-    # at all and works; the range here is a preference, not a gate.)
-    return in_range or anywhere
-
-
-def menu_option_number(widget):
-    """Which number key selects `widget`, or None if it cannot be derived.
-
-    The cache names the item buttons `a`..`r` at children 15..32, so option N is child 14+N --
-    CONFIRMED live 2026-09-08 against the real menu, where `Maple longbow` (the human's option
-    3) sat at child 17. Deriving the key from the matched widget is what makes the keypress
-    safe: the number stays tied to the product's NAME instead of to a position guessed in
-    config, so a log type with a different option list cannot silently make the wrong thing.
-
-    Returns None past 9 (the digit row cannot address those) or for a child outside the button
-    range, and the caller clicks the widget instead."""
-    if widget is None:
-        return None
-    child = widget.get("child")
-    if child is None or not (SKILLMULTI_FIRST_ITEM_CHILD <= child <= SKILLMULTI_LAST_ITEM_CHILD):
-        return None
-    option = child - SKILLMULTI_FIRST_ITEM_CHILD + 1
-    return option if 1 <= option <= 9 else None
-
-
-def menu_is_open():
-    """Any group-270 widget on screen. Used only to tell "the menu never opened" (a use-on that
-    did not land) from "the menu opened but this product is not on it" (a wrong config) -- two
-    failures that need different messages."""
-    return any(w.get("group") == SKILLMULTI_GROUP and w.get("screenX") is not None
-               for w in controller.get_widgets_dump())
+# Aliases for the skillmulti module functions, so existing code continues to work unchanged.
+strip_tags = skillmulti.strip_tags
+menu_label = skillmulti.menu_label
+menu_item_widget = skillmulti.item_widget
+menu_option_number = skillmulti.option_number
+menu_is_open = skillmulti.is_open
 
 
 def _confirm(check, budget_s, poll_s=0.2):
