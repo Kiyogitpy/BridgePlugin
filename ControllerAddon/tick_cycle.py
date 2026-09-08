@@ -54,7 +54,14 @@ def at_phase(events, target_ms, *, now_fn=time.time, sleep_fn=time.sleep):
 
     This is the FIRST cycle of a chain only -- it has no previous critical tick to count from.
     Every cycle after it must go through at_tick, or the cycle period is whatever the caller's
-    own work happened to take rather than a fixed number of ticks."""
+    own work happened to take rather than a fixed number of ticks.
+
+    THE SLEEP CROSSES A TICK BOUNDARY, SO THE STREAM IS PUMPED AGAIN AFTER IT. The pump before
+    the sleep only anchors the boundary we are aiming at; without the second one `events.ticks
+    .tick` still holds the tick we LEFT, and a caller reading current_tick() right after this
+    returns records the wrong tick number -- which pins the next cycle one tick early and makes
+    a 3-tick cycle fire as a 2-tick one. "Returns the phase actually woken at" is only honest if
+    the tick number is actually current too."""
     if events is None:
         return None
     now = now_fn()
@@ -63,6 +70,8 @@ def at_phase(events, target_ms, *, now_fn=time.time, sleep_fn=time.sleep):
     if events.ticks.is_stale(now):
         return None
     sleep_fn((events.ticks.ms_until_next(now) + target_ms) / 1000.0)
+    now = now_fn()
+    events.pump(now=now)
     return tick_phase_ms(events, now_fn())
 
 

@@ -92,6 +92,21 @@ def _ticking_events(clock, monkeypatch, start_tick=100, phase_ms=0.0):
     return events
 
 
+def test_at_phase_leaves_the_TICK_NUMBER_current_after_the_sleep(monkeypatch):
+    """at_phase sleeps ACROSS a tick boundary by construction, so a caller that reads
+    current_tick() right afterwards must be answered with the tick it woke IN, not the one it
+    left. Pumping only before the sleep answered 100 here; the cycle built on that pinned its
+    next critical click one tick early, turning a 3-tick cycle into a 2-tick one."""
+    clock = _Clock()
+    events = _ticking_events(clock, monkeypatch, start_tick=100, phase_ms=200.0)
+    assert tick_cycle.current_tick(events, now=clock.now()) == 100
+
+    woke = tick_cycle.at_phase(events, 60.0, now_fn=clock.now, sleep_fn=clock.sleep)
+    assert woke == pytest.approx(60.0, abs=1.0)
+    assert clock.t == pytest.approx(1000.460, abs=1e-6)     # 400ms to the boundary, then 60ms
+    assert tick_cycle.current_tick(events, now=clock.now()) == 101
+
+
 def test_current_tick_reports_the_bridges_tick_number(monkeypatch):
     clock = _Clock()
     events = _ticking_events(clock, monkeypatch, start_tick=100)

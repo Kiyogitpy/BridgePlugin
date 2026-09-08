@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "routines"))
 
 import pytest
 
+import bridge_events
 import controller
 import granite_3t as g
 
@@ -552,17 +553,69 @@ def test_a_missed_target_tick_is_a_desync_not_a_late_click(monkeypatch):
     assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800), 205) == "desync"
 
 
-def test_the_first_cycle_of_a_chain_still_enters_through_at_phase(monkeypatch):
-    """It has no previous critical tick to count from."""
-    used = []
-    monkeypatch.setattr(tick_cycle, "at_phase",
-                        lambda ev, ms, **kw: (used.append(ms), 60.0)[1])
-    _ok_cycle_patches(monkeypatch)
+class _Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def _ticking_events(clock, monkeypatch, start_tick=100, phase_ms=0.0):
+    """A REAL EventStream whose TICK packets are synthesised from the fake clock, so the tick
+    NUMBER advances exactly as the bridge's would as the clock is slept forward.
+
+    A fixture whose tick number never moves (the _FakeEvents above) cannot see an off-by-one in
+    the tick that gets RECORDED, which is what this file used to pin."""
+    events = bridge_events.EventStream(sock=None)
+    boundary_s = clock.now() - phase_ms / 1000.0
+
+    def _poll(sock):
+        elapsed_ms = (clock.now() - boundary_s) * 1000.0
+        n = int(elapsed_ms // bridge_events.GAME_TICK_MS)
+        return [("TICK", {"tick": start_tick + n,
+                          "atMillis": boundary_s * 1000.0 + n * bridge_events.GAME_TICK_MS})]
+
+    monkeypatch.setattr(controller, "poll_udp", _poll)
+    events.pump(now=clock.now())
+    return events
+
+
+def test_the_first_cycle_of_a_chain_enters_through_at_phase_and_records_the_TICK_IT_FIRED_IN(
+        monkeypatch):
+    """The first cycle has no previous critical tick to count from, so it enters through
+    at_phase -- but the tick number it RECORDS has to be the tick the log click actually landed
+    in, and that is the half this test used to get wrong.
+
+    at_phase sleeps ACROSS a tick boundary. Reading the stream's tick number afterwards without
+    pumping again answers the tick we LEFT: the recorded tick was one low, so tick() pinned the
+    next cycle at that + CYCLE_TICKS = only TWO ticks after the real critical click, and a
+    2-tick cycle re-fires knife-on-log before the skilling timer has expired and yields nothing.
+    That is the exact defect the whole tick-pinning fix exists to remove, and it recurs after
+    every chain start, every desync and every deliberate miss, all of which drop the pin and
+    re-enter here.
+
+    So: real at_phase, real TickModel, a clock that really advances -- and the assertion is that
+    the recorded tick equals the tick the click landed in, confirmed against a fresh pump."""
+    clock = _Clock()
+    # 200ms into tick 100, so at_phase's 400ms-to-the-boundary + 60ms sleep lands in tick 101.
+    events = _ticking_events(clock, monkeypatch, start_tick=100, phase_ms=200.0)
+    monkeypatch.setattr(tick_cycle, "click_in_place", lambda ser, **kw: 92.0)
+    monkeypatch.setattr(tick_cycle, "timed_click", lambda ser, pt, **kw: 200.0)
+    monkeypatch.setattr(g.random, "random", lambda: 1.0)      # never a deliberate miss
+    monkeypatch.setattr(g, "_now", clock.now)
+    monkeypatch.setattr(g, "_sleep", clock.sleep)
+
     ctx = _Ctx()
-    ctx.events = _FakeEvents()
+    ctx.events = events
     assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "ok"
-    assert used == [60]
-    assert ctx.state.data["g3t_fired_tick"] == 100      # _FakeTicks' tick number
+
+    events.pump(now=clock.now())
+    assert events.ticks.tick == 101         # where the log click really landed
+    assert ctx.state.data["g3t_fired_tick"] == 101
 
 
 def test_tick_targets_CYCLE_TICKS_after_the_last_critical_click(monkeypatch):
@@ -616,40 +669,6 @@ def test_a_desync_drops_the_pin_so_the_next_cycle_re_enters_on_a_clean_boundary(
     g.tick(ctx)
     assert targets[1] == 303
     assert targets[2] is None       # the desync dropped the pin
-
-
-def test_rockClickTickOffset_minus_one_clicks_the_rock_a_tick_BEFORE_the_log(monkeypatch):
-    """I8. The knife selection is client-side, so it survives both flights and is only consumed
-    by the log click -- which is what makes the inverted order expressible at all."""
-    order = []
-    monkeypatch.setattr(tick_cycle, "at_phase", lambda ev, ms, **kw: 60.0)
-    monkeypatch.setattr(tick_cycle, "at_tick",
-                        lambda ev, target, ms, **kw: (order.append(("at_tick", target)), 60.0)[1])
-    monkeypatch.setattr(controller, "move_to_human",
-                        lambda ser, x, y, **kw: order.append(("park", (x, y))))
-    _ok_cycle_patches(monkeypatch, order)
-
-    ctx = _Ctx()
-    ctx.events = _FakeEvents()          # tick 100
-    result = g.run_cycle(ctx, _cfg(rockClickTickOffset=-1),
-                         (1700, 800), (1740, 800), (1640, 800))
-    assert result == "ok"
-    assert order == [("rock", (1640, 800)), ("park", (1740, 800)),
-                     ("at_tick", 101), "log-in-place"]
-    assert ctx.state.data["g3t_fired_tick"] == 101
-
-
-def test_rockClickTickOffset_minus_one_leads_the_pinned_log_tick(monkeypatch):
-    opened = []
-    monkeypatch.setattr(tick_cycle, "at_tick",
-                        lambda ev, target, ms, **kw: (opened.append(target), 60.0)[1])
-    monkeypatch.setattr(tick_cycle, "at_phase",
-                        lambda *a, **k: pytest.fail("the tick is pinned; at_phase is wrong here"))
-    _ok_cycle_patches(monkeypatch)
-    ctx = _Ctx()
-    ctx.events = _FakeEvents()
-    g.run_cycle(ctx, _cfg(rockClickTickOffset=-1), (1700, 800), (1740, 800), (1640, 800), 205)
-    assert opened == [204, 205]         # rock on 204, log on the pinned 205
 
 
 # --------------------------------------------------------------------------------------------
@@ -917,6 +936,56 @@ def test_a_normal_chain_runs_when_the_tab_and_the_hover_both_check_out(monkeypat
     ctx = _chain_ctx(monkeypatch, started)
     g.tick(ctx)
     assert started
+
+
+# --------------------------------------------------------------------------------------------
+# Both I11 gates sit BEFORE _stall_check and return from tick() without running a cycle, so a
+# gate that never passes is a silent forever-loop with no terminal condition at all.
+# --------------------------------------------------------------------------------------------
+
+def test_a_tab_that_never_opens_is_eventually_a_stop_that_names_the_gate(monkeypatch):
+    """open_inventory_tab reads /state's inventoryTabOpen, which is None -> False whenever the
+    bridge read fails -- so this is a bridge outage, not an exotic case."""
+    ctx = _chain_ctx(monkeypatch, [])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: False)
+    ctx.state.data["g3t_tab_fails"] = g.INVENTORY_TAB_STOP - 1
+    g.tick(ctx)
+    assert ctx.state.safety_stopped is True
+    assert "inventory tab" in ctx.state.safety_reason.lower()
+
+
+def test_a_tab_failure_followed_by_a_success_does_NOT_stop_the_run(monkeypatch):
+    answers = iter([False, True])
+    ctx = _chain_ctx(monkeypatch, [])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: next(answers))
+    g.tick(ctx)
+    assert ctx.state.data["g3t_tab_fails"] == 1
+    g.tick(ctx)
+    assert ctx.state.safety_stopped is False
+    assert ctx.state.data["g3t_tab_fails"] == 0
+
+
+def test_an_unreadable_hover_is_eventually_a_stop_that_names_the_likely_cause(monkeypatch):
+    """controller.get_hover() returns None on a bridge error AND on any client built without
+    MenuStateProvider -- so against a stale client this gate failing is the DEFAULT outcome, and
+    this routine needs a rebuild anyway for its Routine-dropdown entry."""
+    ctx = _chain_ctx(monkeypatch, [])
+    monkeypatch.setattr(controller, "get_hover", lambda: None)
+    ctx.state.data["g3t_hover_fails"] = g.KNIFE_HOVER_STOP - 1
+    g.tick(ctx)
+    assert ctx.state.safety_stopped is True
+    assert "menustateprovider" in ctx.state.safety_reason.lower()
+
+
+def test_a_hover_failure_followed_by_a_success_does_NOT_stop_the_run(monkeypatch):
+    answers = iter([None, {"option": "Use", "target": "Knife"}])
+    ctx = _chain_ctx(monkeypatch, [])
+    monkeypatch.setattr(controller, "get_hover", lambda: next(answers))
+    g.tick(ctx)
+    assert ctx.state.data["g3t_hover_fails"] == 1
+    g.tick(ctx)
+    assert ctx.state.safety_stopped is False
+    assert ctx.state.data["g3t_hover_fails"] == 0
 
 
 # --------------------------------------------------------------------------------------------

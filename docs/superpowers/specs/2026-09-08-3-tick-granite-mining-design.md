@@ -176,9 +176,6 @@ knifeName, logName:   str                 # substring match, this repo's convent
 maxReachPx:           220                 # startup refuses above this, reporting the measurement
 logClickPhaseMs:      60                  # where in the critical tick the log click lands
 keepItems:            ["pickaxe"]         # never dropped, and see "Startup assertions" 5
-rockClickTickOffset:  0                   # LIVE-VERIFY (see checklist item 2); 0 = the rock
-                                          #   click shares the log click's tick, -1 = it leads
-                                          #   by one, inverting the order within the cycle
 missChance:           0.03                # deliberate one-tick-late rock click
 fullInventory:        "drop"
 xpStallStopS:         60
@@ -338,10 +335,18 @@ selection. What must never happen is an HTTP read between the log click and the 
 The knife and log points, by contrast, are resolved once per chain — items fill the inventory
 from low slots upward, so with the knife and log in the first two slots the granite stacks
 above them and their screen positions do not move.
-2. **`rockClickTickOffset`.** The wiki says the action must start "on the same tick as moving to
-   the next rock". A click on tick T causes movement on T+1, so "moving" may mean the tick the
-   walk executes rather than the tick it is clicked. If the yield rate is poor at offset 0, try
-   −1. This is the highest-risk unknown in the design.
+2. **Whether the rock click belongs in the log click's own tick.** The wiki says the action must
+   start "on the same tick as moving to the next rock". A click on tick T causes movement on
+   T+1, so "moving" may mean the tick the walk executes rather than the tick it is clicked. This
+   is the highest-risk unknown in the design — but **it is not a config flip, and there is no
+   `rockClickTickOffset` any more.** Clicking the rock BEFORE the log cannot work while the
+   knife selection is live: an OSRS item selection is consumed by the next click on any target,
+   so the rock click would spend it (issuing a "Use Knife → Granite rock" that does nothing) and
+   the following in-place log click would be a bare left-click with nothing selected — neither
+   action fires, and the cycle is recorded "ok" while yielding nothing. An offset of −1 was
+   implemented on that mistaken premise and deleted. If the first session shows the same-tick
+   order is wrong, the fix is to restructure `prepare()` so the knife is selected AFTER the rock
+   click, which is a design change rather than a setting.
 3. **Real click-window occupancy on this hardware.** The routine logs one line per cycle
    (`cycle ok: opened at phase Xms, in-place Yms, flight+click Zms, occupancy Wms of 600ms`)
    plus a median/max summary every 25 cycles; fit `logClickPhaseMs` from it. If p90 occupancy

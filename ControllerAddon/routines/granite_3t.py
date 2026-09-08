@@ -72,13 +72,6 @@ DEFAULT_CONFIG = {
     # (60 + 145 + 170 + 145 = 520) does fit. A guess; fit it from the per-cycle occupancy this
     # routine logs.
     "logClickPhaseMs": 60,
-    # LIVE-VERIFY (spec checklist item 2): the wiki says the action must start "on the same tick
-    # as moving to the next rock", and a click on tick T causes movement on T+1. 0 puts the rock
-    # click in the SAME tick as the log click (after it); -1 puts it one tick EARLIER, so the
-    # order within the cycle inverts -- rock click, park back on the log, then the log click on
-    # the critical tick. Both are implemented; see run_cycle. If the yield rate is poor at 0,
-    # try -1.
-    "rockClickTickOffset": 0,
     # Deliberate imperfection: a drawn fraction of cycles place the rock click one tick late.
     # A machine that never misses a 3-tick cycle is itself the signature -- EVENT_MOUSE_CLICK_V2
     # carries inter-press timing to the server at 1ms resolution (CLAUDE.md, telemetry).
@@ -134,6 +127,20 @@ STARTUP_DEFER_MAX_S = 60.0
 # tell", never "the items are gone". A 200ms hiccup, a client GC pause or a LOADING screen must
 # cost latency, not the run (CLAUDE.md's standing rule: network drops are ridden out).
 EMPTY_INVENTORY_STOP = 20
+
+# The two once-per-chain gates below `_run_chain`'s inventory read both return from tick()
+# WITHOUT running a cycle, and both sit BEFORE _stall_check -- so a gate that never passes is a
+# silent forever-loop with one debug line per engine iteration and no terminal condition at all
+# (the XP stall watch is never reached to notice that no xp is arriving). Same shape and same
+# answer as EMPTY_INVENTORY_STOP: ride out a transient, stop on a persistent one.
+#
+# Neither failure is exotic. open_inventory_tab reads /state's `inventoryTabOpen`, which is None
+# -> False whenever the bridge read fails; and controller.get_hover() returns None on a bridge
+# error AND on any client built without MenuStateProvider -- so on a client that has not been
+# rebuilt the hover gate failing is the DEFAULT outcome, and this routine needs a rebuild anyway
+# for its Routine-dropdown entry.
+INVENTORY_TAB_STOP = 15
+KNIFE_HOVER_STOP = 15
 
 # Per-cycle occupancy bookkeeping -- spec live-checklist item 3 is fitting logClickPhaseMs from
 # these numbers, and without them the first live session has no instrument for the one figure it
@@ -416,15 +423,18 @@ def run_cycle(ctx, cfg, knife_point, log_point, rock_point, target_tick=None):
     cycle of a chain. On "ok" the tick that was actually fired on is recorded in
     ctx.state.data["g3t_fired_tick"] and tick() pins the next cycle at that + CYCLE_TICKS; every
     other result clears it, so the next cycle re-enters on a clean boundary instead of
-    inheriting a period that is now wrong."""
-    offset = int(cfg.get("rockClickTickOffset", 0) or 0)
-    if offset < 0:
-        return _cycle_rock_first(ctx, cfg, log_point, rock_point, target_tick, offset)
-    return _cycle_log_first(ctx, cfg, log_point, rock_point, target_tick)
+    inheriting a period that is now wrong.
 
-
-def _cycle_log_first(ctx, cfg, log_point, rock_point, target_tick):
-    """rockClickTickOffset == 0 (the default): log click, then the rock click in the SAME tick."""
+    THE ORDER WITHIN THE TICK IS FIXED -- log click, then rock click -- AND CANNOT BE FLIPPED BY
+    CONFIG. A `rockClickTickOffset` of -1 (rock click first) was implemented and deleted: it
+    cannot work while a knife selection is live, because an OSRS item selection is consumed by
+    the next click on ANY target, so clicking the rock first issues "Use Knife -> Granite rock"
+    (which does nothing), spends the selection, and leaves the following in-place log click a
+    bare left-click with nothing selected -- knife-on-log never fires either and the cycle
+    yields nothing while being recorded "ok". See _consume_knife_selection, which states the
+    same rule. If a live session shows this ordering is wrong, the fix is to restructure
+    prepare() so the knife is selected AFTER the rock click; that is a design change, not a
+    config flip."""
     phase, fired, opened_at = _open_window(ctx, cfg, target_tick)
     if phase is None:
         return "no_clock"
@@ -460,78 +470,6 @@ def _cycle_log_first(ctx, cfg, log_point, rock_point, target_tick):
     flight_ms = tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3, now_fn=_now)
     ctx.state.data["g3t_fired_tick"] = fired
     _log_occupancy(ctx, "ok", phase, in_place_ms, flight_ms, window.spent_ms(_now()))
-    return "ok"
-
-
-def _cycle_rock_first(ctx, cfg, log_point, rock_point, target_tick, offset):
-    """rockClickTickOffset < 0: the rock click LEADS the log click by |offset| ticks.
-
-    This is spec live-checklist item 2, the highest-risk unknown in the design -- the wiki says
-    the 3-tick action must start "on the same tick as moving to the next rock", and a click on
-    tick T only causes movement on T+1, so "moving" may mean the tick the walk EXECUTES.
-
-    Expressible because item selection is client-side: the knife selection prepare() made
-    survives both flights and is only consumed by the log click. The order within the cycle
-    inverts -- click the rock on tick T+offset, fly BACK to the log, then fire knife-on-log in
-    place on tick T. The return flight is allowed to cross the boundary; at_tick waits out
-    whatever is left of the log tick, and answers "missed" if it overran the whole tick."""
-    rock_tick = None if target_tick is None else target_tick + offset
-    phase, fired, opened_at = _open_window(ctx, cfg, rock_tick)
-    if phase is None:
-        return "no_clock"
-    if phase == "missed":
-        debug_log.log(CATEGORY, f"desync: rock tick {rock_tick} was already past when the cycle "
-                                f"opened -- resyncing rather than firing a tick late")
-        return "desync"
-
-    window = tick_cycle.Window(opened_at=opened_at, phase_ms=phase)
-
-    if _deliberate_miss(cfg):
-        # A miss here slides the rock click into the log click's own tick, so the pair can no
-        # longer be placed at all and the caller resyncs -- which is what a human's missed
-        # cycle looks like from the game's side.
-        debug_log.log(CATEGORY, "deliberate miss -- placing the rock click a tick late")
-        if ctx.events is not None:
-            ctx.events.wait_ticks(1, now_fn=_now, sleep_fn=_sleep)
-        flight_ms = tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3, now_fn=_now)
-        _log_occupancy(ctx, "miss", phase, 0.0, flight_ms, window.spent_ms(_now()))
-        return "miss"
-
-    need = _flight_budget(log_point, rock_point)
-    now = _now()
-    if not window.room_for(need, now):
-        debug_log.log(CATEGORY,
-                      f"desync: {window.spent_ms(now):.0f}ms of the rock tick spent with "
-                      f"~{need:.0f}ms of flight+click still needed -- abandoning the cycle")
-        _log_occupancy(ctx, "desync", phase, 0.0, 0.0, window.spent_ms(now))
-        return "desync"
-
-    flight_ms = tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3, now_fn=_now)
-    rock_occupancy = window.spent_ms(_now())
-    controller.move_to_human(ctx.ser, int(log_point[0]), int(log_point[1]),
-                             aim_radius=AIM_RADIUS_PX)
-
-    # The pin is authoritative when there is one; only the first cycle of a chain has to
-    # derive the log tick from the tick the rock click actually landed on.
-    log_tick = target_tick if target_tick is not None else (
-        None if fired is None else fired - offset)
-    if log_tick is None:
-        # The clock answered a phase but no tick number, so there is nothing to schedule
-        # against. Refuse rather than guess -- the rock click has already gone out, so this
-        # cycle is forfeit either way.
-        return "no_clock"
-    log_phase = tick_cycle.at_tick(ctx.events, log_tick, cfg["logClickPhaseMs"],
-                                   now_fn=_now, sleep_fn=_sleep)
-    if log_phase is None:
-        return "no_clock"
-    if log_phase == "missed":
-        debug_log.log(CATEGORY, f"desync: the flight back to the log overran tick {log_tick} "
-                                f"-- the log click is not placed at all this cycle")
-        return "desync"
-
-    in_place_ms = tick_cycle.click_in_place(ctx.ser, now_fn=_now)
-    ctx.state.data["g3t_fired_tick"] = log_tick
-    _log_occupancy(ctx, "ok", phase, in_place_ms, flight_ms, rock_occupancy)
     return "ok"
 
 
@@ -737,13 +675,33 @@ def _run_chain(ctx):
     # this repo opens the tab first (CLAUDE.md, gf_live27: "after a pause/resume the stats tab
     # was up and the right-click offered View Attack guide").
     if not controller.open_inventory_tab(ctx.ser):
-        debug_log.log(CATEGORY, "could not confirm the inventory tab is open -- not starting a "
-                                "chain this tick")
+        fails = data.get("g3t_tab_fails", 0) + 1
+        data["g3t_tab_fails"] = fails
+        if fails >= INVENTORY_TAB_STOP:
+            ctx.state.trigger_safety_stop(
+                f"the inventory tab could not be confirmed open {fails} ticks running -- "
+                f"/state is unreadable (bridge down?) or the tab hotkey is not landing. Nothing "
+                f"has been clicked since; without this the routine would idle forever")
+        else:
+            debug_log.log(CATEGORY, f"could not confirm the inventory tab is open ({fails}) -- "
+                                    f"not starting a chain this tick")
         return
+    data["g3t_tab_fails"] = 0
+
     ok, detail = _knife_click_is_a_selection(ctx, knife_point)
     if not ok:
-        debug_log.log(CATEGORY, f"refusing to run a chain: {detail}")
+        fails = data.get("g3t_hover_fails", 0) + 1
+        data["g3t_hover_fails"] = fails
+        if fails >= KNIFE_HOVER_STOP:
+            ctx.state.trigger_safety_stop(
+                f"the knife hover check has failed {fails} ticks running ({detail}) -- either "
+                f"the bridge cannot be read, or this client was built without "
+                f"MenuStateProvider so /hover does not exist (rebuild it), or a Menu Entry "
+                f"Swapper entry really has changed the knife's left click")
+        else:
+            debug_log.log(CATEGORY, f"refusing to run a chain ({fails}): {detail}")
         return
+    data["g3t_hover_fails"] = 0
 
     # Cleared per chain: ticks pass between chains, so a fired tick from the previous one is no
     # longer a period this cycle can be counted from. The first cycle re-enters via at_phase.

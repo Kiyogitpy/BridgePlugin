@@ -1723,14 +1723,22 @@ only wires it into the panel dropdown.
   nothing. `at_tick` answers `"missed"` when its target tick has already passed, and the routine
   treats that as an ordinary desync -- firing late is worse than not firing, because a click in
   the wrong tick desyncs every cycle after it. `at_phase` survives for the FIRST cycle of a
-  chain, which has no previous critical tick to count from.
-- **`rockClickTickOffset` is IMPLEMENTED, not decorative** (it was declared, documented and read
-  by nothing, so setting it to -1 as the live checklist instructs would have changed nothing and
-  the session would have drawn a false conclusion). 0 puts the rock click in the same tick as
-  the log click, after it; -1 puts it one tick EARLIER, which inverts the order within the cycle
-  -- rock click, fly BACK to the log, then fire knife-on-log in place on the critical tick.
-  Expressible only because item selection is client-side: the selection survives both flights
-  and is consumed by the log click alone.
+  chain, which has no previous critical tick to count from. **`at_phase` PUMPS THE STREAM AGAIN
+  AFTER ITS SLEEP**, because that sleep crosses a boundary by construction: pumping only before
+  it left `events.ticks.tick` holding the tick we LEFT, so `_open_window` recorded a tick one
+  low and pinned the next cycle at +2 rather than +3 -- the exact defect the tick pin exists to
+  remove, re-entered after every chain start, every desync and every deliberate miss.
+- **THE ORDER WITHIN THE CRITICAL TICK IS FIXED -- log click, then rock click -- AND THERE IS NO
+  CONFIG KEY FOR IT.** A `rockClickTickOffset` of -1 (rock click leading the log click) was
+  built and then DELETED: it cannot work while a knife selection is live. An OSRS item selection
+  is consumed by the next click on ANY target, so clicking the rock first issues "Use Knife ->
+  Granite rock" (which does nothing), spends the selection, and leaves the following in-place
+  log click a bare left-click with nothing selected -- knife-on-log never fires either, the
+  cycle yields nothing, and it is recorded `"ok"`. The routine's own `_consume_knife_selection`
+  docstring already stated the rule, and the surviving order is deliberately the one where the
+  log click spends the selection before the rock is clicked. If a live session shows the
+  ordering is wrong, the fix is to restructure `prepare()` so the knife is selected AFTER the
+  rock click -- a design change, not a config flip.
 - **MEASURED from `settings.py`:** a reach is 170ms median at 52px, +120.5ms per doubling of
   distance, floor 90ms; a click hold is 50-145ms (median 85) followed by a 30-90ms trailing
   `human_delay`. **A CLICK'S WALL-CLOCK OCCUPANCY OF THE TICK IS THEREFORE ~145ms MEDIAN AND
@@ -1812,10 +1820,18 @@ only wires it into the panel dropdown.
   above is arithmetic over the fitted movement model, not a measurement on this hardware. If p90
   occupancy exceeds ~540ms live, the answer is the 4-tick celastrus variant (2400ms per cycle),
   not tuning `logClickPhaseMs` further.
+- **Both once-per-chain gates (the inventory tab, the knife hover) are COUNTED and terminal**
+  (`INVENTORY_TAB_STOP` / `KNIFE_HOVER_STOP`, 15 each, same shape as `EMPTY_INVENTORY_STOP`).
+  They sit BEFORE `_stall_check` and return from `tick()` without running a cycle, so a gate
+  that never passes was a silent forever-loop with one debug line per engine iteration and no
+  terminal condition at all -- the XP stall watch is never reached to notice that no xp is
+  arriving. Neither failure is exotic: `open_inventory_tab` reads `/state`'s `inventoryTabOpen`,
+  which is None -> False on any bridge error, and `controller.get_hover()` returns None on a
+  bridge error AND on any client built without `MenuStateProvider`, so **against an un-rebuilt
+  client the hover gate failing is the DEFAULT outcome** -- and this routine needs a rebuild
+  anyway for its dropdown entry.
 - See the spec's live-verification checklist for the full first-session worklist, in priority
-  order -- item 2 (`rockClickTickOffset`, whether the 3-tick action must be clicked on the same
-  tick the walk is CLICKED or the tick it EXECUTES) is called out there as the highest-risk
-  unknown in the whole design.
+  order.
 
 ## Current state of routines/blast_furnace.py
 
