@@ -59,6 +59,32 @@ WOODS = {
 
 DEFAULT_CONFIG = {"wood": "YEW"}
 
+# The engine posts these on load and after every login, and the bridge pushes VARBIT_CHANGED
+# for SUBSCRIBED IDS ONLY (EventsProvider.java). Without them every await_pre below waits its
+# whole budget for a signal that is never sent and confirms only on the HTTP re-read at the
+# deadline -- roughly 45s of dead time per site, visible as slowness and nothing else, since
+# each wait still returns the right answer.
+#
+# MEASURED 2026-09-08 with javap over runelite-api 1.12.38's VarbitID: site 1's block starts at
+# ENT_TOTEMS_SITE_1_BASE = 17611 and the blocks are 18 apart (SITE_2_BASE 17629, SITE_3_BASE
+# 17647 ... SITE_8_BASE 17737, and the m8aq reader's own SITE_VARBIT_COUNT is 18). NOTE the
+# final-review brief said 17613: that id is ENT_TOTEMS_SITE_1_BASE_MULTILOC, two along, and
+# subscribing from it would have missed BASE and BASE_CARVED -- the two the build confirm
+# depends on -- while picking up two ids past the block instead.
+#
+# base..base+11 is exactly what parse_state reads: base (wood + built), +1 BASE_CARVED,
+# +2 MULTILOC, +3/+4/+5 the LOW/MID/TOP segments, +6 DECORATIONS, +7/+8/+9 the nearby spirit
+# trio, +10 DECAY, +11 POINTS (the unclaimed offerings pile). +12.. are the multi-animal flags
+# nothing here reads.
+SITE_1_BASE_VARBIT = 17611
+SITE_VARBIT_STRIDE = 18
+SITE_VARBIT_SPAN = 12
+
+VARBIT_SUBSCRIPTIONS = tuple(
+    SITE_1_BASE_VARBIT + SITE_VARBIT_STRIDE * (number - 1) + offset
+    for number in range(1, 9)
+    for offset in range(SITE_VARBIT_SPAN))
+
 _now = time.monotonic
 _sleep = time.sleep
 
@@ -72,7 +98,13 @@ def get_config(bridge_config):
         debug_log.log(LOG, "unknown wood %r -- falling back to %s"
                       % (wood, DEFAULT_CONFIG["wood"]))
         wood = DEFAULT_CONFIG["wood"]
-    cfg = dict(WOODS[wood])
+    # MERGE, do not replace. The engine reads breaks/safety out of the SAME dict a routine's
+    # get_config returns (ControllerState.break_due, check_safety), so returning only the four
+    # wood keys hands it a config with no breaks block at all -- and before_break can then
+    # never fire. routines/fletching.py:145-153 merges for exactly this reason; the wood keys
+    # go on top so the bridge cannot overwrite what we just resolved.
+    cfg = dict(bridge_config or {})
+    cfg.update(WOODS[wood])
     cfg["wood"] = wood
     return cfg
 
@@ -83,8 +115,12 @@ def read_state():
 
 
 def setup(ctx):
-    debug_log.log(LOG, "setup: %s totems, circuit %s"
-                  % (ctx.config["wood"], "->".join(str(n) for n in route.RING)))
+    """CONFIG IS NOT AVAILABLE HERE. The engine calls setup() at controller.py:3540, BEFORE
+    resolve_config() populates ctx.state.config at :3545 -- so a setup that reads the wood
+    raises AttributeError on the first load however it spells the lookup. Log the circuit,
+    which is static data, and let tick() read the config."""
+    debug_log.log(LOG, "setup: circuit %s"
+                  % "->".join(str(n) for n in route.RING))
 
 
 def tick(ctx):
@@ -99,39 +135,89 @@ def tick(ctx):
         return
 
     data = ctx.state.data
-    signature = progress_signature(state)
+
+    # WHICH SITE FIRST, because the stall watch is scoped to it (see progress_signature).
+    current = data.get("vt_site")
+    if current is None:
+        current = nearest_site()
+        if current is None:
+            debug_log.log(LOG, "not within %d tiles of any totem site -- standing by. There is "
+                               "no router for Varlamore, so start this routine at a site."
+                          % SITE_SEARCH_RADIUS)
+            return
+        data["vt_site"] = current
+
+    signature = progress_signature(state, current)
     if signature == data.get("vt_signature"):
         data["vt_stalled"] = data.get("vt_stalled", 0) + 1
         if data["vt_stalled"] >= STALL_STOP_TICKS:
             ctx.state.trigger_safety_stop(
-                "no totem progress in %d ticks" % STALL_STOP_TICKS)
+                "no progress at site %d in %d ticks" % (current, STALL_STOP_TICKS))
             return
     else:
         data["vt_signature"] = signature
         data["vt_stalled"] = 0
 
-    current = data.get("vt_site")
-    if current is None:
-        current = min(route.RING, key=lambda n: 0 if at_site(n) else 1)
-        data["vt_site"] = current
-
     if not at_site(current):
         previous = data.get("vt_from", route.RING[route.RING.index(current) - 1])
-        if not walk_leg(ctx, previous, current):
-            ctx.state.trigger_safety_stop(
-                "could not walk leg %s->%s" % (previous, current))
-        return
-
-    if count_item(ctx.config["log"]) == 0:
-        if find_basket() and empty_basket(ctx):
+        if walk_leg(ctx, previous, current):
+            data["vt_leg_tries"] = 0
             return
-        if not bank_trip(ctx):
-            ctx.state.trigger_safety_stop("out of %s and the bank trip failed"
-                                          % ctx.config["log"])
+        # A LEG IS RETRIED, not fatal on the first miss. travel._hop_to returns False for a
+        # point it cannot project AT ALL, which covers transient states the next tick will not
+        # be in -- a loading screen, a panel drawn over the minimap, the camera mid-swing.
+        # Hard-stopping the run on one of those throws away a working routine; the ceiling is
+        # what separates that from a leg that genuinely cannot be walked.
+        tries = data.get("vt_leg_tries", 0) + 1
+        data["vt_leg_tries"] = tries
+        debug_log.log(LOG, "leg %s->%s failed (attempt %d of %d)"
+                      % (previous, current, tries, LEG_MAX_ATTEMPTS))
+        if tries >= LEG_MAX_ATTEMPTS:
+            ctx.state.trigger_safety_stop(
+                "could not walk leg %s->%s in %d attempts"
+                % (previous, current, LEG_MAX_ATTEMPTS))
         return
+    data["vt_leg_tries"] = 0
+
+    log_name = ctx.state.config["log"]
+
+    # Top up from the basket BEFORE the site: the basket already holds logs we are carrying, so
+    # this costs no walk, and a totem that could be built this visit otherwise waits a whole
+    # lap. This is NOT the bank check -- that sits below work_site, see there.
+    if count_item(log_name) == 0 and find_basket():
+        empty_basket(ctx)
 
     work_site(ctx, current)
-    start_fletching(ctx)
+
+    # Re-read AFTER the site. work_site just built, carved and decorated, so the top-of-tick
+    # snapshot over-states what is outstanding, and BOTH decisions below are budgets computed
+    # from it. A failed re-read falls back to the snapshot rather than skipping the checks.
+    state = read_state() or state
+
+    # THE BANK CHECK SITS HERE, below work_site, and only at a site the booth can be reached
+    # from. Two separate bugs closed by that:
+    #
+    # 1. It used to run BEFORE work_site on `count_item(log) == 0`, so arriving at a built,
+    #    carved totem holding 4 bows and no logs went banking instead of decorating it -- the
+    #    decorations need BOWS, and we had them.
+    # 2. It used to run at every site. From sites 2-5 the booth is 70-80 tiles off and out of
+    #    the loaded scene, so the trip could only ever fail, and the failure was a safety stop.
+    #    Running out of logs anywhere else is NOT a stop now: claim, carve and decorate all
+    #    still work, so the routine carries on round the ring until the bank leg comes round.
+    #    Only a bank trip actually attempted and failed is fatal.
+    if current in BANK_SITES and vt.logs_needed_for_lap(state) > count_item(log_name):
+        if not bank_trip(ctx):
+            ctx.state.trigger_safety_stop(
+                "the bank trip from site %d failed -- out of %s" % (current, log_name))
+            return
+
+    # FLETCH ONLY WHAT IS NOT SPOKEN FOR. The make menu has no quantity, so the game fletches
+    # until the next click interrupts it; firing it while every log is owed to a build is how
+    # the routine reached "plenty of bows, no logs" and deadlocked. vt.fletch_budget does the
+    # arithmetic (pure, table-tested).
+    if vt.fletch_budget(state, count_item(log_name), count_item(ctx.state.config["bow"])) > 0:
+        start_fletching(ctx)
+
     data["vt_from"] = current
     data["vt_site"] = route.next_in_ring(current)
 
@@ -206,6 +292,28 @@ CARVE_MENU_BUDGET_S = 4.0
 CARVE_BUDGET_S = 6.0
 
 
+def _close_prompt(ctx, force: bool = False) -> None:
+    """ESC whatever group-270 prompt is still on screen.
+
+    A STRANDED INTERFACE EATS THE NEXT WORLD CLICK. motherlode_mine measured this live
+    (mlm_live8): a deposit box left open turned eight consecutive ladder clicks into eight
+    "close the interface" clicks with the player never moving an inch, ended by a ceiling
+    rather than by anything noticing. Here the hazard is worse than usual, because the carve
+    prompt and the fletch prompt are the SAME widget group -- so a carve menu the title gate
+    withheld on, and a make menu opened by a Use that then found no option, are the same open
+    interface, and it survives straight into the leg walk.
+
+    "ESC", never "escape": Firmware.ino's keyFromToken only knows the token ESC and returns 0
+    for anything else, which sends NOTHING and looks exactly like a keypress that landed.
+    Every other caller in the repo (banker.py, cargo_hold.py, giants_foundry.py) uses "ESC".
+
+    `force` skips the is_open() read for a caller that already knows an interface is up (the
+    bank), where a failed widget dump must not mean the close is skipped."""
+    if not force and not skillmulti.is_open():
+        return
+    controller.key_tap(ctx.ser, "ESC")
+
+
 def _await_menu(ctx) -> bool:
     """Wait for the CARVE prompt specifically."""
     outcome = outcome_waits.await_pre(
@@ -234,10 +342,14 @@ def choose_spirit(ctx, spirit: str) -> bool:
     if not skillmulti.showing(skillmulti.TITLE_CARVE):
         debug_log.log(LOG, "carve menu not on screen (title=%r) -- withholding"
                       % skillmulti.prompt_title())
+        # The title being wrong does not mean nothing is up -- a MAKE prompt reads this way,
+        # and it is the same group 270 that would then eat the next world click.
+        _close_prompt(ctx)
         return False
     widget = skillmulti.item_widget(spirit.capitalize())
     if not widget:
         debug_log.log(LOG, "carve menu has no %s option" % spirit)
+        _close_prompt(ctx)
         return False
     option = skillmulti.option_number(widget)
     if option is not None:
@@ -247,16 +359,73 @@ def choose_spirit(ctx, spirit: str) -> bool:
                                         check_ui_blockers=False, simulate_mistakes=False))
 
 
-ARRIVAL_TOLERANCE = 4
+# 7 tiles, and the number is travel.HOP_NEXT_CLICK_LEAD_TILES (6) PLUS ONE -- it has to sit
+# ABOVE the lead or a completed walk can never be seen to have arrived.
+#
+# travel._hop_to deliberately RELEASES a hop longer than that lead with ~6 tiles still to run,
+# so the next hop's aim and mouse flight overlap the remaining tiles instead of starting after
+# the player has stopped (the measured 0.6-1.8s dead stop at every hop boundary; see that
+# constant's own comment). Every leg here ends with an 8-12 tile waypoint, so the LAST hop
+# releases early too and walk_leg returns with the player about 6 tiles short of the stand
+# tile. Against the 4 this shipped with, at_site() then read False, tick() re-entered walk_leg
+# and clicked the PREVIOUS site's first waypoint -- a minimap click back where we came from.
+# That is the "clicking back and forth" signature CLAUDE.md documents, and it makes no progress
+# while looking busy.
+ARRIVAL_TOLERANCE = 7
+
+# ...and the last few tiles are waited out rather than assumed: 6 tiles of running is ~3.6s at
+# one tile per 0.6s tick, so 4.0s is that plus a poll's slack.
+LEG_ARRIVAL_POLL_S = 4.0
+LEG_ARRIVAL_POLL_INTERVAL_S = 0.6      # one game tick -- the soonest the player's tile changes
+
+# How far from a stand tile a restart may be and still be placed on the ring. The widest gap
+# between adjacent stand tiles is 57 tiles (2 -> 1), so 30 covers every point of every leg
+# while still refusing a player who is somewhere else in Varlamore entirely.
+SITE_SEARCH_RADIUS = 30
+
+
+def _player_xy():
+    player = controller.get_player() or {}
+    return player.get("x"), player.get("y")
+
+
+def _tiles_between(x1, y1, x2, y2) -> int:
+    """Chebyshev, because that is what a tile of RUNNING costs -- a diagonal step is one tick."""
+    return max(abs(x1 - x2), abs(y1 - y2))
 
 
 def at_site(site_number: int) -> bool:
-    player = controller.get_player() or {}
-    x, y = player.get("x"), player.get("y")
+    x, y = _player_xy()
     if x is None or y is None:
         return False
     sx, sy = route.SITES[site_number]["stand"]
-    return abs(x - sx) <= ARRIVAL_TOLERANCE and abs(y - sy) <= ARRIVAL_TOLERANCE
+    return _tiles_between(x, y, sx, sy) <= ARRIVAL_TOLERANCE
+
+
+def nearest_site():
+    """The ring site whose stand tile is closest, or None past SITE_SEARCH_RADIUS.
+
+    THE RESTART CASE. ctx.state.data is wiped on every restart and routine reload, so tick()
+    has to re-derive which site it is at. The first draft did that with
+    min(route.RING, key=lambda n: 0 if at_site(n) else 1), which returns RING[0] = 6 whenever
+    the player is on no stand tile at all -- min() keeps the FIRST minimum -- so a routine
+    restarted mid-leg walked 7 -> 6 from wherever it happened to be, across terrain no
+    waypoint covers and no router can path. Picking the genuinely nearest site instead means
+    the resumed leg starts beside the player (see walk_leg's nearest-waypoint start), and
+    "nowhere near the ring" is answered honestly rather than by guessing.
+    """
+    x, y = _player_xy()
+    if x is None or y is None:
+        return None
+    best, best_distance = None, None
+    for number in route.RING:
+        sx, sy = route.SITES[number]["stand"]
+        distance = _tiles_between(x, y, sx, sy)
+        if best_distance is None or distance < best_distance:
+            best, best_distance = number, distance
+    if best_distance is None or best_distance > SITE_SEARCH_RADIUS:
+        return None
+    return best
 
 
 def walk_leg(ctx, a: int, b: int) -> bool:
@@ -271,11 +440,38 @@ def walk_leg(ctx, a: int, b: int) -> bool:
     if not points:
         debug_log.log(LOG, "no recorded path for leg %d->%d" % (a, b))
         return False
-    for x, y in points:
-        if not travel._hop_to(ctx, x, y, route.PLANE):
-            debug_log.log(LOG, "leg %d->%d: hop to (%d,%d) failed" % (a, b, x, y))
+
+    # START FROM THE WAYPOINT NEAREST THE PLAYER, not always index 0. A leg is resumed mid-way
+    # far more often than it is started clean: after a bank trip (which leaves the player ON
+    # leg 8->7, beside the booth), after a restart, and after any hop this function had to
+    # retry. Replaying the leg from its first waypoint in those cases is a minimap click BACK
+    # toward the site we just left. The order stays forward from that index -- the waypoints
+    # are the human's own recorded path and only make sense walked in sequence.
+    x, y = _player_xy()
+    start = 0
+    if x is not None and y is not None:
+        start = min(range(len(points)),
+                    key=lambda i: _tiles_between(x, y, points[i][0], points[i][1]))
+
+    for wx, wy in points[start:]:
+        if not travel._hop_to(ctx, wx, wy, route.PLANE):
+            debug_log.log(LOG, "leg %d->%d: hop to (%d,%d) failed" % (a, b, wx, wy))
             return False
-    return True
+
+    # POLL FOR ARRIVAL rather than returning on the last CLICK. That click released with
+    # HOP_NEXT_CLICK_LEAD_TILES still to run (see ARRIVAL_TOLERANCE), so the player is still
+    # moving when the loop above ends. Returning here without waiting hands tick() a position
+    # that at_site() may still reject, and the caller's only recovery is to walk the leg again.
+    deadline = _now() + LEG_ARRIVAL_POLL_S
+    while True:
+        if at_site(b):
+            return True
+        if _now() >= deadline:
+            break
+        _sleep(LEG_ARRIVAL_POLL_INTERVAL_S)
+    debug_log.log(LOG, "leg %d->%d: still short of site %d after %.1fs"
+                  % (a, b, b, LEG_ARRIVAL_POLL_S))
+    return False
 
 
 def carve(ctx, site) -> bool:
@@ -361,7 +557,7 @@ def start_fletching(ctx) -> bool:
     whose menu differs cannot silently make the wrong thing.
     """
     knife = find_item("Knife")
-    log = find_item(ctx.config["log"])
+    log = find_item(ctx.state.config["log"])
     if not knife or not log:
         return False
     controller.open_inventory_tab(ctx.ser)
@@ -377,10 +573,14 @@ def start_fletching(ctx) -> bool:
         now_fn=_now, sleep_fn=_sleep)
     if not outcome:
         debug_log.log(LOG, "make menu never opened (title=%r)" % skillmulti.prompt_title())
+        # "Never opened" here means "the MAKE title never showed" -- a stray CARVE prompt
+        # satisfies neither and is exactly the interface that must not survive into the walk.
+        _close_prompt(ctx)
         return False
-    widget = skillmulti.item_widget(ctx.config["bow"])
+    widget = skillmulti.item_widget(ctx.state.config["bow"])
     if not widget:
-        debug_log.log(LOG, "make menu has no %s option" % ctx.config["bow"])
+        debug_log.log(LOG, "make menu has no %s option" % ctx.state.config["bow"])
+        _close_prompt(ctx)
         return False
     option = skillmulti.option_number(widget)
     if option is not None:
@@ -397,8 +597,11 @@ BASKET_BUDGET_S = 4.0
 
 
 def find_basket():
+    """Case-insensitively, the way count_item/find_item already match -- /inventory's casing is
+    the game's and nothing here should depend on it."""
+    wanted = {n.lower() for n in BASKET_NAMES}
     for item in controller.get_inventory() or []:
-        if (item.get("name") or "") in BASKET_NAMES:
+        if (item.get("name") or "").lower() in wanted:
             return item
     return None
 
@@ -427,24 +630,66 @@ def _basket_option(ctx, options, expect_change) -> bool:
 
 def empty_basket(ctx) -> bool:
     """Basket -> inventory, in the field ("You empty as many logs as you can carry.")."""
-    before = count_item(ctx.config["log"])
+    before = count_item(ctx.state.config["log"])
     return _basket_option(ctx, ("empty", "empty-to-inventory"),
-                          lambda: count_item(ctx.config["log"]) > before)
+                          lambda: count_item(ctx.state.config["log"]) > before)
 
 
 def fill_basket(ctx) -> bool:
     """Inventory -> basket, at the bank."""
-    before = count_item(ctx.config["log"])
+    before = count_item(ctx.state.config["log"])
     return _basket_option(ctx, ("fill",),
-                          lambda: count_item(ctx.config["log"]) < before)
+                          lambda: count_item(ctx.state.config["log"]) < before)
+
+
+# The only ring sites the bank is reachable from. Leg 8->7's recorded waypoints run through
+# (1412,3347) and (1422,3348), either side of the booth's stand tile (1416,3350) -- 4 and 6
+# tiles off it -- so the bank is ON that leg and nowhere else. From sites 2-5 the booth is
+# 70-80 tiles away and outside the loaded scene, which is why the first draft's
+# get_object_at() there returned nothing and safety-stopped the run with the bank simply out
+# of view. LEGS has no bank entry and there is no router, so this cannot be walked to from
+# anywhere else.
+BANK_SITES = (8, 7)
+
+BANK_HOP_ATTEMPTS = 4
+
+
+def _walk_to_bank(ctx) -> bool:
+    """Hop to the booth's stand tile, repeatedly.
+
+    ONE _hop_to CALL IS NOT AN ARRIVAL: it PULLS an aim point beyond the minimap's reach in
+    toward the player and still returns True, and it releases a long hop early by design. The
+    booth is ~20 tiles off site 8's stand tile and ~37 off site 7's, so neither is guaranteed
+    in a single hop. False only when a hop is genuinely unprojectable or we never get there.
+    """
+    bx, by = route.BANK["stand"]
+    for _ in range(BANK_HOP_ATTEMPTS):
+        x, y = _player_xy()
+        if x is not None and _tiles_between(x, y, bx, by) <= ARRIVAL_TOLERANCE:
+            return True
+        if not travel._hop_to(ctx, bx, by, route.PLANE):
+            debug_log.log(LOG, "bank: hop to (%d,%d) failed" % (bx, by))
+            return False
+    x, y = _player_xy()
+    if x is not None and _tiles_between(x, y, bx, by) <= ARRIVAL_TOLERANCE:
+        return True
+    debug_log.log(LOG, "bank: never reached the stand tile in %d hops" % BANK_HOP_ATTEMPTS)
+    return False
 
 
 def bank_trip(ctx) -> bool:
-    """Withdraw-All logs, close, Fill the basket -- three rounds, the recording's own sequence.
+    """Walk to the booth, then Withdraw-All logs / close / Fill the basket for three rounds --
+    the recording's own sequence.
 
     "You don't have enough inventory space to withdraw that many." is NORMAL here and must not
     be treated as a failure; fletching.py records the same thing for the same click.
+
+    The walk is part of the trip, not the caller's job: the booth only resolves once we are
+    standing beside it, and the caller (tick) has already established we are on a BANK_SITES
+    site, which is the only place this walk is short and recorded.
     """
+    if not _walk_to_bank(ctx):
+        return False
     entry = route.BANK
     booth = controller.get_object_at(entry["tile"][0], entry["tile"][1], route.PLANE,
                                      entry["object_id"])
@@ -454,16 +699,23 @@ def bank_trip(ctx) -> bool:
     for round_index in range(BANK_ROUNDS):
         if not banker.open_bank(ctx, booth):
             return False
-        if not banker.withdraw_all_shift(ctx, ctx.config["log"], fresh=True):
+        if not banker.withdraw_all_shift(ctx, ctx.state.config["log"], fresh=True):
             return False
-        controller.key_tap(ctx.ser, "escape")
+        _close_prompt(ctx, force=True)
         if round_index < BANK_ROUNDS - 1:
-            fill_basket(ctx)
+            # A failed fill is LOGGED here rather than swallowed: without it the round's logs
+            # stay loose in the inventory, the next Withdraw-All has nowhere to go, and the
+            # failure surfaces one step later as a withdraw that looks broken instead.
+            if not fill_basket(ctx):
+                debug_log.log(LOG, "bank: round %d did not fill the basket -- the next "
+                                   "withdraw has fewer free slots than it expects"
+                              % (round_index + 1))
     return True
 
 
 SITE_MAX_ACTIONS = 12     # claim + build + 3 carves + 4 decorates is 9; 12 is a ceiling
 STALL_STOP_TICKS = 40
+LEG_MAX_ATTEMPTS = 3      # a transient un-projectable hop point is not a broken route
 
 # Action name -> the module-level function that performs it. Resolved through globals() at
 # CALL time rather than bound into a dict at import time, so that monkeypatching
@@ -485,7 +737,7 @@ def work_site(ctx, site_number: int) -> bool:
         if site is None:
             return False
         action, argument = vt.next_action(
-            site, logs=count_item(ctx.config["log"]), bows=count_item(ctx.config["bow"]))
+            site, logs=count_item(ctx.state.config["log"]), bows=count_item(ctx.state.config["bow"]))
         if action == "done":
             return True
         handler = globals().get(action) if action in _ACTIONS else None
@@ -496,14 +748,28 @@ def work_site(ctx, site_number: int) -> bool:
     return False
 
 
-def progress_signature(state):
+def progress_signature(state, site_number=None):
     """What "the routine is getting somewhere" looks like.
 
     Deliberately EXCLUDES unclaimedOfferings: ents add to those piles on their own every 48s,
     so including them would let a wedged routine look busy -- the same reason Wintertodt's
-    signature excludes passively-regenerating warmth."""
-    return tuple((s.number, s.base_value, s.base_carved, s.segment_values, s.decorations)
-                 for s in sorted(state.sites.values(), key=lambda s: s.number))
+    signature excludes passively-regenerating warmth.
+
+    SCOPED TO THE SITE BEING WORKED, for the same reason one step further. Ents walk the whole
+    ring every 80 ticks and each visit knocks a totem's durability down until it collapses, so
+    a signature spanning all eight sites changes on its own every few minutes -- which cleared
+    the stall counter of a routine wedged in front of one site, and the watch could never fire.
+    The site number is part of the tuple, so walking on to the next site is itself progress and
+    a healthy lap can never look stalled.
+
+    site_number=None keeps the whole-ring signature for a caller that wants it.
+    """
+    sites = sorted(state.sites.values(), key=lambda site: site.number)
+    if site_number is not None:
+        sites = [site for site in sites if site.number == site_number]
+    return (site_number,) + tuple(
+        (site.number, site.base_value, site.base_carved, site.segment_values, site.decorations)
+        for site in sites)
 
 
 def before_break(ctx):
