@@ -1538,3 +1538,21 @@ def test_drop_items_cancels_a_pending_use_selection_first(monkeypatch):
     monkeypatch.setattr(controller, "drop_items", lambda ser, items: True)
     ss.drop_items(_Ctx(), lambda name: True)
     assert "ESC" in keys, "a pending use-on selection must be cancelled before dropping"
+
+
+def test_drop_items_waits_for_the_last_drop_before_counting(monkeypatch):
+    """MEASURED live 2026-09-08: every pass reported one fewer than it dropped (6/5, 22/21,
+    26/25) because the confirmed-delta read fired within a server tick of the FINAL click. The
+    count must wait for the expected total, bounded."""
+    items = [{"name": "Gold ring", "screenX": i, "screenY": i} for i in range(3)]
+    state = {"inv": list(items), "reads": 0}
+
+    def _inv():
+        state["reads"] += 1
+        # All three land, but only from the third read on -- ordinary tick latency.
+        return [] if state["reads"] >= 3 else list(state["inv"])
+
+    monkeypatch.setattr(controller, "get_inventory", _inv)
+    monkeypatch.setattr(controller, "drop_items", lambda ser, its: True)
+    monkeypatch.setattr(ss, "DROP_CONFIRM_POLL_S", 0.0) if hasattr(ss, "DROP_CONFIRM_POLL_S") else None
+    assert ss.drop_items(_Ctx(), lambda name: True) == 3

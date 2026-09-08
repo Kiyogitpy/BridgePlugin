@@ -1055,6 +1055,13 @@ def drop_items(ctx, predicate):
     # as its progress signal (the input to SORT_FAIL_LIMIT, the ceiling that stops the sort rung
     # spinning forever with a wreck in range), so it must reflect items actually gone, not clicks
     # issued into a stray interface that ate every one of them.
+    # Let the LAST drop land before measuring. Same server-tick latency as the shift-drop check
+    # in controller.drop_items: MEASURED live 2026-09-08, every pass reported one fewer than it
+    # dropped (6 attempted / 5 confirmed, 22/21, 26/25) because this read fired within a tick of
+    # the final click. Bounded, so genuinely-failed drops still report honestly -- and the wait
+    # ends the moment the expected count is reached, so a fully successful pass pays almost
+    # nothing.
+    _poll_drop_confirmed(lambda: len(controller.get_inventory()) <= before - len(items))
     confirmed = max(before - len(controller.get_inventory()), 0)
     if dropped_names:
         summary = ", ".join(f"{n} x{c}" if c > 1 else n for n, c in dropped_names.items())
