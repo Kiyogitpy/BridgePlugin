@@ -483,6 +483,9 @@ LOG_BASKET_NAME = "log basket"  # substring match, and it has to be: MEASURED fr
                                 # a Log brace): a different name, and the user does not have one.
 
 
+EMPTY_BASKET_TRIES = 3
+
+
 def has_log_basket() -> bool:
     return any(LOG_BASKET_NAME in (i.get("name") or "").lower() for i in controller.get_inventory())
 
@@ -521,20 +524,31 @@ def empty_log_basket(ctx) -> bool:
     (controller.py) -- which is what this site needs anyway, since a misclick's corrective
     re-click in that grid lands on the NEIGHBOURING item, here a stack of logs. Passing it
     CRASHED the routine live on 2026-09-08; see the test that now binds the real signature."""
-    basket = next(
-        (i for i in controller.get_inventory() if LOG_BASKET_NAME in (i.get("name") or "").lower()),
-        None,
-    )
-    if basket is None:
-        return False
-
     debug_log.log("bank", "emptying log basket")
-    if not controller.click_menu_action(ctx.ser, basket, ("empty-to-bank", "empty"),
+    for attempt in range(EMPTY_BASKET_TRIES):
+        # Re-read EVERY attempt. MEASURED live 2026-09-08 on the first real bank trip: the
+        # right-click landed on bare ground (menu `['Cancel', 'Walk here']`) because
+        # /inventory reported the basket at screen (31,50) -- read 0.12s after the bank
+        # interface opened, i.e. a pre-layout widget position taken mid-transition. The very
+        # next item in the same panel resolved to a sane (1598,445) 2.8s later, and with the
+        # bank shut the basket itself reads (1529,438). The position was not wrong, it was
+        # EARLY; retrying with the same stale dict would re-aim at the same dead pixel.
+        basket = next((i for i in controller.get_inventory()
+                       if LOG_BASKET_NAME in (i.get("name") or "").lower()), None)
+        if basket is None:
+            return False
+        if controller.click_menu_action(ctx.ser, basket, ("empty-to-bank", "empty"),
                                         offset=(0, 0), check_ui_blockers=False):
-        return False
+            controller.human_delay(0.6, 1.0)
+            return True
+        if attempt + 1 < EMPTY_BASKET_TRIES:
+            controller.human_delay(0.6, 1.0)
 
-    controller.human_delay(0.6, 1.0)
-    return True
+    # Not a stop: a basket that will not empty costs capacity, never the trip -- the deposit
+    # pass right after this still banks the loose logs and the run carries on.
+    debug_log.log("bank", f"the log basket would not empty after {EMPTY_BASKET_TRIES} tries "
+                          f"-- carrying on with it full")
+    return False
 
 
 PLANK_SACK_NAME = "plank sack"

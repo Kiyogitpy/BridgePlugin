@@ -792,6 +792,47 @@ def test_empty_log_basket_calls_click_menu_action_as_it_is_actually_declared(mon
     assert banker.empty_log_basket(_Ctx())
 
 
+def test_empty_log_basket_retries_on_a_stale_widget_position(monkeypatch):
+    """MEASURED LIVE 2026-09-08, first real bank trip: the right-click landed on BARE GROUND
+    (menu `['Cancel', 'Walk here']`) because /inventory reported the basket at screen (31,50),
+    read 0.12s after the bank interface opened -- a pre-layout widget position during the
+    interface transition. 2.8s later the very next item in the same panel resolved to a sane
+    (1598,445), and with the bank shut the basket itself reads (1529,438). So the position is
+    not wrong, it is EARLY, and a re-read is the whole fix.
+
+    Each attempt must re-read the inventory: retrying with the same stale dict would re-aim at
+    the same dead pixel forever.
+    """
+    reads = []
+
+    def inventory():
+        reads.append(1)
+        return _inv("Open log basket")
+
+    monkeypatch.setattr(controller, "get_inventory", inventory)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    attempts = []
+
+    def flaky(ser, entity, option, **kw):
+        attempts.append(1)
+        return len(attempts) > 1        # the first right-click hits bare ground
+
+    monkeypatch.setattr(controller, "click_menu_action", flaky)
+    assert banker.empty_log_basket(_Ctx())
+    assert len(attempts) == 2
+    assert len(reads) == 2, "each attempt must re-read the inventory, not reuse a stale dict"
+
+
+def test_empty_log_basket_gives_up_rather_than_spinning(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: _inv("Open log basket"))
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    attempts = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda *a, **k: attempts.append(1) and False)
+    assert not banker.empty_log_basket(_Ctx())
+    assert len(attempts) == banker.EMPTY_BASKET_TRIES
+
+
 def test_empty_log_basket_is_a_no_op_without_one(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory", lambda: _inv("Yew logs"))
     monkeypatch.setattr(controller, "click_menu_action",
