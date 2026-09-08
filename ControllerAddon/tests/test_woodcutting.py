@@ -95,3 +95,39 @@ def test_a_full_inventory_is_dropped_keeping_the_axe(monkeypatch):
     assert gathering.full_inventory_phase(P, ctx, state.config) is True
     assert dropped == ["Yew logs"] * 26
     assert not ctx.state.safety_stopped
+
+
+# --- the log basket (2026-09-08) ---------------------------------------------------------
+#
+# USER: "we use that for cutting wood basicly doubling our capacity" -- an OPEN log basket
+# auto-collects logs (cache config/obj 28142: "When opened logs will automatically be deposited
+# into it"), so the inventory only reaches 28 once the basket's own 28 are full. That doubling
+# is free; what is NOT free is keeping the basket. It matches neither "axe" nor anything else on
+# the old keep list, so before this both full-inventory policies destroyed it: bank shift-
+# deposited it into the bank after emptying it, and drop threw it on the ground.
+
+
+def test_the_log_basket_is_kept_not_dropped(monkeypatch):
+    inventory = ([{"name": "Rune axe"}, {"name": "Open log basket"}]
+                 + [{"name": "Maple logs"}] * 26)
+    dropped = []
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [] if dropped else list(inventory))
+    monkeypatch.setattr(controller, "drop_items",
+                        lambda ser, items: dropped.extend(i["name"] for i in items) or True)
+    state = controller.ControllerState()
+    state.config = dict(woodcutting.DEFAULT_CONFIG, treeNames=["Maple tree"])
+    ctx = types.SimpleNamespace(ser=None, state=state, events=None)
+    assert gathering.full_inventory_phase(P, ctx, state.config) is True
+    assert dropped == ["Maple logs"] * 26
+    assert "Open log basket" not in dropped
+    assert "Rune axe" not in dropped
+
+
+def test_the_log_basket_is_kept_out_of_the_bank_deposit():
+    # gathering.bank_config feeds keepItems straight to banker.deposit_inventory, whose keep
+    # test is a case-insensitive SUBSTRING match -- so one entry covers "Log basket" and
+    # "Open log basket" both.
+    keep = [k.lower() for k in gathering.bank_config(P)["keepItems"]]
+    for name in ("Log basket", "Open log basket"):
+        assert any(k in name.lower() for k in keep), name

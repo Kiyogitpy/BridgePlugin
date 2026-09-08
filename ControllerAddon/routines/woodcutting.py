@@ -15,6 +15,14 @@
 # tick-cached bulk scan is covered by the chain's own exclude set. A lone tree simply idles
 # until it grows back.
 #
+# THE LOG BASKET NEEDS NO DRIVING, only emptying (2026-09-08, USER: "we use that for cutting
+# wood basicly doubling our capacity" / "it fills automaticly all we need to do is right click it
+# in bank"). An OPEN log basket absorbs logs as they are cut, so the inventory only reaches 28
+# once the basket's own 28 are full -- that is the doubling, and it costs no code. What it does
+# cost is keeping the thing: it is on keep_items below, and banker.deposit_inventory empties it
+# at the bank (banker.empty_log_basket) before the deposit pass runs. Carry it OPEN; a shut one
+# collects nothing and this routine does not open it.
+#
 # A FULL INVENTORY IS DROPPED, not banked (`fullInventory` in the config, see
 # gathering.full_inventory_phase): power-chopping is the normal woodcutting loop. Set it to
 # "bank" for a log-banking session -- the banking path is mining's, unchanged and shared.
@@ -62,7 +70,13 @@ PROFILE = gathering.Profile(
     noun="tree",
     # Substring match, so this also keeps a pickaxe or a battleaxe in the inventory -- harmless
     # here, and far better than dropping the axe we are chopping with.
-    keep_items=("axe",),
+    #
+    # "log basket" is the same rule applied to the container (2026-09-08): it matches neither
+    # "axe" nor anything else, so before this BOTH full-inventory policies destroyed it -- bank
+    # shift-deposited the basket into the bank right after banker.deposit_inventory had emptied
+    # it, and drop threw it on the ground. One substring covers "Log basket" and "Open log
+    # basket" both, which is what the cache says the two states are called.
+    keep_items=("axe", "log basket"),
     # Resolved at call time, not bound here: a test (and controller.py's own module-duplication)
     # must be able to swap the bridge helper out from under it.
     config_fetch=lambda: controller.get_woodcutting_config(),

@@ -474,6 +474,67 @@ def empty_fur_pouch(ctx) -> bool:
     return True
 
 
+LOG_BASKET_NAME = "log basket"  # substring match, and it has to be: MEASURED from the cache
+                                # (config/obj), the item is "Log basket" (28140) while shut and
+                                # "Open log basket" (28142) once opened -- and only the OPEN one
+                                # collects logs on its own, so the shut name alone would miss the
+                                # state this exists for. Deliberately NOT matching the Forestry
+                                # basket (28143/28145, the log basket + forestry kit combined via
+                                # a Log brace): a different name, and the user does not have one.
+
+
+def has_log_basket() -> bool:
+    return any(LOG_BASKET_NAME in (i.get("name") or "").lower() for i in controller.get_inventory())
+
+
+def empty_log_basket(ctx) -> bool:
+    """Empty the log basket into an OPEN bank. Added 2026-09-08 (USER: "need to add a option to
+    empty wood basket too since we use that for cutting wood basicly doubling our capacity",
+    then "it fills automaticly all we need to do is right click it in bank").
+
+    THERE IS NO FILL STEP, and that is the whole shape of this: an open log basket absorbs logs
+    as they are cut (cache config/obj 28142, param_1784: "When opened logs will automatically be
+    deposited into it"), so unlike fill_fur_pouch/fill_coal_bag above there is nothing to drive
+    on the gathering side. The inventory simply does not reach 28 until the basket's own 28 are
+    full -- which is the capacity doubling -- and the only thing we owe it is the empty here.
+
+    An explicit menu selection, not a plain click, and NOT because the click is contested:
+    MEASURED from the cache, neither log_basket_closed (28140) nor log_basket_open (28142) has
+    an "Empty" iop AT ALL -- both offer Fill / Wear / Check / Open|Close / Destroy. So the Empty
+    the user right-clicks is a BANK-CONTEXT option the bank interface substitutes in over the
+    item's own, exactly as fill_fur_pouch's docstring records for the fur pouch
+    ("Deposit-1/5/10/X/All/Empty-to-bank instead -- bank-context actions replace the item's
+    normal one"). A bare left click would resolve to whichever of Fill / Deposit-1 / Wear won
+    that race, and Fill in particular is a silent no-op that looks like success.
+
+    The option is a SEQUENCE tried in priority order against the one menu this already reads
+    back (no extra right-click): the exact bank-context wording is not knowable offline, and the
+    fish barrel next door answers to "Empty-to-bank" while the fur pouch and looting bag answer
+    to "Empty". A wrong single guess would no-op forever -- click_menu_action's sequence form
+    exists for precisely this (see its docstring on chinchompa_hunting's trap states).
+
+    offset=(0, 0) because an inventory icon is small, and check_ui_blockers=False /
+    simulate_mistakes=False because this is a click inside the bank's own inventory panel: the
+    2026-09-02 blocker rects cover it (LIVE bf_live5 -- the default check refused the click and
+    rotated the camera instead), and a simulated misclick's corrective re-click in that grid
+    lands on the NEIGHBOURING item, which here is a stack of logs."""
+    basket = next(
+        (i for i in controller.get_inventory() if LOG_BASKET_NAME in (i.get("name") or "").lower()),
+        None,
+    )
+    if basket is None:
+        return False
+
+    debug_log.log("bank", "emptying log basket")
+    if not controller.click_menu_action(ctx.ser, basket, ("empty-to-bank", "empty"),
+                                        offset=(0, 0), check_ui_blockers=False,
+                                        simulate_mistakes=False):
+        return False
+
+    controller.human_delay(0.6, 1.0)
+    return True
+
+
 PLANK_SACK_NAME = "plank sack"
 
 
@@ -560,6 +621,13 @@ def deposit_inventory(ctx, config: dict) -> None:
     if not config.get("skipContainerDeposit"):
         if has_looting_bag():
             empty_looting_bag(ctx)
+
+        # The log basket, same idea and the same opt-out. It is emptied BEFORE the deposit pass
+        # below, which is load-bearing in both directions: its logs have to reach the bank, and
+        # the basket itself has to survive -- gathering.py puts it on the woodcutting keep list
+        # so the pass does not bank the container away after emptying it.
+        if has_log_basket():
+            empty_log_basket(ctx)
 
         # Empties looting bag/herb sack/seed box/coal bag/etc. into the bank via the bank
         # interface's own "Deposit Containers" widget button, in one click -- CONFIRMED (user

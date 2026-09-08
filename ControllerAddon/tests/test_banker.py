@@ -716,3 +716,100 @@ def test_only_the_varbits_the_candidates_actually_reference_are_read(monkeypatch
     assert values[2187] == 3
 
     assert len(banker._referenced_varbits()) > len(values),         "unnarrowed must read strictly more, or the narrowing is a no-op"
+
+
+# --- the log basket (2026-09-08) ---------------------------------------------------------
+#
+# USER: "need to add a option to empty wood basket too since we use that for cutting wood
+# basicly doubling our capacity", then "it fills automaticly all we need to do is right click
+# it in bank". So there is no Fill step to drive -- only the Empty at the bank.
+
+
+def _inv(*names):
+    return [{"name": n, "screenX": 10, "screenY": 20} for n in names]
+
+
+def test_has_log_basket_matches_the_open_basket_too(monkeypatch):
+    # MEASURED from the cache (config/obj): the item is named "Log basket" (28140) while shut
+    # and "Open log basket" (28142) once opened, and only the OPEN one auto-collects logs --
+    # so the shut name alone would miss the state this feature exists for.
+    monkeypatch.setattr(controller, "get_inventory", lambda: _inv("Open log basket"))
+    assert banker.has_log_basket()
+    monkeypatch.setattr(controller, "get_inventory", lambda: _inv("Log basket"))
+    assert banker.has_log_basket()
+    monkeypatch.setattr(controller, "get_inventory", lambda: _inv("Yew logs", "Rune axe"))
+    assert not banker.has_log_basket()
+
+
+def test_empty_log_basket_selects_the_option_from_the_menu(monkeypatch):
+    # Neither log_basket_closed (28140) nor log_basket_open (28142) has an "Empty" iop at all
+    # -- Fill/Wear/Check/Open|Close/Destroy -- so the Empty is a BANK-CONTEXT option the bank
+    # interface substitutes in, exactly like the fish barrel's Empty-to-bank. A bare left click
+    # would resolve to whichever of Fill/Deposit-1/Wear won, which is why this is a named menu
+    # selection (empty_fur_pouch's own live-confirmed lesson).
+    monkeypatch.setattr(controller, "get_inventory", lambda: _inv("Open log basket"))
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    calls = []
+
+    def fake_menu(ser, entity, option, **kw):
+        calls.append((entity["name"], option, kw))
+        return True
+
+    monkeypatch.setattr(controller, "click_menu_action", fake_menu)
+    assert banker.empty_log_basket(_Ctx())
+
+    name, option, kw = calls[0]
+    assert name == "Open log basket"
+    # A sequence, tried in priority order against ONE menu: the exact bank-context wording is
+    # not knowable offline, and a wrong single guess would no-op forever.
+    assert list(option) == ["empty-to-bank", "empty"]
+    # Bank-interface click: the 2026-09-02 blocker rects cover the bank's own inventory panel,
+    # and a simulated misclick's corrective re-click in that grid lands on the NEIGHBOURING
+    # item (banker.py's standing rule).
+    assert kw["check_ui_blockers"] is False
+    assert kw["simulate_mistakes"] is False
+    assert kw["offset"] == (0, 0)
+
+
+def test_empty_log_basket_is_a_no_op_without_one(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: _inv("Yew logs"))
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda *a, **k: pytest.fail("clicked with no basket in the inventory"))
+    assert not banker.empty_log_basket(_Ctx())
+
+
+def test_deposit_inventory_empties_the_log_basket_before_depositing(monkeypatch):
+    # ORDER IS THE WHOLE POINT: emptied first, so the logs reach the bank; and the basket is on
+    # the keep list, so the deposit pass that follows does not bank the basket itself away.
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: {"open": True})
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: _inv("Open log basket", "Yew logs", "Rune axe"))
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "key_down", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "key_up", lambda *a, **k: None)
+    monkeypatch.setattr(banker, "deposit_all_containers", lambda ctx: True)
+
+    order = []
+    monkeypatch.setattr(banker, "empty_log_basket",
+                        lambda ctx: order.append("empty") or True)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, item, **kw: order.append("deposit:" + item["name"]))
+
+    banker.deposit_inventory(_Ctx(), {"keepItems": ["axe", "log basket"]})
+
+    assert order[0] == "empty"
+    assert "deposit:Yew logs" in order
+    assert not any(o.startswith("deposit:Open log basket") for o in order)
+    assert not any(o.startswith("deposit:Rune axe") for o in order)
+
+
+def test_deposit_inventory_honours_skip_container_deposit_for_the_basket(monkeypatch):
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: {"open": True})
+    monkeypatch.setattr(controller, "get_inventory", lambda: _inv("Open log basket"))
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "key_down", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "key_up", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: None)
+    monkeypatch.setattr(banker, "empty_log_basket",
+                        lambda ctx: pytest.fail("emptied under skipContainerDeposit"))
+    banker.deposit_inventory(_Ctx(), {"keepItems": ["log basket"], "skipContainerDeposit": True})
