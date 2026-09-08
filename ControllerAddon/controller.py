@@ -3374,6 +3374,7 @@ ROUTINE_FILES = {
     "KARAMBWAN_FISHING": "routines/karambwan_fishing.py",
     "DEEP_SEA_TRAWLING": "routines/deep_sea_trawling.py",
     "WINTERTODT": "routines/wintertodt.py",
+    "FLETCHING": "routines/fletching.py",
 }
 
 

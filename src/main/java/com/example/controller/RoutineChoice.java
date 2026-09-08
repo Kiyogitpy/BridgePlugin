@@ -34,7 +34,8 @@ public enum RoutineChoice
 	AGILITY("Agility (course runner)"),
 	KARAMBWAN_FISHING("Karambwan Fishing (DKP + fish barrel)"),
 	DEEP_SEA_TRAWLING("Deep Sea Trawling"),
-	WINTERTODT("Wintertodt (group, fletch)");
+	WINTERTODT("Wintertodt (group, fletch)"),
+	FLETCHING("Fletching (bank, knife logs)");
 
 	private final String label;
 
