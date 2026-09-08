@@ -97,7 +97,43 @@ def tick(ctx):
             "not in the Auburn Valley. This routine has no router -- worldmap has no "
             "collision data for Varlamore -- so it cannot walk back. Start it in the valley.")
         return
-    # Later tasks add the ladder here.
+
+    data = ctx.state.data
+    signature = progress_signature(state)
+    if signature == data.get("vt_signature"):
+        data["vt_stalled"] = data.get("vt_stalled", 0) + 1
+        if data["vt_stalled"] >= STALL_STOP_TICKS:
+            ctx.state.trigger_safety_stop(
+                "no totem progress in %d ticks" % STALL_STOP_TICKS)
+            return
+    else:
+        data["vt_signature"] = signature
+        data["vt_stalled"] = 0
+
+    current = data.get("vt_site")
+    if current is None:
+        current = min(route.RING, key=lambda n: 0 if at_site(n) else 1)
+        data["vt_site"] = current
+
+    if not at_site(current):
+        previous = data.get("vt_from", route.RING[route.RING.index(current) - 1])
+        if not walk_leg(ctx, previous, current):
+            ctx.state.trigger_safety_stop(
+                "could not walk leg %s->%s" % (previous, current))
+        return
+
+    if count_item(ctx.config["log"]) == 0:
+        if find_basket() and empty_basket(ctx):
+            return
+        if not bank_trip(ctx):
+            ctx.state.trigger_safety_stop("out of %s and the bank trip failed"
+                                          % ctx.config["log"])
+        return
+
+    work_site(ctx, current)
+    start_fletching(ctx)
+    data["vt_from"] = current
+    data["vt_site"] = route.next_in_ring(current)
 
 
 CLAIM_BUDGET_S = 6.0
@@ -424,3 +460,58 @@ def bank_trip(ctx) -> bool:
         if round_index < BANK_ROUNDS - 1:
             fill_basket(ctx)
     return True
+
+
+SITE_MAX_ACTIONS = 12     # claim + build + 3 carves + 4 decorates is 9; 12 is a ceiling
+STALL_STOP_TICKS = 40
+
+# Action name -> the module-level function that performs it. Resolved through globals() at
+# CALL time rather than bound into a dict at import time, so that monkeypatching
+# routines.vale_totems.build (which every test of this loop does) actually takes effect. A
+# dict built at import captures the original function objects and silently ignores the patch.
+_ACTIONS = ("claim", "build", "carve", "decorate")
+
+
+def work_site(ctx, site_number: int) -> bool:
+    """Run the ladder at one site until it reports done, an action fails, or the ceiling.
+
+    The ceiling is load-bearing: every action here confirms against the reader, so an action
+    that reports success without advancing the totem would otherwise loop forever. A failed
+    action ends the visit rather than retrying -- the caller walks on and the next lap sees the
+    site again, which is cheaper than spinning in front of it.
+    """
+    for _ in range(SITE_MAX_ACTIONS):
+        site = _site_now(site_number)
+        if site is None:
+            return False
+        action, argument = vt.next_action(
+            site, logs=count_item(ctx.config["log"]), bows=count_item(ctx.config["bow"]))
+        if action == "done":
+            return True
+        handler = globals().get(action) if action in _ACTIONS else None
+        if handler is None or not handler(ctx, site):
+            debug_log.log(LOG, "site %d: %s did not land" % (site_number, action))
+            return False
+    debug_log.log(LOG, "site %d: hit the action ceiling" % site_number)
+    return False
+
+
+def progress_signature(state):
+    """What "the routine is getting somewhere" looks like.
+
+    Deliberately EXCLUDES unclaimedOfferings: ents add to those piles on their own every 48s,
+    so including them would let a wedged routine look busy -- the same reason Wintertodt's
+    signature excludes passively-regenerating warmth."""
+    return tuple((s.number, s.base_value, s.base_carved, s.segment_values, s.decorations)
+                 for s in sorted(state.sites.values(), key=lambda s: s.number))
+
+
+def before_break(ctx):
+    """Finish the site we are standing at before the break starts.
+
+    Cheap insurance rather than a play-out: an unfinished totem simply earns nothing until the
+    next lap, so there is no GOTR-style round to protect -- but leaving mid-carve with the
+    make menu open would have the break start on an open interface."""
+    current = ctx.state.data.get("vt_site")
+    if current is not None and at_site(current):
+        work_site(ctx, current)

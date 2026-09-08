@@ -380,3 +380,57 @@ def test_bank_trip_withdraws_and_fills_for_every_round(monkeypatch):
     assert withdrawals == ["Yew logs"] * vtr_routine.BANK_ROUNDS
     # The last round has nowhere to put the logs, so it does not fill.
     assert len(fills) == vtr_routine.BANK_ROUNDS - 1
+
+
+def test_work_site_runs_the_ladder_until_the_site_is_done(monkeypatch):
+    calls = []
+    seq = iter([("claim", None), ("build", None), ("carve", "EAGLE"),
+                ("decorate", None), ("done", None)])
+    monkeypatch.setattr(vt, "next_action", lambda site, **k: next(seq))
+    monkeypatch.setattr(vtr_routine, "claim", lambda c, s: calls.append("claim") or True)
+    monkeypatch.setattr(vtr_routine, "build", lambda c, s: calls.append("build") or True)
+    monkeypatch.setattr(vtr_routine, "carve", lambda c, s: calls.append("carve") or True)
+    monkeypatch.setattr(vtr_routine, "decorate",
+                        lambda c, s: calls.append("decorate") or True)
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: _one_site())
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 10)
+    vtr_routine.work_site(_ctx_only(), 6)
+    assert calls == ["claim", "build", "carve", "decorate"]
+
+
+def test_work_site_stops_after_a_failed_action_rather_than_retrying_forever(monkeypatch):
+    calls = []
+    monkeypatch.setattr(vt, "next_action", lambda site, **k: ("build", None))
+    monkeypatch.setattr(vtr_routine, "build", lambda c, s: calls.append("build") or False)
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: _one_site())
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 10)
+    vtr_routine.work_site(_ctx_only(), 6)
+    assert len(calls) == 1
+
+
+def test_work_site_is_bounded_even_when_every_action_reports_success(monkeypatch):
+    calls = []
+    monkeypatch.setattr(vt, "next_action", lambda site, **k: ("carve", "EAGLE"))
+    monkeypatch.setattr(vtr_routine, "carve", lambda c, s: calls.append(1) or True)
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: _one_site())
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 10)
+    vtr_routine.work_site(_ctx_only(), 6)
+    assert len(calls) == vtr_routine.SITE_MAX_ACTIONS
+
+
+def test_progress_signature_changes_when_any_site_advances():
+    a = vt.parse_state({"sites": [{"siteNumber": 1, "baseValue": 0, "wood": "NONE",
+                                   "baseCarved": False, "bottom": {"value": 0},
+                                   "middle": {"value": 0}, "top": {"value": 0},
+                                   "decorations": 0, "nearbySpirits": [],
+                                   "durabilityRemaining": 0, "unclaimedOfferings": 0}],
+                        "researchPoints": 0, "totalUnclaimedOfferings": 0,
+                        "atValeTotems": True})
+    b = vt.parse_state({"sites": [{"siteNumber": 1, "baseValue": 4, "wood": "YEW",
+                                   "baseCarved": False, "bottom": {"value": 0},
+                                   "middle": {"value": 0}, "top": {"value": 0},
+                                   "decorations": 0, "nearbySpirits": [],
+                                   "durabilityRemaining": 5, "unclaimedOfferings": 0}],
+                        "researchPoints": 0, "totalUnclaimedOfferings": 0,
+                        "atValeTotems": True})
+    assert vtr_routine.progress_signature(a) != vtr_routine.progress_signature(b)
