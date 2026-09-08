@@ -34,6 +34,7 @@
 # safety stop asking the user to start it standing in the valley.
 import time
 
+import banker
 import controller
 import debug_log
 import outcome_waits
@@ -351,3 +352,75 @@ def start_fletching(ctx) -> bool:
         return True
     return bool(controller.click_entity(ctx.ser, widget, offset=(0, 0),
                                         check_ui_blockers=False, simulate_mistakes=False))
+
+
+# Cache: the shut basket is "Log basket" (28140) and the open one "Open log basket" (28142).
+BASKET_NAMES = ("Log basket", "Open log basket")
+BANK_ROUNDS = 3          # recording: withdraw/fill three times -> ~28 in the basket, ~23 loose
+BASKET_BUDGET_S = 4.0
+
+
+def find_basket():
+    for item in controller.get_inventory() or []:
+        if (item.get("name") or "") in BASKET_NAMES:
+            return item
+    return None
+
+
+def _basket_option(ctx, options, expect_change) -> bool:
+    """Select a NAMED option on the basket, never a bare left click.
+
+    The basket offers Fill / Wear / Check / Open|Close / Destroy and a bare click races them --
+    and Fill is a SILENT NO-OP that looks like success. banker.empty_log_basket already selects
+    by name for exactly this reason, and `options` is passed as a SEQUENCE for the same reason
+    it does: click_menu_action takes one, tries each against the single menu it reads back, and
+    the exact wording is the thing the live checklist has to confirm.
+
+    Note click_menu_action has no simulate_mistakes parameter -- it reads the real menu and
+    clicks a named entry, so there is no aim to miss."""
+    basket = find_basket()
+    if not basket:
+        return False
+    controller.open_inventory_tab(ctx.ser)
+    if not controller.click_menu_action(ctx.ser, basket, options, offset=(0, 0),
+                                        check_ui_blockers=False):
+        return False
+    return bool(outcome_waits.await_pre(ctx, ["INVENTORY_CHANGED"], BASKET_BUDGET_S,
+                                        expect_change, now_fn=_now, sleep_fn=_sleep))
+
+
+def empty_basket(ctx) -> bool:
+    """Basket -> inventory, in the field ("You empty as many logs as you can carry.")."""
+    before = count_item(ctx.config["log"])
+    return _basket_option(ctx, ("empty", "empty-to-inventory"),
+                          lambda: count_item(ctx.config["log"]) > before)
+
+
+def fill_basket(ctx) -> bool:
+    """Inventory -> basket, at the bank."""
+    before = count_item(ctx.config["log"])
+    return _basket_option(ctx, ("fill",),
+                          lambda: count_item(ctx.config["log"]) < before)
+
+
+def bank_trip(ctx) -> bool:
+    """Withdraw-All logs, close, Fill the basket -- three rounds, the recording's own sequence.
+
+    "You don't have enough inventory space to withdraw that many." is NORMAL here and must not
+    be treated as a failure; fletching.py records the same thing for the same click.
+    """
+    entry = route.BANK
+    booth = controller.get_object_at(entry["tile"][0], entry["tile"][1], route.PLANE,
+                                     entry["object_id"])
+    if not booth:
+        debug_log.log(LOG, "bank booth not in view")
+        return False
+    for round_index in range(BANK_ROUNDS):
+        if not banker.open_bank(ctx, booth):
+            return False
+        if not banker.withdraw_all_shift(ctx, ctx.config["log"], fresh=True):
+            return False
+        controller.key_tap(ctx.ser, "escape")
+        if round_index < BANK_ROUNDS - 1:
+            fill_basket(ctx)
+    return True

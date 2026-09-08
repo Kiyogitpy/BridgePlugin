@@ -326,3 +326,57 @@ def test_walk_leg_refuses_a_leg_with_no_recorded_path(monkeypatch):
     monkeypatch.setattr(travel, "_hop_to",
                         lambda *a, **k: pytest.fail("should not hop an unrecorded leg"))
     assert vtr_routine.walk_leg(_ctx_only(), 6, 3) is False
+
+
+import banker
+
+
+def test_find_basket_matches_either_open_or_shut(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Open log basket", "screenX": 1, "screenY": 1}])
+    assert vtr_routine.find_basket() is not None
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Log basket", "screenX": 1, "screenY": 1}])
+    assert vtr_routine.find_basket() is not None
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Knife"}])
+    assert vtr_routine.find_basket() is None
+
+
+def test_empty_basket_uses_the_named_menu_option_not_a_bare_click(monkeypatch):
+    # A bare left click races Fill / Wear / Check, and Fill is a silent no-op that looks like
+    # success -- the same reason banker.empty_log_basket selects its option by name.
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Open log basket", "screenX": 1, "screenY": 1}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    calls = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, opt, **k: calls.append(opt) or True)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 5)
+    vtr_routine.empty_basket(_ctx_only())
+    # A SEQUENCE of candidate names, the banker.empty_log_basket idiom -- click_menu_action
+    # tries each against the one menu it reads back.
+    assert calls and any("empty" in o.lower() for o in calls[0])
+
+
+def test_empty_basket_is_a_no_op_without_a_basket(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Knife"}])
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda *a, **k: pytest.fail("clicked with no basket"))
+    assert vtr_routine.empty_basket(_ctx_only()) is False
+
+
+def test_bank_trip_withdraws_and_fills_for_every_round(monkeypatch):
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda *a, **k: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **k: True)
+    withdrawals = []
+    monkeypatch.setattr(banker, "withdraw_all_shift",
+                        lambda ctx, name, fresh=False: withdrawals.append(name) or True)
+    fills = []
+    monkeypatch.setattr(vtr_routine, "fill_basket",
+                        lambda ctx: fills.append(1) or True)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
+    assert vtr_routine.bank_trip(_ctx_only()) is True
+    assert withdrawals == ["Yew logs"] * vtr_routine.BANK_ROUNDS
+    # The last round has nowhere to put the logs, so it does not fill.
+    assert len(fills) == vtr_routine.BANK_ROUNDS - 1
