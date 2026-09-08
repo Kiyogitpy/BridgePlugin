@@ -105,10 +105,15 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   `tools/vm-guest-setup.ps1` provisioned the guest (a fresh 22H2 image has NO winget, so
   per-user direct installers from `data\vm-installers\`: Python 3.13.7, and Temurin
   **11.0.30+7 exactly** -- the host's client JVM build, since `java.version` is in the login
-  fingerprint; pip requirements; pointer acceleration off). VirtualBox guest control
-  (`VBoxManage guestcontrol OSRS run --username Kiyo --password osrs ...`) runs commands in
-  the guest from the host without touching the VM window; it needed one guest restart after
-  the Guest Additions install before it answered.
+  fingerprint; pip requirements; pointer acceleration off).
+  **`VBoxManage guestcontrol` IS DEAD ON THIS SETUP and `tools/vmexec.py` replaced it**
+  (commit 946e07f, 2026-09-08): both `run --wait-stdout` and the async `start` form hang or do
+  nothing with the guest logged in and Guest Additions at run level 3, and a guest reboot did
+  not fix it. vmexec drives the guest over the OpenSSH server instead (paramiko, because the
+  password needs supplying without a TTY). Its two forms are not interchangeable: plain SSH has
+  **no window station**, so anything touching the cursor or a GUI dies there with
+  `WinError 1459` -- `--interactive` runs it on the logged-on desktop through a scheduled task,
+  and that is what the client and controller.py need.
   **Fingerprint parity (CLAUDE.md "What the game client sends home")**: the VM's SMBIOS UUID
   is the host's (`--hardware-uuid`, what `wmic csproduct get UUID` answers; VERIFIED identical
   in the guest); CPU count and heap are matched with `-XX:ActiveProcessorCount=32
@@ -149,7 +154,99 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   flags). NOT durable: the two NAT port-forwards (added at runtime). So start the VM with
   `tools/vm-up.ps1` (host), which starts it and re-adds both forwards idempotently; a GUI
   double-click start works too but then run `vm-up.ps1` once to restore the forwards. The
-  client (`vm-run-client.ps1`) and routines never auto-start -- launch them per session.
+  client (`vm-run-client.ps1`) and routines never auto-start -- launch them per session, OR
+  drive the whole session from the host with **`run-vm.bat`** (repo root, added
+  2026-09-08; `tools/vm-session.ps1` is the real script). It runs `vm-up.ps1`, launches the
+  client in the guest over `VBoxManage guestcontrol`, waits for the bridge on the 18080
+  forward, waits for `/login/status` to report `loggedIn` with NO `clickToPlay` (the
+  `login.is_fully_logged_in()` test -- `loggedIn` alone is already true under the
+  click-here-to-play screen), then starts the routine in the guest with
+  `BRIDGE_SERIAL_PORT=COM3`. **Bare `run-vm.bat` is PANEL MODE**: controller.py is started with
+  NO routine argument, which is what makes it re-read the plugin's Routine dropdown every loop
+  (`ROUTINE_FILES`) and hot-swap routines live, gated by Controller Enabled -- so the routine is
+  chosen in the GUI and can be changed without restarting anything. `run-vm.bat <routine>` pins
+  one instead (the dropdown is then ignored), and `-NoRoutine` starts no controller.py at all.
+  Every step is idempotent and deadlined; it REFUSES to launch
+  when a RuneLite client is running on the host (two clients fight over one self-refreshing
+  Jagex token) or when python.exe is already running in the guest (one process per COM port),
+  `-Force` overrides both. **F1 still has to be pressed inside the VM window** -- the panic key
+  is polled in the guest.
+
+  **THERE IS NO SYNC IN THE PYTHON EDIT->RUN LOOP (2026-09-08).** The routine runs from
+  `Z:\Httpbridge\ControllerAddon`, which IS this repo through the share, so a Python edit on
+  the host is live in the guest with no `vm-sync.ps1` at all -- and the routine's log lands in
+  the host's own `ControllerAddon\logs`, readable with no copy-back. MEASURED in the guest off
+  the share: `import worldmap, controller, travel` 0.31s, `reachable_from` + an 8-step route
+  0.026s (1207 tiles, so the collision map really loads), and the deob guard passes there
+  (`data/` is visible through the share where the synced mirror excluded it), so the guest now
+  gets the guard's real protection instead of its warn-only fallback.
+  `PYTHONDONTWRITEBYTECODE=1` keeps the guest from scattering `__pycache__` into the host repo.
+  **`C:\work` is only for GRADLE** (host and guest would otherwise fight over one `build\` on a
+  network drive), so `vm-session.ps1` syncs it in the CLIENT-launch branch alone. The three
+  guest-side halves are `.cmd` files on the share (`vm-guest-sync.cmd`,
+  `vm-guest-launch-client.cmd`, `vm-guest-run-routine.cmd`) so the host passes one unquoted
+  token per call -- and the routine launcher takes its log name as argument 1 because a
+  scheduled task inherits no environment. **Each maps `Z:` from `\\VBOXSVR\Docs` on its own
+  first LINE, which is load-bearing twice over**: a drive letter is per-LOGON-SESSION, MEASURED
+  2026-09-08 the scheduled-task desktop session had none, and a one-liner
+  (`net use ... & echo > Z:\...`) still failed -- the mapping has to complete on an earlier
+  line than the command using it.
+
+  **Host-side bridge reads go through `BRIDGE_API_BASE`** (2026-09-08): `settings.py`'s
+  `API_BASE` is now `os.environ.get("BRIDGE_API_BASE", "http://localhost:8080")` and
+  `.mcp.json` sets it to `http://127.0.0.1:18080` for the `osrs-debug` MCP server, so
+  `bridge_get` reads the VM's live game state from the host again. The guest's own
+  controller.py keeps the default and is untouched. **`poll_events` stays guest-only**: a
+  `natpf1` rule forwards host->guest, while the plugin sends its UDP to the guest's own
+  loopback, so the event stream never crosses.
+
+  **VERIFIED END TO END FROM A POWERED-OFF VM, 2026-09-08**: `run-vm.bat` -> guest ready 14s ->
+  sync -> client launched on the desktop -> bridge up ~35s later -> controller.py started ->
+  `loggedIn: True`, camera set (pitch 1024 -> 4160), and the panel's routine working, with its
+  log read off the host the whole time. Three failures on the way, each worth keeping:
+  - **A CLIENT LAUNCHED FROM A SCHEDULED TASK COMES UP UNFOCUSED, and that silently defeats
+    everything.** MEASURED: `/state` `windowFocused: False`, and controller.py clicked Play Now
+    with the physical Arduino once a tick FOREVER without the login screen advancing --
+    `login.attempt_login` runs BEFORE the engine's own `windowFocused` gate, so the login path
+    is not covered by it. Focusing the window made the very next click land and the account
+    logged straight in. `vm-guest-focus-client.ps1` (SetForegroundWindow, on the desktop) is now
+    a step of `vm-session.ps1` before the routine starts. **The engine gap is NOT fixed**: any
+    routine whose client is unfocused at the login screen still burns clicks silently.
+  - **PowerShell 5.1 turns a native command's stderr into a TERMINATING error under
+    `$ErrorActionPreference = "Stop"`.** paramiko writes "Error reading SSH protocol banner"
+    while the guest is still booting -- normal, transient -- and that one line killed the entire
+    cold start from inside `vm-up.ps1`'s readiness loop. Every vmexec call in these scripts runs
+    under `Continue` now, and each step checks its own outcome instead.
+  - **RuneLite's credentials.properties auto-login did NOT take** after the client had been
+    force-killed; the client sat on `loginIndex 10` (Play Now) and the login gate correctly
+    refused to start a routine there. `-SkipLoginGate` is the right answer -- login.py clicks
+    that screen itself.
+  Also MEASURED that day: the two NAT forwards SURVIVED a power-off (this file records them as
+  non-durable; `vm-up.ps1` re-adds them idempotently either way), and the guest auto-logs into
+  the console session (`AutoAdminLogon = 1`), which is what makes a `--interactive` desktop task
+  possible at all after a cold boot.
+
+  **Screen geometry (settled 2026-09-08).** The VM runs WINDOWED AND MAXIMIZED on the host's
+  1920x1080 second display (`GUI/LastNormalWindowPosition = 2560,23,1920,1017,max`), which is
+  what makes the GUEST desktop **1920x974** -- VirtualBox sizes the guest to the VM window's
+  client area, so 974 is 1080 minus the VM's own chrome. Inside that, the RuneLite window is
+  MAXIMIZED, which `vm-guest-focus-client.ps1` now asserts on every run. **USER's choice is
+  windowed, not fullscreen**: VirtualBox fullscreen was tried and reverted the same day (it
+  gives the guest a true 1920x1080 and the canvas 1889x1017 against 1859x911, ~13% more area),
+  so **do not set `GUI/Fullscreen`** -- the key was deleted. Canvas with the sidebar collapsed
+  is 1859x911; an expanded side panel costs ~242px of canvas WIDTH (measured 1617x911), which
+  is worth checking before concluding the client shrank.
+  Two traps found getting there:
+  - **An SSH session cannot see the display.** `[Screen]::AllScreens` over plain SSH reports a
+    phantom `1024x768` screen named **`WinDisc`** -- not the real desktop. It made the client
+    look far larger than its screen with the sidebar off the edge, which was wrong. Measure any
+    guest geometry from the DESKTOP session (`vmexec.py --interactive`), never over SSH.
+  - **`ShowWindow(SW_RESTORE)` UN-maximizes an already-maximized window** -- the focus helper's
+    first draft would have shrunk the client on every run. It uses `SW_SHOWMAXIMIZED` (3).
+  **`routines/pest_control.py` cannot work in the VM as written**: `ABS_MINIMAP_CLICK_X/Y`
+  (2365, 80) is an absolute HOST screen pixel captured with ShareX, and the guest desktop is
+  only 1920 wide -- x=2365 is off-screen there. It needs re-capturing in the guest before that
+  routine is run in the VM.
   **The RuneLite PROFILE must be copied by hand -- it does NOT transfer.** The active profile
   (`~/.runelite/profiles2/default-1209788292728200.properties`, ~1.5 MB: every plugin
   setting, keybind, and the load-bearing Menu Entry Swapper swaps the routines depend on) has
