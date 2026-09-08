@@ -72,13 +72,52 @@ def run(command, timeout=300, detach=False):
         client.close()
 
 
+INTERACTIVE_TASK = "OSRSInteractive"
+
+
+def run_interactive(command, task=INTERACTIVE_TASK, timeout=120.0):
+    """Run `command` on the guest's INTERACTIVE DESKTOP, not in the SSH session.
+
+    MEASURED 2026-09-08: anything that touches the cursor dies over plain SSH with
+    `OSError: [WinError 1459] This operation requires an interactive window station` -- an SSH
+    session has no window station, and controller.py drives a physical cursor through Win32
+    calls. Nothing in the SSH session can reach the desktop directly, and Start-Process does not
+    cross sessions.
+
+    A scheduled task registered with `-LogonType Interactive` runs in the logged-on user's own
+    session, which is exactly the desktop the client and the Arduino live on. `schtasks /IT`
+    registers but refuses to trigger ("ERROR: Element not found"); the ScheduledTasks cmdlets
+    with an explicit principal work.
+
+    The command goes through a .cmd file rather than the task's own arguments -- a task action's
+    argument quoting is one more layer to get wrong, and a file has none."""
+    body = "@echo off\r\n" + command.replace("\n", "\r\n") + "\r\n"
+    ps = (
+        "$body = @'\n" + body + "\n'@\n"
+        f"Set-Content -Path C:\\work\\_vmexec_task.cmd -Value $body -Encoding ascii\n"
+        "$a = New-ScheduledTaskAction -Execute 'C:\\work\\_vmexec_task.cmd'\n"
+        "$p = New-ScheduledTaskPrincipal -UserId 'osrs-vm\\kiyo' -LogonType Interactive\n"
+        f"Register-ScheduledTask -TaskName '{task}' -Action $a -Principal $p -Force | Out-Null\n"
+        f"Start-ScheduledTask -TaskName '{task}'\n"
+        "Start-Sleep -Seconds 2\n"
+        f"(Get-ScheduledTask -TaskName '{task}').State\n"
+    )
+    return run(ps, timeout=timeout)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run a command inside the OSRS VM over SSH.")
     parser.add_argument("command", help="the command line to run in the guest")
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--detach", action="store_true",
                         help="start it and return immediately (long-running things)")
+    parser.add_argument("--interactive", action="store_true",
+                        help="run it on the guest's DESKTOP via a scheduled task -- required for "
+                             "anything touching the cursor, which WinError 1459s over plain SSH")
+    parser.add_argument("--task", default=INTERACTIVE_TASK)
     args = parser.parse_args()
+    if args.interactive:
+        return run_interactive(args.command, task=args.task, timeout=args.timeout)
     return run(args.command, timeout=args.timeout, detach=args.detach)
 
 
