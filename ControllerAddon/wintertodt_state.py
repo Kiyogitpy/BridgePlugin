@@ -8,9 +8,12 @@ first live session's corrections belong.
 Design: docs/superpowers/specs/2026-09-08-wintertodt-design.md
 """
 
+import re
 import wintertodt_ids as w
 
 BRAZIER_KEYS = ("SOUTH_WEST", "NORTH_WEST", "NORTH_EAST", "SOUTH_EAST")
+INVENTORY_SIZE = 28
+_DOSE_RE = re.compile(r"\((\d)\)\s*$")
 
 
 def _braziers(reader):
@@ -87,3 +90,78 @@ def choose_brazier(reader, current=None, preferred="SOUTH_WEST"):
             return key
     # All pyromancers incapacitated, return preferred if present as last resort.
     return preferred if preferred in braziers else None
+
+
+def count_item(items, item_id) -> int:
+    return sum(1 for i in (items or []) if i.get("id") == item_id)
+
+
+def has_tool(items, name) -> bool:
+    """Substring match on the item NAME, the banker.py keepItems convention.
+
+    Deliberately loose: "axe" also matches a Dragon axe or a battleaxe, and any of those chops
+    bruma roots. The arena crate hands out a Bronze axe, so the exact name is not knowable
+    offline anyway."""
+    needle = name.lower()
+    return any(needle in (i.get("name") or "").lower() for i in (items or []))
+
+
+def potion_doses(items) -> int:
+    """Total rejuvenation DOSES held, not potions.
+
+    Each potion holds 4 and each dose restores 30% warmth, so doses are the unit that matters.
+    The game writes the dose count into the name as "Rejuvenation potion(3)"; a name with no
+    suffix counts as one, which is the safe direction (it under-counts, so we restock early)."""
+    total = 0
+    for item in (items or []):
+        name = (item.get("name") or "").lower()
+        if w.POTION_NAME not in name or "(unf)" in name:
+            continue
+        match = _DOSE_RE.search(name)
+        total += int(match.group(1)) if match else 1
+    return total
+
+
+def kit_deficit(items, min_doses) -> list:
+    """Everything missing from the kit, as names the routine can act on.
+
+    Ordered tools-first so the axe (which gates the whole loop) is fetched before potions."""
+    missing = [tool for tool in w.TOOL_NAMES if not has_tool(items, tool)]
+    if potion_doses(items) < min_doses:
+        missing.append("potion")
+    return missing
+
+
+def needs_drink(reader, drink_at) -> bool:
+    """True only when warmth is READABLE and below the threshold.
+
+    Unreadable answers False: warmth_percent returns None there, and treating None as 0 would
+    fire the emergency rung on a bridge blip."""
+    percent = warmth_percent(reader)
+    return percent is not None and percent < drink_at
+
+
+def inventory_full(items, size=INVENTORY_SIZE) -> bool:
+    return len(items or []) >= size
+
+
+def feed_item(items, *, fletch, energy_percent, feed_roots_near_end, feed_roots_below_energy):
+    """Which item id to feed the brazier, or None when nothing should be fed yet.
+
+    THE DEADLOCK GUARD LIVES HERE, and it is the invariant the spec calls out: `feed` and
+    `fletch` must between them accept every state a full inventory can be in. A feed rung that
+    accepted only kindling, paired with fletch=False, would strand a full inventory of roots --
+    chopping blocked by the full inventory, fletching disabled, and nothing willing to spend
+    them. So roots are feedable whenever fletching will not happen: either it is switched off,
+    or the round is too near its end to be worth the fletch (a root is 10 points, and 10 beats
+    the 0 an unfed root is worth when the round ends)."""
+    if count_item(items, w.ITEM_KINDLING):
+        return w.ITEM_KINDLING
+    if not count_item(items, w.ITEM_ROOT):
+        return None
+    if not fletch:
+        return w.ITEM_ROOT
+    near_end = (feed_roots_near_end
+                and energy_percent is not None
+                and 0 <= energy_percent <= feed_roots_below_energy)
+    return w.ITEM_ROOT if near_end else None

@@ -124,3 +124,76 @@ def test_reward_eligible_uses_the_threshold():
     assert ws.reward_eligible(reader(points=499)) is False
     assert ws.reward_eligible(reader(points=0)) is False
     assert ws.reward_eligible({}) is False
+
+
+def inv(*names):
+    """An inventory of {'id','name'} dicts. Dose counts ride in the name, as the game shows."""
+    out = []
+    for n in names:
+        if n == "root":
+            out.append({"id": ws.w.ITEM_ROOT, "name": "Bruma root"})
+        elif n == "kindling":
+            out.append({"id": ws.w.ITEM_KINDLING, "name": "Bruma kindling"})
+        else:
+            out.append({"id": 0, "name": n})
+    return out
+
+
+def test_kit_deficit_names_every_missing_tool():
+    assert set(ws.kit_deficit(inv(), min_doses=0)) == {"axe", "knife", "tinderbox", "hammer"}
+    full = inv("Bronze axe", "Knife", "Tinderbox", "Hammer")
+    assert ws.kit_deficit(full, min_doses=0) == []
+
+
+def test_potion_doses_counts_doses_not_potions():
+    items = inv("Rejuvenation potion(4)", "Rejuvenation potion(2)")
+    assert ws.potion_doses(items) == 6
+
+
+def test_an_undosed_potion_name_counts_as_one_dose():
+    assert ws.potion_doses(inv("Rejuvenation potion")) == 1
+
+
+def test_kit_deficit_reports_potions_when_under_the_minimum():
+    items = inv("Bronze axe", "Knife", "Tinderbox", "Hammer", "Rejuvenation potion(1)")
+    assert ws.kit_deficit(items, min_doses=4) == ["potion"]
+    assert ws.kit_deficit(items, min_doses=1) == []
+
+
+def test_needs_drink_is_false_when_warmth_cannot_be_read():
+    # Unreadable must never fire the emergency rung -- see warmth_percent's None contract.
+    assert ws.needs_drink({}, drink_at=45) is False
+    assert ws.needs_drink(reader(warmth=400), drink_at=45) is True
+    assert ws.needs_drink(reader(warmth=600), drink_at=45) is False
+
+
+def test_feed_item_prefers_kindling():
+    items = inv("root", "root", "kindling")
+    assert ws.feed_item(items, fletch=True, energy_percent=80,
+                        feed_roots_near_end=True, feed_roots_below_energy=15) == ws.w.ITEM_KINDLING
+
+
+def test_feed_item_accepts_roots_when_fletching_is_off():
+    # THE DEADLOCK GUARD. With fletch=False nothing else will ever spend a root: chopping is
+    # blocked by the full inventory and the fletch rung is disabled. feed and fletch must
+    # between them accept every state a full inventory can be in.
+    items = inv(*(["root"] * 28))
+    assert ws.feed_item(items, fletch=False, energy_percent=80,
+                        feed_roots_near_end=True, feed_roots_below_energy=15) == ws.w.ITEM_ROOT
+
+
+def test_feed_item_accepts_roots_near_the_round_end():
+    items = inv(*(["root"] * 28))
+    assert ws.feed_item(items, fletch=True, energy_percent=10,
+                        feed_roots_near_end=True, feed_roots_below_energy=15) == ws.w.ITEM_ROOT
+
+
+def test_feed_item_holds_roots_back_mid_round_when_fletching():
+    items = inv(*(["root"] * 28))
+    assert ws.feed_item(items, fletch=True, energy_percent=80,
+                        feed_roots_near_end=True, feed_roots_below_energy=15) is None
+
+
+def test_feed_item_returns_none_with_nothing_feedable():
+    assert ws.feed_item(inv("Knife"), fletch=True, energy_percent=80,
+                        feed_roots_near_end=True, feed_roots_below_energy=15) is None
