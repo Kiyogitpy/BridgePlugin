@@ -556,3 +556,132 @@ def test_light_phase_menu_escalation_does_not_report_success_when_confirm_times_
     monkeypatch.setattr(controller, "get_api",
                         lambda *a, **k: {"braziers": {"SOUTH_WEST": {"status": "UNLIT"}}})
     assert wt.light_phase(ctx, {}, "SOUTH_WEST") is False
+
+
+# --- Task 9: tick, before_break and the stuck watch -------------------------------------------
+
+def test_tick_dispatches_to_the_phase_derive_phase_chose(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(wt, "snapshot", lambda c: ({"atWintertodt": True}, [], "SOUTH_WEST"))
+    monkeypatch.setattr(wt.ws, "derive_phase", lambda **k: "chop")
+    called = {}
+    monkeypatch.setattr(wt, "chop_phase", lambda c, items: called.setdefault("chop", True))
+    wt.tick(ctx)
+    assert called.get("chop") is True
+
+
+def test_tick_outside_the_arena_safety_stops(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(wt, "snapshot", lambda c: ({"atWintertodt": False}, [], None))
+    wt.tick(ctx)
+    assert ctx.state.safety_stopped is True
+
+
+def test_the_stuck_watch_warns_then_stops_on_an_unchanged_signature(hermetic):
+    ctx = _Ctx()
+    wt._stuck_watch(ctx, "same")
+    hermetic["t"] += wt.STALL_WARN_S + 1
+    wt._stuck_watch(ctx, "same")
+    assert ctx.state.safety_stopped is False       # warn first
+    hermetic["t"] += wt.STALL_STOP_S
+    wt._stuck_watch(ctx, "same")
+    assert ctx.state.safety_stopped is True
+
+
+def test_the_stuck_watch_resets_when_anything_moves(hermetic):
+    ctx = _Ctx()
+    wt._stuck_watch(ctx, "a")
+    hermetic["t"] += wt.STALL_STOP_S + 1
+    wt._stuck_watch(ctx, "b")
+    assert ctx.state.safety_stopped is False
+
+
+def test_progress_signature_moves_when_points_move():
+    a = wt._progress_signature({"points": 100, "energyPercent": 50}, [])
+    b = wt._progress_signature({"points": 125, "energyPercent": 50}, [])
+    assert a != b
+
+
+def test_before_break_plays_an_active_round_out(monkeypatch, hermetic):
+    # Points are all-or-nothing at 500, so a break landing mid-round throws the round away.
+    ctx = _Ctx()
+    rounds = {"active": True}
+    ticks = {"n": 0}
+
+    def fake_tick(c):
+        ticks["n"] += 1
+        hermetic["t"] += 1.0
+        if ticks["n"] >= 3:
+            rounds["active"] = False
+
+    monkeypatch.setattr(wt, "tick", fake_tick)
+    monkeypatch.setattr(wt, "_reader", lambda: {"atWintertodt": True,
+                                                "roundActive": rounds["active"]})
+    wt.before_break(ctx)
+    assert ticks["n"] >= 3
+
+
+def test_before_break_gives_up_at_its_ceiling(monkeypatch, hermetic):
+    ctx = _Ctx()
+    monkeypatch.setattr(wt, "tick", lambda c: hermetic.__setitem__("t", hermetic["t"] + 5.0))
+    monkeypatch.setattr(wt, "_reader", lambda: {"atWintertodt": True, "roundActive": True})
+    wt.before_break(ctx)     # must return rather than spin forever
+
+
+# --- real-path test (the Task 6 `.ok` lesson, restated in this task's own brief): the two
+# tick() tests above stub wt.snapshot / wt.ws.derive_phase / wt.chop_phase for convenience, which
+# means they cannot see a wrong phase string or a wrong-arity lambda inside _PHASES -- the table
+# lookup and the call both happen through names those tests never let run for real. This one
+# mocks only controller.*, so the REAL wintertodt_state.derive_phase and the REAL _PHASES table
+# execute end to end. -------------------------------------------------------------------------
+
+def test_tick_real_dispatch_path_reaches_chop_phase_with_only_controller_mocked(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_api", lambda *a, **k: {
+        "atWintertodt": True, "roundActive": True, "warmth": 1000, "energyPercent": 100,
+        "braziers": {},
+    })
+    monkeypatch.setattr(controller, "get_inventory", lambda *a, **k: [
+        {"id": 0, "name": n} for n in
+        ("Bronze axe", "Knife", "Tinderbox", "Hammer", "Rejuvenation potion(4)")
+    ])
+    roots = {"id": w.OBJ_ROOTS, "name": "Bruma roots", "actions": ["Chop"],
+             "distance": 2, "x": 5, "y": 5, "plane": 0, "onScreen": True,
+             "screenX": 10, "screenY": 10}
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [roots])
+    # click_entity refused rather than mocked to succeed: chop_phase must reach the real click
+    # primitive and come back False with no exception and no safety stop -- a wrong phase name
+    # in _PHASES (KeyError/None) or a wrong-arity lambda (TypeError) would blow up right here,
+    # something none of the mocked-chop_phase tests above can ever exercise.
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: False)
+    wt.tick(ctx)
+    assert ctx.state.data.get("wt_phase") == "chop"
+    assert ctx.state.safety_stopped is False
+
+
+def test_before_break_real_tick_path_plays_a_round_out_with_only_controller_mocked(monkeypatch):
+    """Same lesson applied to before_break: its own two tests above stub wt.tick itself, so
+    they cannot see before_break failing to import/call the real tick correctly. Here tick is
+    untouched -- only controller.* is mocked -- and the round ends the instant roundActive
+    reads False, which is derive_phase's own real "between_rounds" / kit / chop routing doing
+    its job rather than a canned fake_tick."""
+    ctx = _Ctx()
+    rounds = {"active": True}
+    calls = {"n": 0}
+
+    def fake_get_api(*a, **k):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            rounds["active"] = False
+        return {"atWintertodt": True, "roundActive": rounds["active"], "warmth": 1000,
+                "energyPercent": 100, "braziers": {}}
+
+    monkeypatch.setattr(controller, "get_api", fake_get_api)
+    monkeypatch.setattr(controller, "get_inventory", lambda *a, **k: [
+        {"id": 0, "name": n} for n in
+        ("Bronze axe", "Knife", "Tinderbox", "Hammer", "Rejuvenation potion(4)")
+    ])
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [])
+    wt.before_break(ctx)
+    assert calls["n"] >= 2
+    assert ctx.state.safety_stopped is False

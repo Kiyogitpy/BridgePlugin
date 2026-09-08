@@ -551,3 +551,120 @@ def dodge_phase(ctx) -> bool:
             debug_log.log(LOG, "dodge: stepped off the snowfall tile")
             return True
     return False
+
+
+# --- dispatcher: tick / before_break / the stuck watch ----------------------------------------
+
+STALL_WARN_S = 60.0
+STALL_STOP_S = 180.0
+BREAK_DEFER_MAX_S = 420.0        # a round averages ~5 min including the 60s gap
+# NB: how many inactive reads make a round end is the CONFIG key `roundEndReads`, read by
+# derive_phase. Do not add a module constant beside it -- two sources for one number is how
+# they drift apart.
+
+
+def _progress_signature(reader, items):
+    """Everything that moves when the routine is working. Unchanged for STALL_STOP_S means
+    stuck -- and CLAUDE.md's standing lesson is that a silent loop is worse than a crash."""
+    reader = reader or {}
+    return "|".join(str(x) for x in (
+        reader.get("points"),
+        reader.get("energyPercent"),
+        reader.get("warmth"),
+        len(items or []),
+        ws.count_item(items, w.ITEM_ROOT),
+        ws.count_item(items, w.ITEM_KINDLING),
+    ))
+
+
+def _stuck_watch(ctx, signature):
+    data = _d(ctx)
+    if data.get("wt_sig") != signature:
+        data["wt_sig"] = signature
+        data["wt_sig_at"] = _now()
+        data["wt_sig_warned"] = False
+        return
+    elapsed = _now() - float(data.get("wt_sig_at") or _now())
+    if elapsed >= STALL_STOP_S:
+        ctx.state.trigger_safety_stop(
+            "wintertodt: no progress for %.0fs" % elapsed)
+    elif elapsed >= STALL_WARN_S and not data.get("wt_sig_warned"):
+        data["wt_sig_warned"] = True
+        debug_log.log(LOG, "[!] wintertodt: STUCK? no progress for %.0fs" % elapsed)
+
+
+def between_rounds_phase(ctx, reader, items) -> bool:
+    """The ~60s gap. Top up kit and potions, and be standing at the brazier ready to light the
+    instant the timer hits 0:00 -- worth 25 points plus Firemaking level * 6 XP, the wiki's
+    single best-value action of the round."""
+    config = ctx.state.config or DEFAULT_CONFIG
+    if ws.kit_deficit(items, config.get("minDoses", 4)):
+        return kit_phase(ctx, items)
+    seconds = reader.get("secondsUntilRoundStart")
+    if seconds is not None and seconds > 5:
+        brazier = _nearest(_objects(ids=w.BRAZIER_IDS))
+        if brazier and _too_far(brazier):
+            return _walk_to(ctx, brazier)
+    outcome_waits.tick_pause(ctx, 1, now_fn=_now, sleep_fn=_sleep)
+    return True
+
+
+_PHASES = {
+    "kit": lambda ctx, reader, items, brazier: kit_phase(ctx, items),
+    "warmth": lambda ctx, reader, items, brazier: warmth_phase(ctx, items),
+    "dodge": lambda ctx, reader, items, brazier: dodge_phase(ctx),
+    "light": lambda ctx, reader, items, brazier: light_phase(ctx, reader, brazier),
+    "fix": lambda ctx, reader, items, brazier: fix_phase(ctx, reader, brazier),
+    "feed": lambda ctx, reader, items, brazier: feed_phase(ctx, reader, items, brazier),
+    "fletch": lambda ctx, reader, items, brazier: fletch_phase(ctx, items),
+    "chop": lambda ctx, reader, items, brazier: chop_phase(ctx, items),
+    "between_rounds": lambda ctx, reader, items, brazier:
+        between_rounds_phase(ctx, reader, items),
+}
+
+
+def tick(ctx):
+    reader, items, brazier = snapshot(ctx)
+    config = ctx.state.config or DEFAULT_CONFIG
+    data = _d(ctx)
+
+    phase = ws.derive_phase(
+        reader=reader, items=items, config=config, brazier=brazier,
+        snow_on_tile=_snow_on_tile(ctx),
+        round_over_streak=int(data.get("wt_round_over_streak") or 0),
+    )
+
+    if phase != data.get("wt_phase"):
+        debug_log.log(LOG, "phase=%s brazier=%s points=%s warmth=%s energy=%s"
+            % (phase, brazier, reader.get("points"), reader.get("warmth"),
+               reader.get("energyPercent")))
+        data["wt_phase"] = phase
+
+    if phase == "stop":
+        ctx.state.trigger_safety_stop(
+            "wintertodt: not in the Wintertodt arena (region %d) -- this routine owns no travel"
+            % w.REGION)
+        return
+
+    _stuck_watch(ctx, _progress_signature(reader, items))
+    handler = _PHASES.get(phase)
+    if handler:
+        handler(ctx, reader, items, brazier)
+
+
+def before_break(ctx):
+    """Play the round out before the break starts.
+
+    Points are all-or-nothing at 500 and every point is forfeited by leaving mid-round, so a
+    break landing mid-round throws away the whole round. GOTR's own measured lesson, and the
+    reason `before_break` exists in the routine contract at all. The break begins the moment
+    this returns, so the ceiling matters as much as the loop."""
+    started = _now()
+    while _now() - started < BREAK_DEFER_MAX_S:
+        reader = _reader()
+        if not ws.round_active(reader):
+            debug_log.log(LOG, "before_break: round over, break may start")
+            return
+        tick(ctx)
+    debug_log.log(LOG, "before_break: gave up waiting for the round to end after %.0fs"
+        % BREAK_DEFER_MAX_S)
