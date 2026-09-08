@@ -260,6 +260,118 @@ def run_cycle(ctx, cfg, knife_point, log_point, rock_point):
     return "ok"
 
 
+def _inventory_full():
+    return len(controller.get_inventory() or []) >= getattr(controller, "INVENTORY_SIZE", 28)
+
+
+def full_inventory_phase(ctx, cfg):
+    """Replaced in Task 7. Returning False here means 'this tick was not spent on a drop'."""
+    return False
+
+
+CHAIN_MAX_S = 45.0      # hand control back to the engine at least this often
+
+
+def resync(ctx):
+    """Give up on the current cycle and re-enter on a clean tick boundary.
+
+    USER's decision, and the reason there is no desync ceiling: a missed tick is an ordinary
+    event in 3-tick mining -- a human's rate dips and recovers -- so this never stops the run.
+    The XP stall watch in tick() is the only thing that does.
+
+    Clearing the movement abort is not optional: request_movement_abort is STICKY, and left set
+    it silently kills every flight for the rest of the session."""
+    controller.clear_movement_abort()
+    if ctx.events is not None:
+        ctx.events.wait_ticks(1, now_fn=_now, sleep_fn=_sleep)
+    else:
+        _sleep(tick_cycle.GAME_TICK_MS / 1000.0)
+
+
+def _stall_check(ctx, cfg, now):
+    """True when the run should stop. Keyed on Mining XP, NOT on desyncs.
+
+    This routine's failure mode is exceptionally silent: a perfectly-aimed click landing in the
+    wrong tick looks identical in the log to a good one, so without this a contested rock or a
+    nudged camera would click a dead pixel for hours. CLAUDE.md's standing lesson -- a silent
+    loop is worse than a crash."""
+    data = ctx.state.data
+    xp = (controller.get_player() or {}).get("miningXp")
+    if xp is None:
+        return False
+    if data.get("g3t_xp") is None or xp > data["g3t_xp"]:
+        data["g3t_xp"] = xp
+        data["g3t_xp_at"] = now
+        return False
+    since = now - (data.get("g3t_xp_at") or now)
+    if since >= cfg["xpStallStopS"]:
+        ctx.state.trigger_safety_stop(
+            f"no Mining xp for {since:.0f}s -- the rocks may be contested, the camera moved, "
+            f"or the client is stuttering")
+        return True
+    return False
+
+
+def tick(ctx):
+    cfg = ctx.state.config
+    data = ctx.state.data
+
+    if full_inventory_phase(ctx, cfg):
+        return
+
+    inv = controller.get_inventory() or []
+    knife = find_item(inv, cfg["knifeName"])
+    log = find_item(inv, cfg["logName"])
+    if knife is None or log is None:
+        ctx.state.trigger_safety_stop(
+            f"the {cfg['knifeName']!r} or {cfg['logName']!r} is gone from the inventory")
+        return
+
+    # Checked between chains, never inside a cycle. USER says teak/mahogany are not consumed by
+    # knife-on-log; if that is wrong, a log lasts one cycle and this catches it in seconds
+    # instead of letting the run go quietly dry (spec live-checklist item 1).
+    logs = log_count(inv, cfg["logName"])
+    if logs < (data.get("g3t_logs") or logs):
+        ctx.state.trigger_safety_stop(
+            f"the {cfg['logName']!r} count fell {data['g3t_logs']} -> {logs}: knife-on-log IS "
+            f"consuming the log, so this routine needs a supply loop it does not have")
+        return
+    data["g3t_logs"] = logs
+
+    knife_point = (int(knife["screenX"]), int(knife["screenY"]))
+    log_point = (int(log["screenX"]), int(log["screenY"]))
+    tiles = cfg["rockTiles"]
+
+    started = _now()
+    while True:
+        now = _now()
+        if ctx.state.safety_stopped or now - started >= CHAIN_MAX_S:
+            return
+        if _stall_check(ctx, cfg, now):
+            return
+        if _inventory_full():
+            return          # next tick drops
+
+        # Hold off the idle drift for the whole cycle: it is documented in CLAUDE.md as having
+        # fired mid-work before, and here it would drag the cursor off the parked log and break
+        # the cycle with nothing in the log to say so.
+        controller.mark_busy(3.0)
+
+        index = data.get("g3t_index", 0) % len(tiles)
+        rock_point = prepare(ctx, cfg, knife_point, log_point, tiles[index])
+        if rock_point is None:
+            debug_log.log(CATEGORY, f"rock {tiles[index]} did not resolve -- resyncing")
+            resync(ctx)
+            data["g3t_index"] = next_rock_index(index, len(tiles))
+            continue
+
+        result = run_cycle(ctx, cfg, knife_point, log_point, rock_point)
+        data["g3t_index"] = next_rock_index(index, len(tiles))
+        if result != "ok":
+            resync(ctx)
+
+
+
 def _probe():
     """Read-only geometry probe, for capturing rockTiles and checking the setup without
     launching the routine. Imports controller only -- never the serial port -- so it is safe

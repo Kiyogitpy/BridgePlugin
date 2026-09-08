@@ -280,3 +280,120 @@ def test_run_cycle_makes_NO_bridge_call_between_the_two_clicks(monkeypatch):
     ctx.events = _FakeEvents()
     assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "ok"
     assert calls == []
+
+
+def test_tick_chains_many_cycles_rather_than_one_per_engine_iteration(monkeypatch):
+    """The engine loop costs ~1s, which is longer than a whole 1.8s cycle -- one cycle per
+    engine iteration would halve the rate."""
+    ran = []
+    monkeypatch.setattr(g, "prepare", lambda *a, **k: (1640, 800))
+    monkeypatch.setattr(g, "run_cycle", lambda *a, **k: (ran.append(1), "ok")[1])
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": 1000})
+    times = iter([1000.0 + i * 2.0 for i in range(200)])
+    monkeypatch.setattr(g, "_now", lambda: next(times))
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    ctx.state.config = _cfg()
+    ctx.state.data["g3t_index"] = 0
+    g.tick(ctx)
+    assert len(ran) > 1
+
+
+def test_a_desync_resyncs_and_the_run_CONTINUES(monkeypatch):
+    """USER's decision: resync and carry on. A desync is never a stop."""
+    results = iter(["desync", "ok", "ok"])
+    monkeypatch.setattr(g, "prepare", lambda *a, **k: (1640, 800))
+    monkeypatch.setattr(g, "run_cycle", lambda *a, **k: next(results, "ok"))
+    resyncs = []
+    monkeypatch.setattr(g, "resync", lambda ctx: resyncs.append(1))
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": 1000})
+    times = iter([1000.0 + i * 5.0 for i in range(200)])
+    monkeypatch.setattr(g, "_now", lambda: next(times))
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    ctx.state.config = _cfg()
+    ctx.state.data["g3t_index"] = 0
+    g.tick(ctx)
+    assert resyncs
+    assert ctx.state.safety_stopped is False
+
+
+def test_resync_clears_the_movement_abort_flag(monkeypatch):
+    """request_movement_abort is sticky -- left set, it silently kills every later flight."""
+    cleared = []
+    monkeypatch.setattr(controller, "clear_movement_abort", lambda: cleared.append(1))
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    g.resync(ctx)
+    assert cleared == [1]
+
+
+def test_no_mining_xp_for_the_stall_window_safety_stops(monkeypatch):
+    """NOT a desync ceiling -- an ordinary desync never trips this. It fires when the cursor is
+    clicking a dead pixel, which in this routine looks identical in the log to working."""
+    monkeypatch.setattr(g, "prepare", lambda *a, **k: (1640, 800))
+    monkeypatch.setattr(g, "run_cycle", lambda *a, **k: "ok")
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": 1000})   # never rises
+    times = iter([1000.0 + i * 10.0 for i in range(200)])
+    monkeypatch.setattr(g, "_now", lambda: next(times))
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    # 20s, NOT the 60s default: CHAIN_MAX_S is 45, so with a 10s-per-iteration fake clock the
+    # chain cap would return before a 60s stall could ever fire and the test would pass
+    # vacuously. The constant under test is the comparison, not the shipped number.
+    ctx.state.config = _cfg(xpStallStopS=20)
+    ctx.state.data["g3t_index"] = 0
+    ctx.state.data["g3t_xp"] = 1000
+    ctx.state.data["g3t_xp_at"] = 1000.0
+    g.tick(ctx)
+    assert ctx.state.safety_stopped is True
+    assert "xp" in ctx.state.safety_reason.lower()
+
+
+def test_a_rising_xp_reading_resets_the_stall_clock(monkeypatch):
+    # STRICTLY increasing. A repeating sequence wraps back below its own high-water mark, the
+    # stall clock stops resetting, and the test then passes only because CHAIN_MAX_S returns
+    # first -- i.e. for the wrong reason, proving nothing about the reset.
+    xps = iter(range(1000, 100000, 50))
+    monkeypatch.setattr(g, "prepare", lambda *a, **k: (1640, 800))
+    monkeypatch.setattr(g, "run_cycle", lambda *a, **k: "ok")
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": next(xps)})
+    times = iter([1000.0 + i * 10.0 for i in range(200)])
+    monkeypatch.setattr(g, "_now", lambda: next(times))
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    ctx.state.config = _cfg(xpStallStopS=20)
+    ctx.state.data["g3t_index"] = 0
+    g.tick(ctx)
+    assert ctx.state.safety_stopped is False
+
+
+def test_the_rotation_advances_one_rock_per_cycle(monkeypatch):
+    seen = []
+    monkeypatch.setattr(g, "prepare",
+                        lambda ctx, cfg, kp, lp, tile: (seen.append(tuple(tile)), (1, 2))[1])
+    monkeypatch.setattr(g, "run_cycle", lambda *a, **k: "ok")
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": 1000})
+    times = iter([1000.0 + i * 8.0 for i in range(200)])
+    monkeypatch.setattr(g, "_now", lambda: next(times))
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    ctx.state.config = _cfg()
+    ctx.state.data["g3t_index"] = 0
+    g.tick(ctx)
+    assert seen[:4] == [(10, 20, 0), (11, 20, 0), (12, 20, 0), (13, 20, 0)]
