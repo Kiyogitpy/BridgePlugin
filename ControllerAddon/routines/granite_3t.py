@@ -48,9 +48,11 @@ import time
 if __package__ in (None, "") and os.path.dirname(__file__) == os.path.abspath(sys.path[0]):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import banker
 import controller
 import debug_log
 import tick_cycle
+import travel
 
 CATEGORY = "granite3t"
 
@@ -131,6 +133,13 @@ DEFAULT_CONFIG = {
     # A machine that never misses a 3-tick cycle is itself the signature -- EVENT_MOUSE_CLICK_V2
     # carries inter-press timing to the server at 1ms resolution (CLAUDE.md, telemetry).
     "missChance": 0.03,
+
+    # THE GREAT CONCH BANK, ~381 map steps NW of the mine (bank chest 57958 open / 57959
+    # closed, options Bank+Collect; wiki "Bank chest (The Great Conch)"). The trip is long, but
+    # a WORKING cycle never consumes a log, so this should be paid once per session at most --
+    # if it starts recurring, cycles are overrunning and the occupancy log is where to look.
+    "bankTile": [3180, 2421, 0],
+    "restockLogs": 27,          # one loose + 26 for the basket
 
     "fullInventory": "drop",
     "xpStallStopS": 60,
@@ -243,6 +252,20 @@ def keep_names(cfg):
 MINED_ITEM = "granite"
 
 
+def byproduct_names(cfg):
+    """Everything THIS ACTIVITY produces, which is therefore safe to drop and safe to find in
+    the inventory at startup.
+
+    MEASURED LIVE 2026-09-08: the startup guard refused to start over a Sandstone (2kg) and a
+    Teak stock. Both are this routine's own litter -- the quarry drops sandstone alongside
+    granite, and a Teak stock is what an UNINTERRUPTED fletch leaves behind when a cycle
+    overruns. Refusing to start over the debris of the previous run is the guard being right
+    about the rule and wrong about the case; it exists to protect a carried pickaxe or a
+    teleport tablet, not to demand a spotless inventory."""
+    fletch_byproduct = (cfg["logName"] or "").lower().replace(" logs", "").replace(" log", "")
+    return [MINED_ITEM, "sandstone"] + ([f"{fletch_byproduct} stock"] if fletch_byproduct else [])
+
+
 def check_inventory_is_clean(cfg, inv):
     """(ok, message). Refuse to start when the inventory holds anything the drop would bin.
 
@@ -251,14 +274,14 @@ def check_inventory_is_clean(cfg, inv):
     mine about a minute in, mining then earns nothing, and the XP stall watch stops the run 60s
     later blaming contested rocks. Naming the offending items and refusing is the honest
     response; `keepItems` is the escape hatch."""
-    allowed = keep_names(cfg) + (MINED_ITEM,)
+    allowed = keep_names(cfg) + tuple(byproduct_names(cfg))
     unexpected = sorted({(item.get("name") or "?") for item in (inv or [])
                          if not any(a in (item.get("name") or "").lower() for a in allowed)})
     if unexpected:
         return False, ("the inventory holds items this routine would DROP on the first full "
                        f"inventory: {', '.join(unexpected)} -- bank them, or add them to "
                        "keepItems")
-    return True, "inventory holds only the knife, the log, keepItems and granite"
+    return True, "inventory holds only the knife, the log, keepItems and this mine's byproducts"
 
 
 def rock_points(cfg):
@@ -475,6 +498,93 @@ def _one_via_floor(ctx, cfg, basket, logs):
     controller.click_menu_action(ctx.ser, item, ("take",), check_ui_blockers=False)
     _await(lambda: loose_logs(controller.get_inventory() or [], cfg), BASKET_REFILL_BUDGET_S)
     return len(loose_logs(controller.get_inventory() or [], cfg)) == 1
+
+
+
+# --------------------------------------------------------------------------------------------
+# Restocking logs from The Great Conch bank
+# --------------------------------------------------------------------------------------------
+
+BANK_ARRIVAL_TILES = 6
+RESTOCK_MAX_TRIPS = 2
+
+
+def _tile_of(p):
+    return (p.get("x"), p.get("y"), p.get("plane", 0))
+
+
+def _dist(a, b):
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+
+def restock_phase(ctx, cfg):
+    """Walk to the bank, withdraw logs, walk back. True while the trip is in progress.
+
+    WHY THIS EXISTS AT ALL, given a working cycle never consumes a log: the log basket cannot
+    dispense one. MEASURED LIVE 2026-09-08 -- a basket in the inventory offers
+    Open/Use/Check/Wear/Fill/Destroy and NO Empty, closed or open, because Empty is a
+    bank-context option the bank interface substitutes in (the same fact banker.empty_log_basket
+    already records from the cache). So once the loose log is gone, the 26 spares in the basket
+    are unreachable at the mine and only a bank fixes it. USER: "if you run out of logs make
+    sure you get to a bank restock and go back".
+    """
+    data = ctx.state.data
+    home = data.get("g3t_home_tile")
+    if home is None:
+        home = _tile_of(controller.get_player() or {})
+        data["g3t_home_tile"] = home
+
+    trips = data.get("g3t_restock_trips", 0)
+    if trips >= RESTOCK_MAX_TRIPS:
+        ctx.state.trigger_safety_stop(
+            f"{trips} bank trips and still no loose {cfg['logName']!r} -- the bank is out, or "
+            f"the withdraw is not landing")
+        return True
+
+    here = _tile_of(controller.get_player() or {})
+    bank_tile = tuple(cfg["bankTile"])
+
+    if _dist(here, bank_tile) > BANK_ARRIVAL_TILES:
+        debug_log.log(CATEGORY, f"restock: walking to the bank at {bank_tile} "
+                                f"({_dist(here, bank_tile)} tiles away)")
+        travel.walk_to(ctx, {"x": bank_tile[0], "y": bank_tile[1], "plane": bank_tile[2]})
+        return True
+
+    bank = banker.find_nearby_bank({"maxBankDistance": 12})
+    if bank is None:
+        debug_log.log(CATEGORY, "restock: at the bank tile but no bank object in view")
+        return True
+    if not banker.open_bank(ctx, bank):
+        debug_log.log(CATEGORY, "restock: could not open the bank")
+        return True
+
+    data["g3t_restock_trips"] = trips + 1
+    # Everything the mine produced goes back, so the withdraw has room and the trip home starts
+    # clean. keepItems protects the pickaxe and the basket.
+    banker.deposit_inventory(ctx, {"keepItems": list(keep_names(cfg))})
+    banker.search_and_withdraw(ctx, cfg["logName"], int(cfg.get("restockLogs") or 27),
+                               contains=True)
+    banker.close_bank(ctx)
+
+    debug_log.log(CATEGORY, f"restock: withdrew logs, walking back to {home}")
+    data["g3t_returning"] = True
+    return True
+
+
+def return_phase(ctx, cfg):
+    """Walk back to the tile the run started from. True while still travelling."""
+    data = ctx.state.data
+    home = data.get("g3t_home_tile")
+    if home is None:
+        data["g3t_returning"] = False
+        return False
+    here = _tile_of(controller.get_player() or {})
+    if _dist(here, home) <= 2:
+        debug_log.log(CATEGORY, "back at the rocks")
+        data["g3t_returning"] = False
+        return False
+    travel.walk_to(ctx, {"x": home[0], "y": home[1], "plane": home[2]})
+    return True
 
 
 def _startup_check(ctx, cfg):
@@ -861,14 +971,19 @@ def _run_chain(ctx):
     # cycle never consumes a log (the rock click interrupts the fletch), so reaching into the
     # basket means something went wrong earlier -- which is precisely what the wiki means by
     # carrying spares "in case of mistakes". See ensure_one_loose_log.
+    # A trip home from the bank takes priority over everything: we have the logs, we are just
+    # not standing on the rocks yet.
+    if data.get("g3t_returning") and return_phase(ctx, cfg):
+        return
+
     if not ensure_one_loose_log(ctx, cfg):
         fails = data.get("g3t_log_refills", 0) + 1
         data["g3t_log_refills"] = fails
         if fails >= BASKET_REFILL_TRIES:
-            ctx.state.trigger_safety_stop(
-                f"cannot get exactly one loose {cfg['logName']!r} into the inventory after "
-                f"{fails} attempts -- the log basket is empty or its Empty option was not "
-                f"found, so a bank restock is needed")
+            # The basket cannot dispense a single log outside a bank (see restock_phase), so
+            # the only fix is the trip. Reset the counter so the trip gets a clean slate.
+            data["g3t_log_refills"] = 0
+            restock_phase(ctx, cfg)
         return
     data["g3t_log_refills"] = 0
 
