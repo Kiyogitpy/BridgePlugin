@@ -2947,18 +2947,50 @@ def drop_items(ser: serial.Serial, items) -> bool:
     open_inventory_tab(ser)
     before = len(get_inventory() or [])
     shift_works = None
+    # SHIFT is held ONCE across the whole burst, not tapped per item. USER 2026-09-08, watching
+    # the screen: "it didnt hold it past each item it released between which is a bit odd and not
+    # very human" -- exactly right, and it is a wire-visible signature, not just an odd look. Per
+    # this repo's telemetry notes, EVENT_KEYBOARD sends EVERY key press with the ms since the
+    # previous key, and warns in as many words that "a fixed SHIFT-down-to-click gap is a
+    # signature". Tapping SHIFT per item wrote ~20 presses at machine-regular spacing into that
+    # packet for a single inventory; a human presses once, clicks down the inventory, releases.
+    shift_held = False
+
+    def _hold_shift():
+        nonlocal shift_held
+        if not shift_held:
+            key_down(ser, "SHIFT")
+            shift_held = True
+
+    def _release_shift():
+        nonlocal shift_held
+        if shift_held:
+            key_up(ser, "SHIFT")
+            shift_held = False
+
+    try:
+        _drop_loop(ser, items, before, _hold_shift, _release_shift)
+    finally:
+        # Always released, whatever happened -- a stuck SHIFT turns every later click in the
+        # session into a shift-click. The firmware's 60s stuck-input watchdog is the last resort
+        # behind this, not a substitute for it.
+        _release_shift()
+    return len(get_inventory() or []) < before
+
+
+def _drop_loop(ser, items, before, hold_shift, release_shift) -> None:
+    """The drop pass itself. Split out of drop_items so the SHIFT hold has one guaranteed
+    release point (drop_items' finally) regardless of how this returns."""
+    shift_works = None
     for item in items:
         if shift_works is False:
+            # A held SHIFT would change what the right-click menu offers, so drop it first.
+            release_shift()
             click_menu_action(ser, item, "Drop", offset=(0, 0), check_ui_blockers=False)
         else:
-            key_down(ser, "SHIFT")
-            try:
-                click_entity(ser, item, offset=(0, 0), check_ui_blockers=False,
-                             simulate_mistakes=False)
-            finally:
-                # Always released, even if the click raises -- a stuck SHIFT turns every later
-                # click in the session into a shift-click.
-                key_up(ser, "SHIFT")
+            hold_shift()
+            click_entity(ser, item, offset=(0, 0), check_ui_blockers=False,
+                         simulate_mistakes=False)
         human_delay(*DROP_CLICK_DELAY)
         if shift_works is None:
             # POLL, don't read once. CONFIRMED LIVE 2026-09-08 (USER, watching the screen: "no it
@@ -2972,9 +3004,9 @@ def drop_items(ser: serial.Serial, items) -> bool:
             if not shift_works:
                 debug_log.log("action", "shift-drop did nothing (shift-click drop off?) -- "
                                         "using the right-click menu instead")
+                release_shift()
                 click_menu_action(ser, item, "Drop", offset=(0, 0), check_ui_blockers=False)
                 human_delay(*DROP_CLICK_DELAY)
-    return len(get_inventory() or []) < before
 
 
 def consume_first(ser: serial.Serial, category: str) -> bool:

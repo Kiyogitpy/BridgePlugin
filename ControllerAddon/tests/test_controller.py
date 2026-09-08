@@ -1804,8 +1804,12 @@ def test_drop_items_opens_the_inventory_tab_and_shift_drops_each_item(monkeypatc
     assert calls[0] == ("tab",)
     kinds = [c[0] for c in calls]
     assert kinds.count("click") == 2 and "menu" not in kinds
-    # SHIFT is held around every click and released again, so a crash mid-loop can't leave it down.
-    assert [c[1] for c in calls if c[0] == "line"] == ["KD SHIFT", "KU SHIFT"] * 2
+    # SHIFT is held ONCE across the whole burst and released once at the end -- not tapped per
+    # item. USER 2026-09-08: "it didnt hold it past each item it released between which is a bit
+    # odd and not very human", and EVENT_KEYBOARD carries every press with its inter-key gap, so
+    # the per-item tapping this used to assert was a wire-visible signature. The release is still
+    # guaranteed by drop_items' finally, which the raises-mid-flight test below pins.
+    assert [c[1] for c in calls if c[0] == "line"] == ["KD SHIFT", "KU SHIFT"]
 
 
 def test_drop_items_never_simulates_a_misclick_on_an_inventory_slot(monkeypatch):
@@ -1876,3 +1880,69 @@ def test_drop_items_still_escalates_when_shift_drop_is_genuinely_off(monkeypatch
 
     controller.drop_items(object(), items)
     assert menu == ["Drop", "Drop"], "the failed item is retried and the rest go via the menu"
+
+
+def test_drop_items_holds_shift_once_across_the_whole_burst(monkeypatch):
+    """USER 2026-09-08, watching the screen: "it didnt hold it past each item it released between
+    which is a bit odd and not very human". It is also wire-visible: EVENT_KEYBOARD carries every
+    key press with the ms since the previous key, so tapping SHIFT per item wrote ~20
+    machine-spaced presses into that packet for one inventory. A human presses once, clicks down
+    the inventory, releases once."""
+    items = [{"name": "Logs", "screenX": i, "screenY": i} for i in range(5)]
+    state = {"inv": list(items)}
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: state["inv"][:0] if state.get("done") else list(state["inv"]))
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    keys = []
+    monkeypatch.setattr(controller, "key_down", lambda ser, k: keys.append(("down", k)))
+    monkeypatch.setattr(controller, "key_up", lambda ser, k: keys.append(("up", k)))
+
+    def _click(ser, item, **kw):
+        state["inv"] = state["inv"][1:]      # each shift-click really drops
+        return True
+
+    monkeypatch.setattr(controller, "click_entity", _click)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda *a, **k: pytest.fail("shift-drop worked; must not use the menu"))
+
+    controller.drop_items(object(), items)
+    assert keys == [("down", "SHIFT"), ("up", "SHIFT")], f"one hold, one release; got {keys}"
+
+
+def test_drop_items_always_releases_shift_even_if_a_click_raises(monkeypatch):
+    """A stuck SHIFT turns every later click in the session into a shift-click."""
+    items = [{"name": "Logs", "screenX": 1, "screenY": 1}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(items))
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    keys = []
+    monkeypatch.setattr(controller, "key_down", lambda ser, k: keys.append(("down", k)))
+    monkeypatch.setattr(controller, "key_up", lambda ser, k: keys.append(("up", k)))
+
+    def _boom(*a, **k):
+        raise RuntimeError("serial died mid-flight")
+
+    monkeypatch.setattr(controller, "click_entity", _boom)
+    with pytest.raises(RuntimeError):
+        controller.drop_items(object(), items)
+    assert ("up", "SHIFT") in keys
+
+
+def test_drop_items_releases_shift_before_falling_back_to_the_menu(monkeypatch):
+    """A held SHIFT changes what the right-click menu offers."""
+    items = [{"name": "Logs", "screenX": i, "screenY": i} for i in range(2)]
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(items))  # never shrinks
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "DROP_CONFIRM_S", 0.05)
+    monkeypatch.setattr(controller, "DROP_CONFIRM_POLL_S", 0.0)
+    events = []
+    monkeypatch.setattr(controller, "key_down", lambda ser, k: events.append("shift-down"))
+    monkeypatch.setattr(controller, "key_up", lambda ser, k: events.append("shift-up"))
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **kw: events.append("menu") or True)
+
+    controller.drop_items(object(), items)
+    assert events.index("shift-up") < events.index("menu"), events
