@@ -74,6 +74,102 @@ def test_at_phase_refuses_rather_than_guessing_when_the_clock_is_stale():
     assert tick_cycle.at_phase(events, 60.0, now_fn=clock.now, sleep_fn=clock.sleep) is None
 
 
+def _ticking_events(clock, monkeypatch, start_tick=100, phase_ms=0.0):
+    """A REAL EventStream whose TICK packets are synthesised from the fake clock, so the tick
+    NUMBER advances exactly as the bridge's would as the clock is slept forward. This is what
+    at_tick counts, so a fixture whose tick never moves would prove nothing."""
+    events = bridge_events.EventStream(sock=None)
+    boundary_s = clock.now() - phase_ms / 1000.0
+
+    def _poll(sock):
+        elapsed_ms = (clock.now() - boundary_s) * 1000.0
+        n = int(elapsed_ms // bridge_events.GAME_TICK_MS)
+        return [("TICK", {"tick": start_tick + n,
+                          "atMillis": boundary_s * 1000.0 + n * bridge_events.GAME_TICK_MS})]
+
+    monkeypatch.setattr(controller, "poll_udp", _poll)
+    events.pump(now=clock.now())
+    return events
+
+
+def test_current_tick_reports_the_bridges_tick_number(monkeypatch):
+    clock = _Clock()
+    events = _ticking_events(clock, monkeypatch, start_tick=100)
+    assert tick_cycle.current_tick(events, now=clock.now()) == 100
+
+
+def test_current_tick_is_none_without_a_stream_or_with_a_stale_clock():
+    clock = _Clock()
+    assert tick_cycle.current_tick(None) is None
+    events = _events_at(clock, 250.0)
+    clock.t += 5.0
+    assert tick_cycle.current_tick(events, now=clock.now()) is None
+
+
+def test_at_tick_waits_for_the_named_tick_and_lands_at_its_phase(monkeypatch):
+    """THE C1 FIX. at_phase lands on whatever boundary comes next, so the cycle period was
+    however long the caller's own work took; at_tick pins it to a counted tick."""
+    clock = _Clock()
+    events = _ticking_events(clock, monkeypatch, start_tick=100, phase_ms=200.0)
+    woke = tick_cycle.at_tick(events, 103, 60.0, now_fn=clock.now, sleep_fn=clock.sleep)
+    assert tick_cycle.current_tick(events, now=clock.now()) == 103
+    assert woke == pytest.approx(60.0, abs=6.0)
+    # 400ms left of tick 100, then two whole ticks, then 60ms in.
+    assert clock.t == pytest.approx(1000.0 + 1.66, abs=0.02)
+
+
+def test_at_tick_reports_missed_rather_than_firing_late(monkeypatch):
+    """A click placed in the wrong tick desyncs every cycle after it, so a target that has
+    already passed must be refused, not fired late."""
+    clock = _Clock()
+    events = _ticking_events(clock, monkeypatch, start_tick=100)
+    assert tick_cycle.at_tick(events, 99, 60.0,
+                              now_fn=clock.now, sleep_fn=clock.sleep) == "missed"
+
+
+def test_at_tick_returns_immediately_when_the_target_tick_is_already_current(monkeypatch):
+    clock = _Clock()
+    events = _ticking_events(clock, monkeypatch, start_tick=100, phase_ms=10.0)
+    woke = tick_cycle.at_tick(events, 100, 60.0, now_fn=clock.now, sleep_fn=clock.sleep)
+    assert woke == pytest.approx(60.0, abs=6.0)
+    assert clock.t == pytest.approx(1000.05, abs=0.01)
+
+
+def test_at_tick_refuses_rather_than_guessing_when_the_clock_is_stale():
+    clock = _Clock()
+    events = _events_at(clock, 250.0)
+    clock.t += 5.0
+    assert tick_cycle.at_tick(events, 101, 60.0,
+                              now_fn=clock.now, sleep_fn=clock.sleep) is None
+
+
+def test_at_tick_gives_up_on_a_clock_that_answers_but_never_advances(monkeypatch):
+    """A wedged listener keeps the model fresh (so is_stale is false) while the tick number
+    stands still. max_wait_ticks is what stops that hanging the routine forever."""
+    clock = _Clock()
+    events = bridge_events.EventStream(sock=None)
+    monkeypatch.setattr(controller, "poll_udp",
+                        lambda sock: [("TICK", {"tick": 100,
+                                                "atMillis": clock.now() * 1000.0})])
+    events.pump(now=clock.now())
+    assert tick_cycle.at_tick(events, 103, 60.0, now_fn=clock.now, sleep_fn=clock.sleep,
+                              max_wait_ticks=3) is None
+    assert clock.t < 1000.0 + 4 * 0.6 + 0.05
+
+
+def test_at_tick_is_none_without_a_stream():
+    assert tick_cycle.at_tick(None, 100, 60.0) is None
+
+
+def test_click_cost_ms_books_the_UPPER_end_of_the_hold_plus_its_trailing_delay():
+    """It feeds Window.room_for, which is a guard: conservative costs one abandoned cycle,
+    optimistic costs a desynced chain."""
+    import settings
+    assert tick_cycle.CLICK_COST_MS == pytest.approx(
+        (settings.CLICK_HOLD_RANGE_S[1] + 0.09) * 1000.0)
+    assert tick_cycle.CLICK_COST_MS > 85.0 + 60.0        # comfortably past the medians
+
+
 def test_estimate_flight_ms_matches_the_fitted_model_at_its_reference_distance():
     import settings
     assert tick_cycle.estimate_flight_ms(settings.HM2_D_REF) == pytest.approx(

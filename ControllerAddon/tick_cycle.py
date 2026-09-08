@@ -27,6 +27,13 @@ import settings
 
 GAME_TICK_MS = bridge_events.GAME_TICK_MS
 
+# What one click costs in WALL-CLOCK OCCUPANCY of the tick, for the desync guard's arithmetic:
+# CLICK_HOLD_RANGE_S's upper bound (145ms) plus click_human's own trailing human_delay(0.03,
+# 0.09) upper bound (90ms). The UPPER end deliberately, not the 85ms/60ms medians: this number
+# feeds Window.room_for, which is a GUARD. Being conservative costs one abandoned cycle;
+# being optimistic lets a click slip into the next tick and desyncs every cycle after it.
+CLICK_COST_MS = (settings.CLICK_HOLD_RANGE_S[1] + 0.09) * 1000.0
+
 
 def tick_phase_ms(events, now):
     """Milliseconds since the last tick boundary, or None when the clock cannot be trusted."""
@@ -43,7 +50,11 @@ def at_phase(events, target_ms, *, now_fn=time.time, sleep_fn=time.sleep):
 
     Always the NEXT boundary, even when `target_ms` is still ahead in the current tick: a caller
     building a fixed-length cycle needs a predictable period more than it needs the odd tick
-    saved."""
+    saved.
+
+    This is the FIRST cycle of a chain only -- it has no previous critical tick to count from.
+    Every cycle after it must go through at_tick, or the cycle period is whatever the caller's
+    own work happened to take rather than a fixed number of ticks."""
     if events is None:
         return None
     now = now_fn()
@@ -53,6 +64,62 @@ def at_phase(events, target_ms, *, now_fn=time.time, sleep_fn=time.sleep):
         return None
     sleep_fn((events.ticks.ms_until_next(now) + target_ms) / 1000.0)
     return tick_phase_ms(events, now_fn())
+
+
+def current_tick(events, *, now=None):
+    """The bridge's tick number, or None when the clock is unusable.
+
+    `now` is injectable for the same reason everything else here is: a caller running on a
+    patched clock must not silently fall back to the real one."""
+    if events is None:
+        return None
+    if events.ticks.is_stale(time.time() if now is None else now):
+        return None
+    return events.ticks.tick
+
+
+def at_tick(events, target_tick, target_ms, *, now_fn=time.time, sleep_fn=time.sleep,
+            max_wait_ticks=6):
+    """Sleep until tick `target_tick` is current, then `target_ms` into it.
+
+    Returns the phase actually woken at, None when the clock is unusable, or the string
+    "missed" when `target_tick` is already in the past -- the caller must resync rather than
+    fire late, because a click placed in the wrong tick desyncs every cycle after it.
+
+    at_phase cannot express this: it lands on the NEXT boundary whenever it is called, so the
+    cycle period ends up being however long the caller's own work took. That is exactly the
+    C1 defect this exists to close -- a 3-tick cycle has to be counted in TICKS, not inferred
+    from how long an HTTP read happened to take.
+
+    The wait is bounded by `max_wait_ticks` so a clock that keeps answering but stops ADVANCING
+    (a wedged listener, a client paused under a modal) cannot hang the routine: that returns
+    None, same as a stale clock, and the caller refuses rather than guessing."""
+    if events is None:
+        return None
+    deadline = now_fn() + (max_wait_ticks + 1) * GAME_TICK_MS / 1000.0
+    while True:
+        now = now_fn()
+        events.pump(now=now)
+        now = now_fn()
+        if events.ticks.is_stale(now):
+            return None
+        current = events.ticks.tick
+        if current is None:
+            return None
+        if current > target_tick:
+            return "missed"
+        if current == target_tick:
+            phase = events.ticks.phase_ms(now)
+            if phase < target_ms:
+                sleep_fn((target_ms - phase) / 1000.0)
+            return tick_phase_ms(events, now_fn())
+        if now >= deadline:
+            return None
+        # Never sleep past one boundary in a single step: a TICK packet has to be pumped every
+        # step or the loop cannot see the tick it is waiting for arrive. The floor keeps a
+        # boundary that has just passed (ms_until_next == 0) from spinning.
+        step_ms = min(events.ticks.ms_until_next(now) + 1.0, GAME_TICK_MS)
+        sleep_fn(max(step_ms, 5.0) / 1000.0)
 
 
 def estimate_flight_ms(dist_px):

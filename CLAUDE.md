@@ -1705,21 +1705,45 @@ only wires it into the panel dropdown.
   on a pushed signal -- the tick boundary is where a click LANDS. Here two clicks must fall
   inside one named 600ms tick, which is why this needed a new scheduler
   (`ControllerAddon/tick_cycle.py`) rather than another `gathering.Profile`.
-- **The cycle is two dead ticks then one critical tick.** T+1 clicks the knife (a client-side
-  selection that sends no packet at all -- the packet is sent by the click on the TARGET) and
-  flies to the log, parking the cursor there; T+2 does nothing, the cursor just rests on the log;
-  the critical tick T clicks `click_human` **IN PLACE** on the log (~92ms, no flight -- the same
-  measured figure CLAUDE.md's giants_foundry section records) to fire the 3-tick action, then
-  makes ONE short flight to the next rock and clicks it. Two clicks, one flight, in the critical
-  tick -- that asymmetry is the whole reason it fits in 600ms. The next rock's screen point is
-  re-resolved over HTTP during the dead ticks (the player moves between rocks each cycle, so the
-  projection changes), never during the critical tick.
+- **The cycle is two dead ticks then one critical tick, AND IT IS COUNTED IN TICKS.** The tick
+  after the critical one clicks the knife (a client-side selection that sends no packet at all
+  -- the packet is sent by the click on the TARGET) and flies to the log, parking the cursor
+  there; the tick after that does nothing, the cursor just rests on the log; then the next
+  critical tick clicks `click_human` **IN PLACE** on the log (no flight) to fire the 3-tick
+  action, then makes ONE short flight to the next rock and clicks it. Two clicks, one flight,
+  in the critical tick -- that asymmetry is the whole reason it fits in 600ms. The next rock's
+  screen point is re-resolved over HTTP during the dead ticks (the player moves between rocks
+  each cycle, so the projection changes), never during the critical tick.
+- **`run_cycle` records the bridge TICK NUMBER its critical click landed on and the next cycle
+  targets `that + CYCLE_TICKS` (3) through `tick_cycle.at_tick`.** The first draft used
+  `at_phase`, which sleeps to the NEXT boundary whenever it is called -- so nothing pinned the
+  period at all: it was however long `prepare()`'s knife flight, log flight and HTTP read
+  happened to take, rounded up, and HTTP latency flipped it cycle to cycle. A fast prepare gives
+  a 2-TICK cycle, which re-fires knife-on-log before the skilling timer has expired and yields
+  nothing. `at_tick` answers `"missed"` when its target tick has already passed, and the routine
+  treats that as an ordinary desync -- firing late is worse than not firing, because a click in
+  the wrong tick desyncs every cycle after it. `at_phase` survives for the FIRST cycle of a
+  chain, which has no previous critical tick to count from.
+- **`rockClickTickOffset` is IMPLEMENTED, not decorative** (it was declared, documented and read
+  by nothing, so setting it to -1 as the live checklist instructs would have changed nothing and
+  the session would have drawn a false conclusion). 0 puts the rock click in the same tick as
+  the log click, after it; -1 puts it one tick EARLIER, which inverts the order within the cycle
+  -- rock click, fly BACK to the log, then fire knife-on-log in place on the critical tick.
+  Expressible only because item selection is client-side: the selection survives both flights
+  and is consumed by the log click alone.
 - **MEASURED from `settings.py`:** a reach is 170ms median at 52px, +120.5ms per doubling of
-  distance, floor 90ms; a click hold is 50-145ms. So one aimed flight-and-click is ~255ms
-  median / ~420ms p90 -- two of those in one tick is already over budget at p90. The
-  parked-cursor trick is what brings the critical tick down to ~347ms median (92ms in-place +
-  ~170ms flight + ~85ms hold), arithmetic that the go/no-go bench below has not yet confirmed on
-  this hardware.
+  distance, floor 90ms; a click hold is 50-145ms (median 85) followed by a 30-90ms trailing
+  `human_delay`. **A CLICK'S WALL-CLOCK OCCUPANCY OF THE TICK IS THEREFORE ~145ms MEDIAN AND
+  ~235ms WORST CASE, NOT 92ms.** The 92ms this file records for giants_foundry is
+  reading-to-click-LANDING (roughly to mouse-DOWN), which is a different quantity, and the
+  spec's original budget line (`60 + 92 + 270 + 145 = 567`) charged the click cost two different
+  ways in one sum. Honestly: the critical tick costs **~520ms median** (60 phase + 145 log click
+  + 170 flight + 145 rock click) and **~730ms at p90**, so the median cycle fits in 600ms and
+  the p90 cycle DOES NOT -- `Window.room_for` is expected to abandon some cycles, and
+  `tick_cycle.CLICK_COST_MS` books the 235ms worst case rather than the median because a
+  conservative guard costs one cycle while an optimistic one desyncs the chain. **Whether an
+  over-budget RELEASE even matters is UNKNOWN** -- if the game acts on mouse-down only the press
+  has to land in the tick -- and that is now item 6 of the spec's live-verification checklist.
 - **`controller.click_entity` cannot be used inside the critical tick.** With a `refresh_target`
   it reads the bridge at departure, once per leg, and again at the settle -- exactly the
   "~1s per click" cost CLAUDE.md already records for deep-sea-trawling, which is the whole tick
@@ -1740,11 +1764,50 @@ only wires it into the panel dropdown.
   distance as short as possible.
 - **A desync never stops the run** (USER's decision: resync and carry on, no ceiling on
   desyncs) -- an ordinary missed tick or a cycle that yielded nothing is not itself an error,
-  since granite's second roll is a bonus, not a guarantee. **The only terminal condition is a
-  60-second stall with NO Mining XP at all** (`xpStallStopS`), which fires when the rocks are
-  contested, the camera has drifted, or the client is stuttering -- i.e. when the cursor is
-  clicking a dead pixel. A perfectly-aimed click into the wrong tick looks identical in the log
-  to a good one, which is why the XP stall is the one belt this routine has.
+  since granite's second roll is a bonus, not a guarantee. A desync does DROP THE PIN, so the
+  next cycle re-enters through `at_phase` on a clean boundary instead of inheriting a period
+  that is now wrong. **The XP stall is the routine's one BELT, but it is NOT the only terminal
+  condition** -- an earlier version of this section said it was, and that was simply false
+  (there are seven `trigger_safety_stop` sites). The run stops on: no Mining xp for
+  `xpStallStopS` (60s); a full inventory whose drop freed nothing, or whose every item is on the
+  keep list; the knife or the log gone from a NON-empty inventory; `/inventory` reading empty 20
+  ticks running; no `rockTiles` configured; and either a startup assertion failing once it is
+  genuinely answerable (geometry out of budget, a rock that will not resolve, more than one log,
+  an inventory holding something the drop would bin) or still being unanswerable after
+  `STARTUP_DEFER_MAX_S`. A perfectly-aimed click into the wrong tick looks identical in the log
+  to a good one, which is why the XP stall is the belt it is.
+- **The XP stall clock only counts time during which `tick()` was actually running.** It is
+  wall-clock and breaks are ON by default (20-40 min apart, 2-8 min long), during which `tick()`
+  is not called at all -- so the first check after a break computed a several-hundred-second
+  stall and stopped a perfectly healthy run with a message that was false. The same shape fires
+  after an F2 pause, after any unfocus over 60s, and after `login.py`'s reconnect wait, all of
+  which this codebase's standing rule says a routine must ride out. A gap over
+  `TICK_GAP_RESEED_S` (5s) between `tick()` calls re-seeds the clock and logs one line;
+  wintertodt stands its own watch down between rounds for the same reason.
+- **The startup assertions run from `tick()`, DEFERRED, because `setup()` runs before the
+  engine's login and focus gates** (VERIFIED in `controller.py`: `routine.setup(ctx)` at 3539,
+  `login.is_fully_logged_in()` at 3552, `windowFocused` at 3558). At the login screen
+  `get_inventory()` returns `[]` and no TICK packet has arrived, so BOTH assertions would fail
+  and the run would be permanently safety-stopped before it began -- the GOTR run-47 bite this
+  file already records. An empty inventory or a stale clock means "cannot tell yet" and defers
+  quietly; `STARTUP_DEFER_MAX_S` (60s) turns a still-unanswerable check into a stop that names
+  what could not be read.
+- **The drop keeps `keepItems` (default `["pickaxe"]`) as well as the knife and the log, AND
+  startup refuses an inventory holding anything else.** The keep list alone is not enough: it
+  only knows the names it was told, and nothing here checks whether the pickaxe is worn or
+  carried, so a carried one would be shift-dropped on the floor of a busy mine about a minute
+  in, mining would then earn nothing, and the stall watch would stop the run 60s later blaming
+  contested rocks. The startup refusal NAMES the offending items rather than binning them.
+- **The chain gate is once per chain, never per cycle** (it costs an HTTP read and belongs
+  outside the critical tick): `controller.open_inventory_tab` -- the gf_live27 lesson, a
+  pause/resume can leave the stats tab up -- plus a `/hover` read over the knife proving its
+  left click really is a Use. A Menu Entry Swapper entry making it "Drop" would bin the knife on
+  cycle 1 and every cycle after would look perfect in the log, so unlike
+  `controller.hover_matches` this one fails CLOSED: an unreadable hover refuses the chain.
+- **`rockTiles`/`rockId` have NO config surface** -- this routine reads `DEFAULT_CONFIG` only,
+  so the panel's dropdown entry ships with an empty rotation and selecting it stops immediately
+  with a clear message. Capture the tiles with `python routines/granite_3t.py --probe` at the
+  mine and paste them into `DEFAULT_CONFIG` in the Python file before a first run.
 - **`tick_bench.py` is the go/no-go gate and has NOT been run.** The ~347ms critical-tick figure
   above is arithmetic over the fitted movement model, not a measurement on this hardware. If p90
   occupancy exceeds ~540ms live, the answer is the 4-tick celastrus variant (2400ms per cycle),

@@ -40,6 +40,11 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 0, "y": 0, "plane": 0})
     monkeypatch.setattr(controller, "get_object_at", lambda *a, **k: None)
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "move_to_human", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_human", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "mark_busy", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "get_hover", lambda: {"option": "Use", "target": "Knife"})
 
 
 def _cfg(**over):
@@ -100,27 +105,46 @@ def test_geometry_passes_and_still_reports_the_measurement(monkeypatch):
     assert "100" in msg
 
 
-def test_setup_safety_stops_without_a_tick_clock(monkeypatch):
-    """The one place this repo's 'always tolerate ctx.events is None' rule inverts: there is
-    no fallback, and degrading silently to a 5-tick miner would be worse than stopping."""
+def test_setup_NEVER_safety_stops_because_it_runs_before_the_login_gate():
+    """setup() is called at controller.py:3539; is_fully_logged_in at 3552 and windowFocused at
+    3558. At the login screen /inventory answers [] and no TICK packet has arrived, so running
+    the assertions here would permanently stop every run before it began."""
     ctx = _Ctx()
-    ctx.events = None
+    ctx.events = None                       # the worst case: no clock at all
     ctx.state.config = _cfg()
-    monkeypatch.setattr(g, "check_geometry", lambda cfg, inv: (True, "fine"))
     g.setup(ctx)
-    assert ctx.state.safety_stopped is True
-    assert "tick" in ctx.state.safety_reason.lower()
+    assert ctx.state.safety_stopped is False
+    assert ctx.state.data["g3t_startup_pending"] is True
+
+
+def test_geometry_refuses_an_inventory_holding_anything_it_would_DROP():
+    """The keep list alone is not enough: a carried pickaxe would be binned on the first full
+    inventory and the stall watch would stop the run 60s later blaming contested rocks."""
+    inv = [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1),
+           _item("Rune pickaxe", 1700, 830, 2), _item("Ring of dueling(8)", 1740, 830, 3)]
+    ok, msg = g.check_inventory_is_clean(_cfg(), inv)
+    assert ok is False
+    assert "Ring of dueling(8)" in msg            # the offending item is NAMED
+    assert "Rune pickaxe" not in msg              # keepItems defaults to ("pickaxe",)
+
+
+def test_the_clean_inventory_check_accepts_the_knife_log_keepitems_and_granite():
+    inv = [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1),
+           _item("Rune pickaxe", 1700, 830, 2), _item("Granite (5kg)", 1740, 830, 3)]
+    assert g.check_inventory_is_clean(_cfg(), inv)[0] is True
 
 
 import tick_cycle
 
 
 class _FakeTicks:
-    def __init__(self, phase=0.0):
+    def __init__(self, phase=0.0, tick=100, stale=False):
         self.phase = phase
+        self.tick = tick
+        self.stale = stale
 
     def is_stale(self, now):
-        return False
+        return self.stale
 
 
 class _FakeEvents:
@@ -173,9 +197,15 @@ def test_run_cycle_reports_desync_when_the_clock_will_not_answer(monkeypatch):
     assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "no_clock"
 
 
-def test_run_cycle_ABORTS_the_rock_click_rather_than_letting_it_cross_the_boundary(monkeypatch):
+def test_run_cycle_ABANDONS_the_rock_click_rather_than_letting_it_cross_the_boundary(
+        monkeypatch):
     """A click that slips into the next tick is worse than no click: it starts the NEXT cycle's
-    mine at the wrong phase and desyncs everything after it."""
+    mine at the wrong phase and desyncs everything after it.
+
+    The flight is simply NOT STARTED -- there is nothing to abort. request_movement_abort() was
+    called here once and was a no-op (no flight is in progress, and resync clears the flag
+    immediately after); the firmware's `X` flush it stands for is only legal from inside
+    move()'s own flight loop."""
     clicked = []
     aborted = []
     monkeypatch.setattr(tick_cycle, "at_phase", lambda ev, ms, **kw: 60.0)
@@ -192,6 +222,7 @@ def test_run_cycle_ABORTS_the_rock_click_rather_than_letting_it_cross_the_bounda
     ctx.events = _FakeEvents()
     assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "desync"
     assert clicked == []
+    assert aborted == []
 
 
 def test_a_deliberate_miss_still_clicks_the_rock_but_a_tick_late(monkeypatch):
@@ -471,3 +502,464 @@ def test_a_full_inventory_with_nothing_droppable_safety_stops(monkeypatch):
     assert g.full_inventory_phase(ctx, _cfg()) is True
     assert ctx.state.safety_stopped is True
     assert dropped == []          # never even attempted
+
+
+# --------------------------------------------------------------------------------------------
+# C1 / I8 -- the cycle is PINNED to CYCLE_TICKS, and the rock click's tick offset is real config
+# --------------------------------------------------------------------------------------------
+
+def _ok_cycle_patches(monkeypatch, order=None):
+    """The click primitives, stubbed. `order` collects the sequence when given."""
+    def _in_place(ser, **kw):
+        if order is not None:
+            order.append("log-in-place")
+        return 92.0
+
+    def _timed(ser, pt, **kw):
+        if order is not None:
+            order.append(("rock", pt))
+        return 200.0
+
+    monkeypatch.setattr(tick_cycle, "click_in_place", _in_place)
+    monkeypatch.setattr(tick_cycle, "timed_click", _timed)
+    monkeypatch.setattr(g.random, "random", lambda: 1.0)      # never a deliberate miss
+    monkeypatch.setattr(g, "_now", lambda: 1000.0)
+
+
+def test_run_cycle_pins_the_critical_click_to_the_named_tick(monkeypatch):
+    """THE C1 FIX. Once a cycle has fired, the next one is scheduled by TICK NUMBER through
+    at_tick -- at_phase lands on whatever boundary comes next, which made the period whatever
+    prepare()'s knife flight, log flight and HTTP read happened to take."""
+    called = []
+    monkeypatch.setattr(tick_cycle, "at_tick",
+                        lambda ev, target, ms, **kw: (called.append((target, ms)), 60.0)[1])
+    monkeypatch.setattr(tick_cycle, "at_phase",
+                        lambda *a, **k: pytest.fail("at_phase must not be used once a tick "
+                                                    "has been pinned"))
+    _ok_cycle_patches(monkeypatch)
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800), 205) == "ok"
+    assert called == [(205, 60)]
+
+
+def test_a_missed_target_tick_is_a_desync_not_a_late_click(monkeypatch):
+    monkeypatch.setattr(tick_cycle, "at_tick", lambda *a, **k: "missed")
+    _ok_cycle_patches(monkeypatch)
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800), 205) == "desync"
+
+
+def test_the_first_cycle_of_a_chain_still_enters_through_at_phase(monkeypatch):
+    """It has no previous critical tick to count from."""
+    used = []
+    monkeypatch.setattr(tick_cycle, "at_phase",
+                        lambda ev, ms, **kw: (used.append(ms), 60.0)[1])
+    _ok_cycle_patches(monkeypatch)
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "ok"
+    assert used == [60]
+    assert ctx.state.data["g3t_fired_tick"] == 100      # _FakeTicks' tick number
+
+
+def test_tick_targets_CYCLE_TICKS_after_the_last_critical_click(monkeypatch):
+    targets = []
+
+    def _fake_run_cycle(ctx, cfg, kp, lp, rp, target_tick=None):
+        targets.append(target_tick)
+        ctx.state.data["g3t_fired_tick"] = 200 + len(targets)
+        return "ok"
+
+    monkeypatch.setattr(g, "prepare", lambda *a, **k: (1640, 800))
+    monkeypatch.setattr(g, "run_cycle", _fake_run_cycle)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": 1000})
+    times = iter([1000.0 + i * 5.0 for i in range(200)])
+    monkeypatch.setattr(g, "_now", lambda: next(times))
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    ctx.state.config = _cfg()
+    g.tick(ctx)
+    assert g.CYCLE_TICKS == 3
+    assert targets[0] is None                       # first cycle of the chain
+    assert targets[1] == 201 + g.CYCLE_TICKS
+    assert targets[2] == 202 + g.CYCLE_TICKS
+
+
+def test_a_desync_drops_the_pin_so_the_next_cycle_re_enters_on_a_clean_boundary(monkeypatch):
+    targets = []
+
+    def _fake_run_cycle(ctx, cfg, kp, lp, rp, target_tick=None):
+        targets.append(target_tick)
+        if len(targets) == 1:
+            ctx.state.data["g3t_fired_tick"] = 300
+            return "ok"
+        return "desync"
+
+    monkeypatch.setattr(g, "prepare", lambda *a, **k: (1640, 800))
+    monkeypatch.setattr(g, "run_cycle", _fake_run_cycle)
+    monkeypatch.setattr(g, "resync", lambda ctx: None)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": 1000})
+    times = iter([1000.0 + i * 5.0 for i in range(200)])
+    monkeypatch.setattr(g, "_now", lambda: next(times))
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    ctx.state.config = _cfg()
+    g.tick(ctx)
+    assert targets[1] == 303
+    assert targets[2] is None       # the desync dropped the pin
+
+
+def test_rockClickTickOffset_minus_one_clicks_the_rock_a_tick_BEFORE_the_log(monkeypatch):
+    """I8. The knife selection is client-side, so it survives both flights and is only consumed
+    by the log click -- which is what makes the inverted order expressible at all."""
+    order = []
+    monkeypatch.setattr(tick_cycle, "at_phase", lambda ev, ms, **kw: 60.0)
+    monkeypatch.setattr(tick_cycle, "at_tick",
+                        lambda ev, target, ms, **kw: (order.append(("at_tick", target)), 60.0)[1])
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **kw: order.append(("park", (x, y))))
+    _ok_cycle_patches(monkeypatch, order)
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()          # tick 100
+    result = g.run_cycle(ctx, _cfg(rockClickTickOffset=-1),
+                         (1700, 800), (1740, 800), (1640, 800))
+    assert result == "ok"
+    assert order == [("rock", (1640, 800)), ("park", (1740, 800)),
+                     ("at_tick", 101), "log-in-place"]
+    assert ctx.state.data["g3t_fired_tick"] == 101
+
+
+def test_rockClickTickOffset_minus_one_leads_the_pinned_log_tick(monkeypatch):
+    opened = []
+    monkeypatch.setattr(tick_cycle, "at_tick",
+                        lambda ev, target, ms, **kw: (opened.append(target), 60.0)[1])
+    monkeypatch.setattr(tick_cycle, "at_phase",
+                        lambda *a, **k: pytest.fail("the tick is pinned; at_phase is wrong here"))
+    _ok_cycle_patches(monkeypatch)
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    g.run_cycle(ctx, _cfg(rockClickTickOffset=-1), (1700, 800), (1740, 800), (1640, 800), 205)
+    assert opened == [204, 205]         # rock on 204, log on the pinned 205
+
+
+# --------------------------------------------------------------------------------------------
+# I5 -- the desync guard books the click, not just the flight
+# --------------------------------------------------------------------------------------------
+
+def test_the_desync_guard_books_the_click_hold_as_well_as_the_flight():
+    log_point, rock_point = (1740, 800), (1640, 800)
+    flight_only = tick_cycle.estimate_flight_ms(100.0)
+    assert g._flight_budget(log_point, rock_point) == pytest.approx(
+        flight_only + tick_cycle.CLICK_COST_MS)
+
+
+def test_a_cycle_with_room_for_the_flight_but_not_the_click_is_a_desync(monkeypatch):
+    """The exact hole I5 describes: room_for passed on the median flight alone, the click then
+    spent a further 50-145ms hold plus a 30-90ms delay, and it landed in the NEXT tick while
+    being recorded as "ok"."""
+    clicked = []
+    monkeypatch.setattr(tick_cycle, "at_phase", lambda ev, ms, **kw: 60.0)
+    monkeypatch.setattr(tick_cycle, "click_in_place", lambda ser, **kw: 0.0)
+    monkeypatch.setattr(tick_cycle, "timed_click",
+                        lambda ser, pt, **kw: (clicked.append(pt), 200.0)[1])
+    monkeypatch.setattr(g.random, "random", lambda: 1.0)
+    # 160ms into the tick, so 440ms of budget is left.
+    times = iter([1000.0, 1000.10, 1000.10, 1000.10])
+    monkeypatch.setattr(g, "_now", lambda: next(times))
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    assert tick_cycle.estimate_flight_ms(100.0) < 440.0     # the flight ALONE would have fitted
+    assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "desync"
+    assert clicked == []
+
+
+# --------------------------------------------------------------------------------------------
+# I7 -- per-cycle occupancy is measured and logged
+# --------------------------------------------------------------------------------------------
+
+def test_every_cycle_logs_its_measured_occupancy(monkeypatch):
+    """Spec live-checklist item 3 is "fit logClickPhaseMs from the measured ms per cycle" --
+    both click primitives already returned elapsed ms and every call site threw them away."""
+    lines = []
+    monkeypatch.setattr(g.debug_log, "log", lambda cat, msg: lines.append(msg))
+    monkeypatch.setattr(tick_cycle, "at_phase", lambda ev, ms, **kw: 60.0)
+    _ok_cycle_patches(monkeypatch)
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "ok"
+    assert any("occupancy" in line and "in-place 92ms" in line for line in lines)
+    assert ctx.state.data["g3t_occupancy"] == [pytest.approx(60.0)]
+    assert ctx.state.data["g3t_cycles"] == 1
+
+
+def test_a_periodic_summary_makes_a_long_run_readable(monkeypatch):
+    lines = []
+    monkeypatch.setattr(g.debug_log, "log", lambda cat, msg: lines.append(msg))
+    ctx = _Ctx()
+    for i in range(g.OCCUPANCY_SUMMARY_EVERY):
+        g._log_occupancy(ctx, "ok", 60.0, 92.0, 200.0, 350.0 + i)
+    assert any(line.startswith("occupancy over the last") for line in lines)
+
+
+# --------------------------------------------------------------------------------------------
+# I9 -- neither the knife nor the log is clicked at an exact pixel
+# --------------------------------------------------------------------------------------------
+
+def test_the_knife_and_log_are_not_aimed_at_one_exact_pixel(monkeypatch):
+    """~2,000 identical landings an hour on each of two points, with the whole cursor
+    trajectory on the wire at 20Hz -- CLAUDE.md's fidget-anchor lesson exactly."""
+    radii = []
+    monkeypatch.setattr(tick_cycle, "timed_click",
+                        lambda ser, pt, **kw: (radii.append(kw.get("aim_radius")), 200.0)[1])
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **kw: radii.append(kw.get("aim_radius")))
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda *a, **k: {"screenX": 1640, "screenY": 800, "id": 1})
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    g.prepare(ctx, _cfg(), (1700, 800), (1740, 800), [10, 20, 0])
+    assert g.AIM_RADIUS_PX > 0
+    assert radii == [g.AIM_RADIUS_PX, g.AIM_RADIUS_PX]
+
+
+# --------------------------------------------------------------------------------------------
+# C4 -- the startup assertions are DEFERRED into tick(), because setup() runs before the gates
+# --------------------------------------------------------------------------------------------
+
+def _startup_ctx(monkeypatch, inv, stale=False, events=True):
+    ctx = _Ctx()
+    ctx.events = _FakeEvents() if events else None
+    if events:
+        ctx.events.ticks.stale = stale
+    ctx.state.config = _cfg()
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    return ctx
+
+
+def test_the_startup_check_DEFERS_on_an_empty_inventory(monkeypatch):
+    """At the login screen /inventory answers [] -- that is "cannot tell yet", not "failed"."""
+    ctx = _startup_ctx(monkeypatch, [])
+    assert g._startup_check(ctx, ctx.state.config) is False
+    assert ctx.state.safety_stopped is False
+
+
+def test_the_startup_check_DEFERS_on_a_stale_tick_clock(monkeypatch):
+    ctx = _startup_ctx(monkeypatch, [_item("Knife", 1700, 800, 0),
+                                     _item("Teak logs", 1740, 800, 1)], stale=True)
+    assert g._startup_check(ctx, ctx.state.config) is False
+    assert ctx.state.safety_stopped is False
+
+
+def test_setup_then_a_tick_at_the_login_screen_does_not_stop_the_run(monkeypatch):
+    ctx = _startup_ctx(monkeypatch, [])
+    g.setup(ctx)
+    g.tick(ctx)
+    assert ctx.state.safety_stopped is False
+    assert ctx.state.data["g3t_startup_pending"] is True
+
+
+def test_the_startup_check_STOPS_once_it_is_genuinely_answerable_and_wrong(monkeypatch):
+    """get_object_at answers None from the autouse fixture, so no rock resolves."""
+    ctx = _startup_ctx(monkeypatch, [_item("Knife", 1700, 800, 0),
+                                     _item("Teak logs", 1740, 800, 1)])
+    assert g._startup_check(ctx, ctx.state.config) is False
+    assert ctx.state.safety_stopped is True
+    assert "rock" in ctx.state.safety_reason.lower()
+
+
+def test_an_unanswerable_startup_stops_at_the_deferral_ceiling(monkeypatch):
+    """So a misconfigured run refuses loudly instead of idling forever."""
+    ctx = _startup_ctx(monkeypatch, [], events=False)
+    ctx.state.data["g3t_startup_since"] = 1000.0
+    monkeypatch.setattr(g, "_now", lambda: 1000.0 + g.STARTUP_DEFER_MAX_S + 1.0)
+    assert g._startup_check(ctx, ctx.state.config) is False
+    assert ctx.state.safety_stopped is True
+    assert "tick clock" in ctx.state.safety_reason.lower()
+    assert "inventory" in ctx.state.safety_reason.lower()
+
+
+def test_the_startup_happy_path_seeds_the_rotation_and_the_log_count(monkeypatch):
+    """M15 -- only the refusals were pinned, and tick() depends on both of these."""
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda *a, **k: {"screenX": 1640, "screenY": 800, "id": 1})
+    ctx = _startup_ctx(monkeypatch, [_item("Knife", 1700, 800, 0),
+                                     _item("Teak logs", 1740, 800, 1)])
+    assert g._startup_check(ctx, ctx.state.config) is True
+    assert ctx.state.safety_stopped is False
+    assert ctx.state.data["g3t_index"] == 0
+    assert ctx.state.data["g3t_logs"] == 1
+    assert ctx.state.data["g3t_startup_pending"] is False
+
+
+# --------------------------------------------------------------------------------------------
+# C2 -- the XP stall clock only counts time during which tick() was actually running
+# --------------------------------------------------------------------------------------------
+
+def test_a_long_gap_between_ticks_stands_the_stall_clock_down(monkeypatch):
+    """Breaks are ON by default (20-40 min apart, 2-8 min long) and tick() is not called during
+    one, so no xp can arrive. The first check afterwards computed a several-hundred second
+    stall and stopped the run with a message that was simply false."""
+    monkeypatch.setattr(g, "_run_chain", lambda ctx: None)
+    monkeypatch.setattr(g, "_now", lambda: 1400.0)
+    ctx = _Ctx()
+    ctx.state.config = _cfg()
+    ctx.state.data["g3t_xp"] = 1000
+    ctx.state.data["g3t_xp_at"] = 1000.0
+    ctx.state.data["g3t_last_tick_at"] = 1000.0     # a 400s break
+    g.tick(ctx)
+    assert ctx.state.safety_stopped is False
+    assert ctx.state.data["g3t_xp_at"] == 1400.0    # re-seeded, not accumulated
+
+
+def test_a_short_gap_between_ticks_leaves_the_stall_clock_alone(monkeypatch):
+    """The engine loop's own ~1s cadence must not stand the watch down every tick, or the one
+    belt this routine has never fires."""
+    monkeypatch.setattr(g, "_run_chain", lambda ctx: None)
+    monkeypatch.setattr(g, "_now", lambda: 1001.0)
+    ctx = _Ctx()
+    ctx.state.config = _cfg()
+    ctx.state.data["g3t_xp_at"] = 900.0
+    ctx.state.data["g3t_last_tick_at"] = 1000.0
+    g.tick(ctx)
+    assert ctx.state.data["g3t_xp_at"] == 900.0
+
+
+# --------------------------------------------------------------------------------------------
+# I6 -- an empty /inventory read means "cannot tell", never "the items are gone"
+# --------------------------------------------------------------------------------------------
+
+def test_a_single_empty_inventory_read_does_NOT_stop_the_run(monkeypatch):
+    """controller.get_inventory returns [] on ANY bridge error, so a 200ms hiccup would
+    otherwise end an unattended run hours before anyone looked."""
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    ctx.state.config = _cfg()
+    g.tick(ctx)
+    assert ctx.state.safety_stopped is False
+    assert ctx.state.data["g3t_empty_reads"] == 1
+
+
+def test_a_run_of_empty_inventory_reads_is_eventually_a_stop(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    ctx.state.config = _cfg()
+    ctx.state.data["g3t_empty_reads"] = g.EMPTY_INVENTORY_STOP - 1
+    g.tick(ctx)
+    assert ctx.state.safety_stopped is True
+
+
+# --------------------------------------------------------------------------------------------
+# I11 -- the inventory tab is open, and the knife's left click really is a selection
+# --------------------------------------------------------------------------------------------
+
+def _chain_ctx(monkeypatch, started):
+    monkeypatch.setattr(g, "prepare", lambda *a, **k: (started.append("cycle"), (1640, 800))[1])
+    monkeypatch.setattr(g, "run_cycle", lambda *a, **k: "ok")
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": 1000})
+    times = iter([1000.0 + i * 10.0 for i in range(200)])
+    monkeypatch.setattr(g, "_now", lambda: next(times))
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    ctx.state.config = _cfg()
+    return ctx
+
+
+def test_no_chain_starts_when_the_inventory_tab_will_not_open(monkeypatch):
+    """gf_live27: after a pause/resume the stats tab was up and every inventory click landed on
+    the wrong interface."""
+    started = []
+    ctx = _chain_ctx(monkeypatch, started)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: False)
+    g.tick(ctx)
+    assert started == []
+    assert ctx.state.safety_stopped is False        # transient, not terminal
+
+
+def test_no_chain_starts_when_the_knife_left_click_is_not_a_Use(monkeypatch):
+    """A Menu Entry Swapper entry making the knife's left click "Drop" would bin the knife on
+    cycle 1, and every cycle after it would look perfect in the log."""
+    started = []
+    ctx = _chain_ctx(monkeypatch, started)
+    monkeypatch.setattr(controller, "get_hover", lambda: {"option": "Drop", "target": "Knife"})
+    g.tick(ctx)
+    assert started == []
+
+
+def test_the_knife_hover_check_fails_CLOSED_when_it_cannot_read_the_hover(monkeypatch):
+    """Unlike controller.hover_matches, which never blocks when it cannot verify: there is no
+    post-hoc check here that would ever notice a dropped knife."""
+    started = []
+    ctx = _chain_ctx(monkeypatch, started)
+    monkeypatch.setattr(controller, "get_hover", lambda: None)
+    g.tick(ctx)
+    assert started == []
+
+
+def test_a_normal_chain_runs_when_the_tab_and_the_hover_both_check_out(monkeypatch):
+    started = []
+    ctx = _chain_ctx(monkeypatch, started)
+    g.tick(ctx)
+    assert started
+
+
+# --------------------------------------------------------------------------------------------
+# M13 -- a failed rock resolve must not leave the knife selected
+# --------------------------------------------------------------------------------------------
+
+def test_a_failed_rock_resolve_CONSUMES_the_knife_selection(monkeypatch):
+    """Otherwise the next cycle's knife click DESELECTS it and that cycle is silently wasted
+    too -- and there is no test of the rock_point-is-None branch at all otherwise."""
+    consumed = []
+    monkeypatch.setattr(g, "prepare", lambda *a, **k: None)
+    monkeypatch.setattr(tick_cycle, "click_in_place",
+                        lambda ser, **kw: (consumed.append(1), 92.0)[1])
+    monkeypatch.setattr(g, "resync", lambda ctx: None)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": 1000})
+    times = iter([1000.0 + i * 10.0 for i in range(200)])
+    monkeypatch.setattr(g, "_now", lambda: next(times))
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    ctx.state.config = _cfg()
+    g.tick(ctx)
+    assert consumed
+    assert ctx.state.safety_stopped is False
+
+
+# --------------------------------------------------------------------------------------------
+# C3 -- the drop keeps everything on keepItems
+# --------------------------------------------------------------------------------------------
+
+def test_the_drop_keeps_a_carried_pickaxe(monkeypatch):
+    """Nothing checks whether the pickaxe is worn or carried; a carried one dropped on the floor
+    of a busy mine ends the run about a minute later with a message naming the wrong cause."""
+    dropped = {}
+    inv = [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1),
+           _item("Rune pickaxe", 1700, 830, 2)]
+    inv += [_item("Granite (5kg)", 1700 + i, 860, 3 + i) for i in range(25)]
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    monkeypatch.setattr(controller, "drop_items",
+                        lambda ser, items: (dropped.update(names=[i["name"] for i in items]),
+                                            True)[1])
+    ctx = _Ctx()
+    assert g.full_inventory_phase(ctx, _cfg()) is True
+    assert set(dropped["names"]) == {"Granite (5kg)"}

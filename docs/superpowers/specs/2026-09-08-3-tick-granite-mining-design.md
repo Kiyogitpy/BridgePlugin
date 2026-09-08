@@ -73,16 +73,40 @@ packet is sent by the click on the target. So the selection, and the flight to t
 happen during the two dead ticks of the previous cycle, and the cursor is already parked on the
 log when the critical tick opens.
 
-The cycle, with the knife and the log in fixed adjacent inventory slots:
+The cycle, with the knife and the log in fixed adjacent inventory slots. The critical tick is
+numbered T and the next one is pinned at **T + 3** — counted in ticks by
+`tick_cycle.at_tick`, never inferred from how long the dead-tick work took:
 
 | tick | action | cursor cost |
 |---|---|---|
 | T+1 (dead) | click the knife (selects it, no packet); fly to the log and park | two short flights across 600ms |
 | T+2 (dead) | nothing; the cursor rests on the log | free |
-| **T (critical)** | `click_human` **in place** on the log (~92ms, no flight) → the 3-tick action fires; one short flight to the rock (~170ms); click (~85ms) | **~347ms median, ~560ms p90** |
+| **T+3 (critical)** | `click_human` **in place** on the log (no flight) → the 3-tick action fires; one short flight to the rock; click | **~460ms median, ~700ms p90** — see below |
 
-The 92ms in-place figure is this repo's own MEASURED number (CLAUDE.md, giants_foundry: a
-`click_human` landed 92ms after the reading it was aimed from).
+**The 92ms in-place figure is not the tick cost of a click, and an earlier draft of this spec
+double-charged because of it.** The 92ms CLAUDE.md records (giants_foundry) is
+reading-to-click-LANDING, i.e. roughly to mouse-DOWN. As wall-clock OCCUPANCY of the tick —
+which is what the budget arithmetic needs — `click_human` is a 50–145ms hold (median 85) plus
+a 30–90ms trailing `human_delay`: **~145ms median, ~235ms worst case, and the hold distribution
+has no hard ceiling.** The old sum `60 + 92 + 270 + 145 = 567` charged the click cost two
+different ways in one line (92 for one click, 145 for the other).
+
+Honestly restated, with `logClickPhaseMs` 60:
+
+| | phase | log click | flight to rock | rock click | total |
+|---|---|---|---|---|---|
+| median | 60 | 145 | 170 | 145 | **520ms** |
+| p90 | 60 | ~200 | 270 | ~200 | **~730ms** |
+
+So the median cycle fits in 600ms and the p90 cycle **does not** — which is why `Window.room_for`
+exists and why some cycles are expected to abandon. `tick_cycle.CLICK_COST_MS` books the 235ms
+worst case rather than the median, deliberately: the guard being conservative costs one abandoned
+cycle, the guard being optimistic desyncs the whole chain.
+
+**Whether an over-budget RELEASE actually matters is unknown**, and neither this spec nor the
+bench answers it: if the game acts on mouse-DOWN, only the press has to land inside the tick and
+the trailing hold/delay is free; if it acts on release, the whole 145–235ms is on the budget.
+That question is now item 6 of the live-verification checklist.
 
 **This is the load-bearing claim of the whole design**, and it is arithmetic, not measurement,
 until the bench in Task 1 says otherwise. It also explains why the client geometry is a hard
@@ -101,8 +125,17 @@ serial port. No Java.
 The tick-phase scheduler. Pure functions over an injected clock (`now_fn`/`sleep_fn`), the
 fake-clock fixture pattern from `tests/test_blast_furnace.py`.
 
+- `at_tick(events, target_tick, target_ms, *, now_fn, sleep_fn, max_wait_ticks)` — sleep until
+  a NAMED tick is current, then `target_ms` into it; `"missed"` when that tick has already
+  passed, so the caller resyncs rather than firing late. **This is what pins the cycle to three
+  ticks.** `at_phase` alone cannot: it lands on the next boundary whenever it happens to be
+  called, so the period is however long the caller's own work took — a fast `prepare()` gives a
+  2-tick cycle, which re-fires knife-on-log before the skilling timer has expired and yields
+  nothing.
+- `current_tick(events, *, now)` — the bridge's tick number, or None when the clock is unusable.
 - `at_phase(events, target_ms, *, now_fn, sleep_fn)` — sleep until the next tick boundary plus
-  `target_ms`. Built on `EventStream.ticks` (`TickModel.phase_ms` / `ms_until_next`), which is
+  `target_ms`. Used only by the FIRST cycle of a chain, which has no previous critical tick to
+  count from. Built on `EventStream.ticks` (`TickModel.phase_ms` / `ms_until_next`), which is
   anchored on the bridge's own `atMillis` — Java's `System.currentTimeMillis()` at the real tick
   boundary — not on when Python drained the packet. That anchoring is exactly why this is
   possible at all; see `TickModel.phase_ms`'s own docstring.
@@ -111,10 +144,13 @@ fake-clock fixture pattern from `tests/test_blast_furnace.py`.
   `refresh_target` it reads the bridge at departure, once per leg and again at the settle, which
   is the "~1s per click" CLAUDE.md already records for deep-sea-trawling.
 - `Window` — tracks how much of the 600ms budget a cycle has spent, and answers
-  `room_for(estimate_ms)`. **A cycle that cannot fit its remaining click aborts rather than
-  letting the click slip into the next tick**, via `controller.request_movement_abort()` and the
-  v3 firmware `X` flush, which exists for precisely this (see CLAUDE.md's firmware section, and
-  note `X` is only legal from inside a flight loop).
+  `room_for(estimate_ms)`, fed `estimate_flight_ms(dist) + CLICK_COST_MS` (the flight's median
+  plus the click's WORST case). **A cycle that cannot fit its remaining flight-and-click is
+  ABANDONED BEFORE THE FLIGHT BEGINS** — it is simply not started. An earlier draft described
+  this as aborting via `controller.request_movement_abort()` and the v3 firmware `X` flush;
+  that call was a no-op (no flight is in progress, and `resync` cleared the flag immediately
+  afterwards) and has been removed. Do not "restore" it: `X` is only legal from inside
+  `move()`'s own flight loop, which is exactly where this code is not.
 
 ### ControllerAddon/routines/granite_3t.py (new)
 
@@ -139,14 +175,19 @@ rockId:               int                 # the granite rock's object id, for ge
 knifeName, logName:   str                 # substring match, this repo's convention
 maxReachPx:           220                 # startup refuses above this, reporting the measurement
 logClickPhaseMs:      60                  # where in the critical tick the log click lands
-rockClickTickOffset:  0                   # LIVE-VERIFY (see checklist item 2)
+keepItems:            ["pickaxe"]         # never dropped, and see "Startup assertions" 5
+rockClickTickOffset:  0                   # LIVE-VERIFY (see checklist item 2); 0 = the rock
+                                          #   click shares the log click's tick, -1 = it leads
+                                          #   by one, inverting the order within the cycle
 missChance:           0.03                # deliberate one-tick-late rock click
 fullInventory:        "drop"
 xpStallStopS:         60
 ```
 
-`logClickPhaseMs` of 60 leaves ~190ms of slack under the p90 tail (60 + 92 + 270 + 145 = 567).
-It is a guess; the routine logs measured per-cycle occupancy so it can be fitted instead.
+`logClickPhaseMs` of 60 is a GUESS and the table above says why it is a tight one: the median
+cycle finishes at ~520ms of the 600ms tick and the p90 does not finish at all. The routine logs
+measured per-cycle occupancy (one line per cycle plus a median/max summary every 25) so it can
+be fitted rather than guessed.
 
 ## Startup assertions
 
@@ -160,6 +201,21 @@ shape `deob_guard.py` already uses:
 3. `max |rock − log|` in pixels is within `maxReachPx`, **reported as a number either way** so a
    refusal tells USER how much to zoom.
 4. `ctx.events` is not `None` and `ctx.events.ticks.is_stale()` is false.
+5. The inventory holds NOTHING but the knife, the log, `keepItems` and granite. The drop
+   shift-drops everything not on the keep list, so a carried pickaxe, teleport tablet, food or
+   piece of jewellery would be binned on the floor of a busy mine about a minute into the run —
+   and the failure is silent and delayed: mining then earns nothing and the XP stall watch stops
+   the run 60s later blaming contested rocks. The refusal NAMES the offending items.
+
+**These run from `tick()`, not from `setup()`, and that is load-bearing.** `setup()` is called
+BEFORE the engine's login and focus gates (`controller.py`: `routine.setup(ctx)` at 3539,
+`login.is_fully_logged_in()` at 3552, `windowFocused` at 3558). At the login screen
+`get_inventory()` answers `[]` and no TICK packet has arrived, so assertions 1 and 4 would BOTH
+fail and the run would be permanently safety-stopped before it began — the bite CLAUDE.md
+already records for GOTR run 47. So `setup()` only records that the checks are owed; `tick()`
+runs them and **defers quietly** (no stop) while the inventory reads empty or the clock is
+stale, because those mean "cannot tell yet". `STARTUP_DEFER_MAX_S` (60s) bounds the deferral so
+a genuinely misconfigured run refuses loudly instead of idling forever.
 
 Assertion 4 is the one place in this repo where CLAUDE.md's standing rule — *every consumer
 must tolerate `ctx.events is None` and keep a working fallback* — becomes a hard requirement
@@ -196,7 +252,17 @@ desync detector is the *window*, not the yield: a cycle whose measured occupancy
 boundary and re-enters. It logs one line carrying the measured phase and occupancy.
 
 **One belt, and it is deliberately not a desync ceiling.** A stuck watch on Mining XP:
-`xpStallStopS` (60s) with **no XP at all** safety-stops. That is not "stop after N misses" — an
+`xpStallStopS` (60s) with **no XP at all** safety-stops. **The clock only counts time during
+which `tick()` was actually running**: breaks are on by default (20–40 min apart, 2–8 min long)
+and `tick()` is not called during one, nor during an F2 pause, a window unfocus or a
+reconnect wait, so no XP can arrive across any of them. A gap over `TICK_GAP_RESEED_S` (5s)
+between `tick()` calls re-seeds the stall clock and logs one line saying so —
+`wintertodt.py` stands its own watch down between rounds for the same reason.
+
+An EMPTY `/inventory` read is likewise never a stop on its own: `controller.get_inventory()`
+returns `[]` on any bridge error, so a 200ms hiccup, a client GC pause or a LOADING screen would
+otherwise end an unattended run with a false message. `EMPTY_INVENTORY_STOP` (20 consecutive)
+still catches a genuinely emptied inventory. That is not "stop after N misses" — an
 ordinary desync, or a run of them, never trips it. It fires when the rocks are contested, the
 camera has moved, or the client is stuttering, i.e. when the cursor is clicking a dead pixel.
 CLAUDE.md's standing lesson applies: a silent loop is worse than a crash, and this routine's
@@ -212,6 +278,11 @@ a failure. The knife and the log are on the keep list by name.
 
 `get_config` forces `safety.stopOnInventoryFull` off, for the reason `gathering.get_config`
 already documents: `check_safety` runs before `tick` and would otherwise win the race.
+
+The keep list is `knifeName` + `logName` + `keepItems` (default `["pickaxe"]`, matching
+`gathering.py`'s mining profile). Startup assertion 5 above is the other half of this: the keep
+list only knows the names it was told about, so anything unexpected is refused at startup rather
+than silently binned later.
 
 ## Humanization
 
@@ -271,10 +342,24 @@ above them and their screen positions do not move.
    the next rock". A click on tick T causes movement on T+1, so "moving" may mean the tick the
    walk executes rather than the tick it is clicked. If the yield rate is poor at offset 0, try
    −1. This is the highest-risk unknown in the design.
-3. **Real click-window occupancy on this hardware.** The routine logs measured ms per cycle;
-   fit `logClickPhaseMs` from it. If p90 occupancy exceeds ~500ms the arithmetic above has
-   failed, and the honest answer is the 4-tick celastrus variant (2400ms per cycle), not tuning.
+3. **Real click-window occupancy on this hardware.** The routine logs one line per cycle
+   (`cycle ok: opened at phase Xms, in-place Yms, flight+click Zms, occupancy Wms of 600ms`)
+   plus a median/max summary every 25 cycles; fit `logClickPhaseMs` from it. If p90 occupancy
+   exceeds ~500ms the arithmetic above has failed, and the honest answer is the 4-tick celastrus
+   variant (2400ms per cycle), not tuning.
 4. **Does the second roll actually land?** Compare granite/hour against the wiki's ~116k xp/hr
    at 70. A rotation that is not buying the movement stall will read close to plain mining.
 5. Whether the parked cursor survives a full cycle untouched — i.e. that `mark_busy` and the
    fidget suppression are sufficient.
+6. **Does the game act on mouse-DOWN or on mouse-UP?** The whole budget above turns on it: if
+   the press is what counts, the click's 50–145ms hold and 30–90ms trailing delay are free and
+   `CLICK_COST_MS` is over-conservative by ~235ms per click; if the release is what counts, the
+   p90 cycle genuinely does not fit and `logClickPhaseMs` has to come down. Measurable by
+   deliberately placing a rock click so its press lands inside the tick and its release does not,
+   and reading whether the mine started. Neither the spec nor `tick_bench.py` answers this today.
+7. **`rockTiles` and `rockId` have no config surface.** There is no `ControllerConfig.java`
+   section for this routine, so the panel's dropdown entry ships with an empty rotation and
+   selecting it stops immediately with "no rockTiles configured -- capture them with the probe".
+   That is safe and well-messaged, but it means the tiles must be captured with
+   `python routines/granite_3t.py --probe` at the mine and pasted into `DEFAULT_CONFIG` in the
+   Python file before a first run.
