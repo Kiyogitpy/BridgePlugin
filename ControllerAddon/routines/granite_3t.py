@@ -35,8 +35,18 @@ move.
 """
 
 import math
+import os
 import random
+import sys
 import time
+
+# Run as a SCRIPT (`python routines/granite_3t.py`, the probe) and this file's directory is
+# sys.path[0], so ControllerAddon/ itself is not importable and `import controller` dies. The
+# engine loads this module by path with ControllerAddon/ already on the path, where this is a
+# no-op. MEASURED live 2026-09-08: the probe was the first thing run at the mine and it
+# traceback'd on the import before printing a single rock.
+if __package__ in (None, "") and os.path.dirname(__file__) == os.path.abspath(sys.path[0]):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import controller
 import debug_log
@@ -48,23 +58,32 @@ DEFAULT_CONFIG = {
     "enabled": True,
 
     # Captured once at the mine -- see the probe at the bottom of this file.
-    "rockTiles": [],            # [[x, y, plane], x4], cycled in order
+    # CAPTURED LIVE 2026-09-08 at the Cape Conch mine's eastern cluster: four rocks all at
+    # distance 1 from the stand tile (3255,2354), so every hop is one step and the movement
+    # stall that buys the second roll is paid on every cycle. Ordered to walk a square rather
+    # than bounce between two tiles.
+    "rockTiles": [[3254, 2353, 0], [3256, 2353, 0], [3256, 2354, 0], [3254, 2354, 0]],
     # Granite rocks share one object id per variant; the probe prints it alongside each tile.
     # get_object_at needs it, and matching by id rather than name is what keeps a DEPLETED rock
     # (a different id, offering no actions) from resolving as a live one.
-    "rockId": None,
+    "rockId": 11387,            # MEASURED live 2026-09-08 at Cape Conch
 
     "knifeName": "knife",
     "logName": "teak logs",
-    # Never dropped, and required to be the ONLY unexpected thing in the inventory at startup.
-    # gathering.py's mining profile keeps "pickaxe" for exactly this reason: nothing here checks
-    # whether the pickaxe is worn or carried, and a carried one binned on the first full
-    # inventory ends the run ~60s later with a stall message that names the wrong cause.
-    "keepItems": ["pickaxe"],
+    # Never dropped, and allowed in the inventory at startup. gathering.py's mining profile
+    # keeps "pickaxe" for the same reason: nothing here checks whether the pickaxe is worn or
+    # carried, and a carried one binned on the first full inventory ends the run ~60s later with
+    # a stall message naming the wrong cause. "log basket" is here because USER carries one as a
+    # spare-log safety net (2026-09-08). Note the basket does NOT feed the routine -- nothing
+    # refills the loose log from it, so an emptied log slot is still a stop, by design.
+    "keepItems": ["pickaxe", "log basket"],
 
-    # Startup refuses above this. The flight is the whole cost of the critical tick, and it
-    # scales with distance: settings.HM2_SLOPE_MS_PER_BIT is +120.5ms per DOUBLING.
-    "maxReachPx": 220,
+    # An OPTIONAL extra-strict cap on the reach. The real limit is DERIVED from the tick budget
+    # in check_geometry (tick_cycle.max_reach_px) and is ~82px; this only ever tightens it, never
+    # loosens it. It shipped at 220 as a hand-picked guess and MEASURED LIVE 2026-09-08 that guess
+    # was ~3x what the budget actually affords, which would have accepted a geometry unable to
+    # hit a single tick. None disables the cap.
+    "maxReachPx": None,
     # Where in the critical tick the log click lands. The honest budget for the critical tick is
     # 60 (phase) + ~145 (in-place click_human: an 85ms median hold plus its 30-90ms trailing
     # delay) + ~270 (p90 flight at this geometry) + ~145 (the rock click) = ~620ms, i.e. the p90
@@ -248,11 +267,29 @@ def check_geometry(cfg, inv):
 
     reach = max(math.hypot(px - log["screenX"], py - log["screenY"]) for px, py in points)
     flight = tick_cycle.estimate_flight_ms(reach)
-    limit = cfg["maxReachPx"]
-    msg = (f"furthest rock is {reach:.0f}px from the log (limit {limit}px), "
-           f"~{flight:.0f}ms median flight")
+
+    # The limit is DERIVED from the tick budget, not hand-picked. MEASURED LIVE 2026-09-08:
+    # `maxReachPx` shipped at 220 while the arithmetic only allows 82, so the routine would
+    # have accepted a geometry that could not hit a single tick. `maxReachPx` survives only as
+    # an optional HARD CAP for a user who wants to be stricter than the budget -- never looser.
+    budget = (tick_cycle.GAME_TICK_MS
+              - cfg["logClickPhaseMs"]        # the window opens part way into the tick
+              - tick_cycle.CLICK_COST_MEDIAN_MS   # the in-place log click
+              - tick_cycle.CLICK_COST_MEDIAN_MS)  # the rock click after the flight
+    limit = tick_cycle.max_reach_px(budget)
+    cap = cfg.get("maxReachPx")
+    if cap:
+        limit = min(limit, cap)
+
+    msg = (f"furthest rock is {reach:.0f}px from the log; the {tick_cycle.GAME_TICK_MS:.0f}ms "
+           f"tick allows {limit:.0f}px ({budget:.0f}ms of flight), and this reach costs "
+           f"~{flight:.0f}ms")
     if reach > limit:
-        return False, msg + " -- zoom in, shrink the client, or turn the camera south"
+        return False, (msg + " -- SHRINK THE CLIENT WINDOW first (the dominant lever), then "
+                             "zoom OUT so the whole rotation clusters tightly, then turn the "
+                             "camera so the cluster sits nearest the inventory. Zooming IN "
+                             "makes this worse: it magnifies the spread between the rocks, and "
+                             "the furthest one sets this number.")
     return True, msg
 
 

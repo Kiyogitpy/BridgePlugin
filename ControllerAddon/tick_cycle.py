@@ -34,6 +34,30 @@ GAME_TICK_MS = bridge_events.GAME_TICK_MS
 # being optimistic lets a click slip into the next tick and desyncs every cycle after it.
 CLICK_COST_MS = (settings.CLICK_HOLD_RANGE_S[1] + 0.09) * 1000.0
 
+# The MEDIAN cost of a click, for PLANNING rather than guarding. CLICK_COST_MS above books the
+# worst case on purpose -- a guard that is optimistic desyncs a whole chain, where a guard that
+# is pessimistic costs one abandoned cycle. But feeding that same worst case into the geometry
+# check makes it demand the impossible: 600 - 60 - 235 - 235 leaves 70ms for the flight, which is
+# below HM2_MIN_MS (90), so NO geometry on earth would ever pass. MEASURED 2026-09-08 while
+# setting the routine up live -- the check refused a legitimate 60px setup. Same split the rest
+# of this repo uses: plan on the median, guard on the tail.
+CLICK_COST_MEDIAN_MS = 145.0
+
+
+def max_reach_px(budget_ms):
+    """The furthest a flight may travel and still fit `budget_ms`, i.e. the inverse of
+    estimate_flight_ms. Returns 0.0 when even the model's floor does not fit.
+
+    This exists because a hand-picked pixel limit is a guess that does not follow from the
+    budget, and MEASURED LIVE 2026-09-08 the guess was wrong by a factor of three: the config
+    said 220px while the arithmetic only allows 82px, so a geometry the routine would have
+    accepted could not have hit a single tick. Deriving it means the refusal message can tell
+    the user the real target instead of an invented one."""
+    if budget_ms <= settings.HM2_MIN_MS:
+        return 0.0
+    doublings = (budget_ms - settings.HM2_MED_REF_MS) / settings.HM2_SLOPE_MS_PER_BIT
+    return settings.HM2_D_REF * (2.0 ** doublings)
+
 
 def tick_phase_ms(events, now):
     """Milliseconds since the last tick boundary, or None when the clock cannot be trusted."""

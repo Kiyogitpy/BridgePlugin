@@ -91,19 +91,23 @@ def test_geometry_refuses_when_the_rocks_are_too_far_from_the_log_AND_reports_th
     monkeypatch.setattr(controller, "get_object_at",
                         lambda *a, **k: {"screenX": 400, "screenY": 800, "id": 1})
     inv = [_item("Knife", 1700, 800, slot=0), _item("Teak logs", 1740, 800, slot=1)]
-    ok, msg = g.check_geometry(_cfg(maxReachPx=220), inv)
+    ok, msg = g.check_geometry(_cfg(), inv)
     assert ok is False
     assert "1340" in msg          # |1740 - 400| -- the measurement must be IN the message
-    assert "220" in msg
+    # ...and the DERIVED limit, not a hand-picked one. MEASURED LIVE 2026-09-08: the config's
+    # 220 was three times what the tick budget actually allows, so a geometry that could never
+    # hit a tick would have been accepted.
+    assert f"{tick_cycle.max_reach_px(600.0 - 60.0 - 2 * tick_cycle.CLICK_COST_MEDIAN_MS):.0f}px" in msg
 
 
 def test_geometry_passes_and_still_reports_the_measurement(monkeypatch):
+    # 60px from the log -- inside the ~82px the 600ms tick actually affords.
     monkeypatch.setattr(controller, "get_object_at",
-                        lambda *a, **k: {"screenX": 1640, "screenY": 800, "id": 1})
+                        lambda *a, **k: {"screenX": 1680, "screenY": 800, "id": 1})
     inv = [_item("Knife", 1700, 800, slot=0), _item("Teak logs", 1740, 800, slot=1)]
-    ok, msg = g.check_geometry(_cfg(maxReachPx=220), inv)
+    ok, msg = g.check_geometry(_cfg(), inv)
     assert ok is True
-    assert "100" in msg
+    assert "60" in msg
 
 
 def test_setup_NEVER_safety_stops_because_it_runs_before_the_login_gate():
@@ -813,7 +817,7 @@ def test_an_unanswerable_startup_stops_at_the_deferral_ceiling(monkeypatch):
 def test_the_startup_happy_path_seeds_the_rotation_and_the_log_count(monkeypatch):
     """M15 -- only the refusals were pinned, and tick() depends on both of these."""
     monkeypatch.setattr(controller, "get_object_at",
-                        lambda *a, **k: {"screenX": 1640, "screenY": 800, "id": 1})
+                        lambda *a, **k: {"screenX": 1680, "screenY": 800, "id": 1})
     ctx = _startup_ctx(monkeypatch, [_item("Knife", 1700, 800, 0),
                                      _item("Teak logs", 1740, 800, 1)])
     assert g._startup_check(ctx, ctx.state.config) is True
