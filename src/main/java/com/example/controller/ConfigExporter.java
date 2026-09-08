@@ -275,6 +275,20 @@ public final class ConfigExporter
 		return data;
 	}
 
+	// routines/vale_totems.py has no dedicated /vale-totems-config endpoint -- its get_config
+	// reads the single valeTotemsWood key straight off the bridge's generic /config, the same
+	// as fletching.py/wintertodt.py/granite_3t.py do for the shared breaks/safety keys, so
+	// ConfigProvider.getConfig() is what actually puts this on the wire; this export exists so
+	// the enum-NAME convention (the Python side upper-cases and looks it up in WOODS, falling
+	// back to YEW on anything unrecognised) lives in one place, beside every other routine's
+	// exported keys, rather than being reinvented ad hoc in ConfigProvider.
+	public static Map<String, Object> exportValeTotems(ControllerConfig config)
+	{
+		Map<String, Object> data = new LinkedHashMap<>();
+		data.put("valeTotemsWood", config.valeTotemsWood().name());
+		return data;
+	}
+
 	/** Breaks shape shared by every routine's export -- read from ControllerConfig's shared
 	 * Breaks section rather than a routine-specific duplicate (see this plan's Collision Table). */
 	/** What is built in the player's POH. Shared by every routine that plans travel, because

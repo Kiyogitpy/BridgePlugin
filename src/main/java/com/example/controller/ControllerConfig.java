@@ -88,6 +88,9 @@ public interface ControllerConfig extends Config
 	@ConfigSection(name = "Mahogany Homes", description = "Mahogany Homes routine settings", position = 15)
 	String mahoganyHomesSection = "mahoganyHomes";
 
+	@ConfigSection(name = "Vale Totems", description = "Forestry totem circuit", position = 18)
+	String valeTotemsSection = "valeTotems";
+
 	// ============================================================
 	// General
 	// ============================================================
@@ -1340,5 +1343,20 @@ public interface ControllerConfig extends Config
 	default boolean usePohFairyRing()
 	{
 		return false;
+	}
+
+	// ============================================================
+	// Vale Totems
+	// ============================================================
+
+	@ConfigItem(
+		keyName = "valeTotemsWood",
+		name = "Totem wood",
+		description = "Which log to build and decorate Vale Totems with.",
+		section = valeTotemsSection
+	)
+	default ValeTotemWood valeTotemsWood()
+	{
+		return ValeTotemWood.YEW;
 	}
 }

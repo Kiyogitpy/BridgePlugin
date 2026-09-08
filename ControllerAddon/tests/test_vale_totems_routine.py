@@ -434,3 +434,21 @@ def test_progress_signature_changes_when_any_site_advances():
                         "researchPoints": 0, "totalUnclaimedOfferings": 0,
                         "atValeTotems": True})
     assert vtr_routine.progress_signature(a) != vtr_routine.progress_signature(b)
+
+
+def test_the_routine_is_wired_into_the_gui_map():
+    import controller as c
+    assert c.ROUTINE_FILES.get("VALE_TOTEMS") == "routines/vale_totems.py"
+
+
+def test_the_enum_and_the_map_agree():
+    import pathlib
+    import re
+    import controller as c
+    java = pathlib.Path(__file__).resolve().parents[2] / "src/main/java/com/example/controller/RoutineChoice.java"
+    # [A-Z0-9_]+, not the brief's [A-Z_]+: GRANITE_3T (landed on this branch concurrently,
+    # commit a580778) is a real enum entry with a digit in its name, and the map-vs-enum
+    # invariant this test checks has to hold for it too.
+    names = set(re.findall(r"^\t([A-Z0-9_]+)\(", java.read_text(), re.M))
+    assert "VALE_TOTEMS" in names
+    assert set(c.ROUTINE_FILES) <= names

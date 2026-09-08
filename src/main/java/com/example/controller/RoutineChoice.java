@@ -36,7 +36,8 @@ public enum RoutineChoice
 	DEEP_SEA_TRAWLING("Deep Sea Trawling"),
 	WINTERTODT("Wintertodt (group, fletch)"),
 	FLETCHING("Fletching (bank, knife logs)"),
-	GRANITE_3T("3-Tick Granite");
+	GRANITE_3T("3-Tick Granite"),
+	VALE_TOTEMS("Vale Totems (Forestry)");
 
 	private final String label;
 

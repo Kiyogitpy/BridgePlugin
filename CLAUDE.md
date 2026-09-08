@@ -1625,6 +1625,72 @@ run live.** Needs a client rebuild (the `RoutineChoice` entry is Java).
 - **`before_break` paces its own loop** rather than relying on a phase handler to sleep, and
   stands the stuck watch down during `between_rounds`.
 
+## Current state of routines/vale_totems.py
+
+Written 2026-09-08 from a human recording (`recordings/2026-09-08_135457_vale-totem.*`, 8m22s,
+194 actions, ~1.9 laps), the vendored m8aq `ValeTotems` reader, the Plugin Hub `totem-fletching`
+source and the OSRS Wiki. Design: `docs/superpowers/specs/2026-09-08-vale-totems-design.md`,
+whose "Live-verification checklist" is the first session's worklist. **NOT YET RUN LIVE** --
+every fact below is either MEASURED from a cited source or the routine's own reasoning over the
+reader's fields; nothing has been checked against a real client. This task (12) only wires the
+Routine dropdown, adds the wood config item, and documents -- the routine itself (Tasks 1-11) was
+already committed and fully unit-tested before this task started.
+
+- **All state comes from one already-vendored reader, `GET /api/minigames/vale-totems`** -- no
+  Java change needed for state, same "answers on the current build" free lunch the m8aq vendoring
+  gave every other minigame reader. **The reader's helper METHODS are not in the JSON**:
+  `isFullyCarved()`, `isFullyBuilt()`, `isFullyDecorated()`, `isOfferingCapped()`, `isStarted()`,
+  `getMissingNearbySpirits()` and `getIncorrectCarvings()` are Java methods and Gson serializes
+  fields only -- the same trap this file already records for GOTR's round phase and Wintertodt's
+  `isOperational()`. `vale_totems.py` re-derives every one of them from the serialized fields
+  (`baseValue`, `baseCarved`, `decorations`, `nearbySpiritValues`, `bottom`/`middle`/`top`, ...)
+  rather than trusting a method Gson silently dropped.
+- **THE 270-TITLE TRAP: the carve prompt and the fletch prompt are BOTH widget group 270**
+  (`InterfaceID.Skillmulti`) -- the site's base loc cycles Build -> Carve -> Decorate on one
+  object id, and the last two share both that object id AND this widget group, so neither the
+  object nor the group can tell the two prompts apart. The only discriminator is the TITLE at
+  **widget 270.5**: `"What animal would you like to carve?"` is the carve prompt (options A..E
+  at 270.15-270.19 are the five spirits in a fixed order, so number key `n` carves the spirit
+  whose `nearbyValue` is `n`, no name mapping needed); `"What would you like to make?"` is the
+  fletch prompt. `skillmulti.py` (shared with `routines/fletching.py`) carries
+  `TITLE_CARVE`/`TITLE_MAKE` for exactly this gate, and every number-key press is conditioned on
+  it -- answering blind risks acting on whichever of the two prompts happens to be open.
+- **The fletch prompt is answered with the derived bow-option number, NEVER `Space`.** `Space`
+  repeats the *last crafted item*, which is only correct by accident when the previous fletch in
+  the session happened to be the same bow -- a fresh login, or one manual fletch of something
+  else first, makes `Space` silently produce the wrong item, and the failure then surfaces far
+  from its cause, at the *next* totem, as "you don't have anything to decorate with". The bow
+  index (`3` for a longbow, per the wood tables) is a property of the configured wood and is
+  looked up, never guessed from what was last made.
+- **`worldmap.py` has NO collision data for Varlamore.** MEASURED 2026-09-08:
+  `reachable_from(radius=40)` returns a single tile at every totem site, at the bank, at Civitas
+  illa Fortis, at Aldarin and at the Hunter guild, while the same call at Varrock square returns
+  5089 tiles -- the EthanApi map this repo's routing runs on predates this content entirely, not
+  a tuning gap. So the routine walks **recorded waypoints** (`vale_totem_route.py`, one tile per
+  tick off the user's own walked path) rather than a computed route, and -- the direct
+  consequence -- **it has no way to walk from an arbitrary tile back into the ring**, so it must
+  be started standing in the valley; a player found outside safety-stops instead of trying to
+  improvise a way home, the same rule `wintertodt.py` applies to its own region check.
+- **The wood dropdown added this task is Java-only wiring** (`ValeTotemWood`, `valeTotemsWood`
+  config item, `ConfigExporter.exportValeTotems`, and `ConfigProvider.getConfig()` -- the
+  routine's `get_config(bridge_config)` reads `valeTotemsWood` straight off the bridge's generic
+  `/config`, the same as `fletching.py`/`wintertodt.py`/`granite_3t.py` already do for their own
+  shared keys, so `ConfigProvider` is what actually puts it on the wire and
+  `ConfigExporter.exportValeTotems` exists only to keep the enum-NAME convention in one place
+  beside every other routine's exported keys). Only Yew is measured against the recording; the
+  dropdown lets the other four woods be selected but their bow option index and Fletching level
+  are unverified past the wiki table `vale_totems.py.WOODS` was built from.
+- **Nothing in this routine has been run live.** The spec's "Live-verification checklist" is the
+  first session's worklist, in priority order: (1) the fletch prompt's title and that `3` selects
+  a longbow; (2) the carve prompt's title, and that 270.5 is readable via `/widget` while it is
+  open; (3) the waypoint hops clear both log balances (`56990` on leg 4->3, `56991` near site 7)
+  -- the one place a recorded path might not survive being re-walked as discrete hops; (4) that
+  `nearbySpirits` updates mid-carve and the re-read between carves picks the change up; (5) that
+  bank-side `Fill` and field `Empty` on the log basket resolve to the right menu options; (6)
+  whether a totem with durability left is ever met still standing and decorated, i.e. the
+  claim-and-pass branch is exercised at all; (7) whether `3` holds as the bow index for any
+  non-yew wood, if the dropdown is ever moved off Yew.
+
 ## Current state of routines/granite_3t.py
 
 Written 2026-09-08 from the OSRS Wiki (Tick manipulation rev 15292712, Pay-to-play Mining
