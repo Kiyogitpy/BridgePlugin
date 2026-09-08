@@ -380,3 +380,108 @@ def test_feed_phase_real_click_path_never_clicks_the_unlit_twin(monkeypatch):
     items = [{"id": w.ITEM_KINDLING, "name": "Bruma kindling"}]
     assert wt.feed_phase(ctx, {}, items, "SOUTH_WEST") is True
     assert clicked["id"] == w.OBJ_BRAZIER_LIT
+
+
+# --- Task 8: light / fix / dodge --------------------------------------------------------------
+
+def test_light_phase_targets_the_unlit_id_and_escalates_to_the_menu_when_hijacked(monkeypatch):
+    ctx = _Ctx()
+    scene = [{"id": w.OBJ_BRAZIER_UNLIT, "name": "Brazier", "actions": ["Light"],
+              "distance": 2, "x": 1, "y": 1, "plane": 0}]
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
+    tries = {"bare": 0, "menu": 0}
+    monkeypatch.setattr(wt, "_click_object",
+                        lambda *a, **k: tries.__setitem__("bare", tries["bare"] + 1) or False)
+    monkeypatch.setattr(wt, "_click_menu",
+                        lambda *a, **k: tries.__setitem__("menu", tries["menu"] + 1) or True)
+    # _await must be stubbed too, or the menu branch falls through to the real
+    # bridge_events.await_outcome and spins against a fake clock for the whole budget.
+    monkeypatch.setattr(wt, "_await", lambda *a, **k: True)
+    assert wt.light_phase(ctx, {}, "SOUTH_WEST") is True
+    # A Wintertodt brazier on an official world is the most crowded object in the game;
+    # golem_crafting MEASURED a 30-40% bare-click hijack rate on a far quieter one.
+    assert tries["menu"] == 1
+
+
+def test_light_phase_stops_after_its_ceiling(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [])
+    for _ in range(wt.LIGHT_MAX_CLICKS + 1):
+        wt.light_phase(ctx, {}, "SOUTH_WEST")
+    assert ctx.state.safety_stopped is True
+
+
+def test_fix_phase_targets_the_broken_id(monkeypatch):
+    ctx = _Ctx()
+    scene = [{"id": w.OBJ_BRAZIER_BROKEN, "name": "Brazier", "actions": ["Fix"],
+              "distance": 2, "x": 1, "y": 1, "plane": 0}]
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
+    seen = {}
+    monkeypatch.setattr(wt, "_click_object",
+                        lambda c, o, action, budget_s, confirm, signals=None:
+                        seen.setdefault("id", o["id"]) or True)
+    assert wt.fix_phase(ctx, {}, "SOUTH_WEST") is True
+    assert seen["id"] == w.OBJ_BRAZIER_BROKEN
+
+
+def test_dodge_phase_steps_off_the_tile_and_forgets_the_snow(monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data["wt_snow_tile"] = (10, 20, 0)
+    ctx.state.data["wt_snow_at"] = wt._now()
+    monkeypatch.setattr(controller, "get_player", lambda *a, **k: {"x": 10, "y": 20, "plane": 0})
+    walked = {}
+    monkeypatch.setattr(wt, "_force_walk",
+                        lambda c, x, y, p: walked.setdefault("to", (x, y)) or True)
+    assert wt.dodge_phase(ctx) is True
+    assert walked["to"] != (10, 20)
+    assert "wt_snow_tile" not in ctx.state.data
+
+
+# --- real-path tests (Task 6's `.ok` lesson): only controller.* mocked, so the real
+# wt._click_object / wt._click_menu / wt._await -> outcome_waits.await_pre ->
+# bridge_events.Outcome actually execute. A stubbed-helper test above is structurally blind to
+# a crash inside those real call chains -- Task 6 shipped exactly that, green, on every mocked
+# test it had. -------------------------------------------------------------------------------
+
+def test_light_phase_real_bare_click_path_confirms_via_await_pre(monkeypatch):
+    """The bare click succeeds and the reader already reads LIT -- exercises the REAL
+    wt._click_object -> outcome_waits.await_pre -> bridge_events.Outcome, never touching the
+    menu escalation."""
+    ctx = _Ctx()
+    obj = {"id": w.OBJ_BRAZIER_UNLIT, "name": "Brazier", "actions": ["Light"],
+           "distance": 2, "x": 1, "y": 1, "plane": 0, "onScreen": True,
+           "screenX": 10, "screenY": 10}
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [obj])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_api",
+                        lambda *a, **k: {"braziers": {"SOUTH_WEST": {"status": "LIT"}}})
+    assert wt.light_phase(ctx, {}, "SOUTH_WEST") is True
+
+
+def test_light_phase_real_menu_escalation_path_confirms_via_await(monkeypatch):
+    """The bare click is refused (hijacked by whatever is drawn over the pixel) -- exercises
+    the REAL wt._click_menu -> controller.click_menu_action and the REAL wt._await ->
+    outcome_waits.await_pre, with only controller.* mocked."""
+    ctx = _Ctx()
+    obj = {"id": w.OBJ_BRAZIER_UNLIT, "name": "Brazier", "actions": ["Light"],
+           "distance": 2, "x": 1, "y": 1, "plane": 0, "onScreen": True,
+           "screenX": 10, "screenY": 10}
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [obj])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: False)
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_api",
+                        lambda *a, **k: {"braziers": {"SOUTH_WEST": {"status": "LIT"}}})
+    assert wt.light_phase(ctx, {}, "SOUTH_WEST") is True
+
+
+def test_fix_phase_real_bare_click_path_confirms_via_await_pre(monkeypatch):
+    """Same shape as the light_phase real-path test, for the fix rung and the BROKEN id."""
+    ctx = _Ctx()
+    obj = {"id": w.OBJ_BRAZIER_BROKEN, "name": "Brazier", "actions": ["Fix"],
+           "distance": 2, "x": 1, "y": 1, "plane": 0, "onScreen": True,
+           "screenX": 10, "screenY": 10}
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [obj])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_api",
+                        lambda *a, **k: {"braziers": {"SOUTH_WEST": {"status": "LIT"}}})
+    assert wt.fix_phase(ctx, {}, "SOUTH_WEST") is True

@@ -440,3 +440,86 @@ def feed_phase(ctx, reader, items, brazier) -> bool:
         lambda: (ws.count_item(_inventory(), w.ITEM_KINDLING) == 0
                  and ws.count_item(_inventory(), w.ITEM_ROOT) == 0),
         signals=["CHAT_MESSAGE", "INVENTORY_CHANGED"])
+
+
+# --- light / fix / dodge rungs ---------------------------------------------------------------
+
+LIGHT_MAX_CLICKS = 10
+FIX_MAX_CLICKS = 10
+BRAZIER_ACTION_BUDGET_S = 6.0
+DODGE_STEPS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1))
+
+
+def _click_menu(ctx, obj, option) -> bool:
+    """The right-click escalation, immune to whatever is DRAWN over the aim pixel.
+
+    golem_crafting MEASURED a 30-40% bare-click hijack rate from other players' models covering
+    a plinth, and a Wintertodt brazier on an official world is far more crowded than that.
+    Re-resolve the object first -- click_menu_action right-clicks exactly the pixel it is
+    given, and a stale one produces a menu of pure ground options."""
+    fresh = _nearest(_objects(ids={obj.get("id")}, fresh=True))
+    return bool(controller.click_menu_action(ctx.ser, fresh or obj, option, offset=(0, 0),
+                                             refresh_target=_refresh(fresh or obj)))
+
+
+def _brazier_action(ctx, ctr_key, obj_id, option, want_status, brazier) -> bool:
+    """Shared body for light and fix: bare click, then the menu, then a ceiling."""
+    data = _d(ctx)
+    obj = _nearest(_objects(ids={obj_id}, action=option))
+    data[ctr_key] = int(data.get(ctr_key) or 0) + 1
+    if data[ctr_key] > (LIGHT_MAX_CLICKS if option == "Light" else FIX_MAX_CLICKS):
+        ctx.state.trigger_safety_stop(
+            "wintertodt: %s never registered on the %s brazier after %d attempts"
+            % (option, brazier, data[ctr_key] - 1))
+        return False
+    if not obj:
+        return False
+
+    confirm = lambda: ws.brazier_status(_reader(), brazier) == want_status
+    signals = ["CHAT_MESSAGE"]
+    if _click_object(ctx, obj, option, BRAZIER_ACTION_BUDGET_S, confirm, signals=signals):
+        data[ctr_key] = 0
+        return True
+    if _click_menu(ctx, obj, option):
+        if _await(ctx, signals, BRAZIER_ACTION_BUDGET_S + _walk_budget(obj), confirm):
+            data[ctr_key] = 0
+        return True
+    return False
+
+
+def light_phase(ctx, reader, brazier) -> bool:
+    """25 points, and the wiki says it is worth interrupting anything else for.
+
+    `reader` is accepted (the _PHASES dispatcher passes it) but not used: the confirm re-reads
+    the HUD itself, because the snapshot that chose this rung is by then a click old."""
+    return _brazier_action(ctx, "wt_light_clicks", w.OBJ_BRAZIER_UNLIT, "Light",
+                           "LIT", brazier)
+
+
+def fix_phase(ctx, reader, brazier) -> bool:
+    """25 points. The wiki warns braziers are "fixed extremely quickly on Wintertodt worlds",
+    so losing this race is normal and is a no-op, not a failure."""
+    return _brazier_action(ctx, "wt_fix_clicks", w.OBJ_BRAZIER_BROKEN, "Fix",
+                           "LIT", brazier)
+
+
+def _force_walk(ctx, x, y, plane) -> bool:
+    """A SHIFT-clicked walk. CLAUDE.md's standing rule: always shift+click a plain ground tile,
+    or a nearby interactive object's own action can swallow the click."""
+    return bool(travel.walk_to_exact_tile(ctx, x, y, plane))
+
+
+def dodge_phase(ctx) -> bool:
+    """Step one tile out of the 3x3 area attack.
+
+    An ACCELERATOR: if 29325 never reaches /objects (checklist item 1) this rung simply never
+    fires and warmth is healed reactively instead. Nothing else depends on it."""
+    px, py, plane = _player_tile()
+    if px is None:
+        return False
+    _d(ctx).pop("wt_snow_tile", None)
+    for dx, dy in DODGE_STEPS:
+        if _force_walk(ctx, px + dx * 2, py + dy * 2, plane):
+            debug_log.log(LOG, "dodge: stepped off the snowfall tile")
+            return True
+    return False
