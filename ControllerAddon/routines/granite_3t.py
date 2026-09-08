@@ -198,19 +198,21 @@ def prepare(ctx, cfg, knife_point, log_point, rock_tile):
     Three things happen here and the order is load-bearing:
       1. Click the knife. In OSRS this is a client-side SELECTION and sends no packet, which is
          exactly why it can live outside the critical tick.
-      2. Re-resolve the rock's screen point over HTTP. The projection moves every cycle because
+      2. Park the cursor on the log, so the critical tick's first click costs no flight. This is
+         UNCONDITIONAL so run_cycle's click_in_place assumption ("cursor is on the log") holds
+         even if the rock resolve fails transiently.
+      3. Re-resolve the rock's screen point over HTTP. The projection moves every cycle because
          the PLAYER moves between rocks; the 1200ms of dead time is where that read is
          affordable.
-      3. Park the cursor on the log, so the critical tick's first click costs no flight.
     """
     tick_cycle.timed_click(ctx.ser, knife_point, aim_radius=0, now_fn=_now)
+    controller.move_to_human(ctx.ser, int(log_point[0]), int(log_point[1]), aim_radius=0)
 
     x, y, plane = rock_tile[0], rock_tile[1], rock_tile[2]
     obj = controller.get_object_at(x, y, plane, cfg.get("rockId"))
     if not obj or obj.get("screenX") is None:
         return None
 
-    controller.move_to_human(ctx.ser, int(log_point[0]), int(log_point[1]), aim_radius=0)
     return int(obj["screenX"]), int(obj["screenY"])
 
 

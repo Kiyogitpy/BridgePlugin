@@ -243,3 +243,40 @@ def test_prepare_selects_the_knife_then_parks_on_the_log(monkeypatch):
     point = g.prepare(ctx, _cfg(), (1700, 800), (1740, 800), [10, 20, 0])
     assert point == (1640, 800)
     assert order == [("click", (1700, 800)), ("park", (1740, 800))]
+
+
+def test_prepare_parks_on_the_log_even_when_the_rock_does_not_resolve(monkeypatch):
+    """The park must be unconditional: run_cycle's click_in_place assumes the cursor is on
+    the log, and its abandon arithmetic measures from log_point."""
+    order = []
+    monkeypatch.setattr(tick_cycle, "timed_click",
+                        lambda ser, pt, **kw: (order.append(("click", pt)), 200.0)[1])
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **kw: order.append(("park", (x, y))))
+    monkeypatch.setattr(controller, "get_object_at", lambda *a, **k: None)
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    assert g.prepare(ctx, _cfg(), (1700, 800), (1740, 800), [10, 20, 0]) is None
+    assert order == [("click", (1700, 800)), ("park", (1740, 800))]
+
+
+def test_run_cycle_makes_NO_bridge_call_between_the_two_clicks(monkeypatch):
+    """The invariant the module exists for: one round trip is 15-120ms out of a 600ms
+    budget that is already mostly spent."""
+    calls = []
+    monkeypatch.setattr(controller, "api_get",
+                        lambda path, params=None, timeout=0.3: calls.append(path))
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda *a, **k: calls.append("get_object_at"))
+    monkeypatch.setattr(controller, "get_player", lambda: calls.append("get_player"))
+    monkeypatch.setattr(tick_cycle, "at_phase", lambda ev, ms, **kw: 60.0)
+    monkeypatch.setattr(tick_cycle, "click_in_place", lambda ser, **kw: 92.0)
+    monkeypatch.setattr(tick_cycle, "timed_click", lambda ser, pt, **kw: 255.0)
+    monkeypatch.setattr(g.random, "random", lambda: 1.0)
+    monkeypatch.setattr(g, "_now", lambda: 1000.0)
+
+    ctx = _Ctx()
+    ctx.events = _FakeEvents()
+    assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "ok"
+    assert calls == []
