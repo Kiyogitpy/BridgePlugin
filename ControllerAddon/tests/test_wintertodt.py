@@ -258,3 +258,125 @@ def test_kit_phase_falls_back_to_take_concoction_when_take_10_is_not_offered(mon
     items = [{"id": 0, "name": n} for n in ("Bronze axe", "Knife", "Tinderbox", "Hammer")]
     assert wt.kit_phase(ctx, items) is True
     assert seen["action"] == "Take-concoction"
+
+
+# --- Task 7: chop / fletch / feed ------------------------------------------------------------
+
+def test_chop_phase_confirms_on_the_games_own_inventory_full_line(monkeypatch):
+    ctx = _Ctx()
+    roots = {"id": w.OBJ_ROOTS, "name": "Bruma roots", "actions": ["Chop"],
+             "distance": 2, "x": 5, "y": 5, "plane": 0}
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [roots])
+    seen = {}
+
+    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None):
+        seen["signals"] = signals
+        seen["action"] = action
+        return True
+
+    monkeypatch.setattr(wt, "_click_object", fake_click)
+    assert wt.chop_phase(ctx, []) is True
+    assert seen["action"] == "Chop"
+    # The chat line is the pushed signal; the inventory read is the confirm.
+    assert any("CHAT" in str(s) for s in seen["signals"])
+
+
+def test_chop_phase_with_no_roots_in_view_does_not_stop_the_run(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [])
+    assert wt.chop_phase(ctx, []) is False
+    assert ctx.state.safety_stopped is False
+
+
+def test_chop_phase_real_click_path_confirms_on_a_full_inventory(monkeypatch):
+    """Exercises the REAL wt._click_object / outcome_waits.await_pre, mocking only controller.*
+    -- this is what would have caught the Task 6 `.ok` crash, which every mocked-helper test
+    above is structurally blind to."""
+    ctx = _Ctx()
+    roots = {"id": w.OBJ_ROOTS, "name": "Bruma roots", "actions": ["Chop"],
+             "distance": 2, "x": 5, "y": 5, "plane": 0, "onScreen": True,
+             "screenX": 10, "screenY": 10}
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [roots])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_inventory", lambda *a, **k: [{"id": 0}] * 28)
+    assert wt.chop_phase(ctx, []) is True
+
+
+def test_fletch_phase_uses_the_knife_on_a_root(monkeypatch):
+    ctx = _Ctx()
+    used = {}
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(wt, "_use_knife_on_root",
+                        lambda c, knife, root: used.setdefault("ok", True) or True)
+    monkeypatch.setattr(wt, "_await", lambda *a, **k: True)
+    items = [{"id": 0, "name": "Knife", "slot": 0},
+             {"id": w.ITEM_ROOT, "name": "Bruma root", "slot": 1}]
+    assert wt.fletch_phase(ctx, items) is True
+    assert used["ok"] is True
+
+
+def test_fletch_phase_without_a_knife_falls_through_rather_than_looping(monkeypatch):
+    ctx = _Ctx()
+    items = [{"id": w.ITEM_ROOT, "name": "Bruma root", "slot": 1}]
+    assert wt.fletch_phase(ctx, items) is False
+
+
+def test_fletch_phase_real_use_on_path_confirms_when_roots_are_gone(monkeypatch):
+    """Exercises the REAL wt._use_knife_on_root (-> wt._use_on) and the REAL wt._await
+    (-> outcome_waits.await_pre), mocking only controller.*."""
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_inventory", lambda *a, **k: [])
+    items = [{"id": 0, "name": "Knife", "slot": 0, "screenX": 1, "screenY": 1},
+             {"id": w.ITEM_ROOT, "name": "Bruma root", "slot": 1, "screenX": 2, "screenY": 2}]
+    assert wt.fletch_phase(ctx, items) is True
+
+
+def test_feed_phase_clicks_the_lit_brazier_and_never_the_unlit_twin(monkeypatch):
+    ctx = _Ctx()
+    scene = [
+        {"id": w.OBJ_BRAZIER_UNLIT, "name": "Brazier", "actions": ["Light"],
+         "distance": 1, "x": 1, "y": 1, "plane": 0},
+        {"id": w.OBJ_BRAZIER_LIT, "name": "Burning brazier", "actions": ["Feed"],
+         "distance": 4, "x": 9, "y": 9, "plane": 0},
+    ]
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
+    seen = {}
+
+    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None):
+        seen["id"] = obj["id"]
+        return True                      # feed_phase returns this straight through
+
+    monkeypatch.setattr(wt, "_click_object", fake_click)
+    items = [{"id": w.ITEM_KINDLING, "name": "Bruma kindling"}]
+    assert wt.feed_phase(ctx, {}, items, "SOUTH_WEST") is True
+    # The NEARER object is the unlit one; picking by name or by distance would take it.
+    assert seen["id"] == w.OBJ_BRAZIER_LIT
+
+
+def test_feed_phase_real_click_path_never_clicks_the_unlit_twin(monkeypatch):
+    """Exercises the REAL wt._click_object, mocking only controller.* -- the same nearer-unlit-
+    twin geometry as the test above, but through the genuine click/confirm path rather than a
+    stubbed `_click_object` that could silently accept the wrong object id."""
+    ctx = _Ctx()
+    scene = [
+        {"id": w.OBJ_BRAZIER_UNLIT, "name": "Brazier", "actions": ["Light"],
+         "distance": 1, "x": 1, "y": 1, "plane": 0, "onScreen": True,
+         "screenX": 3, "screenY": 3},
+        {"id": w.OBJ_BRAZIER_LIT, "name": "Burning brazier", "actions": ["Feed"],
+         "distance": 4, "x": 9, "y": 9, "plane": 0, "onScreen": True,
+         "screenX": 20, "screenY": 20},
+    ]
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
+    clicked = {}
+
+    def fake_click_entity(ser, entity, **kwargs):
+        clicked["id"] = entity.get("id")
+        return True
+
+    monkeypatch.setattr(controller, "click_entity", fake_click_entity)
+    monkeypatch.setattr(controller, "get_inventory", lambda *a, **k: [])
+    items = [{"id": w.ITEM_KINDLING, "name": "Bruma kindling"}]
+    assert wt.feed_phase(ctx, {}, items, "SOUTH_WEST") is True
+    assert clicked["id"] == w.OBJ_BRAZIER_LIT

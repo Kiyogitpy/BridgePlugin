@@ -371,3 +371,72 @@ def warmth_phase(ctx, items) -> bool:
     return _click_inventory_item(
         ctx, dose, "Drink", DRINK_BUDGET_S,
         lambda: (ws.warmth_percent(_reader()) or 0.0) > before + 5)
+
+
+# --- chop / fletch / feed rungs --------------------------------------------------------------
+
+CHOP_BUDGET_S = 90.0             # a whole inventory of roots; a guess, fit it live
+FLETCH_BUDGET_S = 90.0           # a whole inventory fletched; a guess, fit it live
+FEED_BUDGET_S = 60.0             # a whole inventory fed; a guess, fit it live
+
+
+def _await(ctx, signals, budget_s, confirm, since=None):
+    # `bridge_events.Outcome` has no `.ok` -- its fields are hit/signal/payload/confirmed/
+    # latency_s and `__bool__` returns `hit`. An earlier draft wrote `outcome.ok` here and at
+    # three sites in Task 6; it crashed on the first genuinely SUCCESSFUL click and was
+    # invisible to tests that mock the click helpers. Use plain truthiness.
+    outcome = outcome_waits.await_pre(ctx, signals, budget_s, confirm, since=since,
+                                      now_fn=_now, sleep_fn=_sleep)
+    return bool(outcome)
+
+
+def chop_phase(ctx, items) -> bool:
+    """Chop until the inventory is full.
+
+    ONE CLICK, not one per root: chopping is a CONTINUOUS action and the game ends it itself
+    with "Your inventory is too full". Re-clicking mid-action would cancel and restart it."""
+    roots = _nearest(_objects(ids={w.OBJ_ROOTS}, action="Chop"))
+    if not roots:
+        debug_log.log(LOG, "chop: no Bruma roots in view")
+        return False
+    return _click_object(
+        ctx, roots, "Chop", CHOP_BUDGET_S,
+        lambda: ws.inventory_full(_inventory()),
+        signals=["CHAT_MESSAGE"])
+
+
+def _use_knife_on_root(ctx, knife, root) -> bool:
+    return _use_on(ctx, knife, root)
+
+
+def fletch_phase(ctx, items) -> bool:
+    """Fletch the whole inventory of roots into kindling.
+
+    Also CONTINUOUS: one knife-on-root and the game fletches the lot, ending with "You have run
+    out of bruma roots"."""
+    knife = next((i for i in items if "knife" in (i.get("name") or "").lower()), None)
+    root = next((i for i in items if i.get("id") == w.ITEM_ROOT), None)
+    if not knife or not root:
+        return False
+    controller.open_inventory_tab(ctx.ser)
+    if not _use_knife_on_root(ctx, knife, root):
+        return False
+    return _await(ctx, ["CHAT_MESSAGE", "INVENTORY_CHANGED"], FLETCH_BUDGET_S,
+                  lambda: ws.count_item(_inventory(), w.ITEM_ROOT) == 0)
+
+
+def feed_phase(ctx, reader, items, brazier) -> bool:
+    """Feed the lit brazier until we are empty.
+
+    The brazier is found by the LIT id (29314) specifically. Its unlit and broken twins are
+    both named "Brazier" and one of them is usually nearer, so a nearest-by-name pick takes the
+    wrong object -- the shut-vs-open door lesson."""
+    lit = _nearest(_objects(ids={w.OBJ_BRAZIER_LIT}, action="Feed"))
+    if not lit:
+        debug_log.log(LOG, "feed: no burning brazier in view")
+        return False
+    return _click_object(
+        ctx, lit, "Feed", FEED_BUDGET_S,
+        lambda: (ws.count_item(_inventory(), w.ITEM_KINDLING) == 0
+                 and ws.count_item(_inventory(), w.ITEM_ROOT) == 0),
+        signals=["CHAT_MESSAGE", "INVENTORY_CHANGED"])
