@@ -1274,8 +1274,11 @@ def _too_far(obj) -> bool:
 
 
 def _walk_to(ctx, obj) -> bool:
-    import travel
-    return bool(travel.walk_to(ctx, obj.get("x"), obj.get("y"), obj.get("plane", 0)))
+    # travel.walk_to takes a TARGET DICT, not x/y/plane positionals -- an earlier draft passed
+    # four positional args and raised AttributeError on the first walk. travel.walk_to_exact_tile
+    # is the one that takes x/y/plane; do not confuse them.
+    return bool(travel.walk_to(ctx, {"x": obj.get("x"), "y": obj.get("y"),
+                                     "plane": obj.get("plane", 0)}))
 
 
 def _click_inventory_item(ctx, item, action, budget_s, confirm):
