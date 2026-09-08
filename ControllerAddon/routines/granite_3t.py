@@ -265,8 +265,24 @@ def _inventory_full():
 
 
 def full_inventory_phase(ctx, cfg):
-    """Replaced in Task 7. Returning False here means 'this tick was not spent on a drop'."""
-    return False
+    """True when this tick was spent dropping. Knife + log leaves 26 slots, so this comes due
+    roughly every 26 cycles (~60-70s).
+
+    controller.drop_items is the right primitive and its contract matters here: it returns the
+    CONFIRMED inventory delta, not the number of clicks issued, and it polls DROP_CONFIRM_S
+    before deciding -- a verification window shorter than the game's 0.6s tick reads a good drop
+    as a failure. It also holds SHIFT once across the burst rather than tapping it per item,
+    which is a wire-visible difference (EVENT_KEYBOARD carries every press with its gap)."""
+    if not _inventory_full():
+        return False
+
+    keep = (cfg["knifeName"].lower(), cfg["logName"].lower())
+    items = [i for i in (controller.get_inventory() or [])
+             if not any(k in (i.get("name") or "").lower() for k in keep)]
+    debug_log.log(CATEGORY, f"inventory full -- dropping {len(items)} granite")
+    if not controller.drop_items(ctx.ser, items):
+        ctx.state.trigger_safety_stop("inventory still full after dropping the granite")
+    return True
 
 
 CHAIN_MAX_S = 45.0      # hand control back to the engine at least this often

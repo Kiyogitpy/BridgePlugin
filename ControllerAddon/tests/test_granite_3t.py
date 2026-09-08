@@ -410,3 +410,50 @@ def test_tick_safety_stops_on_an_empty_rock_rotation(monkeypatch):
     g.tick(ctx)
     assert ctx.state.safety_stopped is True
     assert "rocktiles" in ctx.state.safety_reason.lower()
+
+
+def _full_inventory():
+    inv = [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)]
+    inv += [_item("Granite (5kg)", 1700 + i, 830, 2 + i) for i in range(26)]
+    return inv
+
+
+def test_a_full_inventory_drops_the_granite(monkeypatch):
+    dropped = {}
+    monkeypatch.setattr(controller, "get_inventory", _full_inventory)
+    monkeypatch.setattr(controller, "drop_items",
+                        lambda ser, items: (dropped.update(names=[i["name"] for i in items]),
+                                            True)[1])
+    ctx = _Ctx()
+    assert g.full_inventory_phase(ctx, _cfg()) is True
+    assert set(dropped["names"]) == {"Granite (5kg)"}
+
+
+def test_the_drop_NEVER_touches_the_knife_or_the_log(monkeypatch):
+    """A dropped log ends the run; a dropped knife ends it too. Both are on the keep list."""
+    dropped = {}
+    monkeypatch.setattr(controller, "get_inventory", _full_inventory)
+    monkeypatch.setattr(controller, "drop_items",
+                        lambda ser, items: (dropped.update(names=[i["name"] for i in items]),
+                                            True)[1])
+    ctx = _Ctx()
+    g.full_inventory_phase(ctx, _cfg())
+    assert "Knife" not in dropped["names"]
+    assert "Teak logs" not in dropped["names"]
+
+
+def test_a_drop_that_frees_nothing_safety_stops(monkeypatch):
+    """drop_items returns the CONFIRMED delta. False means nothing left the inventory, and a
+    routine that keeps mining with no room is the silent loop this repo keeps paying for."""
+    monkeypatch.setattr(controller, "get_inventory", _full_inventory)
+    monkeypatch.setattr(controller, "drop_items", lambda ser, items: False)
+    ctx = _Ctx()
+    g.full_inventory_phase(ctx, _cfg())
+    assert ctx.state.safety_stopped is True
+
+
+def test_a_non_full_inventory_is_not_a_drop_tick(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
+    ctx = _Ctx()
+    assert g.full_inventory_phase(ctx, _cfg()) is False
