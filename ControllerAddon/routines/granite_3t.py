@@ -316,8 +316,12 @@ def check_geometry(cfg, inv):
     if logs == 0:
         return True, "no loose log yet -- will draw one from the log basket"
     if logs > 1:
-        return False, (f"{logs} x {cfg['logName']!r} in the inventory -- there must be exactly "
-                       f"one, or knife-on-log opens a Make-X interface and eats a tick")
+        # NOT a refusal any more: ensure_one_loose_log drops back to one on the first tick, and
+        # a restock deliberately comes home with a pile. MEASURED LIVE 2026-09-08 -- the first
+        # bank trip returned with 26 loose logs and this guard stopped the run one basket-Fill
+        # short of working. The rule it states is still true; it is just not a reason to refuse.
+        return True, (f"{logs} x {cfg['logName']!r} loose -- will drop back to exactly one "
+                      f"(more than one opens a Make-X interface and eats a tick)")
 
     log = find_item(inv, cfg["logName"])
     if log.get("screenX") is None:
@@ -561,12 +565,28 @@ def restock_phase(ctx, cfg):
         travel.walk_to(ctx, {"x": bank_tile[0], "y": bank_tile[1], "plane": bank_tile[2]})
         return True
 
-    bank = banker.find_nearby_bank({"maxBankDistance": 12})
-    if bank is None:
-        debug_log.log(CATEGORY, "restock: at the bank tile but no bank object in view")
+    # TRY EVERY NEARBY BANK OBJECT, not just the closest. MEASURED LIVE 2026-09-08: the
+    # inventory panel is dragged into the middle of the screen for this routine (the whole
+    # geometry argument depends on the log slot being near the rocks), and at the bank that
+    # panel sits over the nearest chest's clickbox -- open_bank refused with "aim point is
+    # behind a UI panel" and rotated the camera instead. The Great Conch bank has seven
+    # bankable objects spread over several tiles, so the one behind the panel is not the only
+    # one; walking a tile would also work but trying the next object is cheaper and surer.
+    banks = [o for o in (controller.get_objects(interactable=True) or [])
+             if any(a.lower() == "bank" for a in (o.get("actions") or []))
+             and (o.get("distance") or 99) <= 12]
+    banks.sort(key=lambda o: o.get("distance") or 99)
+    if not banks:
+        debug_log.log(CATEGORY, "restock: at the bank tile but no bankable object in view")
         return True
-    if not banker.open_bank(ctx, bank):
-        debug_log.log(CATEGORY, "restock: could not open the bank")
+    for candidate in banks[:4]:
+        if banker.open_bank(ctx, candidate):
+            break
+        debug_log.log(CATEGORY, f"restock: {candidate.get('name')} at "
+                                f"({candidate.get('x')},{candidate.get('y')}) would not open "
+                                f"-- trying the next one")
+    else:
+        debug_log.log(CATEGORY, "restock: no bank object would open")
         return True
 
     data["g3t_restock_trips"] = trips + 1
@@ -946,14 +966,43 @@ def tick(ctx):
         data["g3t_last_tick_at"] = _now()
 
 
+def _reseed_stall(ctx):
+    """Stand the Mining-XP stall watch down for this tick.
+
+    The watch is wall-clock and only resets on rising xp, so any tick spent NOT cycling -- a
+    bank walk, a basket refill, an unreadable position -- looks identical to a stall. MEASURED
+    LIVE 2026-09-08: an 80s round trip to the bank tripped "no Mining xp for 80s -- the rocks
+    may be contested", which was true and entirely beside the point. Same shape as the gap
+    reseed in tick(), which covers breaks and pauses; this covers work we chose to do."""
+    ctx.state.data["g3t_xp_at"] = _now()
+
+
+def _hold_one_log(ctx, cfg):
+    """True when exactly one loose log is in hand. False means this tick was spent getting
+    there -- topping up from the basket, or a leg of the bank trip."""
+    data = ctx.state.data
+    if ensure_one_loose_log(ctx, cfg):
+        data["g3t_log_refills"] = 0
+        # Re-baseline: whatever the count was before, we deliberately hold exactly one now, and
+        # the consumption warning downstream compares against this. Without it, resolving a
+        # 26-log surplus reads as "25 logs consumed".
+        data["g3t_logs"] = 1
+        return True
+    fails = data.get("g3t_log_refills", 0) + 1
+    data["g3t_log_refills"] = fails
+    if fails >= BASKET_REFILL_TRIES:
+        # The basket cannot dispense a single log outside a bank (see restock_phase), so the
+        # only fix is the trip. Reset so the trip gets a clean slate.
+        data["g3t_log_refills"] = 0
+        restock_phase(ctx, cfg)
+    return False
+
+
 def _run_chain(ctx):
     cfg = ctx.state.config
     data = ctx.state.data
 
     if data.get("g3t_startup_pending") and not _startup_check(ctx, cfg):
-        return
-
-    if full_inventory_phase(ctx, cfg):
         return
 
     inv = controller.get_inventory() or []
@@ -973,6 +1022,35 @@ def _run_chain(ctx):
         return
     data["g3t_empty_reads"] = 0
 
+    # THE LOG SURPLUS IS RESOLVED BEFORE THE FULL-INVENTORY DROP, and the order is load-bearing.
+    # MEASURED LIVE 2026-09-08: the first restock came back with 27 logs, which fills the
+    # inventory -- and every one of them is on the keep list, so full_inventory_phase found
+    # nothing droppable and safety-stopped a run that was one basket-Fill away from working.
+    # A pile of logs is a known, resolvable state, not a stuck one.
+    # WALK HOME WHENEVER WE ARE NOT AT THE ROCKS, derived from POSITION rather than from a
+    # stored "returning" flag. MEASURED LIVE 2026-09-08: a restart at the bank lost the flag and
+    # the routine cheerfully tried to cycle there, logging "rock did not resolve" for all four
+    # rocks forever. ctx.state.data does not survive a restart; the player's position does.
+    here = _tile_of(controller.get_player() or {})
+    if here[0] is None:
+        # AN UNREADABLE POSITION IS "CANNOT TELL", NOT "CARRY ON". MEASURED LIVE 2026-09-08:
+        # /player reads empty for a tick right after the bank interface closes, the walk-home
+        # check was skipped, and the routine cheerfully cycled at the bank -- "rock did not
+        # resolve" four times a second. Same rule as the empty /inventory read above.
+        _reseed_stall(ctx)
+        return
+    if _dist(here, tuple(cfg["mineTile"])) > BANK_ARRIVAL_TILES:
+        _reseed_stall(ctx)
+        if return_phase(ctx, cfg):
+            return
+    if not _hold_one_log(ctx, cfg):
+        _reseed_stall(ctx)
+        return
+
+    if full_inventory_phase(ctx, cfg):
+        return
+
+
     knife = find_item(inv, cfg["knifeName"])
     if knife is None:
         ctx.state.trigger_safety_stop(f"the {cfg['knifeName']!r} is gone from the inventory")
@@ -982,21 +1060,6 @@ def _run_chain(ctx):
     # cycle never consumes a log (the rock click interrupts the fletch), so reaching into the
     # basket means something went wrong earlier -- which is precisely what the wiki means by
     # carrying spares "in case of mistakes". See ensure_one_loose_log.
-    # A trip home from the bank takes priority over everything: we have the logs, we are just
-    # not standing on the rocks yet.
-    if data.get("g3t_returning") and return_phase(ctx, cfg):
-        return
-
-    if not ensure_one_loose_log(ctx, cfg):
-        fails = data.get("g3t_log_refills", 0) + 1
-        data["g3t_log_refills"] = fails
-        if fails >= BASKET_REFILL_TRIES:
-            # The basket cannot dispense a single log outside a bank (see restock_phase), so
-            # the only fix is the trip. Reset the counter so the trip gets a clean slate.
-            data["g3t_log_refills"] = 0
-            restock_phase(ctx, cfg)
-        return
-    data["g3t_log_refills"] = 0
 
     log = find_item(inv := (controller.get_inventory() or []), cfg["logName"])
     if log is None or log.get("screenX") is None:
