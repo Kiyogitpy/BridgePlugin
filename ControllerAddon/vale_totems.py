@@ -173,3 +173,37 @@ def logs_needed_for_lap(state) -> int:
         else:
             total += max(0, MAX_DECORATIONS - site.decorations)
     return total
+
+
+def builds_needed(state) -> int:
+    """Sites that still need a totem erected -- one LOG each, and a log a bow cannot replace."""
+    return sum(1 for site in state.sites.values()
+               if not site_is_finished(site) and needs_build(site))
+
+
+def bows_needed(state) -> int:
+    """Decorations still outstanding across the ring, which is also the bow count.
+
+    logs_needed_for_lap already charges an unbuilt site LOGS_PER_TOTEM (1 build + 4
+    decorations) and a built one its missing decorations, so the bows are simply that total
+    minus the one build log each unbuilt site owes."""
+    return max(0, logs_needed_for_lap(state) - builds_needed(state))
+
+
+def fletch_budget(state, logs: int, bows: int) -> int:
+    """How many more bows are worth fletching right now. 0 means "do not fire the fletch".
+
+    THE DEADLOCK THIS EXISTS TO PREVENT (final review 2026-09-08): start_fletching picks a make
+    option with NO quantity, so the game keeps fletching until the next click interrupts it --
+    8-14 bows over a 15-25s leg where the design budgets 4. Every bow is a log already spent,
+    and `build` needs a LOG specifically, so a routine that fletches whatever it is holding
+    walks itself into "plenty of bows, no logs" and can never build again. That is a genuine
+    deadlock, not waste.
+
+    So the build logs are RESERVED first: only logs beyond the ones the outstanding builds owe
+    may become bows. The fletch itself is still not stopped mid-action -- the next site's click
+    interrupts it, which is how the human plays -- this only decides whether to start one.
+    """
+    want = max(0, bows_needed(state) - bows)
+    spare = max(0, logs - builds_needed(state))
+    return min(want, spare)

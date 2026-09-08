@@ -135,3 +135,66 @@ def test_logs_needed_for_a_lap_counts_only_the_work_still_outstanding():
               decorations=4, durabilityRemaining=5),                     # finished: 0
     )
     assert vt.logs_needed_for_lap(vt.parse_state(payload)) == 5
+
+
+# --- C4a: the fletch budget (final review 2026-09-08) -----------------------------------
+#
+# The make menu has NO quantity, so the game fletches until the next click interrupts it --
+# 8-14 bows over a 15-25s leg where a totem needs 4. Every bow is a log already spent, and
+# build needs a LOG specifically, so an unbudgeted fletch walks the routine into "plenty of
+# bows, no logs" and it can never build again. That is a deadlock, not waste.
+
+
+def _ring(*sites):
+    return vt.parse_state(_payload(*sites))
+
+
+def test_no_bow_is_fletched_out_of_a_log_a_build_is_owed():
+    # Eight unbuilt sites owe eight build logs. Holding three, none of them is spare.
+    state = _ring(*[_site(siteNumber=n) for n in range(1, 9)])
+    assert vt.builds_needed(state) == 8
+    assert vt.fletch_budget(state, logs=3, bows=0) == 0
+    assert vt.fletch_budget(state, logs=8, bows=0) == 0
+
+
+def test_the_spare_logs_above_the_builds_are_the_budget():
+    state = _ring(*[_site(siteNumber=n) for n in range(1, 9)])
+    # 8 builds owed; 12 logs leaves 4 spare, and 32 decorations are still wanted.
+    assert vt.bows_needed(state) == 32
+    assert vt.fletch_budget(state, logs=12, bows=0) == 4
+
+
+def test_the_budget_never_exceeds_the_bows_still_wanted():
+    # One site, built and carved, three of four decorations done: one bow left to want.
+    state = _ring(_site(siteNumber=1, baseValue=4, wood="YEW", baseCarved=True,
+                        decorations=3, durabilityRemaining=5))
+    assert vt.builds_needed(state) == 0
+    assert vt.bows_needed(state) == 1
+    assert vt.fletch_budget(state, logs=27, bows=0) == 1
+    # ...and once that bow is in hand there is nothing left to make.
+    assert vt.fletch_budget(state, logs=27, bows=1) == 0
+    assert vt.fletch_budget(state, logs=27, bows=9) == 0
+
+
+def test_a_finished_ring_wants_no_bows_at_all():
+    state = _ring(*[_site(siteNumber=n, baseValue=4, wood="YEW", baseCarved=True,
+                          decorations=4, durabilityRemaining=5) for n in range(1, 9)])
+    assert vt.fletch_budget(state, logs=28, bows=0) == 0
+
+
+def test_the_budget_is_never_negative():
+    state = _ring(_site(siteNumber=1))
+    assert vt.fletch_budget(state, logs=0, bows=0) == 0
+    assert vt.fletch_budget(state, logs=0, bows=99) == 0
+
+
+def test_builds_and_bows_add_back_up_to_the_lap_budget():
+    """The two halves are derived from logs_needed_for_lap, so they must reconstruct it --
+    one build log plus four decorations per unbuilt site is LOGS_PER_TOTEM."""
+    state = _ring(_site(siteNumber=1),
+                  _site(siteNumber=2, baseValue=4, wood="YEW", baseCarved=True,
+                        decorations=1, durabilityRemaining=5),
+                  _site(siteNumber=3, baseValue=4, wood="YEW", baseCarved=True,
+                        decorations=4, durabilityRemaining=5))
+    assert vt.builds_needed(state) + vt.bows_needed(state) == vt.logs_needed_for_lap(state)
+    assert vt.logs_needed_for_lap(state) == vt.LOGS_PER_TOTEM + 3
