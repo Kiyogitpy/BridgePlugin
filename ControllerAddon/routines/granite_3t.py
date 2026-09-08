@@ -199,7 +199,9 @@ def _probe():
     player = controller.get_player() or {}
     print(f"player at ({player.get('x')},{player.get('y')},{player.get('plane')})")
     for item in inv:
-        print(f"  slot {item.get('slot'):>2}  {item.get('name'):<20} "
+        slot = item.get("slot") if item.get("slot") is not None else "?"
+        name = item.get("name") or "?"
+        print(f"  slot {slot:>2}  {name:<20} "
               f"({item.get('screenX')},{item.get('screenY')})")
     granite = [o for o in (controller.get_objects(interactable=True) or [])
                if "granite" in (o.get("name") or "").lower()]
