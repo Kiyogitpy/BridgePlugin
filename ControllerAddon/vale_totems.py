@@ -116,3 +116,60 @@ def needs_carve(site) -> bool:
 def needs_decorate(site) -> bool:
     return (not needs_build(site) and site.base_carved
             and site.decorations < MAX_DECORATIONS)
+
+
+# One log builds the totem, four more become the decorations. Wiki: 40 logs for all eight.
+LOGS_PER_TOTEM = 5
+
+
+def site_is_finished(site) -> bool:
+    """Built, carved and fully decorated -- nothing left to do but let the ents visit."""
+    return (not needs_build(site) and site.base_carved
+            and site.decorations >= MAX_DECORATIONS)
+
+
+def next_action(site, *, logs: int, bows: int):
+    """The single next thing to do at `site`, as (action, argument).
+
+    A LADDER, re-derived from live state every call rather than a script -- which is what lets
+    a still-standing totem with durability left fall straight through to ("done", None) and be
+    passed. The recording rebuilds every site every lap only because a yew totem's 5 durability
+    is spent by the time the ~4.4-minute lap comes round; that is a property of the lap time,
+    not a rule.
+
+    Claim outranks everything: the pile is already earned, and a build on a capped pile is
+    refused by the game anyway.
+
+    Running out of a material yields ("done", None), NOT a retry -- the caller walks on and the
+    bank rung deals with it. A rung that cannot progress must never hold the routine in place.
+    """
+    if site.unclaimed_offerings > 0:
+        return ("claim", None)
+    if needs_build(site):
+        return ("build", None) if logs > 0 else ("done", None)
+    if needs_carve(site):
+        missing = missing_spirits(site)
+        if missing:
+            return ("carve", missing[0])
+        # baseCarved is false but nothing nearby is missing: the spirits rotated under us.
+        # Fall through rather than guess -- the next read will show the new trio.
+        return ("done", None)
+    if needs_decorate(site):
+        return ("decorate", None) if bows > 0 else ("done", None)
+    return ("done", None)
+
+
+def logs_needed_for_lap(state) -> int:
+    """Logs required to finish every site that still has work outstanding.
+
+    Used only to decide whether a bank trip is due, so it counts the WORK LEFT rather than
+    assuming a full lap: a site already built needs its decorations but not its build log."""
+    total = 0
+    for site in state.sites.values():
+        if site_is_finished(site):
+            continue
+        if needs_build(site):
+            total += LOGS_PER_TOTEM
+        else:
+            total += max(0, MAX_DECORATIONS - site.decorations)
+    return total

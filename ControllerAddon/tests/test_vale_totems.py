@@ -73,3 +73,53 @@ def test_state_carries_the_globals():
     assert state.research_points == 94
     assert state.total_unclaimed == 385
     assert state.at_vale_totems is True
+
+
+import vale_totem_route as vtr
+
+
+def test_claim_outranks_everything_so_offerings_are_never_left_behind():
+    site = vt.parse_state(_payload(_site(unclaimedOfferings=65))).sites[1]
+    assert vt.next_action(site, logs=10, bows=10) == ("claim", None)
+
+
+def test_build_is_chosen_once_the_pile_is_claimed():
+    site = vt.parse_state(_payload(_site())).sites[1]
+    assert vt.next_action(site, logs=10, bows=10) == ("build", None)
+
+
+def test_build_is_not_chosen_without_a_log():
+    site = vt.parse_state(_payload(_site())).sites[1]
+    assert vt.next_action(site, logs=0, bows=10) == ("done", None)
+
+
+def test_carve_names_the_first_missing_spirit():
+    site = vt.parse_state(_payload(_site(
+        baseValue=4, wood="YEW",
+        bottom={"value": 10, "spirit": "BUFFALO"},
+        nearbySpirits=["BUFFALO", "JAGUAR", "SNAKE"]))).sites[1]
+    assert vt.next_action(site, logs=10, bows=10) == ("carve", "JAGUAR")
+
+
+def test_decorate_is_skipped_with_no_bows_so_the_routine_moves_on_instead_of_spinning():
+    site = vt.parse_state(_payload(_site(
+        baseValue=4, wood="YEW", baseCarved=True, decorations=1))).sites[1]
+    assert vt.next_action(site, logs=10, bows=2) == ("decorate", None)
+    assert vt.next_action(site, logs=10, bows=0) == ("done", None)
+
+
+def test_a_finished_totem_is_done():
+    site = vt.parse_state(_payload(_site(
+        baseValue=4, wood="YEW", baseCarved=True, decorations=4,
+        durabilityRemaining=5))).sites[1]
+    assert vt.next_action(site, logs=10, bows=10) == ("done", None)
+    assert vt.site_is_finished(site) is True
+
+
+def test_logs_needed_for_a_lap_counts_only_the_work_still_outstanding():
+    payload = _payload(
+        _site(siteNumber=1),                                             # unbuilt: 1 + 4
+        _site(siteNumber=2, baseValue=4, wood="YEW", baseCarved=True,
+              decorations=4, durabilityRemaining=5),                     # finished: 0
+    )
+    assert vt.logs_needed_for_lap(vt.parse_state(payload)) == 5
