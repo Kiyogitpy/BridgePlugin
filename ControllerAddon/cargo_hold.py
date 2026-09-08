@@ -251,7 +251,15 @@ def deposit_item(ctx, name: str) -> bool:
 
     # NOT **_CLICK_KWARGS -- see withdraw_salvage's own comment: click_menu_action has no
     # simulate_mistakes parameter, and splatting the dict here is a runtime TypeError.
-    controller.click_menu_action(ctx.ser, entry, "Deposit-All", offset=(0, 0),
+    # ("Deposit-All", "Deposit") -- NOT "Deposit-All" alone. CONFIRMED LIVE 2026-09-08:
+    #     [!] No 'Deposit-All' entry in menu for Diamond bracelet (['Cancel', 'Examine', 'Deposit'])
+    # A STACKED item in the 944 side panel offers Deposit-All/-1/-5/-10/-X, but a single
+    # non-stackable one offers only "Deposit". The widget capture that this module was built from
+    # showed exactly that asymmetry (stacked Plundered salvage with the full set, a lone Rune
+    # scimitar with just ['Deposit', 'Examine']) and the first implementation still asked only for
+    # Deposit-All -- so the keeper sink could not stow any single item, which is most of them.
+    # click_menu_action takes a sequence and matches whichever entry is present.
+    controller.click_menu_action(ctx.ser, entry, ("Deposit-All", "Deposit"), offset=(0, 0),
                                  check_ui_blockers=False)
 
     def _count_dropped():

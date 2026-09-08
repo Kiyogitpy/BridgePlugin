@@ -354,7 +354,8 @@ def test_deposit_item_deposits_the_named_item_and_confirms_it_dropped(monkeypatc
         return [{"name": "Rune scimitar"}] if reads["n"] < 2 else []
     monkeypatch.setattr(controller, "get_inventory", _inv)
     assert cargo_hold.deposit_item(_Ctx(), "Rune scimitar") is True
-    assert calls == [("Deposit-All", {"offset": (0, 0), "check_ui_blockers": False})]
+    assert calls == [(("Deposit-All", "Deposit"),
+                      {"offset": (0, 0), "check_ui_blockers": False})]
 
 
 def test_deposit_item_matches_exact_name_not_substring(monkeypatch):
@@ -410,5 +411,5 @@ def test_deposit_item_does_not_splat_click_kwargs_into_click_menu_action(monkeyp
     cargo_hold.deposit_item(_Ctx(), "Rune scimitar")
     assert len(calls) == 1
     option, kwargs = calls[0]
-    assert option == "Deposit-All"
+    assert option == ("Deposit-All", "Deposit")   # stacked vs single-item menus
     assert "simulate_mistakes" not in kwargs

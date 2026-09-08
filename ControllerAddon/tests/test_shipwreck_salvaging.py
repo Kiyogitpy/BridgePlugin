@@ -560,37 +560,29 @@ def test_keep_list_matches_case_insensitive_substrings():
     assert ss.keep_item("Emerald ring", ["diamond", "ruby"]) is False
 
 
-def test_the_inert_amulet_is_matched_without_relying_on_the_apostrophe():
-    """Cache obj 32398 is named "Sailors' amulet (inert)". The default list keys on
-    "amulet (inert)" precisely so a differing apostrophe cannot silently drop it."""
-    assert "amulet (inert)" in ss.DEFAULT_CONFIG["keepItems"]
-    assert ss.keep_item("Sailors' amulet (inert)", ss.DEFAULT_CONFIG["keepItems"]) is True
-    assert ss.keep_item("Sailors’ amulet (inert)", ss.DEFAULT_CONFIG["keepItems"]) is True
 
-
-def test_the_default_keep_list_drops_what_the_user_asked_to_toss():
+def test_the_default_keep_list_keeps_only_what_the_hold_will_take(monkeypatch):
+    """USER 2026-09-08: "only rune cannonball and repairkit since we can store that in the hold,
+    otherwise eventually we would fill our entire inventory". 943.14 deposits SALVAGE ONLY, so a
+    keeper the hold will not take occupies a slot for the rest of the run."""
     keep = ss.DEFAULT_CONFIG["keepItems"]
-    for tossed in ["Casket", "Oyster pearls", "Gold ring", "Sapphire ring",
-                   "Emerald bracelet", "Mithril scimitar", "Mithril cannonball",
-                   "Adamant cannonball"]:
+    assert sorted(keep) == ["repair kit", "rune cannonball"]
+    for kept in ["Rune cannonball", "Mahogany repair kit"]:
+        assert ss.keep_item(kept, keep) is True, kept
+    # Everything that used to be kept but cannot go in the hold is now dropped.
+    for tossed in ["Diamond bracelet", "Diamond ring", "Ruby bracelet", "Facility bottle (empty)",
+                   "Rune scimitar", "Dragon cannonball", "Sailors' amulet (inert)",
+                   "Casket", "Oyster pearls", "Gold ring", "Emerald bracelet",
+                   "Mithril scimitar", "Mithril cannonball", "Adamant cannonball"]:
         assert ss.keep_item(tossed, keep) is False, tossed
 
 
-def test_the_default_keep_list_keeps_what_the_user_asked_to_keep():
-    keep = ss.DEFAULT_CONFIG["keepItems"]
-    for kept in ["Facility bottle (empty)", "Mahogany repair kit", "Diamond ring",
-                 "Diamond bracelet", "Ruby bracelet", "Dragon cannonball",
-                 "Rune scimitar", "Rune cannonball", "Sailors' amulet (inert)"]:
-        assert ss.keep_item(kept, keep) is True, kept
-
-
-# --- drop_items --------------------------------------------------------------------------
 
 def test_drop_items_drops_only_what_the_predicate_selects(monkeypatch):
     """The wrapper owns the predicate filter; controller.drop_items owns the clicking."""
     inv = [{"name": "Gold ring", "screenX": 1, "screenY": 1},
            {"name": "Chisel", "screenX": 2, "screenY": 2},
-           {"name": "Rune scimitar", "screenX": 3, "screenY": 3}]
+           {"name": "Rune cannonball", "screenX": 3, "screenY": 3}]
     state = {"inv": list(inv)}
     monkeypatch.setattr(controller, "get_inventory", lambda: list(state["inv"]))
     handed = []
@@ -888,7 +880,7 @@ def test_sort_disposal_respects_the_keep_list(monkeypatch):
     ss.sort_phase(_Ctx())
     pred = predicates[0]
     assert pred("Gold ring") is True          # not on the default keep-list
-    assert pred("Rune scimitar") is False     # on it
+    assert pred("Rune cannonball") is False   # on it
     assert pred("Chisel") is False            # hard-keep
     assert pred("Plundered salvage") is False # never dropped by disposal
 
@@ -1346,15 +1338,15 @@ def test_keeper_names_excludes_hard_keep_even_when_it_matches_keepitems():
     """A pathological keepItems entry that happens to overlap a HARD_KEEP word must still be
     excluded -- the exclusion is by HARD_KEEP membership, not by whether keepItems asked for it."""
     inv = [{"name": "Chisel"}, {"name": "Rune pouch"}, {"name": "Coins"},
-           {"name": "Rune scimitar"}]
+           {"name": "Rune cannonball"}]
     names = ss._keeper_names(inv, ["chisel", "rune", "coins", "scimitar"])
-    assert names == {"Rune scimitar"}
+    assert names == {"Rune cannonball"}
 
 
 def test_stow_keepers_never_calls_deposit_item_with_a_hard_keep_name(monkeypatch):
     inv = [{"name": "Chisel"}, {"name": "Rune pouch"}, {"name": "Coins"},
            {"name": "Gem bag"}, {"name": "Plank sack"}, {"name": "Log basket"},
-           {"name": "Rune scimitar"}]
+           {"name": "Rune cannonball"}]
     monkeypatch.setattr(controller, "get_inventory", lambda: inv)
     monkeypatch.setattr(ss.cargo_hold, "open_hold", lambda ctx: True)
     monkeypatch.setattr(ss.cargo_hold, "close_hold", lambda ctx: True)
@@ -1363,7 +1355,7 @@ def test_stow_keepers_never_calls_deposit_item_with_a_hard_keep_name(monkeypatch
                         lambda ctx, name: deposited.append(name) or True)
     ctx = _Ctx()
     freed = ss.stow_keepers(ctx)
-    assert deposited == ["Rune scimitar"]
+    assert deposited == ["Rune cannonball"]
     for hard in ["Chisel", "Rune pouch", "Coins", "Gem bag", "Plank sack", "Log basket"]:
         assert hard not in deposited
     assert freed == 1
@@ -1381,7 +1373,7 @@ def test_stow_keepers_returns_zero_when_nothing_qualifies(monkeypatch):
 def test_sort_phase_stows_keepers_when_free_slots_run_low(monkeypatch):
     """C2 step 2: sort_phase itself must call stow_keepers once free slots fall below
     KEEPER_STOW_FREE_SLOTS, before it tries to withdraw more salvage."""
-    inv = ([{"name": "Rune scimitar", "screenX": i, "screenY": i}
+    inv = ([{"name": "Rune cannonball", "screenX": i, "screenY": i}
             for i in range(controller.INVENTORY_SIZE - 2)]
            + [{"name": "Plundered salvage", "screenX": 900, "screenY": 900}])
     assert controller.INVENTORY_SIZE - len(inv) < ss.KEEPER_STOW_FREE_SLOTS
@@ -1399,7 +1391,7 @@ def test_sort_phase_stows_keepers_when_free_slots_run_low(monkeypatch):
 def test_withdraw_is_skipped_with_zero_free_slots_and_hold_has_salvage_is_untouched(monkeypatch):
     """The free-slot guard (C2, mandatory): must not attempt a withdraw with no room, and must
     NOT record hold_has_salvage=False over it -- a full INVENTORY says nothing about the hold."""
-    full_inv = [{"name": "Rune scimitar", "screenX": i, "screenY": i}
+    full_inv = [{"name": "Rune cannonball", "screenX": i, "screenY": i}
                 for i in range(controller.INVENTORY_SIZE)]
     monkeypatch.setattr(controller, "get_inventory", lambda: full_inv)
     monkeypatch.setattr(ss, "drop_items", lambda ctx, pred: 0)
@@ -1418,7 +1410,7 @@ def test_withdraw_is_skipped_with_zero_free_slots_and_hold_has_salvage_is_untouc
 
 
 def test_terminal_stop_fires_when_the_inventory_is_full_of_keepers_the_hold_wont_take(monkeypatch):
-    inv = [{"name": "Rune scimitar", "screenX": i, "screenY": i}
+    inv = [{"name": "Rune cannonball", "screenX": i, "screenY": i}
            for i in range(controller.INVENTORY_SIZE)]
     monkeypatch.setattr(controller, "get_inventory", lambda: inv)
     monkeypatch.setattr(ss, "drop_items", lambda ctx, pred: 0)  # every item is a keeper
@@ -1436,7 +1428,7 @@ def test_terminal_stop_fires_when_the_inventory_is_full_of_keepers_the_hold_wont
 def test_no_terminal_stop_when_the_inventory_is_full_but_still_has_something_droppable(monkeypatch):
     """A full inventory alone is not the stuck condition -- only "full AND nothing left to
     sort/stow/drop" is."""
-    inv = ([{"name": "Rune scimitar", "screenX": i, "screenY": i}
+    inv = ([{"name": "Rune cannonball", "screenX": i, "screenY": i}
             for i in range(controller.INVENTORY_SIZE - 1)]
            + [{"name": "Gold ring", "screenX": 900, "screenY": 900}])   # droppable, not kept
     monkeypatch.setattr(controller, "get_inventory", lambda: inv)
@@ -1475,7 +1467,7 @@ def test_stow_phase_logs_when_the_hold_does_not_close(monkeypatch):
 
 
 def test_stow_keepers_logs_when_the_hold_does_not_close(monkeypatch):
-    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Rune scimitar"}])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Rune cannonball"}])
     monkeypatch.setattr(ss.cargo_hold, "open_hold", lambda ctx: True)
     monkeypatch.setattr(ss.cargo_hold, "deposit_item", lambda ctx, name: True)
     monkeypatch.setattr(ss.cargo_hold, "close_hold", lambda ctx: False)

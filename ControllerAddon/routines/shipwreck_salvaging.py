@@ -82,17 +82,22 @@ DEFAULT_CONFIG = {
                               # Trap inherited from banker.py's same convention: "ring" would
                               # match Gold/Sapphire/Ruby ring alike, and "rune" would match every
                               # runite item -- hence the spelled-out entries below.
-        "amulet (inert)",     # Sailors' amulet (inert), cache obj 32398. Keyed WITHOUT the
-                              # apostrophe on purpose: that character is the one most likely to
-                              # differ between the cache dump and the runtime item name, and a
-                              # near-miss here fails silently IN THE DROP DIRECTION.
-        "facility bottle",    # ~34.6k each, the most valuable single drop
-        "mahogany repair kit",
-        "diamond",            # Diamond ring + Diamond bracelet, ~2.1-2.3k each
-        "ruby",               # Ruby bracelet ~1.4k
-        "dragon cannonball",
-        "rune scimitar",
-        "rune cannonball",
+                              #
+                              # CUT TO TWO ENTRIES 2026-09-08 (USER): "change the whitelist to
+                              # only rune cannonball and repairkit since we can store that in the
+                              # hold, otherwise eventually we would fill our entire inventory".
+                              # This is the structural answer to the keeper-accumulation problem,
+                              # not a preference: 943.14 deposits SALVAGE ONLY, so anything kept
+                              # that the hold will not take occupies an inventory slot for the
+                              # rest of the run. MEASURED live the same day -- a single sort pass
+                              # produced 11 Gold rings, and the wiki's own table implies ~50
+                              # non-stacking keepers an hour against ~24 usable slots, so the old
+                              # eight-entry list filled the inventory within the hour and left
+                              # the routine hooking with nowhere to put anything. Keeping only
+                              # what the hold accepts removes the failure mode at its source
+                              # instead of bounding it with a safety stop.
+        "rune cannonball",    # stackable, so any number costs ONE slot
+        "repair kit",         # substring, so it covers Mahogany/other repair kits alike
     ],
 
     "breaks": {
