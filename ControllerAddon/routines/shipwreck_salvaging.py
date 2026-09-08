@@ -31,6 +31,7 @@ import controller
 import debug_log
 import sailing
 import cargo_hold
+import crew
 
 DEFAULT_CONFIG = {
     "enabled": True,
@@ -76,7 +77,13 @@ DEFAULT_CONFIG = {
                               # AND the won't-engage reposition.
     "stowSalvage": True,      # deposit salvage into the boat's cargo hold instead of dropping
                               # it on the deck. False restores the pre-2026-09-07 behaviour.
-    "sortWhenIdle": True,     # spend a respawn gap sorting rather than idling
+    "sortWhenIdle": True,     # sort while no wreck is in range
+    "crewOnHookWhileSorting": True,   # USER 2026-09-08: "put our crewman on the hook while doing
+                              # so". The player gives up its own hook for the length of a drain,
+                              # so a crewmate covering one is what keeps salvage arriving. The
+                              # side-panel flow this uses has NEVER been driven live (see crew.py)
+                              # and fails safe -- a failure costs the crewmate's salvage for that
+                              # drain and nothing else. Set False to leave the crew alone.     # spend a respawn gap sorting rather than idling
     "holdFullSlots": 4,       # treat the hold as full this many slots short of its capacity
     "keepItems": [            # case-insensitive SUBSTRING keep-list applied to SORTED output.
                               # Trap inherited from banker.py's same convention: "ring" would
@@ -412,7 +419,7 @@ def _sort_progress_tick(data: dict, made_progress: bool) -> None:
 
 
 def derive_phase(config, *, wreck_in_range, hold_full, inventory_salvage, free_slots,
-                 hold_has_salvage, sort_parked=False):
+                 hold_has_salvage, sort_parked=False, draining=False):
     """Which phase this tick should run, derived ENTIRELY from live state.
 
     Never from a stored phase: ctx.state.data is wiped on restart while the boat's real state
@@ -453,6 +460,16 @@ def derive_phase(config, *, wreck_in_range, hold_full, inventory_salvage, free_s
     something_to_sort = bool(inventory_salvage) or hold_has_salvage is not False
 
     if not sort_parked:
+        # DRAINING (USER 2026-09-08: "when the cargo hold is full we should salvage all of it").
+        # hold_full alone is not enough to hold the rung: it clears the moment the hold has room
+        # again, so a wreck rising one batch into a drain pulled the player straight back to the
+        # hook -- MEASURED in the 2026-09-08 live5 log as a sort/hook/sort alternation that never
+        # emptied the hold on a busy world. `draining` latches when the hold first reads full and
+        # only releases when the hold reports NO salvage left, so a drain runs to completion. The
+        # crewmate keeps a hook working meanwhile (see crew.assign_to_hook), which is why giving
+        # up the player's own hook for the duration costs nothing.
+        if draining and something_to_sort:
+            return "sort"
         if hold_full and something_to_sort:
             return "sort"
         if config.get("sortWhenIdle", True) and not wreck_in_range and something_to_sort:
@@ -724,7 +741,26 @@ def tick(ctx):
         free_slots=free_slots,
         hold_has_salvage=data.get("hold_has_salvage"),
         sort_parked=sort_parked,
+        draining=bool(data.get("draining")),
     )
+    # Latch the drain the moment the hold first reads full, and release it only once the hold
+    # reports no salvage left. USER 2026-09-08: "when the cargo hold is full we should salvage all
+    # of it, and put our crewman on the hook while doing so. after salvaging deposit all repair
+    # kits etc." -- so the drain owns the player until the hold is empty, the crewmate covers the
+    # hook meanwhile, and the keepers go into the hold at the end.
+    if data.get("hold_full") and not data.get("draining"):
+        data["draining"] = True
+        debug_log.log("salvage", "the hold is full -- draining it completely before hooking again")
+        if config.get("crewOnHookWhileSorting", True):
+            if not crew.assign_to_hook(ctx):
+                # Unverified interface: a failure here costs the crewmate's salvage for the drain,
+                # nothing else. Never a stop.
+                debug_log.log("salvage", "could not put a crewmate on a hook -- draining anyway")
+    if data.get("draining") and data.get("hold_has_salvage") is False and not inventory_salvage:
+        data.pop("draining", None)
+        debug_log.log("salvage", "the hold is drained -- stowing keepers, then back to the hook")
+        stow_keepers(ctx)
+
     if phase != data.get("salvage_phase"):
         debug_log.log("salvage", f"phase -> {phase}")
         data["salvage_phase"] = phase

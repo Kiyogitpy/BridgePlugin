@@ -647,7 +647,7 @@ def _cfg(**over):
 
 def _phase(**kw):
     args = {"wreck_in_range": False, "hold_full": False, "inventory_salvage": 0,
-            "free_slots": 20, "hold_has_salvage": False}
+            "free_slots": 20, "hold_has_salvage": False, "draining": False}
     cfg = kw.pop("config", _cfg())
     args.update(kw)
     return ss.derive_phase(cfg, **args)
@@ -1621,3 +1621,70 @@ def test_salvage_relics_are_hard_kept_and_never_dropped():
                   "Broken sextant", "Mouldy doll", "Smashed mirror", "Antique lamp"]:
         assert ss.keep_item(relic, []) is True, relic
         assert ss.keep_item(relic, ss.DEFAULT_CONFIG["keepItems"]) is True, relic
+
+
+# --- draining the hold completely (USER 2026-09-08) ---------------------------------------
+
+def test_draining_outranks_a_wreck_in_range():
+    """USER: "when the cargo hold is full we should salvage all of it". hold_full alone clears as
+    soon as the hold has room, so a wreck rising one batch in pulled the player back to the hook
+    -- MEASURED as a sort/hook/sort alternation that never emptied the hold."""
+    assert _phase(wreck_in_range=True, draining=True, hold_has_salvage=True) == "sort"
+
+
+def test_draining_releases_once_the_hold_is_empty():
+    """The latch must not outlive the work -- with nothing left to sort it falls through."""
+    assert _phase(wreck_in_range=True, draining=True,
+                  hold_has_salvage=False, inventory_salvage=0) == "hook"
+
+
+def test_a_parked_sort_rung_still_beats_the_drain_latch():
+    """SORT_FAIL_LIMIT is the ceiling on a sort that cannot progress; draining must not defeat
+    it, or the C1 loop comes back wearing a different name."""
+    assert _phase(wreck_in_range=True, draining=True, hold_has_salvage=True,
+                  sort_parked=True) == "hook"
+
+
+def test_tick_latches_the_drain_and_puts_a_crewmate_on_a_hook(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player())
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(ss, "sort_phase", lambda ctx: True)
+    assigned = []
+    monkeypatch.setattr(ss.crew, "assign_to_hook", lambda ctx: assigned.append(True) or True)
+    ctx = _Ctx()
+    ctx.state.data["hold_full"] = True
+    ctx.state.data["hold_has_salvage"] = True
+    ss.tick(ctx)
+    assert ctx.state.data.get("draining") is True
+    assert assigned == [True]
+
+
+def test_a_failed_crew_assignment_never_stops_the_drain(monkeypatch):
+    """crew.py drives an interface nothing has ever driven live; a failure there must cost the
+    crewmate's salvage for that drain and nothing more."""
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player())
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(ss, "sort_phase", lambda ctx: True)
+    monkeypatch.setattr(ss.crew, "assign_to_hook", lambda ctx: False)
+    ctx = _Ctx()
+    ctx.state.data["hold_full"] = True
+    ctx.state.data["hold_has_salvage"] = True
+    ss.tick(ctx)
+    assert ctx.state.data.get("draining") is True
+
+
+def test_the_drain_ends_by_stowing_the_keepers(monkeypatch):
+    """USER: "after salvaging deposit all repair kits etc." """
+    monkeypatch.setattr(controller, "get_player", lambda: _boat_player())
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    stowed = []
+    monkeypatch.setattr(ss, "stow_keepers", lambda ctx: stowed.append(True) or 1)
+    ctx = _Ctx()
+    ctx.state.data["draining"] = True
+    ctx.state.data["hold_has_salvage"] = False
+    ss.tick(ctx)
+    assert stowed == [True]
+    assert ctx.state.data.get("draining") is None
