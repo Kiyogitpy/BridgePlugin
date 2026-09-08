@@ -404,9 +404,15 @@ def choose_brazier(reader, current=None, preferred="SOUTH_WEST"):
     for key in BRAZIER_KEYS:
         if brazier_operational(braziers.get(key)):
             return key
+    # The preference only wins if IT is relightable. An earlier draft of this function
+    # returned `preferred` whenever ANY brazier had a live pyromancer, without checking
+    # `preferred` itself -- so with SW/NW/SE incapacitated and NE alive it returned
+    # SOUTH_WEST, a brazier that can never be relit, while NE sat unused. Caught in review.
+    if preferred in braziers and pyromancer_status(reader, preferred) != "INCAPACITATED":
+        return preferred
     for key in BRAZIER_KEYS:
-        if pyromancer_status(reader, key) != "INCAPACITATED":
-            return preferred if preferred in braziers else key
+        if key in braziers and pyromancer_status(reader, key) != "INCAPACITATED":
+            return key
     return preferred if preferred in braziers else None
 ```
 
