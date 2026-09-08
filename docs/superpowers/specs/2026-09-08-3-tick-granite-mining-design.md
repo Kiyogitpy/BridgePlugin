@@ -64,6 +64,20 @@ The log basket is not a supply either: emptying it puts 28 loose logs in the inv
 mechanic requires **exactly one** loose log or a Make-X interface opens and eats a tick. Feeding
 one log at a time out of a basket is not an operation the game offers.
 
+**THE LIKELY ANSWER, and the account already owns it: MAGIC LOGS.** The reason teak works for
+most players is almost certainly that they *cannot fletch it* — the action is attempted, sets the
+skilling timer to 3, fails the level check and consumes nothing. This account is Fletching 74,
+comfortably past teak stock (46) and mahogany stock (61), which is why its logs are being eaten.
+Every knife product from **magic logs** needs Fletching **80** (magic shortbow (u)), 85 (longbow)
+or 87 (shield) — all above 74 — and the bank holds **630 Magic logs**.
+
+Switching to them is a one-line config change (`logName: "magic logs"`, and "magic logs" on
+`keepItems`). **It is a hypothesis, not a fact**: it rests on a level-failed fletch still setting
+the skilling timer, which is UNVERIFIED and could instead open a fletching interface (a widget in
+the way, worse than the current state) or refuse outright with no timer set. The test is cheap
+and definitive — one bank trip, one short run, and the occupancy log plus the Mining XP rate say
+which. Do that before anything else.
+
 Options, none of them chosen — **this is a decision for USER, not something to pick unattended**:
 
 1. **Buy the consumable in bulk.** ~2,000/hour means a real cost per hour (teak ~130gp each,

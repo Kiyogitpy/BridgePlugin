@@ -1710,10 +1710,15 @@ are plural; a substring filter that guesses the singular silently returns nothin
 The real blocker is that the mechanic allows exactly ONE loose log (a second opens Make-X and
 eats a tick), and a log basket cannot dispense one at a time. Emptying the basket does not help -- the mechanic needs EXACTLY ONE loose log or a Make-X
 interface eats a tick. So the routine is currently correct-but-unrunnable and stops saying so.
-The options (buy in bulk; try a log the account cannot fletch, e.g. redwood at Fletching 77 --
-UNVERIFIED whether a level-failed action still sets the timer; move to a mine with a bank; or
-just use gathering.py's ordinary mining) are USER's to choose, and are written up in the spec's
-"Supply: the unresolved blocker".
+**The likely answer is MAGIC LOGS, and the account owns 630 of them.** The reason teak works for
+most players is almost certainly that they cannot fletch it -- the action sets the timer, fails
+the level check and consumes nothing. This account is Fletching 74, past teak stock (46) and
+mahogany stock (61), which is exactly why its logs are eaten. Every knife product from magic logs
+needs 80/85/87, all above 74. Switching is one config line (`logName`, plus `keepItems`), but it
+is a HYPOTHESIS: it assumes a level-failed fletch still sets the skilling timer, which is
+UNVERIFIED and could instead open a fletching interface (worse) or set no timer at all. One bank
+trip and one short run settle it. The full option list is in the spec's "Supply: the unresolved
+blocker".
 
 Three further things MEASURED live that day, all now fixed:
 
