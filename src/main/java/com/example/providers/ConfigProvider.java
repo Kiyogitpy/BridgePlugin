@@ -30,8 +30,10 @@ public class ConfigProvider extends BridgeProvider
 	//
 	// valeTotemsWood is the one exception: routines/vale_totems.py has no dedicated config
 	// endpoint and reads this key straight off whatever resolve_config() hands its get_config()
-	// as bridge_config, which is this endpoint's response -- so it has to be here, not only in
-	// ConfigExporter.exportValeTotems (kept for the enum-NAME convention, see its own comment).
+	// as bridge_config, which is this endpoint's response -- so it lives HERE, and only here.
+	// (ConfigExporter briefly carried an exportValeTotems() alongside it for the enum-NAME
+	// convention; nothing ever called it, so it was removed 2026-09-08 rather than left as a
+	// second place this key could drift out of sync.)
 	private Object getConfig()
 	{
 		Map<String, Object> data = new LinkedHashMap<>();

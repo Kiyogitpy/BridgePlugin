@@ -54,7 +54,6 @@
 #     python controller.py routines/fletching.py
 
 import random
-import re
 import time
 
 import banker
