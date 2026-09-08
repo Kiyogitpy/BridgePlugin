@@ -2906,6 +2906,27 @@ def click_menu_action(ser: serial.Serial, entity: dict, option, target_hint: str
 
 DROP_CLICK_DELAY = (0.12, 0.28)   # between drops; the human recordings' inventory cadence
 
+# How long to wait for a drop to actually register before concluding shift-click drop is off.
+# A drop is processed on the NEXT server tick, i.e. 0-600ms after the click, so any verification
+# window shorter than one tick reads a good drop as a failure. MEASURED consequence of getting
+# this wrong (2026-09-08, shipwreck salvaging): every disposal pass fell back to the right-click
+# menu at ~1s per item instead of ~0.1s, and said so in the log, while shift-drop was working
+# fine. Bounded rather than unbounded so an account that genuinely has the setting off still
+# escalates promptly.
+DROP_CONFIRM_S = 1.5
+DROP_CONFIRM_POLL_S = 0.1
+
+
+def _drop_confirmed(before: int) -> bool:
+    """Whether the inventory has shrunk below `before`, polled to DROP_CONFIRM_S."""
+    deadline = time.time() + DROP_CONFIRM_S
+    while True:
+        if len(get_inventory() or []) < before:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(DROP_CONFIRM_POLL_S)
+
 
 def drop_items(ser: serial.Serial, items) -> bool:
     """Drop every inventory entry in `items` (dicts from GET /inventory, so each carries its own
@@ -2940,7 +2961,14 @@ def drop_items(ser: serial.Serial, items) -> bool:
                 key_up(ser, "SHIFT")
         human_delay(*DROP_CLICK_DELAY)
         if shift_works is None:
-            shift_works = len(get_inventory() or []) < before
+            # POLL, don't read once. CONFIRMED LIVE 2026-09-08 (USER, watching the screen: "no it
+            # just went straight for right clicking every single item in inventory"): a drop is
+            # processed on the NEXT server tick, up to 600ms away, but DROP_CLICK_DELAY is only
+            # 120-280ms -- so a single read here judged a perfectly good shift-drop as a failure
+            # most of the time, printed "shift-click drop off?", and dumped the whole rest of the
+            # pass onto the right-click menu at ~1s per item instead of ~0.1s. The log could not
+            # show this: it faithfully reported the fallback it had wrongly decided to take.
+            shift_works = _drop_confirmed(before)
             if not shift_works:
                 debug_log.log("action", "shift-drop did nothing (shift-click drop off?) -- "
                                         "using the right-click menu instead")

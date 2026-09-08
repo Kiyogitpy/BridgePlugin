@@ -1825,3 +1825,54 @@ def test_drop_items_falls_back_to_the_menu_when_shift_drop_is_off(monkeypatch):
     assert [m[1] for m in menus] == [10, 30]      # the first item is retried, then the second
     assert all(m[2] == "Drop" for m in menus)
     assert len([c for c in calls if c[0] == "click"]) == 1   # only the one probing shift-click
+
+
+def test_drop_items_waits_a_full_game_tick_before_declaring_shift_drop_off(monkeypatch):
+    """CONFIRMED LIVE 2026-09-08 (USER, watching the screen: "no it just went straight for right
+    clicking every single item in inventory"). A drop lands on the NEXT server tick, up to 600ms
+    away, but the old check read /inventory once after DROP_CLICK_DELAY (120-280ms) -- so a
+    working shift-drop was judged a failure and the whole pass fell back to the right-click menu
+    at ~1s per item. The log could not reveal this: it faithfully reported the fallback it had
+    wrongly chosen."""
+    items = [{"name": "Logs", "screenX": i, "screenY": i} for i in range(3)]
+    state = {"inv": list(items), "reads": 0}
+
+    def _inv():
+        state["reads"] += 1
+        # The drop only becomes visible on the third read -- ordinary tick latency.
+        if state["reads"] >= 3 and len(state["inv"]) == 3:
+            state["inv"] = state["inv"][1:]
+        return list(state["inv"])
+
+    monkeypatch.setattr(controller, "get_inventory", _inv)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "key_down", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "key_up", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    menu = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **kw: menu.append(option) or True)
+    monkeypatch.setattr(controller, "DROP_CONFIRM_POLL_S", 0.0)
+
+    controller.drop_items(object(), items)
+    assert menu == [], "a drop confirmed on a later read must not trigger the menu fallback"
+
+
+def test_drop_items_still_escalates_when_shift_drop_is_genuinely_off(monkeypatch):
+    """The poll is bounded, so an account with the setting off still falls back promptly."""
+    items = [{"name": "Logs", "screenX": i, "screenY": i} for i in range(2)]
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(items))  # never shrinks
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "key_down", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "key_up", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    menu = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, option, **kw: menu.append(option) or True)
+    monkeypatch.setattr(controller, "DROP_CONFIRM_S", 0.05)
+    monkeypatch.setattr(controller, "DROP_CONFIRM_POLL_S", 0.0)
+
+    controller.drop_items(object(), items)
+    assert menu == ["Drop", "Drop"], "the failed item is retried and the rest go via the menu"
