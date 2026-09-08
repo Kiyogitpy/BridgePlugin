@@ -1570,6 +1570,61 @@ Routine dropdown entry are both Java).
   unbuilt thing after banking, but the station's `Operate` interface is unseen), depth
   management, and a second net.
 
+## Current state of routines/wintertodt.py
+
+Written 2026-09-08 from the OSRS Wiki (Wintertodt rev 15276053, Strategies rev 15278826), the
+cache dump `5bc2ff1e`, RuneLite's own decompiled `WintertodtPlugin` and live bridge reads.
+Design: `docs/superpowers/specs/2026-09-08-wintertodt-design.md`, whose live-verification
+checklist is the first session's worklist. **There is no human recording and NOTHING has been
+run live.** Needs a client rebuild (the `RoutineChoice` entry is Java).
+
+- **`GET /api/minigames/wintertodt` already serves the whole HUD** -- points, energy, warmth
+  (raw 0-1000), `secondsUntilRoundStart`, and per-brazier LIT/UNLIT/BROKEN plus pyromancer
+  ALIVE/INCAPACITATED. VERIFIED live 2026-09-08. **No Java change for state.** But
+  `isOperational()` and `isRewardEligible()` are Java METHODS, so Gson omits them and
+  `wintertodt_state` re-derives both -- the same trap CLAUDE.md records for GOTR.
+- **NEVER MATCH A BRAZIER OR CRATE BY NAME.** Nine objects share three names: the unlit
+  brazier (29312) and the broken one (29313) are both `Brazier` and differ only in their
+  action, and SIX objects are called `Crate` -- 29316-29320 hand out hammer/knife/axe/
+  tinderbox/concoctions while 29301-29305 are scenery with no ops at all. This is the
+  shut-vs-open door lesson five ways over.
+- **There is NO banking and NO loadout.** Every tool is free from the arena crates and USER
+  chose never to search the Reward Cart (it holds 8,000, so nothing is lost). The routine never
+  leaves region 6462, which is why `derive_phase` returns `stop` rather than trying to travel.
+- **Chop, fletch and feed are CONTINUOUS actions**, ended by the game's own chat lines
+  (`Your inventory is too full`, `You have run out of bruma roots`). One inventory is about
+  three clicks, so this routine is an interrupt handler, not a click loop. Re-clicking a
+  running action cancels it.
+- **Fletching is a deliberate POINTS-over-XP trade** (USER's choice). The wiki is explicit that
+  fletching is SLOWER Firemaking XP; it buys reward-cart rolls. A low FM/hr is the design, not
+  a bug. `fletch=False` is the one-key switch to the faster-XP roots-only method, and
+  `feed_item`/`derive_phase` are written so that switch cannot deadlock a full inventory of
+  roots -- pinned by test.
+- **500 points is a CLIFF**: below it the round pays nothing and leaving mid-round forfeits
+  everything. Hence warmth outranks all work below it in the ladder, and `before_break` plays
+  the round out (GOTR's lesson).
+- **The 3x3 area-attack warning is a GameObject (29325), not a spotanim**, so it arrives as an
+  ordinary `OBJECT_SPAWNED` event. The dodge rung is an accelerator only: if it never arrives,
+  warmth is healed reactively instead and nothing else breaks.
+- **Expect the brazier to be contested.** golem_crafting MEASURED a 30-40% bare-click hijack
+  rate from other players' models on a far quieter object; the light/fix rungs escalate to
+  `click_menu_action` after a failed bare click for exactly that reason.
+- **No `expected_action` hover gate on any world click.** `/hover` reports what is under the
+  cursor RIGHT NOW and these clicks are issued while walking -- the gate withholds every one
+  (the Gauntlet and Motherlode both paid for this).
+- **Repairing a brazier does NOT light it.** Fix transitions BROKEN -> UNLIT; the wiki says a
+  broken brazier "can then be relit after it is fixed". `fix_phase` therefore confirms on
+  LEAVING "BROKEN", never on reaching "LIT" -- an earlier draft waited for "LIT" and ten
+  successful repairs still spent the whole ceiling.
+- **`bridge_events.Outcome` has no `.ok`** -- its fields are hit/signal/payload/confirmed/
+  latency_s and `__bool__` returns `hit`. An earlier draft wrote `outcome.ok`, which crashes
+  only on a SUCCESSFUL click and so hid from every test that mocked the click helper.
+- **`_progress_signature` deliberately excludes warmth and energy**: warmth regenerates ~8%/min
+  passively and energy falls because other players damage the boss, so either would defeat the
+  stuck watch.
+- **`before_break` paces its own loop** rather than relying on a phase handler to sleep, and
+  stands the stuck watch down during `between_rounds`.
+
 ## Current state of routines/blast_furnace.py
 
 **Live gold session 2026-09-04 (bf_live3-9), the first routine converted to event-driven

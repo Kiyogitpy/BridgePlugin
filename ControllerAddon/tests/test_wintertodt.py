@@ -797,3 +797,16 @@ def test_before_break_reads_defensively_when_the_reader_itself_raises(monkeypatc
     monkeypatch.setattr(wt, "_reader", lambda: (_ for _ in ()).throw(RuntimeError("bridge blew up")))
     wt.before_break(ctx)     # must not raise
     assert ctx.state.safety_stopped is False
+
+
+def test_the_routine_is_wired_into_the_gui_dropdown():
+    # A routine file alone is only launchable from the command line. Both the Java enum entry
+    # and this key are required, per CLAUDE.md's routine contract.
+    assert controller.ROUTINE_FILES["WINTERTODT"] == "routines/wintertodt.py"
+
+
+def test_the_java_enum_has_a_matching_constant():
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[2] / \
+        "src/main/java/com/example/controller/RoutineChoice.java"
+    assert "WINTERTODT(" in src.read_text(encoding="utf-8")

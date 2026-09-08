@@ -33,7 +33,8 @@ public enum RoutineChoice
 	CORRUPTED_GAUNTLET("Corrupted Gauntlet"),
 	AGILITY("Agility (course runner)"),
 	KARAMBWAN_FISHING("Karambwan Fishing (DKP + fish barrel)"),
-	DEEP_SEA_TRAWLING("Deep Sea Trawling");
+	DEEP_SEA_TRAWLING("Deep Sea Trawling"),
+	WINTERTODT("Wintertodt (group, fletch)");
 
 	private final String label;
 
