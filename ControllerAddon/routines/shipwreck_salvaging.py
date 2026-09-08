@@ -34,7 +34,22 @@ import cargo_hold
 
 DEFAULT_CONFIG = {
     "enabled": True,
-    "wreckNames": ["Small shipwreck", "Fisherman's shipwreck", "Large shipwreck"],
+    # Every tier, not a hand-picked subset. CONFIRMED live 2026-09-08: the account was parked at
+    # PIRATE shipwrecks (id 60472, Sailing 64) and the old three-name list matched nothing, so
+    # find_wreck_in_hook_range returned None and the routine would have sat in "wait" forever
+    # next to two active wrecks. Listing all eight is safe because _wreck_is_salvageable already
+    # filters on SALVAGE_LEVEL_REQ against the player's own boosted Sailing level -- the name
+    # list is "which tiers am I willing to work", and the answer is "whichever I can".
+    "wreckNames": [
+        "Small shipwreck",        # 15
+        "Fisherman's shipwreck",  # 26
+        "Barracuda shipwreck",    # 35
+        "Large shipwreck",        # 53
+        "Pirate shipwreck",       # 64
+        "Mercenary shipwreck",    # 73
+        "Fremennik shipwreck",    # 80
+        "Merchant shipwreck",     # 87
+    ],
     "hookName": "salvaging hook",  # tier-agnostic on purpose: deploy_hook() matches this as a
                                     # substring against the boat's actual hook name, and the boat's
                                     # hook tier (Bronze/Iron/.../Dragon, see

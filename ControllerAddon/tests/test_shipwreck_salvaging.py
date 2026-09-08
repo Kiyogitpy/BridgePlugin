@@ -1593,3 +1593,15 @@ def test_sort_phase_logs_when_the_hold_does_not_close_after_withdrawing(monkeypa
     monkeypatch.setattr(ss.debug_log, "log", lambda cat, msg: logged.append(msg))
     ss.sort_phase(_Ctx())
     assert any("did not close" in m for m in logged)
+
+
+def test_every_salvage_tier_is_configured_by_name():
+    """CONFIRMED live 2026-09-08: the account was parked at PIRATE shipwrecks and the old
+    three-name wreckNames matched nothing, so the routine would have idled beside two active
+    wrecks. Every tier in SALVAGE_LEVEL_REQ must have a matching name -- the level filter is
+    what decides which are actually workable."""
+    names = {n.lower() for n in ss.DEFAULT_CONFIG["wreckNames"]}
+    for tier in ["small", "fisherman's", "barracuda", "large",
+                 "pirate", "mercenary", "fremennik", "merchant"]:
+        assert f"{tier} shipwreck" in names, tier
+    assert len(names) == len(ss.SALVAGE_LEVEL_REQ)
