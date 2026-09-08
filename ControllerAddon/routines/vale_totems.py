@@ -38,6 +38,7 @@ import controller
 import debug_log
 import outcome_waits
 import skillmulti
+import travel
 import vale_totems as vt
 import vale_totem_route as route
 
@@ -207,6 +208,37 @@ def choose_spirit(ctx, spirit: str) -> bool:
         return True
     return bool(controller.click_entity(ctx.ser, widget, offset=(0, 0),
                                         check_ui_blockers=False, simulate_mistakes=False))
+
+
+ARRIVAL_TOLERANCE = 4
+
+
+def at_site(site_number: int) -> bool:
+    player = controller.get_player() or {}
+    x, y = player.get("x"), player.get("y")
+    if x is None or y is None:
+        return False
+    sx, sy = route.SITES[site_number]["stand"]
+    return abs(x - sx) <= ARRIVAL_TOLERANCE and abs(y - sy) <= ARRIVAL_TOLERANCE
+
+
+def walk_leg(ctx, a: int, b: int) -> bool:
+    """Walk site `a` -> site `b` by hopping the recorded waypoints.
+
+    NO ROUTER: worldmap has no collision data for Varlamore, so travel.walk_to cannot be used
+    here at all. These are the human's own tick-by-tick positions, so the path is known-good;
+    the risk is only that a discrete hop lands differently than a continuous run, which is what
+    the live checklist watches at the two log balances.
+    """
+    points = route.leg_waypoints(a, b)
+    if not points:
+        debug_log.log(LOG, "no recorded path for leg %d->%d" % (a, b))
+        return False
+    for x, y in points:
+        if not travel._hop_to(ctx, x, y, route.PLANE):
+            debug_log.log(LOG, "leg %d->%d: hop to (%d,%d) failed" % (a, b, x, y))
+            return False
+    return True
 
 
 def carve(ctx, site) -> bool:

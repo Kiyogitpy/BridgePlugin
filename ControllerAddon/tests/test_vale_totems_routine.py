@@ -284,3 +284,45 @@ def test_start_fletching_never_presses_space(monkeypatch):
     monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
     vtr_routine.start_fletching(_ctx_only())
     assert "space" not in [k.lower() for k in keys]
+
+
+import travel
+
+
+def test_at_site_is_true_within_tolerance_of_the_stand_tile(monkeypatch):
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 1477, "y": 3331, "plane": 0})
+    assert vtr_routine.at_site(6) is True
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 1400, "y": 3300, "plane": 0})
+    assert vtr_routine.at_site(6) is False
+
+
+def test_walk_leg_hops_every_recorded_waypoint_in_order(monkeypatch):
+    hops = []
+    monkeypatch.setattr(travel, "_hop_to",
+                        lambda ctx, x, y, plane, **k: hops.append((x, y)) or True)
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 1438, "y": 3307, "plane": 0})
+    assert vtr_routine.walk_leg(_ctx_only(), 6, 5) is True
+    assert hops == list(route.leg_waypoints(6, 5))
+
+
+def test_walk_leg_stops_at_the_first_hop_that_fails(monkeypatch):
+    hops = []
+
+    def hop(ctx, x, y, plane, **k):
+        hops.append((x, y))
+        return len(hops) < 3
+
+    monkeypatch.setattr(travel, "_hop_to", hop)
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 0, "y": 0, "plane": 0})
+    assert vtr_routine.walk_leg(_ctx_only(), 6, 5) is False
+    assert len(hops) == 3
+
+
+def test_walk_leg_refuses_a_leg_with_no_recorded_path(monkeypatch):
+    monkeypatch.setattr(travel, "_hop_to",
+                        lambda *a, **k: pytest.fail("should not hop an unrecorded leg"))
+    assert vtr_routine.walk_leg(_ctx_only(), 6, 3) is False
