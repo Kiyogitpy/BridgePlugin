@@ -105,6 +105,10 @@ DEFAULT_CONFIG = {
                               # instead of bounding it with a safety stop.
         "rune cannonball",    # stackable, so any number costs ONE slot
         "repair kit",         # substring, so it covers Mahogany/other repair kits alike
+        "facility bottle",    # ~34.6k each and only ~0.4/hour (the guide's own table), so it
+                              # costs at most one slot occasionally. Added back 2026-09-08 after
+                              # one turned up live in the VM inventory and the trimmed keep-list
+                              # would have dropped it on the next pass.
     ],
 
     "breaks": {

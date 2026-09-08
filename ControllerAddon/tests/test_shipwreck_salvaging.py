@@ -566,11 +566,11 @@ def test_the_default_keep_list_keeps_only_what_the_hold_will_take(monkeypatch):
     otherwise eventually we would fill our entire inventory". 943.14 deposits SALVAGE ONLY, so a
     keeper the hold will not take occupies a slot for the rest of the run."""
     keep = ss.DEFAULT_CONFIG["keepItems"]
-    assert sorted(keep) == ["repair kit", "rune cannonball"]
-    for kept in ["Rune cannonball", "Mahogany repair kit"]:
+    assert sorted(keep) == ["facility bottle", "repair kit", "rune cannonball"]
+    for kept in ["Rune cannonball", "Mahogany repair kit", "Facility bottle (empty)"]:
         assert ss.keep_item(kept, keep) is True, kept
     # Everything that used to be kept but cannot go in the hold is now dropped.
-    for tossed in ["Diamond bracelet", "Diamond ring", "Ruby bracelet", "Facility bottle (empty)",
+    for tossed in ["Diamond bracelet", "Diamond ring", "Ruby bracelet",
                    "Rune scimitar", "Dragon cannonball", "Sailors' amulet (inert)",
                    "Casket", "Oyster pearls", "Gold ring", "Emerald bracelet",
                    "Mithril scimitar", "Mithril cannonball", "Adamant cannonball"]:
