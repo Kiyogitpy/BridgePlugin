@@ -13,10 +13,21 @@ before any logic is.
 
 USER's decisions, and they shape everything:
 
-- **Knife + teak/mahogany logs** as the 3-tick item, and **the log is not consumed** (USER's
-  answer; teak and mahogany have no knife-fletch product, so the action starts, sets the
-  skilling timer and makes nothing). This is the single largest scope reduction in the design:
-  there is **no supply loop, no restock, and no bank trip**.
+- **Knife + teak/mahogany logs** as the 3-tick item. The design assumed **the log is not
+  consumed** and called that "the single largest scope reduction: no supply loop, no restock,
+  no bank trip."
+
+  **THAT ASSUMPTION IS FALSE AND WAS DISPROVED ON THE FIRST LIVE RUN, 2026-09-08.** The teak
+  log came back as a **Teak stock** (item 9446): knife-on-teak IS a real fletch — a crossbow
+  stock, Fletching 46, and this account is Fletching 74 — so one log is consumed per cycle.
+  At a 1.8s cycle that is **~2,000 logs per hour**. USER had reached the same conclusion
+  independently a few minutes earlier ("and that means we consume the log") after originally
+  answering that it was not consumed.
+
+  Everything downstream of the old assumption is therefore wrong: this routine needs a
+  consumable supply model it does not have. The live account had 1 loose log, an unreadable
+  log basket, and **zero teak, mahogany, swamp tar or guam in the bank** — and Cape Conch has
+  no bank object in the scene. See "Supply: the unresolved blocker" below.
 - **Cape Conch mine**, so there is **no desert heat** and nothing to maintain to stay alive.
 - **A fixed rock rotation captured once into config**, not a per-tick `/objects` scan.
 - **Drop a full inventory at once**, not between mines.
@@ -25,6 +36,40 @@ USER's decisions, and they shape everything:
   itself the signature.
 - **USER sets the client geometry up** (small client, zoomed in, camera south); the routine
   measures it and refuses to run when it is out of budget.
+
+## Supply: the unresolved blocker (2026-09-08)
+
+The tick item is consumed once per cycle, so a 1.8s cycle burns **~2,000 items/hour**. That is
+inherent to the method, not to this implementation — every item on the wiki's 3-tick list is
+consumed by its action (herb tar consumes the herb, knife-on-log consumes the log, kebbit claws
+consume the vambraces). The wiki's own advice to carry spares "in a log basket in case of
+mistakes" reads very differently once you know the base rate.
+
+MEASURED on the live account: **1 loose teak log, a log basket whose contents the m8aq reader
+cannot see** (`contentsLoaded: false`, `storedQuantity: -1` — CLAUDE.md already records this
+limitation), and **zero teak logs, mahogany logs, swamp tar or clean guam in a 931-item bank**.
+Cape Conch has **no bank object in the loaded scene**. So the routine cannot run for more than
+~28 cycles (~50 seconds) even in the best case, and cannot restock at all.
+
+The log basket is not a supply either: emptying it puts 28 loose logs in the inventory, and the
+mechanic requires **exactly one** loose log or a Make-X interface opens and eats a tick. Feeding
+one log at a time out of a basket is not an operation the game offers.
+
+Options, none of them chosen — **this is a decision for USER, not something to pick unattended**:
+
+1. **Buy the consumable in bulk.** ~2,000/hour means a real cost per hour (teak ~130gp each,
+   clean guam far cheaper). This is what the method actually costs and most players accept it.
+2. **Use an item the account cannot process.** If the fletch fails on a level requirement, the
+   action may still set the skilling timer while consuming nothing. This account is Fletching
+   74, so redwood logs (redwood stock, Fletching 77) are the candidate. **UNVERIFIED and
+   possibly wrong** — the game may refuse the action outright and set no timer at all, which
+   would silently degrade to ordinary 5-tick mining. Worth one live test, cheap to run.
+3. **Move to a mine with a bank** and accept a restock trip roughly every minute, which is a
+   poor ratio and probably not worth it.
+4. **Abandon 3-tick for this account** and use `gathering.py`'s ordinary mining loop on granite,
+   which needs no consumable at all and no new machinery.
+
+Until one is chosen, the routine is correct but unrunnable, and it stops cleanly saying so.
 
 ## Why this cannot be gathering.py
 
@@ -320,7 +365,9 @@ than silently binned later.
 
 The first session's worklist, in the order the failures would bite:
 
-1. **Does knife-on-teak-log leave the log intact, and set the timer with no Make-X interface?**
+1. **~~Does knife-on-teak-log leave the log intact?~~ ANSWERED 2026-09-08: NO.** The log
+   fletches into a Teak stock and is consumed, one per cycle. The remaining open question is
+   which consumable to use instead — see "Supply: the unresolved blocker".
    USER says yes; it is item 1 because the entire no-supply-loop scope rests on it. The routine
    re-counts the log **between chains and at every drop**, and safety-stops loudly if the count
    has fallen rather than running dry unnoticed. At one log per cycle a consumed log would be

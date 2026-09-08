@@ -95,7 +95,10 @@ DEFAULT_CONFIG = {
     # cycle does NOT fit and is expected to abandon at the room_for guard sometimes. The median
     # (60 + 145 + 170 + 145 = 520) does fit. A guess; fit it from the per-cycle occupancy this
     # routine logs.
-    "logClickPhaseMs": 60,
+    # MEASURED LIVE 2026-09-08: dropped 60 -> 25. The in-place log click alone came in at
+    # 101-191ms, so at phase 60 the flight had ~390ms against a ~382ms need -- an 8ms margin,
+    # i.e. a coin flip per cycle. Every millisecond of phase is a millisecond off the flight.
+    "logClickPhaseMs": 25,
 
     # WHAT MUST FIT INSIDE THE TICK: both mouse-DOWNs, or both whole clicks?
     #
@@ -123,7 +126,7 @@ DEFAULT_CONFIG = {
     # from the log slot. At scale 1.0 the budget allows 82px, so nothing passes; the furthest
     # rock needs 0.58 to fit, and 0.55 leaves a little margin (limit 267px) without going
     # further from the fitted model than the practised-reach argument supports.
-    "flightSpeedScale": 0.55,
+    "flightSpeedScale": 0.5,
     # Deliberate imperfection: a drawn fraction of cycles place the rock click one tick late.
     # A machine that never misses a 3-tick cycle is itself the signature -- EVENT_MOUSE_CLICK_V2
     # carries inter-press timing to the server at 1ms resolution (CLAUDE.md, telemetry).
@@ -310,9 +313,10 @@ def check_geometry(cfg, inv):
               - cfg["logClickPhaseMs"]           # the window opens part way into the tick
               - tick_cycle.CLICK_COST_MEDIAN_MS)  # the in-place log click delays the flight
     if not cfg.get("assumeClickLandsOnPress"):
-        # The conservative reading: the rock click's hold and trailing pause are on the budget
-        # too, because the game may only act on the RELEASE.
-        budget -= tick_cycle.CLICK_COST_MEDIAN_MS
+        # The conservative reading: the rock click must fully LAND (press through release)
+        # inside the tick, because the game may only act on the release. Its trailing pause is
+        # NOT charged -- that happens after mouse-up, when the game already has the click.
+        budget -= tick_cycle.CLICK_LANDING_MEDIAN_MS
     limit = tick_cycle.max_reach_px(budget, scale)
     cap = cfg.get("maxReachPx")
     if cap:
@@ -432,7 +436,7 @@ def _flight_budget(from_point, to_point, scale=1.0):
     "ok" -- precisely the failure the room_for guard exists to prevent. tick_cycle.CLICK_COST_MS
     is the upper end of that pair, deliberately."""
     dist = math.hypot(to_point[0] - from_point[0], to_point[1] - from_point[1])
-    return tick_cycle.estimate_flight_ms(dist, scale) + tick_cycle.CLICK_COST_MS
+    return tick_cycle.estimate_flight_ms(dist, scale) + tick_cycle.CLICK_LANDING_COST_MS
 
 
 def _deliberate_miss(cfg):

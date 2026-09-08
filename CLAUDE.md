@@ -1693,6 +1693,52 @@ already committed and fully unit-tested before this task started.
 
 ## Current state of routines/granite_3t.py
 
+**FIRST LIVE SESSION 2026-09-08 AT CAPE CONCH. It reached the mine, passed its geometry gate and
+ran real cycles, then stopped on a blocker that invalidates the design's biggest assumption:
+THE TICK ITEM IS CONSUMED, ONE PER CYCLE.** The teak log came back as a **Teak stock** (item
+9446) -- knife-on-teak is a real fletch (crossbow stock, Fletching 46; this account is 74), so
+the cycle burns **~2,000 logs/hour**. The spec had recorded "the log is not consumed" as USER's
+answer and built "no supply loop, no restock, no bank trip" on it. USER reached the same
+correction independently mid-session ("and that means we consume the log").
+
+MEASURED the same session: 1 loose log, a log basket whose contents the reader cannot see, and
+**zero teak / mahogany / swamp tar / guam in a 931-item bank**, with no bank object at Cape
+Conch. Emptying the basket does not help -- the mechanic needs EXACTLY ONE loose log or a Make-X
+interface eats a tick. So the routine is currently correct-but-unrunnable and stops saying so.
+The options (buy in bulk; try a log the account cannot fletch, e.g. redwood at Fletching 77 --
+UNVERIFIED whether a level-failed action still sets the timer; move to a mine with a bank; or
+just use gathering.py's ordinary mining) are USER's to choose, and are written up in the spec's
+"Supply: the unresolved blocker".
+
+Three further things MEASURED live that day, all now fixed:
+
+- **The probe could not run at all.** `python routines/granite_3t.py` puts `routines/` on
+  sys.path[0], so `import controller` traceback'd -- and that was the exact command the setup
+  instructions gave. There is a sys.path bootstrap in the `__main__` path now.
+- **`maxReachPx` was a hand-picked 220 that does not follow from the tick budget** (the real
+  allowance is ~82px at scale 1.0). `check_geometry` DERIVES the limit now and reports it, so a
+  refusal names the real target; `maxReachPx` survives only as an optional stricter cap.
+- **The geometry gate and the runtime guard priced a click differently, so startup passed and
+  then EVERY cycle abandoned** -- 50 desyncs, 0 completed, on the first run. A click that
+  DELAYS following work costs hold+tail; the LAST click of the tick only has to LAND, because
+  its trailing pause happens after mouse-up when the game already has the click.
+  `CLICK_COST_MS` and `CLICK_LANDING_COST_MS` are now separate and both sites agree.
+
+And two geometry facts worth keeping, both USER's:
+
+- **Zooming IN can make the reach WORSE.** It pulls the nearest rock closer but magnifies the
+  SPREAD between rocks, and the check uses the furthest. MEASURED: default zoom 896-1006px,
+  zoomed in 664-1089px.
+- **The rotation needs FOUR rocks and the RESPAWN sets that floor**, not the click budget.
+  Granite respawns in 5s against a 1.8s cycle: 4 rocks = 7.2s (safe), 3 = 5.4s (marginal),
+  2 = 3.6s and the rock is not there. A two-rock rotation was briefly configured because only
+  the two nearest fit the budget; USER caught it ("two rocks most likely wont work"). When the
+  budget and the respawn disagree, the respawn wins and the budget is bought with
+  `flightSpeedScale` -- a practised repeated reach at the same two pixels is legitimately faster
+  than `settings.HM2_*`'s general fit (USER: "a human with known X Y cordinate most likely speed
+  up too after some practice"). That scaling is narrowly for this shape of routine.
+
+
 Written 2026-09-08 from the OSRS Wiki (Tick manipulation rev 15292712, Pay-to-play Mining
 training rev 15297907) and this repo's own fitted mouse-movement model (`settings.py`'s HM2
 reach/hold figures). Design: `docs/superpowers/specs/2026-09-08-3-tick-granite-mining-design.md`,

@@ -97,9 +97,14 @@ def test_geometry_refuses_when_the_rocks_are_too_far_from_the_log_AND_reports_th
     # ...and the DERIVED limit, not a hand-picked one. MEASURED LIVE 2026-09-08: the config's
     # 220 was three times what the tick budget actually allows, so a geometry that could never
     # hit a tick would have been accepted.
+    # Derived exactly as check_geometry derives it, so retuning a constant does not break a
+    # test that is really about "the message names the real limit".
     cfg = _cfg()
-    limit = tick_cycle.max_reach_px(600.0 - 60.0 - 2 * tick_cycle.CLICK_COST_MEDIAN_MS,
-                                    cfg["flightSpeedScale"])
+    limit = tick_cycle.max_reach_px(
+        600.0 - cfg["logClickPhaseMs"]
+        - tick_cycle.CLICK_COST_MEDIAN_MS       # log click delays the flight
+        - tick_cycle.CLICK_LANDING_MEDIAN_MS,   # rock click only has to land
+        cfg["flightSpeedScale"])
     assert f"{limit:.0f}px" in msg
 
 
@@ -552,7 +557,7 @@ def test_run_cycle_pins_the_critical_click_to_the_named_tick(monkeypatch):
     ctx = _Ctx()
     ctx.events = _FakeEvents()
     assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800), 205) == "ok"
-    assert called == [(205, 60)]
+    assert called == [(205, _cfg()["logClickPhaseMs"])]
 
 
 def test_a_missed_target_tick_is_a_desync_not_a_late_click(monkeypatch):
@@ -689,7 +694,7 @@ def test_the_desync_guard_books_the_click_hold_as_well_as_the_flight():
     log_point, rock_point = (1740, 800), (1640, 800)
     flight_only = tick_cycle.estimate_flight_ms(100.0)
     assert g._flight_budget(log_point, rock_point) == pytest.approx(
-        flight_only + tick_cycle.CLICK_COST_MS)
+        flight_only + tick_cycle.CLICK_LANDING_COST_MS)
 
 
 def test_a_cycle_with_room_for_the_flight_but_not_the_click_is_a_desync(monkeypatch):
@@ -702,13 +707,16 @@ def test_a_cycle_with_room_for_the_flight_but_not_the_click_is_a_desync(monkeypa
     monkeypatch.setattr(tick_cycle, "timed_click",
                         lambda ser, pt, **kw: (clicked.append(pt), 200.0)[1])
     monkeypatch.setattr(g.random, "random", lambda: 1.0)
-    # 160ms into the tick, so 440ms of budget is left.
-    times = iter([1000.0, 1000.10, 1000.10, 1000.10])
+    # 260ms into the tick (60 phase + 200 elapsed), so 340ms of budget is left. Chosen so the
+    # flight ALONE fits and the flight-plus-landing does not -- which is the whole point.
+    times = iter([1000.0, 1000.20, 1000.20, 1000.20])
     monkeypatch.setattr(g, "_now", lambda: next(times))
 
     ctx = _Ctx()
     ctx.events = _FakeEvents()
-    assert tick_cycle.estimate_flight_ms(100.0) < 440.0     # the flight ALONE would have fitted
+    assert tick_cycle.estimate_flight_ms(100.0) < 340.0     # the flight ALONE would have fitted
+    assert (tick_cycle.estimate_flight_ms(100.0)
+            + tick_cycle.CLICK_LANDING_COST_MS) > 340.0     # ...with the landing, it does not
     # scale pinned at 1.0: this test is about the CLICK cost being booked, not about how fast
     # the flight happens to be configured.
     assert g.run_cycle(ctx, _cfg(flightSpeedScale=1.0),

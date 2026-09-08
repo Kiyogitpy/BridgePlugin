@@ -27,12 +27,28 @@ import settings
 
 GAME_TICK_MS = bridge_events.GAME_TICK_MS
 
-# What one click costs in WALL-CLOCK OCCUPANCY of the tick, for the desync guard's arithmetic:
-# CLICK_HOLD_RANGE_S's upper bound (145ms) plus click_human's own trailing human_delay(0.03,
-# 0.09) upper bound (90ms). The UPPER end deliberately, not the 85ms/60ms medians: this number
-# feeds Window.room_for, which is a GUARD. Being conservative costs one abandoned cycle;
-# being optimistic lets a click slip into the next tick and desyncs every cycle after it.
-CLICK_COST_MS = (settings.CLICK_HOLD_RANGE_S[1] + 0.09) * 1000.0
+# TWO DIFFERENT CLICK COSTS, BECAUSE A CLICK COSTS TWO DIFFERENT THINGS.
+#
+# click_human is: press, a CLICK_HOLD_RANGE_S hold (50-145ms), release, then a trailing
+# human_delay(0.03, 0.09). Which part is on the tick's budget depends on what the click IS:
+#
+#   * A click that DELAYS FOLLOWING WORK (the in-place log click, whose release and trailing
+#     pause both happen before the flight can start) costs the whole thing: hold + tail.
+#   * The LAST click of the tick (the rock click) only has to LAND. Its trailing pause is our
+#     own pacing and happens after mouse-up, when the game already has the click -- charging it
+#     against the tick is charging for time the game does not care about.
+#
+# MEASURED LIVE 2026-09-08, and this was a real bug: booking the tail against the final click
+# made the guard demand ~472ms while the geometry gate promised 237ms, so startup passed and
+# then EVERY SINGLE CYCLE abandoned at room_for -- 50 desyncs, 0 completed cycles, before the
+# first fix. The gate and the guard have to price the same thing.
+#
+# Upper bounds here, medians below: these feed Window.room_for, which is a GUARD, and being
+# pessimistic costs one abandoned cycle where being optimistic desyncs the whole chain.
+CLICK_HOLD_MAX_MS = settings.CLICK_HOLD_RANGE_S[1] * 1000.0          # 145
+CLICK_TAIL_MAX_MS = 90.0                                             # human_delay(0.03, 0.09)
+CLICK_COST_MS = CLICK_HOLD_MAX_MS + CLICK_TAIL_MAX_MS                # delays following work
+CLICK_LANDING_COST_MS = CLICK_HOLD_MAX_MS                            # only has to land
 
 # The MEDIAN cost of a click, for PLANNING rather than guarding. CLICK_COST_MS above books the
 # worst case on purpose -- a guard that is optimistic desyncs a whole chain, where a guard that
@@ -41,7 +57,10 @@ CLICK_COST_MS = (settings.CLICK_HOLD_RANGE_S[1] + 0.09) * 1000.0
 # below HM2_MIN_MS (90), so NO geometry on earth would ever pass. MEASURED 2026-09-08 while
 # setting the routine up live -- the check refused a legitimate 60px setup. Same split the rest
 # of this repo uses: plan on the median, guard on the tail.
-CLICK_COST_MEDIAN_MS = 145.0
+CLICK_HOLD_MEDIAN_MS = 85.0        # CLAUDE.md's fitted median hold
+CLICK_TAIL_MEDIAN_MS = 60.0        # the middle of human_delay(0.03, 0.09)
+CLICK_COST_MEDIAN_MS = CLICK_HOLD_MEDIAN_MS + CLICK_TAIL_MEDIAN_MS   # 145, delays what follows
+CLICK_LANDING_MEDIAN_MS = CLICK_HOLD_MEDIAN_MS                       # 85, only has to land
 
 
 # A PRACTISED reach is faster than the fitted model, and this is the one activity where saying
