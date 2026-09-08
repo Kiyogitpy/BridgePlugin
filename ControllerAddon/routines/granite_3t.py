@@ -139,6 +139,10 @@ DEFAULT_CONFIG = {
     # a WORKING cycle never consumes a log, so this should be paid once per session at most --
     # if it starts recurring, cycles are overrunning and the occupancy log is where to look.
     "bankTile": [3180, 2421, 0],
+    # Where the rotation is worked from, and where a bank trip returns to. Recorded at STARTUP
+    # rather than when the restock happens: a routine restarted while standing at the bank would
+    # otherwise adopt the bank as "home" and never walk back to the rocks.
+    "mineTile": [3255, 2354, 0],
     "restockLogs": 27,          # one loose + 26 for the basket
 
     "fullInventory": "drop",
@@ -483,6 +487,16 @@ def _one_via_floor(ctx, cfg, basket, logs):
         else:
             debug_log.log(CATEGORY, "could not Fill the basket -- the extras stay loose")
 
+    # A FULL BASKET ABSORBS NOTHING, and without this that is an infinite loop: Fill succeeds,
+    # takes zero logs, and we come back next tick with the same pile. Extra loose logs are not
+    # merely untidy -- a second one opens Make-X on the next knife-on-log and eats a tick -- so
+    # whatever the basket would not take goes on the floor.
+    still = loose_logs(controller.get_inventory() or [], cfg)
+    if len(still) > 1:
+        debug_log.log(CATEGORY, f"the basket would not take {len(still) - 1} logs -- dropping "
+                                f"them so knife-on-log cannot open Make-X")
+        controller.drop_items(ctx.ser, still[1:])
+
     player = controller.get_player() or {}
     item = None
     for _ in range(3):
@@ -529,10 +543,7 @@ def restock_phase(ctx, cfg):
     sure you get to a bank restock and go back".
     """
     data = ctx.state.data
-    home = data.get("g3t_home_tile")
-    if home is None:
-        home = _tile_of(controller.get_player() or {})
-        data["g3t_home_tile"] = home
+    home = data.get("g3t_home_tile") or tuple(cfg["mineTile"])
 
     trips = data.get("g3t_restock_trips", 0)
     if trips >= RESTOCK_MAX_TRIPS:
