@@ -37,12 +37,12 @@ def _percentile(values, p):
 def one_window(ser, log_point, rock_point):
     """One critical tick: click in place on the parked point, fly to the rock, click.
     Returns (total_ms, in_place_ms, flight_and_click_ms)."""
-    t0 = time.time()
+    t0 = time.perf_counter()
     controller.click_human(ser)                       # the log click -- cursor already parked
-    t1 = time.time()
+    t1 = time.perf_counter()
     controller.move_to_human(ser, rock_point[0], rock_point[1], aim_radius=3)
     controller.click_human(ser)
-    t2 = time.time()
+    t2 = time.perf_counter()
     return (t2 - t0) * 1000.0, (t1 - t0) * 1000.0, (t2 - t1) * 1000.0
 
 
@@ -63,7 +63,7 @@ def main():
     dist = ((args.a[0] - args.b[0]) ** 2 + (args.a[1] - args.b[1]) ** 2) ** 0.5
     with serial.Serial(args.port, args.baud, timeout=1) as ser:
         time.sleep(2.0)                       # Leonardo reset after the port opens
-        controller.probe_firmware_protocol(ser)
+        controller.FIRMWARE_PROTOCOL = controller.probe_firmware_protocol(ser)
         totals, in_place, flights = [], [], []
         for _ in range(args.cycles):
             controller.move_to_human(ser, args.a[0], args.a[1], aim_radius=0)  # park
