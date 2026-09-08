@@ -763,12 +763,33 @@ def test_empty_log_basket_selects_the_option_from_the_menu(monkeypatch):
     # A sequence, tried in priority order against ONE menu: the exact bank-context wording is
     # not knowable offline, and a wrong single guess would no-op forever.
     assert list(option) == ["empty-to-bank", "empty"]
-    # Bank-interface click: the 2026-09-02 blocker rects cover the bank's own inventory panel,
-    # and a simulated misclick's corrective re-click in that grid lands on the NEIGHBOURING
-    # item (banker.py's standing rule).
+    # Bank-interface click: the 2026-09-02 blocker rects cover the bank's own inventory panel.
     assert kw["check_ui_blockers"] is False
-    assert kw["simulate_mistakes"] is False
     assert kw["offset"] == (0, 0)
+
+
+def test_empty_log_basket_calls_click_menu_action_as_it_is_actually_declared(monkeypatch):
+    """The fake above accepts **kw, so it will cheerfully report back an argument the REAL
+    function does not have -- which is exactly what happened: the first version of
+    empty_log_basket passed simulate_mistakes=False (copied from click_entity, which does take
+    it), the test asserted the fake had received it, the suite went green, and the routine died
+    live on `TypeError: click_menu_action() got an unexpected keyword argument`. CLAUDE.md
+    already carried the lesson -- "a stub that lies about a shape is worse than no stub" -- so
+    this binds the call against the real signature, where a bad kwarg is a TypeError here
+    instead of in the VM. (click_menu_action needs no simulate_mistakes: it hardcodes
+    simulate_mistakes=False on its own right-click.)"""
+    import inspect
+
+    sig = inspect.signature(controller.click_menu_action)
+    monkeypatch.setattr(controller, "get_inventory", lambda: _inv("Open log basket"))
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+
+    def binding_menu(*args, **kwargs):
+        sig.bind(*args, **kwargs)      # raises TypeError on an argument that does not exist
+        return True
+
+    monkeypatch.setattr(controller, "click_menu_action", binding_menu)
+    assert banker.empty_log_basket(_Ctx())
 
 
 def test_empty_log_basket_is_a_no_op_without_one(monkeypatch):

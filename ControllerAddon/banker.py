@@ -513,11 +513,14 @@ def empty_log_basket(ctx) -> bool:
     to "Empty". A wrong single guess would no-op forever -- click_menu_action's sequence form
     exists for precisely this (see its docstring on chinchompa_hunting's trap states).
 
-    offset=(0, 0) because an inventory icon is small, and check_ui_blockers=False /
-    simulate_mistakes=False because this is a click inside the bank's own inventory panel: the
-    2026-09-02 blocker rects cover it (LIVE bf_live5 -- the default check refused the click and
-    rotated the camera instead), and a simulated misclick's corrective re-click in that grid
-    lands on the NEIGHBOURING item, which here is a stack of logs."""
+    offset=(0, 0) because an inventory icon is small, and check_ui_blockers=False because this
+    is a click inside the bank's own inventory panel, which the 2026-09-02 blocker rects cover
+    (LIVE bf_live5 -- the default check refused the click and rotated the camera instead).
+    There is deliberately NO simulate_mistakes argument here: click_menu_action does not take
+    one, because it already hardcodes simulate_mistakes=False on its own right-click
+    (controller.py) -- which is what this site needs anyway, since a misclick's corrective
+    re-click in that grid lands on the NEIGHBOURING item, here a stack of logs. Passing it
+    CRASHED the routine live on 2026-09-08; see the test that now binds the real signature."""
     basket = next(
         (i for i in controller.get_inventory() if LOG_BASKET_NAME in (i.get("name") or "").lower()),
         None,
@@ -527,8 +530,7 @@ def empty_log_basket(ctx) -> bool:
 
     debug_log.log("bank", "emptying log basket")
     if not controller.click_menu_action(ctx.ser, basket, ("empty-to-bank", "empty"),
-                                        offset=(0, 0), check_ui_blockers=False,
-                                        simulate_mistakes=False):
+                                        offset=(0, 0), check_ui_blockers=False):
         return False
 
     controller.human_delay(0.6, 1.0)
