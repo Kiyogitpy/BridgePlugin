@@ -462,28 +462,43 @@ def _click_menu(ctx, obj, option) -> bool:
                                              refresh_target=_refresh(fresh or obj)))
 
 
-def _brazier_action(ctx, ctr_key, obj_id, option, want_status, brazier) -> bool:
-    """Shared body for light and fix: bare click, then the menu, then a ceiling."""
+def _brazier_action(ctx, ctr_key, obj_id, option, done, brazier) -> bool:
+    """Shared body for light and fix: bare click, then the menu, then a ceiling.
+
+    `done` is a zero-arg predicate: True when THIS RUNG'S goal is already satisfied. Checked
+    BEFORE anything else, fix round 1 (finding 2): on a busy official world another player
+    relighting/fixing first is the NORMAL case -- the object simply vanishes from /objects --
+    and that must read as success, never as a failed click. The ceiling below it only ever
+    counts a REAL attempt (an object we could actually see and clicked) that produced nothing;
+    an object that was never even visible is not an attempt at all and must not spend it."""
     data = _d(ctx)
+    if done():
+        data[ctr_key] = 0
+        return True
+
     obj = _nearest(_objects(ids={obj_id}, action=option))
+    if not obj:
+        return False
+
     data[ctr_key] = int(data.get(ctr_key) or 0) + 1
     if data[ctr_key] > (LIGHT_MAX_CLICKS if option == "Light" else FIX_MAX_CLICKS):
         ctx.state.trigger_safety_stop(
             "wintertodt: %s never registered on the %s brazier after %d attempts"
             % (option, brazier, data[ctr_key] - 1))
         return False
-    if not obj:
-        return False
 
-    confirm = lambda: ws.brazier_status(_reader(), brazier) == want_status
     signals = ["CHAT_MESSAGE"]
-    if _click_object(ctx, obj, option, BRAZIER_ACTION_BUDGET_S, confirm, signals=signals):
+    if _click_object(ctx, obj, option, BRAZIER_ACTION_BUDGET_S, done, signals=signals):
         data[ctr_key] = 0
         return True
     if _click_menu(ctx, obj, option):
-        if _await(ctx, signals, BRAZIER_ACTION_BUDGET_S + _walk_budget(obj), confirm):
+        # fix round 1 (finding 3): reflect the confirm's own outcome, exactly like the
+        # bare-click branch above -- returning True unconditionally here is what let a menu
+        # click that never actually confirmed masquerade as success.
+        confirmed = _await(ctx, signals, BRAZIER_ACTION_BUDGET_S + _walk_budget(obj), done)
+        if confirmed:
             data[ctr_key] = 0
-        return True
+        return bool(confirmed)
     return False
 
 
@@ -493,14 +508,27 @@ def light_phase(ctx, reader, brazier) -> bool:
     `reader` is accepted (the _PHASES dispatcher passes it) but not used: the confirm re-reads
     the HUD itself, because the snapshot that chose this rung is by then a click old."""
     return _brazier_action(ctx, "wt_light_clicks", w.OBJ_BRAZIER_UNLIT, "Light",
-                           "LIT", brazier)
+                           lambda: ws.brazier_status(_reader(), brazier) == "LIT", brazier)
 
 
 def fix_phase(ctx, reader, brazier) -> bool:
     """25 points. The wiki warns braziers are "fixed extremely quickly on Wintertodt worlds",
-    so losing this race is normal and is a no-op, not a failure."""
-    return _brazier_action(ctx, "wt_fix_clicks", w.OBJ_BRAZIER_BROKEN, "Fix",
-                           "LIT", brazier)
+    so losing this race is normal and is a no-op, not a failure.
+
+    Fix round 1 (finding 1): REPAIRING A BRAZIER DOES NOT LIGHT IT. The wiki's Strategies page
+    says a broken brazier "can then be relit after it is fixed", and the HUD section lists
+    three distinct states (unlit / lit / damaged) -- Fix transitions BROKEN -> UNLIT, never
+    straight to LIT. So this confirms on LEAVING "BROKEN", not on reaching "LIT"; the light
+    rung relights on its own next tick, exactly the wiki's own sequence.
+
+    "UNKNOWN" (an unreadable reader) is excluded from "done" on purpose -- ws.brazier_status
+    returns it for a key the reader has no data for at all, and treating THAT as "no longer
+    broken, goal met" is the same "unreadable is not empty" mistake the m8aq readers guard
+    against everywhere else in this repo. An unreadable brazier must fall through to a real
+    attempt, not be waved through as already fixed."""
+    return _brazier_action(
+        ctx, "wt_fix_clicks", w.OBJ_BRAZIER_BROKEN, "Fix",
+        lambda: ws.brazier_status(_reader(), brazier) not in ("BROKEN", "UNKNOWN"), brazier)
 
 
 def _force_walk(ctx, x, y, plane) -> bool:

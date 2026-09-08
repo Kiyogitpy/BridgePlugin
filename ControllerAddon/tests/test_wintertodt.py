@@ -404,11 +404,33 @@ def test_light_phase_targets_the_unlit_id_and_escalates_to_the_menu_when_hijacke
 
 
 def test_light_phase_stops_after_its_ceiling(monkeypatch):
+    """Fix round 1 (finding 2): the ceiling only ever counts a REAL attempt -- a brazier we can
+    see and click that never confirms. An absent target is NOT an attempt (see the ABSENT-
+    object test below, which pins the opposite case), so this scene keeps the brazier visible
+    every tick and makes both click paths genuinely fail instead."""
     ctx = _Ctx()
-    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [])
+    scene = [{"id": w.OBJ_BRAZIER_UNLIT, "name": "Brazier", "actions": ["Light"],
+              "distance": 2, "x": 1, "y": 1, "plane": 0}]
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
+    monkeypatch.setattr(wt, "_click_object", lambda *a, **k: False)
+    monkeypatch.setattr(wt, "_click_menu", lambda *a, **k: False)
     for _ in range(wt.LIGHT_MAX_CLICKS + 1):
         wt.light_phase(ctx, {}, "SOUTH_WEST")
     assert ctx.state.safety_stopped is True
+
+
+def test_light_phase_with_the_target_absent_does_not_walk_the_counter_to_a_safety_stop(monkeypatch):
+    """Fix round 1 (finding 2): another player relighting/fixing first is the NORMAL case on a
+    busy world and the object simply vanishes from /objects -- that must never be counted as a
+    failed attempt. Only controller.* is mocked; the reader stays at its hermetic-fixture
+    default ({}, i.e. brazier status UNKNOWN), so this is the REAL wt.light_phase/_brazier_
+    action path start to finish. Would have tripped the pre-fix code, which incremented the
+    ceiling counter unconditionally, before ever checking whether an object was found."""
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [])
+    for _ in range(wt.LIGHT_MAX_CLICKS * 3):
+        wt.light_phase(ctx, {}, "SOUTH_WEST")
+    assert ctx.state.safety_stopped is False
 
 
 def test_fix_phase_targets_the_broken_id(monkeypatch):
@@ -475,13 +497,62 @@ def test_light_phase_real_menu_escalation_path_confirms_via_await(monkeypatch):
 
 
 def test_fix_phase_real_bare_click_path_confirms_via_await_pre(monkeypatch):
-    """Same shape as the light_phase real-path test, for the fix rung and the BROKEN id."""
+    """Fix round 1 (finding 1): re-pointed at the REAL post-repair status. Repairing a brazier
+    does NOT light it -- the wiki: a broken brazier "can then be relit after it is fixed" -- so
+    the reader starts at BROKEN and the click's own side effect moves it to UNLIT, never to
+    LIT. The original stub read "LIT" from the start, which coincidentally agreed with the
+    pre-fix (wrong) want_status="LIT" and so could not have caught it; with a real BROKEN ->
+    UNLIT transition, the old confirm (status == "LIT") could never be satisfied and this test
+    would fail against it."""
     ctx = _Ctx()
     obj = {"id": w.OBJ_BRAZIER_BROKEN, "name": "Brazier", "actions": ["Fix"],
            "distance": 2, "x": 1, "y": 1, "plane": 0, "onScreen": True,
            "screenX": 10, "screenY": 10}
+    status = {"val": "BROKEN"}
     monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [obj])
-    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
     monkeypatch.setattr(controller, "get_api",
-                        lambda *a, **k: {"braziers": {"SOUTH_WEST": {"status": "LIT"}}})
+                        lambda *a, **k: {"braziers": {"SOUTH_WEST": {"status": status["val"]}}})
+
+    def fake_click_entity(ser, entity, **kwargs):
+        status["val"] = "UNLIT"     # what a genuine repair actually produces
+        return True
+
+    monkeypatch.setattr(controller, "click_entity", fake_click_entity)
     assert wt.fix_phase(ctx, {}, "SOUTH_WEST") is True
+
+
+def test_fix_phase_when_already_unlit_resets_the_counter_without_a_click(monkeypatch):
+    """Fix round 1 (finding 1 + 2): another player fixed the brazier first -- the reader
+    already reads UNLIT (never LIT) and the object has already vanished from /objects. This
+    must read as success and reset the counter with NO click at all. Only controller.* is
+    mocked (get_objects, get_api), so this is the real wt.fix_phase -> _brazier_action path.
+    Would fail two ways against the pre-fix code: want_status="LIT" could never recognise
+    UNLIT as done, and the counter incremented unconditionally before checking for an object,
+    so repeated calls would climb straight to a safety stop instead of resetting to 0."""
+    ctx = _Ctx()
+    ctx.state.data["wt_fix_clicks"] = 9
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [])
+    monkeypatch.setattr(controller, "get_api",
+                        lambda *a, **k: {"braziers": {"SOUTH_WEST": {"status": "UNLIT"}}})
+    assert wt.fix_phase(ctx, {}, "SOUTH_WEST") is True
+    assert ctx.state.data["wt_fix_clicks"] == 0
+
+
+def test_light_phase_menu_escalation_does_not_report_success_when_confirm_times_out(monkeypatch):
+    """Fix round 1 (finding 3, Minor): the menu branch must reflect its own confirm's outcome,
+    exactly like the bare-click branch already does. Only controller.* is mocked, so the REAL
+    wt._click_menu -> controller.click_menu_action and the REAL wt._await ->
+    outcome_waits.await_pre -> bridge_events.Outcome execute, with the reader genuinely never
+    leaving UNLIT -- the confirm never lands and the budget really expires (against the fake
+    clock). Pre-fix, this returned True unconditionally once the menu click itself resolved,
+    which is exactly how both Criticals masqueraded as success from the dispatcher's view."""
+    ctx = _Ctx()
+    obj = {"id": w.OBJ_BRAZIER_UNLIT, "name": "Brazier", "actions": ["Light"],
+           "distance": 2, "x": 1, "y": 1, "plane": 0, "onScreen": True,
+           "screenX": 10, "screenY": 10}
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [obj])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: False)      # bare refused
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)  # menu resolves
+    monkeypatch.setattr(controller, "get_api",
+                        lambda *a, **k: {"braziers": {"SOUTH_WEST": {"status": "UNLIT"}}})
+    assert wt.light_phase(ctx, {}, "SOUTH_WEST") is False
