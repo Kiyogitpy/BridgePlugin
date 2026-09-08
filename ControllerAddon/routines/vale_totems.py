@@ -36,6 +36,7 @@ import time
 
 import controller
 import debug_log
+import outcome_waits
 import skillmulti
 import vale_totems as vt
 import vale_totem_route as route
@@ -95,3 +96,69 @@ def tick(ctx):
             "collision data for Varlamore -- so it cannot walk back. Start it in the valley.")
         return
     # Later tasks add the ladder here.
+
+
+CLAIM_BUDGET_S = 6.0
+BUILD_BUDGET_S = 6.0
+
+
+def site_object(site_number: int, which: str):
+    """The totem base or the offerings pile at `site_number`, by ID on its own known tile.
+
+    BY ID, NEVER BY NAME: the base multiloc is called "Totem site" before it is built and
+    "Yew totem" both while it needs carving AND while it needs decorating, so the name cannot
+    separate the last two states -- the Wintertodt brazier lesson. The tile and the id are both
+    fixed and measured, so /object/at answers exactly one thing.
+    """
+    entry = route.SITES[site_number]
+    x, y = entry["totem"] if which == "totem" else entry["offerings"]
+    obj_id = entry["base_id"] if which == "totem" else entry["offerings_id"]
+    return controller.get_object_at(x, y, route.PLANE, obj_id)
+
+
+def _click_site(ctx, site_number, which, budget_s, confirm):
+    """Click a site object and confirm on the READER, never on the click landing.
+
+    The aim is re-resolved through object_refresh_target for the whole flight: these clicks are
+    issued while the player is still walking up, and a click that departs toward a tick-old
+    projection is the "flick back" CLAUDE.md documents."""
+    entry = route.SITES[site_number]
+    x, y = entry["totem"] if which == "totem" else entry["offerings"]
+    obj_id = entry["base_id"] if which == "totem" else entry["offerings_id"]
+    obj = site_object(site_number, which)
+    if not obj:
+        debug_log.log(LOG, "site %d: %s object not in view" % (site_number, which))
+        return False
+    refresh = controller.object_refresh_target(x, y, route.PLANE, obj_id)
+    if not controller.click_entity(ctx.ser, obj, refresh_target=refresh):
+        return False
+    outcome = outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"], budget_s,
+                                      confirm, now_fn=_now, sleep_fn=_sleep)
+    return bool(outcome)
+
+
+def _site_now(site_number):
+    state = read_state()
+    return None if state is None else state.sites.get(site_number)
+
+
+def claim(ctx, site) -> bool:
+    """Take the offerings pile. Confirmed on the pile reading empty."""
+    n = site.number
+
+    def done():
+        fresh = _site_now(n)
+        return fresh is not None and fresh.unclaimed_offerings == 0
+
+    return _click_site(ctx, n, "offerings", CLAIM_BUDGET_S, done)
+
+
+def build(ctx, site) -> bool:
+    """Erect a totem. Confirmed on baseValue leaving 0 -- one log, and 15% run energy back."""
+    n = site.number
+
+    def done():
+        fresh = _site_now(n)
+        return fresh is not None and fresh.base_value != 0
+
+    return _click_site(ctx, n, "totem", BUILD_BUDGET_S, done)
