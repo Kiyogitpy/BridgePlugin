@@ -829,7 +829,7 @@ def setup(ctx):
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_granite_3t.py -v`
-Expected: 9 passed.
+Expected: 8 passed.
 
 - [ ] **Step 5: Add the standalone probe**
 
@@ -1117,7 +1117,7 @@ Note that `request_movement_abort()` sets a **sticky** flag. It is cleared by `r
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_granite_3t.py -v`
-Expected: 16 passed.
+Expected: 15 passed.
 
 - [ ] **Step 5: Run the whole suite and commit**
 
@@ -1392,7 +1392,7 @@ def full_inventory_phase(ctx, cfg):
     return False
 ```
 
-Re-run. Expected: 22 passed.
+Re-run. Expected: 21 passed.
 
 - [ ] **Step 5: Run the whole suite and commit**
 
@@ -1502,7 +1502,7 @@ def full_inventory_phase(ctx, cfg):
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/test_granite_3t.py -v`
-Expected: 26 passed.
+Expected: 25 passed.
 
 - [ ] **Step 5: Run the whole suite and commit**
 
