@@ -39,7 +39,7 @@ def _no_live_bridge(monkeypatch):
     """Hermetic: nothing here may reach the running client or the serial port."""
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
     monkeypatch.setattr(controller, "get_player",
-                        lambda: {"x": 3255, "y": 2354, "plane": 0})
+                        lambda: {"x": 3249, "y": 2351, "plane": 0})
     monkeypatch.setattr(controller, "get_object_at", lambda *a, **k: None)
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
     monkeypatch.setattr(controller, "move_to_human", lambda *a, **k: None)
@@ -346,7 +346,7 @@ def test_tick_chains_many_cycles_rather_than_one_per_engine_iteration(monkeypatc
     monkeypatch.setattr(g, "run_cycle", lambda *a, **k: (ran.append(1), "ok")[1])
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3255, "y": 2354, "plane": 0, "miningXp": 1000})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3249, "y": 2351, "plane": 0, "miningXp": 1000})
     times = iter([1000.0 + i * 2.0 for i in range(200)])
     monkeypatch.setattr(g, "_now", lambda: next(times))
 
@@ -367,7 +367,7 @@ def test_a_desync_resyncs_and_the_run_CONTINUES(monkeypatch):
     monkeypatch.setattr(g, "resync", lambda ctx: resyncs.append(1))
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3255, "y": 2354, "plane": 0, "miningXp": 1000})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3249, "y": 2351, "plane": 0, "miningXp": 1000})
     times = iter([1000.0 + i * 5.0 for i in range(200)])
     monkeypatch.setattr(g, "_now", lambda: next(times))
 
@@ -397,7 +397,7 @@ def test_no_mining_xp_for_the_stall_window_safety_stops(monkeypatch):
     monkeypatch.setattr(g, "run_cycle", lambda *a, **k: "ok")
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3255, "y": 2354, "plane": 0, "miningXp": 1000})   # never rises
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3249, "y": 2351, "plane": 0, "miningXp": 1000})   # never rises
     times = iter([1000.0 + i * 10.0 for i in range(200)])
     monkeypatch.setattr(g, "_now", lambda: next(times))
 
@@ -424,7 +424,7 @@ def test_a_rising_xp_reading_resets_the_stall_clock(monkeypatch):
     monkeypatch.setattr(g, "run_cycle", lambda *a, **k: "ok")
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3255, "y": 2354, "plane": 0, "miningXp": next(xps)})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3249, "y": 2351, "plane": 0, "miningXp": next(xps)})
     times = iter([1000.0 + i * 10.0 for i in range(200)])
     monkeypatch.setattr(g, "_now", lambda: next(times))
 
@@ -443,7 +443,7 @@ def test_the_rotation_advances_one_rock_per_cycle(monkeypatch):
     monkeypatch.setattr(g, "run_cycle", lambda *a, **k: "ok")
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3255, "y": 2354, "plane": 0, "miningXp": 1000})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3249, "y": 2351, "plane": 0, "miningXp": 1000})
     times = iter([1000.0 + i * 8.0 for i in range(200)])
     monkeypatch.setattr(g, "_now", lambda: next(times))
 
@@ -654,7 +654,7 @@ def test_tick_targets_CYCLE_TICKS_after_the_last_critical_click(monkeypatch):
     monkeypatch.setattr(g, "run_cycle", _fake_run_cycle)
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3255, "y": 2354, "plane": 0, "miningXp": 1000})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3249, "y": 2351, "plane": 0, "miningXp": 1000})
     times = iter([1000.0 + i * 5.0 for i in range(200)])
     monkeypatch.setattr(g, "_now", lambda: next(times))
 
@@ -683,7 +683,7 @@ def test_a_desync_drops_the_pin_so_the_next_cycle_re_enters_on_a_clean_boundary(
     monkeypatch.setattr(g, "resync", lambda ctx: None)
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3255, "y": 2354, "plane": 0, "miningXp": 1000})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3249, "y": 2351, "plane": 0, "miningXp": 1000})
     times = iter([1000.0 + i * 5.0 for i in range(200)])
     monkeypatch.setattr(g, "_now", lambda: next(times))
 
@@ -921,7 +921,7 @@ def _chain_ctx(monkeypatch, started):
     monkeypatch.setattr(g, "run_cycle", lambda *a, **k: "ok")
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3255, "y": 2354, "plane": 0, "miningXp": 1000})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3249, "y": 2351, "plane": 0, "miningXp": 1000})
     times = iter([1000.0 + i * 10.0 for i in range(200)])
     monkeypatch.setattr(g, "_now", lambda: next(times))
     ctx = _Ctx()
@@ -1032,7 +1032,7 @@ def test_a_failed_rock_resolve_CONSUMES_the_knife_selection(monkeypatch):
     monkeypatch.setattr(g, "resync", lambda ctx: None)
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3255, "y": 2354, "plane": 0, "miningXp": 1000})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3249, "y": 2351, "plane": 0, "miningXp": 1000})
     times = iter([1000.0 + i * 10.0 for i in range(200)])
     monkeypatch.setattr(g, "_now", lambda: next(times))
 

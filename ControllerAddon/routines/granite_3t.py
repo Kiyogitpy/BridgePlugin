@@ -53,6 +53,7 @@ import controller
 import debug_log
 import tick_cycle
 import travel
+import worldmap
 
 CATEGORY = "granite3t"
 
@@ -69,7 +70,19 @@ DEFAULT_CONFIG = {
     # two nearest fit the click budget; USER caught it -- "two rocks most likely wont work" --
     # and the arithmetic agrees. When the budget and the respawn disagree, the respawn wins and
     # the budget is bought with flightSpeedScale instead.
-    "rockTiles": [[3254, 2353, 0], [3256, 2353, 0], [3256, 2354, 0], [3254, 2354, 0]],
+    # THE PLAYER MUST MOVE BETWEEN ROCKS, and the first rotation did not make it.
+    #
+    # MEASURED LIVE 2026-09-08: the eastern 2x2 cluster sits around (3255,2354) with every rock
+    # cardinally adjacent to the stand tile, so mining each one required no step at all. Cycles
+    # fit the tick beautifully (occupancy median 353ms, 20 of 21 inside 600ms) and it STILL did
+    # not work: the log was consumed every cycle and Mining xp barely moved. The wiki says the
+    # 3-tick action must start "on the same tick as MOVING to the next rock", and rocks give
+    # their second roll only "if moving up to them" -- with no movement there is nothing to
+    # interrupt the fletch, so it completes and eats the log, and the next rock click merely
+    # cancels the previous unfinished mine, which is why the xp was near zero.
+    #
+    # This western line does force a step: from (3249,2351) two of the four are at distance 2.
+    "rockTiles": [[3247, 2350, 0], [3248, 2350, 0], [3249, 2350, 0], [3250, 2349, 0]],
     # Granite rocks share one object id per variant; the probe prints it alongside each tile.
     # get_object_at needs it, and matching by id rather than name is what keeps a DEPLETED rock
     # (a different id, offering no actions) from resolving as a live one.
@@ -138,11 +151,19 @@ DEFAULT_CONFIG = {
     # closed, options Bank+Collect; wiki "Bank chest (The Great Conch)"). The trip is long, but
     # a WORKING cycle never consumes a log, so this should be paid once per session at most --
     # if it starts recurring, cycles are overrunning and the occupancy log is where to look.
-    "bankTile": [3180, 2421, 0],
+    # STAND OUTSIDE THE BANK, not on it. MEASURED LIVE 2026-09-08: the bank building's interior
+    # is an ISOLATED POCKET on our static collision map -- find_path from (3180,2417),
+    # (3180,2421), (3183,2418) and every other inside tile to the mine answers None, while
+    # (3182,2422) answers 381 steps. The outbound route only ever reached a tile ADJACENT to the
+    # bank; open_bank's own approach walked the player in, and then nothing could route them out
+    # and the routine sat there idle-drifting for seven minutes. Same family as the enclosed
+    # components CLAUDE.md records for Ferox Enclave. The chests are still 3-6 tiles away from
+    # here, which open_bank handles.
+    "bankTile": [3182, 2422, 0],
     # Where the rotation is worked from, and where a bank trip returns to. Recorded at STARTUP
     # rather than when the restock happens: a routine restarted while standing at the bank would
     # otherwise adopt the bank as "home" and never walk back to the rocks.
-    "mineTile": [3255, 2354, 0],
+    "mineTile": [3249, 2351, 0],
     "restockLogs": 27,          # one loose + 26 for the basket
 
     "fullInventory": "drop",
@@ -524,7 +545,7 @@ def _one_via_floor(ctx, cfg, basket, logs):
 # --------------------------------------------------------------------------------------------
 
 BANK_ARRIVAL_TILES = 6
-RESTOCK_MAX_TRIPS = 2
+RESTOCK_MAX_TRIPS = 6
 
 
 def _tile_of(p):
@@ -602,18 +623,46 @@ def restock_phase(ctx, cfg):
     return True
 
 
-def return_phase(ctx, cfg):
-    """Walk back to the tile the run started from. True while still travelling."""
-    data = ctx.state.data
-    home = data.get("g3t_home_tile")
-    if home is None:
-        data["g3t_returning"] = False
+def _step_out(ctx, tile):
+    """One direct minimap click at `tile`, bypassing the router.
+
+    For when the static map says there is no route but the game plainly disagrees -- standing
+    inside a building whose interior is an isolated component on our snapshot. worldmap can be
+    wrong about a doorway; the game's own pathing is not."""
+    point = controller.get_minimap_walk_point(tile[0], tile[1], tile[2])
+    if not point or not point.get("onMinimap"):
         return False
+    controller.click_entity(ctx.ser, point, offset=(0, 0), check_ui_blockers=False,
+                            simulate_mistakes=False)
+    return True
+
+
+def return_phase(ctx, cfg):
+    """Walk back to the rocks. True while still travelling.
+
+    HOME COMES FROM CONFIG, NOT FROM ctx.state.data. MEASURED LIVE 2026-09-08: this read
+    data["g3t_home_tile"], which a restart wipes, and returned False the instant it was missing
+    -- so a routine restarted at the bank fell straight through to the startup check, refused
+    because the rocks do not resolve from there, and idle-drifted for seven minutes without one
+    line of explanation. The player's position survives a restart; ctx.state.data does not."""
+    home = tuple(cfg["mineTile"])
     here = _tile_of(controller.get_player() or {})
+    if here[0] is None:
+        return True                       # cannot tell; try again next tick rather than mine
     if _dist(here, home) <= 2:
         debug_log.log(CATEGORY, "back at the rocks")
-        data["g3t_returning"] = False
+        ctx.state.data["g3t_returning"] = False
         return False
+
+    if worldmap.find_path(here[0], here[1], here[2], home[0], home[1],
+                          goal_adjacent=True) is None:
+        out = tuple(cfg["bankTile"])
+        debug_log.log(CATEGORY, f"no map route home from {here} -- stepping out to {out}")
+        if not _step_out(ctx, out):
+            debug_log.log(CATEGORY, "could not step out: no minimap point for the bank tile")
+        _sleep(2.0)
+        return True
+
     travel.walk_to(ctx, {"x": home[0], "y": home[1], "plane": home[2]})
     return True
 
@@ -628,6 +677,21 @@ def _startup_check(ctx, cfg):
     data = ctx.state.data
     now = _now()
     since = data.setdefault("g3t_startup_since", now)
+
+    # NOT BEING AT THE ROCKS IS "NOT YET", NOT "CANNOT". MEASURED LIVE 2026-09-08: a restart
+    # while standing at the bank refused with "at least one rock does not resolve on screen" --
+    # perfectly true, and exactly what a routine holding a fresh armful of logs and a walk home
+    # ahead of it looks like. The walk-home leg in _run_chain is what fixes it, and it cannot
+    # run while startup keeps stopping the routine.
+    here = _tile_of(controller.get_player() or {})
+    if here[0] is not None and _dist(here, tuple(cfg["mineTile"])) > BANK_ARRIVAL_TILES:
+        if not data.get("g3t_startup_away_logged"):
+            data["g3t_startup_away_logged"] = True
+            debug_log.log(CATEGORY, "startup deferred: not at the rocks yet -- walking back "
+                                    "before the geometry can be measured")
+        data["g3t_startup_since"] = now      # the walk is not part of the defer budget
+        return False
+    data.pop("g3t_startup_away_logged", None)
 
     inv = controller.get_inventory() or []
     clock_live = ctx.events is not None and not ctx.events.ticks.is_stale(now)
@@ -1002,6 +1066,22 @@ def _run_chain(ctx):
     cfg = ctx.state.config
     data = ctx.state.data
 
+    # THE WALK HOME COMES BEFORE EVERYTHING, INCLUDING THE STARTUP CHECK. Startup measures the
+    # geometry against the rocks, which only resolve at the mine, so a restart at the bank
+    # refused ("at least one rock does not resolve") and returned -- and the walk that would
+    # have fixed it sat below the refusal and never ran. MEASURED LIVE 2026-09-08.
+    here = _tile_of(controller.get_player() or {})
+    if here[0] is None:
+        # AN UNREADABLE POSITION IS "CANNOT TELL", NOT "CARRY ON": /player reads empty for a
+        # tick right after the bank interface closes, and cycling on that read means cycling at
+        # the bank. Same rule as the empty /inventory read below.
+        _reseed_stall(ctx)
+        return
+    if _dist(here, tuple(cfg["mineTile"])) > BANK_ARRIVAL_TILES:
+        _reseed_stall(ctx)
+        if return_phase(ctx, cfg):
+            return
+
     if data.get("g3t_startup_pending") and not _startup_check(ctx, cfg):
         return
 
@@ -1031,18 +1111,6 @@ def _run_chain(ctx):
     # stored "returning" flag. MEASURED LIVE 2026-09-08: a restart at the bank lost the flag and
     # the routine cheerfully tried to cycle there, logging "rock did not resolve" for all four
     # rocks forever. ctx.state.data does not survive a restart; the player's position does.
-    here = _tile_of(controller.get_player() or {})
-    if here[0] is None:
-        # AN UNREADABLE POSITION IS "CANNOT TELL", NOT "CARRY ON". MEASURED LIVE 2026-09-08:
-        # /player reads empty for a tick right after the bank interface closes, the walk-home
-        # check was skipped, and the routine cheerfully cycled at the bank -- "rock did not
-        # resolve" four times a second. Same rule as the empty /inventory read above.
-        _reseed_stall(ctx)
-        return
-    if _dist(here, tuple(cfg["mineTile"])) > BANK_ARRIVAL_TILES:
-        _reseed_stall(ctx)
-        if return_phase(ctx, cfg):
-            return
     if not _hold_one_log(ctx, cfg):
         _reseed_stall(ctx)
         return
