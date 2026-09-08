@@ -2054,7 +2054,9 @@ needs a client rebuild** (`woodcuttingXp`, `/woodcutting-config`, the panel's ac
     is a silent no-op that looks like success**. The option is the SEQUENCE
     `("empty-to-bank", "empty")` tried against the one menu `click_menu_action` already reads
     back: the fish barrel next door answers to the first and the fur pouch and looting bag to
-    the second, and the exact wording is not knowable offline. Called from
+    the second. **CONFIRMED LIVE 2026-09-08 it is `Empty-to-bank`** (`menu-select Empty-to-bank
+    Open log basket`), so the first name was right; keep "empty" behind it for the SHUT basket,
+    which has not been exercised. Called from
     `deposit_inventory` beside `empty_looting_bag`, under the same `skipContainerDeposit`
     opt-out, so every routine that banks gets it.
   - **The basket matched nothing on the keep list, so BOTH full-inventory policies destroyed
@@ -2071,24 +2073,47 @@ needs a client rebuild** (`woodcuttingXp`, `/woodcutting-config`, the panel's ac
     routine's "is it worth emptying" question is not answerable from the bridge; emptying an
     already-empty container is a no-op, which is why `empty_log_basket` is called
     unconditionally whenever one is carried rather than gated on a count.
+  - **The bank's own "Deposit Containers" button does NOT empty a log basket** -- MEASURED
+    2026-09-08, logs went on arriving loose after a trip whose `deposit_all_containers` click
+    had landed. That button covers the looting bag / herb sack / seed box / coal bag family;
+    the basket needs its own Empty, which is the whole reason this helper exists.
+  - **The empty RETRIES against a fresh `/inventory` read, three times.** MEASURED the same
+    day: one right-click hit BARE GROUND (`['Cancel', 'Walk here']`) because `/inventory`
+    reported the basket at screen **(31,50)** -- read 0.12s after the bank interface opened,
+    i.e. a pre-layout widget position taken mid-transition. The next item in the same panel
+    resolved to a sane (1598,445) 2.8s later, and with the bank shut the basket reads
+    (1529,438). **The position was not wrong, it was EARLY**, so a retry has to RE-READ rather
+    than re-aim at the same dict. Failing all three is not a stop -- the deposit right after
+    still banks the loose logs, so a stuck basket costs capacity, never the trip. **Any
+    inventory-item click issued immediately after a bank opens shares this exposure.**
+  - **THE DOUBLING IS VERIFIED LIVE 2026-09-08**: over the 12 minutes after an empty, +8606
+    Woodcutting xp (~49 yew logs at 175 each) left only **19** in the inventory -- the basket
+    took the first 28.
   - **A FULL basket is silently indistinguishable from a missing one while chopping.** MEASURED
     the same run: with an open basket carried, logs arrived LOOSE in the inventory (12 Yew logs
     in slots 2-13) -- the basket was already full from a previous session, so there was no
     doubling at all until the first bank trip emptied it. Nothing in the log says so, and the
     reader above cannot either. If a session's inventory fills at the normal rate with a basket
     carried, that is the reason; it self-corrects on the first bank trip.
+- **`GATHER_BUDGET_S` (12s) IS TOO SHORT FOR YEWS -- MEASURED 2026-09-08, and it was the
+  worklist's own open question.** A yew at this account's level yields a log about every
+  **10.5s** (1973 xp / ~180 per log over 115s), so an ordinary gap between logs reaches the
+  budget and `gather` logs `nothing from Yew tree in 12.2s -- re-picking` while the player is
+  still happily chopping. It costs no logs -- `tick` then returns at the `not isIdle` gate and
+  the GAME auto-chops the tree to the ground (one such gap ran 95s and still earned 1973 xp) --
+  but it forfeits the pre-hover chain and fills the log with false failures. The fix is a
+  per-Profile budget (woodcutting wants ~30s); NOT applied yet.
 - **FIRST LIVE RUN 2026-09-08 (VM, `logs/vm_woodcutting_*.log`), and the client rebuild is
   IN**: chopping Yew trees at (1591,3487) with `woodcuttingXp` reporting real drops
   (`+180 Woodcutting xp, tree still up`), arrival 0.18s after the click, the next tree
   pre-hovered. So `xp_field`, `/woodcutting-config` and the panel entry are all confirmed
   present in the running client.
 - **Woodcutting's remaining live worklist:** whether a tree's `OBJECT_DESPAWNED` lands on
-  the tree's own tile the way a rock's does; whether `GATHER_BUDGET_S` (12s) covers a slow
-  yew/magic chop at the user's level; whether the account has shift-click drop ON (watch for
+  the tree's own tile the way a rock's does; whether the account has shift-click drop ON (watch for
   `shift-drop did nothing (shift-click drop off?)` in the log, `drop` policy only); that the
-  panel's Chop down scan lists "Yew tree" rather than a bare "Yew"; and **the log basket's
-  real bank-context option text** -- watch for `emptying log basket` followed by the logs
-  actually leaving, and for `No 'empty-to-bank' entry in menu` if neither name is right.
+  panel's Chop down scan lists "Yew tree" rather than a bare "Yew". The log basket's own
+  questions are settled (above); what is left there is whether a SHUT basket really offers
+  "Empty", which the sequence's second name assumes.
 
 - **Rock choice is the sidebar panel's "Gathering" section**
   (`SettingsPanel.java`): Refresh scans every plane of the loaded scene on the client thread
