@@ -103,3 +103,68 @@ def test_a_recorded_snowfall_expires_so_a_missed_despawn_cannot_pin_the_dodge_ru
     ctx.state.data["wt_snow_at"] = wt._now()
     hermetic["t"] += wt.SNOW_MEMORY_S + 1
     assert wt._snow_on_tile(ctx) is False
+
+
+def test_kit_phase_clicks_the_crate_whose_id_hands_out_the_missing_tool(monkeypatch):
+    ctx = _Ctx()
+    scene = [{"id": cid, "name": "Crate", "actions": [act], "distance": 2,
+              "x": 1, "y": 1, "plane": 0}
+             for cid, (act, _item) in w.CRATE_TOOLS.items()]
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
+    clicked = {}
+
+    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None):
+        clicked["id"] = obj["id"]
+        clicked["action"] = action
+        return True
+
+    monkeypatch.setattr(wt, "_click_object", fake_click)
+    # Everything present except the knife.
+    items = [{"id": 0, "name": n} for n in
+             ("Bronze axe", "Tinderbox", "Hammer", "Rejuvenation potion(4)")]
+    assert wt.kit_phase(ctx, items) is True
+    assert clicked["id"] == 29317
+    assert clicked["action"] == "Take-knife"
+
+
+def test_kit_phase_takes_concoctions_in_bulk(monkeypatch):
+    ctx = _Ctx()
+    scene = [{"id": 29320, "name": "Crate", "actions": [w.CRATE_TAKE_10], "distance": 2,
+              "x": 1, "y": 1, "plane": 0}]
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
+    seen = {}
+
+    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None):
+        seen["action"] = action
+        return True                      # a real True: kit_phase's result is asserted `is True`
+
+    monkeypatch.setattr(wt, "_click_object", fake_click)
+    items = [{"id": 0, "name": n} for n in ("Bronze axe", "Knife", "Tinderbox", "Hammer")]
+    assert wt.kit_phase(ctx, items) is True
+    assert seen["action"] == w.CRATE_TAKE_10
+
+
+def test_kit_phase_stops_the_run_after_too_many_fruitless_takes(monkeypatch):
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_objects", lambda *a, **k: [])
+    for _ in range(wt.KIT_MAX_TAKES + 1):
+        wt.kit_phase(ctx, [])
+    assert ctx.state.safety_stopped is True
+    assert "kit" in ctx.state.stop_reason.lower()
+
+
+def test_warmth_phase_drinks_a_dose_and_confirms_on_warmth_rising(monkeypatch):
+    ctx = _Ctx()
+    calls = {"n": 0}
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(wt, "_click_inventory_item",
+                        lambda c, item, action, budget_s, confirm: calls.__setitem__("n", 1) or True)
+    items = [{"id": 0, "name": "Rejuvenation potion(4)", "slot": 3}]
+    assert wt.warmth_phase(ctx, items) is True
+    assert calls["n"] == 1
+
+
+def test_warmth_phase_with_no_potion_is_a_safety_stop_not_a_silent_loop(monkeypatch):
+    ctx = _Ctx()
+    assert wt.warmth_phase(ctx, []) is False
+    assert ctx.state.safety_stopped is True
