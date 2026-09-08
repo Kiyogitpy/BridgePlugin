@@ -1024,35 +1024,32 @@ def drop_items(ctx, predicate):
     if not items:
         return 0
 
+    # L1 (CONFIRMED LIVE 2026-09-08, the first live run): cancel any pending "use item on" first.
+    # The old code left-clicked each item and relied on a forced-Drop swap. That swap exists for
+    # SALVAGE but NOT for the sorted output -- MEASURED, /hover on a Mithril scimitar reported
+    # default option "Wield" with entries [Cancel, Examine, Drop, Use, Wield]. So the first
+    # left-click SELECTED an item for use-on, and from then on every menu in the game collapsed
+    # to ['Cancel', 'Use'] -- which is why the right-click fallback then reported "No 'Drop'
+    # entry" for eleven items in a row while Drop was plainly in the real menu. USER: "it was
+    # using the top thing onto another making shift drop not work is likely" -- exactly right,
+    # and a live selection defeats shift-drop too, so this must be cleared BEFORE the drop loop,
+    # not merely avoided by it.
+    controller.key_tap(ctx.ser, "ESC")
+    controller.human_delay(0.15, 0.25)
+
     before = len(controller.get_inventory())
-    drop_works = None
     dropped_names = {}
     for item in items:
         name = item.get("name") or ""
-        if drop_works is False:
-            controller.click_menu_action(ctx.ser, item, "Drop", offset=(0, 0),
-                                         check_ui_blockers=False)
-            controller.human_delay(0.06, 0.12)  # 40% faster still, on top of the earlier 2x (original 0.2-0.4s)
-        else:
-            # simulate_mistakes=False (2026-09-03): with Drop as the forced left-click, a
-            # simulated near-miss lands on the NEIGHBOURING slot -- fine when that is more
-            # salvage, but it drops whatever tool happens to sit there (chisel, rune pouch, ...)
-            # when it is not. Same reasoning as banker.py's no-misclick rule for bank UI buttons.
-            controller.click_entity(ctx.ser, item, check_ui_blockers=False,
-                                    simulate_mistakes=False)
-            if drop_works is None:
-                # I8: poll rather than a single ~100ms read -- see DROP_CONFIRM_S's comment.
-                drop_works = _poll_drop_confirmed(lambda: len(controller.get_inventory()) < before)
-                if not drop_works:
-                    debug_log.log("salvage", f"the first drop ('{name}') did nothing -- the forced "
-                                              f"left-click Drop swap may be missing or mis-set; "
-                                              f"using the right-click menu for the rest of this pass")
-                    controller.click_menu_action(ctx.ser, item, "Drop", offset=(0, 0),
-                                                 check_ui_blockers=False)
-                    controller.human_delay(0.06, 0.12)
-            else:
-                controller.human_delay(0.06, 0.12)  # 40% faster still, on top of the earlier 2x (original 0.2-0.4s)
         dropped_names[name] = dropped_names.get(name, 0) + 1
+
+    # L1: delegate the clicking to controller.drop_items rather than re-implementing it. That
+    # helper SHIFT+clicks (OSRS's own drop shortcut, which needs no per-item menu swap at all --
+    # USER: "Hold shift to drop"), verifies the first drop against /inventory, and escalates the
+    # whole pass to the right-click "Drop" entry if shift-drop is switched off. This routine's
+    # local copy had the verify-then-escalate SHAPE but clicked WITHOUT shift, which is the bug
+    # above. One implementation, already proven in the gathering routines.
+    controller.drop_items(ctx.ser, items)
 
     # I8: the CONFIRMED delta, not the attempt count above -- sort_phase treats this return value
     # as its progress signal (the input to SORT_FAIL_LIMIT, the ceiling that stops the sort rung

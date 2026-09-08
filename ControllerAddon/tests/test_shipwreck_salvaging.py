@@ -190,27 +190,6 @@ def test_tick_does_not_drop_or_stow_with_plenty_of_room(monkeypatch):
     assert not stow_calls
 
 
-def test_drop_salvage_never_simulates_a_misclick(monkeypatch):
-    """I6 changed drop_items to verify the FIRST click against a shrinking inventory (see the
-    dedicated I6 tests below for the not-shrinking/fallback case) -- so the mock inventory here
-    must actually shrink in response to a click, or drop_works reads False on item 0 and every
-    later item goes through click_menu_action instead, which this test isn't about."""
-    ctx = _Ctx()
-    inv = _inventory(3) + [{"name": "Chisel", "screenX": 1, "screenY": 1}]
-    monkeypatch.setattr(controller, "get_inventory", lambda: list(inv))
-    seen = []
-
-    def _click(ser, ent, **kw):
-        seen.append((ent["name"], kw))
-        inv.remove(ent)
-        return True
-    monkeypatch.setattr(controller, "click_entity", _click)
-    ss.drop_salvage(ctx)
-    assert [n for n, _ in seen] == ["Small salvage"] * 3
-    assert all(kw.get("simulate_mistakes") is False for _, kw in seen)
-
-
-# --- chat signals ------------------------------------------------------------------------
 
 def test_sunk_message_clears_the_hook_cooldown():
     ctx = _Ctx()
@@ -608,75 +587,38 @@ def test_the_default_keep_list_keeps_what_the_user_asked_to_keep():
 # --- drop_items --------------------------------------------------------------------------
 
 def test_drop_items_drops_only_what_the_predicate_selects(monkeypatch):
-    """I8: the mock inventory must actually shrink in response to a click, or the confirmed-delta
-    return (see the I8 tests below) reads 0 regardless of what the predicate selected -- this
-    test is about the predicate filter, not the confirmation, so give it a working drop."""
+    """The wrapper owns the predicate filter; controller.drop_items owns the clicking."""
     inv = [{"name": "Gold ring", "screenX": 1, "screenY": 1},
            {"name": "Chisel", "screenX": 2, "screenY": 2},
            {"name": "Rune scimitar", "screenX": 3, "screenY": 3}]
-    monkeypatch.setattr(controller, "get_inventory", lambda: list(inv))
-    clicked = []
-    def _click(ser, item, **kw):
-        clicked.append(item["name"])
-        inv.remove(item)
+    state = {"inv": list(inv)}
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(state["inv"]))
+    handed = []
+
+    def _drop(ser, items):
+        handed.append([i["name"] for i in items])
+        for i in items:
+            state["inv"].remove(i)
         return True
-    monkeypatch.setattr(controller, "click_entity", _click)
-    ctx = _Ctx()
-    dropped = ss.drop_items(ctx, lambda name: name == "Gold ring")
-    assert clicked == ["Gold ring"]
+
+    monkeypatch.setattr(controller, "drop_items", _drop)
+    dropped = ss.drop_items(_Ctx(), lambda name: name == "Gold ring")
+    assert handed == [["Gold ring"]]
     assert dropped == 1
 
 
-def test_drop_items_never_simulates_a_misclick(monkeypatch):
-    """A simulated near-miss lands on the NEIGHBOURING slot -- which is a tool."""
-    monkeypatch.setattr(controller, "get_inventory",
-                        lambda: [{"name": "Gold ring", "screenX": 1, "screenY": 1}])
-    seen = {}
-    monkeypatch.setattr(controller, "click_entity",
-                        lambda ser, item, **kw: seen.update(kw) or True)
-    ss.drop_items(_Ctx(), lambda name: True)
-    assert seen.get("simulate_mistakes") is False
-    assert seen.get("check_ui_blockers") is False
-
-
-# --- I6: drop_items verifies the first drop and falls back to the menu ---------------------
-
-def test_drop_items_falls_back_to_the_menu_when_the_first_drop_frees_nothing(monkeypatch):
-    """A forced-Drop swap that has gone missing or is mis-set on a ring/bracelet/scimitar would
-    otherwise leave click_entity resolving to Wear/Wield -- a truthful-looking 'dropped' count
-    with nothing actually leaving the inventory, which drives straight into the C2 deadlock."""
-    monkeypatch.setattr(ss, "DROP_CONFIRM_S", 0.02)  # I8 poll -- keep the "never shrinks" path fast
-    inv = [{"name": "Gold ring", "screenX": 1, "screenY": 1},
-           {"name": "Sapphire ring", "screenX": 2, "screenY": 2}]
-    monkeypatch.setattr(controller, "get_inventory", lambda: inv)   # static: nothing ever drops
-    entity_clicks = []
-    menu_clicks = []
-    monkeypatch.setattr(controller, "click_entity",
-                        lambda ser, ent, **kw: entity_clicks.append(ent["name"]) or True)
-    monkeypatch.setattr(controller, "click_menu_action",
-                        lambda ser, ent, option, **kw: menu_clicks.append((ent["name"], option)) or True)
-    dropped = ss.drop_items(_Ctx(), lambda name: True)
-    # Only the (failed) first attempt goes through click_entity -- everything after the verify
-    # fails, including the retry of item 0 itself, goes through the menu.
-    assert entity_clicks == ["Gold ring"]
-    assert menu_clicks == [("Gold ring", "Drop"), ("Sapphire ring", "Drop")]
-    # I8: both click_entity and click_menu_action "succeed" (return True) here, but the static
-    # inventory never actually shrinks -- so the CONFIRMED delta sort_phase relies on as its
-    # progress signal must read 0, not the number of clicks issued. This is the regression guard
-    # for SORT_FAIL_LIMIT: a click that lands on nothing (e.g. a stray interface eating it) must
-    # never be reported as progress.
-    assert dropped == 0
-
-
 def test_drop_items_logs_the_names_it_dropped(monkeypatch):
-    inv = [{"name": "Gold ring", "screenX": 1, "screenY": 1},
-           {"name": "Gold ring", "screenX": 2, "screenY": 2}]
-    calls = list(inv)
-    def _click(ser, ent, **kw):
-        calls.remove(ent)
+    """Spec live-checklist item 7b: the keep-list names are wiki-sourced, so a near-miss fails
+    silently in the DROP direction and this log is the only way to see it."""
+    state = {"inv": [{"name": "Gold ring", "screenX": 1, "screenY": 1},
+                     {"name": "Gold ring", "screenX": 2, "screenY": 2}]}
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(state["inv"]))
+
+    def _drop(ser, items):
+        state["inv"] = []
         return True
-    monkeypatch.setattr(controller, "get_inventory", lambda: list(calls))
-    monkeypatch.setattr(controller, "click_entity", _click)
+
+    monkeypatch.setattr(controller, "drop_items", _drop)
     logged = []
     monkeypatch.setattr(ss.debug_log, "log", lambda cat, msg: logged.append((cat, msg)))
     ss.drop_items(_Ctx(), lambda name: True)
@@ -696,53 +638,14 @@ def test_drop_items_dismisses_a_stray_continue_box_on_entry(monkeypatch):
 # --- I8: drop_items returns the CONFIRMED delta, not the attempt count --------------------
 
 def test_drop_items_returns_the_confirmed_delta_not_the_attempt_count(monkeypatch):
-    """Concrete failure this guards: a stray interface open over the inventory (this codebase
-    records exactly that class of bug for motherlode_mine.py -- 'an open interface eats the
-    first world click') swallows every click. Both click_entity and click_menu_action still
-    report success, but nothing leaves the inventory. sort_phase treats drop_items' return
-    value as its progress signal (the input to SORT_FAIL_LIMIT), so a wrong count here defeats
-    the ceiling that stops the sort rung right-clicking a full inventory forever, unattended."""
-    monkeypatch.setattr(ss, "DROP_CONFIRM_S", 0.02)  # I8 poll -- keep the "never shrinks" path fast
-    inv = [{"name": "Small salvage", "screenX": 1, "screenY": 1},
-           {"name": "Small salvage", "screenX": 2, "screenY": 2},
-           {"name": "Small salvage", "screenX": 3, "screenY": 3}]
-    monkeypatch.setattr(controller, "get_inventory", lambda: inv)  # static: nothing ever leaves
-    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **kw: True)
-    monkeypatch.setattr(controller, "click_menu_action", lambda ser, ent, option, **kw: True)
-    dropped = ss.drop_items(_Ctx(), lambda name: True)
-    assert dropped == 0
+    """A stray interface eating every click (motherlode's documented failure) must read as ZERO
+    progress -- sort_phase uses this return value as the input to SORT_FAIL_LIMIT, the ceiling
+    that stops the sort rung right-clicking a full inventory forever, unattended."""
+    inv = [{"name": "Small salvage", "screenX": i, "screenY": i} for i in range(3)]
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)   # static: nothing ever leaves
+    monkeypatch.setattr(controller, "drop_items", lambda ser, items: True)  # claims success
+    assert ss.drop_items(_Ctx(), lambda name: True) == 0
 
-
-def test_drop_items_confirmed_after_a_delay_still_counts_as_working(monkeypatch):
-    """A drop is processed on the NEXT server tick (0-600ms), so the inventory shrinking on the
-    third /inventory read rather than the first is a perfectly good drop, not a broken swap --
-    drop_items must not fall back to the right-click menu or log the 'swap may be missing'
-    warning over ordinary tick latency."""
-    inv = [{"name": "Small salvage", "screenX": 1, "screenY": 1},
-           {"name": "Small salvage", "screenX": 2, "screenY": 2}]
-    reads = {"n": 0}
-
-    def _get_inventory():
-        reads["n"] += 1
-        if reads["n"] < 3:
-            return list(inv)          # first two reads: drop hasn't landed on the server yet
-        return list(inv)[1:]          # third read onward: the server processed it
-
-    monkeypatch.setattr(controller, "get_inventory", _get_inventory)
-    entity_clicks = []
-    menu_clicks = []
-    monkeypatch.setattr(controller, "click_entity",
-                        lambda ser, ent, **kw: entity_clicks.append(ent["name"]) or True)
-    monkeypatch.setattr(controller, "click_menu_action",
-                        lambda ser, ent, option, **kw: menu_clicks.append((ent["name"], option)) or True)
-    logged = []
-    monkeypatch.setattr(ss.debug_log, "log", lambda cat, msg: logged.append(msg))
-    ss.drop_items(_Ctx(), lambda name: True)
-    assert menu_clicks == []
-    assert not any("swap may be missing" in msg for msg in logged)
-
-
-# --- derive_phase ------------------------------------------------------------------------
 
 def _cfg(**over):
     cfg = dict(ss.DEFAULT_CONFIG)
@@ -1605,3 +1508,33 @@ def test_every_salvage_tier_is_configured_by_name():
                  "pirate", "mercenary", "fremennik", "merchant"]:
         assert f"{tier} shipwreck" in names, tier
     assert len(names) == len(ss.SALVAGE_LEVEL_REQ)
+
+
+# --- L1: shift-drop, and cancelling a pending "use on" first (CONFIRMED LIVE 2026-09-08) -----
+
+def test_drop_items_delegates_to_the_shift_drop_helper(monkeypatch):
+    """The bare left-click relied on a forced-Drop swap that exists for salvage but NOT for the
+    sorted output -- /hover on a Mithril scimitar reported default option 'Wield'. Shift-drop
+    needs no per-item swap at all."""
+    inv = [{"name": "Gold ring", "screenX": 1, "screenY": 1}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    seen = []
+    monkeypatch.setattr(controller, "drop_items",
+                        lambda ser, items: seen.append([i["name"] for i in items]) or True)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda *a, **k: pytest.fail("must not bare-left-click; shift-drop instead"))
+    ss.drop_items(_Ctx(), lambda name: name == "Gold ring")
+    assert seen == [["Gold ring"]]
+
+
+def test_drop_items_cancels_a_pending_use_selection_first(monkeypatch):
+    """A live 'use item on' selection collapses EVERY menu to ['Cancel', 'Use'], which defeats
+    the right-click fallback and shift-drop alike. MEASURED live: eleven consecutive
+    "No 'Drop' entry in menu" failures while Drop was plainly in the real menu."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Gold ring", "screenX": 1, "screenY": 1}])
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    monkeypatch.setattr(controller, "drop_items", lambda ser, items: True)
+    ss.drop_items(_Ctx(), lambda name: True)
+    assert "ESC" in keys, "a pending use-on selection must be cancelled before dropping"
