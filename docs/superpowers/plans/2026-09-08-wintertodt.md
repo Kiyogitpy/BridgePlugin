@@ -983,7 +983,6 @@ VARBIT_SUBSCRIPTIONS = [w.VARBIT_WARMTH, w.VARBIT_ROUND_TIMER, w.VARBIT_AREA_ATT
 
 CLICK_RANGE = 10                 # walk first, click close (motherlode's measured rule)
 SNOW_MEMORY_S = 3.0              # how long a recorded snowfall tile stays believed
-OBJECT_POLL_S = 0.9              # a bulk /objects scan is the expensive read here
 
 DEFAULT_CONFIG = {
     "preferredBrazier": "SOUTH_WEST",     # the conventional group brazier -- UNVERIFIED
@@ -1184,9 +1183,12 @@ def test_kit_phase_takes_concoctions_in_bulk(monkeypatch):
               "x": 1, "y": 1, "plane": 0}]
     monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
     seen = {}
-    monkeypatch.setattr(wt, "_click_object",
-                        lambda c, o, action, budget_s, confirm, signals=None:
-                        seen.setdefault("action", action) or True)
+
+    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None):
+        seen["action"] = action
+        return True                      # a real True: kit_phase's result is asserted `is True`
+
+    monkeypatch.setattr(wt, "_click_object", fake_click)
     items = [{"id": 0, "name": n} for n in ("Bronze axe", "Knife", "Tinderbox", "Hammer")]
     assert wt.kit_phase(ctx, items) is True
     assert seen["action"] == w.CRATE_TAKE_10
@@ -1486,9 +1488,12 @@ def test_feed_phase_clicks_the_lit_brazier_and_never_the_unlit_twin(monkeypatch)
     ]
     monkeypatch.setattr(controller, "get_objects", lambda *a, **k: scene)
     seen = {}
-    monkeypatch.setattr(wt, "_click_object",
-                        lambda c, o, action, budget_s, confirm, signals=None:
-                        seen.setdefault("id", o["id"]) or True)
+
+    def fake_click(ctx_, obj, action, budget_s, confirm, signals=None):
+        seen["id"] = obj["id"]
+        return True                      # feed_phase returns this straight through
+
+    monkeypatch.setattr(wt, "_click_object", fake_click)
     items = [{"id": w.ITEM_KINDLING, "name": "Bruma kindling"}]
     assert wt.feed_phase(ctx, {}, items, "SOUTH_WEST") is True
     # The NEARER object is the unlit one; picking by name or by distance would take it.
@@ -1609,6 +1614,9 @@ def test_light_phase_targets_the_unlit_id_and_escalates_to_the_menu_when_hijacke
                         lambda *a, **k: tries.__setitem__("bare", tries["bare"] + 1) or False)
     monkeypatch.setattr(wt, "_click_menu",
                         lambda *a, **k: tries.__setitem__("menu", tries["menu"] + 1) or True)
+    # _await must be stubbed too, or the menu branch falls through to the real
+    # bridge_events.await_outcome and spins against a fake clock for the whole budget.
+    monkeypatch.setattr(wt, "_await", lambda *a, **k: True)
     assert wt.light_phase(ctx, {}, "SOUTH_WEST") is True
     # A Wintertodt brazier on an official world is the most crowded object in the game;
     # golem_crafting MEASURED a 30-40% bare-click hijack rate on a far quieter one.
