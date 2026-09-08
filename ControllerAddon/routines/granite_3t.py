@@ -587,6 +587,11 @@ def restock_phase(ctx, cfg):
     data = ctx.state.data
     home = data.get("g3t_home_tile") or tuple(cfg["mineTile"])
 
+    # The ceiling counts CONSECUTIVE failed trips, not trips ever made. It is a "the bank is
+    # out, or the withdraw is not landing" detector, and a routine that restocks successfully
+    # and mines for another twenty minutes has demonstrably not hit that -- resetting on
+    # progress is what lets this run unattended for hours instead of stopping after six
+    # perfectly good trips.
     trips = data.get("g3t_restock_trips", 0)
     if trips >= RESTOCK_MAX_TRIPS:
         ctx.state.trigger_safety_stop(
@@ -1107,6 +1112,7 @@ def _hold_one_log(ctx, cfg):
         # the consumption warning downstream compares against this. Without it, resolving a
         # 26-log surplus reads as "25 logs consumed".
         data["g3t_logs"] = 1
+        data["g3t_restock_trips"] = 0     # a log in hand means the last trip did its job
         return True
     fails = data.get("g3t_log_refills", 0) + 1
     data["g3t_log_refills"] = fails
