@@ -1883,11 +1883,12 @@ BREAK_DEFER_MAX_S = 420.0        # a round averages ~5 min including the 60s gap
 def _progress_signature(reader, items):
     """Everything that moves when the routine is working. Unchanged for STALL_STOP_S means
     stuck -- and CLAUDE.md's standing lesson is that a silent loop is worse than a crash."""
+    # NOT warmth and NOT energyPercent: both move without us. Warmth regenerates ~8%/min
+    # passively (wiki) and energy falls because OTHER players are damaging the boss, so either
+    # keeps this signature drifting straight through a genuine wedge and defeats the watch.
     reader = reader or {}
     return "|".join(str(x) for x in (
         reader.get("points"),
-        reader.get("energyPercent"),
-        reader.get("warmth"),
         len(items or []),
         ws.count_item(items, w.ITEM_ROOT),
         ws.count_item(items, w.ITEM_KINDLING),
@@ -1983,6 +1984,10 @@ def before_break(ctx):
             log("wintertodt", "before_break: round over, break may start")
             return
         tick(ctx)
+        # Pace the loop HERE, not in the callee. A rung that finds nothing to do returns
+        # without any I/O at all, and an earlier draft then spun 200,000 times against a
+        # frozen clock -- live, that is 420s of unthrottled HTTP on an ordinary transient.
+        outcome_waits.tick_pause(ctx, 1, now_fn=_now, sleep_fn=_sleep)
     log("wintertodt", "before_break: gave up waiting for the round to end after %.0fs"
         % BREAK_DEFER_MAX_S)
 ```
