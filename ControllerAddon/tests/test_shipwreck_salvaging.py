@@ -1688,3 +1688,29 @@ def test_the_drain_ends_by_stowing_the_keepers(monkeypatch):
     ss.tick(ctx)
     assert stowed == [True]
     assert ctx.state.data.get("draining") is None
+
+
+def test_crew_open_panel_does_not_trust_found_alone(monkeypatch):
+    """MEASURED live 2026-09-08: every 937 child reports found=True while the panel is CLOSED --
+    `found` means "this id exists", which WidgetProvider deliberately distinguishes from
+    clickable:false ("right id, interface closed"). Checking found made ensure_ui_state believe
+    the panel was already open, so Q was never tapped and the failure surfaced downstream as
+    "side panel tab 35 is not clickable"."""
+    import crew
+    state = {"open": False, "taps": 0}
+
+    def _widget(group, child, index=None):
+        if state["open"]:
+            return {"found": True, "clickable": True, "hidden": False,
+                    "screenX": 5, "screenY": 5}
+        return {"found": True, "clickable": False, "hidden": True}   # closed, but FOUND
+
+    def _tap(ser, key):
+        state["taps"] += 1
+        state["open"] = True
+
+    monkeypatch.setattr(controller, "get_widget", _widget)
+    monkeypatch.setattr(controller, "key_tap", _tap)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    assert crew.open_panel(_Ctx()) is True
+    assert state["taps"] == 1, "it must actually tap Q when the panel is hidden"

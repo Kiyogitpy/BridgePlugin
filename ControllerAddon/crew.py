@@ -78,7 +78,14 @@ def open_panel(ctx) -> bool:
     uses for the same key -- a single unconfirmed tap is how that function used to report "sail
     toggle not found" with the sails still up."""
     def _open():
-        return bool(controller.get_widget(SIDEPANEL_GROUP, TAB_TITLE).get("found"))
+        # NOT .get("found") -- MEASURED live 2026-09-08: every 937 child reports found=True while
+        # the panel is CLOSED (found means "this id exists", per WidgetProvider's own deliberate
+        # distinction between found:false = wrong id and clickable:false = interface closed). The
+        # first version checked found, so ensure_ui_state concluded the panel was already open and
+        # never tapped Q at all -- the failure surfaced downstream as "side panel tab 35 is not
+        # clickable".
+        widget = controller.get_widget(SIDEPANEL_GROUP, TAB_TITLE)
+        return bool(widget.get("clickable")) and not widget.get("hidden", False)
 
     return controller.ensure_ui_state(
         lambda: controller.key_tap(ctx.ser, SAILING_TAB_KEY), _open, tries=TAB_TRIES)
