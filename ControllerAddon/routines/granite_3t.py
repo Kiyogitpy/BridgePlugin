@@ -279,6 +279,15 @@ def full_inventory_phase(ctx, cfg):
     keep = (cfg["knifeName"].lower(), cfg["logName"].lower())
     items = [i for i in (controller.get_inventory() or [])
              if not any(k in (i.get("name") or "").lower() for k in keep)]
+    if not items:
+        # drop_items would return True vacuously on an empty list, so this tick would keep
+        # "succeeding" forever -- and tick() returns at this gate before _stall_check, so the
+        # XP stall watch could never catch it. Unreachable while knifeName/logName are the
+        # fixed defaults and granite matches neither, but this is the one path that bypasses
+        # the routine's only terminal condition.
+        ctx.state.trigger_safety_stop(
+            "inventory full but every item is on the keep list -- nothing can be dropped")
+        return True
     debug_log.log(CATEGORY, f"inventory full -- dropping {len(items)} granite")
     if not controller.drop_items(ctx.ser, items):
         ctx.state.trigger_safety_stop("inventory still full after dropping the granite")

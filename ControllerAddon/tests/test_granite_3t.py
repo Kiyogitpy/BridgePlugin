@@ -457,3 +457,17 @@ def test_a_non_full_inventory_is_not_a_drop_tick(monkeypatch):
                         lambda: [_item("Knife", 1700, 800, 0), _item("Teak logs", 1740, 800, 1)])
     ctx = _Ctx()
     assert g.full_inventory_phase(ctx, _cfg()) is False
+
+
+def test_a_full_inventory_with_nothing_droppable_safety_stops(monkeypatch):
+    """The one path that bypasses the XP stall watch: tick() returns at the
+    full_inventory_phase gate, so nothing downstream could ever catch this spin."""
+    dropped = []
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [_item("Knife", 1700, 800, i) for i in range(28)])
+    monkeypatch.setattr(controller, "drop_items",
+                        lambda ser, items: (dropped.append(items), True)[1])
+    ctx = _Ctx()
+    assert g.full_inventory_phase(ctx, _cfg()) is True
+    assert ctx.state.safety_stopped is True
+    assert dropped == []          # never even attempted
