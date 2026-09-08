@@ -165,3 +165,67 @@ def feed_item(items, *, fletch, energy_percent, feed_roots_near_end, feed_roots_
                 and energy_percent is not None
                 and 0 <= energy_percent <= feed_roots_below_energy)
     return w.ITEM_ROOT if near_end else None
+
+
+def derive_phase(*, reader, items, config, brazier, snow_on_tile, round_over_streak) -> str:
+    """The ladder, as a pure function of live state. Never reads a stored phase.
+
+    Order is the design, and each rung's position has a reason:
+
+      stop      -- we are not in the arena and this routine owns no travel.
+      kit       -- a missing axe idles the whole loop, and a missing potion disarms `warmth`.
+                   Runs mid-round as well as between rounds for exactly that reason.
+      warmth    -- 0% is instant death and forfeits every point of the round. Outranks all
+                   work below it. Only `kit` beats it, and only because you cannot drink a
+                   potion you do not have.
+      dodge     -- cheap, and the 3x3 attack is the biggest single warmth hit.
+      light/fix -- 25 points each, and the wiki says relighting is worth interrupting anything.
+      feed      -- spend what we hold.
+      fletch    -- turn a full inventory of roots into kindling.
+      chop      -- the default during a round.
+
+    `round_over_streak` is a SUSTAINED count of consecutive inactive reads, not a boolean: a
+    single transitional snapshot (HUD down, points -1) looks exactly like a round end and is
+    the failure family that cost GOTR six live bugs."""
+    if not (reader or {}).get("atWintertodt"):
+        return "stop"
+
+    deficit = kit_deficit(items, config.get("minDoses", 4))
+    cold = needs_drink(reader, config.get("drinkAtWarmth", 45))
+
+    # Kit first only when it would otherwise disarm the warmth rung, or when a tool is missing.
+    if deficit and (not cold or "potion" in deficit):
+        return "kit"
+    if cold:
+        return "warmth"
+
+    if snow_on_tile and config.get("dodgeSnowfall", True):
+        return "dodge"
+
+    if not round_active(reader):
+        if round_over_streak >= config.get("roundEndReads", 3):
+            return "between_rounds"
+        return "chop"          # ride out a transitional read rather than acting on it
+
+    if brazier:
+        status = brazier_status(reader, brazier)
+        alive = pyromancer_status(reader, brazier) != "INCAPACITATED"
+        if status == "BROKEN" and alive:
+            return "fix"
+        if status == "UNLIT" and alive:
+            return "light"
+
+    feed = feed_item(
+        items,
+        fletch=config.get("fletch", True),
+        energy_percent=(reader or {}).get("energyPercent"),
+        feed_roots_near_end=config.get("feedRootsNearRoundEnd", True),
+        feed_roots_below_energy=config.get("feedRootsBelowEnergy", 15),
+    )
+    if feed is not None and brazier_status(reader, brazier) == "LIT":
+        return "feed"
+
+    if config.get("fletch", True) and count_item(items, w.ITEM_ROOT) and inventory_full(items):
+        return "fletch"
+
+    return "chop"

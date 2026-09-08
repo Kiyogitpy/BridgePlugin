@@ -278,3 +278,98 @@ def test_inventory_full_checks_capacity():
     # Can use a custom size.
     assert ws.inventory_full(inv("Knife", "Axe"), size=2) is True
     assert ws.inventory_full(inv("Knife"), size=2) is False
+
+
+CFG = {
+    "preferredBrazier": "SOUTH_WEST",
+    "drinkAtWarmth": 45,
+    "minDoses": 4,
+    "takeConcoctions": 10,
+    "fletch": True,
+    "feedRootsNearRoundEnd": True,
+    "feedRootsBelowEnergy": 15,
+    "dodgeSnowfall": True,
+    "roundEndReads": 3,
+}
+
+KIT = ["Bronze axe", "Knife", "Tinderbox", "Hammer", "Rejuvenation potion(4)"]
+
+
+def phase(**over):
+    args = {
+        "reader": over.pop("reader", reader()),
+        "items": over.pop("items", inv(*KIT)),
+        "config": over.pop("config", CFG),
+        "brazier": over.pop("brazier", "SOUTH_WEST"),
+        "snow_on_tile": over.pop("snow_on_tile", False),
+        "round_over_streak": over.pop("round_over_streak", 0),
+    }
+    args.update(over)
+    return ws.derive_phase(**args)
+
+
+def test_outside_the_arena_is_a_stop_because_this_routine_owns_no_travel():
+    assert phase(reader=reader(atWintertodt=False)) == "stop"
+
+
+def test_warmth_outranks_a_full_inventory_and_a_dead_brazier():
+    # 0% warmth is instant death and forfeits the whole round's points, so nothing outranks it
+    # except restocking the potion it needs.
+    cold = reader(warmth=200, braziers={"SOUTH_WEST": {"status": "UNLIT",
+                                                       "pyromancerStatus": "ALIVE"}})
+    assert phase(reader=cold, items=inv(*KIT, *(["root"] * 23))) == "warmth"
+
+
+def test_kit_outranks_warmth_when_there_is_no_potion_to_drink():
+    cold = reader(warmth=200)
+    assert phase(reader=cold, items=inv("Bronze axe", "Knife", "Tinderbox", "Hammer")) == "kit"
+
+
+def test_dodge_beats_working_but_only_when_enabled():
+    assert phase(snow_on_tile=True) == "dodge"
+    cfg = dict(CFG, dodgeSnowfall=False)
+    assert phase(snow_on_tile=True, config=cfg) != "dodge"
+
+
+def test_an_unlit_brazier_is_relit_even_mid_inventory():
+    # Wiki: "The brazier should be relit immediately any time it is extinguished while you are
+    # nearby ... even if it interrupts cutting or fletching."
+    snap = reader(braziers={"SOUTH_WEST": {"status": "UNLIT", "pyromancerStatus": "ALIVE"}})
+    assert phase(reader=snap, items=inv(*KIT, *(["root"] * 23))) == "light"
+
+
+def test_an_unlit_brazier_with_a_downed_pyromancer_is_not_relightable():
+    snap = reader(braziers={"SOUTH_WEST": {"status": "UNLIT",
+                                           "pyromancerStatus": "INCAPACITATED"}})
+    assert phase(reader=snap, items=inv(*KIT)) != "light"
+
+
+def test_a_broken_brazier_is_fixed():
+    snap = reader(braziers={"SOUTH_WEST": {"status": "BROKEN", "pyromancerStatus": "ALIVE"}})
+    assert phase(reader=snap) == "fix"
+
+
+def test_holding_kindling_feeds():
+    assert phase(items=inv(*KIT, "kindling")) == "feed"
+
+
+def test_a_full_inventory_of_roots_fletches():
+    assert phase(items=inv(*KIT, *(["root"] * 23))) == "fletch"
+
+
+def test_a_full_inventory_of_roots_feeds_when_fletching_is_off():
+    # The deadlock guard again, this time through the ladder rather than feed_item alone.
+    cfg = dict(CFG, fletch=False)
+    assert phase(items=inv(*KIT, *(["root"] * 23)), config=cfg) == "feed"
+
+
+def test_an_empty_inventory_chops():
+    assert phase(items=inv(*KIT)) == "chop"
+
+
+def test_the_round_end_test_is_sustained_not_a_single_read():
+    # The transitional-snapshot family: a teleport/HUD blip reads exactly like a round end for
+    # a tick or two. GOTR paid for this six separate times.
+    over = reader(roundActive=False, points=-1, energyPercent=-1)
+    assert phase(reader=over, round_over_streak=1) != "between_rounds"
+    assert phase(reader=over, round_over_streak=3) == "between_rounds"
