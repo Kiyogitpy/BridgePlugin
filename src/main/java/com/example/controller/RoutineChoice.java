@@ -35,7 +35,8 @@ public enum RoutineChoice
 	KARAMBWAN_FISHING("Karambwan Fishing (DKP + fish barrel)"),
 	DEEP_SEA_TRAWLING("Deep Sea Trawling"),
 	WINTERTODT("Wintertodt (group, fletch)"),
-	FLETCHING("Fletching (bank, knife logs)");
+	FLETCHING("Fletching (bank, knife logs)"),
+	GRANITE_3T("3-Tick Granite");
 
 	private final String label;
 

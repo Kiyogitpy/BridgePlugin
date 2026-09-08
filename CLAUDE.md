@@ -1625,6 +1625,69 @@ run live.** Needs a client rebuild (the `RoutineChoice` entry is Java).
 - **`before_break` paces its own loop** rather than relying on a phase handler to sleep, and
   stands the stuck watch down during `between_rounds`.
 
+## Current state of routines/granite_3t.py
+
+Written 2026-09-08 from the OSRS Wiki (Tick manipulation rev 15292712, Pay-to-play Mining
+training rev 15297907) and this repo's own fitted mouse-movement model (`settings.py`'s HM2
+reach/hold figures). Design: `docs/superpowers/specs/2026-09-08-3-tick-granite-mining-design.md`,
+whose "Live-verification checklist" is the first session's worklist. **NOT YET RUN LIVE** --
+every number below is either MEASURED from a cited source or a first-draft guess; nothing has
+been checked against a real client. No Java is needed to run it from the command line; this task
+only wires it into the panel dropdown.
+
+- **This is a schedule, not a reaction.** Every other routine in this repo clicks and then waits
+  on a pushed signal -- the tick boundary is where a click LANDS. Here two clicks must fall
+  inside one named 600ms tick, which is why this needed a new scheduler
+  (`ControllerAddon/tick_cycle.py`) rather than another `gathering.Profile`.
+- **The cycle is two dead ticks then one critical tick.** T+1 clicks the knife (a client-side
+  selection that sends no packet at all -- the packet is sent by the click on the TARGET) and
+  flies to the log, parking the cursor there; T+2 does nothing, the cursor just rests on the log;
+  the critical tick T clicks `click_human` **IN PLACE** on the log (~92ms, no flight -- the same
+  measured figure CLAUDE.md's giants_foundry section records) to fire the 3-tick action, then
+  makes ONE short flight to the next rock and clicks it. Two clicks, one flight, in the critical
+  tick -- that asymmetry is the whole reason it fits in 600ms. The next rock's screen point is
+  re-resolved over HTTP during the dead ticks (the player moves between rocks each cycle, so the
+  projection changes), never during the critical tick.
+- **MEASURED from `settings.py`:** a reach is 170ms median at 52px, +120.5ms per doubling of
+  distance, floor 90ms; a click hold is 50-145ms. So one aimed flight-and-click is ~255ms
+  median / ~420ms p90 -- two of those in one tick is already over budget at p90. The
+  parked-cursor trick is what brings the critical tick down to ~347ms median (92ms in-place +
+  ~170ms flight + ~85ms hold), arithmetic that the go/no-go bench below has not yet confirmed on
+  this hardware.
+- **`controller.click_entity` cannot be used inside the critical tick.** With a `refresh_target`
+  it reads the bridge at departure, once per leg, and again at the settle -- exactly the
+  "~1s per click" cost CLAUDE.md already records for deep-sea-trawling, which is the whole tick
+  budget on its own. `tick_cycle.timed_click` exists to be HTTP-free: it moves to a pre-resolved
+  `(x, y)` and clicks with no bridge call anywhere in the path.
+- **`ctx.events` is a HARD REQUIREMENT here, and that INVERTS the repo-wide rule that every
+  consumer must tolerate `ctx.events is None` and keep a working fallback.** Without the tick
+  clock there is no tick phase, and without the phase this routine silently degrades into an
+  ordinary 5-tick miner with extra steps -- indistinguishable in the log from a working run.
+  Startup refuses to start when `ctx.events` is `None` or its tick model is stale, rather than
+  falling back to polling. **Do not "fix" this into a polling fallback** -- there is no
+  HTTP-cheap way to hit a 600ms window without the pushed tick clock, so a fallback here would
+  just be the bug this design exists to avoid, wearing a different hat.
+- **Startup also refuses to run unless the click geometry fits**, reporting the measured pixel
+  distance between the log and each rock either way (`maxReachPx`, 220 first-draft), so a refusal
+  tells the user how far to zoom in rather than failing silently. The wiki gives humans the same
+  advice for this method: small client, zoomed in, camera south, to keep inventory-to-rock
+  distance as short as possible.
+- **A desync never stops the run** (USER's decision: resync and carry on, no ceiling on
+  desyncs) -- an ordinary missed tick or a cycle that yielded nothing is not itself an error,
+  since granite's second roll is a bonus, not a guarantee. **The only terminal condition is a
+  60-second stall with NO Mining XP at all** (`xpStallStopS`), which fires when the rocks are
+  contested, the camera has drifted, or the client is stuttering -- i.e. when the cursor is
+  clicking a dead pixel. A perfectly-aimed click into the wrong tick looks identical in the log
+  to a good one, which is why the XP stall is the one belt this routine has.
+- **`tick_bench.py` is the go/no-go gate and has NOT been run.** The ~347ms critical-tick figure
+  above is arithmetic over the fitted movement model, not a measurement on this hardware. If p90
+  occupancy exceeds ~540ms live, the answer is the 4-tick celastrus variant (2400ms per cycle),
+  not tuning `logClickPhaseMs` further.
+- See the spec's live-verification checklist for the full first-session worklist, in priority
+  order -- item 2 (`rockClickTickOffset`, whether the 3-tick action must be clicked on the same
+  tick the walk is CLICKED or the tick it EXECUTES) is called out there as the highest-risk
+  unknown in the whole design.
+
 ## Current state of routines/blast_furnace.py
 
 **Live gold session 2026-09-04 (bf_live3-9), the first routine converted to event-driven
