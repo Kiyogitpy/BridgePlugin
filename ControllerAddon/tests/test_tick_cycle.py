@@ -176,13 +176,16 @@ def test_at_tick_is_none_without_a_stream():
     assert tick_cycle.at_tick(None, 100, 60.0) is None
 
 
-def test_click_cost_ms_books_the_UPPER_end_of_the_hold_plus_its_trailing_delay():
+def test_click_cost_ms_books_the_UPPER_end_of_the_fast_hold():
     """It feeds Window.room_for, which is a guard: conservative costs one abandoned cycle,
-    optimistic costs a desynced chain."""
-    import settings
+    optimistic costs a desynced chain. The clicks in the critical tick are fast_click, not
+    click_human -- MEASURED live 2026-09-08, click_human's 50-145ms hold plus its 30-90ms
+    trailing pause cost ~166ms for the in-place log click alone, and 11 of 18 cycles overran
+    the 600ms tick because of it."""
     assert tick_cycle.CLICK_COST_MS == pytest.approx(
-        (settings.CLICK_HOLD_RANGE_S[1] + 0.09) * 1000.0)
-    assert tick_cycle.CLICK_COST_MS > 85.0 + 60.0        # comfortably past the medians
+        tick_cycle.FAST_HOLD_RANGE_S[1] * 1000.0)
+    assert tick_cycle.CLICK_TAIL_MAX_MS == 0.0           # fast_click has no trailing pause
+    assert tick_cycle.CLICK_COST_MS >= tick_cycle.CLICK_COST_MEDIAN_MS
 
 
 def test_estimate_flight_ms_matches_the_fitted_model_at_its_reference_distance():
@@ -207,7 +210,7 @@ def test_timed_click_moves_then_clicks_and_reports_elapsed(monkeypatch):
     calls = []
     monkeypatch.setattr(controller, "move_to_human",
                         lambda ser, x, y, **kw: (calls.append(("move", x, y)), clock.sleep(0.17)))
-    monkeypatch.setattr(controller, "click_human",
+    monkeypatch.setattr(tick_cycle, "fast_click",
                         lambda ser: (calls.append(("click",)), clock.sleep(0.085)))
     elapsed = tick_cycle.timed_click(object(), (400, 300), now_fn=clock.now)
     assert calls == [("move", 400, 300), ("click",)]
@@ -218,7 +221,7 @@ def test_click_in_place_never_moves(monkeypatch):
     clock = _Clock()
     moved = []
     monkeypatch.setattr(controller, "move_to_human", lambda *a, **k: moved.append(a))
-    monkeypatch.setattr(controller, "click_human", lambda ser: clock.sleep(0.092))
+    monkeypatch.setattr(tick_cycle, "fast_click", lambda ser: clock.sleep(0.092))
     elapsed = tick_cycle.click_in_place(object(), now_fn=clock.now)
     assert moved == []
     assert elapsed == pytest.approx(92.0, abs=1.0)

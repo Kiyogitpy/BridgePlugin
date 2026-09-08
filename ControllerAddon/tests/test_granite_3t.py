@@ -91,7 +91,9 @@ def test_geometry_refuses_when_the_rocks_are_too_far_from_the_log_AND_reports_th
     monkeypatch.setattr(controller, "get_object_at",
                         lambda *a, **k: {"screenX": 400, "screenY": 800, "id": 1})
     inv = [_item("Knife", 1700, 800, slot=0), _item("Teak logs", 1740, 800, slot=1)]
-    ok, msg = g.check_geometry(_cfg(), inv)
+    # Scale pinned at 1.0: this test is about the message naming the derived limit, not about
+    # how fast the flight happens to be configured.
+    ok, msg = g.check_geometry(_cfg(flightSpeedScale=1.0), inv)
     assert ok is False
     assert "1340" in msg          # |1740 - 400| -- the measurement must be IN the message
     # ...and the DERIVED limit, not a hand-picked one. MEASURED LIVE 2026-09-08: the config's
@@ -99,7 +101,7 @@ def test_geometry_refuses_when_the_rocks_are_too_far_from_the_log_AND_reports_th
     # hit a tick would have been accepted.
     # Derived exactly as check_geometry derives it, so retuning a constant does not break a
     # test that is really about "the message names the real limit".
-    cfg = _cfg()
+    cfg = _cfg(flightSpeedScale=1.0)
     limit = tick_cycle.max_reach_px(
         600.0 - cfg["logClickPhaseMs"]
         - tick_cycle.CLICK_COST_MEDIAN_MS       # log click delays the flight

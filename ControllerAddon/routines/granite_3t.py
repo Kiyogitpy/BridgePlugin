@@ -283,8 +283,11 @@ def check_geometry(cfg, inv):
         return False, f"no {cfg['knifeName']!r} in the inventory"
 
     logs = log_count(inv, cfg["logName"])
+    if logs == 0 and find_item(inv, LOG_BASKET_NAME) is None:
+        return False, (f"no {cfg['logName']!r} in the inventory and no log basket to draw a "
+                       f"spare from")
     if logs == 0:
-        return False, f"no {cfg['logName']!r} in the inventory"
+        return True, "no loose log yet -- will draw one from the log basket"
     if logs > 1:
         return False, (f"{logs} x {cfg['logName']!r} in the inventory -- there must be exactly "
                        f"one, or knife-on-log opens a Make-X interface and eats a tick")
@@ -348,6 +351,130 @@ def setup(ctx):
     ctx.state.data["g3t_startup_since"] = _now()
     debug_log.log(CATEGORY, "startup checks deferred to the first tick (setup runs before the "
                             "engine's login and focus gates)")
+
+
+# --------------------------------------------------------------------------------------------
+# Keeping exactly ONE loose log in the inventory
+# --------------------------------------------------------------------------------------------
+
+LOG_BASKET_NAME = "log basket"
+BASKET_EMPTY_OPTIONS = ("empty", "empty-to-bank")
+BASKET_REFILL_BUDGET_S = 6.0
+BASKET_REFILL_TRIES = 3
+
+
+def loose_logs(inv, cfg):
+    needle = (cfg["logName"] or "").lower()
+    return [i for i in (inv or []) if needle in (i.get("name") or "").lower()]
+
+
+def _basket_action(ctx, basket, options):
+    return controller.click_menu_action(ctx.ser, basket, options, offset=(0, 0),
+                                        check_ui_blockers=False)
+
+
+def _await(pred, budget_s):
+    deadline = _now() + budget_s
+    while _now() < deadline:
+        if pred():
+            return True
+        _sleep(0.3)
+    return pred()
+
+
+def ensure_one_loose_log(ctx, cfg):
+    """Keep EXACTLY ONE loose log in the inventory. True when that holds.
+
+    THE MECHANIC, and it is the whole reason this routine works (USER, 2026-09-08): "we
+    interrupt the fletching with another task therefore it doesnt get consumed". The log click
+    STARTS a fletch, setting the skilling timer to 3; the rock click on the same tick starts
+    mining, and per the wiki's own rule -- "by starting the timer on a different action, players
+    clear any existing timer" -- that clears the pending fletch before it completes. No product,
+    no consumption, one log forever.
+
+    MEASURED the hard way the same day: on the first live run every cycle desynced at the
+    room_for guard, so the rock click never fired, the fletch completed unopposed and the teak
+    log became a Teak stock. I read that as "the log is consumed, this needs a supply loop" and
+    was wrong -- consumption is the SYMPTOM of a cycle that failed to interrupt.
+
+    So this runs only after a MISTAKE, which is exactly what the wiki means by carrying spares
+    in a log basket.
+
+    DRAWING ONE LOG OUT OF A BASKET TAKES FOUR STEPS, and the roundabout shape is the game's,
+    not ours (USER): the basket has no "give me one" option, and Empty dumps ALL of them. So:
+    empty the basket, drop exactly ONE log on the floor, FILL the basket again (which sweeps
+    every remaining loose log back in), then pick the dropped one up. An earlier draft just
+    dropped the 25 extras and left them to despawn -- this keeps the whole stack.
+    """
+    inv = controller.get_inventory() or []
+    if not inv:
+        return False                      # cannot tell; the caller's empty-read guard owns this
+
+    logs = loose_logs(inv, cfg)
+    if len(logs) == 1:
+        return True
+
+    basket = find_item(inv, LOG_BASKET_NAME)
+
+    if len(logs) > 1:
+        # More than one loose log opens a Make-X interface on the next knife-on-log and eats a
+        # tick. Put them back in the basket rather than on the floor when we can.
+        if basket is not None:
+            debug_log.log(CATEGORY, f"{len(logs)} loose logs -- dropping one, refilling the "
+                                    f"basket, then picking the dropped one back up")
+            return _one_via_floor(ctx, cfg, basket, logs)
+        debug_log.log(CATEGORY, f"{len(logs)} loose logs and no basket -- dropping the extras")
+        controller.drop_items(ctx.ser, logs[1:])
+        return len(loose_logs(controller.get_inventory() or [], cfg)) == 1
+
+    if basket is None:
+        return False                      # no loose log and nothing to draw on -- caller stops
+
+    debug_log.log(CATEGORY, "out of loose logs -- emptying the log basket")
+    if not _basket_action(ctx, basket, BASKET_EMPTY_OPTIONS):
+        debug_log.log(CATEGORY, "could not select Empty on the log basket")
+        return False
+    if not _await(lambda: loose_logs(controller.get_inventory() or [], cfg),
+                  BASKET_REFILL_BUDGET_S):
+        debug_log.log(CATEGORY, "the basket produced no logs")
+        return False
+
+    inv = controller.get_inventory() or []
+    basket = find_item(inv, LOG_BASKET_NAME)
+    return _one_via_floor(ctx, cfg, basket, loose_logs(inv, cfg))
+
+
+def _one_via_floor(ctx, cfg, basket, logs):
+    """Drop one log, sweep the rest back into the basket, pick the dropped one up."""
+    if not logs:
+        return False
+    dropped = logs[0]
+    if not controller.drop_items(ctx.ser, [dropped]):
+        debug_log.log(CATEGORY, "could not drop a log to the floor")
+        return False
+
+    if basket is not None and loose_logs(controller.get_inventory() or [], cfg):
+        if _basket_action(ctx, basket, ("fill",)):
+            _await(lambda: not loose_logs(controller.get_inventory() or [], cfg),
+                   BASKET_REFILL_BUDGET_S)
+        else:
+            debug_log.log(CATEGORY, "could not Fill the basket -- the extras stay loose")
+
+    player = controller.get_player() or {}
+    item = None
+    for _ in range(3):
+        item = controller.get_ground_item_at(player.get("x"), player.get("y"),
+                                             player.get("plane", 0), dropped.get("id"))
+        if item:
+            break
+        _sleep(0.3)
+    if not item:
+        debug_log.log(CATEGORY, "the dropped log is not on the ground yet")
+        return False
+
+    controller.click_menu_action(ctx.ser, item, ("take",), check_ui_blockers=False)
+    _await(lambda: loose_logs(controller.get_inventory() or [], cfg), BASKET_REFILL_BUDGET_S)
+    return len(loose_logs(controller.get_inventory() or [], cfg)) == 1
 
 
 def _startup_check(ctx, cfg):
@@ -726,10 +853,27 @@ def _run_chain(ctx):
     data["g3t_empty_reads"] = 0
 
     knife = find_item(inv, cfg["knifeName"])
-    log = find_item(inv, cfg["logName"])
-    if knife is None or log is None:
-        ctx.state.trigger_safety_stop(
-            f"the {cfg['knifeName']!r} or {cfg['logName']!r} is gone from the inventory")
+    if knife is None:
+        ctx.state.trigger_safety_stop(f"the {cfg['knifeName']!r} is gone from the inventory")
+        return
+
+    # EXACTLY ONE loose log, refilled from the basket when a mistake has eaten one. A working
+    # cycle never consumes a log (the rock click interrupts the fletch), so reaching into the
+    # basket means something went wrong earlier -- which is precisely what the wiki means by
+    # carrying spares "in case of mistakes". See ensure_one_loose_log.
+    if not ensure_one_loose_log(ctx, cfg):
+        fails = data.get("g3t_log_refills", 0) + 1
+        data["g3t_log_refills"] = fails
+        if fails >= BASKET_REFILL_TRIES:
+            ctx.state.trigger_safety_stop(
+                f"cannot get exactly one loose {cfg['logName']!r} into the inventory after "
+                f"{fails} attempts -- the log basket is empty or its Empty option was not "
+                f"found, so a bank restock is needed")
+        return
+    data["g3t_log_refills"] = 0
+
+    log = find_item(inv := (controller.get_inventory() or []), cfg["logName"])
+    if log is None or log.get("screenX") is None:
         return
 
     # Checked once per chain (so within CHAIN_MAX_S, not "in seconds"). The constraint this
@@ -739,12 +883,17 @@ def _run_chain(ctx):
     # and the rock click. USER says teak/mahogany are not consumed by knife-on-log; if that is
     # wrong, the worst case is one chain of clicks landing on an empty slot (harmless with a
     # knife selected) before this stops the run. Spec live-checklist item 1 verifies exactly it.
+    # A FALLING LOG COUNT IS A DIAGNOSTIC, NOT A STOP. A cycle that lands both clicks never
+    # consumes a log; one that fails to interrupt does. So losing logs means cycles are not
+    # completing, and the occupancy log is where to look -- ensure_one_loose_log above has
+    # already topped us back up from the basket.
     logs = log_count(inv, cfg["logName"])
-    if logs < (data.get("g3t_logs") or logs):
-        ctx.state.trigger_safety_stop(
-            f"the {cfg['logName']!r} count fell {data['g3t_logs']} -> {logs}: knife-on-log IS "
-            f"consuming the log, so this routine needs a supply loop it does not have")
-        return
+    before = data.get("g3t_logs")
+    if before is not None and logs < before:
+        data["g3t_logs_burned"] = data.get("g3t_logs_burned", 0) + (before - logs)
+        debug_log.log(CATEGORY,
+                      f"a log was consumed ({before} -> {logs}, {data['g3t_logs_burned']} total) "
+                      f"-- a cycle failed to interrupt the fletch; check the occupancy lines")
     data["g3t_logs"] = logs
 
     knife_point = (int(knife["screenX"]), int(knife["screenY"]))

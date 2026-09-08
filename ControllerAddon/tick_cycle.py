@@ -23,9 +23,30 @@ import time
 
 import bridge_events
 import controller
+import input_state
 import settings
 
 GAME_TICK_MS = bridge_events.GAME_TICK_MS
+
+# A PRACTISED 3-TICK CLICK IS A FAST CLICK, and the two clicks of the critical tick are the one
+# place in this repo where that matters. controller.click_human is built for ordinary play: a
+# 50-145ms hold plus a 30-90ms trailing pause, ~166ms MEASURED live 2026-09-08 for the in-place
+# log click alone. Inside a 600ms tick that pause is pure loss -- it happens after mouse-up, so
+# the game already has the click, and all it does is delay the flight that follows.
+#
+# A human hammering two clicks into one tick does not pause between them either, so a short hold
+# and no trailing pause is the more faithful imitation here, not a shortcut. Everywhere else in
+# the codebase click_human remains right.
+FAST_HOLD_RANGE_S = (0.035, 0.075)
+
+
+def fast_click(ser):
+    """click_human with a practised-cadence hold and no trailing pause. See FAST_HOLD_RANGE_S."""
+    input_state.mark_mouse_activity()
+    controller.mouse_left_down(ser)
+    controller.human_delay(*FAST_HOLD_RANGE_S)
+    controller.mouse_left_up(ser)
+
 
 # TWO DIFFERENT CLICK COSTS, BECAUSE A CLICK COSTS TWO DIFFERENT THINGS.
 #
@@ -45,8 +66,8 @@ GAME_TICK_MS = bridge_events.GAME_TICK_MS
 #
 # Upper bounds here, medians below: these feed Window.room_for, which is a GUARD, and being
 # pessimistic costs one abandoned cycle where being optimistic desyncs the whole chain.
-CLICK_HOLD_MAX_MS = settings.CLICK_HOLD_RANGE_S[1] * 1000.0          # 145
-CLICK_TAIL_MAX_MS = 90.0                                             # human_delay(0.03, 0.09)
+CLICK_HOLD_MAX_MS = FAST_HOLD_RANGE_S[1] * 1000.0                    # 75
+CLICK_TAIL_MAX_MS = 0.0                                              # fast_click has no tail
 CLICK_COST_MS = CLICK_HOLD_MAX_MS + CLICK_TAIL_MAX_MS                # delays following work
 CLICK_LANDING_COST_MS = CLICK_HOLD_MAX_MS                            # only has to land
 
@@ -57,8 +78,8 @@ CLICK_LANDING_COST_MS = CLICK_HOLD_MAX_MS                            # only has 
 # below HM2_MIN_MS (90), so NO geometry on earth would ever pass. MEASURED 2026-09-08 while
 # setting the routine up live -- the check refused a legitimate 60px setup. Same split the rest
 # of this repo uses: plan on the median, guard on the tail.
-CLICK_HOLD_MEDIAN_MS = 85.0        # CLAUDE.md's fitted median hold
-CLICK_TAIL_MEDIAN_MS = 60.0        # the middle of human_delay(0.03, 0.09)
+CLICK_HOLD_MEDIAN_MS = 55.0        # middle of FAST_HOLD_RANGE_S
+CLICK_TAIL_MEDIAN_MS = 0.0         # fast_click has no trailing pause
 CLICK_COST_MEDIAN_MS = CLICK_HOLD_MEDIAN_MS + CLICK_TAIL_MEDIAN_MS   # 145, delays what follows
 CLICK_LANDING_MEDIAN_MS = CLICK_HOLD_MEDIAN_MS                       # 85, only has to land
 
@@ -213,7 +234,7 @@ def click_in_place(ser, *, now_fn=time.time):
     This is the primitive that makes the critical tick affordable: the log click costs no
     flight at all because the cursor was parked on it during the previous cycle's dead ticks."""
     t0 = now_fn()
-    controller.click_human(ser)
+    fast_click(ser)
     return (now_fn() - t0) * 1000.0
 
 
@@ -230,7 +251,7 @@ def timed_click(ser, point, *, aim_radius=0, duration_scale=1.0, now_fn=time.tim
     t0 = now_fn()
     controller.move_to_human(ser, int(point[0]), int(point[1]), aim_radius=aim_radius,
                              duration_scale=duration_scale)
-    controller.click_human(ser)
+    fast_click(ser)
     return (now_fn() - t0) * 1000.0
 
 
