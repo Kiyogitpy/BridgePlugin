@@ -82,7 +82,21 @@ DEFAULT_CONFIG = {
     # cancels the previous unfinished mine, which is why the xp was near zero.
     #
     # This western line does force a step: from (3249,2351) two of the four are at distance 2.
-    "rockTiles": [[3247, 2350, 0], [3248, 2350, 0], [3249, 2350, 0], [3250, 2349, 0]],
+    # ORDER IS PART OF THE ROTATION, NOT COSMETIC. A transition only displaces the pending
+    # fletch if it forces the player to STEP, and a step is only forced when the next rock is
+    # 2+ tiles away -- adjacent rocks are mined from where you stand. MEASURED LIVE 2026-09-08:
+    # in map order (B,C,D,E) three of the four transitions are distance 1, so three cycles in
+    # four could not displace the fletch and the log died within a few minutes. Reordered to
+    # B,D,C,E the step distances are 2,1,2,3 -- three of four now force a step, which is the
+    # best this rock layout allows.
+    #
+    # THIS MINE CANNOT DO BETTER, and that is worth knowing before anyone tunes it further: a
+    # clean rotation needs every consecutive pair 2+ apart with no tile adjacent to all of
+    # them, and neither the western line nor the eastern 2x2 here has one. The eastern cluster
+    # ordered diagonally gets all four transitions to distance 2, but (3255,2353) is adjacent
+    # to all four rocks, so a player who ever stands there stops moving entirely. The Bandit
+    # Camp Quarry is the classic 3t4g spot for presumably this reason.
+    "rockTiles": [[3247, 2350, 0], [3249, 2350, 0], [3248, 2350, 0], [3250, 2349, 0]],
     # Granite rocks share one object id per variant; the probe prints it alongside each tile.
     # get_object_at needs it, and matching by id rather than name is what keeps a DEPLETED rock
     # (a different id, offering no actions) from resolving as a live one.
