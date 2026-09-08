@@ -280,6 +280,32 @@ $argv += $extra
 
 Start-GuestDesktop ($argv -join " ") "OSRSRoutine"
 
+# RE-FOCUS THE CLIENT, because launching the routine is what just stole the focus.
+#
+# USER-REPORTED 2026-09-08: "when you did this a cmd window opened and we lost focus?" --
+# exactly right, and MEASURED in the same run: the routine parked on `[!] RuneLite window is
+# not focused -- waiting` at 11:11:42 and sat there doing nothing until a human focused the
+# window. The focus step ABOVE runs before this launch, and the launch is a scheduled task
+# whose action is cmd.exe -- a console window that appears on the desktop and takes the
+# foreground back. So the pre-launch focus was being undone a second later, every single time,
+# by the very next line of this script.
+#
+# Ordering is the whole fix: the pre-launch focus still matters (login.attempt_login clicks
+# BEFORE the engine's own gate, so a client unfocused at the login screen burns clicks
+# silently), and this one keeps it. The engine recovers on its own once focus returns -- it
+# logs `RuneLite window focused -- resuming` -- so this only has to happen, not be instant.
+Start-Sleep -Seconds 2
+$st = Get-Bridge "/state"
+for ($i = 0; $i -lt 3 -and $st -and -not $st.windowFocused; $i++) {
+    Write-Host "  the routine's console took the focus -- giving it back to the client"
+    Start-GuestDesktop "cmd /c $sharem-guest-focus-client.cmd" "OSRSFocus"
+    Start-Sleep -Seconds 3
+    $st = Get-Bridge "/state"
+}
+if ($st -and -not $st.windowFocused) {
+    Write-Host "  STILL not focused -- the routine will idle until you click the game window." -ForegroundColor Yellow
+}
+
 Write-Host "  started: python -u controller.py $(if (-not $panelMode) { "$routine " })$($extra -join ' ')" -ForegroundColor Green
 if ($panelMode) {
     Write-Host "  Now pick it in RuneLite: Controller Settings -> Routine, and tick Controller" -ForegroundColor Yellow
