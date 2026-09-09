@@ -1764,6 +1764,33 @@ Four things were MEASURED, and the first is not about this routine at all:
   three minutes, the decorate clicks landing, `direct leg toward site N: one click at ...`
   in the log. The digit key works for the make prompt (Space was the human's choice; `3` is
   derived from the widget and starts the same action).
+- **A leg is a CHAIN of far clicks, the minimap counts, and the fletch is restarted after
+  each one and STOPPED at the build reserve.** USER: "hops still too short to craft bows",
+  then "gotta leave a few logs in the inventory to actually craft the totems too". MEASURED:
+  with the viewport alone the far click reached only 11-18 tiles on most legs (7-11s, 3-5
+  bows) and the recorded hops that followed ended the fletch with no restart. Now
+  `_far_click_target` takes the farthest point reachable by EITHER the viewport (rendered,
+  not under a panel) or the minimap (`onMinimap`, not on an orb -- 28 tiles whatever the
+  camera renders; site 4's whole 24-tile leg became one minimap click), `walk_leg` chains up
+  to `DIRECT_LEG_MAX_STRETCHES` such clicks, the fletch hook fires after every one (it
+  re-derives the budget live, so it restarts the fletch the click just ended or does nothing),
+  and -- because the make prompt has NO quantity and a long stretch would eat every loose
+  log -- `_direct_leg` watches the loose count and re-clicks the SAME walk target once the
+  hook's reserve (`builds_needed`) is all that is left: the walk continues, the fletch ends,
+  `fletch stopped at the build reserve (4 Yew logs left)`. A stall (a log balance the game's
+  own pathfinder will not cross) hands the rest of the leg to the recorded hops. RESULT over
+  five minutes: 28 bows, 6 totems erected, 18 decorations, 8 claims.
+- **The basket is emptied below a totem's worth plus spare (`LOOSE_LOG_TARGET`, 9), not only
+  at zero.** USER: "running with full log basket empty inventory? better to empty so we can
+  craft some bows". A basket KNOWN empty is skipped; an unknown one is tried once.
+- **Decorate is ONE click.** USER: "only need to click once to decorate i dont think it
+  speeds it up", and the recording agrees: one Decorate, then four decoration animations
+  1.2s apart with no further click. `decorate` now confirms on the count reaching what the
+  bows in hand allow, budgeted per decoration, instead of one click per decoration landing on
+  a loop already running.
+- **A site click that resolved to the wrong action is retried ONCE through the menu**
+  (`_click_site(option=...)`, `/last-action` as the tell). The bare click still misses the
+  pile at sites 5-7 about one time in six ("Walk here"); the menu picks Claim by name.
 - **The field Empty on the OPEN basket is SHIFT + left click.** MEASURED: the open basket's
   right-click menu in the field is `['Cancel','Examine','Destroy','Close','Use','Check',
   'Wear','Fill']` -- Empty is a SUBMENU option (cache `isubop3=1,Empty`) that `/menu` cannot

@@ -184,13 +184,22 @@ def tick(ctx):
     # Top up from the basket BEFORE the site: the basket already holds logs we are carrying, so
     # this costs no walk, and a totem that could be built this visit otherwise waits a whole
     # lap. This is NOT the bank check -- that sits below work_site, see there.
-    if count_item(log_name) == 0 and find_basket():
+    #
+    # BELOW A TOTEM'S WORTH PLUS SPARE, not only at zero. USER 2026-09-09: "i just see it
+    # running with full log basket empty inventory? better to empty so we can craft some
+    # bows" -- the leg's fletch needs loose logs and the build reserve keeps some back, so
+    # a basket left full while the inventory sits at one or two logs makes no bows at all.
+    # A basket KNOWN to be empty is skipped (one shift-click saved per site); an unknown one
+    # is tried, and the first empty teaches the estimate.
+    if (count_item(log_name) < LOOSE_LOG_TARGET and find_basket()
+            and (data.get(BASKET_LOGS_KEY) is None or basket_logs(data) > 0)):
         empty_basket(ctx)
 
     # STAND STILL FIRST. See SITE_SETTLE_S -- every action at this site aims at a model a few
     # pixels wide, and a target sliding under the cursor is the difference between "Claim" and
     # "Walk here". A timeout here is not a failure: work_site simply proceeds.
     controller.wait_until_player_idle(timeout_s=SITE_SETTLE_S)
+    data["vt_fletch_due"] = False        # the leg is over; the next site decides afresh
 
     work_site(ctx, current)
 
@@ -256,12 +265,20 @@ def site_object(site_number: int, which: str):
     return controller.get_object_at(x, y, route.PLANE, obj_id)
 
 
-def _click_site(ctx, site_number, which, budget_s, confirm):
+def _click_site(ctx, site_number, which, budget_s, confirm, option=None):
     """Click a site object and confirm on the READER, never on the click landing.
 
     The aim is re-resolved through object_refresh_target for the whole flight: these clicks are
     issued while the player is still walking up, and a click that departs toward a tick-old
-    projection is the "flick back" CLAUDE.md documents."""
+    projection is the "flick back" CLAUDE.md documents.
+
+    `option` names the menu entry the click is meant to be ("Claim", "Build", "Decorate").
+    When the confirm fails AND /last-action shows the click resolved to something else -- a
+    miss beside a pile a few pixels wide, MEASURED 2026-09-09 as "Walk here" at sites 5-7 on
+    roughly one claim in six -- the click is retried ONCE through the right-click menu by
+    name, re-resolving the object first (CLAUDE.md's click_menu_action trap). That tier is
+    immune to a pixel that slides off the model; it is not used first because a bare click
+    is what the human does and what lands five times in six."""
     entry = route.SITES[site_number]
     x, y = entry["totem"] if which == "totem" else entry["offerings"]
     obj_id = entry["base_id"] if which == "totem" else entry["offerings_id"]
@@ -275,7 +292,21 @@ def _click_site(ctx, site_number, which, budget_s, confirm):
         return False
     outcome = outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"], budget_s,
                                       confirm, now_fn=_now, sleep_fn=_sleep)
-    return bool(outcome)
+    if outcome or not option:
+        return bool(outcome)
+    last = controller.get_last_action() or {}
+    if (last.get("option") or "").lower() == option.lower():
+        return False            # the right action registered and still did not confirm
+    debug_log.log(LOG, "site %d: %s click resolved to %r -- retrying through the menu"
+                  % (site_number, option, last.get("option")))
+    obj = site_object(site_number, which)
+    if not obj:
+        return False
+    if not controller.click_menu_action(ctx.ser, obj, option, offset=(0, 0),
+                                        refresh_target=refresh):
+        return False
+    return bool(outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"], budget_s,
+                                        confirm, now_fn=_now, sleep_fn=_sleep))
 
 
 def _site_now(site_number):
@@ -291,7 +322,7 @@ def claim(ctx, site) -> bool:
         fresh = _site_now(n)
         return fresh is not None and fresh.unclaimed_offerings == 0
 
-    return _click_site(ctx, n, "offerings", CLAIM_BUDGET_S, done)
+    return _click_site(ctx, n, "offerings", CLAIM_BUDGET_S, done, option="Claim")
 
 
 def build(ctx, site) -> bool:
@@ -302,7 +333,7 @@ def build(ctx, site) -> bool:
         fresh = _site_now(n)
         return fresh is not None and fresh.base_value != 0
 
-    return _click_site(ctx, n, "totem", BUILD_BUDGET_S, done)
+    return _click_site(ctx, n, "totem", BUILD_BUDGET_S, done, option="Build")
 
 
 CARVE_MENU_BUDGET_S = 4.0
@@ -416,6 +447,10 @@ LEG_ARRIVAL_POLL_INTERVAL_S = 0.6      # one game tick -- the soonest the player
 # while still refusing a player who is somewhere else in Varlamore entirely.
 SITE_SEARCH_RADIUS = 30
 
+# Loose logs to keep in hand between sites: one totem (LOGS_PER_TOTEM) plus a few for the
+# next leg's bows. Below this the basket is emptied at the site.
+LOOSE_LOG_TARGET = vt.LOGS_PER_TOTEM + 4
+
 
 def _player_xy():
     player = controller.get_player() or {}
@@ -469,58 +504,87 @@ DIRECT_LEG_STALL_S = 3.0
 DIRECT_LEG_POLL_S = 0.6
 
 
-def _direct_leg(ctx, b: int, points, fire_hook) -> bool:
-    """ONE shift-click in the VIEWPORT at the farthest point of the leg that is rendered, fire
-    the hook, then only poll until that stretch is walked.
+ARRIVED, STRETCH, NO_CLICK, STALLED = "arrived", "stretch", "no-click", "stalled"
 
-    Tries site `b`'s stand tile first, then the recorded waypoints from the far end back. The
-    stand tile is 20-57 tiles off and MEASURED 2026-09-09 not rendered at this camera (the
-    first draft aimed only there and fell straight back to the hops -- 0 bows again), while a
-    waypoint 10-20 tiles out usually is: 12s of running is 6 bows, more than a totem needs.
 
-    Returns True on arrival at the site. Returns False -- having clicked NOTHING -- when no
-    candidate is rendered or every one sits under a UI panel, and False -- having fired the
-    hook -- once the intermediate point is reached or the player stalls, so the caller's hop
-    fallback carries the rest of the leg from the nearest waypoint; by then the fletch has had
-    its uninterrupted stretch. Every click before that would end it, which is why there is
-    exactly one."""
+def _far_click_target(b: int, points):
+    """The farthest point of the leg that ONE click can reach right now: site `b`'s stand
+    tile first, then the recorded waypoints from the far end. A point is reachable if it is
+    rendered in the viewport (and not under a panel) OR on the minimap (and not on an orb).
+
+    The minimap half is what makes the stretches long enough. MEASURED 2026-09-09 with the
+    viewport alone: the picked point was 11-18 tiles out on most legs -- 7-11s, 3-5 bows,
+    then the next click ended the fletch. The minimap reaches 28 tiles whatever the camera
+    renders (CLAUDE.md's measurement), and the game paths there on its own."""
     sx, sy = route.SITES[b]["stand"]
-    target = None
     for cx, cy in [(sx, sy)] + [tuple(pt) for pt in reversed(points)]:
         point = controller.get_ground_walk_point(cx, cy, route.PLANE)
-        if not point.get("onScreen"):
-            continue
-        if controller.is_point_blocked_by_ui(point.get("screenX", -1), point.get("screenY", -1)):
-            continue
-        target = (cx, cy, point)
-        break
+        if point.get("onScreen") and not controller.is_point_blocked_by_ui(
+                point.get("screenX", -1), point.get("screenY", -1)):
+            return cx, cy, point, True
+        point = controller.get_minimap_walk_point(cx, cy, route.PLANE)
+        if point.get("onMinimap") and not controller.is_point_on_minimap_orb(
+                point.get("screenX", -1), point.get("screenY", -1)):
+            return cx, cy, point, False
+    return None
+
+
+def _direct_leg(ctx, b: int, points, fire_hook) -> str:
+    """ONE click at the farthest reachable point of the leg, fire the hook, then only poll.
+
+    ARRIVED: at the site. STRETCH: the intermediate point was reached, the hook has fired --
+    the caller clicks again from here. NO_CLICK: nothing reachable, nothing clicked.
+    STALLED: the hook has fired but the player stopped short (a log balance the game's own
+    pathfinder will not cross), so the recorded hops take over. Every click before the
+    stretch is walked would end the fletch, which is why there is exactly one per stretch."""
+    target = _far_click_target(b, points)
     if target is None:
-        return False
-    cx, cy, point = target
-    travel._click_walk_point(ctx, point, shift=True)
-    fire_hook()
-    debug_log.log(LOG, "direct leg toward site %d: one click at (%d,%d), fletch on the move"
-                  % (b, cx, cy))
+        return NO_CLICK
+    cx, cy, point, viewport = target
+    sx, sy = route.SITES[b]["stand"]
+    travel._click_walk_point(ctx, point, shift=viewport)
+    fletching = bool(fire_hook())
+    debug_log.log(LOG, "direct leg toward site %d: one %s click at (%d,%d), fletch on the move"
+                  % (b, "viewport" if viewport else "minimap", cx, cy))
+
+    # THE FLETCH HAS NO QUANTITY: it turns every loose log into a bow until something ends
+    # it, and a stretch long enough to make bows is long enough to eat the build logs too
+    # (USER 2026-09-09: "gotta leave a few logs in the inventory to actually craft the
+    # totems too"). So the loose count is watched, and once only the reserve the hook set
+    # aside is left, the SAME walk target is clicked again -- the game keeps the walk and
+    # ends the fletch, exactly what a human does with a stray click.
+    log_name = ctx.state.config["log"]
+    reserve = int(ctx.state.data.get(LOG_RESERVE_KEY) or 0)
 
     deadline = _now() + DIRECT_LEG_MAX_S
     last_xy, still_since = _player_xy(), _now()
     while _now() < deadline:
         _sleep(DIRECT_LEG_POLL_S)
+        if fletching and count_item(log_name) <= reserve:
+            travel._click_walk_point(ctx, point, shift=viewport)
+            fletching = False
+            debug_log.log(LOG, "fletch stopped at the build reserve (%d %s left)"
+                          % (reserve, log_name))
         if at_site(b):
-            return True
+            return ARRIVED
         xy = _player_xy()
         if (cx, cy) != (sx, sy) and xy[0] is not None \
                 and _tiles_between(xy[0], xy[1], cx, cy) <= ARRIVAL_TOLERANCE:
-            return False        # the stretch is walked; the hops take the rest
+            return STRETCH
         if xy != last_xy:
             last_xy, still_since = xy, _now()
         elif _now() - still_since >= DIRECT_LEG_STALL_S:
             debug_log.log(LOG, "direct leg to site %d stalled at %s -- falling back to the "
                                "recorded hops" % (b, xy))
-            return False
+            return STALLED
     debug_log.log(LOG, "direct leg to site %d: not there after %.0fs -- falling back to the "
                        "recorded hops" % (b, DIRECT_LEG_MAX_S))
-    return False
+    return STALLED
+
+
+# A leg is at most this many far clicks before the hops take over -- the longest leg (57
+# tiles) is two or three 24-28 tile stretches; more than five means something is circling.
+DIRECT_LEG_MAX_STRETCHES = 5
 
 
 def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
@@ -548,15 +612,22 @@ def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
     # then bows every 1.8s untouched. The bot's waypoint hops every ~2s each ended the fletch
     # (anim 1248 started, no product, every leg), so decorations never got made. USER:
     # "between each totem we should be able to craft enough bows for the next one".
-    fired = {"hook": False}
-
+    # The hook fires after EVERY far click, not only the first: each click ends the fletch
+    # that was running, and _fletch_on_the_move re-derives the budget live, so a stretch
+    # that still wants bows restarts it and one that does not costs nothing.
     def fire_hook():
-        if after_first_hop is not None and not fired["hook"]:
-            fired["hook"] = True
-            after_first_hop()
+        # Returns the hook's own verdict -- True when a fletch actually started -- because
+        # _direct_leg only watches the log reserve for a fletch it knows is running.
+        if after_first_hop is None:
+            return False
+        return after_first_hop()
 
-    if _direct_leg(ctx, b, points, fire_hook):
-        return True
+    for _ in range(DIRECT_LEG_MAX_STRETCHES):
+        verdict = _direct_leg(ctx, b, points, fire_hook)
+        if verdict == ARRIVED:
+            return True
+        if verdict != STRETCH:
+            break               # nothing clickable, or stalled: the recorded hops from here
 
     # START FROM THE WAYPOINT NEAREST THE PLAYER, not always index 0. A leg is resumed mid-way
     # far more often than it is started clean: after a bank trip (which leaves the player ON
@@ -636,6 +707,7 @@ def carve(ctx, site) -> bool:
 
 
 DECORATE_BUDGET_S = 6.0
+DECORATE_ACTION_S = 1.5     # recording: one decoration animation every 1.2s after ONE click
 FLETCH_MENU_BUDGET_S = 4.0
 
 
@@ -655,15 +727,30 @@ def find_item(name: str):
 
 
 def decorate(ctx, site) -> bool:
-    """Attach one decoration. Confirmed on the reader's decoration count rising."""
+    """ONE Decorate click, confirmed on every bow in hand going on.
+
+    USER 2026-09-09: "only need to click once to decorate i dont think it speeds it up", and
+    the recording agrees -- one Decorate click is followed by four decoration animations
+    1.2s apart with no further click. Decorating is a continuous action like fletching: it
+    runs until the totem is full or the bows run out. The first draft clicked once per
+    decoration (confirming on the count rising by one), so every extra click landed on a
+    loop that was already running. Now the confirm is the count reaching what the bows in
+    hand allow, with a budget of one action per decoration plus the walk."""
     n = site.number
-    before = site.decorations
+    bows = count_item(ctx.state.config["bow"])
+    target = min(vt.MAX_DECORATIONS, site.decorations + bows)
+    if target <= site.decorations:
+        return False
 
     def landed():
         fresh = _site_now(n)
-        return fresh is not None and fresh.decorations > before
+        return fresh is not None and fresh.decorations >= target
 
-    return _click_site(ctx, n, "totem", DECORATE_BUDGET_S, landed)
+    budget = DECORATE_BUDGET_S + DECORATE_ACTION_S * (target - site.decorations)
+    return _click_site(ctx, n, "totem", budget, landed, option="Decorate")
+
+
+LOG_RESERVE_KEY = "vt_log_reserve"
 
 
 def _fletch_on_the_move(ctx) -> bool:
@@ -674,7 +761,9 @@ def _fletch_on_the_move(ctx) -> bool:
     after a failed leg, and a log owed to a build must never become a bow (vt.fletch_budget's
     own deadlock note)."""
     data = ctx.state.data
-    if not data.pop("vt_fletch_due", False):
+    # Not popped: the flag stays up for the whole leg so every far click can restart the
+    # fletch the click just ended; tick() clears it on arrival at the site.
+    if not data.get("vt_fletch_due", False):
         return False
     state = read_state()
     if state is None:
@@ -682,7 +771,24 @@ def _fletch_on_the_move(ctx) -> bool:
     if vt.fletch_budget(state, count_item(ctx.state.config["log"]),
                         count_item(ctx.state.config["bow"])) <= 0:
         return False
+    # What the fletch must NOT touch: one log per build still owed, the same reserve
+    # fletch_budget spares. _direct_leg stops the fletch when the loose count reaches it.
+    data[LOG_RESERVE_KEY] = vt.builds_needed(state)
     return start_fletching(ctx)
+
+
+# The Vale Research Exchange's Fletching knife (USER 2026-09-09: "new knife name fletching
+# knife") or an ordinary Knife -- the reward one first, since it is the one the user bought
+# to use here.
+KNIFE_NAMES = ("Fletching knife", "Knife")
+
+
+def find_knife():
+    for name in KNIFE_NAMES:
+        item = find_item(name)
+        if item:
+            return item
+    return None
 
 
 def start_fletching(ctx) -> bool:
@@ -696,7 +802,7 @@ def start_fletching(ctx) -> bool:
     The option is matched by NAME and its digit derived from the matched widget, so a wood
     whose menu differs cannot silently make the wrong thing.
     """
-    knife = find_item("Knife")
+    knife = find_knife()
     log = find_item(ctx.state.config["log"])
     if not knife or not log:
         return False

@@ -17,6 +17,9 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_ground_walk_point",
                         lambda x, y, p, inst=False: {"onScreen": False})
     monkeypatch.setattr(controller, "is_point_blocked_by_ui", lambda x, y: None)
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, p, inst=False: {"onMinimap": False})
+    monkeypatch.setattr(controller, "is_point_on_minimap_orb", lambda x, y: None)
     monkeypatch.setattr(travel, "_click_walk_point",
                         lambda ctx, point, shift: pytest.fail("unexpected viewport walk click"))
 
@@ -245,6 +248,8 @@ def test_decorate_confirms_on_the_decoration_count_rising(monkeypatch):
                         lambda *a, **k: {"screenX": 1, "screenY": 2})
     monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    # One bow in hand: the one click is confirmed once it has gone on (1 -> 2).
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 1 if "longbow" in name else 0)
     monkeypatch.setattr(vtr_routine, "read_state",
                         lambda: type("S", (), {"sites": {6: _one_site(
                             baseValue=4, wood="YEW", baseCarved=True,
@@ -1185,6 +1190,57 @@ def test_the_fletch_hook_rechecks_the_budget_against_live_state(monkeypatch):
     assert vtr_routine._fletch_on_the_move(ctx) is False
 
 
+def test_a_minimap_point_counts_as_a_far_click_when_nothing_is_rendered(monkeypatch):
+    """MEASURED 2026-09-09: viewport-only picks were 11-18 tiles, 3-5 bows. The minimap
+    reaches 28 tiles whatever is rendered."""
+    points = route.leg_waypoints(8, 7)
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, p, inst=False: {"onMinimap": (x, y) == points[3],
+                                                     "screenX": 1900, "screenY": 200})
+    clicks = []
+    monkeypatch.setattr(travel, "_click_walk_point",
+                        lambda ctx, point, shift: clicks.append(shift))
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
+    seq = iter([_stand(8), _stand(8)] + [_stand(7)] * 20)
+    monkeypatch.setattr(controller, "get_player", lambda: next(seq))
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    assert vtr_routine.walk_leg(_ctx_only(), 8, 7) is True
+    assert clicks == [False], "one minimap click (no SHIFT on the minimap)"
+
+
+def test_a_far_click_on_an_orb_is_not_taken(monkeypatch):
+    points = route.leg_waypoints(8, 7)
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, p, inst=False: {"onMinimap": True, "screenX": 1966, "screenY": 151})
+    monkeypatch.setattr(controller, "is_point_on_minimap_orb", lambda x, y: {"x": 1910})
+    monkeypatch.setattr(travel, "_click_walk_point", lambda *a, **k: pytest.fail("clicked an orb"))
+    hops = []
+    monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane, **k: hops.append(1) or True)
+    monkeypatch.setattr(controller, "get_player", lambda: _stand(7))
+    vtr_routine.walk_leg(_ctx_only(), 8, 7)
+    assert hops
+
+
+def test_the_fletch_flag_survives_the_leg_and_is_cleared_at_the_site(monkeypatch):
+    """Every far click ends the running fletch, so the flag must still be up for the next
+    stretch to restart it; it is cleared once the site is reached."""
+    monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 40 if "logs" in name else 0)
+    fired = []
+    monkeypatch.setattr(vtr_routine, "start_fletching", lambda c: fired.append(1) or True)
+    ctx = _ctx_only()
+    ctx.state.data["vt_fletch_due"] = True
+    assert vtr_routine._fletch_on_the_move(ctx) is True
+    assert vtr_routine._fletch_on_the_move(ctx) is True, "second stretch restarts it"
+    assert fired == [1, 1]
+    stops = []
+    ctx2 = _running_tick(monkeypatch, stops, at=6)
+    ctx2.state.data["vt_fletch_due"] = True
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
+    vtr_routine.tick(ctx2)
+    assert ctx2.state.data.get("vt_fletch_due") is False, "cleared on arrival, before the site work"
+
+
 def test_the_fletch_hook_is_a_no_op_when_nothing_is_due(monkeypatch):
     monkeypatch.setattr(vtr_routine, "start_fletching",
                         lambda c: pytest.fail("fletched with no flag set"))
@@ -1230,7 +1286,7 @@ def test_a_stalled_direct_leg_falls_back_to_the_hops_without_refiring_the_hook(m
     fired = []
     vtr_routine.walk_leg(_ctx_only(), 8, 7, after_first_hop=lambda: fired.append(1))
     assert hops, "the stalled direct leg must hand over to the recorded hops"
-    assert fired == [1], "the fletch hook fires once, not again on the first hop"
+    assert fired == [1, 1], "the hook fires after the far click and again after the first hop"
 
 
 def test_an_off_screen_stand_tile_skips_the_direct_click_entirely(monkeypatch):
@@ -1262,6 +1318,167 @@ def test_the_direct_click_aims_at_the_farthest_rendered_waypoint_when_the_site_i
     monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
     fired = []
     assert vtr_routine.walk_leg(_ctx_only(), 8, 7, after_first_hop=lambda: fired.append(1)) is True
-    assert len(clicks) == 1, "one viewport click for the fletch stretch"
-    assert fired == [1]
-    assert hops and hops[0] in points[2:], "the hops resume from the walked stretch, not the start"
+    # Two STRETCHES: the far rendered waypoint, then -- from there -- a second far click that
+    # arrives. The fletch re-fires after each, and the hops are never needed.
+    assert len(clicks) == 2, "one click per stretch, chained"
+    assert fired == [1, 1], "the fletch restarts after every click that ended it"
+    assert hops == [], "no hop click while a far click can still reach"
+
+
+def test_the_fletch_is_stopped_at_the_build_reserve_by_reclicking_the_walk(monkeypatch):
+    """USER 2026-09-09: "gotta leave a few logs in the inventory to actually craft the
+    totems too" -- the make prompt has no quantity, so the stretch itself must end the fletch
+    once only the build reserve is left, with a click that keeps the walk."""
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500, "screenY": 300})
+    clicks = []
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: clicks.append(point))
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
+    seq = iter([_stand(8), _stand(8), {"x": 1420, "y": 3340, "plane": 0},
+                {"x": 1430, "y": 3342, "plane": 0}] + [_stand(7)] * 20)
+    monkeypatch.setattr(controller, "get_player", lambda: next(seq))
+    logs = iter([6, 4, 3, 3, 3, 3, 3, 3])          # loose logs falling as bows are made
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: next(logs))
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.LOG_RESERVE_KEY] = 3
+    assert vtr_routine.walk_leg(ctx, 8, 7, after_first_hop=lambda: True) is True
+    assert len(clicks) == 2, "the walk click, then ONE re-click at the reserve"
+    assert clicks[0] == clicks[1], "the re-click aims at the same target so the walk continues"
+
+
+def test_the_fletch_hook_sets_the_reserve_it_started_against(monkeypatch):
+    monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())    # 8 builds owed
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 40 if "logs" in name else 0)
+    monkeypatch.setattr(vtr_routine, "start_fletching", lambda c: True)
+    ctx = _ctx_only()
+    ctx.state.data["vt_fletch_due"] = True
+    assert vtr_routine._fletch_on_the_move(ctx) is True
+    assert ctx.state.data[vtr_routine.LOG_RESERVE_KEY] == 8
+
+
+# --- 2026-09-09: a site click that resolved to the wrong action gets one menu retry --------
+
+def _site_click_world(monkeypatch, last_option, menu_result=True):
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda x, y, p, i, **k: {"screenX": 1, "screenY": 2, "id": i})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
+    monkeypatch.setattr(controller, "get_last_action", lambda: {"option": last_option})
+    menu = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, opt, **k: menu.append(opt) or menu_result)
+    return menu
+
+
+def test_a_claim_that_resolved_to_walk_here_is_retried_through_the_menu(monkeypatch):
+    """MEASURED 2026-09-09: the bare click missed the pile at sites 5-7 about one time in six
+    and /last-action read "Walk here". The menu tier picks Claim by name."""
+    menu = _site_click_world(monkeypatch, "Walk here")
+    # The pile empties only once the MENU click has gone out -- the bare click missed.
+    monkeypatch.setattr(controller, "get_api", lambda g, r: _pile_payload(8, 0 if menu else 65))
+    site = vt.parse_state(_pile_payload(8, 65)).sites[8]
+    monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    assert vtr_routine.claim(_ctx_only(), site) is True
+    assert menu == ["Claim"]
+
+
+def test_a_claim_that_registered_but_did_not_confirm_is_not_retried(monkeypatch):
+    menu = _site_click_world(monkeypatch, "Claim")
+    monkeypatch.setattr(controller, "get_api", lambda g, r: _pile_payload(8, 65))
+    site = vt.parse_state(_pile_payload(8, 65)).sites[8]
+    monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    assert vtr_routine.claim(_ctx_only(), site) is False
+    assert menu == [], "a registered Claim that changed nothing is not a miss to retry"
+
+
+def _stepping_clock():
+    t = {"v": 0.0}
+
+    def now():
+        t["v"] += 0.5
+        return t["v"]
+    return now
+
+
+def _pile_payload(n, unclaimed):
+    return {"sites": [{"siteNumber": n, "baseValue": 0, "wood": "NONE", "baseCarved": False,
+                       "bottom": {"value": 0}, "middle": {"value": 0}, "top": {"value": 0},
+                       "decorations": 0, "nearbySpirits": ["BUFFALO", "JAGUAR", "SNAKE"],
+                       "durabilityRemaining": 0, "unclaimedOfferings": unclaimed}],
+            "researchPoints": 0, "totalUnclaimedOfferings": unclaimed, "atValeTotems": True}
+
+
+def test_the_basket_is_emptied_below_a_totems_worth_not_only_at_zero(monkeypatch):
+    """USER 2026-09-09: "running with full log basket empty inventory? better to empty so we
+    can craft some bows"."""
+    stops = []
+    ctx = _running_tick(monkeypatch, stops, at=6)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 2 if "logs" in name else 0)
+    monkeypatch.setattr(vtr_routine, "find_basket", lambda: {"name": "Open log basket"})
+    emptied = []
+    monkeypatch.setattr(vtr_routine, "empty_basket", lambda c: emptied.append(1) or True)
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 28
+    vtr_routine.tick(ctx)
+    assert emptied == [1]
+
+
+def test_a_basket_known_to_be_empty_is_not_clicked(monkeypatch):
+    stops = []
+    ctx = _running_tick(monkeypatch, stops, at=6)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
+    monkeypatch.setattr(vtr_routine, "find_basket", lambda: {"name": "Open log basket"})
+    monkeypatch.setattr(vtr_routine, "empty_basket",
+                        lambda c: pytest.fail("shift-clicked a basket known to be empty"))
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 0
+    vtr_routine.tick(ctx)
+
+
+def test_decorate_is_one_click_confirmed_on_every_bow_going_on(monkeypatch):
+    """USER 2026-09-09: one Decorate click runs all four (recording: four animations after a
+    single click). Clicking per decoration only landed on a loop already running."""
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda x, y, p, i, **k: {"screenX": 1, "screenY": 2, "id": i})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: clicks.append(1) or True)
+    monkeypatch.setattr(controller, "get_last_action", lambda: {"option": "Decorate"})
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 4 if "longbow" in name else 0)
+    reads = iter([0, 1, 2, 3, 4, 4, 4, 4])
+    site_payload = lambda d: {"sites": [{"siteNumber": 8, "baseValue": 4, "wood": "YEW",
+                                          "baseCarved": True, "bottom": {"value": 10},
+                                          "middle": {"value": 11}, "top": {"value": 13},
+                                          "decorations": d, "nearbySpirits": ["BUFFALO", "JAGUAR", "SNAKE"],
+                                          "durabilityRemaining": 5, "unclaimedOfferings": 0}],
+                              "researchPoints": 0, "totalUnclaimedOfferings": 0, "atValeTotems": True}
+    monkeypatch.setattr(controller, "get_api", lambda g, r: site_payload(next(reads)))
+    site = vt.parse_state(site_payload(0)).sites[8]
+    monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    assert vtr_routine.decorate(_ctx_only(), site) is True
+    assert clicks == [1], "one click for all four decorations"
+
+
+def test_decorate_with_no_bows_does_not_click(monkeypatch):
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: pytest.fail("clicked with no bows"))
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
+    site = vt.parse_state({"sites": [{"siteNumber": 8, "baseValue": 4, "wood": "YEW",
+                                      "baseCarved": True, "bottom": {"value": 10},
+                                      "middle": {"value": 11}, "top": {"value": 13},
+                                      "decorations": 1, "nearbySpirits": [], "durabilityRemaining": 5,
+                                      "unclaimedOfferings": 0}],
+                           "researchPoints": 0, "totalUnclaimedOfferings": 0, "atValeTotems": True}).sites[8]
+    assert vtr_routine.decorate(_ctx_only(), site) is False
+
+
+def test_the_fletching_knife_is_found_and_preferred(monkeypatch):
+    """USER 2026-09-09: "new knife name fletching knife" -- the Vale Research Exchange reward."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Knife", "screenX": 1, "screenY": 1},
+                                 {"name": "Fletching knife", "screenX": 2, "screenY": 2}])
+    assert vtr_routine.find_knife()["name"] == "Fletching knife"
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Knife", "screenX": 1, "screenY": 1}])
+    assert vtr_routine.find_knife()["name"] == "Knife"
