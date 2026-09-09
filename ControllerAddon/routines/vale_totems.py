@@ -903,8 +903,15 @@ def start_stringing(ctx) -> bool:
         return False
     before = count_item(unstrung)
     controller.open_inventory_tab(ctx.ser)
-    if not controller.click_entity(ctx.ser, spool, offset=(0, 0), check_ui_blockers=False,
-                                   simulate_mistakes=False, expected_action="Use"):
+    # The spool's own options are Fill/Check/Empty/Drop -- "Use" is only its left click when
+    # the account's menu swap puts it there (USER 2026-09-09: "i changed the menu to be use on
+    # leftclick"); the right-click menu is the fallback for a client without the swap.
+    used = controller.click_entity(ctx.ser, spool, offset=(0, 0), check_ui_blockers=False,
+                                   simulate_mistakes=False, expected_action="Use")
+    if not used:
+        used = controller.click_menu_action(ctx.ser, spool, "use", offset=(0, 0),
+                                            check_ui_blockers=False)
+    if not used:
         return False
     if not controller.click_entity(ctx.ser, bow, offset=(0, 0), check_ui_blockers=False,
                                    simulate_mistakes=False):
@@ -1193,6 +1200,45 @@ def fill_basket(ctx) -> bool:
 # next move is the log balance to site 6; the bank comes round again on the next 8->7 leg.
 BANK_SITES = (8,)
 
+# Everything the routine carries on purpose; anything else that turns up in the inventory
+# (the Molten glass a mis-aimed withdraw pulled, 2026-09-09) is banked at the next trip.
+# Substrings, banker.deposit_inventory's convention: "logs" and "longbow" cover every wood.
+KEEP_SUBSTRINGS = ("basket", "knife", "spool", "offerings", "logs", "longbow")
+BANK_SLOT_SETTLE_S = 2.0
+BANK_SLOT_POLL_S = 0.3
+
+
+def _deposit_junk(ctx) -> None:
+    """Shift-deposit whatever is not on KEEP_SUBSTRINGS, only when there is something."""
+    junk = [i.get("name") for i in (controller.get_inventory() or [])
+            if not any(k in (i.get("name") or "").lower() for k in KEEP_SUBSTRINGS)]
+    if not junk:
+        return
+    debug_log.log(LOG, "bank: depositing %s" % sorted(set(junk)))
+    banker.deposit_inventory(ctx, {"keepItems": list(KEEP_SUBSTRINGS),
+                                   "skipContainerDeposit": True})
+
+
+def _bank_slot(name):
+    bank = controller.get_bank(fresh=True) or {}
+    for item in bank.get("items") or []:
+        if (item.get("name") or "").lower() == name.lower():
+            return (item.get("screenX"), item.get("screenY"))
+    return None
+
+
+def _await_bank_slot(name) -> bool:
+    """True once two consecutive fresh reads agree on where `name` sits in the open bank."""
+    deadline = _now() + BANK_SLOT_SETTLE_S
+    last = _bank_slot(name)
+    while _now() < deadline:
+        _sleep(BANK_SLOT_POLL_S)
+        now = _bank_slot(name)
+        if now is not None and now == last:
+            return True
+        last = now
+    return False
+
 BANK_HOP_ATTEMPTS = 4
 
 
@@ -1259,6 +1305,14 @@ def bank_trip(ctx) -> bool:
     for round_index in range(BANK_ROUNDS):
         if not banker.open_bank(ctx, booth):
             return False
+        if round_index == 0:
+            _deposit_junk(ctx)
+        # LET THE INTERFACE LAY OUT before aiming at a slot. MEASURED on the host 2026-09-09:
+        # the first withdraw after the bank opened hit MOLTEN GLASS, not the yew logs the
+        # fresh /bank read had placed there -- the same early-position trap CLAUDE.md records
+        # for the basket 0.12s after a bank open. The slot is trusted only once two fresh
+        # reads a beat apart agree on where it is.
+        _await_bank_slot(ctx.state.config["log"])
         if not banker.withdraw_all_shift(ctx, ctx.state.config["log"], fresh=True):
             return False
         _close_prompt(ctx, force=True)

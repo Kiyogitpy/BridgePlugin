@@ -7,6 +7,7 @@ from routines import vale_totems as vtr_routine
 import bank_memory
 
 _REAL_WALK_TO_SITE = vtr_routine._walk_to_site   # the autouse fixture stubs it; leg tests want it back
+_REAL_DEPOSIT_JUNK = vtr_routine._deposit_junk
 
 
 @pytest.fixture(autouse=True)
@@ -16,6 +17,9 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_widgets_dump", lambda scan=False: [])
     monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: None)
     monkeypatch.setattr(bank_memory, "load", lambda names=None: None)
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: {"open": True, "items": []})
+    monkeypatch.setattr(vtr_routine, "_await_bank_slot", lambda name: True)
+    monkeypatch.setattr(vtr_routine, "_deposit_junk", lambda ctx: None)
     # tick() now walks the next leg and pre-hovers the first target itself; neither belongs
     # in a test of the site logic, and both touch the serial port.
     monkeypatch.setattr(vtr_routine, "_walk_to_site", lambda ctx, n: None)
@@ -1700,3 +1704,32 @@ def test_the_wood_never_switches_on_an_empty_or_unseen_memory(monkeypatch):
         vtr_routine.bank_trip(ctx)
         assert withdrawn and withdrawn[0] == "Yew logs", "stayed on yew"
         assert ctx.state.data.get(vtr_routine.WOOD_KEY) is None
+
+
+def test_junk_in_the_inventory_is_deposited_on_the_bank_trip(monkeypatch):
+    """Host 2026-09-09: a mis-aimed withdraw pulled 13 Molten glass; nothing ever banked it."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Molten glass"}, {"name": "Yew logs"},
+                                 {"name": "Open log basket"}, {"name": "Bow string spool"}])
+    calls = []
+    monkeypatch.setattr(banker, "deposit_inventory", lambda ctx, cfg: calls.append(cfg))
+    _REAL_DEPOSIT_JUNK(_ctx_only())
+    assert calls and "logs" in calls[0]["keepItems"] and calls[0]["skipContainerDeposit"]
+
+
+def test_nothing_is_deposited_when_everything_is_kept(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Yew logs"}, {"name": "Yew longbow (u)"},
+                                 {"name": "Fletching knife"}, {"name": "Vale offerings"}])
+    monkeypatch.setattr(banker, "deposit_inventory", lambda ctx, cfg: pytest.fail("deposited kept items"))
+    _REAL_DEPOSIT_JUNK(_ctx_only())
+
+
+def test_the_bank_slot_is_trusted_only_once_two_reads_agree(monkeypatch):
+    reads = iter([{"items": [{"name": "Yew logs", "screenX": 650, "screenY": 574}]},
+                  {"items": [{"name": "Yew logs", "screenX": 650, "screenY": 226}]},
+                  {"items": [{"name": "Yew logs", "screenX": 650, "screenY": 226}]}])
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: next(reads))
+    monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    assert vtr_routine._await_bank_slot("Yew logs") is True
