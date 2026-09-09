@@ -4,6 +4,7 @@ import controller
 import vale_totems as vt
 import vale_totem_route as route
 from routines import vale_totems as vtr_routine
+import bank_memory
 
 
 @pytest.fixture(autouse=True)
@@ -12,6 +13,7 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
     monkeypatch.setattr(controller, "get_widgets_dump", lambda scan=False: [])
     monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: None)
+    monkeypatch.setattr(bank_memory, "load", lambda names=None: None)
     # The direct leg's viewport click: off-screen by default, so every existing walk_leg test
     # keeps exercising the waypoint hops it was written against.
     monkeypatch.setattr(controller, "get_ground_walk_point",
@@ -249,7 +251,7 @@ def test_decorate_confirms_on_the_decoration_count_rising(monkeypatch):
     monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
     # One bow in hand: the one click is confirmed once it has gone on (1 -> 2).
-    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 1 if "longbow" in name else 0)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 1 if name == "Yew longbow (u)" else 0)
     monkeypatch.setattr(vtr_routine, "read_state",
                         lambda: type("S", (), {"sites": {6: _one_site(
                             baseValue=4, wood="YEW", baseCarved=True,
@@ -669,6 +671,8 @@ def _running_tick(monkeypatch, stops, payload=None, at=6):
                         lambda ctx: pytest.fail("bank_trip must not be attempted here"))
     monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
     monkeypatch.setattr(vtr_routine, "find_basket", lambda: None)
+    monkeypatch.setattr(vtr_routine, "_walk_to_site", lambda ctx, n: None)
+    monkeypatch.setattr(vtr_routine, "_prehover_first_action", lambda ctx, n: None)
     return _ctx(monkeypatch, stops)
 
 
@@ -1076,10 +1080,12 @@ def test_a_fill_that_moves_nothing_means_the_basket_is_full(monkeypatch):
 
 
 def test_empty_basket_subtracts_what_arrived_and_zeroes_on_nothing(monkeypatch):
+    # 27 free slots in the fixture's inventory; 21 arrived, fewer than could fit, so the
+    # basket handed over everything it had: empty now, whatever the estimate said.
     ctx = _basket_ctx(monkeypatch, [0, 21, 21])
     ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 28
     vtr_routine.empty_basket(ctx)
-    assert vtr_routine.basket_logs(ctx.state.data) == 7
+    assert vtr_routine.basket_logs(ctx.state.data) == 0
     ctx = _basket_ctx(monkeypatch, [0, 0, 0])
     ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 7
     vtr_routine.empty_basket(ctx)
@@ -1176,7 +1182,8 @@ def test_walk_leg_fires_the_hook_after_the_first_hop_not_before(monkeypatch):
     vtr_routine.walk_leg(_ctx_only(), 8, 7,
                          after_first_hop=lambda: order.append(("fletch",)))
     assert order[0][0] == "hop", "the move command must go out first"
-    assert order[1] == ("fletch",), "the fletch must follow the FIRST hop, not the last"
+    assert order[-1] == ("fletch",), "on a hop leg the fletch follows the LAST hop -- the one run nothing interrupts"
+    assert order.count(("fletch",)) == 1
 
 
 def test_the_fletch_hook_rechecks_the_budget_against_live_state(monkeypatch):
@@ -1230,8 +1237,8 @@ def test_the_fletch_flag_survives_the_leg_and_is_cleared_at_the_site(monkeypatch
     monkeypatch.setattr(vtr_routine, "start_fletching", lambda c: fired.append(1) or True)
     ctx = _ctx_only()
     ctx.state.data["vt_fletch_due"] = True
-    assert vtr_routine._fletch_on_the_move(ctx) is True
-    assert vtr_routine._fletch_on_the_move(ctx) is True, "second stretch restarts it"
+    assert vtr_routine._fletch_on_the_move(ctx) == "fletch"
+    assert vtr_routine._fletch_on_the_move(ctx) == "fletch", "a later call still answers"
     assert fired == [1, 1]
     stops = []
     ctx2 = _running_tick(monkeypatch, stops, at=6)
@@ -1286,7 +1293,7 @@ def test_a_stalled_direct_leg_falls_back_to_the_hops_without_refiring_the_hook(m
     fired = []
     vtr_routine.walk_leg(_ctx_only(), 8, 7, after_first_hop=lambda: fired.append(1))
     assert hops, "the stalled direct leg must hand over to the recorded hops"
-    assert fired == [1, 1], "the hook fires after the far click and again after the first hop"
+    assert fired == [1], "once per leg -- not again on the hops"
 
 
 def test_an_off_screen_stand_tile_skips_the_direct_click_entirely(monkeypatch):
@@ -1321,7 +1328,7 @@ def test_the_direct_click_aims_at_the_farthest_rendered_waypoint_when_the_site_i
     # Two STRETCHES: the far rendered waypoint, then -- from there -- a second far click that
     # arrives. The fletch re-fires after each, and the hops are never needed.
     assert len(clicks) == 2, "one click per stretch, chained"
-    assert fired == [1, 1], "the fletch restarts after every click that ended it"
+    assert fired == [1], "the fletch is started once, on the first move of the leg"
     assert hops == [], "no hop click while a far click can still reach"
 
 
@@ -1342,7 +1349,7 @@ def test_the_fletch_is_stopped_at_the_build_reserve_by_reclicking_the_walk(monke
     monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
     ctx = _ctx_only()
     ctx.state.data[vtr_routine.LOG_RESERVE_KEY] = 3
-    assert vtr_routine.walk_leg(ctx, 8, 7, after_first_hop=lambda: True) is True
+    assert vtr_routine.walk_leg(ctx, 8, 7, after_first_hop=lambda: "fletch") is True
     assert len(clicks) == 2, "the walk click, then ONE re-click at the reserve"
     assert clicks[0] == clicks[1], "the re-click aims at the same target so the walk continues"
 
@@ -1353,7 +1360,7 @@ def test_the_fletch_hook_sets_the_reserve_it_started_against(monkeypatch):
     monkeypatch.setattr(vtr_routine, "start_fletching", lambda c: True)
     ctx = _ctx_only()
     ctx.state.data["vt_fletch_due"] = True
-    assert vtr_routine._fletch_on_the_move(ctx) is True
+    assert vtr_routine._fletch_on_the_move(ctx) == "fletch"
     assert ctx.state.data[vtr_routine.LOG_RESERVE_KEY] == 8
 
 
@@ -1482,3 +1489,168 @@ def test_the_fletching_knife_is_found_and_preferred(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [{"name": "Knife", "screenX": 1, "screenY": 1}])
     assert vtr_routine.find_knife()["name"] == "Knife"
+
+
+def test_the_next_leg_starts_inside_the_same_tick(monkeypatch):
+    """USER 2026-09-09: "compared to the human its very slow" -- ~3s of engine round trip
+    between the last site action and the leg's first click, at every site."""
+    stops = []
+    ctx = _running_tick(monkeypatch, stops, at=6)
+    walked = []
+    monkeypatch.setattr(vtr_routine, "_walk_to_site", lambda c, n: walked.append(n))
+    vtr_routine.tick(ctx)
+    assert walked == [route.next_in_ring(6)]
+
+
+def test_an_immediately_stalling_leg_is_remembered_and_hopped_from_then_on(monkeypatch):
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500, "screenY": 300})
+    far = []
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: far.append(1))
+    hops = []
+    monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane, **k: hops.append((x, y)) or True)
+    monkeypatch.setattr(controller, "get_player", lambda: _stand(6))     # never moves
+    clock = {"t": 0.0}
+    monkeypatch.setattr(vtr_routine, "_now", lambda: clock["t"])
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    ctx = _ctx_only()
+    vtr_routine.walk_leg(ctx, 6, 5)
+    assert far == [1] and hops
+    assert ctx.state.data[vtr_routine.NO_DIRECT_KEY][str((6, 5))] is True
+    far.clear(); hops.clear()
+    vtr_routine.walk_leg(ctx, 6, 5)
+    assert far == [], "the second time the far click is not even attempted"
+    assert hops
+
+
+def test_an_empty_that_fills_every_free_slot_leaves_the_basket_unknown_not_empty(monkeypatch):
+    """USER 2026-09-09: "just ignored a totem for some reason, had 17 logs in logbasket none
+    in inventory" -- a slots-worth moved out of an unknown basket was recorded as 'now empty'."""
+    inv = [{"name": "Open log basket", "screenX": 1, "screenY": 1}] + [{"name": "x"}] * 20  # 7 free
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    _shift_keys(monkeypatch, [])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
+    counts = iter([0, 7, 7, 7, 7])          # 7 logs arrived: exactly the free slots
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: next(counts))
+    ctx = _ctx_only()
+    vtr_routine.empty_basket(ctx)
+    assert ctx.state.data.get(vtr_routine.BASKET_LOGS_KEY) is None, "unknown, NOT zero"
+
+
+def test_an_empty_that_moves_fewer_than_the_free_slots_means_the_basket_is_empty(monkeypatch):
+    inv = [{"name": "Open log basket", "screenX": 1, "screenY": 1}] + [{"name": "x"}] * 20
+    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    _shift_keys(monkeypatch, [])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
+    counts = iter([0, 3, 3, 3, 3])
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: next(counts))
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 28
+    vtr_routine.empty_basket(ctx)
+    assert ctx.state.data[vtr_routine.BASKET_LOGS_KEY] == 0
+
+
+def test_above_eight_bows_the_leg_strings_instead_of_fletching(monkeypatch):
+    """USER 2026-09-09: "if we have above say 8 bows (two totems) instead of fletching more
+    during a long run use the spool to string the bows"."""
+    monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())
+    monkeypatch.setattr(vtr_routine, "count_item",
+                        lambda name: {"Yew logs": 20, "Yew longbow (u)": 9, "Yew longbow": 0}.get(name, 0))
+    monkeypatch.setattr(vtr_routine, "find_spool", lambda: {"name": "Bow string spool"})
+    monkeypatch.setattr(vtr_routine, "start_fletching", lambda c: pytest.fail("fletched with 9 bows in hand"))
+    strung = []
+    monkeypatch.setattr(vtr_routine, "start_stringing", lambda c: strung.append(1) or True)
+    ctx = _ctx_only()
+    ctx.state.data["vt_fletch_due"] = True
+    assert vtr_routine._fletch_on_the_move(ctx) == "string"
+    assert strung == [1]
+
+
+def test_below_eight_bows_the_leg_fletches_as_before(monkeypatch):
+    monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())
+    monkeypatch.setattr(vtr_routine, "count_item",
+                        lambda name: {"Yew logs": 20, "Yew longbow (u)": 3}.get(name, 0))
+    monkeypatch.setattr(vtr_routine, "find_spool", lambda: {"name": "Bow string spool"})
+    monkeypatch.setattr(vtr_routine, "start_stringing", lambda c: pytest.fail("strung with 3 bows"))
+    monkeypatch.setattr(vtr_routine, "start_fletching", lambda c: True)
+    ctx = _ctx_only()
+    ctx.state.data["vt_fletch_due"] = True
+    assert vtr_routine._fletch_on_the_move(ctx) == "fletch"
+
+
+def test_strung_bows_count_as_decorations(monkeypatch):
+    monkeypatch.setattr(vtr_routine, "count_item",
+                        lambda name: {"Yew longbow (u)": 1, "Yew longbow": 3}.get(name, 0))
+    assert vtr_routine.bow_count(_ctx_only()) == 4
+
+
+def test_a_spool_that_strings_nothing_is_marked_dead(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Bow string spool", "screenX": 1, "screenY": 1},
+                                 {"name": "Yew longbow (u)", "screenX": 2, "screenY": 2}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 1)     # never falls
+    monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    ctx = _ctx_only()
+    assert vtr_routine.start_stringing(ctx) is False
+    assert ctx.state.data.get(vtr_routine.SPOOL_DEAD_KEY) is True
+
+
+class _Memory:
+    def __init__(self, q): self.q = q
+    def quantity(self, name): return self.q
+
+
+def test_the_bank_out_of_the_current_wood_steps_down_to_the_next(monkeypatch):
+    """USER 2026-09-09: "When we run out of yew logs swap to maple logs"."""
+    _at_the_bank(monkeypatch)
+    monkeypatch.setattr(bank_memory, "load", lambda names=None: _Memory(0))
+    monkeypatch.setattr(controller, "get_object_at", lambda *a, **k: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **k: True)
+    withdrawn = []
+    monkeypatch.setattr(banker, "withdraw_all_shift",
+                        lambda ctx, name, fresh=False: withdrawn.append(name) or True)
+    monkeypatch.setattr(vtr_routine, "fill_basket", lambda ctx: True)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
+    ctx = _ctx_only()
+    assert vtr_routine.bank_trip(ctx) is True
+    assert withdrawn and withdrawn[0] == "Maple logs"
+    assert ctx.state.config["wood"] == "MAPLE"
+    assert ctx.state.config["bow"] == "Maple longbow (u)"
+    assert ctx.state.data[vtr_routine.WOOD_KEY] == "MAPLE"
+
+
+def test_the_wood_switch_survives_the_engine_re_resolving_the_config():
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.WOOD_KEY] = "MAPLE"
+    ctx.state.config = vtr_routine.get_config(None)          # the panel says YEW again
+    vtr_routine._wood_override(ctx)
+    assert ctx.state.config["log"] == "Maple logs"
+
+
+def test_decorating_counts_only_bows_of_the_totems_own_wood(monkeypatch):
+    monkeypatch.setattr(vtr_routine, "count_item",
+                        lambda name: {"Yew longbow (u)": 6, "Maple longbow (u)": 2}.get(name, 0))
+    ctx = _ctx_only()
+    assert vtr_routine.bow_count(ctx, "MAPLE") == 2
+    assert vtr_routine.bow_count(ctx, "YEW") == 6
+    assert vtr_routine.bow_count(ctx) == 6            # the wood being worked is yew
+
+
+def test_a_failed_bank_trip_with_logs_in_hand_is_not_a_stop(monkeypatch):
+    stops = []
+    monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())
+    _park_at(monkeypatch, 8)
+    monkeypatch.setattr(vtr_routine, "work_site", lambda ctx, n: True)
+    monkeypatch.setattr(vtr_routine, "_walk_to_site", lambda ctx, n: None)
+    monkeypatch.setattr(vtr_routine, "_prehover_first_action", lambda ctx, n: None)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 4 if "logs" in name else 0)
+    monkeypatch.setattr(vtr_routine, "find_basket", lambda: None)
+    monkeypatch.setattr(vtr_routine, "bank_trip", lambda ctx: False)
+    vtr_routine.tick(_ctx(monkeypatch, stops))
+    assert stops == [], "four logs in hand: carry on, try the bank next pass"

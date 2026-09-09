@@ -198,3 +198,13 @@ def test_builds_and_bows_add_back_up_to_the_lap_budget():
                         decorations=4, durabilityRemaining=5))
     assert vt.builds_needed(state) + vt.bows_needed(state) == vt.logs_needed_for_lap(state)
     assert vt.logs_needed_for_lap(state) == vt.LOGS_PER_TOTEM + 3
+
+
+def test_bows_in_hand_cover_decorations_in_the_lap_need():
+    """Host 2026-09-09: 20 bows and 4 logs read as 40 short and sent the routine banking with
+    four free slots. Eight unbuilt sites need 8 build logs; 20 bows cover 20 of the 32
+    decorations."""
+    state = vt.parse_state(_payload(*[_site(siteNumber=n) for n in range(1, 9)]))
+    assert vt.logs_needed_for_lap(state) == 40
+    assert vt.logs_needed_for_lap(state, bows=20) == 8 + 12
+    assert vt.logs_needed_for_lap(state, bows=100) == 8, "bows never cover a build log"

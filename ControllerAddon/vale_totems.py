@@ -159,20 +159,27 @@ def next_action(site, *, logs: int, bows: int):
     return ("done", None)
 
 
-def logs_needed_for_lap(state) -> int:
+def logs_needed_for_lap(state, bows: int = 0) -> int:
     """Logs required to finish every site that still has work outstanding.
 
     Used only to decide whether a bank trip is due, so it counts the WORK LEFT rather than
-    assuming a full lap: a site already built needs its decorations but not its build log."""
-    total = 0
+    assuming a full lap: a site already built needs its decorations but not its build log.
+
+    `bows` already in hand cover decorations one for one and are subtracted -- MEASURED
+    2026-09-09 on the host: 20 bows and 4 logs in hand read as "40 logs short" and sent the
+    routine banking with four free slots, where a four-log round and a stale bank position
+    turned into a safety stop."""
+    builds = 0
+    decorations = 0
     for site in state.sites.values():
         if site_is_finished(site):
             continue
         if needs_build(site):
-            total += LOGS_PER_TOTEM
+            builds += 1
+            decorations += MAX_DECORATIONS
         else:
-            total += max(0, MAX_DECORATIONS - site.decorations)
-    return total
+            decorations += max(0, MAX_DECORATIONS - site.decorations)
+    return builds + max(0, decorations - bows)
 
 
 def builds_needed(state) -> int:
