@@ -585,7 +585,7 @@ NO_DIRECT_KEY = "vt_no_direct"   # legs whose far click the game will not path a
 ARRIVED, STRETCH, NO_CLICK, STALLED = "arrived", "stretch", "no-click", "stalled"
 
 
-def _far_click_target(b: int, points):
+def _far_click_target(b: int, points, px=None, py=None):
     """The farthest point of the leg that ONE click can reach right now: site `b`'s stand
     tile first, then the recorded waypoints from the far end. A point is reachable if it is
     rendered in the viewport (and not under a panel) OR on the minimap (and not on an orb).
@@ -600,7 +600,14 @@ def _far_click_target(b: int, points):
     # fallback for a point the minimap cannot show.
     sx, sy = route.SITES[b]["stand"]
     for cx, cy in [(sx, sy)] + [tuple(pt) for pt in reversed(points)]:
-        point = controller.get_minimap_walk_point(cx, cy, route.PLANE)
+        # WITHIN THE MINIMAP'S REAL REACH. /minimap/walk's onMinimap is a generous test
+        # (CLAUDE.md: the cardinals still read "on" at 32 tiles) and a 38-tile point projected
+        # to a pixel outside the drawn circle, which clicks nothing (USER 2026-09-09: "long
+        # leg hop clicked outside of minimap window resulting in small hops"). 24 is the
+        # measured-safe hop range travel already uses.
+        in_reach = (px is None
+                    or _tiles_between(px, py, cx, cy) <= travel.WALK_HOP_MAX_TILES)
+        point = controller.get_minimap_walk_point(cx, cy, route.PLANE) if in_reach else {}
         if point.get("onMinimap") and not controller.is_point_on_minimap_orb(
                 point.get("screenX", -1), point.get("screenY", -1)):
             return cx, cy, point, False
@@ -619,7 +626,8 @@ def _direct_leg(ctx, b: int, points, fire_hook) -> str:
     STALLED: the hook has fired but the player stopped short (a log balance the game's own
     pathfinder will not cross), so the recorded hops take over. Every click before the
     stretch is walked would end the fletch, which is why there is exactly one per stretch."""
-    target = _far_click_target(b, points)
+    here = _player_xy()
+    target = _far_click_target(b, points, *here)
     if target is None:
         return NO_CLICK
     cx, cy, point, viewport = target
@@ -642,7 +650,7 @@ def _direct_leg(ctx, b: int, points, fire_hook) -> str:
     reserve = int(ctx.state.data.get(LOG_RESERVE_KEY) or 0)
 
     deadline = _now() + DIRECT_LEG_MAX_S
-    last_xy, still_since = _player_xy(), _now()
+    last_xy, still_since = here, _now()
     while _now() < deadline:
         _sleep(DIRECT_LEG_POLL_S)
         if fletching and count_item(log_name) <= reserve:
@@ -1226,15 +1234,21 @@ def bank_trip(ctx) -> bool:
         return False
     # OUT OF THIS WOOD? The bank memory (every tab, search or not) answers before the first
     # withdraw; 0 -- known empty, never "never seen" -- steps the wood down one.
-    memory = bank_memory.load(names=[ctx.state.config["log"]])
-    if memory is not None and memory.quantity(ctx.state.config["log"]) == 0:
+    # UNFILTERED, on purpose. MEASURED 2026-09-09 on the host: the name-filtered read answered
+    # "0 Yew logs" with 129 in the bank and the routine withdrew maple (USER: "it just withdrew
+    # maple when yew still exist"). The whole bank is one read per bank trip, and the answer
+    # is trusted only when the memory has actually SEEN a populated bank.
+    memory = bank_memory.load()
+    quantity = memory.quantity(ctx.state.config["log"]) if memory is not None else None
+    if memory is not None and memory.seen and len(memory.items or []) > 0 and quantity == 0:
         fallback = WOOD_FALLBACK.get(ctx.state.config["wood"])
         if not fallback:
             debug_log.log(LOG, "the bank is out of %s and there is no wood below %s"
                           % (ctx.state.config["log"], ctx.state.config["wood"]))
             return False
-        debug_log.log(LOG, "the bank is out of %s -- switching to %s"
-                      % (ctx.state.config["log"], fallback))
+        debug_log.log(LOG, "the bank is out of %s (memory: %d items, %s of them) -- "
+                           "switching to %s" % (ctx.state.config["log"], len(memory.items),
+                                                quantity, fallback))
         _apply_wood(ctx, fallback)
     entry = route.BANK
     booth = controller.get_object_at(entry["tile"][0], entry["tile"][1], route.PLANE,

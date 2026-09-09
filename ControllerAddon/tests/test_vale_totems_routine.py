@@ -6,6 +6,8 @@ import vale_totem_route as route
 from routines import vale_totems as vtr_routine
 import bank_memory
 
+_REAL_WALK_TO_SITE = vtr_routine._walk_to_site   # the autouse fixture stubs it; leg tests want it back
+
 
 @pytest.fixture(autouse=True)
 def _no_live_bridge(monkeypatch):
@@ -14,6 +16,10 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_widgets_dump", lambda scan=False: [])
     monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: None)
     monkeypatch.setattr(bank_memory, "load", lambda names=None: None)
+    # tick() now walks the next leg and pre-hovers the first target itself; neither belongs
+    # in a test of the site logic, and both touch the serial port.
+    monkeypatch.setattr(vtr_routine, "_walk_to_site", lambda ctx, n: None)
+    monkeypatch.setattr(vtr_routine, "_prehover_first_action", lambda ctx, n: None)
     # The direct leg's viewport click: off-screen by default, so every existing walk_leg test
     # keeps exercising the waypoint hops it was written against.
     monkeypatch.setattr(controller, "get_ground_walk_point",
@@ -885,6 +891,7 @@ def test_a_fletch_that_finds_no_option_escapes_the_menu_it_opened(monkeypatch):
 # --- I4: one failed hop is not a broken route -------------------------------------------
 
 def test_a_failed_leg_is_retried_before_it_stops_the_run(monkeypatch):
+    monkeypatch.setattr(vtr_routine, "_walk_to_site", _REAL_WALK_TO_SITE)
     """I4: _hop_to returns False for a point it cannot project AT ALL -- a loading screen, a
     panel drawn over the minimap, the camera mid-swing. Hard-stopping the run on one of
     those throws away a working routine."""
@@ -905,6 +912,7 @@ def test_a_failed_leg_is_retried_before_it_stops_the_run(monkeypatch):
 
 
 def test_a_leg_that_succeeds_clears_the_retry_count(monkeypatch):
+    monkeypatch.setattr(vtr_routine, "_walk_to_site", _REAL_WALK_TO_SITE)
     stops = []
     monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 1450, "y": 3400, "plane": 0})
@@ -1202,7 +1210,7 @@ def test_a_minimap_point_counts_as_a_far_click_when_nothing_is_rendered(monkeypa
     reaches 28 tiles whatever is rendered."""
     points = route.leg_waypoints(8, 7)
     monkeypatch.setattr(controller, "get_minimap_walk_point",
-                        lambda x, y, p, inst=False: {"onMinimap": (x, y) == points[3],
+                        lambda x, y, p, inst=False: {"onMinimap": (x, y) == points[2],
                                                      "screenX": 1900, "screenY": 200})
     clicks = []
     monkeypatch.setattr(travel, "_click_walk_point",
@@ -1602,7 +1610,8 @@ def test_a_spool_that_strings_nothing_is_marked_dead(monkeypatch):
 
 
 class _Memory:
-    def __init__(self, q): self.q = q
+    def __init__(self, q, seen=True, items=None):
+        self.q, self.seen, self.items = q, seen, (items if items is not None else [{"name": "x"}])
     def quantity(self, name): return self.q
 
 
@@ -1654,3 +1663,40 @@ def test_a_failed_bank_trip_with_logs_in_hand_is_not_a_stop(monkeypatch):
     monkeypatch.setattr(vtr_routine, "bank_trip", lambda ctx: False)
     vtr_routine.tick(_ctx(monkeypatch, stops))
     assert stops == [], "four logs in hand: carry on, try the bank next pass"
+
+
+def test_a_minimap_far_click_stays_within_the_measured_reach(monkeypatch):
+    """USER 2026-09-09: "long leg hop clicked outside of minimap window resulting in small
+    hops" -- onMinimap said yes for a 38-tile point that projected outside the circle."""
+    points = route.leg_waypoints(8, 7)          # up to 54 tiles from site 8's stand tile
+    asked = []
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, p, inst=False: asked.append((x, y)) or {"onMinimap": True, "screenX": 2273, "screenY": 248})
+    clicks = []
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: clicks.append(point))
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: True)
+    seq = iter([_stand(8), _stand(8)] + [_stand(7)] * 30)
+    monkeypatch.setattr(controller, "get_player", lambda: next(seq))
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    vtr_routine.walk_leg(_ctx_only(), 8, 7)
+    s8 = route.SITES[8]["stand"]
+    assert all(max(abs(x - s8[0]), abs(y - s8[1])) <= travel.WALK_HOP_MAX_TILES for x, y in asked),         "a point beyond the minimap's reach must not even be asked for"
+    assert clicks
+
+
+def test_the_wood_never_switches_on_an_empty_or_unseen_memory(monkeypatch):
+    """Host 2026-09-09: a filtered read answered "0 Yew logs" with 129 in the bank."""
+    for mem in (_Memory(0, seen=False), _Memory(0, items=[]), _Memory(None)):
+        _at_the_bank(monkeypatch)
+        monkeypatch.setattr(bank_memory, "load", lambda names=None, m=mem: m)
+        monkeypatch.setattr(controller, "get_object_at", lambda *a, **k: {"screenX": 1, "screenY": 2})
+        monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **k: True)
+        withdrawn = []
+        monkeypatch.setattr(banker, "withdraw_all_shift",
+                            lambda ctx, name, fresh=False: withdrawn.append(name) or True)
+        monkeypatch.setattr(vtr_routine, "fill_basket", lambda ctx: True)
+        monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
+        ctx = _ctx_only()
+        vtr_routine.bank_trip(ctx)
+        assert withdrawn and withdrawn[0] == "Yew logs", "stayed on yew"
+        assert ctx.state.data.get(vtr_routine.WOOD_KEY) is None
