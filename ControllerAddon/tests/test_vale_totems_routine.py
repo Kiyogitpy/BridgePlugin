@@ -673,7 +673,10 @@ def test_the_bank_leg_is_the_only_one_that_passes_the_booth():
     near = {leg for leg, pts in route.LEGS.items()
             if any(math.dist(p, bank) <= 8 for p in pts)}
     assert near == {(8, 7)}
-    assert set(vtr_routine.BANK_SITES) == {8, 7}
+    # Only 8: the booth is one hop from site 8's stand tile and ~37 tiles (off the minimap,
+    # back along the leg just walked) from site 7's. MEASURED live 2026-09-09: the site-7
+    # trip fired one site after a full bank at 8 and safety-stopped the run.
+    assert set(vtr_routine.BANK_SITES) == {8}
 
 
 def test_the_bank_trip_is_attempted_at_the_bank_site_when_logs_run_short(monkeypatch):
@@ -942,3 +945,142 @@ def test_find_basket_is_case_insensitive(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [{"name": "open log BASKET", "screenX": 1, "screenY": 1}])
     assert vtr_routine.find_basket() is not None
+
+
+# --- 2026-09-09 live fixes: the basket counts, and a full basket ends the bank trip --------
+
+def test_the_lap_check_counts_the_logs_in_the_basket(monkeypatch):
+    """vt_live1: 28 in the basket + 19 loose against a 30-log lap, and the check counted only
+    the loose 19 -- a 37-tile trip back to the booth one site after banking there."""
+    stops = []
+    # Five sites finished, three unbuilt: a 15-log lap.
+    payload = _full_state(baseValue=4, wood="YEW", baseCarved=True, decorations=4,
+                          durabilityRemaining=5)
+    for site in payload["sites"][:3]:
+        site.update(baseValue=0, wood="NONE", baseCarved=False, decorations=0,
+                    durabilityRemaining=0)
+    monkeypatch.setattr(controller, "get_api", lambda g, r: payload)
+    _park_at(monkeypatch, 8)
+    monkeypatch.setattr(vtr_routine, "work_site", lambda ctx, n: True)
+    monkeypatch.setattr(vtr_routine, "start_fletching", lambda ctx: True)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
+    monkeypatch.setattr(vtr_routine, "find_basket", lambda: None)
+    monkeypatch.setattr(vtr_routine, "bank_trip",
+                        lambda ctx: pytest.fail("the basket holds 28 -- no trip is due"))
+    ctx = _ctx(monkeypatch, stops)
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 28
+    vtr_routine.tick(ctx)
+    assert stops == []
+
+
+def test_an_unknown_basket_counts_as_empty_so_the_first_lap_still_banks(monkeypatch):
+    stops = []
+    monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())
+    _park_at(monkeypatch, 8)
+    monkeypatch.setattr(vtr_routine, "work_site", lambda ctx, n: True)
+    monkeypatch.setattr(vtr_routine, "start_fletching", lambda ctx: True)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
+    monkeypatch.setattr(vtr_routine, "find_basket", lambda: None)
+    tried = []
+    monkeypatch.setattr(vtr_routine, "bank_trip", lambda ctx: tried.append(1) or True)
+    vtr_routine.tick(_ctx(monkeypatch, stops))
+    assert tried == [1]
+
+
+def _basket_ctx(monkeypatch, counts):
+    """count_item answers the next value from `counts` on every call, holding the last."""
+    # OPEN, because only 28142 log_basket_open carries Empty (live + cache, 2026-09-09) --
+    # these tests are about the fill/empty ESTIMATE, not about opening.
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Open log basket", "screenX": 1, "screenY": 1}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, ent, opt, **k: True)
+    seq = list(counts)
+    monkeypatch.setattr(vtr_routine, "count_item",
+                        lambda name: seq.pop(0) if len(seq) > 1 else seq[0])
+    return _ctx_only()
+
+
+def test_fill_basket_adds_what_left_the_inventory_to_the_estimate(monkeypatch):
+    ctx = _basket_ctx(monkeypatch, [21, 0, 0])      # 21 loose before, 0 after
+    vtr_routine.fill_basket(ctx)
+    assert vtr_routine.basket_logs(ctx.state.data) == 21
+
+
+def test_a_fill_that_moves_nothing_means_the_basket_is_full(monkeypatch):
+    """The recorder showed the Fill entry resolving correctly and the game answering
+    "The basket is full." -- the user had filled it by hand before the run."""
+    ctx = _basket_ctx(monkeypatch, [21, 21, 21])
+    vtr_routine.fill_basket(ctx)
+    assert vtr_routine.basket_logs(ctx.state.data) == vtr_routine.BASKET_CAPACITY
+
+
+def test_empty_basket_subtracts_what_arrived_and_zeroes_on_nothing(monkeypatch):
+    ctx = _basket_ctx(monkeypatch, [0, 21, 21])
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 28
+    vtr_routine.empty_basket(ctx)
+    assert vtr_routine.basket_logs(ctx.state.data) == 7
+    ctx = _basket_ctx(monkeypatch, [0, 0, 0])
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 7
+    vtr_routine.empty_basket(ctx)
+    assert vtr_routine.basket_logs(ctx.state.data) == 0
+
+
+def test_bank_trip_stops_its_rounds_once_the_basket_is_full(monkeypatch):
+    """vt_live1: rounds 2 and 3 against an already-full basket drew "The basket is full."
+    and "You don't have enough inventory space." -- ~15s of nothing."""
+    _at_the_bank(monkeypatch)
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda *a, **k: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **k: True)
+    withdrawals = []
+    monkeypatch.setattr(banker, "withdraw_all_shift",
+                        lambda ctx, name, fresh=False: withdrawals.append(name) or True)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
+    fills = []
+
+    def fill(ctx):
+        fills.append(1)
+        ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = vtr_routine.BASKET_CAPACITY
+        return False        # nothing moved
+
+    monkeypatch.setattr(vtr_routine, "fill_basket", fill)
+    assert vtr_routine.bank_trip(_ctx_only()) is True
+    assert fills == [1]
+    assert withdrawals == ["Yew logs"], "a full basket ends the trip with the round's logs in hand"
+
+
+def test_empty_basket_opens_a_shut_basket_first(monkeypatch):
+    """MEASURED live 2026-09-09: a right-click on the SHUT basket offers no Empty at all
+    (['Cancel','Examine','Destroy','Open','Use','Check','Wear','Fill']), and the cache agrees
+    -- only 28142 log_basket_open carries Empty."""
+    names = ["Log basket", "Log basket", "Open log basket", "Open log basket"]
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": names[min(len(names) - 1, calls["n"])],
+                                  "screenX": 1, "screenY": 1}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    calls = {"n": 0}
+    chosen = []
+
+    def menu(ser, ent, opt, **k):
+        chosen.append(tuple(opt))
+        calls["n"] += 2      # the basket reads as OPEN from the next look on
+        return True
+
+    monkeypatch.setattr(controller, "click_menu_action", menu)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 5)
+    vtr_routine.empty_basket(_ctx_only())
+    assert chosen and chosen[0] == ("open",), "did not open the shut basket first"
+    assert any("empty" in o[0] for o in chosen[1:]), "never tried to empty it"
+
+
+def test_empty_basket_does_not_reopen_an_already_open_basket(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Open log basket", "screenX": 1, "screenY": 1}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    chosen = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, opt, **k: chosen.append(tuple(opt)) or True)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 5)
+    vtr_routine.empty_basket(_ctx_only())
+    assert chosen and "open" not in chosen[0], "re-opened a basket that was already open"

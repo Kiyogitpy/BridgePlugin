@@ -184,6 +184,47 @@ def test_an_unreachable_hop_point_is_pulled_in_rather_than_abandoning_the_walk(m
     assert max(abs(seen[-1][0] - 3000), abs(seen[-1][1] - 3000)) <= 12
 
 
+def test_a_minimap_hop_aim_on_an_orb_is_pulled_in_off_it(monkeypatch):
+    """MEASURED live 2026-09-09 (vale_totems vt_live1): a westward hop's aim point at screen
+    (1966,151) was the Hitpoints orb drawn over the minimap circle's left edge. /minimap/walk
+    called it onMinimap, the click was eaten by the orb, and four identical clicks moved the
+    player nowhere. The orb rects come from /state's minimapOrbs; an aim inside one is
+    rejected and the pull-in moves the next aim toward the centre, off the orbs."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": False})
+    # The HP orb, 57x34 at (1910,155); the far aim projects onto it, closer aims do not.
+    monkeypatch.setattr(controller, "get_state",
+                        lambda: {"minimapOrbs": [{"x": 1910, "y": 155, "width": 57, "height": 34}]})
+
+    def minimap(x, y, p, inst=False):
+        far = max(abs(x - 3000), abs(y - 3000)) >= 20
+        return {"onMinimap": True, "screenX": 1966 if far else 2050, "screenY": 170}
+
+    monkeypatch.setattr(controller, "get_minimap_walk_point", minimap)
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicked.append(entity) or True)
+
+    assert travel._hop_to(_Ctx(), 2976, 3000, 0) is True
+    assert clicked and clicked[0]["screenX"] == 2050, "clicked the orb instead of pulling in"
+
+
+def test_a_minimap_hop_on_an_orb_with_no_orb_rects_is_left_alone(monkeypatch):
+    """An un-rebuilt client answers no minimapOrbs; the hop must behave exactly as before."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": False})
+    monkeypatch.setattr(controller, "get_state", lambda: {})
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, p, inst=False: {"onMinimap": True, "screenX": 1966, "screenY": 170})
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicked.append(entity) or True)
+    assert travel._hop_to(_Ctx(), 2976, 3000, 0) is True
+    assert clicked[0]["screenX"] == 1966
+
+
 def test_a_hop_point_that_is_unreachable_at_every_distance_still_gives_up(monkeypatch):
     """The pull-in must stay bounded -- an unreachable target has to fail, not loop."""
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3000, "y": 3000, "plane": 0})

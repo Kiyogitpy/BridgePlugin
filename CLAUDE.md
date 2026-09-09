@@ -1074,6 +1074,18 @@ steps above.
   the human recordings do. Hops no longer than the lead keep the exact wait (instant release
   would spam clicks at their own destination). VERIFIED live the same night (Ardougne→JESS,
   ~30 tiles): 16 consecutive moving ticks across 2-3 hop boundaries, zero stopped ticks.
+- **THE MINIMAP ORBS ARE DRAWN OVER THE MINIMAP CIRCLE AND EAT A HOP CLICK.** MEASURED live
+  2026-09-09 (vale_totems): a westward hop's aim point at screen (1966,151) was reported
+  `onMinimap: true` by `/minimap/walk` and was the **Hitpoints orb** sitting over the circle's
+  left edge; four identical clicks moved the player nowhere and the trip failed. `onMinimap`
+  is a CIRCLE test and knows nothing about what is painted on top, and a minimap hop cannot
+  use `uiBlockers` -- the minimap rect is itself in that list, deliberately. So
+  `GameStateProvider` now also reports **`minimapOrbs`**, one rect per visible orb-sized child
+  of the Orbs group (the HP/prayer/run/special orbs and their number boxes, the compass, the
+  XP, world-map and wiki buttons -- 46 rects on this client), and `travel._hop_to` rejects a
+  minimap aim point inside one and pulls in toward the player instead. Needs a client rebuild;
+  an older client answers no rects and behaves exactly as before.
+
 - **The minimap reaches 28 tiles, and the DIAGONALS are what bound it.** MEASURED live 2026-08-28
   from (3037,3345) by walking `/minimap/walk` outward in all eight directions: `onMinimap` held to
   28 everywhere, then failed at 30 on the four diagonals while the cardinals were still on at 32 —
@@ -1691,98 +1703,118 @@ already committed and fully unit-tested before this task started.
   claim-and-pass branch is exercised at all; (7) whether `3` holds as the bow index for any
   non-yew wood, if the dropdown is ever moved off Yew.
 
+### First live session 2026-09-09 (VM, runs vt_live1 + vm_vale_totems_1900..1924)
+
+The lap works: claim -> build -> carve x3 -> decorate x4, the recorded waypoints, the bank
+trip and the fletch all ran unattended, and sites 1 and 8 were taken to built/carved/4
+decorations. Checklist items 1, 2 and 5 are answered below; 3, 4, 6 and 7 are still open.
+Four things were MEASURED, and the first is not about this routine at all:
+
+- **A GUEST CONSOLE SITTING OVER THE 3D VIEWPORT SWALLOWS EVERY WORLD CLICK, AND
+  `windowFocused` STAYS TRUE THROUGHOUT.** This cost most of the session and it will bite any
+  routine run in the VM. A routine launched through `vmexec.py --interactive` runs as a
+  scheduled task, which opens a console ON the guest desktop; when that console covers the
+  viewport the client reports canvas mouse **(-1,-1)** for every point under it, so world
+  clicks land on the console while INVENTORY and sidebar clicks (further right, uncovered)
+  keep working perfectly. It read as `claim did not land` at site after site while the
+  build/carve/decorate clicks on an object one tile away landed fine, and `/last-action`
+  showed the claim resolving to `Walk here`.
+  **The diagnostic is two lines and it is decisive**: move the cursor to an object's reported
+  `screenX/screenY`, then compare `/state`'s own `mouseScreenX/mouseScreenY`. Equal means the
+  client is seeing the cursor; **(-2,21)** -- canvas (-1,-1) converted to screen -- means
+  something is covering the canvas there. With the client raised, the same pixel hovered
+  `Claim`/`Offerings` exactly. **Focus is not the same question as z-order**: raising the
+  client alone did NOT fix it (run 4), minimising the console did (runs 3 and 6), which is a
+  clean A/B. `toolsm-guest-run-routine.cmd` now launches the routine with `start /min`, and
+  `toolsm-guest-hide-console.ps1` minimises every console and re-raises the client.
+- **The shut log basket has NO Empty option at all**, which closes CLAUDE.md's own open
+  question ("whether a SHUT basket really offers Empty" -- it does not). MEASURED live: a
+  right-click on `Log basket` (28140) offers `['Cancel','Examine','Destroy','Open','Use',
+  'Check','Wear','Fill']`, and the cache agrees -- only `log_basket_open` (28142) carries
+  Empty. So `empty_basket` now calls `open_basket` first, which is idempotent and skips when
+  the basket is already open. Before this every field top-up failed with "No 'empty' entry in
+  menu".
+- **The basket's contents are COUNTED, because the lap check cannot see them.** MEASURED:
+  holding 28 in the basket and 19 loose against a 30-log lap, the check counted only the loose
+  19 and sent the routine 37 tiles back to the booth one site after it had banked there.
+  `/api/storage/log-basket` cannot answer this (CLAUDE.md records why), so `basket_logs` is an
+  ESTIMATE maintained by what fill and empty actually moved; unknown counts as empty, which
+  banks one extra time rather than skipping a trip that was needed.
+- **`BANK_SITES` is site 8 alone.** The booth is one hop from site 8's stand tile and ~37
+  tiles from site 7's -- off the minimap, back along the leg just walked. The site-7 trip
+  fired one site after a full bank at 8 and safety-stopped the run.
+- **A bank trip stops as soon as the basket reports full**: a Fill that moves nothing draws
+  "The basket is full." and the withdraw after it "You don't have enough inventory space", so
+  rounds 2 and 3 were ~15s of nothing on a basket that was already full.
+- Still unanswered from the spec's checklist: the two log balances on legs 4->3 and near site
+  7 (item 3), whether `nearbySpirits` really rotates mid-carve (item 4), the claim-and-pass
+  branch (item 6), and any non-yew wood (item 7).
+
 ## Current state of routines/granite_3t.py
 
-**THE MECHANIC, SETTLED LIVE 2026-09-08 AFTER GETTING IT WRONG THREE WAYS.** A cycle is FOUR
-clicks, not three, and every one of them earns its place:
+**REWRITTEN 2026-09-09 FROM USER'S OWN RECORDINGS, AND THE CYCLE IS SETTLED. Everything below
+this block that disagrees with it is history.** USER: "Opus has tried his best to make 3t mining
+work but it looks like a mess" -- and the mess was three wrong readings of the tick data stacked
+on each other (CYCLE_TICKS 3 at phase 25 -> "the fletch cancels the mine" -> a second rock
+click -> CYCLE_TICKS 4). Three recordings settle it (`recordings/2026-09-09_081631_simple3t`,
+`_082746_simple3t-take2`, `_085109_simple3t-1rock`; USER's caveat: "my recordings are not
+great advice for 3t since it requires a lot of practice", so the TICK facts are taken from
+them and the cadence is not). `ControllerAddon/tick_report.py <jsonl>` is the analysis, and
+the routine's own per-cycle outcome lines are the same numbers live.
 
-    tick T-2 (dead)  click the knife (a client-side SELECTION, no packet)
-    tick T-1 (dead)  re-resolve the rock over HTTP; park the cursor on the log
-    tick T  (crit)   click the log IN PLACE -> starts a fletch, setting the skilling timer to 3
-                     ...then ONE short flight to the rock and click it -> this is the MOVE, and
-                     being a new action it is what displaces the pending fletch
-    tick T+1         click the rock AGAIN, in place -> THIS is what actually starts mining,
-                     with the skilling timer already sitting at 3
+- **THE RECORDER'S TICK LABELS ARE ONE LOW ON EVERY OUTCOME RECORD.** An xp/chat/anim record is
+  written during packet processing, ~20ms BEFORE the GameTick that bumps the label; the
+  `tick` records' own timestamps are the boundaries. Every tick number below is re-derived
+  that way. Read a recording's labels naively and every conclusion about "which tick" is wrong.
+- **A knife-on-log clicked during client tick N pays its Mining xp with the packet that opens
+  tick N+3** (six same-tick cycles in take 2, every one). So the NEXT fletch belongs in tick
+  N+3, after that packet -- `CYCLE_TICKS = 3`. Take 1 clicked every fletch in N+4 (USER: "my 3
+  tick is a bit too slow"), and the previous commit fit `CYCLE_TICKS = 4` to that.
+- **THE MINE CLICK MUST LAND IN THE SAME CLIENT TICK AS THE FLETCH.** Every same-tick pair paid
+  at 3; every pair whose Mine slipped into the next tick paid at 4 (two in take 2, both cycles
+  of the 1-rock recording: fletch at phase 520-540, Mine at phase 80-160 of the next tick).
+  A late rock click is a 4-tick cycle, never a lost log -- so **there is no abandon/late branch
+  any more**: the rock is clicked regardless.
+- **Why the 2026-09-08 CYCLE_TICKS=3 attempt ate logs**, two ways. (1) It clicked the log 25ms
+  after the bridge's GameTick anchor, inside the model's jitter; a fletch processed one tick
+  EARLY lands while the mine's timer is still positive (wiki: the timer is set "if the timer is
+  not positive"), cancels the mine and completes the fletch -- the log becomes a Teak stock.
+  `fletchPhaseMs` is now drawn from 150-320. (2) When the rock did not resolve it "consumed the
+  knife selection" by clicking the log: a fletch with no mine behind it. The bot's own recording
+  (`2026-09-08_222357_granite3t-diag`) shows runs of those two ticks apart. `prepare` now runs
+  only AFTER the rock has resolved, so there is never a selection to consume.
+- **One Mine click, one flight.** The wiki's "clicking the rock again" is the drop-between-mines
+  variant; a second click cancels the mine it just started (28 Mine clicks : 26 fletches in
+  take 1, once the human's re-clicks are read).
+- **The step between rocks is about YIELD, not about the cycle working**: a cardinally
+  adjacent rock also paid at 3 (take 2, tick 72160). The western-line "must step 2 tiles"
+  config is gone; Cape Conch is the eastern 2x2 in USER's own row-alternating order.
+- **Press vs release (old checklist item 6), ANSWERED from the same recordings:** a WORLD click
+  fires its menu action 1-23ms after mouse DOWN; an INVENTORY click ~10ms after mouse UP (drag
+  detection). So the rock click only has to be pressed inside the tick and the geometry budget
+  books nothing for it; `Window.room_for` and the landing constants are deleted.
+- **Sites (`SITES`, `cfg["site"]`, default `gem_mine`).** USER 2026-09-09: "swapping place to
+  gem mine since it will make us have to drop less", plus the JCW guide transcript. The
+  underground Shilo gem mine (region 11410, ids 11380/11381, 48 rocks, 59.4s respawn) cannot
+  run a fixed rotation, so `rockTiles: []` selects the DYNAMIC one: nearest live rock from a
+  `/objects` scan each cycle, the just-mined tile excluded so every cycle steps; a rock further
+  than `stepMaxTiles` (2) goes through `far_rock_cycle` -- click it, select the knife and park
+  while walking, poll the true tile, fletch ONE STEP OUT and re-click the rock in that same
+  tick (the guide's rule, verbatim). A full inventory there is `fullInventory: "deposit"`: walk
+  to the mine's Bank Deposit Chest (loc 10530 at (2842,9382)), one Deposit-All per stack (never
+  "Deposit inventory", which would bank the knife, log and gem bag), Empty the gem bag, ESC,
+  resume. No bank there, so a lost log is a safety stop; the guide's adamant-pickaxe advice
+  (its 4-tick roll lets a broken cycle right itself) is USER's to follow. The guide's ground
+  markers (region 11410, pasted 2026-09-09) are the human's lap and are NOT used yet -- greedy
+  nearest-rock roams instead; wire them in only if it corners itself live.
+- **NOT RUN LIVE in this form.** First session: read the `paid N ticks` lines and the every-25
+  summary; expect 3 with the occasional 4. If 4 dominates, the fletch phase is too late for the
+  flight; if logs vanish, the phase is too early or the rock did not resolve; if nothing pays,
+  read the recorder with `tick_report.py` before touching a constant.
 
-THE LOG IS ONLY CONSUMED WHEN A CYCLE FAILS. USER: "we interrupt the fletching with another
-task therefore it doesnt get consumed". Every log we lost was a cycle that failed to displace
-the fletch, and each failure cost a 380-tile round trip to The Great Conch bank. The three ways
-it failed, in the order they were found and fixed:
 
-1. **Every cycle overran the tick** (occupancy median 644ms) because `click_human` costs a
-   50-145ms hold PLUS a 30-90ms trailing pause. The pause happens after mouse-up, when the game
-   already has the click, so inside a tick it is pure loss. `tick_cycle.fast_click` (35-75ms
-   hold, no tail) cut the in-place log click from ~166ms to ~50ms.
-2. **The rotation required no movement.** The eastern 2x2 cluster has every rock adjacent to
-   the stand tile. The wiki is explicit twice over -- the 3-tick action must start "on the same
-   tick as MOVING to the next rock", and rocks give a second roll only "if moving up to them".
-   With no step there is nothing to displace the fletch, and each rock click merely cancels the
-   previous unfinished mine, which is why xp was near zero. The western line forces a step.
-3. **Only one rock click.** The wiki's powermining recipe names two -- "clicking to MOVE to the
-   next rock, then ... clicking the rock AGAIN" -- and the 1.5-tick woodcutting entry says the
-   same: delay the timer on the same tick as the MOVE, "then, on the next tick, click the tree".
-   Adding the second click is what finally kept the log.
-
-**AND THE DESYNC GUARD HAD TO BE INVERTED.** `Window.room_for` was written when a skipped cycle
-cost a cycle; by the time it refuses, the log click has already started a fletch, so abandoning
-leaves the fletch to complete and eat the log. A late rock click forfeits one cycle's tick
-manipulation; a lost log costs eight minutes. So the routine fires late rather than abandoning.
-
-**FIRST LIVE SESSION 2026-09-08 AT CAPE CONCH. It reached the mine, passed its geometry gate and
-ran real cycles, then stopped on a blocker that invalidates the design's biggest assumption:
-THE TICK ITEM IS CONSUMED, ONE PER CYCLE.** The teak log came back as a **Teak stock** (item
-9446) -- knife-on-teak is a real fletch (crossbow stock, Fletching 46; this account is 74), so
-the cycle burns **~2,000 logs/hour**. The spec had recorded "the log is not consumed" as USER's
-answer and built "no supply loop, no restock, no bank trip" on it. USER reached the same
-correction independently mid-session ("and that means we consume the log").
-
-MEASURED the same session: 1 loose log and a log basket whose contents the reader cannot see,
-with no bank object at Cape Conch. **STOCK IS NOT THE BLOCKER** -- I first recorded the bank as
-empty of every candidate, which was MY query bug: `bank_memory` was searched for singular names
-("teak log") against plural items, returning zero for everything. The same bank actually holds
-**1,242 Teak logs, 20,727 Swamp tar, 140 clean Tarromin, 279 Mahogany logs**. OSRS item names
-are plural; a substring filter that guesses the singular silently returns nothing.
-The real blocker is that the mechanic allows exactly ONE loose log (a second opens Make-X and
-eats a tick), and a log basket cannot dispense one at a time. Emptying the basket does not help -- the mechanic needs EXACTLY ONE loose log or a Make-X
-interface eats a tick. So the routine is currently correct-but-unrunnable and stops saying so.
-**The likely answer is MAGIC LOGS, and the account owns 630 of them.** The reason teak works for
-most players is almost certainly that they cannot fletch it -- the action sets the timer, fails
-the level check and consumes nothing. This account is Fletching 74, past teak stock (46) and
-mahogany stock (61), which is exactly why its logs are eaten. Every knife product from magic logs
-needs 80/85/87, all above 74. Switching is one config line (`logName`, plus `keepItems`), but it
-is a HYPOTHESIS: it assumes a level-failed fletch still sets the skilling timer, which is
-UNVERIFIED and could instead open a fletching interface (worse) or set no timer at all. One bank
-trip and one short run settle it. The full option list is in the spec's "Supply: the unresolved
-blocker".
-
-Three further things MEASURED live that day, all now fixed:
-
-- **The probe could not run at all.** `python routines/granite_3t.py` puts `routines/` on
-  sys.path[0], so `import controller` traceback'd -- and that was the exact command the setup
-  instructions gave. There is a sys.path bootstrap in the `__main__` path now.
-- **`maxReachPx` was a hand-picked 220 that does not follow from the tick budget** (the real
-  allowance is ~82px at scale 1.0). `check_geometry` DERIVES the limit now and reports it, so a
-  refusal names the real target; `maxReachPx` survives only as an optional stricter cap.
-- **The geometry gate and the runtime guard priced a click differently, so startup passed and
-  then EVERY cycle abandoned** -- 50 desyncs, 0 completed, on the first run. A click that
-  DELAYS following work costs hold+tail; the LAST click of the tick only has to LAND, because
-  its trailing pause happens after mouse-up when the game already has the click.
-  `CLICK_COST_MS` and `CLICK_LANDING_COST_MS` are now separate and both sites agree.
-
-And two geometry facts worth keeping, both USER's:
-
-- **Zooming IN can make the reach WORSE.** It pulls the nearest rock closer but magnifies the
-  SPREAD between rocks, and the check uses the furthest. MEASURED: default zoom 896-1006px,
-  zoomed in 664-1089px.
-- **The rotation needs FOUR rocks and the RESPAWN sets that floor**, not the click budget.
-  Granite respawns in 5s against a 1.8s cycle: 4 rocks = 7.2s (safe), 3 = 5.4s (marginal),
-  2 = 3.6s and the rock is not there. A two-rock rotation was briefly configured because only
-  the two nearest fit the budget; USER caught it ("two rocks most likely wont work"). When the
-  budget and the respawn disagree, the respawn wins and the budget is bought with
-  `flightSpeedScale` -- a practised repeated reach at the same two pixels is legitimately faster
-  than `settings.HM2_*`'s general fit (USER: "a human with known X Y cordinate most likely speed
-  up too after some practice"). That scaling is narrowly for this shape of routine.
-
+**The design-era notes below predate the 2026-09-09 rewrite; read them for the measurements
+(reach model, click costs, the probe, the startup gates), not for the cycle.**
 
 Written 2026-09-08 from the OSRS Wiki (Tick manipulation rev 15292712, Pay-to-play Mining
 training rev 15297907) and this repo's own fitted mouse-movement model (`settings.py`'s HM2

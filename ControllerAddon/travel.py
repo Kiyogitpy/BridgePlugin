@@ -1167,8 +1167,17 @@ def _hop_to(ctx, x: int, y: int, plane: int, inst: bool = False, prefer_viewport
 
         minimap_point = controller.get_minimap_walk_point(aim_x, aim_y, plane, inst=inst)
         if minimap_point.get("onMinimap"):
-            point = minimap_point
-            break
+            # onMinimap is a circle test; the orb cluster is drawn OVER the circle's left edge
+            # and eats the click (vale_totems 2026-09-09: four hops on the Hitpoints orb, no
+            # movement). Pulling in moves the aim toward the centre, off the orbs.
+            orb = controller.is_point_on_minimap_orb(minimap_point.get("screenX", -1),
+                                                     minimap_point.get("screenY", -1))
+            if orb is not None:
+                debug_log.log("travel", "hop aim (%d,%d) sits on a minimap orb -- pulling in"
+                              % (aim_x, aim_y))
+            else:
+                point = minimap_point
+                break
 
         # Off the minimap (its reach is a user setting -- zooming in shrinks it) and too far for
         # the short-hop rule: a rendered tile still beats giving up on the walk.

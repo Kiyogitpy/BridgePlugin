@@ -2416,6 +2416,21 @@ def is_point_blocked_by_ui(x: int, y: int):
     return None
 
 
+def is_point_on_minimap_orb(x: int, y: int):
+    """The minimap ORB rect covering (x, y), or None. A minimap hop cannot use uiBlockers
+    (the minimap rect itself is one), but the orb cluster is drawn OVER the circle's left edge
+    and a click there is eaten by the orb. MEASURED live 2026-09-09 (vale_totems): a westward
+    hop's aim point sat on the Hitpoints orb, /minimap/walk called it onMinimap, and four
+    identical clicks moved nothing. `minimapOrbs` needs the 2026-09-09 client rebuild; an
+    older client answers no rects and this returns None (no protection, no refusal)."""
+    for rect in get_state().get("minimapOrbs", []) or []:
+        rx, ry = rect.get("x", 0), rect.get("y", 0)
+        rw, rh = rect.get("width", 0), rect.get("height", 0)
+        if rx <= x < rx + rw and ry <= y < ry + rh:
+            return rect
+    return None
+
+
 def nudge_camera_yaw(ser: serial.Serial, key: str) -> None:
     """Hold the given arrow key just long enough for a small camera turn,
     then release -- shared by both camera-nudge use cases below."""
@@ -3574,8 +3589,12 @@ def main():
             unfocused_logged = False
 
             # Camera defaults (overhead + slight zoom-out) once after every login, for
-            # every routine -- see login.setup_camera.
-            login.ensure_camera_after_login(ctx)
+            # every routine -- see login.setup_camera. A routine whose whole geometry is the
+            # user's own camera (granite_3t: zoomed in, tilted, the rocks next to the inventory)
+            # declares KEEP_CAMERA = True and is left alone -- MEASURED 2026-09-09, the reset
+            # re-tilted pitch 3255 -> 4160 and zoomed out on top of a hand-set view.
+            if not getattr(routine, "KEEP_CAMERA", False):
+                login.ensure_camera_after_login(ctx)
 
             if subs_posted_for != active_path:
                 _post_routine_subscriptions(routine)

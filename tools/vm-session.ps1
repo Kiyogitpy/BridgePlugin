@@ -294,11 +294,22 @@ Start-GuestDesktop ($argv -join " ") "OSRSRoutine"
 # BEFORE the engine's own gate, so a client unfocused at the login screen burns clicks
 # silently), and this one keeps it. The engine recovers on its own once focus returns -- it
 # logs `RuneLite window focused -- resuming` -- so this only has to happen, not be instant.
+#
+# ...AND MINIMISE IT, which focus alone does not do. MEASURED 2026-09-09 (vale_totems in the
+# VM): with the client focused and `windowFocused` reporting true, the routine's console was
+# still SITTING OVER the 3D viewport, and the client then reports canvas mouse (-1,-1) for
+# every point under it -- so every WORLD click was swallowed while inventory and sidebar
+# clicks (further right, uncovered) kept working perfectly. It read as "claim did not land"
+# at site after site with no other symptom. vm-guest-hide-console.ps1 minimises every console
+# on the desktop and then raises the client; see its header for how to tell this apart from a
+# click that genuinely missed.
+Start-Sleep -Seconds 2
+Start-GuestDesktop "cmd /c $sharem-guest-hide-console.cmd" "OSRSHideConsole"
 Start-Sleep -Seconds 2
 $st = Get-Bridge "/state"
 for ($i = 0; $i -lt 3 -and $st -and -not $st.windowFocused; $i++) {
     Write-Host "  the routine's console took the focus -- giving it back to the client"
-    Start-GuestDesktop "cmd /c $sharem-guest-focus-client.cmd" "OSRSFocus"
+    Start-GuestDesktop "cmd /c $sharem-guest-hide-console.cmd" "OSRSHideConsole"
     Start-Sleep -Seconds 3
     $st = Get-Bridge "/state"
 }

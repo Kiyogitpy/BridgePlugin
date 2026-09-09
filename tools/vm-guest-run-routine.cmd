@@ -47,4 +47,13 @@ REM Python 3.13 is a per-user install in the guest; fall back to the py launcher
 REM session did not pick up the user PATH.
 set PYEXE=python
 where python >nul 2>&1 || set PYEXE=py
-%PYEXE% -u controller.py%ARGS% > logs\%ROUTINE_LOG% 2>&1
+REM MINIMISED, and that is load-bearing rather than tidy. MEASURED live 2026-09-09
+REM (vale_totems in the VM): this console sits on the guest desktop for the whole run,
+REM and when it covers the 3D viewport the client reports canvas mouse (-1,-1) for every
+REM point under it -- so every WORLD click is swallowed while inventory and sidebar clicks
+REM (further right, uncovered) keep landing perfectly. It reads as "claim did not land"
+REM at site after site, with `windowFocused` reporting TRUE throughout, so neither the
+REM engine's focus gate nor the session script's focus step catches it. Focus is not the
+REM same question as z-order: raising the client alone did NOT fix it, minimising this
+REM console did (clean A/B, runs 3 and 4).
+start "osrs-routine" /min cmd /c "%PYEXE% -u controller.py%ARGS% > logs\%ROUTINE_LOG% 2>&1"

@@ -176,6 +176,18 @@ public class GameStateProvider extends BridgeProvider
 		addBlockerRect(uiBlockers, WidgetInfo.MINIMAP_ORBS);
 		data.put("uiBlockers", uiBlockers);
 
+		// The ORBS THEMSELVES, one rect per visible orb-sized child of the Orbs group. The
+		// MINIMAP_ORBS blocker above is the group's full-size layer, so it cannot say WHERE
+		// inside the minimap area an orb sits -- and a minimap hop opts out of uiBlockers
+		// entirely, since the minimap rect itself is in that list. MEASURED live 2026-09-09
+		// (vale_totems, vt_live1): a hop toward a bank west of the player aimed at screen
+		// (1966,151), which /minimap/walk reported onMinimap and which is the Hitpoints orb
+		// drawn over the minimap circle's left edge; four identical clicks, player never moved.
+		// travel._hop_to rejects a minimap aim point inside any of these and pulls in instead.
+		List<Map<String, Object>> minimapOrbs = new ArrayList<>();
+		collectOrbRects(minimapOrbs, client.getWidget(WidgetInfo.MINIMAP_ORBS), 0);
+		data.put("minimapOrbs", minimapOrbs);
+
 		// True while a "click here to continue"-style dialogue (NPC/player chat, an
 		// examine/sprite box, or a two-item box) is open -- e.g. from a misclick on scenery
 		// sharing a pixel with an intended target. Deliberately excludes DIALOG_OPTION (a
@@ -219,6 +231,44 @@ public class GameStateProvider extends BridgeProvider
 		rect.put("width", (int) Math.round(bounds.width * scale[0]));
 		rect.put("height", (int) Math.round(bounds.height * scale[1]));
 		out.add(rect);
+	}
+
+	// Orb-sized (<= 80 real px each way) visible descendants of the Orbs group: the HP /
+	// prayer / run / special orbs, their number boxes, the XP orb, the compass, the world-map
+	// and wiki buttons. Containers larger than that are skipped so the group's own full-size
+	// layer never becomes a rect that covers the whole minimap.
+	private static final int ORB_MAX_REAL_PX = 80;
+
+	private void collectOrbRects(List<Map<String, Object>> out, Widget widget, int depth)
+	{
+		if (widget == null || widget.isHidden() || depth > 4)
+		{
+			return;
+		}
+		Rectangle bounds = widget.getBounds();
+		if (bounds != null && bounds.width > 0 && bounds.height > 0
+			&& bounds.width <= ORB_MAX_REAL_PX && bounds.height <= ORB_MAX_REAL_PX)
+		{
+			double[] scale = com.example.util.RuneLiteUtil.getStretchScale(client);
+			Point screen = com.example.util.RuneLiteUtil.canvasToScreen(client, bounds.x, bounds.y);
+			Map<String, Object> rect = new HashMap<>();
+			rect.put("x", screen.x);
+			rect.put("y", screen.y);
+			rect.put("width", (int) Math.round(bounds.width * scale[0]));
+			rect.put("height", (int) Math.round(bounds.height * scale[1]));
+			out.add(rect);
+		}
+		for (Widget[] children : new Widget[][]{widget.getStaticChildren(), widget.getDynamicChildren(), widget.getNestedChildren()})
+		{
+			if (children == null)
+			{
+				continue;
+			}
+			for (Widget child : children)
+			{
+				collectOrbRects(out, child, depth + 1);
+			}
+		}
 	}
 
 	private boolean isWidgetVisible(WidgetInfo info)

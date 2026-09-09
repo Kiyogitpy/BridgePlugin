@@ -187,6 +187,11 @@ def tick(ctx):
     if count_item(log_name) == 0 and find_basket():
         empty_basket(ctx)
 
+    # STAND STILL FIRST. See SITE_SETTLE_S -- every action at this site aims at a model a few
+    # pixels wide, and a target sliding under the cursor is the difference between "Claim" and
+    # "Walk here". A timeout here is not a failure: work_site simply proceeds.
+    controller.wait_until_player_idle(timeout_s=SITE_SETTLE_S)
+
     work_site(ctx, current)
 
     # Re-read AFTER the site. work_site just built, carved and decorated, so the top-of-tick
@@ -205,7 +210,13 @@ def tick(ctx):
     #    Running out of logs anywhere else is NOT a stop now: claim, carve and decorate all
     #    still work, so the routine carries on round the ring until the bank leg comes round.
     #    Only a bank trip actually attempted and failed is fatal.
-    if current in BANK_SITES and vt.logs_needed_for_lap(state) > count_item(log_name):
+    # THE BASKET COUNTS. MEASURED live 2026-09-09 (vt_live1): having just banked at site 8
+    # (28 in the basket + 19 loose = 47 logs against a 30-log lap), the check at site 7 counted
+    # only the loose 19 and sent the routine 37 tiles back to the booth -- and that hop is what
+    # found the minimap-orb bug. The basket's contents are not readable off the bridge
+    # (CLAUDE.md, /api/storage/log-basket), so they are ESTIMATED from what fill/empty moved.
+    if (current in BANK_SITES
+            and vt.logs_needed_for_lap(state) > count_item(log_name) + basket_logs(data)):
         if not bank_trip(ctx):
             ctx.state.trigger_safety_stop(
                 "the bank trip from site %d failed -- out of %s" % (current, log_name))
@@ -254,7 +265,8 @@ def _click_site(ctx, site_number, which, budget_s, confirm):
         debug_log.log(LOG, "site %d: %s object not in view" % (site_number, which))
         return False
     refresh = controller.object_refresh_target(x, y, route.PLANE, obj_id)
-    if not controller.click_entity(ctx.ser, obj, refresh_target=refresh):
+    if not controller.click_entity(ctx.ser, obj, refresh_target=refresh,
+                                   refresh_legs=SITE_REFRESH_LEGS):
         return False
     outcome = outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"], budget_s,
                                       confirm, now_fn=_now, sleep_fn=_sleep)
@@ -372,6 +384,22 @@ def choose_spirit(ctx, spirit: str) -> bool:
 # That is the "clicking back and forth" signature CLAUDE.md documents, and it makes no progress
 # while looking busy.
 ARRIVAL_TOLERANCE = 7
+
+# Re-aim checkpoints for a click at a site. MEASURED live 2026-09-09: the first click after a
+# leg is issued while the player is STILL RUNNING (walk_leg releases early by design, see
+# ARRIVAL_TOLERANCE), and a single mid-flight refresh lands behind the target -- site 7's claim
+# aimed at (1019,428) and landed at (996,429), 23px back, which at the guest's zoomed-out
+# camera is off the model entirely and resolves to "Walk here". More checkpoints keep the aim
+# on a target that is sliding across the screen; see CLAUDE.md's refresh_legs note.
+SITE_REFRESH_LEGS = 3
+
+# ...and the first action at a site waits for the player to actually STOP, bounded. The same
+# claim clicked from a standstill lands every time (MEASURED with a one-click probe: offerings
+# 250 -> 315 on a pile the running routine had failed at six times). This costs the ~4s of
+# running that walk_leg deliberately overlapped, once per site, and buys every action at that
+# site a stationary target -- the camera is still catching up for part of it, which is the
+# other half of the drift.
+SITE_SETTLE_S = 5.0
 
 # ...and the last few tiles are waited out rather than assumed: 6 tiles of running is ~3.6s at
 # one tile per 0.6s tick, so 4.0s is that plus a poll's slack.
@@ -495,7 +523,8 @@ def carve(ctx, site) -> bool:
     entry = route.SITES[n]
     refresh = controller.object_refresh_target(entry["totem"][0], entry["totem"][1],
                                               route.PLANE, entry["base_id"])
-    if not controller.click_entity(ctx.ser, obj, refresh_target=refresh):
+    if not controller.click_entity(ctx.ser, obj, refresh_target=refresh,
+                                   refresh_legs=SITE_REFRESH_LEGS):
         return False
     if not _await_menu(ctx):
         debug_log.log(LOG, "site %d: carve menu never opened" % n)
@@ -628,18 +657,76 @@ def _basket_option(ctx, options, expect_change) -> bool:
                                         expect_change, now_fn=_now, sleep_fn=_sleep))
 
 
+BASKET_CAPACITY = 28
+BASKET_LOGS_KEY = "vt_basket_logs"
+
+
+def basket_logs(data) -> int:
+    """Our ESTIMATE of the logs in the basket -- 0 until a fill or empty has taught us
+    otherwise. Conservative on purpose: an unknown basket makes the lap check bank at site 8,
+    which is on the way and costs ~15s, whereas over-counting it would skip a needed trip."""
+    return int(data.get(BASKET_LOGS_KEY) or 0)
+
+
+BASKET_CLOSED_NAME = "log basket"        # 28140, the shut one
+BASKET_OPEN_NAME = "open log basket"     # 28142
+
+
+def _basket_is_open() -> bool:
+    basket = find_basket()
+    return bool(basket) and (basket.get("name") or "").lower() == BASKET_OPEN_NAME
+
+
+def open_basket(ctx) -> bool:
+    """Shut basket -> open basket, so that it can be emptied at all.
+
+    MEASURED live 2026-09-09 (vale_totems in the VM): a right-click on the SHUT basket offers
+    ['Cancel','Examine','Destroy','Open','Use','Check','Wear','Fill'] -- there is NO Empty on
+    it, so every field top-up failed with "No 'empty' entry in menu". The cache agrees: 28140
+    log_basket_closed has iops Fill/Wear/Check/Open/Destroy, and only 28142 log_basket_open
+    carries Empty. CLAUDE.md had this listed as the basket's one unverified question.
+
+    Cheap and idempotent -- an already-open basket returns True without clicking."""
+    if _basket_is_open():
+        return True
+    return _basket_option(ctx, ("open",), _basket_is_open)
+
+
 def empty_basket(ctx) -> bool:
-    """Basket -> inventory, in the field ("You empty as many logs as you can carry.")."""
-    before = count_item(ctx.state.config["log"])
-    return _basket_option(ctx, ("empty", "empty-to-inventory"),
-                          lambda: count_item(ctx.state.config["log"]) > before)
+    """Basket -> inventory, in the field ("You empty as many logs as you can carry.").
+
+    The logs that ARRIVE are subtracted from the basket estimate; a successful Empty that
+    moved nothing means the basket is empty, whatever the estimate said."""
+    log = ctx.state.config["log"]
+    before = count_item(log)
+    if not open_basket(ctx):
+        debug_log.log(LOG, "could not open the log basket -- cannot empty it this visit")
+        return False
+    ok = _basket_option(ctx, ("empty", "empty-to-inventory"),
+                        lambda: count_item(log) > before)
+    moved = max(0, count_item(log) - before)
+    data = ctx.state.data
+    data[BASKET_LOGS_KEY] = max(0, basket_logs(data) - moved) if moved else 0
+    return ok
 
 
 def fill_basket(ctx) -> bool:
-    """Inventory -> basket, at the bank."""
-    before = count_item(ctx.state.config["log"])
-    return _basket_option(ctx, ("fill",),
-                          lambda: count_item(ctx.state.config["log"]) < before)
+    """Inventory -> basket, at the bank.
+
+    The logs that LEAVE are added to the estimate. A Fill that moved nothing is the game's
+    "The basket is full." (MEASURED 2026-09-09 -- the recorder showed the menu entry
+    resolving correctly and that chat line following), so the estimate is pinned to the
+    capacity rather than left where it was; bank_trip stops its rounds on that."""
+    log = ctx.state.config["log"]
+    before = count_item(log)
+    ok = _basket_option(ctx, ("fill",), lambda: count_item(log) < before)
+    moved = max(0, before - count_item(log))
+    data = ctx.state.data
+    if moved:
+        data[BASKET_LOGS_KEY] = min(BASKET_CAPACITY, basket_logs(data) + moved)
+    else:
+        data[BASKET_LOGS_KEY] = BASKET_CAPACITY
+    return ok
 
 
 # The only ring sites the bank is reachable from. Leg 8->7's recorded waypoints run through
@@ -649,7 +736,13 @@ def fill_basket(ctx) -> bool:
 # get_object_at() there returned nothing and safety-stopped the run with the bank simply out
 # of view. LEGS has no bank entry and there is no router, so this cannot be walked to from
 # anywhere else.
-BANK_SITES = (8, 7)
+#
+# ONLY site 8, since 2026-09-09. The booth is ~20 tiles from site 8's stand tile (one hop)
+# and ~37 from site 7's -- off the minimap, back along the leg just walked, and then 37
+# tiles back again. MEASURED live (vt_live1): the site-7 trip fired one site after a full
+# bank at 8, walked nowhere (the minimap-orb bug) and safety-stopped the run. From 7 the
+# next move is the log balance to site 6; the bank comes round again on the next 8->7 leg.
+BANK_SITES = (8,)
 
 BANK_HOP_ATTEMPTS = 4
 
@@ -703,13 +796,27 @@ def bank_trip(ctx) -> bool:
             return False
         _close_prompt(ctx, force=True)
         if round_index < BANK_ROUNDS - 1:
-            # A failed fill is LOGGED here rather than swallowed: without it the round's logs
-            # stay loose in the inventory, the next Withdraw-All has nowhere to go, and the
-            # failure surfaces one step later as a withdraw that looks broken instead.
+            # A FULL basket ends the trip with this round's withdraw already in hand: another
+            # Fill would only draw "The basket is full." and the withdraw after it "You don't
+            # have enough inventory space." -- MEASURED 2026-09-09, two wasted rounds (~15s)
+            # on a basket the user had filled by hand before the run.
+            if basket_logs(ctx.state.data) >= BASKET_CAPACITY:
+                debug_log.log(LOG, "bank: basket already full -- done after round %d"
+                              % (round_index + 1))
+                break
             if not fill_basket(ctx):
+                # A failed fill is LOGGED rather than swallowed: a fill that fails for any
+                # reason other than a full basket (a menu miss) leaves this round's logs
+                # loose, and the next Withdraw-All then has fewer free slots than it expects.
                 debug_log.log(LOG, "bank: round %d did not fill the basket -- the next "
                                    "withdraw has fewer free slots than it expects"
                               % (round_index + 1))
+            if basket_logs(ctx.state.data) >= BASKET_CAPACITY:
+                # fill_basket pinned the estimate to the capacity (nothing moved, or the
+                # count reached it): this round's withdraw is already in hand, so stop here.
+                debug_log.log(LOG, "bank: basket full -- done after round %d"
+                              % (round_index + 1))
+                break
     return True
 
 
