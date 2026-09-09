@@ -128,9 +128,6 @@ DEFAULT_CONFIG = {
     # 101-191ms, so at phase 60 the flight had ~390ms against a ~382ms need -- an 8ms margin,
     # i.e. a coin flip per cycle. Every millisecond of phase is a millisecond off the flight.
     "logClickPhaseMs": 25,
-    # See run_cycle: the first rock click moves and clears the fletch, the second
-    # actually mines. Off only for A/B testing the mechanic.
-    "secondRockClick": True,
 
     # WHAT MUST FIT INSIDE THE TICK: both mouse-DOWNs, or both whole clicks?
     #
@@ -207,7 +204,18 @@ DEFAULT_CONFIG = {
 # THE WHOLE POINT OF THE ROUTINE'S NAME. The critical click of cycle N+1 is pinned to the tick
 # CYCLE_TICKS after the critical click of cycle N -- not to "the next boundary after prepare()
 # finished", which is what an at_phase-only cycle degrades to.
-CYCLE_TICKS = 3
+# FOUR, AND THIS IS MEASURED FROM USER'S OWN PLAY, NOT FROM THE NAME.
+#
+# recordings/2026-09-09_081631_simple3t (98s, 26 cycles): the gap between one knife-on-log and
+# the next is FOUR ticks in 13 of 24 cycles, never three except when the human was visibly
+# recovering. The mine click lands 0 or 1 ticks after the fletch, split about evenly.
+#
+# "3-tick" names the ROLL interval, not the cycle: the fletch sets the skilling timer to 3, so
+# the mine rolls three ticks later -- and the NEXT fletch has to come after that roll, i.e. on
+# the fourth tick. At CYCLE_TICKS = 3 the next fletch fired exactly when the roll was due, which
+# cancelled the mine (near-zero xp, MEASURED) and left the displaced fletch to complete and eat
+# the log (a bank trip every ~20 cycles, MEASURED). One number, both symptoms.
+CYCLE_TICKS = 4
 
 # The knife and the log are clicked thousands of times an hour at points that are constant for
 # a whole chain. aim_radius=0 makes pick_aim_point short-circuit and land on the IDENTICAL pixel
@@ -926,27 +934,11 @@ def run_cycle(ctx, cfg, knife_point, log_point, rock_point, target_tick=None):
     ctx.state.data["g3t_fired_tick"] = fired
     _log_occupancy(ctx, "ok", phase, in_place_ms, flight_ms, window.spent_ms(_now()))
 
-    # THE SECOND ROCK CLICK, ONE TICK LATER, AND IT IS NOT OPTIONAL.
-    #
-    # The wiki's powermining recipe describes TWO clicks on the rock, not one: "starting the
-    # 3-tick action and clicking to MOVE to the next rock, then both quickly dropping the ore
-    # and clicking the rock AGAIN on the same tick". The 1.5-tick woodcutting entry spells the
-    # same shape out even more plainly -- delay the timer on the same tick as clicking to MOVE,
-    # "then, on the next tick, click the tree".
-    #
-    # So the first rock click is the MOVE: it walks the player and, being a new action, clears
-    # the pending fletch before it can complete. The second click is what actually starts
-    # mining, with the skilling timer already sitting at 3.
-    #
-    # MEASURED LIVE 2026-09-08 without it: cycles fit the tick, the player moved, granite was
-    # mined -- and the teak log was still consumed every cycle, because nothing ever displaced
-    # the fletch. The cursor is already on the rock here, so this costs one in-place click.
-    if cfg.get("secondRockClick", True):
-        if ctx.events is not None:
-            ctx.events.wait_ticks(1, now_fn=_now, sleep_fn=_sleep)
-        else:
-            _sleep(tick_cycle.GAME_TICK_MS / 1000.0)
-        tick_cycle.fast_click(ctx.ser)
+    # ONE mine click per fletch, not two. I added a second on the strength of the wiki's
+    # powermining wording ("clicking the rock AGAIN"), which describes the ore-dropping variant
+    # rather than the base cycle. USER's recording settles it: 28 Mine clicks against 26
+    # knife-on-log pairs, i.e. one each. The extra click was cancelling the mine it had just
+    # started.
     return "ok"
 
 

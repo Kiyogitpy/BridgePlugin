@@ -641,11 +641,7 @@ def test_the_first_cycle_of_a_chain_enters_through_at_phase_and_records_the_TICK
 
     ctx = _Ctx()
     ctx.events = events
-    # secondRockClick off: it waits a further tick at the END of the cycle, which would advance
-    # the model past the tick under test. What is being pinned here is the tick the LOG click
-    # landed in, not where the cycle finishes.
-    assert g.run_cycle(ctx, _cfg(secondRockClick=False),
-                       (1700, 800), (1740, 800), (1640, 800)) == "ok"
+    assert g.run_cycle(ctx, _cfg(), (1700, 800), (1740, 800), (1640, 800)) == "ok"
 
     events.pump(now=clock.now())
     assert events.ticks.tick == 101         # where the log click really landed
@@ -672,7 +668,7 @@ def test_tick_targets_CYCLE_TICKS_after_the_last_critical_click(monkeypatch):
     ctx.events = _FakeEvents()
     ctx.state.config = _cfg()
     g.tick(ctx)
-    assert g.CYCLE_TICKS == 3
+    assert g.CYCLE_TICKS == 4   # MEASURED from USER's recording; see the constant
     assert targets[0] is None                       # first cycle of the chain
     assert targets[1] == 201 + g.CYCLE_TICKS
     assert targets[2] == 202 + g.CYCLE_TICKS
@@ -701,7 +697,7 @@ def test_a_desync_drops_the_pin_so_the_next_cycle_re_enters_on_a_clean_boundary(
     ctx.events = _FakeEvents()
     ctx.state.config = _cfg()
     g.tick(ctx)
-    assert targets[1] == 303
+    assert targets[1] == 300 + g.CYCLE_TICKS
     assert targets[2] is None       # the desync dropped the pin
 
 
