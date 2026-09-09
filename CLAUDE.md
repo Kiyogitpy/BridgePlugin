@@ -1746,6 +1746,36 @@ Four things were MEASURED, and the first is not about this routine at all:
 - **A bank trip stops as soon as the basket reports full**: a Fill that moves nothing draws
   "The basket is full." and the withdraw after it "You don't have enough inventory space", so
   rounds 2 and 3 were ~15s of nothing on a basket that was already full.
+- **THE FLETCH FOLLOWS THE MOVE COMMAND, AND NOTHING MAY BE CLICKED UNTIL THE NEXT SITE.**
+  USER: "can only fletch after we give the move command", then "between each totem we should
+  be able to craft enough bows for the next one ... as ive shown in the recording". Both are
+  in the recording, and the routine had both backwards: it fletched at the site (the next
+  tick's walk click landed on an action that had only just begun), and once that was moved
+  after the first hop, the hop every ~2s still ended every fletch before its first bow --
+  anim 1248 started, no product, every leg, 0 bows across a whole lap, decorations 2/32.
+  MEASURED from the recording: every human fletch run (5-9 bows, one every 1.8s) has ZERO
+  clicks between the knife and the next site's action -- ONE "Walk here" on a tile up to 31
+  tiles away, then knife -> logs -> Space, then hands off. So `walk_leg` now makes ONE
+  shift-click in the viewport at the farthest point of the leg that is rendered (the next
+  stand tile first, then the recorded waypoints from the far end -- the stand tile is 20-57
+  tiles off and MEASURED not rendered at this camera, which is why a first draft aimed only
+  there and fell straight back to the hops), fires the fletch, and only POLLS until that
+  stretch is walked or stalls; the recorded hops carry whatever is left. RESULT: 21 bows in
+  three minutes, the decorate clicks landing, `direct leg toward site N: one click at ...`
+  in the log. The digit key works for the make prompt (Space was the human's choice; `3` is
+  derived from the widget and starts the same action).
+- **The field Empty on the OPEN basket is SHIFT + left click.** MEASURED: the open basket's
+  right-click menu in the field is `['Cancel','Examine','Destroy','Close','Use','Check',
+  'Wear','Fill']` -- Empty is a SUBMENU option (cache `isubop3=1,Empty`) that `/menu` cannot
+  list, a plain left click hovers Fill, and the profile's only basket swap
+  (`menuentryswapper.ui_983043_28140=9`) is the BANK one. The recording shows it three
+  times out of three: SHIFT down ~0.25s, left click on "Open log basket", logged as `CC_OP
+  Empty` with the sub-option identifier 65540. `/hover` DOES read Empty with SHIFT held (the
+  gate passed live), so `empty_basket` shift-clicks with `expected_action="Empty"` and
+  falls back to one ungated shift-click judged only by the inventory delta. Note the empty
+  only ever yields as many logs as there are free slots, so with 15+ bows in hand it hands
+  over 4-8 logs -- enough for the next builds, and the reason the bank check counts the
+  basket rather than the loose logs.
 - Still unanswered from the spec's checklist: the two log balances on legs 4->3 and near site
   7 (item 3), whether `nearbySpirits` really rotates mid-carve (item 4), the claim-and-pass
   branch (item 6), and any non-yew wood (item 7).

@@ -461,6 +461,68 @@ def nearest_site():
     return best
 
 
+# The direct leg: how long a whole leg may take (the longest, 2->1, is 57 tiles, ~35s running
+# with a detour) and how long the player may stand still before the leg is declared stalled
+# and the waypoint hops take over. 3s is five ticks -- a real path never pauses that long.
+DIRECT_LEG_MAX_S = 50.0
+DIRECT_LEG_STALL_S = 3.0
+DIRECT_LEG_POLL_S = 0.6
+
+
+def _direct_leg(ctx, b: int, points, fire_hook) -> bool:
+    """ONE shift-click in the VIEWPORT at the farthest point of the leg that is rendered, fire
+    the hook, then only poll until that stretch is walked.
+
+    Tries site `b`'s stand tile first, then the recorded waypoints from the far end back. The
+    stand tile is 20-57 tiles off and MEASURED 2026-09-09 not rendered at this camera (the
+    first draft aimed only there and fell straight back to the hops -- 0 bows again), while a
+    waypoint 10-20 tiles out usually is: 12s of running is 6 bows, more than a totem needs.
+
+    Returns True on arrival at the site. Returns False -- having clicked NOTHING -- when no
+    candidate is rendered or every one sits under a UI panel, and False -- having fired the
+    hook -- once the intermediate point is reached or the player stalls, so the caller's hop
+    fallback carries the rest of the leg from the nearest waypoint; by then the fletch has had
+    its uninterrupted stretch. Every click before that would end it, which is why there is
+    exactly one."""
+    sx, sy = route.SITES[b]["stand"]
+    target = None
+    for cx, cy in [(sx, sy)] + [tuple(pt) for pt in reversed(points)]:
+        point = controller.get_ground_walk_point(cx, cy, route.PLANE)
+        if not point.get("onScreen"):
+            continue
+        if controller.is_point_blocked_by_ui(point.get("screenX", -1), point.get("screenY", -1)):
+            continue
+        target = (cx, cy, point)
+        break
+    if target is None:
+        return False
+    cx, cy, point = target
+    travel._click_walk_point(ctx, point, shift=True)
+    fire_hook()
+    debug_log.log(LOG, "direct leg toward site %d: one click at (%d,%d), fletch on the move"
+                  % (b, cx, cy))
+
+    deadline = _now() + DIRECT_LEG_MAX_S
+    last_xy, still_since = _player_xy(), _now()
+    while _now() < deadline:
+        _sleep(DIRECT_LEG_POLL_S)
+        if at_site(b):
+            return True
+        xy = _player_xy()
+        if (cx, cy) != (sx, sy) and xy[0] is not None \
+                and _tiles_between(xy[0], xy[1], cx, cy) <= ARRIVAL_TOLERANCE:
+            return False        # the stretch is walked; the hops take the rest
+        if xy != last_xy:
+            last_xy, still_since = xy, _now()
+        elif _now() - still_since >= DIRECT_LEG_STALL_S:
+            debug_log.log(LOG, "direct leg to site %d stalled at %s -- falling back to the "
+                               "recorded hops" % (b, xy))
+            return False
+    debug_log.log(LOG, "direct leg to site %d: not there after %.0fs -- falling back to the "
+                       "recorded hops" % (b, DIRECT_LEG_MAX_S))
+    return False
+
+
 def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
     """Walk site `a` -> site `b` by hopping the recorded waypoints.
 
@@ -480,6 +542,22 @@ def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
         debug_log.log(LOG, "no recorded path for leg %d->%d" % (a, b))
         return False
 
+    # ONE FAR CLICK, THEN HANDS OFF -- the human's shape, and the only one a fletch survives.
+    # MEASURED 2026-09-09 from the recording: every fletch run (5-9 bows) has ZERO clicks
+    # between the knife and the next site -- one "Walk here" on a tile up to 31 tiles away,
+    # then bows every 1.8s untouched. The bot's waypoint hops every ~2s each ended the fletch
+    # (anim 1248 started, no product, every leg), so decorations never got made. USER:
+    # "between each totem we should be able to craft enough bows for the next one".
+    fired = {"hook": False}
+
+    def fire_hook():
+        if after_first_hop is not None and not fired["hook"]:
+            fired["hook"] = True
+            after_first_hop()
+
+    if _direct_leg(ctx, b, points, fire_hook):
+        return True
+
     # START FROM THE WAYPOINT NEAREST THE PLAYER, not always index 0. A leg is resumed mid-way
     # far more often than it is started clean: after a bank trip (which leaves the player ON
     # leg 8->7, beside the booth), after a restart, and after any hop this function had to
@@ -496,9 +574,9 @@ def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
         if not travel._hop_to(ctx, wx, wy, route.PLANE):
             debug_log.log(LOG, "leg %d->%d: hop to (%d,%d) failed" % (a, b, wx, wy))
             return False
-        if index == 0 and after_first_hop is not None:
+        if index == 0:
             # The move is out; anything that must overlap the walk starts HERE, not before.
-            after_first_hop()
+            fire_hook()
 
     # POLL FOR ARRIVAL rather than returning on the last CLICK. That click released with
     # HOP_NEXT_CLICK_LEAD_TILES still to run (see ARRIVAL_TOLERANCE), so the player is still
@@ -735,8 +813,39 @@ def empty_basket(ctx) -> bool:
     if not open_basket(ctx):
         debug_log.log(LOG, "could not open the log basket -- cannot empty it this visit")
         return False
-    ok = _basket_option(ctx, ("empty", "empty-to-inventory"),
-                        lambda: count_item(log) > before)
+    # A SHIFT + LEFT CLICK -- not a menu selection, and not a plain click either. MEASURED
+    # 2026-09-09: even the OPEN basket's right-click menu in the field is ['Cancel','Examine',
+    # 'Destroy','Close','Use','Check','Wear','Fill'] -- Empty is a SUBMENU option (cache:
+    # isubop under Check) that /menu cannot list, and a plain left click hovers Fill, not
+    # Empty (the first cut was withheld on exactly that). The recording settles how the human
+    # does it, three times out of three: SHIFT down ~0.25s, then a left click on "Open log
+    # basket", which the game logs as CC_OP Empty with the sub-option identifier 65540. So
+    # SHIFT is held around the click. The hover gate is tried first (with SHIFT down the
+    # client's default entry should read Empty); if it withholds, one ungated shift-click
+    # goes out and the inventory delta below is the only verdict -- a wrong action here
+    # moves no logs, which is a False, never a wrong click.
+    basket = find_basket()
+    if not basket:
+        return False
+    controller.open_inventory_tab(ctx.ser)
+    controller.key_down(ctx.ser, "SHIFT")
+    try:
+        controller.human_delay(0.2, 0.35)
+        clicked = controller.click_entity(ctx.ser, basket, offset=(0, 0),
+                                          check_ui_blockers=False, simulate_mistakes=False,
+                                          expected_action="Empty")
+        if not clicked:
+            debug_log.log(LOG, "shift-click on the log basket did not hover as Empty -- "
+                               "sending it ungated and trusting the inventory delta")
+            clicked = controller.click_entity(ctx.ser, basket, offset=(0, 0),
+                                              check_ui_blockers=False, simulate_mistakes=False)
+    finally:
+        controller.key_up(ctx.ser, "SHIFT")
+    if not clicked:
+        return False
+    ok = bool(outcome_waits.await_pre(ctx, ["INVENTORY_CHANGED"], BASKET_BUDGET_S,
+                                      lambda: count_item(log) > before,
+                                      now_fn=_now, sleep_fn=_sleep))
     moved = max(0, count_item(log) - before)
     data = ctx.state.data
     data[BASKET_LOGS_KEY] = max(0, basket_logs(data) - moved) if moved else 0

@@ -12,6 +12,13 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
     monkeypatch.setattr(controller, "get_widgets_dump", lambda scan=False: [])
     monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: None)
+    # The direct leg's viewport click: off-screen by default, so every existing walk_leg test
+    # keeps exercising the waypoint hops it was written against.
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": False})
+    monkeypatch.setattr(controller, "is_point_blocked_by_ui", lambda x, y: None)
+    monkeypatch.setattr(travel, "_click_walk_point",
+                        lambda ctx, point, shift: pytest.fail("unexpected viewport walk click"))
 
 
 def test_default_config_is_yew():
@@ -405,20 +412,62 @@ def test_find_basket_matches_either_open_or_shut(monkeypatch):
     assert vtr_routine.find_basket() is None
 
 
-def test_empty_basket_uses_the_named_menu_option_not_a_bare_click(monkeypatch):
-    # A bare left click races Fill / Wear / Check, and Fill is a silent no-op that looks like
-    # success -- the same reason banker.empty_log_basket selects its option by name.
+def _shift_keys(monkeypatch, log):
+    monkeypatch.setattr(controller, "key_down", lambda ser, k: log.append(("down", k)))
+    monkeypatch.setattr(controller, "key_up", lambda ser, k: log.append(("up", k)))
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+
+
+def test_empty_basket_is_a_shift_left_click_for_empty(monkeypatch):
+    """MEASURED 2026-09-09: even the OPEN basket's field menu has no top-level Empty (a
+    submenu option /menu cannot list) and a plain left click hovers Fill. The recording's
+    field Empty is SHIFT held ~0.25s then a left click on "Open log basket" (CC_OP Empty,
+    sub-option id 65540), three times out of three."""
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [{"name": "Open log basket", "screenX": 1, "screenY": 1}])
     monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
-    calls = []
     monkeypatch.setattr(controller, "click_menu_action",
-                        lambda ser, ent, opt, **k: calls.append(opt) or True)
+                        lambda *a, **k: pytest.fail("the menu cannot reach Empty"))
+    log = []
+    _shift_keys(monkeypatch, log)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: log.append(("click", k.get("expected_action"))) or True)
     monkeypatch.setattr(vtr_routine, "count_item", lambda name: 5)
     vtr_routine.empty_basket(_ctx_only())
-    # A SEQUENCE of candidate names, the banker.empty_log_basket idiom -- click_menu_action
-    # tries each against the one menu it reads back.
-    assert calls and any("empty" in o.lower() for o in calls[0])
+    assert log == [("down", "SHIFT"), ("click", "Empty"), ("up", "SHIFT")]
+
+
+def test_a_withheld_shift_click_falls_back_to_one_ungated_shift_click(monkeypatch):
+    """The gate reads the un-shifted default on some clients; the inventory delta is then the
+    only verdict, and SHIFT stays held for the fallback and is released after it."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Open log basket", "screenX": 1, "screenY": 1}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    log = []
+    _shift_keys(monkeypatch, log)
+    replies = iter([controller.CLICK_WITHHELD, True])
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: log.append(("click", k.get("expected_action"))) or next(replies))
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 5)
+    vtr_routine.empty_basket(_ctx_only())
+    assert log == [("down", "SHIFT"), ("click", "Empty"), ("click", None), ("up", "SHIFT")]
+
+
+def test_shift_is_released_even_when_the_click_raises(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Open log basket", "screenX": 1, "screenY": 1}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    log = []
+    _shift_keys(monkeypatch, log)
+
+    def boom(*a, **k):
+        raise RuntimeError("serial died")
+
+    monkeypatch.setattr(controller, "click_entity", boom)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 5)
+    with pytest.raises(RuntimeError):
+        vtr_routine.empty_basket(_ctx_only())
+    assert log[-1] == ("up", "SHIFT"), "a held SHIFT would turn every later click into a force-walk"
 
 
 def test_empty_basket_is_a_no_op_without_a_basket(monkeypatch):
@@ -999,6 +1048,8 @@ def _basket_ctx(monkeypatch, counts):
                         lambda: [{"name": "Open log basket", "screenX": 1, "screenY": 1}])
     monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
     monkeypatch.setattr(controller, "click_menu_action", lambda ser, ent, opt, **k: True)
+    _shift_keys(monkeypatch, [])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
     seq = list(counts)
     monkeypatch.setattr(vtr_routine, "count_item",
                         lambda name: seq.pop(0) if len(seq) > 1 else seq[0])
@@ -1072,10 +1123,13 @@ def test_empty_basket_opens_a_shut_basket_first(monkeypatch):
         return True
 
     monkeypatch.setattr(controller, "click_menu_action", menu)
+    _shift_keys(monkeypatch, [])
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: chosen.append(("left", k.get("expected_action"))) or True)
     monkeypatch.setattr(vtr_routine, "count_item", lambda name: 5)
     vtr_routine.empty_basket(_ctx_only())
     assert chosen and chosen[0] == ("open",), "did not open the shut basket first"
-    assert any("empty" in o[0] for o in chosen[1:]), "never tried to empty it"
+    assert ("left", "Empty") in chosen[1:], "never tried to empty it"
 
 
 def test_empty_basket_does_not_reopen_an_already_open_basket(monkeypatch):
@@ -1085,9 +1139,11 @@ def test_empty_basket_does_not_reopen_an_already_open_basket(monkeypatch):
     chosen = []
     monkeypatch.setattr(controller, "click_menu_action",
                         lambda ser, ent, opt, **k: chosen.append(tuple(opt)) or True)
+    _shift_keys(monkeypatch, [])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
     monkeypatch.setattr(vtr_routine, "count_item", lambda name: 5)
     vtr_routine.empty_basket(_ctx_only())
-    assert chosen and "open" not in chosen[0], "re-opened a basket that was already open"
+    assert not chosen, "re-opened a basket that was already open"
 
 
 # --- 2026-09-09 live: the fletch must follow the move command, never precede it ------------
@@ -1133,3 +1189,79 @@ def test_the_fletch_hook_is_a_no_op_when_nothing_is_due(monkeypatch):
     monkeypatch.setattr(vtr_routine, "start_fletching",
                         lambda c: pytest.fail("fletched with no flag set"))
     assert vtr_routine._fletch_on_the_move(_ctx_only()) is False
+
+
+# --- 2026-09-09: one far click per leg, then hands off, or the fletch never lands ----------
+
+def _stand(site):
+    return {"x": route.SITES[site]["stand"][0], "y": route.SITES[site]["stand"][1], "plane": 0}
+
+
+def test_a_rendered_stand_tile_gets_one_viewport_click_and_no_hops(monkeypatch):
+    """The human's shape: one Walk here on the far tile, knife, then NOTHING until the site.
+    Every waypoint hop the bot used to click ended the fletch before its first bow."""
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500, "screenY": 300})
+    clicks, order = [], []
+    monkeypatch.setattr(travel, "_click_walk_point",
+                        lambda ctx, point, shift: clicks.append((point, shift)) or order.append("walk"))
+    monkeypatch.setattr(travel, "_hop_to",
+                        lambda *a, **k: pytest.fail("hopped -- that click would end the fletch"))
+    positions = iter([_stand(8), {"x": 1420, "y": 3340, "plane": 0}, _stand(7), _stand(7)])
+    monkeypatch.setattr(controller, "get_player", lambda: next(positions))
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    assert vtr_routine.walk_leg(_ctx_only(), 8, 7,
+                                after_first_hop=lambda: order.append("fletch")) is True
+    assert len(clicks) == 1 and clicks[0][1] is True, "exactly one SHIFT viewport click"
+    assert order == ["walk", "fletch"], "the move goes out first, the fletch right after"
+
+
+def test_a_stalled_direct_leg_falls_back_to_the_hops_without_refiring_the_hook(monkeypatch):
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500, "screenY": 300})
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: None)
+    hops = []
+    monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane, **k: hops.append((x, y)) or True)
+    # Never moves off site 8's stand tile: the direct walk stalls, then the hops must run.
+    monkeypatch.setattr(controller, "get_player", lambda: _stand(8))
+    clock = {"t": 0.0}
+    monkeypatch.setattr(vtr_routine, "_now", lambda: clock["t"])
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    fired = []
+    vtr_routine.walk_leg(_ctx_only(), 8, 7, after_first_hop=lambda: fired.append(1))
+    assert hops, "the stalled direct leg must hand over to the recorded hops"
+    assert fired == [1], "the fletch hook fires once, not again on the first hop"
+
+
+def test_an_off_screen_stand_tile_skips_the_direct_click_entirely(monkeypatch):
+    hops = []
+    monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane, **k: hops.append((x, y)) or True)
+    monkeypatch.setattr(controller, "get_player", lambda: _stand(7))
+    vtr_routine.walk_leg(_ctx_only(), 8, 7)
+    assert hops, "with the tile not rendered the hops are the only way there"
+
+
+def test_the_direct_click_aims_at_the_farthest_rendered_waypoint_when_the_site_is_not(monkeypatch):
+    """MEASURED 2026-09-09: the next stand tile is 20-57 tiles off and not rendered, so aiming
+    only there fell back to the hops every leg. A waypoint 10-20 tiles out is; 12s of running
+    there is 6 bows."""
+    points = route.leg_waypoints(8, 7)
+    visible = set(points[:3])            # only the near half of the leg is rendered
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": (x, y) in visible,
+                                                     "screenX": 500, "screenY": 300})
+    clicks = []
+    monkeypatch.setattr(travel, "_click_walk_point",
+                        lambda ctx, point, shift: clicks.append(point))
+    hops = []
+    monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane, **k: hops.append((x, y)) or True)
+    # Stand at site 8, then arrive at the clicked waypoint, then at site 7.
+    seq = iter([_stand(8), _stand(8), {"x": points[2][0], "y": points[2][1], "plane": 0}]
+               + [_stand(7)] * 20)
+    monkeypatch.setattr(controller, "get_player", lambda: next(seq))
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    fired = []
+    assert vtr_routine.walk_leg(_ctx_only(), 8, 7, after_first_hop=lambda: fired.append(1)) is True
+    assert len(clicks) == 1, "one viewport click for the fletch stretch"
+    assert fired == [1]
+    assert hops and hops[0] in points[2:], "the hops resume from the walked stretch, not the start"
