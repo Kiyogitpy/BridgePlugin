@@ -160,7 +160,7 @@ def tick(ctx):
 
     if not at_site(current):
         previous = data.get("vt_from", route.RING[route.RING.index(current) - 1])
-        if walk_leg(ctx, previous, current):
+        if walk_leg(ctx, previous, current, after_first_hop=lambda: _fletch_on_the_move(ctx)):
             data["vt_leg_tries"] = 0
             return
         # A LEG IS RETRIED, not fatal on the first miss. travel._hop_to returns False for a
@@ -226,8 +226,13 @@ def tick(ctx):
     # until the next click interrupts it; firing it while every log is owed to a build is how
     # the routine reached "plenty of bows, no logs" and deadlocked. vt.fletch_budget does the
     # arithmetic (pure, table-tested).
-    if vt.fletch_budget(state, count_item(log_name), count_item(ctx.state.config["bow"])) > 0:
-        start_fletching(ctx)
+    # DUE, not done. The fletch itself is fired by walk_leg once the first hop is clicked --
+    # USER 2026-09-09: "can only fletch after we give the move command". Starting it here, at
+    # a standstill, means the next tick's walk click lands on an action that has just begun
+    # and cancels it; the budget is re-derived at the moment it actually fires, so a stale
+    # flag can never make a bow out of a log a build is owed.
+    data["vt_fletch_due"] = vt.fletch_budget(
+        state, count_item(log_name), count_item(ctx.state.config["bow"])) > 0
 
     data["vt_from"] = current
     data["vt_site"] = route.next_in_ring(current)
@@ -456,13 +461,19 @@ def nearest_site():
     return best
 
 
-def walk_leg(ctx, a: int, b: int) -> bool:
+def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
     """Walk site `a` -> site `b` by hopping the recorded waypoints.
 
     NO ROUTER: worldmap has no collision data for Varlamore, so travel.walk_to cannot be used
     here at all. These are the human's own tick-by-tick positions, so the path is known-good;
     the risk is only that a discrete hop lands differently than a continuous run, which is what
     the live checklist watches at the two log balances.
+
+    `after_first_hop` runs ONCE, immediately after the leg's first hop click is out and before
+    the remaining waypoints are clicked. USER 2026-09-09: "can only fletch after we give the
+    move command" -- a knife-on-log started while standing still is cancelled by the very next
+    walk click, so the fletch has to be issued with the player already on its way. That is the
+    hook; see tick() for the caller.
     """
     points = route.leg_waypoints(a, b)
     if not points:
@@ -481,10 +492,13 @@ def walk_leg(ctx, a: int, b: int) -> bool:
         start = min(range(len(points)),
                     key=lambda i: _tiles_between(x, y, points[i][0], points[i][1]))
 
-    for wx, wy in points[start:]:
+    for index, (wx, wy) in enumerate(points[start:]):
         if not travel._hop_to(ctx, wx, wy, route.PLANE):
             debug_log.log(LOG, "leg %d->%d: hop to (%d,%d) failed" % (a, b, wx, wy))
             return False
+        if index == 0 and after_first_hop is not None:
+            # The move is out; anything that must overlap the walk starts HERE, not before.
+            after_first_hop()
 
     # POLL FOR ARRIVAL rather than returning on the last CLICK. That click released with
     # HOP_NEXT_CLICK_LEAD_TILES still to run (see ARRIVAL_TOLERANCE), so the player is still
@@ -572,6 +586,25 @@ def decorate(ctx, site) -> bool:
         return fresh is not None and fresh.decorations > before
 
     return _click_site(ctx, n, "totem", DECORATE_BUDGET_S, landed)
+
+
+def _fletch_on_the_move(ctx) -> bool:
+    """Start a fletch while the player is already walking, if one is still worth starting.
+
+    Called from walk_leg's after_first_hop hook. Re-derives the budget from LIVE state rather
+    than trusting the flag tick() set at the previous site: the walk may have been re-entered
+    after a failed leg, and a log owed to a build must never become a bow (vt.fletch_budget's
+    own deadlock note)."""
+    data = ctx.state.data
+    if not data.pop("vt_fletch_due", False):
+        return False
+    state = read_state()
+    if state is None:
+        return False
+    if vt.fletch_budget(state, count_item(ctx.state.config["log"]),
+                        count_item(ctx.state.config["bow"])) <= 0:
+        return False
+    return start_fletching(ctx)
 
 
 def start_fletching(ctx) -> bool:

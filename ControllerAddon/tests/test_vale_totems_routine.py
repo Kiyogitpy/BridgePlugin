@@ -745,7 +745,10 @@ def test_the_fletch_is_skipped_when_every_log_is_owed_to_a_build(monkeypatch):
     vtr_routine.tick(_ctx(monkeypatch, stops))
 
 
-def test_the_fletch_fires_once_the_builds_are_covered(monkeypatch):
+def test_the_fletch_is_marked_due_once_the_builds_are_covered(monkeypatch):
+    """It is DUE at the site and FIRED by walk_leg once the move command is out -- USER
+    2026-09-09, "can only fletch after we give the move command". This used to assert that
+    tick() fletched here, which is exactly the standstill fletch the next walk click cancels."""
     stops = []
     monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())
     _park_at(monkeypatch, 6)
@@ -754,10 +757,11 @@ def test_the_fletch_fires_once_the_builds_are_covered(monkeypatch):
     monkeypatch.setattr(vtr_routine, "bank_trip", lambda ctx: True)
     monkeypatch.setattr(vtr_routine, "count_item",
                         lambda name: 40 if "logs" in name else 0)
-    fired = []
-    monkeypatch.setattr(vtr_routine, "start_fletching", lambda ctx: fired.append(1) or True)
-    vtr_routine.tick(_ctx(monkeypatch, stops))
-    assert fired == [1]
+    monkeypatch.setattr(vtr_routine, "start_fletching",
+                        lambda ctx: pytest.fail("fletched before the move command"))
+    ctx = _ctx(monkeypatch, stops)
+    vtr_routine.tick(ctx)
+    assert ctx.state.data.get("vt_fletch_due") is True
 
 
 # --- I2: the varbits every await_pre here waits on --------------------------------------
@@ -830,7 +834,7 @@ def test_a_failed_leg_is_retried_before_it_stops_the_run(monkeypatch):
     monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 1450, "y": 3400, "plane": 0})
     monkeypatch.setattr(vtr_routine, "at_site", lambda n: False)
-    monkeypatch.setattr(vtr_routine, "walk_leg", lambda ctx, a, b: False)
+    monkeypatch.setattr(vtr_routine, "walk_leg", lambda ctx, a, b, **kw: False)
     ctx = _ctx(monkeypatch, stops)
     ctx.state.data["vt_site"] = 5
     ctx.state.data["vt_from"] = 6
@@ -848,7 +852,7 @@ def test_a_leg_that_succeeds_clears_the_retry_count(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 1450, "y": 3400, "plane": 0})
     monkeypatch.setattr(vtr_routine, "at_site", lambda n: False)
     outcomes = iter([False, True])
-    monkeypatch.setattr(vtr_routine, "walk_leg", lambda ctx, a, b: next(outcomes))
+    monkeypatch.setattr(vtr_routine, "walk_leg", lambda ctx, a, b, **kw: next(outcomes))
     ctx = _ctx(monkeypatch, stops)
     ctx.state.data["vt_site"] = 5
     vtr_routine.tick(ctx)
@@ -1084,3 +1088,48 @@ def test_empty_basket_does_not_reopen_an_already_open_basket(monkeypatch):
     monkeypatch.setattr(vtr_routine, "count_item", lambda name: 5)
     vtr_routine.empty_basket(_ctx_only())
     assert chosen and "open" not in chosen[0], "re-opened a basket that was already open"
+
+
+# --- 2026-09-09 live: the fletch must follow the move command, never precede it ------------
+
+def test_the_site_only_marks_a_fletch_due_it_does_not_start_one(monkeypatch):
+    """USER 2026-09-09: "can only fletch after we give the move command". A knife-on-log
+    started at a standstill is cancelled by the next walk click, so tick() must not fire one
+    while it is still standing at the site."""
+    stops = []
+    ctx = _running_tick(monkeypatch, stops, at=6)
+    monkeypatch.setattr(vtr_routine, "start_fletching",
+                        lambda c: pytest.fail("fletched before the move command"))
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 10)
+    vtr_routine.tick(ctx)
+    assert ctx.state.data.get("vt_fletch_due") is True
+
+
+def test_walk_leg_fires_the_hook_after_the_first_hop_not_before(monkeypatch):
+    order = []
+    monkeypatch.setattr(travel, "_hop_to",
+                        lambda ctx, x, y, plane, **k: order.append(("hop", x, y)) or True)
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": route.SITES[7]["stand"][0],
+                                 "y": route.SITES[7]["stand"][1], "plane": 0})
+    vtr_routine.walk_leg(_ctx_only(), 8, 7,
+                         after_first_hop=lambda: order.append(("fletch",)))
+    assert order[0][0] == "hop", "the move command must go out first"
+    assert order[1] == ("fletch",), "the fletch must follow the FIRST hop, not the last"
+
+
+def test_the_fletch_hook_rechecks_the_budget_against_live_state(monkeypatch):
+    """The flag was set at the previous site; a log owed to a build must never become a bow."""
+    monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)   # no logs at all
+    monkeypatch.setattr(vtr_routine, "start_fletching",
+                        lambda c: pytest.fail("fletched with nothing to spare"))
+    ctx = _ctx_only()
+    ctx.state.data["vt_fletch_due"] = True
+    assert vtr_routine._fletch_on_the_move(ctx) is False
+
+
+def test_the_fletch_hook_is_a_no_op_when_nothing_is_due(monkeypatch):
+    monkeypatch.setattr(vtr_routine, "start_fletching",
+                        lambda c: pytest.fail("fletched with no flag set"))
+    assert vtr_routine._fletch_on_the_move(_ctx_only()) is False
