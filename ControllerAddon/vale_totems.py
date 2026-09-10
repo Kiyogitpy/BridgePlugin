@@ -23,6 +23,12 @@ WOOD_DURABILITY = {"OAK": 2, "WILLOW": 3, "MAPLE": 4, "YEW": 5, "MAGIC": 6, "RED
 
 MAX_DECORATIONS = 4
 
+# The reader's own OFFERING_CAP (ValeTotems.java, "the documented soft cap"): a build on a
+# capped pile is refused by the game, and that is the ONLY reason a pile is ever claimed.
+# USER 2026-09-10: "skip picking up vale offerings since they stack up on the floor and i
+# can pick them later saving the routine some time".
+OFFERING_CAP = 15_000
+
 
 @dataclass
 class Site:
@@ -101,6 +107,10 @@ def missing_spirits(site) -> list:
     return [s for s in site.nearby_spirits if s not in done]
 
 
+def offering_capped(site) -> bool:
+    return site.unclaimed_offerings >= OFFERING_CAP
+
+
 def needs_build(site) -> bool:
     return site.base_value == 0
 
@@ -137,13 +147,13 @@ def next_action(site, *, logs: int, bows: int):
     is spent by the time the ~4.4-minute lap comes round; that is a property of the lap time,
     not a rule.
 
-    Claim outranks everything: the pile is already earned, and a build on a capped pile is
-    refused by the game anyway.
+    A CAPPED pile is claimed before anything else, because a build on a capped pile is refused
+    by the game; a pile below the cap is left on the floor for the user (2026-09-10).
 
     Running out of a material yields ("done", None), NOT a retry -- the caller walks on and the
     bank rung deals with it. A rung that cannot progress must never hold the routine in place.
     """
-    if site.unclaimed_offerings > 0:
+    if offering_capped(site):
         return ("claim", None)
     if needs_build(site):
         return ("build", None) if logs > 0 else ("done", None)

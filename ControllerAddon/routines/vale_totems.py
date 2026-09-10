@@ -60,6 +60,12 @@ WOODS = {
 
 DEFAULT_CONFIG = {"wood": "YEW"}
 
+# USER 2026-09-10: "we probably dont want to change camera angle on start since it puts
+# camera entirely above us looking down meaning the camera skew wont do anything". The
+# engine's login camera reset (pitch to the top, zoom out) is what makes a far tile
+# un-renderable here; the yaw turn only reaches far with the camera the user left.
+KEEP_CAMERA = True
+
 # USER 2026-09-09: "When we run out of yew logs swap to maple logs". The bank memory says
 # when the current wood's logs are gone, and the routine steps down one wood; the totems
 # already standing keep their own wood, so bows are matched to each SITE's wood below.
@@ -76,8 +82,24 @@ def _apply_wood(ctx, wood: str) -> None:
 
 def _wood_override(ctx) -> None:
     """The engine re-resolves the config from the bridge, which would put the panel's wood
-    back; the switch lives in data and is re-applied at the top of every tick."""
+    back; the switch lives in data and is re-applied at the top of every tick.
+
+    THE LOGS IN HAND DECIDE FIRST. MEASURED live 2026-09-10 (vt_markers3): the bank trip had
+    switched to maple, a restart wiped ctx.state.data, the panel said YEW again, and with 16
+    Maple logs and 8 maple bows in hand every site read "Yew logs: 0" -- claimed and walked
+    on, three sites, nothing built. So when none of the configured wood's logs are carried
+    and a lower wood's are, that wood is adopted (and remembered) before anything reads the
+    config. The configured wood is kept while any of its logs are in hand."""
     wood = ctx.state.data.get(WOOD_KEY)
+    if not wood and count_item(ctx.state.config["log"]) == 0:
+        step = WOOD_FALLBACK.get(ctx.state.config["wood"])
+        while step:
+            if count_item(WOODS[step]["log"]) > 0:
+                debug_log.log(LOG, "holding %s and no %s -- working %s"
+                              % (WOODS[step]["log"], ctx.state.config["log"], step))
+                wood = step
+                break
+            step = WOOD_FALLBACK.get(step)
     if wood and ctx.state.config.get("wood") != wood:
         _apply_wood(ctx, wood)
 
@@ -221,6 +243,11 @@ def tick(ctx):
     controller.wait_until_player_idle(timeout_s=SITE_SETTLE_S)
     data["vt_fletch_due"] = False        # the leg is over; the next site decides afresh
 
+    # AT THE BANK SITE WITH A TRIP DUE, THE CAMERA TURNS TOWARD THE BOOTH WHILE THE
+    # DECORATION RUNS, so the booth is on screen for one direct click afterwards. USER
+    # 2026-09-10: "while decorating we can adjust camera if needed and click the banker
+    # directly after the decoration is done. that way we save a bit of time not doing hop ->
+    # click bank".
     work_site(ctx, current)
 
     # Re-read AFTER the site. work_site just built, carved and decorated, so the top-of-tick
@@ -244,9 +271,7 @@ def tick(ctx):
     # only the loose 19 and sent the routine 37 tiles back to the booth -- and that hop is what
     # found the minimap-orb bug. The basket's contents are not readable off the bridge
     # (CLAUDE.md, /api/storage/log-basket), so they are ESTIMATED from what fill/empty moved.
-    if (current in BANK_SITES
-            and vt.logs_needed_for_lap(state, bow_count(ctx))
-            > count_item(log_name) + basket_logs(data)):
+    if current in BANK_SITES and _bank_trip_due(ctx, state):
         if not bank_trip(ctx):
             # FATAL ONLY WITH NOTHING IN HAND. A trip can fail with logs still held (a
             # withdraw that raced the bank closing, MEASURED on the host 2026-09-09); the
@@ -279,6 +304,20 @@ def tick(ctx):
     # engine round trip plus the top-of-tick reads, at every one of eight sites. The human
     # is walking within a second of the final decoration.
     _walk_to_site(ctx, data["vt_site"])
+
+
+def _bank_trip_due(ctx, state) -> bool:
+    """The lap's outstanding work needs more logs than the hands and the basket hold."""
+    return (vt.logs_needed_for_lap(state, bow_count(ctx))
+            > count_item(ctx.state.config["log"]) + basket_logs(ctx.state.data))
+
+
+def _face_booth(ctx) -> None:
+    """Turn the camera toward the booth if it is not already on screen; sends nothing when
+    it is."""
+    bx, by = route.BANK["tile"]
+    if not controller.get_ground_walk_point(bx, by, route.PLANE).get("onScreen"):
+        controller.face_toward(ctx.ser, bx, by)
 
 
 def _walk_to_site(ctx, current: int) -> None:
@@ -322,6 +361,12 @@ def site_object(site_number: int, which: str):
     return controller.get_object_at(x, y, route.PLANE, obj_id)
 
 
+PREHOVER_TRACK_DRIFT_PX = 10   # re-aim the parked cursor once the model has slid this far
+PREHOVER_TRACK_POLL_S = 0.15
+PREHOVER_STILL_READS = 2       # /player.moving false this many polls running = the run is over
+PREHOVER_OFFSET = (-7, 7)      # hover_entity's own default aim offset, kept while tracking
+
+
 def _prehover_first_action(ctx, site_number: int) -> None:
     """Rest the cursor on the pile if it has offerings, else on the totem base -- whatever
     work_site will click first -- so the click that follows the settle is a click in place.
@@ -329,20 +374,39 @@ def _prehover_first_action(ctx, site_number: int) -> None:
     site = _site_now(site_number)
     if site is None:
         return
-    which = "offerings" if site.unclaimed_offerings > 0 else "totem"
+    which = "offerings" if vt.offering_capped(site) else "totem"
     entry = route.SITES[site_number]
     x, y = entry["totem"] if which == "totem" else entry["offerings"]
     obj_id = entry["base_id"] if which == "totem" else entry["offerings_id"]
     obj = site_object(site_number, which)
     if not obj:
         return
-    controller.hover_entity(ctx.ser, obj,
-                            refresh_target=controller.object_refresh_target(
-                                x, y, route.PLANE, obj_id),
-                            refresh_legs=SITE_REFRESH_LEGS)
+    refresh = controller.object_refresh_target(x, y, route.PLANE, obj_id)
+    controller.hover_entity(ctx.ser, obj, refresh_target=refresh, refresh_legs=SITE_REFRESH_LEGS)
+
+    # TRACK UNTIL THE PLAYER STOPS. USER 2026-09-10: "when we get towards the totem the click
+    # while moving often misses" -- "the cursor hover while approaching". at_site fires
+    # ARRIVAL_TOLERANCE tiles out, so the hover flight ends with the player still running
+    # the last tiles in and the projection slides out from under the cursor. While /player
+    # says the run is on, the hover follows the live projection whenever it has drifted;
+    # the settle wait that follows then finds the cursor already on the model.
+    deadline = _now() + SITE_SETTLE_S
+    still = 0
+    while _now() < deadline:
+        player = controller.get_player() or {}
+        still = still + 1 if not player.get("moving") else 0
+        if still >= PREHOVER_STILL_READS:
+            return
+        target = refresh() if callable(refresh) else None
+        if target:
+            tx, ty = int(target[0]) + PREHOVER_OFFSET[0], int(target[1]) + PREHOVER_OFFSET[1]
+            cx, cy = controller.get_cursor_pos()
+            if max(abs(cx - tx), abs(cy - ty)) > PREHOVER_TRACK_DRIFT_PX:
+                controller.move_to_human(ctx.ser, tx, ty, aim_radius=controller.ENTITY_AIM_RADIUS)
+        _sleep(PREHOVER_TRACK_POLL_S)
 
 
-def _click_site(ctx, site_number, which, budget_s, confirm, option=None):
+def _click_site(ctx, site_number, which, budget_s, confirm, option=None, after_click=None):
     """Click a site object and confirm on the READER, never on the click landing.
 
     The aim is re-resolved through object_refresh_target for the whole flight: these clicks are
@@ -367,6 +431,8 @@ def _click_site(ctx, site_number, which, budget_s, confirm, option=None):
     if not controller.click_entity(ctx.ser, obj, refresh_target=refresh,
                                    refresh_legs=SITE_REFRESH_LEGS):
         return False
+    if after_click is not None:
+        after_click()          # e.g. the camera turn toward the booth while the action runs
     outcome = outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"], budget_s,
                                       confirm, now_fn=_now, sleep_fn=_sleep)
     if outcome or not option:
@@ -585,7 +651,25 @@ NO_DIRECT_KEY = "vt_no_direct"   # legs whose far click the game will not path a
 ARRIVED, STRETCH, NO_CLICK, STALLED = "arrived", "stretch", "no-click", "stalled"
 
 
-def _far_click_target(b: int, points, px=None, py=None):
+# The straight line toward the stand is tried before any marker: points every LINE_STEP_TILES
+# from just short of the stand down to LINE_MIN_TILES out, the farthest that projects wins.
+LINE_STEP_TILES = 3
+LINE_MIN_TILES = 8
+
+
+def _line_candidates(px, py, sx, sy):
+    """Tiles on the straight line (px,py) -> (sx,sy), farthest first, short of the stand."""
+    dist = _tiles_between(px, py, sx, sy)
+    out = []
+    d = dist - LINE_STEP_TILES
+    while d >= LINE_MIN_TILES:
+        t = d / dist
+        out.append((int(round(px + (sx - px) * t)), int(round(py + (sy - py) * t))))
+        d -= LINE_STEP_TILES
+    return out
+
+
+def _far_click_target(b: int, points, px=None, py=None, ser=None, skip=()):
     """The farthest point of the leg that ONE click can reach right now: site `b`'s stand
     tile first, then the recorded waypoints from the far end. A point is reachable if it is
     rendered in the viewport (and not under a panel) OR on the minimap (and not on an orb).
@@ -594,12 +678,43 @@ def _far_click_target(b: int, points, px=None, py=None):
     viewport alone: the picked point was 11-18 tiles out on most legs -- 7-11s, 3-5 bows,
     then the next click ended the fletch. The minimap reaches 28 tiles whatever the camera
     renders (CLAUDE.md's measurement), and the game paths there on its own."""
-    # MINIMAP FIRST for each candidate (USER 2026-09-09: "click minimap as far away as
-    # possible -> click knife -> click log -> confirm and voila"): nothing is drawn on it to
-    # hijack the click and its reach does not depend on the camera; the viewport is the
-    # fallback for a point the minimap cannot show.
+    # FACE THE CAMERA AT THE LEG FIRST (USER 2026-09-10: "i can click much further by nudging
+    # the camera in the direction of the totem and click the totem directly instead of minimap
+    # hop" -- six middle-mouse drags in the recording, each right before a far viewport click).
+    # The stand tile is 20-57 tiles off and not rendered at the default camera; turning toward
+    # it brings it (and the near waypoints) on screen, so a direct viewport click reaches far
+    # further than a minimap hop. Only when it is genuinely off screen -- a turn is not free of
+    # a mouse flight, so a tile already rendered is left alone.
     sx, sy = route.SITES[b]["stand"]
-    for cx, cy in [(sx, sy)] + [tuple(pt) for pt in reversed(points)]:
+    if ser is not None and not controller.get_ground_walk_point(
+            sx, sy, route.PLANE).get("onScreen"):
+        controller.face_toward(ser, sx, sy, px=px, py=py)
+
+    # VIEWPORT FIRST for each candidate now that the camera faces the leg: the human clicks the
+    # world directly (the recording has zero minimap hops on these legs). The minimap is the
+    # fallback for a point the turn could not bring on screen. Farthest candidate first.
+    # STRAIGHT TOWARD THE TOTEM BEFORE ANY MARKER. USER 2026-09-10: "we click the tile marker
+    # 20 instead of just running straight to totem ... they are guidelines not meant as a
+    # hop". MEASURED: from the booth the stand tile 37 tiles out projected ABOVE the
+    # viewport's top edge (isOnScreen is a bounds test) while the ground short of it was on
+    # screen, so the farthest on-screen point on the line to the stand is the click; the
+    # markers only answer when nothing on that line projects.
+    line = [] if px is None else _line_candidates(px, py, sx, sy)
+    for cx, cy in [(sx, sy)] + line + [tuple(pt) for pt in reversed(points)]:
+        # A MARKER ALREADY REACHED IS NOT A FAR CLICK. MEASURED live 2026-09-10 (vt_markers2,
+        # legs 6->5 and 5->4): a stretch ends within ARRIVAL_TOLERANCE of its marker, the
+        # stand tile is neither rendered nor on the minimap, and the marker just reached --
+        # still rendered, three tiles off -- was picked again five times in five seconds,
+        # each click ending the fletch. Nothing farther reachable means NO_CLICK; the hops
+        # take it from here and pull an off-minimap point in.
+        if px is not None and _tiles_between(px, py, cx, cy) <= ARRIVAL_TOLERANCE:
+            continue
+        if (cx, cy) in skip:            # a target the game would not path to from this site
+            continue
+        point = controller.get_ground_walk_point(cx, cy, route.PLANE)
+        if point.get("onScreen") and not controller.is_point_blocked_by_ui(
+                point.get("screenX", -1), point.get("screenY", -1)):
+            return cx, cy, point, True
         # WITHIN THE MINIMAP'S REAL REACH. /minimap/walk's onMinimap is a generous test
         # (CLAUDE.md: the cardinals still read "on" at 32 tiles) and a 38-tile point projected
         # to a pixel outside the drawn circle, which clicks nothing (USER 2026-09-09: "long
@@ -611,14 +726,42 @@ def _far_click_target(b: int, points, px=None, py=None):
         if point.get("onMinimap") and not controller.is_point_on_minimap_orb(
                 point.get("screenX", -1), point.get("screenY", -1)):
             return cx, cy, point, False
-        point = controller.get_ground_walk_point(cx, cy, route.PLANE)
-        if point.get("onScreen") and not controller.is_point_blocked_by_ui(
-                point.get("screenX", -1), point.get("screenY", -1)):
-            return cx, cy, point, True
     return None
 
 
-def _direct_leg(ctx, b: int, points, fire_hook) -> str:
+def _ahead(points, origin, x, y):
+    """The markers still ahead of (x, y) along the leg's polyline -- the one ending the
+    nearest stretch and everything after it, minus one already reached."""
+    start = _resume_index(points, origin, x, y)
+    if start < len(points) - 1 and _tiles_between(x, y, *points[start]) <= ARRIVAL_TOLERANCE:
+        start += 1
+    return points[start:]
+
+
+def _walk_point_now(cx, cy):
+    """(point, viewport) for tile (cx, cy) as the client projects it RIGHT NOW: the viewport
+    when rendered and uncovered, else the minimap when on it and off the orbs, else None."""
+    if cx is None or cy is None:
+        return None, False
+    point = controller.get_ground_walk_point(cx, cy, route.PLANE)
+    if point.get("onScreen") and not controller.is_point_blocked_by_ui(
+            point.get("screenX", -1), point.get("screenY", -1)):
+        return point, True
+    point = controller.get_minimap_walk_point(cx, cy, route.PLANE)
+    if point.get("onMinimap") and not controller.is_point_on_minimap_orb(
+            point.get("screenX", -1), point.get("screenY", -1)):
+        return point, False
+    return None, False
+
+
+HOOK_MIN_STRETCH_TILES = 12    # ~4s of running: a bow, or three strings; shorter is not worth it
+
+
+def _hook_due(stretch_tiles: int, final: bool) -> bool:
+    return final or stretch_tiles >= HOOK_MIN_STRETCH_TILES
+
+
+def _direct_leg(ctx, b: int, points, fire_hook, origin, skip=()):
     """ONE click at the farthest reachable point of the leg, fire the hook, then only poll.
 
     ARRIVED: at the site. STRETCH: the intermediate point was reached, the hook has fired --
@@ -627,13 +770,23 @@ def _direct_leg(ctx, b: int, points, fire_hook) -> str:
     pathfinder will not cross), so the recorded hops take over. Every click before the
     stretch is walked would end the fletch, which is why there is exactly one per stretch."""
     here = _player_xy()
-    target = _far_click_target(b, points, *here)
+    # ONLY THE MARKERS AHEAD. MEASURED live 2026-09-10 (vt_markers4, 8->7 from the booth):
+    # the first stretch reached the middle marker, the stand tile was not rendered, and the
+    # pick fell to the first marker -- 20 tiles BACK toward the bank just left.
+    ahead = points if here[0] is None else _ahead(points, origin, *here)
+    target = _far_click_target(b, ahead, *here, ser=ctx.ser, skip=skip)
     if target is None:
-        return NO_CLICK
+        return NO_CLICK, None
     cx, cy, point, viewport = target
     sx, sy = route.SITES[b]["stand"]
     travel._click_walk_point(ctx, point, shift=viewport)
-    started = fire_hook()
+    # THE ACTION GOES ON EVERY STRETCH WORTH IT. USER 2026-09-10: "no stringing on that long
+    # walk?" -- a 48-tile first stretch toward site 1 ran with idle hands while the action
+    # waited for the final stand-tile click, 9 tiles from the end. A walk click always ends a
+    # make action, so a later stretch click restarts it; a stretch too short to make a bow
+    # (HOOK_MIN_STRETCH_TILES) is skipped unless it is the final one.
+    stretch = 0 if here[0] is None else _tiles_between(here[0], here[1], cx, cy)
+    started = fire_hook() if _hook_due(stretch, final=(cx, cy) == (sx, sy)) else False
     fletching = started == "fletch"
     debug_log.log(LOG, "direct leg toward site %d: one %s click at (%d,%d)%s"
                   % (b, "viewport" if viewport else "minimap", cx, cy,
@@ -647,32 +800,68 @@ def _direct_leg(ctx, b: int, points, fire_hook) -> str:
     # aside is left, the SAME walk target is clicked again -- the game keeps the walk and
     # ends the fletch, exactly what a human does with a stray click.
     log_name = ctx.state.config["log"]
+    bow_name = ctx.state.config["bow"]
     reserve = int(ctx.state.data.get(LOG_RESERVE_KEY) or 0)
 
     deadline = _now() + DIRECT_LEG_MAX_S
     last_xy, still_since = here, _now()
     while _now() < deadline:
         _sleep(DIRECT_LEG_POLL_S)
-        if fletching and count_item(log_name) <= reserve:
-            travel._click_walk_point(ctx, point, shift=viewport)
+        if fletching and (count_item(log_name) <= reserve
+                          or count_item(bow_name) >= STRING_ABOVE_BOWS):
+            # THE SPOOL IS THE INTERRUPTION. USER 2026-09-10: "instead of clicking to
+            # interupt the fletch we can use the spool to start stringing to interupt it
+            # instead. that way no new walk click will be needed and it can be done mid
+            # walk" -- and "lower it to fire at 8 bows in inventory": the fletch ends either
+            # at the build reserve or once STRING_ABOVE_BOWS unstrung bows are in hand, and
+            # the hands go straight on to stringing them. Only without a usable spool (or
+            # nothing to string) is the walk re-clicked, at THE SAME TILE, RE-RESOLVED --
+            # never the same pixel (vt_markers4: the stale pixel overshot site 5 by 17 tiles).
+            if (count_item(bow_name) > 0 and find_spool()
+                    and not ctx.state.data.get(SPOOL_DEAD_KEY) and start_stringing(ctx)):
+                debug_log.log(LOG, "fletch -> stringing mid-walk (%d %s, %d %s left)"
+                              % (count_item(bow_name), bow_name, count_item(log_name), log_name))
+            else:
+                fresh, fresh_viewport = _walk_point_now(cx, cy)
+                if fresh is None:
+                    fresh, fresh_viewport = _walk_point_now(*_player_xy()), True
+                if fresh is not None:
+                    travel._click_walk_point(ctx, fresh, shift=fresh_viewport)
+                debug_log.log(LOG, "fletch stopped at the build reserve (%d %s left)"
+                              % (reserve, log_name))
             fletching = False
-            debug_log.log(LOG, "fletch stopped at the build reserve (%d %s left)"
-                          % (reserve, log_name))
         if at_site(b):
-            return ARRIVED
+            return ARRIVED, (cx, cy)
         xy = _player_xy()
         if (cx, cy) != (sx, sy) and xy[0] is not None \
                 and _tiles_between(xy[0], xy[1], cx, cy) <= ARRIVAL_TOLERANCE:
-            return STRETCH
+            return STRETCH, (cx, cy)
         if xy != last_xy:
             last_xy, still_since = xy, _now()
         elif _now() - still_since >= DIRECT_LEG_STALL_S:
             debug_log.log(LOG, "direct leg to site %d stalled at %s -- falling back to the "
                                "recorded hops" % (b, xy))
-            return STALLED
+            return STALLED, (cx, cy)
     debug_log.log(LOG, "direct leg to site %d: not there after %.0fs -- falling back to the "
                        "recorded hops" % (b, DIRECT_LEG_MAX_S))
-    return STALLED
+    return STALLED, (cx, cy)
+
+
+def _resume_index(points, origin, x, y) -> int:
+    """Index of the marker ending the polyline stretch (origin -> points...) nearest (x, y)."""
+    best, best_d = 0, None
+    prev = origin
+    for i, (qx, qy) in enumerate(points):
+        vx, vy = qx - prev[0], qy - prev[1]
+        length2 = vx * vx + vy * vy
+        t = 0.0 if not length2 else max(0.0, min(1.0, ((x - prev[0]) * vx + (y - prev[1]) * vy)
+                                                    / length2))
+        cx, cy = prev[0] + t * vx, prev[1] + t * vy
+        d = (x - cx) ** 2 + (y - cy) ** 2
+        if best_d is None or d < best_d:
+            best, best_d = i, d
+        prev = (qx, qy)
+    return best
 
 
 # A leg is at most this many far clicks before the hops take over -- the longest leg (57
@@ -681,18 +870,20 @@ DIRECT_LEG_MAX_STRETCHES = 5
 
 
 def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
-    """Walk site `a` -> site `b` by hopping the recorded waypoints.
+    """Walk site `a` -> site `b` with STRAIGHT clicks: the stand tile itself whenever the
+    client can project it (viewport with the camera faced at it, else the minimap within
+    reach), otherwise the farthest of USER's markers still ahead. No marker-by-marker hops,
+    no shortcuts -- USER 2026-09-10: "click straight near the totems no small hops or
+    shortcuts"; "the markers are a guide not an enforcement". The markers only ever say where
+    to aim when the totem itself cannot be aimed at.
 
     NO ROUTER: worldmap has no collision data for Varlamore, so travel.walk_to cannot be used
-    here at all. These are the human's own tick-by-tick positions, so the path is known-good;
-    the risk is only that a discrete hop lands differently than a continuous run, which is what
-    the live checklist watches at the two log balances.
+    here at all; the game's own pathfinder walks whatever tile is clicked.
 
-    `after_first_hop` runs ONCE, immediately after the leg's first hop click is out and before
-    the remaining waypoints are clicked. USER 2026-09-09: "can only fletch after we give the
-    move command" -- a knife-on-log started while standing still is cancelled by the very next
-    walk click, so the fletch has to be issued with the player already on its way. That is the
-    hook; see tick() for the caller.
+    `after_first_hop` runs ONCE, immediately after the leg's first move click is out. USER
+    2026-09-09: "can only fletch after we give the move command" -- a knife-on-log started
+    while standing still is cancelled by the very next walk click, so the fletch has to be
+    issued with the player already on its way. That is the hook; see tick() for the caller.
     """
     points = route.leg_waypoints(a, b)
     if not points:
@@ -702,68 +893,50 @@ def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
     # ONE FAR CLICK, THEN HANDS OFF -- the human's shape, and the only one a fletch survives.
     # MEASURED 2026-09-09 from the recording: every fletch run (5-9 bows) has ZERO clicks
     # between the knife and the next site -- one "Walk here" on a tile up to 31 tiles away,
-    # then bows every 1.8s untouched. The bot's waypoint hops every ~2s each ended the fletch
-    # (anim 1248 started, no product, every leg), so decorations never got made. USER:
-    # "between each totem we should be able to craft enough bows for the next one".
-    # ONCE PER LEG. USER 2026-09-09: "just saw a fletch bow before clicking move basically
-    # just cancel the action" -- the second far click of a long leg ended the fletch the first
-    # had started, and the hook then re-issued knife/log/make for the tail. A walk click ALWAYS
-    # ends a make action (the recording's uninterrupted runs are the proof), so the fletch is
-    # started on the first move only; the first stretch is 24-28 tiles, 6+ bows, more than a
-    # totem needs. On a hop-only leg it fires after the LAST hop instead, whose final run to
-    # the site is the one stretch nothing clicks through.
-    fired = {"done": False}
-
+    # then bows every 1.8s untouched. ONCE PER LEG: a walk click ALWAYS ends a make action
+    # (the recording's uninterrupted runs are the proof), so the fletch is started on the
+    # first move only.
     def fire_hook():
         # Returns the hook's own verdict ("fletch" / "string" / False) because _direct_leg
-        # only watches the log reserve for a fletch it knows is running.
-        if after_first_hop is None or fired["done"]:
-            return False
-        fired["done"] = True
-        return after_first_hop()
+        # only watches the log reserve for a fletch it knows is running. Fired on EVERY
+        # stretch that is long enough or final (see _hook_due) -- the hook re-derives its
+        # budget live, so a restart after a click that ended the action is safe.
+        return False if after_first_hop is None else after_first_hop()
 
-    # A leg whose far click the game refused to path at all (MEASURED: 6->5, 4->3 and the
-    # 8->7 leg from the booth all stall at once, a cliff or a log balance between) is
-    # remembered, and the recorded hops take it from the start -- a 2s stall and a wasted
-    # fletch start per lap otherwise.
+    # A TARGET the game refused to path to is remembered PER TARGET, not per leg. MEASURED
+    # live 2026-09-10 (vt_markers4, 1->8): a viewport click straight at site 8's stand tile 46
+    # tiles off moved the player 5 tiles and stopped (the game's pathfinder gives up on that
+    # line -- the river); the next attempt skips that target and takes the farthest marker.
     no_direct = ctx.state.data.setdefault(NO_DIRECT_KEY, {})
-    stretches = 0
-    if not no_direct.get(str((a, b))):
-        for _ in range(DIRECT_LEG_MAX_STRETCHES):
-            verdict = _direct_leg(ctx, b, points, fire_hook)
-            if verdict == ARRIVED:
-                return True
-            if verdict == STRETCH:
-                stretches += 1
-                continue
-            if verdict == STALLED and stretches == 0 and _tiles_between(
-                    *(_player_xy() + route.SITES[a]["stand"])) <= ARRIVAL_TOLERANCE:
-                no_direct[str((a, b))] = True
-                debug_log.log(LOG, "leg %d->%d: the far click does not path from site %d -- "
-                                   "recorded hops from now on" % (a, b, a))
-            break               # nothing clickable, or stalled: the recorded hops from here
+    banned = no_direct.setdefault(str((a, b)), [])
+    skip = {tuple(t) for t in banned}
+    origin = route.SITES[a]["stand"]
+    sx, sy = route.SITES[b]["stand"]
 
-    # START FROM THE WAYPOINT NEAREST THE PLAYER, not always index 0. A leg is resumed mid-way
-    # far more often than it is started clean: after a bank trip (which leaves the player ON
-    # leg 8->7, beside the booth), after a restart, and after any hop this function had to
-    # retry. Replaying the leg from its first waypoint in those cases is a minimap click BACK
-    # toward the site we just left. The order stays forward from that index -- the waypoints
-    # are the human's own recorded path and only make sense walked in sequence.
-    x, y = _player_xy()
-    start = 0
-    if x is not None and y is not None:
-        start = min(range(len(points)),
-                    key=lambda i: _tiles_between(x, y, points[i][0], points[i][1]))
-
-    remaining = points[start:]
-    for index, (wx, wy) in enumerate(remaining):
-        if not travel._hop_to(ctx, wx, wy, route.PLANE):
-            debug_log.log(LOG, "leg %d->%d: hop to (%d,%d) failed" % (a, b, wx, wy))
+    # A BOUNDED CHAIN OF STRAIGHT CLICKS. Each iteration is one click: a far click at the
+    # farthest projectable candidate, or -- when nothing projects -- one minimap hop AT the
+    # stand tile, which travel._hop_to pulls in toward the player when it is beyond reach.
+    # A stalled click is retried from wherever the player stopped, its target banned.
+    for _ in range(DIRECT_LEG_MAX_STRETCHES):
+        if at_site(b):
+            return True
+        verdict, target = _direct_leg(ctx, b, points, fire_hook, origin, skip)
+        if verdict == ARRIVED:
+            return True
+        if verdict == STRETCH:
+            continue
+        if verdict == STALLED:
+            if target is not None and target not in skip:
+                skip.add(target)
+                banned.append(list(target))
+                debug_log.log(LOG, "leg %d->%d: the click at %s did not walk there -- "
+                                   "not tried again this session" % (a, b, target))
+            continue
+        # NO_CLICK: nothing projectable. One hop toward the totem itself.
+        if not travel._hop_to(ctx, sx, sy, route.PLANE):
+            debug_log.log(LOG, "leg %d->%d: hop toward site %d failed" % (a, b, b))
             return False
-        if index == len(remaining) - 1:
-            # The LAST move is out; the run from here to the site is the one stretch no
-            # further click interrupts, so this is where a fletch on a hop leg belongs.
-            fire_hook()
+        fire_hook()
 
     # POLL FOR ARRIVAL rather than returning on the last CLICK. That click released with
     # HOP_NEXT_CLICK_LEAD_TILES still to run (see ARRIVAL_TOLERANCE), so the player is still
@@ -782,18 +955,19 @@ def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
 
 
 def carve(ctx, site) -> bool:
-    """Carve ONE spirit into the totem.
+    """Carve the missing spirits into the totem: ONE Carve click, then the prompt answered as
+    many times as it reopens.
 
-    Re-reads the site immediately before choosing, because the wiki says the nearby trio can
-    change WHILE the player is carving -- so the spirit picked at build time may already be
-    wrong by the third carve. One carve per call; the caller loops on needs_carve.
+    USER 2026-09-10: "we dont have to click inbetween choosing each totem piece like 1 2 3
+    the menu will pop up after we choose one until we chose all three". Each spirit is
+    re-derived from a fresh read before it is chosen, because the wiki says the nearby trio
+    can change WHILE the player is carving. A prompt that does not reopen ends the call with
+    what was carved; the caller's ladder re-reads the site and clicks Carve again if needed.
     """
     n = site.number
     fresh = _site_now(n) or site
-    missing = vt.missing_spirits(fresh)
-    if not missing:
+    if not vt.missing_spirits(fresh):
         return False
-    spirit = missing[0]
 
     obj = site_object(n, "totem")
     if not obj:
@@ -805,21 +979,30 @@ def carve(ctx, site) -> bool:
     if not controller.click_entity(ctx.ser, obj, refresh_target=refresh,
                                    refresh_legs=SITE_REFRESH_LEGS):
         return False
-    if not _await_menu(ctx):
-        debug_log.log(LOG, "site %d: carve menu never opened" % n)
-        return False
-    if not choose_spirit(ctx, spirit):
-        return False
 
-    before = set(fresh.segment_values)
+    carved_any = False
+    for _ in range(3):
+        if not _await_menu(ctx):
+            if not carved_any:
+                debug_log.log(LOG, "site %d: carve menu never opened" % n)
+            return carved_any
+        fresh = _site_now(n) or fresh
+        missing = vt.missing_spirits(fresh)
+        if not missing:
+            return True
+        before = set(fresh.segment_values)          # BEFORE the key: the varbit can move fast
+        if not choose_spirit(ctx, missing[0]):
+            return carved_any
 
-    def landed():
-        after = _site_now(n)
-        return after is not None and set(after.segment_values) != before
+        def landed():
+            after = _site_now(n)
+            return after is not None and set(after.segment_values) != before
 
-    return bool(outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"],
-                                        CARVE_BUDGET_S, landed,
-                                        now_fn=_now, sleep_fn=_sleep))
+        if not outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"],
+                                       CARVE_BUDGET_S, landed, now_fn=_now, sleep_fn=_sleep):
+            return carved_any
+        carved_any = True
+    return True
 
 
 DECORATE_BUDGET_S = 6.0
@@ -842,7 +1025,7 @@ def find_item(name: str):
     return None
 
 
-def decorate(ctx, site) -> bool:
+def decorate(ctx, site, after_click=None) -> bool:
     """ONE Decorate click, confirmed on every bow in hand going on.
 
     USER 2026-09-09: "only need to click once to decorate i dont think it speeds it up", and
@@ -863,14 +1046,17 @@ def decorate(ctx, site) -> bool:
         return fresh is not None and fresh.decorations >= target
 
     budget = DECORATE_BUDGET_S + DECORATE_ACTION_S * (target - site.decorations)
-    return _click_site(ctx, n, "totem", budget, landed, option="Decorate")
+    return _click_site(ctx, n, "totem", budget, landed, option="Decorate", after_click=after_click)
 
 
 LOG_RESERVE_KEY = "vt_log_reserve"
 STRING_ABOVE_BOWS = 8            # two totems' worth in hand: string instead of fletching
 SPOOL_NAMES = ("Bow string spool",)
 SPOOL_DEAD_KEY = "vt_spool_dead"  # a spool that strung nothing (empty?) is not tried again
-STRING_START_BUDGET_S = 4.0
+SPOOL_STRIKES_KEY = "vt_spool_strikes"
+SPOOL_STRIKES = 2                 # failed uses before the spool is written off for the session
+STRING_START_BUDGET_S = 6.0       # recording: the first string lands +2.1s after the prompt
+STRING_PROMPT_WAIT_S = 1.5
 
 
 def bow_count(ctx, wood=None) -> int:
@@ -916,28 +1102,47 @@ def start_stringing(ctx) -> bool:
     if not controller.click_entity(ctx.ser, bow, offset=(0, 0), check_ui_blockers=False,
                                    simulate_mistakes=False):
         return False
-    # A make prompt, if the game asks: pick the strung bow by name.
-    if outcome_waits.await_pre(ctx, ["WIDGET_LOADED"], 1.5,
-                               lambda: skillmulti.showing(skillmulti.TITLE_MAKE),
-                               now_fn=_now, sleep_fn=_sleep):
+    # A prompt, if the game asks. The MAKE menu is answered by the strung bow's own number;
+    # any other group-270 prompt (a quantity prompt: one product, so nothing to choose) with
+    # Space, the key the human's recording uses. Missing the prompt was the first live
+    # failure: the string never started, and the spool was written off.
+    # SPACE FOLLOWS THE BOW CLICK WHETHER OR NOT A PROMPT WAS SEEN. MEASURED live 2026-09-10
+    # (vt_markers5 vs 6): the string landed only when Space was pressed; twice the prompt was
+    # not detected inside the wait, nothing was pressed, and the spool struck out. The
+    # human's recording presses Space ~0.8s after the bow click regardless, and Space with
+    # nothing open does nothing. Only a MAKE-titled menu (several products) is answered by
+    # the strung bow's own number instead.
+    outcome_waits.await_pre(ctx, ["WIDGET_LOADED"], STRING_PROMPT_WAIT_S,
+                            skillmulti.is_open, now_fn=_now, sleep_fn=_sleep)
+    if skillmulti.showing(skillmulti.TITLE_MAKE):
         widget = skillmulti.item_widget(ctx.state.config["strung"])
-        if widget:
-            option = skillmulti.option_number(widget)
-            if option is not None:
-                controller.key_tap(ctx.ser, str(option))
-            else:
-                controller.click_entity(ctx.ser, widget, offset=(0, 0),
-                                       check_ui_blockers=False, simulate_mistakes=False)
+        option = skillmulti.option_number(widget) if widget else None
+        if option is not None:
+            controller.key_tap(ctx.ser, str(option))
+        elif widget:
+            controller.click_entity(ctx.ser, widget, offset=(0, 0),
+                                   check_ui_blockers=False, simulate_mistakes=False)
         else:
             _close_prompt(ctx)
             return False
+    else:
+        controller.key_tap(ctx.ser, "SPACE")
     ok = bool(outcome_waits.await_pre(ctx, ["INVENTORY_CHANGED"], STRING_START_BUDGET_S,
                                       lambda: count_item(unstrung) < before,
                                       now_fn=_now, sleep_fn=_sleep))
     if not ok:
-        ctx.state.data[SPOOL_DEAD_KEY] = True
-        debug_log.log(LOG, "the spool strung nothing -- is it loaded? not trying it again "
-                           "this session")
+        # TWO STRIKES. MEASURED live 2026-09-10 (vt_markers4): the FIRST use strung nothing
+        # inside the budget and the spool was written off for the session, so every later
+        # leg fletched with 19 unstrung bows in hand. /last-action says what the bow click
+        # actually did, for the next diagnosis.
+        strikes = ctx.state.data.get(SPOOL_STRIKES_KEY, 0) + 1
+        ctx.state.data[SPOOL_STRIKES_KEY] = strikes
+        last = controller.get_last_action() or {}
+        debug_log.log(LOG, "the spool strung nothing (strike %d of %d; last action %r on %r)"
+                      % (strikes, SPOOL_STRIKES, last.get("option"), last.get("target")))
+        if strikes >= SPOOL_STRIKES:
+            ctx.state.data[SPOOL_DEAD_KEY] = True
+            debug_log.log(LOG, "not trying the spool again this session -- is it loaded?")
     return ok
 
 
@@ -965,6 +1170,13 @@ def _fletch_on_the_move(ctx) -> bool:
             and find_spool() and not data.get(SPOOL_DEAD_KEY)):
         return "string" if start_stringing(ctx) else False
     if vt.fletch_budget(state, count_item(ctx.state.config["log"]), bow_count(ctx)) <= 0:
+        # NOTHING WORTH FLETCHING, BUT UNSTRUNG BOWS IN HAND: string them. USER 2026-09-10:
+        # "nor is it stringing the bows" -- live (vt_markers2) the later legs held 5 logs all
+        # owed to builds and 6 unstrung bows, so the leg walked with the hands idle. Free XP
+        # on the same walk; a strung bow decorates just as well.
+        if (count_item(ctx.state.config["bow"]) > 0 and find_spool()
+                and not data.get(SPOOL_DEAD_KEY)):
+            return "string" if start_stringing(ctx) else False
         return False
     # What the fletch must NOT touch: one log per build still owed, the same reserve
     # fletch_budget spares. _direct_leg stops the fletch when the loose count reaches it.
@@ -1240,6 +1452,33 @@ def _await_bank_slot(name) -> bool:
     return False
 
 BANK_HOP_ATTEMPTS = 4
+BANK_DIRECT_BUDGET_S = 4.0     # on top of the walk: the click, the approach, the interface
+
+
+def _open_bank_direct(ctx) -> bool:
+    """Click the booth from where we stand and wait for the interface, walk budgeted.
+    Not from the booth's own stand tile: there banker.open_bank's click is the same thing."""
+    entry = route.BANK
+    px, py = _player_xy()
+    if px is not None and _tiles_between(px, py, *entry["stand"]) <= ARRIVAL_TOLERANCE:
+        return False
+    booth = controller.get_object_at(entry["tile"][0], entry["tile"][1], route.PLANE,
+                                     entry["object_id"])
+    if not booth or not booth.get("onScreen", True):
+        return False
+    refresh = controller.object_refresh_target(entry["tile"][0], entry["tile"][1],
+                                              route.PLANE, entry["object_id"])
+    if not controller.click_entity(ctx.ser, booth, refresh_target=refresh,
+                                   refresh_legs=SITE_REFRESH_LEGS):
+        return False
+    tiles = booth.get("distance") or (0 if px is None else _tiles_between(px, py, *entry["stand"]))
+    budget = BANK_DIRECT_BUDGET_S + tiles * outcome_waits.WALK_S_PER_TILE
+    opened = bool(outcome_waits.await_pre(ctx, ["WIDGET_LOADED"], budget, banker.is_open,
+                                          now_fn=_now, sleep_fn=_sleep))
+    debug_log.log(LOG, "bank: direct booth click %s" % ("opened the bank" if opened
+                                                       else "did not open the bank -- hopping"))
+    return opened
+
 
 
 def _walk_to_bank(ctx) -> bool:
@@ -1265,6 +1504,12 @@ def _walk_to_bank(ctx) -> bool:
     return False
 
 
+def _exact_stock(memory, name: str) -> int:
+    """Remembered quantity of the item called exactly `name` (case-insensitive)."""
+    return sum(int(item.get("quantity") or 0) for item in (memory.items or [])
+               if (item.get("name") or "").strip().lower() == name.strip().lower())
+
+
 def bank_trip(ctx) -> bool:
     """Walk to the booth, then Withdraw-All logs / close / Fill the basket for three rounds --
     the recording's own sequence.
@@ -1276,7 +1521,10 @@ def bank_trip(ctx) -> bool:
     standing beside it, and the caller (tick) has already established we are on a BANK_SITES
     site, which is the only place this walk is short and recorded.
     """
-    if not _walk_to_bank(ctx):
+    # ONE DIRECT CLICK ON THE BOOTH FROM THE SITE (~21 tiles): the game walks there and opens
+    # on arrival. USER 2026-09-10: "click the banker directly after the decoration is done.
+    # that way we save a bit of time not doing hop -> click bank". The hop is the fallback.
+    if not _open_bank_direct(ctx) and not _walk_to_bank(ctx):
         return False
     # OUT OF THIS WOOD? The bank memory (every tab, search or not) answers before the first
     # withdraw; 0 -- known empty, never "never seen" -- steps the wood down one.
@@ -1284,8 +1532,11 @@ def bank_trip(ctx) -> bool:
     # "0 Yew logs" with 129 in the bank and the routine withdrew maple (USER: "it just withdrew
     # maple when yew still exist"). The whole bank is one read per bank trip, and the answer
     # is trusted only when the memory has actually SEEN a populated bank.
+    # EXACT NAME, not bank_memory.quantity's substring match. MEASURED live 2026-09-10
+    # (vt_markers1): with no Yew logs banked at all, "Abyssal lantern (yew logs)" counted as
+    # one, the fallback never fired, and the run stopped at the booth holding maple.
     memory = bank_memory.load()
-    quantity = memory.quantity(ctx.state.config["log"]) if memory is not None else None
+    quantity = _exact_stock(memory, ctx.state.config["log"]) if memory is not None else None
     if memory is not None and memory.seen and len(memory.items or []) > 0 and quantity == 0:
         fallback = WOOD_FALLBACK.get(ctx.state.config["wood"])
         if not fallback:
@@ -1342,6 +1593,7 @@ def bank_trip(ctx) -> bool:
 
 
 SITE_MAX_ACTIONS = 12     # claim + build + 3 carves + 4 decorates is 9; 12 is a ceiling
+SITE_ACTION_RETRIES = 1   # a failed action is tried once more before the visit ends
 STALL_STOP_TICKS = 40
 LEG_MAX_ATTEMPTS = 3      # a transient un-projectable hop point is not a broken route
 
@@ -1352,7 +1604,7 @@ LEG_MAX_ATTEMPTS = 3      # a transient un-projectable hop point is not a broken
 _ACTIONS = ("claim", "build", "carve", "decorate")
 
 
-def work_site(ctx, site_number: int) -> bool:
+def work_site(ctx, site_number: int, during_decorate=None) -> bool:
     """Run the ladder at one site until it reports done, an action fails, or the ceiling.
 
     The ceiling is load-bearing: every action here confirms against the reader, so an action
@@ -1360,21 +1612,63 @@ def work_site(ctx, site_number: int) -> bool:
     action ends the visit rather than retrying -- the caller walks on and the next lap sees the
     site again, which is cheaper than spinning in front of it.
     """
+    # AT THE BANK SITE WITH A TRIP DUE, THE CAMERA TURNS TOWARD THE BOOTH WHILE THE
+    # DECORATION RUNS, so the booth is on screen for one direct click afterwards. USER
+    # 2026-09-10: "while decorating we can adjust camera if needed and click the banker
+    # directly after the decoration is done. that way we save a bit of time not doing hop ->
+    # click bank".
+    if during_decorate is None and site_number in BANK_SITES:
+        state = read_state()
+        if state is not None and _bank_trip_due(ctx, state):
+            during_decorate = lambda: _face_booth(ctx)
+    done_actions = []
+    failed = {}
     for _ in range(SITE_MAX_ACTIONS):
         site = _site_now(site_number)
         if site is None:
             return False
-        action, argument = vt.next_action(
-            site, logs=count_item(ctx.state.config["log"]),
-            bows=bow_count(ctx, site.wood if site.base_value else None))
+        logs = count_item(ctx.state.config["log"])
+        bows = bow_count(ctx, site.wood if site.base_value else None)
+        action, argument = vt.next_action(site, logs=logs, bows=bows)
         if action == "done":
+            _log_site_outcome(ctx, site, done_actions, logs, bows)
             return True
         handler = globals().get(action) if action in _ACTIONS else None
+        if action == "decorate" and during_decorate is not None:
+            handler = lambda c, st: decorate(c, st, after_click=during_decorate)
         if handler is None or not handler(ctx, site):
-            debug_log.log(LOG, "site %d: %s did not land" % (site_number, action))
-            return False
+            # ONE RETRY, re-read first. MEASURED live 2026-09-10 (vt_markers4, site 4): a
+            # single build click that did not land ended the visit and the totem was skipped
+            # for the whole lap (USER: "skipped a totem"). A second try costs a click; the
+            # skip costs a lap.
+            retried = failed.get(action, 0) + 1
+            failed[action] = retried
+            debug_log.log(LOG, "site %d: %s did not land%s"
+                          % (site_number, action, " -- retrying" if retried <= SITE_ACTION_RETRIES
+                             else ""))
+            if retried > SITE_ACTION_RETRIES:
+                return False
+            continue
+        done_actions.append(action)
     debug_log.log(LOG, "site %d: hit the action ceiling" % site_number)
     return False
+
+
+def _log_site_outcome(ctx, site, done_actions, logs: int, bows: int) -> None:
+    """ONE line per site visit saying what was done and what the totem looks like on leaving.
+    USER 2026-09-10: "Add a log for finishing totems too since its not built one in 3 hops"
+    -- the site work was invisible in the log except as clicks, so three sites skipped for
+    want of logs looked like three sites finished."""
+    log_name = ctx.state.config["log"]
+    if not site.base_value:
+        state = "unbuilt" + ("" if logs else " (no %s)" % log_name)
+    elif not site.base_carved:
+        state = "%s totem carved %d/3" % (site.wood.title(), sum(1 for v in site.segment_values if v))
+    else:
+        state = "%s totem, %d/4 decorations" % (site.wood.title(), site.decorations)             + ("" if site.decorations >= 4 or bows else " (no bows)")
+    debug_log.log(LOG, "site %d: %s -> %s; %d %s, %d bows in hand"
+                  % (site.number, ", ".join(done_actions) or "nothing to do", state,
+                     logs, log_name, bows))
 
 
 def progress_signature(state, site_number=None):

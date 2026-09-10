@@ -2,14 +2,15 @@
 
 An ACCELERATOR, never truth -- the same rule trawling_routes.py states. The live reader
 (GET /api/minigames/vale-totems) decides WHAT to do at a site; this table only says where to
-walk. Site ids and tiles were MEASURED from recordings/2026-09-08_135457_vale-totem.*.
+walk. Site ids and tiles were MEASURED from recordings/2026-09-08_135457_vale-totem.*; the
+legs are USER's ground markers (2026-09-10).
 
 WHY WAYPOINTS AND NOT worldmap.find_path: worldmap.py has NO usable collision data for any of
 Varlamore. MEASURED 2026-09-08 -- reachable_from(radius=40) answers 1 tile at every totem site,
 at the bank, at Civitas illa Fortis, at Aldarin and at the Hunter guild, and find_path between
-any two sites answers None. So the routine walks the path the human actually walked: these are
-their own tick-by-tick positions, simplified to ~10-tile steps, six of the eight legs
-cross-checked against a second traversal.
+any two sites answers None. So the routine walks a fixed table of click targets: USER's own
+ground markers of the optimal lap (2026-09-10), which replaced the human recording's
+tick-by-tick positions.
 """
 
 PLANE = 0
@@ -38,23 +39,22 @@ RING = (6, 5, 4, 3, 2, 1, 8, 7)
 
 BANK = {"object_id": 57330, "tile": (1416, 3351), "stand": (1416, 3350)}
 
-# Agility shortcuts standing ON the recorded path -- 56990 is one tile off leg 4->3's second
-# waypoint. Recorded so a live failure there is recognisable; nothing reads them yet.
-LOG_BALANCES = {56990: (1401, 3290), 56991: (1453, 3335)}
-
+# ONE CLICK PER STRETCH: USER's own ground markers of "the most optimal path" (2026-09-10),
+# decoded from region coordinates. Each tuple is the sequence of click targets from site a's
+# stand tile, the last one being site b's stand tile itself; every stretch is at most 24
+# tiles, travel.WALK_HOP_MAX_TILES, so any of them is one minimap click or one viewport
+# click with the camera facing the leg. The (3, 2) leg is the markers' "LOG BASKET / NO BANK"
+# line -- the Nemus Retreat Bank buffalo branch ("11 - BANK" / "DETOUR EXIT") is deliberately
+# not used: the basket carries the lap, and banking stays at the Auburnvale booth.
 LEGS = {
-    (6, 5): ((1477, 3330), (1473, 3319), (1463, 3314), (1453, 3313), (1443, 3315), (1438, 3307)),
-    (5, 4): ((1438, 3307), (1435, 3317), (1424, 3318), (1422, 3307), (1420, 3297), (1412, 3288),
-             (1412, 3287)),
-    (4, 3): ((1412, 3287), (1402, 3290), (1396, 3281), (1387, 3275), (1386, 3275)),
-    (3, 2): ((1386, 3275), (1381, 3285), (1372, 3291), (1361, 3296), (1355, 3305), (1350, 3314),
-             (1347, 3318)),
-    (2, 1): ((1347, 3318), (1351, 3328), (1359, 3335), (1368, 3343), (1368, 3354), (1365, 3365),
-             (1370, 3373)),
-    (1, 8): ((1370, 3374), (1377, 3365), (1385, 3359), (1385, 3349), (1393, 3340), (1398, 3331)),
-    (8, 7): ((1398, 3331), (1405, 3339), (1412, 3347), (1422, 3348), (1433, 3346), (1443, 3345),
-             (1451, 3341)),
-    (7, 6): ((1451, 3341), (1453, 3331), (1461, 3324), (1473, 3322), (1478, 3331)),
+    (7, 6): ((1453, 3336), (1466, 3320), (1477, 3331)),
+    (6, 5): ((1468, 3314), (1455, 3313), (1437, 3305)),
+    (5, 4): ((1422, 3307), (1413, 3287)),
+    (4, 3): ((1401, 3291), (1386, 3274)),
+    (3, 2): ((1369, 3294), (1346, 3318)),
+    (2, 1): ((1362, 3337), (1368, 3354), (1369, 3375)),
+    (1, 8): ((1383, 3363), (1385, 3346), (1397, 3329)),
+    (8, 7): ((1415, 3339), (1435, 3346), (1453, 3340)),
 }
 
 

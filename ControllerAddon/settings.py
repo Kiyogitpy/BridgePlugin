@@ -52,6 +52,19 @@ PAUSE_BEEP_DURATION_MS = 180
 PANIC_BEEP_HZ = 150      # much deeper than either pause tone -- the emergency-exit hotkey
 PANIC_BEEP_DURATION_MS = 250
 
+# ---------------- Camera yaw turn by middle-mouse drag (controller.face_toward, 2026-09-10) ----------------
+# The human's vale-totem recording (2026-09-10) turns the camera with middle-mouse drags of
+# 89-360px, each right before a far viewport click, to click a distant object directly instead
+# of minimap-hopping. These back controller.drag_middle / face_toward.
+CAMERA_YAW_TOLERANCE = 120          # yaw units (of 2048) within which the target is "up the screen" -- no turn
+CAMERA_DRAG_MAX_PX = 360            # the human's longest single drag; a bigger turn is split into several
+CAMERA_DRAG_MARGIN_PX = 40          # keep a drag this far inside the canvas edge (a maximized window clamps)
+CAMERA_UNITS_PER_PX_DEFAULT = 0.95  # yaw units (of 2048) per dragged pixel. MEASURED live 2026-09-10 on this
+                                    # client: 334/352, 336/360, 348/360, 312/337; self-calibrates after the first drag
+CAMERA_DRAG_SIGN_DEFAULT = -1       # a LEFTWARD (-px) drag INCREASES yaw here (same measurement); learned per drag
+CAMERA_MAX_DRAGS = 4                # give up facing after this many drags (a backwards client costs one to learn)
+CAMERA_DRAG_SETTLE_S = 1.5          # wait at most this long for the camera to finish interpolating after a drag
+
 # ---------------- Human-like aiming ----------------
 DEFAULT_AIM_RADIUS = 10         # px; move_to_human's own fallback when a caller doesn't specify one
 ENTITY_AIM_RADIUS = 3           # px; used by click_entity -- tighter than the generic default since

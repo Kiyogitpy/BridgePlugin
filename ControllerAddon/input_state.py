@@ -85,3 +85,13 @@ fidget_ser = None
 # fidget_ser: the engine fidgets through human_delay on __main__'s copy of controller.py and a
 # routine through fidget_once on the other, and they must agree on one anchor.
 fidget_anchor = None
+
+# Camera-yaw drag calibration for controller.face_toward (2026-09-10). Both are learned from
+# the first real drag of a session and refined after every one; None/1 are the pre-learning
+# guesses. Mirrored here for the same two-copies reason as fidget_ser: face_toward is called
+# from a routine (the `controller` copy) but the values are a property of the machine, so both
+# copies must read one estimate. camera_units_per_px is the MAGNITUDE (yaw units per dragged
+# pixel); camera_drag_sign is +1 if a rightward drag increases yaw on this client, -1 if it
+# decreases it (RuneLite's "Right-click moves camera" clients differ, and it is not assumed).
+camera_units_per_px = None
+camera_drag_sign = -1     # settings.CAMERA_DRAG_SIGN_DEFAULT; MEASURED 2026-09-10, a -352px drag gave +334 units

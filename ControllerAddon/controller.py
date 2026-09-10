@@ -1507,6 +1507,14 @@ def mouse_right_click(ser: serial.Serial) -> None:
     send_line(ser, "MRC")
 
 
+def mouse_middle_down(ser: serial.Serial) -> None:
+    send_line(ser, "MMD")
+
+
+def mouse_middle_up(ser: serial.Serial) -> None:
+    send_line(ser, "MMU")
+
+
 def right_click_human(ser: serial.Serial) -> None:
     debug_log.log("action", f"right_click_human at {get_cursor_pos()}")
     mouse_right_down(ser)
@@ -2524,6 +2532,138 @@ def rotate_camera_to_reveal(ser: serial.Serial, x) -> None:
 
     debug_log.log("!", f"Target is off-screen -- rotating camera ({key}) to bring it into view")
     nudge_camera_yaw(ser, key)
+
+
+# --- Camera yaw turn by middle-mouse drag (face_toward, 2026-09-10) ---------------------------
+#
+# A human clicks a distant object directly by flicking the camera toward it first (the
+# 2026-09-10 vale-totem recording: six middle-mouse drags of 89-360px, each right before a far
+# viewport click). This turns the camera so a world tile sits straight up the screen, where the
+# viewport reaches farthest, then the caller re-resolves and clicks it.
+#
+# Yaw convention, derived from RuneLite's Perspective.localToCanvas: screen-right is
+# x*cos(yaw)+y*sin(yaw) and "up the screen" (toward the far distance) is y*cos(yaw)-x*sin(yaw),
+# with local x east and y north. That is maximised for a vector (dx east, dy north) at
+# yaw == -atan2(dx, dy). Yaw is in 2048ths of a turn, the same unit client.getCameraYaw() uses.
+
+def yaw_for_bearing(px: int, py: int, tx: int, ty: int) -> int:
+    """The camera yaw (0..2047) that puts world tile (tx, ty) straight up the screen from the
+    player at (px, py). North up is 0, east up is 1536, south 1024, west 512."""
+    dx, dy = tx - px, ty - py
+    if dx == 0 and dy == 0:
+        return 0
+    units = -math.atan2(dx, dy) / (2 * math.pi) * 2048
+    return int(round(units)) % 2048
+
+
+def yaw_delta(cur: int, target: int) -> int:
+    """Shortest signed turn from cur to target, in (-1024, 1024] yaw units."""
+    return ((target - cur + 1024) % 2048) - 1024
+
+
+def drag_middle(ser: serial.Serial, dx: int, dy: int = 0) -> None:
+    """Hold the middle mouse button and move dx/dy pixels -- the human's camera-turn gesture,
+    which sends NO camera packet to the server (unlike the arrow keys). Repositions first if the
+    drag would run off the canvas (a maximized window clamps the cursor, shortening the turn).
+
+    The MMD press is sent and given a beat to be consumed BEFORE the flight, because the
+    firmware's X (flush) drops QUEUED button commands -- see the firmware header and CLAUDE.md.
+    A real move_to_human flight with a button held is a drag, not a click."""
+    st = get_state() or {}
+    left = st.get("canvasScreenX", 0)
+    top = st.get("canvasScreenY", 0)
+    width = st.get("canvasWidth", 0) or st.get("viewportWidth", 0)
+    height = st.get("canvasHeight", 0) or st.get("viewportHeight", 0)
+    sx, sy = get_cursor_pos()
+
+    # Keep both ends of the drag inside the canvas, a margin off each edge.
+    lo_x, hi_x = left + CAMERA_DRAG_MARGIN_PX, left + width - CAMERA_DRAG_MARGIN_PX
+    lo_y, hi_y = top + CAMERA_DRAG_MARGIN_PX, top + height - CAMERA_DRAG_MARGIN_PX
+    want_x = min(max(sx, lo_x - min(dx, 0)), hi_x - max(dx, 0)) if width else sx
+    want_y = min(max(sy, lo_y - min(dy, 0)), hi_y - max(dy, 0)) if height else sy
+    if (want_x, want_y) != (sx, sy):
+        move_to_human(ser, int(want_x), int(want_y))
+        sx, sy = want_x, want_y
+
+    mouse_middle_down(ser)
+    human_delay(0.04, 0.09)          # let the firmware consume the press before the flight
+    move_to_human(ser, int(sx + dx), int(sy + dy))
+    mouse_middle_up(ser)
+    human_delay(0.05, 0.12)
+
+
+# The bridge's cameraYaw is Client.getCameraYaw(): JAU14, "each unit is equivalent to
+# 2pi/(2^14) radians" (runelite-api Client.java), i.e. 8 per 2048th-of-a-turn unit the
+# arithmetic above uses. MEASURED live 2026-09-10: /state read 7904 and 11104 while this
+# code assumed 0..2047, so every drag was computed from a garbage angle.
+CAMERA_JAU14_PER_UNIT = 8
+
+
+def _camera_yaw_units():
+    """The camera yaw in 2048ths of a turn, or None when the bridge cannot answer."""
+    yaw = (get_state() or {}).get("cameraYaw")
+    return None if yaw is None else (yaw / CAMERA_JAU14_PER_UNIT) % 2048
+
+
+def face_toward(ser: serial.Serial, tx: int, ty: int, px=None, py=None) -> bool:
+    """Turn the camera so world tile (tx, ty) is up the screen, by middle-mouse drag. Returns
+    True once it is within CAMERA_YAW_TOLERANCE, False if it could not get there within
+    CAMERA_MAX_DRAGS. Self-calibrates: the units-per-pixel magnitude and the drag direction are
+    measured from each real drag and kept in input_state (shared across controller's two copies).
+
+    Sends no input at all when the target is already up the screen -- cheap to call per leg."""
+    if px is None or py is None:
+        pl = get_player() or {}
+        px, py = pl.get("x"), pl.get("y")
+        if px is None or py is None:
+            return False
+    target = yaw_for_bearing(px, py, tx, ty)
+
+    for _ in range(CAMERA_MAX_DRAGS):
+        yaw = _camera_yaw_units()
+        if yaw is None:
+            return False
+        delta = yaw_delta(yaw, target)
+        if abs(delta) <= CAMERA_YAW_TOLERANCE:
+            return True
+
+        rate = (input_state.camera_units_per_px or CAMERA_UNITS_PER_PX_DEFAULT) \
+            * input_state.camera_drag_sign          # signed yaw units per +1px drag, our estimate
+        dx = int(round(delta / rate))
+        dx = max(-CAMERA_DRAG_MAX_PX, min(CAMERA_DRAG_MAX_PX, dx))
+        if dx == 0:
+            dx = CAMERA_DRAG_MAX_PX if delta > 0 else -CAMERA_DRAG_MAX_PX
+
+        before = yaw
+        drag_middle(ser, dx)
+        _wait_camera_settled()
+        after = _camera_yaw_units()
+        if after is None:
+            return False
+        moved = yaw_delta(before, after)
+        debug_log.log("camera", f"drag {dx:+d}px: yaw {before:.0f} -> {after:.0f} "
+                                f"(target {target}, {moved:+.0f} units)")
+        if moved != 0:                              # learn the real signed rate from this drag
+            observed = moved / dx
+            input_state.camera_units_per_px = abs(observed)
+            input_state.camera_drag_sign = 1 if observed >= 0 else -1
+
+    yaw = _camera_yaw_units()
+    ok = yaw is not None and abs(yaw_delta(yaw, target)) <= CAMERA_YAW_TOLERANCE
+    if not ok:
+        debug_log.log("!", f"face_toward: camera not on ({tx},{ty}) after {CAMERA_MAX_DRAGS} drags")
+    return ok
+
+
+def _wait_camera_settled() -> None:
+    """Block until the camera finishes interpolating (cameraYaw == cameraYawTarget), at most
+    CAMERA_DRAG_SETTLE_S -- a screen position read before it settles is aimed at the old angle."""
+    deadline = time.monotonic() + CAMERA_DRAG_SETTLE_S
+    while time.monotonic() < deadline:
+        st = get_state() or {}
+        if st.get("cameraYaw") == st.get("cameraYawTarget"):
+            return
+        time.sleep(0.05)
 
 
 # NOTE: every provider (NPCProvider, GroundItemProvider, InventoryProvider,

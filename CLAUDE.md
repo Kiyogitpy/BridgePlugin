@@ -1678,8 +1678,9 @@ already committed and fully unit-tested before this task started.
   `reachable_from(radius=40)` returns a single tile at every totem site, at the bank, at Civitas
   illa Fortis, at Aldarin and at the Hunter guild, while the same call at Varrock square returns
   5089 tiles -- the EthanApi map this repo's routing runs on predates this content entirely, not
-  a tuning gap. So the routine walks **recorded waypoints** (`vale_totem_route.py`, one tile per
-  tick off the user's own walked path) rather than a computed route, and -- the direct
+  a tuning gap. So the routine walks a **fixed table of click targets** (`vale_totem_route.py`
+  -- USER's own ground markers since 2026-09-10, one click per stretch; before that the
+  recording's tick-by-tick positions) rather than a computed route, and -- the direct
   consequence -- **it has no way to walk from an arbitrary tile back into the ring**, so it must
   be started standing in the valley; a player found outside safety-stops instead of trying to
   improvise a way home, the same rule `wintertodt.py` applies to its own region check.
@@ -1803,9 +1804,85 @@ Four things were MEASURED, and the first is not about this routine at all:
   only ever yields as many logs as there are free slots, so with 15+ bows in hand it hands
   over 4-8 logs -- enough for the next builds, and the reason the bank check counts the
   basket rather than the loose logs.
-- Still unanswered from the spec's checklist: the two log balances on legs 4->3 and near site
-  7 (item 3), whether `nearbySpirits` really rotates mid-carve (item 4), the claim-and-pass
-  branch (item 6), and any non-yew wood (item 7).
+- **THE LEGS ARE STRAIGHT CLICKS AT THE TOTEM; USER'S GROUND MARKERS ARE A GUIDE (2026-09-10, eight
+  live runs vt_markers1-8 on the HOST, a full lap in ~4.5 min with every site built, carved
+  and decorated).** USER pasted two RuneLite ground-marker sets ("the most optimal path"):
+  white 1-8 are the totem sites in walking order (their 1 is `SITES[7]`, same ring direction),
+  cyan 1-20 one click per stretch, decoded as `x = (regionId >> 8) * 64 + regionX`,
+  `y = (regionId & 0xFF) * 64 + regionY`. `LEGS` is that table, each leg ending ON the
+  destination stand tile; the label arrows are the next click's heading (USER) and unused.
+  Decisions, all USER's, in the order they were made: the "11 - BANK"/"DETOUR EXIT" markers
+  (the Nemus Retreat **Bank buffalo**, loc 55199 at (1387,3310)) are NOT used -- "we have a
+  log basket we can ignore the bank", banking stays at the Auburnvale booth from site 8; the
+  two Log balances (56990 at (1401,3290), 56991 at (1453,3335), `op1=Walk-across`) were
+  clicked for two runs and then REMOVED -- "adding the shortcuts introduces more fail vectors
+  lets just remove them and click straight near the totems no small hops or shortcuts" --
+  and MEASURED both crossings path fine without them (7->6 and 4->3 walked round the river);
+  "they are guidelines not meant as a hop": `walk_leg` is a bounded chain
+  (`DIRECT_LEG_MAX_STRETCHES`) of straight clicks whose candidates are the STAND TILE, then
+  points every 3 tiles along the straight line toward it (`_line_candidates`, farthest that
+  projects wins), then the markers still ahead (`_ahead`, the polyline projection), and only
+  when nothing projects ONE minimap hop at the stand tile (travel pulls it in). A target the
+  game would not walk to (2s stall) is banned PER TARGET for the session, never the leg.
+  - **A far tile is refused by `isOnScreen`, not by the camera.** MEASURED: from the booth,
+    site 7's stand tile 37 tiles out projected ABOVE the viewport's top edge at USER's pitch
+    while the ground short of it was on screen -- `isOnScreen` is a bounds test on the real
+    viewport. That is what the straight-line candidates answer. With the camera faced at
+    the leg a viewport click reached 46-48 tiles on some legs.
+  - **`Client.getCameraYaw()` is JAU14 (0..16383), 8 per 2048th** -- `face_toward` assumed
+    0..2047 and every drag was aimed from a garbage angle (USER: "the camera implementation
+    doesnt seem to work as intended"). Fixed in `controller._camera_yaw_units`; MEASURED
+    live: a -352px drag gives +334 units, i.e. 0.95 units/px with a LEFTWARD drag INCREASING
+    yaw, now the defaults (`CAMERA_UNITS_PER_PX_DEFAULT`, `CAMERA_DRAG_SIGN_DEFAULT`); a
+    720-unit turn is two drags, on target. Every drag logs `[camera] drag Npx: yaw A -> B`.
+    `KEEP_CAMERA = True` for this routine (USER: the login reset "puts camera entirely above
+    us looking down meaning the camera skew wont do anything").
+  - **The fletch/string fires on EVERY stretch of `HOOK_MIN_STRETCH_TILES` (12) or more and
+    on the final one**, restarting after the click that ended it (USER, after a
+    final-stretch-only draft left a 48-tile run idle: "no stringing on that long walk?").
+    **The fletch is ended by STARTING THE SPOOL, not by a walk click** (USER, after the
+    run: "use the spool to start stringing to interupt it instead ... no new walk click
+    will be needed and it can be done mid walk"), at the build reserve OR once
+    `STRING_ABOVE_BOWS` (8) unstrung bows are in hand; only with no usable spool does the
+    old walk re-click run, and that one RE-PROJECTS the target tile (`_walk_point_now`):
+    re-clicking the original PIXEL after six tiles of running mapped 17 tiles past site 5.
+    Not yet run live in this form.
+  - **The logs in hand decide the wood** (`_wood_override`): a restart wiped the bank trip's
+    maple switch, the panel said YEW, and three sites were claimed and skipped for "Yew logs:
+    0" with 16 Maple logs carried (USER: "its not built one in 3 hops"). Bank stock is the
+    EXACT item name (`_exact_stock`): `bank_memory.quantity`'s substring match counted
+    "Abyssal lantern (yew logs)" as one Yew log and the fallback never fired.
+  - **Claim only a CAPPED pile** (`vt.OFFERING_CAP` 15,000, the reader's own; a build on a
+    capped pile is refused) -- USER: "skip picking up vale offerings since they stack up on
+    the floor and i can pick them later". **Carve is ONE click then the reopening prompt
+    answered up to three times** (USER: "the menu will pop up after we choose one until we
+    chose all three"); `before` is snapshotted BEFORE the key, the varbit moves fast. A
+    failed site action gets ONE retry (`SITE_ACTION_RETRIES`) -- a single failed build had
+    skipped a totem for a lap. **One outcome line per site**
+    (`site N: build, carve, decorate -> Maple totem, 4/4 decorations; 9 Maple logs, 5 bows
+    in hand`) -- USER: "Add a log for finishing totems too".
+  - **The pre-hover TRACKS the totem until the player stops** (`_prehover_first_action`):
+    at_site fires 7 tiles out, the hover flight ended with the player still running and
+    the projection slid out from under the cursor (USER: "the click while moving often
+    misses" -- "the cursor hover while approaching"); the cursor now follows the live
+    projection whenever it has drifted `PREHOVER_TRACK_DRIFT_PX` until `/player.moving`
+    is false. The site clicks themselves never missed in runs 6-8 (three object clicks
+    for three actions at every site); what the eye saw was the parked hover.
+  - **At site 8 with a trip due, the decorate click's confirm wait turns the camera toward
+    the booth and the trip then CLICKS THE BOOTH DIRECTLY from the site** (~21 tiles; the
+    game walks there and opens on arrival), the hop to the stand tile only as the fallback
+    -- USER: "click the banker directly after the decoration is done. that way we save a
+    bit of time not doing hop -> click bank". `banker.open_bank`'s own 12-tile "too far"
+    guard is exactly that hop, which is why the routine opens the bank before calling it.
+    Not yet run live in this form.
+  - **The spool needs SPACE after the bow click, pressed blind** (the human's recording;
+    Space with nothing open does nothing) -- twice the prompt was not detected inside the
+    wait, nothing was pressed and the spool was written off on ONE strike; now
+    `SPOOL_STRIKES` (2) and the confirm is 6s. With nothing worth fletching (all logs owed to
+    builds) and unstrung bows in hand, the leg strings (USER: "nor is it stringing the bows").
+- Still unanswered from the spec's checklist: whether `nearbySpirits` really rotates mid-carve
+  (item 4), the claim-and-pass branch (item 6), and any non-yew wood (item 7). Item 3 (the log
+  balances) is now a designed crossing rather than an open question, unverified live.
 
 ## Current state of routines/granite_3t.py
 

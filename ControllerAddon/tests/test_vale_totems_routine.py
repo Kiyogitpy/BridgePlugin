@@ -8,6 +8,7 @@ import bank_memory
 
 _REAL_WALK_TO_SITE = vtr_routine._walk_to_site   # the autouse fixture stubs it; leg tests want it back
 _REAL_DEPOSIT_JUNK = vtr_routine._deposit_junk
+_REAL_PREHOVER = vtr_routine._prehover_first_action   # the autouse fixture stubs it too
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +33,10 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_minimap_walk_point",
                         lambda x, y, p, inst=False: {"onMinimap": False})
     monkeypatch.setattr(controller, "is_point_on_minimap_orb", lambda x, y: None)
+    # face_toward drives the Arduino (middle-mouse drag); off by default so existing walk_leg
+    # tests exercise the waypoint hops. The camera tests below override it explicitly.
+    monkeypatch.setattr(controller, "face_toward",
+                        lambda ser, tx, ty, px=None, py=None: False)
     monkeypatch.setattr(travel, "_click_walk_point",
                         lambda ctx, point, shift: pytest.fail("unexpected viewport walk click"))
 
@@ -340,56 +345,28 @@ def _standing_at(monkeypatch, x, y):
     monkeypatch.setattr(controller, "get_player", lambda: {"x": x, "y": y, "plane": 0})
 
 
-def test_walk_leg_hops_every_recorded_waypoint_in_order(monkeypatch):
-    _fake_clock(monkeypatch)
-    hops = []
-    monkeypatch.setattr(travel, "_hop_to",
-                        lambda ctx, x, y, plane, **k: hops.append((x, y)) or True)
-    # Standing on site 6's stand tile, i.e. the start of the leg: every waypoint is walked.
-    _standing_at(monkeypatch, *route.SITES[6]["stand"])
-    # The arrival poll reads the player's position too, so it has to end up at site 5 for the
-    # leg to be an arrival -- move the player there once the last hop has been issued.
-    end = route.SITES[5]["stand"]
-
-    def hop(ctx, x, y, plane, **k):
-        hops.append((x, y))
-        if len(hops) == len(route.leg_waypoints(6, 5)):
-            _standing_at(monkeypatch, *end)
-        return True
-
-    monkeypatch.setattr(travel, "_hop_to", hop)
-    assert vtr_routine.walk_leg(_ctx_only(), 6, 5) is True
-    assert hops == list(route.leg_waypoints(6, 5))
-
-
-def test_walk_leg_stops_at_the_first_hop_that_fails(monkeypatch):
-    _fake_clock(monkeypatch)
-    hops = []
-
-    def hop(ctx, x, y, plane, **k):
-        hops.append((x, y))
-        return len(hops) < 3
-
-    monkeypatch.setattr(travel, "_hop_to", hop)
-    _standing_at(monkeypatch, *route.SITES[6]["stand"])
-    assert vtr_routine.walk_leg(_ctx_only(), 6, 5) is False
-    assert len(hops) == 3
-
-
-def test_walk_leg_resumes_from_the_waypoint_nearest_the_player(monkeypatch):
-    """C3: a leg is resumed mid-way far more often than started clean -- after a bank trip
-    (which leaves the player standing ON leg 8->7), after a restart, after a retried hop.
-    Replaying from waypoint 0 is a minimap click BACK toward the site we just left."""
+def test_walk_leg_resumes_ahead_of_the_player_never_behind(monkeypatch):
+    """A leg is resumed mid-way far more often than started clean -- after a bank trip
+    (which leaves the player beside the booth ON leg 8->7), after a restart. The booth
+    (1416,3350) sits between the first two markers, 11 tiles from (1415,3339) and 19 from
+    (1435,3346); with the stand tile not rendered, the far click is the marker AHEAD."""
     _fake_clock(monkeypatch)
     points = route.leg_waypoints(8, 7)
-    hops = []
-    monkeypatch.setattr(travel, "_hop_to",
-                        lambda ctx, x, y, plane, **k: hops.append((x, y)) or True)
-    # The bank's stand tile: on the 8->7 leg, beside waypoint index 2.
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": (x, y) != route.SITES[7]["stand"],
+                                                     "screenX": 500, "screenY": 300, "tile": (x, y)})
+    clicks = []
+
+    def click(ctx, point, shift):
+        clicks.append(point["tile"])
+        _standing_at(monkeypatch, *route.SITES[7]["stand"])
+
+    monkeypatch.setattr(travel, "_click_walk_point", click)
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
     _standing_at(monkeypatch, *route.BANK["stand"])
-    vtr_routine.walk_leg(_ctx_only(), 8, 7)
-    assert hops == list(points[2:]), "the resumed leg must not walk backwards"
-    assert points[0] not in hops
+    assert vtr_routine.walk_leg(_ctx_only(), 8, 7) is True
+    assert points[0] not in clicks, "the resumed leg must not walk backwards"
+    assert all(x > route.BANK["stand"][0] for x, y in clicks), "every click is ahead (east)"
 
 
 def test_walk_leg_waits_for_arrival_rather_than_returning_on_the_last_click(monkeypatch):
@@ -526,7 +503,9 @@ def test_bank_trip_walks_to_the_booth_before_looking_for_it(monkeypatch):
     hops = []
     monkeypatch.setattr(travel, "_hop_to",
                         lambda ctx, x, y, plane, **k: hops.append((x, y)) or True)
-    positions = iter([{"x": 1397, "y": 3329, "plane": 0}])   # site 8's stand tile
+    # Site 8's stand tile: one read for the direct attempt's own "not at the booth" check,
+    # one for the hop that follows; then the booth.
+    positions = iter([{"x": 1397, "y": 3329, "plane": 0}] * 2)
 
     def player():
         try:
@@ -536,13 +515,100 @@ def test_bank_trip_walks_to_the_booth_before_looking_for_it(monkeypatch):
 
     monkeypatch.setattr(controller, "get_player", player)
     monkeypatch.setattr(controller, "get_object_at",
-                        lambda *a, **k: {"screenX": 1, "screenY": 2})
+                        lambda *a, **k: {"screenX": 1, "screenY": 2, "onScreen": True, "distance": 21})
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(banker, "is_open", lambda: False)          # the direct click never opened it
+    monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
     monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **k: True)
     monkeypatch.setattr(banker, "withdraw_all_shift", lambda ctx, name, fresh=False: True)
     monkeypatch.setattr(vtr_routine, "fill_basket", lambda ctx: True)
     monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
     assert vtr_routine.bank_trip(_ctx_only()) is True
-    assert hops == [route.BANK["stand"]]
+    assert hops == [route.BANK["stand"]], "the hop is the fallback when the direct click fails"
+
+
+def test_bank_trip_clicks_the_booth_directly_from_the_site_when_it_is_on_screen(monkeypatch):
+    """USER 2026-09-10: "click the banker directly after the decoration is done. that way we
+    save a bit of time not doing hop -> click bank". The booth is ~21 tiles from site 8; the
+    game walks there and opens on arrival, so no hop and no idle wait."""
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped to the booth"))
+    _park_at(monkeypatch, 8)
+    booth = {"id": route.BANK["object_id"], "screenX": 700, "screenY": 300, "onScreen": True,
+             "distance": 21}
+    monkeypatch.setattr(controller, "get_object_at", lambda *a, **k: booth)
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    clicks = []
+    opened = {"v": False}
+
+    def click(ser, ent, **k):
+        clicks.append(ent.get("id"))
+        opened["v"] = True
+        return True
+
+    monkeypatch.setattr(controller, "click_entity", click)
+    monkeypatch.setattr(banker, "is_open", lambda: opened["v"])
+    monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **k: True)
+    monkeypatch.setattr(banker, "withdraw_all_shift", lambda ctx, name, fresh=False: True)
+    monkeypatch.setattr(vtr_routine, "fill_basket", lambda ctx: True)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
+    assert vtr_routine.bank_trip(_ctx_only()) is True
+    assert clicks == [route.BANK["object_id"]]
+
+
+def test_the_decorate_at_the_bank_site_turns_the_camera_toward_the_booth_when_a_trip_is_due(monkeypatch):
+    """USER 2026-09-10: "while decorating we can adjust camera if needed and click the
+    banker directly after the decoration is done"."""
+    monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())   # 8 builds owed
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)           # nothing in hand
+    site = vt.parse_state(_full_state(baseValue=4, wood="YEW", baseCarved=True,
+                                      bottom={"value": 10}, middle={"value": 11},
+                                      top={"value": 13}, decorations=0)).sites[8]
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: site)
+    monkeypatch.setattr(vt, "next_action", lambda st, **k: ("decorate", None))
+    seen = {}
+
+    def decorate(ctx, st, after_click=None):
+        seen["hook"] = after_click
+        monkeypatch.setattr(vt, "next_action", lambda s2, **k: ("done", None))
+        return True
+
+    monkeypatch.setattr(vtr_routine, "decorate", decorate)
+    assert vtr_routine.work_site(_ctx_only(), 8) is True
+    assert callable(seen["hook"]), "site 8 with a trip due: the decorate gets the camera hook"
+    faced = []
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": False})
+    monkeypatch.setattr(controller, "face_toward",
+                        lambda ser, tx, ty, px=None, py=None: faced.append((tx, ty)) or True)
+    seen["hook"]()
+    assert faced == [route.BANK["tile"]]
+
+    # ...and not at a site the booth cannot be reached from.
+    seen.clear()
+    assert vtr_routine.work_site(_ctx_only(), 6) is True
+    assert seen.get("hook") is None
+
+
+def test_the_decorate_hook_runs_after_the_click_and_before_its_confirm(monkeypatch):
+    order = []
+
+    def click_site(ctx, n, which, budget, confirm, option=None, after_click=None):
+        order.append("click")
+        if after_click:
+            after_click()
+        order.append("confirm")
+        return True
+
+    monkeypatch.setattr(vtr_routine, "_click_site", click_site)
+    monkeypatch.setattr(vtr_routine, "bow_count", lambda ctx, wood=None: 4)
+    site = vt.parse_state(_full_state(baseValue=4, wood="YEW", baseCarved=True,
+                                      bottom={"value": 10}, middle={"value": 11},
+                                      top={"value": 13}, decorations=0)).sites[8]
+    assert vtr_routine.decorate(_ctx_only(), site, after_click=lambda: order.append("camera")) is True
+    assert order == ["click", "camera", "confirm"]
 
 
 def test_bank_trip_closes_the_interface_with_the_token_the_firmware_understands(monkeypatch):
@@ -598,7 +664,7 @@ def test_work_site_stops_after_a_failed_action_rather_than_retrying_forever(monk
     monkeypatch.setattr(vtr_routine, "_site_now", lambda n: _one_site())
     monkeypatch.setattr(vtr_routine, "count_item", lambda name: 10)
     vtr_routine.work_site(_ctx_only(), 6)
-    assert len(calls) == 1
+    assert len(calls) == 1 + vtr_routine.SITE_ACTION_RETRIES, "one retry, then the visit ends"
 
 
 def test_work_site_is_bounded_even_when_every_action_reports_success(monkeypatch):
@@ -733,14 +799,16 @@ def test_no_bank_trip_from_a_site_the_booth_cannot_be_seen_from(monkeypatch):
 
 
 def test_the_bank_leg_is_the_only_one_that_passes_the_booth():
-    """Leg 8->7's recorded waypoints straddle the booth's stand tile and no other leg comes
-    near it, which is the whole evidence BANK_SITES rests on -- so it is pinned here rather
-    than only asserted in a comment."""
-    import math
+    """The booth's stand tile is one hop (<= travel.WALK_HOP_MAX_TILES) from site 8's stand
+    tile and beyond the minimap's 28-tile reach from every other site, which is the whole
+    evidence BANK_SITES rests on -- so it is pinned here rather than only asserted in a
+    comment. (With the 2026-09-10 markers the 8->7 leg no longer passes the booth itself;
+    its first marker is 11 tiles from it, which is how the resume rejoins the leg.)"""
     bank = route.BANK["stand"]
-    near = {leg for leg, pts in route.LEGS.items()
-            if any(math.dist(p, bank) <= 8 for p in pts)}
-    assert near == {(8, 7)}
+    dist = {n: vtr_routine._tiles_between(*bank, *route.SITES[n]["stand"]) for n in route.RING}
+    assert dist[8] <= travel.WALK_HOP_MAX_TILES
+    assert all(d > 28 for n, d in dist.items() if n != 8), dist
+    assert min(vtr_routine._tiles_between(*bank, *p) for p in route.LEGS[(8, 7)]) <= 12
     # Only 8: the booth is one hop from site 8's stand tile and ~37 tiles (off the minimap,
     # back along the leg just walked) from site 7's. MEASURED live 2026-09-09: the site-7
     # trip fired one site after a full bank at 8 and safety-stopped the run.
@@ -1184,18 +1252,42 @@ def test_the_site_only_marks_a_fletch_due_it_does_not_start_one(monkeypatch):
     assert ctx.state.data.get("vt_fletch_due") is True
 
 
-def test_walk_leg_fires_the_hook_after_the_first_hop_not_before(monkeypatch):
+def test_with_nothing_to_far_click_the_fallback_is_one_hop_toward_the_stand_tile(monkeypatch):
+    """USER 2026-09-10: "click straight near the totems no small hops or shortcuts". When
+    neither the stand tile nor a marker projects, the one fallback is a minimap hop AT the
+    stand tile (travel pulls it in toward the player when it is beyond reach) -- never the
+    markers one by one -- and the fletch follows that move."""
     order = []
-    monkeypatch.setattr(travel, "_hop_to",
-                        lambda ctx, x, y, plane, **k: order.append(("hop", x, y)) or True)
-    monkeypatch.setattr(controller, "get_player",
-                        lambda: {"x": route.SITES[7]["stand"][0],
-                                 "y": route.SITES[7]["stand"][1], "plane": 0})
-    vtr_routine.walk_leg(_ctx_only(), 8, 7,
-                         after_first_hop=lambda: order.append(("fletch",)))
-    assert order[0][0] == "hop", "the move command must go out first"
-    assert order[-1] == ("fletch",), "on a hop leg the fletch follows the LAST hop -- the one run nothing interrupts"
-    assert order.count(("fletch",)) == 1
+
+    def hop(ctx, x, y, plane, **k):
+        order.append(("hop", x, y))
+        _standing_at(monkeypatch, *route.SITES[7]["stand"])
+        return True
+
+    monkeypatch.setattr(travel, "_hop_to", hop)
+    _standing_at(monkeypatch, *route.SITES[8]["stand"])
+    vtr_routine.walk_leg(_ctx_only(), 8, 7, after_first_hop=lambda: order.append(("fletch",)))
+    assert order == [("hop",) + route.SITES[7]["stand"], ("fletch",)]
+
+
+def test_the_hook_strings_when_there_is_nothing_worth_fletching(monkeypatch):
+    """USER 2026-09-10: "nor is it stringing the bows". Live (vt_markers2) the later legs held
+    5 logs all owed to builds and 6 unstrung bows: fletch budget 0, below the 8-bow stringing
+    threshold, so the leg walked with the hands idle. Stringing is free XP on the same walk
+    and a strung bow decorates just as well, so with nothing to fletch the spool is used."""
+    monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())
+    monkeypatch.setattr(vtr_routine, "count_item",
+                        lambda name: {"Yew logs": 5, "Yew longbow (u)": 6}.get(name, 0))
+    monkeypatch.setattr(vt, "fletch_budget", lambda state, logs, bows: 0)
+    monkeypatch.setattr(vtr_routine, "find_spool", lambda: {"name": "Bow string spool"})
+    monkeypatch.setattr(vtr_routine, "start_fletching",
+                        lambda c: pytest.fail("fletched a log a build is owed"))
+    strung = []
+    monkeypatch.setattr(vtr_routine, "start_stringing", lambda c: strung.append(1) or True)
+    ctx = _ctx_only()
+    ctx.state.data["vt_fletch_due"] = True
+    assert vtr_routine._fletch_on_the_move(ctx) == "string"
+    assert strung == [1]
 
 
 def test_the_fletch_hook_rechecks_the_budget_against_live_state(monkeypatch):
@@ -1214,7 +1306,7 @@ def test_a_minimap_point_counts_as_a_far_click_when_nothing_is_rendered(monkeypa
     reaches 28 tiles whatever is rendered."""
     points = route.leg_waypoints(8, 7)
     monkeypatch.setattr(controller, "get_minimap_walk_point",
-                        lambda x, y, p, inst=False: {"onMinimap": (x, y) == points[2],
+                        lambda x, y, p, inst=False: {"onMinimap": (x, y) == points[0],
                                                      "screenX": 1900, "screenY": 200})
     clicks = []
     monkeypatch.setattr(travel, "_click_walk_point",
@@ -1227,6 +1319,107 @@ def test_a_minimap_point_counts_as_a_far_click_when_nothing_is_rendered(monkeypa
     assert clicks == [False], "one minimap click (no SHIFT on the minimap)"
 
 
+def test_the_hook_fires_on_every_stretch_long_enough_to_be_worth_it(monkeypatch):
+    """USER 2026-09-10: "no stringing on that long walk?" -- a 48-tile first stretch toward
+    site 1 ran with idle hands because the action waited for the stand-tile click, 9 tiles
+    from the end. The action starts on any stretch of HOOK_MIN_STRETCH_TILES or more and on
+    the final one; a later click restarts it (the hook re-derives its budget live)."""
+    _fake_clock(monkeypatch)
+    player = {"xy": route.BANK["stand"]}
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": player["xy"][0], "y": player["xy"][1], "plane": 0})
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {
+                            "onScreen": vtr_routine._tiles_between(x, y, *player["xy"]) <= 20,
+                            "screenX": 500, "screenY": 300, "tile": (x, y)})
+    order = []
+
+    def click(ctx, point, shift):
+        order.append(("click", point["tile"]))
+        player["xy"] = point["tile"]
+
+    monkeypatch.setattr(travel, "_click_walk_point", click)
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    assert vtr_routine.walk_leg(_ctx_only(), 8, 7, after_first_hop=lambda: order.append(("fletch",))) is True
+    stand = route.SITES[7]["stand"]
+    assert order[0][0] == "click" and order[0][1] != stand and order[1] == ("fletch",),         "the first stretch (~20 tiles) gets the action"
+    assert order[-2] == ("click", stand) and order[-1] == ("fletch",),         "...and the final stretch restarts it"
+
+
+def test_a_short_stretch_that_is_not_final_does_not_start_the_action(monkeypatch):
+    fired = []
+    tiles = vtr_routine.HOOK_MIN_STRETCH_TILES - 1
+    assert vtr_routine._hook_due(tiles, final=False) is False
+    assert vtr_routine._hook_due(tiles, final=True) is True
+    assert vtr_routine._hook_due(vtr_routine.HOOK_MIN_STRETCH_TILES, final=False) is True
+
+
+def test_the_far_click_runs_the_straight_line_toward_the_stand_before_any_marker(monkeypatch):
+    """USER 2026-09-10: "we click the tile marker 20 instead of just running straight to
+    totem ... they are guidelines not meant as a hop"; "we saw the totem spot on screen".
+    MEASURED: from the booth, site 7's stand tile (37 tiles) projected ABOVE the viewport's
+    top edge (isOnScreen is a bounds test) while the ground short of it was on screen. The
+    click goes to the farthest on-screen point on the straight line toward the stand; a
+    marker is only a fallback when nothing on that line projects."""
+    _fake_clock(monkeypatch)
+    player = {"xy": route.BANK["stand"]}
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": player["xy"][0], "y": player["xy"][1], "plane": 0})
+    # Rendered within 25 tiles of the player -- the stand (37) is not, marker 20 (19) is.
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {
+                            "onScreen": vtr_routine._tiles_between(x, y, *player["xy"]) <= 25,
+                            "screenX": 500, "screenY": 300, "tile": (x, y)})
+    clicks = []
+
+    def click(ctx, point, shift):
+        clicks.append(point["tile"])
+        player["xy"] = point["tile"]
+
+    monkeypatch.setattr(travel, "_click_walk_point", click)
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    assert vtr_routine.walk_leg(_ctx_only(), 8, 7) is True
+    stand = route.SITES[7]["stand"]
+    first = clicks[0]
+    assert first != (1435, 3346), "marker 20 is a guide, not a hop"
+    assert 20 <= vtr_routine._tiles_between(*route.BANK["stand"], *first) <= 25, first
+    # ...and ON the straight line booth -> stand (within a tile of it).
+    bx, by = route.BANK["stand"]
+    dx, dy = stand[0] - bx, stand[1] - by
+    t = ((first[0] - bx) * dx + (first[1] - by) * dy) / (dx * dx + dy * dy)
+    assert abs(first[0] - (bx + t * dx)) <= 1 and abs(first[1] - (by + t * dy)) <= 1
+    assert clicks[-1] == stand
+
+
+def test_a_marker_already_reached_is_never_the_far_click(monkeypatch):
+    """MEASURED live 2026-09-10 (vt_markers2, legs 6->5 and 5->4): the stretch to the first
+    marker ended within ARRIVAL_TOLERANCE of it, the stand tile was neither rendered nor on
+    the minimap, and the next pick chose the SAME marker -- still rendered, three tiles away
+    -- five times in five seconds, each click ending the fletch. F1. A marker the player has
+    already reached is not a far click; with nothing farther reachable the hops take over,
+    and they start at the marker AFTER the one already reached."""
+    _fake_clock(monkeypatch)
+    points = route.leg_waypoints(5, 4)          # (1422,3307), then the stand (1413,3287)
+    _standing_at(monkeypatch, points[0][0] + 2, points[0][1] + 1)      # 2 tiles from marker 0
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": (x, y) == points[0],
+                                                     "screenX": 500, "screenY": 300})
+    monkeypatch.setattr(travel, "_click_walk_point",
+                        lambda *a, **k: pytest.fail("clicked the marker already reached"))
+    hops = []
+
+    def hop(ctx, x, y, plane, **k):
+        hops.append((x, y))
+        _standing_at(monkeypatch, *route.SITES[4]["stand"])
+        return True
+
+    monkeypatch.setattr(travel, "_hop_to", hop)
+    assert vtr_routine.walk_leg(_ctx_only(), 5, 4) is True
+    assert hops == [route.SITES[4]["stand"]]
+
+
 def test_a_far_click_on_an_orb_is_not_taken(monkeypatch):
     points = route.leg_waypoints(8, 7)
     monkeypatch.setattr(controller, "get_minimap_walk_point",
@@ -1235,7 +1428,8 @@ def test_a_far_click_on_an_orb_is_not_taken(monkeypatch):
     monkeypatch.setattr(travel, "_click_walk_point", lambda *a, **k: pytest.fail("clicked an orb"))
     hops = []
     monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane, **k: hops.append(1) or True)
-    monkeypatch.setattr(controller, "get_player", lambda: _stand(7))
+    monkeypatch.setattr(controller, "get_player", lambda: _stand(8))
+    _fake_clock(monkeypatch)
     vtr_routine.walk_leg(_ctx_only(), 8, 7)
     assert hops
 
@@ -1291,56 +1485,66 @@ def test_a_rendered_stand_tile_gets_one_viewport_click_and_no_hops(monkeypatch):
     assert order == ["walk", "fletch"], "the move goes out first, the fletch right after"
 
 
-def test_a_stalled_direct_leg_falls_back_to_the_hops_without_refiring_the_hook(monkeypatch):
+def test_a_stalled_far_click_is_retried_in_place_bounded_and_the_hook_fires_once(monkeypatch):
     monkeypatch.setattr(controller, "get_ground_walk_point",
                         lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500, "screenY": 300})
-    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: None)
+    clicks = []
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: clicks.append(1))
     hops = []
     monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane, **k: hops.append((x, y)) or True)
-    # Never moves off site 8's stand tile: the direct walk stalls, then the hops must run.
+    # Never moves off site 8's stand tile: every click stalls, each target is banned in turn,
+    # then the stand-tile hop is the fallback, all inside DIRECT_LEG_MAX_STRETCHES.
     monkeypatch.setattr(controller, "get_player", lambda: _stand(8))
     clock = {"t": 0.0}
     monkeypatch.setattr(vtr_routine, "_now", lambda: clock["t"])
     monkeypatch.setattr(vtr_routine, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
     fired = []
-    vtr_routine.walk_leg(_ctx_only(), 8, 7, after_first_hop=lambda: fired.append(1))
-    assert hops, "the stalled direct leg must hand over to the recorded hops"
-    assert fired == [1], "once per leg -- not again on the hops"
+    assert vtr_routine.walk_leg(_ctx_only(), 8, 7, after_first_hop=lambda: fired.append(1)) is False
+    assert len(clicks) + len(hops) == vtr_routine.DIRECT_LEG_MAX_STRETCHES
+    assert fired, "the stand-tile click, which stalled first, still started the action"
 
 
 def test_an_off_screen_stand_tile_skips_the_direct_click_entirely(monkeypatch):
+    _fake_clock(monkeypatch)
     hops = []
     monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane, **k: hops.append((x, y)) or True)
-    monkeypatch.setattr(controller, "get_player", lambda: _stand(7))
+    monkeypatch.setattr(controller, "get_player", lambda: _stand(8))
     vtr_routine.walk_leg(_ctx_only(), 8, 7)
-    assert hops, "with the tile not rendered the hops are the only way there"
+    assert hops and set(hops) == {route.SITES[7]["stand"]},         "with nothing rendered the stand-tile hop is the only way there"
 
 
 def test_the_direct_click_aims_at_the_farthest_rendered_waypoint_when_the_site_is_not(monkeypatch):
     """MEASURED 2026-09-09: the next stand tile is 20-57 tiles off and not rendered, so aiming
     only there fell back to the hops every leg. A waypoint 10-20 tiles out is; 12s of running
-    there is 6 bows."""
+    there is 6 bows. Rendering here is distance-based (anything within 20 tiles of the player
+    is on screen), so each stretch reaches the farthest marker the camera can see and the
+    8->7 leg is three chained clicks: 18, 20 and 18 tiles."""
     points = route.leg_waypoints(8, 7)
-    visible = set(points[:3])            # only the near half of the leg is rendered
+    player = {"xy": route.SITES[8]["stand"]}
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": player["xy"][0], "y": player["xy"][1], "plane": 0})
     monkeypatch.setattr(controller, "get_ground_walk_point",
-                        lambda x, y, p, inst=False: {"onScreen": (x, y) in visible,
-                                                     "screenX": 500, "screenY": 300})
+                        lambda x, y, p, inst=False: {
+                            "onScreen": vtr_routine._tiles_between(x, y, *player["xy"]) <= 20,
+                            "screenX": 500, "screenY": 300, "tile": (x, y)})
     clicks = []
-    monkeypatch.setattr(travel, "_click_walk_point",
-                        lambda ctx, point, shift: clicks.append(point))
+
+    def click(ctx, point, shift):
+        clicks.append(point["tile"])
+        player["xy"] = point["tile"]          # the run to the clicked tile, elided
+
+    monkeypatch.setattr(travel, "_click_walk_point", click)
     hops = []
     monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane, **k: hops.append((x, y)) or True)
-    # Stand at site 8, then arrive at the clicked waypoint, then at site 7.
-    seq = iter([_stand(8), _stand(8), {"x": points[2][0], "y": points[2][1], "plane": 0}]
-               + [_stand(7)] * 20)
-    monkeypatch.setattr(controller, "get_player", lambda: next(seq))
     monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
     fired = []
     assert vtr_routine.walk_leg(_ctx_only(), 8, 7, after_first_hop=lambda: fired.append(1)) is True
-    # Two STRETCHES: the far rendered waypoint, then -- from there -- a second far click that
-    # arrives. The fletch re-fires after each, and the hops are never needed.
-    assert len(clicks) == 2, "one click per stretch, chained"
-    assert fired == [1], "the fletch is started once, on the first move of the leg"
+    assert clicks[-1] == route.SITES[7]["stand"]
+    prev = route.SITES[8]["stand"]
+    for tile in clicks:
+        assert 8 <= vtr_routine._tiles_between(*prev, *tile) <= 20, (prev, tile)
+        prev = tile
+    assert fired == [1] * len(clicks), "the fletch is (re)started on every long stretch"
     assert hops == [], "no hop click while a far click can still reach"
 
 
@@ -1348,13 +1552,22 @@ def test_the_fletch_is_stopped_at_the_build_reserve_by_reclicking_the_walk(monke
     """USER 2026-09-09: "gotta leave a few logs in the inventory to actually craft the
     totems too" -- the make prompt has no quantity, so the stretch itself must end the fletch
     once only the build reserve is left, with a click that keeps the walk."""
-    monkeypatch.setattr(controller, "get_ground_walk_point",
-                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500, "screenY": 300})
+    # Every resolution is a fresh dict stamped with the tile and a serial, so the test can
+    # tell "the same TILE, re-resolved" from "the same PIXEL, reused".
+    resolved = {"n": 0}
+
+    def ground(x, y, p, inst=False):
+        resolved["n"] += 1
+        return {"onScreen": True, "screenX": 500 + resolved["n"], "screenY": 300,
+                "tile": (x, y), "serial": resolved["n"]}
+
+    monkeypatch.setattr(controller, "get_ground_walk_point", ground)
     clicks = []
     monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: clicks.append(point))
     monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
-    seq = iter([_stand(8), _stand(8), {"x": 1420, "y": 3340, "plane": 0},
-                {"x": 1430, "y": 3342, "plane": 0}] + [_stand(7)] * 20)
+    seq = iter([_stand(8), _stand(8), _stand(8), {"x": 1420, "y": 3340, "plane": 0},
+                {"x": 1430, "y": 3342, "plane": 0}, {"x": 1440, "y": 3342, "plane": 0}]
+               + [_stand(7)] * 20)
     monkeypatch.setattr(controller, "get_player", lambda: next(seq))
     logs = iter([6, 4, 3, 3, 3, 3, 3, 3])          # loose logs falling as bows are made
     monkeypatch.setattr(vtr_routine, "count_item", lambda name: next(logs))
@@ -1363,7 +1576,64 @@ def test_the_fletch_is_stopped_at_the_build_reserve_by_reclicking_the_walk(monke
     ctx.state.data[vtr_routine.LOG_RESERVE_KEY] = 3
     assert vtr_routine.walk_leg(ctx, 8, 7, after_first_hop=lambda: "fletch") is True
     assert len(clicks) == 2, "the walk click, then ONE re-click at the reserve"
-    assert clicks[0] == clicks[1], "the re-click aims at the same target so the walk continues"
+    assert clicks[0]["tile"] == clicks[1]["tile"], "the re-click aims at the same TILE"
+    # MEASURED live 2026-09-10 (vt_markers4, 6->5): re-clicking the same PIXEL after the
+    # player has run six tiles maps to a tile far beyond the target -- the run overshot site 5
+    # by 17 tiles and stalled. The tile is re-resolved for the player's new position.
+    assert clicks[1]["serial"] > clicks[0]["serial"], "the re-click re-resolves the tile"
+
+
+def _fletch_stretch(monkeypatch, logs_seq, bows_seq):
+    """One far click at the stand with a fletch running; count_item answers logs then bows."""
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500, "screenY": 300,
+                                                     "tile": (x, y)})
+    clicks = []
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: clicks.append(point["tile"]))
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
+    seq = iter([_stand(8), _stand(8), _stand(8), {"x": 1420, "y": 3340, "plane": 0},
+                {"x": 1430, "y": 3342, "plane": 0}, {"x": 1440, "y": 3342, "plane": 0}]
+               + [_stand(7)] * 20)
+    monkeypatch.setattr(controller, "get_player", lambda: next(seq))
+    logs, bows = iter(logs_seq), iter(bows_seq)
+    monkeypatch.setattr(vtr_routine, "count_item",
+                        lambda name: next(logs) if "logs" in name else next(bows))
+    monkeypatch.setattr(vtr_routine, "find_spool", lambda: {"name": "Bow string spool"})
+    strung = []
+    monkeypatch.setattr(vtr_routine, "start_stringing", lambda c: strung.append(1) or True)
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    return clicks, strung
+
+
+def test_the_build_reserve_switches_the_fletch_to_stringing_instead_of_reclicking(monkeypatch):
+    """USER 2026-09-10: "instead of clicking to interupt the fletch we can use the spool to
+    start stringing to interupt it instead. that way no new walk click will be needed and it
+    can be done mid walk"."""
+    clicks, strung = _fletch_stretch(monkeypatch, logs_seq=[6, 4, 3, 3, 3, 3], bows_seq=[2] * 12)
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.LOG_RESERVE_KEY] = 3
+    assert vtr_routine.walk_leg(ctx, 8, 7, after_first_hop=lambda: "fletch") is True
+    assert len(clicks) == 1, "the walk click only -- the spool is the interruption"
+    assert strung == [1]
+
+
+def test_eight_unstrung_bows_switch_the_fletch_to_stringing_mid_walk(monkeypatch):
+    """USER 2026-09-10: "lower it to fire at 8 bows in inventory"."""
+    clicks, strung = _fletch_stretch(monkeypatch, logs_seq=[20] * 12,
+                                     bows_seq=[5, 7, vtr_routine.STRING_ABOVE_BOWS, 9, 9, 9])
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.LOG_RESERVE_KEY] = 3
+    assert vtr_routine.walk_leg(ctx, 8, 7, after_first_hop=lambda: "fletch") is True
+    assert len(clicks) == 1 and strung == [1]
+
+
+def test_the_reserve_still_reclicks_the_walk_when_no_spool_is_carried(monkeypatch):
+    clicks, strung = _fletch_stretch(monkeypatch, logs_seq=[6, 4, 3, 3, 3, 3], bows_seq=[2] * 12)
+    monkeypatch.setattr(vtr_routine, "find_spool", lambda: None)
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.LOG_RESERVE_KEY] = 3
+    assert vtr_routine.walk_leg(ctx, 8, 7, after_first_hop=lambda: "fletch") is True
+    assert len(clicks) == 2 and strung == []
 
 
 def test_the_fletch_hook_sets_the_reserve_it_started_against(monkeypatch):
@@ -1480,6 +1750,82 @@ def test_decorate_is_one_click_confirmed_on_every_bow_going_on(monkeypatch):
     assert clicks == [1], "one click for all four decorations"
 
 
+def test_carve_answers_the_reopening_prompt_three_times_on_one_totem_click(monkeypatch):
+    """USER 2026-09-10: "we dont have to click inbetween choosing each totem piece like 1 2 3
+    the menu will pop up after we choose one until we chose all three"."""
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: clicks.append(1) or True)
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(vtr_routine, "site_object", lambda n, w: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(vtr_routine, "_await_menu", lambda ctx: True)      # it keeps reopening
+
+    class _Site:
+        number = 7
+        nearby_spirits = ["BUFFALO", "JAGUAR", "SNAKE"]
+        segment_values = (0, 0, 0)
+        base_carved = False
+
+    carved = []
+
+    def choose(ctx, spirit):
+        carved.append(spirit)
+        vals = list(_Site.segment_values)
+        vals[len(carved) - 1] = vt.SPIRIT_VALUES[spirit] + vt.CARVED_OFFSET
+        _Site.segment_values = tuple(vals)
+        return True
+
+    monkeypatch.setattr(vtr_routine, "choose_spirit", choose)
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: _Site)
+    monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    assert vtr_routine.carve(_ctx_only(), _Site) is True
+    assert clicks == [1], "one Carve click for the whole trio"
+    assert carved == ["BUFFALO", "JAGUAR", "SNAKE"]
+
+
+def test_the_prehover_tracks_the_totem_until_the_player_stops(monkeypatch):
+    """USER 2026-09-10: "when we get towards the totem the click while moving often misses"
+    -- "the cursor hover while approaching". The hover flight ends while the player is still
+    running the last tiles in, so the cursor rests where the totem WAS. Until /player says
+    the run is over, the hover follows the live projection whenever it has drifted."""
+    positions = iter([(500, 300), (520, 290), (540, 280), (541, 280), (541, 280)])
+    monkeypatch.setattr(vtr_routine, "site_object", lambda n, w: {"screenX": 500, "screenY": 300})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: lambda: next(positions))
+    hovers, moves = [], []
+    monkeypatch.setattr(controller, "hover_entity", lambda ser, obj, **k: hovers.append(1) or True)
+    cursor = {"xy": (493, 307)}                   # where the first hover parked (offset -7,+7)
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: cursor["xy"])
+
+    def move(ser, x, y, **k):
+        moves.append((x, y))
+        cursor["xy"] = (x, y)
+
+    monkeypatch.setattr(controller, "move_to_human", move)
+    moving = iter([True, True, True, False, False, False])
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 1, "y": 1, "plane": 0, "moving": next(moving)})
+    site = vt.parse_state(_full_state()).sites[6]
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: site)
+    monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    _REAL_PREHOVER(_ctx_only(), 6)
+    assert hovers == [1]
+    assert len(moves) >= 2, "the cursor followed the sliding projection while the player ran"
+    assert abs(moves[-1][0] - (540 - 7)) <= 3 and abs(moves[-1][1] - (280 + 7)) <= 3
+
+
+def test_the_first_action_prehovered_is_the_totem_when_the_pile_is_below_the_cap(monkeypatch):
+    hovered = []
+    monkeypatch.setattr(vtr_routine, "site_object",
+                        lambda n, w: hovered.append(w) or {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "hover_entity", lambda *a, **k: True)
+    site = vt.parse_state(_full_state(unclaimedOfferings=65)).sites[6]
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: site)
+    _REAL_PREHOVER(_ctx_only(), 6)
+    assert hovered == ["totem"]
+
+
 def test_decorate_with_no_bows_does_not_click(monkeypatch):
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: pytest.fail("clicked with no bows"))
     monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
@@ -1514,11 +1860,18 @@ def test_the_next_leg_starts_inside_the_same_tick(monkeypatch):
     assert walked == [route.next_in_ring(6)]
 
 
-def test_an_immediately_stalling_leg_is_remembered_and_hopped_from_then_on(monkeypatch):
+def test_a_stalling_far_click_bans_only_its_target_not_the_leg(monkeypatch):
+    """MEASURED live 2026-09-10 (vt_markers4, leg 1->8): a viewport click straight at site 8's
+    stand tile 46 tiles off moved the player 5 tiles and stopped -- the game's pathfinder
+    gives up on that line (the river) -- and the whole leg was marked "hops from now on",
+    although its own markers would have far-clicked fine. Only the target that stalled is
+    remembered; the next attempt far-clicks the farthest OTHER candidate."""
+    points = route.leg_waypoints(6, 5)
     monkeypatch.setattr(controller, "get_ground_walk_point",
-                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500, "screenY": 300})
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500, "screenY": 300,
+                                                     "tile": (x, y)})
     far = []
-    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: far.append(1))
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: far.append(point["tile"]))
     hops = []
     monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane, **k: hops.append((x, y)) or True)
     monkeypatch.setattr(controller, "get_player", lambda: _stand(6))     # never moves
@@ -1527,12 +1880,35 @@ def test_an_immediately_stalling_leg_is_remembered_and_hopped_from_then_on(monke
     monkeypatch.setattr(vtr_routine, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
     ctx = _ctx_only()
     vtr_routine.walk_leg(ctx, 6, 5)
-    assert far == [1] and hops
-    assert ctx.state.data[vtr_routine.NO_DIRECT_KEY][str((6, 5))] is True
-    far.clear(); hops.clear()
-    vtr_routine.walk_leg(ctx, 6, 5)
-    assert far == [], "the second time the far click is not even attempted"
-    assert hops
+    banned = ctx.state.data[vtr_routine.NO_DIRECT_KEY][str((6, 5))]
+    assert far[0] == route.SITES[5]["stand"] and banned[0] == list(route.SITES[5]["stand"])
+    assert far[1] != route.SITES[5]["stand"], "after the stand stalls, the next candidate is tried"
+    assert len(far) + len(hops) == vtr_routine.DIRECT_LEG_MAX_STRETCHES
+
+
+def test_a_marker_behind_the_player_is_never_the_far_click(monkeypatch):
+    """MEASURED live 2026-09-10 (vt_markers4, leg 8->7 from the booth): the first stretch
+    reached the middle marker (1435,3346); the stand tile was not rendered, the marker just
+    reached was (rightly) skipped, and the pick fell to (1415,3339) -- 20 tiles BACK west,
+    toward the bank it had just left. Candidates are cut at the player's position along
+    the leg: the stand tile plus the markers still ahead."""
+    _fake_clock(monkeypatch)
+    points = route.leg_waypoints(8, 7)
+    _standing_at(monkeypatch, 1436, 3347)                     # beside the middle marker
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": (x, y) != route.SITES[7]["stand"],
+                                                     "screenX": 500, "screenY": 300, "tile": (x, y)})
+    clicks = []
+
+    def click(ctx, point, shift):
+        clicks.append(point["tile"])
+        _standing_at(monkeypatch, *route.SITES[7]["stand"])
+
+    monkeypatch.setattr(travel, "_click_walk_point", click)
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
+    assert vtr_routine.walk_leg(_ctx_only(), 8, 7) is True
+    assert points[0] not in clicks
+    assert all(x >= 1436 for x, y in clicks), "every click is ahead of the player"
 
 
 def test_an_empty_that_fills_every_free_slot_leaves_the_basket_unknown_not_empty(monkeypatch):
@@ -1598,31 +1974,82 @@ def test_strung_bows_count_as_decorations(monkeypatch):
     assert vtr_routine.bow_count(_ctx_only()) == 4
 
 
-def test_a_spool_that_strings_nothing_is_marked_dead(monkeypatch):
+def _spool_world(monkeypatch, *, prompt_title="", strings=False):
     monkeypatch.setattr(controller, "get_inventory",
                         lambda: [{"name": "Bow string spool", "screenX": 1, "screenY": 1},
                                  {"name": "Yew longbow (u)", "screenX": 2, "screenY": 2}])
     monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
     monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
-    monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
-    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 1)     # never falls
+    monkeypatch.setattr(controller, "get_last_action", lambda: {"option": "Use", "target": "x"})
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: keys.append(k))
+    monkeypatch.setattr(skillmulti, "is_open", lambda: bool(prompt_title))
+    monkeypatch.setattr(skillmulti, "prompt_title", lambda: prompt_title)
+    monkeypatch.setattr(skillmulti, "showing", lambda t: t == prompt_title)
+    counts = iter([1] + ([0] * 20 if strings else [1] * 20))
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: next(counts))
     monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
     monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    return keys
+
+
+def test_a_spool_that_strings_nothing_is_marked_dead_only_on_the_second_strike(monkeypatch):
+    """MEASURED live 2026-09-10 (vt_markers4): the FIRST use strung nothing within the budget
+    and the spool was written off for the whole session, so every later leg fletched with 19
+    unstrung bows in hand (USER: "we have like 16 bows ... and we decide to fletch more")."""
+    _spool_world(monkeypatch)
     ctx = _ctx_only()
+    assert vtr_routine.start_stringing(ctx) is False
+    assert ctx.state.data.get(vtr_routine.SPOOL_DEAD_KEY) is None, "one strike is not dead"
     assert vtr_routine.start_stringing(ctx) is False
     assert ctx.state.data.get(vtr_routine.SPOOL_DEAD_KEY) is True
 
 
-class _Memory:
-    def __init__(self, q, seen=True, items=None):
-        self.q, self.seen, self.items = q, seen, (items if items is not None else [{"name": "x"}])
-    def quantity(self, name): return self.q
+def test_space_follows_the_bow_click_even_when_no_prompt_was_seen(monkeypatch):
+    """MEASURED live 2026-09-10 (vt_markers5 vs 6): the string only ever landed when Space
+    was pressed after the bow click; twice the prompt was not detected inside the wait and
+    nothing was pressed, and the spool struck out. The human presses Space ~0.8s after the
+    bow click regardless; Space with nothing open does nothing, so it is pressed blind. Only a
+    MAKE-titled menu (several products) needs the derived number instead."""
+    keys = _spool_world(monkeypatch, prompt_title="", strings=True)
+    ctx = _ctx_only()
+    assert vtr_routine.start_stringing(ctx) is True
+    assert keys == ["SPACE"]
+
+
+def test_work_site_retries_a_failed_action_once_before_walking_on(monkeypatch):
+    """MEASURED live 2026-09-10 (vt_markers4, site 4): one build click that did not land ended
+    the visit and the totem was skipped for the whole lap (USER: "skipped a totem")."""
+    site = vt.parse_state(_full_state()).sites[4]
+    done = vt.parse_state(_full_state(baseValue=4, wood="YEW", baseCarved=True,
+                                      bottom={"value": 10}, middle={"value": 11},
+                                      top={"value": 13}, decorations=4)).sites[4]
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: site)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 5)
+    attempts = []
+
+    def build(ctx, s):
+        attempts.append(1)
+        if len(attempts) == 2:
+            monkeypatch.setattr(vtr_routine, "_site_now", lambda n: done)
+        return len(attempts) == 2
+
+    monkeypatch.setattr(vtr_routine, "build", build)
+    assert vtr_routine.work_site(_ctx_only(), 4) is True
+    assert attempts == [1, 1]
+
+
+def _memory(**payload):
+    """A REAL bank_memory.BankMemory -- a stub answering quantity() independently of seen/items
+    encoded a shape the class cannot produce and hid the substring-match bug below."""
+    return bank_memory.BankMemory(payload)
 
 
 def test_the_bank_out_of_the_current_wood_steps_down_to_the_next(monkeypatch):
     """USER 2026-09-09: "When we run out of yew logs swap to maple logs"."""
     _at_the_bank(monkeypatch)
-    monkeypatch.setattr(bank_memory, "load", lambda names=None: _Memory(0))
+    monkeypatch.setattr(bank_memory, "load", lambda names=None: _memory(
+        seen=True, items=[{"name": "Maple logs", "quantity": 5374, "id": 1517}]))
     monkeypatch.setattr(controller, "get_object_at", lambda *a, **k: {"screenX": 1, "screenY": 2})
     monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **k: True)
     withdrawn = []
@@ -1636,6 +2063,67 @@ def test_the_bank_out_of_the_current_wood_steps_down_to_the_next(monkeypatch):
     assert ctx.state.config["wood"] == "MAPLE"
     assert ctx.state.config["bow"] == "Maple longbow (u)"
     assert ctx.state.data[vtr_routine.WOOD_KEY] == "MAPLE"
+
+
+def test_a_name_that_merely_contains_the_log_name_does_not_count_as_stock(monkeypatch):
+    """MEASURED live 2026-09-10 (vt_markers1): the bank held NO Yew logs but did hold one
+    "Abyssal lantern (yew logs)", bank_memory.quantity's substring match counted it as 1, the
+    fallback never fired, the withdraw found nothing and the run safety-stopped with 13 Maple
+    logs in hand. Stock is the EXACT item name."""
+    _at_the_bank(monkeypatch)
+    memory = bank_memory.BankMemory({"seen": True, "items": [
+        {"name": "Abyssal lantern (yew logs)", "quantity": 1, "id": 26842},
+        {"name": "Yew pyre logs", "quantity": 23, "id": 3446},
+        {"name": "Maple logs", "quantity": 5374, "id": 1517}]})
+    monkeypatch.setattr(bank_memory, "load", lambda names=None: memory)
+    monkeypatch.setattr(controller, "get_object_at", lambda *a, **k: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **k: True)
+    withdrawn = []
+    monkeypatch.setattr(banker, "withdraw_all_shift",
+                        lambda ctx, name, fresh=False: withdrawn.append(name) or True)
+    monkeypatch.setattr(vtr_routine, "fill_basket", lambda ctx: True)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
+    ctx = _ctx_only()
+    assert vtr_routine.bank_trip(ctx) is True
+    assert withdrawn and withdrawn[0] == "Maple logs"
+    assert ctx.state.config["wood"] == "MAPLE"
+
+
+def test_the_logs_in_hand_decide_the_wood_after_a_restart(monkeypatch):
+    """MEASURED live 2026-09-10 (vt_markers3): run 2 had switched to maple at the bank, the
+    restart wiped that (it lived in ctx.state.data) and the panel said YEW again, so with 16
+    Maple logs and 8 maple bows in hand every site read "Yew logs: 0", claimed and walked on
+    -- three sites, nothing built (USER: "its not built one in 3 hops")."""
+    monkeypatch.setattr(vtr_routine, "count_item",
+                        lambda name: {"Maple logs": 16, "Maple longbow (u)": 8}.get(name, 0))
+    ctx = _ctx_only()                                   # config: the panel's YEW
+    vtr_routine._wood_override(ctx)
+    assert ctx.state.config["wood"] == "MAPLE"
+    assert ctx.state.config["log"] == "Maple logs"
+    assert ctx.state.data[vtr_routine.WOOD_KEY] == "MAPLE"
+
+
+def test_the_configured_wood_is_kept_while_its_logs_are_in_hand(monkeypatch):
+    monkeypatch.setattr(vtr_routine, "count_item",
+                        lambda name: {"Yew logs": 3, "Maple logs": 16}.get(name, 0))
+    ctx = _ctx_only()
+    vtr_routine._wood_override(ctx)
+    assert ctx.state.config["wood"] == "YEW"
+
+
+def test_work_site_logs_one_outcome_line_per_site(monkeypatch):
+    """USER 2026-09-10: "Add a log for finishing totems too" -- the site work was invisible
+    in the log except as clicks, so three sites skipped for want of logs looked like three
+    sites finished."""
+    lines = []
+    monkeypatch.setattr(vtr_routine.debug_log, "log", lambda cat, msg: lines.append(msg))
+    site = vt.parse_state(_full_state()).sites[4]            # unbuilt, nothing to claim
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: site)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
+    assert vtr_routine.work_site(_ctx_only(), 4) is True
+    outcome = [l for l in lines if l.startswith("site 4:")]
+    assert len(outcome) == 1
+    assert "no Yew logs" in outcome[0] and "unbuilt" in outcome[0], outcome
 
 
 def test_the_wood_switch_survives_the_engine_re_resolving_the_config():
@@ -1690,7 +2178,8 @@ def test_a_minimap_far_click_stays_within_the_measured_reach(monkeypatch):
 
 def test_the_wood_never_switches_on_an_empty_or_unseen_memory(monkeypatch):
     """Host 2026-09-09: a filtered read answered "0 Yew logs" with 129 in the bank."""
-    for mem in (_Memory(0, seen=False), _Memory(0, items=[]), _Memory(None)):
+    # Never seen (no items at all), and seen-but-empty: neither is evidence the wood ran out.
+    for mem in (_memory(seen=False), _memory(seen=True, items=[])):
         _at_the_bank(monkeypatch)
         monkeypatch.setattr(bank_memory, "load", lambda names=None, m=mem: m)
         monkeypatch.setattr(controller, "get_object_at", lambda *a, **k: {"screenX": 1, "screenY": 2})
@@ -1733,3 +2222,58 @@ def test_the_bank_slot_is_trusted_only_once_two_reads_agree(monkeypatch):
     monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
     monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
     assert vtr_routine._await_bank_slot("Yew logs") is True
+
+
+# --- 2026-09-10: face the camera toward the leg before looking for a viewport click ----------
+#
+# USER's recording (2026-09-10_075943): "i can click much further by nudging the camera in the
+# direction of the totem and click the totem directly instead of minimap hop". Six middle-mouse
+# drags, each right before a far viewport click at the top of the screen.
+
+def _leg_8_to_7_positions(monkeypatch):
+    seq = iter([_stand(8), _stand(8)] + [_stand(7)] * 20)
+    monkeypatch.setattr(controller, "get_player", lambda: next(seq))
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
+
+
+def test_the_far_click_faces_the_camera_at_the_stand_tile_when_it_is_off_screen(monkeypatch):
+    faced = []
+    monkeypatch.setattr(controller, "face_toward",
+                        lambda ser, tx, ty, px=None, py=None: faced.append((tx, ty)) or True)
+    # Rendered only once the camera has been turned toward it.
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": bool(faced),
+                                                     "screenX": 700, "screenY": 120})
+    clicks = []
+    monkeypatch.setattr(travel, "_click_walk_point",
+                        lambda ctx, point, shift: clicks.append(shift))
+    _leg_8_to_7_positions(monkeypatch)
+    assert vtr_routine.walk_leg(_ctx_only(), 8, 7) is True
+    assert faced == [route.SITES[7]["stand"]], "faced the next site's stand tile, once"
+    assert clicks == [True], "then ONE shift viewport click"
+
+
+def test_the_far_click_prefers_the_viewport_over_the_minimap_for_the_same_point(monkeypatch):
+    """The human clicks the world, not the minimap, once the camera faces the leg."""
+    monkeypatch.setattr(controller, "face_toward", lambda ser, tx, ty, px=None, py=None: True)
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 700, "screenY": 120})
+    monkeypatch.setattr(controller, "get_minimap_walk_point",
+                        lambda x, y, p, inst=False: {"onMinimap": True, "screenX": 1900, "screenY": 200})
+    clicks = []
+    monkeypatch.setattr(travel, "_click_walk_point",
+                        lambda ctx, point, shift: clicks.append(shift))
+    _leg_8_to_7_positions(monkeypatch)
+    assert vtr_routine.walk_leg(_ctx_only(), 8, 7) is True
+    assert clicks == [True], "viewport (SHIFT) wins when both can reach the point"
+
+
+def test_the_far_click_does_not_turn_the_camera_when_the_stand_tile_is_already_rendered(monkeypatch):
+    monkeypatch.setattr(controller, "face_toward",
+                        lambda *a, **k: pytest.fail("turned the camera for a tile already on screen"))
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 700, "screenY": 120})
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: None)
+    _leg_8_to_7_positions(monkeypatch)
+    assert vtr_routine.walk_leg(_ctx_only(), 8, 7) is True

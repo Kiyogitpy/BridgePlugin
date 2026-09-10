@@ -1946,3 +1946,156 @@ def test_drop_items_releases_shift_before_falling_back_to_the_menu(monkeypatch):
 
     controller.drop_items(object(), items)
     assert events.index("shift-up") < events.index("menu"), events
+
+
+# --- 2026-09-10: camera yaw turn by middle-mouse drag (face_toward) ---------------------------
+#
+# The human's vale-totem recording (2026-09-10_075943): six middle-mouse drags of 89-360px,
+# every one right before a far viewport click, never an arrow key. Yaw convention derived from
+# RuneLite's Perspective.localToCanvas: screen-right = x*cos(yaw) + y*sin(yaw), screen-up =
+# y*cos(yaw) - x*sin(yaw), local x east and y north -- so a target at bearing b (clockwise from
+# north, in 2048ths) sits straight up the screen when yaw == -b.
+
+def test_yaw_for_bearing_puts_north_up_at_yaw_zero():
+    assert controller.yaw_for_bearing(100, 100, 100, 130) == 0
+
+
+def test_yaw_for_bearing_puts_east_up_at_yaw_1536():
+    assert controller.yaw_for_bearing(100, 100, 140, 100) == 1536
+
+
+def test_yaw_for_bearing_south_and_west():
+    assert controller.yaw_for_bearing(100, 100, 100, 60) == 1024
+    assert controller.yaw_for_bearing(100, 100, 60, 100) == 512
+
+
+def test_yaw_delta_takes_the_short_way_round():
+    assert controller.yaw_delta(0, 1536) == -512
+    assert controller.yaw_delta(1900, 100) == 248
+    assert controller.yaw_delta(100, 1900) == -248
+    assert controller.yaw_delta(700, 700) == 0
+
+
+def _camera_state(**over):
+    st = {"canvasScreenX": 100, "canvasScreenY": 50, "canvasWidth": 1800, "canvasHeight": 900,
+          "cameraYaw": 0, "cameraYawTarget": 0}
+    st.update(over)
+    return st
+
+
+# THE BRIDGE REPORTS YAW IN JAU14 (Client.getCameraYaw: "measured in JAU14 ... 2pi/(2^14)"),
+# 8 per 2048th-of-a-turn unit the turn arithmetic uses. MEASURED live 2026-09-10: /state read
+# 7904 and 11104 while a 0..2047 yaw was assumed, so every drag was computed from a garbage
+# angle (USER: "the camera implementation doesnt seem to work as intended").
+JAU14 = 8
+
+
+def test_drag_middle_presses_moves_and_releases_in_that_order(monkeypatch):
+    """The firmware's own rule: X (flush) drops QUEUED button commands, so the press has to be
+    consumed before the flight starts. The primitive sends MMD, pauses, flies, then MMU."""
+    order = []
+    monkeypatch.setattr(controller, "send_line", lambda ser, s: order.append(s))
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **kw: order.append(("move", x, y)))
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: order.append("pause"))
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (900, 500))
+    monkeypatch.setattr(controller, "get_state", lambda: _camera_state())
+    controller.drag_middle(object(), 200)
+    assert order == ["MMD", "pause", ("move", 1100, 500), "MMU", "pause"]
+
+
+def test_drag_middle_moves_off_the_canvas_edge_before_pressing(monkeypatch):
+    """A drag that would leave the canvas clamps inside a maximized window and turns the
+    camera less than asked; a cursor parked on the sidebar is worse (the press lands on a
+    panel). From the edge the cursor is first moved to where the whole drag fits."""
+    order = []
+    monkeypatch.setattr(controller, "send_line", lambda ser, s: order.append(s))
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **kw: order.append(("move", x, y)))
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (1850, 500))   # 50px from the right edge
+    monkeypatch.setattr(controller, "get_state", lambda: _camera_state())
+    controller.drag_middle(object(), 300)
+    assert order[0][0] == "move" and order[1] == "MMD", "reposition first, then press"
+    start_x = order[0][1]
+    assert 100 <= start_x and start_x + 300 <= 100 + 1800 - controller.CAMERA_DRAG_MARGIN_PX
+    assert order[2] == ("move", start_x + 300, order[0][2])
+
+
+def _install_camera_world(monkeypatch, *, yaw0, units_per_px, drags):
+    """A fake client whose yaw moves by units_per_px per dragged pixel (sign included), read
+    back through /state; every drag_middle call is recorded in `drags`."""
+    yaw = {"v": yaw0}
+    import input_state
+    input_state.camera_units_per_px = None
+    input_state.camera_drag_sign = 1
+
+    def drag(ser, dx, dy=0):
+        drags.append(dx)
+        yaw["v"] = (yaw["v"] + int(round(dx * units_per_px))) % 2048
+
+    monkeypatch.setattr(controller, "drag_middle", drag)
+    # The fake client reports JAU14, as the real one does.
+    monkeypatch.setattr(controller, "get_state",
+                        lambda: _camera_state(cameraYaw=yaw["v"] * JAU14,
+                                              cameraYawTarget=yaw["v"] * JAU14))
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller.time, "sleep", lambda s: None)
+    return yaw
+
+
+def test_face_toward_reads_the_bridge_yaw_as_jau14(monkeypatch):
+    """East up the screen is 1536 in 2048ths, which the bridge reports as 12288. A code path
+    reading that as 2048ths lands on 12288 % 2048 = 0 (north) and drags for no reason."""
+    drags = []
+    monkeypatch.setattr(controller, "drag_middle", lambda ser, dx, dy=0: drags.append(dx))
+    monkeypatch.setattr(controller, "get_state",
+                        lambda: _camera_state(cameraYaw=1536 * JAU14, cameraYawTarget=1536 * JAU14))
+    monkeypatch.setattr(controller.time, "sleep", lambda s: None)
+    assert controller.face_toward(object(), 140, 100, px=100, py=100) is True
+    assert drags == []
+
+
+def test_face_toward_sends_no_input_when_the_target_is_already_up_the_screen(monkeypatch):
+    drags = []
+    _install_camera_world(monkeypatch, yaw0=1500, units_per_px=2.0, drags=drags)
+    # target due east wants 1536; 1500 is inside the tolerance
+    assert controller.face_toward(object(), 140, 100, px=100, py=100) is True
+    assert drags == []
+
+
+def test_face_toward_turns_the_camera_until_the_target_is_up_the_screen(monkeypatch):
+    drags = []
+    yaw = _install_camera_world(monkeypatch, yaw0=0, units_per_px=2.0, drags=drags)
+    assert controller.face_toward(object(), 140, 100, px=100, py=100) is True   # east: 1536
+    assert drags, "a 512-unit turn needs a drag"
+    assert abs(controller.yaw_delta(yaw["v"], 1536)) <= controller.CAMERA_YAW_TOLERANCE
+
+
+def test_face_toward_learns_a_backwards_drag_direction_from_the_first_drag(monkeypatch):
+    """The client's drag direction is NOT assumed: with a backwards client (a +dx drag turns
+    the camera the wrong way) the first drag measures the real signed rate, the sign is
+    remembered, and the correcting drags use it -- so the camera still ends up facing the
+    target rather than spinning away from it."""
+    drags = []
+    yaw = _install_camera_world(monkeypatch, yaw0=0, units_per_px=-2.0, drags=drags)
+    assert controller.face_toward(object(), 140, 100, px=100, py=100) is True    # east: 1536
+    assert abs(controller.yaw_delta(yaw["v"], 1536)) <= controller.CAMERA_YAW_TOLERANCE
+    import input_state
+    assert input_state.camera_drag_sign == -1, "the backwards direction was learned"
+    assert input_state.camera_units_per_px == pytest.approx(2.0, rel=0.2)
+
+
+def test_face_toward_gives_up_after_the_drag_budget_and_says_so(monkeypatch):
+    drags = []
+    _install_camera_world(monkeypatch, yaw0=0, units_per_px=0.0, drags=drags)   # camera never moves
+    assert controller.face_toward(object(), 100, 60, px=100, py=100) is False
+    assert len(drags) == controller.CAMERA_MAX_DRAGS
+
+
+def test_face_toward_caps_one_drag_at_the_human_maximum(monkeypatch):
+    """The human's longest drag was 360px; a bigger turn is two flicks, as in the recording."""
+    drags = []
+    _install_camera_world(monkeypatch, yaw0=0, units_per_px=1.0, drags=drags)   # 1024 units = 1024px
+    controller.face_toward(object(), 100, 60, px=100, py=100)
+    assert all(abs(d) <= controller.CAMERA_DRAG_MAX_PX for d in drags)

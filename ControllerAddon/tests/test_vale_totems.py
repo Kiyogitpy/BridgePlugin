@@ -90,8 +90,16 @@ def test_state_carries_the_globals():
 import vale_totem_route as vtr
 
 
-def test_claim_outranks_everything_so_offerings_are_never_left_behind():
+def test_a_pile_below_the_cap_is_left_on_the_floor():
+    """USER 2026-09-10: "skip picking up vale offerings since they stack up on the floor and
+    i can pick them later saving the routine some time". Only a CAPPED pile is claimed,
+    because a build on a capped pile is refused by the game (reader: OFFERING_CAP 15,000)."""
     site = vt.parse_state(_payload(_site(unclaimedOfferings=65))).sites[1]
+    assert vt.next_action(site, logs=10, bows=10) == ("build", None)
+
+
+def test_a_capped_pile_is_claimed_before_anything_else():
+    site = vt.parse_state(_payload(_site(unclaimedOfferings=vt.OFFERING_CAP))).sites[1]
     assert vt.next_action(site, logs=10, bows=10) == ("claim", None)
 
 
