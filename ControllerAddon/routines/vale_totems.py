@@ -502,17 +502,27 @@ MISS_CHECK_S = 1.0          # how long /last-action is polled for the click's ow
 MISS_CHECK_POLL_S = 0.15
 
 
+# An option that can only be offered AFTER `option` has landed on the same object: a record
+# of it is proof of success, not a miss. MEASURED run 17 (site 6): a simulated misclick's
+# corrective reclick landed after the Build had registered, the totem now offered Carve, the
+# record read "Carve" and the menu retry then found no Build to select.
+_LATER_SITE_OPTIONS = {"claim": (), "build": ("carve", "decorate"), "carve": ("decorate",),
+                       "decorate": ()}
+
+
 def _click_missed(before_action: dict, option: str) -> bool:
-    """True once /last-action shows a NEW record (not `before_action`) whose option is not
-    `option`; False when the record is ours, or when nothing new appeared within MISS_CHECK_S
-    (the click may still register on arrival -- the caller's confirm decides that)."""
+    """True once /last-action shows a NEW record (not `before_action`) whose option is neither
+    `option` nor one that only exists once `option` has landed; False when the record is
+    ours, or when nothing new appeared within MISS_CHECK_S (the click may still register on
+    arrival -- the caller's confirm decides that)."""
     def key(rec):
         return (rec.get("tick"), rec.get("option"), rec.get("target"), rec.get("id"))
+    ok = (option.lower(),) + _LATER_SITE_OPTIONS.get(option.lower(), ())
     deadline = _now() + MISS_CHECK_S
     while True:
         last = controller.get_last_action() or {}
         if last and key(last) != key(before_action):
-            return (last.get("option") or "").lower() != option.lower()
+            return (last.get("option") or "").lower() not in ok
         if _now() >= deadline:
             return False
         _sleep(MISS_CHECK_POLL_S)

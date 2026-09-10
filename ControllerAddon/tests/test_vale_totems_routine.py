@@ -2613,3 +2613,16 @@ def test_a_bank_trip_is_due_at_a_finished_ring_when_less_than_a_lap_is_held(monk
     assert vtr_routine._bank_trip_due(ctx, state) is True
     ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 28          # 4 + 28 + 8 = 40: a lap's worth
     assert vtr_routine._bank_trip_due(ctx, state) is False
+
+
+def test_a_later_option_on_the_same_object_is_proof_the_click_landed_not_a_miss(monkeypatch):
+    """MEASURED run 17, site 6: the corrective reclick after a simulated misclick registered
+    as Carve because the Build had already landed; the menu retry then found no Build."""
+    _fake_clock(monkeypatch)
+    actions = iter([{"tick": 5, "option": "Carve", "target": "Maple totem"}] * 5)
+    monkeypatch.setattr(controller, "get_last_action", lambda: next(actions))
+    assert vtr_routine._click_missed({"tick": 1, "option": "Decorate"}, "Build") is False
+    actions = iter([{"tick": 5, "option": "Walk here", "target": ""}] * 5)
+    assert vtr_routine._click_missed({"tick": 1, "option": "Decorate"}, "Build") is True
+    actions = iter([{"tick": 5, "option": "Claim", "target": "Offerings"}] * 5)
+    assert vtr_routine._click_missed({"tick": 1, "option": "Decorate"}, "Build") is True
