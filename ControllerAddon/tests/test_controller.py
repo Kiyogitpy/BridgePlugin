@@ -902,14 +902,14 @@ def test_click_entity_skips_settle_when_cursor_already_on_target(monkeypatch):
                                  check_ui_blockers=False,
                                  refresh_target=lambda: (104, 103))
     assert ok
-    assert len(moves) == 1                 # within tolerance: no extra motion
+    assert moves == []                     # within tolerance: clicked in place, no motion at all
     assert clicks == [1]
 
 
 def test_click_entity_settle_tolerates_lost_target(monkeypatch):
     """refresh_target returning None mid-settle = target died/despawned; click the last-known
     point anyway, same as move()'s own target_lost path."""
-    moves, clicks = _click_entity_harness(monkeypatch)
+    moves, clicks = _click_entity_harness(monkeypatch, cursor=(300, 300))
     entity = {"name": "Goblin", "id": 1, "screenX": 100, "screenY": 100}
     ok = controller.click_entity(None, entity, offset=(0, 0), simulate_mistakes=False,
                                  check_ui_blockers=False,
@@ -2202,3 +2202,46 @@ def test_drag_middle_keeps_the_drag_off_the_canvas_top_and_bottom(monkeypatch):
     monkeypatch.setattr(controller, "move_to_human", lambda ser, x, y, **k: moves.append((x, y)))
     controller.drag_middle(object(), 300)
     assert moves[0][1] >= 50 + controller.CAMERA_DRAG_MARGIN_Y_PX, "repositioned down first"
+
+
+def test_click_entity_clicks_in_place_when_the_cursor_is_already_on_the_aim(monkeypatch):
+    """USER 2026-09-10: "the weird little flick if we basically have the mouse already over the
+    target ... we don't really have to move if the interact is correct already"."""
+    moves, clicks = _click_entity_harness(monkeypatch, cursor=(104, 103))
+    entity = {"name": "Goblin", "id": 1, "screenX": 100, "screenY": 100}
+    ok = controller.click_entity(None, entity, offset=(0, 0), simulate_mistakes=False,
+                                 check_ui_blockers=False)
+    assert ok
+    assert moves == [], "no flight: the cursor was already on the aim"
+    assert clicks == [1]
+
+
+def test_click_entity_clicks_in_place_when_the_hover_already_names_the_entity(monkeypatch):
+    moves, clicks = _click_entity_harness(monkeypatch, cursor=(130, 100))   # 30px off the aim
+    monkeypatch.setattr(controller, "get_hover",
+                        lambda: {"option": "Attack", "target": "Goblin (level-2)", "menuOpen": False})
+    entity = {"name": "Goblin", "id": 1, "screenX": 100, "screenY": 100}
+    assert controller.click_entity(None, entity, offset=(0, 0), simulate_mistakes=False,
+                                   check_ui_blockers=False)
+    assert moves == []
+    assert clicks == [1]
+
+
+def test_click_entity_still_flies_when_the_hover_names_something_else(monkeypatch):
+    moves, clicks = _click_entity_harness(monkeypatch, cursor=(130, 100))
+    monkeypatch.setattr(controller, "get_hover",
+                        lambda: {"option": "Walk here", "target": "", "menuOpen": False})
+    entity = {"name": "Goblin", "id": 1, "screenX": 100, "screenY": 100}
+    assert controller.click_entity(None, entity, offset=(0, 0), simulate_mistakes=False,
+                                   check_ui_blockers=False)
+    assert moves == [(100, 100)]
+    assert clicks == [1]
+
+
+def test_a_simulated_miss_keeps_its_flight_even_from_on_top_of_the_target(monkeypatch):
+    moves, clicks = _click_entity_harness(monkeypatch, cursor=(100, 100))
+    monkeypatch.setattr(controller.random, "random", lambda: 0.0)          # force the miss
+    monkeypatch.setattr(controller, "_reclick_after_misclick", lambda *a, **k: None)
+    entity = {"name": "Goblin", "id": 1, "screenX": 100, "screenY": 100}
+    controller.click_entity(None, entity, offset=(0, 0), check_ui_blockers=False)
+    assert len(moves) == 1, "the miss is the motion"

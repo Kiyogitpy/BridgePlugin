@@ -2821,25 +2821,42 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
             rotate_camera_away_from_ui(ser, blocker)
             return False
 
-    debug_log.log("action", f"click_entity target={entity.get('name')}(id={entity.get('id')}) at ({aim_x},{aim_y})")
-    move_to_human(
-        ser,
-        aim_x,
-        aim_y,
-        aim_radius=ENTITY_AIM_RADIUS,
-        refresh_target=refresh_target,
-        refresh_legs=refresh_legs,
-    )
-    if _movement_abort.is_set():
-        return False
+    # CLICK IN PLACE WHEN THE CURSOR IS ALREADY ON THE TARGET. USER 2026-09-10: "have you
+    # noticed the weird little flick if we basically have the mouse already over the target?
+    # ... we don't really have to move if the interact is correct already". Every pre-hovered
+    # click (vale totems' tracked hover, mixology's parked cursor) used to fly to a fresh aim
+    # point a few px away and back through the settle -- a visible twitch a hand never makes.
+    # Two tests: the cursor within CLICK_IN_PLACE_RADIUS_PX of the aim (aim jitter plus the
+    # hover tracker's drift), or within CLICK_IN_PLACE_HOVER_RADIUS_PX with /hover already
+    # naming this entity (the cursor is on the model, wherever on it). A simulated miss keeps
+    # its flight -- the miss IS the motion.
+    in_place = False
+    if not missed:
+        in_place = _cursor_already_on(entity, aim_x, aim_y)
+    if in_place:
+        debug_log.log("action", f"click_entity target={entity.get('name')}(id={entity.get('id')}) "
+                                f"in place (cursor already on it)")
+    else:
+        debug_log.log("action", f"click_entity target={entity.get('name')}(id={entity.get('id')}) at ({aim_x},{aim_y})")
+        move_to_human(
+            ser,
+            aim_x,
+            aim_y,
+            aim_radius=ENTITY_AIM_RADIUS,
+            refresh_target=refresh_target,
+            refresh_legs=refresh_legs,
+        )
+        if _movement_abort.is_set():
+            return False
 
     # A deliberate simulated miss skips BOTH the settle and the hover verification -- each
     # would "correct" the miss the moment it was made, defeating the humanization. The
     # corrective reclick below is the one that gets the full treatment.
     if not missed:
-        _settle_on_target_before_click(ser, refresh_target)
-        if _movement_abort.is_set():
-            return False
+        if not in_place:
+            _settle_on_target_before_click(ser, refresh_target)
+            if _movement_abort.is_set():
+                return False
         if (expected_action or expected_target) and button != "right" \
                 and not _verify_hover_before_click(ser, expected_action, expected_target,
                                                    refresh_target):
@@ -2857,6 +2874,23 @@ def click_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
                                 refresh_legs, expected_action, expected_target)
 
     return True
+
+
+def _cursor_already_on(entity: dict, aim_x: int, aim_y: int) -> bool:
+    """Whether the cursor can click `entity` where it is: within CLICK_IN_PLACE_RADIUS_PX of
+    the aim, or within CLICK_IN_PLACE_HOVER_RADIUS_PX with the live hover naming the entity.
+    The hover read is only paid in the band between the two radii."""
+    cur = get_cursor_pos()
+    dist = math.hypot(aim_x - cur[0], aim_y - cur[1])
+    if dist <= CLICK_IN_PLACE_RADIUS_PX:
+        return True
+    name = (entity.get("name") or "").strip().lower()
+    if not name or dist > CLICK_IN_PLACE_HOVER_RADIUS_PX:
+        return False
+    hover = get_hover() or {}
+    if hover.get("menuOpen"):
+        return False
+    return name in (hover.get("target") or "").lower()
 
 
 def _settle_on_target_before_click(ser: serial.Serial, refresh_target) -> None:

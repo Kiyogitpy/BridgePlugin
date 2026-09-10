@@ -1950,6 +1950,12 @@ Four things were MEASURED, and the first is not about this routine at all:
   - **Typing to Claude with the game window focused reaches the game**: F-keys switch tabs,
     Escape closes the make menu, digits answer prompts. Three "make menu never opened" and a
     run of stalled walk clicks in run 11 line up exactly with keystrokes in the recorder.
+  - **A click whose cursor is already on the target is made IN PLACE** (`controller.
+    _cursor_already_on`, `CLICK_IN_PLACE_RADIUS_PX` 12 / `CLICK_IN_PLACE_HOVER_RADIUS_PX` 40
+    with `/hover` naming the entity). USER: "the weird little flick if we basically have the
+    mouse already over the target ... we don't really have to move if the interact is
+    correct already" -- every pre-hovered click used to fly to a fresh aim point a few px away
+    and back through the settle. Shared by every routine; a simulated miss keeps its flight.
   - Known and left alone: a lap that starts with too few logs reaches site 8 empty, the bank
     trip refills there, and site 8 stays unbuilt until the next lap (one lap in run 10, after a
     mid-lap restart). Steady state carries 52 logs for a 40-log lap, so it only follows a

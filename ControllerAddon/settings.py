@@ -85,6 +85,12 @@ CAMERA_DRAG_CURVE_FRACTION = 0.04   # S-curve control offset for a middle DRAG. 
 # ---------------- Human-like aiming ----------------
 DEFAULT_AIM_RADIUS = 10         # px; move_to_human's own fallback when a caller doesn't specify one
 ENTITY_AIM_RADIUS = 3           # px; used by click_entity -- tighter than the generic default since
+# CLICK IN PLACE (controller._cursor_already_on). USER 2026-09-10: "the weird little flick if we
+# basically have the mouse already over the target". Within the first radius the cursor is on
+# the aim to within its own jitter (ENTITY_AIM_RADIUS) plus the hover tracker's drift
+# (PREHOVER_TRACK_DRIFT_PX 10); up to the second, /hover naming the entity is what decides.
+CLICK_IN_PLACE_RADIUS_PX = 12
+CLICK_IN_PLACE_HOVER_RADIUS_PX = 40
                                  # ground items and inventory slots have small clickboxes
 DEFAULT_OVERSHOOT_PX = 22       # px; how far a simulated overshoot flies past the target
 DEFAULT_OVERSHOOT_CHANCE = 0.42  # probability a given move overshoots before correcting
