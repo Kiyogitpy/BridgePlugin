@@ -492,10 +492,26 @@ def _click_site(ctx, site_number, which, budget_s, confirm, option=None, after_c
                                         confirm, now_fn=_now, sleep_fn=_sleep))
 
 
+IDLE_ANIM_READS = 2          # consecutive idle reads, IDLE_ANIM_POLL_S apart
+IDLE_ANIM_POLL_S = 0.15
+
+
 def _await_idle_animation(budget_s: float = None) -> bool:
-    """Poll until the player's animation reads -1, at most CARVE_KEY_ANIM_WAIT_S."""
-    return _poll_prompt(lambda: (controller.get_player() or {}).get("animation", -1) == -1,
-                        CARVE_KEY_ANIM_WAIT_S if budget_s is None else budget_s, 0.1)
+    """Poll until the player's animation reads -1 on IDLE_ANIM_READS consecutive reads, at
+    most CARVE_KEY_ANIM_WAIT_S. TWO reads, not one: MEASURED run 19 (site 6) a carve's
+    varbit lands a frame before its animation starts, so a single read right after the
+    confirm saw -1 and the Decorate went out into the animation and was dropped."""
+    idle = {"n": 0}
+
+    def settled():
+        if (controller.get_player() or {}).get("animation", -1) == -1:
+            idle["n"] += 1
+        else:
+            idle["n"] = 0
+        return idle["n"] >= IDLE_ANIM_READS
+
+    return _poll_prompt(settled, CARVE_KEY_ANIM_WAIT_S if budget_s is None else budget_s,
+                        IDLE_ANIM_POLL_S)
 
 
 MISS_CHECK_S = 1.0          # how long /last-action is polled for the click's own record

@@ -2626,3 +2626,13 @@ def test_a_later_option_on_the_same_object_is_proof_the_click_landed_not_a_miss(
     assert vtr_routine._click_missed({"tick": 1, "option": "Decorate"}, "Build") is True
     actions = iter([{"tick": 5, "option": "Claim", "target": "Offerings"}] * 5)
     assert vtr_routine._click_missed({"tick": 1, "option": "Decorate"}, "Build") is True
+
+
+def test_the_idle_animation_wait_needs_two_idle_reads_in_a_row(monkeypatch):
+    """MEASURED run 19: a carve's varbit lands a frame before its animation starts."""
+    _fake_clock(monkeypatch)
+    anim = iter([-1, 9401, 9401, -1, -1] + [-1] * 20)      # idle for one frame, then busy
+    reads = []
+    monkeypatch.setattr(controller, "get_player", lambda: reads.append(1) or {"animation": next(anim)})
+    assert vtr_routine._await_idle_animation() is True
+    assert len(reads) == 5, "the lone idle read before the animation did not count"
