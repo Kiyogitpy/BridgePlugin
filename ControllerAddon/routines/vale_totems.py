@@ -317,10 +317,22 @@ def tick(ctx):
     _walk_to_site(ctx, data["vt_site"])
 
 
+# A LAP'S WORTH, whatever the ring reads right now. MEASURED run 17 (2026-09-10, 15:15): the
+# bank site came round with every totem still reading complete from the lap just walked, the
+# outstanding-work need was ~0, no trip was made -- and site 7 finished with 1 log because
+# every totem decays before the ring comes back to it (eight visits a lap, each a build and
+# four decorations, ~40 units). So the trip is also due whenever hands, basket and bows hold
+# less than that; a trip loads ~50, so it fires about once a lap, which is what the laps
+# that did bank showed anyway.
+LAP_UNITS = len(route.SITES) * vt.LOGS_PER_TOTEM
+
+
 def _bank_trip_due(ctx, state) -> bool:
-    """The lap's outstanding work needs more logs than the hands and the basket hold."""
-    return (vt.logs_needed_for_lap(state, bow_count(ctx))
-            > count_item(ctx.state.config["log"]) + basket_logs(ctx.state.data))
+    """The lap ahead needs more logs than the hands and the basket hold: the ring's
+    outstanding work, or a full lap's worth, whichever is larger."""
+    bows = bow_count(ctx)
+    need = max(vt.logs_needed_for_lap(state, bows), LAP_UNITS - bows)
+    return need > count_item(ctx.state.config["log"]) + basket_logs(ctx.state.data)
 
 
 def _face_booth(ctx) -> None:

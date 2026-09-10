@@ -1121,7 +1121,7 @@ def test_the_lap_check_counts_the_logs_in_the_basket(monkeypatch):
     _park_at(monkeypatch, 8)
     monkeypatch.setattr(vtr_routine, "work_site", lambda ctx, n: True)
     monkeypatch.setattr(vtr_routine, "start_fletching", lambda ctx: True)
-    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 19)   # the measured 19 loose
     monkeypatch.setattr(vtr_routine, "find_basket", lambda: None)
     monkeypatch.setattr(vtr_routine, "bank_trip",
                         lambda ctx: pytest.fail("the basket holds 28 -- no trip is due"))
@@ -2597,3 +2597,19 @@ def test_a_site_click_waits_for_the_previous_animation_to_end(monkeypatch):
                         lambda ctx, signals, budget, confirm, **k: True)
     vtr_routine._click_site(_ctx_only(), 6, "totem", 6.0, lambda: True, option="Decorate")
     assert order.index("click") >= 3, "three animation reads (two busy) before the click"
+
+
+def test_a_bank_trip_is_due_at_a_finished_ring_when_less_than_a_lap_is_held(monkeypatch):
+    """MEASURED run 17: every totem read complete at site 8, need ~0, no trip, and the lap
+    ran dry at site 7 -- every totem decays before the ring comes back round."""
+    state = vt.parse_state(_full_state(baseValue=4, wood="YEW", baseCarved=True,
+                                       bottom={"value": 10}, middle={"value": 11},
+                                       top={"value": 13}, decorations=4))
+    assert vt.logs_needed_for_lap(state) == 0
+    ctx = _ctx_only()
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 4)
+    monkeypatch.setattr(vtr_routine, "bow_count", lambda c, wood=None: 8)
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 20          # 4 + 20 + 8 = 32 < 40
+    assert vtr_routine._bank_trip_due(ctx, state) is True
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 28          # 4 + 28 + 8 = 40: a lap's worth
+    assert vtr_routine._bank_trip_due(ctx, state) is False
