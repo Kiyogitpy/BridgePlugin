@@ -440,6 +440,12 @@ def _click_site(ctx, site_number, which, budget_s, confirm, option=None, after_c
         debug_log.log(LOG, "site %d: %s object not in view" % (site_number, which))
         return False
     refresh = controller.object_refresh_target(x, y, route.PLANE, obj_id)
+    # NOT WHILE THE PREVIOUS ACTION IS STILL ANIMATING. MEASURED run 16 (2026-09-10): with the
+    # in-place click the Decorate went out 0.66s after the third carve key, inside the carve's
+    # animation, registered as Decorate and did nothing -- the same drop the carve keys
+    # suffer. The flight used to add the half second that hid this; the wait costs only the
+    # animation's tail, and only when there is one.
+    _await_idle_animation()
     before_action = controller.get_last_action() or {}
     if not controller.click_entity(ctx.ser, obj, refresh_target=refresh,
                                    refresh_legs=SITE_REFRESH_LEGS):
@@ -472,6 +478,12 @@ def _click_site(ctx, site_number, which, budget_s, confirm, option=None, after_c
         return False
     return bool(outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"], budget_s,
                                         confirm, now_fn=_now, sleep_fn=_sleep))
+
+
+def _await_idle_animation(budget_s: float = None) -> bool:
+    """Poll until the player's animation reads -1, at most CARVE_KEY_ANIM_WAIT_S."""
+    return _poll_prompt(lambda: (controller.get_player() or {}).get("animation", -1) == -1,
+                        CARVE_KEY_ANIM_WAIT_S if budget_s is None else budget_s, 0.1)
 
 
 MISS_CHECK_S = 1.0          # how long /last-action is polled for the click's own record
@@ -1109,8 +1121,7 @@ def carve(ctx, site) -> bool:
             # build's 827, or the previous action's) was still playing. The prompt is already
             # up by then, so this costs at most the animation's tail; the re-press below stays
             # as the belt for the tick-phase race it cannot see.
-            _poll_prompt(lambda: (controller.get_player() or {}).get("animation", -1) == -1,
-                         CARVE_KEY_ANIM_WAIT_S, 0.1)
+            _await_idle_animation()
         fresh = _site_now(n) or fresh
         missing = vt.missing_spirits(fresh)
         if not missing:

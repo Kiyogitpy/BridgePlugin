@@ -32,6 +32,8 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "is_point_blocked_by_ui", lambda x, y: None)
     monkeypatch.setattr(controller, "get_minimap_walk_point",
                         lambda x, y, p, inst=False: {"onMinimap": False})
+    # The animation wait before a site click / carve key reads /player; idle by default.
+    monkeypatch.setattr(controller, "get_player", lambda: {"animation": -1})
     monkeypatch.setattr(controller, "is_point_on_minimap_orb", lambda x, y: None)
     # face_toward drives the Arduino (middle-mouse drag); off by default so existing walk_leg
     # tests exercise the waypoint hops. The camera tests below override it explicitly.
@@ -2574,3 +2576,24 @@ def test_a_site_click_whose_record_is_ours_waits_for_the_confirm(monkeypatch):
                         lambda ctx, signals, budget, confirm, **k: waited.append(budget) or True)
     assert vtr_routine._click_site(_ctx_only(), 6, "totem", 6.0, lambda: True, option="Build") is True
     assert waited == [6.0]
+
+
+def test_a_site_click_waits_for_the_previous_animation_to_end(monkeypatch):
+    """MEASURED run 16: an in-place Decorate 0.66s after the last carve key, inside the carve
+    animation, registered and did nothing."""
+    _fake_clock(monkeypatch)
+    site = _one_site(baseValue=4, wood="YEW", baseCarved=True,
+                     bottom={"value": 10}, middle={"value": 11}, top={"value": 13})
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: site)
+    monkeypatch.setattr(vtr_routine, "site_object", lambda n, w: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    anim = iter([9401, 9401, -1] + [-1] * 20)
+    order = []
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: order.append("read") or {"animation": next(anim)})
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: order.append("click") or True)
+    monkeypatch.setattr(controller, "get_last_action", lambda: {"tick": 1, "option": "Decorate"})
+    monkeypatch.setattr(outcome_waits, "await_pre",
+                        lambda ctx, signals, budget, confirm, **k: True)
+    vtr_routine._click_site(_ctx_only(), 6, "totem", 6.0, lambda: True, option="Decorate")
+    assert order.index("click") >= 3, "three animation reads (two busy) before the click"
