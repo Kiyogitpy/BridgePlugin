@@ -1295,3 +1295,18 @@ def test_a_stale_scale_still_teaches_because_its_error_is_collinear(monkeypatch)
     worst = max(abs(r - 1.0) for r in ratios)
     assert worst < 0.05, (
         f"clean flight offered ratios {[round(r, 3) for r in ratios]}, expected ~1.0")
+
+
+def test_move_curve_fraction_overrides_the_reach_curve_for_that_move_only():
+    import random
+    import human_move as hm
+    rng = random.Random(7)
+    wide = [abs(o) for o in hm._curve_offsets(360.0, random.Random(1))]
+    hm._CURVE_OVERRIDE = 0.04
+    try:
+        narrow = [abs(o) for o in hm._curve_offsets(360.0, random.Random(1))]
+    finally:
+        hm._CURVE_OVERRIDE = None
+    assert max(narrow) < max(wide)
+    assert max(narrow) <= 0.04 * 360.0 * 4        # a few sigma of the drag's own wander
+    assert hm._CURVE_OVERRIDE is None

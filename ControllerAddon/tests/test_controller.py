@@ -2099,3 +2099,106 @@ def test_face_toward_caps_one_drag_at_the_human_maximum(monkeypatch):
     _install_camera_world(monkeypatch, yaw0=0, units_per_px=1.0, drags=drags)   # 1024 units = 1024px
     controller.face_toward(object(), 100, 60, px=100, py=100)
     assert all(abs(d) <= controller.CAMERA_DRAG_MAX_PX for d in drags)
+
+
+def _install_pitching_camera(monkeypatch, *, yaw0, pitch0, kick, pitch_per_px, drags):
+    """A fake client whose yaw moves 2 units per dragged px AND whose pitch is kicked by `kick`
+    JAU14 on every yaw drag (the bulge of a human-shaped drag, MEASURED 2026-09-10 at ~+115
+    per drag); a vertical drag moves the pitch by pitch_per_px per px."""
+    cam = {"yaw": yaw0, "pitch": pitch0}
+    import input_state
+    input_state.camera_units_per_px = None
+    input_state.camera_drag_sign = 1
+    input_state.camera_pitch_home = None
+    input_state.camera_pitch_per_px = None
+    input_state.camera_pitch_sign = 1
+
+    def drag(ser, dx, dy=0, aim_radius=None):
+        drags.append((dx, dy))
+        if dx:
+            cam["yaw"] = (cam["yaw"] + int(round(dx * 2.0))) % 2048
+            cam["pitch"] += kick
+        if dy:
+            cam["pitch"] += int(round(dy * pitch_per_px))
+
+    monkeypatch.setattr(controller, "drag_middle", drag)
+    monkeypatch.setattr(controller, "get_state",
+                        lambda: _camera_state(cameraYaw=cam["yaw"] * JAU14,
+                                              cameraYawTarget=cam["yaw"] * JAU14,
+                                              cameraPitch=cam["pitch"],
+                                              cameraPitchTarget=cam["pitch"]))
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller.time, "sleep", lambda s: None)
+    return cam
+
+
+def test_face_toward_pulls_the_pitch_back_after_every_yaw_drag(monkeypatch):
+    """USER 2026-09-10: "with enough camera moves our up and down would eventually end up in
+    a weird place". MEASURED the same day: ~+115 JAU14 of pitch per yaw drag. The keeper
+    corrects it back to the pitch the process first turned the camera at."""
+    drags = []
+    cam = _install_pitching_camera(monkeypatch, yaw0=0, pitch0=3200, kick=115,
+                                   pitch_per_px=7.6, drags=drags)
+    assert controller.face_toward(object(), 140, 100, px=100, py=100) is True   # east: 1536
+    assert any(dx == 0 and dy for dx, dy in drags), "a vertical corrective drag went out"
+    assert abs(cam["pitch"] - 3200) <= controller.CAMERA_PITCH_TOLERANCE
+
+
+def test_the_pitch_keeper_learns_a_backwards_vertical_drag(monkeypatch):
+    drags = []
+    cam = _install_pitching_camera(monkeypatch, yaw0=0, pitch0=3200, kick=115,
+                                   pitch_per_px=-7.6, drags=drags)
+    controller.face_toward(object(), 140, 100, px=100, py=100)
+    import input_state
+    assert input_state.camera_pitch_sign == -1
+    assert abs(cam["pitch"] - 3200) <= controller.CAMERA_PITCH_TOLERANCE
+
+
+def test_the_pitch_keeper_holds_the_first_pitch_across_calls_not_the_drifted_one(monkeypatch):
+    drags = []
+    cam = _install_pitching_camera(monkeypatch, yaw0=0, pitch0=3200, kick=115,
+                                   pitch_per_px=7.6, drags=drags)
+    controller.face_toward(object(), 140, 100, px=100, py=100)     # east
+    controller.face_toward(object(), 60, 100, px=100, py=100)      # west
+    controller.face_toward(object(), 140, 100, px=100, py=100)     # east again
+    assert abs(cam["pitch"] - 3200) <= controller.CAMERA_PITCH_TOLERANCE
+    import input_state
+    assert input_state.camera_pitch_home == 3200
+
+
+def test_face_toward_sends_no_pitch_drag_when_the_pitch_did_not_move(monkeypatch):
+    drags = []
+    _install_pitching_camera(monkeypatch, yaw0=0, pitch0=3200, kick=0,
+                             pitch_per_px=7.6, drags=drags)
+    controller.face_toward(object(), 140, 100, px=100, py=100)
+    assert not any(dx == 0 for dx, dy in drags)
+
+
+def test_drag_middle_uses_the_drag_curve_not_the_reach_curve(monkeypatch):
+    """MEASURED 2026-09-10 from the human's recording: middle drags wander at most ~8% of their
+    length vertically; a reach's 35% S-curve would bulge ~100px of pure pitch on a 360px drag."""
+    seen = {}
+    monkeypatch.setattr(controller, "get_state", lambda: _camera_state())
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (900, 500))
+    monkeypatch.setattr(controller, "mouse_middle_down", lambda ser: None)
+    monkeypatch.setattr(controller, "mouse_middle_up", lambda ser: None)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **k: seen.update(k) or seen.update(xy=(x, y)))
+    controller.drag_middle(object(), 300)
+    assert seen.get("curve_fraction") == controller.CAMERA_DRAG_CURVE_FRACTION
+    assert seen["xy"] == (1200, 500)
+
+
+def test_drag_middle_keeps_the_drag_off_the_canvas_top_and_bottom(monkeypatch):
+    """A drag started on the viewport's top rows had its bulge clamped at the screen edge and
+    came back 500+ pitch units off (vt_markers12); the vertical margin covers the bulge."""
+    moves = []
+    monkeypatch.setattr(controller, "get_state", lambda: _camera_state())
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (900, 60))   # near the top
+    monkeypatch.setattr(controller, "mouse_middle_down", lambda ser: None)
+    monkeypatch.setattr(controller, "mouse_middle_up", lambda ser: None)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "move_to_human", lambda ser, x, y, **k: moves.append((x, y)))
+    controller.drag_middle(object(), 300)
+    assert moves[0][1] >= 50 + controller.CAMERA_DRAG_MARGIN_Y_PX, "repositioned down first"

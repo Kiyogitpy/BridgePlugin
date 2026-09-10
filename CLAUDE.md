@@ -1914,6 +1914,42 @@ Four things were MEASURED, and the first is not about this routine at all:
   - The two unverified items from the morning -- the spool as the fletch's interruption and
     the direct booth click from site 8 -- both VERIFIED live in run 9 (bank open 11s after one
     click from the site, no hop).
+  - **CAMERA PITCH DRIFTS WITH EVERY YAW DRAG, AND THE DRAG'S CURVE WAS THE CAUSE** (USER: "with
+    enough camera moves our up and down would eventually end up in a weird place"; then "it
+    happened again so the pitch is too far up"). MEASURED with /state sampled at 0.15s: a 360px
+    yaw drag swung the pitch +-300 JAU14 mid-drag and netted ~+115; once the walk clicks landed
+    on the viewport's top rows the drag started there, its bulge was clamped at the screen edge
+    and single drags came back 500+ off (run 12: 3192 at 13:49 had become 3909 by 14:02). The
+    human's own middle drags (recording `vale-totem-human-string`, 12 of them) wander 2-28px
+    vertically on 89-360px, under 8% of their length; a reach's `HM2_CURVE_FRACTION` (0.35)
+    bulges ~100px on the same drag, and on a middle drag every vertical pixel IS pitch. Fixes,
+    all in controller/settings/human_move and so shared by every routine that turns the camera:
+    `human_move.move(curve_fraction=)` (a per-move override, `CAMERA_DRAG_CURVE_FRACTION`
+    0.04 for drags), `CAMERA_DRAG_MARGIN_Y_PX` (160) so a drag's bulge cannot reach the canvas
+    edge, and a PITCH KEEPER in `face_toward` (`_hold_pitch`): after every yaw drag the pitch is
+    pulled back to `input_state.camera_pitch_home` -- the pitch at the FIRST turn of the
+    process, i.e. whatever the user set before launching (USER: "whatever i set the camera to
+    now is the most ideal") -- with tight-aim vertical drags (`CAMERA_PITCH_AIM_RADIUS_PX` 2;
+    the default 10px jitter on a 16px drag made the learned rate swing 4..9/px), the rate
+    learned damped and bounded. VERIFIED run 13: a yaw drag kicked +124, one 16px drag put it
+    within 4 of home. Set the camera by hand, then start the routine; a restart re-takes home.
+  - **The same-id booth trap in `banker._refresh_bank_object`**: a counter is several booths
+    with one id and the first id match in the scan was whichever came first, so bank rounds 2
+    and 3 walked to a different booth (USER: "just choose the same one again"). It prefers the
+    same TILE now. VERIFIED run 13: rounds 2 and 3 clicked the identical pixel.
+  - **The first site click fires from the tracked hover within `EARLY_CLICK_TILES` (2) of the
+    stand tile instead of waiting for the stop** (USER: "the hover actually feels a bit
+    pointless unless we actually click with it"). A miss shows as `resolved to 'Walk here'`.
+  - **A viewport far click needs `VIEWPORT_EDGE_MARGIN_PX` (24) inside the canvas**: a
+    stand-line point projected on the canvas's top row passed isOnScreen and the click's jitter
+    landed on the window frame (run 12, 6->5: player never moved, target banned for the session).
+  - **The first carve key waits (<= 1s) for the player's animation to read -1**: across runs
+    9-13 the dropped first keys and the landed ones overlapped completely in delay after the
+    Carve click (0.42-0.56 vs 0.43-1.47s); every dropped one went out during the build's erect
+    animation. The re-press stays as the belt.
+  - **Typing to Claude with the game window focused reaches the game**: F-keys switch tabs,
+    Escape closes the make menu, digits answer prompts. Three "make menu never opened" and a
+    run of stalled walk clicks in run 11 line up exactly with keystrokes in the recorder.
   - Known and left alone: a lap that starts with too few logs reaches site 8 empty, the bank
     trip refills there, and site 8 stays unbuilt until the next lap (one lap in run 10, after a
     mid-lap restart). Steady state carries 52 logs for a 40-log lap, so it only follows a

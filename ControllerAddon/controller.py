@@ -2057,8 +2057,11 @@ def move_to_human(
     duration_scale: float = 1.0,
     refresh_target=None,
     refresh_legs: int = None,
+    curve_fraction: float = None,
 ) -> None:
     """
+    curve_fraction: per-move override of the path's S-curve amplitude (human_move); only the
+        camera drag sets it -- a middle drag's vertical wander IS camera pitch.
     refresh_target, if given, is a zero-arg callable returning the target's current
     (x, y) screen position, or None if it's no longer found. For moving targets
     (NPCs), a long flight is split so the final approach re-aims at where the
@@ -2119,7 +2122,8 @@ def move_to_human(
                 send_line(ser, "X")
         human_move.move(ser, aim[0], aim[1], get_cursor_pos=get_cursor_pos, send_line=send_line,
                         abort=_movement_abort, duration_scale=duration_scale,
-                        refresh_target=v2_refresh, flush_queue=flush)
+                        refresh_target=v2_refresh, flush_queue=flush,
+                        curve_fraction=curve_fraction)
         return
 
     start = get_cursor_pos()
@@ -2561,7 +2565,7 @@ def yaw_delta(cur: int, target: int) -> int:
     return ((target - cur + 1024) % 2048) - 1024
 
 
-def drag_middle(ser: serial.Serial, dx: int, dy: int = 0) -> None:
+def drag_middle(ser: serial.Serial, dx: int, dy: int = 0, aim_radius: int = None) -> None:
     """Hold the middle mouse button and move dx/dy pixels -- the human's camera-turn gesture,
     which sends NO camera packet to the server (unlike the arrow keys). Repositions first if the
     drag would run off the canvas (a maximized window clamps the cursor, shortening the turn).
@@ -2577,8 +2581,12 @@ def drag_middle(ser: serial.Serial, dx: int, dy: int = 0) -> None:
     sx, sy = get_cursor_pos()
 
     # Keep both ends of the drag inside the canvas, a margin off each edge.
+    # A TALLER VERTICAL MARGIN. MEASURED 2026-09-10 (vt_markers12): the walk clicks before a
+    # camera turn land on the top rows of the viewport, the drag started there, its bulge was
+    # clamped at the screen edge mid-drag, and the asymmetric path came back 500+ pitch units
+    # off. The drag's ends are kept far enough from the top and bottom for its whole path.
     lo_x, hi_x = left + CAMERA_DRAG_MARGIN_PX, left + width - CAMERA_DRAG_MARGIN_PX
-    lo_y, hi_y = top + CAMERA_DRAG_MARGIN_PX, top + height - CAMERA_DRAG_MARGIN_PX
+    lo_y, hi_y = top + CAMERA_DRAG_MARGIN_Y_PX, top + height - CAMERA_DRAG_MARGIN_Y_PX
     want_x = min(max(sx, lo_x - min(dx, 0)), hi_x - max(dx, 0)) if width else sx
     want_y = min(max(sy, lo_y - min(dy, 0)), hi_y - max(dy, 0)) if height else sy
     if (want_x, want_y) != (sx, sy):
@@ -2587,7 +2595,12 @@ def drag_middle(ser: serial.Serial, dx: int, dy: int = 0) -> None:
 
     mouse_middle_down(ser)
     human_delay(0.04, 0.09)          # let the firmware consume the press before the flight
-    move_to_human(ser, int(sx + dx), int(sy + dy))
+    # A DRAG IS NOT A REACH: its curve is the human's middle-drag wander (settings
+    # CAMERA_DRAG_CURVE_FRACTION), not a reach's S-curve -- every vertical pixel is pitch.
+    kwargs = {"curve_fraction": CAMERA_DRAG_CURVE_FRACTION}
+    if aim_radius is not None:
+        kwargs["aim_radius"] = aim_radius
+    move_to_human(ser, int(sx + dx), int(sy + dy), **kwargs)
     mouse_middle_up(ser)
     human_delay(0.05, 0.12)
 
@@ -2605,6 +2618,51 @@ def _camera_yaw_units():
     return None if yaw is None else (yaw / CAMERA_JAU14_PER_UNIT) % 2048
 
 
+def _camera_pitch():
+    return (get_state() or {}).get("cameraPitch")
+
+
+def _hold_pitch(ser: serial.Serial, home) -> None:
+    """Pull the pitch back to `home` after a yaw drag, with up to CAMERA_PITCH_MAX_TRIES
+    vertical middle-drags. See settings.CAMERA_PITCH_TOLERANCE for the measurement: a yaw drag
+    is a human-shaped path, and what its bulge leaves behind is ~+115 JAU14 of pitch per drag.
+    The rate and sign are learned from the first correction that moves the camera, as the yaw
+    drag learns its own; the vertical drag's own small yaw bulge is what face_toward's next
+    iteration corrects."""
+    if home is None:
+        return
+    for _ in range(CAMERA_PITCH_MAX_TRIES):
+        now = _camera_pitch()
+        if now is None:
+            return
+        delta = home - now
+        if abs(delta) <= CAMERA_PITCH_TOLERANCE:
+            return
+        rate = (input_state.camera_pitch_per_px or CAMERA_PITCH_PER_PX_DEFAULT)             * input_state.camera_pitch_sign
+        dy = int(round(delta / rate))
+        dy = max(-CAMERA_DRAG_MAX_PX, min(CAMERA_DRAG_MAX_PX, dy))
+        if dy == 0:
+            return
+        # TIGHT AIM: a 16-40px correction with the default 10px landing jitter made the learned
+        # rate swing 4..9 per px (MEASURED vt_markers12) and the corrections overshoot.
+        drag_middle(ser, 0, dy, aim_radius=CAMERA_PITCH_AIM_RADIUS_PX)
+        _wait_camera_settled()
+        after = _camera_pitch()
+        if after is None:
+            return
+        moved = after - now
+        debug_log.log("camera", f"pitch drag {dy:+d}px: pitch {now} -> {after} "
+                                f"(home {home}, {moved:+d})")
+        if moved != 0:
+            observed = moved / dy
+            rate = abs(observed)
+            if input_state.camera_pitch_per_px:          # damped, so one odd drag cannot swing it
+                rate = 0.5 * input_state.camera_pitch_per_px + 0.5 * rate
+            input_state.camera_pitch_per_px = max(CAMERA_PITCH_PER_PX_MIN,
+                                                  min(CAMERA_PITCH_PER_PX_MAX, rate))
+            input_state.camera_pitch_sign = 1 if observed >= 0 else -1
+
+
 def face_toward(ser: serial.Serial, tx: int, ty: int, px=None, py=None) -> bool:
     """Turn the camera so world tile (tx, ty) is up the screen, by middle-mouse drag. Returns
     True once it is within CAMERA_YAW_TOLERANCE, False if it could not get there within
@@ -2618,6 +2676,11 @@ def face_toward(ser: serial.Serial, tx: int, ty: int, px=None, py=None) -> bool:
         if px is None or py is None:
             return False
     target = yaw_for_bearing(px, py, tx, ty)
+    # The pitch to keep: the one the process first turned the camera at (the routine's or
+    # the user's own setting), never the drifted one a later call happens to find.
+    if input_state.camera_pitch_home is None:
+        input_state.camera_pitch_home = _camera_pitch()
+    home = input_state.camera_pitch_home
 
     for _ in range(CAMERA_MAX_DRAGS):
         yaw = _camera_yaw_units()
@@ -2647,6 +2710,7 @@ def face_toward(ser: serial.Serial, tx: int, ty: int, px=None, py=None) -> bool:
             observed = moved / dx
             input_state.camera_units_per_px = abs(observed)
             input_state.camera_drag_sign = 1 if observed >= 0 else -1
+        _hold_pitch(ser, home)
 
     yaw = _camera_yaw_units()
     ok = yaw is not None and abs(yaw_delta(yaw, target)) <= CAMERA_YAW_TOLERANCE
@@ -2661,7 +2725,8 @@ def _wait_camera_settled() -> None:
     deadline = time.monotonic() + CAMERA_DRAG_SETTLE_S
     while time.monotonic() < deadline:
         st = get_state() or {}
-        if st.get("cameraYaw") == st.get("cameraYawTarget"):
+        if (st.get("cameraYaw") == st.get("cameraYawTarget")
+                and st.get("cameraPitch") == st.get("cameraPitchTarget")):
             return
         time.sleep(0.05)
 

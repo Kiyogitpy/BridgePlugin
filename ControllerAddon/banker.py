@@ -159,10 +159,18 @@ def _refresh_bank_object(bank_obj: dict) -> dict:
     `bank_obj` unchanged if a matching id isn't found (e.g. a transient read miss); a stale
     position is still better than no click attempt at all."""
     target_id = bank_obj.get("id")
+    tile = (bank_obj.get("x"), bank_obj.get("y"))
+    # THE SAME TILE FIRST. A bank counter is several booths sharing one id, and the first id
+    # match in the scan is whichever the list happens to order first -- USER 2026-09-10,
+    # watching the vale totems bank trip: "we click one banker then after we fill inventory we
+    # swap to a different banker. just choose the same one again".
+    same_id = None
     for obj in controller.get_objects(radius=15):
         if obj.get("id") == target_id and obj.get("visible", True):
-            return obj
-    return bank_obj
+            if (obj.get("x"), obj.get("y")) == tile:
+                return obj
+            same_id = same_id or obj
+    return same_id or bank_obj
 
 
 BANK_PIN_GROUP = 213            # the PIN keypad; MEASURED live in the VM 2026-09-08

@@ -95,3 +95,8 @@ fidget_anchor = None
 # decreases it (RuneLite's "Right-click moves camera" clients differ, and it is not assumed).
 camera_units_per_px = None
 camera_drag_sign = -1     # settings.CAMERA_DRAG_SIGN_DEFAULT; MEASURED 2026-09-10, a -352px drag gave +334 units
+# The pitch the process first turned the camera at, and the learned vertical-drag rate/sign
+# (settings.CAMERA_PITCH_*). See controller._hold_pitch.
+camera_pitch_home = None
+camera_pitch_per_px = None
+camera_pitch_sign = 1

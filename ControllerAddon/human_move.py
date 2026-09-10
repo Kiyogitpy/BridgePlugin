@@ -179,6 +179,15 @@ def _ease(t: float) -> float:
     return t * t * (3.0 - 2.0 * t)
 
 
+# A per-move override of HM2_CURVE_FRACTION, set by move(curve_fraction=...) for its own
+# duration. A middle-mouse camera DRAG is the one move that must not curve like a reach:
+# MEASURED 2026-09-10 from the human's recording, their 89-360px middle drags wander 2-28px
+# vertically (under 8% of their length), while a reach's 35% control offset bulges ~100px on
+# a 360px drag -- and every vertical pixel of a middle drag is camera PITCH, which then hits
+# the pitch limit mid-drag and comes back 500+ units off. Single-threaded by design.
+_CURVE_OVERRIDE = None
+
+
 def _curve_offsets(seg_len: float, rng: random.Random):
     """Two OPPOSING perpendicular control offsets, giving an S-curve rather than a bow.
 
@@ -186,8 +195,9 @@ def _curve_offsets(seg_len: float, rng: random.Random):
     0.963 against a human's 0.787): a bow of any amplitude is still one smooth arc. Opposing
     offsets make the path change direction mid-flight, which is both longer and less regular.
     """
-    a = rng.gauss(0.0, HM2_CURVE_FRACTION) * seg_len
-    b = -rng.gauss(0.0, HM2_CURVE_FRACTION) * seg_len
+    fraction = HM2_CURVE_FRACTION if _CURVE_OVERRIDE is None else _CURVE_OVERRIDE
+    a = rng.gauss(0.0, fraction) * seg_len
+    b = -rng.gauss(0.0, fraction) * seg_len
     return a, b
 
 
@@ -424,8 +434,12 @@ def _drain(t0: float, queued_ms: float) -> None:
 
 def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
          duration_scale: float = 1.0, refresh_target=None, flush_queue=None,
-         rng: random.Random = random, _recurve_depth: int = 0) -> None:
+         rng: random.Random = random, _recurve_depth: int = 0,
+         curve_fraction: float = None) -> None:
     """Drive the cursor to (x, y).
+
+    curve_fraction, if given, replaces HM2_CURVE_FRACTION for this move (and its own
+    recurves) -- see _CURVE_OVERRIDE for the one caller that needs it, the camera drag.
 
     Dependencies are injected rather than imported from controller, so this module can be unit
     tested with no serial port, no Windows cursor API, and no import cycle.
@@ -444,6 +458,17 @@ def move(ser, x: int, y: int, *, get_cursor_pos, send_line, abort=None,
     rewound bookkeeping would be wrong. A flushed flight never feeds _learn_scale -- its
     emitted units include motion that never happened.
     """
+    global _CURVE_OVERRIDE
+    if curve_fraction is not None and _recurve_depth == 0:
+        saved = _CURVE_OVERRIDE
+        _CURVE_OVERRIDE = curve_fraction
+        try:
+            return move(ser, x, y, get_cursor_pos=get_cursor_pos, send_line=send_line,
+                        abort=abort, duration_scale=duration_scale,
+                        refresh_target=refresh_target, flush_queue=flush_queue, rng=rng,
+                        _recurve_depth=_recurve_depth)
+        finally:
+            _CURVE_OVERRIDE = saved
     start = get_cursor_pos()
     target = (float(x), float(y))
     total_dist = math.hypot(target[0] - start[0], target[1] - start[1])

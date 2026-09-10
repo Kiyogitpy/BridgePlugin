@@ -1929,14 +1929,15 @@ def test_an_empty_that_fills_every_free_slot_leaves_the_basket_unknown_not_empty
     """USER 2026-09-09: "just ignored a totem for some reason, had 17 logs in logbasket none
     in inventory" -- a slots-worth moved out of an unknown basket was recorded as 'now empty'."""
     inv = [{"name": "Open log basket", "screenX": 1, "screenY": 1}] + [{"name": "x"}] * 20  # 7 free
-    monkeypatch.setattr(controller, "get_inventory", lambda: inv)
+    state = {"clicked": False}
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: inv + [{"name": "Maple logs"}] * 7 if state["clicked"] else inv)
     monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
     _shift_keys(monkeypatch, [])
-    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
-    counts = iter([0, 7, 7, 7, 7])          # 7 logs arrived: exactly the free slots
-    monkeypatch.setattr(vtr_routine, "count_item", lambda name: next(counts))
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: state.__setitem__("clicked", True) or True)
     ctx = _ctx_only()
-    vtr_routine.empty_basket(ctx)
+    vtr_routine.empty_basket(ctx)                 # 7 logs arrived: exactly the free slots
     assert ctx.state.data.get(vtr_routine.BASKET_LOGS_KEY) is None, "unknown, NOT zero"
 
 
@@ -2312,7 +2313,21 @@ def _carve_fixture(monkeypatch, land_after_presses):
     monkeypatch.setattr(vtr_routine, "_await_menu", lambda ctx: True)
     monkeypatch.setattr(outcome_waits, "await_pre",
                         lambda ctx, signals, budget, confirm, **k: bool(confirm()))
+    monkeypatch.setattr(controller, "get_player", lambda: {"animation": -1})
     return site, pressed
+
+
+def test_the_first_carve_key_waits_for_the_build_animation_to_end(monkeypatch):
+    """MEASURED runs 9-13: every dropped first key went out while the player was still
+    animating; the landed ones came after. The key waits for animation -1, up to a bound."""
+    site, pressed = _carve_fixture(monkeypatch, land_after_presses=1)
+    anim = iter([827, 827, -1] + [-1] * 20)
+    reads = []
+    monkeypatch.setattr(controller, "get_player", lambda: reads.append(1) or {"animation": next(anim)})
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    assert vtr_routine.carve(_ctx_only(), site) is True
+    assert len(reads) >= 3, "polled until the animation ended"
+    assert pressed == ["EAGLE"]
 
 
 import outcome_waits
@@ -2429,3 +2444,96 @@ def test_an_unknown_basket_is_not_emptied_ahead_of_the_spool(monkeypatch):
     """Unknown means the fletch might not be ended by the Empty AND no log might arrive to
     cover the one the spool's 1.5s could cost the reserve; the spool alone is the safe end."""
     assert _spool_leg(monkeypatch, basket_estimate=None) == ["walk", "string"]
+
+
+def test_the_site_click_does_not_wait_for_the_stop_within_the_early_click_distance(monkeypatch):
+    """USER 2026-09-10: "the hover actually feels a bit pointless unless we actually click
+    with it". Within EARLY_CLICK_TILES the settle wait is skipped and the first action fires
+    from the tracked hover while the player is still running in."""
+    stops = []
+    ctx = _ctx(monkeypatch, stops)
+    site = _one_site(baseValue=4, wood="YEW", baseCarved=True, decorations=4,
+                     bottom={"value": 10}, middle={"value": 11}, top={"value": 13})
+    state = type("S", (), {"sites": {6: site}, "at_vale_totems": True})()
+    monkeypatch.setattr(vtr_routine, "read_state", lambda: state)
+    monkeypatch.setattr(vtr_routine, "nearest_site", lambda: 6)
+    sx, sy = route.SITES[6]["stand"]
+    _standing_at(monkeypatch, sx + 1, sy)                     # one tile out, still running
+    monkeypatch.setattr(vtr_routine, "work_site", lambda c, n, during_decorate=None: True)
+    monkeypatch.setattr(vtr_routine, "_basket_top_up_due", lambda c: False)
+    monkeypatch.setattr(vtr_routine, "bow_count", lambda c, wood=None: 0)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
+    monkeypatch.setattr(controller, "wait_until_player_idle",
+                        lambda **k: pytest.fail("waited for the stop inside the early-click distance"))
+    vtr_routine.tick(ctx)
+    assert not stops
+
+
+def test_the_site_click_still_waits_for_the_stop_further_out(monkeypatch):
+    stops = []
+    ctx = _ctx(monkeypatch, stops)
+    site = _one_site(baseValue=4, wood="YEW", baseCarved=True, decorations=4,
+                     bottom={"value": 10}, middle={"value": 11}, top={"value": 13})
+    state = type("S", (), {"sites": {6: site}, "at_vale_totems": True})()
+    monkeypatch.setattr(vtr_routine, "read_state", lambda: state)
+    monkeypatch.setattr(vtr_routine, "nearest_site", lambda: 6)
+    sx, sy = route.SITES[6]["stand"]
+    _standing_at(monkeypatch, sx + vtr_routine.EARLY_CLICK_TILES + 1, sy)
+    monkeypatch.setattr(vtr_routine, "work_site", lambda c, n, during_decorate=None: True)
+    monkeypatch.setattr(vtr_routine, "_basket_top_up_due", lambda c: False)
+    monkeypatch.setattr(vtr_routine, "bow_count", lambda c, wood=None: 0)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
+    waited = []
+    monkeypatch.setattr(controller, "wait_until_player_idle", lambda **k: waited.append(k) or True)
+    vtr_routine.tick(ctx)
+    assert waited
+
+
+def test_a_viewport_point_on_the_canvas_edge_is_not_a_far_click(monkeypatch):
+    """MEASURED 2026-09-10 (vt_markers12): a point projected on the canvas's top row passed
+    isOnScreen and the click's jitter landed on the window frame -- the player never moved."""
+    monkeypatch.setattr(controller, "get_state",
+                        lambda: {"canvasScreenX": 0, "canvasScreenY": 23,
+                                 "canvasWidth": 2529, "canvasHeight": 1377})
+    assert vtr_routine._viewport_click_ok({"onScreen": True, "screenX": 1245, "screenY": 23}) is False
+    assert vtr_routine._viewport_click_ok({"onScreen": True, "screenX": 1245, "screenY": 300}) is True
+    assert vtr_routine._viewport_click_ok({"onScreen": True, "screenX": 2520, "screenY": 300}) is False
+
+
+def test_the_far_click_skips_an_edge_projection_for_the_next_candidate(monkeypatch):
+    monkeypatch.setattr(controller, "get_state",
+                        lambda: {"canvasScreenX": 0, "canvasScreenY": 23,
+                                 "canvasWidth": 2529, "canvasHeight": 1377})
+    sx, sy = route.SITES[5]["stand"]
+
+    def ground(x, y, p, inst=False):
+        edge = (x, y) == (sx, sy)
+        return {"onScreen": True, "screenX": 1245, "screenY": 23 if edge else 400, "tile": (x, y)}
+
+    monkeypatch.setattr(controller, "get_ground_walk_point", ground)
+    target = vtr_routine._far_click_target(5, route.leg_waypoints(6, 5), *route.SITES[6]["stand"])
+    assert target is not None and (target[0], target[1]) != (sx, sy)
+
+
+def test_empty_basket_measures_the_move_in_free_slots_so_a_running_fletch_cannot_zero_the_estimate(monkeypatch):
+    """MEASURED runs 11-13: with a fletch running, a log turned into a bow between the read
+    and the Empty, the loose-log delta came out one short of the free slots, and the basket
+    was recorded EMPTY with ~17 logs in it -- the lap then ran dry a site early."""
+    state = {"clicked": False}
+    tools = [{"name": "Open log basket", "screenX": 1, "screenY": 1}, {"name": "Fletching knife"}]
+    # before: 3 logs, 1 bow, 22 free. after: one log became a bow AND 22 moved in: 24 logs,
+    # 2 bows, 0 free -- the loose delta reads 21, the free-slot delta the true 22.
+    before = tools + [{"name": "Yew logs"}] * 3 + [{"name": "Yew longbow (u)"}]
+    after = tools + [{"name": "Yew logs"}] * 24 + [{"name": "Yew longbow (u)"}] * 2
+    monkeypatch.setattr(controller, "get_inventory", lambda: after if state["clicked"] else before)
+    monkeypatch.setattr(vtr_routine, "open_basket", lambda ctx: True)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda *a, **k: state.__setitem__("clicked", True) or True)
+    _shift_keys(monkeypatch, [])
+    monkeypatch.setattr(outcome_waits, "await_pre",
+                        lambda ctx, signals, budget, confirm, **k: bool(confirm()))
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 28
+    assert vtr_routine.empty_basket(ctx) is True
+    assert ctx.state.data[vtr_routine.BASKET_LOGS_KEY] == 28 - 22, "22 slots filled: 6 left, not 0"

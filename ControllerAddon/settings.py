@@ -63,7 +63,24 @@ CAMERA_UNITS_PER_PX_DEFAULT = 0.95  # yaw units (of 2048) per dragged pixel. MEA
                                     # client: 334/352, 336/360, 348/360, 312/337; self-calibrates after the first drag
 CAMERA_DRAG_SIGN_DEFAULT = -1       # a LEFTWARD (-px) drag INCREASES yaw here (same measurement); learned per drag
 CAMERA_MAX_DRAGS = 4                # give up facing after this many drags (a backwards client costs one to learn)
-CAMERA_DRAG_SETTLE_S = 1.5          # wait at most this long for the camera to finish interpolating after a drag
+CAMERA_DRAG_SETTLE_S = 1.5
+# PITCH KEEPER. MEASURED live 2026-09-10 (vale totems run 11, /state sampled at 0.15s): a
+# 360px yaw drag swings the pitch by +-300 JAU14 mid-drag (the human-shaped path bulges) and
+# nets about +115 per drag, so a lap's 4-8 drags would tilt the camera to its limit within a
+# few laps (USER: "with enough camera moves our up and down would eventually end up in a weird
+# place"). After every yaw drag the pitch is pulled back to where it was when the process first
+# turned the camera, with a vertical middle-drag whose rate is learned like the yaw's.
+CAMERA_PITCH_TOLERANCE = 60         # JAU14 pitch units left uncorrected (a drag nets ~115)
+CAMERA_PITCH_PER_PX_DEFAULT = 7.6   # JAU14 per dragged px until learned: the yaw's 0.95 units x 8
+CAMERA_PITCH_SIGN_DEFAULT = 1       # +1: a downward (+dy) drag raises the pitch value; learned on the first correction
+CAMERA_PITCH_MAX_TRIES = 3          # corrective drags per yaw drag
+CAMERA_PITCH_AIM_RADIUS_PX = 2      # landing jitter of a corrective drag (the default 10 is half of a 20px drag)
+CAMERA_PITCH_PER_PX_MIN = 3.0       # bounds on the learned vertical rate (MEASURED 3.8..9.3 with the loose aim)
+CAMERA_PITCH_PER_PX_MAX = 12.0
+CAMERA_DRAG_MARGIN_Y_PX = 160       # a drag's ends stay this far from the canvas top/bottom: its bulge must not clamp
+CAMERA_DRAG_CURVE_FRACTION = 0.04   # S-curve control offset for a middle DRAG. MEASURED 2026-09-10 from the human's
+                                    # recording: 89-360px middle drags wander 2-28px vertically, under 8% of their
+                                    # length; a reach's HM2_CURVE_FRACTION (0.35) would bulge ~100px, all of it pitch.          # wait at most this long for the camera to finish interpolating after a drag
 
 # ---------------- Human-like aiming ----------------
 DEFAULT_AIM_RADIUS = 10         # px; move_to_human's own fallback when a caller doesn't specify one

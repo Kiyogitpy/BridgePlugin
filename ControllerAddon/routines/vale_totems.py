@@ -240,7 +240,18 @@ def tick(ctx):
     # flight from the inventory (where the knife left the cursor) to the pile took 1.5s AFTER
     # the player had stopped. Hovering it during the settle spends that time on the walk.
     _prehover_first_action(ctx, current)
-    controller.wait_until_player_idle(timeout_s=SITE_SETTLE_S)
+    # CLICK FROM THE HOVER BEFORE THE STOP. USER 2026-09-10: "the hover actually feels a bit
+    # pointless unless we actually click with it" -- the tracked cursor was resting on the
+    # target for the last tiles of every approach and the click still waited for the player
+    # to stand still. The human clicks the totem from a few tiles out and lets the game queue
+    # the interaction (the same rule CLAUDE.md's "clicking while moving" section measured at
+    # 0.6-1.0s after the walk click). Within EARLY_CLICK_TILES the projection barely slides
+    # between the tracker's last re-aim and the mouse-down, so the settle is skipped and the
+    # first action fires at once; further out the settle still waits for the stop. A click
+    # that resolves to "Walk here" is _click_site's menu retry, and is logged so the miss
+    # rate of the early click can be read off the log.
+    if _tiles_to_site(current) > EARLY_CLICK_TILES:
+        controller.wait_until_player_idle(timeout_s=SITE_SETTLE_S)
     data["vt_fletch_due"] = False        # the leg is over; the next site decides afresh
 
     # AT THE BANK SITE WITH A TRIP DUE, THE CAMERA TURNS TOWARD THE BOOTH WHILE THE
@@ -395,6 +406,9 @@ def _prehover_first_action(ctx, site_number: int) -> None:
         still = still + 1 if not player.get("moving") else 0
         if still >= PREHOVER_STILL_READS:
             return
+        px, py = player.get("x"), player.get("y")
+        if px is not None and _tiles_between(px, py, *entry["stand"]) <= EARLY_CLICK_TILES:
+            return                       # close enough to click from the hover -- see tick()
         target = refresh() if callable(refresh) else None
         if target:
             tx, ty = int(target[0]) + PREHOVER_OFFSET[0], int(target[1]) + PREHOVER_OFFSET[1]
@@ -482,6 +496,7 @@ CARVE_BUDGET_S = 6.0
 # A landed carve key carves within ~0.6s (MEASURED, every carve in vt-markers7-approach); the
 # human re-presses a dropped one at ~1.0-1.2s. See carve() for the race this covers.
 CARVE_KEY_REPRESS_S = 1.5
+CARVE_KEY_ANIM_WAIT_S = 1.0     # longest wait for the previous animation before the first key
 
 
 def _close_prompt(ctx, force: bool = False) -> None:
@@ -606,6 +621,20 @@ def _tiles_between(x1, y1, x2, y2) -> int:
     return max(abs(x1 - x2), abs(y1 - y2))
 
 
+# The tracked hover clicks from this close instead of waiting for the stop; see tick().
+EARLY_CLICK_TILES = 2
+
+
+def _tiles_to_site(site_number: int) -> int:
+    """Chebyshev tiles from the player to the site's stand tile; a large number when the
+    player cannot be read, so a caller's "close enough" test fails safe."""
+    x, y = _player_xy()
+    if x is None or y is None:
+        return 10 ** 6
+    sx, sy = route.SITES[site_number]["stand"]
+    return _tiles_between(x, y, sx, sy)
+
+
 def at_site(site_number: int) -> bool:
     x, y = _player_xy()
     if x is None or y is None:
@@ -670,6 +699,30 @@ def _line_candidates(px, py, sx, sy):
     return out
 
 
+# A viewport candidate must project at least this far inside the canvas edge. MEASURED live
+# 2026-09-10 (vt_markers12, 6->5): the stand-line point projected on the canvas's TOP ROW
+# (screen y 23 with the canvas starting at 23), isOnScreen said yes, and the click's own
+# landing jitter put it at y 22 -- the window frame. The player never moved and the target
+# was banned for the session.
+VIEWPORT_EDGE_MARGIN_PX = 24
+
+
+def _viewport_click_ok(point) -> bool:
+    """On screen, not under a panel, and clear of the canvas edges by the margin."""
+    if not point.get("onScreen"):
+        return False
+    x, y = point.get("screenX", -1), point.get("screenY", -1)
+    if controller.is_point_blocked_by_ui(x, y):
+        return False
+    st = controller.get_state() or {}
+    left, top = st.get("canvasScreenX"), st.get("canvasScreenY")
+    width, height = st.get("canvasWidth"), st.get("canvasHeight")
+    if None in (left, top, width, height):
+        return True                       # cannot tell -- the old behaviour
+    m = VIEWPORT_EDGE_MARGIN_PX
+    return left + m <= x <= left + width - m and top + m <= y <= top + height - m
+
+
 def _far_click_target(b: int, points, px=None, py=None, ser=None, skip=()):
     """The farthest point of the leg that ONE click can reach right now: site `b`'s stand
     tile first, then the recorded waypoints from the far end. A point is reachable if it is
@@ -713,8 +766,7 @@ def _far_click_target(b: int, points, px=None, py=None, ser=None, skip=()):
         if (cx, cy) in skip:            # a target the game would not path to from this site
             continue
         point = controller.get_ground_walk_point(cx, cy, route.PLANE)
-        if point.get("onScreen") and not controller.is_point_blocked_by_ui(
-                point.get("screenX", -1), point.get("screenY", -1)):
+        if _viewport_click_ok(point):
             return cx, cy, point, True
         # WITHIN THE MINIMAP'S REAL REACH. /minimap/walk's onMinimap is a generous test
         # (CLAUDE.md: the cardinals still read "on" at 32 tiles) and a 38-tile point projected
@@ -745,8 +797,7 @@ def _walk_point_now(cx, cy):
     if cx is None or cy is None:
         return None, False
     point = controller.get_ground_walk_point(cx, cy, route.PLANE)
-    if point.get("onScreen") and not controller.is_point_blocked_by_ui(
-            point.get("screenX", -1), point.get("screenY", -1)):
+    if _viewport_click_ok(point):
         return point, True
     point = controller.get_minimap_walk_point(cx, cy, route.PLANE)
     if point.get("onMinimap") and not controller.is_point_on_minimap_orb(
@@ -1015,11 +1066,21 @@ def carve(ctx, site) -> bool:
         return False
 
     carved_any = False
-    for _ in range(3):
+    for index in range(3):
         if not _await_menu(ctx):
             if not carved_any:
                 debug_log.log(LOG, "site %d: carve menu never opened" % n)
             return carved_any
+        if index == 0:
+            # THE FIRST KEY WAITS FOR THE BUILD ANIMATION TO END. MEASURED across runs 9-13
+            # (2026-09-10): the dropped first keys (0.42-0.56s after the Carve click) and the
+            # landed ones (0.43-1.47s) overlap completely in delay; what separates them in the
+            # recorder is that every dropped key went out while the player's animation (the
+            # build's 827, or the previous action's) was still playing. The prompt is already
+            # up by then, so this costs at most the animation's tail; the re-press below stays
+            # as the belt for the tick-phase race it cannot see.
+            _poll_prompt(lambda: (controller.get_player() or {}).get("animation", -1) == -1,
+                         CARVE_KEY_ANIM_WAIT_S, 0.1)
         fresh = _site_now(n) or fresh
         missing = vt.missing_spirits(fresh)
         if not missing:
@@ -1446,7 +1507,14 @@ def empty_basket(ctx) -> bool:
     ok = bool(outcome_waits.await_pre(ctx, ["INVENTORY_CHANGED"], BASKET_BUDGET_S,
                                       lambda: count_item(log) > before,
                                       now_fn=_now, sleep_fn=_sleep))
-    moved = max(0, count_item(log) - before)
+    # MOVED IS MEASURED IN FREE SLOTS, NOT LOOSE LOGS. MEASURED 2026-09-10 (runs 11-13): the
+    # on-the-move Empty goes out while a fletch is still running, a log became a bow between
+    # the `before` read and the Empty landing, the loose delta came out one short of the free
+    # slots, and the rule below called the basket EMPTY with ~17 logs still in it -- no Empty
+    # was tried again that run and the lap ran dry one site early. A fletch swaps a log for
+    # a bow in the same slot, so the free-slot delta is exactly what the Empty moved.
+    free_after = 28 - len(controller.get_inventory() or [])
+    moved = max(0, free_before - free_after)
     data = ctx.state.data
     # An Empty hands over at most the FREE SLOTS' worth, so "it moved as many as could fit"
     # says nothing about what is left. USER 2026-09-09: "just ignored a totem for some reason,

@@ -952,3 +952,21 @@ def test_enter_bank_pin_never_simulates_a_misclick(monkeypatch):
     banker.enter_bank_pin(_Ctx())
     assert kwargs.get("simulate_mistakes") is False
     assert kwargs.get("check_ui_blockers") is False
+
+
+def test_refresh_bank_object_prefers_the_same_tile_among_booths_sharing_an_id(monkeypatch):
+    """USER 2026-09-10, watching the vale totems bank trip: "we click one banker then after we
+    fill inventory we swap to a different banker. just choose the same one again". A counter
+    is several booths with one id; the first id match in the scan was whichever came first."""
+    booths = [{"id": 57330, "x": 1414, "y": 3351, "screenX": 1, "screenY": 1},
+              {"id": 57330, "x": 1416, "y": 3351, "screenX": 2, "screenY": 2}]
+    monkeypatch.setattr(controller, "get_objects", lambda radius=15: booths)
+    fresh = banker._refresh_bank_object({"id": 57330, "x": 1416, "y": 3351})
+    assert (fresh["x"], fresh["y"]) == (1416, 3351)
+
+
+def test_refresh_bank_object_still_falls_back_to_any_booth_with_the_id(monkeypatch):
+    booths = [{"id": 57330, "x": 1414, "y": 3351}]
+    monkeypatch.setattr(controller, "get_objects", lambda radius=15: booths)
+    fresh = banker._refresh_bank_object({"id": 57330, "x": 1416, "y": 3351})
+    assert (fresh["x"], fresh["y"]) == (1414, 3351)
