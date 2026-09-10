@@ -1880,6 +1880,44 @@ Four things were MEASURED, and the first is not about this routine at all:
     wait, nothing was pressed and the spool was written off on ONE strike; now
     `SPOOL_STRIKES` (2) and the confirm is 6s. With nothing worth fletching (all logs owed to
     builds) and unstrung bows in hand, the leg strings (USER: "nor is it stringing the bows").
+- **AFTERNOON TUNING SESSION 2026-09-10 (host, runs vt_markers9-11, recorder `vt-markers9`): THE
+  LAP IS AT HUMAN PARITY.** MEASURED run 9: 8 sites in 4m36s INCLUDING the bank trip, 33-39s per
+  site against the human recording's 37.2s; site work 11-12s, legs 16-25s (game-bound: run
+  energy 98% with run on), 4-6s from the last decoration to the leg's fletch. So "improving
+  time" from here is the exceptions and the idle windows, not the cadence. Found and fixed:
+  - **A CARVE NUMBER PRESSED WHILE THE PREVIOUS ANIMATION STILL PLAYS IS DROPPED.** Recorder
+    signature: Carve click registers (dist 1), busy varbit 12393 goes 0 then 1 with NO carve
+    chat/varbit behind it, and the prompt sits there -- the bot then spent CARVE_BUDGET_S and a
+    fresh Carve click (6s, run 8 site 4). The HUMAN'S OWN recording has the identical signature
+    twice (keys at +0.4s, nothing) and recovers both times by pressing the same number again
+    ~1s later with no new click. `carve` now re-presses ONCE after `CARVE_KEY_REPRESS_S` (1.5s;
+    every landed key in the recording carved within 0.6s). VERIFIED live run 9 site 8: dropped
+    key recovered in 1.6s.
+  - **AN INVENTORY `Empty` ENDS A RUNNING ACTION.** MEASURED (run 9, leg 4->3): strings landed
+    at 39.2s and 40.4s, the basket Empty went out at 41.1s, the 41.6s string never came. So the
+    basket top-up moved ONTO THE LEG (`_empty_on_the_move`): after the walk re-click at the
+    reserve, and BEFORE the spool in the stringing branch when the basket is KNOWN to hold logs
+    -- the Empty is then the interruption itself and the stringing runs untouched. An unknown
+    basket (a restart) keeps spool-first. VERIFIED run 10 leg 6->5: `basket emptied on the move:
+    14 Maple logs loose`, stringing after it, and site 5's first click 0.2s after arrival with
+    no basket step.
+  - **The camera turns toward the NEXT site during the decorate wait at every site**
+    (`_decorate_camera_hook`, the booth turn generalized): the decorate is ~5s of idle hands and
+    the leg had opened with two drags (~1.5s) at half the sites. VERIFIED run 10: drags during
+    the decorations, 4/4 landed, the leg's first click needed none.
+  - **Bow click -> Space is POLLED** (`_poll_prompt`, 0.15s on a ~50ms widgets dump). 19
+    string starts measured 0.6-1.05s (human ~0.8s) except two at 1.75s, where the prompt's
+    WIDGET_LOADED was missed and `await_pre` only re-read at its budget.
+  - **`curl localhost` reads ~210ms on EVERY bridge endpoint on this host; `127.0.0.1` and
+    Python's requests read 10-50ms.** It is the resolver, not the bridge -- time the bridge
+    with 127.0.0.1 before concluding a read is slow.
+  - The two unverified items from the morning -- the spool as the fletch's interruption and
+    the direct booth click from site 8 -- both VERIFIED live in run 9 (bank open 11s after one
+    click from the site, no hop).
+  - Known and left alone: a lap that starts with too few logs reaches site 8 empty, the bank
+    trip refills there, and site 8 stays unbuilt until the next lap (one lap in run 10, after a
+    mid-lap restart). Steady state carries 52 logs for a 40-log lap, so it only follows a
+    restart; walking back from the booth would cost ~17s.
 - Still unanswered from the spec's checklist: whether `nearbySpirits` really rotates mid-carve
   (item 4), the claim-and-pass branch (item 6), and any non-yew wood (item 7). Item 3 (the log
   balances) is now a designed crossing rather than an open question, unverified live.
@@ -3242,7 +3280,7 @@ any hole in the recording, loudly.
 
 **Keystroke privacy**: the key listener sets `isEnabledOnLoginScreen() == false` and drops
 everything unless the game state is `LOGGED_IN`, so an account password can't land in a plaintext
-recording. Note this does *not* cover a bank PIN typed while already logged in.
+recording.
 
 ### Findings from the first live recording (Falconry, 2026-08-23) — all fixed, don't re-derive
 

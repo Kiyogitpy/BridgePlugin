@@ -249,7 +249,9 @@ def test_carve_rereads_the_spirits_before_choosing(monkeypatch):
                         lambda ctx, s: chosen.append(s) or True)
     monkeypatch.setattr(vtr_routine, "_await_menu", lambda ctx: True)
     vtr_routine.carve(_ctx_only(), stale)
-    assert chosen == ["EAGLE"], "carve used the stale trio instead of re-reading"
+    # The key is re-pressed once when nothing carves (see the re-press tests), so the
+    # assertion is about WHICH spirit, not how many presses.
+    assert chosen and set(chosen) == {"EAGLE"}, "carve used the stale trio instead of re-reading"
 
 
 def test_count_item_counts_slots_not_distinct_names(monkeypatch):
@@ -586,10 +588,22 @@ def test_the_decorate_at_the_bank_site_turns_the_camera_toward_the_booth_when_a_
     seen["hook"]()
     assert faced == [route.BANK["tile"]]
 
-    # ...and not at a site the booth cannot be reached from.
+    # ...and at a site the booth cannot be reached from, the camera faces the NEXT site
+    # instead (MEASURED vt_markers9: the leg's opening drags overlap the decorations).
     seen.clear()
+    faced.clear()
+    monkeypatch.setattr(vt, "next_action", lambda st, **k: ("decorate", None))
     assert vtr_routine.work_site(_ctx_only(), 6) is True
-    assert seen.get("hook") is None
+    seen["hook"]()
+    assert faced == [route.SITES[route.next_in_ring(6)]["stand"]]
+
+
+def test_the_decorate_camera_hook_sends_nothing_when_the_next_site_is_already_on_screen(monkeypatch):
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True})
+    monkeypatch.setattr(controller, "face_toward",
+                        lambda *a, **k: pytest.fail("a rendered tile needs no drag"))
+    vtr_routine._decorate_camera_hook(_ctx_only(), 6)()
 
 
 def test_the_decorate_hook_runs_after_the_click_and_before_its_confirm(monkeypatch):
@@ -650,7 +664,7 @@ def test_work_site_runs_the_ladder_until_the_site_is_done(monkeypatch):
     monkeypatch.setattr(vtr_routine, "build", lambda c, s: calls.append("build") or True)
     monkeypatch.setattr(vtr_routine, "carve", lambda c, s: calls.append("carve") or True)
     monkeypatch.setattr(vtr_routine, "decorate",
-                        lambda c, s: calls.append("decorate") or True)
+                        lambda c, s, after_click=None: calls.append("decorate") or True)
     monkeypatch.setattr(vtr_routine, "_site_now", lambda n: _one_site())
     monkeypatch.setattr(vtr_routine, "count_item", lambda name: 10)
     vtr_routine.work_site(_ctx_only(), 6)
@@ -2277,3 +2291,141 @@ def test_the_far_click_does_not_turn_the_camera_when_the_stand_tile_is_already_r
     monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: None)
     _leg_8_to_7_positions(monkeypatch)
     assert vtr_routine.walk_leg(_ctx_only(), 8, 7) is True
+
+
+def _carve_fixture(monkeypatch, land_after_presses):
+    """A carve whose key LANDS only once `land_after_presses` numbers have been pressed --
+    the dropped-key race MEASURED 2026-09-10 (recording vt-markers7-approach, site 4)."""
+    site = _one_site(baseValue=4, wood="YEW", nearbySpirits=["EAGLE", "SCORPION", "SNAKE"])
+    carved = _one_site(baseValue=4, wood="YEW", baseCarved=True,
+                       bottom={"value": 12, "spirit": "EAGLE"},
+                       middle={"value": 14, "spirit": "SCORPION"},
+                       top={"value": 13, "spirit": "SNAKE"},
+                       nearbySpirits=["EAGLE", "SCORPION", "SNAKE"])
+    pressed = []
+    monkeypatch.setattr(vtr_routine, "_site_now",
+                        lambda n: carved if len(pressed) >= land_after_presses else site)
+    monkeypatch.setattr(vtr_routine, "site_object", lambda n, w: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(vtr_routine, "choose_spirit", lambda ctx, s: pressed.append(s) or True)
+    monkeypatch.setattr(vtr_routine, "_await_menu", lambda ctx: True)
+    monkeypatch.setattr(outcome_waits, "await_pre",
+                        lambda ctx, signals, budget, confirm, **k: bool(confirm()))
+    return site, pressed
+
+
+import outcome_waits
+
+
+def test_a_carve_key_that_did_not_carve_is_pressed_again_once(monkeypatch):
+    """MEASURED 2026-09-10 (vt-markers7-approach, site 4): the Carve click registered, the
+    number was pressed 0.4s later while the build animation was still playing, and the game
+    dropped the selection -- busy varbit 12393 went to 1 with no carve behind it, for six
+    seconds, until a whole new Carve click. The human's own recording shows the identical
+    signature twice (keys at +0.4s dropped) and recovers each time by pressing the same
+    number again ~1s later, with no new click. So the routine does the same: one re-press."""
+    site, pressed = _carve_fixture(monkeypatch, land_after_presses=2)
+    assert vtr_routine.carve(_ctx_only(), site) is True
+    assert pressed == ["EAGLE", "EAGLE"]
+
+
+def test_a_carve_key_that_landed_is_not_pressed_twice(monkeypatch):
+    site, pressed = _carve_fixture(monkeypatch, land_after_presses=1)
+    assert vtr_routine.carve(_ctx_only(), site) is True
+    assert pressed == ["EAGLE"]
+
+
+def test_the_basket_is_emptied_on_the_leg_once_the_fletch_stops_at_the_reserve(monkeypatch):
+    """The top-up used to wait for the site (~2s in front of the totem, MEASURED run
+    vt_markers8: basket click, delta wait, then the pre-hover flight it delayed). The fletch
+    has already stopped at the reserve by then and the hands are idle for the rest of the
+    stretch, so the Empty goes out there, on the move -- and a later stretch's hook can
+    fletch the logs it brought."""
+    resolved = {"n": 0}
+
+    def ground(x, y, p, inst=False):
+        resolved["n"] += 1
+        return {"onScreen": True, "screenX": 500 + resolved["n"], "screenY": 300,
+                "tile": (x, y), "serial": resolved["n"]}
+
+    monkeypatch.setattr(controller, "get_ground_walk_point", ground)
+    events = []
+    monkeypatch.setattr(travel, "_click_walk_point",
+                        lambda ctx, point, shift: events.append("walk"))
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
+    seq = iter([_stand(8), _stand(8), _stand(8), {"x": 1420, "y": 3340, "plane": 0},
+                {"x": 1430, "y": 3342, "plane": 0}, {"x": 1440, "y": 3342, "plane": 0}]
+               + [_stand(7)] * 20)
+    monkeypatch.setattr(controller, "get_player", lambda: next(seq))
+    logs = iter([6, 4, 3] + [3] * 30)              # loose logs falling as bows are made
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: next(logs))
+    monkeypatch.setattr(vtr_routine, "find_basket", lambda: {"name": "Open log basket"})
+    monkeypatch.setattr(vtr_routine, "empty_basket", lambda ctx: events.append("empty") or True)
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.LOG_RESERVE_KEY] = 3
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 10
+    assert vtr_routine.walk_leg(ctx, 8, 7, after_first_hop=lambda: "fletch") is True
+    assert events == ["walk", "walk", "empty"], "the re-click ends the fletch, THEN the basket"
+
+
+def test_a_known_empty_basket_is_not_emptied_on_the_leg(monkeypatch):
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500,
+                                                     "screenY": 300, "tile": (x, y)})
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: None)
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
+    seq = iter([_stand(8), _stand(8), _stand(8), {"x": 1420, "y": 3340, "plane": 0}]
+               + [_stand(7)] * 20)
+    monkeypatch.setattr(controller, "get_player", lambda: next(seq))
+    logs = iter([6, 3] + [3] * 30)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: next(logs))
+    monkeypatch.setattr(vtr_routine, "find_basket", lambda: {"name": "Open log basket"})
+    monkeypatch.setattr(vtr_routine, "empty_basket",
+                        lambda ctx: pytest.fail("a basket known to be empty was emptied"))
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.LOG_RESERVE_KEY] = 3
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 0
+    assert vtr_routine.walk_leg(ctx, 8, 7, after_first_hop=lambda: "fletch") is True
+
+
+def _spool_leg(monkeypatch, basket_estimate):
+    """A fletch stretch that reaches the reserve with unstrung bows in hand and a basket."""
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500,
+                                                     "screenY": 300, "tile": (x, y)})
+    events = []
+    monkeypatch.setattr(travel, "_click_walk_point",
+                        lambda ctx, point, shift: events.append("walk"))
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
+    seq = iter([_stand(8), _stand(8), _stand(8), {"x": 1420, "y": 3340, "plane": 0},
+                {"x": 1430, "y": 3342, "plane": 0}] + [_stand(7)] * 20)
+    monkeypatch.setattr(controller, "get_player", lambda: next(seq))
+    logs, bows = iter([6, 3] + [3] * 30), iter([4] * 30)
+    monkeypatch.setattr(vtr_routine, "count_item",
+                        lambda name: next(logs) if "logs" in name else next(bows))
+    monkeypatch.setattr(vtr_routine, "find_spool", lambda: {"name": "Bow string spool"})
+    monkeypatch.setattr(vtr_routine, "find_basket", lambda: {"name": "Open log basket"})
+    monkeypatch.setattr(vtr_routine, "empty_basket", lambda ctx: events.append("empty") or True)
+    monkeypatch.setattr(vtr_routine, "start_stringing", lambda c: events.append("string") or True)
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.LOG_RESERVE_KEY] = 3
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = basket_estimate
+    assert vtr_routine.walk_leg(ctx, 8, 7, after_first_hop=lambda: "fletch") is True
+    return events
+
+
+def test_a_basket_known_to_hold_logs_is_emptied_before_the_spool_not_after(monkeypatch):
+    """MEASURED 2026-09-10 (vt_markers9, leg 4->3): an Empty ends a running action -- the
+    next string slot after the at-site Empty never fired. So the Empty goes out BEFORE the
+    spool: it is the interruption, and the stringing then runs untouched."""
+    assert _spool_leg(monkeypatch, basket_estimate=10) == ["walk", "empty", "string"]
+
+
+def test_an_unknown_basket_is_not_emptied_ahead_of_the_spool(monkeypatch):
+    """Unknown means the fletch might not be ended by the Empty AND no log might arrive to
+    cover the one the spool's 1.5s could cost the reserve; the spool alone is the safe end."""
+    assert _spool_leg(monkeypatch, basket_estimate=None) == ["walk", "string"]

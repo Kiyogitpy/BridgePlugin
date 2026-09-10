@@ -38,6 +38,7 @@ import banker
 import controller
 import debug_log
 import outcome_waits
+import settings
 import skillmulti
 import travel
 import vale_totems as vt
@@ -229,8 +230,7 @@ def tick(ctx):
     # a basket left full while the inventory sits at one or two logs makes no bows at all.
     # A basket KNOWN to be empty is skipped (one shift-click saved per site); an unknown one
     # is tried, and the first empty teaches the estimate.
-    if (count_item(log_name) < LOOSE_LOG_TARGET and find_basket()
-            and (data.get(BASKET_LOGS_KEY) is None or basket_logs(data) > 0)):
+    if _basket_top_up_due(ctx):
         empty_basket(ctx)
 
     # STAND STILL FIRST. See SITE_SETTLE_S -- every action at this site aims at a model a few
@@ -315,9 +315,7 @@ def _bank_trip_due(ctx, state) -> bool:
 def _face_booth(ctx) -> None:
     """Turn the camera toward the booth if it is not already on screen; sends nothing when
     it is."""
-    bx, by = route.BANK["tile"]
-    if not controller.get_ground_walk_point(bx, by, route.PLANE).get("onScreen"):
-        controller.face_toward(ctx.ser, bx, by)
+    _face_tile(ctx, *route.BANK["tile"])
 
 
 def _walk_to_site(ctx, current: int) -> None:
@@ -481,6 +479,9 @@ def build(ctx, site) -> bool:
 
 CARVE_MENU_BUDGET_S = 4.0
 CARVE_BUDGET_S = 6.0
+# A landed carve key carves within ~0.6s (MEASURED, every carve in vt-markers7-approach); the
+# human re-presses a dropped one at ~1.0-1.2s. See carve() for the race this covers.
+CARVE_KEY_REPRESS_S = 1.5
 
 
 def _close_prompt(ctx, force: bool = False) -> None:
@@ -817,11 +818,26 @@ def _direct_leg(ctx, b: int, points, fire_hook, origin, skip=()):
             # the hands go straight on to stringing them. Only without a usable spool (or
             # nothing to string) is the walk re-clicked, at THE SAME TILE, RE-RESOLVED --
             # never the same pixel (vt_markers4: the stale pixel overshot site 5 by 17 tiles).
+            strung = False
             if (count_item(bow_name) > 0 and find_spool()
-                    and not ctx.state.data.get(SPOOL_DEAD_KEY) and start_stringing(ctx)):
-                debug_log.log(LOG, "fletch -> stringing mid-walk (%d %s, %d %s left)"
-                              % (count_item(bow_name), bow_name, count_item(log_name), log_name))
-            else:
+                    and not ctx.state.data.get(SPOOL_DEAD_KEY)):
+                # THE BASKET FIRST, THEN THE SPOOL. MEASURED 2026-09-10 (run vt_markers9,
+                # leg 4->3): the at-site Empty landed 0.7s after a string and the next string
+                # slot never fired -- an inventory Empty ENDS a running action. So an Empty
+                # sent after the spool would cut the stringing short; sent BEFORE it, it is
+                # the interruption itself (the fletch ends on it), the logs come aboard, and
+                # the stringing then runs untouched for the rest of the stretch with no
+                # top-up left to do at the site. Only a basket KNOWN to hold logs: if the
+                # Empty were ever not to end the fletch, the spool click ~1.5s later does,
+                # and the one log that could be fletched meanwhile is one the Empty brought.
+                if _basket_top_up_due(ctx) and basket_logs(ctx.state.data) > 0:
+                    _empty_on_the_move(ctx, log_name)
+                strung = start_stringing(ctx)
+                if strung:
+                    debug_log.log(LOG, "fletch -> stringing mid-walk (%d %s, %d %s left)"
+                                  % (count_item(bow_name), bow_name, count_item(log_name),
+                                     log_name))
+            if not strung:
                 fresh, fresh_viewport = _walk_point_now(cx, cy)
                 if fresh is None:
                     fresh, fresh_viewport = _walk_point_now(*_player_xy()), True
@@ -829,6 +845,16 @@ def _direct_leg(ctx, b: int, points, fire_hook, origin, skip=()):
                     travel._click_walk_point(ctx, fresh, shift=fresh_viewport)
                 debug_log.log(LOG, "fletch stopped at the build reserve (%d %s left)"
                               % (reserve, log_name))
+                # THE BASKET TOP-UP HAPPENS HERE, ON THE MOVE, when the hands have just gone
+                # idle -- not in front of the totem. MEASURED vt_markers8: at the site the
+                # Empty (click, delta wait) held the pre-hover flight back ~2s at every site
+                # it fired on, while the rest of this stretch was walked with nothing to do.
+                # ONLY after the walk re-click: an Empty is an inventory op and the human's
+                # recording suggests it ends a running action (a fletch stopped on the tick
+                # of an Empty), so it is never sent over the stringing the other branch just
+                # started. A later stretch's hook then fletches the logs it brought.
+                if _basket_top_up_due(ctx):
+                    _empty_on_the_move(ctx, log_name)
             fletching = False
         if at_site(b):
             return ARRIVED, (cx, cy)
@@ -845,6 +871,14 @@ def _direct_leg(ctx, b: int, points, fire_hook, origin, skip=()):
     debug_log.log(LOG, "direct leg to site %d: not there after %.0fs -- falling back to the "
                        "recorded hops" % (b, DIRECT_LEG_MAX_S))
     return STALLED, (cx, cy)
+
+
+def _empty_on_the_move(ctx, log_name: str) -> bool:
+    ok = empty_basket(ctx)
+    if ok:
+        debug_log.log(LOG, "basket emptied on the move: %d %s loose"
+                      % (count_item(log_name), log_name))
+    return ok
 
 
 def _resume_index(points, origin, x, y) -> int:
@@ -998,8 +1032,30 @@ def carve(ctx, site) -> bool:
             after = _site_now(n)
             return after is not None and set(after.segment_values) != before
 
-        if not outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"],
-                                       CARVE_BUDGET_S, landed, now_fn=_now, sleep_fn=_sleep):
+        outcome = outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"],
+                                          CARVE_KEY_REPRESS_S, landed,
+                                          now_fn=_now, sleep_fn=_sleep)
+        if not outcome:
+            # THE GAME DROPS A NUMBER PRESSED WHILE THE PREVIOUS ANIMATION IS STILL PLAYING.
+            # MEASURED 2026-09-10 (recording vt-markers7-approach, site 4): Carve click
+            # registered, key at +0.4s with the build's erect animation (827) still running,
+            # busy varbit 12393 went 0 then 1 with NO carve behind it, and nothing happened
+            # for six seconds until a fresh Carve click. Every landed key in the same
+            # recording came at or after the busy drop (+0.5..+0.7s) and carved within 0.6s.
+            # The human's own recording has the identical signature twice (keys at +0.4s,
+            # nothing) and recovers both times by pressing the SAME number again ~1s later,
+            # no new click -- so that is what this does, once. A key that landed carves well
+            # inside CARVE_KEY_REPRESS_S, so the re-press costs nothing on a good tick, and
+            # choose_spirit re-checks the title first: a prompt that has gone means a new
+            # Carve click (the caller's retry), not a blind keypress.
+            debug_log.log(LOG, "site %d: the %s key did not carve within %.1fs -- pressing it "
+                               "again" % (n, missing[0], CARVE_KEY_REPRESS_S))
+            if not choose_spirit(ctx, missing[0]):
+                return carved_any
+            outcome = outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"],
+                                              CARVE_BUDGET_S - CARVE_KEY_REPRESS_S, landed,
+                                              now_fn=_now, sleep_fn=_sleep)
+        if not outcome:
             return carved_any
         carved_any = True
     return True
@@ -1057,6 +1113,19 @@ SPOOL_STRIKES_KEY = "vt_spool_strikes"
 SPOOL_STRIKES = 2                 # failed uses before the spool is written off for the session
 STRING_START_BUDGET_S = 6.0       # recording: the first string lands +2.1s after the prompt
 STRING_PROMPT_WAIT_S = 1.5
+STRING_PROMPT_POLL_S = 0.15
+
+
+def _poll_prompt(predicate, budget_s: float, poll_s: float) -> bool:
+    """True as soon as predicate() holds, False once budget_s has passed without it."""
+    deadline = _now() + budget_s
+    while True:
+        if predicate():
+            return True
+        now = _now()
+        if now >= deadline:
+            return False
+        _sleep(min(poll_s, deadline - now))
 
 
 def bow_count(ctx, wood=None) -> int:
@@ -1112,8 +1181,16 @@ def start_stringing(ctx) -> bool:
     # human's recording presses Space ~0.8s after the bow click regardless, and Space with
     # nothing open does nothing. Only a MAKE-titled menu (several products) is answered by
     # the strung bow's own number instead.
-    outcome_waits.await_pre(ctx, ["WIDGET_LOADED"], STRING_PROMPT_WAIT_S,
-                            skillmulti.is_open, now_fn=_now, sleep_fn=_sleep)
+    # POLLED, not awaited on WIDGET_LOADED. MEASURED runs vt_markers9/10 (19 string starts):
+    # bow click -> Space was 0.6-1.05s (the human: ~0.8s) except twice at 1.75s, when the
+    # prompt's event was missed and the whole STRING_PROMPT_WAIT_S went by before the one
+    # HTTP read at the budget noticed it. A widgets dump is ~50ms, so polling it every
+    # STRING_PROMPT_POLL_S sees the prompt within ~0.2s of it opening every time; the human
+    # reaction draw then pads the keypress as the event path would have.
+    if _poll_prompt(skillmulti.is_open, STRING_PROMPT_WAIT_S, STRING_PROMPT_POLL_S):
+        pad = controller.sample_human_delay(*settings.REACTION_DELAY_S)
+        if pad > 0:
+            _sleep(pad)
     if skillmulti.showing(skillmulti.TITLE_MAKE):
         widget = skillmulti.item_widget(ctx.state.config["strung"])
         option = skillmulti.option_number(widget) if widget else None
@@ -1314,6 +1391,15 @@ def open_basket(ctx) -> bool:
     if _basket_is_open():
         return True
     return _basket_option(ctx, ("open",), _basket_is_open)
+
+
+def _basket_top_up_due(ctx) -> bool:
+    """Loose logs below a totem's worth plus spare, a basket carried, and the basket not
+    KNOWN to be empty (None is unknown -> try it, and the first Empty teaches the
+    estimate). The one condition behind both the at-site top-up and the on-the-leg one."""
+    data = ctx.state.data
+    return (bool(find_basket()) and count_item(ctx.state.config["log"]) < LOOSE_LOG_TARGET
+            and (data.get(BASKET_LOGS_KEY) is None or basket_logs(data) > 0))
 
 
 def empty_basket(ctx) -> bool:
@@ -1617,10 +1703,8 @@ def work_site(ctx, site_number: int, during_decorate=None) -> bool:
     # 2026-09-10: "while decorating we can adjust camera if needed and click the banker
     # directly after the decoration is done. that way we save a bit of time not doing hop ->
     # click bank".
-    if during_decorate is None and site_number in BANK_SITES:
-        state = read_state()
-        if state is not None and _bank_trip_due(ctx, state):
-            during_decorate = lambda: _face_booth(ctx)
+    if during_decorate is None:
+        during_decorate = _decorate_camera_hook(ctx, site_number)
     done_actions = []
     failed = {}
     for _ in range(SITE_MAX_ACTIONS):
@@ -1652,6 +1736,31 @@ def work_site(ctx, site_number: int, during_decorate=None) -> bool:
         done_actions.append(action)
     debug_log.log(LOG, "site %d: hit the action ceiling" % site_number)
     return False
+
+
+def _decorate_camera_hook(ctx, site_number: int):
+    """What the camera does while the decorations run: face the booth when this is the bank
+    site with a trip due, else face the NEXT site so the leg's first click needs no drag.
+
+    MEASURED run vt_markers9 (2026-09-10): the decorate wait is ~5s of idle hands at every
+    site, and the leg that follows opened with two middle-mouse drags (~1.5s) at four of the
+    eight sites before its first click could be aimed -- the same drags _far_click_target
+    makes when the stand tile is off screen. Made here instead, they overlap the decorations
+    and _far_click_target finds the tile already rendered. A camera drag never interrupts an
+    action (the human's recording turns the camera mid-fletch, mid-walk, at will)."""
+    if site_number in BANK_SITES:
+        state = read_state()
+        if state is not None and _bank_trip_due(ctx, state):
+            return lambda: _face_booth(ctx)
+    nxt = route.next_in_ring(site_number)
+    return lambda: _face_tile(ctx, *route.SITES[nxt]["stand"])
+
+
+def _face_tile(ctx, tx: int, ty: int) -> None:
+    """Turn the camera toward (tx, ty) if it is not already rendered; sends nothing when it
+    is -- the same rule _far_click_target applies before a far click."""
+    if not controller.get_ground_walk_point(tx, ty, route.PLANE).get("onScreen"):
+        controller.face_toward(ctx.ser, tx, ty)
 
 
 def _log_site_outcome(ctx, site, done_actions, logs: int, bows: int) -> None:
