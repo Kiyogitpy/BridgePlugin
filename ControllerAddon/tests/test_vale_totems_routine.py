@@ -2537,3 +2537,40 @@ def test_empty_basket_measures_the_move_in_free_slots_so_a_running_fletch_cannot
     ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 28
     assert vtr_routine.empty_basket(ctx) is True
     assert ctx.state.data[vtr_routine.BASKET_LOGS_KEY] == 28 - 22, "22 slots filled: 6 left, not 0"
+
+
+def test_a_site_click_that_resolved_to_walk_here_goes_to_the_menu_within_a_second(monkeypatch):
+    """MEASURED runs 13-14: the miss was only noticed at the 6s confirm budget."""
+    _fake_clock(monkeypatch)
+    site = _one_site(baseValue=0)
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: site)
+    monkeypatch.setattr(vtr_routine, "site_object", lambda n, w: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    actions = iter([{"tick": 1, "option": "Decorate", "target": "Maple totem"}]
+                   + [{"tick": 5, "option": "Walk here", "target": ""}] * 20)
+    monkeypatch.setattr(controller, "get_last_action", lambda: next(actions))
+    order = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda *a, **k: order.append("menu " + a[2]) or True)
+    monkeypatch.setattr(outcome_waits, "await_pre",
+                        lambda ctx, signals, budget, confirm, **k: order.append("wait") or True)
+    vtr_routine._click_site(_ctx_only(), 6, "totem", 6.0, lambda: True, option="Build")
+    assert order == ["menu Build", "wait"], "the menu retry comes BEFORE any confirm wait"
+
+
+def test_a_site_click_whose_record_is_ours_waits_for_the_confirm(monkeypatch):
+    _fake_clock(monkeypatch)
+    site = _one_site(baseValue=0)
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: site)
+    monkeypatch.setattr(vtr_routine, "site_object", lambda n, w: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    actions = iter([{"tick": 1, "option": "Decorate"}] + [{"tick": 5, "option": "Build"}] * 20)
+    monkeypatch.setattr(controller, "get_last_action", lambda: next(actions))
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: pytest.fail("no menu needed"))
+    waited = []
+    monkeypatch.setattr(outcome_waits, "await_pre",
+                        lambda ctx, signals, budget, confirm, **k: waited.append(budget) or True)
+    assert vtr_routine._click_site(_ctx_only(), 6, "totem", 6.0, lambda: True, option="Build") is True
+    assert waited == [6.0]

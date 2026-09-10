@@ -440,18 +440,28 @@ def _click_site(ctx, site_number, which, budget_s, confirm, option=None, after_c
         debug_log.log(LOG, "site %d: %s object not in view" % (site_number, which))
         return False
     refresh = controller.object_refresh_target(x, y, route.PLANE, obj_id)
+    before_action = controller.get_last_action() or {}
     if not controller.click_entity(ctx.ser, obj, refresh_target=refresh,
                                    refresh_legs=SITE_REFRESH_LEGS):
         return False
     if after_click is not None:
         after_click()          # e.g. the camera turn toward the booth while the action runs
-    outcome = outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"], budget_s,
-                                      confirm, now_fn=_now, sleep_fn=_sleep)
-    if outcome or not option:
-        return bool(outcome)
+    # A MISS IS KNOWN WITHIN A SECOND, NOT AT THE BUDGET. MEASURED runs 13-14: an early click
+    # that resolved to "Walk here" spent the whole 6s confirm budget before /last-action was
+    # consulted, and that one wait cost more than the early click saved over ten sites.
+    # /last-action names what the click became as soon as the game processes it, so it is
+    # polled for the click's own record first; one that is not ours goes straight to the menu.
+    missed = option and _click_missed(before_action, option)
+    outcome = None
+    if not missed:
+        outcome = outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"], budget_s,
+                                          confirm, now_fn=_now, sleep_fn=_sleep)
+        if outcome or not option:
+            return bool(outcome)
+        last = controller.get_last_action() or {}
+        if (last.get("option") or "").lower() == option.lower():
+            return False            # the right action registered and still did not confirm
     last = controller.get_last_action() or {}
-    if (last.get("option") or "").lower() == option.lower():
-        return False            # the right action registered and still did not confirm
     debug_log.log(LOG, "site %d: %s click resolved to %r -- retrying through the menu"
                   % (site_number, option, last.get("option")))
     obj = site_object(site_number, which)
@@ -462,6 +472,26 @@ def _click_site(ctx, site_number, which, budget_s, confirm, option=None, after_c
         return False
     return bool(outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"], budget_s,
                                         confirm, now_fn=_now, sleep_fn=_sleep))
+
+
+MISS_CHECK_S = 1.0          # how long /last-action is polled for the click's own record
+MISS_CHECK_POLL_S = 0.15
+
+
+def _click_missed(before_action: dict, option: str) -> bool:
+    """True once /last-action shows a NEW record (not `before_action`) whose option is not
+    `option`; False when the record is ours, or when nothing new appeared within MISS_CHECK_S
+    (the click may still register on arrival -- the caller's confirm decides that)."""
+    def key(rec):
+        return (rec.get("tick"), rec.get("option"), rec.get("target"), rec.get("id"))
+    deadline = _now() + MISS_CHECK_S
+    while True:
+        last = controller.get_last_action() or {}
+        if last and key(last) != key(before_action):
+            return (last.get("option") or "").lower() != option.lower()
+        if _now() >= deadline:
+            return False
+        _sleep(MISS_CHECK_POLL_S)
 
 
 def _site_now(site_number):
@@ -622,7 +652,7 @@ def _tiles_between(x1, y1, x2, y2) -> int:
 
 
 # The tracked hover clicks from this close instead of waiting for the stop; see tick().
-EARLY_CLICK_TILES = 2
+EARLY_CLICK_TILES = 1        # 2 missed 3 of ~23 early clicks (runs 13-14); the last tile slides less
 
 
 def _tiles_to_site(site_number: int) -> int:
