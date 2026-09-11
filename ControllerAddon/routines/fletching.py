@@ -442,17 +442,6 @@ def bank_phase(ctx, config):
         return
 
     if not banker.open_bank(ctx, bank):
-        if banker.bank_pin_open():
-            # Not a click failure and not worth retrying -- the booth click landed and opened
-            # the PIN keypad. Say so, because "could not open Bank booth" sends you looking at
-            # aim and geometry that were never wrong.
-            # banker.open_bank answers the keypad itself (banker.enter_bank_pin), so reaching
-            # here means that FAILED: no PIN stored for this machine, or a wrong one. Either
-            # way retrying the booth cannot help.
-            ctx.state.trigger_safety_stop(
-                "fletching: the bank PIN keypad is up and could not be answered -- store the "
-                "PIN on THIS machine with `python bank_pin.py --set`, or enter it by hand")
-            return
         tries = ctx.state.data.get("fl_bank_tries", 0) + 1
         ctx.state.data["fl_bank_tries"] = tries
         if tries >= BANK_OPEN_TRIES:

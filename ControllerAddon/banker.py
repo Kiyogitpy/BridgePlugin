@@ -34,7 +34,6 @@ import re
 import time
 
 import bank_memory
-import bank_pin
 import bridge_events
 import controller
 import debug_log
@@ -173,89 +172,6 @@ def _refresh_bank_object(bank_obj: dict) -> dict:
     return same_id or bank_obj
 
 
-BANK_PIN_GROUP = 213            # the PIN keypad; MEASURED live in the VM 2026-09-08
-BANK_PIN_PROMPT_CHILD = 10      # "First click the FIRST digit." -> SECOND -> THIRD -> FOURTH
-BANK_PIN_FIRST_BUTTON = 16      # digit buttons run 16, 18, 20, ... ; 3..6 are the '?' readout
-BANK_PIN_DIGIT_BUDGET_S = 6.0   # per digit, for the prompt to advance
-BANK_PIN_POLL_S = 0.2
-
-
-def bank_pin_open(dump=None) -> bool:
-    """True while the bank PIN keypad is on screen."""
-    dump = controller.get_widgets_dump() if dump is None else dump
-    return any(w.get("group") == BANK_PIN_GROUP and w.get("screenX") is not None for w in dump)
-
-
-def _pin_prompt(dump) -> str:
-    for w in dump:
-        if w.get("group") == BANK_PIN_GROUP and w.get("child") == BANK_PIN_PROMPT_CHILD:
-            return (w.get("text") or "").strip()
-    return ""
-
-
-def _pin_button(dump, digit: str):
-    """The keypad button showing `digit`.
-
-    Matched by TEXT, never by position: the keypad RESHUFFLES after every digit (MEASURED --
-    one capture read 2 9 4 1 8 / 6 3 / 5 0 7 across the grid), which is the whole point of it.
-    Restricted to the button children so the '?' readout at 3..6 and the title can never
-    match."""
-    for w in dump:
-        if w.get("group") != BANK_PIN_GROUP or w.get("screenX") is None:
-            continue
-        child = w.get("child")
-        if child is None or child < BANK_PIN_FIRST_BUTTON:
-            continue
-        if (w.get("text") or "").strip() == digit:
-            return w
-    return None
-
-
-def enter_bank_pin(ctx) -> bool:
-    """Answer the bank PIN keypad. True once it is gone.
-
-    The PIN comes from bank_pin.load() -- DPAPI-encrypted per machine, see that module. NOTHING
-    here logs a digit, and a failure says only which POSITION it got stuck at.
-
-    No simulated misclick and no UI-blocker check: this is an interface click (banker.py's own
-    rule), and a miss plus its corrective reclick would enter a WRONG DIGIT, which on a real
-    account means a lockout attempt rather than a retry."""
-    pin = bank_pin.load()
-    if not pin:
-        debug_log.log("bank", "the bank PIN keypad is up and no PIN is stored for this machine "
-                              "-- enter it by hand, or run: python bank_pin.py --set")
-        return False
-
-    for position, digit in enumerate(pin, start=1):
-        dump = controller.get_widgets_dump()
-        if not bank_pin_open(dump):
-            return True  # already satisfied (a partial entry finished it, or someone typed it)
-        before = _pin_prompt(dump)
-        button = _pin_button(dump, digit)
-        if button is None:
-            debug_log.log("bank", f"no keypad button for digit {position} of the PIN")
-            return False
-        controller.click_entity(ctx.ser, button, offset=(0, 0),
-                                check_ui_blockers=False, simulate_mistakes=False)
-
-        # The prompt advancing (or the keypad closing) is the confirmation. A fixed sleep would
-        # race the reshuffle and the next digit would be read off a stale dump.
-        deadline = time.time() + BANK_PIN_DIGIT_BUDGET_S
-        while time.time() < deadline:
-            dump = controller.get_widgets_dump()
-            if not bank_pin_open(dump) or _pin_prompt(dump) != before:
-                break
-            time.sleep(BANK_PIN_POLL_S)
-        else:
-            debug_log.log("bank", f"the keypad did not advance past digit {position}")
-            return False
-
-    ok = not bank_pin_open()
-    debug_log.log("bank", "bank PIN accepted" if ok else "bank PIN entered but the keypad is "
-                                                         "still up (wrong PIN?)")
-    return ok
-
-
 def open_bank(ctx, bank_obj, timeout_s: float = 20.0) -> bool:
     """Walk to and open a bank object. Returns once the interface is up.
 
@@ -300,15 +216,6 @@ def open_bank(ctx, bank_obj, timeout_s: float = 20.0) -> bool:
     deadline = time.time() + timeout_s
     first_click = True
     while time.time() < deadline:
-        # The PIN keypad, if this login has not answered it yet. MEASURED live in the VM
-        # 2026-09-08: a FRESH client login prompts on the first bank access, the booth click
-        # opens THAT instead of the bank, and every retry below then re-clicks a booth that was
-        # working perfectly -- 15 clicks, then a safety stop blaming the click. Handled here
-        # rather than in one routine because it blocks EVERY routine that banks.
-        if bank_pin_open():
-            if not enter_bank_pin(ctx):
-                return False
-            continue
         # The FIRST click flies while still running in -- clicking the booth mid-approach is
         # what the human does (the game re-paths to it and opens on arrival), and the click's
         # aim stays true through the flight via refresh_target below. USER 2026-08-30, watching

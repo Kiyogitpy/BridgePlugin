@@ -758,20 +758,3 @@ def test_routine_is_wired_into_the_panel():
                         "RoutineChoice.java")
     with open(java, encoding="utf-8") as fh:
         assert "FLETCHING(" in fh.read()
-
-
-# --- the VM's first run: a fresh login prompts for the bank PIN ---------------------------
-
-
-def test_bank_phase_says_pin_instead_of_blaming_the_booth_click(monkeypatch):
-    """The booth click WORKED and opened the PIN keypad; retrying it 15 times and reporting
-    "could not open Bank booth" sent me looking at aim and geometry that were never wrong."""
-    _bank_stubs(monkeypatch, after_withdraw=[_item("Knife")])
-    monkeypatch.setattr(banker, "open_bank", lambda ctx, bank, **k: False)
-    monkeypatch.setattr(banker, "bank_pin_open", lambda dump=None: True)
-    ctx = _Ctx()
-    fletching.bank_phase(ctx, ctx.state.config)
-    assert ctx.state.safety_stopped
-    assert "PIN" in ctx.state.stop_reason
-    # ... and it stops at once rather than burning the retry budget on a click that is fine.
-    assert ctx.state.data.get("fl_bank_tries", 0) == 0
