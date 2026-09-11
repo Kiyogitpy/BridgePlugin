@@ -31,6 +31,7 @@
 # tile itself rather than firing one tile out (a rock clicked from a neighbouring tile can be
 # mined from THAT tile, and then only one of the three rocks is adjacent).
 
+import math
 import time
 
 import bridge_events
@@ -61,8 +62,14 @@ ORE_BUDGET_S = 5.5        # an ore every 1.8s at this level; survives one missed
 FALLBACK_POLL_S = 0.15
 SWAP_REACTION_S = (0.10, 0.30)   # after the depleting ore, before the in-place click (human 0.12-0.55)
 RESPAWN_WAIT_S = 0.3      # every rock spent (other players): poll for the 2.4s respawn
-CHAIN_MAX_S = 60.0
-CHAIN_MAX_TARGETS = 60
+# MEASURED mgi_live2: every chain hand-back cost 1.0-1.5s before the next click (the engine
+# loop's own iteration), i.e. ~2% at 60s. The chain checks pause/safety itself, so it can hold
+# tick() for minutes; a break is delayed by at most this.
+CHAIN_MAX_S = 240.0
+CHAIN_MAX_TARGETS = 240
+ORES_PER_ROCK = 2         # what the rock being clicked is expected to add before it depletes
+TRACK_DRIFT_PX = 6        # re-hover past this drift: must stay under CLICK_IN_PLACE_RADIUS_PX (12) with both jitters
+TRACK_POLL_S = 0.25
 FAILED_CLICK_STOP = 10    # consecutive clicks that produced nothing -> safety stop
 DEPOSIT_BASE_S = 3.0      # plus WALK_S_PER_TILE per tile to the box
 WALK_S_PER_TILE = 0.6
@@ -212,9 +219,57 @@ def _player_tile():
     return (p["x"], p["y"], p.get("plane", 0))
 
 
+def _on_screen(rock):
+    """The rock WITH its current screen position, whether it is up or spent right now: the
+    live id first, else the spent object standing on the same tile. None when neither is
+    in the scene (a rock this routine never saw)."""
+    live = _rock_live(rock)
+    if live is None:
+        live = controller.get_object_at(rock["x"], rock["y"], rock["plane"], ROCK_IDS[rock["id"]])
+    if live is None:
+        return None
+    merged = dict(rock)
+    merged.update(live)
+    return merged
+
+
+def _track_hover(ctx, resolve, offset=(-7, 7), check_ui_blockers=True):
+    """Keep the cursor parked on a MOVING projection (a tile or object while the player walks
+    and the camera follows): re-hover only once the resolved aim has drifted more than
+    TRACK_DRIFT_PX from the cursor, so the click that follows is made in place. `resolve`
+    returns a dict with screenX/screenY or None. MEASURED mgi_live2: a hover made two tiles
+    out slid ~30px by arrival and the click flew; the human's walk click after the deposit
+    was in place because the cursor had been parked on the tile during the deposit walk."""
+    pt = resolve()
+    if not pt or pt.get("screenX") is None or pt.get("screenY") is None:
+        return False
+    aim = (int(pt["screenX"]) + offset[0], int(pt["screenY"]) + offset[1])
+    cur = controller.get_cursor_pos()
+    if math.hypot(aim[0] - cur[0], aim[1] - cur[1]) <= TRACK_DRIFT_PX:
+        return False
+    return controller.hover_entity(ctx.ser, pt, offset=offset, check_ui_blockers=check_ui_blockers)
+
+
+def _park_on(ctx, rock):
+    """Rest the cursor on `rock` so the click that follows the current rock's depletion is
+    made IN PLACE (click_entity's _cursor_already_on). MEASURED mgi_live1 2026-09-11: with a
+    bare {x, y, plane, id} record hover_entity silently no-ops (no screen position), and every
+    swap click flew -- USER: "while mining one ore hover the next ore and just click dont move
+    mouse". The next rock is usually still SPENT at this moment (it respawns 2.4s into a 3.6s
+    cycle), so the position comes from whichever object stands on its tile. Logged because a
+    hover moves the cursor with no click, and a skipped one is otherwise invisible."""
+    target = _on_screen(rock)
+    if target is None:
+        debug_log.log(LOG, f"pre-hover SKIPPED: nothing on the rock tile {_tile(rock)}")
+        return False
+    ok = controller.hover_entity(ctx.ser, target, refresh_target=_refresh(target))
+    debug_log.log(LOG, f"pre-hover {'->' if ok else 'SKIPPED for'} the rock at {_tile(rock)}")
+    return ok
+
+
 # --- one rock ----------------------------------------------------------------------------
 
-def mine_rock(ctx, rock, hover_next=None):
+def mine_rock(ctx, rock, hover_next=None, hover_item=None):
     """Click `rock`, park the cursor on `hover_next`, then wait on the pushed signals until the
     rock is confirmed gone from its tile. Returns depleted | failed | timeout | no_click.
 
@@ -228,8 +283,14 @@ def mine_rock(ctx, rock, hover_next=None):
     if not controller.click_entity(ctx.ser, rock, refresh_target=_refresh(rock)):
         return "no_click"
     t_click = _now()
-    if hover_next is not None:
-        controller.hover_entity(ctx.ser, hover_next, refresh_target=_refresh(hover_next))
+    if hover_item is not None:
+        # This rock fills the inventory: the next click is Use on the ore, so park THERE
+        # (mgi_live2: 0.42s flight to the inventory per trip otherwise).
+        controller.open_inventory_tab(ctx.ser)
+        ok = controller.hover_entity(ctx.ser, hover_item, offset=(0, 0), check_ui_blockers=False)
+        debug_log.log(LOG, f"pre-hover {'->' if ok else 'SKIPPED for'} the ore (deposit next)")
+    elif hover_next is not None:
+        _park_on(ctx, hover_next)
 
     tile = (rock["x"], rock["y"], rock["plane"])
 
@@ -316,12 +377,31 @@ def deposit_trip(ctx, cfg):
         tiles = max(0, int(box.get("distance") or 0))
         budget = DEPOSIT_BASE_S + tiles * WALK_S_PER_TILE
         debug_log.log(LOG, f"depositing {_ore_count(cfg)} ore at the box (dist={tiles})")
-        res = bridge_events.await_outcome(events, {"INVENTORY_CHANGED": None}, budget,
-                                          confirm=lambda: _ore_count(cfg) == 0, since=since,
-                                          reaction=False, now_fn=_now, sleep_fn=_sleep)
+        # While the game walks us to the box, park the cursor on the stand tile so the
+        # Walk-here that follows the deposit is in place (the human's 0.1s, our 0.7s flight).
+        stand = _stand(cfg)
+
+        def walk_point():
+            p = controller.get_ground_walk_point(*stand)
+            return p if p and p.get("onScreen") else None
+
+        t0 = _now()
+        deadline = t0 + budget
+        res = None
+        while True:
+            now = _now()
+            if now >= deadline:
+                break
+            res = bridge_events.await_outcome(events, {"INVENTORY_CHANGED": None},
+                                              min(TRACK_POLL_S, deadline - now),
+                                              confirm=lambda: _ore_count(cfg) == 0, since=since,
+                                              reaction=False, now_fn=_now, sleep_fn=_sleep)
+            if res:
+                break
+            _track_hover(ctx, walk_point, offset=(0, 0))
         if res:
             ctx.state.data[FULL_KEY] = False
-            debug_log.log(LOG, f"deposited ({res.latency_s:.1f}s)")
+            debug_log.log(LOG, f"deposited ({_now() - t0:.1f}s)")
             return True
         debug_log.log(LOG, f"[!] the ore is still in the inventory after {budget:.1f}s "
                            f"(attempt {attempt + 1}/{DEPOSIT_TRIES}; box onScreen="
@@ -355,6 +435,11 @@ def return_to_stand(ctx, cfg, rocks, spent_at):
                                           RETURN_POLL_S, confirm=lambda: _player_tile() == stand,
                                           since=None, reaction=False, now_fn=_now, sleep_fn=_sleep)
         if res:
+            # The camera keeps gliding through the last step, so the parked cursor can have
+            # slid off the rock between the last poll and now; one more pass makes the click
+            # that follows an in-place one (mgi_live4: a 10px flight cost 0.36s per trip).
+            if hovered is not None:
+                _track_hover(ctx, lambda: _on_screen(hovered))
             return hovered or True
         here = _player_tile()
         if hovered is None and here is not None and here[2] == stand[2] and \
@@ -362,7 +447,7 @@ def return_to_stand(ctx, cfg, rocks, spent_at):
             rock = pick_rock(rocks, up=lambda r: _rock_live(r) is not None, last=None,
                              spent_at=spent_at)
             if rock is not None:
-                controller.hover_entity(ctx.ser, rock, refresh_target=_refresh(rock))
+                _park_on(ctx, rock)
                 hovered = rock
     debug_log.log(LOG, f"[!] did not reach the stand tile {stand[:2]} in {RETURN_BUDGET_S:.0f}s")
     return False
@@ -443,7 +528,14 @@ def tick(ctx):
         nxt = pick_rock(rocks, up=lambda r: True, last=_tile(rock), spent_at=spent_at)
         if nxt is not None and _tile(nxt) == _tile(rock):
             nxt = None
-        outcome = mine_rock(ctx, target, hover_next=nxt)
+        ore_item = None
+        free = _free_slots()
+        if free is not None and deposit_due(free - ORES_PER_ROCK, cfg.get("depositAtFreeSlots", 2)):
+            ore_item = next((i for i in (controller.get_inventory() or [])
+                             if i.get("name") == cfg.get("oreName", "Iron ore")), None)
+            if ore_item is not None:
+                nxt = None
+        outcome = mine_rock(ctx, target, hover_next=nxt, hover_item=ore_item)
         if outcome == "depleted":
             spent_at[_tile(rock)] = _now()
             last = _tile(rock)

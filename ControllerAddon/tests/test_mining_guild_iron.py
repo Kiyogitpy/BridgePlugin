@@ -113,6 +113,7 @@ class Game:
         self.in_place = 0
         self.batches = deque()
         self.auto_ore = False       # each rock click feeds its own two-ore script
+        self.deposit_delay_batches = 0
 
     def script_rock(self, tile):
         self.feed(_xp(), (None, None, self.first_ore))
@@ -129,7 +130,7 @@ class Game:
     def object_at(self, x, y, plane, obj_id, **_kw):
         if self.rocks.get((x, y)) != obj_id:
             return None
-        return _obj(obj_id, x, y)
+        return _obj(obj_id, x, y, name="Rocks" if obj_id in mgi.SPENT_TO_LIVE else "Iron rocks")
 
     def inventory(self):
         items = [{"name": "Open gem sack", "qty": 1, "screenX": 900, "screenY": 380, "slot": 0}]
@@ -195,9 +196,19 @@ def game(monkeypatch):
     monkeypatch.setattr(controller, "key_down", lambda ser, k: None)
     monkeypatch.setattr(controller, "key_up", lambda ser, k: None)
     monkeypatch.setattr(controller, "fidget_once", lambda: None)
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (0, 0))
 
     def hover_entity(ser, entity, **kw):
-        g.hovers.append((entity.get("x"), entity.get("y")))
+        # The real hover_entity silently no-ops without a screen position (mgi_live1, 2026-09-11:
+        # every swap click flew because the hover was handed a bare {x, y, plane, id} record).
+        if entity.get("screenX") is None or entity.get("screenY") is None:
+            return False
+        if entity.get("name") == "Iron ore":
+            g.hovers.append(("item", "Iron ore"))
+        elif entity.get("name") == "Iron rocks" or entity.get("id") in mgi.SPENT_TO_LIVE:
+            g.hovers.append((entity.get("x"), entity.get("y")))
+        else:
+            g.hovers.append(("walk", (entity.get("x"), entity.get("y"))))
         return True
     monkeypatch.setattr(controller, "hover_entity", hover_entity)
 
@@ -212,6 +223,8 @@ def game(monkeypatch):
         elif entity.get("name") == "Bank Deposit Box":
             g.clicks.append(("box", (entity["x"], entity["y"])))
             # The game walks to the box and deposits every ore there.
+            for _ in range(g.deposit_delay_batches):
+                g.feed(("TICK", {"tick": 1}))
             g.feed(("INVENTORY_CHANGED", None,
                     lambda: (setattr(g, "ore", 0), g.player.update(x=3014, y=9720))))
         else:
@@ -246,6 +259,18 @@ def test_mine_rock_waits_through_the_first_ore_and_ends_on_the_depletion(game):
     assert game.clicks == [("rock", N)]
     assert game.hovers == [W]            # the next rock was parked under the cursor immediately
     assert game.ore == 7
+
+
+def test_mine_rock_hovers_the_next_rock_even_while_it_is_still_spent(game):
+    """The next rock in the rotation is usually SPENT when the current one is clicked (it
+    respawns 2.4s into the 3.6s cycle), so its screen position has to come from the spent
+    object on that tile, not from the live id."""
+    ctx = _ctx(game)
+    game.rocks[W] = mgi.ROCK_IDS[11364]      # west is down right now
+    game.feed(_xp(), _despawn(N), (None, None, lambda: game.second_ore(N)))
+    result = mgi.mine_rock(ctx, _obj(11365, *N), hover_next={"x": W[0], "y": W[1], "plane": 0, "id": 11364})
+    assert result == "depleted"
+    assert game.hovers == [W]
 
 
 def test_mine_rock_reports_a_click_that_produced_nothing(game):
@@ -325,3 +350,52 @@ def test_routine_is_wired_into_the_panel_dropdown():
     java = open(os.path.join(os.path.dirname(__file__), "..", "..", "src", "main", "java", "com",
                              "example", "controller", "RoutineChoice.java"), encoding="utf-8").read()
     assert "MINING_GUILD_IRON(" in java
+
+
+# --- speedups (mgi_live2, 2026-09-11) ---------------------------------------------------------
+
+def test_tick_prehovers_the_ore_before_the_rock_that_fills_the_inventory(game):
+    """MEASURED mgi_live2: depletion -> Use click was 0.25s reaction + 0.42s flight to the
+    inventory. The human's ore click was already in place. When the rock being clicked will
+    push the inventory below the threshold, the ORE is parked under the cursor, not a rock."""
+    ctx = _ctx(game)
+    game.ore = 24                        # 25 used -> 3 free; this rock's two ores make it 1
+    game.auto_ore = True
+    ctx.state.data[mgi.CHAIN_LIMIT_KEY] = 2
+    mgi.tick(ctx)
+    kinds = [k for k, _ in game.clicks]
+    assert kinds[:5] == ["rock", "use", "box", "walk", "rock"], game.clicks
+    assert game.hovers[0] == ("item", "Iron ore")
+
+
+def test_track_hover_rehovers_only_when_the_projection_drifts(game):
+    hovered = []
+    cursor = {"pos": (0, 0)}
+
+    def resolve():
+        return {"screenX": cursor["next"][0], "screenY": cursor["next"][1]}
+
+    def hover(ser, entity, **kw):
+        hovered.append((entity["screenX"], entity["screenY"]))
+        cursor["pos"] = (entity["screenX"], entity["screenY"])
+        return True
+    controller.hover_entity = hover
+    controller.get_cursor_pos = lambda: cursor["pos"]
+    ctx = _ctx(game)
+    cursor["next"] = (500, 400)
+    mgi._track_hover(ctx, resolve, offset=(0, 0))       # first: nothing parked yet -> hover
+    cursor["next"] = (504, 403)
+    mgi._track_hover(ctx, resolve, offset=(0, 0))       # 5px drift: leave it
+    cursor["next"] = (540, 400)
+    mgi._track_hover(ctx, resolve, offset=(0, 0))       # 40px drift: re-hover
+    assert hovered == [(500, 400), (540, 400)]
+
+
+def test_deposit_trip_parks_the_cursor_on_the_stand_tile_while_walking_to_the_box(game):
+    """The human clicked Walk-here 0.1s after the deposit landed because the cursor was
+    already on the tile; ours flew 0.7s. So the tile is hovered during the deposit walk."""
+    ctx = _ctx(game)
+    game.ore = 27
+    game.deposit_delay_batches = 60      # ~1.2s of empty 20ms polls before the deposit lands
+    assert mgi.deposit_trip(ctx, ctx.state.config)
+    assert ("walk", (3021, 9721)) in game.hovers
