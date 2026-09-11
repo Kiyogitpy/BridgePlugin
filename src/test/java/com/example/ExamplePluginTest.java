@@ -1,6 +1,7 @@
 package com.example;
 
 import com.example.controller.ControllerPlugin;
+import com.example.gauntletrecolor.GauntletRecolorPlugin;
 import com.sun.jna.Native;
 import com.sun.jna.Pointer;
 import net.runelite.client.RuneLite;
@@ -104,6 +105,7 @@ public class ExamplePluginTest
 		makeProcessDpiAware();
 		List<Class<? extends Plugin>> plugins = zombieLitePlugins();
 		plugins.add(ControllerPlugin.class);
+		plugins.add(GauntletRecolorPlugin.class);
 		ExternalPluginManager.loadBuiltin(plugins.toArray(new Class[0]));
 		RuneLite.main(args);
 	}
