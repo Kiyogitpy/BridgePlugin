@@ -19,8 +19,10 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: None)
     monkeypatch.setattr(bank_memory, "load", lambda names=None: None)
     monkeypatch.setattr(controller, "get_bank", lambda fresh=False: {"open": True, "items": []})
-    monkeypatch.setattr(vtr_routine, "_await_bank_slot", lambda name: True)
+    monkeypatch.setattr(vtr_routine, "_await_bank_slot", lambda name, expected=None: True)
     monkeypatch.setattr(vtr_routine, "_deposit_junk", lambda ctx: None)
+    monkeypatch.setattr(banker, "is_open", lambda: False)     # walk_leg closes an open bank first
+    monkeypatch.setattr(controller, "get_last_action", lambda: None)
     # tick() now walks the next leg and pre-hovers the first target itself; neither belongs
     # in a test of the site logic, and both touch the serial port.
     monkeypatch.setattr(vtr_routine, "_walk_to_site", lambda ctx, n: None)
@@ -90,7 +92,11 @@ def _ctx(monkeypatch, stops):
             # worse than no stub.
             self.config = vtr_routine.get_config(None)
 
+            self.paused = False
+            self.safety_stopped = False
+
         def trigger_safety_stop(self, reason):
+            self.safety_stopped = True
             stops.append(reason)
 
     class _Ctx:
@@ -177,6 +183,9 @@ def _ctx_only():
         def __init__(self):
             self.data = {}
             self.config = vtr_routine.get_config(None)
+
+            self.paused = False
+            self.safety_stopped = False
 
         def trigger_safety_stop(self, reason):
             raise AssertionError("unexpected safety stop: %s" % reason)
@@ -611,7 +620,7 @@ def test_the_decorate_camera_hook_sends_nothing_when_the_next_site_is_already_on
 def test_the_decorate_hook_runs_after_the_click_and_before_its_confirm(monkeypatch):
     order = []
 
-    def click_site(ctx, n, which, budget, confirm, option=None, after_click=None):
+    def click_site(ctx, n, which, budget, confirm, option=None, after_click=None, **kw):
         order.append("click")
         if after_click:
             after_click()
@@ -1652,6 +1661,28 @@ def test_the_reserve_still_reclicks_the_walk_when_no_spool_is_carried(monkeypatc
     assert len(clicks) == 2 and strung == []
 
 
+def test_an_unresolvable_reserve_reclick_is_a_no_op_not_a_crash(monkeypatch):
+    """CRASHED LIVE 2026-09-11 (vt_markers27, AttributeError: 'tuple' object has no
+    attribute 'get', controller.click_entity). The fallback that re-resolves the player's
+    OWN tile when the far target can no longer be projected was written as
+        fresh, fresh_viewport = _walk_point_now(*_player_xy()), True
+    -- the RHS is a tuple `(_walk_point_now(...), True)`, and since _walk_point_now itself
+    returns a (point, viewport) pair, `fresh` ends up holding that WHOLE pair instead of
+    the point dict (or None). `if fresh is not None:` then always passes -- a non-None
+    tuple, never actually None -- and travel._click_walk_point is handed a tuple where a
+    dict (or nothing at all) was meant. Neither resolution being possible any more (target
+    off-screen and off-minimap, same for the player's own tile) must be a no-op, not a
+    crash."""
+    clicks, strung = _fletch_stretch(monkeypatch, logs_seq=[6, 4, 3, 3, 3, 3], bows_seq=[2] * 12)
+    monkeypatch.setattr(vtr_routine, "find_spool", lambda: None)     # force the reclick branch
+    monkeypatch.setattr(vtr_routine, "_walk_point_now", lambda cx, cy: (None, False))
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.LOG_RESERVE_KEY] = 3
+    assert vtr_routine.walk_leg(ctx, 8, 7, after_first_hop=lambda: "fletch") is True
+    assert len(clicks) == 1, "only the leg's initial walk click -- no bogus reclick"
+    assert strung == []
+
+
 def test_the_fletch_hook_sets_the_reserve_it_started_against(monkeypatch):
     monkeypatch.setattr(controller, "get_api", lambda g, r: _full_state())    # 8 builds owed
     monkeypatch.setattr(vtr_routine, "count_item", lambda name: 40 if "logs" in name else 0)
@@ -2082,6 +2113,36 @@ def test_the_bank_out_of_the_current_wood_steps_down_to_the_next(monkeypatch):
     assert ctx.state.data[vtr_routine.WOOD_KEY] == "MAPLE"
 
 
+def test_bank_exhaustion_steps_back_up_to_a_live_panel_change(monkeypatch):
+    """SAFETY-STOPPED LIVE 2026-09-11: _wood_override's "logs in hand decide first" rule
+    latches onto whatever wood is in hand the moment it first runs and never re-derives (see
+    its own docstring) -- so once THAT wood, and everything WOOD_FALLBACK steps to below it,
+    is bank-exhausted too, the routine ignored a live panel change to MAGIC (630 logs sitting
+    in the bank) made specifically to recover from an earlier Yew/Maple/Willow/Oak exhaustion
+    stop, and safety-stopped again with Magic never considered. Once the override wood is
+    bank-dry all the way down, the reason to prefer it over the panel is gone."""
+    ctx = _ctx_only()
+    vtr_routine._apply_wood(ctx, "OAK")            # the override has walked all the way down
+    memory = bank_memory.BankMemory({"seen": True, "items": [
+        {"name": "Magic logs", "quantity": 630, "id": 1513}]})
+    monkeypatch.setattr(bank_memory, "load", lambda names=None: memory)
+    monkeypatch.setattr(controller, "get_config", lambda: {"valeTotemsWood": "MAGIC"})
+    assert vtr_routine._step_wood_down_if_bank_is_out(ctx) is True
+    assert ctx.state.config["wood"] == "MAGIC"
+    assert ctx.state.data[vtr_routine.WOOD_KEY] == "MAGIC"
+
+
+def test_bank_exhaustion_stays_stopped_when_the_panel_wood_is_out_too(monkeypatch):
+    ctx = _ctx_only()
+    vtr_routine._apply_wood(ctx, "OAK")
+    memory = bank_memory.BankMemory({"seen": True, "items": [
+        {"name": "Teak logs", "quantity": 1240, "id": 6333}]})    # present, but not a bow wood
+    monkeypatch.setattr(bank_memory, "load", lambda names=None: memory)
+    monkeypatch.setattr(controller, "get_config", lambda: {"valeTotemsWood": "MAGIC"})
+    assert vtr_routine._step_wood_down_if_bank_is_out(ctx) is False
+    assert ctx.state.config["wood"] == "OAK", "must not switch to a panel wood with no stock"
+
+
 def test_a_name_that_merely_contains_the_log_name_does_not_count_as_stock(monkeypatch):
     """MEASURED live 2026-09-10 (vt_markers1): the bank held NO Yew logs but did hold one
     "Abyssal lantern (yew logs)", bank_memory.quantity's substring match counted it as 1, the
@@ -2467,6 +2528,9 @@ def test_the_site_click_does_not_wait_for_the_stop_within_the_early_click_distan
     monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
     monkeypatch.setattr(controller, "wait_until_player_idle",
                         lambda **k: pytest.fail("waited for the stop inside the early-click distance"))
+    # This totem reads finished with 0 visits left, so tick reaches _hold_for_collapse and
+    # stands there for HOLD_MAX_S of real seconds without a fake clock.
+    _fake_clock(monkeypatch)
     vtr_routine.tick(ctx)
     assert not stops
 
@@ -2487,6 +2551,7 @@ def test_the_site_click_still_waits_for_the_stop_further_out(monkeypatch):
     monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
     waited = []
     monkeypatch.setattr(controller, "wait_until_player_idle", lambda **k: waited.append(k) or True)
+    _fake_clock(monkeypatch)
     vtr_routine.tick(ctx)
     assert waited
 
@@ -2636,3 +2701,567 @@ def test_the_idle_animation_wait_needs_two_idle_reads_in_a_row(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: reads.append(1) or {"animation": next(anim)})
     assert vtr_routine._await_idle_animation() is True
     assert len(reads) == 5, "the lone idle read before the animation did not count"
+
+
+# --- 2026-09-10 evening: the lap's remaining waste is exceptions and small fixed costs ------
+
+def test_a_decorate_whose_count_stops_moving_gives_up_long_before_the_budget(monkeypatch):
+    """MEASURED run 19 (site 6, recorder vt-markers9): two decorations landed, then
+    "Congratulations, you've just advanced your Fletching level" -- the level-up box ended
+    the action, and the confirm waited its whole 12s budget before the retry click (which
+    goes straight through the box) restarted it. A decoration lands every 1.2s, so a count
+    that has not moved for DECORATE_STALL_S is a stopped action, whatever stopped it."""
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda x, y, p, i, **k: {"screenX": 1, "screenY": 2, "id": i})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
+    monkeypatch.setattr(controller, "get_last_action", lambda: {"option": "Decorate"})
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 4 if "longbow" in name else 0)
+    reads = [0, 1, 2] + [2] * 40
+    payload = lambda d: {"sites": [{"siteNumber": 8, "baseValue": 4, "wood": "YEW",
+                                    "baseCarved": True, "bottom": {"value": 10},
+                                    "middle": {"value": 11}, "top": {"value": 13},
+                                    "decorations": d, "nearbySpirits": ["BUFFALO", "JAGUAR", "SNAKE"],
+                                    "durabilityRemaining": 5, "unclaimedOfferings": 0}],
+                        "researchPoints": 0, "totalUnclaimedOfferings": 0, "atValeTotems": True}
+    served = []
+    monkeypatch.setattr(controller, "get_api",
+                        lambda g, r: payload(served.append(1) or reads[len(served) - 1]))
+    site = vt.parse_state(payload(0)).sites[8]
+    clock = _stepping_clock()
+    monkeypatch.setattr(vtr_routine, "_now", clock)
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    t0 = clock()
+    assert vtr_routine.decorate(_ctx_only(), site) is False
+    elapsed = clock() - t0
+    budget = vtr_routine.DECORATE_BUDGET_S + vtr_routine.DECORATE_ACTION_S * 4
+    # The stepping clock charges 0.5s per read of it, so the whole _click_site path (idle
+    # reads, the miss check, the stall) is measured; the stall itself is the reader reads.
+    assert elapsed < budget, "gave up at %.1fs of a %.1fs budget" % (elapsed, budget)
+    assert len(served) <= 3 + int(vtr_routine.DECORATE_STALL_S / 0.5) + 3,         "%d reader reads: the stall watch did not fire" % len(served)
+
+
+def test_the_bank_camera_turn_is_decided_on_what_the_site_will_leave_in_hand(monkeypatch):
+    """MEASURED run 20: at site 8 the trip was NOT due before the site (5 logs + 22 in the
+    basket + 13 bows) and WAS due after it (4 logs, 9 bows), so the hook faced site 7, the
+    booth was off screen, and the trip fell back to a minimap hop instead of the direct
+    booth click."""
+    finished = dict(baseValue=4, wood="YEW", baseCarved=True, bottom={"value": 10},
+                    middle={"value": 11}, top={"value": 13}, decorations=4)
+    payload = _full_state(**finished)
+    payload["sites"][7] = dict(payload["sites"][7], baseValue=0, wood="NONE", baseCarved=False,
+                               decorations=0)        # site 8 is unbuilt
+    monkeypatch.setattr(controller, "get_api", lambda g, r: payload)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 5 if name == "Yew logs" else 0)
+    monkeypatch.setattr(vtr_routine, "bow_count", lambda ctx, wood=None: 13)
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = 22
+    state = vt.parse_state(payload)
+    assert vtr_routine._bank_trip_due(ctx, state) is False, "not due before the site"
+    assert vtr_routine._bank_trip_due_after(ctx, state, 8) is True, "due once built and decorated"
+    faced = []
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": False})
+    monkeypatch.setattr(controller, "face_toward",
+                        lambda ser, tx, ty, px=None, py=None: faced.append((tx, ty)) or True)
+    vtr_routine._decorate_camera_hook(ctx, 8)()
+    assert faced == [route.BANK["tile"]]
+
+
+def test_fill_is_the_open_baskets_left_click_with_the_menu_as_the_fallback(monkeypatch):
+    """The human's recording: Fill is ONE left click on the open basket (CC_OP, no menu),
+    0.4s after Escape. The menu is kept for a client whose hover does not read Fill."""
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Open log basket", "screenX": 1, "screenY": 1}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    counts = [21, 0, 0]
+    monkeypatch.setattr(vtr_routine, "count_item",
+                        lambda name: counts.pop(0) if len(counts) > 1 else counts[0])
+    gated = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: gated.append(k.get("expected_action")) or True)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda *a, **k: pytest.fail("the hover read Fill -- no menu needed"))
+    ctx = _ctx_only()
+    assert vtr_routine.fill_basket(ctx) is True
+    assert gated == ["Fill"]
+    assert vtr_routine.basket_logs(ctx.state.data) == 21
+
+    # Withheld (the hover did not read Fill): the named menu entry, as before.
+    counts[:] = [21, 0, 0]
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: controller.CLICK_WITHHELD)
+    chosen = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, ent, opt, **k: chosen.append(tuple(opt)) or True)
+    assert vtr_routine.fill_basket(_ctx_only()) is True
+    assert chosen == [("fill",)]
+
+
+def test_the_bank_slot_wait_accepts_a_slot_matching_the_previous_round_at_once(monkeypatch):
+    """Rounds 2 and 3 reopen the same bank at the same scroll; the slot two reads agreed on
+    in round 1 is proof enough when the first fresh read lands on it again."""
+    monkeypatch.setattr(controller, "get_bank",
+                        lambda fresh=False: {"items": [{"name": "Yew logs",
+                                                        "screenX": 650, "screenY": 226}]})
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: pytest.fail("slept on a known slot"))
+    assert vtr_routine._await_bank_slot("Yew logs", expected=(650, 226)) is True
+
+
+def test_the_first_click_of_a_visit_does_not_wait_for_an_animation_but_the_second_does(monkeypatch):
+    """The player has just stopped running: there is no previous action to let finish. Every
+    later click at the site follows one and keeps the wait (run 16: a Decorate 0.66s into
+    the carve animation was dropped)."""
+    waits = []
+    monkeypatch.setattr(vtr_routine, "_await_idle_animation",
+                        lambda *a, **k: waits.append(1) or True)
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda x, y, p, i, **k: {"screenX": 1, "screenY": 2, "id": i})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
+    monkeypatch.setattr(controller, "get_last_action", lambda: None)
+    monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    ctx = _ctx_only()
+    vtr_routine._start_visit(ctx)
+    assert vtr_routine._click_site(ctx, 8, "totem", 1.0, lambda: True) is True
+    assert waits == [], "the first click of the visit waited for an animation that cannot exist"
+    assert vtr_routine._click_site(ctx, 8, "totem", 1.0, lambda: True) is True
+    assert waits == [1], "the second click must wait for the first action's animation"
+
+
+def test_the_basket_is_emptied_on_the_legs_first_hook_before_any_action_starts(monkeypatch):
+    """MEASURED run 22 (site 3): a leg opening with stringing never reached the fletch
+    branch's on-the-move Empty, so the top-up ran in front of the totem, 1.5s before the
+    first click. The hook runs right after a walk click, when nothing is running."""
+    monkeypatch.setattr(vtr_routine, "_basket_top_up_due", lambda ctx: True)
+    emptied = []
+    monkeypatch.setattr(vtr_routine, "empty_basket", lambda ctx: emptied.append(1) or True)
+    ctx = _ctx_only()
+    ctx.state.data["vt_fletch_due"] = False        # nothing to fletch or string this leg
+    ctx.state.data[vtr_routine.LEG_EMPTIED_KEY] = False
+    assert vtr_routine._fletch_on_the_move(ctx) is False
+    assert emptied == [1], "the top-up belongs on the leg, not in front of the totem"
+    assert vtr_routine._fletch_on_the_move(ctx) is False
+    assert emptied == [1], "once per leg -- a later stretch's hook must not empty again"
+
+
+def test_a_bank_that_runs_out_mid_trip_steps_the_wood_down_and_carries_on(monkeypatch):
+    """MEASURED run 22 (21:25): round 1 took the last Yew logs, round 2 shift-clicked the
+    placeholder and withdrew nothing, the trip failed with 4910 Maple logs banked."""
+    _at_the_bank(monkeypatch)
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda *a, **k: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **k: True)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
+    monkeypatch.setattr(vtr_routine, "fill_basket", lambda ctx: True)
+    stock = {"Yew logs": 20, "Maple logs": 4910}
+
+    class _Memory:
+        seen = True
+
+        @property
+        def items(self):
+            return [{"name": n, "quantity": q} for n, q in stock.items()]
+
+    monkeypatch.setattr(bank_memory, "load", lambda names=None: _Memory())
+    withdrawals = []
+
+    def withdraw(ctx, name, fresh=False):
+        withdrawals.append(name)
+        if stock.get(name, 0) <= 0:
+            return False            # a placeholder: nothing arrives
+        stock[name] = max(0, stock[name] - 28)   # round 1 takes the last yew; maple never runs out
+        return True
+
+    monkeypatch.setattr(banker, "withdraw_all_shift", withdraw)
+    ctx = _ctx_only()
+    assert vtr_routine.bank_trip(ctx) is True
+    assert withdrawals == ["Yew logs", "Yew logs", "Maple logs", "Maple logs"], withdrawals
+    assert ctx.state.config["wood"] == "MAPLE"
+    assert ctx.state.data[vtr_routine.WOOD_KEY] == "MAPLE"
+
+
+def test_a_target_is_banned_for_the_session_only_on_its_second_stall(monkeypatch):
+    """MEASURED run 22 (21:27:57): the straight click at site 3's stand -- good for ten laps
+    -- registered as CANCEL under a stray right-click and was banned for the session on that
+    one stall. A stall skips the target for the rest of the leg; the session ban takes two."""
+    points = route.leg_waypoints(6, 5)
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500, "screenY": 300,
+                                                     "tile": (x, y)})
+    far = []
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: far.append(point["tile"]))
+    monkeypatch.setattr(travel, "_hop_to", lambda ctx, x, y, plane, **k: True)
+    monkeypatch.setattr(controller, "get_player", lambda: _stand(6))     # never moves
+    clock = {"t": 0.0}
+    monkeypatch.setattr(vtr_routine, "_now", lambda: clock["t"])
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    ctx = _ctx_only()
+    vtr_routine.walk_leg(ctx, 6, 5)                     # lap 1: every target stalls once
+    stand = route.SITES[5]["stand"]
+    assert far[0] == stand and far.count(stand) == 1, "skipped for the rest of that leg"
+    far.clear()
+    vtr_routine.walk_leg(ctx, 6, 5)                     # lap 2: the stand is tried again
+    assert far[0] == stand, "one stall is not a session ban"
+    far.clear()
+    vtr_routine.walk_leg(ctx, 6, 5)                     # lap 3: two strikes -- banned
+    assert stand not in far, "the second stall bans the target for the session"
+
+
+def test_a_failed_withdraw_closes_the_bank_before_the_trip_gives_up(monkeypatch):
+    """MEASURED run 23: the trip returned with the interface open and the next leg's six far
+    clicks were all eaten by it."""
+    _at_the_bank(monkeypatch)
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda *a, **k: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **k: True)
+    monkeypatch.setattr(banker, "withdraw_all_shift", lambda ctx, name, fresh=False: False)
+    closed = []
+    monkeypatch.setattr(banker, "close_bank", lambda ctx: closed.append(1))
+    assert vtr_routine.bank_trip(_ctx_only()) is False
+    assert closed == [1]
+
+
+def test_a_leg_closes_an_open_bank_before_its_first_click(monkeypatch):
+    monkeypatch.setattr(banker, "is_open", lambda: True)
+    closed = []
+    monkeypatch.setattr(banker, "close_bank", lambda ctx: closed.append(1))
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, p, inst=False: {"onScreen": True, "screenX": 500, "screenY": 300})
+    order = []
+    monkeypatch.setattr(travel, "_click_walk_point", lambda ctx, point, shift: order.append("click"))
+    positions = iter([_stand(8), _stand(8)] + [_stand(7)] * 20)
+    monkeypatch.setattr(controller, "get_player", lambda: next(positions))
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    monkeypatch.setattr(travel, "_hop_to", lambda *a, **k: pytest.fail("hopped"))
+    assert vtr_routine.walk_leg(_ctx_only(), 8, 7) is True
+    assert closed == [1] and order == ["click"]
+
+
+def test_a_bank_left_on_a_numbered_tab_is_switched_to_the_main_tab(monkeypatch):
+    """MEASURED run 23 (21:35:37): the bank opened on a numbered tab, /bank listed no Maple
+    logs for 2.3s with 4910 banked, and the trip failed."""
+    _at_the_bank(monkeypatch)
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda *a, **k: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **k: True)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
+    monkeypatch.setattr(vtr_routine, "fill_basket", lambda ctx: True)
+    tab = {"current": 3}
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: {"open": True, "items": [],
+                                                                     "currentTab": tab["current"]})
+    monkeypatch.setattr(vtr_routine, "_await_bank_slot",
+                        lambda name, expected=None: tab["current"] == 0)
+    switched = []
+
+    def switch(ctx, index):
+        switched.append(index)
+        tab["current"] = index
+        return True
+
+    monkeypatch.setattr(banker, "switch_bank_tab", switch)
+    withdrawals = []
+    monkeypatch.setattr(banker, "withdraw_all_shift",
+                        lambda ctx, name, fresh=False: withdrawals.append(name) or True)
+    assert vtr_routine.bank_trip(_ctx_only()) is True
+    assert switched == [0]
+    assert len(withdrawals) == vtr_routine.BANK_ROUNDS
+
+
+def test_a_refused_decorate_drops_the_bows_of_another_wood(monkeypatch):
+    """MEASURED run 24 (site 7): 5 Yew longbows ahead of 3 Maple longbows in slot order, and
+    every Decorate on the maple totem drew "You may only add decorations which match the
+    wood used to build the totem."."""
+    site = _one_site(baseValue=4, wood="MAPLE", baseCarved=True, decorations=0)
+    ctx = _ctx_only()
+    vtr_routine._apply_wood(ctx, "MAPLE")
+    monkeypatch.setattr(vtr_routine, "bow_count", lambda c, wood=None: 3)
+    monkeypatch.setattr(vtr_routine, "_click_site", lambda *a, **k: False)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Maple logs"}, {"name": "Yew longbow"},
+                                 {"name": "Yew longbow"}, {"name": "Maple longbow"},
+                                 {"name": "Maple longbow (u)"}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    dropped = []
+    monkeypatch.setattr(controller, "drop_items",
+                        lambda ser, items: dropped.extend(i["name"] for i in items) or True)
+    assert vtr_routine.decorate(ctx, site) is False
+    assert dropped == ["Yew longbow", "Yew longbow"], "only the other wood's bows go"
+
+    # A decorate that landed drops nothing, whatever is in hand.
+    dropped.clear()
+    monkeypatch.setattr(vtr_routine, "_click_site", lambda *a, **k: True)
+    assert vtr_routine.decorate(ctx, site) is True
+    assert dropped == []
+
+
+def test_the_bank_trip_deposits_bows_of_a_wood_no_longer_worked(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Maple logs"}, {"name": "Yew longbow"},
+                                 {"name": "Maple longbow (u)"}, {"name": "Open log basket"}])
+    calls = []
+    monkeypatch.setattr(banker, "deposit_inventory", lambda ctx, cfg: calls.append(cfg))
+    ctx = _ctx_only()
+    vtr_routine._apply_wood(ctx, "MAPLE")
+    _REAL_DEPOSIT_JUNK(ctx)
+    assert calls, "the yew bow is junk once maple is the working wood"
+    keep = calls[0]["keepItems"]
+    assert "maple longbow (u)" in keep and "maple longbow" in keep and "longbow" not in keep
+
+
+def test_no_basket_top_up_is_due_into_a_full_inventory(monkeypatch):
+    """MEASURED run 25: unknown basket, 28/28 slots, and the Empty sat out its 4s budget at
+    every site with nothing able to arrive (USER: "alot of standing around the totem")."""
+    full = [{"name": "Open log basket"}] + [{"name": "Maple longbow"}] * 27
+    monkeypatch.setattr(controller, "get_inventory", lambda: full)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
+    ctx = _ctx_only()
+    ctx.state.data[vtr_routine.BASKET_LOGS_KEY] = None      # unknown, as after a restart
+    assert vtr_routine._basket_top_up_due(ctx) is False
+    monkeypatch.setattr(controller, "get_inventory", lambda: full[:-1])   # one free slot
+    assert vtr_routine._basket_top_up_due(ctx) is True
+
+
+def test_the_early_click_is_kept_for_tall_targets_but_a_build_waits_for_the_stop(monkeypatch):
+    """MEASURED runs 24/26: Build clicks from the moving hover at the small unbuilt base
+    resolved to "Walk here" at 4 of 12 sites; claim/carve/decorate aim at tall models."""
+    unbuilt = _one_site(baseValue=0, wood="NONE", baseCarved=False, decorations=0)
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: unbuilt)
+    assert vtr_routine._first_action_is_build(6) is True
+    capped = _one_site(baseValue=0, unclaimedOfferings=vt.OFFERING_CAP)
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: capped)
+    assert vtr_routine._first_action_is_build(6) is False, "the capped pile is claimed first"
+    built = _one_site(baseValue=4, wood="YEW", baseCarved=False)
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: built)
+    assert vtr_routine._first_action_is_build(6) is False
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: None)
+    assert vtr_routine._first_action_is_build(6) is True, "unreadable: the safe side is the stop"
+
+
+def test_carve_stops_waiting_for_the_prompt_once_the_totem_reads_fully_carved(monkeypatch):
+    """MEASURED runs 25/26: a totem needing two spirits got them from two keys, and the third
+    iteration waited the whole menu budget for a prompt that had closed for good."""
+    monkeypatch.setattr(controller, "click_entity", lambda ser, ent, **k: True)
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(vtr_routine, "site_object", lambda n, w: {"screenX": 1, "screenY": 2})
+    menus = []
+    monkeypatch.setattr(vtr_routine, "_await_menu", lambda ctx: menus.append(1) or True)
+
+    class _Site:
+        number = 7
+        nearby_spirits = ["BUFFALO", "JAGUAR", "SNAKE"]
+        segment_values = (vt.SPIRIT_VALUES["BUFFALO"] + vt.CARVED_OFFSET, 0, 0)   # one done
+        base_carved = False
+
+    carved = []
+
+    def choose(ctx, spirit):
+        carved.append(spirit)
+        vals = list(_Site.segment_values)
+        vals[len(carved)] = vt.SPIRIT_VALUES[spirit] + vt.CARVED_OFFSET
+        _Site.segment_values = tuple(vals)
+        if len(carved) == 2:
+            _Site.base_carved = True          # the game closes the prompt for good
+        return True
+
+    monkeypatch.setattr(vtr_routine, "choose_spirit", choose)
+    monkeypatch.setattr(vtr_routine, "_site_now", lambda n: _Site)
+    monkeypatch.setattr(vtr_routine, "_now", _stepping_clock())
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: None)
+    assert vtr_routine.carve(_ctx_only(), _Site) is True
+    assert carved == ["JAGUAR", "SNAKE"]
+    assert len(menus) == 2, "no third wait for a prompt that cannot reopen"
+
+
+# --------------------------------------------- holding at a totem that is about to collapse
+#
+# USER 2026-09-11, on moving the routine up to magic logs: "the time they stay up has increased
+# so we need to adapt so we dont just run around in circles". A magic totem outlives the lap by
+# ~12s, so the ring arrives early, finds nothing to do, and the site then sits collapsed and
+# earning nothing until the ring comes back ~276s later.
+
+def _ring_state(per_site=None):
+    """The whole eight-site ring, every site finished, overridden per site number."""
+    per_site = per_site or {}
+    sites = []
+    for n in range(1, 9):
+        raw = {"siteNumber": n, "baseValue": 4, "wood": "MAGIC", "baseCarved": True,
+               "bottom": {"value": 10}, "middle": {"value": 11}, "top": {"value": 13},
+               "decorations": 4, "nearbySpirits": ["BUFFALO", "JAGUAR", "SNAKE"],
+               "durabilityRemaining": 4, "unclaimedOfferings": 0}
+        raw.update(per_site.get(n, {}))
+        sites.append(raw)
+    return vt.parse_state({"sites": sites, "researchPoints": 0,
+                           "totalUnclaimedOfferings": 0, "atValeTotems": True})
+
+
+def _hold_fixture(monkeypatch, reads, *, worked=None):
+    """`reads` are the site snapshots _hold_for_collapse sees, one per poll."""
+    _fake_clock(monkeypatch)
+    it = iter(reads)
+    last = {"site": reads[-1]}
+
+    def site_now(n):
+        try:
+            last["site"] = next(it)
+        except StopIteration:
+            pass
+        return last["site"]
+
+    monkeypatch.setattr(vtr_routine, "_site_now", site_now)
+    monkeypatch.setattr(vtr_routine, "_string_if_worthwhile", lambda ctx: False)
+    monkeypatch.setattr(vtr_routine, "work_site",
+                        lambda ctx, n, **k: (worked.append(n), True)[1]
+                        if worked is not None else True)
+
+
+def test_the_hold_waits_for_the_totem_to_fall_and_then_rebuilds_it(monkeypatch):
+    """The whole point: arriving ~12s early must not mean leaving, or the site is dead ground
+    for the rest of the lap."""
+    fallen = _one_site(siteNumber=6)          # baseValue 0 -- the totem is down
+    standing = _one_site(siteNumber=6, baseValue=4, wood="MAGIC", baseCarved=True,
+                         decorations=4, durabilityRemaining=1)
+    worked = []
+    _hold_fixture(monkeypatch, [standing, standing, fallen], worked=worked)
+    state = _ring_state({6: {"durabilityRemaining": 1}})
+    assert vtr_routine._hold_for_collapse(_ctx_only(), 6, state) is True
+    assert worked == [6], "the rebuild must happen on the spot, not next lap"
+
+
+def test_the_hold_gives_up_at_its_budget_and_walks_on(monkeypatch):
+    """A totem that does not fall inside one ent cycle is not worth a whole lap of standing --
+    the wiki says a visit only POSSIBLY collapses the totem."""
+    standing = _one_site(siteNumber=6, baseValue=4, wood="MAGIC", baseCarved=True,
+                         decorations=4, durabilityRemaining=1)
+    worked = []
+    _hold_fixture(monkeypatch, [standing], worked=worked)
+    state = _ring_state({6: {"durabilityRemaining": 1}})
+    assert vtr_routine._hold_for_collapse(_ctx_only(), 6, state) is False
+    assert worked == []
+
+
+def test_a_totem_with_visits_left_is_walked_past_without_a_wait(monkeypatch):
+    """Each remaining durability is another ~48s of standing still; the ring is better use of
+    that time."""
+    slept = []
+    monkeypatch.setattr(vtr_routine, "_sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(vtr_routine, "_site_now",
+                        lambda n: pytest.fail("no read should be needed"))
+    state = _ring_state({6: {"durabilityRemaining": 3}})
+    assert vtr_routine._hold_for_collapse(_ctx_only(), 6, state) is False
+    assert slept == []
+
+
+def test_the_hold_releases_on_a_pause(monkeypatch):
+    """F2 must not be swallowed by a minute of standing about."""
+    standing = _one_site(siteNumber=6, baseValue=4, wood="MAGIC", baseCarved=True,
+                         decorations=4, durabilityRemaining=1)
+    worked = []
+    _hold_fixture(monkeypatch, [standing], worked=worked)
+    ctx = _ctx_only()
+    ctx.state.paused = True
+    assert vtr_routine._hold_for_collapse(
+        ctx, 6, _ring_state({6: {"durabilityRemaining": 1}})) is False
+
+
+def test_the_hold_strings_bows_rather_than_fletching_logs(monkeypatch):
+    """Stringing spends unstrung bows -- logs already committed -- so it cannot eat the build
+    reserve. A fletch here has no walk click to end it and would run the whole wait, which is
+    exactly the "plenty of bows, no logs" deadlock vt.fletch_budget exists to prevent."""
+    standing = _one_site(siteNumber=6, baseValue=4, wood="MAGIC", baseCarved=True,
+                         decorations=4, durabilityRemaining=1)
+    _hold_fixture(monkeypatch, [standing])
+    strung = []
+    monkeypatch.setattr(vtr_routine, "_string_if_worthwhile",
+                        lambda ctx: strung.append(True) or True)
+    monkeypatch.setattr(vtr_routine, "start_fletching",
+                        lambda ctx: pytest.fail("a hold must never start a fletch"))
+    vtr_routine._hold_for_collapse(_ctx_only(), 6, _ring_state({6: {"durabilityRemaining": 1}}))
+    assert strung, "the wait is bow time, not idle time"
+
+
+def test_a_full_lap_with_nothing_to_do_is_reported(monkeypatch):
+    """The belt for a wood that outlives the lap by more than one ent visit (redwood, or a
+    faster lap): the hold threshold is too low and only a human can decide to raise it."""
+    lines = []
+    monkeypatch.setattr(vtr_routine.debug_log, "log", lambda cat, msg: lines.append(msg))
+    ctx = _ctx_only()
+    state = _ring_state()
+    for n in route.RING:
+        vtr_routine._note_lap_progress(ctx, n, True, state)
+    assert any("full lap" in line for line in lines)
+    assert any("durability" in line.lower() for line in lines)
+
+
+def test_one_site_worth_of_work_clears_the_idle_lap_count(monkeypatch):
+    lines = []
+    monkeypatch.setattr(vtr_routine.debug_log, "log", lambda cat, msg: lines.append(msg))
+    ctx = _ctx_only()
+    state = _ring_state()
+    for n in route.RING[:-1]:
+        vtr_routine._note_lap_progress(ctx, n, True, state)
+    vtr_routine._note_lap_progress(ctx, route.RING[-1], False, state)
+    for n in route.RING[:-1]:
+        vtr_routine._note_lap_progress(ctx, n, True, state)
+    assert not any("full lap" in line for line in lines)
+
+
+def test_the_site_outcome_line_reports_the_visits_left(monkeypatch):
+    """The durability is the hold's own countdown and appears nowhere else in the log, so a
+    session's worth of these lines is what HOLD_DURABILITY gets tuned against."""
+    lines = []
+    monkeypatch.setattr(vtr_routine.debug_log, "log", lambda cat, msg: lines.append(msg))
+    site = _one_site(siteNumber=6, baseValue=4, wood="MAGIC", baseCarved=True,
+                     decorations=4, durabilityRemaining=1)
+    vtr_routine._log_site_outcome(_ctx_only(), site, ["build", "carve", "decorate"], 9, 5)
+    assert "1 visit left" in lines[0]
+
+
+def test_an_unbuilt_site_has_no_visits_to_report(monkeypatch):
+    lines = []
+    monkeypatch.setattr(vtr_routine.debug_log, "log", lambda cat, msg: lines.append(msg))
+    vtr_routine._log_site_outcome(_ctx_only(), _one_site(siteNumber=6), [], 9, 5)
+    assert "visit" not in lines[0]
+
+
+def test_tick_holds_at_a_finished_totem_before_walking_on(monkeypatch):
+    """The wiring: without this the hold is unreachable and the ring keeps lapping early."""
+    stops = []
+    ctx = _ctx(monkeypatch, stops)
+    site = _one_site(baseValue=4, wood="MAGIC", baseCarved=True, decorations=4,
+                     durabilityRemaining=1,
+                     bottom={"value": 10}, middle={"value": 11}, top={"value": 13})
+    state = type("S", (), {"sites": {6: site}, "at_vale_totems": True})()
+    monkeypatch.setattr(vtr_routine, "read_state", lambda: state)
+    monkeypatch.setattr(vtr_routine, "nearest_site", lambda: 6)
+    _standing_at(monkeypatch, *route.SITES[6]["stand"])
+    monkeypatch.setattr(vtr_routine, "work_site", lambda c, n, during_decorate=None: True)
+    monkeypatch.setattr(vtr_routine, "_basket_top_up_due", lambda c: False)
+    monkeypatch.setattr(vtr_routine, "bow_count", lambda c, wood=None: 0)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 0)
+    monkeypatch.setattr(controller, "wait_until_player_idle", lambda **k: True)
+    held = []
+    monkeypatch.setattr(vtr_routine, "_hold_for_collapse",
+                        lambda c, n, st: held.append(n) or False)
+    vtr_routine.tick(ctx)
+    assert held == [6]
+    assert not stops
+
+
+def test_the_legs_log_reserve_is_a_lap_of_builds_not_the_instants(monkeypatch):
+    """The stop watch _direct_leg runs on. Keyed on builds_needed, a fully-standing ring
+    reserves NOTHING and the leg lets the fletch run the loose logs to zero -- the same
+    2026-09-11 failure as fletch_budget, one layer down."""
+    state = _ring_state()                      # every site standing and complete
+    assert vt.builds_needed(state) == 0
+    monkeypatch.setattr(vtr_routine, "read_state", lambda: state)
+    monkeypatch.setattr(vtr_routine, "count_item", lambda name: 20)
+    monkeypatch.setattr(vtr_routine, "bow_count", lambda c, wood=None: 0)
+    monkeypatch.setattr(vtr_routine, "find_spool", lambda: None)
+    monkeypatch.setattr(vtr_routine, "start_fletching", lambda c: True)
+    monkeypatch.setattr(vtr_routine, "_basket_top_up_due", lambda c: False)
+    ctx = _ctx_only()
+    ctx.state.data["vt_fletch_due"] = True
+    assert vtr_routine._fletch_on_the_move(ctx) == "fletch"
+    assert ctx.state.data[vtr_routine.LOG_RESERVE_KEY] == len(route.SITES)

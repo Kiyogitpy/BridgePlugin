@@ -32,6 +32,7 @@
 # bank -- there is no way to walk from an arbitrary tile back into that ring. So a player found
 # outside the valley cannot be walked home by this routine at all; the only safe response is a
 # safety stop asking the user to start it standing in the valley.
+import dataclasses
 import time
 
 import banker
@@ -250,9 +251,22 @@ def tick(ctx):
     # first action fires at once; further out the settle still waits for the stop. A click
     # that resolves to "Walk here" is _click_site's menu retry, and is logged so the miss
     # rate of the early click can be read off the log.
-    if _tiles_to_site(current) > EARLY_CLICK_TILES:
+    # ...BUT NOT FOR A BUILD. The unbuilt base ("Totem site") is a small, low model; the built
+    # totem and the pile are tall. MEASURED runs 24/26 (after the first click stopped waiting
+    # for an animation that cannot exist, ~0.25s earlier): Build clicks from the moving hover
+    # resolved to "Walk here" at 4 of 12 sites (run 21, with that 0.25s still in front, missed
+    # none), each costing a 1.5-2s menu retry -- more than the stop it skipped. Claim, Carve
+    # and Decorate keep the early click.
+    if _tiles_to_site(current) > EARLY_CLICK_TILES or _first_action_is_build(current):
         controller.wait_until_player_idle(timeout_s=SITE_SETTLE_S)
     data["vt_fletch_due"] = False        # the leg is over; the next site decides afresh
+
+    # WAS THERE ANYTHING TO DO HERE AT ALL? Read BEFORE work_site: afterwards a site that was
+    # just rebuilt and one that was already standing are indistinguishable, and the difference
+    # is the whole "are we running in circles" question.
+    before = state.sites.get(current)
+    idle_visit = (before is not None and vt.site_is_finished(before)
+                  and not vt.offering_capped(before))
 
     # AT THE BANK SITE WITH A TRIP DUE, THE CAMERA TURNS TOWARD THE BOOTH WHILE THE
     # DECORATION RUNS, so the booth is on screen for one direct click afterwards. USER
@@ -265,6 +279,16 @@ def tick(ctx):
     # snapshot over-states what is outstanding, and BOTH decisions below are budgets computed
     # from it. A failed re-read falls back to the snapshot rather than skipping the checks.
     state = read_state() or state
+
+    # WAIT OUT THE LAST FEW SECONDS OF A TOTEM THAT IS ABOUT TO FALL -- see
+    # _hold_for_collapse. ABOVE the bank check on purpose: a totem that falls while we stand
+    # here is rebuilt first, so the trip's budget is computed from the site as it will really
+    # be left, and the trip itself is not delayed by a wait it could have absorbed.
+    if _hold_for_collapse(ctx, current, state):
+        idle_visit = False
+        state = read_state() or state
+
+    _note_lap_progress(ctx, current, idle_visit, state)
 
     # THE BANK CHECK SITS HERE, below work_site, and only at a site the booth can be reached
     # from. Two separate bugs closed by that:
@@ -327,12 +351,35 @@ def tick(ctx):
 LAP_UNITS = len(route.SITES) * vt.LOGS_PER_TOTEM
 
 
-def _bank_trip_due(ctx, state) -> bool:
+def _bank_trip_due(ctx, state, logs=None, bows=None) -> bool:
     """The lap ahead needs more logs than the hands and the basket hold: the ring's
-    outstanding work, or a full lap's worth, whichever is larger."""
-    bows = bow_count(ctx)
+    outstanding work, or a full lap's worth, whichever is larger. `logs`/`bows` override
+    the live counts for a caller asking about a moment other than now."""
+    bows = bow_count(ctx) if bows is None else bows
+    logs = count_item(ctx.state.config["log"]) if logs is None else logs
     need = max(vt.logs_needed_for_lap(state, bows), LAP_UNITS - bows)
-    return need > count_item(ctx.state.config["log"]) + basket_logs(ctx.state.data)
+    return need > logs + basket_logs(ctx.state.data)
+
+
+def _bank_trip_due_after(ctx, state, site_number: int) -> bool:
+    """_bank_trip_due as it will read once this site's work is done: the build's log and
+    the decorations' bows spent, the site finished. MEASURED run 20 (site 8): the trip was
+    not due BEFORE the site and was due AFTER it, so the decorate-time camera hook faced
+    site 7, the booth was off screen when the trip fired, and the direct booth click fell
+    back to a minimap hop."""
+    site = state.sites.get(site_number)
+    if site is None:
+        return _bank_trip_due(ctx, state)
+    logs = count_item(ctx.state.config["log"]) - (1 if vt.needs_build(site) else 0)
+    bows = bow_count(ctx)
+    if site.wood in (ctx.state.config["wood"], "NONE"):
+        bows -= max(0, vt.MAX_DECORATIONS - site.decorations)
+    finished = dataclasses.replace(site, base_value=site.base_value or 1, base_carved=True,
+                                   decorations=vt.MAX_DECORATIONS)
+    sites = dict(state.sites)
+    sites[site_number] = finished
+    after = dataclasses.replace(state, sites=sites)
+    return _bank_trip_due(ctx, after, logs=max(0, logs), bows=max(0, bows))
 
 
 def _face_booth(ctx) -> None:
@@ -350,6 +397,7 @@ def _walk_to_site(ctx, current: int) -> None:
     run on one of those throws away a working routine; the ceiling is what separates that
     from a leg that genuinely cannot be walked."""
     data = ctx.state.data
+    data[LEG_EMPTIED_KEY] = False       # one basket top-up per leg, on its first hook
     previous = data.get("vt_from", route.RING[route.RING.index(current) - 1])
     if walk_leg(ctx, previous, current, after_first_hop=lambda: _fletch_on_the_move(ctx)):
         data["vt_leg_tries"] = 0
@@ -430,8 +478,38 @@ def _prehover_first_action(ctx, site_number: int) -> None:
         _sleep(PREHOVER_TRACK_POLL_S)
 
 
-def _click_site(ctx, site_number, which, budget_s, confirm, option=None, after_click=None):
+VISIT_CLICKS_KEY = "vt_visit_clicks"
+
+
+def _start_visit(ctx) -> None:
+    """work_site calls this on arrival: the next click at the site is the visit's first."""
+    ctx.state.data[VISIT_CLICKS_KEY] = 0
+
+
+def _first_click_of_visit(ctx) -> bool:
+    return ctx.state.data.get(VISIT_CLICKS_KEY, 1) == 0
+
+
+def _note_click(ctx) -> None:
+    ctx.state.data[VISIT_CLICKS_KEY] = ctx.state.data.get(VISIT_CLICKS_KEY, 0) + 1
+
+
+def _confirm_wait(ctx, budget_s, confirm, wait=None):
+    """The confirm wait behind a site click: the caller's own `wait(budget_s)` when it has
+    one (the decorate's stall watch), else the pushed-signal wait every site click uses."""
+    if wait is not None:
+        return wait(budget_s)
+    return outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"], budget_s,
+                                   confirm, now_fn=_now, sleep_fn=_sleep)
+
+
+def _click_site(ctx, site_number, which, budget_s, confirm, option=None, after_click=None,
+                wait=None):
     """Click a site object and confirm on the READER, never on the click landing.
+
+    `wait(budget_s)` replaces the default pushed-signal confirm wait when given -- the
+    decorate passes a stall watch so a stopped action is noticed in seconds, not at the
+    budget.
 
     The aim is re-resolved through object_refresh_target for the whole flight: these clicks are
     issued while the player is still walking up, and a click that departs toward a tick-old
@@ -457,7 +535,12 @@ def _click_site(ctx, site_number, which, budget_s, confirm, option=None, after_c
     # animation, registered as Decorate and did nothing -- the same drop the carve keys
     # suffer. The flight used to add the half second that hid this; the wait costs only the
     # animation's tail, and only when there is one.
-    _await_idle_animation()
+    # NOT FOR THE FIRST CLICK OF A VISIT: the player has just stopped running and no action
+    # of ours has an animation to finish, so the two idle reads (~0.25s, once per site) buy
+    # nothing there. Every later click follows an action and keeps the wait.
+    if not _first_click_of_visit(ctx):
+        _await_idle_animation()
+    _note_click(ctx)
     before_action = controller.get_last_action() or {}
     if not controller.click_entity(ctx.ser, obj, refresh_target=refresh,
                                    refresh_legs=SITE_REFRESH_LEGS):
@@ -472,8 +555,7 @@ def _click_site(ctx, site_number, which, budget_s, confirm, option=None, after_c
     missed = option and _click_missed(before_action, option)
     outcome = None
     if not missed:
-        outcome = outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"], budget_s,
-                                          confirm, now_fn=_now, sleep_fn=_sleep)
+        outcome = _confirm_wait(ctx, budget_s, confirm, wait)
         if outcome or not option:
             return bool(outcome)
         last = controller.get_last_action() or {}
@@ -488,8 +570,8 @@ def _click_site(ctx, site_number, which, budget_s, confirm, option=None, after_c
     if not controller.click_menu_action(ctx.ser, obj, option, offset=(0, 0),
                                         refresh_target=refresh):
         return False
-    return bool(outcome_waits.await_pre(ctx, ["VARBIT_CHANGED", "CHAT_MESSAGE"], budget_s,
-                                        confirm, now_fn=_now, sleep_fn=_sleep))
+    _note_click(ctx)
+    return bool(_confirm_wait(ctx, budget_s, confirm, wait))
 
 
 IDLE_ANIM_READS = 2          # consecutive idle reads, IDLE_ANIM_POLL_S apart
@@ -703,6 +785,16 @@ def _tiles_between(x1, y1, x2, y2) -> int:
 
 # The tracked hover clicks from this close instead of waiting for the stop; see tick().
 EARLY_CLICK_TILES = 1        # 2 missed 3 of ~23 early clicks (runs 13-14); the last tile slides less
+
+
+def _first_action_is_build(site_number: int) -> bool:
+    """Whether the visit opens with a Build on the small unbuilt base (a capped pile is
+    claimed first, and the pile is a tall target). Unreadable state answers True -- the safe
+    side is the stop."""
+    site = _site_now(site_number)
+    if site is None:
+        return True
+    return vt.needs_build(site) and not vt.offering_capped(site)
 
 
 def _tiles_to_site(site_number: int) -> int:
@@ -971,7 +1063,8 @@ def _direct_leg(ctx, b: int, points, fire_hook, origin, skip=()):
             if not strung:
                 fresh, fresh_viewport = _walk_point_now(cx, cy)
                 if fresh is None:
-                    fresh, fresh_viewport = _walk_point_now(*_player_xy()), True
+                    fresh, _ = _walk_point_now(*_player_xy())
+                    fresh_viewport = True
                 if fresh is not None:
                     travel._click_walk_point(ctx, fresh, shift=fresh_viewport)
                 debug_log.log(LOG, "fletch stopped at the build reserve (%d %s left)"
@@ -1032,6 +1125,7 @@ def _resume_index(points, origin, x, y) -> int:
 # A leg is at most this many far clicks before the hops take over -- the longest leg (57
 # tiles) is two or three 24-28 tile stretches; more than five means something is circling.
 DIRECT_LEG_MAX_STRETCHES = 5
+DIRECT_TARGET_STRIKES = 2       # stalls (on separate legs) before a target is banned for the session
 
 
 def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
@@ -1054,6 +1148,11 @@ def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
     if not points:
         debug_log.log(LOG, "no recorded path for leg %d->%d" % (a, b))
         return False
+    # AN OPEN BANK EATS THE FIRST WORLD CLICK (motherlode's deposit-box lesson; run 23 lost a
+    # whole leg to one) -- whoever left it open, a failed trip or a hand.
+    if banker.is_open():
+        debug_log.log(LOG, "leg %d->%d: the bank is open -- closing it first" % (a, b))
+        banker.close_bank(ctx)
 
     # ONE FAR CLICK, THEN HANDS OFF -- the human's shape, and the only one a fletch survives.
     # MEASURED 2026-09-09 from the recording: every fletch run (5-9 bows) has ZERO clicks
@@ -1072,9 +1171,16 @@ def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
     # live 2026-09-10 (vt_markers4, 1->8): a viewport click straight at site 8's stand tile 46
     # tiles off moved the player 5 tiles and stopped (the game's pathfinder gives up on that
     # line -- the river); the next attempt skips that target and takes the farthest marker.
+    # TWO STRIKES FOR THE SESSION BAN, one for the rest of this leg. MEASURED run 22
+    # (21:27:57, recorder vt-markers22): the straight click at site 3's stand tile -- which
+    # had walked every one of the previous ten laps -- registered as CANCEL because a
+    # right-click from another input source landed on the same pixel 20ms later, the player
+    # never moved, and the target was banned for the session on that one stall. A stall
+    # inside this call still skips the target for the rest of the leg (retrying it at once
+    # is the 2s it just cost); the session ban waits for a second stall on another lap.
     no_direct = ctx.state.data.setdefault(NO_DIRECT_KEY, {})
     banned = no_direct.setdefault(str((a, b)), [])
-    skip = {tuple(t) for t in banned}
+    skip = {tuple(t) for t in banned if banned.count(list(t)) >= DIRECT_TARGET_STRIKES}
     origin = route.SITES[a]["stand"]
     sx, sy = route.SITES[b]["stand"]
 
@@ -1094,8 +1200,12 @@ def walk_leg(ctx, a: int, b: int, after_first_hop=None) -> bool:
             if target is not None and target not in skip:
                 skip.add(target)
                 banned.append(list(target))
-                debug_log.log(LOG, "leg %d->%d: the click at %s did not walk there -- "
-                                   "not tried again this session" % (a, b, target))
+                strikes = banned.count(list(target))
+                debug_log.log(LOG, "leg %d->%d: the click at %s did not walk there -- %s"
+                              % (a, b, target,
+                                 "not tried again this session" if strikes >= DIRECT_TARGET_STRIKES
+                                 else "strike %d of %d, retried next lap"
+                                 % (strikes, DIRECT_TARGET_STRIKES)))
             continue
         # NO_CLICK: nothing projectable. One hop toward the totem itself.
         if not travel._hop_to(ctx, sx, sy, route.PLANE):
@@ -1144,9 +1254,19 @@ def carve(ctx, site) -> bool:
     if not controller.click_entity(ctx.ser, obj, refresh_target=refresh,
                                    refresh_legs=SITE_REFRESH_LEGS):
         return False
+    _note_click(ctx)
 
     carved_any = False
     for index in range(3):
+        # DONE IS DONE: once the reader says the totem is fully carved (or nothing nearby is
+        # missing), no prompt is coming. MEASURED runs 25/26 (sites 7 and 4, both partially
+        # carved before a restart): two keys finished the trio and the third iteration sat
+        # out the whole CARVE_MENU_BUDGET_S (4.8s and 5.6s from the last key to the Decorate
+        # click) waiting for a menu that had closed for good.
+        if index > 0:
+            fresh = _site_now(n) or fresh
+            if fresh.base_carved or not vt.missing_spirits(fresh):
+                return True
         if not _await_menu(ctx):
             if not carved_any:
                 debug_log.log(LOG, "site %d: carve menu never opened" % n)
@@ -1203,7 +1323,42 @@ def carve(ctx, site) -> bool:
 
 DECORATE_BUDGET_S = 6.0
 DECORATE_ACTION_S = 1.5     # recording: one decoration animation every 1.2s after ONE click
+# A decoration lands every 1.2s (the first +1.3s after the click, recording), so a count that
+# has not moved for this long is a STOPPED action, whatever stopped it. MEASURED run 19 (site
+# 6, recorder vt-markers9): two decorations landed, then the Fletching level-up box ended the
+# action, and the confirm sat out its whole 12s budget before the retry click -- which goes
+# straight through the box -- restarted it. Two beats plus slack.
+DECORATE_STALL_S = 2.8
+DECORATE_POLL_S = 0.3
 FLETCH_MENU_BUDGET_S = 4.0
+
+
+def _await_count(read, target: int, budget_s: float, stall_s: float,
+                 poll_s: float = DECORATE_POLL_S, on_stall=None) -> bool:
+    """Poll read() -> int until it reaches `target`; give up as soon as it has not moved
+    for `stall_s`, or at `budget_s`. A None read (bridge hiccup) neither counts as progress
+    nor resets the stall clock. Success is padded by a human reaction draw, the way every
+    await_pre confirm is."""
+    start = _now()
+    deadline = start + budget_s
+    last, last_change = read(), start
+    while True:
+        if last is not None and last >= target:
+            pad = controller.sample_human_delay(*settings.REACTION_DELAY_S)
+            if pad > 0:
+                _sleep(pad)
+            return True
+        now = _now()
+        if now >= deadline:
+            return False
+        if now - last_change >= stall_s:
+            if on_stall is not None:
+                on_stall(last)
+            return False
+        _sleep(poll_s)
+        value = read()
+        if value is not None and value != last:
+            last, last_change = value, _now()
 
 
 def count_item(name: str) -> int:
@@ -1241,11 +1396,56 @@ def decorate(ctx, site, after_click=None) -> bool:
         fresh = _site_now(n)
         return fresh is not None and fresh.decorations >= target
 
+    def count():
+        fresh = _site_now(n)
+        return None if fresh is None else fresh.decorations
+
+    def stalled(last):
+        debug_log.log(LOG, "site %d: decorations stopped at %s/%d for %.1fs -- the click was "
+                           "dropped or a dialogue ended the action; retrying"
+                      % (n, last, target, DECORATE_STALL_S))
+
     budget = DECORATE_BUDGET_S + DECORATE_ACTION_S * (target - site.decorations)
-    return _click_site(ctx, n, "totem", budget, landed, option="Decorate", after_click=after_click)
+    ok = _click_site(ctx, n, "totem", budget, landed, option="Decorate", after_click=after_click,
+                     wait=lambda b: _await_count(count, target, b, DECORATE_STALL_S,
+                                                 on_stall=stalled))
+    if not ok:
+        _shed_foreign_bows(ctx, site)       # the caller's one retry then decorates
+    return ok
+
+
+def _foreign_bows(ctx, wood):
+    """Inventory entries that are longbows of any wood but `wood`."""
+    keep = {name.lower() for name in _bows_for(ctx, wood)}
+    return [item for item in (controller.get_inventory() or [])
+            if "longbow" in (item.get("name") or "").lower()
+            and (item.get("name") or "").lower() not in keep]
+
+
+def _shed_foreign_bows(ctx, site) -> bool:
+    """Drop bows of any wood but the site's, after a decorate that did not land.
+
+    MEASURED run 24 (site 7, recorder vt-markers22): with 5 Yew longbows sitting in earlier
+    slots than 3 Maple longbows, two Decorate clicks on a maple totem each drew "You may only
+    add decorations which match the wood used to build the totem." -- the game takes the
+    FIRST bow in slot order and refuses on it, so a leftover of the previous wood blocks every
+    decoration of the new one. Reactive on purpose: bows of another wood are harmless while
+    the matching ones sit ahead of them (sites 6-2 of the same run decorated 4/4 with the yew
+    bows still in hand), so nothing is dropped until a decorate has actually been refused.
+    The bank trip deposits them for good (_deposit_junk keeps only the working wood's)."""
+    foreign = _foreign_bows(ctx, site.wood)
+    if not foreign:
+        return False
+    debug_log.log(LOG, "site %d: dropping %d bows of another wood (%s) -- they block the "
+                       "%s totem's decorations"
+                  % (site.number, len(foreign), sorted({i.get("name") for i in foreign}),
+                     site.wood.title()))
+    controller.open_inventory_tab(ctx.ser)
+    return bool(controller.drop_items(ctx.ser, foreign))
 
 
 LOG_RESERVE_KEY = "vt_log_reserve"
+LEG_EMPTIED_KEY = "vt_leg_emptied"
 STRING_ABOVE_BOWS = 8            # two totems' worth in hand: string instead of fletching
 SPOOL_NAMES = ("Bow string spool",)
 SPOOL_DEAD_KEY = "vt_spool_dead"  # a spool that strung nothing (empty?) is not tried again
@@ -1363,6 +1563,20 @@ def start_stringing(ctx) -> bool:
     return ok
 
 
+def _string_if_worthwhile(ctx) -> bool:
+    """Start the spool on the unstrung bows in hand, if there are any and the spool works.
+
+    Safe anywhere, which is the point: stringing spends unstrung bows -- logs already
+    committed -- so unlike a fletch it can never eat the log a build is owed, and it needs no
+    interrupt to stay that way. A strung bow decorates exactly as well (wiki)."""
+    data = ctx.state.data
+    if count_item(ctx.state.config["bow"]) <= 0:
+        return False
+    if data.get(SPOOL_DEAD_KEY) or not find_spool():
+        return False
+    return bool(start_stringing(ctx))
+
+
 def _fletch_on_the_move(ctx) -> bool:
     """Start a fletch while the player is already walking, if one is still worth starting.
 
@@ -1371,6 +1585,17 @@ def _fletch_on_the_move(ctx) -> bool:
     after a failed leg, and a log owed to a build must never become a bow (vt.fletch_budget's
     own deadlock note)."""
     data = ctx.state.data
+    # THE BASKET TOP-UP GOES ON THE LEG, ONCE, BEFORE ANY ACTION STARTS. MEASURED run 22
+    # (site 3): a leg that opened with STRINGING never reached the fletch branch's own
+    # on-the-move Empty, so the top-up ran in front of the totem -- 1.5s between arrival
+    # and the first click, at every site the leg's action was not a fletch. The hook only
+    # ever runs right after a walk click, and a walk click ends whatever make action was
+    # running, so an Empty here cannot cut anything short; the fletch/string that follows
+    # then starts from the topped-up count. Once per leg: a second Empty on a later stretch
+    # would only ever move what the first could not fit.
+    if not data.get(LEG_EMPTIED_KEY) and _basket_top_up_due(ctx):
+        data[LEG_EMPTIED_KEY] = True
+        _empty_on_the_move(ctx, ctx.state.config["log"])
     # Not popped: the flag stays up for the whole leg so every far click can restart the
     # fletch the click just ended; tick() clears it on arrival at the site.
     if not data.get("vt_fletch_due", False):
@@ -1391,13 +1616,14 @@ def _fletch_on_the_move(ctx) -> bool:
         # "nor is it stringing the bows" -- live (vt_markers2) the later legs held 5 logs all
         # owed to builds and 6 unstrung bows, so the leg walked with the hands idle. Free XP
         # on the same walk; a strung bow decorates just as well.
-        if (count_item(ctx.state.config["bow"]) > 0 and find_spool()
-                and not data.get(SPOOL_DEAD_KEY)):
-            return "string" if start_stringing(ctx) else False
-        return False
+        return "string" if _string_if_worthwhile(ctx) else False
     # What the fletch must NOT touch: one log per build still owed, the same reserve
     # fletch_budget spares. _direct_leg stops the fletch when the loose count reaches it.
-    data[LOG_RESERVE_KEY] = vt.builds_needed(state)
+    # A LAP OF BUILDS, not the ones outstanding this instant -- the same correction
+    # vt.fletch_budget carries, and for the same measured reason (2026-09-11): a ring that
+    # reads fully standing owes 0 builds right now and 8 over the lap, so a reserve keyed on
+    # the instant is no reserve at all and the leg runs the loose logs down to zero.
+    data[LOG_RESERVE_KEY] = vt.lap_builds(state)
     return "fletch" if start_fletching(ctx) else False
 
 
@@ -1538,7 +1764,15 @@ def _basket_top_up_due(ctx) -> bool:
     KNOWN to be empty (None is unknown -> try it, and the first Empty teaches the
     estimate). The one condition behind both the at-site top-up and the on-the-leg one."""
     data = ctx.state.data
-    return (bool(find_basket()) and count_item(ctx.state.config["log"]) < LOOSE_LOG_TARGET
+    # ...AND A FREE SLOT TO RECEIVE A LOG. MEASURED run 25 (21:49:20, USER: "alot of standing
+    # around the totem"): a restart with 13 bows in hand left the basket estimate unknown, the
+    # inventory FULL, and the at-site Empty went out at every site anyway -- nothing could
+    # arrive, so each one sat out its whole BASKET_BUDGET_S in front of the totem, and a
+    # moved-nothing Empty against zero free slots teaches the estimate nothing, so it never
+    # stopped. An Empty into a full inventory is a no-op by construction.
+    inventory = controller.get_inventory() or []
+    return (bool(find_basket()) and len(inventory) < 28
+            and count_item(ctx.state.config["log"]) < LOOSE_LOG_TARGET
             and (data.get(BASKET_LOGS_KEY) is None or basket_logs(data) > 0))
 
 
@@ -1620,7 +1854,24 @@ def fill_basket(ctx) -> bool:
     capacity rather than left where it was; bank_trip stops its rounds on that."""
     log = ctx.state.config["log"]
     before = count_item(log)
-    ok = _basket_option(ctx, ("fill",), lambda: count_item(log) < before)
+    # ONE LEFT CLICK, the human's shape (recording 2026-09-10_075943: Fill is a CC_OP with no
+    # menu, 0.4s after Escape) -- the OPEN basket's own left click is Fill in the field, and
+    # /hover proves it before the click goes out. A withheld click (a client whose default
+    # entry reads otherwise, or a bank not yet closed) falls back to the named menu entry.
+    ok = False
+    basket = find_basket()
+    if basket:
+        controller.open_inventory_tab(ctx.ser)
+        clicked = controller.click_entity(ctx.ser, basket, offset=(0, 0),
+                                          check_ui_blockers=False, simulate_mistakes=False,
+                                          expected_action="Fill")
+        if clicked:
+            ok = bool(outcome_waits.await_pre(ctx, ["INVENTORY_CHANGED"], BASKET_BUDGET_S,
+                                              lambda: count_item(log) < before,
+                                              now_fn=_now, sleep_fn=_sleep))
+        else:
+            debug_log.log(LOG, "left-click is not 'Fill' on the basket here -- using the menu")
+            ok = _basket_option(ctx, ("fill",), lambda: count_item(log) < before)
     moved = max(0, before - count_item(log))
     data = ctx.state.data
     if moved:
@@ -1648,20 +1899,26 @@ BANK_SITES = (8,)
 # Everything the routine carries on purpose; anything else that turns up in the inventory
 # (the Molten glass a mis-aimed withdraw pulled, 2026-09-09) is banked at the next trip.
 # Substrings, banker.deposit_inventory's convention: "logs" and "longbow" cover every wood.
-KEEP_SUBSTRINGS = ("basket", "knife", "spool", "offerings", "logs", "longbow")
+KEEP_SUBSTRINGS = ("basket", "knife", "spool", "offerings", "logs")
+
+
+def _keep_substrings(ctx):
+    """KEEP_SUBSTRINGS plus the WORKING wood's bows only -- a bow of another wood is
+    deposited (see _shed_foreign_bows for the game rule that makes it dead weight)."""
+    return list(KEEP_SUBSTRINGS) + [name.lower() for name in _bows_for(ctx)]
 BANK_SLOT_SETTLE_S = 2.0
 BANK_SLOT_POLL_S = 0.3
 
 
 def _deposit_junk(ctx) -> None:
     """Shift-deposit whatever is not on KEEP_SUBSTRINGS, only when there is something."""
+    keep = _keep_substrings(ctx)
     junk = [i.get("name") for i in (controller.get_inventory() or [])
-            if not any(k in (i.get("name") or "").lower() for k in KEEP_SUBSTRINGS)]
+            if not any(k in (i.get("name") or "").lower() for k in keep)]
     if not junk:
         return
     debug_log.log(LOG, "bank: depositing %s" % sorted(set(junk)))
-    banker.deposit_inventory(ctx, {"keepItems": list(KEEP_SUBSTRINGS),
-                                   "skipContainerDeposit": True})
+    banker.deposit_inventory(ctx, {"keepItems": keep, "skipContainerDeposit": True})
 
 
 def _bank_slot(name):
@@ -1672,10 +1929,14 @@ def _bank_slot(name):
     return None
 
 
-def _await_bank_slot(name) -> bool:
-    """True once two consecutive fresh reads agree on where `name` sits in the open bank."""
+def _await_bank_slot(name, expected=None) -> bool:
+    """True once two consecutive fresh reads agree on where `name` sits in the open bank --
+    or at once when the first read already lands on `expected`, the slot a previous round
+    settled on (rounds 2 and 3 reopen the same bank at the same scroll)."""
     deadline = _now() + BANK_SLOT_SETTLE_S
     last = _bank_slot(name)
+    if expected is not None and last == expected:
+        return True
     while _now() < deadline:
         _sleep(BANK_SLOT_POLL_S)
         now = _bank_slot(name)
@@ -1743,6 +2004,46 @@ def _exact_stock(memory, name: str) -> int:
                if (item.get("name") or "").strip().lower() == name.strip().lower())
 
 
+def _step_wood_down_if_bank_is_out(ctx):
+    """Ask the bank memory whether the current wood's logs are gone; step the wood down when
+    they are. True: switched. None: nothing to do (stock, or a memory that cannot tell).
+    False: out, and no wood below to step to."""
+    memory = bank_memory.load()
+    quantity = _exact_stock(memory, ctx.state.config["log"]) if memory is not None else None
+    if memory is None or not memory.seen or not (memory.items or []) or quantity != 0:
+        return None
+    fallback = WOOD_FALLBACK.get(ctx.state.config["wood"])
+    if not fallback:
+        # THE HELD-LOGS OVERRIDE HAS NOTHING LEFT TO PROTECT. _wood_override's "logs in hand
+        # decide first" rule latches onto whatever wood was in hand the moment it first ran
+        # and never re-derives afterward (see its own docstring) -- so once that wood, and
+        # everything the fallback chain steps to below it, is bank-exhausted too, sticking to
+        # it means permanently ignoring a panel change the user made specifically to get out
+        # of this hole. MEASURED live 2026-09-11: panel set to MAGIC (630 in the bank) right
+        # after a Yew/Maple/Willow/Oak exhaustion stop, but a single leftover Maple log from
+        # the previous session re-latched the override onto MAPLE on the very next tick, and
+        # the next bank trip walked MAPLE -> WILLOW -> OAK -- bone dry -- and stopped again
+        # with Magic never considered. With nothing of the override wood left anywhere, the
+        # reason to prefer it over the panel is gone; re-derive fresh from the bridge.
+        panel_wood = str((controller.get_config() or {}).get("valeTotemsWood") or "").upper()
+        if panel_wood in WOODS and panel_wood != ctx.state.config["wood"]:
+            panel_quantity = _exact_stock(memory, WOODS[panel_wood]["log"])
+            if panel_quantity > 0:
+                debug_log.log(LOG, "the bank is out of %s and there is no wood below it -- "
+                                   "the panel wants %s and the bank has %d -- switching"
+                              % (ctx.state.config["log"], panel_wood, panel_quantity))
+                _apply_wood(ctx, panel_wood)
+                return True
+        debug_log.log(LOG, "the bank is out of %s and there is no wood below %s"
+                      % (ctx.state.config["log"], ctx.state.config["wood"]))
+        return False
+    debug_log.log(LOG, "the bank is out of %s (memory: %d items, %s of them) -- "
+                       "switching to %s" % (ctx.state.config["log"], len(memory.items),
+                                            quantity, fallback))
+    _apply_wood(ctx, fallback)
+    return True
+
+
 def bank_trip(ctx) -> bool:
     """Walk to the booth, then Withdraw-All logs / close / Fill the basket for three rounds --
     the recording's own sequence.
@@ -1768,25 +2069,18 @@ def bank_trip(ctx) -> bool:
     # EXACT NAME, not bank_memory.quantity's substring match. MEASURED live 2026-09-10
     # (vt_markers1): with no Yew logs banked at all, "Abyssal lantern (yew logs)" counted as
     # one, the fallback never fired, and the run stopped at the booth holding maple.
-    memory = bank_memory.load()
-    quantity = _exact_stock(memory, ctx.state.config["log"]) if memory is not None else None
-    if memory is not None and memory.seen and len(memory.items or []) > 0 and quantity == 0:
-        fallback = WOOD_FALLBACK.get(ctx.state.config["wood"])
-        if not fallback:
-            debug_log.log(LOG, "the bank is out of %s and there is no wood below %s"
-                          % (ctx.state.config["log"], ctx.state.config["wood"]))
-            return False
-        debug_log.log(LOG, "the bank is out of %s (memory: %d items, %s of them) -- "
-                           "switching to %s" % (ctx.state.config["log"], len(memory.items),
-                                                quantity, fallback))
-        _apply_wood(ctx, fallback)
+    if _step_wood_down_if_bank_is_out(ctx) is False:
+        return False
     entry = route.BANK
     booth = controller.get_object_at(entry["tile"][0], entry["tile"][1], route.PLANE,
                                      entry["object_id"])
     if not booth:
         debug_log.log(LOG, "bank booth not in view")
         return False
-    for round_index in range(BANK_ROUNDS):
+    slot = None
+    round_index = 0
+    switched = False
+    while round_index < BANK_ROUNDS:
         if not banker.open_bank(ctx, booth):
             return False
         if round_index == 0:
@@ -1796,8 +2090,35 @@ def bank_trip(ctx) -> bool:
         # fresh /bank read had placed there -- the same early-position trap CLAUDE.md records
         # for the basket 0.12s after a bank open. The slot is trusted only once two fresh
         # reads a beat apart agree on where it is.
-        _await_bank_slot(ctx.state.config["log"])
+        settled = _await_bank_slot(ctx.state.config["log"], expected=slot)
+        if not settled and slot is None:
+            # THE BANK OPENS ON WHATEVER TAB IT WAS LEFT ON. MEASURED run 23 (21:35:37): the
+            # booth click opened the bank and /bank listed no Maple logs for 2.3s with 4910
+            # banked -- the interface was on a numbered tab (the user had banked by hand in
+            # between), so the withdraw "skipped" and the trip failed. Tab 0 shows everything.
+            bank = controller.get_bank(fresh=True) or {}
+            if bank.get("currentTab") not in (None, 0) and banker.switch_bank_tab(ctx, 0):
+                debug_log.log(LOG, "bank: %s not on tab %s -- switched to the main tab"
+                              % (ctx.state.config["log"], bank.get("currentTab")))
+                settled = _await_bank_slot(ctx.state.config["log"])
+        if settled and slot is None:
+            slot = _bank_slot(ctx.state.config["log"])
         if not banker.withdraw_all_shift(ctx, ctx.state.config["log"], fresh=True):
+            # THE BANK CAN RUN OUT MID-TRIP. MEASURED run 22 (21:25): round 1 took the last
+            # Yew logs, round 2 aimed at the same slot -- now the PLACEHOLDER (item 13983),
+            # which a shift-click withdraws nothing from -- and the whole trip failed with
+            # 4910 Maple logs banked; the start-of-trip memory check had seen yew in stock.
+            # The memory self-heals during the trip (it captured the empty slot 148s before
+            # this was read), so it is asked again here, once, and the rounds carry on with
+            # the wood below at the same open bank.
+            if not switched and _step_wood_down_if_bank_is_out(ctx):
+                switched = True
+                slot = None
+                continue
+            # CLOSE THE BANK ON THE WAY OUT. MEASURED run 23: a trip that failed here left the
+            # interface OPEN, and every walk click of the leg after it was eaten by it -- six
+            # "stalled" far clicks with the player never moving, then the leg's ceiling.
+            banker.close_bank(ctx)
             return False
         _close_prompt(ctx, force=True)
         if round_index < BANK_ROUNDS - 1:
@@ -1822,6 +2143,7 @@ def bank_trip(ctx) -> bool:
                 debug_log.log(LOG, "bank: basket full -- done after round %d"
                               % (round_index + 1))
                 break
+        round_index += 1
     return True
 
 
@@ -1852,6 +2174,7 @@ def work_site(ctx, site_number: int, during_decorate=None) -> bool:
     # click bank".
     if during_decorate is None:
         during_decorate = _decorate_camera_hook(ctx, site_number)
+    _start_visit(ctx)
     done_actions = []
     failed = {}
     for _ in range(SITE_MAX_ACTIONS):
@@ -1897,7 +2220,7 @@ def _decorate_camera_hook(ctx, site_number: int):
     action (the human's recording turns the camera mid-fletch, mid-walk, at will)."""
     if site_number in BANK_SITES:
         state = read_state()
-        if state is not None and _bank_trip_due(ctx, state):
+        if state is not None and _bank_trip_due_after(ctx, state, site_number):
             return lambda: _face_booth(ctx)
     nxt = route.next_in_ring(site_number)
     return lambda: _face_tile(ctx, *route.SITES[nxt]["stand"])
@@ -1922,9 +2245,107 @@ def _log_site_outcome(ctx, site, done_actions, logs: int, bows: int) -> None:
         state = "%s totem carved %d/3" % (site.wood.title(), sum(1 for v in site.segment_values if v))
     else:
         state = "%s totem, %d/4 decorations" % (site.wood.title(), site.decorations)             + ("" if site.decorations >= 4 or bows else " (no bows)")
+    # THE DURABILITY GOES IN THE LINE. It is the countdown the hold reads (one ent visit per
+    # 48s), so a session's worth of these is the measurement that says whether HOLD_DURABILITY
+    # and HOLD_MAX_S are right for the wood in use -- there is nowhere else it is visible.
+    if site.base_value:
+        state += ", %d visit%s left" % (site.durability_remaining,
+                                        "" if site.durability_remaining == 1 else "s")
     debug_log.log(LOG, "site %d: %s -> %s; %d %s, %d bows in hand"
                   % (site.number, ", ".join(done_actions) or "nothing to do", state,
                      logs, log_name, bows))
+
+
+# HOLDING AT A TOTEM THAT IS ABOUT TO FALL
+#
+# USER 2026-09-11, on moving up to magic logs: "Since we moved up to magic logs on vale totems
+# the time they stay up has increased so we need to adapt so we dont just run around in
+# circles." The arithmetic (vt.hold_due's own comment): ents move every 80 ticks (48s) and each
+# visit costs one durability, so a YEW totem's 5 visits are ~240s against a ~276s lap and the
+# ring always came back to a collapsed totem. MAGIC's 6 are ~288s -- the ring arrives ~12s
+# EARLY, finds nothing to click, and is not back for another 276s, so the site spends most of
+# the lap collapsed and earning nothing.
+#
+# So the correction is made WHERE THE WORK IS, not at the bank (USER's choice, 2026-09-11:
+# "hold at totem"). The eight sites run eight independent clocks; a pause at the booth shifts
+# the whole lap uniformly and cannot align a site 40s from falling with one 5s from falling,
+# while a wait at the site self-corrects per site and costs only the seconds it is early by.
+# The lap then lengthens to match the decay on its own: the hold delays every site behind it,
+# so the next one is that much less early.
+HOLD_MAX_S = 60.0        # one ent cycle (48s) and a little: a visit only POSSIBLY fells it
+HOLD_POLL_S = 1.2        # two game ticks -- the reader cannot change faster than the ent moves
+HOLD_DURABILITY = vt.DEFAULT_WAIT_DURABILITY
+
+
+def _hold_for_collapse(ctx, site_number, state) -> bool:
+    """Wait at a finished totem on its last visit until an ent fells it, then rebuild it.
+
+    Returns True only when the totem fell and the site was worked -- a caller counting this
+    visit as idle needs to know the difference.
+
+    NOT A FLETCH. The wait is spent on the SPOOL (_string_if_worthwhile): a fletch started
+    here has no walk click to end it, would run the whole minute, and would turn every log a
+    build is owed into a bow -- the "plenty of bows, no logs" deadlock vt.fletch_budget exists
+    to prevent. Stringing spends bows that are already spent logs, so it needs no interrupt.
+    """
+    site = state.sites.get(site_number) if state is not None else None
+    if site is None or not vt.hold_due(site, wait_durability=HOLD_DURABILITY):
+        return False
+    debug_log.log(LOG, "site %d: %s totem still up with %d visit(s) left -- holding for the "
+                       "collapse (up to %ds)"
+                  % (site_number, site.wood.title(), site.durability_remaining, HOLD_MAX_S))
+    _string_if_worthwhile(ctx)
+    started = _now()
+    deadline = started + HOLD_MAX_S
+    while _now() < deadline:
+        _sleep(HOLD_POLL_S)
+        # A HAND THAT NEVER MOVES FOR A MINUTE IS THE SIGNATURE CLAUDE.md's stillness
+        # measurements name outright (the human cursor is never still past ~4.5s of active
+        # play). The engine's own idle drift runs BETWEEN ticks and this holds one, so the
+        # fidget has to be asked for here; it is position-invariant, so the cursor still
+        # rests where the next click wants it.
+        controller.fidget_once()
+        # A minute is long enough that the panic/pause keys must be honoured inside it.
+        if getattr(ctx.state, "safety_stopped", False) or getattr(ctx.state, "paused", False):
+            return False
+        fresh = _site_now(site_number)
+        if fresh is None or vt.site_is_finished(fresh):
+            continue
+        debug_log.log(LOG, "site %d: the totem fell after %.0fs -- rebuilding it now"
+                      % (site_number, _now() - started))
+        work_site(ctx, site_number)
+        return True
+    debug_log.log(LOG, "site %d: still standing after %.0fs -- walking on"
+                  % (site_number, _now() - started))
+    return False
+
+
+IDLE_SITES_KEY = "vt_idle_sites"
+
+
+def _note_lap_progress(ctx, site_number, idle_visit: bool, state) -> None:
+    """Count consecutive sites that had nothing to do, and say so once a whole ring of them
+    has gone by.
+
+    LOG ONLY, deliberately. A full idle lap means every totem is outliving the lap by more
+    than the one ent visit HOLD_DURABILITY waits for -- redwood, or a lap that has got
+    faster -- and the answer is to raise that threshold, which is a decision about how long
+    the routine should stand still. It is not a thing to guess at unattended, and the current
+    durability readings are exactly what the decision needs, so they go in the line."""
+    data = ctx.state.data
+    if not idle_visit:
+        data[IDLE_SITES_KEY] = 0
+        return
+    idle = data.get(IDLE_SITES_KEY, 0) + 1
+    data[IDLE_SITES_KEY] = idle
+    if idle < len(route.RING):
+        return
+    data[IDLE_SITES_KEY] = 0
+    readings = " ".join("%d:%d" % (n, s.durability_remaining)
+                        for n, s in sorted(state.sites.items())) if state else "unreadable"
+    debug_log.log(LOG, "[!] a full lap with nothing to do at any site -- every totem is "
+                       "outlasting the lap by more than the %d visit(s) HOLD_DURABILITY waits "
+                       "for. Durability now: %s" % (HOLD_DURABILITY, readings))
 
 
 def progress_signature(state, site_number=None):

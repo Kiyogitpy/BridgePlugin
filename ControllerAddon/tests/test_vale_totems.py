@@ -172,22 +172,44 @@ def test_the_spare_logs_above_the_builds_are_the_budget():
     assert vt.fletch_budget(state, logs=12, bows=0) == 4
 
 
-def test_the_budget_never_exceeds_the_bows_still_wanted():
-    # One site, built and carved, three of four decorations done: one bow left to want.
+def test_the_budget_is_capped_by_the_bows_the_LAP_will_want():
+    """One site: whatever it looks like now, the lap ahead is one build and four decorations,
+    because it will have collapsed by the time the ring returns to it."""
     state = _ring(_site(siteNumber=1, baseValue=4, wood="YEW", baseCarved=True,
                         decorations=3, durabilityRemaining=5))
-    assert vt.builds_needed(state) == 0
-    assert vt.bows_needed(state) == 1
-    assert vt.fletch_budget(state, logs=27, bows=0) == 1
-    # ...and once that bow is in hand there is nothing left to make.
-    assert vt.fletch_budget(state, logs=27, bows=1) == 0
+    assert vt.fletch_budget(state, logs=27, bows=0) == 4
+    assert vt.fletch_budget(state, logs=27, bows=1) == 3
+    # ...and a lap's worth already in hand wants nothing more.
+    assert vt.fletch_budget(state, logs=27, bows=4) == 0
     assert vt.fletch_budget(state, logs=27, bows=9) == 0
 
 
-def test_a_finished_ring_wants_no_bows_at_all():
+def test_a_finished_RING_STILL_FLETCHES_because_the_lap_ahead_needs_bows():
+    """THE REGRESSION, MEASURED LIVE 2026-09-11 (vt_hold1, 10:29:31). Every totem read
+    complete, so the instant's bows_needed was 0, so no fletch fired on the leg -- and site 5
+    collapsed ~1s later and was rebuilt 1/4 decorated with 13 logs and 0 bows in hand. USER:
+    "we didnt cut inbetween totems?"
+
+    Sampled either side of that moment, site 5 reads 1 at 10:29:22 and is gone at 10:29:37:
+    the global durability drop lands ~10:29:32, one second after the budget was taken. A totem
+    on its last visit IS work; which side of a 45s tick the snapshot falls on is luck. So the
+    budget counts the LAP, exactly as _bank_trip_due already counts LAP_UNITS."""
     state = _ring(*[_site(siteNumber=n, baseValue=4, wood="YEW", baseCarved=True,
                           decorations=4, durabilityRemaining=5) for n in range(1, 9)])
-    assert vt.fletch_budget(state, logs=28, bows=0) == 0
+    assert vt.bows_needed(state) == 0, "nothing is outstanding this instant -- that is the trap"
+    assert vt.fletch_budget(state, logs=28, bows=0) == 20, "8 logs held back for the 8 builds"
+
+
+def test_the_build_reserve_is_a_LAP_of_builds_even_with_nothing_to_build_now():
+    """The other half of the same deadlock: with every totem standing, builds_needed is 0, so
+    a reserve keyed on the instant lets every log become a bow -- and the ring then collapses
+    with plenty of bows and nothing to build with."""
+    state = _ring(*[_site(siteNumber=n, baseValue=4, wood="YEW", baseCarved=True,
+                          decorations=4, durabilityRemaining=5) for n in range(1, 9)])
+    assert vt.builds_needed(state) == 0
+    assert vt.lap_builds(state) == 8
+    assert vt.fletch_budget(state, logs=8, bows=0) == 0
+    assert vt.fletch_budget(state, logs=9, bows=0) == 1
 
 
 def test_the_budget_is_never_negative():
@@ -216,3 +238,54 @@ def test_bows_in_hand_cover_decorations_in_the_lap_need():
     assert vt.logs_needed_for_lap(state) == 40
     assert vt.logs_needed_for_lap(state, bows=20) == 8 + 12
     assert vt.logs_needed_for_lap(state, bows=100) == 8, "bows never cover a build log"
+
+
+# ---------------------------------------------------------------- holding for the collapse
+
+def _parsed(raw):
+    """One raw site dict as the Site dataclass hold_due actually takes."""
+    return vt.parse_state(_payload(raw)).sites[raw["siteNumber"]]
+
+
+def _standing(durability, **kw):
+    """A finished totem with `durability` ent visits left in it."""
+    kw.setdefault("baseValue", 4)
+    kw.setdefault("wood", "MAGIC")
+    kw.setdefault("baseCarved", True)
+    kw.setdefault("decorations", 4)
+    return _parsed(_site(durabilityRemaining=durability, **kw))
+
+
+def test_a_totem_on_its_last_durability_is_worth_waiting_for():
+    """MAGIC lasts 6 ent visits (~288s at one visit per 48s) against a ~276s lap, so the ring
+    arrives ~12s early and finds nothing to do. Waiting out those seconds is what stops the
+    site sitting collapsed for the rest of the lap."""
+    assert vt.hold_due(_standing(1)) is True
+
+
+def test_a_durability_reading_of_zero_is_still_a_hold():
+    """The reader can show a finished totem at 0 in the tick before it falls; walking on there
+    is exactly the early departure this exists to prevent."""
+    assert vt.hold_due(_standing(0)) is True
+
+
+def test_a_totem_with_visits_left_is_not_waited_for():
+    """Each remaining durability is another ~48s. Standing there is worse than lapping."""
+    assert vt.hold_due(_standing(2)) is False
+    assert vt.hold_due(_standing(6)) is False
+
+
+def test_the_wait_threshold_is_a_parameter():
+    assert vt.hold_due(_standing(2), wait_durability=2) is True
+
+
+def test_a_site_with_work_outstanding_is_never_held_at():
+    """Unbuilt, uncarved and undecorated all have something to click right now."""
+    assert vt.hold_due(_parsed(_site(durabilityRemaining=0))) is False
+    assert vt.hold_due(_standing(1, baseCarved=False)) is False
+    assert vt.hold_due(_standing(1, decorations=3)) is False
+
+
+def test_a_capped_pile_is_claimed_rather_than_waited_on():
+    """A build on a capped pile is refused, so the claim is real work and outranks the wait."""
+    assert vt.hold_due(_standing(1, unclaimedOfferings=vt.OFFERING_CAP)) is False

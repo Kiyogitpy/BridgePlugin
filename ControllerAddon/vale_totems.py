@@ -138,6 +138,32 @@ def site_is_finished(site) -> bool:
             and site.decorations >= MAX_DECORATIONS)
 
 
+# HOW LONG A STANDING TOTEM IS WORTH WAITING FOR, in ent visits still in it. Ents move every
+# 80 ticks (48s, wiki) and each visit costs one durability, so a durability reading is very
+# nearly a countdown in 48-second units.
+#
+# WHY THIS EXISTS (USER 2026-09-11, on moving up to magic logs: "the time they stay up has
+# increased so we need to adapt so we dont just run around in circles"): a lap is ~276s
+# (MEASURED run 9, eight sites including the bank trip). A YEW totem holds 5 visits, ~240s, so
+# the ring always came back to a collapsed totem and always had work. MAGIC holds 6, ~288s --
+# the ring arrives ~12s EARLY, finds nothing to do, and does not come back for another 276s,
+# so every site then sits collapsed and earning nothing for most of the lap. The cost is not
+# the running; it is the dead ground behind us.
+DEFAULT_WAIT_DURABILITY = 1
+
+
+def hold_due(site, *, wait_durability: int = DEFAULT_WAIT_DURABILITY) -> bool:
+    """True when the only thing left at this site is waiting for an ent to fell the totem.
+
+    Deliberately narrow. It answers "nothing to click here AND the totem is about to fall",
+    never "nothing to click here" -- a totem with visits left is another ~48s each, and
+    standing through those is worse than walking the ring and coming back.
+    """
+    if not site_is_finished(site) or offering_capped(site):
+        return False
+    return site.durability_remaining <= wait_durability
+
+
 def next_action(site, *, logs: int, bows: int):
     """The single next thing to do at `site`, as (action, argument).
 
@@ -207,6 +233,19 @@ def bows_needed(state) -> int:
     return max(0, logs_needed_for_lap(state) - builds_needed(state))
 
 
+def lap_builds(state) -> int:
+    """Build logs the LAP AHEAD owes: one per site, whatever is standing this instant.
+
+    Every standing totem will have collapsed by the time the ring returns to it -- that is
+    what a lap IS -- so the builds outstanding right now systematically under-count it."""
+    return len(state.sites)
+
+
+def lap_decorations(state) -> int:
+    """Decorations the LAP AHEAD owes: MAX_DECORATIONS per site, same reasoning."""
+    return len(state.sites) * MAX_DECORATIONS
+
+
 def fletch_budget(state, logs: int, bows: int) -> int:
     """How many more bows are worth fletching right now. 0 means "do not fire the fletch".
 
@@ -217,10 +256,21 @@ def fletch_budget(state, logs: int, bows: int) -> int:
     walks itself into "plenty of bows, no logs" and can never build again. That is a genuine
     deadlock, not waste.
 
-    So the build logs are RESERVED first: only logs beyond the ones the outstanding builds owe
-    may become bows. The fletch itself is still not stopped mid-action -- the next site's click
-    interrupts it, which is how the human plays -- this only decides whether to start one.
+    So the build logs are RESERVED first: only logs beyond the ones the builds owe may become
+    bows. The fletch itself is still not stopped mid-action -- the next site's click interrupts
+    it, which is how the human plays -- this only decides whether to start one.
+
+    BOTH HALVES COUNT THE LAP, NOT THE INSTANT (2026-09-11, MEASURED live -- see
+    test_a_finished_RING_STILL_FLETCHES...). Keyed on the work outstanding right now, this
+    returned 0 for the whole of lap 2 with magic logs, because every totem still read complete:
+    the routine cut nothing on any leg and then rebuilt site 5 with 1 of 4 decorations holding
+    13 logs and no bows. A totem standing on its last visit is work that has not happened yet,
+    and a snapshot lands either side of the game's 45-second durability tick by luck. The
+    reserve moved with it: keyed on the instant, a fully-standing ring reserves NOTHING and
+    every log becomes a bow -- the same deadlock from the other end.
+
+    This is the lesson _bank_trip_due already learned as LAP_UNITS (CLAUDE.md, run 17).
     """
-    want = max(0, bows_needed(state) - bows)
-    spare = max(0, logs - builds_needed(state))
+    want = max(0, lap_decorations(state) - bows)
+    spare = max(0, logs - lap_builds(state))
     return min(want, spare)

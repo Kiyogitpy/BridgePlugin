@@ -1960,6 +1960,70 @@ Four things were MEASURED, and the first is not about this routine at all:
     trip refills there, and site 8 stays unbuilt until the next lap (one lap in run 10, after a
     mid-lap restart). Steady state carries 52 logs for a 40-log lap, so it only follows a
     restart; walking back from the booth would cost ~17s.
+- **MAGIC LOGS OUTLIVE THE LAP, SO THE ROUTINE NOW WAITS AT THE TOTEM (2026-09-11, NOT YET RUN
+  LIVE).** USER: "Since we moved up to magic logs on vale totems the time they stay up has
+  increased so we need to adapt so we dont just run around in circles". The arithmetic: ents
+  move every 80 ticks (48s, wiki) and each visit costs one durability, so YEW's 5 visits are
+  ~240s against the MEASURED ~276s lap (run 9, eight sites including the bank trip) -- the ring
+  always came back to a collapsed totem and always had work. MAGIC's 6 are ~288s, so the ring
+  arrives ~12s EARLY, finds nothing to click, and is not back for another 276s. **The cost is
+  not the running, it is the dead ground behind us**: each site then spends most of the lap
+  collapsed and earning nothing.
+  - **The correction is made where the work is, not at the bank** (USER's choice: "hold at
+    totem"). The eight sites run eight independent clocks; a pause at the booth shifts the whole
+    lap uniformly and cannot align a site 40s from falling with one 5s from falling, while a
+    wait at the site costs only the seconds that site is early by and delays every site behind
+    it -- so the lap lengthens to match the decay on its own.
+  - `vt.hold_due` (pure, table-tested) is the rule: finished, pile not capped, and
+    `durabilityRemaining <= HOLD_DURABILITY` (1). `routines/vale_totems.py._hold_for_collapse`
+    then polls `_site_now` every `HOLD_POLL_S` (1.2s) for up to `HOLD_MAX_S` (60s -- one ent
+    cycle and a little, since the wiki says a visit only POSSIBLY fells the totem), rebuilds on
+    the spot when it falls, and walks on otherwise. It sits ABOVE the bank check in `tick` so a
+    totem that falls while we stand there is rebuilt before the trip's budget is computed.
+  - **The wait is spent on the SPOOL, never on a fletch** (`_string_if_worthwhile`). A fletch
+    started standing still has no walk click to end it -- the leg's own stop, `_direct_leg`'s
+    reserve watch, is not running -- so it would fletch for the whole minute and turn every log
+    a build is owed into a bow: the "plenty of bows, no logs" deadlock `vt.fletch_budget`
+    exists to prevent. Stringing spends unstrung bows, which are logs already committed, so it
+    needs no interrupt to stay safe.
+  - `controller.fidget_once()` runs every poll: the engine's idle drift fires BETWEEN ticks and
+    this holds one, and a cursor still for a minute is the signature CLAUDE.md's own stillness
+    measurements name.
+  - **Every site-outcome line now carries the durability** (`, N visits left`). It is the hold's
+    own countdown and appears nowhere else, so a session of those lines is what
+    `HOLD_DURABILITY`/`HOLD_MAX_S` get tuned against.
+  - **A full ring with nothing to do is LOGGED, not acted on** (`_note_lap_progress`). It means
+    every totem is outliving the lap by more than the one visit the hold waits for -- redwood,
+    or a faster lap -- and the answer is to raise `HOLD_DURABILITY`, which is a decision about
+    how long the routine should stand still and not one to guess at unattended. The line names
+    the current per-site durabilities, which is exactly what the decision needs.
+  - **FIRST LIVE RUN (vt_hold1, 2026-09-11, HOST) MEASURED TWO THINGS AND FOUND A THIRD BUG.**
+    (1) A fresh MAGIC totem really does read 6, and (2) **THE DURABILITY DRAIN IS GLOBAL AND
+    SYNCHRONISED** -- every built totem loses one at the SAME instant, every ~45s (sampled at
+    10s: `10:26:21 3:6 4:6 5:5 6:4` -> `10:26:36 3:5 4:5 5:4 6:3`, drops at ~10:28:02,
+    ~10:28:47, ~10:29:32). So the wiki's 80 ticks is a single world-wide clock; what staggers
+    the COLLAPSES is when each totem was BUILT, i.e. the lap itself -- which is why the
+    correction still has to be made per site. The lap came out at 289s against the 288s
+    lifetime (site 6 built 10:24:42, rebuilt 10:29:31), so the hold was never reached in this
+    run: it is a margin fix, not a per-lap one.
+  - **THE BUG THAT RUN FOUND: `vt.fletch_budget` COUNTED THE INSTANT, SO A FULLY-STANDING RING
+    FLETCHED NOTHING.** USER: "we didnt cut inbetween totems?" MEASURED: at 10:29:31, with
+    every totem complete, `bows_needed` was 0 -> budget 0 -> `direct leg toward site 5` with no
+    `fletch on the move`, and site 5 was then rebuilt **1/4 decorated holding 13 logs and 0
+    bows**. The sampler puts site 5 at durability 1 at 10:29:22 and gone at 10:29:37, i.e. the
+    global drop landed ~1s AFTER the budget was taken -- **a totem on its last visit is work
+    that has not happened yet, and which side of a 45s tick a snapshot falls on is luck.** So
+    both halves now count the LAP: `want` is `lap_decorations` (sites x 4) and the reserve is
+    `lap_builds` (one per site), never `bows_needed`/`builds_needed`. The reserve had to move
+    with it or the deadlock simply reverses -- a standing ring owes 0 builds, so every log
+    becomes a bow and the ring collapses with nothing to build from. `_fletch_on_the_move`'s
+    `LOG_RESERVE_KEY` (the stop `_direct_leg` watches) had the identical defect and takes
+    `vt.lap_builds` too. **This is the same lesson `_bank_trip_due` already carries as
+    `LAP_UNITS` (run 17)** -- it was fixed for the bank trip in 2026-09-10 and never for the
+    fletch; magic logs made "all eight standing" the normal state and so made it bite every lap.
+  - First live session's worklist: that `durabilityRemaining` really counts down one per ent
+    visit on this account (the whole design rests on it), whether the hold usually fires at 1 or
+    at 0, and whether 60s is generous or tight for a single ent cycle.
 - Still unanswered from the spec's checklist: whether `nearbySpirits` really rotates mid-carve
   (item 4), the claim-and-pass branch (item 6), and any non-yew wood (item 7). Item 3 (the log
   balances) is now a designed crossing rather than an open question, unverified live.
