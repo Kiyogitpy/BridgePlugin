@@ -2254,10 +2254,11 @@ only wires it into the panel dropdown.
 
 Written 2026-09-11 inline (USER: "Just implement it inline its very simple routine") from the
 user's recording `recordings/2026-09-11_121030_mining-guild-single-tile.*` (2m56s, 40 Mine
-clicks, 72 ores, 4 deposits). **NOT YET RUN LIVE**; the panel entry needs a client rebuild, the
-command line runs today. It is deliberately NOT a `gathering.Profile`: gathering re-picks from
-tick-cached bulk scans, pre-hovers only after a stillness check and budgets for walking to far
-rocks, none of which this activity has.
+clicks, 72 ores, 4 deposits), then **live-debugged the same day over seven runs (mgi_live1-7,
+host) to 1674 ore/hr against the recording's 1473**. The panel entry needs a client rebuild;
+the command line runs today. It is deliberately NOT a `gathering.Profile`: gathering re-picks
+from tick-cached bulk scans, pre-hovers only after a stillness check and budgets for walking
+to far rocks, none of which this activity has.
 
 - **Shape**: stand on ONE tile (config `standTile`, default the recording's (3021,9721)) with
   three iron rocks cardinally adjacent (N (3021,9722) id 11365, W (3020,9721) 11364, S
@@ -2268,28 +2269,41 @@ rocks, none of which this activity has.
   save the next iron rocks" on exactly 36 of 72 successes), so the swap trigger is the
   DEPLETION, never a count: `mine_rock` awaits `XP_GAINED`/`OBJECT_DESPAWNED`/
   `INVENTORY_CHANGED`, confirmed by `/object/at` gone (an ore with the rock standing re-arms
-  `ORE_BUDGET_S` 5.5). No tick reads anywhere. The next rock is pre-hovered the moment the
-  click goes out, so the swap is `SWAP_REACTION_S` (0.10-0.30s, human 0.12-0.55 median 0.33)
-  plus an in-place click. Rocks respawn in 2.4s against a 3.6s cycle, so one is always up.
-- **A click that produced nothing** (no swing animation and no ore for `CLICK_GRACE_S` 1.2s) is
-  "failed": re-pick another rock, dismiss a continue box if one is up, safety-stop after
-  `FAILED_CLICK_STOP` (10) in a row. A swinging player is never failed, only "timeout".
-- **Deposit below 2 free slots** (USER's choice; at 1 free the second ore is refused and the
-  swing wasted): Use Iron ore (hover-gated "Use", no simulated misclick -- the gem sack is the
-  neighbour) on the Bank Deposit Box 10529 at (3013,9720), 8 tiles; the game walks and
-  deposits every ore (~4.4s). Confirmed on `INVENTORY_CHANGED` + zero ore, budget 3s + walk,
-  two tries then a stop. The chat "inventory is too full" forces a trip regardless.
-- **Return is walk-click, hover, click ON the stand tile** (USER's choice over the human's
-  one-tile-early click, which can leave the player mining from a neighbour tile where only one
-  rock is adjacent): shift-click the tile, poll `/player` via `PLAYER_STOPPED`/`PLAYER_MOVING`
-  at 0.1s, park the cursor on a rock within `HOVER_WITHIN_TILES` (2), click on arrival.
+  `ORE_BUDGET_S` 5.5). No tick reads anywhere. **MEASURED live: rock-to-rock is 3.60s
+  EXACTLY -- six ticks, tick-quantized -- in every run**, so the reaction draw
+  (`SWAP_REACTION_S` 0.10-0.30, human 0.12-0.55) only has to stay inside the tick and cannot
+  be traded for speed. The per-rock rate is the game's floor for this method.
+- **THE PRE-HOVER MUST CARRY A SCREEN POSITION.** Run 1 handed `hover_entity` the bare
+  `{x, y, plane, id}` record; it silently no-oped and every swap click flew. `_park_on` resolves
+  the next rock through `/object/at`, using the SPENT id when it is down (it usually is: a rock
+  respawns 2.4s into the 3.6s cycle), and logs `pre-hover ->`. Every swap click now logs
+  `in place (cursor already on it)`.
+- **NO SIMULATED MISCLICK ON A ROCK CLICK** (run 6): a miss "beside" a rock is a Walk-here
+  onto the neighbouring tile, the player ended on (3020,9722) two tiles from the south rock,
+  and every click on it then "did not take" for the rest of the chain -- the failure counter
+  never reached its ceiling because the two adjacent rocks kept depleting in between. A
+  "failed" click (no swing, no ore for `CLICK_GRACE_S` 1.2s) also re-checks the stand tile and
+  walks back. Ten consecutive failures is the safety stop.
+- **The deposit trip is at human parity (13.2s vs the recording's 13.2s), after four cuts:**
+  (1) `CHAIN_MAX_S` 60 -> 240: every chain hand-back cost 1.0-1.5s before the next click;
+  (2) the ORE is parked under the cursor before the rock that fills the inventory
+  (`ORES_PER_ROCK`); (3) **the Use is ARMED before the depletion** -- after the trigger rock's
+  first ore, Use is selected on the ore and the cursor parked on the box (a selection is
+  client-side and sends no packet, the same fact granite_3t's knife rests on), so the depletion
+  is answered with ONE in-place box click 0.3s later, where run 2 paid a 0.4s flight to the
+  inventory and a 1.0s flight to the box; (4) the stand tile is tracked under the cursor
+  during the deposit walk (`_track_hover`, `TRACK_DRIFT_PX` 6 -- it must stay under
+  `CLICK_IN_PLACE_RADIUS_PX` with both jitters) and the first rock through arrival, since the
+  camera keeps gliding after the last step. Deposit = Use ore on Bank Deposit Box 10529 at
+  (3013,9720), 8 tiles; the game walks and deposits every ore (~4.5s), sack and minerals stay.
+  Trigger: below 2 free slots (USER's choice) or the "inventory is too full" chat.
+- **The walk is ~11 tiles each way, not 8**: the rocks block the diagonal into the stand tile,
+  so the game paths round via y=9719, and the human's 3.8s walk is the same path at run speed.
+  Not shrinkable. USER declined the human's one-tile-early rock click (~0.9s/trip): the game
+  can mine from the neighbouring tile it stops on, and then only one rock is adjacent.
 - Tests (`tests/test_mining_guild_iron.py`) drive a REAL `EventStream` through a scripted
   `poll_udp` whose rock script is fed by the click itself (a fixed batch order desynced the
   moment the pick order differed -- feed each event from the click that causes it).
-- First live worklist: whether `/object/at` answers fast enough for the in-place click to land
-  on the tick after the depletion (log `depleted after 2 ore(s), N.NNs after the click` and the
-  gap to the next `click_entity ... in place`); whether the box's projection near the top of
-  the viewport is `onScreen` at the user's camera; and the hover gate on the ore's "Use".
 
 ## Current state of routines/blast_furnace.py
 
