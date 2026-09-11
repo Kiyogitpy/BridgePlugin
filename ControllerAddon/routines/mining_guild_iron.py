@@ -55,6 +55,7 @@ FULL_KEY = "mgi_full"            # the game said the inventory is full: deposit 
 FAILS_KEY = "mgi_fails"
 RETURN_FAILS_KEY = "mgi_return_fails"
 CHAIN_LIMIT_KEY = "mgi_chain_limit"   # tests: cap the chain at N rock clicks
+USE_ARMED_KEY = "mgi_use_armed"       # Use is selected on the ore and the cursor is on the box
 
 INVENTORY_SIZE = 28
 CLICK_GRACE_S = 1.2       # no swing and no ore this long after a click -> it did not take
@@ -269,7 +270,27 @@ def _park_on(ctx, rock):
 
 # --- one rock ----------------------------------------------------------------------------
 
-def mine_rock(ctx, rock, hover_next=None, hover_item=None):
+def _arm_use(ctx, ore, box):
+    """Select Use on the ore and park the cursor on the deposit box while the trigger rock is
+    still being mined. An item selection is client-side and sends no packet (the same fact
+    granite_3t's knife selection rests on), so mining carries on; the depletion is then
+    answered with ONE in-place click on the box. MEASURED mgi_live5: the Use click + the
+    ~1000px flight to the box cost ~1.0s of every trip after the depletion."""
+    controller.open_inventory_tab(ctx.ser)
+    ok = controller.click_entity(ctx.ser, ore, offset=(0, 0), check_ui_blockers=False,
+                                 simulate_mistakes=False, expected_action="Use")
+    if getattr(ok, "withheld", False):
+        ok = controller.click_entity(ctx.ser, ore, offset=(0, 0), check_ui_blockers=False,
+                                     simulate_mistakes=False)
+    if not ok:
+        return False
+    hovered = controller.hover_entity(ctx.ser, box, refresh_target=_refresh(box))
+    ctx.state.data[USE_ARMED_KEY] = True
+    debug_log.log(LOG, f"Use armed on the ore, cursor {'on' if hovered else 'NOT on'} the box")
+    return True
+
+
+def mine_rock(ctx, rock, hover_next=None, hover_item=None, box=None):
     """Click `rock`, park the cursor on `hover_next`, then wait on the pushed signals until the
     rock is confirmed gone from its tile. Returns depleted | failed | timeout | no_click.
 
@@ -280,7 +301,11 @@ def mine_rock(ctx, rock, hover_next=None, hover_item=None):
     events = ctx.events
     since = events.mark() if events is not None else None
     xp_base = _xp()
-    if not controller.click_entity(ctx.ser, rock, refresh_target=_refresh(rock)):
+    # NO simulated misclick here (mgi_live6): a miss "beside" a rock is a Walk-here onto the
+    # neighbouring tile, and this routine lives or dies on standing on ONE tile -- the player
+    # ended up on (3020,9722), two tiles from the south rock, and every click on it failed.
+    if not controller.click_entity(ctx.ser, rock, refresh_target=_refresh(rock),
+                                   simulate_mistakes=False):
         return "no_click"
     t_click = _now()
     if hover_item is not None:
@@ -330,6 +355,8 @@ def mine_rock(ctx, rock, hover_next=None, hover_item=None):
             ores += 1
             xp_base = res.confirmed[1]
             deadline = _now() + ORE_BUDGET_S
+            if ores == 1 and hover_item is not None and box is not None:
+                _arm_use(ctx, hover_item, box)
             since = events.mark() if events is not None else None
             continue
         if ores == 0 and _now() >= grace and controller.get_combat().get("isIdle", True):
@@ -352,6 +379,7 @@ def deposit_trip(ctx, cfg):
     """Use the ore on the deposit box and confirm the ore left the inventory. The game walks
     to the box and deposits on arrival, so the budget carries the walk."""
     events = ctx.events
+    armed = bool(ctx.state.data.pop(USE_ARMED_KEY, False))
     for attempt in range(DEPOSIT_TRIES):
         inv = controller.get_inventory() or []
         ore = next((i for i in inv if i.get("name") == cfg.get("oreName", "Iron ore")), None)
@@ -362,17 +390,19 @@ def deposit_trip(ctx, cfg):
         if box is None:
             debug_log.log(LOG, "[!] no Bank Deposit Box in the scene")
             return False
-        controller.open_inventory_tab(ctx.ser)
         since = events.mark() if events is not None else None
-        # The gem sack sits beside the ore: no simulated misclick on either click.
-        ok = controller.click_entity(ctx.ser, ore, offset=(0, 0), check_ui_blockers=False,
-                                     simulate_mistakes=False, expected_action="Use")
-        if getattr(ok, "withheld", False):
-            debug_log.log(LOG, "left-click is not Use on the ore -- clicking it anyway")
+        if not armed:
+            controller.open_inventory_tab(ctx.ser)
+            # The gem sack sits beside the ore: no simulated misclick on either click.
             ok = controller.click_entity(ctx.ser, ore, offset=(0, 0), check_ui_blockers=False,
-                                         simulate_mistakes=False)
-        if not ok:
-            continue
+                                         simulate_mistakes=False, expected_action="Use")
+            if getattr(ok, "withheld", False):
+                debug_log.log(LOG, "left-click is not Use on the ore -- clicking it anyway")
+                ok = controller.click_entity(ctx.ser, ore, offset=(0, 0), check_ui_blockers=False,
+                                             simulate_mistakes=False)
+            if not ok:
+                continue
+        armed = False        # a retry runs the whole sequence
         controller.click_entity(ctx.ser, box, refresh_target=_refresh(box), simulate_mistakes=False)
         tiles = max(0, int(box.get("distance") or 0))
         budget = DEPOSIT_BASE_S + tiles * WALK_S_PER_TILE
@@ -528,14 +558,16 @@ def tick(ctx):
         nxt = pick_rock(rocks, up=lambda r: True, last=_tile(rock), spent_at=spent_at)
         if nxt is not None and _tile(nxt) == _tile(rock):
             nxt = None
-        ore_item = None
+        ore_item = box = None
         free = _free_slots()
         if free is not None and deposit_due(free - ORES_PER_ROCK, cfg.get("depositAtFreeSlots", 2)):
             ore_item = next((i for i in (controller.get_inventory() or [])
                              if i.get("name") == cfg.get("oreName", "Iron ore")), None)
             if ore_item is not None:
                 nxt = None
-        outcome = mine_rock(ctx, target, hover_next=nxt, hover_item=ore_item)
+                box = _find_box(cfg)
+        data.pop(USE_ARMED_KEY, None)
+        outcome = mine_rock(ctx, target, hover_next=nxt, hover_item=ore_item, box=box)
         if outcome == "depleted":
             spent_at[_tile(rock)] = _now()
             last = _tile(rock)
@@ -551,6 +583,16 @@ def tick(ctx):
                 return
             if controller.continue_box_open():
                 controller.dismiss_continue_box(ctx.ser)
+            # A click that produced nothing is what standing on the WRONG tile looks like (a
+            # stray Walk-here, another player's push): check, and walk back before the next.
+            if _player_tile() != _stand(cfg):
+                debug_log.log(LOG, f"off the stand tile at {_player_tile()} -- walking back")
+                back = return_to_stand(ctx, cfg, rocks, spent_at)
+                if not back:
+                    return
+                hovered = back if isinstance(back, dict) else None
+                last = None
+                continue
             last = _tile(rock)
             continue
         if outcome == "timeout":

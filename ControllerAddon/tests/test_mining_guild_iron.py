@@ -205,6 +205,8 @@ def game(monkeypatch):
             return False
         if entity.get("name") == "Iron ore":
             g.hovers.append(("item", "Iron ore"))
+        elif entity.get("name") == "Bank Deposit Box":
+            g.hovers.append(("box", (entity.get("x"), entity.get("y"))))
         elif entity.get("name") == "Iron rocks" or entity.get("id") in mgi.SPENT_TO_LIVE:
             g.hovers.append((entity.get("x"), entity.get("y")))
         else:
@@ -212,6 +214,18 @@ def game(monkeypatch):
         return True
     monkeypatch.setattr(controller, "hover_entity", hover_entity)
 
+    def click_entity(ser, entity, **kw):
+        return _fixture_click(g)(ser, entity, **kw)
+    monkeypatch.setattr(controller, "click_entity", click_entity)
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(mgi, "_now", lambda: clock["t"])
+    monkeypatch.setattr(mgi, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    g.clock = clock
+    return g
+
+
+def _fixture_click(g):
     def click_entity(ser, entity, **kw):
         if entity.get("name") == "Iron rocks":
             tile = (entity["x"], entity["y"])
@@ -231,13 +245,7 @@ def game(monkeypatch):
             g.clicks.append(("walk", (entity.get("x"), entity.get("y"))))
             g.feed(("PLAYER_STOPPED", None, lambda: g.player.update(x=3021, y=9721)))
         return True
-    monkeypatch.setattr(controller, "click_entity", click_entity)
-
-    clock = {"t": 1000.0}
-    monkeypatch.setattr(mgi, "_now", lambda: clock["t"])
-    monkeypatch.setattr(mgi, "_sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
-    g.clock = clock
-    return g
+    return click_entity
 
 
 def _ctx(game):
@@ -399,3 +407,65 @@ def test_deposit_trip_parks_the_cursor_on_the_stand_tile_while_walking_to_the_bo
     game.deposit_delay_batches = 60      # ~1.2s of empty 20ms polls before the deposit lands
     assert mgi.deposit_trip(ctx, ctx.state.config)
     assert ("walk", (3021, 9721)) in game.hovers
+
+
+def test_the_use_is_armed_and_the_box_hovered_before_the_trigger_rock_depletes(game):
+    """Selecting Use on the ore is client-side (no packet, mining carries on), so after the
+    trigger rock's FIRST ore the ore is clicked and the cursor parked on the box; the deposit
+    is then one in-place box click on the depletion instead of ore flight + box flight."""
+    ctx = _ctx(game)
+    game.ore = 24                        # 3 free: this rock's two ores make the deposit due
+    game.auto_ore = True
+    ctx.state.data[mgi.CHAIN_LIMIT_KEY] = 2
+    mgi.tick(ctx)
+    kinds = [k for k, _ in game.clicks]
+    assert kinds[:5] == ["rock", "use", "box", "walk", "rock"], game.clicks
+    # The Use went out while the rock was still up (before its second ore), and the box was
+    # hovered before the depletion, so deposit_trip issued no second Use.
+    assert kinds.count("use") == 1
+    assert ("box", (3013, 9720)) in game.hovers
+    assert game.hovers.index(("box", (3013, 9720))) < game.hovers.index((3020, 9721)) \
+        if (3020, 9721) in game.hovers else True
+
+
+def test_rock_clicks_never_simulate_a_misclick(game, monkeypatch):
+    """mgi_live6: a simulated miss beside a rock is a Walk-here onto the neighbouring tile, and
+    the player then mines from the wrong tile for the rest of the chain."""
+    seen = {}
+    real = controller.click_entity
+
+    def spy(ser, entity, **kw):
+        if entity.get("name") == "Iron rocks":
+            seen["simulate_mistakes"] = kw.get("simulate_mistakes", True)
+        return real(ser, entity, **kw)
+    monkeypatch.setattr(controller, "click_entity", spy)
+    ctx = _ctx(game)
+    game.feed(_xp(), _despawn(N), (None, None, lambda: game.second_ore(N)))
+    mgi.mine_rock(ctx, _obj(11365, *N))
+    assert seen["simulate_mistakes"] is False
+
+
+def test_a_failed_click_off_the_stand_tile_walks_back_before_the_next_rock(game):
+    ctx = _ctx(game)
+    game.idle = True                     # the first click produces nothing...
+    calls = {"n": 0}
+    orig = game.object_at
+
+    def object_at(x, y, plane, obj_id, **kw):
+        return orig(x, y, plane, obj_id, **kw)
+    game.object_at = object_at
+    # ...because a stray Walk-here left the player one tile off the stand tile.
+    real_player = dict(game.player)
+
+    def click_entity(ser, entity, **kw):
+        if entity.get("name") == "Iron rocks" and calls["n"] == 0:
+            calls["n"] += 1
+            game.clicks.append(("rock", (entity["x"], entity["y"])))
+            game.player.update(x=3020, y=9722)
+            return True
+        return _fixture_click(game)(ser, entity, **kw)
+    controller.click_entity = click_entity
+    ctx.state.data[mgi.CHAIN_LIMIT_KEY] = 2
+    mgi.tick(ctx)
+    kinds = [k for k, _ in game.clicks]
+    assert kinds[:2] == ["rock", "walk"], game.clicks
