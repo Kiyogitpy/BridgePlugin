@@ -2301,6 +2301,16 @@ to far rocks, none of which this activity has.
   so the game paths round via y=9719, and the human's 3.8s walk is the same path at run speed.
   Not shrinkable. USER declined the human's one-tile-early rock click (~0.9s/trip): the game
   can mine from the neighbouring tile it stops on, and then only one rock is adjacent.
+- **The arrival click waits for the camera glide to settle** (`_await_settled`, two
+  projection reads within 3px, <= 0.8s). Run 7: a click made during the glide landed 35px
+  from where the rock was drawn, resolved to a Walk-here beyond it, and the player walked off
+  round the rocks twice (10s each).
+- **Run 8 (52 min unattended, 1324 ore, 1523/hr, 1 failed click, scheduled break at 45 min
+  taken cleanly)**: 26% of rocks took 7 ticks instead of 6 with the reaction unchanged
+  (median 0.32s) -- the depletion event was arriving later in the server tick that session
+  and the click crossed the boundary. The only lever is a shorter `SWAP_REACTION_S`; USER's
+  call, since it goes under the recording's fastest 0.12s. A random event (Freaky Forester)
+  spawned during the break and was dismissed by hand; nothing here handles them.
 - Tests (`tests/test_mining_guild_iron.py`) drive a REAL `EventStream` through a scripted
   `poll_udp` whose rock script is fed by the click itself (a fixed batch order desynced the
   moment the pick order differed -- feed each event from the click that causes it).
