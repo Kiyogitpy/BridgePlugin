@@ -86,8 +86,6 @@ tasks.register('run', JavaExec) {
 	classpath = sourceSets.test.runtimeClasspath + configurations.zombieLite
 	mainClass = pluginMainClass
 
-	// ZombieLite's own launcher sets this for its HD plugin; harmless when that plugin is absent.
-	systemProperty 'rlhd.resource-path', "${zombieLiteDir}/src/main/resources"
 	jvmArgs "-ea"
 	// Machine-specific client JVM args, read from ~/.gradle/gradle.properties so they never
 	// enter the repo. The OSRS VM sets `clientJvmArgs=-XX:ActiveProcessorCount=32
