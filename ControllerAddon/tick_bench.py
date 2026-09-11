@@ -81,8 +81,8 @@ def main():
     print(f"  WHOLE WINDOW   : median {statistics.median(totals):6.1f}ms  "
           f"p90 {_percentile(totals, 0.90):6.1f}ms  max {max(totals):6.1f}ms")
     p90 = _percentile(totals, 0.90)
-    budget = 600.0 - 60.0                     # tick minus the spec's logClickPhaseMs
-    print(f"\n  budget at logClickPhaseMs=60 is {budget:.0f}ms -- "
+    budget = 600.0 - 320.0                    # tick minus the latest fletchPhaseMs
+    print(f"\n  budget at fletchPhaseMs=320 is {budget:.0f}ms -- "
           f"{'PASS' if p90 <= budget else 'FAIL'} at p90")
     if p90 > budget:
         print("  3-tick is NOT viable at this geometry. Either shorten the distance "

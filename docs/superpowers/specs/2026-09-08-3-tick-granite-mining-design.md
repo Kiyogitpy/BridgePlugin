@@ -444,3 +444,55 @@ above them and their screen positions do not move.
    That is safe and well-messaged, but it means the tiles must be captured with
    `python routines/granite_3t.py --probe` at the mine and pasted into `DEFAULT_CONFIG` in the
    Python file before a first run.
+
+
+## 2026-09-09: the cycle, settled from USER's recordings, and the rewrite
+
+Everything above describing the cycle as ~520ms budgets, `Window.room_for`, a second rock
+click, or `CYCLE_TICKS = 4` is superseded. Three recordings of USER playing the method
+(`recordings/2026-09-09_081631_simple3t`, `_082746_simple3t-take2`, `_085109_simple3t-1rock`)
+were re-derived tick by tick with `ControllerAddon/tick_report.py` (the recorder's own labels
+are one low on outcome records -- see CLAUDE.md), and they settle:
+
+| fact | evidence |
+|---|---|
+| A fletch clicked in client tick N pays xp with the packet opening N+3 | six same-tick cycles in take 2, all |
+| The Mine click must be in the SAME client tick as the fletch; next tick pays at 4 | 2 pairs in take 2, both 1-rock cycles |
+| The next fletch goes in tick N+3, after the xp packet: `CYCLE_TICKS = 3` | take 1 = every fletch at N+4 = "too slow" |
+| A fletch processed a tick early cancels the mine and eats the log | wiki "timer set if not positive"; the phase-25 attempt |
+| One Mine click per fletch | 28 Mine : 26 fletches in take 1 |
+| World clicks act on mouse DOWN (1-23ms), inventory clicks on mouse UP (~10ms) | every action in all three recordings |
+| The step between rocks buys yield, not the 3-tick pay | cardinal-adjacent mine at 72160 paid at 3 |
+
+The routine now: `fletchPhaseMs` drawn 150-320; log click in place, one flight, one rock click,
+fired regardless of budget (a slow flight is a 4-tick cycle, a skipped click is a lost log);
+resolve the rock BEFORE selecting the knife (no selection left to "consume" by clicking the
+log); per-cycle outcome accounting from the `XP_GAINED` stream (`paid 3 / 4 / other` lines and
+an every-25 summary); `Window` and the landing constants deleted from `tick_cycle.py`.
+
+**Sites.** `cfg["site"]` selects `SITES[...]` over the defaults. `cape_conch` is the eastern
+2x2 in USER's row-alternating order. `gem_mine` (the default now, USER: "swapping place to gem
+mine since it will make us have to drop less"; the JCW guide transcript) is the underground
+Shilo mine: 48 rocks on a 59.4s respawn, so `rockTiles: []` selects the dynamic rotation
+(nearest live rock each cycle, the just-mined tile excluded; a rock further than 2 tiles is
+walked to and the fletch starts one step out, `far_rock_cycle`), `regionId` 11410 gates the
+start, there is no bank so a lost log is a stop, and a full inventory is deposited at the
+mine's Bank Deposit Chest (loc 10530, (2842,9382)) one Deposit-All per stack plus Empty on the
+gem bag. The guide's ground markers (region 11410) are recorded in CLAUDE.md and not used.
+
+**Live-verification checklist for this form** (nothing below has run live):
+
+1. `paid 3 ticks` is the common line and `paid 4` the exception. If 4 dominates, the flight is
+   not fitting: lower `fletchPhaseMs` or zoom so the rocks sit nearer the log slot. If logs
+   are consumed, the fletch is landing a tick early (raise the floor) or a rock is not
+   resolving (read the `no live rock` / `did not resolve` lines).
+2. `far_rock_cycle`: that the true-tile poll sees the step-out tile in time, and that the
+   re-clicked rock is mined on arrival (xp 3 ticks after the one-step-out fletch).
+3. The deposit: that `Deposit-All` on an uncut gem in the 192.24 grid is the left click on
+   this account (else the menu fallback fires), that `Empty` is offered on the Open gem bag
+   there, and that ESC closes 192 (else 192.1).
+4. The dynamic scan's cost: `/objects` at radius 12 inside the dead time, alongside the knife
+   and park flights. If a cycle's dead time overruns, `at_tick` reports `missed` and the log
+   says `desync`.
+5. That greedy nearest-rock does not corner itself in the mine's dead ends; the guide's lap
+   markers are the fallback design.

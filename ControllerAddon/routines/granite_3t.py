@@ -1,39 +1,30 @@
 """3-tick granite mining ("3t4g") at the Cape Conch mine.
 
-Design: docs/superpowers/specs/2026-09-08-3-tick-granite-mining-design.md -- read it before
-changing any timing constant here. NOT YET RUN LIVE; the spec's live-verification checklist is
-the first session's worklist.
+Design: docs/superpowers/specs/2026-09-08-3-tick-granite-mining-design.md. THE CYCLE BELOW IS
+MEASURED FROM USER'S OWN RECORDINGS (2026-09-09, recordings/2026-09-09_081631_simple3t and
+_082746_simple3t-take2), not from the wiki's prose; see CYCLE_TICKS for the tick-by-tick facts.
 
 THE SHAPE, and why it is not gathering.py. Every other routine here is reactive: click, wait on
 a pushed signal, confirm over HTTP. This one is a SCHEDULE. Per cycle, with the critical tick
 numbered T and the next one pinned at T + CYCLE_TICKS:
 
-    tick T+1 (dead)  select the knife; resolve the NEXT rock's screen point over HTTP;
-                     fly to the log and PARK the cursor there
-    tick T+2 (dead)  nothing -- the cursor rests on the log
-    tick T+3 (crit)  click IN PLACE on the log (no flight) -> the 3-tick action fires;
-                     ONE short flight to the rock; click
-
-THE CYCLE IS COUNTED IN TICKS, NOT INFERRED. `run_cycle` records the bridge tick number its
-critical click landed on and the next cycle targets `that + CYCLE_TICKS` through
-`tick_cycle.at_tick`. An earlier draft used `at_phase`, which lands on the NEXT boundary
-whenever it is called -- so the period was however long `prepare()`'s knife flight, log flight
-and HTTP read happened to take, rounded up. A fast prepare gave a 2-tick cycle, which re-fires
-knife-on-log before the skilling timer has expired and yields nothing at all.
+    dead time        resolve the NEXT rock's screen point over HTTP (skipping a depleted one);
+                     select the knife; fly to the log and PARK the cursor there
+    tick T (crit)    click IN PLACE on the log (no flight) -> knife-on-log starts the fletch and
+                     sets the skilling timer; ONE short flight to the rock; ONE click, in the
+                     SAME client tick -> the character walks to the rock, the fletch is
+                     displaced, and the mine rolls three ticks after the fletch
+    tick T+3         the Mining xp arrives with this tick's packet; this is the next critical
+                     tick, and the next knife-on-log is clicked inside it, after the packet
 
 Two clicks in one 600ms tick, but only ONE flight, because item selection in OSRS is
 client-side: clicking the knife sends no packet, so the selection and the flight to the log are
-both paid during the dead ticks. That is the entire reason this is affordable on a physical
-mouse -- two aimed flights would be ~510ms median and over budget at p90, against ~347ms for
-one. See the spec's "The insight that makes it feasible on our hardware".
+both paid during the dead ticks. A cycle whose rock click slips into the next tick pays at
+FOUR ticks (measured) -- it never loses the log, so there is no abandon path anywhere here.
 
-The rocks' projections MOVE as the player walks between them, so the next rock's point is
-re-resolved every cycle -- during the dead ticks, where 1200ms of slack absorbs an HTTP read.
-The knife and log points are resolved once per chain: the inventory fills from low slots
-upward, so with those two in the first slots the granite stacks above them and they do not
-move.
+THE CYCLE IS COUNTED IN TICKS, NOT INFERRED. `run_cycle` records the bridge tick number its
+log click landed on and the next cycle targets `that + CYCLE_TICKS` through `tick_cycle.at_tick`.
 """
-
 import math
 import os
 import random
@@ -57,50 +48,82 @@ import worldmap
 
 CATEGORY = "granite3t"
 
+# The whole geometry is USER's own camera: zoomed in, tilted, the rocks beside the inventory.
+# The engine's login camera reset (overhead + zoom out) would undo it; see controller.main.
+KEEP_CAMERA = True
+
 DEFAULT_CONFIG = {
     "enabled": True,
 
-    # CAPTURED LIVE 2026-09-08 at the Cape Conch mine's eastern cluster: four rocks all one step
-    # from the stand tile (3255,2354), ordered to walk the square rather than bounce between two.
+    # WHICH MINE. Everything site-specific below (rock ids, rotation, home, bank, what gets
+    # mined) is overridden per site from SITES by get_config; the values that follow are the
+    # Cape Conch ones and double as the fixed-rotation reference.
+    "site": "cape_conch",
+
+    # THE EASTERN 2x2 CLUSTER AT CAPE CONCH, IN ROW-ALTERNATING ORDER -- USER's own rotation,
+    # read off both 2026-09-09 recordings. The stand tiles are (3255,2353) and (3255,2354); a
+    # rock on the OTHER row from where the player stands is diagonal, and the game steps the
+    # player onto that row to mine it, which is what buys the rock's second roll ("two rolls
+    # for resources if moving up to them", wiki). Alternating rows every cycle makes every
+    # transition a step. A cardinally adjacent rock also paid at 3 ticks in the recording
+    # (tick 72160), so the step is about yield, not about the cycle working at all.
     #
-    # FOUR IS A FLOOR, NOT A PREFERENCE, AND THE RESPAWN SETS IT. Granite respawns in 5s (wiki,
-    # Granite rocks) and a 3-tick cycle is 1.8s, so the rotation must be long enough that a rock
-    # is back by the time we return: 4 rocks = 7.2s (safe), 3 = 5.4s (marginal), 2 = 3.6s and the
-    # rock is simply not there. A two-rock rotation was briefly configured here because only the
-    # two nearest fit the click budget; USER caught it -- "two rocks most likely wont work" --
-    # and the arithmetic agrees. When the budget and the respawn disagree, the respawn wins and
-    # the budget is bought with flightSpeedScale instead.
-    # THE PLAYER MUST MOVE BETWEEN ROCKS, and the first rotation did not make it.
-    #
-    # MEASURED LIVE 2026-09-08: the eastern 2x2 cluster sits around (3255,2354) with every rock
-    # cardinally adjacent to the stand tile, so mining each one required no step at all. Cycles
-    # fit the tick beautifully (occupancy median 353ms, 20 of 21 inside 600ms) and it STILL did
-    # not work: the log was consumed every cycle and Mining xp barely moved. The wiki says the
-    # 3-tick action must start "on the same tick as MOVING to the next rock", and rocks give
-    # their second roll only "if moving up to them" -- with no movement there is nothing to
-    # interrupt the fletch, so it completes and eats the log, and the next rock click merely
-    # cancels the previous unfinished mine, which is why the xp was near zero.
-    #
-    # This western line does force a step: from (3249,2351) two of the four are at distance 2.
-    # ORDER IS PART OF THE ROTATION, NOT COSMETIC. A transition only displaces the pending
-    # fletch if it forces the player to STEP, and a step is only forced when the next rock is
-    # 2+ tiles away -- adjacent rocks are mined from where you stand. MEASURED LIVE 2026-09-08:
-    # in map order (B,C,D,E) three of the four transitions are distance 1, so three cycles in
-    # four could not displace the fletch and the log died within a few minutes. Reordered to
-    # B,D,C,E the step distances are 2,1,2,3 -- three of four now force a step, which is the
-    # best this rock layout allows.
-    #
-    # THIS MINE CANNOT DO BETTER, and that is worth knowing before anyone tunes it further: a
-    # clean rotation needs every consecutive pair 2+ apart with no tile adjacent to all of
-    # them, and neither the western line nor the eastern 2x2 here has one. The eastern cluster
-    # ordered diagonally gets all four transitions to distance 2, but (3255,2353) is adjacent
-    # to all four rocks, so a player who ever stands there stops moving entirely. The Bandit
-    # Camp Quarry is the classic 3t4g spot for presumably this reason.
-    "rockTiles": [[3247, 2350, 0], [3249, 2350, 0], [3248, 2350, 0], [3250, 2349, 0]],
+    # Four rocks against a 5s respawn: a 1.8s cycle returns to a rock after 7.2s.
+    # USER 2026-09-09, back at Cape Conch after the gem mine's long walks: "there is 4 granite
+    # right next to me only mine these 4 ... make sure we always move 1 tile to mine". The
+    # western line: three rocks in the row north of the stand tile (3248,2349) and one two
+    # tiles east. Three of them are adjacent from that tile, so an ORDER cannot force the step
+    # by itself -- forceStep below does: the rotation skips any rock adjacent to the tile the
+    # player is standing on, and from every stand tile here at least one rock is 2-3 away.
+    # USER's own order, recorded 2026-09-09 (recordings/2026-09-09_103509_order): B -> D -> A
+    # -> C. The recording also shows WHY it always moves: the game walks to a tile CARDINALLY
+    # beside a rock before mining it (diagonal is not enough -- the player stepped from
+    # (3249,2349) to (3248,2349) for B and from (3247,2349) two tiles to (3249,2349) for C), so
+    # in this order the next rock is never the one straight north of the stand tile. Strict
+    # order, no forceStep: the order itself is the guarantee.
+    "rockTiles": [[3248, 2350, 0], [3250, 2349, 0], [3247, 2350, 0], [3249, 2350, 0]],
+    "forceStep": False,
+    # THE REAL 3T4G DROP (wiki, Tick manipulation): "starting the 3-tick action and clicking to
+    # move to the next rock, then both quickly dropping the ore and clicking the rock again on
+    # the same tick". The ore from the PREVIOUS cycle (it arrived with the xp) is shift-dropped
+    # in the tick after the fletch, while the character is walking, and the rock is clicked
+    # again in that same tick because the drop interrupts the queued mine. False falls back to
+    # dropping a full inventory with drop_burst. USER 2026-09-09: "is this not feasible?"
+    # OFF after measuring it: with the drop + re-click, 27 of 43 cycles paid at 3 (g3t_live42/46)
+    # against 16 of 17 without (g3t_live39/40), and a lost first roll costs 4 ticks where a full
+    # inventory sweep costs ~3.5s per 26 cycles. The failing cycles' timings did not separate
+    # from the good ones in the log; the suspect is a re-click processed in the roll's own tick,
+    # which starts a fresh mine on the pickaxe timer (exactly the "paid 7" seen). Left in as a
+    # switch for another look with the recorder alongside.
+    "dropBetweenMines": False,
+    # Whether the rock is clicked again after that drop. The wiki says yes; MEASURED g3t_live42
+    # the re-click landing late in its tick cost the 3-tick roll on ~a third of cycles (16 of 26
+    # paid at 3 against 12 of 13 without the per-cycle drop). EXPERIMENT 2026-09-09: off, to
+    # learn whether a drop interrupts the queued mine at all. ANSWERED g3t_live43: it does --
+    # without the re-click the mines restarted on the pickaxe timer (10 pays landed 2 ticks
+    # into the NEXT cycle) and three rocks never paid. So the re-click stays, and the cursor is
+    # parked on the ore straight after the rock press so the drop is an in-place click.
+    "dropReclick": True,
+    # The drop clicks are PLAIN left clicks: USER 2026-09-09 swapped the granite's left click
+    # to Drop with the Menu Entry Swapper after a shift-click came out as "Use" (the game's
+    # own shift-click-drop setting is not what this account relies on). True holds SHIFT.
+    "dropWithShift": False,
     # Granite rocks share one object id per variant; the probe prints it alongside each tile.
     # get_object_at needs it, and matching by id rather than name is what keeps a DEPLETED rock
     # (a different id, offering no actions) from resolving as a live one.
-    "rockId": 11387,            # MEASURED live 2026-09-08 at Cape Conch
+    "rockIds": [11387],         # MEASURED live 2026-09-08 at Cape Conch
+    "rockName": "granite rocks",    # what the probe lists
+    # A site whose rockTiles is EMPTY runs the DYNAMIC rotation: the nearest live rock each
+    # cycle, from a /objects scan of this radius. A rock further than stepMaxTiles from the
+    # player cannot be mined in the same tick as the fletch (the walk takes more than one step),
+    # so it is walked to first and the fletch starts one step out -- the guide's own rule.
+    "scanRadius": 12,
+    "stepMaxTiles": 2,
+    # A region the player must be in, or the run stops before clicking anything. None = no gate.
+    "regionId": None,
+    # What THIS ACTIVITY produces: safe to find in the inventory at startup, and what a full
+    # inventory drops or deposits.
+    "minedItems": ["granite", "sandstone"],
 
     "knifeName": "knife",
     "logName": "teak logs",
@@ -110,77 +133,59 @@ DEFAULT_CONFIG = {
     # a stall message naming the wrong cause. "log basket" is here because USER carries one as a
     # spare-log safety net (2026-09-08). Note the basket does NOT feed the routine -- nothing
     # refills the loose log from it, so an emptied log slot is still a stop, by design.
-    "keepItems": ["pickaxe", "log basket"],
+    "keepItems": ["pickaxe", "log basket", "gem bag", "gem sack"],
+
+    # WHERE IN THE CRITICAL TICK THE LOG CLICK LANDS, drawn per cycle from this range (ms after
+    # the bridge's tick anchor). Two constraints set it. The floor: a fletch processed one tick
+    # EARLY -- while the previous mine's timer is still positive -- cancels the mine and lets the
+    # fletch complete and eat the log, and the 2026-09-08 attempt at 25ms did exactly that
+    # (the bridge anchors on GameTick, ~20ms after the packet, and the packet itself jitters).
+    # The ceiling: the rock click has to be PRESSED before the tick ends, and the flight from
+    # the log slot to the furthest rock costs ~200ms at flightSpeedScale 0.45. USER's own
+    # successful fletches landed anywhere from 21ms to 582ms in; the bot has no reason to be
+    # near either edge.
+    "fletchPhaseMs": [150, 320],
 
     # An OPTIONAL extra-strict cap on the reach. The real limit is DERIVED from the tick budget
-    # in check_geometry (tick_cycle.max_reach_px) and is ~82px; this only ever tightens it, never
-    # loosens it. It shipped at 220 as a hand-picked guess and MEASURED LIVE 2026-09-08 that guess
-    # was ~3x what the budget actually affords, which would have accepted a geometry unable to
-    # hit a single tick. None disables the cap.
+    # in check_geometry (tick_cycle.max_reach_px); this only ever tightens it, never loosens it.
+    # None disables the cap.
     "maxReachPx": None,
-    # Where in the critical tick the log click lands. The honest budget for the critical tick is
-    # 60 (phase) + ~145 (in-place click_human: an 85ms median hold plus its 30-90ms trailing
-    # delay) + ~270 (p90 flight at this geometry) + ~145 (the rock click) = ~620ms, i.e. the p90
-    # cycle does NOT fit and is expected to abandon at the room_for guard sometimes. The median
-    # (60 + 145 + 170 + 145 = 520) does fit. A guess; fit it from the per-cycle occupancy this
-    # routine logs.
-    # MEASURED LIVE 2026-09-08: dropped 60 -> 25. The in-place log click alone came in at
-    # 101-191ms, so at phase 60 the flight had ~390ms against a ~382ms need -- an 8ms margin,
-    # i.e. a coin flip per cycle. Every millisecond of phase is a millisecond off the flight.
-    "logClickPhaseMs": 25,
-
-    # WHAT MUST FIT INSIDE THE TICK: both mouse-DOWNs, or both whole clicks?
-    #
-    # A click here is a press, a 50-145ms hold, a release, then a 30-90ms trailing pause. The
-    # LOG click's full cost always counts -- the flight cannot start until our own code stops
-    # sleeping. The ROCK click is the open question: if the game acts on mouse-DOWN then only its
-    # press has to land inside the tick and its ~145ms tail is free; if it acts on release, the
-    # tail is on the budget.
-    #
-    # The difference is not marginal -- it is 250ms of flight (82px) versus 395ms (190px), and
-    # MEASURED LIVE 2026-09-08 at Cape Conch it is the difference between a geometry that is
-    # physically impossible to arrange (the log slot would have to sit ON the rocks, covering the
-    # clickboxes -- USER: "i cant put inventory ui in center ill block the clickbox") and one
-    # that is merely tight.
-    #
-    # Default FALSE, the conservative reading. Setting it True is not a fix -- it is running the
-    # experiment, and the evidence is whether cycles actually earn xp at a 3-tick cadence in the
-    # occupancy log. This is live-verification checklist item 6.
-    "assumeClickLandsOnPress": False,
 
     # Flight-time multiplier for the two clicks this routine makes, passed straight through to
     # move_to_human's duration_scale -- see tick_cycle.PRACTISED_FLIGHT_SCALE for why a
     # repeated fixed-target reach is legitimately faster than settings.HM2_*'s general fit.
-    # MEASURED LIVE 2026-09-08 at the live layout: the four rocks sit 157 / 174 / 221 / 234px
-    # from the log slot. At scale 1.0 the budget allows 82px, so nothing passes; the furthest
-    # rock needs 0.58 to fit, and 0.55 leaves a little margin (limit 267px) without going
-    # further from the fitted model than the practised-reach argument supports.
-    "flightSpeedScale": 0.45,
-    # Deliberate imperfection: a drawn fraction of cycles place the rock click one tick late.
-    # A machine that never misses a 3-tick cycle is itself the signature -- EVENT_MOUSE_CLICK_V2
-    # carries inter-press timing to the server at 1ms resolution (CLAUDE.md, telemetry).
-    "missChance": 0.03,
+    # MEASURED LIVE 2026-09-08: the rocks sit 157-234px from the log slot at USER's layout.
+    "flightSpeedScale": 0.22,
+    # Deliberate imperfection: a drawn fraction of cycles run one tick late (paying at 4, which
+    # is what USER's own slower take looks like). A machine that never misses a 3-tick cycle is
+    # itself the signature -- EVENT_MOUSE_CLICK_V2 carries inter-press timing to the server at
+    # 1ms resolution (CLAUDE.md, telemetry).
+    # OFF (2026-09-09): the xp-driven cycle already varies on its own -- roll failures pay at 7,
+    # inventories drop, re-entries realign -- and the deliberate one-tick pause was visible
+    # (USER: "it pauses briefly") and paid 7 on the cycle after it once in two.
+    "missChance": 0.0,
 
     # THE GREAT CONCH BANK, ~381 map steps NW of the mine (bank chest 57958 open / 57959
-    # closed, options Bank+Collect; wiki "Bank chest (The Great Conch)"). The trip is long, but
-    # a WORKING cycle never consumes a log, so this should be paid once per session at most --
-    # if it starts recurring, cycles are overrunning and the occupancy log is where to look.
+    # closed, options Bank+Collect; wiki "Bank chest (The Great Conch)"). A WORKING cycle never
+    # consumes a log, so this is paid only after mistakes -- if it starts recurring, cycles are
+    # not displacing the fletch and the per-cycle outcome lines are where to look.
     # STAND OUTSIDE THE BANK, not on it. MEASURED LIVE 2026-09-08: the bank building's interior
-    # is an ISOLATED POCKET on our static collision map -- find_path from (3180,2417),
-    # (3180,2421), (3183,2418) and every other inside tile to the mine answers None, while
-    # (3182,2422) answers 381 steps. The outbound route only ever reached a tile ADJACENT to the
-    # bank; open_bank's own approach walked the player in, and then nothing could route them out
-    # and the routine sat there idle-drifting for seven minutes. Same family as the enclosed
-    # components CLAUDE.md records for Ferox Enclave. The chests are still 3-6 tiles away from
-    # here, which open_bank handles.
+    # is an ISOLATED POCKET on our static collision map -- find_path from every inside tile to
+    # the mine answers None, while (3182,2422) answers 381 steps. Same family as the enclosed
+    # components CLAUDE.md records for Ferox Enclave. The chests are 3-6 tiles from here, which
+    # open_bank handles.
     "bankTile": [3182, 2422, 0],
-    # Where the rotation is worked from, and where a bank trip returns to. Recorded at STARTUP
-    # rather than when the restock happens: a routine restarted while standing at the bank would
-    # otherwise adopt the bank as "home" and never walk back to the rocks.
-    "mineTile": [3249, 2351, 0],
+    # Where the rotation is worked from, and where a bank trip returns to. From CONFIG rather
+    # than "wherever the run started": a routine restarted at the bank would otherwise adopt the
+    # bank as home and never walk back to the rocks.
+    "mineTile": [3248, 2349, 0],
     "restockLogs": 27,          # one loose + 26 for the basket
 
+    # "drop" (shift-drop everything not kept) or "deposit" (walk to depositTile, Deposit-All
+    # each stack, Empty the gem bag, close, resume).
     "fullInventory": "drop",
+    "depositTile": None,
+    "depositId": None,
     "xpStallStopS": 60,
 
     "breaks": {
@@ -200,22 +205,102 @@ DEFAULT_CONFIG = {
     },
 }
 
+# Per-site overrides, merged over DEFAULT_CONFIG by get_config. An EMPTY rockTiles means the
+# dynamic rotation.
+SITES = {
+    # The fixed 2x2 rotation the defaults above describe.
+    "cape_conch": {},
+    # THE UNDERGROUND SHILO VILLAGE GEM MINE (USER 2026-09-09: "swapping place to gem mine since
+    # it will make us have to drop less"). 48 gem rocks (ids 11380/11381, cache `gemrock1`/
+    # `gemrock`, op1 Mine) on a 59.4s respawn, so a fixed four-rock rotation is impossible here
+    # and the routine roams: nearest live rock each cycle, the previous tile excluded so every
+    # cycle steps. An OPEN gem bag absorbs sapphire and better (60 each); opal, jade and topaz
+    # (105/128 of successes, wiki) still land loose, so the inventory fills every ~40 cycles and
+    # goes to the mine's own Bank Deposit Chest (loc 10530 at (2842,9382), MEASURED by
+    # karambwan_fishing 2026-09-06) rather than the floor. There is no bank to restock logs from
+    # -- a lost log is a stop here, so the guide's advice stands: an ADAMANT pickaxe, whose
+    # 4-tick roll lets a broken cycle right itself.
+    "gem_mine": {
+        "rockTiles": [],
+        "rockIds": [11380, 11381],
+        "rockName": "gem rocks",
+        "regionId": 11410,
+        "mineTile": None,
+        "bankTile": None,
+        "minedItems": ["uncut", "clue geode"],
+        # "gem sack" too: USER's is the upgraded sack ("Open gem sack" on /inventory, MEASURED
+        # live 2026-09-09), and a keep list naming only the bag would have deposited it.
+        "keepItems": ["pickaxe", "log basket", "gem bag", "gem sack"],
+        "fullInventory": "deposit",
+        "depositTile": [2842, 9382, 0],
+        "depositId": 10530,
+    },
+}
 
-# THE WHOLE POINT OF THE ROUTINE'S NAME. The critical click of cycle N+1 is pinned to the tick
-# CYCLE_TICKS after the critical click of cycle N -- not to "the next boundary after prepare()
-# finished", which is what an at_phase-only cycle degrades to.
-# FOUR, AND THIS IS MEASURED FROM USER'S OWN PLAY, NOT FROM THE NAME.
+
+def site_config(cfg):
+    merged = dict(cfg)
+    merged.update(SITES.get(cfg.get("site")) or {})
+    return merged
+
+
+# --------------------------------------------------------------------------------------------
+# The cycle
+# --------------------------------------------------------------------------------------------
+
+# THREE, MEASURED FROM USER'S OWN RECORDINGS (2026-09-09, simple3t and simple3t-take2), and
+# the number is about WHEN THE XP LANDS, not about the name of the method:
 #
-# recordings/2026-09-09_081631_simple3t (98s, 26 cycles): the gap between one knife-on-log and
-# the next is FOUR ticks in 13 of 24 cycles, never three except when the human was visibly
-# recovering. The mine click lands 0 or 1 ticks after the fletch, split about evenly.
+#   * A knife-on-log clicked during client tick N pays its Mining xp with the packet that OPENS
+#     tick N+3, every time the cycle works.
+#   * The next knife-on-log therefore belongs in tick N+3 -- after that packet, never before
+#     it. The wiki: the fletch "sets the timer to three if the timer is not positive"; a fletch
+#     processed one tick early lands while the mine's timer is still running, cancels the mine
+#     (no xp) and then runs to completion (the log becomes a Teak stock). That is exactly what
+#     the CYCLE_TICKS = 3 attempt of 2026-09-08 did, because it clicked the log 25ms after the
+#     bridge's tick anchor -- inside the tick model's jitter.
+#   * USER's take 1 clicked every fletch in tick N+4 (their own "my 3 tick is a bit too slow"),
+#     and a previous commit fit CYCLE_TICKS = 4 to that. Take 2 has real 3-tick cycles.
+CYCLE_TICKS = 3
+
+# THE NEXT ROCK IS NOT CLICKED UNTIL THE MINING XP HAS LANDED (USER 2026-09-09: "lets not click
+# another rock until we get a xp notifier"). USER's own slow full run (recordings/2026-09-09_
+# 092238_simple3t-full-run-slow) is exactly that shape and paid at 3 ticks in 25 of 29 cycles:
+# fletch + rock in one tick, wait for the drop, then the next pair. So the cycle is no longer
+# PINNED to a tick count; it is driven by the XP_GAINED event, and CYCLE_TICKS above is what a
+# paying cycle measures, not a schedule. A roll that fails is not a failure of ours -- the
+# pickaxe keeps rolling every four ticks (adamant, the guide's choice for that reason) and the
+# xp lands later; only a mine that has paid nothing for XP_WAIT_MAX_TICKS is treated as not
+# running at all and re-clicked.
+XP_WAIT_MAX_TICKS = 14
+# Reaction between the xp drop and the next fletch. Short on purpose: the xp EVENT proves the
+# boundary has passed (the early-fletch hazard of 2026-09-08 was a click sent BEFORE it), and
+# every ms spent here is a ms the rock flight does not have -- MEASURED g3t_live33, a 140-320ms
+# reaction plus a 360-780ms flight put the rock press in the NEXT tick on 5 of 6 cycles, and
+# those paid at 4-12 ticks on the pickaxe's own timer instead of 3. MEASURED g3t_live34: a
+# press at client phase 546-624 STILL paid at 4-8 -- the upload latency puts the last ~60ms of
+# the client tick into the server's next one, so the press has to land by ~450ms.
+# NOT ZERO. MEASURED g3t_live54: the three cycles that fletched 21-23ms after the xp packet
+# all paid at 7, and every one of the 13 that fletched at 40ms or later paid at 3 -- a fletch
+# sent in the same breath as the packet that carried the drop does not take. USER: "is it
+# because we aren't waiting for a new tick?" -- in effect, yes.
+XP_REACTION_MS = (45, 95)
+# A fire with no drop to react to (chain start, a resync, a mine that never paid) is aligned to
+# the next boundary plus this, instead of landing wherever the loop happened to be. MEASURED
+# g3t_live49 recorder: the two re-entries fletched at phase 341 and 540 and both missed, while
+# the 22 paying cycles all fletched at 101-241 with the rock press by ~500.
+REENTRY_PHASE_MS = (40, 90)
+LATE_PAY_REST_TICKS = 0     # the "stop for one tick" theory was built on the off-by-one above
+
+# THE MINE CLICK LANDS IN THE SAME CLIENT TICK AS THE FLETCH, and that is measured too: every
+# same-tick pair in take 2 paid at 3 ticks, and both pairs whose Mine slipped into the next tick
+# paid at 4. A 4-tick cycle is the worst a slow flight costs -- never a log -- which is why
+# there is no "abandon the rock click" branch anywhere below. Fire, always.
 #
-# "3-tick" names the ROLL interval, not the cycle: the fletch sets the skilling timer to 3, so
-# the mine rolls three ticks later -- and the NEXT fletch has to come after that roll, i.e. on
-# the fourth tick. At CYCLE_TICKS = 3 the next fletch fired exactly when the roll was due, which
-# cancelled the mine (near-zero xp, MEASURED) and left the displaced fletch to complete and eat
-# the log (a bank trip every ~20 cycles, MEASURED). One number, both symptoms.
-CYCLE_TICKS = 4
+# What the recorder says about press vs release (checklist item 6, settled): a WORLD click fires
+# its menu action 1-23ms after mouse DOWN; an INVENTORY click fires ~10ms after mouse UP (the
+# client waits for the release to tell a click from a drag). So the log click costs its whole
+# hold, and the rock click only has to be PRESSED inside the tick.
 
 # The knife and the log are clicked thousands of times an hour at points that are constant for
 # a whole chain. aim_radius=0 makes pick_aim_point short-circuit and land on the IDENTICAL pixel
@@ -256,11 +341,10 @@ EMPTY_INVENTORY_STOP = 20
 INVENTORY_TAB_STOP = 15
 KNIFE_HOVER_STOP = 15
 
-# Per-cycle occupancy bookkeeping -- spec live-checklist item 3 is fitting logClickPhaseMs from
-# these numbers, and without them the first live session has no instrument for the one figure it
-# exists to measure. Shape borrowed from the engine's own `[engine] loop:` summary line.
-OCCUPANCY_WINDOW = 60
-OCCUPANCY_SUMMARY_EVERY = 25
+# Per-cycle outcome bookkeeping: every OUTCOME_SUMMARY_EVERY cycles one line says how many paid
+# at 3 ticks, at 4, and not at all -- the same three numbers the analysis of USER's recordings
+# was judged by, so a live run can be read the same way.
+OUTCOME_SUMMARY_EVERY = 25
 
 
 def _now():
@@ -272,9 +356,22 @@ def _sleep(s):
 
 
 def get_config(bridge_config):
-    """DEFAULT_CONFIG only -- this routine has no ControllerConfig section, same as
-    gemstone_crab.py and pest_control.py."""
-    return DEFAULT_CONFIG
+    """DEFAULT_CONFIG with the chosen site's overrides -- this routine has no ControllerConfig
+    section, same as gemstone_crab.py and pest_control.py."""
+    return site_config(DEFAULT_CONFIG)
+
+
+def rock_ids(cfg):
+    ids = cfg.get("rockIds")
+    if not ids and cfg.get("rockId") is not None:
+        ids = [cfg["rockId"]]
+    return set(ids or [])
+
+
+def dynamic_rotation(cfg):
+    """True when rockTiles is empty: pick the nearest live rock each cycle instead of walking a
+    fixed list."""
+    return not (cfg.get("rockTiles") or [])
 
 
 def find_item(inv, name_substring):
@@ -297,11 +394,6 @@ def keep_names(cfg):
     return tuple(k for k in keep if k)
 
 
-# The only thing the routine EXPECTS to accumulate. Anything else in the inventory at startup is
-# a thing USER put there and would lose.
-MINED_ITEM = "granite"
-
-
 def byproduct_names(cfg):
     """Everything THIS ACTIVITY produces, which is therefore safe to drop and safe to find in
     the inventory at startup.
@@ -313,7 +405,8 @@ def byproduct_names(cfg):
     about the rule and wrong about the case; it exists to protect a carried pickaxe or a
     teleport tablet, not to demand a spotless inventory."""
     fletch_byproduct = (cfg["logName"] or "").lower().replace(" logs", "").replace(" log", "")
-    return [MINED_ITEM, "sandstone"] + ([f"{fletch_byproduct} stock"] if fletch_byproduct else [])
+    mined = [(m or "").lower() for m in (cfg.get("minedItems") or []) if m]
+    return mined + ([f"{fletch_byproduct} stock"] if fletch_byproduct else [])
 
 
 def check_inventory_is_clean(cfg, inv):
@@ -338,13 +431,17 @@ def rock_points(cfg):
     """Live screen points for every configured rock tile, or None when any will not resolve.
 
     None means "cannot aim", never "no rock there" -- the caller refuses rather than guessing."""
+    if dynamic_rotation(cfg):
+        # The nearest few live rocks stand in for the rotation: the reach that matters is the
+        # one the next cycles will actually make.
+        rocks = live_rocks(cfg)[:4]
+        return [(int(r["screenX"]), int(r["screenY"])) for r in rocks] or None
     points = []
     for tile in cfg.get("rockTiles") or []:
-        x, y, plane = tile[0], tile[1], tile[2]
-        obj = controller.get_object_at(x, y, plane, cfg.get("rockId"))
-        if not obj or obj.get("screenX") is None:
+        point = resolve_rock(cfg, tile)
+        if point is None:
             return None
-        points.append((int(obj["screenX"]), int(obj["screenY"])))
+        points.append(point)
     return points or None
 
 
@@ -373,12 +470,14 @@ def check_geometry(cfg, inv):
     if log.get("screenX") is None:
         return False, f"{cfg['logName']!r} has no screen position (inventory tab closed?)"
 
-    if len(cfg.get("rockTiles") or []) < 2:
+    if not dynamic_rotation(cfg) and len(cfg.get("rockTiles") or []) < 2:
         return False, "fewer than 2 rockTiles configured -- the rotation needs the movement "\
                       "stall between rocks to buy the second roll"
 
     points = rock_points(cfg)
     if points is None:
+        if dynamic_rotation(cfg):
+            return False, f"no live {cfg.get('rockName', 'rock')} in view"
         return False, "at least one rock in rockTiles does not resolve on screen"
 
     reach = max(math.hypot(px - log["screenX"], py - log["screenY"]) for px, py in points)
@@ -388,15 +487,13 @@ def check_geometry(cfg, inv):
     # `maxReachPx` shipped at 220 while the arithmetic only allows 82, so the routine would
     # have accepted a geometry that could not hit a single tick. `maxReachPx` survives only as
     # an optional HARD CAP for a user who wants to be stricter than the budget -- never looser.
+    # The rock click only has to be PRESSED inside the tick (a world click fires its menu action
+    # 1-23ms after mouse DOWN -- MEASURED from USER's recordings 2026-09-09), so the budget is
+    # the tick minus the latest fletch phase minus the in-place log click, and nothing for the
+    # rock click's own hold.
     scale = cfg.get("flightSpeedScale") or 1.0
-    budget = (tick_cycle.GAME_TICK_MS
-              - cfg["logClickPhaseMs"]           # the window opens part way into the tick
-              - tick_cycle.CLICK_COST_MEDIAN_MS)  # the in-place log click delays the flight
-    if not cfg.get("assumeClickLandsOnPress"):
-        # The conservative reading: the rock click must fully LAND (press through release)
-        # inside the tick, because the game may only act on the release. Its trailing pause is
-        # NOT charged -- that happens after mouse-up, when the game already has the click.
-        budget -= tick_cycle.CLICK_LANDING_MEDIAN_MS
+    phase_hi = float((cfg.get("fletchPhaseMs") or (150, 320))[1])
+    budget = tick_cycle.GAME_TICK_MS - phase_hi - tick_cycle.CLICK_COST_MEDIAN_MS
     limit = tick_cycle.max_reach_px(budget, scale)
     cap = cfg.get("maxReachPx")
     if cap:
@@ -405,6 +502,11 @@ def check_geometry(cfg, inv):
     msg = (f"furthest rock is {reach:.0f}px from the log; the {tick_cycle.GAME_TICK_MS:.0f}ms "
            f"tick allows {limit:.0f}px ({budget:.0f}ms of flight), and this reach costs "
            f"~{flight:.0f}ms")
+    if reach > limit and dynamic_rotation(cfg):
+        # ADVISORY ONLY when roaming: the reach depends on where the player happens to stand
+        # (MEASURED live 2026-09-09: 338px at one spot, 553px a few tiles away), a far rock is
+        # walked to by far_rock_cycle, and a near rock past the budget merely pays at 4.
+        return True, msg + " -- over budget from here; the nearest rocks still run, the rest are walked to"
     if reach > limit:
         return False, (msg + " -- SHRINK THE CLIENT WINDOW first (the dominant lever), then "
                              "zoom OUT so the whole rotation clusters tightly, then turn the "
@@ -446,6 +548,20 @@ def loose_logs(inv, cfg):
 
 
 def _basket_action(ctx, basket, options):
+    """Take `options` on the basket. Empty is a SHIFT-CLICK on this account (USER 2026-09-09:
+    "gotta shift click the log basket to empty it" -- a Menu Entry Swapper shift swap), and
+    MEASURED live the same day the basket's plain menu is Cancel/Examine/Destroy/Open/Use/
+    Check/Wear/Fill with NO Empty in it at all, so the menu is only the fallback for a client
+    without that swap. Fill stays a menu selection."""
+    if "empty" in options:
+        controller.key_down(ctx.ser, "SHIFT")
+        try:
+            ok = controller.click_entity(ctx.ser, basket, offset=(0, 0), check_ui_blockers=False,
+                                         simulate_mistakes=False)
+        finally:
+            controller.key_up(ctx.ser, "SHIFT")
+        if ok:
+            return True
     return controller.click_menu_action(ctx.ser, basket, options, offset=(0, 0),
                                         check_ui_blockers=False)
 
@@ -715,7 +831,8 @@ def _startup_check(ctx, cfg):
     # ahead of it looks like. The walk-home leg in _run_chain is what fixes it, and it cannot
     # run while startup keeps stopping the routine.
     here = _tile_of(controller.get_player() or {})
-    if here[0] is not None and _dist(here, tuple(cfg["mineTile"])) > BANK_ARRIVAL_TILES:
+    if cfg.get("mineTile") and here[0] is not None \
+            and _dist(here, tuple(cfg["mineTile"])) > BANK_ARRIVAL_TILES:
         if not data.get("g3t_startup_away_logged"):
             data["g3t_startup_away_logged"] = True
             debug_log.log(CATEGORY, "startup deferred: not at the rocks yet -- walking back "
@@ -754,8 +871,8 @@ def _startup_check(ctx, cfg):
     data["g3t_index"] = 0
     data["g3t_logs"] = log_count(inv, cfg["logName"])
     data["g3t_startup_pending"] = False
-    debug_log.log(CATEGORY, f"ready: {len(cfg['rockTiles'])} rocks, "
-                            f"{data['g3t_logs']} log(s)")
+    rotation = "nearest live rock" if dynamic_rotation(cfg) else f"{len(cfg['rockTiles'])} rocks"
+    debug_log.log(CATEGORY, f"ready: {rotation}, {data['g3t_logs']} log(s)")
     return True
 
 
@@ -763,183 +880,342 @@ def next_rock_index(index, count):
     return (index + 1) % count if count else 0
 
 
-def prepare(ctx, cfg, knife_point, log_point, rock_tile):
-    """The DEAD-TICK half of a cycle. Returns the next rock's live screen point, or None.
+def rock_refresh_target(cfg, tile, blockers=None):
+    """A zero-arg callable answering the rock's LIVE screen point (or None), over every id in
+    rockIds -- controller.object_refresh_target for a rock whose live id is one of several.
+    With `blockers`, a point behind a UI rect answers None (move_to_human then keeps its last
+    aim) rather than steering the click onto the sidebar."""
+    x, y, plane = tile[0], tile[1], tile[2] if len(tile) > 2 else 0
+    ids = sorted(rock_ids(cfg))
 
-    Three things happen here and the order is load-bearing:
-      1. Click the knife. In OSRS this is a client-side SELECTION and sends no packet, which is
-         exactly why it can live outside the critical tick.
-      2. Park the cursor on the log, so the critical tick's first click costs no flight. This is
-         UNCONDITIONAL so run_cycle's click_in_place assumption ("cursor is on the log") holds
-         even if the rock resolve fails transiently.
-      3. Re-resolve the rock's screen point over HTTP. The projection moves every cycle because
-         the PLAYER moves between rocks; the 1200ms of dead time is where that read is
-         affordable.
-    """
+    def _refresh():
+        for rock_id in ids:
+            obj = controller.get_object_at(x, y, plane, rock_id)
+            if obj and obj.get("screenX") is not None:
+                point = (int(obj["screenX"]), int(obj["screenY"]))
+                if blockers and _behind_ui(point, blockers):
+                    return None
+                return point
+        return None
+    return _refresh
+
+
+def _ui_blockers():
+    return (controller.get_state() or {}).get("uiBlockers") or []
+
+
+def _behind_ui(point, blockers):
+    """MEASURED live 2026-09-09 (g3t_live31): a rock whose projection sat under the sidebar's
+    tab strip was clicked as "Sailing Options", the panel opened over the inventory, and the
+    next four knife clicks hit "Facilities". timed_click bypasses click_entity's blocker check
+    by design, so the rocks are filtered here instead."""
+    x, y = point
+    for rect in blockers:
+        rx, ry = rect.get("x", 0), rect.get("y", 0)
+        if rx <= x < rx + rect.get("width", 0) and ry <= y < ry + rect.get("height", 0):
+            return True
+    return False
+
+
+def resolve_rock(cfg, tile):
+    """The rock's live screen point, or None when it does not resolve.
+
+    None means "not a live rock right now": get_object_at matches by id, and a DEPLETED granite
+    rock is a different id (11391 "Rocks", no actions), so this is also the depletion test. The
+    projection moves every cycle because the PLAYER moves between rocks, so it is re-read every
+    cycle -- during the dead ticks, where 1200ms of slack absorbs an HTTP read."""
+    x, y, plane = tile[0], tile[1], tile[2]
+    for rock_id in sorted(rock_ids(cfg)):
+        obj = controller.get_object_at(x, y, plane, rock_id)
+        if obj and obj.get("screenX") is not None:
+            return int(obj["screenX"]), int(obj["screenY"])
+    return None
+
+
+def next_live_rock(cfg, index, player=None, exclude=None):
+    """(point, index) of the first rock at or after `index` in the rotation that resolves --
+    and, with forceStep and a player tile, that is NOT adjacent to where the player stands, so
+    mining it means a step (USER: "make sure we always move 1 tile to mine"; the wiki's second
+    roll comes only "if moving up to them"). A rotation with nothing but adjacent live rocks
+    falls back to the first live one rather than idling. `exclude` is the index just clicked:
+    its rock is about to deplete on its own pay and is never re-picked (MEASURED g3t_live39:
+    picked again while the other three were still on respawn, then clicked as it emptied).
+    (None, index) when none resolves.
+
+    THIS IS CALLED AT FIRE TIME, not during the wait. USER: "if we mine 4 rocks the first one
+    will always respawn when we mine the last" -- granite's 5s respawn against three 1.8s
+    cycles means the next rock in order is back by the time the drop lands, and not before."""
+    tiles = cfg.get("rockTiles") or []
+    fallback = None
+    for offset in range(len(tiles)):
+        i = (index + offset) % len(tiles)
+        if exclude is not None and i == exclude:
+            continue
+        point = resolve_rock(cfg, tiles[i])
+        if point is None:
+            continue
+        if cfg.get("forceStep") and player and player.get("x") is not None:
+            if max(abs(tiles[i][0] - player["x"]), abs(tiles[i][1] - player["y"])) < 2:
+                if fallback is None:
+                    fallback = (point, i)
+                continue
+        return point, i
+    return fallback if fallback else (None, index)
+
+
+def live_rocks(cfg, player=None):
+    """Every live rock in the scan radius, nearest first: id in rockIds, offering Mine, with a
+    screen point. A depleted rock is a different id and never appears here.
+
+    `distance` is the bridge's own Chebyshev distance from the player; when a player dict is
+    given it is recomputed from that, so a caller holding a fresher position than the tick-cached
+    scan can rank by it."""
+    objs = controller.get_objects(radius=cfg.get("scanRadius") or 12, interactable=True) or []
+    ids = rock_ids(cfg)
+    blockers = _ui_blockers()
+    rocks = []
+    seen = set()
+    for o in objs:
+        if o.get("id") not in ids or o.get("screenX") is None:
+            continue
+        if _behind_ui((o["screenX"], o["screenY"]), blockers):
+            continue
+        if not any((a or "").lower() == "mine" for a in (o.get("actions") or [])):
+            continue
+        tile = (o.get("x"), o.get("y"))
+        if tile in seen:
+            continue
+        seen.add(tile)
+        if player and player.get("x") is not None:
+            o = dict(o)
+            o["distance"] = max(abs(o["x"] - player["x"]), abs(o["y"] - player["y"]))
+        rocks.append(o)
+    rocks.sort(key=lambda o: (o.get("distance") if o.get("distance") is not None else 99))
+    return rocks
+
+
+def pick_rock(cfg, player, avoid_tile=None):
+    """The nearest live rock, never the one just mined.
+
+    Excluding the last tile is what makes every cycle a STEP: a failed roll leaves that rock
+    live, and re-clicking it from where we stand forfeits the second roll the move buys."""
+    for rock in live_rocks(cfg, player):
+        if avoid_tile is not None and (rock.get("x"), rock.get("y")) == tuple(avoid_tile):
+            continue
+        return rock
+    return None
+
+
+def mined_tile_from_last_action(cfg, player, since_tick=None):
+    """The world tile of the rock the game ACTUALLY resolved the last Mine click to, or None.
+
+    The tile we aimed at is not the tile we mined: adjacent gem rocks' clickboxes overlap and
+    the click resolves to whichever the client draws on top. MEASURED live 2026-09-09
+    (g3t_live29 recorder): 9 of 69 rock clicks landed on a rock depleted ~700ms earlier -- the
+    rock OUR previous cycle had just mined, re-picked because the exclusion held the aimed
+    tile. /last-action carries the click's scene coordinates; world = the scene base + them."""
+    last = controller.get_last_action() or {}
+    if (last.get("option") or "").lower() != "mine" or last.get("id") not in rock_ids(cfg):
+        return None
+    if since_tick is not None and last.get("tick") is not None and last["tick"] < since_tick:
+        return None
+    bx, by = player.get("baseX"), player.get("baseY")
+    if bx is None or by is None or last.get("param0") is None:
+        return None
+    return (bx + int(last["param0"]), by + int(last["param1"]))
+
+
+def prepare(ctx, cfg, knife_point, log_point):
+    """The DEAD-TICK half of a cycle: select the knife, park the cursor on the log.
+
+    Called only once the next rock HAS resolved, so a knife selection is never left live with
+    nothing to spend it on. The 2026-09-08 version selected first and, when the rock then failed
+    to resolve, "consumed" the selection by clicking the log -- which IS a knife-on-log with no
+    rock click behind it, i.e. a fletch that runs to completion and eats the log. The bot's own
+    recording shows runs of those two ticks apart. Resolve, then select, and there is nothing
+    to consume.
+
+    The knife click is a client-side SELECTION and sends no packet, which is why both flights
+    can live outside the critical tick."""
     scale = cfg.get("flightSpeedScale") or 1.0
     tick_cycle.timed_click(ctx.ser, knife_point, aim_radius=AIM_RADIUS_PX,
                            duration_scale=scale, now_fn=_now)
     controller.move_to_human(ctx.ser, int(log_point[0]), int(log_point[1]),
                              aim_radius=AIM_RADIUS_PX, duration_scale=scale)
 
-    x, y, plane = rock_tile[0], rock_tile[1], rock_tile[2]
-    obj = controller.get_object_at(x, y, plane, cfg.get("rockId"))
-    if not obj or obj.get("screenX") is None:
-        return None
 
-    return int(obj["screenX"]), int(obj["screenY"])
+def run_cycle(ctx, cfg, log_point, rock_point, rock_refresh=None):
+    """The critical pair, fired NOW: log click in place (the cursor was parked there by arm),
+    ONE flight, ONE rock click. "ok" | "no_clock".
 
-
-def _flight_budget(from_point, to_point, scale=1.0):
-    """Median flight PLUS the click that follows it, in ms.
-
-    estimate_flight_ms's own docstring says it is a MEDIAN and the caller must add a margin.
-    Booking only the flight (the first draft) let clicks through that then spent a further
-    50-145ms hold and a 30-90ms trailing delay, landed in the NEXT tick, and were recorded as
-    "ok" -- precisely the failure the room_for guard exists to prevent. tick_cycle.CLICK_COST_MS
-    is the upper end of that pair, deliberately."""
-    dist = math.hypot(to_point[0] - from_point[0], to_point[1] - from_point[1])
-    return tick_cycle.estimate_flight_ms(dist, scale) + tick_cycle.CLICK_LANDING_COST_MS
-
-
-def _deliberate_miss(cfg):
-    """DELIBERATE IMPERFECTION. A human running 3t4g misses cycles and their rate visibly dips
-    and recovers; a machine that never misses is itself the signature, and per CLAUDE.md's
-    telemetry notes EVENT_MOUSE_CLICK_V2 carries inter-press timing to the server at 1ms
-    resolution independently of everything else. This is the honest replacement for the engine's
-    MISTAKE_MISCLICK_CHANCE, which is turned OFF everywhere in this routine: a simulated
-    near-miss plus its corrective reclick would wreck the cycle outright, and in the inventory it
-    would drop the log."""
-    return random.random() < cfg.get("missChance", 0.0)
-
-
-def _log_occupancy(ctx, result, phase, in_place_ms, flight_ms, occupancy_ms):
-    """One line per cycle, plus a periodic summary -- the instrument the spec's live-checklist
-    item 3 ("fit logClickPhaseMs from the measured ms per cycle") needs and which nothing
-    previously produced: click_in_place and timed_click both returned elapsed ms and every call
-    site threw them away. Summary shape borrowed from the engine's own `[engine] loop:` line."""
-    debug_log.log(CATEGORY,
-                  f"cycle {result}: opened at phase {phase:.0f}ms, in-place {in_place_ms:.0f}ms, "
-                  f"flight+click {flight_ms:.0f}ms, occupancy {occupancy_ms:.0f}ms "
-                  f"of {tick_cycle.GAME_TICK_MS}ms")
-    data = ctx.state.data
-    history = data.setdefault("g3t_occupancy", [])
-    history.append(occupancy_ms)
-    del history[:-OCCUPANCY_WINDOW]
-    count = data.get("g3t_cycles", 0) + 1
-    data["g3t_cycles"] = count
-    if count % OCCUPANCY_SUMMARY_EVERY == 0 and history:
-        ordered = sorted(history)
-        debug_log.log(CATEGORY,
-                      f"occupancy over the last {len(ordered)} of {count} cycles: "
-                      f"median {ordered[len(ordered) // 2]:.0f}ms, max {ordered[-1]:.0f}ms")
-
-
-def _open_window(ctx, cfg, target_tick):
-    """Sleep to this cycle's click phase. Returns (phase, tick_number, opened_at).
-
-    `phase` is None (unusable clock) or the string "missed" (the target tick is already past)
-    on failure, in which case the other two are None. When `target_tick` is None this is the
-    FIRST cycle of a chain -- there is no previous critical tick to count from, so it lands on
-    the next boundary via at_phase and reports whichever tick that turned out to be.
-
-    One clock read, shared between the tick number and the window's open time: they describe the
-    same instant, and reading twice would put a stray draw between them."""
-    if target_tick is None:
-        phase = tick_cycle.at_phase(ctx.events, cfg["logClickPhaseMs"],
-                                    now_fn=_now, sleep_fn=_sleep)
-    else:
-        phase = tick_cycle.at_tick(ctx.events, target_tick, cfg["logClickPhaseMs"],
-                                   now_fn=_now, sleep_fn=_sleep)
-    if phase is None or phase == "missed":
-        return phase, None, None
+    The caller has just seen the previous cycle's xp land (or is starting a chain), so this is
+    the tick to fletch in; there is no schedule to wait for. THE ORDER IS FIXED -- log, then
+    rock: an OSRS item selection is consumed by the next click on ANY target, so a rock click
+    first would issue "Use Knife -> Gem rocks" and leave the log click bare. There is no
+    abandon and no late branch: once the log is clicked a fletch is running and the rock click
+    is the only thing that displaces it; a slow flight costs a 4-tick pay, a skipped click
+    costs the log."""
     opened_at = _now()
-    return phase, tick_cycle.current_tick(ctx.events, now=opened_at), opened_at
-
-
-def run_cycle(ctx, cfg, knife_point, log_point, rock_point, target_tick=None):
-    """The CRITICAL TICK. "ok" | "miss" | "desync" | "no_clock".
-
-    No HTTP between the two clicks -- that is the invariant the whole module exists to protect.
-
-    `target_tick` is the bridge tick number the LOG click must land on, or None for the first
-    cycle of a chain. On "ok" the tick that was actually fired on is recorded in
-    ctx.state.data["g3t_fired_tick"] and tick() pins the next cycle at that + CYCLE_TICKS; every
-    other result clears it, so the next cycle re-enters on a clean boundary instead of
-    inheriting a period that is now wrong.
-
-    THE ORDER WITHIN THE TICK IS FIXED -- log click, then rock click -- AND CANNOT BE FLIPPED BY
-    CONFIG. A `rockClickTickOffset` of -1 (rock click first) was implemented and deleted: it
-    cannot work while a knife selection is live, because an OSRS item selection is consumed by
-    the next click on ANY target, so clicking the rock first issues "Use Knife -> Granite rock"
-    (which does nothing), spends the selection, and leaves the following in-place log click a
-    bare left-click with nothing selected -- knife-on-log never fires either and the cycle
-    yields nothing while being recorded "ok". See _consume_knife_selection, which states the
-    same rule. If a live session shows this ordering is wrong, the fix is to restructure
-    prepare() so the knife is selected AFTER the rock click; that is a design change, not a
-    config flip."""
-    phase, fired, opened_at = _open_window(ctx, cfg, target_tick)
-    if phase is None:
+    fired = tick_cycle.current_tick(ctx.events, now=opened_at)
+    phase = tick_cycle.tick_phase_ms(ctx.events, opened_at)
+    if fired is None or phase is None:
         return "no_clock"
-    if phase == "missed":
-        debug_log.log(CATEGORY, f"desync: tick {target_tick} was already past when the cycle "
-                                f"opened -- resyncing rather than firing a tick late")
-        return "desync"
-
-    window = tick_cycle.Window(opened_at=opened_at, phase_ms=phase)
+    scale = cfg.get("flightSpeedScale") or 1.0
     in_place_ms = tick_cycle.click_in_place(ctx.ser, now_fn=_now)
-
-    if _deliberate_miss(cfg):
-        debug_log.log(CATEGORY, "deliberate miss -- placing the rock click a tick late")
-        if ctx.events is not None:
-            ctx.events.wait_ticks(1, now_fn=_now, sleep_fn=_sleep)
-        flight_ms = tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3,
-                                           duration_scale=cfg.get("flightSpeedScale") or 1.0,
-                                           now_fn=_now)
-        _log_occupancy(ctx, "miss", phase, in_place_ms, flight_ms, window.spent_ms(_now()))
-        return "miss"
-
-    need = _flight_budget(log_point, rock_point, cfg.get("flightSpeedScale") or 1.0)
-    now = _now()
-    if not window.room_for(need, now):
-        # A click that slips into the NEXT tick is worse than no click at all: it starts the
-        # next mine at the wrong phase and desyncs every cycle after it. The flight is simply
-        # NOT STARTED -- there is nothing to abort, and request_movement_abort() is only legal
-        # from inside a flight loop anyway (the v3 firmware `X` contract).
-        # ABANDONING IS NOT FREE ANY MORE, SO WE DO NOT ABANDON: WE FIRE LATE.
-        #
-        # The guard was written when a skipped cycle cost a cycle. It does not any more. The log
-        # click has ALREADY fired by this point, so it has started a fletch -- and the rock
-        # click is the only thing that displaces it. Abandon here and the fletch runs to
-        # completion, eats the log, and the routine has to walk 380 tiles to the bank and back
-        # for another one. MEASURED LIVE 2026-09-08: 7 desyncs in 80 cycles, and the log was
-        # gone by the end of them.
-        #
-        # A late rock click forfeits this cycle's tick manipulation, which is cheap. Losing the
-        # log costs an eight-minute round trip. So fire it, mark the cycle a desync so the
-        # caller resyncs, and keep the log.
-        debug_log.log(CATEGORY,
-                      f"late: {window.spent_ms(now):.0f}ms of the tick spent with "
-                      f"~{need:.0f}ms still needed -- clicking the rock anyway to displace the "
-                      f"fletch (a lost cycle is cheaper than a lost log)")
-        rescue_ms = tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3,
-                                           duration_scale=cfg.get("flightSpeedScale") or 1.0,
-                                           now_fn=_now)
-        _log_occupancy(ctx, "desync", phase, in_place_ms, rescue_ms, window.spent_ms(_now()))
-        return "desync"
-
     flight_ms = tick_cycle.timed_click(ctx.ser, rock_point, aim_radius=3,
-                                       duration_scale=cfg.get("flightSpeedScale") or 1.0,
-                                       now_fn=_now)
+                                       duration_scale=scale, now_fn=_now,
+                                       refresh_target=rock_refresh,
+                                       refresh_legs=1 if rock_refresh else None)
+    spent = phase + (_now() - opened_at) * 1000.0
     ctx.state.data["g3t_fired_tick"] = fired
-    _log_occupancy(ctx, "ok", phase, in_place_ms, flight_ms, window.spent_ms(_now()))
-
-    # ONE mine click per fletch, not two. I added a second on the strength of the wiki's
-    # powermining wording ("clicking the rock AGAIN"), which describes the ore-dropping variant
-    # rather than the base cycle. USER's recording settles it: 28 Mine clicks against 26
-    # knife-on-log pairs, i.e. one each. The extra click was cancelling the mine it had just
-    # started.
+    ctx.state.data["g3t_fired_at"] = (opened_at, phase)
+    _note_cycle(ctx, fired, phase, in_place_ms, flight_ms, spent)
     return "ok"
+
+
+def pay_ticks(fired_at, seen_at):
+    """How many ticks after the fletch the drop landed, from WALL TIME: the fletch's phase plus
+    the ms until the xp was seen, in ticks, rounded. The xp is dispatched ~20ms before its
+    boundary, so the sum sits just under a whole number of ticks and rounds to it. No tick
+    counters anywhere -- MEASURED g3t_live57/58, every counter-based version was off by one in
+    one direction or the other depending on whether the TICK event had been pumped."""
+    if not fired_at:
+        return None
+    opened_at, phase = fired_at
+    return int(round((phase + (seen_at - opened_at) * 1000.0 + 25.0) / tick_cycle.GAME_TICK_MS))
+
+
+def wait_for_mining_xp(ctx, mark, timeout_s):
+    """The Mining XP_GAINED that arrives after `mark`, or None at the timeout.
+
+    Not EventStream.wait_for_event: that scans the whole buffer and would answer with the
+    previous cycle's drop. since(mark) only sees what arrived after the click."""
+    if ctx.events is None:
+        return None
+    deadline = _now() + timeout_s
+    while True:
+        for event_type, payload in ctx.events.since(mark):
+            if event_type == "XP_GAINED" and (payload or {}).get("skill") == "Mining":
+                return payload or {}
+        if _now() >= deadline:
+            return None
+        _sleep(0.005)       # the drop is the cycle's starting gun; 20ms of poll was 20ms of flight
+
+
+FAR_ROCK_WALK_BUDGET_S = 3.5    # <= 12 tiles at a run is 6 ticks; 6.0 was three lost cycles per miss
+FAR_ROCK_POLL_S = 0.05
+
+
+def armed_on_log(cfg):
+    """True when the knife is SELECTED and the cursor rests on the log: /hover then reads
+    "Use  Knife -> Teak logs". The bridge has no item-selection state of its own, and this
+    question decides the whole cycle: MEASURED live 2026-09-09 (g3t_live29 recorder) every
+    desync was followed by a blind re-prepare whose knife click landed with the knife still
+    selected ("Use Knife -> Knife"), after which the log click SELECTED the log and the rock
+    click used the log on the rock -- two to three garbage cycles per desync, most of the
+    unpaid cycles of that run. None means the hover could not be read (fail open: prepare)."""
+    hover = controller.get_hover()
+    if not hover:
+        return None
+    if hover.get("menuOpen"):
+        return False
+    target = (hover.get("target") or "").lower()
+    if "->" not in target:
+        return False
+    selected, _, under = target.partition("->")
+    return ((cfg.get("knifeName") or "knife").lower() in selected
+            and (cfg.get("logName") or "").lower() in under)
+
+
+def arm(ctx, cfg, knife_point, log_point):
+    """prepare, then PROVE it: the knife selected and the cursor on the log. Up to two
+    passes, because a stale selection (knife or log) is spent by the first knife click and
+    only the second one selects. False when it still cannot be proved."""
+    for attempt in range(2):
+        if armed_on_log(cfg):
+            return True
+        if attempt == 1:
+            controller.open_inventory_tab(ctx.ser)     # a switched sidebar tab looks the same
+        prepare(ctx, cfg, knife_point, log_point)
+    ok = armed_on_log(cfg)
+    if ok is None:
+        return True          # unreadable hover: the old blind behaviour, once per cycle
+    if not ok:
+        debug_log.log(CATEGORY, "could not arm the knife on the log (hover disagrees twice)")
+    return bool(ok)
+
+
+def far_rock_cycle(ctx, cfg, knife_point, log_point, rock):
+    """A rock more than stepMaxTiles away: walk to it first, and fletch ONE STEP OUT.
+
+    The guide's rule for the gem mine, verbatim: "click the far rock that you're supposed to go
+    to next, and once your true tile goes over the [one-tile-out] marker start your knife-log
+    animation and continue like normal". So: click the rock (the walk starts), select the knife
+    and park on the log while walking, poll the true tile, and the moment it is within
+    stepMaxTiles of the rock fire the ordinary pair -- log in place, one flight, rock.
+
+    "ok" | "desync"."""
+    scale = cfg.get("flightSpeedScale") or 1.0
+    tile = (rock.get("x"), rock.get("y"))
+    step = int(cfg.get("stepMaxTiles") or 2)
+    # A FRESH point for the walk click: the scan's projection is tick-cached and the player was
+    # walking when it was taken -- MEASURED live 2026-09-09, a stale one resolved to "Walk
+    # here" beside the rock and the wait below then spent its whole budget.
+    refresh = rock_refresh_target(cfg, (tile[0], tile[1], rock.get("plane", 0)))
+    start = refresh()
+    if start is None:
+        return "desync"
+    tick_cycle.timed_click(ctx.ser, start, aim_radius=3, duration_scale=scale, now_fn=_now,
+                           refresh_target=refresh, refresh_legs=2)
+    if not arm(ctx, cfg, knife_point, log_point):
+        return "desync"
+    deadline = _now() + FAR_ROCK_WALK_BUDGET_S
+    while _now() < deadline:
+        p = controller.get_player() or {}
+        if p.get("x") is not None and max(abs(p["x"] - tile[0]), abs(p["y"] - tile[1])) <= step:
+            break
+        _sleep(FAR_ROCK_POLL_S)
+    else:
+        debug_log.log(CATEGORY, f"far rock {tile}: never got within {step} tiles -- resyncing")
+        return "desync"
+    point = refresh()
+    if point is None:
+        debug_log.log(CATEGORY, f"far rock {tile}: gone before we arrived -- resyncing")
+        return "desync"
+    opened_at = _now()
+    fired = tick_cycle.current_tick(ctx.events, now=opened_at)
+    phase = tick_cycle.tick_phase_ms(ctx.events, opened_at)
+    if fired is None or phase is None:
+        return "desync"
+    in_place_ms = tick_cycle.click_in_place(ctx.ser, now_fn=_now)
+    flight_ms = tick_cycle.timed_click(ctx.ser, point, aim_radius=3, duration_scale=scale,
+                                       now_fn=_now, refresh_target=refresh, refresh_legs=2)
+    spent = phase + (_now() - opened_at) * 1000.0
+    ctx.state.data["g3t_fired_tick"] = fired
+    ctx.state.data["g3t_fired_at"] = (opened_at, phase)
+    debug_log.log(CATEGORY, f"far rock {tile}: fletched one step out")
+    _note_cycle(ctx, fired, phase, in_place_ms, flight_ms, spent)
+    return "ok"
+
+
+def _note_cycle(ctx, fired, phase, in_place_ms, flight_ms, spent_ms):
+    """One line per cycle, and the record the outcome accounting joins the xp to."""
+    same_tick = spent_ms < tick_cycle.GAME_TICK_MS
+    verdict = "same tick" if same_tick else "NEXT tick -- expect a 4-tick pay"
+    data = ctx.state.data
+    dead = data.pop("g3t_dead", None)
+    fl = tick_cycle.LAST_FLIGHT
+    breakdown = (f" [move {fl.get('move_ms', 0):.0f} settle {fl.get('settle_ms', 0):.0f}"
+                 f"{'*' if fl.get('settled') else ''} click {fl.get('click_ms', 0):.0f}]")
+    debug_log.log(CATEGORY,
+                  f"cycle fired on tick {fired}: log click at phase {phase:.0f}ms "
+                  f"({in_place_ms:.0f}ms), rock click +{flight_ms:.0f}ms{breakdown}, "
+                  f"{spent_ms:.0f}ms into the tick ({verdict})"
+                  + (f"; dead time: {dead}" if dead else ""))
+    pending = data.setdefault("g3t_pending", [])
+    pending.append({"tick": fired, "same_tick": same_tick})
+    del pending[:-8]
+    data["g3t_cycles"] = data.get("g3t_cycles", 0) + 1
 
 
 def _inventory_full():
@@ -948,7 +1224,7 @@ def _inventory_full():
 
 def full_inventory_phase(ctx, cfg):
     """True when this tick was spent dropping. Knife + log leaves 26 slots, so this comes due
-    roughly every 26 cycles (~60-70s).
+    roughly every 26 cycles (~50s).
 
     controller.drop_items is the right primitive and its contract matters here: it returns the
     CONFIRMED inventory delta, not the number of clicks issued, and it polls DROP_CONFIRM_S
@@ -964,15 +1240,193 @@ def full_inventory_phase(ctx, cfg):
     if not items:
         # drop_items would return True vacuously on an empty list, so this tick would keep
         # "succeeding" forever -- and tick() returns at this gate before _stall_check, so the
-        # XP stall watch could never catch it. Unreachable while knifeName/logName are the
-        # fixed defaults and granite matches neither, but this is the one path that bypasses
-        # the routine's only terminal condition.
+        # XP stall watch could never catch it.
         ctx.state.trigger_safety_stop(
             "inventory full but every item is on the keep list -- nothing can be dropped")
         return True
-    debug_log.log(CATEGORY, f"inventory full -- dropping {len(items)} granite")
-    if not controller.drop_items(ctx.ser, items):
-        ctx.state.trigger_safety_stop("inventory still full after dropping the granite")
+    if (cfg.get("fullInventory") or "drop") == "deposit":
+        deposit_phase(ctx, cfg, items)
+        return True
+    debug_log.log(CATEGORY, f"inventory full -- dropping {len(items)} items")
+    dropped = drop_burst(ctx, items, shift=bool(cfg.get("dropWithShift")))
+    if not dropped and not controller.drop_items(ctx.ser, items):
+        ctx.state.trigger_safety_stop("inventory still full after dropping")
+    return True
+
+
+DROP_HOP_SCALE = 0.45           # the 74px hop between slots, a practised short reach
+DROP_HOP_PAUSE_S = (0.02, 0.09) # USER 2026-09-09 on 0.3 / 0-20ms: "bit too fast dropping"
+DROP_CONFIRM_S = 1.5
+
+
+def drop_burst(ctx, items, shift=False):
+    """Drop `items` the way a human clicks down an inventory: one short hop and one fast click
+    per slot, row by row, left to right (USER 2026-09-09: "quick and human looking").
+
+    NOT a glide with a click burst (mastering_mixology's herb sweep): MEASURED g3t_live49, the
+    eased glide bunches its clicks at each row's ends and every second slot survived (12 of 26
+    left, alternating); the slower 5-7Hz sweep of g3t_live48 only worked by over-clicking.
+
+    Only the given items are ever clicked, so the knife, the log, the basket and the sack are
+    never under the cursor. `shift` holds SHIFT across the burst for an account that relies on
+    the game's shift-click-drop; USER's left click is a Drop swap. True when the inventory
+    shrank; False hands over to controller.drop_items' verified per-item path."""
+    todo = sorted((i for i in items if i.get("screenX") is not None and i.get("slot") is not None),
+                  key=lambda i: i["slot"])
+    if not todo:
+        return False
+    before = len(controller.get_inventory() or [])
+    if shift:
+        controller.key_down(ctx.ser, "SHIFT")
+    try:
+        for item in todo:
+            controller.move_to_human(ctx.ser, int(item["screenX"]), int(item["screenY"]),
+                                     aim_radius=3, duration_scale=DROP_HOP_SCALE)
+            tick_cycle.fast_click(ctx.ser)
+            pause = random.uniform(*DROP_HOP_PAUSE_S)
+            if pause:
+                _sleep(pause)
+    finally:
+        if shift:
+            controller.key_up(ctx.ser, "SHIFT")
+    deadline = _now() + DROP_CONFIRM_S
+    while _now() < deadline:
+        if len(controller.get_inventory() or []) < before:
+            return True
+        _sleep(0.2)
+    debug_log.log(CATEGORY, "the drop burst dropped nothing -- falling back to the per-item drop")
+    return False
+
+
+# --------------------------------------------------------------------------------------------
+# Depositing at the gem mine's Bank Deposit Chest
+# --------------------------------------------------------------------------------------------
+
+DEPOSIT_GROUP = 192             # the deposit-box interface (karambwan_fishing, motherlode)
+DEPOSIT_INV_CHILD = 24          # its inventory grid
+DEPOSIT_CLOSE_CHILD = 1
+DEPOSIT_ACTION = "Deposit"
+DEPOSIT_ALL_ACTION = "Deposit-All"
+GEM_BAG_NAMES = ("gem bag", "gem sack")     # the sack is the bag + tote, same Empty
+GEM_BAG_EMPTY_OPTIONS = ("empty",)
+DEPOSIT_CLICK_RANGE = 10        # further than this (or off screen): walk first
+DEPOSIT_OPEN_BUDGET_S = 4.0
+DEPOSIT_ITEM_BUDGET_S = 2.0
+DEPOSIT_FAIL_STOP = 10
+
+
+def _deposit_open():
+    return bool((controller.get_widget(DEPOSIT_GROUP, DEPOSIT_INV_CHILD) or {}).get("clickable"))
+
+
+def _deposit_children():
+    data = controller.get_widget_children(DEPOSIT_GROUP, DEPOSIT_INV_CHILD) or []
+    if isinstance(data, dict):
+        data = data.get("children") or []
+    return [c for c in data if isinstance(c, dict) and c.get("itemName")]
+
+
+def _find_deposit_chest(cfg):
+    objs = controller.get_objects(radius=30, interactable=True) or []
+    chests = [o for o in objs if o.get("id") == cfg.get("depositId")]
+    chests.sort(key=lambda o: o.get("distance") if o.get("distance") is not None else 99)
+    return chests[0] if chests else None
+
+
+def _deposit_fail(ctx, what):
+    n = ctx.state.data.get("g3t_deposit_fails", 0) + 1
+    ctx.state.data["g3t_deposit_fails"] = n
+    debug_log.log(CATEGORY, f"deposit: {what} ({n})")
+    if n >= DEPOSIT_FAIL_STOP:
+        ctx.state.trigger_safety_stop(f"deposit: {what} {n} times running")
+
+
+def _interface_click(ctx, target, option):
+    """One left click gated on /hover reporting `option`, the right-click menu as the fallback
+    -- karambwan_fishing's _click_option, whose account has these swapped to left clicks."""
+    ok = controller.click_entity(ctx.ser, target, expected_action=option, offset=(0, 0),
+                                 check_ui_blockers=False, simulate_mistakes=False)
+    if ok:
+        return True
+    return bool(controller.click_menu_action(ctx.ser, target, option, offset=(0, 0),
+                                             check_ui_blockers=False))
+
+
+def deposit_phase(ctx, cfg, items):
+    """Walk to the deposit chest, Deposit-All every stack not on the keep list, Empty the gem
+    bag, close, and let the chain resume where it stands. True while the trip is in progress.
+
+    The guide banks once per lap at this chest; the routine banks when the inventory is full,
+    which on the gem mine's opal/jade/topaz mix is every ~40 cycles. Deposit-All per stack
+    rather than the "Deposit inventory" button, because that button would bank the knife, the
+    log and the gem bag too."""
+    tile = cfg.get("depositTile")
+    if not tile:
+        ctx.state.trigger_safety_stop("fullInventory is 'deposit' but no depositTile is set")
+        return True
+    target = {"x": tile[0], "y": tile[1], "plane": tile[2] if len(tile) > 2 else 0}
+    chest = _find_deposit_chest(cfg)
+    if chest is None or (chest.get("distance") or 99) > DEPOSIT_CLICK_RANGE:
+        debug_log.log(CATEGORY, "deposit: walking to the chest")
+        travel.walk_to(ctx, target, goal_adjacent=True)
+        return True
+
+    if not _deposit_open():
+        refresh = controller.object_refresh_target(chest["x"], chest["y"], chest.get("plane", 0),
+                                                   chest["id"])
+        if not controller.click_entity(ctx.ser, chest, refresh_target=refresh,
+                                       simulate_mistakes=False):
+            _deposit_fail(ctx, "could not click the chest")
+            return True
+        if not _await(_deposit_open, DEPOSIT_OPEN_BUDGET_S + 0.6 * (chest.get("distance") or 0)):
+            _deposit_fail(ctx, "the deposit interface did not open")
+            return True
+
+    keep = keep_names(cfg)
+    for _ in range(len(items) + 2):
+        loose = {(i.get("name") or "").lower() for i in (controller.get_inventory() or [])
+                 if not any(k in (i.get("name") or "").lower() for k in keep)}
+        if not loose:
+            break
+        child = next((c for c in _deposit_children()
+                      if (c.get("itemName") or "").lower() in loose), None)
+        if child is None:
+            _deposit_fail(ctx, "a stack is not in the deposit grid")
+            break
+        name = (child.get("itemName") or "").lower()
+        if not _interface_click(ctx, child, DEPOSIT_ALL_ACTION):
+            _deposit_fail(ctx, f"could not Deposit-All the {name}")
+            break
+        _await(lambda n=name: n not in {(i.get("name") or "").lower()
+                                        for i in (controller.get_inventory() or [])},
+               DEPOSIT_ITEM_BUDGET_S)
+
+    bag = next((c for c in _deposit_children()
+                if any(n in (c.get("itemName") or "").lower() for n in GEM_BAG_NAMES)), None)
+    if bag is not None:
+        if not controller.click_menu_action(ctx.ser, bag, GEM_BAG_EMPTY_OPTIONS, offset=(0, 0),
+                                            check_ui_blockers=False):
+            debug_log.log(CATEGORY, "deposit: could not Empty the gem bag -- carrying on")
+        else:
+            _sleep(0.6)
+
+    for _ in range(3):
+        if not _deposit_open():
+            break
+        controller.key_tap(ctx.ser, "ESC")
+        if _await(lambda: not _deposit_open(), 1.5):
+            break
+        button = controller.get_widget(DEPOSIT_GROUP, DEPOSIT_CLOSE_CHILD) or {}
+        if button.get("clickable"):
+            controller.click_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False,
+                                    simulate_mistakes=False)
+            _await(lambda: not _deposit_open(), 1.5)
+    if _deposit_open():
+        _deposit_fail(ctx, "the deposit interface would not close")
+        return True
+    if not _inventory_full():
+        ctx.state.data["g3t_deposit_fails"] = 0
+        debug_log.log(CATEGORY, "deposit: done")
     return True
 
 
@@ -980,18 +1434,17 @@ CHAIN_MAX_S = 45.0      # hand control back to the engine at least this often
 
 
 def resync(ctx):
-    """Give up on the current cycle and re-enter on a clean tick boundary.
+    """Drop the pin and re-enter on a clean tick boundary.
 
     USER's decision, and the reason there is no desync ceiling: a missed tick is an ordinary
     event in 3-tick mining -- a human's rate dips and recovers -- so this never stops the run.
     The XP stall watch in tick() is the only thing that does.
 
-    Clearing the movement abort is cheap insurance, kept deliberately: nothing in this routine
-    SETS it any more (a desync declines to start the flight rather than aborting one mid-air --
-    the firmware's `X` flush is only legal from inside move()'s own flight loop), but the flag
-    is process-global and STICKY, so anything else that leaves it set would silently kill every
-    flight for the rest of the session."""
+    Clearing the movement abort is cheap insurance: nothing in this routine SETS it, but the
+    flag is process-global and STICKY, so anything else that leaves it set would silently kill
+    every flight for the rest of the session."""
     controller.clear_movement_abort()
+    ctx.state.data["g3t_fired_tick"] = None
     if ctx.events is not None:
         ctx.events.wait_ticks(1, now_fn=_now, sleep_fn=_sleep)
     else:
@@ -1051,15 +1504,6 @@ def _knife_click_is_a_selection(ctx, knife_point):
     return True, option
 
 
-def _consume_knife_selection(ctx):
-    """prepare() has already SELECTED the knife and parked the cursor on the log, so a cycle
-    abandoned after it leaves the selection live -- and the NEXT cycle's knife click would then
-    DESELECT it, silently wasting that cycle too (M13). Firing knife-on-log consumes it: the
-    cursor is already on the log, so this costs one in-place click and no flight, and starting a
-    3-tick timer with no rock click is harmless because the caller resyncs anyway."""
-    tick_cycle.click_in_place(ctx.ser, now_fn=_now)
-
-
 def tick(ctx):
     """Gap-aware wrapper around one chain of cycles.
 
@@ -1112,6 +1556,10 @@ def _hold_one_log(ctx, cfg):
         # The basket cannot dispense a single log outside a bank (see restock_phase), so the
         # only fix is the trip. Reset so the trip gets a clean slate.
         data["g3t_log_refills"] = 0
+        if not cfg.get("bankTile"):
+            ctx.state.trigger_safety_stop(
+                f"no loose {cfg['logName']!r} left and this site has no bank to restock from")
+            return False
         # Hand the trip to restock_phase via a flag rather than calling it here, so the
         # walk-home leg above stands aside for the whole journey.
         data["g3t_restocking"] = True
@@ -1140,14 +1588,22 @@ def _run_chain(ctx):
     # geometry against the rocks, which only resolve at the mine, so a restart at the bank
     # refused ("at least one rock does not resolve") and returned -- and the walk that would
     # have fixed it sat below the refusal and never ran. MEASURED LIVE 2026-09-08.
-    here = _tile_of(controller.get_player() or {})
+    player = controller.get_player() or {}
+    here = _tile_of(player)
     if here[0] is None:
         # AN UNREADABLE POSITION IS "CANNOT TELL", NOT "CARRY ON": /player reads empty for a
         # tick right after the bank interface closes, and cycling on that read means cycling at
         # the bank. Same rule as the empty /inventory read below.
         _reseed_stall(ctx)
         return
-    if _dist(here, tuple(cfg["mineTile"])) > BANK_ARRIVAL_TILES:
+    if cfg.get("regionId") is not None and player.get("regionId") != cfg["regionId"]:
+        # No travel here, deliberately -- the gem mine is entered by a Karamja-gloves teleport
+        # and left by another, so "walk there" has no meaning. Same rule as wintertodt.py.
+        ctx.state.trigger_safety_stop(
+            f"not in region {cfg['regionId']} (player reads {player.get('regionId')}) -- start "
+            f"this routine standing inside the mine")
+        return
+    if cfg.get("mineTile") and _dist(here, tuple(cfg["mineTile"])) > BANK_ARRIVAL_TILES:
         _reseed_stall(ctx)
         if return_phase(ctx, cfg):
             return
@@ -1225,11 +1681,8 @@ def _run_chain(ctx):
 
     knife_point = (int(knife["screenX"]), int(knife["screenY"]))
     log_point = (int(log["screenX"]), int(log["screenY"]))
-    tiles = cfg["rockTiles"]
-
-    if not tiles:
-        ctx.state.trigger_safety_stop("no rockTiles configured -- capture them with the probe")
-        return
+    tiles = cfg.get("rockTiles") or []
+    dynamic = dynamic_rotation(cfg)
 
     # Once per chain, both outside the critical tick. Every other inventory-clicking site in
     # this repo opens the tab first (CLAUDE.md, gf_live27: "after a pause/resume the stats tab
@@ -1262,43 +1715,284 @@ def _run_chain(ctx):
             debug_log.log(CATEGORY, f"refusing to run a chain ({fails}): {detail}")
         return
     data["g3t_hover_fails"] = 0
-
-    # Cleared per chain: ticks pass between chains, so a fired tick from the previous one is no
-    # longer a period this cycle can be counted from. The first cycle re-enters via at_phase.
-    data["g3t_fired_tick"] = None
+    # Per chain: nothing is known about the previous chain's selection state, and the first
+    # cycle simply fires -- there is no pay to wait for yet.
+    data["g3t_pending"] = []
     started = _now()
+    pending = None              # everything the next fire needs, prepared during the xp wait
     while True:
         now = _now()
-        if ctx.state.safety_stopped or now - started >= CHAIN_MAX_S:
-            return
-        if _stall_check(ctx, cfg, now):
-            return
-        if _inventory_full():
+        if ctx.state.safety_stopped or getattr(ctx.state, "paused", False) \
+                or now - started >= CHAIN_MAX_S:
+            return          # F2 is only polled between engine iterations: honour it here too
+
+        aligned_by_xp = pending is not None and pending.get("after_xp")
+        if pending is None:
+            if _stall_check(ctx, cfg, now):
+                return
+            pending = _prep_next(ctx, cfg, tiles, dynamic)
+            if pending is None:
+                resync(ctx)
+                continue
+        if pending.get("full"):
             return          # next tick drops
+        if pending.get("stop"):
+            return
+        if not aligned_by_xp and ctx.events is not None:
+            ctx.events.wait_ticks(1, now_fn=_now, sleep_fn=_sleep)
+            _sleep(random.uniform(*REENTRY_PHASE_MS) / 1000.0)
 
-        # Hold off the idle drift for the whole cycle: it is documented in CLAUDE.md as having
-        # fired mid-work before, and here it would drag the cursor off the parked log and break
-        # the cycle with nothing in the log to say so.
-        controller.mark_busy(3.0)
-
-        index = data.get("g3t_index", 0) % len(tiles)
-        rock_point = prepare(ctx, cfg, knife_point, log_point, tiles[index])
-        if rock_point is None:
-            debug_log.log(CATEGORY, f"rock {tiles[index]} did not resolve -- resyncing")
-            _consume_knife_selection(ctx)
-            data["g3t_fired_tick"] = None
-            resync(ctx)
-            data["g3t_index"] = next_rock_index(index, len(tiles))
-            continue
-
-        fired = data.get("g3t_fired_tick")
-        result = run_cycle(ctx, cfg, knife_point, log_point, rock_point,
-                           None if fired is None else fired + CYCLE_TICKS)
-        data["g3t_index"] = next_rock_index(index, len(tiles))
+        # ---- FIRE: NOTHING BETWEEN THE XP AND THIS BUT THE REACTION DRAW -------------------
+        # Every bridge read that used to sit here (stall check, inventory, hover, resolve) is
+        # done in _prep_next during the previous cycle's wait. MEASURED g3t_live36: ~100ms of
+        # reads between the drop and the log click put the rock press at phase 400-430, and
+        # every one of those paid 4; USER's own presses land by ~260-400 and pay 3.
+        controller.mark_busy(6.0)
+        if pending.get("fixed"):
+            # Resolve the rock NOW, in rotation order, never the one just clicked: one uncached
+            # read per candidate (~20ms), and the first one in order is usually live.
+            t_res = _now()
+            last = data.get("g3t_last_index")
+            start_at = 0 if last is None else (last + 1) % len(tiles)
+            point, index = next_live_rock(cfg, start_at, pending.get("player") or {},
+                                          exclude=last)
+            if point is None:
+                debug_log.log(CATEGORY, "no rock in the rotation is live -- waiting a tick")
+                resync(ctx)
+                pending = None
+                continue
+            tile = tuple(tiles[index])
+            # NO re-aim and NO settle on the fixed rotation: the player is standing still when
+            # the pair fires, so the point resolved 20ms ago is the point, and every ms between
+            # the fletch and the press is exposure to the server boundary -- MEASURED
+            # g3t_live51 recorder, three cycles whose mine started 3 ticks late (paid 7) with
+            # both clicks inside the client tick.
+            pending.update(tile=tile, index=index, fresh=point, refresh=None,
+                           dead=(pending["dead"] or "") +
+                           f"; rock {tile[0]},{tile[1]} resolved in {(_now() - t_res) * 1000:.0f}ms")
+            data["g3t_last_index"] = index
+        mark = ctx.events.mark() if ctx.events is not None else None
+        if pending["far"] is not None:
+            result = far_rock_cycle(ctx, cfg, pending["knife_point"], pending["log_point"],
+                                    pending["far"])
+        else:
+            data["g3t_dead"] = pending["dead"]
+            result = run_cycle(ctx, cfg, pending["log_point"], pending["fresh"],
+                               rock_refresh=pending["refresh"])
+            if pending["index"] is not None:
+                data["g3t_index"] = next_rock_index(pending["index"], len(tiles))
         if result != "ok":
-            data["g3t_fired_tick"] = None
             resync(ctx)
+            pending = None
+            continue
+        t_fired = _now()
+        fired_tile = pending["tile"]
 
+        # ---- DEAD TIME, tick +1: drop the previous cycle's ore and re-click the rock ----------
+        if cfg.get("dropBetweenMines") and pending.get("tile") is not None:
+            ore = newest_mined_item(cfg, controller.get_inventory() or [])
+            if ore is not None:
+                refresh = pending.get("refresh") or rock_refresh_target(cfg, pending["tile"],
+                                                                        _ui_blockers())
+                spent = drop_between_mines(ctx, cfg, ore, refresh)
+                debug_log.log(CATEGORY, f"dropped {ore.get('name')} (slot {ore.get('slot')})"
+                                        f"{' and re-clicked the rock' if cfg.get('dropReclick', True) else ''}"
+                                        f" in {spent:.0f}ms")
+
+        # ---- DEAD TIME, tick +2: the game's verdict on that click, then the NEXT rock, armed --
+        if _stall_check(ctx, cfg, _now()):
+            return
+        pending = _prep_next(ctx, cfg, tiles, dynamic)
+
+        # ---- USER: no other rock until the xp notifier ----------------------------------------
+        if mark is None:
+            _sleep(CYCLE_TICKS * tick_cycle.GAME_TICK_MS / 1000.0)
+            continue
+        xp = wait_for_mining_xp(ctx, mark, XP_WAIT_MAX_TICKS * tick_cycle.GAME_TICK_MS / 1000.0)
+        if xp is None:
+            debug_log.log(CATEGORY,
+                          f"no Mining xp within {XP_WAIT_MAX_TICKS} ticks of the rock click on "
+                          f"{fired_tile[:2]} -- the mine is not running, moving on")
+            data["g3t_unpaid"] = data.get("g3t_unpaid", 0) + 1
+            continue
+        # The bridge stamps XP_GAINED with the tick of the packet that carried it (unlike the
+        # recorder's labels, which run one low). MEASURED g3t_live34-37: every "paid 4" under a
+        # +1 here had arrived 1360-1410ms after a rock click made ~420ms into its tick -- three
+        # ticks after the fletch to the millisecond. Do not add one.
+        t_seen = _now()
+        # WHICH TICK THE DROP LANDED IN, AND THE FLOOR FROM ITS BOUNDARY -- with no tick-field
+        # arithmetic. The xp is dispatched ~20ms BEFORE the GameTick that anchors the tick
+        # model, so seen late in a tick it belongs to the boundary about to be pumped: wait for
+        # that TICK event, then the fletch phase counts from it. Seen early in a tick, the
+        # boundary already passed. MEASURED g3t_live57: comparing against the xp's own tick
+        # field passed at once, the anchor was still the old tick, and every fletch went out
+        # at phase 1-11 -- the exact miss of g3t_live54 (fletches at 21-23 all paid 7).
+        landed = xp.get("tick")
+        if ctx.events is not None:
+            seen_tick = tick_cycle.current_tick(ctx.events, now=t_seen)
+            seen_phase = tick_cycle.tick_phase_ms(ctx.events, t_seen)
+            if seen_tick is not None and seen_phase is not None:
+                if seen_phase > 400:
+                    settle_deadline = _now() + 0.15
+                    while _now() < settle_deadline:
+                        ctx.events.pump(now=_now())
+                        current = tick_cycle.current_tick(ctx.events, now=_now())
+                        if current is None or current > seen_tick:
+                            break
+                        _sleep(0.003)
+                    landed = seen_tick + 1
+                else:
+                    landed = seen_tick
+        fired = data.get("g3t_fired_tick")
+        pay = pay_ticks(data.get("g3t_fired_at"), t_seen)
+        key = "g3t_paid3" if pay == 3 else "g3t_paid4" if pay == 4 else "g3t_paid_other"
+        data[key] = data.get(key, 0) + 1
+        debug_log.log(CATEGORY, f"+{xp.get('delta')} Mining xp on tick {landed}: paid "
+                                f"{pay} ticks after the fletch on {fired} "
+                                f"({(t_seen - t_fired) * 1000:.0f}ms after the rock click)")
+        cycles = data.get("g3t_cycles", 0)
+        if cycles and cycles % OUTCOME_SUMMARY_EVERY == 0 and data.get("g3t_summary_at") != cycles:
+            data["g3t_summary_at"] = cycles
+            p3, p4 = data.get("g3t_paid3", 0), data.get("g3t_paid4", 0)
+            po, un = data.get("g3t_paid_other", 0), data.get("g3t_unpaid", 0)
+            debug_log.log(CATEGORY, f"after {cycles} cycles: {p3} paid at 3 ticks, {p4} at 4, "
+                                    f"{po} later, {un} never")
+        if pending is not None:
+            pending["after_xp"] = True
+            if pending.get("count", 0) + 1 >= getattr(controller, "INVENTORY_SIZE", 28):
+                # THE DROP THAT JUST LANDED FILLED THE LAST SLOT. The prep counted 27 before the
+                # xp; firing now gets "Your inventory is too full to hold any more granite" and
+                # a 14-tick wait for a mine that never runs -- MEASURED g3t_live51 recorder,
+                # twice per inventory. Drop now, then re-prep.
+                debug_log.log(CATEGORY, "that drop filled the inventory -- dropping before the "
+                                        "next fletch")
+                full_inventory_phase(ctx, cfg)
+                pending = None
+                continue
+        lo, hi = XP_REACTION_MS
+        target_phase = random.uniform(lo, hi)
+        phase_now = tick_cycle.tick_phase_ms(ctx.events, _now()) if ctx.events is not None else None
+        if phase_now is not None and phase_now < target_phase:
+            pause = (target_phase - phase_now) / 1000.0
+        else:
+            pause = 0.0
+        if pay != CYCLE_TICKS:
+            pause += LATE_PAY_REST_TICKS * tick_cycle.GAME_TICK_MS / 1000.0
+        if random.random() < cfg.get("missChance", 0.0):
+            debug_log.log(CATEGORY, "deliberate miss -- reacting a tick late")
+            pause += tick_cycle.GAME_TICK_MS / 1000.0
+        _sleep(pause)
+
+
+# How far into the next CLIENT tick the drop click goes. NOT near the boundary: the server's
+# input cut-off sits ~100-150ms into the client tick (the same offset that let a phase-25
+# fletch cancel the previous mine on 2026-09-08), so a drop at phase 5-30 was processed in the
+# SAME server tick as the fletch and rock click and every cycle of g3t_live44 paid nothing.
+# 150-230 puts the drop, and the re-click ~250ms after it, in the server tick after the pair.
+DROP_BETWEEN_PHASE_MS = (260, 320)     # EXPERIMENT g3t_live47: 150-230 still lost ~a third of first rolls
+
+
+def newest_mined_item(cfg, inv):
+    """The most recently mined item: the highest-slot inventory entry matching minedItems."""
+    names = [(m or "").lower() for m in (cfg.get("minedItems") or []) if m]
+    mined = [i for i in (inv or []) if i.get("slot") is not None and i.get("screenX") is not None
+             and any(n in (i.get("name") or "").lower() for n in names)]
+    return max(mined, key=lambda i: i["slot"]) if mined else None
+
+
+def drop_between_mines(ctx, cfg, ore, rock_refresh):
+    """The tick after the fletch: shift-drop `ore`, then click the rock again, both inside that
+    one tick. Returns ms spent, for the log. Nothing here is confirmed -- the full-inventory
+    sweep remains the safety net for anything this misses."""
+    scale = cfg.get("flightSpeedScale") or 1.0
+    # PARK ON THE ORE BEFORE THE BOUNDARY, so the drop itself costs no flight -- MEASURED
+    # g3t_live42: drop-plus-re-click as two flights took 400-570ms from the boundary and the
+    # latest re-clicks cost the 3-tick roll.
+    controller.move_to_human(ctx.ser, int(ore["screenX"]), int(ore["screenY"]),
+                             aim_radius=AIM_RADIUS_PX, duration_scale=scale)
+    if ctx.events is not None:
+        ctx.events.wait_ticks(1, now_fn=_now, sleep_fn=_sleep)
+    _sleep(random.uniform(*DROP_BETWEEN_PHASE_MS) / 1000.0)
+    t0 = _now()
+    if cfg.get("dropWithShift"):
+        controller.key_down(ctx.ser, "SHIFT")
+    try:
+        tick_cycle.click_in_place(ctx.ser, now_fn=_now)
+    finally:
+        if cfg.get("dropWithShift"):
+            controller.key_up(ctx.ser, "SHIFT")
+    if cfg.get("dropReclick", True):
+        point = rock_refresh() if rock_refresh else None
+        if point is not None:
+            tick_cycle.timed_click(ctx.ser, point, aim_radius=3, duration_scale=scale,
+                                   now_fn=_now, refresh_target=rock_refresh, refresh_legs=1)
+    return (_now() - t0) * 1000.0
+
+
+def _prep_next(ctx, cfg, tiles, dynamic):
+    """Everything the next fire needs, gathered DURING the previous cycle's xp wait: the slot
+    points (re-read -- the panel moved mid-chain once), the game's verdict on the last rock
+    click, the next rock, the knife armed on the log, and the rock's fresh point. Returns the
+    pending dict, or None when there is nothing to fire at (the caller waits a tick)."""
+    data = ctx.state.data
+    inv = controller.get_inventory() or []
+    out = {"far": None, "index": None, "full": False, "stop": False, "dead": None,
+           "count": len(inv)}
+    if len(inv) >= getattr(controller, "INVENTORY_SIZE", 28):
+        out["full"] = True
+        return out
+    knife_item = find_item(inv, cfg["knifeName"])
+    log_item = find_item(inv, cfg["logName"])
+    if knife_item is None or log_item is None or log_item.get("screenX") is None \
+            or knife_item.get("screenX") is None:
+        out["stop"] = True          # the top of the next tick re-checks and stops if they are gone
+        return out
+    knife_point = (int(knife_item["screenX"]), int(knife_item["screenY"]))
+    log_point = (int(log_item["screenX"]), int(log_item["screenY"]))
+    out["knife_point"], out["log_point"] = knife_point, log_point
+    out["player"] = controller.get_player() or {}    # read here, not in the critical path
+    t0 = _now()
+
+    if dynamic:
+        player = controller.get_player() or {}
+        mined = mined_tile_from_last_action(cfg, player, data.get("g3t_fired_tick"))
+        if mined is not None:
+            data["g3t_last_rock"] = mined
+        rock = pick_rock(cfg, player, data.get("g3t_last_rock"))
+        if rock is None:
+            debug_log.log(CATEGORY, "no live rock in the scan -- waiting a tick")
+            return None
+        data["g3t_last_rock"] = (rock.get("x"), rock.get("y"))
+        tile = (rock.get("x"), rock.get("y"), rock.get("plane", 0))
+        if ((rock.get("distance") or 0) > int(cfg.get("stepMaxTiles") or 2)
+                and not armed_on_log(cfg)):
+            # A far rock is walked to FIRST (its click would spend a live selection as "Use
+            # Knife -> Gem rocks" and walk nowhere), so this branch only runs with nothing
+            # selected; armed, the ordinary cycle fletches now and the walk follows.
+            out["far"], out["tile"] = rock, tile
+            return out
+    else:
+        # FIXED ROTATION: the rock is chosen AT FIRE TIME (see next_live_rock); here only the
+        # arming happens, and the fire step resolves the rock in order.
+        t1 = _now()
+        if not arm(ctx, cfg, knife_point, log_point):
+            return None
+        out.update(tile=None, refresh=None, fresh=None, fixed=True,
+                   dead=f"arm {(_now() - t1) * 1000:.0f}ms")
+        return out
+    t1 = _now()
+    if not arm(ctx, cfg, knife_point, log_point):
+        return None
+    t2 = _now()
+    refresh = rock_refresh_target(cfg, tile, _ui_blockers())
+    fresh = refresh()
+    if fresh is None:
+        debug_log.log(CATEGORY, f"rock {tile[:2]} vanished or slid behind the UI -- re-picking")
+        return None
+    out.update(tile=tile, refresh=refresh, fresh=fresh,
+               dead=(f"rock {tile[0]},{tile[1]}; pick {(t1 - t0) * 1000:.0f}ms, arm "
+                     f"{(t2 - t1) * 1000:.0f}ms, re-resolve {(_now() - t2) * 1000:.0f}ms"))
+    return out
 
 
 def _probe():
@@ -1316,16 +2010,16 @@ def _probe():
         name = item.get("name") or "?"
         print(f"  slot {slot:>2}  {name:<20} "
               f"({item.get('screenX')},{item.get('screenY')})")
+    cfg = site_config(DEFAULT_CONFIG)
+    needle = (cfg.get("rockName") or "rock").lower()
     granite = [o for o in (controller.get_objects(interactable=True) or [])
-               if "granite" in (o.get("name") or "").lower()]
-    print(f"\n{len(granite)} granite object(s) in range:")
+               if needle in (o.get("name") or "").lower()]
+    print(f"\n{len(granite)} {needle} object(s) in range (region {player.get('regionId')}):")
     for obj in sorted(granite, key=lambda o: o.get("distance", 9999)):
         print(f"  [{obj.get('x')}, {obj.get('y')}, {obj.get('plane')}]  "
               f"id={obj.get('id')} dist={obj.get('distance')} "
               f"screen=({obj.get('screenX')},{obj.get('screenY')})")
-    cfg = dict(DEFAULT_CONFIG)
-    if cfg.get("rockTiles"):
-        print("\n" + check_geometry(cfg, inv)[1])
+    print("\n" + check_geometry(cfg, inv)[1])
 
 
 if __name__ == "__main__":

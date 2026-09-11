@@ -27,6 +27,7 @@ import input_state
 import settings
 
 GAME_TICK_MS = bridge_events.GAME_TICK_MS
+LATE_TICK_POLL_MS = 15.0     # see at_tick: how quickly a late TICK packet is noticed
 
 # A PRACTISED 3-TICK CLICK IS A FAST CLICK, and the two clicks of the critical tick are the one
 # place in this repo where that matters. controller.click_human is built for ordinary play: a
@@ -48,40 +49,21 @@ def fast_click(ser):
     controller.mouse_left_up(ser)
 
 
-# TWO DIFFERENT CLICK COSTS, BECAUSE A CLICK COSTS TWO DIFFERENT THINGS.
+# WHAT A CLICK COSTS THE TICK. The in-place log click DELAYS the flight that follows it: its
+# whole hold is on the budget (an inventory click fires on mouse UP -- MEASURED from USER's
+# recordings 2026-09-09, the client waits for the release to tell a click from a drag). The
+# rock click that ends the tick only has to be PRESSED inside it (a world click fires its menu
+# action 1-23ms after mouse DOWN, same recordings), so nothing is booked for it.
 #
-# click_human is: press, a CLICK_HOLD_RANGE_S hold (50-145ms), release, then a trailing
-# human_delay(0.03, 0.09). Which part is on the tick's budget depends on what the click IS:
-#
-#   * A click that DELAYS FOLLOWING WORK (the in-place log click, whose release and trailing
-#     pause both happen before the flight can start) costs the whole thing: hold + tail.
-#   * The LAST click of the tick (the rock click) only has to LAND. Its trailing pause is our
-#     own pacing and happens after mouse-up, when the game already has the click -- charging it
-#     against the tick is charging for time the game does not care about.
-#
-# MEASURED LIVE 2026-09-08, and this was a real bug: booking the tail against the final click
-# made the guard demand ~472ms while the geometry gate promised 237ms, so startup passed and
-# then EVERY SINGLE CYCLE abandoned at room_for -- 50 desyncs, 0 completed cycles, before the
-# first fix. The gate and the guard have to price the same thing.
-#
-# Upper bounds here, medians below: these feed Window.room_for, which is a GUARD, and being
-# pessimistic costs one abandoned cycle where being optimistic desyncs the whole chain.
+# There is no per-cycle guard any more -- the routine fires the rock click regardless, because
+# a late click costs a 4-tick pay and a skipped one costs the log -- so these only feed the
+# geometry check, which plans on the median.
 CLICK_HOLD_MAX_MS = FAST_HOLD_RANGE_S[1] * 1000.0                    # 75
 CLICK_TAIL_MAX_MS = 0.0                                              # fast_click has no tail
-CLICK_COST_MS = CLICK_HOLD_MAX_MS + CLICK_TAIL_MAX_MS                # delays following work
-CLICK_LANDING_COST_MS = CLICK_HOLD_MAX_MS                            # only has to land
-
-# The MEDIAN cost of a click, for PLANNING rather than guarding. CLICK_COST_MS above books the
-# worst case on purpose -- a guard that is optimistic desyncs a whole chain, where a guard that
-# is pessimistic costs one abandoned cycle. But feeding that same worst case into the geometry
-# check makes it demand the impossible: 600 - 60 - 235 - 235 leaves 70ms for the flight, which is
-# below HM2_MIN_MS (90), so NO geometry on earth would ever pass. MEASURED 2026-09-08 while
-# setting the routine up live -- the check refused a legitimate 60px setup. Same split the rest
-# of this repo uses: plan on the median, guard on the tail.
+CLICK_COST_MS = CLICK_HOLD_MAX_MS + CLICK_TAIL_MAX_MS
 CLICK_HOLD_MEDIAN_MS = 55.0        # middle of FAST_HOLD_RANGE_S
-CLICK_TAIL_MEDIAN_MS = 0.0         # fast_click has no trailing pause
-CLICK_COST_MEDIAN_MS = CLICK_HOLD_MEDIAN_MS + CLICK_TAIL_MEDIAN_MS   # 145, delays what follows
-CLICK_LANDING_MEDIAN_MS = CLICK_HOLD_MEDIAN_MS                       # 85, only has to land
+CLICK_TAIL_MEDIAN_MS = 0.0
+CLICK_COST_MEDIAN_MS = CLICK_HOLD_MEDIAN_MS + CLICK_TAIL_MEDIAN_MS
 
 
 # A PRACTISED reach is faster than the fitted model, and this is the one activity where saying
@@ -206,7 +188,17 @@ def at_tick(events, target_tick, target_ms, *, now_fn=time.time, sleep_fn=time.s
         # Never sleep past one boundary in a single step: a TICK packet has to be pumped every
         # step or the loop cannot see the tick it is waiting for arrive. The floor keeps a
         # boundary that has just passed (ms_until_next == 0) from spinning.
-        step_ms = min(events.ticks.ms_until_next(now) + 1.0, GAME_TICK_MS)
+        #
+        # AND POLL FAST WHILE WAITING FOR THE VERY NEXT TICK. MEASURED live 2026-09-09
+        # (g3t_live27/29): fletches landing at phase ~583 instead of the drawn 150-320. When
+        # the target tick's packet arrives a few ms LATER than the model's boundary, `current`
+        # is still target-1 while the model's phase has already wrapped to ~0 -- so
+        # ms_until_next reads ~600 and this slept a whole extra tick, waking with the target
+        # tick nearly spent. A late packet has to be noticed within a few ms, not a tick.
+        if current == target_tick - 1:
+            step_ms = min(events.ticks.ms_until_next(now) + 1.0, LATE_TICK_POLL_MS)
+        else:
+            step_ms = min(events.ticks.ms_until_next(now) + 1.0, GAME_TICK_MS)
         sleep_fn(max(step_ms, 5.0) / 1000.0)
 
 
@@ -214,9 +206,6 @@ def estimate_flight_ms(dist_px, scale=1.0):
     """The fitted HM2 reach model's MEDIAN time for a distance, for budget arithmetic only.
 
     Not a prediction of any individual flight -- HM2_SIGMA is 0.368, so the p90 is ~1.6x this.
-    Window.room_for is deliberately fed this median and given a caller-side margin rather than
-    a p90, because refusing every cycle whose worst case might overrun would refuse most of
-    them.
 
     `scale` multiplies the result, matching move_to_human's own `duration_scale`, so a caller
     that flies faster gets a budget that agrees with what it will actually do. See
@@ -238,39 +227,40 @@ def click_in_place(ser, *, now_fn=time.time):
     return (now_fn() - t0) * 1000.0
 
 
-def timed_click(ser, point, *, aim_radius=0, duration_scale=1.0, now_fn=time.time):
-    """Fly to a PRE-RESOLVED (x, y) and click. Returns elapsed ms.
+SETTLE_PX = 25.0      # a landing further than this from the live target gets one short correction
+LAST_FLIGHT = {}      # the breakdown of the most recent timed_click, for the routine's log line
+
+
+def timed_click(ser, point, *, aim_radius=0, duration_scale=1.0, now_fn=time.time,
+                refresh_target=None, refresh_legs=None):
+    """Fly to `point` and click. Returns elapsed ms.
 
     `duration_scale` is passed through to move_to_human. See PRACTISED_FLIGHT_SCALE.
 
-    NO HTTP ANYWHERE IN THIS CALL, which is why it is not controller.click_entity: that one
-    reads the bridge at departure, once per refresh leg and again at the settle -- the ~1s per
-    click CLAUDE.md already records for deep-sea-trawling. Inside the critical tick there is no
-    room for a single round trip, so the caller resolves the point during the dead ticks and
-    hands it here as plain numbers."""
+    With no `refresh_target` this makes NO HTTP call at all: the caller resolved the point
+    during the dead ticks and hands it here as plain numbers. With one, the flight re-aims at
+    each leg through it and takes one last look before the press -- each look is a single
+    uncached /object/at (~20ms), which the critical tick CAN afford, and MEASURED live
+    2026-09-09 (g3t_live31 recorder) it cannot afford to skip: the player is mid-step when the
+    rock click lands and the camera pans with them, so a point resolved 300ms earlier is off
+    the rock and the click resolved to "Walk here" in 9 of 12 cycles."""
     t0 = now_fn()
     controller.move_to_human(ser, int(point[0]), int(point[1]), aim_radius=aim_radius,
-                             duration_scale=duration_scale)
+                             duration_scale=duration_scale, refresh_target=refresh_target,
+                             refresh_legs=refresh_legs)
+    t1 = now_fn()
+    settled = False
+    if refresh_target is not None:
+        fresh = refresh_target()
+        if fresh is not None:
+            cur = controller.get_cursor_pos()
+            if math.hypot(fresh[0] - cur[0], fresh[1] - cur[1]) > SETTLE_PX:
+                settled = True
+                controller.move_to_human(ser, int(fresh[0]), int(fresh[1]), aim_radius=2,
+                                         duration_scale=duration_scale)
+    t2 = now_fn()
     fast_click(ser)
-    return (now_fn() - t0) * 1000.0
-
-
-class Window:
-    """How much of one 600ms tick a cycle has spent.
-
-    `phase_ms` is where in the tick the window was OPENED -- the cycle starts part way into the
-    tick by design (logClickPhaseMs), so that time is already spent before the first click."""
-
-    def __init__(self, opened_at, phase_ms, budget_ms=GAME_TICK_MS):
-        self.opened_at = opened_at
-        self.phase_ms = phase_ms
-        self.budget_ms = budget_ms
-
-    def spent_ms(self, now):
-        return self.phase_ms + (now - self.opened_at) * 1000.0
-
-    def remaining_ms(self, now):
-        return self.budget_ms - self.spent_ms(now)
-
-    def room_for(self, estimate_ms, now):
-        return self.remaining_ms(now) >= estimate_ms
+    t3 = now_fn()
+    LAST_FLIGHT.update(move_ms=(t1 - t0) * 1000.0, settle_ms=(t2 - t1) * 1000.0,
+                       settled=settled, click_ms=(t3 - t2) * 1000.0)
+    return (t3 - t0) * 1000.0

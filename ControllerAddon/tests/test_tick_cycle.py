@@ -177,11 +177,9 @@ def test_at_tick_is_none_without_a_stream():
 
 
 def test_click_cost_ms_books_the_UPPER_end_of_the_fast_hold():
-    """It feeds Window.room_for, which is a guard: conservative costs one abandoned cycle,
-    optimistic costs a desynced chain. The clicks in the critical tick are fast_click, not
-    click_human -- MEASURED live 2026-09-08, click_human's 50-145ms hold plus its 30-90ms
-    trailing pause cost ~166ms for the in-place log click alone, and 11 of 18 cycles overran
-    the 600ms tick because of it."""
+    """The clicks in the critical tick are fast_click, not click_human -- MEASURED live
+    2026-09-08, click_human's 50-145ms hold plus its 30-90ms trailing pause cost ~166ms for the
+    in-place log click alone, and 11 of 18 cycles overran the 600ms tick because of it."""
     assert tick_cycle.CLICK_COST_MS == pytest.approx(
         tick_cycle.FAST_HOLD_RANGE_S[1] * 1000.0)
     assert tick_cycle.CLICK_TAIL_MAX_MS == 0.0           # fast_click has no trailing pause
@@ -217,6 +215,32 @@ def test_timed_click_moves_then_clicks_and_reports_elapsed(monkeypatch):
     assert elapsed == pytest.approx(255.0, abs=1.0)
 
 
+def test_timed_click_settles_on_the_live_target_before_pressing(monkeypatch):
+    """MEASURED live 2026-09-09: the player is mid-step when the rock click lands and the camera
+    pans with them, so a point resolved 300ms earlier was off the rock in 9 of 12 cycles."""
+    moves = []
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **kw: moves.append((x, y, kw.get("refresh_target"))))
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (100, 100))
+    monkeypatch.setattr(controller, "mouse_left_down", lambda ser: None)
+    monkeypatch.setattr(controller, "mouse_left_up", lambda ser: None)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    refresh = lambda: (140, 100)              # the rock has slid 40px since the flight was aimed
+    tick_cycle.timed_click(object(), (100, 100), refresh_target=refresh, refresh_legs=2)
+    assert moves[0][2] is refresh              # the flight itself re-aims through it
+    assert moves[1][:2] == (140, 100)          # and one correction lands on the live point
+
+
+def test_timed_click_without_a_refresh_makes_no_extra_move(monkeypatch):
+    moves = []
+    monkeypatch.setattr(controller, "move_to_human", lambda ser, x, y, **kw: moves.append((x, y)))
+    monkeypatch.setattr(controller, "mouse_left_down", lambda ser: None)
+    monkeypatch.setattr(controller, "mouse_left_up", lambda ser: None)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    tick_cycle.timed_click(object(), (100, 100))
+    assert moves == [(100, 100)]
+
+
 def test_click_in_place_never_moves(monkeypatch):
     clock = _Clock()
     moved = []
@@ -225,18 +249,3 @@ def test_click_in_place_never_moves(monkeypatch):
     elapsed = tick_cycle.click_in_place(object(), now_fn=clock.now)
     assert moved == []
     assert elapsed == pytest.approx(92.0, abs=1.0)
-
-
-def test_window_counts_the_phase_it_opened_at_not_just_elapsed_time():
-    """The window opens PART WAY into the tick -- at logClickPhaseMs -- so the phase is
-    already spent before a single click has been issued."""
-    w = tick_cycle.Window(opened_at=1000.0, phase_ms=60.0)
-    assert w.spent_ms(1000.0) == pytest.approx(60.0)
-    assert w.spent_ms(1000.2) == pytest.approx(260.0)
-    assert w.remaining_ms(1000.2) == pytest.approx(340.0)
-
-
-def test_window_room_for_refuses_a_click_that_would_cross_the_boundary():
-    w = tick_cycle.Window(opened_at=1000.0, phase_ms=60.0)
-    assert w.room_for(300.0, 1000.2) is True       # 340ms left
-    assert w.room_for(400.0, 1000.2) is False
