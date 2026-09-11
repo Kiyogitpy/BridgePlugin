@@ -469,3 +469,31 @@ def test_a_failed_click_off_the_stand_tile_walks_back_before_the_next_rock(game)
     mgi.tick(ctx)
     kinds = [k for k, _ in game.clicks]
     assert kinds[:2] == ["rock", "walk"], game.clicks
+
+
+def test_arrival_click_waits_for_the_camera_glide_to_settle(game):
+    """mgi_live7: on arrival the camera is still gliding after the last step; a click made
+    against a projection 35px from where the rock was drawn resolved to a Walk-here beyond
+    the rock and the player walked off. The arrival click waits until two consecutive
+    projection reads agree."""
+    ctx = _ctx(game)
+    game.player.update(x=3019, y=9720)          # one tile out, arrival comes on the next poll
+    game.rocks[N] = game.rocks[S] = 11391       # only the west rock is up: it gets hovered
+    reads = {"n": 0}
+    orig = game.object_at
+
+    def gliding(x, y, plane, obj_id, **kw):
+        o = orig(x, y, plane, obj_id, **kw)
+        if o is not None and (x, y) == W:
+            reads["n"] += 1
+            o["screenX"] = 500 + max(0, 5 - reads["n"]) * 30   # moves for the first reads
+        return o
+    controller.get_object_at = gliding          # the fixture's monkeypatch restores it
+    for _ in range(12):                          # a couple of polls one tile out first
+        game.feed(("TICK", {"tick": 1}))
+    game.feed(("PLAYER_STOPPED", None, lambda: game.player.update(x=3021, y=9721)))
+    back = mgi.return_to_stand(ctx, ctx.state.config, ctx.state.data[mgi.ROCKS_KEY],
+                               ctx.state.data.setdefault(mgi.SPENT_KEY, {}))
+    assert isinstance(back, dict) and (back["x"], back["y"]) == W
+    assert reads["n"] >= 6                      # kept reading until the projection held still
+    assert game.hovers[-1] == W

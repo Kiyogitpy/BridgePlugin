@@ -71,6 +71,9 @@ CHAIN_MAX_TARGETS = 240
 ORES_PER_ROCK = 2         # what the rock being clicked is expected to add before it depletes
 TRACK_DRIFT_PX = 6        # re-hover past this drift: must stay under CLICK_IN_PLACE_RADIUS_PX (12) with both jitters
 TRACK_POLL_S = 0.25
+SETTLE_MAX_S = 0.8        # arrival: wait this long at most for the camera glide to stop
+SETTLE_POLL_S = 0.08
+SETTLE_PX = 3             # two consecutive projection reads this close = settled
 FAILED_CLICK_STOP = 10    # consecutive clicks that produced nothing -> safety stop
 DEPOSIT_BASE_S = 3.0      # plus WALK_S_PER_TILE per tile to the box
 WALK_S_PER_TILE = 0.6
@@ -249,6 +252,21 @@ def _track_hover(ctx, resolve, offset=(-7, 7), check_ui_blockers=True):
     if math.hypot(aim[0] - cur[0], aim[1] - cur[1]) <= TRACK_DRIFT_PX:
         return False
     return controller.hover_entity(ctx.ser, pt, offset=offset, check_ui_blockers=check_ui_blockers)
+
+
+def _await_settled(rock, max_s=SETTLE_MAX_S):
+    """Block until the rock's screen projection has stopped moving (two consecutive reads
+    within SETTLE_PX), or max_s. Returns the last projection read, or None."""
+    deadline = _now() + max_s
+    prev = None
+    while True:
+        cur = _on_screen(rock)
+        if cur is not None and prev is not None and                 abs(cur["screenX"] - prev["screenX"]) <= SETTLE_PX and                 abs(cur["screenY"] - prev["screenY"]) <= SETTLE_PX:
+            return cur
+        if _now() >= deadline:
+            return cur
+        prev = cur
+        _sleep(SETTLE_POLL_S)
 
 
 def _park_on(ctx, rock):
@@ -465,10 +483,13 @@ def return_to_stand(ctx, cfg, rocks, spent_at):
                                           RETURN_POLL_S, confirm=lambda: _player_tile() == stand,
                                           since=None, reaction=False, now_fn=_now, sleep_fn=_sleep)
         if res:
-            # The camera keeps gliding through the last step, so the parked cursor can have
-            # slid off the rock between the last poll and now; one more pass makes the click
-            # that follows an in-place one (mgi_live4: a 10px flight cost 0.36s per trip).
+            # The camera keeps gliding after the last step. MEASURED mgi_live7: a click made
+            # during the glide landed 35px from where the rock was drawn, resolved to a
+            # Walk-here beyond it, and the player walked off round the rocks (10s lost, twice).
+            # So wait until two consecutive projection reads agree, then re-park the cursor so
+            # the click that follows is in place.
             if hovered is not None:
+                _await_settled(hovered)
                 _track_hover(ctx, lambda: _on_screen(hovered))
             return hovered or True
         here = _player_tile()
