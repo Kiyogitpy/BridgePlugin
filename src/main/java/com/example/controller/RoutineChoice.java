@@ -37,7 +37,8 @@ public enum RoutineChoice
 	WINTERTODT("Wintertodt (group, fletch)"),
 	FLETCHING("Fletching (bank, knife logs)"),
 	GRANITE_3T("3-Tick Granite"),
-	VALE_TOTEMS("Vale Totems (Forestry)");
+	VALE_TOTEMS("Vale Totems (Forestry)"),
+	MINING_GUILD_IRON("Mining Guild Iron (single tile, deposit box)");
 
 	private final String label;
 

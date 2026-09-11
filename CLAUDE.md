@@ -2250,6 +2250,47 @@ only wires it into the panel dropdown.
 - See the spec's live-verification checklist for the full first-session worklist, in priority
   order.
 
+## Current state of routines/mining_guild_iron.py
+
+Written 2026-09-11 inline (USER: "Just implement it inline its very simple routine") from the
+user's recording `recordings/2026-09-11_121030_mining-guild-single-tile.*` (2m56s, 40 Mine
+clicks, 72 ores, 4 deposits). **NOT YET RUN LIVE**; the panel entry needs a client rebuild, the
+command line runs today. It is deliberately NOT a `gathering.Profile`: gathering re-picks from
+tick-cached bulk scans, pre-hovers only after a stillness check and budgets for walking to far
+rocks, none of which this activity has.
+
+- **Shape**: stand on ONE tile (config `standTile`, default the recording's (3021,9721)) with
+  three iron rocks cardinally adjacent (N (3021,9722) id 11365, W (3020,9721) 11364, S
+  (3021,9720) 11365; spent = 11390/11391 "Rocks"). `discover_rocks` reads them from one bulk
+  scan; after that every "is it up" is one uncached `/object/at` with the rock's live id.
+- **Every rock is exactly two ores, the second depletes it** (MEASURED: click -> anim 624
+  +0.3s -> ore +1.5s -> ore +3.3s -> spent). The Mining gloves alternate strictly ("will not
+  save the next iron rocks" on exactly 36 of 72 successes), so the swap trigger is the
+  DEPLETION, never a count: `mine_rock` awaits `XP_GAINED`/`OBJECT_DESPAWNED`/
+  `INVENTORY_CHANGED`, confirmed by `/object/at` gone (an ore with the rock standing re-arms
+  `ORE_BUDGET_S` 5.5). No tick reads anywhere. The next rock is pre-hovered the moment the
+  click goes out, so the swap is `SWAP_REACTION_S` (0.10-0.30s, human 0.12-0.55 median 0.33)
+  plus an in-place click. Rocks respawn in 2.4s against a 3.6s cycle, so one is always up.
+- **A click that produced nothing** (no swing animation and no ore for `CLICK_GRACE_S` 1.2s) is
+  "failed": re-pick another rock, dismiss a continue box if one is up, safety-stop after
+  `FAILED_CLICK_STOP` (10) in a row. A swinging player is never failed, only "timeout".
+- **Deposit below 2 free slots** (USER's choice; at 1 free the second ore is refused and the
+  swing wasted): Use Iron ore (hover-gated "Use", no simulated misclick -- the gem sack is the
+  neighbour) on the Bank Deposit Box 10529 at (3013,9720), 8 tiles; the game walks and
+  deposits every ore (~4.4s). Confirmed on `INVENTORY_CHANGED` + zero ore, budget 3s + walk,
+  two tries then a stop. The chat "inventory is too full" forces a trip regardless.
+- **Return is walk-click, hover, click ON the stand tile** (USER's choice over the human's
+  one-tile-early click, which can leave the player mining from a neighbour tile where only one
+  rock is adjacent): shift-click the tile, poll `/player` via `PLAYER_STOPPED`/`PLAYER_MOVING`
+  at 0.1s, park the cursor on a rock within `HOVER_WITHIN_TILES` (2), click on arrival.
+- Tests (`tests/test_mining_guild_iron.py`) drive a REAL `EventStream` through a scripted
+  `poll_udp` whose rock script is fed by the click itself (a fixed batch order desynced the
+  moment the pick order differed -- feed each event from the click that causes it).
+- First live worklist: whether `/object/at` answers fast enough for the in-place click to land
+  on the tick after the depletion (log `depleted after 2 ore(s), N.NNs after the click` and the
+  gap to the next `click_entity ... in place`); whether the box's projection near the top of
+  the viewport is `onScreen` at the user's camera; and the hover gate on the ore's "Use".
+
 ## Current state of routines/blast_furnace.py
 
 **Live gold session 2026-09-04 (bf_live3-9), the first routine converted to event-driven

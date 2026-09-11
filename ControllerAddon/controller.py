@@ -3631,6 +3631,7 @@ ROUTINE_FILES = {
     "FLETCHING": "routines/fletching.py",
     "GRANITE_3T": "routines/granite_3t.py",
     "VALE_TOTEMS": "routines/vale_totems.py",
+    "MINING_GUILD_IRON": "routines/mining_guild_iron.py",
 }
 
 
