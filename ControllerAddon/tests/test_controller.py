@@ -1237,6 +1237,27 @@ def test_pointer_acceleration_warning_fires_only_when_detected(monkeypatch):
         assert controller.warn_if_pointer_acceleration() is expected
 
 
+def test_get_dpi_scale_makes_the_process_dpi_aware_before_measuring(monkeypatch):
+    """REGRESSION 2026-09-13 (user report, 125%-scaled laptop): LOGPIXELSX reports a virtualized
+    96 to a DPI-unaware process, and get_dpi_scale caches for the process lifetime -- so any
+    caller running before set_dpi_aware() locked the scale to 1.0 and left every bridge
+    screenX/screenY unscaled, putting clicks at 1/1.25 of the correct offset. main() did exactly
+    that via deob_guard's api_get(). Measuring must therefore be ordered AFTER awareness, not
+    merely happen to be."""
+    order = []
+    monkeypatch.setattr(controller, "_dpi_scale_cache", None)
+    monkeypatch.setattr(controller, "set_dpi_aware", lambda: order.append("aware"))
+    monkeypatch.setattr(
+        controller.user32, "GetDC",
+        lambda h: order.append("measure") or 1,
+    )
+    monkeypatch.setattr(controller.user32, "ReleaseDC", lambda h, hdc: 1)
+    monkeypatch.setattr(controller.ctypes.windll.gdi32, "GetDeviceCaps", lambda hdc, idx: 120)
+
+    assert controller.get_dpi_scale() == 1.25
+    assert order == ["aware", "measure"], f"awareness must precede measurement, got {order}"
+
+
 def test_hover_matches_accepts_any_of_a_sequence_of_actions(monkeypatch):
     """State-dependent actions the caller doesn't choose (GOLEM_PLINTH_OPTIONS): any match in
     the sequence passes; a hover outside the whole set still blocks."""

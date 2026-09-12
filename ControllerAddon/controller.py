@@ -1357,6 +1357,20 @@ def get_dpi_scale() -> float:
     """
     global _dpi_scale_cache
     if _dpi_scale_cache is None:
+        # MUST be DPI-aware BEFORE measuring, and this is the only place that can guarantee it:
+        # LOGPIXELSX reports a virtualized 96 to a DPI-UNAWARE process, so whichever caller runs
+        # first would otherwise cache 1.0 for the whole process lifetime and silently leave every
+        # bridge screenX/screenY unscaled. CONFIRMED live 2026-09-13 (user report, 125%-scaled
+        # laptop): main() ran deob_guard's ensure() -- which makes its own api_get(), and api_get
+        # ends in _scale_screen_coords(..., get_dpi_scale()) -- two lines BEFORE set_dpi_aware(),
+        # poisoning the cache with 1.0 on every single run. Clicks then landed at 1/1.25 of the
+        # correct offset (short, and up-left of the target) and the routine read that as "the
+        # interaction did not register", retrying forever on a ladder it was never touching.
+        # Invisible on a 100%-scaled display, where 1.0 happens to be right anyway -- which is why
+        # this only ever showed up on the laptop. set_dpi_aware() is idempotent, so calling it here
+        # is free insurance that does not depend on main()'s statement order staying correct (and
+        # bench_hover.py already calls get_dpi_scale() before its own set_dpi_aware()).
+        set_dpi_aware()
         try:
             hdc = user32.GetDC(None)
             dpi_x = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
@@ -3692,17 +3706,19 @@ def main():
     args = parser.parse_args()
     debug_log.init(args.debug_log or os.environ.get("DEBUG_LOG") == "1")
 
+    set_dpi_aware()  # must happen before ANY cursor/window/bridge coordinate query -- including
+                      # deob_guard's own api_get() just below, which scales its reply through
+                      # get_dpi_scale() and CACHES the result for the process lifetime. Windows
+                      # virtualizes DPI to 96 until this call lands, so running it after the guard
+                      # cached 1.0 on a 125% display and broke every click. See get_dpi_scale.
+    warn_if_pointer_acceleration()
+
     # Before the serial port is even opened: is this a client build somebody has deobfuscated
     # and READ (CLAUDE.md, "What the game client sends home")? A block exits here; a bridge
     # that is not up yet is re-checked from the engine loop until it answers.
     import deob_guard
     deob = deob_guard.Guard(skip=args.skip_deob_check)
     deob.ensure()
-
-    set_dpi_aware()  # must happen before any cursor/window coordinate queries below,
-                      # otherwise Windows silently virtualizes them to 96 DPI while
-                      # RuneLite's Java window reports/receives real physical pixels
-    warn_if_pointer_acceleration()
     start_panic_listener()
     if args.no_events:
         udp = None
