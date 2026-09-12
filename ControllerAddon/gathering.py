@@ -77,6 +77,7 @@ class Profile:
 FALLBACK_POLL_S = 0.25    # idle-check cadence past the grace; also the HTTP-only cadence with no events
 GATHER_BUDGET_S = 12.0    # nothing gained and no depletion for this long (plus the walk) -> re-pick
 WALK_S_PER_TILE = 0.6     # a queued interaction is performed on ARRIVAL: budget the walk
+GAME_TICK_S = bridge_events.GAME_TICK_MS / 1000.0   # the server tick a queued click waits for
 IDLE_GRACE_S = 1.5        # idle with no progress past this (plus the walk) -> the click failed
 # ...but only if the idle SUSTAINS for this long. An animation trough between two swings is not
 # idleness: MEASURED live 2026-09-07 in the Motherlode Mine over 45s of uninterrupted, XP-earning
@@ -210,10 +211,10 @@ def _outcome(profile, target, xp_base):
     return None
 
 
-def gather(profile, ctx, target, config, exclude=(), pick_next=None):
+def gather(profile, ctx, target, config, exclude=(), pick_next=None, stop=None):
     """Click `target`, pre-hover the next candidate, then wait on the pushed signals until the
     object is confirmed gone. Returns (outcome, next_target) with outcome one of
-    depleted | idle | timeout | no_click. `exclude` lists tiles the pre-hover must not pick:
+    depleted | full | idle | timeout | no_click. `exclude` lists tiles the pre-hover must not pick:
     the bulk /objects scan is tick-cached, so an object spent a moment ago can still appear in
     it under its old id, and without this the cursor went straight back to it.
 
@@ -223,7 +224,17 @@ def gather(profile, ctx, target, config, exclude=(), pick_next=None):
     filters, so the default chooser was parking the cursor on a different vein entirely --
     MEASURED live 2026-09-07, the default would have hovered (3753,5684) while the routine went
     on to click (3752,5684), and 19 of the 66 veins in its pre-hover pool were on the FLOOR
-    BELOW. A hover aimed at the wrong object buys nothing and costs a cursor flight."""
+    BELOW. A hover aimed at the wrong object buys nothing and costs a cursor flight.
+
+    `stop() -> bool` (optional, ADDED 2026-09-13 on a user report that motherlode_mine was slow
+    to notice a full inventory) ends the wait early with outcome "full" the moment it holds. It
+    is checked ONLY right after a resource actually landed -- that is the only moment inventory
+    can have changed, so it costs one extra read per ore rather than one per poll. Without it a
+    gather that fills the last slot mid-object cannot tell that apart from a dead click: the
+    game stops the player, nothing further is gained, and the loop sits out IDLE_GRACE_S +
+    IDLE_CONFIRM_S (4.5s) before returning "idle" -- which also mislabels a perfectly good
+    object as one that "did not take". Default None reproduces every existing caller's prior
+    behaviour exactly, outcome "full" included (nothing can return it without a stop)."""
     since = ctx.events.mark() if ctx.events is not None else None
     xp_base = skill_xp(profile)
     if not controller.click_entity(ctx.ser, target, refresh_target=_refresh(target)):
@@ -287,13 +298,36 @@ def gather(profile, ctx, target, config, exclude=(), pick_next=None):
     if not walking:
         prehover()
 
+    # Has the player been SEEN walking since the click? A click is queued and acted on by the
+    # server a tick later, so for the first ~600ms after it `moving` is still False from BEFORE
+    # the click -- indistinguishable, on one read, from having already arrived.
+    seen_moving = False
+
     def confirm():
+        nonlocal seen_moving
         out = _outcome(profile, target, xp_base)
         if out:
             return out
         # A far target: the game walks there first. PLAYER_STOPPED (or /player.moving going
         # false) is the arrival; from then on the budgets are the working budgets alone.
-        if walking and (controller.get_player() or {}).get("moving") is False:
+        #
+        # `moving is False` ALONE is not arrival -- USER 2026-09-13: "we hover the next ore
+        # before movement settles so the hover is useless now". MEASURED in that same run: a
+        # dist=2 vein logged "arrived ... 0.21s after the click", and two tiles cannot be walked
+        # in 0.21s at 0.6s/tile. The pre-hover therefore fired while the player was standing
+        # still about to walk, the projection slid out from under the parked cursor, and the
+        # hover bought nothing -- the exact failure the prehover-after-arrival change was meant
+        # to fix, reintroduced through the arrival test rather than the hover. Requiring the
+        # player to have been observed MOVING first makes the stop mean something. The elapsed
+        # fallback keeps a target that never needs a step (already adjacent, or a walk too short
+        # to catch between polls) from waiting out the whole budget.
+        if not walking:
+            return None
+        moving = (controller.get_player() or {}).get("moving")
+        if moving is True:
+            seen_moving = True
+            return None
+        if moving is False and (seen_moving or _now() - t_click >= GAME_TICK_S):
             return "arrived"
         return None
 
@@ -331,6 +365,15 @@ def gather(profile, ctx, target, config, exclude=(), pick_next=None):
                 debug_log.log(profile.key, f"+{value[1] - xp_base} {profile.skill} xp, "
                                            f"{profile.noun} still up")
                 xp_base = value[1]
+                # The resource that just landed may have been the one that filled us up. This
+                # is the moment to notice: the player has already been stopped by the game, so
+                # every later signal this loop waits on is one that can never come. Checked
+                # BEFORE the pre-hover, which would otherwise fly the cursor to a next object
+                # we are not going to mine.
+                if stop is not None and stop():
+                    debug_log.log(profile.key, f"stopping on {target.get('name')} -- no room "
+                                               f"for more ({_now() - t_click:.2f}s after the click)")
+                    return "full", nxt
                 # A resource landed, so the player is demonstrably standing at the object --
                 # the belt to arrival's braces, for an arrival signal we missed.
                 walking = False

@@ -1645,7 +1645,13 @@ def test_async_key_watchdog_fires_the_action_once_per_press(monkeypatch):
 
 # --- event-driven outcomes engine plumbing (2026-09-04) ------------------------------
 
-def test_subscribe_varbits_posts_csv_and_returns_the_bridge_answer(monkeypatch):
+def test_subscribe_varbits_sends_literal_commas_not_percent_encoded(monkeypatch):
+    """REGRESSION 2026-09-13: the CSV must reach the bridge with REAL commas. Passed through
+    requests' `params=`, each one is encoded as %2C, and BridgeHttpServer.parseQuery never
+    URL-decoded -- so the whole list arrived as one unparseable id, parseIds returned an empty
+    set, and every routine with two or more VARBIT_SUBSCRIPTIONS silently ran with varbit events
+    off (HTTP 200 and a well-formed reply throughout, so nothing warned). Measured cost: ladder
+    climbs spending their full 6s budget instead of returning on the varbit."""
     seen = {}
 
     def fake_get(path, params=None, timeout=0.3):
@@ -1654,8 +1660,10 @@ def test_subscribe_varbits_posts_csv_and_returns_the_bridge_answer(monkeypatch):
     monkeypatch.setattr(controller, "api_get", fake_get)
     controller._subscribe_warned = False
     assert controller.subscribe_varbits((13691, 5667)) == {"varbits": [5667, 13691], "varps": []}
-    assert seen["path"] == "/events/subscribe"
-    assert seen["params"] == {"varbits": "13691,5667", "varps": ""}
+    assert seen["path"] == "/events/subscribe?varbits=13691,5667&varps="
+    assert "%2C" not in seen["path"]
+    # The query rides in the path precisely so requests cannot re-encode it.
+    assert seen["params"] is None
 
 
 def test_subscribe_varbits_warns_once_when_the_bridge_lacks_the_endpoint(monkeypatch):

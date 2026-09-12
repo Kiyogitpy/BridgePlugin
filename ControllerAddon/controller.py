@@ -319,9 +319,22 @@ def subscribe_varbits(varbits=(), varps=()):
     /events/subscribe, EventsProvider.java). Empty clears. None when the bridge cannot answer
     (older client without the endpoint: logged once, varbit events simply stay off)."""
     global _subscribe_warned
-    params = {"varbits": ",".join(str(v) for v in varbits),
-              "varps": ",".join(str(v) for v in varps)}
-    result = api_get("/events/subscribe", params=params)
+    # The CSV goes in the PATH, not through requests' `params=`. CONFIRMED live 2026-09-13
+    # (user report, motherlode_mine climbs taking 11-12s): requests percent-encodes a comma as
+    # %2C, and BridgeHttpServer.parseQuery reads getRawQuery() and splits on &/= WITHOUT ever
+    # URL-decoding, so the bridge saw one unparseable id "5558%2C5556%2C2086" and
+    # EventSubscriptions.parseIds returned an EMPTY set -- silently, with HTTP 200 and a
+    # perfectly well-formed reply, so the "bridge has no /events/subscribe" warning below never
+    # fired either. Every routine subscribing to TWO OR MORE varbits has therefore been running
+    # with varbit events entirely off (a single id has no comma, so it worked and hid this):
+    # every await_pre on a VARBIT_CHANGED signal fell through to confirm()-at-the-deadline and
+    # spent its FULL budget. MEASURED: a ladder climb cost 11-12s against a 6s budget + walk.
+    # A literal comma is legal in a query string and survives BridgeHttpServer as-is, so this
+    # works on an un-rebuilt client too -- which the matching parseQuery URL-decode fix does
+    # not, needing ./gradlew.bat run first.
+    query = (f"?varbits={','.join(str(v) for v in varbits)}"
+             f"&varps={','.join(str(v) for v in varps)}")
+    result = api_get("/events/subscribe" + query)
     if result is None and not _subscribe_warned:
         _subscribe_warned = True
         debug_log.log("!", "bridge has no /events/subscribe -- VARBIT_CHANGED events are off "

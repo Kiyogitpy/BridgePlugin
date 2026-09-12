@@ -144,13 +144,38 @@ public class BridgeHttpServer
 			int idx = pair.indexOf('=');
 			if (idx > 0)
 			{
-				query.put(pair.substring(0, idx), pair.substring(idx + 1));
+				query.put(decode(pair.substring(0, idx)), decode(pair.substring(idx + 1)));
 			}
 			else
 			{
-				query.put(pair, "");
+				query.put(decode(pair), "");
 			}
 		}
 		return query;
+	}
+
+	/**
+	 * Percent-decode one query name/value. This read getRawQuery() and never decoded, which is
+	 * fine until a value legitimately contains an encoded character -- CONFIRMED live 2026-09-13:
+	 * Python's requests encodes a comma as %2C, so /events/subscribe?varbits=a%2Cb%2Cc reached
+	 * EventSubscriptions.parseIds as ONE unparseable token and every routine subscribing to two
+	 * or more varbits silently got an EMPTY subscription set (HTTP 200, well-formed reply, no
+	 * warning anywhere) and ran with varbit events off. A single id has no comma, which is why
+	 * this hid for so long. Applies to every registerQuery endpoint, not just that one -- any
+	 * value with a space, &, = or + was equally broken.
+	 *
+	 * Never throws: a malformed escape yields the raw text rather than a 500 on a query that
+	 * used to work.
+	 */
+	private static String decode(String s)
+	{
+		try
+		{
+			return java.net.URLDecoder.decode(s, StandardCharsets.UTF_8.name());
+		}
+		catch (Exception e)
+		{
+			return s;
+		}
 	}
 }

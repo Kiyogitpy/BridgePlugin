@@ -399,13 +399,34 @@ def test_arrival_at_a_far_target_rebases_the_idle_grace(scene, monkeypatch):
     a = _rock(1, 1, dist=6)
     scene.objects = [a]
     scene.readings = [(True, 5000, True), (True, 5000, True)]
-    monkeypatch.setattr(controller, "get_player",
-                        lambda: {"miningXp": scene.cur()[1], "x": 3000, "y": 3000, "moving": False})
-    ctx = make_ctx(scene.events([("PLAYER_STOPPED", {"x": 3005, "y": 3000, "plane": 0})] + [None] * 300))
+    # The player is WALKING on the first read and stopped from then on. It used to report
+    # moving=False on every read while still firing PLAYER_STOPPED -- a player that stops
+    # without ever having moved, which the game cannot produce. That mock is what let the
+    # premature-arrival bug through (see gather's confirm()): with it, "moving is False" on the
+    # very first read looked like arrival, which is exactly what happened live at 0.21s into a
+    # 6-tile walk.
+    # Several reads, because _outcome() reads the player too and would otherwise eat the only
+    # moving=True on its own before confirm() ever sees one.
+    reads = {"n": 0}
+
+    def _player():
+        reads["n"] += 1
+        return {"miningXp": scene.cur()[1], "x": 3000, "y": 3000, "moving": reads["n"] <= 2}
+
+    monkeypatch.setattr(controller, "get_player", _player)
+    # The stop lands a little way in, not on the very first pump: a 6-tile walk cannot already
+    # be over one poll after the click, and pretending it is was what made the old premature
+    # arrival look correct here.
+    ctx = make_ctx(scene.events([None] * 40
+                                + [("PLAYER_STOPPED", {"x": 3005, "y": 3000, "plane": 0})]
+                                + [None] * 300))
     outcome, _ = gathering.gather(P, ctx, a, ctx.state.config)
     assert outcome == "idle"
     elapsed = scene.now - 1000.0
-    assert gathering.IDLE_GRACE_S <= elapsed < 6 * gathering.WALK_S_PER_TILE + gathering.IDLE_GRACE_S
+    # Rebased on ARRIVAL: grace + confirm measured from the stop (plus the short walk before
+    # it), NOT from click + the whole 3.6s walk budget, which would come to 8.1s.
+    assert gathering.IDLE_GRACE_S <= elapsed < (gathering.IDLE_GRACE_S
+                                                + gathering.IDLE_CONFIRM_S + 1.0)
 
 
 # --- the fullInventory policy (2026-09-07) ----------------------------------------

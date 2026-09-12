@@ -605,7 +605,11 @@ def note_vein_failure(ctx, target, outcome):
     fails = data.setdefault("mlm_vein_fails", {})
     tile = gathering.target_tile(target)
     key = str(tile)
-    if outcome == "depleted":
+    # "full" is PROGRESS, not a failure: gather only returns it after a resource landed (see its
+    # `stop` parameter), so the vein is demonstrably working and we merely ran out of room. Left
+    # in the failure path it would put two strikes on a perfectly good vein and blacklist it for
+    # VEIN_BLOCK_S -- exactly the veins nearest the anchor, which fill us up the most often.
+    if outcome in ("depleted", "full"):
         fails.pop(key, None)
         return
     n = fails.get(key, 0) + 1
@@ -722,7 +726,8 @@ def mine_phase(ctx):
             return pick_vein(_ctx, reach2, flags2, exclude=excl)
 
         outcome, _next = gathering.gather(PROFILE, ctx, target, _vein_config(ctx),
-                                          exclude=worked, pick_next=_choose_next)
+                                          exclude=worked, pick_next=_choose_next,
+                                          stop=lambda: _allowance(ctx) <= 0)
         note_vein_failure(ctx, target, outcome)
         if outcome != "depleted":
             return          # hand back so the engine gets its safety/break turn
