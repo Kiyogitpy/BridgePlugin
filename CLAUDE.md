@@ -732,6 +732,33 @@ steps above.
 
 ## Known environment gotchas
 
+- **A bridge query value is only safe if it has no characters `requests` will percent-encode.**
+  `BridgeHttpServer.parseQuery` read `getRawQuery()` and split on `&`/`=` without ever
+  URL-decoding, so a `%2C` (what `requests` turns a comma into when you pass `params=`) arrived
+  literally. CONFIRMED live 2026-09-13: `subscribe_varbits` sent `varbits=5558%2C5556%2C2086`,
+  `EventSubscriptions.parseIds` found no separator and returned an **empty set** — so *every*
+  routine with two or more `VARBIT_SUBSCRIPTIONS` had been running with varbit events entirely
+  off, and one with a single id worked (no comma), which is what hid it for so long. It failed
+  **silently**: HTTP 200, a well-formed `{"varbits":[],"varps":[]}` reply, so the "bridge has no
+  /events/subscribe" warning never fired either. The cost is pure latency, never a wrong click —
+  which is exactly why nothing caught it: `await_pre` just falls through to `confirm()`-at-the-
+  deadline and spends its **full budget**. MEASURED: motherlode ladder climbs at 11–12s against a
+  6s budget, 5.7–6.0s once subscribed. `parseQuery` now decodes (fixes every `registerQuery`
+  endpoint — a space, `&`, `=` or `+` in any value was equally broken) but **that half needs a
+  client rebuild**; `subscribe_varbits` also puts its CSV in the path where `requests` cannot
+  re-encode it, which is what makes it work on an un-rebuilt client. Check
+  `GET /events/subscriptions` (plural — the read-only one) to see what the bridge actually holds.
+  **`GET /events/subscribe` with no params CLEARS the set**, so it is not a read.
+- **`get_dpi_scale()` caches for the process lifetime, and Windows lies about DPI until
+  `set_dpi_aware()` runs.** `LOGPIXELSX` reports a virtualized 96 to a DPI-unaware process, so any
+  caller that measures first locks the scale to 1.0 and leaves every bridge `screenX`/`screenY`
+  unscaled. CONFIRMED live 2026-09-13: `main()` ran `deob_guard.ensure()` — which makes its own
+  `api_get()`, and `api_get` ends in `_scale_screen_coords(..., get_dpi_scale())` — two lines
+  before `set_dpi_aware()`. On a 125% display every click then landed at 1/1.25 of the correct
+  offset (short, up-left) and routines read that as "the interaction did not register", retrying
+  forever on an object they were never touching. **Invisible at 100% scaling**, where 1.0 is right
+  anyway — so it only ever showed up on the laptop. `get_dpi_scale()` now calls `set_dpi_aware()`
+  itself before measuring; don't reintroduce a measurement that trusts statement order.
 - **Instanced areas break forward world-coordinate conversion — check for this first in any new
   provider that reads or writes a `WorldPoint`/`LocalPoint`.** Hit four separate times so far
   (`PlayerProvider`, `NPCProvider`, `ObjectProvider`, `GroundItemProvider`, all fixed 2026-08-14):
