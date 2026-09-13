@@ -160,6 +160,7 @@ VEIN_FAIL_LIMIT = 2         # clicks on one vein that produce nothing before it 
 VEIN_BLOCK_S = 60.0         # ...and for how long
 STALL_WARN_S = 90.0
 STALL_STOP_S = 240.0
+STALL_CHARGE_CAP_S = 15.0   # most one tick can add to the stall clock (see _stuck_watch)
 WALK_S_PER_TILE = 0.6
 
 DEFAULT_CONFIG = {
@@ -765,9 +766,33 @@ def climb(ctx, up) -> bool:
                            f"tiles off -- walking to it first")
         _walk_to_object(ctx, ladder, TILE_LADDER)
         return False
+    data = _d(ctx)
     mark = outcome_waits.mark(ctx)
-    if not controller.click_entity(ctx.ser, ladder, refresh_target=_refresh(ladder)):
-        return False
+    # NO SIMULATED MISCLICK ON A LADDER, and ESCALATE TO THE MENU once a bare click has already
+    # failed on it. MEASURED live 2026-09-13, a run that safety-stopped on "8 attempts to climb
+    # down and the floor never changed": the cascade opened with "Misclick -- aimed beside Ladder
+    # instead of on it", and a miss beside a ladder is a Walk-here that MOVES THE PLAYER -- after
+    # which the next seven clicks re-aimed at the same pixel (1047,703 three times over, plus
+    # "in place" repeats) and none of them registered. That is the bare-click hijack this file
+    # already records for golem_crafting's plinths: whatever is drawn over the pixel wins a left
+    # click, and re-clicking it cannot help, but a NAMED menu entry is immune to it. Same
+    # rationale as mining_guild_iron's no-misclick-on-rocks rule.
+    fails = data.get("mlm_climb_fails", 0)
+    if fails:
+        fresh = controller.get_object_at(ladder.get("x"), ladder.get("y"),
+                                         ladder.get("plane"), ladder.get("id")) or ladder
+        debug_log.log(LOG, f"bare click failed {fails}x -- taking the {LADDER_ACTION} menu entry")
+        clicked = controller.click_menu_action(ctx.ser, fresh, LADDER_ACTION, offset=(0, 0),
+                                               refresh_target=_refresh(fresh))
+    else:
+        clicked = controller.click_entity(ctx.ser, ladder, refresh_target=_refresh(ladder),
+                                          simulate_mistakes=False)
+    if not clicked:
+        # A click we could not even ISSUE still counts against the ceiling. Returning here
+        # without counting is an unbounded loop: the menu escalation above only runs once a
+        # failure is on record, so a ladder whose menu never opens would retry for ever with
+        # nothing incrementing -- which is exactly what the first draft of this did.
+        return _note_climb_failure(ctx, up, "the click could not be issued")
     # The wait EXTENDS WHILE THE PLAYER IS STILL MOVING, and only stillness past the budget
     # spends it. MEASURED live 2026-09-07 (mlm_live9): a climb reported "did not register" at
     # 11.4s and had plainly worked -- the next tick was already upstairs and mining. A
@@ -786,14 +811,20 @@ def climb(ctx, up) -> bool:
         if (controller.get_player() or {}).get("moving") is not True:
             break
         debug_log.log(LOG, f"still walking to the {'up' if up else 'down'} ladder -- waiting on")
-    data = _d(ctx)
     if arrived:
         debug_log.log(LOG, f"climbed {'up' if up else 'down'}")
         data["mlm_climb_fails"] = 0
         return True
+    return _note_climb_failure(ctx, up, "did not register")
+
+
+def _note_climb_failure(ctx, up, why) -> bool:
+    """Count one failed climb and stop the run at the ceiling. Always returns False, so every
+    caller can `return _note_climb_failure(...)`."""
+    data = _d(ctx)
     n = data.get("mlm_climb_fails", 0) + 1
     data["mlm_climb_fails"] = n
-    debug_log.log(LOG, f"the climb {'up' if up else 'down'} did not register ({n})")
+    debug_log.log(LOG, f"the climb {'up' if up else 'down'} {why} ({n})")
     if n >= CLIMB_MAX_TRIES:
         ctx.state.trigger_safety_stop(
             f"motherlode: {n} attempts to climb {'up' if up else 'down'} and the floor never "
@@ -1123,13 +1154,29 @@ def _progress_signature(ctx, phase):
 
 def _stuck_watch(ctx, phase):
     data = _d(ctx)
+    now = _now()
+    # THE STALL CLOCK ONLY COUNTS TIME THE ROUTINE WAS ACTUALLY RUNNING, so it ACCUMULATES per
+    # tick with a cap instead of reading a wall-clock difference. tick() is not called while the
+    # window is unfocused, during a break, or while paused -- the engine parks in all three BY
+    # DESIGN. MEASURED live 2026-09-13: the window sat unfocused for five minutes and the very
+    # first tick after it came back measured a 315s stall and safety-stopped a healthy run
+    # ("nothing changed for 315s in the hopper phase"). Charging at most STALL_CHARGE_CAP_S per
+    # tick makes that park cost one tick's worth instead of the whole five minutes, while a
+    # genuinely wedged routine -- which keeps ticking, roughly every 10s in the failing-climb
+    # case that prompted this -- still accumulates at full speed and stops on time. A plain
+    # "re-seed on a long gap" rule cannot do both: a slow-but-healthy tick and a park are the
+    # same gap, and this loop legitimately runs 45s+ per iteration while mining.
+    last = data.get("mlm_tick_at")
+    data["mlm_tick_at"] = now
     signature = _progress_signature(ctx, phase)
     if signature != data.get("mlm_sig"):
         data["mlm_sig"] = signature
-        data["mlm_sig_at"] = _now()
+        data["mlm_stalled"] = 0.0
         data.pop("mlm_warned", None)
         return
-    stalled = _now() - (data.get("mlm_sig_at") or _now())
+    if last is not None:
+        data["mlm_stalled"] = data.get("mlm_stalled", 0.0) + min(now - last, STALL_CHARGE_CAP_S)
+    stalled = data.get("mlm_stalled", 0.0)
     if stalled >= STALL_STOP_S:
         ctx.state.trigger_safety_stop(
             f"motherlode: nothing changed for {stalled:.0f}s in the {phase} phase")

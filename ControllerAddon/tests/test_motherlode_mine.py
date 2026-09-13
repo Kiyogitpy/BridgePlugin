@@ -469,11 +469,25 @@ def test_an_empty_first_read_is_retried_rather_than_stopped(monkeypatch):
 # --- the stuck watch ----------------------------------------------------------------------
 
 def test_the_stuck_watch_stops_a_wedged_run(_hermetic):
+    # A wedged routine keeps TICKING -- the failing-climb run that prompted this ticked about
+    # every 10s -- so the stall is accumulated tick by tick, not read off one clock jump.
     ctx = _Ctx()
     mlm._stuck_watch(ctx, "mine")
-    _hermetic.t += mlm.STALL_STOP_S + 1
-    mlm._stuck_watch(ctx, "mine")
+    for _ in range(int(mlm.STALL_STOP_S / 10) + 2):
+        _hermetic.t += 10
+        mlm._stuck_watch(ctx, "mine")
     assert ctx.state.safety_stopped is True
+
+
+def test_a_long_unfocused_gap_is_not_charged_to_the_stall_watch(_hermetic):
+    """REGRESSION 2026-09-13: the window sat unfocused for five minutes and the first tick back
+    safety-stopped a healthy run with "nothing changed for 315s". tick() is not called while
+    unfocused, on a break, or paused, so that time was never the routine's to be charged for."""
+    ctx = _Ctx()
+    mlm._stuck_watch(ctx, "mine")
+    _hermetic.t += mlm.STALL_STOP_S + 75      # a 5-minute park, as one gap
+    mlm._stuck_watch(ctx, "mine")
+    assert ctx.state.safety_stopped is False
 
 
 def test_progress_resets_the_stuck_watch(_hermetic, monkeypatch):

@@ -407,11 +407,13 @@ def test_arrival_at_a_far_target_rebases_the_idle_grace(scene, monkeypatch):
     # 6-tile walk.
     # Several reads, because _outcome() reads the player too and would otherwise eat the only
     # moving=True on its own before confirm() ever sees one.
+    # ...and ends up STANDING NEXT TO the rock at (1,1), which is what arrival actually means.
+    # It used to report x=3000,y=3000 -- nowhere near the target it had supposedly arrived at.
     reads = {"n": 0}
 
     def _player():
         reads["n"] += 1
-        return {"miningXp": scene.cur()[1], "x": 3000, "y": 3000, "moving": reads["n"] <= 2}
+        return {"miningXp": scene.cur()[1], "x": 2, "y": 1, "moving": reads["n"] <= 2}
 
     monkeypatch.setattr(controller, "get_player", _player)
     # The stop lands a little way in, not on the very first pump: a 6-tile walk cannot already
@@ -423,8 +425,9 @@ def test_arrival_at_a_far_target_rebases_the_idle_grace(scene, monkeypatch):
     outcome, _ = gathering.gather(P, ctx, a, ctx.state.config)
     assert outcome == "idle"
     elapsed = scene.now - 1000.0
-    # Rebased on ARRIVAL: grace + confirm measured from the stop (plus the short walk before
-    # it), NOT from click + the whole 3.6s walk budget, which would come to 8.1s.
+    # Rebased on ARRIVAL (~0.8s in, where the stop lands): grace + confirm run from there, so
+    # ~5.3s. NOT from click + the whole 3.6s walk budget, which would come to 8.1s. The 1.0s of
+    # slack is the walk before the stop; the point of the bound is to sit well under 8.1.
     assert gathering.IDLE_GRACE_S <= elapsed < (gathering.IDLE_GRACE_S
                                                 + gathering.IDLE_CONFIRM_S + 1.0)
 

@@ -78,6 +78,7 @@ FALLBACK_POLL_S = 0.25    # idle-check cadence past the grace; also the HTTP-onl
 GATHER_BUDGET_S = 12.0    # nothing gained and no depletion for this long (plus the walk) -> re-pick
 WALK_S_PER_TILE = 0.6     # a queued interaction is performed on ARRIVAL: budget the walk
 GAME_TICK_S = bridge_events.GAME_TICK_MS / 1000.0   # the server tick a queued click waits for
+ARRIVAL_TILES = 2         # standing this close to the target counts as arrived (see confirm())
 IDLE_GRACE_S = 1.5        # idle with no progress past this (plus the walk) -> the click failed
 # ...but only if the idle SUSTAINS for this long. An animation trough between two swings is not
 # idleness: MEASURED live 2026-09-07 in the Motherlode Mine over 45s of uninterrupted, XP-earning
@@ -323,11 +324,26 @@ def gather(profile, ctx, target, config, exclude=(), pick_next=None, stop=None):
         # to catch between polls) from waiting out the whole budget.
         if not walking:
             return None
-        moving = (controller.get_player() or {}).get("moving")
+        p = controller.get_player() or {}
+        moving = p.get("moving")
         if moving is True:
             seen_moving = True
             return None
-        if moving is False and (seen_moving or _now() - t_click >= GAME_TICK_S):
+        if moving is not False:
+            return None
+        # POSITION is the definitive arrival test; `moving` alone is not. MEASURED live
+        # 2026-09-13, after the first pass at this: "arrived at Ore vein (0.49s after the click)"
+        # on a dist=3 vein, which is three tiles in half a second. OSRS movement is tile-stepped,
+        # so /player.moving reads False in the gaps BETWEEN steps as well as at the end of the
+        # walk -- a brief True followed by a False is not proof of arrival, it is proof of one
+        # step. Standing next to the target is proof. The walk-time fallback keeps an object
+        # whose footprint means we never get within ARRIVAL_TILES (or a routine that works it
+        # from range) from waiting out the whole budget instead.
+        tx, ty, _tplane = target_tile(target)
+        px, py = p.get("x"), p.get("y")
+        near = (px is not None and tx is not None
+                and max(abs(px - tx), abs(py - ty)) <= ARRIVAL_TILES)
+        if near or _now() - t_click >= walk_s:
             return "arrived"
         return None
 
