@@ -491,6 +491,47 @@ def test_a_worn_hammer_still_uses_the_one_click_deposit(monkeypatch):
     assert called == ["all"]
 
 
+def _broken_strut(dist=1):
+    return {"id": mlm.BROKEN_STRUT_ID, "name": "Broken strut", "actions": ["Hammer"],
+            "x": 3742, "y": 5663, "plane": 0, "distance": dist,
+            "screenX": 500, "screenY": 400, "tileHeight": 0}
+
+
+def test_a_broken_strut_in_view_starts_the_patience_clock_without_the_chat_line(monkeypatch,
+                                                                                _hermetic):
+    """USER 2026-09-13: "still not fixing the strutt". mlm_broken_since was only ever set from
+    the chat line announcing the break, so a machine ALREADY broken when the run started -- or
+    broken while unfocused or on a break -- could never be repaired, however long we stood next
+    to it. The object itself is the evidence."""
+    ctx = _Ctx()
+    ctx.state.data["mlm_hammer"] = True
+    monkeypatch.setattr(controller, "get_varbit", lambda vid, **kw: 0)   # downstairs
+    monkeypatch.setattr(mlm, "_objects", lambda **kw: [_broken_strut()])
+    assert "mlm_broken_since" not in ctx.state.data
+    mlm._maybe_repair(ctx)                       # no chat has ever fired
+    assert ctx.state.data.get("mlm_broken_since") is not None
+
+
+def test_the_hopper_trip_can_repair_so_a_break_cannot_deadlock_the_run(monkeypatch, _hermetic):
+    """A broken machine stops the SACK filling; collect_phase only runs when there is a sack
+    worth draining; and _maybe_repair used to be reachable ONLY from collect_phase. So a break
+    deadlocked the run -- no repair meant no sack, and no sack meant no trip to repair from."""
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_varbit", lambda vid, **kw: 0)   # downstairs
+    monkeypatch.setattr(mlm, "_hopper_candidates",
+                        lambda c: [{"id": mlm.HOPPER_ID, "name": "Hopper", "distance": 1,
+                                    "x": 3748, "y": 5672, "plane": 0,
+                                    "screenX": 500, "screenY": 400}])
+    monkeypatch.setattr(mlm, "_held_paydirt", lambda items=None: 27 if not called else 0)
+    monkeypatch.setattr(mlm, "too_far", lambda o: False)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(mlm.outcome_waits, "await_pre", lambda *a, **k: True)
+    called = []
+    monkeypatch.setattr(mlm, "_maybe_repair", lambda c: called.append("repair") or False)
+    mlm.hopper_phase(ctx)
+    assert called == ["repair"], "the hopper trip must be able to repair"
+
+
 def test_an_empty_first_read_is_retried_rather_than_stopped(monkeypatch):
     # The first logged-in tick after an auto-login serves nothing -- run 47's GOTR lesson.
     ctx = _Ctx()

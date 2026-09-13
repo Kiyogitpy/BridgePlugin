@@ -908,6 +908,14 @@ def hopper_phase(ctx) -> bool:
         data["mlm_pending_at"] = _now()
         debug_log.log(LOG, f"deposited {held} pay-dirt at the "
                            f"{'upper' if upper else 'lower'} hopper")
+        # REPAIR FROM HERE TOO, not only from collect_phase. A broken machine stops the SACK
+        # filling, collect_phase only runs when there is a sack worth draining, and _maybe_repair
+        # used to be called from collect_phase alone -- so a break deadlocked the run: no repair
+        # meant no sack, and no sack meant no collect trip to repair from. This is the one place
+        # we are reliably downstairs (every single inventory) with empty hands, which is exactly
+        # when a repair is cheapest.
+        if not upper:
+            _maybe_repair(ctx)
         return True
     if upper and not _d(ctx).get("mlm_upper_locked"):
         # Pay-dirt still in hand after clicking the upstairs hopper: it is the locked one.
@@ -1141,14 +1149,28 @@ def _maybe_repair(ctx) -> bool:
     """True when this tick was spent repairing. Only ever runs downstairs, where the struts are,
     and only once a broken machine has actually cost us -- see repair_due."""
     config = ctx.state.config or {}
-    if not repair_due(_d(ctx).get("mlm_broken_since"), bool(_d(ctx).get("mlm_hammer")),
+    data = _d(ctx)
+    # THE BROKEN STRUT ITSELF IS THE EVIDENCE, not just the chat line announcing it. USER
+    # 2026-09-13: "still not fixing the strutt". mlm_broken_since was set ONLY from
+    # BROKEN_CHAT ("will need to be repaired"), and repair_due answers False without it -- so a
+    # machine that was ALREADY broken when the run started, or that broke while the window was
+    # unfocused or during a break, could never be repaired however long we stood next to it.
+    # MEASURED live: "Broken strut id=26670 actions=['Hammer']" eleven tiles away, with the
+    # routine mining happily past it and the sack not filling. The object's presence is ground
+    # truth; the chat is just the faster notification of it. Dating it from FIRST SIGHT keeps
+    # repairPatienceS meaning what it says -- leave it for other players for a while first --
+    # rather than repairing the instant we log in next to one.
+    strut = next((o for o in _objects(ids={BROKEN_STRUT_ID}, action=STRUT_ACTION)
+                  if same_floor(o, _upstairs())), None)
+    if strut is not None and not data.get("mlm_broken_since"):
+        data["mlm_broken_since"] = _now()
+        debug_log.log(LOG, "a broken strut is in view -- starting the repair patience clock")
+    if not repair_due(data.get("mlm_broken_since"), bool(data.get("mlm_hammer")),
                       float(config.get("repairPatienceS", DEFAULT_CONFIG["repairPatienceS"])),
                       _now()):
         return False
-    strut = next((o for o in _objects(ids={BROKEN_STRUT_ID}, action=STRUT_ACTION)
-                  if same_floor(o, _upstairs())), None)
     if strut is None:
-        _d(ctx).pop("mlm_broken_since", None)       # someone else got there first
+        data.pop("mlm_broken_since", None)          # someone else got there first
         return False
     tile = (strut.get("x"), strut.get("y"), strut.get("plane", 0))
     mark = outcome_waits.mark(ctx)
