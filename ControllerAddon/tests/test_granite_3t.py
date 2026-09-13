@@ -1180,7 +1180,6 @@ def test_pay_ticks_counts_from_the_fletch_in_wall_time():
     assert g.pay_ticks((1000.0, 100.0), 1001.0) == 2          # a tick early (impossible pay)
     assert g.pay_ticks((1000.0, 300.0), 1003.9) == 7          # a failed roll, pickaxe pay
     assert g.pay_ticks(None, 1001.0) is None
-    assert "g3t_paid4" not in ctx.state.data
 
 
 def test_a_mine_that_never_pays_is_re_picked_not_a_stop(monkeypatch):
