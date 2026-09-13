@@ -44,6 +44,14 @@ BAD_LINE = re.compile(
     re.IGNORECASE,
 )
 
+# A SAFETY STOP LEAVES THE PROCESS ALIVE AND PERMANENTLY IDLE, which --restart cannot see: it
+# only watches for the process dying. MEASURED 2026-09-13: a motherlode run safety-stopped at
+# 02:59 and sat there until 08:03 -- five hours, 600 "Still stopped" lines, the watchdog having
+# correctly ALERTED within 15s and then been unable to do anything about it. Recovery is opt-in
+# and CAPPED, because a safety stop can be perfectly correct (no pickaxe, a PvP threat) and
+# restarting into the same condition would be a loop, not a fix.
+SAFETY_STOP = re.compile(r"Safety stop:", re.IGNORECASE)
+
 
 def log_alert(path, msg):
     stamp = time.strftime("%H:%M:%S")
@@ -54,6 +62,37 @@ def log_alert(path, msg):
             fh.write(line + "\n")
     except OSError:
         pass
+
+
+def kill_controller():
+    """Stop every controller.py process, so a relaunch cannot end up with two of them fighting
+    over the one serial port."""
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name = 'python.exe'\" | "
+             "Where-Object { $_.CommandLine -like '*controller.py*' } | "
+             "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
+            capture_output=True, text=True, timeout=30)
+        return True
+    except Exception:
+        return False
+
+
+def relaunch(args, alerts):
+    """Start controller.py again, appending to the same log. Sleeps afterwards so the new
+    process has claimed the serial port before anything checks whether it is running."""
+    try:
+        with open(args.log, "a", encoding="utf-8") as out:
+            subprocess.Popen(
+                [sys.executable, "-u", "controller.py", args.routine, "--debug-log"],
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                stdout=out, stderr=subprocess.STDOUT)
+        time.sleep(20)
+        return True
+    except Exception as exc:
+        log_alert(alerts, f"ALERT restart failed: {exc}")
+        return False
 
 
 def controller_running():
@@ -96,6 +135,9 @@ def main():
                     help="alert when total XP has not moved for this long (default 300)")
     ap.add_argument("--restart", action="store_true",
                     help="relaunch controller.py if the process disappears")
+    ap.add_argument("--recover-safety-stops", type=int, default=0, metavar="N",
+                    help="also restart after a safety stop, at most N times (0 = never). A stop "
+                         "leaves the process alive but idle, which --restart cannot see.")
     ap.add_argument("--routine", default="routines/motherlode_mine.py")
     args = ap.parse_args()
 
@@ -112,6 +154,8 @@ def main():
     warned_down = False
     warned_bridge = False
     warned_focus = False
+    recoveries = 0
+    stopped_at = None
 
     while True:
         # --- the log ------------------------------------------------------------------
@@ -127,6 +171,21 @@ def main():
                 for line in chunk.splitlines():
                     if BAD_LINE.search(line):
                         log_alert(alerts, "ALERT log: " + line.strip()[:200])
+                    if SAFETY_STOP.search(line):
+                        stopped_at = time.monotonic()
+                        if recoveries < args.recover_safety_stops:
+                            recoveries += 1
+                            log_alert(alerts, f"recovering from the safety stop "
+                                              f"({recoveries}/{args.recover_safety_stops}) -- "
+                                              f"restarting {args.routine}")
+                            kill_controller()
+                            time.sleep(3)
+                            relaunch(args, alerts)
+                            pos = os.path.getsize(args.log)   # skip the pre-restart backlog
+                            break
+                        elif args.recover_safety_stops:
+                            log_alert(alerts, "ALERT safety stop, and the recovery budget is "
+                                              "spent -- leaving it stopped for a human")
         except OSError:
             pass
 
@@ -167,16 +226,8 @@ def main():
                 log_alert(alerts, "ALERT controller.py is NOT running")
             if args.restart:
                 log_alert(alerts, f"restarting {args.routine}")
-                try:
-                    with open(args.log, "a", encoding="utf-8") as out:
-                        subprocess.Popen(
-                            [sys.executable, "-u", "controller.py", args.routine, "--debug-log"],
-                            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            stdout=out, stderr=subprocess.STDOUT)
-                    time.sleep(20)           # let it claim the serial port before re-checking
+                if relaunch(args, alerts):
                     warned_down = False
-                except Exception as exc:
-                    log_alert(alerts, f"ALERT restart failed: {exc}")
         elif warned_down:
             warned_down = False
             log_alert(alerts, "OK controller.py running again")

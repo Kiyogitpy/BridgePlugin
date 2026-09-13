@@ -300,6 +300,18 @@ def _count(items, needle) -> int:
     return sum(1 for i in items if needle in (i.get("name") or "").lower())
 
 
+def _worn_items():
+    """Worn items as a LIST.
+
+    `/equipment` is a DICT KEYED BY SLOT, not a list -- iterating it yields slot NAMES, so a
+    naive membership test contributes nothing from equipment and a name lookup raises on a str.
+    teleports._item_rows records the same trap, found the same way."""
+    worn = controller.get_equipment() or {}
+    if isinstance(worn, dict):
+        return [v for v in worn.values() if isinstance(v, dict)]
+    return [i for i in worn if isinstance(i, dict)]
+
+
 def _held_paydirt(items=None) -> int:
     return _count(_inventory() if items is None else items, PAYDIRT_NAME)
 
@@ -546,10 +558,22 @@ def _startup_ok(ctx) -> bool:
         ctx.state.trigger_safety_stop(
             f"motherlode: start inside the Motherlode Mine (region {REGION}, saw {region})")
         return False
-    data["mlm_hammer"] = _count(items, HAMMER_NAME) > 0
+    # A HAMMER COUNTS WHEREVER IT IS. USER 2026-09-13: "we carry hammer but not in equipment its
+    # in equipment" -- an Imcando hammer is worn, and this only ever looked at the inventory, so
+    # it reported "no hammer carried" and turned repairs off on an account that could repair.
+    # The two uses are NOT the same question, hence two keys: repairing needs a hammer ANYWHERE,
+    # while the deposit only cares whether one is in the INVENTORY, because that is the only case
+    # where "Deposit inventory" would bank it (_deposit_each_ore is the slower per-stack path we
+    # take purely to avoid that).
+    in_inventory = _count(items, HAMMER_NAME) > 0
+    data["mlm_hammer_in_inventory"] = in_inventory
+    data["mlm_hammer"] = in_inventory or _count(_worn_items(), HAMMER_NAME) > 0
     if not data["mlm_hammer"]:
-        debug_log.log(LOG, "no hammer carried -- strut repairs are off for this run; a broken "
-                           "machine will be left for other players")
+        debug_log.log(LOG, "no hammer carried or worn -- strut repairs are off for this run; a "
+                           "broken machine will be left for other players")
+    elif not in_inventory:
+        debug_log.log(LOG, "hammer is WORN -- repairs are on, and the deposit can stay on the "
+                           "one-click Deposit inventory")
     if data.get("mlm_anchor") is None:
         setup(ctx)
     sack, _effective, capacity = sack_state(ctx)
@@ -1051,7 +1075,10 @@ def bank_phase(ctx) -> bool:
     if not _open_deposit_box(ctx):
         return False
     had_gem_sack = _count(_inventory(), GEM_SACK_NAME) > 0
-    ok = _deposit_each_ore(ctx) if _d(ctx).get("mlm_hammer") else _deposit_inventory(ctx)
+    # Keyed on the hammer being in the INVENTORY, not merely owned: a WORN hammer is not at risk
+    # from "Deposit inventory", so it must not cost us the slower per-stack path.
+    ok = (_deposit_each_ore(ctx) if _d(ctx).get("mlm_hammer_in_inventory")
+          else _deposit_inventory(ctx))
     if ok and had_gem_sack and _count(_inventory(), GEM_SACK_NAME) == 0:
         debug_log.log(LOG, "[!] the open gem sack was banked -- the deposit box's Deposit Lock "
                            "is no longer set on it")

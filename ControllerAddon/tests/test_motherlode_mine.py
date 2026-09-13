@@ -393,6 +393,7 @@ def test_a_carried_hammer_switches_to_per_item_deposits(monkeypatch):
     # Deposit-inventory would bank the hammer; per-item Deposit-All cannot.
     ctx = _Ctx()
     ctx.state.data["mlm_hammer"] = True
+    ctx.state.data["mlm_hammer_in_inventory"] = True
     _standing(monkeypatch, DOWNSTAIRS_H)
     monkeypatch.setattr(controller, "get_inventory", lambda: _items("Hammer", "Coal"))
     monkeypatch.setattr(mlm, "_open_deposit_box", lambda c: True)
@@ -453,6 +454,36 @@ def test_a_missing_hammer_only_turns_repairs_off(monkeypatch):
     assert mlm._startup_ok(ctx) is True
     assert ctx.state.safety_stopped is False
     assert ctx.state.data["mlm_hammer"] is False
+
+
+def test_a_worn_hammer_enables_repairs_and_keeps_the_one_click_deposit(monkeypatch):
+    """USER 2026-09-13: "we carry hammer but not in inventory its in equipment". An Imcando
+    hammer is WORN, and the check only read the inventory -- so repairs were off on an account
+    that could repair. /equipment is a dict keyed by SLOT, so it also has to be unwrapped."""
+    ctx = _Ctx()
+    monkeypatch.setattr(controller, "get_inventory", lambda: _items("Open gem sack"))
+    monkeypatch.setattr(controller, "get_equipment",
+                        lambda: {"WEAPON": {"name": "Imcando hammer"},
+                                 "HEAD": {"name": "Prospector helmet"}})
+    assert mlm._startup_ok(ctx) is True
+    assert ctx.state.data["mlm_hammer"] is True             # repairs ON
+    # ...but the deposit must NOT fall to the slow per-stack path: a worn hammer is not at risk
+    # from "Deposit inventory".
+    assert ctx.state.data["mlm_hammer_in_inventory"] is False
+
+
+def test_a_worn_hammer_still_uses_the_one_click_deposit(monkeypatch):
+    ctx = _Ctx()
+    ctx.state.data["mlm_hammer"] = True                      # owned...
+    ctx.state.data["mlm_hammer_in_inventory"] = False        # ...but worn
+    _standing(monkeypatch, DOWNSTAIRS_H)
+    monkeypatch.setattr(controller, "get_inventory", lambda: _items("Coal"))
+    monkeypatch.setattr(mlm, "_open_deposit_box", lambda c: True)
+    called = []
+    monkeypatch.setattr(mlm, "_deposit_each_ore", lambda c: called.append("each") or True)
+    monkeypatch.setattr(mlm, "_deposit_inventory", lambda c: called.append("all") or True)
+    mlm.bank_phase(ctx)
+    assert called == ["all"]
 
 
 def test_an_empty_first_read_is_retried_rather_than_stopped(monkeypatch):
