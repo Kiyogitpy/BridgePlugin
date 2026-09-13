@@ -111,6 +111,16 @@ PICKAXE_NAME = "pickaxe"
 KEEP_ITEMS = (PICKAXE_NAME, HAMMER_NAME, GEM_SACK_NAME)
 
 BROKEN_CHAT = "will need to be repaired"
+# The hopper's own refusal, MEASURED live 2026-09-13 at widget 193.2: "You've already got some
+# pay-dirt in the machine. You can put more in once the last batch comes out." It is NOT the
+# group-229 continue box this file records elsewhere, and /state.dialogOpen does not see it
+# either -- the text has to be read off the widget. USER: "you cant deposit if we have ore in
+# the waterway without repairing the strut", and "sack never moves only ore". So this message is
+# PROOF the machine is stalled, which is exactly the "we cant deposit our ore" condition the
+# repair rule was always written around -- it bypasses repairPatienceS rather than waiting it out.
+MACHINE_BUSY_GROUP = 193
+MACHINE_BUSY_CHILD = 2
+MACHINE_BUSY_TEXT = "already got some pay-dirt in the machine"
 # The game's own refusal, and the AUTHORITATIVE "stop mining" signal. MEASURED live 2026-09-07
 # (mlm_live7) from a frame dump, after every click had been dying silently for two minutes: a
 # "Click here to continue" box reading "Your sack will be full once your current dirt is
@@ -917,6 +927,16 @@ def hopper_phase(ctx) -> bool:
         if not upper:
             _maybe_repair(ctx)
         return True
+    # THE REFUSAL IS DIAGNOSTIC, so read it instead of re-clicking through it. MEASURED live
+    # 2026-09-13: the hopper answered "You've already got some pay-dirt in the machine" on every
+    # click, the engine's stray-dialogue check Spaced the box away, and the routine clicked again
+    # -- for minutes, with the sack frozen (USER: "sack never moves only ore") because a broken
+    # strut had stopped the waterway. Repairing is the only thing that can clear it, and waiting
+    # out repairPatienceS here is precisely backwards: we are the ones being blocked.
+    if not upper and _machine_blocked():
+        debug_log.log(LOG, "the hopper says the last batch is still in the machine")
+        if _maybe_repair(ctx, urgent=True):
+            return False
     if upper and not _d(ctx).get("mlm_upper_locked"):
         # Pay-dirt still in hand after clicking the upstairs hopper: it is the locked one.
         _d(ctx)["mlm_upper_locked"] = True
@@ -1145,9 +1165,20 @@ def _return_to_anchor(ctx):
 
 # --- repairs -------------------------------------------------------------------------------------------------
 
-def _maybe_repair(ctx) -> bool:
+def _machine_blocked() -> bool:
+    """Is the hopper refusing because the last batch has not come out? See MACHINE_BUSY_TEXT."""
+    text = (controller.get_widget(MACHINE_BUSY_GROUP, MACHINE_BUSY_CHILD) or {}).get("text") or ""
+    return MACHINE_BUSY_TEXT in text.lower()
+
+
+def _maybe_repair(ctx, urgent=False) -> bool:
     """True when this tick was spent repairing. Only ever runs downstairs, where the struts are,
-    and only once a broken machine has actually cost us -- see repair_due."""
+    and only once a broken machine has actually cost us -- see repair_due.
+
+    `urgent` skips the patience entirely. It is set when the hopper has just told us it cannot
+    take the pay-dirt until the last batch comes out: at that point the broken machine is no
+    longer somebody else's problem to fix eventually, it is the thing standing between us and
+    depositing, which is the one case the patience rule always meant to exclude."""
     config = ctx.state.config or {}
     data = _d(ctx)
     # THE BROKEN STRUT ITSELF IS THE EVIDENCE, not just the chat line announcing it. USER
@@ -1165,9 +1196,12 @@ def _maybe_repair(ctx) -> bool:
     if strut is not None and not data.get("mlm_broken_since"):
         data["mlm_broken_since"] = _now()
         debug_log.log(LOG, "a broken strut is in view -- starting the repair patience clock")
-    if not repair_due(data.get("mlm_broken_since"), bool(data.get("mlm_hammer")),
-                      float(config.get("repairPatienceS", DEFAULT_CONFIG["repairPatienceS"])),
-                      _now()):
+    if urgent and strut is not None and data.get("mlm_hammer"):
+        debug_log.log(LOG, "the machine is blocked and a strut is broken -- repairing NOW, "
+                           "patience does not apply when we cannot deposit")
+    elif not repair_due(data.get("mlm_broken_since"), bool(data.get("mlm_hammer")),
+                        float(config.get("repairPatienceS", DEFAULT_CONFIG["repairPatienceS"])),
+                        _now()):
         return False
     if strut is None:
         data.pop("mlm_broken_since", None)          # someone else got there first

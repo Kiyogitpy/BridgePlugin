@@ -532,6 +532,34 @@ def test_the_hopper_trip_can_repair_so_a_break_cannot_deadlock_the_run(monkeypat
     assert called == ["repair"], "the hopper trip must be able to repair"
 
 
+def test_a_blocked_machine_repairs_immediately_instead_of_reclicking(monkeypatch, _hermetic):
+    """MEASURED live 2026-09-13: the hopper answered "You've already got some pay-dirt in the
+    machine" on every click, the engine Spaced the box away, and the routine clicked again for
+    minutes with the sack frozen -- a broken strut had stopped the waterway. USER: "you cant
+    deposit if we have ore in the waterway without repairing the strut". Waiting out
+    repairPatienceS here is backwards: we are the ones being blocked."""
+    ctx = _Ctx()
+    ctx.state.data["mlm_hammer"] = True
+    monkeypatch.setattr(controller, "get_varbit", lambda vid, **kw: 0)      # downstairs
+    monkeypatch.setattr(mlm, "_held_paydirt", lambda items=None: 27)
+    monkeypatch.setattr(mlm, "_hopper_candidates",
+                        lambda c: [{"id": mlm.HOPPER_ID, "name": "Hopper", "distance": 1,
+                                    "x": 3748, "y": 5672, "plane": 0,
+                                    "screenX": 500, "screenY": 400}])
+    monkeypatch.setattr(mlm, "too_far", lambda o: False)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(mlm.outcome_waits, "await_pre", lambda *a, **k: False)   # deposit refused
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda g, c, **kw: {"text": "You've already got some pay-dirt in the "
+                                                    "machine."} if g == mlm.MACHINE_BUSY_GROUP
+                        else {})
+    repairs = []
+    monkeypatch.setattr(mlm, "_maybe_repair",
+                        lambda c, urgent=False: repairs.append(urgent) or True)
+    mlm.hopper_phase(ctx)
+    assert repairs == [True], "a blocked machine must trigger an URGENT repair, not another click"
+
+
 def test_an_empty_first_read_is_retried_rather_than_stopped(monkeypatch):
     # The first logged-in tick after an auto-login serves nothing -- run 47's GOTR lesson.
     ctx = _Ctx()
