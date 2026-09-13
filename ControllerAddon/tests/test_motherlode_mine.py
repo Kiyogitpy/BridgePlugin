@@ -60,6 +60,11 @@ def _hermetic(monkeypatch):
     monkeypatch.setattr(mlm, "_sleep", clock.sleep)
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
     monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [])
+    # Nothing worn by default. Without this the hammer check reaches the RUNNING CLIENT, so
+    # test_a_missing_hammer_only_turns_repairs_off passed or failed depending on what the
+    # account happened to have equipped -- it went red the moment a real Imcando hammer was
+    # worn. Same hermeticity rule test_banker.py's _no_live_bridge already applies.
+    monkeypatch.setattr(controller, "get_equipment", lambda: {})
     # Upstairs by default: varbit 2086 is the PLAYER's floor (exact, no rebuild needed) and
     # tileHeight is the OBJECT's, so the two have to agree in a fixture as they do live.
     monkeypatch.setattr(controller, "get_varbit",
