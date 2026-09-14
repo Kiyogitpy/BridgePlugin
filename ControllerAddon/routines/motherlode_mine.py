@@ -166,6 +166,9 @@ DEPOSIT_MAX_STACKS = 10
 CLOSE_TRIES = 3
 NO_VEIN_STOP = 40
 ANCHOR_TOLERANCE = 6        # further than this from the anchor and we walk back before mining
+ANCHOR_DIRECT_WALK_TILES = 14   # within this, click the anchor rather than ask the router
+                                # (worldmap cannot route this mine's upper floor -- see
+                                # _return_to_anchor)
 VEIN_FAIL_LIMIT = 2         # clicks on one vein that produce nothing before it is set aside
 VEIN_BLOCK_S = 60.0         # ...and for how long
 STALL_WARN_S = 90.0
@@ -1170,6 +1173,24 @@ def _return_to_anchor(ctx):
         return
     if _d(ctx).get("mlm_anchor_upstairs", True) and not climb(ctx, up=True):
         return
+    # THE STATIC MAP CANNOT ROUTE THE UPPER FLOOR OF THIS MINE, so a short walk back is clicked
+    # directly rather than asked for. CLAUDE.md records why: the upper level sits DIRECTLY ABOVE
+    # the lower one at the same x/y and the same plane 0, so worldmap holds one set of collision
+    # data for both and it describes the DOWNSTAIRS layout. MEASURED live 2026-09-14: the player
+    # drifted to (3759,5683), seven tiles from the anchor at (3752,5680) and so outside
+    # ANCHOR_TOLERANCE, and every tick then logged "no walking route to (3752,5680) -- not
+    # attempting the walk" -- about twice a second for four minutes, until the stall watch
+    # safety-stopped the run. The anchor is a handful of tiles away and in plain view at that
+    # point, which is exactly the case walk_to_exact_tile handles without a router.
+    here = _player_tile() or {}
+    if here.get("x") is not None:
+        gap = max(abs(here["x"] - anchor["x"]), abs(here["y"] - anchor["y"]))
+        if gap <= ANCHOR_DIRECT_WALK_TILES:
+            if travel.walk_to_exact_tile(ctx, anchor["x"], anchor["y"],
+                                         anchor.get("plane", here.get("plane", 0))):
+                return
+            debug_log.log(LOG, f"direct walk back to the anchor did not take ({gap} tiles) -- "
+                               f"falling back to the router")
     travel.walk_to(ctx, anchor, goal_adjacent=False)
 
 

@@ -593,6 +593,41 @@ def test_a_blocked_machine_repairs_immediately_instead_of_reclicking(monkeypatch
     assert repairs == [True], "a blocked machine must trigger an URGENT repair, not another click"
 
 
+def test_a_nearby_anchor_is_clicked_directly_not_routed(monkeypatch, _hermetic):
+    """MEASURED live 2026-09-14: the player drifted 7 tiles off the anchor, past
+    ANCHOR_TOLERANCE, and every tick logged "no walking route to (3752,5680)" about twice a
+    second for four minutes until the stall watch stopped the run. worldmap holds ONE set of
+    collision data for both floors of this mine (they share x/y and plane 0) and it describes
+    the downstairs layout, so it cannot route the upper floor at all. A few tiles in plain view
+    should be clicked, not asked for."""
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    ctx.state.data["mlm_anchor_upstairs"] = True
+    _standing(monkeypatch, UPSTAIRS_H, x=3759, y=5683)
+    monkeypatch.setattr(mlm, "climb", lambda c, up: True)
+    direct, routed = [], []
+    monkeypatch.setattr(travel, "walk_to_exact_tile",
+                        lambda c, x, y, p, **kw: direct.append((x, y)) or True)
+    monkeypatch.setattr(travel, "walk_to", lambda c, g, **kw: routed.append(g) or False)
+    mlm._return_to_anchor(ctx)
+    assert direct == [(3752, 5680)], "a 7-tile anchor must be clicked directly"
+    assert routed == [], "the router must not be consulted for a walk it cannot compute"
+
+
+def test_a_distant_anchor_still_uses_the_router(monkeypatch, _hermetic):
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    ctx.state.data["mlm_anchor_upstairs"] = True
+    _standing(monkeypatch, UPSTAIRS_H, x=3700, y=5600)
+    monkeypatch.setattr(mlm, "climb", lambda c, up: True)
+    direct, routed = [], []
+    monkeypatch.setattr(travel, "walk_to_exact_tile",
+                        lambda c, x, y, p, **kw: direct.append((x, y)) or True)
+    monkeypatch.setattr(travel, "walk_to", lambda c, g, **kw: routed.append(g) or True)
+    mlm._return_to_anchor(ctx)
+    assert direct == [] and routed, "a long walk back still belongs to the router"
+
+
 def test_an_empty_first_read_is_retried_rather_than_stopped(monkeypatch):
     # The first logged-in tick after an auto-login serves nothing -- run 47's GOTR lesson.
     ctx = _Ctx()
