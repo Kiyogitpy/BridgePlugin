@@ -166,9 +166,11 @@ DEPOSIT_MAX_STACKS = 10
 CLOSE_TRIES = 3
 NO_VEIN_STOP = 40
 ANCHOR_TOLERANCE = 6        # further than this from the anchor and we walk back before mining
+UPPER_LOCK_STRIKES = 3      # failed upper-hopper deposits before we believe it is locked
 ROCKFALL_IDS = {26679, 26680}   # the two rockfall variants; both offer Mine
 ROCKFALL_ACTION = "Mine"
 ROCKFALL_REACH_TILES = 6        # walk closer than this before clicking one
+ROCKFALL_REACH_SCAN = 8         # flood radius for "are we fenced in" (see blocking_rockfall)
 ROCKFALL_BUDGET_S = 12.0        # a rockfall takes a few swings to clear
 WALK_STALL_TICKS = 2            # ticks stuck on one tile before we suspect something blocks us
 ANCHOR_DIRECT_WALK_TILES = 14   # within this, click the anchor rather than ask the router
@@ -465,7 +467,79 @@ def _stalled_walking(ctx, key) -> int:
     return n
 
 
-def clear_rockfall(ctx, toward=None) -> bool:
+def _line_tiles(ax, ay, bx, by):
+    """Every tile on the straight line from (ax,ay) to (bx,by), endpoints included."""
+    dx, dy = abs(bx - ax), abs(by - ay)
+    sx, sy = (1 if ax < bx else -1), (1 if ay < by else -1)
+    err = dx - dy
+    x, y = ax, ay
+    out = [(x, y)]
+    while (x, y) != (bx, by) and len(out) <= 64:
+        err2 = err * 2
+        if err2 > -dy:
+            err -= dy
+            x += sx
+        if err2 < dx:
+            err += dx
+            y += sy
+        out.append((x, y))
+    return out
+
+
+def blocking_rockfall(ctx, target):
+    """The same-floor rockfall standing between us and `target`, if there is one.
+
+    USER 2026-09-14: "make sure it checks if it blocks the path first before we click the hopper.
+    looks a bit strange otherwise" -- and it is not only cosmetic, since clicking a hopper we
+    cannot reach is what put strikes on a perfectly good upper hopper in the first place.
+
+    The test is a LIVE FLOOD from our own tile, and the fall we want is the one standing on its
+    FRONTIER. MEASURED live 2026-09-14, which is what settled the method: player (3757,5678),
+    upper hopper (3755,5677) two tiles away, onScreen, and /last-action reporting a perfectly
+    resolved "Deposit Hopper" on every click -- the click was never the problem. The flood
+    answered 45 reachable tiles, can_reach(hopper) False, and exactly one rockfall (3757,5677)
+    cardinally touching that set. A straight line between the two tiles does NOT cross it, so the
+    obvious geometric test misses the very rock that walls us in.
+
+    Reachability is used only to say "we are fenced in", never to veto an ordinary click: an
+    empty or undecided flood falls through to the straight line and then to nothing, because this
+    file already records that live collision is ambiguous in this mine (two floors, one set of
+    coordinates). Being wrong here costs one cleared rock, which is recoverable; refusing to
+    clear is what leaves the run stuck."""
+    if not target or target.get("x") is None:
+        return None
+    here = _player_tile() or {}
+    if here.get("x") is None:
+        return None
+    upper = _upstairs()
+    falls = {(o.get("x"), o.get("y")): o
+             for o in _objects(ids=ROCKFALL_IDS, action=ROCKFALL_ACTION)
+             if same_floor(o, upper)}
+    if not falls:
+        return None
+
+    def toward(o):
+        return max(abs(o.get("x", 0) - target["x"]), abs(o.get("y", 0) - target["y"]))
+
+    plane = here.get("plane", 0)
+    reach = travel.reachable_set(here["x"], here["y"], plane, ROCKFALL_REACH_SCAN)
+    if reach:
+        if travel.can_reach(target, reach, plane=plane) is not False:
+            return None             # we can get there; nothing is in the way
+        # The rocks ON THE EDGE of where we can walk are the ones fencing us in. Of those, take
+        # whichever sits nearest the thing we are trying to reach.
+        frontier = [o for tile, o in falls.items()
+                    if any(n in reach for n in ((tile[0] + 1, tile[1]), (tile[0] - 1, tile[1]),
+                                                (tile[0], tile[1] + 1), (tile[0], tile[1] - 1)))]
+        if frontier:
+            return min(frontier, key=toward)
+    for tile in _line_tiles(here["x"], here["y"], target["x"], target["y"]):
+        if tile in falls:
+            return falls[tile]
+    return None
+
+
+def clear_rockfall(ctx, toward=None, fall=None) -> bool:
     """Mine the rockfall in the way. True when this tick was spent on one.
 
     AN ESCAPE HATCH, NOT A PATHING TOOL. USER 2026-09-14: "It only needs to mine rockfall if it
@@ -485,8 +559,8 @@ def clear_rockfall(ctx, toward=None) -> bool:
     and a rockfall one storey below is not in our way), nearest first, preferring the ones that
     lie toward `toward` when given."""
     upper = _upstairs()
-    falls = [o for o in _objects(ids=ROCKFALL_IDS, action=ROCKFALL_ACTION)
-             if same_floor(o, upper)]
+    falls = [fall] if fall is not None else [
+        o for o in _objects(ids=ROCKFALL_IDS, action=ROCKFALL_ACTION) if same_floor(o, upper)]
     if not falls:
         return False
     here = _player_tile() or {}
@@ -997,6 +1071,16 @@ def hopper_phase(ctx) -> bool:
         _walk_to_object(ctx, hopper, TILE_LOWER_HOPPER)
         return False
     upper = _upstairs()
+    # CHECK THE WAY BEFORE CLICKING. USER 2026-09-14: "make sure it checks if it blocks the path
+    # first before we click the hopper. looks a bit strange otherwise." It is not only cosmetic:
+    # clicking a hopper we cannot reach is exactly what put strikes on a perfectly good upper
+    # hopper and latched it as "locked".
+    fall = blocking_rockfall(ctx, hopper)
+    if fall is not None:
+        debug_log.log(LOG, f"a rockfall at ({fall.get('x')},{fall.get('y')}) is between us and "
+                           f"the hopper -- clearing it first")
+        clear_rockfall(ctx, toward=hopper, fall=fall)
+        return False
     mark = outcome_waits.mark(ctx)
     if not controller.click_entity(ctx.ser, hopper, refresh_target=_refresh(hopper)):
         return False
@@ -1006,6 +1090,7 @@ def hopper_phase(ctx) -> bool:
         now_fn=_now, sleep_fn=_sleep)
     if deposited:
         data = _d(ctx)
+        data.pop("mlm_upper_misses", None)
         data["mlm_pending"] = int(data.get("mlm_pending") or 0) + held
         data["mlm_pending_at"] = _now()
         debug_log.log(LOG, f"deposited {held} pay-dirt at the "
@@ -1038,11 +1123,32 @@ def hopper_phase(ctx) -> bool:
         else:
             _maybe_repair(ctx, urgent=True)
         return False
+    # A hopper CLOSE enough to click but that never takes the pay-dirt, while the player has not
+    # moved, is the blocked-path case rather than the locked-hopper one: too_far never fires at
+    # three tiles, so we click happily from the wrong side of a rockfall and the interaction just
+    # never happens. Clear the way before counting this against the hopper.
+    if upper and _stalled_walking(ctx, "mlm_hopper_reach") >= WALK_STALL_TICKS and clear_rockfall(
+            ctx, toward=hopper):
+        return False
     if upper and not _d(ctx).get("mlm_upper_locked"):
-        # Pay-dirt still in hand after clicking the upstairs hopper: it is the locked one.
+        # ONE failed deposit is not proof the hopper is locked, and treating it as proof is
+        # expensive: the latch is permanent for the session and sends every trip back down the
+        # ladder. MEASURED live 2026-09-14, with the hopper BOUGHT and three tiles away offering
+        # Deposit: a single miss latched it, so hopper_phase then found no upstairs candidate,
+        # tried to climb down, could not reach the ladder either, and sat there failing the climb
+        # over and over. A deposit can fail for reasons that have nothing to do with the hopper
+        # being locked -- the click missed, the way was blocked, the walk timed out -- so this
+        # needs a run of failures, and a single success clears the count.
+        misses = int(_d(ctx).get("mlm_upper_misses") or 0) + 1
+        _d(ctx)["mlm_upper_misses"] = misses
+        if misses < UPPER_LOCK_STRIKES:
+            debug_log.log(LOG, f"the upper hopper did not take the pay-dirt "
+                               f"({misses}/{UPPER_LOCK_STRIKES}) -- trying again before giving "
+                               f"up on it")
+            return False
         _d(ctx)["mlm_upper_locked"] = True
-        debug_log.log(LOG, "the upper hopper would not take the pay-dirt -- still locked "
-                           "(50 golden nuggets from Percy). Using the ladder and the lower one.")
+        debug_log.log(LOG, f"the upper hopper refused {misses} times -- treating it as locked "
+                           f"(50 golden nuggets from Percy). Using the ladder and the lower one.")
     return False
 
 

@@ -385,7 +385,12 @@ def test_a_locked_upper_hopper_latches_and_falls_back_to_the_ladder(monkeypatch)
     monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
 
+    # One miss is not proof: a deposit can fail because the click missed or the way was blocked,
+    # and the latch is permanent for the session. It takes a RUN of failures.
     assert mlm.hopper_phase(ctx) is False        # the pay-dirt never left the inventory
+    assert "mlm_upper_locked" not in ctx.state.data
+    for _ in range(mlm.UPPER_LOCK_STRIKES):
+        mlm.hopper_phase(ctx)
     assert ctx.state.data["mlm_upper_locked"] is True
     # Latched: nothing upstairs is offered any more, so the next call takes the ladder.
     assert mlm._hopper_candidates(ctx) == []
@@ -632,6 +637,38 @@ def _rockfall(x, y, dist=2, height=UPSTAIRS_H):
     return {"id": 26679, "name": "Rockfall", "actions": ["Mine"], "x": x, "y": y, "plane": 0,
             "distance": dist, "screenX": 500, "screenY": 400, "tileHeight": height,
             "onScreen": True}
+
+
+def test_a_rockfall_on_the_line_is_cleared_before_the_hopper_is_clicked(monkeypatch, _hermetic):
+    """USER 2026-09-14: "make sure it checks if it blocks the path first before we click the
+    hopper. looks a bit strange otherwise." Not only cosmetic -- clicking a hopper we cannot
+    reach is what put strikes on a perfectly good upper hopper and latched it as locked."""
+    ctx = _Ctx()
+    _standing(monkeypatch, UPSTAIRS_H, x=3758, y=5680)
+    monkeypatch.setattr(controller, "get_inventory", lambda: _paydirt(27))
+    monkeypatch.setattr(mlm, "_hopper_candidates",
+                        lambda c: [{"id": mlm.HOPPER_ID, "name": "Hopper", "distance": 3,
+                                    "x": 3758, "y": 5677, "plane": 0, "onScreen": True,
+                                    "screenX": 500, "screenY": 400}])
+    # ...with a rockfall sitting squarely between (3758,5680) and (3758,5677).
+    monkeypatch.setattr(mlm, "_objects", lambda **kw: [_rockfall(3758, 5678)])
+    clicked, cleared = [], []
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: clicked.append(a) or True)
+    monkeypatch.setattr(mlm, "clear_rockfall",
+                        lambda c, toward=None, fall=None: cleared.append(fall) or True)
+
+    assert mlm.hopper_phase(ctx) is False
+    assert cleared and cleared[0]["x"] == 3758, "the blocking fall must be cleared first"
+    assert clicked == [], "the hopper must not be clicked through a rock"
+
+
+def test_a_rockfall_beside_the_line_does_not_delay_the_hopper(monkeypatch, _hermetic):
+    """The pre-check must not fire on every rockfall merely near us, or the routine would spend
+    its time clearing rocks it could have walked around."""
+    ctx = _Ctx()
+    _standing(monkeypatch, UPSTAIRS_H, x=3758, y=5680)
+    monkeypatch.setattr(mlm, "_objects", lambda **kw: [_rockfall(3752, 5690)])
+    assert mlm.blocking_rockfall(ctx, {"x": 3758, "y": 5677}) is None
 
 
 def test_a_rockfall_is_only_mined_once_we_are_actually_stuck(monkeypatch, _hermetic):
