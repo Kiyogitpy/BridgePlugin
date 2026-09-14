@@ -166,6 +166,11 @@ DEPOSIT_MAX_STACKS = 10
 CLOSE_TRIES = 3
 NO_VEIN_STOP = 40
 ANCHOR_TOLERANCE = 6        # further than this from the anchor and we walk back before mining
+ROCKFALL_IDS = {26679, 26680}   # the two rockfall variants; both offer Mine
+ROCKFALL_ACTION = "Mine"
+ROCKFALL_REACH_TILES = 6        # walk closer than this before clicking one
+ROCKFALL_BUDGET_S = 12.0        # a rockfall takes a few swings to clear
+WALK_STALL_TICKS = 2            # ticks stuck on one tile before we suspect something blocks us
 ANCHOR_DIRECT_WALK_TILES = 14   # within this, click the anchor rather than ask the router
                                 # (worldmap cannot route this mine's upper floor -- see
                                 # _return_to_anchor)
@@ -441,6 +446,82 @@ def _walk_to_object(ctx, obj, fallback_tile):
     tile = {"x": obj.get("x"), "y": obj.get("y"), "plane": obj.get("plane", 0)} \
         if obj and obj.get("x") is not None else fallback_tile
     travel.walk_to(ctx, tile, goal_adjacent=True)
+
+
+def _stalled_walking(ctx, key) -> int:
+    """Consecutive ticks spent trying to get somewhere without the player's tile changing.
+
+    The walk helpers report nothing useful when a route simply cannot be computed or the way is
+    physically blocked, so "are we actually getting anywhere" has to be measured from the tile."""
+    data = _d(ctx)
+    here = _player_tile() or {}
+    now_tile = (here.get("x"), here.get("y"))
+    if data.get(f"{key}_tile") != now_tile:
+        data[f"{key}_tile"] = now_tile
+        data[f"{key}_stuck"] = 0
+        return 0
+    n = int(data.get(f"{key}_stuck") or 0) + 1
+    data[f"{key}_stuck"] = n
+    return n
+
+
+def clear_rockfall(ctx, toward=None) -> bool:
+    """Mine the rockfall in the way. True when this tick was spent on one.
+
+    AN ESCAPE HATCH, NOT A PATHING TOOL. USER 2026-09-14: "It only needs to mine rockfall if it
+    needs to get out, we coded it to not go into this area but i see it sometimes make it in."
+    So every caller gates this on being demonstrably STUCK (_stalled_walking) rather than calling
+    it whenever a rockfall happens to be near: the pocket behind Mercy is chosen precisely
+    BECAUSE nothing there needs clearing, and clearing one we did not have to would be both
+    wasted time and a step further from where we are supposed to mine.
+
+    The routine had no rockfall handling at all before this -- the only mentions in the file were
+    comments explaining that the chosen spot avoids them. That holds right up until a run drifts
+    somewhere else, and then a rockfall between us and the way out is simply unpassable and
+    nothing in the routine can act on it (USER: "should be blocking us from getting to the
+    hopper, if path is blocked we need to mine rockfall").
+
+    Only ever clears one on OUR OWN FLOOR (the floor test is the whole reason this mine is hard,
+    and a rockfall one storey below is not in our way), nearest first, preferring the ones that
+    lie toward `toward` when given."""
+    upper = _upstairs()
+    falls = [o for o in _objects(ids=ROCKFALL_IDS, action=ROCKFALL_ACTION)
+             if same_floor(o, upper)]
+    if not falls:
+        return False
+    here = _player_tile() or {}
+
+    def rank(o):
+        d = o.get("distance")
+        d = 99 if d is None else d
+        if toward and toward.get("x") is not None and here.get("x") is not None:
+            # Prefer a fall that sits between us and where we are trying to get to, rather than
+            # whichever happens to be nearest -- clearing one behind us helps nothing.
+            toward_d = max(abs(o.get("x", 0) - toward["x"]), abs(o.get("y", 0) - toward["y"]))
+            return (toward_d, d)
+        return (d, d)
+
+    fall = min(falls, key=rank)
+    if too_far(fall, ROCKFALL_REACH_TILES):
+        debug_log.log(LOG, f"walking to the rockfall at ({fall.get('x')},{fall.get('y')})")
+        _walk_to_object(ctx, fall, None)
+        return True
+    tile = (fall.get("x"), fall.get("y"), fall.get("plane", 0))
+    mark = outcome_waits.mark(ctx)
+    debug_log.log(LOG, f"mining the rockfall at ({tile[0]},{tile[1]}) -- it is in the way")
+    if not controller.click_entity(ctx.ser, fall, refresh_target=_refresh(fall),
+                                   simulate_mistakes=False):
+        return True
+    gone = outcome_waits.await_pre(
+        ctx, {"OBJECT_DESPAWNED": lambda p: (p.get("x"), p.get("y")) == (tile[0], tile[1]),
+              "XP_GAINED": lambda p: p.get("skill") == "Mining"},
+        ROCKFALL_BUDGET_S + _walk_budget(fall),
+        confirm=lambda: (controller.get_object_at(tile[0], tile[1], tile[2],
+                                                  fall.get("id")) is None) or None,
+        since=mark, reaction=False, now_fn=_now, sleep_fn=_sleep)
+    if gone:
+        debug_log.log(LOG, "rockfall cleared")
+    return True
 
 
 def is_upper(height) -> bool:
@@ -905,6 +986,13 @@ def hopper_phase(ctx) -> bool:
         return False
 
     if too_far(hopper):
+        # A hopper we can see but never get closer to means something is in the way, and in this
+        # mine that something is a rockfall (USER: "should be blocking us from getting to the
+        # hopper, if path is blocked we need to mine rockfall"). Measured from the player's own
+        # tile, because the walk helpers cannot report "there is no way through".
+        if _stalled_walking(ctx, "mlm_hopper_walk") >= WALK_STALL_TICKS and clear_rockfall(
+                ctx, toward=hopper):
+            return False
         debug_log.log(LOG, "walking to the hopper first")
         _walk_to_object(ctx, hopper, TILE_LOWER_HOPPER)
         return False
@@ -1182,6 +1270,12 @@ def _return_to_anchor(ctx):
     # attempting the walk" -- about twice a second for four minutes, until the stall watch
     # safety-stopped the run. The anchor is a handful of tiles away and in plain view at that
     # point, which is exactly the case walk_to_exact_tile handles without a router.
+    # THE WAY OUT is the case rockfall clearing exists for: the run has drifted somewhere it was
+    # never meant to be and a rockfall is between it and the mining pocket. Gated on actually
+    # being stuck, so a rockfall we can simply walk around is left alone.
+    if _stalled_walking(ctx, "mlm_anchor_walk") >= WALK_STALL_TICKS and clear_rockfall(
+            ctx, toward=anchor):
+        return
     here = _player_tile() or {}
     if here.get("x") is not None:
         gap = max(abs(here["x"] - anchor["x"]), abs(here["y"] - anchor["y"]))

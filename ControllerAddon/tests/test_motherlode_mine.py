@@ -628,6 +628,62 @@ def test_a_distant_anchor_still_uses_the_router(monkeypatch, _hermetic):
     assert direct == [] and routed, "a long walk back still belongs to the router"
 
 
+def _rockfall(x, y, dist=2, height=UPSTAIRS_H):
+    return {"id": 26679, "name": "Rockfall", "actions": ["Mine"], "x": x, "y": y, "plane": 0,
+            "distance": dist, "screenX": 500, "screenY": 400, "tileHeight": height,
+            "onScreen": True}
+
+
+def test_a_rockfall_is_only_mined_once_we_are_actually_stuck(monkeypatch, _hermetic):
+    """USER 2026-09-14: "It only needs to mine rockfall if it needs to get out, we coded it to
+    not go into this area but i see it sometimes make it in." So a rockfall merely being nearby
+    is not a reason to clear one -- being unable to move is."""
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    ctx.state.data["mlm_anchor_upstairs"] = True
+    _standing(monkeypatch, UPSTAIRS_H, x=3759, y=5683)
+    monkeypatch.setattr(mlm, "climb", lambda c, up: True)
+    monkeypatch.setattr(travel, "walk_to_exact_tile", lambda c, x, y, p, **kw: True)
+    monkeypatch.setattr(travel, "walk_to", lambda c, g, **kw: True)
+    cleared = []
+    monkeypatch.setattr(mlm, "clear_rockfall",
+                        lambda c, toward=None: cleared.append(toward) or True)
+
+    mlm._return_to_anchor(ctx)                  # tick 1: the tile is new, so not stuck yet
+    assert cleared == [], "a first attempt must just walk"
+    for _ in range(mlm.WALK_STALL_TICKS + 1):   # the tile never changes -> stuck
+        mlm._return_to_anchor(ctx)
+    assert cleared, "a walk that never moves us must fall back to clearing the way out"
+
+
+def test_clear_rockfall_ignores_one_on_the_other_floor(monkeypatch, _hermetic):
+    """The floor test is the whole reason this mine is hard; a rockfall one storey below is not
+    in our way, and mining at it would be the through-the-floor bug all over again."""
+    ctx = _Ctx()
+    _standing(monkeypatch, UPSTAIRS_H)
+    monkeypatch.setattr(mlm, "_objects",
+                        lambda **kw: [_rockfall(3757, 5677, height=DOWNSTAIRS_H)])
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: clicks.append(a) or True)
+    assert mlm.clear_rockfall(ctx) is False
+    assert clicks == []
+
+
+def test_clear_rockfall_prefers_the_one_toward_where_we_are_going(monkeypatch, _hermetic):
+    """Clearing whichever is nearest can mean clearing one BEHIND us, which helps nothing."""
+    ctx = _Ctx()
+    _standing(monkeypatch, UPSTAIRS_H)
+    behind, between = _rockfall(3765, 5690, dist=1), _rockfall(3753, 5681, dist=5)
+    monkeypatch.setattr(mlm, "_objects", lambda **kw: [behind, between])
+    monkeypatch.setattr(mlm, "too_far", lambda o, rng=None: False)
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    picked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, obj, **k: picked.append((obj["x"], obj["y"])) or False)
+    mlm.clear_rockfall(ctx, toward={"x": 3752, "y": 5680})
+    assert picked == [(3753, 5681)], "must clear the one between us and the goal"
+
+
 def test_an_empty_first_read_is_retried_rather_than_stopped(monkeypatch):
     # The first logged-in tick after an auto-login serves nothing -- run 47's GOTR lesson.
     ctx = _Ctx()
