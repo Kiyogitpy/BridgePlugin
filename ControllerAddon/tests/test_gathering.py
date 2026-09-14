@@ -392,6 +392,27 @@ def test_chain_stops_before_clicking_with_a_full_inventory(scene):
     assert ctx.state.data["mining_stand_tile"] == {"x": 3000, "y": 3000, "plane": 0}
 
 
+def test_arrival_needs_us_adjacent_not_merely_close(scene, monkeypatch):
+    """REGRESSION 2026-09-14. ARRIVAL_TILES was 2, so a vein TWO tiles away already counted as
+    arrived at the instant it was clicked -- MEASURED live as "arrived at Ore vein (0.24s after
+    the click)" on a dist=2 vein, which is not a walk, it is no walk at all. The pre-hover then
+    parked the cursor while the player was still moving and the projection slid out from under
+    it, which is exactly what the arrival test exists to prevent. Gathering happens ADJACENT."""
+    a = _rock(1, 1, dist=2)
+    scene.objects = [a]
+    scene.readings = [(True, 5000, True)]
+    # Two tiles away and NOT moving yet: the click has been issued but the walk has not begun.
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"miningXp": 5000, "x": 3, "y": 1, "moving": False})
+    ctx = make_ctx(scene.events([None] * 40))
+    hovered = []
+    monkeypatch.setattr(controller, "hover_entity",
+                        lambda *a, **k: hovered.append(1) or True)
+    gathering.gather(P, ctx, a, ctx.state.config)
+    # The walk budget (2 tiles) must elapse before anything calls this arrival.
+    assert scene.now - 1000.0 >= 2 * gathering.WALK_S_PER_TILE
+
+
 def test_arrival_at_a_far_target_rebases_the_idle_grace(scene, monkeypatch):
     # 6 tiles away (3.6s walk budget). PLAYER_STOPPED + /player.moving false = arrived, after
     # which an idle player with nothing gained is a failed click IDLE_GRACE_S later -- not

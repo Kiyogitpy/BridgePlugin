@@ -78,7 +78,14 @@ FALLBACK_POLL_S = 0.25    # idle-check cadence past the grace; also the HTTP-onl
 GATHER_BUDGET_S = 12.0    # nothing gained and no depletion for this long (plus the walk) -> re-pick
 WALK_S_PER_TILE = 0.6     # a queued interaction is performed on ARRIVAL: budget the walk
 GAME_TICK_S = bridge_events.GAME_TICK_MS / 1000.0   # the server tick a queued click waits for
-ARRIVAL_TILES = 2         # standing this close to the target counts as arrived (see confirm())
+ARRIVAL_TILES = 1         # ADJACENT, which is where gathering actually happens (see confirm()).
+                          # Not 2: a target two tiles away already satisfies "within 2" at the
+                          # moment it is clicked, so arrival fired before the player had moved a
+                          # step -- MEASURED live 2026-09-14, "arrived at Ore vein (0.24s after
+                          # the click)" on a dist=2 vein, and the pre-hover then parked the
+                          # cursor while the player was still walking, which is the very thing
+                          # the arrival test exists to prevent (USER: "hovering is still wrong
+                          # somehow, we hover before our movement settles").
 IDLE_GRACE_S = 1.5        # idle with no progress past this (plus the walk) -> the click failed
 # ...but only if the idle SUSTAINS for this long. An animation trough between two swings is not
 # idleness: MEASURED live 2026-09-07 in the Motherlode Mine over 45s of uninterrupted, XP-earning

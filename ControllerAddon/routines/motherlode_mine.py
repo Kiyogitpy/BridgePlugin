@@ -46,6 +46,7 @@
 # Run with:
 #     python -u controller.py routines/motherlode_mine.py
 
+import collections
 import time
 
 import controller
@@ -171,6 +172,8 @@ ROCKFALL_IDS = {26679, 26680}   # the two rockfall variants; both offer Mine
 ROCKFALL_ACTION = "Mine"
 ROCKFALL_REACH_TILES = 6        # walk closer than this before clicking one
 ROCKFALL_REACH_SCAN = 8         # flood radius for "are we fenced in" (see blocking_rockfall)
+ROCKFALL_ROUTE_SCAN = 12        # collision radius for rockfall_on_route
+BLOCK_MOVEMENT_OBJECT = 256     # an object's own blocking, distinct from a wall's edge bits
 ROCKFALL_BUDGET_S = 12.0        # a rockfall takes a few swings to clear
 WALK_STALL_TICKS = 2            # ticks stuck on one tile before we suspect something blocks us
 ANCHOR_DIRECT_WALK_TILES = 14   # within this, click the anchor rather than ask the router
@@ -531,12 +534,96 @@ def blocking_rockfall(ctx, target):
         frontier = [o for tile, o in falls.items()
                     if any(n in reach for n in ((tile[0] + 1, tile[1]), (tile[0] - 1, tile[1]),
                                                 (tile[0], tile[1] + 1), (tile[0], tile[1] - 1)))]
+        # WE CAN ONLY MINE WHAT WE CAN STAND NEXT TO, so nearness to US is the first key, not
+        # nearness to the target. MEASURED live 2026-09-14: ranking by the target alone picked a
+        # frontier fall at (3748,5684), NINE tiles away with the adjacent one at (3757,5677)
+        # sitting right there, and the walk to it died on "no walking route" every tick. Every
+        # frontier fall opens the pocket, so the cheapest reachable one is the right one; the
+        # target only breaks ties between equally close rocks.
+        near = [o for o in frontier if (o.get("distance") or 99) <= ROCKFALL_REACH_TILES]
+        if near:
+            return min(near, key=lambda o: (o.get("distance") or 99, toward(o)))
         if frontier:
-            return min(frontier, key=toward)
+            return min(frontier, key=lambda o: (o.get("distance") or 99, toward(o)))
     for tile in _line_tiles(here["x"], here["y"], target["x"], target["y"]):
         if tile in falls:
             return falls[tile]
     return None
+
+
+def rockfall_on_route(ctx, target):
+    """Route from us to `target`; return the first rockfall the route has to go THROUGH, or None.
+
+    USER 2026-09-14, giving the algorithm outright: "route from us to the upper hopper if there
+    is a rockfall in the way mine it if not great deposit."
+
+    This is a real route over the client's LIVE collision grid, not a straight line and not
+    can_reach. Both of those were tried and both were wrong here: a straight line missed the rock
+    actually fencing us in (it was off the line), and can_reach gives false negatives in this mine
+    because two floors share one set of coordinates -- CLAUDE.md calls it "a PREFERENCE for veins
+    here, never a veto" -- so after clearing the real blocker it still said "unreachable" and the
+    routine walked past the hopper hunting more rocks.
+
+    The search is a 0-1 BFS: an ordinary step costs 0, stepping INTO a rockfall costs 1. So the
+    cheapest route is the one crossing the fewest rocks, and a cost of zero means the way is
+    already open -- go and deposit. A rockfall's own blocking is the BLOCK_MOVEMENT_OBJECT bit,
+    which live flags keep distinct from a wall's directional bits (the one thing the static map
+    cannot do), so the rock can be treated as passable-if-mined while real walls still block."""
+    here = _player_tile() or {}
+    if here.get("x") is None or not target or target.get("x") is None:
+        return None
+    plane = here.get("plane", 0)
+    tiles = controller.get_collision(here["x"], here["y"], plane,
+                                     radius=ROCKFALL_ROUTE_SCAN) or []
+    if not tiles:
+        return None
+    flags = {(t["x"], t["y"]): t.get("flags") for t in tiles}
+    start = (here["x"], here["y"])
+    if start not in flags:
+        return None
+    upper = _upstairs()
+    falls = {(o.get("x"), o.get("y")): o
+             for o in _objects(ids=ROCKFALL_IDS, action=ROCKFALL_ACTION)
+             if same_floor(o, upper)}
+    tx, ty = target["x"], target["y"]
+    goals = {(tx, ty), (tx + 1, ty), (tx - 1, ty), (tx, ty + 1), (tx, ty - 1)}
+
+    dist = {start: 0}
+    prev = {}
+    queue = collections.deque([start])
+    landed = None
+    while queue:
+        cur = queue.popleft()
+        if cur in goals:
+            landed = cur
+            break
+        cx, cy = cur
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nxt = (cx + dx, cy + dy)
+            if nxt not in flags:
+                continue
+            nxt_flags = flags.get(nxt)
+            step = 0
+            if nxt in falls:
+                # The rock is what blocks this tile; ignore its own blocking bit and let the
+                # route price it instead. Walls on the same edge still refuse.
+                nxt_flags = (nxt_flags or 0) & ~BLOCK_MOVEMENT_OBJECT
+                step = 1
+            if not travel._passable(flags.get(cur), nxt_flags, dx, dy):
+                continue
+            cost = dist[cur] + step
+            if cost < dist.get(nxt, 1 << 30):
+                dist[nxt] = cost
+                prev[nxt] = cur
+                (queue.appendleft if step == 0 else queue.append)(nxt)
+    if landed is None:
+        return None                 # no way through even by mining: not our problem to solve
+    node, first = landed, None
+    while node in prev:
+        if node in falls:
+            first = node            # keep walking back; we want the EARLIEST one on the route
+        node = prev[node]
+    return falls.get(first) if first else None
 
 
 def clear_rockfall(ctx, toward=None, fall=None) -> bool:
@@ -577,8 +664,30 @@ def clear_rockfall(ctx, toward=None, fall=None) -> bool:
 
     fall = min(falls, key=rank)
     if too_far(fall, ROCKFALL_REACH_TILES):
-        debug_log.log(LOG, f"walking to the rockfall at ({fall.get('x')},{fall.get('y')})")
-        _walk_to_object(ctx, fall, None)
+        # DIRECT, not travel.walk_to. The router cannot path this mine's upper floor at all (one
+        # collision map for two floors -- see _return_to_anchor), and a rockfall we are trying to
+        # reach is by definition on the edge of a pocket it cannot describe. MEASURED live: the
+        # router answered "no walking route to (3748,5684)" on every tick and the run just spun.
+        here = _player_tile() or {}
+        plane = fall.get("plane", here.get("plane", 0))
+        # WALK BESIDE IT, NOT ONTO IT. A rockfall's own tile is impassable by definition, so
+        # aiming the walk at it asks the game for somewhere it can never stand: MEASURED live
+        # 2026-09-14, the routine logged "walking to the rockfall at (3748,5684)" and then simply
+        # idled, tick after tick, having issued a walk that could not resolve. The tile we want
+        # is one of its neighbours that our own flood says we can stand on.
+        reach = travel.reachable_set(here.get("x"), here.get("y"), plane, ROCKFALL_REACH_SCAN)
+        fx, fy = fall.get("x"), fall.get("y")
+        spots = [n for n in ((fx + 1, fy), (fx - 1, fy), (fx, fy + 1), (fx, fy - 1))
+                 if n in reach] if reach else []
+        if not spots:
+            debug_log.log(LOG, f"no standable tile beside the rockfall at ({fx},{fy})")
+            return False
+        spot = min(spots, key=lambda n: max(abs(n[0] - here.get("x", 0)),
+                                            abs(n[1] - here.get("y", 0))))
+        debug_log.log(LOG, f"walking to ({spot[0]},{spot[1]}), beside the rockfall at ({fx},{fy})")
+        if not travel.walk_to_exact_tile(ctx, spot[0], spot[1], plane, wait_for_arrival=False):
+            debug_log.log(LOG, "could not head for that rockfall -- it is out of view")
+            return False
         return True
     tile = (fall.get("x"), fall.get("y"), fall.get("plane", 0))
     mark = outcome_waits.mark(ctx)
@@ -1071,14 +1180,15 @@ def hopper_phase(ctx) -> bool:
         _walk_to_object(ctx, hopper, TILE_LOWER_HOPPER)
         return False
     upper = _upstairs()
-    # CHECK THE WAY BEFORE CLICKING. USER 2026-09-14: "make sure it checks if it blocks the path
-    # first before we click the hopper. looks a bit strange otherwise." It is not only cosmetic:
-    # clicking a hopper we cannot reach is exactly what put strikes on a perfectly good upper
-    # hopper and latched it as "locked".
-    fall = blocking_rockfall(ctx, hopper)
+    # USER 2026-09-14: "route from us to the upper hopper if there is a rockfall in the way mine
+    # it if not great deposit." A real route, so a rock only gets mined when the route genuinely
+    # has to pass through it -- which is what stops the two failures before this one: a straight
+    # line missed the rock that was fencing us in, and can_reach false-negatives in this mine sent
+    # the routine past the hopper hunting rocks it never needed to touch.
+    fall = rockfall_on_route(ctx, hopper)
     if fall is not None:
-        debug_log.log(LOG, f"a rockfall at ({fall.get('x')},{fall.get('y')}) is between us and "
-                           f"the hopper -- clearing it first")
+        debug_log.log(LOG, f"the route to the hopper runs through the rockfall at "
+                           f"({fall.get('x')},{fall.get('y')}) -- mining it")
         clear_rockfall(ctx, toward=hopper, fall=fall)
         return False
     mark = outcome_waits.mark(ctx)
@@ -1123,13 +1233,20 @@ def hopper_phase(ctx) -> bool:
         else:
             _maybe_repair(ctx, urgent=True)
         return False
-    # A hopper CLOSE enough to click but that never takes the pay-dirt, while the player has not
-    # moved, is the blocked-path case rather than the locked-hopper one: too_far never fires at
-    # three tiles, so we click happily from the wrong side of a rockfall and the interaction just
-    # never happens. Clear the way before counting this against the hopper.
-    if upper and _stalled_walking(ctx, "mlm_hopper_reach") >= WALK_STALL_TICKS and clear_rockfall(
-            ctx, toward=hopper):
-        return False
+    # A hopper close enough to click that never takes the pay-dirt, while the player has not
+    # MOVED, is the blocked-path case rather than the locked-hopper one: too_far never fires at
+    # two or three tiles, so we click happily from the wrong side of a rockfall and the game's
+    # own pathfinder silently declines. THIS is the evidence worth acting on -- the click
+    # resolved (/last-action showed "Deposit Hopper"), nothing happened, and we are still on the
+    # same tile. Only now is it worth asking which rockfall fences us in, because the answer is
+    # corroborated rather than guessed.
+    if upper and _stalled_walking(ctx, "mlm_hopper_reach") >= 1:
+        fall = blocking_rockfall(ctx, hopper)
+        if fall is not None:
+            debug_log.log(LOG, f"the hopper click went nowhere and we have not moved -- the "
+                               f"rockfall at ({fall.get('x')},{fall.get('y')}) is fencing us in")
+            clear_rockfall(ctx, toward=hopper, fall=fall)
+            return False
     if upper and not _d(ctx).get("mlm_upper_locked"):
         # ONE failed deposit is not proof the hopper is locked, and treating it as proof is
         # expensive: the latch is permanent for the session and sends every trip back down the

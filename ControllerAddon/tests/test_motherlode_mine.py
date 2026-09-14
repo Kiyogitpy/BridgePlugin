@@ -639,10 +639,16 @@ def _rockfall(x, y, dist=2, height=UPSTAIRS_H):
             "onScreen": True}
 
 
-def test_a_rockfall_on_the_line_is_cleared_before_the_hopper_is_clicked(monkeypatch, _hermetic):
-    """USER 2026-09-14: "make sure it checks if it blocks the path first before we click the
-    hopper. looks a bit strange otherwise." Not only cosmetic -- clicking a hopper we cannot
-    reach is what put strikes on a perfectly good upper hopper and latched it as locked."""
+def test_a_rock_is_mined_only_when_the_route_runs_through_it(monkeypatch, _hermetic):
+    """USER 2026-09-14, the algorithm verbatim: "route from us to the upper hopper if there is a
+    rockfall in the way mine it if not great deposit."
+
+    Two earlier attempts got this wrong in opposite directions. A straight line MISSED the rock
+    fencing us in, because it sat off the line. can_reach then over-fired: CLAUDE.md records it
+    as "a PREFERENCE for veins here, never a veto" (two floors, one set of coordinates), so after
+    the real blocker had been cleared it still answered False and the routine walked past the
+    hopper hunting rocks -- USER: "it just passed the hopper and went to another rockfall for no
+    reason." Only a real route can tell the two cases apart."""
     ctx = _Ctx()
     _standing(monkeypatch, UPSTAIRS_H, x=3758, y=5680)
     monkeypatch.setattr(controller, "get_inventory", lambda: _paydirt(27))
@@ -650,16 +656,22 @@ def test_a_rockfall_on_the_line_is_cleared_before_the_hopper_is_clicked(monkeypa
                         lambda c: [{"id": mlm.HOPPER_ID, "name": "Hopper", "distance": 3,
                                     "x": 3758, "y": 5677, "plane": 0, "onScreen": True,
                                     "screenX": 500, "screenY": 400}])
-    # ...with a rockfall sitting squarely between (3758,5680) and (3758,5677).
-    monkeypatch.setattr(mlm, "_objects", lambda **kw: [_rockfall(3758, 5678)])
     clicked, cleared = [], []
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: clicked.append(a) or True)
     monkeypatch.setattr(mlm, "clear_rockfall",
                         lambda c, toward=None, fall=None: cleared.append(fall) or True)
 
-    assert mlm.hopper_phase(ctx) is False
-    assert cleared and cleared[0]["x"] == 3758, "the blocking fall must be cleared first"
-    assert clicked == [], "the hopper must not be clicked through a rock"
+    # A route with nothing on it: deposit, do not go rock-hunting.
+    monkeypatch.setattr(mlm, "rockfall_on_route", lambda c, t: None)
+    mlm.hopper_phase(ctx)
+    assert clicked and cleared == [], "a clear route must just deposit"
+
+    # A route that genuinely runs through a rock: mine that rock, do not click the hopper.
+    clicked.clear()
+    monkeypatch.setattr(mlm, "rockfall_on_route", lambda c, t: _rockfall(3758, 5678))
+    mlm.hopper_phase(ctx)
+    assert cleared and cleared[0]["x"] == 3758
+    assert clicked == [], "no point clicking a hopper the route cannot reach"
 
 
 def test_a_rockfall_beside_the_line_does_not_delay_the_hopper(monkeypatch, _hermetic):
@@ -958,6 +970,10 @@ def test_a_ladder_that_never_registers_stops_the_run(monkeypatch):
     monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [down])
     monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    # From the second attempt on, climb() escalates to the named Climb menu entry (a bare click
+    # cannot beat whatever is drawn over the pixel), which would otherwise reach the serial port.
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_object_at", lambda *a, **k: down)
     for _ in range(mlm.CLIMB_MAX_TRIES):
         mlm.climb(ctx, up=False)
     assert ctx.state.safety_stopped is True
