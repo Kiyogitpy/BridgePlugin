@@ -181,13 +181,14 @@ DEFAULT_CONFIG = {
     # Where we mine from. Defaults to the pocket behind Mercy; set to None to anchor wherever
     # the run happens to start (only honoured when that is upstairs -- see setup).
     "anchorTile": dict(TILE_ANCHOR_DEFAULT),
-    # auto | never | always -- see _hopper_candidates. "never" until the upstairs hopper is
-    # bought (50 golden nuggets from Prospector Percy; USER 2026-09-07: "need to unlock that
-    # hopper we cant use it yet"), so the first live session spends no click on a fixture we
-    # already know refuses us. Flip to "auto" the day it is bought and every ladder trip goes
-    # away -- "auto" tries a same-floor hopper first and latches back to the ladder if the
-    # deposit does not take.
-    "upperHopper": "never",
+    # auto | never | always -- see _hopper_candidates. "auto" since 2026-09-14: the upstairs
+    # hopper has been BOUGHT (50 golden nuggets from Prospector Percy). USER: "we can now use
+    # the hopper at the top of the mine so we dont have to go down the stairs to deposit. only
+    # to retrieve from sack". So every deposit now happens on the mining floor and the ladder is
+    # only for the sack trip, which collect_phase already owns. "auto" (rather than "always")
+    # keeps the fallback: if the upper hopper ever refuses for a reason that is genuinely about
+    # THIS hopper, mlm_upper_locked latches and the run goes back to the ladder for the session.
+    "upperHopper": "auto",
     # Leave a broken machine to other players for this long before spending a hammer on it.
     "repairPatienceS": 180,
     "breaks": {
@@ -872,9 +873,9 @@ def _hopper_candidates(ctx):
     """Reachable hoppers, nearest first, honouring the upperHopper policy.
 
     Default "auto": whatever is reachable on our own floor is tried first, and a deposit that
-    leaves the pay-dirt in hand latches mlm_upper_locked for the session. The upper hopper costs
-    50 golden nuggets and is not bought yet, so today that is one wasted click per run; the day
-    it is bought, every ladder trip disappears with no change here."""
+    leaves the pay-dirt in hand latches mlm_upper_locked for the session. The upper hopper was
+    bought on 2026-09-14, so upstairs now deposits upstairs and the ladder is only the sack
+    trip's -- see DEFAULT_CONFIG["upperHopper"]."""
     policy = str((ctx.state.config or {}).get("upperHopper",
                                               DEFAULT_CONFIG["upperHopper"])).lower()
     upper = _upstairs()
@@ -933,10 +934,19 @@ def hopper_phase(ctx) -> bool:
     # -- for minutes, with the sack frozen (USER: "sack never moves only ore") because a broken
     # strut had stopped the waterway. Repairing is the only thing that can clear it, and waiting
     # out repairPatienceS here is precisely backwards: we are the ones being blocked.
-    if not upper and _machine_blocked():
+    if _machine_blocked():
         debug_log.log(LOG, "the hopper says the last batch is still in the machine")
-        if _maybe_repair(ctx, urgent=True):
-            return False
+        # NOT a reason to latch mlm_upper_locked, and getting that wrong would be expensive now
+        # that the upper hopper is the normal one: this refusal is about the MACHINE being
+        # stalled, not about which hopper we clicked. Latching here would send every deposit
+        # back down the ladder for the rest of the session over a broken strut.
+        if upper:
+            # The struts are DOWNSTAIRS, so the repair cannot happen from up here. Climbing down
+            # also puts us at the lower hopper, which takes the pay-dirt once the waterway runs.
+            climb(ctx, up=False)
+        else:
+            _maybe_repair(ctx, urgent=True)
+        return False
     if upper and not _d(ctx).get("mlm_upper_locked"):
         # Pay-dirt still in hand after clicking the upstairs hopper: it is the locked one.
         _d(ctx)["mlm_upper_locked"] = True

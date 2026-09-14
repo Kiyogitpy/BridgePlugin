@@ -335,13 +335,46 @@ def _standing(monkeypatch, height, **player):
                                  "weaponName": "Rune pickaxe", "tileHeight": height, **player})
 
 
-def test_the_upper_hopper_is_not_touched_until_it_is_unlocked(monkeypatch):
-    # USER 2026-09-07: "need to unlock that hopper we cant use it yet" -- the shipped default is
-    # "never", so a run today spends no click on it and goes straight for the ladder.
+def test_the_upper_hopper_is_used_now_that_it_is_bought(monkeypatch):
+    # USER 2026-09-14: "we can now use the hopper at the top of the mine so we dont have to go
+    # down the stairs to deposit. only to retrieve from sack." The shipped default is "auto", so
+    # a deposit made upstairs stays upstairs and the ladder is only the sack trip's.
     ctx = _Ctx()
     _standing(monkeypatch, UPSTAIRS_H)
     monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [UPPER_HOPPER])
+    assert mlm._hopper_candidates(ctx) == [UPPER_HOPPER]
+
+
+def test_upper_hopper_never_still_takes_the_ladder(monkeypatch):
+    # The opt-out still works, for an account that has not bought it.
+    ctx = _Ctx({**mlm.DEFAULT_CONFIG, "upperHopper": "never"})
+    _standing(monkeypatch, UPSTAIRS_H)
+    monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [UPPER_HOPPER])
     assert mlm._hopper_candidates(ctx) == []
+
+
+def test_a_blocked_machine_upstairs_climbs_down_and_does_not_latch_the_upper_hopper(monkeypatch,
+                                                                                    _hermetic):
+    """The hopper refuses both when it is the locked one AND when the machine is stalled, and
+    those must not be confused. Latching on a stalled machine would send every deposit back down
+    the ladder for the rest of the session over a broken strut -- expensive now that the upper
+    hopper is the normal one. The struts are downstairs, so the answer is to climb."""
+    ctx = _Ctx()
+    _standing(monkeypatch, UPSTAIRS_H)
+    monkeypatch.setattr(controller, "get_inventory", lambda: _paydirt(27))
+    monkeypatch.setattr(controller, "get_objects", lambda fresh=False, **kw: [UPPER_HOPPER])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_widget",
+                        lambda g, c, **kw: {"text": "You've already got some pay-dirt in the "
+                                                    "machine."} if g == mlm.MACHINE_BUSY_GROUP
+                        else {})
+    climbed = []
+    monkeypatch.setattr(mlm, "climb", lambda c, up: climbed.append(up) or True)
+
+    assert mlm.hopper_phase(ctx) is False
+    assert climbed == [False], "a stalled machine seen from upstairs must climb down to the struts"
+    assert "mlm_upper_locked" not in ctx.state.data
 
 
 def test_a_locked_upper_hopper_latches_and_falls_back_to_the_ladder(monkeypatch):
