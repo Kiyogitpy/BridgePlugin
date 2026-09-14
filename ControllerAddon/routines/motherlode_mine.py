@@ -408,8 +408,19 @@ def snapshot(ctx, force=False):
     here = _player_tile()
     if here is None:
         return {}, None
-    reach = worldmap.reachable_from(here["x"], here["y"], here.get("plane", 0),
-                                    radius=REACH_RADIUS)
+    # LIVE collision, not the static map. USER 2026-09-14: "we dont even have to go to that
+    # place there are plenty nodes not behind rockfall where im standing now."
+    #
+    # This used worldmap.reachable_from, and that is why the routine kept walking into the
+    # blocked pocket: the static map holds ONE set of collision data for both floors of this
+    # mine and it describes the DOWNSTAIRS layout, and -- decisively -- it cannot know about
+    # rockfalls at all, which are dynamic objects that come and go. So it reported veins behind a
+    # rockfall as perfectly reachable, pick_vein ranked them best-tier, and the run walked itself
+    # into somewhere it could not get out of. The client's own grid does know: MEASURED live the
+    # same day, travel.reachable_set answered 45 tiles while fenced in by one rockfall and 92
+    # once it was cleared.
+    reach = travel.reachable_set(here["x"], here["y"], here.get("plane", 0),
+                                 radius=REACH_RADIUS)
     tiles = controller.get_collision(here["x"], here["y"], here.get("plane", 0),
                                      radius=COLLISION_RADIUS) or []
     flags = {(t["x"], t["y"]): t.get("flags") for t in tiles} or None
