@@ -562,6 +562,79 @@ def blocking_rockfall(ctx, target):
     return None
 
 
+def rock_cost_map(ctx):
+    """For every tile near us: how many ROCKFALLS we would have to mine to stand there.
+
+    One 0-1 BFS over the client's live collision grid, run once and reused for every candidate
+    this tick. Cost 0 means "walk there right now"; cost 1 means "one rockfall in the way".
+
+    This is the honest answer to the question the routine kept getting wrong -- USER 2026-09-14,
+    after it wedged itself yet again: "we have a whole cashed map, we know the tile it sits on
+    how can we not solve this?" We can, and this is how: the rockfall TILES are known exactly
+    from /objects, and the live grid distinguishes an object's own blocking
+    (BLOCK_MOVEMENT_OBJECT) from a wall's edge bits, so a rock can be priced as
+    passable-if-mined while real walls still refuse. Nothing here is a guess or a ranking
+    heuristic -- a vein with a cost-0 neighbour is minable from where we stand, full stop.
+
+    Returns ({tile: cost}, {tile: rockfall object}). Empty when the client cannot answer, which
+    every caller must read as "cannot tell" and fall back on."""
+    data = _d(ctx)
+    cached = data.get("mlm_rockcost")
+    if cached and _now() - cached[0] < SNAPSHOT_MAX_AGE_S:
+        return cached[1], cached[2]
+    here = _player_tile() or {}
+    if here.get("x") is None:
+        return {}, {}
+    plane = here.get("plane", 0)
+    tiles = controller.get_collision(here["x"], here["y"], plane,
+                                     radius=ROCKFALL_ROUTE_SCAN) or []
+    if not tiles:
+        return {}, {}
+    flags = {(t["x"], t["y"]): t.get("flags") for t in tiles}
+    start = (here["x"], here["y"])
+    if start not in flags:
+        return {}, {}
+    upper = _upstairs()
+    falls = {(o.get("x"), o.get("y")): o
+             for o in _objects(ids=ROCKFALL_IDS, action=ROCKFALL_ACTION)
+             if same_floor(o, upper)}
+    dist = {start: 0}
+    queue = collections.deque([start])
+    while queue:
+        cur = queue.popleft()
+        cx, cy = cur
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nxt = (cx + dx, cy + dy)
+            if nxt not in flags:
+                continue
+            nxt_flags = flags.get(nxt)
+            step = 0
+            if nxt in falls:
+                nxt_flags = (nxt_flags or 0) & ~BLOCK_MOVEMENT_OBJECT
+                step = 1
+            if not travel._passable(flags.get(cur), nxt_flags, dx, dy):
+                continue
+            cost = dist[cur] + step
+            if cost < dist.get(nxt, 1 << 30):
+                dist[nxt] = cost
+                (queue.appendleft if step == 0 else queue.append)(nxt)
+    data["mlm_rockcost"] = (_now(), dist, falls)
+    return dist, falls
+
+
+def rocks_in_the_way(obj, cost):
+    """How many rockfalls stand between us and working `obj`. None when we cannot tell.
+
+    A vein is worked from a tile BESIDE it, so the answer is the cheapest of its neighbours."""
+    if not cost or obj is None or obj.get("x") is None:
+        return None
+    x, y = obj.get("x"), obj.get("y")
+    best = min((cost.get(n, 1 << 30)
+                for n in ((x, y), (x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1))),
+               default=1 << 30)
+    return None if best >= (1 << 30) else best
+
+
 def rockfall_on_route(ctx, target):
     """Route from us to `target`; return the first rockfall the route has to go THROUGH, or None.
 
@@ -948,7 +1021,9 @@ def pick_vein(ctx, reach, flags, exclude=(), objects=None):
     excluded = set(exclude)
     blocked = _blocked_veins(ctx)
     upper = _upstairs()
+    rock_cost, _falls = rock_cost_map(ctx)
     best = None
+    free_only = []
     for obj in (controller.get_objects(interactable=True) if objects is None
                 else objects) or []:
         if (obj.get("name") or "").lower() != VEIN_NAME.lower():
@@ -976,9 +1051,29 @@ def pick_vein(ctx, reach, flags, exclude=(), objects=None):
         # first run 90 seconds AND rejected upstairs veins two tiles away that mine fine. A
         # walled-off vein now costs two dead clicks and is set aside by note_vein_failure, which
         # is the empirical answer to a question this data cannot answer in advance.
+        # ROCKS ARE A VETO, not a ranking. USER 2026-09-14, after it walked at a vein behind a
+        # rockfall yet again: "we have a whole cashed map, we know the tile it sits on how can we
+        # not solve this?" -- and "The click didnt take because we are stuck behind rockfall".
+        # We CAN solve it: rock_cost_map prices every tile by how many rockfalls stand in the
+        # way, from the exact tiles /objects reports, so this is a fact rather than a guess.
+        # Ranking was never enough: a blocked vein still wins whenever the reachability signal is
+        # ambiguous, and in this mine it very often is.
+        rocks = rocks_in_the_way(obj, rock_cost)
+        if rocks:
+            free_only.append(obj)       # remembered only so we can say how many we skipped
+            continue
         rank = (0 if _reachable(obj, reach, flags) else 1, distance)
         if best is None or rank < best[0]:
             best = (rank, obj)
+    if best is None and free_only:
+        # Everything in range needs a rock moved. Say so ONCE rather than silently doing
+        # nothing -- the caller's own escape (clear_rockfall) is what handles it.
+        data = _d(ctx)
+        if not data.get("mlm_all_blocked_logged"):
+            data["mlm_all_blocked_logged"] = True
+            debug_log.log(LOG, f"every vein in range ({len(free_only)}) is behind a rockfall")
+        return None
+    _d(ctx).pop("mlm_all_blocked_logged", None)
     return best[1] if best else None
 
 

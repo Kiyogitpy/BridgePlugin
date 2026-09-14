@@ -639,6 +639,46 @@ def _rockfall(x, y, dist=2, height=UPSTAIRS_H):
             "onScreen": True}
 
 
+def test_a_vein_behind_a_rockfall_is_never_picked_when_a_free_one_exists(monkeypatch, _hermetic):
+    """USER 2026-09-14: "we have a whole cashed map, we know the tile it sits on how can we not
+    solve this?" -- after the routine walked at a vein behind a rockfall and reported "the click
+    did not take". Ranking was never enough: a blocked vein still wins whenever the reachability
+    signal is ambiguous, and in this mine it very often is. The rockfall TILES are known exactly,
+    so this is a veto."""
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    _standing(monkeypatch, UPSTAIRS_H, x=3752, y=5680)
+    near_but_blocked = {"id": 26661, "name": "Ore vein", "actions": ["Mine"], "plane": 0,
+                        "x": 3753, "y": 5680, "distance": 1, "tileHeight": UPSTAIRS_H,
+                        "screenX": 1, "screenY": 1, "visible": True}
+    further_but_free = {"id": 26661, "name": "Ore vein", "actions": ["Mine"], "plane": 0,
+                        "x": 3750, "y": 5682, "distance": 3, "tileHeight": UPSTAIRS_H,
+                        "screenX": 1, "screenY": 1, "visible": True}
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda **kw: [near_but_blocked, further_but_free])
+    # One rock in front of the near vein; the far one is walkable.
+    monkeypatch.setattr(mlm, "rock_cost_map",
+                        lambda c: ({(3753, 5680): 1, (3754, 5680): 1,
+                                    (3750, 5682): 0, (3751, 5682): 0}, {}))
+    picked = mlm.pick_vein(ctx, set(), None)
+    assert picked is not None and (picked["x"], picked["y"]) == (3750, 5682), \
+        "the free vein must win even though it is further away"
+
+
+def test_an_unknown_rock_cost_does_not_refuse_a_vein(monkeypatch, _hermetic):
+    """Outside the collision read the cost is unknown, and unknown must mean "carry on" -- the
+    same rule every reachability test in this file already follows."""
+    ctx = _Ctx()
+    ctx.state.data["mlm_anchor"] = {"x": 3752, "y": 5680, "plane": 0}
+    _standing(monkeypatch, UPSTAIRS_H, x=3752, y=5680)
+    vein = {"id": 26661, "name": "Ore vein", "actions": ["Mine"], "plane": 0,
+            "x": 3753, "y": 5680, "distance": 1, "tileHeight": UPSTAIRS_H,
+            "screenX": 1, "screenY": 1, "visible": True}
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [vein])
+    monkeypatch.setattr(mlm, "rock_cost_map", lambda c: ({}, {}))   # client could not answer
+    assert mlm.pick_vein(ctx, set(), None) is not None
+
+
 def test_a_rock_is_mined_only_when_the_route_runs_through_it(monkeypatch, _hermetic):
     """USER 2026-09-14, the algorithm verbatim: "route from us to the upper hopper if there is a
     rockfall in the way mine it if not great deposit."
