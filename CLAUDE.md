@@ -42,241 +42,42 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
 ## Running things
 
 - **RuneLite client**: `./gradlew.bat run` (from repo root). Launches via
-  `ExamplePluginTest.main`, which loads the Controller plugin and starts the bridge.
-  **Since 2026-09-05 the same command also loads every ZombieLite plugin** (the user's
-  overlay-only boss-helper bundle, `../ZombieLite`, branch `no-packets` on
-  github.com/Kiyogitpy/ZombieLite) when that checkout exists: `run` builds its jar in place
-  (`buildZombieLite`) and `ExamplePluginTest` loads `CustomPlugins.CLASSLIST` by reflection ahead
-  of `ControllerPlugin`, so nothing here compiles against it and a machine without the checkout
-  gets the bridge alone. Why: a Hunllef kill can only be played by hand with ZombieLite's
-  attack/prayer counters up, and `/recorder` lives in this plugin, so recording it needs both in
-  ONE client. `./gradlew.bat checkZombieLite` links all of its plugin classes against this
-  build's RuneLite without launching (run it after pulling ZombieLite or a `latest.release`
-  bump). That branch has NO packet layer: `com.salvation.packets`, the Zombie Updater, the Zombie
-  Prayer automation and the hopper's auto-teleport/logout were deleted 2026-09-05 so nothing in
-  the merged client can inject input -- keep it that way; the "physical Arduino, never
-  software-injected" rule in "What this is" applies to every plugin loaded next to the bridge.
-  **Zombie Prayer came BACK as indicators-only on 2026-09-06.** The 2026-09-05 removal deleted the
-  whole plugin, and its `PrayerOverlay` was the ONLY reader of `TrackerPlugin.getIncomingDamages()`
-  -- the set every boss plugin's projectile/NPC trackers queue `Damage` into -- so the Whisperer,
-  Cerberus, Jad, Muspah and Mad Angel silently stopped showing what to pray (the Hunllef kept
-  working only because the gauntlet plugin draws its own swap text). USER: "when i said i wanted
-  packet removed i meant packets that simulate clicks"; "take it from upstream". So
-  `plugins/prayer/*`, `audio/PrayerMuter.java` and `TrackerConfig`'s click-pattern enum are
-  upstream's files verbatim, EXCEPT `ZombiePrayerPlugin`, which lost only the three things that
-  acted -- the onGameTick `Prayer.activate()/deactivate()` loop, the Attack-click activation
-  handler, and the Gaussian click-pattern call -- each marked with a `no-packets:` comment.
-  `Prayer.setActive/flick/toggle` and `Widgets.click` stay deleted. Audit of the removal commit
-  (`bc41f45`, 22 files) found nothing else read-only lost; the AoE warning plugin was untouched.
-  Read-only-ness is judged per FILE when taking an upstream commit, not per plugin: an upstream
-  plugin that both draws and clicks is kept with its clicking methods removed, not dropped.
-  **Taking upstream ZombieLite commits (2026-09-05):** the checkout's `origin` is
-  StephanBijzitter's repo and `fork` is the user's; fetch `origin`, `git cherry-pick` onto
-  `no-packets`, push to `fork` ONLY. Skip any upstream commit that touches `com.salvation.packets`
-  or re-adds an input-sending plugin, and run `checkZombieLite` after. Two were taken that day:
-  `39120eb` (graphics-object tick counters) and `3fe479f` (Lowerniel Drakan). The Drakan one is
-  the answer to USER's "feel like it just keeps piling on but should reset after his combo is
-  done": the overlay's telegraph `TreeMap` is only drained in `onAnimationChanged`, and the plugin
-  had registered only the IDLE animation, so a combo's telegraphs accumulated until the boss
-  idled; upstream registers all seven combo animations. If the pile-up is still visible live, the
-  remaining fix is pruning by expiry tick rather than by animation.
-  **Kiyo's own Weapon Tracker addon lives in ZombieLite since 2026-09-06** (`com.WeaponTracker`,
-  commit `75d5515` on `no-packets`): the ZombieLite copy is the CANONICAL one, not
-  `IdeaProjects/weapon_tracker_rs` -- its classifier defers to `com.salvation.data.WeaponDamageType`
-  for melee/ranged/magic (SPEC stays a name check; unarmed -1 is answered UNKNOWN before the table,
-  whose NONE entry maps -1 to MELEE), so it no longer compiles standalone. The per-line file logger
-  was dropped on import (USER: "remove logger from my addon").
-- **The VM (2026-09-07)**: USER wanted the physical mouse free for the second screen. One
-  Windows desktop has one cursor and one foreground window, so the client, the bridge,
-  controller.py AND the Arduino live in a VirtualBox guest instead. VirtualBox 7.2.16 +
-  Extension Pack, VM `OSRS` at `C:\VMs\OSRS` (Windows 10 Pro 22H2 from an official ISO at
-  `E:\VM\`, 8 vCPU, 8 GB, 50 GB dynamic disk, EFI, VBoxSVGA with 3D OFF -- the GPU plugin
-  cannot run there), guest user `Kiyo` / password `osrs`. The Leonardo (USB 2341:8036) is
-  captured by a USB filter, so it is the GUEST's mouse and keyboard and the host never sees
-  it while the VM runs (MEASURED: host COM6 disappears; in the guest it is **COM3**, exported
-  as `BRIDGE_SERIAL_PORT`). The host's `C:\Users\Kiyo\Documents` is shared as `Docs`, which
-  Windows mounted at **`Z:`** (D: is the DVD drive), so `Z:\Httpbridge` and `Z:\ZombieLite`
-  keep the `../ZombieLite` layout the build needs. **The guest does NOT build or run from the
-  share**: host and guest Gradle would fight over one `build\`/`.gradle\` on a network drive,
-  so `tools/vm-sync.ps1` (run in the guest) robocopy-mirrors the repo and ZombieLite into
-  `C:\work\` (excluding .git, build, `data\` -- 5.5 GB the guest never needs; the routing map
-  is inside `ControllerAddon\maps`) and copies guest `logs\`/`recordings\` back to the host.
-  So the loop is: edit on the host, `vm-sync.ps1` in the guest, run there.
-  `tools/vm-guest-setup.ps1` provisioned the guest (a fresh 22H2 image has NO winget, so
-  per-user direct installers from `data\vm-installers\`: Python 3.13.7, and Temurin
-  **11.0.30+7 exactly** -- the host's client JVM build, since `java.version` is in the login
-  fingerprint; pip requirements; pointer acceleration off).
-  **`VBoxManage guestcontrol` IS DEAD ON THIS SETUP and `tools/vmexec.py` replaced it**
-  (commit 946e07f, 2026-09-08): both `run --wait-stdout` and the async `start` form hang or do
-  nothing with the guest logged in and Guest Additions at run level 3, and a guest reboot did
-  not fix it. vmexec drives the guest over the OpenSSH server instead (paramiko, because the
-  password needs supplying without a TTY). Its two forms are not interchangeable: plain SSH has
-  **no window station**, so anything touching the cursor or a GUI dies there with
-  `WinError 1459` -- `--interactive` runs it on the logged-on desktop through a scheduled task,
-  and that is what the client and controller.py need.
-  **Fingerprint parity (CLAUDE.md "What the game client sends home")**: the VM's SMBIOS UUID
-  is the host's (`--hardware-uuid`, what `wmic csproduct get UUID` answers; VERIFIED identical
-  in the guest); CPU count and heap are matched with `-XX:ActiveProcessorCount=32
-  -Xmx8541700096` (the host's measured default `MaxHeapSize`) in the GUEST's run task rather
-  than by giving the VM 32 vCPUs; Windows build (19045) and Temurin 11.0.30 match the host.
-  All of `controller.py`'s Win32 calls (cursor, panic key, DPI) run inside the guest, so
-  nothing in the Python changes. Running a client in a VM is itself USER's accepted risk.
-  **VERIFIED end to end 2026-09-07**: the guest launched to the logged-in game as "07 Kiyo",
-  bridge answering, ZombieLite + Controller loaded, `/client-version` reporting the same jar
-  SHA as the host, the client JVM carrying `-XX:ActiveProcessorCount=32 -Xmx8541700096`, and
-  the Arduino answering `V -> HB 3` over COM3 from inside the guest. **Login has NO Jagex
-  Launcher**: RuneLite reads `%USERPROFILE%\.runelite\credentials.properties` (the JX_ tokens)
-  at startup and signs in automatically; that file was copied from the host once. The tokens
-  self-refresh into the GUEST's `.runelite`, so keep the host's RuneLite CLOSED while the VM
-  runs or the two sessions fight over one refresh token. `tools/vm-run-client.ps1` launches
-  it (default = full/developer "unsafe" start with the injected client and all builtin
-  plugins; `-SafeMode` is a diagnostic external-plugins-off launch). The client is started
-  from the host with `VBoxManage guestcontrol OSRS start ... -- cmd.exe /c "cd /d
-  C:\work\Httpbridge && gradlew.bat --no-daemon run"`; a `natpf1` rule forwards guest 8080 to
-  host 127.0.0.1:18080 for read-only host-side bridge probing. Since the bridge binds loopback
-  by default (2026-09-07), the guest launch sets BRIDGE_BIND_ALL=1 (vm-run-client.ps1, and
-  --putenv BRIDGE_BIND_ALL=1 on any guestcontrol launch) or the forward dead-ends.
-  **SSH into the guest (host VSCode Remote-SSH / a host terminal), 2026-09-07.** OpenSSH server
-  installed in the guest (`tools/vm-setup-ssh.ps1`, run ELEVATED -- Kiyo is a local admin but
-  UAC hands guestcontrol a FILTERED token, so the install needs a real UAC consent: the
-  self-scheduled-`RunLevel Highest` bypass is denied here, so `tools/vm-ssh-elevate.ps1` raises
-  a one-click UAC prompt on the VM screen). A `natpf1` rule forwards host 127.0.0.1:2222 ->
-  guest 22; the host `~/.ssh/config` has an `osrs-vm` block (user kiyo, password osrs, host-key
-  checking off since it is a forwarded localhost). VSCode: Remote-SSH -> Connect to Host ->
-  `osrs-vm`, then open `Z:\Httpbridge` (live host share, Python edits need no sync) or
-  `C:\work\Httpbridge` (the build mirror); its terminal runs IN the guest. Password auth
-  (key auth would need the admin `administrators_authorized_keys` file, another elevation --
-  skipped). VERIFIED to the handshake: the host client got the guest host key and negotiated
-  password auth through the forward.
-  **What persists across a VM power-off vs not.** Durable in the VM/guest: the Arduino USB
-  filter, the Docs share (Z:), the hardware UUID, and inside the guest the RuneLite profile,
-  `credentials.properties`, the OpenSSH server, and `~/.gradle/gradle.properties` (parity JVM
-  flags). NOT durable: the two NAT port-forwards (added at runtime). So start the VM with
-  `tools/vm-up.ps1` (host), which starts it and re-adds both forwards idempotently; a GUI
-  double-click start works too but then run `vm-up.ps1` once to restore the forwards. The
-  client (`vm-run-client.ps1`) and routines never auto-start -- launch them per session, OR
-  drive the whole session from the host with **`run-vm.bat`** (repo root, added
-  2026-09-08; `tools/vm-session.ps1` is the real script). It runs `vm-up.ps1`, launches the
-  client in the guest over `VBoxManage guestcontrol`, waits for the bridge on the 18080
-  forward, waits for `/login/status` to report `loggedIn` with NO `clickToPlay` (the
-  `login.is_fully_logged_in()` test -- `loggedIn` alone is already true under the
-  click-here-to-play screen), then starts the routine in the guest with
-  `BRIDGE_SERIAL_PORT=COM3`. **Bare `run-vm.bat` is PANEL MODE**: controller.py is started with
-  NO routine argument, which is what makes it re-read the plugin's Routine dropdown every loop
-  (`ROUTINE_FILES`) and hot-swap routines live, gated by Controller Enabled -- so the routine is
-  chosen in the GUI and can be changed without restarting anything. `run-vm.bat <routine>` pins
-  one instead (the dropdown is then ignored), and `-NoRoutine` starts no controller.py at all.
-  Every step is idempotent and deadlined; it REFUSES to launch
-  when a RuneLite client is running on the host (two clients fight over one self-refreshing
-  Jagex token) or when python.exe is already running in the guest (one process per COM port),
-  `-Force` overrides both. **F1 still has to be pressed inside the VM window** -- the panic key
-  is polled in the guest.
-
-  **THERE IS NO SYNC IN THE PYTHON EDIT->RUN LOOP (2026-09-08).** The routine runs from
-  `Z:\Httpbridge\ControllerAddon`, which IS this repo through the share, so a Python edit on
-  the host is live in the guest with no `vm-sync.ps1` at all -- and the routine's log lands in
-  the host's own `ControllerAddon\logs`, readable with no copy-back. MEASURED in the guest off
-  the share: `import worldmap, controller, travel` 0.31s, `reachable_from` + an 8-step route
-  0.026s (1207 tiles, so the collision map really loads), and the deob guard passes there
-  (`data/` is visible through the share where the synced mirror excluded it), so the guest now
-  gets the guard's real protection instead of its warn-only fallback.
-  `PYTHONDONTWRITEBYTECODE=1` keeps the guest from scattering `__pycache__` into the host repo.
-  **`C:\work` is only for GRADLE** (host and guest would otherwise fight over one `build\` on a
-  network drive), so `vm-session.ps1` syncs it in the CLIENT-launch branch alone. The three
-  guest-side halves are `.cmd` files on the share (`vm-guest-sync.cmd`,
-  `vm-guest-launch-client.cmd`, `vm-guest-run-routine.cmd`) so the host passes one unquoted
-  token per call -- and the routine launcher takes its log name as argument 1 because a
-  scheduled task inherits no environment. **Each maps `Z:` from `\\VBOXSVR\Docs` on its own
-  first LINE, which is load-bearing twice over**: a drive letter is per-LOGON-SESSION, MEASURED
-  2026-09-08 the scheduled-task desktop session had none, and a one-liner
-  (`net use ... & echo > Z:\...`) still failed -- the mapping has to complete on an earlier
-  line than the command using it.
-
-  **A ROUTINE'S TARGETS AND ITS WHEN-FULL POLICY ARE PANEL CONFIG, NOT PYTHON (2026-09-08).**
-  `gathering.get_config` lets the bridge's answer WIN over `DEFAULT_CONFIG` deliberately (a
-  panel with nothing selected must mean an idle routine, never a surprise trip to the rune
-  rocks), so "run woodcutting on yews, banking" cannot be expressed from the host by editing
-  Python at all. `tools/vm-set-controller-config.ps1` (run IN the guest) writes the keys into
-  the guest's active RuneLite profile properties -- `controller.<keyName>=<value>`, the
-  `@ConfigItem` keyName from `ControllerConfig.java` under the `controller` group:
-      python tools\vmexec.py --% "powershell -NoProfile -ExecutionPolicy Bypass -File \\VBOXSVR\Docs\Httpbridge\tools\vm-set-controller-config.ps1 treeNames='Yew tree' woodcuttingFullInventory=BANK"
-  **It refuses while the client is running, and that guard is load-bearing**: RuneLite holds
-  the profile in memory and rewrites the file on change/exit, so an edit made underneath it is
-  silently discarded. It fired on its first real use, catching a client the VM had resumed from
-  SAVED STATE -- note `vm-up.ps1` reporting "guest ready after 12s" means a resume, not a cold
-  boot, so a previous session's client and routine can still be alive.
-  **Two vmexec quoting traps, MEASURED the same day.** The guest's default shell is PowerShell
-  5.1, so `cmd`'s `&` separator is a parse error there; and the HOST PowerShell expands `$_`
-  and eats quotes before the string ever reaches paramiko, which turns a `Where-Object`
-  one-liner into a silent empty result rather than an error. **Put the guest command in a
-  `.ps1` on the share and invoke it by its UNC path** (`\\VBOXSVR\Docs\Httpbridge\...`,
-  which needs no `Z:` mapping and so sidesteps the per-logon-session drive-letter trap
-  entirely); pass arguments with `--%` in front of the whole vmexec invocation.
-
-    **Host-side bridge reads go through `BRIDGE_API_BASE`** (2026-09-08): `settings.py`'s
-  `API_BASE` is now `os.environ.get("BRIDGE_API_BASE", "http://localhost:8080")` and
-  `.mcp.json` sets it to `http://127.0.0.1:18080` for the `osrs-debug` MCP server, so
-  `bridge_get` reads the VM's live game state from the host again. The guest's own
-  controller.py keeps the default and is untouched. **`poll_events` stays guest-only**: a
-  `natpf1` rule forwards host->guest, while the plugin sends its UDP to the guest's own
-  loopback, so the event stream never crosses.
-
-  **VERIFIED END TO END FROM A POWERED-OFF VM, 2026-09-08**: `run-vm.bat` -> guest ready 14s ->
-  sync -> client launched on the desktop -> bridge up ~35s later -> controller.py started ->
-  `loggedIn: True`, camera set (pitch 1024 -> 4160), and the panel's routine working, with its
-  log read off the host the whole time. Three failures on the way, each worth keeping:
-  - **A CLIENT LAUNCHED FROM A SCHEDULED TASK COMES UP UNFOCUSED, and that silently defeats
-    everything.** MEASURED: `/state` `windowFocused: False`, and controller.py clicked Play Now
-    with the physical Arduino once a tick FOREVER without the login screen advancing --
-    `login.attempt_login` runs BEFORE the engine's own `windowFocused` gate, so the login path
-    is not covered by it. Focusing the window made the very next click land and the account
-    logged straight in. `vm-guest-focus-client.ps1` (SetForegroundWindow, on the desktop) is now
-    a step of `vm-session.ps1` before the routine starts. **The engine gap is NOT fixed**: any
-    routine whose client is unfocused at the login screen still burns clicks silently.
-  - **PowerShell 5.1 turns a native command's stderr into a TERMINATING error under
-    `$ErrorActionPreference = "Stop"`.** paramiko writes "Error reading SSH protocol banner"
-    while the guest is still booting -- normal, transient -- and that one line killed the entire
-    cold start from inside `vm-up.ps1`'s readiness loop. Every vmexec call in these scripts runs
-    under `Continue` now, and each step checks its own outcome instead.
-  - **RuneLite's credentials.properties auto-login did NOT take** after the client had been
-    force-killed; the client sat on `loginIndex 10` (Play Now) and the login gate correctly
-    refused to start a routine there. `-SkipLoginGate` is the right answer -- login.py clicks
-    that screen itself.
-  Also MEASURED that day: the two NAT forwards SURVIVED a power-off (this file records them as
-  non-durable; `vm-up.ps1` re-adds them idempotently either way), and the guest auto-logs into
-  the console session (`AutoAdminLogon = 1`), which is what makes a `--interactive` desktop task
-  possible at all after a cold boot.
-
-  **Screen geometry (settled 2026-09-08).** The VM runs WINDOWED AND MAXIMIZED on the host's
-  1920x1080 second display (`GUI/LastNormalWindowPosition = 2560,23,1920,1017,max`), which is
-  what makes the GUEST desktop **1920x974** -- VirtualBox sizes the guest to the VM window's
-  client area, so 974 is 1080 minus the VM's own chrome. Inside that, the RuneLite window is
-  MAXIMIZED, which `vm-guest-focus-client.ps1` now asserts on every run. **USER's choice is
-  windowed, not fullscreen**: VirtualBox fullscreen was tried and reverted the same day (it
-  gives the guest a true 1920x1080 and the canvas 1889x1017 against 1859x911, ~13% more area),
-  so **do not set `GUI/Fullscreen`** -- the key was deleted. Canvas with the sidebar collapsed
-  is 1859x911; an expanded side panel costs ~242px of canvas WIDTH (measured 1617x911), which
-  is worth checking before concluding the client shrank.
-  Two traps found getting there:
-  - **An SSH session cannot see the display.** `[Screen]::AllScreens` over plain SSH reports a
-    phantom `1024x768` screen named **`WinDisc`** -- not the real desktop. It made the client
-    look far larger than its screen with the sidebar off the edge, which was wrong. Measure any
-    guest geometry from the DESKTOP session (`vmexec.py --interactive`), never over SSH.
-  - **`ShowWindow(SW_RESTORE)` UN-maximizes an already-maximized window** -- the focus helper's
-    first draft would have shrunk the client on every run. It uses `SW_SHOWMAXIMIZED` (3).
-  **`routines/pest_control.py` cannot work in the VM as written**: `ABS_MINIMAP_CLICK_X/Y`
-  (2365, 80) is an absolute HOST screen pixel captured with ShareX, and the guest desktop is
-  only 1920 wide -- x=2365 is off-screen there. It needs re-capturing in the guest before that
-  routine is run in the VM.
-  **The RuneLite PROFILE must be copied by hand -- it does NOT transfer.** The active profile
-  (`~/.runelite/profiles2/default-1209788292728200.properties`, ~1.5 MB: every plugin
-  setting, keybind, and the load-bearing Menu Entry Swapper swaps the routines depend on) has
-  `sync=false`, so it lives only on the host and never reaches the guest through RuneLite's
-  cloud sync. Copied once 2026-09-07 by killing the guest client and copying the host's whole
-  `profiles2\` into the guest `~/.runelite\` (its `profiles.json` then makes the host's
-  `default` profile active in the guest). Re-copy after changing plugin settings on the host.
-  A menu-swap mismatch is not cosmetic here: karambwan's worn-teleport clicks, the ice-glove
-  swap and the mahogany withdraws all assume specific left-click swaps (see those sections).
+  `ExamplePluginTest.main`, which loads the Controller plugin and starts the bridge -- and,
+  when the `../ZombieLite` checkout exists (branch `no-packets` on the user's fork, an
+  overlay-only boss-helper bundle), builds and loads every ZombieLite plugin into the SAME
+  client. **The no-packets rule is absolute**: nothing loaded next to the bridge may inject
+  input -- the "physical Arduino, never software-injected" rule in "What this is" applies to
+  every plugin. Upstream ZombieLite commits are cherry-picked onto `no-packets` (skip any
+  that touch `com.salvation.packets` or re-add an input-sending plugin), read-only-ness is
+  judged per FILE (a plugin that draws and clicks keeps its drawing, loses its clicking),
+  and `./gradlew.bat checkZombieLite` must pass after every pull or `latest.release` bump.
+  Zombie Prayer is indicators-only (its three acting call sites removed, each marked
+  `no-packets:`); Kiyo's Weapon Tracker addon lives in ZombieLite as the CANONICAL copy.
+  Full history, commit ids and the cherry-pick workflow: **`docs/zombielite.md`**.
+- **The VM**: the client, bridge, controller.py AND the Arduino all run inside a
+  VirtualBox guest (`OSRS`, Win10 22H2, guest user `Kiyo`/`osrs`) so the host's physical
+  mouse stays free; the Leonardo is captured by a USB filter and is **COM3 in the guest**
+  (`BRIDGE_SERIAL_PORT`). Login fingerprint parity with the host is maintained (same SMBIOS
+  UUID via `--hardware-uuid`, `-XX:ActiveProcessorCount=32 -Xmx8541700096`, same Temurin
+  11.0.30; no Jagex Launcher -- `credentials.properties` auto-login, keep the host's
+  RuneLite CLOSED while the VM runs or the two fight over one refresh token). Drive a whole
+  session from the host with **`run-vm.bat`** -- bare = PANEL MODE (routine picked in the
+  GUI, hot-swapped live), `run-vm.bat <routine>` pins one. It starts the VM, re-adds the
+  NAT forwards (bridge probe host 127.0.0.1:18080, SSH 2222), launches the client, waits
+  for full login, focuses the window and starts the routine. **Python edits on the host are
+  LIVE in the guest** through the `Z:` share (no sync; logs land in the host's own
+  `ControllerAddon\logs`); only GRADLE runs from the synced `C:\work\` mirror.
+  `tools/vmexec.py` executes guest commands over SSH -- `--interactive` for anything
+  touching the desktop/cursor (plain SSH has no window station); put guest commands in a
+  `.ps1` on the share and invoke by UNC path (two measured quoting traps otherwise).
+  `tools/vm-set-controller-config.ps1` writes panel config -- it refuses while the client
+  runs, and that guard is load-bearing. Host-side bridge reads honour `BRIDGE_API_BASE`
+  (`.mcp.json` points the MCP server at the 18080 forward); `poll_events` stays guest-only.
+  F1 panic must be pressed inside the VM window. Everything else -- provisioning scripts,
+  SSH setup, screen geometry (guest desktop 1920x974, windowed-maximized, never set
+  `GUI/Fullscreen`), profile copying (`profiles2` does NOT sync -- re-copy after changing
+  plugin settings on the host), the guest-console-over-the-viewport click eater, cold-start
+  verification -- is in **`docs/vm.md`**; read it before touching any VM tooling.
 - **A routine**: `python -u controller.py routines/<name>.py` (from `ControllerAddon/`). Runs
   until the panic key (F1) is pressed, a safety stop triggers, or the process is killed.
 - **MCP debug server** (`osrs-debug` in `.mcp.json`): read-only bridge queries
@@ -407,189 +208,37 @@ check. Do take `curtain`, which our name list was missing.
 See `docs/superpowers/specs/2026-08-29-global-collision-pathfinding-design.md` for the design
 this feeds.
 
-## What the game client sends home (read from the rl-suite deobfuscation, 2026-09-07)
+## What the game client sends home
 
-Everything below was READ from `data/decompiled/rl-suite-main/semantics/injected-client-1.12.37-sources/`
-(`PlatformInfo.java`, `classVS.java`, `client.java`, `classDK.java`, `classUO.java`,
-`GameEngine.java`) and the rev-240 packet table
-`data/decompiled/rl-suite-main/data/rev-240/mappings/client-packets.tsv` (117 opcodes, 101 named),
-after USER asked how a VM could be hidden from the client. It is the list of what the client can
-SEE, so future work knows which side of the wire a behaviour lands on. Two caveats: rl-suite's
-semantic names are heuristic anchors (a couple of the server-packet names around the recorder
-toggles look mis-anchored), so trust the described BEHAVIOUR over any name here; and this is the
-Java client launched by `./gradlew.bat run`, not the Jagex Launcher, which this setup never runs.
-Reading packet tables is not a licence to send packets -- see the rl-suite caveat above.
+Full analysis, read from the rl-suite deobfuscation 2026-09-07 (packet-by-packet detail,
+the fingerprint parity table, the recorder's coverage of it): **`docs/telemetry.md`**.
+The facts that shape day-to-day work:
 
-**Login fingerprint (`PlatformInfo`, serialised once at login).** On Windows the Java client
-reads exactly: `os.name`, `os.version`, `os.arch`, `java.vendor`, `java.version`, max heap in MB
-(`Runtime.maxMemory`, the JVM default of a quarter of RAM unless `-Xmx` is set), the CPU count,
-and the SMBIOS system UUID by running **`wmic csproduct get UUID`** and taking the second line
-(macOS `system_profiler`, Linux `/etc/machine-id`; on failure the placeholder
-`12345678-0000-0000-0000-123456789012`, which is what a Windows 11 24H2+ guest sends since `wmic`
-is gone there). The GPU / CPU-name / driver / display string fields exist in the class and the
-Java client's constructor call passes them EMPTY -- they belong to the C++ client -- **but a
-separate method fills THREE of the string slots after construction (found 2026-09-07 while
-diffing our own 1.12.38 deobfuscation, and missed by the first read): the process's own
-executable name (`ProcessHandle.current().info().command()`, first 10 chars), the PARENT
-process's executable name (`.parent()`, first 10 chars), and the file name of the first JVM
-argument whose 10-char prefix hashes to `-1094877034`, which is `-javaagent` (up to 22 chars).**
-So the client can tell `java.exe` launched by a Gradle worker (`./gradlew.bat run`) from
-`RuneLite.exe` launched by the launcher, and reports any Java agent by name. Keep the launch
-shape constant per account; do not add a `-javaagent` to the run task. There is NO MAC-address
-read, NO screen-size read and NO hypervisor check anywhere in the sources. So nothing says
-"VMware" by name; a VM leaks only as a DIFFERENT identity from the one the account has always
-logged in with. Three hypervisor-side knobs make the guest byte-identical: the same UUID
-(VMware `uuid.bios` in the .vmx, VirtualBox `--hardware-uuid`), the same core count, and
-`-Xmx` pinned so `maxMemory` matches -- plus the same launch shape, per the paragraph above.
-Not traced through the obfuscation: which static wrapper calls the UUID getter on the Java
-path; the method sits in the login class in the 1.12.14, 1.12.37 and 1.12.38 sources, so treat
-it as sent.
-
-**MEASURED on this host 2026-09-07** via `GET /client-version`'s `fingerprint` block
-(`LoginFingerprint.java` computes it exactly as the client does; `python tools/deobfuscate.py
---status` prints it). These are the parity targets a different launch or a VM guest must match:
-
-| field | host value under `./gradlew.bat run` |
-|---|---|
-| `processCommand` / `parentProcessCommand` | `java.exe` / `java.exe` (the Gradle worker -- a launcher-run client would report `RuneLite.e`) |
-| `javaAgent` | none |
-| `osName` / `osVersion` / `osArch` | `windows 10` / `10.0` / `amd64` |
-| `javaVendor` / `javaVersion` | `Eclipse Adoptium` / `11.0.30` |
-| `maxMemoryMb` / `availableProcessors` | 8147 / 32 |
-| `smbiosUuid` | matches the host's `wmic csproduct get UUID` (printed by `--status`; not committed) |
-
-The endpoint reads these; it never sends anything. It is served on **loopback only** since
-2026-09-07 -- VERIFIED the same day: `Bridge running on http://127.0.0.1:8080` in the log, a
-LAN request to `192.168.50.240:8080` and `192.168.56.1:8080` refused, `127.0.0.1:8080` 200.
-The bridge has no auth and serves game state, screenshots, recorder keystrokes and the bank
-memory, which is why the default moved; `bridgeBindAll` (Controller Settings) or
-`BRIDGE_BIND_ALL=1` restores all-interfaces, and the VM guest NEEDS the env one because a
-VirtualBox NAT forward lands on the guest's NAT adapter, never on its loopback.
-
-**Continuous, during play -- this is the half that matters to us:**
-- **`EVENT_MOUSE_MOVE`: the whole cursor trajectory, at 20 Hz.** A dedicated thread samples
-  `(x, y, lastPressedTime)` every **50 ms** into a 500-slot buffer; the game loop flushes it
-  when **40 samples** are pending (about every 2 s) or IMMEDIATELY when a button is down.
-  Encoding is delta-from-previous with the time delta in 20 ms units (2 bytes for a step within
-  +-32 px and under 160 ms, 3 bytes within +-128 px and under 640 ms, else absolute), a sample
-  identical to the previous position is SKIPPED, positions are clamped to -1..65534 where
-  **-1 means the cursor is off the canvas**, and a packet is capped at 246 bytes. Server packets
-  switch the recorder on and off (on by default at startup). Consequences: stillness, snap
-  moves, straight lines, an exact-pixel return, a cursor parked for minutes and the cursor
-  LEAVING the window are all server-visible even with no click anywhere near them. This packet
-  is what every measurement in "Movement realism batch" and the fidget anchor fix is aimed at.
-- **`EVENT_MOUSE_CLICK_V2` (7 bytes), every press:** a flag byte, x clamped to the canvas
-  width, `(ms since the previous press, capped 32767) << 1 | right-button`, y clamped to the
-  canvas height. Inter-press timing therefore reaches the server with 1 ms resolution
-  independently of the OP packets. The RELEASE is not sent, so `CLICK_HOLD_RANGE_S` is invisible
-  to this packet (a hold still matters for drag-vs-click on the client).
-- **`EVENT_KEYBOARD`: every key press with ms since the previous key** (24-bit cap). The
-  password typed at login, the SHIFT before every walk click, F-keys, the held UP arrow of
-  `login.setup_camera` -- their rhythm is on the wire. A fixed SHIFT-down-to-click gap is a
-  signature; draw it.
-- **`EVENT_MOUSE_SCROLL`**: the wheel delta per cycle. **`EVENT_CAMERA_POSITION`**: yaw and pitch,
-  sent ONLY after an arrow-key camera move (key codes 96-99), rate-limited; a middle-mouse drag
-  sends nothing.
-- **`EVENT_APPLET_FOCUS`**: 1 / 0 on every window focus gain / loss, so karambwan's Alt+Tab AFK
-  is seen exactly as a human's would be. Focus flapping at machine cadence would not be.
-- **`WINDOW_STATUS`**: window mode plus canvas width and height, on change.
-- **`IDLE`**: sent after 15 000 client cycles (20 ms each, 5 min) with NO mouse AND NO keyboard
-  input -- the AFK-logout signal. **`NO_TIMEOUT`** is a keepalive every ~50 cycles that needs no
-  input, so nothing has to nudge the mouse to hold the connection.
-- **`REFLECTION_CHECK_REPLY`**: the server names classes, fields and methods; the client resolves
-  them by reflection and replies with field values, modifiers and invoke results. RuneLite
-  answers these against the vanilla jar named by `runelite.reflectcheck.jar` (the property is
-  read in `client.java`), which is why an injected client reads as vanilla. We never modify
-  injected classes, so nothing here changes it. **`DETECT_MODIFIED_CLIENT`** is one constant int
-  sent on scene load whenever the client runs inside a top-level `Frame` (every RuneLite
-  instance does), so it is not a differentiator. **`CONNECTION_TELEMETRY`** is login-connection
-  timing counters (three longs, four ints). `SEND_SNAPSHOT` is the abuse report, `BUG_REPORT` and
-  `CLIENT_CHEAT` (`::` commands) are user-initiated.
-
-**What is NOT in any packet:** the plugin list, the sidebar, overlays, ZombieLite, the HTTP
-bridge, the UDP stream, the serial port, other processes, the second monitor. The only channel
-that carries our behaviour is the input stream itself -- which is exactly the channel a physical
-Arduino feeds. Separately, RuneLite's own `TelemetryClient` (`client-1.12.33/.../TelemetryClient.java`)
-sends the OS / Java / launcher-version strings and a "is a Jagex account" boolean to
-**runelite.net**, not Jagex, and the GE plugin submits offers there too.
-
-**Rules that fall out of this for future development:**
-1. Treat every cursor sample as transmitted. "No click happened" never means "nothing was
-   sent"; between-click motion, idle stillness and off-canvas excursions are the signal.
-   Measure it with tools/humanity_report.py <human.jsonl> <bot.jsonl> -- the same metrics over
-   both, which is the only way this class of signature is visible (the routine log cannot see it).
-   **The recorder captures the two things that were previously invisible** (added 2026-09-07):
-   `canvasexit`/`canvasenter` (the cursor leaving the window, which the client encodes as the
-   -1 in `EVENT_MOUSE_MOVE`) and `focus` (its `EVENT_APPLET_FOCUS`), plus a `recorder` stamp
-   record naming the schema. The stamp is load-bearing: a recording made BEFORE it exists
-   reports those metrics as `-` (unmeasurable), never as 0, so an old capture can never be
-   mistaken for "this bot never left the canvas". **Reading a recording out of the ring means
-   reading it BEFORE disarming** -- `handleArm` calls `ring.reset()` unconditionally, so
-   `arm?on=false` wipes the buffer (cost me one live run). VERIFIED live 2026-09-07: a scripted
-   Arduino excursion above the canvas top plus one Alt+Tab produced `recorder` 1, `canvasexit`
-   4, `canvasenter` 5, `focus` 2, and the report tool turned them into real numbers
-   (`off_canvas_fraction` 0.266, `unfocused_fraction` 0.130). Note a maximized window has no
-   left/right edge to leave by -- the cursor clamps inside the canvas; go UP into the title bar.
-   **COMPARE THE SAME ACTIVITY, or the numbers mean nothing.** MEASURED 2026-09-07 over four
-   real recordings, `still_p90_ms`: human karambwan 2038, human GOTR 608, cg-bot 612,
-   foundry-bot 7493. The metric tracks the ACTIVITY's cadence, not human-vs-bot -- a human
-   waiting on a fishing spot and a bot waiting on a foundry machine both look still, and a
-   human at GOTR and a bot in the Gauntlet both click constantly. So a baseline human
-   recording is only useful against a bot recording of THE SAME activity (the same rule the
-   fidget-anchor fix already states). **The tool's first draft got this wrong in a way worth
-   remembering**: `still_segments` held its anchor across sub-threshold gaps, which turned
-   continuous motion into a fake ~150 ms pause every 150 ms and pinned `still_p50_ms` at
-   152-160 ms on EVERY recording, human and bot alike. Two unit tests and two code reviews
-   passed it; running it over one real recording is what caught it. Run any new metric over a
-   real capture before pinning its expected value.
-2. Timing that is drawn from a fitted human distribution (`settings.py`) is on the wire; timing
-   that is a constant is a fingerprint. That applies to key presses as much as clicks.
-3. Keep the login fingerprint constant per machine (same UUID, cores, heap, Windows build, JDK).
-   A VM is fine on this channel once those match; server-side correlation is unknowable from
-   the decompile, so "identical fingerprint" is the ceiling, not "undetectable".
-4. Re-derive this list after a client build bump -- and the tooling below makes that one
-   command, then a diff to read.
-
-**Deobfuscating a new build ourselves, and the guard that forces it (added 2026-09-07).**
-`python tools/deobfuscate.py` (repo root) does the whole thing: finds a JDK 17+ (rl-suite pins
-a 17 toolchain with no foojay resolver, and this machine had only 8 and 11 -- Temurin 17 now
-lives at `~/.jdks/jdk-17.0.20.1+1`, and the script downloads one there from the Adoptium API
-when none exists), takes the jar the running client reports on `GET /client-version` (else the
-newest `injected-client-*.jar` in the Gradle cache, else `--jar`), builds rl-suite's shaded jar
-once, runs the transform, decompiles into
-`data/decompiled/rl-suite-main/semantics/injected-client-<ver>-sources/`, and writes
-`data/decompiled/deob-state.json` keyed on the jar's SHA-256. It answers rl-suite's two
-documented refusals itself: "Expected N packet-handler shapes, found M" is retried with M
-(**1.12.38 has SIX packet readers, MEASURED, where the tool expects five**), and a packet
-fingerprint that matches no bundled profile -- a NEW wire protocol -- is retried with
-`--packet-profile none` and recorded as `protocolKnown: false` (still readable, generic
-`fieldN` packet names). **1.12.38 is still protocol 240**: the osrs-240 profile matched all 252
-names. Our own runs carry no semantic map, so class names are generic (`PlatformInfo` is
-`classVT` in 1.12.38); search by BEHAVIOUR (`wmic csproduct`, `new long[500]`, the packet
-constants, which ARE named) rather than by the class names quoted above.
-- **The guard**: `ControllerAddon/deob_guard.py`, called in `controller.main()` BEFORE the serial
-  port opens and once per engine loop until it settles. `ClientVersionProvider.java`
-  (`GET /client-version`: RuneLite version, `client.getRevision()`, the jar path from the
-  `client` class's code source, its SHA-256 hashed once and cached) is compared with the
-  record: match -> run; mismatch or no record while rl-suite is present -> print the command
-  and exit 2 before any input; endpoint missing (un-rebuilt client), bridge down at startup
-  (re-checked from the loop), or rl-suite absent (`data/` is gitignored, so a fresh clone has no
-  tool) -> warn and drive. `--skip-deob-check` / `SKIP_DEOB_CHECK=1` overrides.
-  `python tools/deobfuscate.py --status` shows record vs client without doing anything.
-- **Every run diffs the telemetry surface against the previous build** (USER: "when we make a
-  new deobfuscate we compare the diff from last rev"). A source diff is noise -- every name
-  changes per build -- so `tools/telemetry_fingerprint.py` extracts the facts this section is
-  built from by their name-independent tells (system properties and env vars read, commands
-  passed to `exec`, the client packet table with ids and lengths, how many places reference
-  each packet constant, the recorder's 500 / 50 ms / 40 constants, the ProcessHandle and
-  `-javaagent` introspection) into `data/decompiled/deob/telemetry-<ver>.json`, and writes
-  `telemetry-diff-<old>-to-<new>.md` beside it. The first run diffs against the author's
-  checked-in 1.12.37 snapshot. **MEASURED 1.12.37 -> 1.12.38: nothing collected changed** --
-  same properties, same three exec commands, same 117-packet table, same recorder constants;
-  only reference counts moved (`CONNECTION_TELEMETRY` 2 -> 3, `EVENT_MOUSE_SCROLL` 3 -> 2, six
-  gameplay packets +-1), which is the obfuscator re-inlining call sites, not new behaviour. A
-  `+ exec`, `+ property`, a packet length change or a recorder constant change in that file is
-  the signal to re-read the sources and amend this section.
+- **Login fingerprint**: OS/Java versions, max heap, CPU count, SMBIOS UUID (via `wmic
+  csproduct get UUID`), plus the process's and PARENT process's executable names and any
+  `-javaagent` by name. Keep the launch shape constant per account; never add a
+  `-javaagent` to the run task. There is NO MAC-address, screen-size or hypervisor read --
+  a VM leaks only as a CHANGED identity, so parity (UUID, cores, heap, JDK) is the
+  ceiling. `GET /client-version` reports the live fingerprint; the bridge binds loopback
+  only since 2026-09-07 (`BRIDGE_BIND_ALL=1` for the VM guest).
+- **The whole cursor trajectory is transmitted at 20 Hz** (`EVENT_MOUSE_MOVE`, including
+  off-canvas as -1), every press with 1 ms inter-press timing, every keypress with its
+  rhythm, scrolls, window focus gain/loss, arrow-key camera moves. "No click happened"
+  never means "nothing was sent" -- stillness, snap moves, an exact-pixel return and the
+  cursor leaving the window are all server-visible.
+- Rules that fall out: (1) treat every cursor sample as transmitted -- measure with
+  `tools/humanity_report.py`, always comparing THE SAME ACTIVITY human-vs-bot, and run any
+  new metric over a real capture before pinning its expected value; (2) timing drawn from
+  a fitted human distribution (`settings.py`) is fine on the wire, a CONSTANT is a
+  fingerprint -- keys as much as clicks; (3) keep the login fingerprint constant per
+  machine; (4) re-derive after every client build bump: `python tools/deobfuscate.py` does
+  the whole thing, `ControllerAddon/deob_guard.py` refuses to drive input against an
+  unanalyzed build, and `tools/telemetry_fingerprint.py` diffs the telemetry surface
+  between builds (1.12.37 -> 1.12.38: nothing collected changed).
+- The plugin list, overlays, ZombieLite, the bridge, the UDP stream and the serial port
+  are in NO packet -- the input stream is the only channel that carries our behaviour,
+  which is exactly the channel the physical Arduino feeds. RuneLite's own telemetry goes
+  to runelite.net, not Jagex.
 
 ## Vendored m8aq readers (`GET /api/...`)
 
@@ -904,226 +553,38 @@ steps above.
   what's under the cursor) and looks like any other single click, so there's no reason not to
   use it for every walk-to-a-tile click, not just ones near a known-risky object. See
   `golem_crafting.py`'s `walk_to_exact_tile` for the reference implementation.
-- **Routing engine replaced 2026-08-29: Shortest Path (the separately-installed RuneLite plugin)
-  is gone, along with roughly 700 lines of door/reachability heuristics it made necessary.**
-  `ControllerAddon/worldmap.py` — an offline, world-wide per-edge collision bitmap covering all
-  four planes, ported from EthanApi's `GlobalCollisionMap` — is now the **only** routing engine.
-  `travel.route_to`/`travel.walk_to` call `worldmap.find_path` directly (0.4-3ms for an in-house
-  route, 151ms for a 314-step cross-city one), no bridge call needed for the route itself, and it
-  fixes the exact gap Shortest Path had: it routes on ANY plane, where Shortest Path's own dumped
-  collision map was ground level only (see the NORMAN's/JEFF's/ROSS's measurements below, and the
-  mahogany_homes.py section for the live session that forced this). The static map bakes doors
-  OPEN, deliberately, same as Shortest Path's own dump was (`CacheMapDumper`'s `Exclusion` list
-  does it on purpose) — so a computed route runs straight through a doorway, and
-  `travel.open_door_toward(ctx, goal)` (built on `first_door_on_route`/`blocked_crossing_on_route`)
-  finds and opens whichever shut door the route actually crosses. That one call replaced the
-  three-tier escalation described in the bullets below (`_door_separates`/`_within_span`,
-  `open_frontier_door`, `open_nearest_shut_door`) — those tiers existed only because there was no
-  route to ask; given a real route the door question is nearly trivial and works identically on
-  every floor. **What did NOT move onto the static map:** object-interaction adjacency ("can I
-  click this hotspot/ladder from here") is still answered from LIVE `GET /collision` flags via
-  `travel.can_reach`/`travel.reachable_set`, because the static map bakes an object's own blocking
-  into the same bits as a wall's and structurally cannot tell furniture from a wall — see JEFF's
-  measurement in the mahogany_homes.py section, still the reason. **Transport execution is gone
-  too, not rebuilt:** `worldmap.find_path` has no transport graph at all, so `route_to`'s own
-  docstring says plainly "no transports" — a routine that needs a teleport now owns that itself
-  (`mahogany_homes.py`'s `CITY_TELEPORTS`, or the standalone `teleport_to_ferox`/`use_fountain`
-  already in `travel.py`). The bullets below describe the Shortest-Path-era machinery as it was
-  measured and built; keep reading them for the MEASURED game geometry (door ids, coordinates,
-  collision flags), which is still true of the game — not for the function names, which have moved
-  onto `worldmap.find_path`/`travel.open_door_toward`/`travel.first_door_on_route`/
-  `travel.blocked_crossing_on_route`.
-
-- **Historical, pre-2026-08-29 — Shortest Path's own transport graph could route through a
-  transport we had no way to execute.** `_use_transport` could only click a single menu option on
-  an object or NPC; any teleport, or any transport opening a destination picker (canoes, charter
-  ships, minecarts), produced an edge with no clickable `objectId`. CONFIRMED live: a `walk_to`
-  from Civitas illa Fortis once returned a route whose first edge was a `QUETZAL_WHISTLE` to a tile
-  **454 tiles away**, purely because the user's own Shortest Path panel had quetzals enabled —
-  `travel.TRANSPORT_POLICY`, sent with every request, was the fix at the time. Moot now: the new
-  routing engine has no transport graph to leak a bad edge from in the first place, and Shortest
-  Path's separate sticky, session-global config-override bug (a quirk of that plugin's own
-  `PluginMessage` handling) went away with the plugin.
-
-- **Doors: `collisionFlags` + `GET /collision` are the ground truth, and the useful question is
-  per-EDGE, not per-door.** `ObjectProvider` reports `collisionFlags` on every object (the client's
-  own `CollisionData` entry for that object's tile) and `CollisionProvider` serves
-  `GET /collision?x=&y=&plane=&radius=` for ARBITRARY tiles, including empty ones -- needed because
-  the doorway you are trying to walk through usually has no object on your side of it.
-
-  MEASURED live by opening Barbara's two doors one at a time and re-reading the SAME doorway:
-
-  | | shut | open |
-  |---|---|---|
-  | outer | id 7452 @ (1746,3534) `mE\|sE` (4104) | id **7453** @ (1747,3534) `mS\|sS`, doorway tiles -> **0** |
-  | inner | id 7452 @ (1748,3537) `mS\|sS` (16416) | id **7453** @ (1748,3536) `mW\|sW`, doorway tile -> **0** |
-
-  Five facts, all confirmed twice and still exactly what `travel.py`'s `DOOR_BLOCKING_FLAGS`/
-  `DOOR_EDGE_BLOCKS` encode:
-  1. Movement and line-of-sight bits are ALWAYS set together for the same edge (`mE|sE`).
-  2. A blocked edge is recorded on BOTH its tiles as opposite directions -- it is a genuine EDGE,
-     not a tile property, so either side is enough to know the crossing is shut.
-  3. Opening a door CLEARS the doorway edge outright (to 0) and the leaf comes to rest blocking a
-     PERPENDICULAR edge.
-  4. The door object MOVES one tile and CHANGES ID when it opens (7452 shut -> 7453 open).
-  5. A shut door's flags are identical to the plain wall segments beside it (Barbara's read 4104
-     either side), so collision can never IDENTIFY a door -- `actions` ("Open" vs "Close") does
-     that, and always did.
-
-  **Do not compare two different doors' flags to infer state** -- an earlier pass did exactly that
-  at Lumbridge (a shut door and a different open one both read 1026), concluded the flags carried
-  no state, and wrote that up as fact. 1026 was the open door's LEAF edge. Comparing one doorway
-  before and after is the only comparison that answers anything.
-
-  What the code actually asks is narrower and needs no classification at all
-  (`travel.blocked_crossing_on_route`/`first_door_on_route`, which replaced `_door_separates`):
-  **is there a step of the computed ROUTE we cannot cross, and is a shut door standing on it?** A
-  shut door across the path answers yes; the same door once open answers no, for free -- and
-  because the question is asked against a real route rather than a straight-line comparison, it no
-  longer misses a door that is off to the side or behind a detour the way the old single-axis
-  `_door_separates` test structurally could (this used to need a separate escalation to a computed
-  path for exactly that case; a route is now asked for up front, every time). Two traps worth
-  knowing: `BLOCK_MOVEMENT_FULL` (2359552) is a COMPOSITE of `FLOOR | FLOOR_DECORATION | OBJECT`,
-  so ORing it into a mask makes a bare floor decoration read as an obstruction (caught on
-  Lumbridge's Trapdoor, 262144) -- `DOOR_BLOCKING_FLAGS` omits it; and an absent `collisionFlags`
-  means "cannot tell", never "no".
-
-- **A door is NOT always a WallObject, and not every door blocks an EDGE.** MEASURED live
-  2026-08-29 at TAU's house, Falador, from the tile the routine was stuck on:
-
-      Door id=24050 type=GameObject (3046,3348) d=1 actions=['Open'] flags=131328  <- the way in
-      Door id=24050 type=WallObject (3046,3353) d=4 actions=['Open'] flags=4104    <- unrelated
-
-  Same id, different object type -- `travel.DOOR_OBJECT_TYPES` is `("WallObject", "GameObject")`
-  for exactly this (the name + "Open" action filter is what keeps it tight: nearby Drawers also
-  offer "Open" and are excluded by name). Its collision is different in KIND too: `131328 =
-  BLOCK_LINE_OF_SIGHT_FULL (131072) | BLOCK_MOVEMENT_OBJECT (256)`, with no movement edge bits at
-  all -- a full-tile blocker like this separates only when its whole destination TILE is refused,
-  which is what `blocked_crossing_on_route`'s destination-tile check (not just the edge test)
-  catches; the route that exposed it ran (3045,3349) -> (3046,3348) -> (3046,3347) -> (3046,3346)
-  straight through the door tile. The line-of-sight bit is the only flag family that marks this
-  door at all, which is why LOS is in the mask and not just movement.
-
-- **A hotspot's or ladder's own tile is usually not routable at all** (furniture stands on it),
-  and aiming a route at the nearby standing tile instead can hide the doorway you actually need,
-  because both the standing tile and the player often sit on the same side of the door. MEASURED
-  live at Barbara's: the hotspot tile (1749,3536) itself reported unroutable (furniture) on 5 of 5
-  checks while its neighbours routed fine. `travel.route_to(goal, goal_adjacent=True)` -- which
-  `open_door_toward` always passes -- routes to a tile BESIDE the target rather than onto it, so
-  the door question is resolved against the actual goal (not a nearby stand-in) by construction.
-  The same TAU session found `standingLocation` itself can be unwalkable (furniture on
-  (3047,3345)) -- another reason routing is asked for against the real goal, not a fallback tile.
-
-- **Historical: three separate heuristic bugs at NORMAN's house (Falador), 2026-08-29, all fixed
-  by moving to real routes rather than by patching the heuristics further.** A radius-limited door
-  search missed doors standing 6-7 tiles away; a single-axis "is this edge between us and the
-  goal" test false-positived on an unrelated `Door 24057` at (3027,3344), seven tiles off the
-  direct line; and a walk aimed at `standingLocation` (3038,3344) crossed no doorway because it
-  sat on the SAME side of the shut door 24050 (3037,3347) as the player. None of these failure
-  modes exist against a real BFS route: `DOOR_ROUTE_LOOKAHEAD` (14 route steps) has no fixed-radius
-  blind spot, and a route that actually reaches the goal is definitionally on the correct side of
-  every door it opens.
-
-- **Opening a door is CONFIRMED, not slept off, and the confirmation must budget the WALK to the
-  door as well as the open itself.** A door is a WallObject whose id encodes its state and changes
-  when it swings (shut -> shut+1, e.g. Barbara's 7452 -> 7453, Falador's 24050 -> 24051) and it
-  also moves a tile, so the object you clicked is not there afterwards to re-read -- the doorway
-  is, so `travel._open_door` polls the blocked EDGE until it clears (`DOOR_CONFIRM_POLL_S`, budget
-  `DOOR_OPEN_WAIT_S + tiles * DOOR_WALK_ALLOWANCE_S` capped at `DOOR_OPEN_WAIT_MAX_S`) and logs
-  `still shut after Ns -- another player may be holding it, or the click missed` otherwise. MEASURED
-  live at ROSS's: a flat 2.0s budget was less than the ~2.4s of walking to a door four tiles off,
-  so a click that DID register as `Open Door` on id 40178 got reported as a failure and interrupted
-  by its own retry, three times over -- fixed by adding the per-tile walk allowance. Also MEASURED
-  at ROSS's front door (40178): it swings shut BEHIND you, so re-reading the doorway can answer
-  "still shut" about a door that worked -- the confirmation also succeeds on `_crossed()` (the
-  player having crossed the door's blocked edge since the click), because getting through is the
-  outcome that matters, not the doorway's state at poll time.
-  **PARTLY SUPERSEDED 2026-08-30.** A good share of those "still shut" timeouts was not the door
-  swinging at all: `_open_door` clicked with a BARE `click_entity` and so aimed at the pixel the
-  door occupied when the ROUTE was computed, while the player was still walking toward it. The
-  recorder showed every click registering as `Open Door` because the MENU resolved correctly --
-  but a stale aim still lands somewhere useless. It now passes `refresh_target`; see "A click's
-  DEPARTURE is aimed too" above. Both effects are real; do not assume a "still shut" log means
-  the door closed behind you until the aim has been ruled out.
-
-- **ADJACENCY IS NOT INTERACTABILITY, and `goal_adjacent` does not give you a tile you can act
-  from.** `worldmap.find_path(goal_adjacent=True)` stops at ANY tile cardinally adjacent to the
-  goal — and it never has to cross a wall to get there, so the route is perfectly valid by the
-  static map's own rules while the tile it lands on cannot touch the target at all. MEASURED live
-  2026-08-30 at BARBARA's: the Bed hotspot at (1749,3539) has its north and east edges walled
-  (16416 / 65664) and only its south and west open (135432 / 132354), both inside the bedroom.
-  The walker parked on the north tile, `can_reach` went on (correctly) answering False, and the
-  routine sat there until its ceiling stopped it. `travel.interaction_tiles(goal)` answers the
-  question that actually matters — which tiles have an OPEN EDGE to the target — from live
-  collision, and walking to one of those routes through the bedroom door, which
-  `open_door_toward` then finds as an ordinary door on the route. Empty means "cannot tell";
-  fall back rather than refuse to work.
-
-- **A route can cross a tile that live collision refuses, so `walk_to` re-routes around it --
-  EXCEPT when a shut door is standing there.** The static map is not live: it cannot know what is
-  standing on a tile right now, and it bakes doors OPEN. MEASURED live 2026-08-30 at TAU's,
-  Falador, where the door is DIAGONAL — which the game cannot express as a `WallObject` on a
-  cardinal edge, so it is a `GameObject` blocking its WHOLE TILE both open and shut. OPENING it
-  therefore does not clear a tile, it MOVES a full-tile blocker: door 24051 ("Close") sat on
-  (3046,3347) reading 131841, the route ran straight through, `_hop_index` refused the first
-  crossing and the walk died one tile from the door. `worldmap.find_path` now takes `avoid=` and
-  `walk_to` feeds it tiles it has learned are really blocked (`WALK_MAX_REROUTES`, 4). The detour
-  is normally free — at TAU's it was the SAME 51 steps.
-  **The exception is load-bearing and cost a regression to find:** at ROSS's the only way in is a
-  SHUT door at (2610,3316), and after the door budget was spent the reroute excluded that very
-  tile, leaving no route at all — failing HARDER than before the reroute existed. A shut door is
-  to be OPENED, never routed around. `_door_on_route` is the discriminator and it is exact: it
-  only ever returns a door offering "Open", so TAU's open leaf ("Close") is avoided and ROSS's
-  shut door is not.
-
-- **MINIMAP for distance, viewport only for short precise hops -- and every viewport walk click
-  is SHIFT-clicked.** User directive 2026-08-29. `_hop_to` used to prefer a viewport click
-  whenever the tile was rendered, with the minimap only as a fallback beyond render distance;
-  with `WALK_HOP_MIN/MAX_TILES` at 16-24 that made nearly every hop of a long route a viewport
-  click into a scene full of interactive scenery. CONFIRMED live the same day
-  (`recordings/2026-08-29_012522_mh-live-run12`): hops resolved as `Chop down` ("You need an
-  axe") and `Cook` ("You haven't got anything to cook") instead of walking, which strands the
-  player somewhere it did not choose and makes the next pass walk back -- the user saw this as
-  clicking back and forth. The minimap has nothing drawn on it to hijack a click; precision is
-  what it lacks, and precision is only wanted at the END of a walk (exact-tile work does not come
-  through `_hop_to` at all -- `walk_to_exact_tile` handles that, and was the ONLY caller obeying
-  CLAUDE.md's own shift-click rule). Now: `HOP_VIEWPORT_MAX_TILES` (6, first draft, wants a live
-  tuning pass) decides, and `_click_walk_point` holds SHIFT for the viewport case.
-
-- **The NEXT hop is clicked BEFORE arrival, not after it** (`HOP_NEXT_CLICK_LEAD_TILES`, 6,
-  added 2026-08-30). USER: "we wait so long the player runs to the tile we clicked before we
-  click the next point resulting in a weird quick stop". MEASURED in that night's recordings
-  (runs 23/24): a 0.6-1.8s dead stop at EVERY hop boundary, because `_hop_to`'s wait released
-  within `WALK_ARRIVAL_TOLERANCE` (3 tiles ≈ 0.9s of running) while the next click needs
-  ~1.5-2s (0.6s poll quantization + walk_to's collision/door bookkeeping + the mouse flight).
-  Hops longer than the lead now release the wait with 6 tiles (~1.8s) still to run, so the next
-  minimap click lands mid-run — the game just replaces the queued destination, which is what
-  the human recordings do. Hops no longer than the lead keep the exact wait (instant release
-  would spam clicks at their own destination). VERIFIED live the same night (Ardougne→JESS,
-  ~30 tiles): 16 consecutive moving ticks across 2-3 hop boundaries, zero stopped ticks.
-- **THE MINIMAP ORBS ARE DRAWN OVER THE MINIMAP CIRCLE AND EAT A HOP CLICK.** MEASURED live
-  2026-09-09 (vale_totems): a westward hop's aim point at screen (1966,151) was reported
-  `onMinimap: true` by `/minimap/walk` and was the **Hitpoints orb** sitting over the circle's
-  left edge; four identical clicks moved the player nowhere and the trip failed. `onMinimap`
-  is a CIRCLE test and knows nothing about what is painted on top, and a minimap hop cannot
-  use `uiBlockers` -- the minimap rect is itself in that list, deliberately. So
-  `GameStateProvider` now also reports **`minimapOrbs`**, one rect per visible orb-sized child
-  of the Orbs group (the HP/prayer/run/special orbs and their number boxes, the compass, the
-  XP, world-map and wiki buttons -- 46 rects on this client), and `travel._hop_to` rejects a
-  minimap aim point inside one and pulls in toward the player instead. Needs a client rebuild;
-  an older client answers no rects and behaves exactly as before.
-
-- **The minimap reaches 28 tiles, and the DIAGONALS are what bound it.** MEASURED live 2026-08-28
-  from (3037,3345) by walking `/minimap/walk` outward in all eight directions: `onMinimap` held to
-  28 everywhere, then failed at 30 on the four diagonals while the cardinals were still on at 32 —
-  a corner sits √2× further from the minimap's centre than a cardinal at the same tile distance.
-  `WALK_HOP_MIN/MAX_TILES` were raised 10-16 → 16-24 on this measurement (user request: fewer
-  stops between clicks, since each hop ends with the player standing still while the next click is
-  aimed and flown). 24 keeps margin under 28 because the minimap's reach is a **user setting** —
-  zooming it in shrinks it — and `_hop_to` now pulls an unreachable aim point in toward the player
-  and retries (`HOP_PULL_IN_FRACTIONS`) instead of abandoning the whole walk, so a zoomed-in
-  minimap degrades to shorter hops rather than a failed trip. Re-measure before raising further.
-
+- **Routing, doors and walking -- the rules.** (The measured history behind every one of
+  these -- door flag tables, Barbara's/TAU's/ROSS's/NORMAN's live geometries, the Shortest
+  Path era -- is **`docs/routing-and-doors.md`**; read it before changing `travel.py` or
+  `worldmap.py`.)
+  - `worldmap.py` (offline per-edge collision map, all four planes, ~ms per route) is the
+    ONLY routing engine -- Shortest Path is gone. It has NO transport graph (a routine owns
+    its own teleports) and bakes doors OPEN, deliberately: route first, then
+    `travel.open_door_toward(ctx, goal)` finds and opens whichever shut door the route
+    actually crosses (`first_door_on_route`/`blocked_crossing_on_route`).
+  - The static map cannot tell furniture from a wall, so object-interaction adjacency
+    ("can I click this from here") stays on LIVE collision flags: `travel.can_reach` /
+    `reachable_set` / `interaction_tiles`. Do not move it onto the map.
+  - Doors: collision flags are ground truth and the useful question is per-EDGE. A shut
+    door's flags are identical to the wall beside it, so `actions` ("Open" vs "Close")
+    identifies a door, never flags -- and never compare two DIFFERENT doors' flags to infer
+    state. A door is not always a WallObject: a diagonal door is a GameObject blocking its
+    whole TILE both open and shut. Opening moves the leaf and CHANGES the object id.
+  - Opening a door is CONFIRMED (the blocked edge cleared, or the player crossed it --
+    some doors swing shut behind you), never slept off, and the budget includes the WALK to
+    the door; the click passes `refresh_target` so the aim tracks the approach.
+  - `walk_to` re-routes around tiles live collision refuses (`find_path(avoid=)`,
+    `WALK_MAX_REROUTES`) -- EXCEPT a shut door standing on the route, which is to be
+    OPENED, never routed around (routing around it can leave no route at all).
+  - ADJACENCY IS NOT INTERACTABILITY: `goal_adjacent=True` can park you on a walled-off
+    neighbour. Walk to `travel.interaction_tiles(goal)` (tiles with an OPEN EDGE to the
+    target, from live collision); empty means "cannot tell", fall back rather than refuse.
+  - MINIMAP for distance, viewport only for short precise hops (`HOP_VIEWPORT_MAX_TILES`),
+    and every viewport walk click is SHIFT-clicked. The NEXT hop is clicked BEFORE arrival
+    (`HOP_NEXT_CLICK_LEAD_TILES`) so the player never dead-stops at hop boundaries. The
+    minimap reaches 28 tiles (its DIAGONALS bound it; it shrinks if the user zooms it) and
+    the ORBS drawn over the circle eat clicks -- `minimapOrbs` on `/state`; `_hop_to`
+    rejects a covered/unreachable aim point and pulls in toward the player.
 - **`TickClock` is no longer a self-registered EventBus subscriber** (changed 2026-08-21). It is
   bumped explicitly by `ControllerPlugin.onGameTick` via `tickClock.bump()`, because RuneLite does
   not guarantee subscriber ordering and the emitted `TICK` payload must carry the number for the
@@ -1248,235 +709,52 @@ that restores exactly the semantics `settings.py`'s own comment originally claim
 
 ## Sub-tick data and clicking while moving
 
-Most game state is genuinely capped at OSRS's own 0.6s server tick — HP, true tile position,
-target switches, which animation is playing — no client-side trick gets around that; the
-information doesn't exist any faster server-side no matter how it's read. But on-screen
-*position* data is not tick-capped: a moving actor's `LocalPoint` is smoothly interpolated by
-the client every render frame, and RuneLite's `ClientTick` event (fires once per frame, not once
-per game tick) is the general mechanism for reading that. This codebase's only current use of it
-is `NpcTrackerRegistry.onClientTick`'s animation-*frame* diffing (catches a repeating attack
-animation restarting even when the animation *id* itself never changes between reps — a
-`GameTick`-only check would structurally miss this, not just see it late).
+Full history (the refresh_legs design, movement-realism fitting sessions, fidget/idle
+tuning, aiming hardening): **`docs/movement-and-clicking.md`**. The working rules:
 
-On the bridge side, only 6 providers (`NPCProvider`, `ObjectProvider`, `TileProvider`,
-`GroundItemProvider`, `GraphicsObjectProvider`, `BankProvider`) are gated by `TickCache` — a
-deliberate perf optimization for the bulk list endpoints (`/npcs`, `/objects`, ...), not a
-platform limitation, and it already has a `?fresh=true` bypass. Single-entity lookups
-(`/npc/by-index`, `/npc/nearest`, `/object/at`, `/player`, `/combat`) were never cached at all —
-every poll already reads the client's current interpolated position fresh, however often you
-ask.
-
-This is why routines gate clicks behind `wait_until_player_idle()` (wait for the player to fully
-stop before trusting a resolved screen position) rather than clicking while moving: most click
-call sites resolve a screen position once and never re-check it, not because the position data
-itself is too slow to get. `move_to_human`/`click_entity` already had a `refresh_target`
-parameter for this (a zero-arg callable re-resolving a target's current screen position — used
-by `slayer.py`/`tormented_demon.py`/`golem_crafting.py`, each hand-writing its own lambda) but it
-only re-aimed once, partway through a flight. `refresh_legs` (added 2026-08-14, purely additive —
-`None`/default reproduces every existing caller's exact prior behavior bit-for-bit) generalizes
-this into multiple re-aim checkpoints toward interpolated waypoints (only the final leg lands
-exactly on the target; earlier legs travel a fraction of the remaining distance, so a re-aim
-mid-flight can still correct the approach), specifically so a routine could eventually click
-without waiting for full stillness first. Reviewed via an independent second pass that caught
-and fixed two real bugs in the first draft (leg 0 was flying the *entire* distance to a stale
-snapshot before ever re-aiming, and per-leg jitter was being redrawn instead of fixed, adding
-real wasted motion even for a stationary target) — see `_move_to_human_tracking`'s own docstring
-for the full account. Covered by unit tests in `tests/test_controller.py`, but **not yet
-exercised against a live client**, and no routine has adopted it yet as of this note. See
-`npc_index_refresh_target`/`ground_tile_refresh_target`/`object_refresh_target`/
-`ground_item_refresh_target` (the last two added 2026-08-14 alongside `/object/at` and
-`/ground-item/at`, the object/ground-item equivalents of `/npc/by-index` — see "Instanced areas
-break forward world-coordinate conversion" above for why both are implemented by filtering the
-already-corrected bulk `/objects`/`/ground-items` lists rather than a fresh forward lookup) for
-ready-made `refresh_target` factories instead of hand-writing the lambda at each call site.
-
-**`click_menu_action` GAINED `refresh_target` on 2026-08-27** (it forwards to the underlying
-`click_entity`, so a right-click now re-aims mid-flight like any other). The warning below
-describes why it was needed and still describes what happens if you DON'T pass one: Added 2026-08-23 after breaking it live. The bare-click path hides stale coordinates
-because `click_entity` re-aims mid-flight from an un-cached endpoint; the menu path has no such
-parameter, so it right-clicks exactly the pixel you give it. Escalating a hijacked plinth click to
-`click_menu_action` using the object from the `/objects` list fetched at the top of the tick — i.e.
-before the player walked — produced a menu of pure ground options (`['Cancel', 'Mark Safespot',
-'Examine', 'Walk here']`): a right-click on bare tile, with the object never involved. Re-resolve
-through `get_object_at`/`get_npc_by_index` immediately before calling it. Also pass `offset=(0, 0)`
-for a small target: the default `(-7, +7)` nudge is by itself enough to slide off a plinth.
-
-**This is the PREFERRED pattern for every new click site — reach for it before
-`wait_until_player_idle()`.** Stated as a standing directive 2026-08-23 (user): a single-entity
-accessor is not tick-limited, so a click can be aimed while the player is still walking, and that
-is what closes the gap to human speed. The shape is:
-
-1. Fire the walk **without waiting for arrival** (no blocking exact-arrival poll).
-2. Issue the target click a beat later, passing a `*_refresh_target` factory **and**
-   `refresh_legs` — the un-cached endpoint behind the factory re-resolves the target's live screen
-   position at each leg, so the aim stays correct even though the player (and camera) moved after
-   the click was decided.
-3. Confirm the outcome on a pushed/un-gated signal (XP_GAINED, a varbit, a state endpoint), not
-   on a fixed sleep.
-
-**Measured against a human, 2026-08-23** (`recordings/2026-08-23_194302_golem-carving.*`, captured
-via `recorder.py` — see "Recording a human session" above): a human clicks the target object
-**0.6–1.0s after the walk click**, from a tile they have not reached yet, four times out of four,
-and every one of those interactions resolved correctly — the game queues the interaction and
-performs it on arrival. Waiting for stillness first is therefore not a correctness requirement,
-it is pure latency we were adding on top of the game's own cadence.
-
-The legacy pattern — `walk_to_exact_tile`/`wait_until_player_idle()` blocking until the player has
-fully stopped, then resolving a screen position once — is *safe* but structurally slower than a
-human, and its blocking walk is what makes an over-tight confirmation timeout destructive rather
-than merely slow (a timeout re-walks and interrupts the action that had genuinely started; see
-`routines/golem_crafting.py`'s craft_phase notes). Prefer the accessor + `refresh_legs` path for
-anything new; leave existing blocking call sites alone unless their throughput is actually a
-problem.
-
-Note the endpoints for this already exist and are already un-cached — `/object/at`,
-`/ground-item/at`, `/npc/by-index`, `/npc/nearest`, `/player`, `/combat` — so adopting this
-needs **no Java change and no client rebuild**, only the Python call site. Check whether the
-accessor you need is already there before proposing a new provider.
-
-**Movement realism batch (added 2026-08-27, Python-only, no rebuild):**
-- **Pointer-scale calibration persists across restarts** (`.hm2_calibration.json` next to
-  human_move.py, gitignored, atomic write, every I/O failure swallowed). It is a property of
-  the MACHINE, not the session, but used to reset to 1.0 every process start, so the first flights
-  under-traveled ~26% and the residual corrections cleaned up the difference. Tests isolate it
-  via an autouse fixture — never let a test write the real file.
-- **Startup warns if Windows "Enhance pointer precision" is on** (`warn_if_pointer_acceleration`,
-  SPI_GETMOUSE via ctypes) — acceleration makes px-per-unit speed-dependent, which the single
-  scalar calibration cannot express. Warn-only, never a hard stop.
-- **Session tempo**: durations now share an OU-drifting log-offset (`HM2_TEMPO_SIGMA`/
-  `HM2_TEMPO_TAU_S`, see their comment for the five-recording measurement: lag-1 ~0.15, 2-min
-  block means wandering 2.4x the i.i.d. expectation). Sessions start in a random mood.
-- **Handedness was MEASURED AND KILLED** the same pass — signed path curvature flipped sign
-  between sessions (left-bulge 39-64%). v2's zero-mean curve draw is correct; do not add a bias.
-- **Click hold times** re-fitted from 589 human down→up pairs (`CLICK_HOLD_RANGE_S`): median
-  85ms, log-sigma 0.266, replacing a geometry whose median sat at 70ms with a truncated tail.
-- **In-wait fidgeting** (same day, after diffing 13.1 active human minutes against 164 active
-  bot minutes): cadence, pause distributions and tick-phase all already matched the human —
-  the ONE loud remaining signature was stillness (human cursor busy 80% of active play, never
-  still >4.5s; bot busy 13%, still-period p90 11.8s). `human_delay` draws ≥2s are now split
-  into measured human-length still segments (median 1.5s, capped 4s) separated by small
-  out-and-back drifts. The fidget is POSITION-INVARIANT so hover-parking through a wait still
-  works; it skips when a right-click menu is open (moving off one closes it), the window is
-  unfocused, or an abort is set; it only ever lengthens a wait, never shortens it; and it arms
-  only via `register_fidget_serial(ser)` in main() — an import without the Arduino keeps the
-  old plain sleep. The 2026-08-30 caveat (main() armed `__main__`'s `_fidget_ser` while a
-  routine reached the other copy's `None`, so **in-wait fidgeting had never once fired for a
-  routine-side wait**) was CLOSED 2026-09-06: the serial is mirrored into
-  `input_state.fidget_ser` and read through `controller._fidget_serial()`. Routines' own
-  0.2-0.5s poll loops still never enter `human_delay`, so `controller.fidget_once()` (same
-  guards, one fidget) is what `outcome_waits.await_long` and the routines call from an event
-  wait; Phase B (a background fidgeter behind a global action lock) remains a design only.
-- **The fidget's return leg lands NEAR its anchor, not on it — an exact return is itself the
-  signature (fixed 2026-09-06, the first live look at fidgeting actually running).** USER,
-  watching karambwan fishing: "investigate idle movement it looks a bit weird? did something
-  change?" — it had, that morning: closing the caveat above turned routine-side fidgeting on
-  for the first time ever. MEASURED from the live recorder run against the user's own human
-  recording of the SAME activity (`recordings/2026-09-06_090950_cg-bot1` vs
-  `..._083723_karamwan-fishing`), tethered out-and-back bursts / longest chain about one
-  anchor / rests on one exact pixel: giants-foundry bot 09-03 **12% / 11 / 13**, GOTR bot 09-02
-  **5% / 3 / 10**, human **26% / 10 / 3**, this run **33% / 19 / 11**. Burst RATE matched the
-  human fine (24.6 vs 22.4 per minute) — the fit is good. What did not was `aim_radius=0` on
-  the return: the cursor snapped to a mathematically identical pixel every time and tethered to
-  one point, which no hand does. The return now aims at a remembered ANCHOR
-  (`input_state.fidget_anchor`) with `IDLE_FIDGET_RETURN_JITTER_PX` (3) of jitter — 200
-  simulated rests spread over 59 distinct pixels, mean drift 2.2px, max 7.2px. **Anchoring is
-  the load-bearing half**: returning to wherever the last fidget happened to land would compound
-  the jitter into a random walk off the target, and mixology/golem_crafting park the cursor on
-  the next target and then click IN PLACE. The anchor is re-taken only when the cursor is more
-  than `IDLE_FIDGET_ANCHOR_RESET_PX` (15) from it, i.e. something else moved it.
-  **General lesson: a humanization that returns to an EXACT coordinate is a tell, however
-  human its timing is.** Diagnose this class by running the same metric over a bot recording
-  and a human recording of the same activity — the routine's own log cannot see it at all.
-  **VERIFIED live 2026-08-27** (recordings/2026-08-27_023951_phase-a-verify, 3.8 active min of
-  slayer): freeze tail dead (max 103s → 8.5s, p90 11.8s → 7.1s), settles firing correctly, no
-  interference — but the residual p90 sat exactly at the then-4-9s idle-move timer, i.e. the
-  TIMER was the new ceiling. `maybe_idle_mouse_move` therefore no longer runs on wall-clock at
-  all: it triggers on time since the last DELIBERATE cursor movement, with the budget drawn
-  from the same measured still-segment distribution.
-  **CORRECTED 2026-08-30 — the sentence above was NOT true in practice, for two separate
-  reasons, and both are now fixed.** (a) The marker lived in `controller.py`, which is loaded
-  TWICE in a running process (see "controller.py exists twice", below), so the engine read one
-  copy while every routine click bumped the other: the trigger never saw routine activity at
-  all and fired continuously through active play. It now lives in `input_state.py`. (b) Even
-  once shared, the drawn budget can be ~1s, which is well inside the ordinary gap between two of
-  our own actions, so it still drifted mid-work — MEASURED 14 drifts per 48 clicks, 5 of them
-  after under 2.5s. `IDLE_MOVE_MIN_STILL_S` (4.0) is now a floor beneath the drawn budget; the
-  same measurement this feature rests on says the human is NEVER still longer than 4.5s, so a
-  drift at 1.3s was out-moving them rather than imitating them. AFTER: 7 drifts, stillness
-  `[4.0, 4.4, 4.4, 17.7, 4.0, 4.5, 4.5]`s, none under 4s. USER-REPORTED throughout as the cursor
-  being "dragged back" mid-work; `maybe_idle_mouse_move` now LOGS every drift, because one that
-  moves the cursor with no click is otherwise invisible in a log full of clicks — which is
-  exactly how it hid.
-  Routines can also declare themselves busy (`controller.mark_busy(seconds)`) — belt and braces,
-  and NOT sufficient on its own: marking work_phase busy left `_climb` unmarked and the drifts
-  simply reappeared there. Prefer the floor; reach for `mark_busy` only for a genuinely long
-  pending action.
-  Still not re-measured on a 30+ active-minute recording; if still-p90 stays >4-5s the remaining
-  freezes are the poll-loop blind spot and Phase B is what's left.
-- The fitting scripts live in the session scratchpad, not the repo; the numbers and method are
-  recorded in the settings comments. Reach segmentation: movement bursts split on 150ms
-  stillness, kept if ≥30px and 80-3000ms; stillness stats count only ACTIVE play (a click
-  within 30s on both sides), so scheduled breaks don't contaminate them.
-
-**Moving-target aiming hardening (added 2026-08-27, needs a client rebuild for the Java parts):**
-- **`npc_index_refresh_target`'s deadband now keys on every motion source, not just the NPC's
-  tile.** The 2026-08-27 tile-only hold (added to suppress hull-animation jitter) was itself a
-  bug for click-while-moving: when the PLAYER walks, the NPC's tile never changes while its
-  projection slides continuously, so the hold served a stale point for the whole flight —
-  literally "clicks land behind". `/npc/by-index` now also reports `npcLocalX/Y`,
-  `playerLocalX/Y` (per-frame interpolated LocalPoints) and `cameraYaw/Pitch/Scale`;
-  `_npc_view_key` folds them into the hold key (quantized by `NPC_HOLD_LOCAL_QUANTUM`). A fully
-  still scene still holds through animation jitter; any real motion re-resolves. Degrades to
-  tile-only against an un-rebuilt client (fields absent → None in the key).
-- **`click_entity` takes one last look before the mouse-down** (`_settle_on_target_before_click`):
-  the flight's final re-aim happens at a submovement boundary, so the settle + click tail
-  (~100-300ms) was blind. One corrective move fires only past `PRECLICK_MAX_DRIFT_PX` (18px —
-  generous because mid-flight refreshes deliberately drop the caller offset, see move_to_human's
-  v2 dispatch), so stationary targets pay nothing. Skipped during a simulated misclick on
-  purpose — settling would un-miss the deliberate miss; the corrective reclick gets the full
-  treatment instead.
-- **Verify-then-click via `GET /hover`** (MenuStateProvider): the default left-click action +
-  target under the cursor RIGHT NOW — the top (highest-index) live menu entry, no menu open
-  needed. Opt-in per call site: `click_entity(..., expected_action="Attack",
-  expected_target="Gargoyle")` reads it before committing; on mismatch it re-aims once via
-  refresh_target, and withholds the click if the hover still disagrees — prevention instead of
-  `/last-action` post-hoc detection, and the first primitive that beats a player camped on the
-  pixel WITHOUT the right-click menu escalation. `hover_matches` never blocks when it cannot
-  verify (endpoint missing on an old build, or a real menu open). A withheld click returns the
-  falsy `CLICK_WITHHELD` sentinel, not plain `False` — every existing truthiness check keeps
-  working, and a caller with an escalation path tells "pixel contested" from "aim failed" via
-  `getattr(result, "withheld", False)`. `expected_action` also takes a sequence (any match
-  passes) for state-dependent options the caller doesn't choose. Adopted same day: slayer.py's
-  two attack clicks (`expected_action="Attack"` + the live target name) and golem_crafting's
-  plinth clicks (`GOLEM_PLINTH_OPTIONS`), where a withhold folds into the existing `hijacked`
-  flag — it spends the same fast-retry budget, escalates to the same menu tier, and past the
-  budget falls through to the same timeout/miss counting, so every measured bound (including
-  the out-of-fur recovery, which counts on `gc_side_misses` climbing) is preserved. None of the
-  adoptions have run live yet.
-
-
-**XP gain is another sub-tick, general-purpose signal — not specific to any one routine.** Added
-2026-08-17 (user directive, generalized from `pyramid_plunder.py`'s tomb-door confirmation):
-`client.getSkillExperience(Skill.X)` reflects the moment the client's own `StatChanged` event
-fires — this is the exact signal the game's own XP Drop plugin uses
-(`data/decompiled/.../xpdrop/XpDropPlugin.java#onStatChanged`) — and is not gated by `TickCache`
-or the 0.6s server tick the way bulk `/objects`/`/npcs` scans or `roomNumber`-style state are.
-Any skilling action that grants XP on success (thieving, mining, fishing, crafting, ...) can use
-this as a fast, definitive "did that attempt actually succeed" check instead of polling chat
-messages, waiting out a fixed delay, or re-reading tick-capped object/state fields.
-
-`PlayerProvider` exposes each skill's cumulative XP the same way (`hitpointsXp` was the existing
-precedent; `thievingXp` was added alongside this note) — add more `data.put("<skill>Xp",
-client.getSkillExperience(Skill.<SKILL>))` lines there for whichever skill a routine needs, same
-pattern. **Requires a RuneLite client rebuild + restart** (`./gradlew.bat run`) before a newly
-added skill's XP field shows up on `GET /player` — it's compiled into the Java plugin, not
-something the Python side can pick up on its own.
-
-Python-side usage pattern (see `pyramid_plunder.py`'s `attempt_door_click`): snapshot
-`controller.get_player().get("<skill>Xp")` immediately before the click, then poll for an
-increase inside the same short wait loop already used for other post-click signals (position
-jump, confirmation chat message, ...) — an XP increase is proof the underlying skill check
-succeeded, sub-tick and often faster than any other available signal.
+- Most game state is capped at OSRS's 0.6s server tick, but SINGLE-ENTITY lookups
+  (`/npc/by-index`, `/npc/nearest`, `/object/at`, `/ground-item/at`, `/player`, `/combat`)
+  are never tick-cached and read the client's per-frame interpolated position fresh. Only
+  the bulk list endpoints go through `TickCache` (`?fresh=true` bypasses it).
+- **The PREFERRED pattern for every new click site** (user directive 2026-08-23): fire the
+  walk WITHOUT waiting for arrival; click the target a beat later passing a
+  `*_refresh_target` factory + `refresh_legs` (the aim re-resolves per leg while the
+  player and camera move); confirm the outcome on a pushed/un-gated signal (XP_GAINED, a
+  varbit, a state endpoint), never a fixed sleep. MEASURED from a human recording: they
+  click the object 0.6-1.0s after the walk click, mid-walk -- the game queues the
+  interaction and performs it on arrival, so waiting for stillness is pure added latency.
+  The legacy `wait_until_player_idle()` pattern is safe but slower; leave existing
+  blocking call sites alone unless their throughput is actually a problem. The endpoints
+  already exist and are un-cached -- no Java change needed to adopt this.
+- **A click's DEPARTURE is aimed through `refresh_target` too** -- passing one is the
+  whole fix at a call site. Anything NOT passing one aims at whatever snapshot it was
+  handed: re-resolve through `/object/at` / `/npc/by-index` immediately before clicking.
+- **`click_menu_action` right-clicks exactly the pixel you give it.** It takes
+  `refresh_target` (forwarded to `click_entity`); without one, re-resolve first -- a
+  tick-old object dict right-clicks bare ground. Pass `offset=(0, 0)` for small targets
+  (the default `(-7, +7)` nudge slides off a plinth).
+- **Verify-then-click via `GET /hover`**: `click_entity(..., expected_action=...,
+  expected_target=...)` reads the default left-click action under the cursor before
+  committing; a withheld click returns the falsy `CLICK_WITHHELD` sentinel
+  (`getattr(result, "withheld", False)` separates "pixel contested" from "aim failed"),
+  and `hover_matches` never blocks when it cannot verify. The gate reads the cursor's
+  position RIGHT NOW, so NEVER put it on clicks issued while still walking up to the
+  target (the Gauntlet and Motherlode both paid for this).
+- `_settle_on_target_before_click` takes one last corrective look before mouse-down
+  (skipped during a simulated misclick, on purpose); a click already on its target is
+  made IN PLACE (`CLICK_IN_PLACE_RADIUS_PX`) instead of re-flying.
+- **XP gain is a sub-tick, general-purpose success signal**: `<skill>Xp` fields on
+  `/player` (add more in `PlayerProvider`; client rebuild required). Snapshot before the
+  click, poll for the increase inside the existing wait -- proof the skill check
+  succeeded, faster than chat or tick-capped state.
+- **Movement realism is FITTED from human recordings, never reasoned** -- session tempo
+  drift, click holds, in-wait fidgeting (`controller.fidget_once()` from routine-side
+  waits; the fidget returns NEAR its anchor, never to the exact pixel -- an exact return
+  is itself a tell), idle drift floored at `IDLE_MOVE_MIN_STILL_S` (the human is never
+  still >4.5s). Validate any humanization change by comparing recordings of the SAME
+  activity human-vs-bot; the routine log cannot see this class of signature. Shared input
+  state lives in `input_state.py`, never module-level in controller.py (which is loaded
+  twice -- see the gotcha).
 
 ## Recording a human session before writing a routine
 
@@ -1670,222 +948,38 @@ the headline claim:
 
 ## Teleporting home from a bank trip (`ControllerAddon/teleports.py`)
 
-Added 2026-09-07, sub-project 2 of the bank-memory work (USER: "make sure slayer is using this
-to decide what method of teleportation is best to get back"). **Not yet run live.**
+Full build history, the corrected single-hop -> graph design, live verification and the
+first-session checklist: **`docs/teleports.md`**. Shape:
 
-**The Shortest Path handshake is GONE and is not coming back.** USER asked whether we could still
-handshake it for a teleport suggestion: no. `ShortestPathProvider.java` (399 lines, the
-`PluginMessage` request/poll) was deleted in `1e96c8d`, and the plugin is no longer an enabled
-Plugin Hub install (`~/.runelite/externalmanager/` has no shortest-path jar, though the jar
-itself still sits in `~/.runelite/plugins/`). Re-adding it would also drag back the hazard this
-file already records: its answers were governed by the user's own Shortest Path panel, which
-once produced a route whose first edge was a `QUETZAL_WHISTLE` to a tile 454 tiles away.
-
-**USER's alternative is the one taken and it is strictly better**: "we jhust skip the handshake
-altogether and use the teleport data from the plugin itself". The plugin ships its transport
-tables as plain TSV resources inside the jar, and `transports/teleportation_items.tsv` is
-vendored byte-identical into `ControllerAddon/vendor/` (see `vendor/VENDORED.md`; the jar carries
-**no LICENSE file**, same as m8aq). 340 rows of destination tile + OR'd item ids + duration +
-wilderness level. **It keys on ITEM IDS and bank memory reports item ids, so the two join
-directly.** This is also CLAUDE.md's own rule applied -- copy the plugin's SOURCE rather than
-your reconstruction of it: `travel.RING_OF_DUELING_NAME`'s Ferox teleport and
-`mahogany_homes.CITY_TELEPORTS` are both hand-rolled reconstructions of rows in this very file.
-
-- **`teleports.py` is PURE** -- no HTTP, no client state, no execution. `choose()` takes the
-  router as an argument, so the whole decision is testable without a map, a bridge or a client.
-- **The header line is ASSERTED, not assumed.** Column order differs BETWEEN Shortest Path's own
-  transport files (`teleportation_spells.tsv` puts Items second where `teleportation_items.tsv`
-  puts it fourth), so a silent upstream re-order would mis-parse every row into plausible-looking
-  nonsense rather than failing. Row-count assertions are a FLOOR (>= 300), like
-  `M8aqProviderTest`'s, so re-vendoring a newer table does not fail the build.
-- MEASURED over the table: **zero rows use `&&`** -- the Items column is purely OR alternatives,
-  usually the charge variants of one item (ring of dueling (8) down to (1)). Matching only the
-  full-charge id would miss a part-used ring, which is the common case. 20 of the 340 rows carry
-  neither a destination nor an item (section markers) and are skipped.
-- **Wilderness level is load-bearing here, not a corner case**: Krystilia's slayer tasks are IN
-  the wilderness, and a teleport does not fire above its own level (283 rows are level 20, 35 are
-  30), so the click would be spent for nothing. `choose` filters on the player's live
-  `wildernessLevel`.
-- ~~**Player-specific destinations are excluded**~~ -- WRONG, corrected below: varbits 2187/4744
-  resolve exactly which house row applies, and the graph uses them.
-- **Walking is the default and a teleport must EARN the trip**: `MIN_SAVING_TILES` (40) over
-  `walk_len`, plus `TELEPORT_COST_TILES` (25) charged against the teleport for the withdraw,
-  click, dialogue and animation. Both are FIRST-DRAFT GUESSES wanting a live session to fit. The
-  one exception: when there is no walking route home at all, anything that lands within reach
-  wins, since it beats a walk that cannot happen.
-
-**Where it runs.** The choice happens INSIDE the bank (`_withdraw_return_teleport`, called from
-both `bank_up` branches after `withdraw_loadout`) because an open bank is the only moment the
-winning item can be withdrawn; `return_to_spot` then uses it and walks whatever is left. So
-**every routine that opts into `returnToSpot` gets this**, not just slayer -- and the callers
-that opted out (firemaking, blast_furnace, golem_crafting) are untouched.
-
-- **A teleport that does not fire costs latency, never the trip.** `_use_return_teleport`
-  returns False and the existing walk home runs exactly as it did before. That is the entire
-  safety argument for executing teleports this codebase has never driven live.
-- **The plan is popped INSIDE `_use_return_teleport`, not by its caller.** A first cut popped it
-  in `return_to_spot` before the call, so the function read nothing and the teleport silently
-  never happened -- and the fallback test could not catch it because it stubs the very function
-  the bug was in. Pinned by `test_return_to_spot_actually_reaches_the_teleport_it_planned`,
-  red-green verified. Popping exactly once is also what stops a dud being retried into an empty
-  inventory.
-- **The landing is CONFIRMED, never slept off** (`RETURN_TELEPORT_BUDGET_S` 6.0s, polled) --
-  karambwan_fishing MEASURED that a teleport's own signals fire on the tick the LOADING screen
-  starts, when the bridge answers nothing at all.
-- **This is the FOURTH copy of the left-click-with-hover-gate teleport pattern** in the repo
-  (`falconry._use_teleport`, `golem_crafting._teleport_home`, `karambwan_fishing._click_option`,
-  now `banker._use_return_teleport`). Extracting one shared helper is the obvious follow-up; it
-  was deliberately not done here rather than editing three working routines mid-task.
-
-
-**CORRECTION, same day: the single-hop model above was WRONG, and the transport GRAPH replaced
-it.** USER: *"that is not true, if you'd ask shortest path the answer would have been take house
-tablet then use the ordnate jewlry box to ferox enclave"*. They were right. Four mistakes, and
-the deep one is that **the data was copied and the ALGORITHM was not**:
-
-- **Only 1 of ~8 teleport tables was vendored** (25 transport files exist in the jar, including a
-  301KB `transports.tsv`). `teleportation_boxes.tsv` and `teleportation_portals_poh.tsv` are now
-  vendored too.
-- **`teleportation_items.tsv` has no `Origin` column; the box and POH-portal tables DO.** Those
-  rows are graph EDGES, usable only from a particular tile. Shortest Path's answer comes from its
-  pathfinder chaining edges -- a flat "teleport from anywhere to X" table structurally cannot
-  express house tablet -> POH -> box.
-- **The house rows were excluded as "player-specific"** on the belief a house could be anywhere.
-  The table's own comment names the varbits that resolve it (**2187** house location, **4744**
-  inside/outside) and `PathfinderConfig.varbitChecks` evaluates them with the same generic
-  machinery that gates diary capes and quest teleports -- nothing about the house is
-  special-cased. MEASURED live: 2187=3, 4744=0.
-- **The box tiers were misread as "only Basic has Ferox".** They are cumulative.
-
-**How Shortest Path solves POH teleports** (read from the decompile, not guessed):
-- `PathfinderConfig.checkJewelleryBoxTier`: a Basic row is available to ANY tier above NONE,
-  Fancy needs FANCY+, Ornate needs ORNATE. Ported verbatim into `teleports.poh_allows`.
-- **An ornate box DISABLES the mounted Amulet of Glory** (`isMountedGlory && ORNATE -> false`),
-  because the box supersedes it -- offering both plans a route through something you would never
-  use. The kind of subtlety only copying the source gives you.
-- **The client cannot see inside a POH, so Shortest Path ASKS**: `usePoh`, `usePohFairyRing`,
-  `usePohSpiritTree`, `useTeleportationPortalsPoh`, `pohJewelleryBoxTier`, `usePohMountedItems`,
-  `usePohObelisk`, plus a hidden `builtTeleportationPortalsPoh` (`ID=X Y Z;...`) it learns. Our
-  `teleports.PohConfig` mirrors those names. USER's actual POH: ornate box, portals to Varrock /
-  Falador / Ardougne / Lunar Isle, a fairy ring, and a mounted digsite pendant.
-- **"Enter your house" is NOT modelled as a transport anywhere** (0 rows across every table). The
-  only way into the POH node is the house tablet itself.
-
-**Shape now.** `teleports.load_all()` parses all three tables keyed by HEADER NAME -- they do not
-share a column order (items has no Origin, boxes has no Varbits, poh_portals has both), so a
-fixed-index parser mis-reads two of the three. `usable()` = items (any-of) AND varbits AND POH
-gates AND wilderness level. `plan(start, goal, owned_ids, route_len, ...)` is a bounded
-breadth-first search over hops (`MAX_HOPS` 2) returning a list of legs, still PURE -- `route_len`
-is an argument, so the whole search tests with no map, bridge or client.
-
-- **An unknown varbit FAILS its check rather than passing it.** These gates pick exactly one row
-  out of the house tablet's ten; answering "yes" on unknown would make every house location
-  simultaneously true.
-- **`unreachable()` is separate from `plan()` returning None.** None means "walk" -- either
-  walking is better or nothing helps. At Ferox those demand opposite actions (walk vs. stop and
-  say so), so the two questions are asked separately.
-- **The POH interior routes as OPEN VOID on our static map** -- MEASURED:
-  `find_path((1923,5709) -> (1870,5698))` answers 64 steps, because POH template coords carry no
-  map data and "no data defaults to PASSABLE". The step count is fictional (the house is
-  instanced and its layout varies per player) but the conclusion is right: you can walk from your
-  arrival tile to the box. A test stub that forbade this was the test's bug, not the code's.
-
-**VERIFIED LIVE 2026-09-07** against the running client -- real inventory, real varbits
-(2187=3, 4744=0), POH config as the user described, goal Ferox Enclave, real `worldmap` router:
-
-    walking to Ferox: None
-    leg 1: [item] Teleport to House tablet     anywhere      -> (1923,5709,0)
-    leg 2: [box]  3: Ferox Enclave             (1870,5698,0) -> (3151,3635,0)
-                  via: Teleport Menu Basic Jewellery Box 37492
-
-**Ferox Enclave is a sealed 413-tile island on our collision map** (component does not grow at
-radius 40/80/150; nothing routes in or out, not even 35 tiles south). MEASURED 2026-09-07. That
-is the deterministic reason a bank trip gets stuck there -- `banker`'s walk home has been
-impossible since worldmap.py replaced Shortest Path on 2026-08-29, independent of the three
-defects fixed earlier that day. Of 210 plane-0 destinations, **167 route normally, 30 are
-enclosed, 13 sit on an unwalkable tile**; the enclosed ones are genuinely enclosed places
-(Slime Pit, Tarn's Lair, the pyramids, Lithkren, the gem mine -- which karambwan_fishing uses
-happily, because it teleports out rather than walking).
-
-**NOT DONE, and each is a real gap:**
-1. **`banker` still calls the old single-hop `choose()`.** The graph is not wired in, so slayer
-   does not yet benefit. Multi-leg execution is the work.
-2. **No execution for a box or portal leg.** The jewellery box opens a destination picker --
-   exactly the shape CLAUDE.md records `_use_transport` could never drive. The route is free; the
-   clicking is not.
-3. **No config surface.** `PohConfig` defaults to everything off/NONE, so until a Controller
-   Settings section (or a routine config block) exists, the graph will never plan a POH route in
-   production.
-4. **`plan()` costs ~19s / 87 `route_len` calls** on a real cross-map query. Fine once per bank
-   trip, far too slow per tick. The fix is one flood from the goal (`reachable_from` returns
-   distances) instead of N `find_path` calls.
-5. **4744's polarity is UNVERIFIED.** With 2187=3 and 4744=0, two rows match: one landing at the
-   POH interior (1923,5709) and one outside at (3340,3003). The search considers both and takes
-   whichever routes; which one the game actually does is a live question.
-6. Only items/boxes/POH portals are vendored. Fairy rings, spirit trees, minecarts, gliders,
-   obelisks and the rest are still absent -- the user has a POH fairy ring that we cannot use.
-
-
-**Wired into banker 2026-09-07 (USER: "go ahead to 1+2+3"), and VERIFIED LIVE against the
-running client.** `_plan_return_teleport` now calls `teleports.plan`, stores every leg, and
-`_use_return_teleport` runs them in order; a leg that does not land stops the chain and the walk
-home recovers, exactly as the single-hop version did. POH contents come off the bridge as a
-`poh` block (`ControllerConfig`'s new Player-Owned House section, mirroring Shortest Path's own
-option names: `usePoh`, `pohJewelleryBoxTier`, `usePohPortals`, `usePohMountedItems`,
-`usePohFairyRing`), defaulting to everything OFF so an unconfigured account never routes through
-a house it may not have. Needs the client rebuild.
-
-Four bugs found by running it live, three of them the SAME SHAPE -- an assumed payload shape
-that a lying test stub then hid:
-
-- **`/equipment` is a DICT KEYED BY SLOT, not a list.** Iterating it yields slot NAMES, so worn
-  items contributed NOTHING to the owned set and a worn-name lookup raised on a `str`.
-  `_item_rows` normalises both shapes. The tell was there earlier and missed: an equipment dump
-  that printed empty while the account was wearing eleven items.
-- **`controller.get_varbit` returns the VALUE, not a `{"value": n}` envelope.** The first cut
-  checked `isinstance(reply, dict)`, so it read NOTHING, so every varbit-gated row was rejected,
-  so the house-tablet chain was impossible. **The unit test passed because its stub returned a
-  dict** -- encoding the same wrong assumption it existed to catch. Both stubs now match reality.
-  General lesson, twice in one session (the other was the pop-order regression): **a stub that
-  lies about a shape is worse than no stub.**
-- **`test_banker.py` was not hermetic**: `_owned_item_ids` reads `bank_memory.load()`, which
-  reaches the RUNNING CLIENT (~929 real items that change as the account is played), so planning
-  outcomes drifted and three unrelated tests failed once and passed on a verbatim re-run. It has
-  a `_no_live_bridge` autouse fixture now, like the other suites; the full run also got ~20%
-  faster.
-- **THE VOID IS ONE CONNECTED COMPONENT, and it made planning both slow and wrong.** "No data
-  defaults to PASSABLE" means every dungeon, instance and POH template is joined into one giant
-  walkable void, so `find_path` invents hundreds-of-tiles routes between unrelated underground
-  coordinates. MEASURED: a single decision cost **106s**, and the invented routes outranked a
-  ring of dueling that teleported straight home. Fixed by bounding an approach walk in BOTH
-  senses -- `APPROACH_MAX_TILES` (60) rejects a long answer, `APPROACH_MAX_NODES` (20000) bounds
-  the SEARCH so a void crawl gives up in milliseconds -- plus `GOAL_FLOOD_RADIUS`: ONE
-  `reachable_from` flood from the anchor replaces a cross-map search per candidate, and its
-  radius doubles as the rule "a landing further than this from home is not worth teleporting to".
-  **106s -> 9.9s**, answers unchanged.
-
-**VERIFIED LIVE 2026-09-07** through banker's own code path, real bank memory (913-929 banked
-items), real varbits, POH set to the user's actual house: `-> Ferox Enclave: 9.9s Ring of
-dueling: Ferox Enclave` and `-> Varrock W bank: 9.9s Varrock tablet`. With the bank in view the
-planner correctly prefers a direct teleport over the house->box chain; with only the house tablet
-owned it finds the chain (pinned by test). **`/bank/memory` is also confirmed working live**
-(`seen=true, source=live, items=929`), which clears item 1 of the bank-memory checklist.
-
-**Still NOT verified live: the actual clicking.** `_run_object_leg` and `_pick_destination` have
-never run inside a POH -- the jewellery box's destination picker is answered by matching the
-TSV's own destination name in the widget dump, and that assumption is untested. Every step
-confirms and any failure falls back to walking, which is the whole safety argument, but treat a
-POH leg as unproven until a live session says otherwise.
-
-**First live session's checklist** -- none of this has touched a real client:
-1. Does the winning teleport's item actually withdraw (`search_and_withdraw` by the TSV's item
-   name, e.g. "Ring of dueling", against a bank listing "Ring of dueling(8)")?
-2. Does the left-click hover gate pass on these items, or does everything fall to the menu?
-3. For a multi-destination item, is the TSV's `destination_name` really the dialogue option text?
-   (This is the assumption the whole "safe subset" rests on and it is UNVERIFIED.)
-4. Fit `MIN_SAVING_TILES` / `TELEPORT_COST_TILES` against real trips -- watch for a tablet burned
-   on a walk that was already short.
-5. Confirm the wilderness filter fires on a Krystilia task above level 20.
+- Shortest Path's own transport TSVs are vendored byte-identical
+  (`ControllerAddon/vendor/`, header names ASSERTED since column order differs between
+  files): teleportation items, jewellery boxes, POH portals. Item rows key on ITEM IDS,
+  which joins directly with bank memory; the Items column is pure OR (charge variants of
+  one item); wilderness level is filtered (a teleport does not fire above its own level,
+  and Krystilia tasks make this a common case, not a corner).
+- **`teleports.py` is PURE** -- no HTTP, no client state, no execution. `plan(start, goal,
+  owned_ids, route_len, ...)` is a bounded BFS over hops (`MAX_HOPS` 2) returning legs --
+  house-tablet -> POH -> jewellery-box chains included. Varbit gates (house location 2187,
+  inside/outside 4744) FAIL CLOSED on unknown; an ornate box disables the mounted glory
+  (ported from the decompile). Walking is the default: a teleport must beat the walk by
+  `MIN_SAVING_TILES` after `TELEPORT_COST_TILES` -- both first-draft guesses.
+  `unreachable()` is a separate question from `plan()` returning None (walk vs.
+  stop-and-say-so). The no-data VOID is one connected walkable component, so approach
+  walks are bounded (`APPROACH_MAX_TILES`/`APPROACH_MAX_NODES`/`GOAL_FLOOD_RADIUS`) --
+  without them one decision cost 106s and invented routes; with them 9.9s, VERIFIED LIVE.
+- **Wired into `banker`**: the plan is made INSIDE the open bank
+  (`_withdraw_return_teleport`), executed by `_use_return_teleport` (which pops the plan
+  itself -- pinned by test), the landing CONFIRMED not slept off; any failed leg falls
+  back to the walk home, which is the whole safety argument. Every routine opting into
+  `returnToSpot` gets it. POH contents come from the bridge's `poh` config block
+  (Controller Settings, everything OFF by default -- an unconfigured account never routes
+  through a house).
+- **Ferox Enclave is a sealed 413-tile island on the collision map** (~30 of 210
+  destinations similarly enclosed) -- walking home from there has been impossible since
+  worldmap replaced Shortest Path, which is why slayer's bank trips stranded there.
+- **The actual CLICKING of a box/portal leg has never run live** -- the destination picker
+  is answered by matching the TSV's destination name in the widget dump, unproven. Fairy
+  rings/spirit trees/gliders are not vendored yet; `plan()` runs once per bank trip only.
 
 ## Clicking interface elements (`/widget`)
 
