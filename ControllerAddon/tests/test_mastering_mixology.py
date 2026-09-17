@@ -224,6 +224,27 @@ def _finished_item(name):
     return {"id": unfinished_id + 10, "name": name}
 
 
+def test_tick_does_nothing_while_not_in_the_lab(game, monkeypatch):
+    """The engine's "logged in" gate is GameState, which is already LOGGED_IN at the
+    click-here-to-play screen -- so tick() runs through the whole login transition. LIVE
+    2026-09-18: after a logout, auto-login reached the welcome screen and tick() meanwhile
+    pulled at the Mox lever three times against an empty world, burning the retry budget into a
+    safety stop that needed a restart."""
+    ctx = FakeCtx()
+    ctx.state.config = dict(mm.DEFAULT_CONFIG)
+    ctx.state.data["mm_level_checked"] = True
+    monkeypatch.setattr(controller, "get_mixology_state",
+                        lambda: {"inLab": False, "stations": {}, "orders": [], "hopper": {}})
+    ran = []
+    monkeypatch.setattr(mm, "_stuck_watch", lambda _c: ran.append("stuck"))
+    monkeypatch.setattr(mm, "maybe_collect_digweed", lambda *a, **k: ran.append("digweed"))
+
+    mm.tick(ctx)
+
+    assert ran == [], "nothing may act on the world while the player is not in the lab"
+    assert not ctx.state.safety_stopped
+
+
 def test_orders_and_deposit_do_not_ping_pong_over_an_unwanted_potion(game, monkeypatch):
     """LIVELOCK, LIVE 2026-09-17: orders_phase sent a finished 'Liplack liquor' to deposit_phase
     as a "leftover", deposit_phase declined to bin a potion no live order wants and handed it

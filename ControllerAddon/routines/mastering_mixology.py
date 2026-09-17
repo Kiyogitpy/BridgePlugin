@@ -1895,6 +1895,18 @@ def tick(ctx) -> None:
         if ctx.state.safety_stopped:
             return
 
+    # NOT IN THE LAB = DO NOTHING. The engine's "logged in" gate is GameState, and GameState is
+    # already LOGGED_IN at the click-here-to-play screen (CLAUDE.md, LoginProvider) -- so tick()
+    # runs during the whole login transition, before the player is in the world at all. LIVE
+    # 2026-09-18: the account was logged out, auto-login reached the welcome screen, and tick()
+    # meanwhile pulled at the Mox lever three times against an empty world ("last-action
+    # target=''" each time), burning the retry budget into a safety stop that needed a restart --
+    # while login was still clicking the welcome screen away. /mixology-state's own inLab is the
+    # honest answer to "can this routine do anything right now", and the same guard covers
+    # walking out of the lab, a hop, or a disconnect mid-cycle.
+    if not controller.get_mixology_state().get("inLab"):
+        return
+
     _stuck_watch(ctx)
 
     # Phase transitions CHAIN inside one tick (bounded by TICK_CHAIN_MAX and the engine's own
