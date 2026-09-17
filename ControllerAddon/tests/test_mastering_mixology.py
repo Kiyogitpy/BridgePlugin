@@ -224,6 +224,36 @@ def _finished_item(name):
     return {"id": unfinished_id + 10, "name": name}
 
 
+def test_orders_and_deposit_do_not_ping_pong_over_an_unwanted_potion(game, monkeypatch):
+    """LIVELOCK, LIVE 2026-09-17: orders_phase sent a finished 'Liplack liquor' to deposit_phase
+    as a "leftover", deposit_phase declined to bin a potion no live order wants and handed it
+    back, and the two traded it at tick rate forever. Only an UNFINISHED leftover actually breaks
+    the leftmost-unprocessed bookkeeping; a finished one is inert."""
+    ctx = FakeCtx()
+    game.inventory = [_finished_item("Liplack liquor")]
+    game.orders = [{"name": "Azure aura mix", "station": "Alembic", "mox": 0, "aga": 0, "lye": 0},
+                   {"name": "Megalite liquid", "station": "Agitator", "mox": 0, "aga": 0, "lye": 0},
+                   {"name": "Mammoth-might mix", "station": "Retort", "mox": 0, "aga": 0, "lye": 0}]
+    monkeypatch.setattr(mm, "_vessel_content", lambda: None)
+    monkeypatch.setattr(mm, "_make_base", lambda *a, **k: False)
+
+    mm.orders_phase(ctx, {})
+
+    assert ctx.state.data.get("mm_phase") != "deposit", "must not bounce a potion deposit declines"
+    assert ctx.state.data.get("mm_chosen_orders"), "it should get on with the next cycle instead"
+
+
+def test_a_finished_potion_a_live_order_wants_still_goes_to_deposit(game, monkeypatch):
+    ctx = FakeCtx()
+    game.inventory = [_finished_item("Azure aura mix")]
+    game.orders = [{"name": "Azure aura mix", "station": "Alembic", "mox": 0, "aga": 0, "lye": 0}]
+    monkeypatch.setattr(mm, "_vessel_content", lambda: None)
+
+    mm.orders_phase(ctx, {})
+
+    assert ctx.state.data.get("mm_phase") == "deposit"
+
+
 def test_a_potion_no_live_order_wants_is_held_not_binned(game, monkeypatch):
     """One belt click fulfils every matching order at once; the NEXT click throws an unmatched
     potion away for a reduced reward. MEASURED live 2026-09-17: four finished potions against

@@ -759,18 +759,39 @@ def orders_phase(ctx, config: dict) -> None:
     # session shifts what "leftmost unprocessed" means for the WHOLE cycle, routing genuine
     # potions to the wrong stations with no error. Flush any leftover potions (deposit_phase
     # actively processes a stray unfinished one) BEFORE choosing new orders.
-    leftover = [
-        i for i in controller.get_inventory()
-        if i.get("id") in UNFINISHED_IDS or i.get("id") in FINISHED_IDS
-    ]
-    if leftover:
+    inventory = controller.get_inventory()
+    leftover_unfinished = [i for i in inventory if i.get("id") in UNFINISHED_IDS]
+    leftover_finished = [i for i in inventory if i.get("id") in FINISHED_IDS]
+
+    # Only an UNFINISHED leftover actually breaks anything -- it is what shifts "leftmost
+    # unprocessed". A FINISHED one is inert: it occupies a slot and nothing else.
+    #
+    # Sending a finished potion here to deposit_phase unconditionally is a LIVELOCK now that
+    # deposit_phase declines to bin a potion no live order wants: orders_phase handed it over,
+    # deposit_phase handed it straight back, at tick rate forever (LIVE 2026-09-17, on a
+    # 'Liplack liquor' nothing wanted). So hand over finished potions only when depositing will
+    # actually do something -- i.e. when some live order wants one of them.
+    if leftover_unfinished:
         debug_log.log(
             "mixology",
             f"leftover potions in inventory before choosing new orders: "
-            f"{[i.get('name') for i in leftover]} -- flushing via deposit first",
+            f"{[i.get('name') for i in leftover_unfinished]} -- flushing via deposit first",
         )
         ctx.state.data["mm_phase"] = "deposit"
         return
+
+    if leftover_finished:
+        orders_now = {(o.get("name") or "")
+                      for o in (controller.get_mixology_state().get("orders") or [])}
+        if any((i.get("name") or "") in orders_now for i in leftover_finished):
+            debug_log.log(
+                "mixology",
+                f"finished potions a live order wants: "
+                f"{[i.get('name') for i in leftover_finished]} -- depositing first",
+            )
+            ctx.state.data["mm_phase"] = "deposit"
+            return
+        # Nothing wants them yet; carry them through this cycle and deposit when an order turns up.
 
     # A potion still INSIDE a station is in no container the leftover check above can see.
     # USER 2026-09-17, watching it live: "it has one in the machine again when going for 3 new".
