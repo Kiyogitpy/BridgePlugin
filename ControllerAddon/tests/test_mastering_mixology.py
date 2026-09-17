@@ -158,6 +158,156 @@ def test_the_finish_wait_gives_up_early_when_the_station_released_it_unfinished(
     assert captured["stop"]() is True
 
 
+def test_a_pull_into_slots_that_already_hold_that_paste_still_counts(game, monkeypatch):
+    """The slot varbits hold WHICH paste is in each slot, so pulling lye into a mixer already
+    reading lye/lye/lye moves no value -- "no change" is not "no pull". LIVE 2026-09-17: a run
+    inherited (3,3,3), the next order was lye-only, and three flawless pulls each read as a
+    failure and safety-stopped the run while /last-action showed "Operate / Lye lever"."""
+    ctx = _ctx_with_events()
+    game.last_action = {"tick": 5, "target": "Lye lever"}
+    monkeypatch.setattr(mm, "_mixer_slots", lambda: (3, 3, 3))    # never changes
+    monkeypatch.setattr(mm, "_await", lambda _ctx, sigs, *a, **k: "MENU_CLICKED" in sigs)
+
+    assert mm._pull_lever(ctx, "lye") is True
+
+
+def test_the_finish_snapshot_is_taken_BEFORE_the_station_runs(game, monkeypatch):
+    """The speedup loops return only once the station has emptied -- i.e. once the potion has
+    ALREADY been delivered. A held_before snapshot taken after them counts the very potion the
+    finish is waiting for, so finished() can never exceed it and the wait sits out its full 90s
+    on a potion that is visibly done. USER 2026-09-17: "standing idle long after its finished",
+    and from the outside, "it correctly hovers the conveyer but doesnt click it" -- the belt
+    pre-hover happens inside that same deadlocked wait."""
+    order = "Liplack liquor"
+    unfinished_id = next(k for k, v in mm.UNFINISHED_IDS.items() if v == order)
+    finished_id = unfinished_id + 10
+
+    game.inventory = []                                  # nothing held when the station starts
+    game.stations["retort"] = {"progress": 0, "potionName": order}
+    ctx = _ctx_with_events()
+    monkeypatch.setattr(mm, "_await", lambda *a, **k: True)
+
+    def speedup(*_a, **_k):
+        # The station finishes and delivers DURING the speedup, as it does live.
+        game.inventory.append({"id": finished_id, "name": order})
+        game.stations["retort"] = {"progress": 0}
+    monkeypatch.setattr(mm, "_process_retort_speedup", speedup)
+
+    captured = {}
+
+    def fake_await_long(_ctx, _sig, _budget, confirm=None, **_kw):
+        captured["confirm"] = confirm
+        return bool(confirm and confirm())
+    monkeypatch.setattr(mm, "_await_long", fake_await_long)
+
+    mm._process_one(ctx, {}, "Retort", game.station("Retort"), order, next_name=None)
+
+    assert captured["confirm"]() is True, "the delivered potion must satisfy the finish"
+
+
+def test_an_EMPTY_station_is_never_called_stalled(game, monkeypatch):
+    """USER 2026-09-17: "standing idle long after its finished". An empty station's
+    (potionName=None, progress=0) sits perfectly still, so keying the stall watch on it declared
+    a FINISHED potion "not running" and re-clicked -- into an empty station, which is exactly
+    what auto-starts the wrong potion."""
+    order = "Alco-augmentator"
+    ctx = _ctx_with_events()
+    game.stations["retort"] = {"progress": 0}          # already finished and emptied
+    monkeypatch.setattr(mm, "_process_retort_speedup", lambda *a, **k: None)
+    monkeypatch.setattr(mm, "_await", lambda *a, **k: True)
+    clicked = []
+    monkeypatch.setattr(mm, "_click_object",
+                        lambda _ctx, name, **kw: clicked.append(name) or {"name": name})
+    t = {"v": 1000.0}
+    monkeypatch.setattr(mm, "_now", lambda: t["v"])
+
+    def fake_await_long(_ctx, _sig, _budget, confirm=None, stop=None, **_kw):
+        if stop:
+            stop()
+        t["v"] += mm.FINISH_STALL_S + 1
+        if stop and stop():
+            pytest.fail("an empty station must never count as stalled")
+        return False
+    monkeypatch.setattr(mm, "_await_long", fake_await_long)
+
+    mm._process_one(ctx, {}, "Retort", game.station("Retort"), order, next_name=None)
+
+    assert clicked == ["Retort"], "only the station's own start click, no re-click into an empty one"
+
+
+def test_orders_phase_empties_a_vessel_that_still_holds_a_mix(monkeypatch):
+    """A loaded vessel fills all three mixer slots, and a full mixer silently swallows lever
+    pulls -- the pull lands but no slot varbit moves, which reads as three failed pulls and a
+    safety stop (LIVE 2026-09-17, /last-action showed "Operate / Lye lever" the whole time).
+    The vessel is a third container the inventory leftover check cannot see."""
+    ctx = FakeCtx()
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_mixology_state",
+                        lambda: {"stations": {"retort": {"progress": 0}},
+                                 "orders": [{"name": "A", "station": "Alembic", "mox": 0, "aga": 0, "lye": 0},
+                                            {"name": "B", "station": "Agitator", "mox": 0, "aga": 0, "lye": 0},
+                                            {"name": "C", "station": "Retort", "mox": 0, "aga": 0, "lye": 0}],
+                                 "hopper": {"mox": 900, "aga": 900, "lye": 900}})
+    monkeypatch.setattr(mm, "_vessel_content", lambda: "Liplack liquor")
+    took = []
+    monkeypatch.setattr(mm, "_take_vessel_contents",
+                        lambda _ctx, name: took.append(name) or True)
+
+    mm.orders_phase(ctx, {})
+
+    assert took == ["Liplack liquor"], "the vessel must be emptied before any lever is pulled"
+    assert "mm_chosen_orders" not in ctx.state.data
+
+
+def test_a_deposit_that_fulfils_no_order_is_counted_and_flagged():
+    """RECORDED 2026-09-17: "You deposit some <potion>, but fail to fulfil an order." The potion
+    was made and deposited, so every other signal looks healthy -- only this line shows the work
+    earned a reduced reward."""
+    ctx = FakeCtx()
+
+    mm.on_event(ctx, "CHAT_MESSAGE",
+                {"message": "You deposit some @mes_hl_pur@Liplack liquor, but fail to fulfil an order."})
+    assert ctx.state.data["mm_wasted_deposits"] == 1
+
+    mm.on_event(ctx, "CHAT_MESSAGE",
+                {"message": "You deposit some Azure aura mix, but fail to fulfill an order."})
+    assert ctx.state.data["mm_wasted_deposits"] == 2, "must match either spelling"
+
+    mm.on_event(ctx, "CHAT_MESSAGE",
+                {"message": "You are rewarded @mes_hl_blu@0/@mes_hl_gre@0/@mes_hl_red@10."})
+    assert ctx.state.data["mm_wasted_deposits"] == 2
+
+
+def test_station_start_and_finish_listen_to_the_games_own_chat(game, monkeypatch):
+    """RECORDED 2026-09-17 (mixology-animation): every station announces itself the same way --
+    "You start concentrating/crystallising/homogenising the <potion>..." 0.9s after the click,
+    and "You finish ..." at the end. Matching "you start"/"you finish" plus the potion name is
+    station-agnostic, and the colour tag sits BEFORE the name so a substring match still hits."""
+    order = "Liplack liquor"
+    ctx = _ctx_with_events()
+    game.stations["agitator"] = {"progress": 0, "potionName": order}
+    monkeypatch.setattr(mm, "_process_agitator_speedup", lambda *a, **k: None)
+
+    signals = []
+
+    def capture(_ctx, sigs, _budget, confirm=None, **_kw):
+        signals.append(sigs)
+        return True
+    monkeypatch.setattr(mm, "_await", capture)
+    monkeypatch.setattr(mm, "_await_long", capture)
+
+    mm._process_one(ctx, {}, "Agitator", game.station("Agitator"), order, next_name=None)
+
+    start_match = signals[0]["CHAT_MESSAGE"]
+    finish_match = signals[-1]["CHAT_MESSAGE"]
+    assert start_match({"message": "You start homogenising the @mes_hl_pur@Liplack liquor..."})
+    assert finish_match({"message": "You finish homogenising the @mes_hl_pur@Liplack liquor."})
+    # The three verbs differ per station, so neither may key on one of them.
+    assert start_match({"message": "You start crystallising the @mes_hl_pur@Liplack liquor..."})
+    # A different potion's message must not satisfy either.
+    assert not finish_match({"message": "You finish homogenising the @mes_hl_pur@Azure aura mix."})
+
+
 def test_a_stalled_station_gets_CLICKED_to_take_the_potion_out(monkeypatch):
     """USER 2026-09-17: "it has to click the machine to get it out". A station never hands its
     potion back on its own, so logging "still busy" and returning waits for something that will
@@ -239,6 +389,7 @@ def test_orders_phase_proceeds_once_every_station_is_clear(monkeypatch):
                                             {"name": "B", "station": "Agitator", "mox": 0, "aga": 0, "lye": 0},
                                             {"name": "C", "station": "Retort", "mox": 0, "aga": 0, "lye": 0}],
                                  "hopper": {"mox": 900, "aga": 900, "lye": 900}})
+    monkeypatch.setattr(mm, "_vessel_content", lambda: None)     # vessel empty too
     monkeypatch.setattr(mm, "_make_base", lambda *a, **k: False)
 
     mm.orders_phase(ctx, {})
@@ -656,24 +807,54 @@ def test_mix_phase_hands_back_when_paused_between_bases(game):
 
 # --- stations --------------------------------------------------------------------------
 
-def test_retort_speedup_clicks_once_per_progress_tick_and_stops_on_finish(game):
+def _retort_readings(game, *states):
+    """One /mixology-state reading per loop pass. The loop is TICK-paced off this read, not off
+    progress events -- the clicks are a speedup, so they must not stop when events stop."""
+    seq = list(states)
+
+    def get_state():
+        game.stations["retort"] = seq.pop(0) if seq else {"progress": 0}
+        return {"stations": game.stations, "orders": [], "digweed": {}, "inLab": True,
+                "hopper": {"mox": 900, "aga": 900, "lye": 900}}
+    return get_state
+
+
+def test_retort_speedup_clicks_every_tick_until_the_potion_leaves(game, monkeypatch):
     ctx = _ctx_with_events()
-    game.stations["retort"] = {"progress": 0, "potionName": "Mammoth-might mix"}
-    game.varbits[11341] = 1
-    for p in (1, 2, 3):
-        game.feed(("VARBIT_CHANGED", _varbit(11327, p),
-                   (lambda p=p: game.stations["retort"].update({"progress": p}))))
-    game.feed(("VARBIT_CHANGED", _varbit(11327, 3)))       # a repeat: no click
-    game.feed(("VARBIT_CHANGED", _varbit(11327, 0)),
-              ("VARBIT_CHANGED", _varbit(11341, 0),
-               lambda: (game.stations["retort"].update({"progress": 0, "potionName": None}),
-                        game.varbits.update({11341: 0}))))
+    order = "Mammoth-might mix"
+    monkeypatch.setattr(controller, "get_mixology_state", _retort_readings(
+        game,
+        {"progress": 1, "potionName": order},
+        {"progress": 2, "potionName": order},
+        {"progress": 3, "potionName": order},
+        {"progress": 0},                       # ejected on its own: done
+    ))
     start = game.clock["t"]
 
-    mm._process_retort_speedup(ctx, game.station("Retort"), "Mammoth-might mix")
+    mm._process_retort_speedup(ctx, game.station("Retort"), order)
 
     assert game.in_place == 3
     assert game.clock["t"] - start < mm.RETORT_MAX_S     # returned on the finish, not the budget
+
+
+def test_retort_speedup_keeps_clicking_when_no_progress_event_arrives(game, monkeypatch):
+    """USER 2026-09-17: "second retort doesnt spam click slowing us down". The event-gated
+    version clicked only on a VARBIT_CHANGED it had seen, and its click-without-events path sat
+    behind `if events is None`, so with a live stream and no events it clicked ZERO times for
+    12s. The clicks are a speedup -- stopping them costs the whole point."""
+    ctx = _ctx_with_events()          # events present, but none are ever fed
+    order = "Mammoth-might mix"
+    monkeypatch.setattr(controller, "get_mixology_state", _retort_readings(
+        game,
+        {"progress": 4, "potionName": order},
+        {"progress": 4, "potionName": order},   # bar not moving: still must click
+        {"progress": 4, "potionName": order},
+        {"progress": 0},
+    ))
+
+    mm._process_retort_speedup(ctx, game.station("Retort"), order)
+
+    assert game.in_place == 3
 
 
 def test_retort_speedup_withholds_a_click_that_would_land_off_the_station(game, monkeypatch):
@@ -684,15 +865,15 @@ def test_retort_speedup_withholds_a_click_that_would_land_off_the_station(game, 
     game.hover_ok = False                       # neither re-aim gets back onto the model
     monkeypatch.setattr(controller, "hover_entity", lambda ser, entity, **kw: True)
     ctx = _ctx_with_events()
-    game.stations["retort"] = {"progress": 0, "potionName": "Mammoth-might mix"}
-    game.varbits[11341] = 1
-    for p in (1, 2):
-        game.feed(("VARBIT_CHANGED", _varbit(11327, p),
-                   (lambda p=p: game.stations["retort"].update({"progress": p}))))
-    game.feed(("VARBIT_CHANGED", _varbit(11341, 0),
-               lambda: game.stations["retort"].update({"progress": 0, "potionName": None})))
+    order = "Mammoth-might mix"
+    monkeypatch.setattr(controller, "get_mixology_state", _retort_readings(
+        game,
+        {"progress": 1, "potionName": order},
+        {"progress": 2, "potionName": order},
+        {"progress": 0},
+    ))
 
-    mm._process_retort_speedup(ctx, game.station("Retort"), "Mammoth-might mix")
+    mm._process_retort_speedup(ctx, game.station("Retort"), order)
 
     assert game.in_place == 0
 
@@ -710,38 +891,37 @@ def test_retort_speedup_recentres_its_aim_before_giving_up(game, monkeypatch):
     monkeypatch.setattr(controller, "hover_entity", hover_entity)
     game.hover_ok = False
     ctx = _ctx_with_events()
-    game.stations["retort"] = {"progress": 0, "potionName": "Mammoth-might mix"}
-    game.varbits[11341] = 1
-    game.feed(("VARBIT_CHANGED", _varbit(11327, 1),
-               lambda: game.stations["retort"].update({"progress": 1})))
-    game.feed(("VARBIT_CHANGED", _varbit(11341, 0),
-               lambda: game.stations["retort"].update({"progress": 0, "potionName": None})))
+    order = "Mammoth-might mix"
+    monkeypatch.setattr(controller, "get_mixology_state", _retort_readings(
+        game,
+        {"progress": 1, "potionName": order},
+        {"progress": 0},
+    ))
 
-    mm._process_retort_speedup(ctx, game.station("Retort"), "Mammoth-might mix")
+    mm._process_retort_speedup(ctx, game.station("Retort"), order)
 
     assert (0, 0) in offsets
     assert game.in_place == 1
 
 
-def test_retort_speedup_stops_once_the_station_holds_a_DIFFERENT_potion(game):
+def test_retort_speedup_stops_once_the_station_holds_a_DIFFERENT_potion(game, monkeypatch):
     """USER 2026-09-17: "we clicked one too many on that station creating an additional potion".
     The Retort finished mid-burst, the extra clicks auto-started the leftover 'Azure aura mix'
     in it, and the loop kept going because progress was climbing again -- for the NEW potion.
     The old guard only asked "is it empty", which a different potion passes straight through."""
     ctx = _ctx_with_events()
-    game.stations["retort"] = {"progress": 0, "potionName": "Mammoth-might mix"}
-    game.varbits[11341] = 1
-    game.feed(("VARBIT_CHANGED", _varbit(11327, 1),
-               lambda: game.stations["retort"].update({"progress": 1})))
-    # The station moves on to someone else's potion; progress keeps climbing, so only an
-    # IDENTITY check can stop the loop.
-    game.feed(("VARBIT_CHANGED", _varbit(11327, 2),
-               lambda: game.stations["retort"].update({"progress": 2,
-                                                       "potionName": "Azure aura mix"})))
-    game.feed(("VARBIT_CHANGED", _varbit(11327, 3),
-               lambda: game.stations["retort"].update({"progress": 3})))
+    order = "Mammoth-might mix"
+    monkeypatch.setattr(controller, "get_mixology_state", _retort_readings(
+        game,
+        {"progress": 1, "potionName": order},
+        # The station has moved on to someone else's potion, and progress keeps climbing -- so
+        # only an IDENTITY check can stop the loop. Spamming here is what auto-started an extra
+        # potion live 2026-09-17.
+        {"progress": 2, "potionName": "Azure aura mix"},
+        {"progress": 3, "potionName": "Azure aura mix"},
+    ))
 
-    mm._process_retort_speedup(ctx, game.station("Retort"), "Mammoth-might mix")
+    mm._process_retort_speedup(ctx, game.station("Retort"), order)
 
     assert game.in_place == 1, "clicks must stop the moment the station is not on our potion"
 

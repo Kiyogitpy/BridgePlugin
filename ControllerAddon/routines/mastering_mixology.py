@@ -172,12 +172,29 @@ NEW_ORDERS_S = 1.5              # belt deposit -> the game has written the three
 STALL_WARN_S = 120.0            # no progress signature change: log a [!] line ...
 STALL_STOP_S = 300.0            # ... then safety-stop (the longest legit silence is one station)
 FOREIGN_STATION_STOP_S = 90.0   # a station still frozen after the collect clicks have been spent
-COLLECT_STALL_S = 4.0           # progress unchanged this long: the potion is done, click it out
+# USER 2026-09-17, the station mechanics: every station advances ON ITS OWN once started and
+# spits the finished potion out by itself. Input only ACCELERATES it -- the Retort by spam
+# clicking, the Agitator and Alembic by a click on their flash cue. So progress that is not
+# moving means the station is not running at all ("basically a misclick"), which makes a frozen
+# progress bar an unambiguous fault signal rather than something to wait out.
+#
+# A running station moves 1 per game tick (0.6s), so ~2s of no change is already 3 missed ticks.
+# MEASURED 2026-09-17: at the first-draft 4.0/6.0 these two waits ran BACK TO BACK (the finish
+# wait spent one, then the restart helper started its own from scratch) and cost 8-11s per
+# station -- about half of a ~60s three-order cycle spent noticing. A false positive is cheap:
+# the station is occupied, so a re-click cannot auto-start anything, and on the Agitator/Alembic
+# an extra click outside the cue window simply does nothing.
+COLLECT_STALL_S = 2.0           # progress unchanged this long: the station is not running
 COLLECT_MAX_TRIES = 4
-FINISH_STALL_S = 6.0            # the finish wait hands back this soon once progress stops moving
+FINISH_STALL_S = 2.0            # the finish wait hands back this soon once progress stops moving
+RESTART_CONFIRM_S = 3.0         # restart click -> progress moving again / the potion delivered
 # Park the cursor only once the station's projection has stopped sliding (same idea, and the same
 # numbers, as mining_guild_iron's arrival settle).
-HOVER_SETTLE_MAX_S = 1.2        # the walk-in plus the camera glide; past this, hover anyway
+# Capped low on purpose: this is paid before EVERY anticipatory hover, and there are nine lever
+# pre-hovers in a cycle. USER 2026-09-17: "significantly slower on the lever" at 1.2s, where a
+# projection that never converges burned the whole ceiling nine times over. A genuinely sliding
+# projection is caught well inside this; one that is still settles in two reads (~0.16s).
+HOVER_SETTLE_MAX_S = 0.4        # the walk-in plus the camera glide; past this, hover anyway
 HOVER_SETTLE_POLL_S = 0.08
 HOVER_SETTLE_PX = 3             # two consecutive projection reads this close = settled
 
@@ -755,6 +772,20 @@ def orders_phase(ctx, config: dict) -> None:
         _collect_if_stalled(ctx, name.capitalize(), _station_state(name))
         return
 
+    # THE MIXING VESSEL IS THE THIRD CONTAINER, and it is no more visible to the inventory check
+    # than a station is. A mix left in it fills all three mixer slots, so the next lever pull can
+    # change nothing -- which reads as "'<X> lever' click registered but no mixer slot changed"
+    # and safety-stops after three tries, with the click itself perfectly on target
+    # (/last-action confirmed "Operate / Lye lever"). LIVE 2026-09-17, on a vessel left loaded by
+    # a previous run. Take it first; deposit_phase knows how to flush whatever that hands us.
+    leftover_mix = _vessel_content()
+    if leftover_mix:
+        debug_log.log("mixology",
+                      f"the mixing vessel still holds '{leftover_mix}' -- taking it before new orders")
+        if _take_vessel_contents(ctx, leftover_mix):
+            ctx.state.data["mm_phase"] = "deposit"
+        return
+
     data = controller.get_mixology_state()
     orders = data.get("orders", [])
     hopper = data.get("hopper", {})
@@ -881,10 +912,25 @@ def _pull_lever(ctx, paste: str, next_name: str = None) -> bool:
         if _await(ctx, {"VARBIT_CHANGED": _varbit_in(VB_MIXER_SLOTS)},
                   PULL_LAND_S + _walk_budget(lever), confirm=landed, since=mark, reaction=False):
             return True
+
+        # NO CHANGE IS NOT THE SAME AS NO PULL. The slot varbits hold WHICH paste is in each
+        # slot, and the mixer overwrites its oldest slot -- so pulling lye into a mixer whose
+        # slots already read lye/lye/lye moves no value at all. LIVE 2026-09-17: a run started
+        # with (3,3,3) left over from a previous Liplack liquor, the next order was Liplack
+        # liquor again, and three flawless pulls each read as a failure and safety-stopped the
+        # run with /last-action showing "Operate / Lye lever" the whole time.
+        #
+        # The verdict above has ALREADY proven the game operated the right lever (a MENU_CLICKED
+        # naming it, on a newer tick), which is the evidence that the paste went in; the slot
+        # diff was only ever a second opinion. Correctness still has a real gate: _make_base
+        # checks the finished vessel against the recipe and re-pulls the whole thing if it
+        # disagrees, at no paste cost.
         debug_log.log(
             "mixology",
-            f"'{lever_name}' click registered but no mixer slot changed -- retry {attempt + 1}/{LEVER_PULL_MAX_ATTEMPTS}",
+            f"'{lever_name}' pulled but no mixer slot value moved -- taking the menu verdict "
+            f"(slots {slots_before} already held it); the vessel check is the backstop",
         )
+        return True
     return False
 
 
@@ -961,6 +1007,31 @@ def _make_base(ctx, order: dict, next_name: str = None) -> bool:
         debug_log.log("mixology", f"vessel take for '{target_name}' didn't land in inventory -- retrying")
         return False
     return True
+
+
+def _take_vessel_contents(ctx, potion_name: str) -> bool:
+    """Empty a vessel that is already holding a mix, so the mixer slots free up.
+
+    A loaded vessel fills all three mixer slots, and a full mixer silently swallows lever pulls --
+    the pull lands ("Operate / Lye lever" in /last-action) but no slot varbit moves, which reads
+    as three failed pulls and a safety stop. Same take as _make_base's, without the recipe
+    bookkeeping: whatever comes out is a stray potion and deposit_phase already knows how to
+    flush one."""
+    target_id = next((k for k, v in UNFINISHED_IDS.items() if v == potion_name), None)
+    if target_id is None:
+        return False
+    before = _count_item(target_id)
+    mark = _mark(ctx)
+    if _click_object(ctx, "Mixing vessel", check_ui_blockers=False) is None:
+        return False
+    return bool(_await(
+        ctx,
+        {"INVENTORY_CHANGED": None,
+         "CHAT_MESSAGE": _chat_has("you collect some", (potion_name or "").lower())},
+        VESSEL_TAKE_S,
+        confirm=lambda: _count_item(target_id) > before,
+        since=mark,
+    ))
 
 
 def mix_phase(ctx, config: dict) -> None:
@@ -1173,6 +1244,15 @@ def _process_one(ctx, config: dict, station_name: str, station: dict, order_name
     potion_vb, _progress_vb = STATION_VARBITS[station_name]
     key = station_name.lower()
 
+    # SNAPSHOT BEFORE THE CLICK. This has to be taken before the station has run at all: the
+    # speedup loops below return only once the station has emptied, i.e. once the potion has
+    # ALREADY been delivered, so a snapshot taken after them counts the very potion the finish is
+    # waiting for. finished() could then never exceed it and the wait sat out its full 90s on a
+    # potion that was visibly done -- USER 2026-09-17: "standing idle long after its finished".
+    unfinished_id = next((k for k, v in UNFINISHED_IDS.items() if v == order_name), None)
+    finished_id = unfinished_id + 10 if unfinished_id is not None else None
+    held_before = _count_item(finished_id) if finished_id is not None else 0
+
     mark = _mark(ctx)
     clicked = _click_object(ctx, station_name, check_ui_blockers=False)
     if clicked is None:
@@ -1181,7 +1261,15 @@ def _process_one(ctx, config: dict, station_name: str, station: dict, order_name
     def started():
         return _station_state(key).get("potionName") == order_name
 
-    if not _await(ctx, {"VARBIT_CHANGED": _varbit_in((potion_vb,))},
+    # The game SAYS it started, and says it the same way at every station -- RECORDED 2026-09-17
+    # (mixology-animation): "You start concentrating/crystallising/homogenising the <potion>...",
+    # 0.9s after the click, landing with the potion varbit. Matching "you start" plus the potion
+    # name is station-agnostic, and the colour tag sits BEFORE the name ("the @mes_hl_pur@Liplack
+    # liquor") so a substring match still hits. This is a positive confirmation that the machine
+    # is actually running, which is what a frozen progress bar could only ever infer after the
+    # fact (USER: "there should be an animation to confirm we are working on the machine").
+    started_chat = _chat_has("you start", (order_name or "").lower())
+    if not _await(ctx, {"VARBIT_CHANGED": _varbit_in((potion_vb,)), "CHAT_MESSAGE": started_chat},
                   STATION_START_S + _walk_budget(clicked), confirm=started, since=mark,
                   reaction=False):
         debug_log.log("mixology", f"{station_name} did not start on '{order_name}' -- retrying next tick")
@@ -1195,9 +1283,6 @@ def _process_one(ctx, config: dict, station_name: str, station: dict, order_name
     elif station_name == "Alembic" and speedups.get("alembic"):
         _process_alembic_speedup(ctx, station)
 
-    unfinished_id = next((k for k, v in UNFINISHED_IDS.items() if v == order_name), None)
-    finished_id = unfinished_id + 10 if unfinished_id is not None else None
-
     # An INCREASE over what was held before this station ran, not "> 0". Two orders in one cycle
     # can be the SAME potion (the game hands out duplicates freely -- seen repeatedly live
     # 2026-09-17), and the first one's finished potion is still in the inventory when the second
@@ -1205,9 +1290,8 @@ def _process_one(ctx, config: dict, station_name: str, station: dict, order_name
     # returns immediately, process_phase sees an empty inventory of unfinished potions and
     # deposits -- abandoning a potion that is still inside the station. That is the stranded
     # 'Megalite liquid' the Alembic was left frozen on. Same snapshot-then-increase rule CLAUDE.md
-    # already states for XP.
-    held_before = _count_item(finished_id) if finished_id is not None else 0
-
+    # already states for XP. held_before is taken at the top of this function, before the click --
+    # see the comment there for why taking it here instead deadlocked the wait.
     def finished():
         return finished_id is not None and _count_item(finished_id) > held_before
 
@@ -1242,6 +1326,14 @@ def _process_one(ctx, config: dict, station_name: str, station: dict, order_name
 
     def station_stalled() -> bool:
         st = _station_state(key)
+        if st.get("potionName") != order_name:
+            # Empty, or moved on. NOT a stall: an empty station's (None, 0) sits perfectly still,
+            # so keying on it declared a FINISHED potion "not running" 2s later and re-clicked --
+            # into an empty station, which is the auto-start-the-wrong-potion hazard, and the
+            # wait meanwhile stood idle (USER 2026-09-17: "standing idle long after its
+            # finished"). Whether the potion actually arrived is finished()'s question, and a
+            # station that let it go unfinished is released_unfinished()'s.
+            return False
         k = (st.get("potionName"), st.get("progress"))
         if watch["key"] != k:
             watch["key"] = k
@@ -1253,13 +1345,28 @@ def _process_one(ctx, config: dict, station_name: str, station: dict, order_name
         return released_unfinished() or (not finished() and station_stalled())
 
     debug_log.log("mixology", f"{station_name} working on '{order_name}' -- awaiting the finish")
-    if not _await_long(ctx, {"VARBIT_CHANGED": _varbit_in((potion_vb,)), "INVENTORY_CHANGED": None},
+    # "You finish concentrating/crystallising/homogenising the <potion>." is the game announcing
+    # the finish directly (RECORDED 2026-09-17), so the wait wakes on it instead of discovering
+    # the finish a poll later. The inventory count still DECIDES -- chat is the accelerator.
+    finished_chat = _chat_has("you finish", (order_name or "").lower())
+    if not _await_long(ctx, {"VARBIT_CHANGED": _varbit_in((potion_vb,)), "INVENTORY_CHANGED": None,
+                             "CHAT_MESSAGE": finished_chat},
                        STATION_FINISH_S, confirm=finished, since=mark, stop=give_up):
         if released_unfinished():
             debug_log.log("mixology", f"{station_name} released '{order_name}' unfinished -- retrying it")
         elif station_stalled():
+            # Re-click HERE. Handing back to process_phase made _collect_if_stalled start its own
+            # stall timer from scratch, so the same stall was waited out twice -- the single
+            # biggest cost in the cycle (MEASURED: 8-11s per station). The stall is established by
+            # this point, and a station that is not running is one whose start click never took,
+            # so clicking it again is the fix rather than a workaround. Safe: it is occupied, so
+            # the click cannot auto-start a different potion.
             debug_log.log("mixology",
-                          f"{station_name} stopped advancing on '{order_name}' -- handing back to be clicked out")
+                          f"{station_name} is not running on '{order_name}' -- clicking it again to start it")
+            restart_mark = _mark(ctx)
+            _click_object(ctx, station_name, check_ui_blockers=False)
+            _await(ctx, {"VARBIT_CHANGED": _varbit_in((potion_vb,)), "INVENTORY_CHANGED": None},
+                   RESTART_CONFIRM_S, confirm=finished, since=restart_mark)
         else:
             debug_log.log("mixology", f"{station_name} finish of '{order_name}' did not confirm within {STATION_FINISH_S}s")
 
@@ -1290,53 +1397,26 @@ def _process_retort_speedup(ctx, station: dict, order_name: str) -> None:
         return
 
     last_progress = -1
+    # ONE CLICK PER TICK, on the clock -- NOT gated on having seen a progress event.
+    #
+    # The clicks are a SPEEDUP, not what drives the bar: USER 2026-09-17, "the retort which we
+    # basically spam click can speed up the progress, it will however regardless if we input
+    # anything move the progress bar". So the clicks are worth nothing if they stop, and the old
+    # event-gated version stopped completely whenever no VARBIT_CHANGED arrived -- its only
+    # click-without-events path was behind `if events is None`, which never runs with a live
+    # stream. MEASURED live 2026-09-17: a Retort holding 'Alco-augmentator' took ZERO clicks for
+    # 12s (USER: "second retort doesnt spam click slowing us down").
+    #
+    # The identity read before every click is what keeps spamming safe -- an extra click into a
+    # station that has moved on auto-starts the next unprocessed potion there (the wrong-station
+    # bug, seen twice today). It is one local request per tick.
     deadline = _now() + RETORT_MAX_S
-    next_http = _now()
     while _now() < deadline:
-        if _now() >= next_http:
-            state = _station_state(order_key)
-            # IDENTITY, not just emptiness. A station holding a DIFFERENT potion used to sail
-            # through this check and keep collecting clicks: LIVE 2026-09-17 the Retort finished
-            # mid-burst, the next clicks auto-started the leftover 'Azure aura mix' in it, and
-            # the loop kept clicking because progress was climbing again -- for the new potion.
-            # The identity check at the bottom of this function only runs on the deadline path,
-            # never on these early returns, so nothing caught it.
-            if state.get("potionName") != order_name:
-                return
-            next_http = _now() + RETORT_HTTP_CONFIRM_S
-            if events is None:
-                progress = state.get("progress", 0) or 0
-                if progress > last_progress:
-                    _click_station_in_place(ctx, "Retort")
-                    last_progress = progress
-        if events is None:
-            _tick_pause(ctx, 1, phase=RETORT_CLICK_PHASE_S)
-            next_http = _now()
-            continue
-
-        hits = [
-            (etype, payload) for etype, payload in events.since(mark)
-            if etype == "VARBIT_CHANGED" and payload
-            and payload.get("varbitId") in (VB_RETORT_POTION, VB_RETORT_PROGRESS)
-        ]
-        mark = events.mark()   # advance AFTER the read, never re-take at the top (C2 lesson)
-        for _etype, payload in hits:
-            vid, value = payload.get("varbitId"), payload.get("value")
-            if vid == VB_RETORT_POTION and value == 0:
-                return
-            if vid == VB_RETORT_PROGRESS and value is not None and value > last_progress:
-                # Identity, checked HERE rather than only on the 2s HTTP cadence: a rising
-                # progress is exactly what a newly auto-started potion looks like, so the event
-                # alone cannot tell "our potion advanced" from "the station moved on". At one
-                # click per tick this read costs a single local request and closes the window
-                # that put an extra potion in the Retort live 2026-09-17.
-                if _station_state(order_key).get("potionName") != order_name:
-                    return
-                _sleep(controller.sample_human_delay(*RETORT_CLICK_PHASE_S))
-                _click_station_in_place(ctx, "Retort")
-                last_progress = value
-        if not hits:
-            _sleep(bridge_events.EVENT_POLL_INTERVAL_S)
+        state = _station_state(order_key)
+        if state.get("potionName") != order_name:
+            return          # finished (it ejects on its own) or the station moved on
+        _click_station_in_place(ctx, "Retort")
+        _tick_pause(ctx, 1, phase=RETORT_CLICK_PHASE_S)
 
     current_potion = _station_state(order_key).get("potionName")
     if current_potion and current_potion != order_name:
@@ -1522,8 +1602,25 @@ def deposit_phase(ctx, config: dict) -> None:
         mark = _mark(ctx)
         if _click_object(ctx, "Retort", check_ui_blockers=False) is None:
             return
-        _await(ctx, {"VARBIT_CHANGED": _varbit_in((VB_RETORT_POTION,)), "INVENTORY_CHANGED": None},
-               STATION_FINISH_S, confirm=lambda: _count_item(item_id) < before, since=mark)
+        # Same stall bail-out _process_one has. Without it this sat out the full STATION_FINISH_S
+        # whenever the flush click did not take -- 90s of the routine visibly doing nothing, which
+        # is where it was caught idling live 2026-09-17. A station that is running advances on its
+        # own, so a progress bar that has not moved means the click missed and re-clicking (next
+        # tick, through this same path) is the fix.
+        watch = {"key": None, "since": None}
+
+        def flush_stalled() -> bool:
+            st = _station_state("retort")
+            k = (st.get("potionName"), st.get("progress"))
+            if watch["key"] != k:
+                watch["key"] = k
+                watch["since"] = _now()
+                return False
+            return _now() - watch["since"] >= FINISH_STALL_S
+
+        _await_long(ctx, {"VARBIT_CHANGED": _varbit_in((VB_RETORT_POTION,)), "INVENTORY_CHANGED": None},
+                    STATION_FINISH_S, confirm=lambda: _count_item(item_id) < before, since=mark,
+                    stop=flush_stalled)
         return
 
     finished = [i for i in inventory if i.get("id") in FINISHED_IDS]
@@ -1663,7 +1760,22 @@ def setup(ctx) -> None:
 
 def on_event(ctx, event_type: str, payload) -> None:
     """A digweed corner's herb-ready varbit flipping non-zero flags the next tick to read
-    /mixology-state -- the accelerator for maybe_collect_digweed's poll."""
+    /mixology-state -- the accelerator for maybe_collect_digweed's poll.
+
+    Also watches for a WASTED deposit. RECORDED 2026-09-17: "You deposit some <potion>, but fail
+    to fulfil an order." -- the belt took a potion that matched none of the three live orders, so
+    the whole cycle's work on it earned a reduced reward. It is the one failure that costs
+    throughput while leaving every other signal looking healthy (the potion really was made, the
+    station really did finish, the deposit really did happen), so nothing else would surface it.
+    Counted here rather than polled: a chat poll can miss messages between reads."""
+    if event_type == "CHAT_MESSAGE" and payload:
+        # "fulfil" is a prefix of "fulfill", so this matches either spelling.
+        if "fail to fulfil" in (payload.get("message") or "").lower():
+            data = ctx.state.data
+            data["mm_wasted_deposits"] = data.get("mm_wasted_deposits", 0) + 1
+            debug_log.log("!", f"WASTED DEPOSIT ({data['mm_wasted_deposits']} so far): "
+                               f"{payload.get('message')}")
+        return
     if event_type != "VARBIT_CHANGED" or not payload:
         return
     if payload.get("varbitId") in VB_HERB_READY and payload.get("value"):
