@@ -96,6 +96,230 @@ def test_process_phase_stops_when_safety_stopped_mid_batch(monkeypatch):
     assert ctx.state.safety_stopped
 
 
+# --- a station frozen on someone else's potion (LIVE 2026-09-17) -----------------------
+#
+# A stray speedup click auto-started an Agitator order in the empty Alembic. process_phase then
+# wanted the Alembic for its own order, found it occupied, and returned every tick for five
+# minutes until the generic stall stop fired with a message that never named the cause.
+
+def _blocked_ctx(frozen_progress=14):
+    ctx = FakeCtx()
+    ctx.state.data["mm_chosen_orders"] = [{"station": "Alembic", "name": "Megalite liquid"}]
+    return ctx
+
+
+def _run_blocked(ctx, monkeypatch, clock, potion, progress):
+    monkeypatch.setattr(controller, "get_inventory", lambda: _unprocessed(1))
+    monkeypatch.setattr(controller, "get_mixology_state",
+                        lambda: {"stations": {"alembic": {"progress": progress(),
+                                                          "potionName": potion()}}})
+    monkeypatch.setattr(mm, "find_object", lambda name: {"name": name})
+    monkeypatch.setattr(mm, "_process_one", lambda *a, **k: None)
+    monkeypatch.setattr(mm, "_now", lambda: clock["t"])
+    mm.process_phase(ctx, {})
+
+
+def test_process_phase_safety_stops_on_a_station_frozen_with_a_foreign_potion(monkeypatch):
+    ctx = _blocked_ctx()
+    clock = {"t": 1000.0}
+    _run_blocked(ctx, monkeypatch, clock, lambda: "Liplack liquor", lambda: 14)
+    assert not ctx.state.safety_stopped          # first sighting only starts the timer
+
+    clock["t"] += mm.FOREIGN_STATION_STOP_S + 1
+    _run_blocked(ctx, monkeypatch, clock, lambda: "Liplack liquor", lambda: 14)
+
+    assert ctx.state.safety_stopped
+    assert "Liplack liquor" in ctx.state.stop_reason
+    assert "Megalite liquid" in ctx.state.stop_reason
+
+
+def test_the_finish_wait_gives_up_early_when_the_station_released_it_unfinished(game, monkeypatch):
+    """USER 2026-09-17: "It's idling" -- an unfinished 'Azure aura mix' was back in the inventory
+    with every station empty, and the finish wait still had 90s to burn before it would retry."""
+    order = "Azure aura mix"
+    unfinished_id = next(k for k, v in mm.UNFINISHED_IDS.items() if v == order)
+
+    game.inventory = [{"id": unfinished_id, "name": order}]   # released, still unfinished
+    game.stations["retort"] = {"progress": 0}                 # and the station is empty
+    ctx = _ctx_with_events()
+    monkeypatch.setattr(mm, "_process_retort_speedup", lambda *a, **k: None)
+    monkeypatch.setattr(mm, "_await", lambda *a, **k: True)
+
+    captured = {}
+
+    def fake_await_long(_ctx, _sig, _budget, confirm=None, stop=None, **_kw):
+        captured["stop"] = stop
+        return False
+    monkeypatch.setattr(mm, "_await_long", fake_await_long)
+
+    mm._process_one(ctx, {}, "Retort", game.station("Retort"), order, next_name=None)
+
+    assert captured["stop"] is not None, "the finish wait must be able to bail out early"
+    assert captured["stop"]() is True
+
+
+def test_a_stalled_station_gets_CLICKED_to_take_the_potion_out(monkeypatch):
+    """USER 2026-09-17: "it has to click the machine to get it out". A station never hands its
+    potion back on its own, so logging "still busy" and returning waits for something that will
+    never happen -- every stall today was a finished potion nobody collected."""
+    ctx = FakeCtx()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(mm, "_now", lambda: clock["t"])
+    clicked = []
+    monkeypatch.setattr(mm, "_click_object",
+                        lambda _ctx, name, **kw: clicked.append(name) or {"name": name})
+    state = {"progress": 7, "potionName": "Marley's moonlight"}
+
+    mm._collect_if_stalled(ctx, "Retort", state)        # first sighting: start the stall timer
+    assert clicked == []
+
+    clock["t"] += mm.COLLECT_STALL_S + 1
+    mm._collect_if_stalled(ctx, "Retort", state)        # still on the same progress -> click
+
+    assert clicked == ["Retort"]
+
+
+def test_a_station_whose_progress_is_moving_is_never_clicked(monkeypatch):
+    ctx = FakeCtx()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(mm, "_now", lambda: clock["t"])
+    clicked = []
+    monkeypatch.setattr(mm, "_click_object",
+                        lambda _ctx, name, **kw: clicked.append(name) or {"name": name})
+
+    for p in range(1, 8):
+        mm._collect_if_stalled(ctx, "Retort", {"progress": p, "potionName": "Liplack liquor"})
+        clock["t"] += mm.COLLECT_STALL_S + 1
+
+    assert clicked == [], "a station that is still advancing must never be click-spammed"
+
+
+def test_collect_clicks_are_bounded(monkeypatch):
+    ctx = FakeCtx()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(mm, "_now", lambda: clock["t"])
+    clicked = []
+    monkeypatch.setattr(mm, "_click_object",
+                        lambda _ctx, name, **kw: clicked.append(name) or {"name": name})
+    state = {"progress": 7, "potionName": "Marley's moonlight"}
+
+    mm._collect_if_stalled(ctx, "Retort", state)
+    for _ in range(12):
+        clock["t"] += mm.COLLECT_STALL_S + 1
+        mm._collect_if_stalled(ctx, "Retort", state)
+
+    assert len(clicked) == mm.COLLECT_MAX_TRIES
+
+
+def test_orders_phase_will_not_start_three_new_while_a_station_holds_a_potion(monkeypatch):
+    """USER 2026-09-17: "it has one in the machine again when going for 3 new". The inventory
+    leftover check above it cannot see inside a station, so a stranded potion sailed past and the
+    next cycle livelocked on "<station> still busy"."""
+    ctx = FakeCtx()
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_mixology_state",
+                        lambda: {"stations": {"retort": {"progress": 4,
+                                                         "potionName": "Mystic mana amalgam"}},
+                                 "orders": [{"name": "A", "station": "Alembic"},
+                                            {"name": "B", "station": "Agitator"},
+                                            {"name": "C", "station": "Retort"}],
+                                 "hopper": {"mox": 900, "aga": 900, "lye": 900}})
+
+    mm.orders_phase(ctx, {})
+
+    assert "mm_chosen_orders" not in ctx.state.data
+
+
+def test_orders_phase_proceeds_once_every_station_is_clear(monkeypatch):
+    ctx = FakeCtx()
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_mixology_state",
+                        lambda: {"stations": {"retort": {"progress": 0}},
+                                 "orders": [{"name": "A", "station": "Alembic", "mox": 0, "aga": 0, "lye": 0},
+                                            {"name": "B", "station": "Agitator", "mox": 0, "aga": 0, "lye": 0},
+                                            {"name": "C", "station": "Retort", "mox": 0, "aga": 0, "lye": 0}],
+                                 "hopper": {"mox": 900, "aga": 900, "lye": 900}})
+    monkeypatch.setattr(mm, "_make_base", lambda *a, **k: False)
+
+    mm.orders_phase(ctx, {})
+
+    assert ctx.state.data.get("mm_chosen_orders")
+
+
+def test_process_phase_holds_the_deposit_while_a_station_is_still_working(monkeypatch):
+    """A potion INSIDE a station is in no container the inventory can see. Counting only the
+    inventory called the cycle done and deposited without it, stranding it there for good --
+    LIVE 2026-09-17, twice (a Retort and an Alembic, each then livelocking the next cycle)."""
+    ctx = FakeCtx()
+    ctx.state.data["mm_chosen_orders"] = [{"station": "Alembic", "name": "Megalite liquid"}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])       # nothing unfinished held
+    monkeypatch.setattr(controller, "get_mixology_state",
+                        lambda: {"stations": {"alembic": {"progress": 6,
+                                                          "potionName": "Megalite liquid"}}})
+    monkeypatch.setattr(mm, "find_object", lambda name: {"name": name})
+    monkeypatch.setattr(mm, "_process_one", lambda *a, **k: None)
+
+    mm.process_phase(ctx, {})
+
+    assert ctx.state.data.get("mm_phase") != "deposit"
+
+
+def test_process_phase_deposits_once_every_station_is_clear(monkeypatch):
+    ctx = FakeCtx()
+    ctx.state.data["mm_chosen_orders"] = [{"station": "Alembic", "name": "Megalite liquid"}]
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_mixology_state",
+                        lambda: {"stations": {"alembic": {"progress": 0}}})
+    monkeypatch.setattr(mm, "find_object", lambda name: {"name": name})
+    monkeypatch.setattr(mm, "_process_one", lambda *a, **k: None)
+
+    mm.process_phase(ctx, {})
+
+    assert ctx.state.data.get("mm_phase") == "deposit"
+
+
+def test_a_station_frozen_on_our_OWN_potion_still_stops(monkeypatch):
+    """The stranded-potion case matches the order name, so exempting "our own" potion was the
+    hole the Alembic fell through: the timer never started and nothing ever stopped the spin."""
+    ctx = _blocked_ctx()
+    clock = {"t": 1000.0}
+    _run_blocked(ctx, monkeypatch, clock, lambda: "Megalite liquid", lambda: 6)
+    clock["t"] += mm.FOREIGN_STATION_STOP_S + 1
+    _run_blocked(ctx, monkeypatch, clock, lambda: "Megalite liquid", lambda: 6)
+
+    assert ctx.state.safety_stopped
+    assert "stranded" in ctx.state.stop_reason
+
+
+def test_a_station_still_working_its_foreign_potion_is_not_a_stop(monkeypatch):
+    """Progress is in the key, so a station that is genuinely climbing keeps resetting the
+    timer -- only a FROZEN one accumulates. Without this a slow potion (STATION_FINISH_S is
+    90s, past the 60s threshold) would be stopped on mid-run."""
+    ctx = _blocked_ctx()
+    clock = {"t": 1000.0}
+    progress = {"v": 1}
+    for _ in range(6):
+        _run_blocked(ctx, monkeypatch, clock, lambda: "Liplack liquor", lambda: progress["v"])
+        clock["t"] += mm.FOREIGN_STATION_STOP_S / 2
+        progress["v"] += 1
+
+    assert not ctx.state.safety_stopped
+
+
+def test_a_station_advancing_on_our_own_order_is_never_a_stop(monkeypatch):
+    """ADVANCING is the thing that makes a busy station fine, not whose potion it is. The
+    name-matches exemption this replaced is what let the stranded-potion freeze spin forever."""
+    ctx = _blocked_ctx()
+    clock = {"t": 1000.0}
+    progress = {"v": 1}
+    for _ in range(6):
+        _run_blocked(ctx, monkeypatch, clock, lambda: "Megalite liquid", lambda: progress["v"])
+        clock["t"] += mm.FOREIGN_STATION_STOP_S / 2
+        progress["v"] += 1
+
+    assert not ctx.state.safety_stopped
+
+
 # --- Event-driven outcomes (2026-09-06) --------------------------------------------------
 #
 # A scripted fake of the bridge plus a REAL bridge_events.EventStream fed by a stubbed
@@ -132,6 +356,8 @@ class Game:
                          _obj("Refiner", 1400, 9320), _obj("Hopper", 1396, 9324)]
         self.clicks = []       # entity clicks, by name
         self.in_place = 0      # click_human count
+        self.hover_ok = True   # what controller.hover_matches answers
+        self.busy = []         # controller.mark_busy durations
         self.batches = deque()
         self.on_click = {}     # name -> callable(game) run when that entity is clicked
 
@@ -181,6 +407,9 @@ def game(monkeypatch):
     monkeypatch.setattr(controller, "wait_until_player_idle", lambda **kw: True)
     monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
     monkeypatch.setattr(controller, "fidget_once", lambda: None)
+    monkeypatch.setattr(controller, "mark_busy", lambda s: g.busy.append(s))
+    monkeypatch.setattr(controller, "hover_matches",
+                        lambda expected_action=None, expected_target=None, **kw: g.hover_ok)
 
     def click_entity(ser, entity, **kw):
         name = entity.get("name")
@@ -447,6 +676,93 @@ def test_retort_speedup_clicks_once_per_progress_tick_and_stops_on_finish(game):
     assert game.clock["t"] - start < mm.RETORT_MAX_S     # returned on the finish, not the budget
 
 
+def test_retort_speedup_withholds_a_click_that_would_land_off_the_station(game, monkeypatch):
+    """A Retort click that misses the model resolves as "Walk here", and WALKING CANCELS the
+    concentration: LIVE 2026-09-17 /hover named the Retort while /last-action showed the walk,
+    and the potion sat frozen at progress 2 for the rest of the run. Withholding costs a few
+    progress points; firing blind costs the potion."""
+    game.hover_ok = False                       # neither re-aim gets back onto the model
+    monkeypatch.setattr(controller, "hover_entity", lambda ser, entity, **kw: True)
+    ctx = _ctx_with_events()
+    game.stations["retort"] = {"progress": 0, "potionName": "Mammoth-might mix"}
+    game.varbits[11341] = 1
+    for p in (1, 2):
+        game.feed(("VARBIT_CHANGED", _varbit(11327, p),
+                   (lambda p=p: game.stations["retort"].update({"progress": p}))))
+    game.feed(("VARBIT_CHANGED", _varbit(11341, 0),
+               lambda: game.stations["retort"].update({"progress": 0, "potionName": None})))
+
+    mm._process_retort_speedup(ctx, game.station("Retort"), "Mammoth-might mix")
+
+    assert game.in_place == 0
+
+
+def test_retort_speedup_recentres_its_aim_before_giving_up(game, monkeypatch):
+    """The default (-7,+7) hover nudge sitting just off the model is what produced the walk, so
+    the retry drops it for the model's centre before withholding."""
+    offsets = []
+
+    def hover_entity(ser, entity, **kw):
+        offsets.append(kw.get("offset"))
+        if kw.get("offset") == (0, 0):
+            game.hover_ok = True       # the centred aim lands on the model
+        return True
+    monkeypatch.setattr(controller, "hover_entity", hover_entity)
+    game.hover_ok = False
+    ctx = _ctx_with_events()
+    game.stations["retort"] = {"progress": 0, "potionName": "Mammoth-might mix"}
+    game.varbits[11341] = 1
+    game.feed(("VARBIT_CHANGED", _varbit(11327, 1),
+               lambda: game.stations["retort"].update({"progress": 1})))
+    game.feed(("VARBIT_CHANGED", _varbit(11341, 0),
+               lambda: game.stations["retort"].update({"progress": 0, "potionName": None})))
+
+    mm._process_retort_speedup(ctx, game.station("Retort"), "Mammoth-might mix")
+
+    assert (0, 0) in offsets
+    assert game.in_place == 1
+
+
+def test_retort_speedup_stops_once_the_station_holds_a_DIFFERENT_potion(game):
+    """USER 2026-09-17: "we clicked one too many on that station creating an additional potion".
+    The Retort finished mid-burst, the extra clicks auto-started the leftover 'Azure aura mix'
+    in it, and the loop kept going because progress was climbing again -- for the NEW potion.
+    The old guard only asked "is it empty", which a different potion passes straight through."""
+    ctx = _ctx_with_events()
+    game.stations["retort"] = {"progress": 0, "potionName": "Mammoth-might mix"}
+    game.varbits[11341] = 1
+    game.feed(("VARBIT_CHANGED", _varbit(11327, 1),
+               lambda: game.stations["retort"].update({"progress": 1})))
+    # The station moves on to someone else's potion; progress keeps climbing, so only an
+    # IDENTITY check can stop the loop.
+    game.feed(("VARBIT_CHANGED", _varbit(11327, 2),
+               lambda: game.stations["retort"].update({"progress": 2,
+                                                       "potionName": "Azure aura mix"})))
+    game.feed(("VARBIT_CHANGED", _varbit(11327, 3),
+               lambda: game.stations["retort"].update({"progress": 3})))
+
+    mm._process_retort_speedup(ctx, game.station("Retort"), "Mammoth-might mix")
+
+    assert game.in_place == 1, "clicks must stop the moment the station is not on our potion"
+
+
+def test_station_hover_waits_for_the_projection_to_stop_sliding(game, monkeypatch):
+    """USER 2026-09-17: "we dont wait until we are stopped to hover meaning the cursor slips
+    out" -- a hover taken mid-walk aims at a projection that keeps moving."""
+    moving = iter([(100, 100), (140, 160), (180, 220), (200, 240), (200, 240), (200, 240)])
+    monkeypatch.setattr(mm, "_refresh_for", lambda e: (lambda: next(moving, (200, 240))))
+    hovered = []
+    monkeypatch.setattr(controller, "hover_entity",
+                        lambda ser, entity, **kw: hovered.append(entity.get("name")) or True)
+    ctx = FakeCtx()
+
+    mm._hover_when_settled(ctx, "Retort", check_ui_blockers=False)
+
+    # It waited out the three moving reads and only parked once two agreed.
+    assert hovered == ["Retort"]
+    assert game.clock["t"] >= 1000.0 + mm.HOVER_SETTLE_POLL_S * 3
+
+
 def test_retort_speedup_stops_when_http_says_the_station_is_empty(game):
     """A lost potion->0 packet must cost a periodic HTTP read, never a run to the budget."""
     ctx = _ctx_with_events()
@@ -503,6 +819,66 @@ def test_flash_speedup_ignores_a_cue_at_another_station(game, monkeypatch):
     mm._process_alembic_speedup(ctx, station)
 
     assert game.in_place == 0
+
+
+# --- the speedup click is verified before it fires (LIVE 2026-09-17) -------------------
+#
+# The cue click is a raw click_human at a cursor parked up to tens of seconds earlier. Idle
+# drift and the camera moving the projection pulled the two 260px apart live: both Agitator
+# attempts missed AND one click landed in the then-empty Alembic, which auto-started an
+# Agitator order there and livelocked the run on "Alembic still busy".
+
+def test_speedup_click_is_withheld_when_the_cursor_is_not_on_the_station(game, monkeypatch):
+    monkeypatch.setattr(mm, "SPEEDUP_MISS_CHANCE", 0.0)
+    # The re-hover cannot rescue it either -- hover_matches keeps saying "not the Alembic".
+    game.hover_ok = False
+    ctx = _ctx_with_events()
+    station = game.station("Alembic")
+    game.stations["alembic"] = {"progress": 2, "potionName": "Liplack liquor"}
+    cue = {"id": mm.ALEMBIC_CUE_GRAPHICS_ID, "x": station["x"], "y": station["y"], "plane": 0, "tick": 3}
+    game.feed(("GRAPHICS_OBJECT_CREATED", cue, lambda: game.graphics.append(dict(cue))))
+
+    mm._process_alembic_speedup(ctx, station)
+
+    assert game.in_place == 0, "a click that cannot be placed must be dropped, never fired blind"
+
+
+def test_speedup_click_rehovers_once_and_fires_when_that_lands_on_target(game, monkeypatch):
+    monkeypatch.setattr(mm, "SPEEDUP_MISS_CHANCE", 0.0)
+    ctx = _ctx_with_events()
+    station = game.station("Alembic")
+    game.stations["alembic"] = {"progress": 2, "potionName": "Liplack liquor"}
+    cue = {"id": mm.ALEMBIC_CUE_GRAPHICS_ID, "x": station["x"], "y": station["y"], "plane": 0, "tick": 3}
+    game.feed(("GRAPHICS_OBJECT_CREATED", cue, lambda: game.graphics.append(dict(cue))))
+
+    # Drifted off at cue time; the corrective re-hover puts it back.
+    game.hover_ok = False
+    rehovered = []
+
+    def hover_entity(ser, entity, **kw):
+        rehovered.append(entity.get("name"))
+        game.hover_ok = True
+        return True
+    monkeypatch.setattr(controller, "hover_entity", hover_entity)
+
+    mm._process_alembic_speedup(ctx, station)
+
+    # The click fired only BECAUSE the re-hover put the cursor back on the station.
+    assert rehovered.count("Alembic") >= 1
+    assert game.in_place == 1
+
+
+def test_speedup_holds_the_idle_drift_off_while_the_cursor_is_parked(game, monkeypatch):
+    monkeypatch.setattr(mm, "SPEEDUP_MISS_CHANCE", 0.0)
+    ctx = _ctx_with_events()
+    station = game.station("Alembic")
+    game.stations["alembic"] = {"progress": 2, "potionName": "Liplack liquor"}
+    cue = {"id": mm.ALEMBIC_CUE_GRAPHICS_ID, "x": station["x"], "y": station["y"], "plane": 0, "tick": 3}
+    game.feed(("GRAPHICS_OBJECT_CREATED", cue, lambda: game.graphics.append(dict(cue))))
+
+    mm._process_alembic_speedup(ctx, station)
+
+    assert game.busy, "the cue wait must hold the anchorless idle drift off the parked cursor"
 
 
 def test_flash_speedup_falls_back_to_polling_without_events(game, monkeypatch):
@@ -681,7 +1057,37 @@ def test_make_base_prehovers_the_vessel_on_the_last_pull_and_the_next_lever_on_t
     assert hovers == ["Mox lever", "Mox lever", "Mixing vessel", "Lye lever"]
 
 
-def test_process_one_prehovers_the_next_target_during_the_finish_wait(game, monkeypatch):
+def test_process_one_waits_for_a_NEW_finished_potion_not_just_any(game, monkeypatch):
+    """The game hands out duplicate orders freely, so the previous order's finished potion is
+    already in the inventory when the second identical one starts. A "> 0" finish check is
+    already true the instant that second station is clicked, so the wait returns immediately,
+    process_phase sees nothing unfinished and deposits -- stranding a potion still inside the
+    station. LIVE 2026-09-17: that is how the Alembic was left frozen on a 'Megalite liquid'."""
+    order = "Mammoth-might mix"
+    unfinished_id = next(k for k, v in mm.UNFINISHED_IDS.items() if v == order)
+    finished_id = unfinished_id + 10
+
+    # One identical finished potion is ALREADY held, from the cycle's earlier duplicate order.
+    game.inventory = [{"id": finished_id, "name": order}]
+    game.stations["agitator"] = {"progress": 0, "potionName": order}
+    ctx = _ctx_with_events()
+    monkeypatch.setattr(mm, "_process_agitator_speedup", lambda *a, **k: None)
+    monkeypatch.setattr(mm, "_await", lambda *a, **k: True)        # the START confirms
+
+    captured = {}
+
+    def fake_await_long(_ctx, _sig, _budget, confirm=None, **_kw):
+        captured["confirm"] = confirm
+        return bool(confirm and confirm())
+    monkeypatch.setattr(mm, "_await_long", fake_await_long)
+
+    mm._process_one(ctx, {}, "Agitator", game.station("Agitator"), order, next_name=None)
+
+    confirm = captured["confirm"]
+    assert confirm() is False, "the potion already held must not count as this station's finish"
+
+    game.inventory.append({"id": finished_id, "name": order})   # the station actually delivers
+    assert confirm() is True
     hovers = []
     monkeypatch.setattr(controller, "hover_entity",
                         lambda ser, entity, **kw: hovers.append(entity.get("name")) or True)

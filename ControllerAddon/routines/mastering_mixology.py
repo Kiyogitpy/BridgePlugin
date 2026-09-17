@@ -171,6 +171,15 @@ TICK_CHAIN_MAX = 3              # phase transitions run inside one tick() before
 NEW_ORDERS_S = 1.5              # belt deposit -> the game has written the three new orders
 STALL_WARN_S = 120.0            # no progress signature change: log a [!] line ...
 STALL_STOP_S = 300.0            # ... then safety-stop (the longest legit silence is one station)
+FOREIGN_STATION_STOP_S = 90.0   # a station still frozen after the collect clicks have been spent
+COLLECT_STALL_S = 4.0           # progress unchanged this long: the potion is done, click it out
+COLLECT_MAX_TRIES = 4
+FINISH_STALL_S = 6.0            # the finish wait hands back this soon once progress stops moving
+# Park the cursor only once the station's projection has stopped sliding (same idea, and the same
+# numbers, as mining_guild_iron's arrival settle).
+HOVER_SETTLE_MAX_S = 1.2        # the walk-in plus the camera glide; past this, hover anyway
+HOVER_SETTLE_POLL_S = 0.08
+HOVER_SETTLE_PX = 3             # two consecutive projection reads this close = settled
 
 # Where the stations stand (hex-agon plugin's AlchemyObject, world tiles): vessel (1394,9326),
 # Alembic (1391,9325), Agitator (1393,9329), Retort (1397,9325), belt (1394,9331). The Retort
@@ -345,6 +354,73 @@ def _hover_object(ctx, name: str, exclude: str = None, **kwargs):
         return None
     controller.hover_entity(ctx.ser, entity, refresh_target=_refresh_for(entity), **kwargs)
     return entity
+
+
+def _hover_when_settled(ctx, station_name: str, **kwargs):
+    """Park the cursor on an object only once its projection has STOPPED MOVING.
+
+    USER 2026-09-17, watching it live: "we dont wait until we are stopped to hover meaning the
+    cursor slips out". The hover that parks the cursor for a station's speedup is taken right
+    after the station click, while the player may still be walking in and the camera is still
+    gliding -- so it aims at a projection that keeps sliding out from under it, and the cursor
+    ends up beside the station rather than on it. On the Retort a click that lands beside it
+    resolves as "Walk here", and walking CANCELS the concentration. USER again, on the lever
+    pre-hovers: "still doing hovering on the levers without settling so they are pointless" --
+    so this is used for EVERY anticipatory hover, not just the station parks.
+
+    Two consecutive projection reads within HOVER_SETTLE_PX mean it has stopped, which costs
+    only two reads (~0.16s) when the projection is already still -- and when it is NOT still the
+    hover was going to be wasted anyway. Past HOVER_SETTLE_MAX_S the hover is taken regardless:
+    a late hover still beats no hover, and _click_station_in_place verifies before committing."""
+    entity = find_object(station_name)
+    if entity is None:
+        return None
+    refresh = _refresh_for(entity)
+    if refresh is not None:
+        prev = None
+        deadline = _now() + HOVER_SETTLE_MAX_S
+        while _now() < deadline:
+            cur = refresh()
+            if (cur is not None and prev is not None
+                    and abs(cur[0] - prev[0]) <= HOVER_SETTLE_PX
+                    and abs(cur[1] - prev[1]) <= HOVER_SETTLE_PX):
+                break
+            prev = cur
+            _sleep(HOVER_SETTLE_POLL_S)
+    return _hover_object(ctx, station_name, **kwargs)
+
+
+def _click_station_in_place(ctx, station_name: str) -> bool:
+    """Fire a speedup click ONLY once the cursor is provably on `station_name`.
+
+    A speedup click is a raw click_human at whatever pixel the cursor holds, and the hover that
+    parked it there can be tens of seconds old. LIVE 2026-09-17: the Agitator's cue clicks fired
+    ~260px off it (idle drift, plus the camera moving the projection during the wait), both
+    attempts missed, and one landed in the then-empty Alembic -- which auto-starts the next
+    unprocessed potion there (the wrong-station bug _process_retort_speedup documents), occupying
+    the station the routine needed next and livelocking 'Alembic still busy' until the stall stop.
+
+    On the RETORT a stray click is worse still: it resolves as "Walk here", and walking CANCELS
+    the concentration -- LIVE 2026-09-17 the potion froze at progress 2 and never moved again,
+    with /hover naming the Retort while /last-action showed the walk.
+
+    So: verify, re-aim, verify again, and DROP the click if it still cannot be placed. A missed
+    speedup costs a few progress points; a stray one costs the whole run. The second re-aim drops
+    the default (-7,+7) hover nudge for the model's centre -- that nudge sitting just off a small
+    station's model is what produces the "Walk here", and a centred aim is CLAUDE.md's documented
+    remedy. hover_matches degrades to True when it cannot verify (no /hover, a menu open), so an
+    un-rebuilt client keeps the old behaviour rather than never clicking at all."""
+    if controller.hover_matches(expected_target=station_name):
+        controller.click_human(ctx.ser)
+        return True
+    for offset in ((-7, 7), (0, 0)):
+        if _hover_object(ctx, station_name, check_ui_blockers=False, offset=offset) is None:
+            continue
+        if controller.hover_matches(expected_target=station_name):
+            controller.click_human(ctx.ser)
+            return True
+    debug_log.log("mixology", f"speedup click withheld -- cursor is not on the {station_name}")
+    return False
 
 
 def check_level_requirement(ctx, config: dict) -> bool:
@@ -596,7 +672,7 @@ def _refine_and_hopper_inventory(ctx) -> None:
         _await(ctx, "INVENTORY_CHANGED", REFINE_START_S + _walk_budget(refiner),
                confirm=lambda: len(_held_herbs()) < n0, since=mark, reaction=False)
 
-        if _hover_object(ctx, "Refiner", check_ui_blockers=False) is None:
+        if _hover_when_settled(ctx, "Refiner", check_ui_blockers=False) is None:
             return
 
         deadline = _now() + REFINE_MAX_S
@@ -663,6 +739,20 @@ def orders_phase(ctx, config: dict) -> None:
             f"{[i.get('name') for i in leftover]} -- flushing via deposit first",
         )
         ctx.state.data["mm_phase"] = "deposit"
+        return
+
+    # A potion still INSIDE a station is in no container the leftover check above can see.
+    # USER 2026-09-17, watching it live: "it has one in the machine again when going for 3 new".
+    # Starting a fresh set of three while a station still holds one strands it: the new cycle's
+    # positional bookkeeping never refers to it again, so nothing ever collects it and the next
+    # cycle livelocks on "<station> still busy". Waiting costs a few seconds; the generic stall
+    # detector still stops the run if the station is genuinely wedged rather than just slow.
+    still_cooking = _busy_station_names()
+    if still_cooking:
+        # Clicking it out is what actually clears this (see _collect_if_stalled); without that
+        # this gate would just wait for a station that never empties itself.
+        name = still_cooking[0]
+        _collect_if_stalled(ctx, name.capitalize(), _station_state(name))
         return
 
     data = controller.get_mixology_state()
@@ -770,7 +860,7 @@ def _pull_lever(ctx, paste: str, next_name: str = None) -> bool:
                          MENU_VERDICT_S, confirm=verdict_ok, since=mark, reaction=False,
                          shorten={"MENU_CLICKED": MENU_VERDICT_SHORTEN_S})
         if verdict and next_name:
-            _hover_object(ctx, next_name, check_ui_blockers=False)
+            _hover_when_settled(ctx, next_name, check_ui_blockers=False)
         if not verdict:
             debug_log.log(
                 "mixology",
@@ -853,7 +943,7 @@ def _make_base(ctx, order: dict, next_name: str = None) -> bool:
         ctx.state.trigger_safety_stop("no mixing vessel found near the player")
         return False
     if next_name:
-        _hover_object(ctx, next_name, check_ui_blockers=False)
+        _hover_when_settled(ctx, next_name, check_ui_blockers=False)
 
     # The game can refuse the take (insufficient paste or Herblore level) and click_entity's own
     # simulated misclick can miss -- the base is made only when its id is in the inventory.
@@ -921,6 +1011,14 @@ def _station_state(key: str) -> dict:
     return controller.get_mixology_state().get("stations", {}).get(key, {}) or {}
 
 
+def _busy_station_names() -> list:
+    """Every station currently holding a potion, from ONE /mixology-state read (asking
+    _station_state three times would cost three)."""
+    stations = controller.get_mixology_state().get("stations", {}) or {}
+    return [k for k in ("retort", "agitator", "alembic")
+            if (stations.get(k) or {}).get("potionName")]
+
+
 def process_phase(ctx, config: dict) -> None:
     chosen = ctx.state.data.get("mm_chosen_orders", [])
 
@@ -942,6 +1040,17 @@ def process_phase(ctx, config: dict) -> None:
             1 for i in controller.get_inventory() if i.get("id") in UNFINISHED_IDS
         )
         if unprocessed_count == 0:
+            # A potion INSIDE a station is in no container the inventory can see, so counting only
+            # the inventory calls the cycle done while a station is still working and deposits
+            # without it -- the potion is then stranded there for good, and the next cycle
+            # livelocks on "<station> still busy" (LIVE 2026-09-17, twice). The finish waits in
+            # _process_one should have covered this; this is the backstop for when one of them
+            # returns early, which is exactly what a wrong finish check did.
+            still_cooking = _busy_station_names()
+            if still_cooking:
+                name = still_cooking[0]
+                _collect_if_stalled(ctx, name.capitalize(), _station_state(name))
+                return
             ctx.state.data["mm_phase"] = "deposit"
             return
 
@@ -965,9 +1074,13 @@ def process_phase(ctx, config: dict) -> None:
         # /mixology-state's stations.{name}.potionName is ground truth for whether the station
         # is free -- never click a busy one (CONFIRMED live 2026-08-12: "tried to start a new
         # potion while we still working on one").
-        if _station_state(station_name.lower()).get("potionName"):
-            debug_log.log("mixology", f"{station_name} still busy -- retrying")
+        station_state = _station_state(station_name.lower())
+        if station_state.get("potionName"):
+            _note_station_blocked(ctx, station_name, station_state, order.get("name"))
+            if not ctx.state.safety_stopped:
+                _collect_if_stalled(ctx, station_name, station_state)
             return
+        ctx.state.data.pop("mm_blocked_key", None)
 
         # A station takes 10-60s, so a digweed that matured during the last one is checked
         # before each station rather than only at the top of the (now cycle-long) tick.
@@ -982,6 +1095,74 @@ def process_phase(ctx, config: dict) -> None:
         following = chosen[order_index + 1] if order_index + 1 < len(chosen) else None
         next_name = following.get("station") if following else "Conveyor belt"
         _process_one(ctx, config, station_name, station, order.get("name"), next_name=next_name)
+
+
+def _collect_if_stalled(ctx, station_name: str, state: dict) -> None:
+    """Click a station that has stopped advancing, to TAKE ITS POTION OUT.
+
+    USER 2026-09-17, watching it live: "it has to click the machine to get it out". A station
+    does not hand its potion back on its own, so the old behaviour -- log "<station> still busy"
+    and return, every tick -- waited for something that was never going to happen. Every stall
+    this routine hit today was really a finished potion nobody collected, and the only reason any
+    of them ever cleared was the leftover flush happening to click the station.
+
+    Rate-limited to a stalled station (progress unchanged for COLLECT_STALL_S) so a genuinely
+    working one is never click-spammed, and the click is safe by construction: the
+    auto-start-the-wrong-potion hazard only exists for an EMPTY station and this one is occupied.
+    _note_station_blocked still escalates to a safety stop if collecting does not clear it."""
+    data = ctx.state.data
+    key = (station_name, state.get("potionName"), state.get("progress"))
+    if data.get("mm_collect_key") != key:
+        data["mm_collect_key"] = key
+        data["mm_collect_since"] = _now()
+        data["mm_collect_tries"] = 0
+        debug_log.log("mixology", f"{station_name} still busy -- retrying")
+        return
+    if _now() - data.get("mm_collect_since", _now()) < COLLECT_STALL_S:
+        return
+    if data.get("mm_collect_tries", 0) >= COLLECT_MAX_TRIES:
+        return          # leave it to _note_station_blocked's stop rather than clicking forever
+    data["mm_collect_tries"] = data.get("mm_collect_tries", 0) + 1
+    data["mm_collect_since"] = _now()
+    debug_log.log("mixology",
+                  f"{station_name} has sat on '{state.get('potionName')}' at progress "
+                  f"{state.get('progress')} for {COLLECT_STALL_S:.0f}s -- clicking it to take the "
+                  f"potion out (try {data['mm_collect_tries']}/{COLLECT_MAX_TRIES})")
+    _click_object(ctx, station_name, check_ui_blockers=False)
+
+
+def _note_station_blocked(ctx, station_name: str, state: dict, want: str) -> None:
+    """Safety-stop when the station this order needs is FROZEN, whatever potion it holds.
+
+    Two ways this happens, both seen live 2026-09-17: a stray click auto-started a potion at the
+    wrong station (a foreign name), or the cycle deposited while a station was still working and
+    stranded one of its own potions there (a matching name). Nothing here can clear either: the
+    caller returns every tick, so the run spins at tick rate until the generic STALL_STOP_S fires
+    five minutes later with a message that does not name the cause. Stopping sooner, naming the
+    potion and the station, is what the recovery -- collect it by hand -- actually needs.
+
+    `progress` is part of the key, so a station genuinely working climbs it every tick and keeps
+    resetting the timer; only a frozen one accumulates. That is what makes a 60s threshold safe
+    against a legitimately slow potion (STATION_FINISH_S is 90s)."""
+    data = ctx.state.data
+    busy_with = state.get("potionName")
+    # A station frozen on OUR OWN potion is stuck just as badly as one holding a stranger's, and
+    # exempting it is the hole the 2026-09-17 Alembic fell through: a stranded 'Megalite liquid'
+    # matched the order name, so the timer never started and the run spun on "Alembic still busy"
+    # with nothing to stop it. Progress is in the key either way, so a station that is genuinely
+    # working keeps resetting the timer and never trips this.
+    key = (station_name, busy_with, state.get("progress"))
+    if data.get("mm_blocked_key") != key:
+        data["mm_blocked_key"] = key
+        data["mm_blocked_since"] = _now()
+        return
+    if _now() - data.get("mm_blocked_since", _now()) >= FOREIGN_STATION_STOP_S:
+        cause = ("a potion was stranded there by an early deposit" if busy_with == want
+                 else "a stray click started a potion at the wrong station")
+        ctx.state.trigger_safety_stop(
+            f"mixology: the {station_name} is frozen holding '{busy_with}' while this order needs "
+            f"it for '{want}' -- {cause}; collect it by hand before restarting"
+        )
 
 
 def _process_one(ctx, config: dict, station_name: str, station: dict, order_name: str,
@@ -1017,18 +1198,70 @@ def _process_one(ctx, config: dict, station_name: str, station: dict, order_name
     unfinished_id = next((k for k, v in UNFINISHED_IDS.items() if v == order_name), None)
     finished_id = unfinished_id + 10 if unfinished_id is not None else None
 
+    # An INCREASE over what was held before this station ran, not "> 0". Two orders in one cycle
+    # can be the SAME potion (the game hands out duplicates freely -- seen repeatedly live
+    # 2026-09-17), and the first one's finished potion is still in the inventory when the second
+    # starts. "> 0" is then already true the instant the second is clicked, so the finish wait
+    # returns immediately, process_phase sees an empty inventory of unfinished potions and
+    # deposits -- abandoning a potion that is still inside the station. That is the stranded
+    # 'Megalite liquid' the Alembic was left frozen on. Same snapshot-then-increase rule CLAUDE.md
+    # already states for XP.
+    held_before = _count_item(finished_id) if finished_id is not None else 0
+
     def finished():
-        return finished_id is not None and _count_item(finished_id) > 0
+        return finished_id is not None and _count_item(finished_id) > held_before
 
     # The potion varbit clearing and the inventory changing land on the finishing tick; the
     # finished id in the inventory is what process_phase's own positional check depends on.
     # Anticipation: the cursor rests on the next target through the wait (a human aims the next
     # station while this one works); the wait itself is chunked with fidgets (_await_long).
     if next_name and not finished():
-        _hover_object(ctx, next_name, check_ui_blockers=False)
+        # Settled, like the other station parks: this one is taken right after the station click,
+        # while the player may still be walking in and the camera gliding, and a long finish wait
+        # follows it -- so the settle costs nothing and an unsettled hover is simply wasted
+        # (USER 2026-09-17: "a lot of hover before we settle so the hover is meaningless").
+        _hover_when_settled(ctx, next_name, check_ui_blockers=False)
+    def released_unfinished():
+        """The station let the potion go WITHOUT finishing it: our unfinished base is back in the
+        inventory and the station is empty. Waiting out the full STATION_FINISH_S for a potion
+        that is not in the machine is pure idle -- USER 2026-09-17: "It's idling", with an
+        unfinished 'Azure aura mix' sitting in the inventory and all three stations reading empty
+        while this wait had 90s left to run. Retrying immediately is always better than sleeping
+        through it; `finished` is checked first so a normal finish is never mistaken for this."""
+        return (not finished()
+                and unfinished_id is not None
+                and _count_item(unfinished_id) > 0
+                and not _station_state(key).get("potionName"))
+
+    # A station that has stopped advancing is DONE and waiting to be emptied, not slow -- the
+    # potion does not come back on its own (USER 2026-09-17: "it has to click the machine to get
+    # it out"). Bailing out on the stall hands straight back to process_phase, whose
+    # _collect_if_stalled clicks it out; sitting here instead burned the full 90s every time
+    # ("if it's idling for more than 10sec something is wrong").
+    watch = {"key": None, "since": None}
+
+    def station_stalled() -> bool:
+        st = _station_state(key)
+        k = (st.get("potionName"), st.get("progress"))
+        if watch["key"] != k:
+            watch["key"] = k
+            watch["since"] = _now()
+            return False
+        return _now() - watch["since"] >= FINISH_STALL_S
+
+    def give_up() -> bool:
+        return released_unfinished() or (not finished() and station_stalled())
+
+    debug_log.log("mixology", f"{station_name} working on '{order_name}' -- awaiting the finish")
     if not _await_long(ctx, {"VARBIT_CHANGED": _varbit_in((potion_vb,)), "INVENTORY_CHANGED": None},
-                       STATION_FINISH_S, confirm=finished, since=mark):
-        debug_log.log("mixology", f"{station_name} finish of '{order_name}' did not confirm within {STATION_FINISH_S}s")
+                       STATION_FINISH_S, confirm=finished, since=mark, stop=give_up):
+        if released_unfinished():
+            debug_log.log("mixology", f"{station_name} released '{order_name}' unfinished -- retrying it")
+        elif station_stalled():
+            debug_log.log("mixology",
+                          f"{station_name} stopped advancing on '{order_name}' -- handing back to be clicked out")
+        else:
+            debug_log.log("mixology", f"{station_name} finish of '{order_name}' did not confirm within {STATION_FINISH_S}s")
 
 
 def _process_retort_speedup(ctx, station: dict, order_name: str) -> None:
@@ -1053,7 +1286,7 @@ def _process_retort_speedup(ctx, station: dict, order_name: str) -> None:
     # The mark is taken BEFORE the hover flight: the first progress tick can land during it,
     # and a mark taken afterwards would read past that event and lose the first click.
     mark = events.mark() if events is not None else None
-    if _hover_object(ctx, "Retort", check_ui_blockers=False) is None:
+    if _hover_when_settled(ctx, "Retort", check_ui_blockers=False) is None:
         return
 
     last_progress = -1
@@ -1062,13 +1295,19 @@ def _process_retort_speedup(ctx, station: dict, order_name: str) -> None:
     while _now() < deadline:
         if _now() >= next_http:
             state = _station_state(order_key)
-            if not state.get("potionName"):
+            # IDENTITY, not just emptiness. A station holding a DIFFERENT potion used to sail
+            # through this check and keep collecting clicks: LIVE 2026-09-17 the Retort finished
+            # mid-burst, the next clicks auto-started the leftover 'Azure aura mix' in it, and
+            # the loop kept clicking because progress was climbing again -- for the new potion.
+            # The identity check at the bottom of this function only runs on the deadline path,
+            # never on these early returns, so nothing caught it.
+            if state.get("potionName") != order_name:
                 return
             next_http = _now() + RETORT_HTTP_CONFIRM_S
             if events is None:
                 progress = state.get("progress", 0) or 0
                 if progress > last_progress:
-                    controller.click_human(ctx.ser)
+                    _click_station_in_place(ctx, "Retort")
                     last_progress = progress
         if events is None:
             _tick_pause(ctx, 1, phase=RETORT_CLICK_PHASE_S)
@@ -1086,8 +1325,15 @@ def _process_retort_speedup(ctx, station: dict, order_name: str) -> None:
             if vid == VB_RETORT_POTION and value == 0:
                 return
             if vid == VB_RETORT_PROGRESS and value is not None and value > last_progress:
+                # Identity, checked HERE rather than only on the 2s HTTP cadence: a rising
+                # progress is exactly what a newly auto-started potion looks like, so the event
+                # alone cannot tell "our potion advanced" from "the station moved on". At one
+                # click per tick this read costs a single local request and closes the window
+                # that put an extra potion in the Retort live 2026-09-17.
+                if _station_state(order_key).get("potionName") != order_name:
+                    return
                 _sleep(controller.sample_human_delay(*RETORT_CLICK_PHASE_S))
-                controller.click_human(ctx.ser)
+                _click_station_in_place(ctx, "Retort")
                 last_progress = value
         if not hits:
             _sleep(bridge_events.EVENT_POLL_INTERVAL_S)
@@ -1137,7 +1383,7 @@ def _process_flash_speedup(ctx, station_name: str, cue_graphics_id: int, station
     # Mark BEFORE the hover flight: the cue lands inside the first third of processing, which
     # can be the very first tick -- a mark taken after the flight would exclude it.
     entry_mark = _mark(ctx)
-    if _hover_object(ctx, station_name, check_ui_blockers=False) is None:
+    if _hover_when_settled(ctx, station_name, check_ui_blockers=False) is None:
         return
 
     sx, sy = station.get("x"), station.get("y")
@@ -1177,6 +1423,13 @@ def _process_flash_speedup(ctx, station_name: str, cue_graphics_id: int, station
         # Fidgets only while waiting for a RETRY cue: the first cue is certain and soon, so the
         # cursor stays planted; a retry cue is a bonus that may never come, and a cursor frozen
         # for a minute costs more than the odd missed retry.
+        #
+        # The idle drift is held off for the whole wait: unlike the fidgeter (which returns to
+        # input_state.fidget_anchor, so a parked cursor stays parked) the drift has no anchor and
+        # walks the cursor off the station -- half of how the cursor and the Agitator came 260px
+        # apart live 2026-09-17. The deliberate anti-freeze motion the comment above wants is the
+        # fidget, which `fidget=` still controls.
+        controller.mark_busy(budget)
         seen = _await_long(ctx, {"GRAPHICS_OBJECT_CREATED": cue_event}, budget,
                            confirm=cue_present, since=mark, stop=station_done,
                            fidget=(attempts > 0 or missed_first), reaction=False)
@@ -1191,14 +1444,14 @@ def _process_flash_speedup(ctx, station_name: str, cue_graphics_id: int, station
                           + (" (late click)" if late else ""))
             _tick_pause(ctx, window_ticks, phase=FLASH_REACTION_S[station_name])
             if late:
-                controller.click_human(ctx.ser)
+                _click_station_in_place(ctx, station_name)
             if events is None:
                 _wait_cue_clear(cue_present, deadline)
             continue
 
         _sleep(controller.sample_human_delay(*FLASH_REACTION_S[station_name]))
         mark_click = _mark(ctx)
-        controller.click_human(ctx.ser)
+        _click_station_in_place(ctx, station_name)
         attempts += 1
 
         if second_click:
@@ -1209,7 +1462,7 @@ def _process_flash_speedup(ctx, station_name: str, cue_graphics_id: int, station
                 _sleep(controller.sample_human_delay(*RETORT_CLICK_PHASE_S))
             else:
                 _tick_pause(ctx, 1, phase=RETORT_CLICK_PHASE_S)
-            controller.click_human(ctx.ser)
+            _click_station_in_place(ctx, station_name)
 
         if skill_before is None:
             return  # cannot judge the hit; never risk a second click on a hit
