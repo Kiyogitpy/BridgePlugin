@@ -187,6 +187,9 @@ FOREIGN_STATION_STOP_S = 90.0   # a station still frozen after the collect click
 COLLECT_STALL_S = 2.0           # progress unchanged this long: the station is not running
 COLLECT_MAX_TRIES = 4
 FINISH_STALL_S = 2.0            # the finish wait hands back this soon once progress stops moving
+# Hold a finished potion no live order wants rather than depositing it for a reduced reward --
+# but not forever: past this many held, take the reduced reward instead of filling the inventory.
+HOLD_UNMATCHED_MAX = 6
 RESTART_CONFIRM_S = 3.0         # restart click -> progress moving again / the potion delivered
 # Park the cursor only once the station's projection has stopped sliding (same idea, and the same
 # numbers, as mining_guild_iron's arrival settle).
@@ -614,6 +617,17 @@ def _clean_grimy_herbs(ctx) -> None:
     leftmost-to-rightmost with a click burst DURING the glide (controller.sweep_and_click, "around
     5-7 clicks per second") rather than re-aiming at each herb -- the grid's tight slot spacing
     means the burst lands on SOME herb regardless of precise aim."""
+    # THE INVENTORY TAB MUST BE THE VISIBLE PANEL BEFORE ANY OF THIS. The sweep is a blind click
+    # burst aimed at inventory SLOT coordinates, and those coordinates stay the same whichever
+    # side panel is actually on screen -- so with another tab open the burst lands on that
+    # panel's contents instead. LIVE 2026-09-17: it landed in Account Management and hit one of
+    # its external links, which opened a browser and took focus off the client, stranding the run
+    # until F1. A burst that cannot see what it is clicking must at least be pointed at the right
+    # panel.
+    if not controller.open_inventory_tab(ctx.ser):
+        debug_log.log("mixology", "could not confirm the inventory tab is open -- skipping the herb sweep")
+        return
+
     deadline = _now() + 30.0
     while _now() < deadline:
         grimy = [
@@ -1361,6 +1375,14 @@ def _process_one(ctx, config: dict, station_name: str, station: dict, order_name
             # this point, and a station that is not running is one whose start click never took,
             # so clicking it again is the fix rather than a workaround. Safe: it is occupied, so
             # the click cannot auto-start a different potion.
+            # RE-VERIFY IMMEDIATELY BEFORE THE CLICK. station_stalled() read the state a moment
+            # ago; if the potion completed in that gap the station is now EMPTY, and a click on
+            # an empty station takes the LEFTMOST unprocessed potion -- i.e. the next order's,
+            # into the wrong station. MEASURED live 2026-09-17: an Alembic recovery click landed
+            # just after it emptied, swallowed the Azure aura mix meant for the Agitator, and the
+            # Agitator then reported "did not start" (7 of those in one run).
+            if _station_state(key).get("potionName") != order_name:
+                return
             debug_log.log("mixology",
                           f"{station_name} is not running on '{order_name}' -- clicking it again to start it")
             restart_mark = _mark(ctx)
@@ -1631,8 +1653,26 @@ def deposit_phase(ctx, config: dict) -> None:
     # Per the wiki a belt click is always safe and always makes progress on whatever is held
     # (fulfils every matching order, or deposits the first potion for a reduced reward) -- never
     # withhold it for a potion count (CORRECTED live 2026-08-13: a `>= 3` gate waited forever).
+    #
+    # But "deposits the first potion for a REDUCED reward" is the wasted deposit this routine
+    # kept paying: one click fulfils every matching order at once, and a held potion that matches
+    # none of the three live orders then gets thrown at the belt by the next click for a fraction
+    # of its value. MEASURED live 2026-09-17: holding four finished potions against three orders,
+    # the deposit phase ran four times shedding one each pass and the surplus was wasted -- 2 of
+    # 26 orders. Orders rotate on every fulfilment, so a potion nothing wants YET is worth
+    # keeping; it costs an inventory slot and nothing else.
+    orders_now = {(o.get("name") or "") for o in (controller.get_mixology_state().get("orders") or [])}
+    matching = [i for i in finished if (i.get("name") or "") in orders_now]
+    if not matching and len(finished) < HOLD_UNMATCHED_MAX:
+        debug_log.log("mixology",
+                      f"holding {[i.get('name') for i in finished]} -- no live order wants them yet "
+                      f"(depositing now would be a reduced reward)")
+        ctx.state.data["mm_phase"] = "orders"
+        return
+
     debug_log.log("mixology", f"Deposit phase entered with {[i.get('name') for i in finished]}")
 
+    held_before_deposit = len(finished)
     mark = _mark(ctx)
     belt = _click_object(ctx, "Conveyor belt", check_ui_blockers=False)
     if belt is None:
@@ -1640,7 +1680,11 @@ def deposit_phase(ctx, config: dict) -> None:
         return
 
     def deposited():
-        return not any(i.get("id") in FINISHED_IDS for i in controller.get_inventory())
+        # A DECREASE, not "all gone": one click fulfils the matching orders and legitimately
+        # leaves an unmatched potion behind, which the old all-gone test read as a failed deposit
+        # and retried -- the retry being exactly what wasted it.
+        return sum(1 for i in controller.get_inventory()
+                   if i.get("id") in FINISHED_IDS) < held_before_deposit
 
     # The deposit empties the inventory of finished potions and the game zeroes then rewrites
     # the order varbits (order 1 type is the first to move).

@@ -2380,9 +2380,20 @@ def sweep_and_click(ser: serial.Serial, x: int, y: int, *, click_rate_hz=(5.0, 7
     bottleneck, the glide was just ending before it could fire more. min_clicks, when given,
     floors the duration at whatever it takes to fit that many clicks at the SLOW end of
     click_rate_hz (a real spam-click burst, not truncated by a short travel distance)."""
-    debug_log.log("action", f"sweep_and_click toward ({x},{y}) from {get_cursor_pos()}")
-
     sx, sy = get_cursor_pos()
+
+    # A blind click burst must never be aimed outside the client. Unlike click_entity, which
+    # checks is_point_within_window before committing, this fires clicks the WHOLE WAY along the
+    # glide -- so a bad endpoint does not just miss, it sprays clicks across whatever is behind
+    # the game. LIVE 2026-09-17: a burst reached RuneLite's own side panel and hit an external
+    # link, opening a browser and taking focus off the client until the panic key. Both ends are
+    # checked because the clicks happen in between.
+    if not is_point_within_window(x, y) or not is_point_within_window(int(sx), int(sy)):
+        debug_log.log("!", f"Refusing to sweep-click toward ({x},{y}) from ({int(sx)},{int(sy)}) "
+                           f"-- outside the RuneLite window")
+        return
+
+    debug_log.log("action", f"sweep_and_click toward ({x},{y}) from ({int(sx)},{int(sy)})")
     dist = math.hypot(x - sx, y - sy)
     bez = build_bezier_path((sx, sy), (x, y)) if dist >= 2 else None
 

@@ -158,6 +158,126 @@ def test_the_finish_wait_gives_up_early_when_the_station_released_it_unfinished(
     assert captured["stop"]() is True
 
 
+def test_the_herb_sweep_opens_the_inventory_tab_first(game, monkeypatch):
+    """The sweep is a blind click burst at inventory SLOT coordinates, and those stay the same
+    whichever side panel is showing -- so with another tab open the burst lands on that panel.
+    LIVE 2026-09-17: it landed in Account Management and hit an external link, opening a browser
+    and taking focus off the client until F1."""
+    ctx = FakeCtx()
+    game.inventory = [{"id": 199, "name": "Grimy guam leaf", "slot": 0,
+                       "screenX": 100, "screenY": 100}]
+    opened = []
+    monkeypatch.setattr(controller, "open_inventory_tab",
+                        lambda ser: opened.append(True) or False)   # cannot confirm the tab
+    swept = []
+    monkeypatch.setattr(controller, "sweep_and_click",
+                        lambda *a, **k: swept.append(a))
+
+    mm._clean_grimy_herbs(ctx)
+
+    assert opened, "the tab must be ensured before any blind burst"
+    assert swept == [], "an unconfirmed tab must not be swept over"
+
+
+def test_the_recovery_click_is_skipped_if_the_station_emptied_first(game, monkeypatch):
+    """station_stalled() reads the state a moment before the click; if the potion completes in
+    that gap the station is EMPTY, and a click on an empty station takes the LEFTMOST unprocessed
+    potion -- the NEXT order's, into the wrong station. MEASURED live 2026-09-17: an Alembic
+    recovery click swallowed the Agitator's Azure aura mix, and the Agitator then reported "did
+    not start" (7 of those in one run)."""
+    order = "Aqualux amalgam"
+    ctx = _ctx_with_events()
+    ctx.state.data["mm_chosen_orders"] = [{"station": "Alembic", "name": order}]
+    monkeypatch.setattr(mm, "_process_alembic_speedup", lambda *a, **k: None)
+    monkeypatch.setattr(mm, "_await", lambda *a, **k: True)
+
+    reads = {"n": 0}
+
+    def station_state(_key):
+        reads["n"] += 1
+        # Stalled while the wait polls it, then EMPTY by the time the recovery click is decided.
+        return {"progress": 4, "potionName": order} if reads["n"] <= 2 else {"progress": 0}
+    monkeypatch.setattr(mm, "_station_state", station_state)
+
+    clicked = []
+    monkeypatch.setattr(mm, "_click_object",
+                        lambda _ctx, name, **kw: clicked.append(name) or {"name": name})
+    t = {"v": 1000.0}
+    monkeypatch.setattr(mm, "_now", lambda: t["v"])
+
+    def fake_await_long(_ctx, _sig, _budget, confirm=None, stop=None, **_kw):
+        if stop:
+            stop()
+        t["v"] += mm.FINISH_STALL_S + 1
+        if stop:
+            stop()
+        return False
+    monkeypatch.setattr(mm, "_await_long", fake_await_long)
+
+    mm._process_one(ctx, {}, "Alembic", game.station("Alembic"), order, next_name=None)
+
+    assert clicked == ["Alembic"], "only the start click -- no recovery click into an emptied station"
+
+
+def _finished_item(name):
+    unfinished_id = next(k for k, v in mm.UNFINISHED_IDS.items() if v == name)
+    return {"id": unfinished_id + 10, "name": name}
+
+
+def test_a_potion_no_live_order_wants_is_held_not_binned(game, monkeypatch):
+    """One belt click fulfils every matching order at once; the NEXT click throws an unmatched
+    potion away for a reduced reward. MEASURED live 2026-09-17: four finished potions against
+    three orders, the deposit phase ran four times shedding one each pass, and the surplus was
+    wasted -- 2 of 26 orders. Orders rotate, so a potion nothing wants yet is worth keeping."""
+    ctx = FakeCtx()
+    game.inventory = [_finished_item("Aqualux amalgam")]
+    monkeypatch.setattr(controller, "get_mixology_state",
+                        lambda: {"stations": {}, "orders": [{"name": "Liplack liquor"},
+                                                            {"name": "Azure aura mix"},
+                                                            {"name": "Megalite liquid"}]})
+    clicked = []
+    monkeypatch.setattr(mm, "_click_object",
+                        lambda _ctx, name, **kw: clicked.append(name) or {"name": name})
+
+    mm.deposit_phase(ctx, {})
+
+    assert clicked == [], "the belt must not be clicked for a potion no order wants"
+    assert ctx.state.data["mm_phase"] == "orders"
+
+
+def test_a_potion_a_live_order_wants_is_deposited(game, monkeypatch):
+    ctx = FakeCtx()
+    game.inventory = [_finished_item("Azure aura mix")]
+    monkeypatch.setattr(controller, "get_mixology_state",
+                        lambda: {"stations": {}, "orders": [{"name": "Azure aura mix"},
+                                                            {"name": "Liplack liquor"},
+                                                            {"name": "Megalite liquid"}]})
+    clicked = []
+    monkeypatch.setattr(mm, "_click_object",
+                        lambda _ctx, name, **kw: clicked.append(name) or {"name": name})
+    monkeypatch.setattr(mm, "_await", lambda *a, **k: True)
+
+    mm.deposit_phase(ctx, {})
+
+    assert clicked == ["Conveyor belt"]
+
+
+def test_unmatched_potions_are_binned_once_they_pile_up(game, monkeypatch):
+    """Holding is bounded -- otherwise a potion nothing ever wants fills the inventory."""
+    ctx = FakeCtx()
+    game.inventory = [_finished_item("Aqualux amalgam") for _ in range(mm.HOLD_UNMATCHED_MAX)]
+    monkeypatch.setattr(controller, "get_mixology_state",
+                        lambda: {"stations": {}, "orders": [{"name": "Liplack liquor"}]})
+    clicked = []
+    monkeypatch.setattr(mm, "_click_object",
+                        lambda _ctx, name, **kw: clicked.append(name) or {"name": name})
+    monkeypatch.setattr(mm, "_await", lambda *a, **k: True)
+
+    mm.deposit_phase(ctx, {})
+
+    assert clicked == ["Conveyor belt"]
+
+
 def test_a_pull_into_slots_that_already_hold_that_paste_still_counts(game, monkeypatch):
     """The slot varbits hold WHICH paste is in each slot, so pulling lye into a mixer already
     reading lye/lye/lye moves no value -- "no change" is not "no pull". LIVE 2026-09-17: a run
@@ -509,6 +629,7 @@ class Game:
         self.in_place = 0      # click_human count
         self.hover_ok = True   # what controller.hover_matches answers
         self.busy = []         # controller.mark_busy durations
+        self.orders = None     # None = derive from held finished potions (see mixology_state)
         self.batches = deque()
         self.on_click = {}     # name -> callable(game) run when that entity is clicked
 
@@ -528,7 +649,14 @@ class Game:
         return out
 
     def mixology_state(self):
-        return {"inLab": True, "orders": [], "hopper": {"mox": 900, "aga": 900, "lye": 900},
+        # `orders` defaults to whatever finished potions are held, so a deposit test does not
+        # have to spell out the live order board just to get past deposit_phase's "does any
+        # live order want this" gate. A test that cares sets g.orders explicitly.
+        orders = self.orders
+        if orders is None:
+            orders = [{"name": i.get("name")} for i in self.inventory
+                      if i.get("id") in mm.FINISHED_IDS]
+        return {"inLab": True, "orders": orders, "hopper": {"mox": 900, "aga": 900, "lye": 900},
                 "stations": self.stations, "digweed": {}}
 
     def station(self, name):
