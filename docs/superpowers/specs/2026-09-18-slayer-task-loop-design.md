@@ -574,6 +574,49 @@ a missing skippable item routes to SKIP and a missing staple to a stop.
 confirm; whether item names in `/inventory`, `/equipment` and bank memory all carry the charge
 suffix the same way.
 
+### 7.10 Loot during a task (added 2026-09-19, from the user's question)
+
+USER: "Do we dump items we pick up during a task to the bank, like alchables?" **Yes: loot is
+banked, never alched.** The account stays on the Lunar spellbook for NPC Contact, and High
+Level Alchemy is a standard-spellbook spell, so alching on the spot is not available; nothing
+in the codebase alchs either. What exists (`combat_core.maybe_loot`, verified 2026-09-19):
+a ground item is taken when its name matches the panel whitelist, OR its GE value is at least
+`minLootValue` (default 5000), OR it is a herb/seed and an open herb sack / seed box is
+carried; other players' drops are skipped. Every bank visit deposits everything not on the
+keep list (`banker.deposit_inventory`), and empties the herb sack and seed box.
+
+Three things the task loop has to add, because a task loadout is nearly a full inventory
+(nechryael: 15 food + 6 potions + escape ring + house teleport + slayer ring ≈ 25 of 28):
+
+1. **A full inventory of loot must not cause a bank trip.** `combat_core.needs_banking` returns
+   True for "full, and some of it is loot", which for the Combat routine means "go bank". In a
+   task that would burn the four RESTOCK trips (§7.5) on three free slots. So the orchestrator
+   splits the predicate: **out of supplies → RESTOCK; merely full → looting pauses** and the
+   fight goes on. Slots free up by themselves as food is eaten. New public helper
+   `combat_core.out_of_critical_supplies(ctx)` already exists for the first half.
+2. **Worth making room for.** With a full inventory and a ground item worth at least
+   `slayerMakeRoomValue` (default 50,000), eat one food to free a slot if HP is not full,
+   then take it. Below that value, or at full HP, it is left. Stackables (coins, runes, noted
+   items, ammo) are always taken when a stack is already held, since they cost no slot.
+3. **The "skip the bank between tasks" rule (§7.9) must count slots, not just supplies.** A
+   bank visit is needed when supplies are short for the next task OR the free slots left after
+   packing the next task's profile would be fewer than `LOOT_RESERVE_SLOTS` (4). Otherwise nine
+   Aya tasks would slowly fill the inventory with loot and starve the tenth task of space.
+
+Per-profile defaults: **`TRIVIAL` (Aya) tasks loot only the whitelist** -- those monsters drop
+nothing worth the clicks, and travel time dominates a 20-kill task; Kuradal tasks use the
+panel's `minLootValue`. Bones follow the panel's Bury Bones toggle; a bonecrusher or ash
+sanctifier stays protected as today.
+
+**Empty vials** are the other slot leak: six prayer potions become six vials. Recommend the
+user turn on automatic vial smashing (Barbarian guard, reachable by the same NPC Contact spell
+-- `NPC Contact.txt:143-146`); the routine does not drop vials itself unless that proves
+necessary live.
+
+Tests: full-of-loot with supplies left does not derive RESTOCK; the make-room rule respects the
+value floor and full HP; the between-task bank decision counts free slots; TRIVIAL ignores
+`minLootValue`.
+
 ## 8. Transport legs (`legs.py`)
 
 Promoted from `banker._run_leg/_run_item_leg/_run_object_leg/_await_arrival` so bank returns
