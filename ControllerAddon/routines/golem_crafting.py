@@ -77,6 +77,7 @@ import banker
 import bridge_events
 import controller
 import debug_log
+import dialogue
 import outcome_waits
 import travel
 import worldmap
@@ -3889,11 +3890,10 @@ KIT_CONFIRM_S = 3.0             # a bank withdraw click -> the item in the inven
 # interface is drawing -- see CLAUDE.md), so an exhausted retry budget stops with a message that
 # says which of the two problems it actually is.
 KIT_WITHDRAW_TRIES = 4
-DIALOGUE_S = 6.0                # slayer ring Teleport -> the destination dialogue, INCLUDING a
-                                # page turn (was 3.0, which only ever covered one page)
-DIALOGUE_MORE_OPTIONS = "more option"   # "More options..." -- the page-forward entry
-DIALOGUE_MAX_PAGES = 3          # the slayer ring has two; the cap is for a dialogue that loops
-DIALOGUE_PAGE_S = 0.6           # a page turn -> the new options being readable
+DIALOGUE_S = dialogue.CHOOSE_BUDGET_S           # kept as names: other call sites in this file
+DIALOGUE_MORE_OPTIONS = dialogue.MORE_OPTIONS
+DIALOGUE_MAX_PAGES = dialogue.MAX_PAGES
+DIALOGUE_PAGE_S = dialogue.PAGE_S
 LEAVE_CAVERN_S = 6.0            # Cave/Exit click -> surface (plus the walk to it)
 POUCH_OPEN_MARKER = "(open)"    # "Large fur pouch (open)" (cache obj 29470) vs "Large fur pouch"
 
@@ -4126,67 +4126,14 @@ def _ensure_pouch_open(ctx, name: str = banker.FUR_POUCH_NAME) -> bool:
     return True
 
 
-def _dialogue_options() -> list:
-    """The REAL options of the open chat menu, in number-key order (key = position + 1) -- the
-    m8aq Dialogue reader returns the TITLE as child 0 then blank trailing children (MEASURED
-    live in Giants' Foundry 2026-09-03; see giants_foundry._dialogue_options)."""
-    d = controller.get_api("ui", "dialogue")
-    if not d or d.get("error"):
-        return []
-    raw = [o if isinstance(o, str) else (o.get("text") or "") for o in (d.get("options") or [])]
-    raw = raw[1:] if raw else raw
-    return [o for o in raw if o.strip()]
-
-
-def find_dialogue_option(options, needle: str):
-    """Index of the first option containing `needle`, else None. Pure."""
-    for i, text in enumerate(options or []):
-        if needle.lower() in (text or "").lower():
-            return i
-    return None
+# The chat-menu helpers moved to dialogue.py 2026-09-18 (the paged slayer-ring lesson lives in
+# its header now); these names stay so the rest of this file reads as before.
+_dialogue_options = dialogue.options
+find_dialogue_option = dialogue.find_option
 
 
 def _choose_dialogue_option(ctx, needle: str, budget_s: float = DIALOGUE_S) -> bool:
-    """Wait for a chat menu whose options contain `needle` and press its number key, PAGING
-    through "More options..." when the destination is not on the first page.
-
-    CONFIRMED live 2026-09-14 (USER: "On slayer ring there is dialog options to tp or a second
-    menu that expand when hovering tele"). The slayer ring's dialogue is paged, and Wyrmscraig is
-    not on page one:
-
-        page 1:  1 Stronghold Slayer Cave | 2 Morytania Slayer Tower
-                 3 Fremennik Slayer Dungeon | 4 More options...
-        page 2:  1 Tarn's Lair | 2 Dark Beasts
-                 3 the Wyrmscraig Cavern | 4 Previous options...
-
-    So the old single-page scan was looking for a Wyrmscraig entry that was never going to be on
-    the page it was reading, and the return leg retried forever: MEASURED, "no dialogue option
-    containing 'wyrmscraig' appeared within 3.0s" once a tick with the pouch already full.
-
-    Paging is bounded by DIALOGUE_MAX_PAGES and never presses the same page-forward twice in a
-    row without the options actually changing, so a dialogue that answers "More options..." with
-    the same page cannot spin."""
-    deadline = time.time() + budget_s
-    pages = 0
-    seen = []
-    while time.time() < deadline:
-        options = _dialogue_options()
-        hit = find_dialogue_option(options, needle)
-        if hit is not None:
-            controller.key_tap(ctx.ser, str(hit + 1))
-            return True
-        more = find_dialogue_option(options, DIALOGUE_MORE_OPTIONS)
-        if more is not None and options != seen and pages < DIALOGUE_MAX_PAGES:
-            debug_log.log("golem crafting",
-                          f"'{needle}' is not on this dialogue page -- taking '{options[more]}'")
-            seen = options
-            pages += 1
-            controller.key_tap(ctx.ser, str(more + 1))
-            time.sleep(DIALOGUE_PAGE_S)
-            continue
-        time.sleep(0.1)
-    debug_log.log("golem crafting", f"no dialogue option containing '{needle}' appeared within {budget_s}s")
-    return False
+    return dialogue.choose(ctx, needle, budget_s, log="golem crafting")
 
 
 def _at_wyrmscraig() -> bool:

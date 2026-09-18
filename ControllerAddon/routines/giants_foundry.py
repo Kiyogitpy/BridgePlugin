@@ -21,6 +21,7 @@ import time
 import banker
 import controller
 import debug_log
+import dialogue
 import travel
 
 DEFAULT_CONFIG = {
@@ -1729,43 +1730,11 @@ def _find_kovac():
     return None
 
 
-def _dialogue():
-    d = controller.get_api("ui", "dialogue")
-    if not d or d.get("error"):
-        return {}
-    return d
-
-
-def _dialogue_open(d):
-    # The real m8aq Dialogue reader (net.runelite.client.plugins.m8aq.api.ui.Dialogue) has
-    # NO open/isOpen/visible/type field at all -- only npcName/npcText/playerText/options/
-    # itemText/itemId/itemName/secondItemId/secondItemName. A "click here to continue" stage
-    # (npcText/playerText/itemText set, options empty) used to collapse to bool(options),
-    # which reads as CLOSED and let hand_in re-click Kovac mid-dialogue, burning its ceiling.
-    # The boolean-key checks are kept for forward-compat in case a future reader adds one.
-    if not d:
-        return False
-    for key in ("open", "isOpen", "visible"):
-        if isinstance(d.get(key), bool):
-            return d[key]
-    dtype = d.get("type")
-    if dtype and dtype != "NONE":
-        return True
-    return bool(d.get("options") or d.get("npcText") or d.get("playerText") or d.get("itemText"))
-
-
-def _dialogue_options(d):
-    """The REAL options of an open chat menu, in number-key order (key = position + 1).
-    The m8aq Dialogue reader returns every non-hidden child of Chatmenu.OPTIONS in order:
-    the TITLE first ("Select an Option" / "How many would you like to add?"), then the
-    options, then blank trailing children -- MEASURED live 2026-09-03 (gf_live6):
-    ['How many would you like to add?', '1', '3', 'X', 'All', '', '']. Counting keys over
-    the raw list pressed 3 for the option "3" at raw index 2 and selected "X" instead."""
-    raw = []
-    for o in d.get("options") or []:
-        raw.append(o if isinstance(o, str) else (o.get("text") or ""))
-    raw = raw[1:] if raw else raw     # child 0 is the title
-    return [o for o in raw if o.strip()]
+# Moved to dialogue.py 2026-09-18; the "no open field" and "title at index 0" findings that
+# were documented here are in its header. Names kept for the call sites and tests below.
+_dialogue = dialogue.read
+_dialogue_open = dialogue.is_open
+_dialogue_options = dialogue.options
 
 
 def _choose_option(ctx, d, substrings, fallback_key=None):
