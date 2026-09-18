@@ -280,6 +280,29 @@ def test_repeated_no_progress_bank_trips_end_in_a_safety_stop(monkeypatch):
     assert "bank withdraw list" in ctx.state.stops[0]
 
 
+def test_combat_config_substitutes_the_task_targets_without_touching_the_panel_config():
+    base = {"targetNames": ["Cow"], "targets": [2805],
+            "safespot": {"enabled": True, "marked": True, "x": 1, "y": 2, "plane": 0},
+            "food": {"enabled": True}}
+    cfg = combat_core.combat_config(base, ("Banshee", "Screaming banshee"))
+
+    assert cfg["targetNames"] == ["Banshee", "Screaming banshee"]
+    assert cfg["targets"] == [], "ids are only ever resolved for NPCs in the scene; names are the durable signal"
+    assert cfg["safespot"]["enabled"] is False and cfg["safespot"]["marked"] is False
+    assert cfg["safespot"]["x"] == 1, "other safespot fields survive"
+    assert cfg["food"] == {"enabled": True}
+    # The panel config the caller holds is untouched.
+    assert base["targetNames"] == ["Cow"] and base["targets"] == [2805]
+    assert base["safespot"]["enabled"] is True
+
+
+def test_combat_config_targets_resolve_through_the_normal_singularizing_matcher():
+    cfg = combat_core.combat_config({}, ("Banshees",))
+    ids, names = combat_core.resolve_targets(cfg)
+    assert ids == set()
+    assert "banshee" in names and "banshees" in names
+
+
 def test_combat_routine_is_a_thin_wrapper_over_combat_core():
     from routines import combat
     assert combat.tick is combat_core.fight_tick

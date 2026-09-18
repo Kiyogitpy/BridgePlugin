@@ -266,6 +266,24 @@ def resolve_targets(config: dict):
     return ids, names
 
 
+def combat_config(base_config: dict, target_names) -> dict:
+    """The panel config with a task's monsters substituted in -- what the Slayer task
+    orchestrator hands fight_tick for each FIGHT tick (spec §5).
+
+    `targets` (ids) is emptied on purpose: ConfigExporter.resolveTargetIds only ever fills it
+    with ids of NPCs currently in the scene, so names are the durable signal and a stale id list
+    from the panel would fight the wrong monster. A marked safespot belongs to one place, so it
+    is forced off for a task fight. The panel config is copied, never mutated."""
+    cfg = dict(base_config or {})
+    cfg["targetNames"] = list(target_names or ())
+    cfg["targets"] = []
+    safespot = dict(cfg.get("safespot") or {})
+    safespot["enabled"] = False
+    safespot["marked"] = False
+    cfg["safespot"] = safespot
+    return cfg
+
+
 # Targets are ranked by WALKING distance, not the bridge's `distance` (a straight-line
 # WorldPoint.distanceTo that ignores walls). MEASURED live 2026-09-18 in the Kalphite cave (plane
 # 2, player 3487,9508): a Kalphite Worker 10 tiles away in a straight line was 112 steps round the
