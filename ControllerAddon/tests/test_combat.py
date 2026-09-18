@@ -7,7 +7,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import banker
 import controller
-from routines import slayer
+import combat_core
+slayer = combat_core   # the fixture and the 19 moved tests keep the short name
 
 
 class _State:
@@ -56,7 +57,7 @@ def test_tick_spends_a_retry_on_the_walk_home_before_fighting_anything(quiet_tic
     ctx.state.data[banker.RETURN_LOCATION_KEY] = {"x": 3200, "y": 3200, "plane": 0}
     ctx.state.data["current_target_index"] = 41
 
-    slayer.tick(ctx)
+    slayer.fight_tick(ctx)
 
     assert "return_to_spot" in quiet_tick
     # Food and prayer must not be starved by a return trip...
@@ -71,7 +72,7 @@ def test_tick_is_unaffected_when_no_walk_home_is_owed(quiet_tick):
     loot -> safespot -> engage ladder runs exactly as before."""
     ctx = _Ctx({"bank": {"enabled": False}, "loot": {"enabled": True}})
 
-    slayer.tick(ctx)
+    slayer.fight_tick(ctx)
 
     assert "return_to_spot" not in quiet_tick
     assert quiet_tick == ["defensive_prayer", "offensive_prayer", "prayer_potions", "supplies", "bracelet",
@@ -260,3 +261,26 @@ def test_out_of_prayer_potions_banks_with_use_prayer_off(prayer_env):
     prayer_env["player"]["prayer"] = 10
     ctx = _Ctx({"prayer": {"enabled": False, "restoreAt": 18}, "potions": {"prayerEnabled": True}})
     assert slayer.out_of_critical_supplies(ctx)
+
+
+def test_repeated_no_progress_bank_trips_end_in_a_safety_stop(monkeypatch):
+    """BANK_NO_PROGRESS_MAX was used at the bank branch of the tick but never defined
+    anywhere (found by the 2026-09-18 survey): two consecutive bank trips that did not
+    restock raised NameError instead of stopping. Three no-progress trips must stop."""
+    ctx = _Ctx({"bank": {"enabled": True}, "food": {"enabled": True, "eatAt": 40}})
+    monkeypatch.setattr(controller, "get_ammo_count", lambda: None)
+    monkeypatch.setattr(combat_core, "needs_banking", lambda ctx: True)
+    monkeypatch.setattr(combat_core, "out_of_critical_supplies", lambda ctx: True)
+    monkeypatch.setattr(banker, "bank_up", lambda ctx, cfg: True)
+
+    for _ in range(combat_core.BANK_NO_PROGRESS_MAX):
+        combat_core.fight_tick(ctx)
+
+    assert ctx.state.stops, "no safety stop after repeated no-progress bank trips"
+    assert "bank withdraw list" in ctx.state.stops[0]
+
+
+def test_combat_routine_is_a_thin_wrapper_over_combat_core():
+    from routines import combat
+    assert combat.tick is combat_core.fight_tick
+    assert combat.on_event is combat_core.on_event

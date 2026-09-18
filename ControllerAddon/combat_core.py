@@ -1,13 +1,12 @@
-# routines/slayer.py
+# combat_core.py
 #
-# Combat/slayer routine: pick a target from the Controller Settings panel's
-# monster list, fight it, keep prayer/food/potions topped up, loot, bury
-# bones. Config comes straight from the bridge's GET /config (i.e. whatever
-# is set in the RuneLite "Controller" side panel) -- see
-# com.example.controller.ControllerConfig / ConfigExporter for the shape.
-#
-# Run with:
-#     python controller.py routines/slayer.py
+# The shared fight loop: pick a target from a config's monster list, fight it, keep
+# prayer/food/potions topped up, loot, bury bones, bank when needed. Two routines drive it:
+#   routines/combat.py  -- config straight from the Controller Settings panel (GET /slayer-config)
+#   routines/slayer.py  -- the task orchestrator, which substitutes the current task's monsters
+#                          into that config (combat_config) and delegates each FIGHT tick here.
+# Moved here from routines/slayer.py 2026-09-18 (git mv; the history is that file's).
+# See com.example.controller.ControllerConfig / ConfigExporter for the config shape.
 
 import math
 import random
@@ -28,13 +27,6 @@ import worldmap
 # the v2 engine (human_move.py) re-aims at its own submovement boundaries and ignores it.
 ENGAGE_REFRESH_LEGS = 3
 
-# GET /slayer-config already includes the master switch (SlayerConfigProvider reads it off
-# ControllerConfig too) alongside every slayer-specific setting -- bridge_config (GET /config)
-# isn't needed here.
-def get_config(bridge_config):
-    return controller.get_slayer_config()
-
-
 def on_event(ctx, event_type, payload):
     if event_type == "CHAT_MESSAGE" and payload and is_bracelet_broken_message(payload.get("message")):
         ctx.state.data["bracelet_check_at"] = 0.0     # check the gloves slot on the next tick
@@ -45,7 +37,7 @@ def on_event(ctx, event_type, payload):
             ctx.state.data["current_target_index"] = None
 
 
-def tick(ctx):
+def fight_tick(ctx):
     config = ctx.state.config
 
     ammo = controller.get_ammo_count()
@@ -136,6 +128,12 @@ def tick(ctx):
 
 def inventory_full() -> bool:
     return len(controller.get_inventory()) >= settings.INVENTORY_SIZE
+
+
+# Consecutive bank trips that completed but left a critical-supply emergency unresolved before
+# the routine stops and asks a human to fix the withdraw list. Referenced by fight_tick's bank
+# branch since 2026-08-06; DEFINED only on 2026-09-18 (it raised NameError before that).
+BANK_NO_PROGRESS_MAX = 3
 
 
 def needs_banking(ctx) -> bool:
