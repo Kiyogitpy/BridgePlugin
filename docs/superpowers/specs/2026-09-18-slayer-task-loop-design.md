@@ -684,6 +684,16 @@ The same jar has `fairy_rings.tsv` (115 rows: ring tile, object id, code), `spir
 `destinations/game_features/bank.tsv` (297 banks -- answers "nearest bank to this site", which
 `banker` cannot today).
 
+**IMPORTED 2026-09-19** (USER: "the findings on travelling sound good, import that"). Six
+tables are vendored byte-identical in `ControllerAddon/vendor/` (re-extract with
+`tools/extract_shortest_path_tables.py`); `ControllerAddon/transports.py` loads them (pure,
+headers asserted, requirements fail closed) and `tests/test_transports.py` pins the hub
+entrances, fairy-ring codes incl. CJQ → the Great Conch, and the row-count floors. The loader
+classifies the table's ~316 plain doors and ~668 Wilderness-ditch rows so a search can leave
+them out, and found one trap worth knowing: `fairy_rings.tsv` contains a DIAL SEQUENCE row
+(the Fairy Queen's hideout) that must not be read as aliases. **What is NOT built yet is
+everything below: the route search and the executor.**
+
 **Design:** vendor `transports.tsv`, `fairy_rings.tsv` and `bank.tsv` byte-identical beside the
 three already in `ControllerAddon/vendor/` (header names asserted, as `teleports.load_all`
 does), and give routing a **transport edge**:
