@@ -497,12 +497,44 @@ task would be fought in the wrong kit. Design:
   alternative: the spec entry names it (`gear=(Gear.worn("mirror shield"), Gear.worn("<1h
   weapon>"))`), chosen with the user when that task's entry is authored.
 
-**4. Low stock stops early, not late.** Staples have floors in the panel's "Slayer tasks"
-section: `slayerMinFood` (default 8 to START a Kuradal task, 3 for an Aya task -- they are
-10-30 kills of level-1-30 monsters), `slayerMinPrayerDoses` (8 for Kuradal, 0 for Aya),
-`slayerMinHouseTeleports` (5). Bank memory makes this checkable without a bank visit. Below a
-floor the routine finishes the task in hand, then safety-stops with the list to buy. **It never
-buys anything** -- no Grand Exchange restocking, by decision; an empty bank is a human's job.
+**4. Supplies are PER TASK, not one global floor** (USER 2026-09-19, correcting the first
+draft's flat "8 food / 8 doses": *"a lot more for tasks that mostly rely on prayer to negate
+damage, 5-6 full prayer pots which is 4 doses each; as for food it depends on the task -- if
+it's nechryaels there is unavoidable damage, we should bring at least 15 food"*). Each
+`TaskSpec` carries a **supply profile**:
+
+```python
+supplies=Supplies(food=15, prayer_potions=6, extras=(("antipoison", 1),))   # nechryael
+```
+
+`prayer_potions` counts FULL (4-dose) potions; the withdraw prefers 4-dose ones and the check
+counts doses (`potions * 4`) so three 4-dose and two 2-dose potions are not mistaken for five.
+Profiles come from four named defaults so 46 entries are not 46 hand-typed tuples, and any
+task overrides its default. The two the user gave are anchors; the other numbers are PROPOSED
+and listed per task in `docs/slayer-sites/decisions.md` for the user to correct:
+
+| Profile | For | Prayer potions | Food |
+|---|---|---|---|
+| `PRAYER` | damage fully negated by one protection prayer (ankou, black demons, bloodveld, hellhounds, trolls, kurask, wyrms at range, ...) | **6** (user: 5-6) | 5 |
+| `PRAYER_PLUS_DAMAGE` | prayer negates the monster but something still hits (nechryael's death spawns, kalphite poison, mixed melee/ranged elves) | 6 | **15** (user, nechryael) |
+| `SAFESPOT` | fought from a safespot with ranged (waterfiends, zygomites) | 2 | 8 |
+| `TRIVIAL` | Aya's tasks: 10-30 kills of level 1-30 monsters | 0 | 3 |
+
+Inventory arithmetic is part of the entry's validation: profile + carry items + displaced
+base gear + teleport items must fit in 28 slots, checked by a catalog test, so an entry that
+cannot physically be packed fails in CI rather than at the bank.
+
+Every trip starts with full prayer from the house pool, so the potions are for the fight only.
+Mid-task, the fight loop's existing "out of critical supplies" bank trip still applies, and it
+restocks to the SAME profile (today it restocks to the panel's flat quantities -- the
+orchestrator passes the profile's counts down as the `withdraw` list instead).
+
+**Low stock stops early, not late.** Before starting a task, `supplies.check` compares the
+task's profile against inventory + bank memory (no bank visit needed). Not enough for THIS
+task: a skippable task is SKIPPED, otherwise the routine safety-stops with the list to buy.
+One staple has a global floor because every task needs it: `slayerMinHouseTeleports` (5).
+**It never buys anything** -- no Grand Exchange restocking, by decision; an empty bank is a
+human's job.
 
 **Tests** (`tests/test_supplies.py`): the charge parser over real names incl. `Slayer ring
 (eternal)` and `Ring of dueling(8)` vs `Slayer ring (8)` spacing; `teleports_left` treats an

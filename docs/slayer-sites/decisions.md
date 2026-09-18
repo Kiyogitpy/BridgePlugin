@@ -93,6 +93,46 @@ giants, hellhounds), **Slayer Tower basement** (abyssal demons, gargoyles, nechr
 **Fremennik Slayer Dungeon** (basilisks, kurask), **Catacombs of Kourend** (dagannoth, dust
 devils). Build those travel routes first.
 
+### Supply profiles for the FIGHT tasks (2026-09-19)
+
+USER: tasks that rely on prayer to negate damage want **5-6 full (4-dose) prayer potions**;
+food depends on the task, and **nechryael need at least 15 food** because the death spawns'
+damage is unavoidable. So supplies are per task (spec §7.9), built from four named profiles.
+Only the two figures above are the user's; **every other row is PROPOSED** from the research's
+attack-style notes and is the user's to correct.
+
+| Profile | Prayer potions (full) | Food |
+|---|---|---|
+| PRAYER | 6 | 5 |
+| PRAYER_PLUS_DAMAGE | 6 | 15 |
+| SAFESPOT | 2 | 8 |
+| TRIVIAL (all Aya tasks) | 0 | 3 |
+
+| Task | Profile | Why | Extras |
+|---|---|---|---|
+| Nechryael | PRAYER_PLUS_DAMAGE | **user**: death spawns hit through Protect from Melee | — |
+| Kalphite | PRAYER_PLUS_DAMAGE | soldier/guardian poison ignores prayer | antipoison |
+| Elves (Lletya) | PRAYER_PLUS_DAMAGE | archers and warriors use different styles; one prayer cannot cover both | — |
+| Gryphons | PRAYER_PLUS_DAMAGE | new content, mechanics thinly documented, no safespot in the eastern cave — start cautious | keep equipped weight ≥ ~30 kg |
+| Aberrant spectres | PRAYER | magic attack, Protect from Magic | nose peg / slayer helmet worn |
+| Abyssal demons | PRAYER | melee, Protect from Melee | — |
+| Ankou | PRAYER | melee, low max hit | — |
+| Basilisks | PRAYER | weak hits with the mirror shield | mirror shield worn |
+| Black demons | PRAYER | melee | — |
+| Bloodveld | PRAYER | magic-based melee, Protect from Melee | — |
+| Cave horrors | PRAYER | melee with the witchwood icon worn | witchwood icon, light source |
+| Dagannoth (Catacombs) | PRAYER | this variant is melee only | — |
+| Dust devils (Catacombs) | PRAYER | melee; multi combat but prayer covers all of them | facemask / slayer helmet worn |
+| Fire giants | PRAYER | melee | — |
+| Gargoyles | PRAYER | melee | rock hammer or granite hammer |
+| Hellhounds | PRAYER | melee | — |
+| Kurask | PRAYER | crush melee | leaf-bladed weapon or broad ammo |
+| Suqahs (south-west) | PRAYER | this group is melee only | — |
+| Trolls | PRAYER | melee; throwers on the approach chip a little | — |
+| Wyrms | PRAYER | magic only when attacked from range, Protect from Magic | heat boots unless elite Kourend |
+| Waterfiends | SAFESPOT | across-the-river safespot with ranged; no prayer fully blocks them otherwise | ranged ammo |
+| Mutated zygomites | SAFESPOT | pillar safespot | fungicide spray with charges |
+
 ### STOP (1)
 
 | Task | Why |
