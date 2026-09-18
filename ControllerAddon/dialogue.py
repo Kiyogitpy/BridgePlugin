@@ -1,8 +1,12 @@
 # dialogue.py -- the chat dialogue, read off the vendored m8aq reader (GET /api/ui/dialogue).
 #
-# Promoted 2026-09-18 out of four private copies (golem_crafting, giants_foundry, crew,
-# guardians_of_the_rift) for the slayer task loop, which walks slayer-master dialogues. Two
-# measured facts shape it:
+# Promoted 2026-09-18 out of two private copies (golem_crafting, giants_foundry) for the slayer
+# task loop, which walks slayer-master dialogues. guardians_of_the_rift.py has its own third
+# copy of this same trio over the same /api/ui/dialogue reader (its own _dialogue/_dialogue_open/
+# _dialogue_options, ~line 1123) that was NOT converted in this task -- a follow-up. crew.py's
+# _dialogue_open/dialogue_options are NOT a copy of this: they read widget group 219 via
+# get_widget/get_widget_children, a different mechanism for a different dialogue surface, and
+# have nothing to delegate here. Two measured facts shape this module:
 #
 # - The reader has NO open/visible field (net.runelite.client.plugins.m8aq.api.ui.Dialogue has
 #   only npcName/npcText/playerText/options/itemText/...). "Open" is therefore "any of those is
