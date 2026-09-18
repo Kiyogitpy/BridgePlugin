@@ -15,6 +15,8 @@ compiled. This file is the input to the task catalog (`slayer_tasks.py`, spec §
 - The house has a **fairy ring** and an **ornate jewellery box**. The POH is therefore the
   travel hub: house teleport, then ring or box. The panel's Player-Owned House section must
   have the fairy ring and ORNATE box set, or none of the ring/box routes below will plan.
+- The house **pool restores prayer and run energy but not hitpoints** (2026-09-19). HP comes
+  from food or the Ferox Pool of Refreshment; see spec §7.9 for the supplies design.
 - Aya and Kuradal are the post-*While Guthix Sleeps* names for Turael and Duradel; one task list
   each (`Turael_Slayer assignments`, `Duradel_Slayer assignments`).
 - **Dogs are blocked at Aya**, so that task is never assigned.

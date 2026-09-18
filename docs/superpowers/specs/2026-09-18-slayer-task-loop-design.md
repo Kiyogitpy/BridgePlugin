@@ -434,6 +434,86 @@ hotkeys. Death: `safety.stopOnDeath` is honoured by the engine already; the cata
 no Wilderness sites, and a test asserts none of the authored sites has y ≥ 3520 on plane 0
 (the overworld Wilderness line) unless the entry is explicitly tagged `wilderness=True`.
 
+### 7.9 Supplies, charges and gear restore (added 2026-09-19, from the user's questions)
+
+USER: "do we have a way to retrieve these special items and refresh our inventory between
+tasks? The teleport rings etc eventually run out, food and prayer pots etc." The bank side
+exists (`banker.bank_up` withdraw lists, `autoFood`/`autoPrayer`, `search_and_withdraw`, bank
+memory, `gear.ensure_worn`, the fight loop's own mid-task bank trip). Four things did not, and
+this section is their design. New module: **`supplies.py`** (pure where it can be).
+
+**The house does most of the work.** MEASURED from the user: the POH has a fairy ring, an
+ornate jewellery box, and a pool that restores **prayer and run energy but NOT hitpoints**
+(rejuvenation tier). The box and the ring never run out, so games necklace / ring of dueling /
+skills necklace / glory / combat bracelet destinations cost nothing. What still depletes:
+house teleport tablets (unless a construction cape is owned), slayer rings (8 charges; the
+eternal ring has none), items the box does not cover (Xeric's talisman, digsite pendant,
+Ectophial refills, teleport crystal, Rada's blessing), food, prayer potions for long Kuradal
+fights, and per-task consumables. **HP comes from food, or for free from the Ferox Pool of
+Refreshment** whenever a bank trip goes there -- so Ferox stays the preferred bank.
+
+**The loop between tasks** (refines §7.5-7.6):
+```
+task done -> NPC Contact next task (D7) -> supplies.check(spec)
+   ok, nothing to fetch  -> house teleport -> pool (prayer + run) -> POH leg -> site
+   something to fetch    -> bank (box -> Ferox, pool heals HP) -> loadout -> house -> pool -> leg
+   short of a SKIPPABLE task's items -> SKIP (30 pts), e.g. lizards with no ice coolers
+   short of a STAPLE     -> finish nothing new: safety stop naming what to buy
+```
+Every house pass drinks from the pool (one object click, confirmed by `/player.prayer` rising
+or already full). A bank visit is skipped entirely when the inventory already satisfies the
+next task -- nine Aya tasks in a row should not mean nine bank trips.
+
+**1. Charge counting.** `supplies.charges(name) -> int | None`: item names carry the count as a
+suffix (`Slayer ring (3)`, `Ring of dueling(8)`, `Games necklace(1)`); parse `\((\d+)\)\s*$`,
+no suffix = uncharged item or unlimited (eternal slayer ring) = `None`.
+`supplies.teleports_left(name)` sums charges over inventory + equipment + bank memory (ONE
+`bank_memory.load(names=...)` call; `seen == False` means unknown, never zero). At the bank the
+routine takes the **lowest-charge** copy first so partly used rings are finished off, and
+swaps in a fresh one when the carried copy has ≤ 1 charge left. A route whose first-leg item
+has no charges anywhere is simply not "owned" for §6's route choice, so the next route is tried.
+
+**2. Per-task consumables.** `TaskSpec.carry` becomes `(name, quantity_rule)`: a fixed count
+(rope ×1, lit bullseye lantern ×1, antipoison ×1) or a function of the task size
+(ice coolers = `count + 5`; fungicide spray: enough charges for `count` kills -- the spray's
+charge suffix is read like a ring's). `supplies.check` compares that against
+inventory + bank memory BEFORE travelling.
+
+**3. Gear restore -- the hole the first draft had.** Kurask need a leaf-bladed weapon,
+basilisks a mirror shield, banshees earmuffs; nothing put the normal gear back, so the next
+task would be fought in the wrong kit. Design:
+- The **base loadout** is the worn equipment captured when no task gear is on: at `setup` and
+  after every task completion, but ONLY if `/slayer.count == 0` or the active task's spec has
+  no `gear`. It is persisted to `~/.runelite/bridge-slayer/<accountHash>-base-gear.json`
+  (same convention as bank memory), because `ctx.state.data` resets on restart and a restart
+  mid-kurask-task would otherwise record the leaf-bladed sword as "normal".
+- Task gear is a per-SLOT override of that base. `gear.ensure_worn` puts it on at the bank;
+  base items it displaces go into the inventory and are **kept** (added to `keepItems`), not
+  banked, so the restore needs no bank visit.
+- On task completion (`count` → 0) the routine re-equips every displaced base item before
+  anything else, confirmed on `/equipment`. A base item that cannot be found is a safety stop
+  naming it.
+- A two-handed base weapon plus a shield requirement (mirror shield) needs a one-handed
+  alternative: the spec entry names it (`gear=(Gear.worn("mirror shield"), Gear.worn("<1h
+  weapon>"))`), chosen with the user when that task's entry is authored.
+
+**4. Low stock stops early, not late.** Staples have floors in the panel's "Slayer tasks"
+section: `slayerMinFood` (default 8 to START a Kuradal task, 3 for an Aya task -- they are
+10-30 kills of level-1-30 monsters), `slayerMinPrayerDoses` (8 for Kuradal, 0 for Aya),
+`slayerMinHouseTeleports` (5). Bank memory makes this checkable without a bank visit. Below a
+floor the routine finishes the task in hand, then safety-stops with the list to buy. **It never
+buys anything** -- no Grand Exchange restocking, by decision; an empty bank is a human's job.
+
+**Tests** (`tests/test_supplies.py`): the charge parser over real names incl. `Slayer ring
+(eternal)` and `Ring of dueling(8)` vs `Slayer ring (8)` spacing; `teleports_left` treats an
+unseen bank as unknown; lowest-charge-first selection; quantity rules; the base loadout is NOT
+overwritten while a gear task is active (the restart case); restore order on completion;
+a missing skippable item routes to SKIP and a missing staple to a stop.
+
+**§12 additions:** the pool object's name/id/action in the user's house and the prayer-rise
+confirm; whether item names in `/inventory`, `/equipment` and bank memory all carry the charge
+suffix the same way.
+
 ## 8. Transport legs (`legs.py`)
 
 Promoted from `banker._run_leg/_run_item_leg/_run_object_leg/_await_arrival` so bank returns
