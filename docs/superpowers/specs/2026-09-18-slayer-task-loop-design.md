@@ -655,6 +655,71 @@ and task travel share one runner; `banker` keeps its behaviour by importing it. 
 retries on PROGRESS, counts FAILED. Each leg carries its own `budget_s` (item 8, fairy 12,
 object 10 + walk budget, walk = `outcome_waits.walk_budget`).
 
+### 8.1 Floors and entrances come from Shortest Path's transport table, not hand-written legs (added 2026-09-19)
+
+USER: "how about travel?" Travel has three layers, and only the middle one was missing:
+
+| Layer | State |
+|---|---|
+| Long hops: item teleports, POH box/portals, fairy rings | `teleports.py` + `legs.py` + `travel.hop_fairy_ring`. Items and fairy rings are live-proven; **POH legs have never run live** |
+| **Changing floor / entering a dungeon** | **nothing** -- `walk_to`, `route_to` and `worldmap.find_path` are same-plane only |
+| Walking on one plane, doors | `worldmap.py` + `travel.walk_to`, live-proven |
+
+The first draft filled the middle layer with a hand-authored `Leg.object(...)` per site. That is
+46 tasks' worth of entrance tiles to research and get wrong. **The data already exists.** The
+installed Shortest Path jar (`shortest-path_*.jar`, the same source the three vendored teleport
+TSVs came from) carries `transports/transports.tsv`: **5,634 rows** of
+`Origin | Destination | menuOption menuTarget objectID | Skills | Items | Quests | Varbits |
+VarPlayers | Duration`. MEASURED 2026-09-19, every entrance the chosen hubs need is in it:
+
+```
+2430 3424 0 -> 2429 9824 0   Enter Cave 26709              Stronghold Slayer Cave
+1639 3673 0 -> 1666 10050 0  Investigate Statue 27785      Catacombs of Kourend
+3417 3536 0 -> 3412 9932 3   Climb-down Ladder 30191       Slayer Tower basement (note: plane 3)
+3417 3540 2 <-> 3412 3540 1  Climb-up/down Staircase       Slayer Tower floors
+2884 3398 0 -> 2884 9798 0   Climb-down Ladder 16680       Taverley Dungeon
+```
+The same jar has `fairy_rings.tsv` (115 rows: ring tile, object id, code), `spirit_trees.tsv`,
+`gnome_gliders.tsv`, `agility_shortcuts.tsv` (with level requirements) and
+`destinations/game_features/bank.tsv` (297 banks -- answers "nearest bank to this site", which
+`banker` cannot today).
+
+**Design:** vendor `transports.tsv`, `fairy_rings.tsv` and `bank.tsv` byte-identical beside the
+three already in `ControllerAddon/vendor/` (header names asserted, as `teleports.load_all`
+does), and give routing a **transport edge**:
+
+- `worldmap.find_path` stays the same-plane engine. A new `travel.route_across(start, goal)`
+  searches over (plane-local walk) + (transport rows whose requirements are met), bounded like
+  `teleports.plan` (`MAX_TRANSPORTS` 4, the approach-walk caps from banker's planner, because
+  the no-data void joins every dungeon). It returns walk segments and transport steps.
+- A transport step is executed by ONE generic primitive, `legs.run_transport(step)`: walk to
+  `Origin` (goal-adjacent), find the object by **id** at that tile (`/object/at`), click it with
+  `expected_action=menuOption`, confirm by `/player` landing within a tile or two of
+  `Destination` (plane included). This replaces `Leg.object` entirely; the catalog's routes
+  shrink to "first-leg teleport, then `walk(site)`" and `walk` is allowed to cross floors.
+- Requirements columns (Skills/Quests/Varbits/Items) FAIL CLOSED on unknown, the rule
+  `teleports.varbits_satisfied` already follows; agility shortcuts are only taken when
+  `/skills` proves the level.
+- Catalog test (replaces the same-plane reachability test): for every FIGHT site,
+  `route_across(landing_of_first_leg, site)` returns a route offline, and its transport steps
+  are printed into `docs/slayer-sites/` so a human can sanity-check them once.
+
+This is a shared-module change (`travel.py`, a new loader, `legs.py`), so it is its own
+sub-project BEFORE the catalog: every other routine that today hard-codes a ladder gets it too.
+
+**The real travel risk is the house, not the dungeons.** The POH is the hub of every route, and
+it is (a) an INSTANCE -- forward world-coordinate resolution is the known-broken direction
+inside instances (CLAUDE.md "Instanced areas"), and `legs.run_object_leg` walks to the TSV's
+template tile `1870 5698` with `travel.walk_to`, which routes on the OVERWORLD map; (b) laid
+out per player, so the box and the ring are wherever this user built them; (c) never run live.
+Design for it rather than hope: inside the house, do NOT route. Find the object by NAME in
+`/objects` (its instance-corrected tile is already served), and click it -- the game paths the
+player there itself, and a house is small enough that the object is in view from the portal.
+Confirm the jewellery-box / fairy-ring interface opening (`/widget`), then the existing pickers.
+Only if the object is not in `/objects` does `instance_nav.walk_to` step toward the room. The
+house must be in **building mode off**, with **teleport-inside** set (varbit 4744, already a
+gate in `teleports.py`). This is §12's first travel item, ahead of any dungeon.
+
 ## 9. NPC Contact (`npc_contact.py`)
 
 Built from `mahogany_homes.request_contract_phase` plus the dialogue helpers, generalised to
