@@ -2,14 +2,15 @@ package com.example.controller;
 
 /**
  * Which controller.py routine should run. The enum name (not the label) is sent over the
- * bridge as-is and must match a key in controller.py's ROUTINE_FILES map, e.g. SLAYER ->
- * routines/slayer.py. Defaults to NONE so a fresh install doesn't silently start acting the
+ * bridge as-is and must match a key in controller.py's ROUTINE_FILES map, e.g. COMBAT ->
+ * routines/combat.py. Defaults to NONE so a fresh install doesn't silently start acting the
  * moment Controller Enabled is checked -- a routine has to be deliberately picked first.
  */
 public enum RoutineChoice
 {
 	NONE("None"),
-	SLAYER("Slayer / Combat"),
+	COMBAT("Combat"),
+	SLAYER("Slayer (tasks)"),
 	MINING("Mining"),
 	WOODCUTTING("Woodcutting"),
 	MOTHERLODE_MINE("Motherlode Mine"),

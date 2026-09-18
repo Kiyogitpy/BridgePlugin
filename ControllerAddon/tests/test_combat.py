@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 
 import pytest
@@ -307,3 +308,25 @@ def test_combat_routine_is_a_thin_wrapper_over_combat_core():
     from routines import combat
     assert combat.tick is combat_core.fight_tick
     assert combat.on_event is combat_core.on_event
+
+
+def test_combat_and_slayer_are_both_wired_into_routine_files_and_routine_choice():
+    """Wiring a routine into ROUTINE_FILES AND RoutineChoice is a required step, not polish
+    (CLAUDE.md). The split adds COMBAT and re-points SLAYER at the task orchestrator."""
+    assert controller.ROUTINE_FILES["COMBAT"] == "routines/combat.py"
+    assert controller.ROUTINE_FILES["SLAYER"] == "routines/slayer.py"
+    java = open(os.path.join(os.path.dirname(__file__), "..", "..", "src", "main", "java", "com",
+                             "example", "controller", "RoutineChoice.java"), encoding="utf-8").read()
+    names = set(re.findall(r"^\s*([A-Z_0-9]+)\(\"", java, flags=re.M))
+    assert "COMBAT" in names and "SLAYER" in names
+    assert set(controller.ROUTINE_FILES) <= names, "every ROUTINE_FILES key must be a RoutineChoice"
+    for rel in controller.ROUTINE_FILES.values():
+        assert os.path.exists(os.path.join(os.path.dirname(__file__), "..", rel)), rel
+
+
+def test_the_slayer_stub_stops_and_points_at_the_spec():
+    from routines import slayer
+    ctx = _Ctx({})
+    slayer.tick(ctx)
+    assert ctx.state.stops and "Combat" in ctx.state.stops[0]
+    assert slayer.SKIP_STRAY_DIALOG_CHECK is True

@@ -3662,6 +3662,7 @@ def load_routine(path: str):
 # file, relative to this file's directory. Add an entry here for every value you add to
 # RoutineChoice.java. Only consulted when no routine is pinned on the command line.
 ROUTINE_FILES = {
+    "COMBAT": "routines/combat.py",
     "SLAYER": "routines/slayer.py",
     "MINING": "routines/mining.py",
     "WOODCUTTING": "routines/woodcutting.py",
