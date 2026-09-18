@@ -1,0 +1,226 @@
+# legs.py -- execute ONE transport leg (a teleport item, a fairy ring, a POH box/portal, a
+# walk) and confirm it landed. Promoted 2026-09-18 out of banker.py's return-teleport runner
+# (_run_leg / _run_item_leg / _run_object_leg / _pick_destination / _await_arrival, added
+# 2026-09-07) so bank returns and slayer task travel share one runner. banker keeps those names
+# as aliases; nothing about the bank path changed.
+#
+# A leg is a flat dict that survives in ctx.state.data across ticks:
+#   {"kind": "item"|"fairy"|"walk"|"box"|"poh_portal", "display": str, "dest": [x, y, plane]|None,
+#    "item": str|None, "option": str|None, "origin": [x, y, plane]|None,
+#    "object_id": int|None, "object_info": str, "code": str|None, "expect": str|None}
+# run_next() is the cursor over a chain: one bounded leg per call, so a routine's tick stays
+# short and a restart resumes at the leg it was on. Object legs by NAME/ACTION (ladders, caves,
+# stairs -- spec §8) are sub-project 3; "box"/"poh_portal" here are banker's POH legs, still
+# UNVERIFIED live.
+
+import time
+
+import controller
+import debug_log
+import travel
+
+ITEM_BUDGET_S = 6.0      # a teleport is ~4 ticks of animation plus a region load; falconry measured 2.4-3.2s
+POLL_S = 0.3
+ARRIVAL_TILES = 12       # several teleports drop you on a small spread of tiles; the walk covers the rest
+PICKER_BUDGET_S = 4.0    # a transport's destination picker -> appeared and answered
+
+DONE = "done"            # the leg landed; cursor advanced
+PROGRESS = "progress"    # the leg did a bounded step and wants another call (fairy rings)
+FAILED = "failed"        # the leg did not land; cursor unchanged, caller decides (retry / stop)
+FINISHED = "finished"    # cursor is past the last leg
+
+
+# ---------------------------------------------------------------- builders
+
+def _base(kind, display, dest):
+    return {"kind": kind, "display": display, "item": None, "option": None,
+            "dest": list(dest) if dest else None, "origin": None, "object_id": None,
+            "object_info": ""}
+
+
+def item(name: str, option: str, dest) -> dict:
+    """An inventory (or worn) teleport item: left-click verified against `option`, else the menu."""
+    leg = _base("item", f"{name}: {option}", dest)
+    leg["item"] = name
+    leg["option"] = option
+    return leg
+
+
+def fairy(code: str, expect: str, dest=None) -> dict:
+    """A fairy-ring hop, delegated to travel.hop_fairy_ring (dialled, never Last-destination)."""
+    leg = _base("fairy", f"fairy ring {code}", dest)
+    leg["code"] = code
+    leg["expect"] = expect
+    return leg
+
+
+def walk(x: int, y: int, plane: int) -> dict:
+    """A same-plane walk to an exact tile (travel.walk_to, goal_adjacent=False)."""
+    return _base("walk", f"walk to {x},{y},{plane}", (x, y, plane))
+
+
+def from_transport(t) -> dict:
+    """A teleports.Transport, flattened -- banker's _leg_dict."""
+    return {
+        "kind": t.kind,
+        "display": t.display,
+        "item": t.item_name,
+        "option": t.destination_name,
+        "dest": list(t.dest),
+        "origin": list(t.origin) if t.origin else None,
+        "object_id": trailing_int(t.object_info),
+        "object_info": t.object_info,
+    }
+
+
+def trailing_int(text):
+    """`Teleport Menu Ornate Jewellery Box 37520` -> 37520.
+
+    The column is `menuOption menuTarget objectID` with both names multi-word, so it cannot be
+    split reliably -- but the object id is always the trailing integer, and an id is all we need
+    to find the thing in /objects.
+    """
+    if not text:
+        return None
+    tail = text.strip().split()[-1]
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------- running
+
+def run_next(ctx, leg_list, cursor: int, log: str = "travel"):
+    """Run the leg at `cursor`. Returns (status, new_cursor)."""
+    if cursor >= len(leg_list or []):
+        return FINISHED, cursor
+    leg = leg_list[cursor]
+    kind = leg.get("kind")
+    if kind == "fairy":
+        ok = travel.hop_fairy_ring(ctx, leg.get("code"), leg.get("expect"), log=log)
+        return (DONE, cursor + 1) if ok else (PROGRESS, cursor)
+    if kind == "walk":
+        dest = leg.get("dest") or []
+        ok = len(dest) == 3 and travel.walk_to(
+            ctx, {"x": dest[0], "y": dest[1], "plane": dest[2]}, goal_adjacent=False)
+        return (DONE, cursor + 1) if ok else (FAILED, cursor)
+    ok = run_leg(ctx, leg, log=log)
+    return (DONE, cursor + 1) if ok else (FAILED, cursor)
+
+
+def await_arrival(dest, budget_s: float = ITEM_BUDGET_S) -> bool:
+    """True once we are standing near `dest`. Polled, never slept off -- karambwan_fishing
+    MEASURED that a teleport's own signals fire on the tick the LOADING screen starts, when the
+    bridge answers nothing at all."""
+    waited = 0.0
+    while waited < budget_s:
+        time.sleep(POLL_S)
+        waited += POLL_S
+        player = controller.get_player() or {}
+        px, py = player.get("x"), player.get("y")
+        if px is None:
+            continue
+        if (player.get("plane", 0) == dest[2]
+                and abs(px - dest[0]) <= ARRIVAL_TILES
+                and abs(py - dest[1]) <= ARRIVAL_TILES):
+            return True
+    return False
+
+
+def run_leg(ctx, leg, log: str = "travel") -> bool:
+    """Execute one item/box/portal hop. False means the chain stops and the caller decides."""
+    dest = leg.get("dest") or []
+    if len(dest) != 3:
+        return False
+    return (run_item_leg(ctx, leg, log) if leg.get("kind") == "item"
+            else run_object_leg(ctx, leg, log)) and await_arrival(dest)
+
+
+def run_item_leg(ctx, leg, log: str = "travel") -> bool:
+    """An inventory teleport: LEFT-click verified through /hover, menu only as the fallback.
+
+    The pattern falconry/karambwan already prove live (USER 2026-09-06: "for inventory teleports
+    ive changed them so we just click the item and we teleport to the right spot").
+    """
+    name = (leg.get("item") or "").lower()
+    it = next((i for i in (controller.get_inventory() or [])
+               if name and name in (i.get("name") or "").lower()), None)
+    if it is None:
+        debug_log.log(log, f"no {leg.get('item')} in inventory -- leg '{leg.get('display')}' cannot run")
+        return False
+
+    option = leg.get("option")
+    debug_log.log(log, f"leg: {leg.get('display')}")
+    controller.open_inventory_tab(ctx.ser)
+    ok = controller.click_entity(ctx.ser, it, check_ui_blockers=False,
+                                 simulate_mistakes=False,
+                                 expected_action=option if option else None)
+    if not ok:
+        if getattr(ok, "withheld", False):
+            debug_log.log(log, f"{leg.get('item')}: left-click isn't the teleport here -- using the menu")
+        ok = controller.click_menu_action(ctx.ser, it, option or "Teleport",
+                                          check_ui_blockers=False)
+    return bool(ok)
+
+
+def run_object_leg(ctx, leg, log: str = "travel") -> bool:
+    """A world-object hop: a POH jewellery box or portal.
+
+    NOT YET VERIFIED LIVE -- it has never run inside a house. Every step confirms, and any
+    failure returns False so the caller falls back rather than clicking blindly.
+    """
+    obj_id = leg.get("object_id")
+    origin = leg.get("origin")
+    if obj_id is None or not origin:
+        return False
+
+    # Walk to the object first: the game accepts a click on anything visible and then silently
+    # does nothing when it cannot path there (CLAUDE.md's standing invariant).
+    if not travel.walk_to(ctx, {"x": origin[0], "y": origin[1], "plane": origin[2]},
+                          goal_adjacent=True):
+        debug_log.log(log, f"couldn't reach {leg.get('display')}'s object")
+        return False
+
+    obj = controller.get_object_at(origin[0], origin[1], origin[2], obj_id, radius=16)
+    if obj is None:
+        obj = next((o for o in (controller.get_objects(radius=16) or [])
+                    if o.get("id") == obj_id), None)
+    if obj is None:
+        debug_log.log(log, f"object {obj_id} not found for {leg.get('display')}")
+        return False
+
+    debug_log.log(log, f"leg: {leg.get('display')} (object {obj_id})")
+    if not controller.click_entity(
+            ctx.ser, obj, simulate_mistakes=False,
+            refresh_target=controller.object_refresh_target(origin[0], origin[1], origin[2],
+                                                            obj_id, radius=16)):
+        return False
+
+    option = leg.get("option")
+    if not option:
+        return True
+    return pick_destination(ctx, option, log)
+
+
+def pick_destination(ctx, option, log: str = "travel") -> bool:
+    """Answer a transport's destination picker by the TSV's own destination name.
+
+    The box's `Display info` is "3: Ferox Enclave" -- the digit is the interface's own shortcut
+    and the text is the entry. The widget carrying that text is clicked. UNVERIFIED live; this
+    is the assumption the whole POH chain rests on.
+    """
+    deadline = time.time() + PICKER_BUDGET_S
+    while time.time() < deadline:
+        dump = controller.get_widgets_dump() or {}
+        widgets = dump.get("widgets") if isinstance(dump, dict) else dump
+        for w in (widgets or []):
+            text = (w.get("text") or "").strip()
+            if option.lower() in text.lower() and w.get("screenX") is not None:
+                debug_log.log(log, f"picking '{text}' from the destination menu")
+                return bool(controller.click_entity(ctx.ser, w, check_ui_blockers=False,
+                                                    simulate_mistakes=False))
+        time.sleep(POLL_S)
+
+    debug_log.log(log, f"destination menu never offered '{option}'")
+    return False

@@ -37,6 +37,7 @@ import bank_memory
 import bridge_events
 import controller
 import debug_log
+import legs
 import teleports
 import travel
 import worldmap
@@ -1167,17 +1168,11 @@ RETURN_WALK_MAX_ATTEMPTS = 3
 
 RETURN_TELEPORT_KEY = "bank_return_teleport"
 
-# How long to wait for a teleport to land before giving up on it and walking. A teleport is
-# ~4 game ticks of animation plus a region load; falconry measured its own landings at 2.4-3.2s.
-RETURN_TELEPORT_BUDGET_S = 6.0
-RETURN_TELEPORT_POLL_S = 0.3
-
-# Close enough to the landing tile to call the teleport landed. Generous: several teleports drop
-# you on a small spread of tiles, and the walk home covers the rest either way.
-RETURN_TELEPORT_ARRIVAL_TILES = 12
-
-# How long a transport's destination picker has to appear and be answered.
-PICKER_BUDGET_S = 4.0
+# The leg runner moved to legs.py 2026-09-18; these names stay for this file's readers.
+RETURN_TELEPORT_BUDGET_S = legs.ITEM_BUDGET_S
+RETURN_TELEPORT_POLL_S = legs.POLL_S
+RETURN_TELEPORT_ARRIVAL_TILES = legs.ARRIVAL_TILES
+PICKER_BUDGET_S = legs.PICKER_BUDGET_S
 
 # One flood from the anchor replaces a cross-map search per candidate teleport. The radius
 # doubles as the rule "a landing further than this from home is not worth teleporting to".
@@ -1300,34 +1295,8 @@ def _referenced_varbits(owned_ids=None):
     return values
 
 
-def _leg_dict(t):
-    """A transport edge, flattened to something that survives in ctx.state.data across ticks."""
-    return {
-        "kind": t.kind,
-        "display": t.display,
-        "item": t.item_name,
-        "option": t.destination_name,
-        "dest": list(t.dest),
-        "origin": list(t.origin) if t.origin else None,
-        "object_id": _trailing_int(t.object_info),
-        "object_info": t.object_info,
-    }
-
-
-def _trailing_int(text):
-    """`Teleport Menu Ornate Jewellery Box 37520` -> 37520.
-
-    The column is `menuOption menuTarget objectID` with both names multi-word, so it cannot be
-    split reliably -- but the object id is always the trailing integer, and an id is all we need
-    to find the thing in /objects.
-    """
-    if not text:
-        return None
-    tail = text.strip().split()[-1]
-    try:
-        return int(tail)
-    except ValueError:
-        return None
+_leg_dict = legs.from_transport
+_trailing_int = legs.trailing_int
 
 
 def _plan_return_teleport(ctx, config):
@@ -1419,122 +1388,13 @@ def _withdraw_return_teleport(ctx, config):
     ctx.state.data[RETURN_TELEPORT_KEY] = {"legs": [_leg_dict(l) for l in legs]}
 
 
-def _await_arrival(dest, budget_s=RETURN_TELEPORT_BUDGET_S):
-    """True once we are standing near `dest`. Polled, never slept off -- karambwan_fishing
-    MEASURED that a teleport's own signals fire on the tick the LOADING screen starts, when the
-    bridge answers nothing at all."""
-    waited = 0.0
-    while waited < budget_s:
-        time.sleep(RETURN_TELEPORT_POLL_S)
-        waited += RETURN_TELEPORT_POLL_S
-        player = controller.get_player() or {}
-        px, py = player.get("x"), player.get("y")
-        if px is None:
-            continue
-        if (player.get("plane", 0) == dest[2]
-                and abs(px - dest[0]) <= RETURN_TELEPORT_ARRIVAL_TILES
-                and abs(py - dest[1]) <= RETURN_TELEPORT_ARRIVAL_TILES):
-            return True
-    return False
-
-
-def _run_leg(ctx, leg):
-    """Execute one hop. False means the chain stops and the caller walks from here."""
-    dest = leg.get("dest") or []
-    if len(dest) != 3:
-        return False
-    return (_run_item_leg(ctx, leg) if leg.get("kind") == "item"
-            else _run_object_leg(ctx, leg)) and _await_arrival(dest)
-
-
-def _run_item_leg(ctx, leg):
-    """An inventory teleport: LEFT-click verified through /hover, menu only as the fallback.
-
-    The pattern falconry/karambwan already prove live (USER 2026-09-06: "for inventory teleports
-    ive changed them so we just click the item and we teleport to the right spot").
-    """
-    name = (leg.get("item") or "").lower()
-    item = next((i for i in (controller.get_inventory() or [])
-                 if name and name in (i.get("name") or "").lower()), None)
-    if item is None:
-        debug_log.log("bank", f"no {leg.get('item')} in inventory -- walking instead")
-        return False
-
-    option = leg.get("option")
-    debug_log.log("bank", f"leg: {leg.get('display')}")
-    controller.open_inventory_tab(ctx.ser)
-    ok = controller.click_entity(ctx.ser, item, check_ui_blockers=False,
-                                 simulate_mistakes=False,
-                                 expected_action=option if option else None)
-    if not ok:
-        if getattr(ok, "withheld", False):
-            debug_log.log("bank", f"{leg.get('item')}: left-click isn't the teleport here "
-                                  f"-- using the menu")
-        ok = controller.click_menu_action(ctx.ser, item, option or "Teleport",
-                                          check_ui_blockers=False)
-    return bool(ok)
-
-
-def _run_object_leg(ctx, leg):
-    """A world-object hop: a POH jewellery box or portal.
-
-    NOT YET VERIFIED LIVE -- it has never run inside a house. Every step confirms, and any
-    failure returns False so the caller falls back to walking rather than clicking blindly.
-    """
-    obj_id = leg.get("object_id")
-    origin = leg.get("origin")
-    if obj_id is None or not origin:
-        return False
-
-    # Walk to the object first: the game accepts a click on anything visible and then silently
-    # does nothing when it cannot path there (CLAUDE.md's standing invariant).
-    if not travel.walk_to(ctx, {"x": origin[0], "y": origin[1], "plane": origin[2]},
-                          goal_adjacent=True):
-        debug_log.log("bank", f"couldn't reach {leg.get('display')}'s object -- walking instead")
-        return False
-
-    obj = controller.get_object_at(origin[0], origin[1], origin[2], obj_id, radius=16)
-    if obj is None:
-        obj = next((o for o in (controller.get_objects(radius=16) or [])
-                    if o.get("id") == obj_id), None)
-    if obj is None:
-        debug_log.log("bank", f"object {obj_id} not found for {leg.get('display')}")
-        return False
-
-    debug_log.log("bank", f"leg: {leg.get('display')} (object {obj_id})")
-    if not controller.click_entity(
-            ctx.ser, obj, simulate_mistakes=False,
-            refresh_target=controller.object_refresh_target(origin[0], origin[1], origin[2],
-                                                            obj_id, radius=16)):
-        return False
-
-    option = leg.get("option")
-    if not option:
-        return True
-    return _pick_destination(ctx, option)
-
-
-def _pick_destination(ctx, option):
-    """Answer a transport's destination picker by the TSV's own destination name.
-
-    The box's `Display info` is "3: Ferox Enclave" -- the digit is the interface's own shortcut
-    and the text is the entry. Both are tried: the widget carrying that text, else the digit.
-    UNVERIFIED live; this is the assumption the whole chain rests on.
-    """
-    deadline = _now() + PICKER_BUDGET_S
-    while _now() < deadline:
-        dump = controller.get_widgets_dump() or {}
-        widgets = dump.get("widgets") if isinstance(dump, dict) else dump
-        for w in (widgets or []):
-            text = (w.get("text") or "").strip()
-            if option.lower() in text.lower() and w.get("screenX") is not None:
-                debug_log.log("bank", f"picking '{text}' from the destination menu")
-                return bool(controller.click_entity(ctx.ser, w, check_ui_blockers=False,
-                                                    simulate_mistakes=False))
-        time.sleep(RETURN_TELEPORT_POLL_S)
-
-    debug_log.log("bank", f"destination menu never offered '{option}' -- walking instead")
-    return False
+# Moved to legs.py (2026-09-18). Aliases so _use_return_teleport and the tests that monkeypatch
+# banker._run_leg keep working; the "bank" log tag becomes legs' default "travel".
+_await_arrival = legs.await_arrival
+_run_leg = legs.run_leg
+_run_item_leg = legs.run_item_leg
+_run_object_leg = legs.run_object_leg
+_pick_destination = legs.pick_destination
 
 
 def _use_return_teleport(ctx):

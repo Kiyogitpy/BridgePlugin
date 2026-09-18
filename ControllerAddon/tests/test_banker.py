@@ -677,7 +677,8 @@ def test_return_to_spot_actually_reaches_the_teleport_it_planned(monkeypatch):
     monkeypatch.setattr(controller, "click_entity",
                         lambda ser, item, **kw: used.append(kw.get("expected_action")) or True)
     # Landed on the first poll.
-    monkeypatch.setattr(banker.time, "sleep", lambda s: None)
+    import legs
+    monkeypatch.setattr(legs.time, "sleep", lambda s: None)   # _await_arrival lives in legs now
     monkeypatch.setattr(controller, "get_player",
                         lambda: {"x": 3151, "y": 3635, "plane": 0})
 
