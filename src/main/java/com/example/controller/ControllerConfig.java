@@ -91,6 +91,9 @@ public interface ControllerConfig extends Config
 	@ConfigSection(name = "Vale Totems", description = "Forestry totem circuit", position = 18)
 	String valeTotemsSection = "valeTotems";
 
+	@ConfigSection(name = "Slayer tasks", description = "The Slayer (tasks) routine: which masters, when the milestone task is, what to skip", position = 19)
+	String slayerTasksSection = "slayerTasks";
+
 	// ============================================================
 	// General
 	// ============================================================
@@ -781,6 +784,85 @@ public interface ControllerConfig extends Config
 	default boolean slayerBraceletReequip()
 	{
 		return true;
+	}
+
+	// ============================================================
+	// Slayer tasks (routines/slayer.py -- spec docs/superpowers/specs/2026-09-18-slayer-task-loop-design.md)
+	// ============================================================
+
+	@ConfigItem(
+		keyName = "slayerFillerMaster",
+		name = "Filler Master",
+		description = "Asked for every task that is NOT a milestone. Aya's tasks give 0 points but count toward the streak.",
+		section = slayerTasksSection,
+		position = 0
+	)
+	default SlayerMasterChoice slayerFillerMaster()
+	{
+		return SlayerMasterChoice.AYA;
+	}
+
+	@ConfigItem(
+		keyName = "slayerMilestoneMaster",
+		name = "Milestone Master",
+		description = "Asked for the task whose completion lands on a milestone (every 10th/50th/100th). Kuradal: 75/225/375 points.",
+		section = slayerTasksSection,
+		position = 1
+	)
+	default SlayerMasterChoice slayerMilestoneMaster()
+	{
+		return SlayerMasterChoice.KURADAL;
+	}
+
+	@ConfigItem(
+		keyName = "slayerMilestoneEvery",
+		name = "Milestone Every N Tasks",
+		description = "The milestone master is used when the NEXT task number is a multiple of this. 10 = every 10th task; 50 = only every 50th.",
+		section = slayerTasksSection,
+		position = 2
+	)
+	@Range(min = 10, max = 50)
+	default int slayerMilestoneEvery()
+	{
+		return 10;
+	}
+
+	@ConfigItem(
+		keyName = "slayerSkipTasks",
+		name = "Always Skip Tasks",
+		description = "Comma-separated task names (as the game names them, e.g. 'Abyssal demons') to cancel for 30 points whenever assigned.",
+		section = slayerTasksSection,
+		position = 3
+	)
+	default String slayerSkipTasks()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+		keyName = "slayerMaxSkips",
+		name = "Max Skips Per Slot",
+		description = "Consecutive 30-point cancels allowed for one task slot before the routine stops and asks a human.",
+		section = slayerTasksSection,
+		position = 4
+	)
+	@Range(min = 0, max = 10)
+	default int slayerMaxSkips()
+	{
+		return 3;
+	}
+
+	@ConfigItem(
+		keyName = "slayerPointsReserve",
+		name = "Points Reserve",
+		description = "Never skip a task if it would leave fewer than this many slayer points.",
+		section = slayerTasksSection,
+		position = 5
+	)
+	@Range(min = 0, max = 5000)
+	default int slayerPointsReserve()
+	{
+		return 60;
 	}
 
 	// ============================================================

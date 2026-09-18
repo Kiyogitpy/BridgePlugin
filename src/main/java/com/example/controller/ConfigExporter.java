@@ -105,6 +105,17 @@ public final class ConfigExporter
 		bracelets.put("reequip", config.slayerBraceletReequip());
 		data.put("bracelets", bracelets);
 
+		// The Slayer (tasks) routine's own settings (spec §10). Enum NAMES on the wire, like
+		// prayer.defensivePrayer above.
+		Map<String, Object> tasks = new LinkedHashMap<>();
+		tasks.put("fillerMaster", config.slayerFillerMaster().name());
+		tasks.put("milestoneMaster", config.slayerMilestoneMaster().name());
+		tasks.put("milestoneEvery", config.slayerMilestoneEvery());
+		tasks.put("skipTasks", parseList(config.slayerSkipTasks()));
+		tasks.put("maxSkips", config.slayerMaxSkips());
+		tasks.put("pointsReserve", config.slayerPointsReserve());
+		data.put("tasks", tasks);
+
 		data.put("poh", sharedPoh(config));
 		data.put("taskLocations", resolveTaskLocations(config));
 
