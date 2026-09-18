@@ -43,6 +43,16 @@ Rules for using it:
    **ice coolers**, skeletons (Digsite Dungeon) need a **rope**. Banshees need earmuffs or a
    slayer helmet (wiki; the plugin's note is empty there).
 
+**The Ectophial is a standing carried item** (USER 2026-09-19: "for a few Aya tasks we would
+want the teleport item" -- the Ectophial). It serves the three Alice's Farm tasks (zombies,
+birds, cows). Facts for the catalog: item ids **4251** (full) / **4252** (empty), both valid
+(`vendor/teleportation_items.tsv:330`); landing **3660,3522,0** beside the Ectofuntus; the
+click option is **"Empty"** (from the plugin -- the TSV row's option column is blank, so the
+route entry must name it); it has **no charges** and refills itself on arrival, so it is never
+counted by §7.9's charge parser and never needs replacing. It goes on the routine's
+never-deposit list alongside the slayer ring. From the landing the farm is ~30 tiles west on
+the same plane (kill area x=3608,y=3521,w=30,h=14), a plain `walk` leg.
+
 User overrides of the plugin's picks:
 
 | Task | Plugin spot | User decision |
