@@ -544,6 +544,98 @@ def test_choose_altar_balances_past_the_gap():
     assert gotr.choose_altar(st, 99, blocked=("DEATH",)) == "AIR"
 
 
+# --- the career point carry (2026-09-19) -----------------------------------
+# Reward points are two pools and a Rewards Guardian search costs ONE OF EACH (wiki
+# "Rewards"), so the quantity to balance is the banked tally, not this game's energy --
+# which resets to 0/0 every game. Ground truth for the shape: DatBear's GOTR Helper
+# balances on `banked + current/100`.
+
+def test_effective_energies_without_a_banked_tally_is_the_old_behaviour():
+    st = make_state(elementalEnergy=40, catalyticEnergy=90)
+    assert gotr.effective_energies(st, None) == (40, 90)
+    assert gotr.effective_energies(st, ()) == (40, 90)
+
+
+def test_effective_energies_carries_the_banked_difference_at_100_per_point():
+    st = make_state(elementalEnergy=40, catalyticEnergy=90)
+    # Banked elemental lead of 2 points = 200 energy, applied to the elemental side.
+    assert gotr.effective_energies(st, (7, 5)) == (240, 90)
+    # Banked catalytic lead of 2 points goes on the catalytic side, both stay >= 0.
+    assert gotr.effective_energies(st, (5, 7)) == (40, 290)
+    # A balanced tally changes nothing.
+    assert gotr.effective_energies(st, (5, 5)) == (40, 90)
+
+
+def test_effective_energies_clamps_the_carry():
+    # The clamp bounds a bad parse; it cannot change a decision, because every consumer
+    # is a sign/threshold test on the difference.
+    st = make_state(elementalEnergy=0, catalyticEnergy=0)
+    assert gotr.effective_energies(st, (900, 0)) == (gotr.CARRY_MAX_ENERGY, 0)
+    assert gotr.effective_energies(st, (0, 900)) == (0, gotr.CARRY_MAX_ENERGY)
+
+
+def test_choose_altar_balances_against_the_banked_tally():
+    # The exact case tonight's logs show going wrong: this game is dead level, so the
+    # old rule takes the higher tier (DEATH, catalytic) every time -- and because the
+    # tier table is lopsided (elemental tops out at FIRE 14, seven catalytic altars sit
+    # above it) that is what drifts the hoard catalytic, game after game.
+    st = make_state(elementalAltar="AIR", catalyticAltar="DEATH",
+                    elementalEnergy=0, catalyticEnergy=0)
+    assert gotr.choose_altar(st, 99) == "DEATH"
+    # With a banked catalytic lead the lagging elemental altar wins instead.
+    assert gotr.choose_altar(st, 99, banked=(50, 56)) == "AIR"
+    # A banked ELEMENTAL lead sends it back to the catalytic altar -- which here is also
+    # the higher tier, so this only proves the carry does not fight the tier rule.
+    assert gotr.choose_altar(st, 99, banked=(56, 50)) == "DEATH"
+    # A balanced tally reproduces the tier rule exactly.
+    assert gotr.choose_altar(st, 99, banked=(50, 50)) == "DEATH"
+    # The carry does not override the level/quest gates.
+    assert gotr.choose_altar(st, 99, banked=(50, 56), blocked=("AIR",)) == "DEATH"
+
+
+def test_choose_altar_carry_and_this_games_energy_combine():
+    # A banked deficit is repaid across the game, not in one trip: once this game has
+    # already put 200 energy into the lagging type, the carry is settled and the tier
+    # rule resumes.
+    st = make_state(elementalAltar="AIR", catalyticAltar="DEATH",
+                    elementalEnergy=0, catalyticEnergy=0)
+    assert gotr.choose_altar(st, 99, banked=(50, 52)) == "AIR"
+    st.update(elementalEnergy=200)
+    assert gotr.choose_altar(st, 99, banked=(50, 52)) == "DEATH"
+
+
+def test_choose_guardian_pile_follows_the_banked_tally():
+    # A rift guardian is the single largest one-sided payout (2x+1 = 6/15/27/45), so it
+    # steers on the same tally.
+    st = make_state(elementalEnergy=0, catalyticEnergy=0)
+    assert gotr.choose_guardian_pile(st, (50, 56)) == gotr.ESSENCE_PILE_ELEMENTAL_ID
+    assert gotr.choose_guardian_pile(st, (56, 50)) == gotr.ESSENCE_PILE_CATALYTIC_ID
+    # Unknown tally keeps the per-game rule.
+    st.update(elementalEnergy=90, catalyticEnergy=10)
+    assert gotr.choose_guardian_pile(st) == gotr.ESSENCE_PILE_CATALYTIC_ID
+    # ...and a banked elemental deficit outweighs a small in-game elemental lead.
+    assert gotr.choose_guardian_pile(st, (50, 52)) == gotr.ESSENCE_PILE_ELEMENTAL_ID
+
+
+def test_parse_reward_summary_reads_the_end_of_game_message():
+    # Regex shape copied from DatBear's REWARD_POINT_PATTERN, with the colour markup
+    # made optional so a tag-stripped CHAT_MESSAGE payload parses too.
+    marked = ("You have earned 4 elemental energy and 3 catalytic energy. "
+              "Total elemental energy: <col=ff0000>1,234</col>, "
+              "Total catalytic energy: <col=ff0000>1,200</col>.")
+    assert gotr.parse_reward_summary(marked) == (1234, 1200)
+    stripped = ("Total elemental energy: 57, Total catalytic energy: 66.")
+    assert gotr.parse_reward_summary(stripped) == (57, 66)
+
+
+def test_parse_reward_summary_ignores_everything_else():
+    assert gotr.parse_reward_summary("") is None
+    assert gotr.parse_reward_summary(None) is None
+    assert gotr.parse_reward_summary("The rift will become active in 30 seconds.") is None
+    # A half-message (only one of the two totals) must not half-latch.
+    assert gotr.parse_reward_summary("Total elemental energy: 57.") is None
+
+
 def test_direct_walk_escalates_to_minimap_when_the_player_does_not_move(monkeypatch):
     # Run 46: the chatbox scrollbar swallowed the same walk click 30 times in a row.
     import controller

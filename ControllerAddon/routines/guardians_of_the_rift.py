@@ -192,13 +192,137 @@ ALTAR_TRIP_MAX_POWER = 96   # no new altar trip this close to 100%: run 45's tri
                             # came back to a finished round with 40 stones and a cell
 
 
-def choose_altar(st, rc_level, blocked=()):
+# ---------------------------------------------------------------------------
+# The career point balance ("the carry") -- added 2026-09-19
+# ---------------------------------------------------------------------------
+# THE MECHANIC (wiki "Rewards", osrs-wiki-data-master/raw/G/Guardians of the Rift.txt
+# line 323, corroborated by raw/R/Rewards Guardian.txt line 18): reward points are TWO
+# SEPARATE POOLS. At the end of a game you gain one ELEMENTAL point per 100 elemental
+# energy and one CATALYTIC point per 100 catalytic energy (the fractional part is that
+# percentage chance of rounding up, so the expectation is exactly energy/100), and
+# searching the Rewards Guardian costs **one of EACH**. The searches a hoard is worth is
+# therefore min(elemental_points, catalytic_points): every point of the LEADING type
+# beyond the lagging one is dead weight, permanently. Balance is the whole value here,
+# and the wiki's own Strategies page agrees -- "when none of these are active, craft at
+# whichever type you have the fewest points for" (raw/G/Guardians of the Rift_Strategies
+# .txt line 168).
+#
+# WHY THE PER-GAME READING IS NOT ENOUGH. The reader's elementalEnergy/catalyticEnergy
+# are GOTR_ELEMENTAL_EARNED_THIS_GAME / GOTR_CATALYTIC_EARNED_THIS_GAME (see
+# GuardiansOfTheRift.java) -- they RESET to 0/0 every game. Balancing on those balances
+# each game in isolation, which is NOT balancing the hoard: whatever residual a game
+# ends on is banked forever, and the next game restarts the arithmetic from 0/0 with no
+# memory of it, so residuals accumulate and are never repaid. MEASURED over tonight's
+# first live session (32 games mined out of ControllerAddon/logs/gotr_run_20260918_*.log
+# by their `[gotr] ... energy=A/B` lines): per-game diff mean -21.2, stdev 61.2, 20/32
+# games catalytic-heavy, accumulating to elemental 5261 / catalytic 5938 = -677 energy
+# = 6.8 reward points that can never be spent, out of 52.6 usable. Both terms are real
+# -- an unbiased random walk of that stdev over 32 games would still have stranded ~3.5
+# points on its own, and the -21.2/game bias is the sawtooth below.
+#
+# WHERE THE BIAS COMES FROM (code reasoning, corroborated by the same logs). Below
+# ENERGY_BALANCE_GAP the ladder is pure tier priority, and the tier table is lopsided:
+# the four elemental altars top out at FIRE 14 while seven of the eight catalytic ones
+# sit above it, so "higher tier" means catalytic in 29 of the 32 possible pairs. From a
+# balanced 0 the trip therefore always departs CATALYTIC, runs the gap negative, and the
+# gap rule hauls it back to ~0 -- an oscillation between 0 and -(one trip) whose time
+# average is strictly negative, never positive. The logs show the corrective working
+# hard (79 altar trips: 42 elemental / 37 catalytic, and on the 64 trips where catalytic
+# was the higher tier it still went elemental 32 times) and the outcome still
+# catalytic-heavy, which is the signature of a biased oscillation rather than a broken
+# rule. Note the tier preference buys RUNECRAFT XP, not points -- Strategies line 11:
+# "Points and experience are based on the amount of essence crafted - not the tier of
+# the altar" -- so nothing about points is lost by correcting the drift.
+#
+# THE FIX, and its ground truth. DatBear's Guardians of the Rift Helper (the canonical
+# Plugin Hub GOTR plugin, github.com/DatBear/Guardians-of-the-Rift-Helper) balances on
+#     potentialPoints(saved, current) = saved + current / 100
+#     potE > potC -> NEED_CATALYTIC ; potC > potE -> NEED_ELEMENTAL ; else BALANCED
+# i.e. on BANKED points PLUS this game's energy -- the CAREER tally, not the game's. Its
+# config calls that "Highlights the guardian needed to keep points balanced or highest
+# tier", which is this routine's own stated strategy. Copying the mechanic rather than
+# reconstructing it (CLAUDE.md's rule for a fact a plugin already knows): carry the
+# banked tally into both one-sided decisions -- choose_altar (stones pay 2 energy of the
+# altar's own type) and choose_guardian_pile (a rift guardian pays 2x+1 energy of its
+# own type only, 6/15/27/45). Those are the only two one-sided energy sources; cells on
+# barriers and the 12-fragment repair pay both types equally (wiki "Gaining energy").
+# We compare in ENERGY units (banked * 100 + this game's energy) rather than DatBear's
+# integer points so the signal is not blind to the first 99 energy of a game.
+#
+# The banked tally is NOT in a varbit -- DatBear gets it only by parsing the game's own
+# text, and so do we (parse_reward_summary below). Until the first end-of-game message
+# is seen, `banked` is None and every decision below behaves EXACTLY as it did before
+# this change, so this can only be a no-op or an improvement.
+
+CARRY_MAX_ENERGY = 300      # clamp on how far the banked tally may pull one decision.
+                            # Every consumer is a sign/threshold test on the DIFFERENCE,
+                            # so this changes no decision a correct parse would make --
+                            # it exists solely to bound the blast radius of a bad parse
+                            # (see parse_reward_summary's note on the points/energy
+                            # wording, the one unverified piece here).
+
+BANKED_POINTS_KEY = "gotr_banked_points"   # ctx.state.data: (elemental, catalytic)
+
+
+def effective_energies(st, banked=None):
+    """(elemental, catalytic) in ENERGY units for the balance decisions: this game's
+    energy plus the banked point tally converted at 100 energy per point (the rate the
+    game itself awards at). `banked` is (elemental_points, catalytic_points) or None;
+    None returns this game's energy untouched, which is the pre-2026-09-19 behaviour and
+    is what runs until the first end-of-game reward message is parsed.
+
+    The whole carry is applied to ONE side so both values stay non-negative and only the
+    DIFFERENCE moves -- every consumer is a sign or threshold test on that difference."""
+    e = st.get("elementalEnergy", 0) or 0
+    c = st.get("catalyticEnergy", 0) or 0
+    if not banked:
+        return e, c
+    carry = (banked[0] - banked[1]) * 100
+    carry = max(-CARRY_MAX_ENERGY, min(CARRY_MAX_ENERGY, carry))
+    return (e + carry, c) if carry >= 0 else (e, c - carry)
+
+
+# Regex shape copied from DatBear's REWARD_POINT_PATTERN -- its `[^>]+>` skips the
+# message's colour markup -- with the markup made OPTIONAL, because our CHAT_MESSAGE
+# payload may already have had tags stripped before it reaches us.
+_REWARD_SUMMARY_RE = re.compile(
+    r"Total elemental energy:(?:[^>]*>)?\s*([\d,]+)"
+    r".*?Total catalytic energy:(?:[^>]*>)?\s*([\d,]+)", re.S)
+
+
+def parse_reward_summary(msg):
+    """(elemental_points, catalytic_points) from the game's end-of-game reward message,
+    or None when this is not that message.
+
+    THE ONE UNVERIFIED PIECE HERE is the wording: the game says "Total elemental
+    energy", but DatBear parses this very message straight into its BANKED POINT fields
+    and then adds `current / 100` to them, so a point count is the reading -- the same
+    reading the Rewards Guardian's own Check dialogue supports ("You have N catalytic
+    energy and N elemental energy", parsed into the same fields). It has not been
+    confirmed against our client's CHAT_MESSAGE payload, so every parse is logged and
+    CARRY_MAX_ENERGY bounds what a units mistake could do."""
+    if not msg:
+        return None
+    m = _REWARD_SUMMARY_RE.search(msg)
+    if not m:
+        return None
+    try:
+        return (int(m.group(1).replace(",", "")), int(m.group(2).replace(",", "")))
+    except ValueError:
+        return None
+
+
+def choose_altar(st, rc_level, blocked=(), banked=None):
     """Which ACTIVE altar to visit: the HIGHER-TIER usable one -- more xp per essence
     (USER 2026-09-01: "prefer altars that give more experience") -- UNLESS one energy
     type leads by ENERGY_BALANCE_GAP or more, in which case the lagging type's altar
     wins when it is usable (USER 2026-09-02). Below the gap, balance is only the
     tiebreak. Level/quest gates unchanged. rc_level None means "cannot read the
-    level" and gates nothing. None = neither active altar is usable right now."""
+    level" and gates nothing. None = neither active altar is usable right now.
+
+    `banked` (elemental_points, catalytic_points) carries the CAREER point tally into
+    the lead/lag question -- see the carry block above for why this game's energy alone
+    is the wrong quantity. None keeps the pre-2026-09-19 per-game-only behaviour."""
     def usable(name):
         if not name or name == "UNKNOWN" or name in blocked:
             return False
@@ -209,8 +333,7 @@ def choose_altar(st, rc_level, blocked=()):
 
     elemental = st.get("elementalAltar") or "UNKNOWN"
     catalytic = st.get("catalyticAltar") or "UNKNOWN"
-    e_energy = st.get("elementalEnergy", 0)
-    c_energy = st.get("catalyticEnergy", 0)
+    e_energy, c_energy = effective_energies(st, banked)
     prefer_elemental = e_energy <= c_energy
     candidates = [n for n in (elemental, catalytic) if usable(n)]
     if not candidates:
@@ -1645,10 +1768,14 @@ def spend_stones_phase(ctx, st):
         controller.human_delay(0.5, 0.9)
 
 
-def choose_guardian_pile(st):
+def choose_guardian_pile(st, banked=None):
     """Which essence pile to assemble at: the one whose energy type LAGS (a guardian pays
-    energy in its own type only), elemental on a tie."""
-    if st.get("elementalEnergy", 0) <= st.get("catalyticEnergy", 0):
+    energy in its own type only -- 2x+1, so 6/15/27/45, the single largest one-sided
+    payout in the game), elemental on a tie. `banked` carries the CAREER point tally, so
+    a guardian repays the hoard's deficit and not just this game's; None keeps the
+    pre-2026-09-19 per-game-only behaviour. See the carry block above."""
+    e, c = effective_energies(st, banked)
+    if e <= c:
         return ESSENCE_PILE_ELEMENTAL_ID
     return ESSENCE_PILE_CATALYTIC_ID
 
@@ -1659,7 +1786,7 @@ def create_guardian_phase(ctx, st):
     data = ctx.state.data
     if _committed(data, "gotr_guardian_clicks_commit"):
         return    # a verified Assemble is walking us there -- nothing to look up yet
-    pile_id = choose_guardian_pile(st)
+    pile_id = choose_guardian_pile(st, data.get(BANKED_POINTS_KEY))
     pile = (_find_object_by_id(pile_id)
             or _find_object_by_name("essence pile (elemental)" if pile_id == ESSENCE_PILE_ELEMENTAL_ID
                                     else "essence pile (catalytic)", exact=True))
@@ -1755,7 +1882,7 @@ def altar_trip_phase(ctx, st):
     cfg = ctx.state.config
     blocked = (tuple(cfg.get("blocked_altars") or ())
                + tuple(data.get("gotr_blocked_altars") or ()))
-    altar = choose_altar(st, _rc_level(), blocked)
+    altar = choose_altar(st, _rc_level(), blocked, data.get(BANKED_POINTS_KEY))
     if altar is None:
         if ((st.get("elementalAltar") or "UNKNOWN") == "UNKNOWN"
                 and (st.get("catalyticAltar") or "UNKNOWN") == "UNKNOWN"):
@@ -2197,6 +2324,7 @@ def _log_state(data, st, state, action):
         f"rot={st.get('altarRotationSecondsRemaining')} "
         f"altars={st.get('elementalAltar')}/{st.get('catalyticAltar')} "
         f"energy={st.get('elementalEnergy')}/{st.get('catalyticEnergy')} "
+        f"banked={'/'.join(map(str, data[BANKED_POINTS_KEY])) if data.get(BANKED_POINTS_KEY) else '?'} "
         f"portal={'open' if st.get('guardianEssencePortalOpen') else 'shut'}/"
         f"{st.get('guardianEssencePortalSecondsRemaining')} "
         f"frags={inv.get('guardianFragments')} ess={inv.get('guardianEssence')} "
@@ -2394,7 +2522,9 @@ _RIFT_STARTS_RE = re.compile(r"rift will become active in (\d+) (second|minute)"
 def on_event(ctx, event_type, payload):
     """Stamp the round-start countdown off the game's own chat (the DatBear helper
     plugin's method -- 'The rift will become active in 30 seconds.' etc.); the prep
-    schedule keys the bench run off it."""
+    schedule keys the bench run off it. Also latch the BANKED reward-point tally out of
+    the end-of-game reward message -- the only place it is readable (it is in no varbit;
+    DatBear reads it the same way) and what the altar/pile balancing steers on."""
     if event_type != "CHAT_MESSAGE":
         return
     msg = ((payload or {}).get("message") or (payload or {}).get("text") or "")
@@ -2402,6 +2532,16 @@ def on_event(ctx, event_type, payload):
     if m:
         n = int(m.group(1)) * (60 if m.group(2) == "minute" else 1)
         ctx.state.data["gotr_round_starts_at"] = time.time() + n
+    banked = parse_reward_summary(msg)
+    if banked:
+        # ctx.state.data is wiped on restart, so this re-latches every game end rather
+        # than being persisted -- one game's worth of staleness is the whole exposure.
+        previous = ctx.state.data.get(BANKED_POINTS_KEY)
+        ctx.state.data[BANKED_POINTS_KEY] = banked
+        if banked != previous:
+            debug_log.log("gotr", f"banked reward points elemental={banked[0]} "
+                                  f"catalytic={banked[1]} ({banked[0] - banked[1]:+d}) "
+                                  f"-- balancing against the career tally")
 
 
 def _leave_side_area(ctx):
