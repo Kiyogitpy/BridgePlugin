@@ -49,6 +49,7 @@ public class PlayerProvider extends BridgeProvider
 	{
 		server.register("/player", () -> onClient(this::getPlayer));
 		server.registerQuery("/varbit", query -> onClient(() -> getVarbit(query)));
+		server.registerQuery("/varp", query -> onClient(() -> getVarp(query)));
 	}
 
 	// ADDED 2026-08-22 (user directive, Blast Furnace live session): generic passthrough to
@@ -60,6 +61,20 @@ public class PlayerProvider extends BridgeProvider
 	// dispenser collection actually happened instead of trusting a blind click+Space.
 	private Object getVarbit(Map<String, String> query)
 	{
+		return readVar(query, client::getVarbitValue);
+	}
+
+	// ADDED 2026-09-18 (slayer task loop, spec §10): the varp twin of /varbit. Slayer task state
+	// is varps (394 kills remaining, 395 task id, 4258 original amount, 2096 Konar area) and
+	// nothing exposed a varp generically before this. Same shape and same "null = unreadable"
+	// rule as /varbit.
+	private Object getVarp(Map<String, String> query)
+	{
+		return readVar(query, client::getVarpValue);
+	}
+
+	private static Object readVar(Map<String, String> query, java.util.function.IntFunction<Integer> read)
+	{
 		Map<String, Object> result = new HashMap<>();
 		String idStr = query.get("id");
 		if (idStr == null || idStr.isEmpty())
@@ -69,7 +84,7 @@ public class PlayerProvider extends BridgeProvider
 		}
 		try
 		{
-			result.put("value", client.getVarbitValue(Integer.parseInt(idStr)));
+			result.put("value", read.apply(Integer.parseInt(idStr)));
 		}
 		catch (NumberFormatException e)
 		{

@@ -2323,3 +2323,19 @@ def test_a_simulated_miss_keeps_its_flight_even_from_on_top_of_the_target(monkey
     entity = {"name": "Goblin", "id": 1, "screenX": 100, "screenY": 100}
     controller.click_entity(None, entity, offset=(0, 0), check_ui_blockers=False)
     assert len(moves) == 1, "the miss is the motion"
+
+
+def test_get_varp_reads_the_varp_endpoint_and_returns_none_when_unreadable(monkeypatch):
+    """/varp is the varp twin of /varbit (PlayerProvider). None means 'cannot verify', which
+    callers must not collapse into zero -- varp 394 == 0 is 'no slayer task'."""
+    calls = []
+
+    def api_get(path, params=None, timeout=0.3):
+        calls.append((path, params))
+        return {"value": 27}
+    monkeypatch.setattr(controller, "api_get", api_get)
+    assert controller.get_varp(394) == 27
+    assert calls == [("/varp", {"id": 394})]
+
+    monkeypatch.setattr(controller, "api_get", lambda *a, **k: None)
+    assert controller.get_varp(394) is None

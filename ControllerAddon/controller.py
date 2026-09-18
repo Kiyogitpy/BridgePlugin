@@ -292,6 +292,15 @@ def get_varbit(varbit_id: int):
     return resp.get("value")
 
 
+def get_varp(varp_id: int):
+    """Raw client.getVarpValue(varp_id) passthrough (PlayerProvider's /varp) -- the varp twin
+    of get_varbit, added 2026-09-18 for slayer task state (varp 394 kills remaining, 395 task
+    id). Returns None if the value couldn't be read; callers treat that as "can't verify",
+    never as zero (0 is a real answer here: it means no task)."""
+    resp = api_get("/varp", params={"id": varp_id}) or {}
+    return resp.get("value")
+
+
 def get_trawling():
     """GET /trawling (TrawlingProvider.java, added 2026-09-06): the deep-sea-trawling item
     containers and varbits. netFish is None (not 0) when the container does not exist, i.e. the
