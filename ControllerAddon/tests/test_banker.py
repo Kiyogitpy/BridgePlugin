@@ -269,6 +269,89 @@ def test_bank_ui_buttons_never_simulate_a_misclick(monkeypatch):
     assert seen == [False, False, False]
 
 
+# --- The typing is VERIFIED, not assumed (2026-09-16) -------------------------------------------
+#
+# USER, watching the screen: "Second time i see it not writing anything when searching" / "the type
+# never worked fur never came up in the searchbar" / "Yes it did open". So the icon click lands and
+# the box opens; the KEYSTROKES go missing. Root cause that time was the Arduino's KEYBOARD HID
+# interface being dead while its mouse and serial stayed healthy -- a host-level probe (KD SHIFT ->
+# GetAsyncKeyState) never saw the key, though serial answered "HB 3" throughout. But the mechanism
+# does not matter to this code: an unfiltered bank means the search did not happen, and returning
+# True there is what let the failure masquerade as "bank has none of the usable fur types" and buy
+# a 13-minute hunting trip. Note the older gf_live30 note above is the same symptom by another
+# route, which is why this checks the EFFECT rather than any one cause.
+
+def _searchable_bank(monkeypatch, counts):
+    """`counts` is the item count /bank reports on each successive read."""
+    seq = list(counts)
+    reads = {"n": 0}
+
+    def get_bank(fresh=False, **kw):
+        i = min(reads["n"], len(seq) - 1)
+        reads["n"] += 1
+        return {"open": True, "searchButton": {"screenX": 100, "screenY": 200},
+                "items": [{"name": f"item{j}"} for j in range(seq[i])]}
+    monkeypatch.setattr(controller, "get_bank", get_bank)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **k: True)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    typed = []
+    monkeypatch.setattr(controller, "type_text", lambda ser, text: typed.append(text))
+    return typed
+
+
+class _SCtx:
+    ser = None
+
+
+def test_a_search_that_filters_the_bank_is_accepted_first_time(monkeypatch):
+    typed = _searchable_bank(monkeypatch, [948, 5])
+    assert banker.search_bank(_SCtx(), "fur") is True
+    assert typed == ["fur"], "no retype needed when the query obviously landed"
+
+
+def test_a_bank_that_does_not_react_is_retyped_then_reported(monkeypatch):
+    """MEASURED live: 948 items before and after, three times over."""
+    typed = _searchable_bank(monkeypatch, [948, 948, 948, 948])
+    assert banker.search_bank(_SCtx(), "fur") is False
+    assert len(typed) == banker.SEARCH_TYPE_TRIES
+    assert typed == ["fur"] * banker.SEARCH_TYPE_TRIES
+
+
+def test_a_retype_that_finally_lands_succeeds(monkeypatch):
+    typed = _searchable_bank(monkeypatch, [948, 948, 5])
+    assert banker.search_bank(_SCtx(), "fur") is True
+    assert len(typed) == 2, "stops retyping the moment the bank reacts"
+
+
+def test_the_check_is_that_the_count_CHANGED_not_that_it_shrank(monkeypatch):
+    """A caller can search again while an earlier filter is still active (_withdraw_kit does,
+    item after item), and the new query can match MORE than the old one. An empty box is the case
+    this has to catch, and that leaves the count exactly where it was."""
+    typed = _searchable_bank(monkeypatch, [1, 5])
+    assert banker.search_bank(_SCtx(), "fur") is True
+    assert typed == ["fur"]
+
+
+def test_the_post_type_read_bypasses_the_tick_cache(monkeypatch):
+    """/bank is a bulk endpoint behind TickCache while the box filters LIVE, so a cached read
+    would answer with the pre-search list and fail every check."""
+    fresh_flags = []
+
+    def get_bank(fresh=False, **kw):
+        fresh_flags.append(fresh)
+        n = 948 if len(fresh_flags) == 1 else 5
+        return {"open": True, "searchButton": {"screenX": 100, "screenY": 200},
+                "items": [{"name": f"item{j}"} for j in range(n)]}
+    monkeypatch.setattr(controller, "get_bank", get_bank)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **k: True)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "type_text", lambda ser, text: None)
+
+    banker.search_bank(_SCtx(), "fur")
+
+    assert fresh_flags[1:] and all(fresh_flags[1:]), "every verification read must be fresh"
+
+
 
 # MEASURED live 2026-09-05 at the Grand Exchange: two booth ids share the name "Grand Exchange
 # booth"; 10061 offers Exchange/Collect (the clerk), 10060 offers Bank/Collect. Name-only

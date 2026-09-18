@@ -63,6 +63,16 @@ DEOB_DIR = DECOMPILED / "deob"
 STATE_PATH = DECOMPILED / "deob-state.json"
 JDKS_DIR = Path.home() / ".jdks"
 ADOPTIUM_17 = "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jdk/hotspot/normal/eclipse"
+# rl-suite normalises the jar; something else has to turn it into source. See ensure_vineflower.
+VINEFLOWER_VERSION = "1.12.0"
+VINEFLOWER_JAR = DECOMPILED / "tools" / f"vineflower-{VINEFLOWER_VERSION}.jar"
+VINEFLOWER_URL = ("https://repo1.maven.org/maven2/org/vineflower/vineflower/"
+                  f"{VINEFLOWER_VERSION}/vineflower-{VINEFLOWER_VERSION}.jar")
+DECOMPILE_HEAP = "4g"      # 722 classes; the default heap is not enough
+# urllib's default User-Agent is "Python-urllib/3.x", which BOTH of these hosts reject with a
+# bare 403 -- MEASURED live 2026-09-15, the Adoptium download died on it after the tool had
+# already decided it needed a JDK. Any ordinary UA is accepted.
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; bridgeplugin-deobfuscate/1.0)"}
 # Honours BRIDGE_API_BASE the way ControllerAddon/settings.py does (2026-09-08), so a HOST
 # run can ask the VM guest's client which jar it loaded -- the guest's bridge reaches the
 # host only through the 18080 NAT forward, and hardcoding 8080 made --status report
@@ -222,12 +232,18 @@ def find_jdk() -> Optional[Path]:
     return best
 
 
+def fetch(url: str, dest: Path, timeout: int = 600) -> None:
+    """Download `url` to `dest`, with a User-Agent. See HTTP_HEADERS for why that is required."""
+    req = urllib.request.Request(url, headers=HTTP_HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as out:
+        shutil.copyfileobj(resp, out)
+
+
 def download_jdk() -> Path:
     JDKS_DIR.mkdir(parents=True, exist_ok=True)
     zip_path = JDKS_DIR / "temurin17.zip"
     log(f"no JDK {MIN_JAVA}+ found -- downloading Temurin 17 to {JDKS_DIR}")
-    with urllib.request.urlopen(ADOPTIUM_17, timeout=60) as resp, open(zip_path, "wb") as out:
-        shutil.copyfileobj(resp, out)
+    fetch(ADOPTIUM_17, zip_path)
     before = {p.name for p in JDKS_DIR.iterdir()}
     with zipfile.ZipFile(zip_path) as z:
         z.extractall(JDKS_DIR)
@@ -327,8 +343,38 @@ def transform(java: Path, tool: Path, jar: Path, deob_jar: Path, audit: Path, pr
     raise SystemExit("transform did not converge")
 
 
+def ensure_vineflower() -> Path:
+    """The decompiler, downloaded on first use.
+
+    CORRECTED 2026-09-15: this file used to call ``rl-suite --decompile``, and step 5 of the
+    docstring above called Vineflower "bundled". It is not, and that option does not exist --
+    rl-suite 1.3.1's own usage text lists only ``--input/--output/--report/--expected-*/
+    --packet-profile``, and its README is explicit that it "turns a RuneLite injected-client JAR
+    into a readable copy **you can decompile**". The transform and the decompile are two tools.
+    MEASURED live against Tonic-Box/rl-suite 1.3.1: the transform succeeded and the very next
+    line died with ``Unknown option: --decompile``."""
+    VINEFLOWER_JAR.parent.mkdir(parents=True, exist_ok=True)
+    if VINEFLOWER_JAR.is_file():
+        return VINEFLOWER_JAR
+    log(f"downloading Vineflower {VINEFLOWER_VERSION} to {VINEFLOWER_JAR}")
+    fetch(VINEFLOWER_URL, VINEFLOWER_JAR)
+    return VINEFLOWER_JAR
+
+
 def decompile(java: Path, tool: Path, deob_jar: Path, sources: Path) -> None:
-    r = run([java, "-jar", tool, "--decompile", "--input", deob_jar, "--source-output", sources])
+    """Decompile the normalised jar into ``sources`` as loose .java files.
+
+    ``--folder`` is load-bearing: without it Vineflower infers the output shape from the
+    destination's name and writes a JAR of sources for a jar input, while
+    ``telemetry_fingerprint.extract`` globs ``sources/*.java`` NON-recursively. The injected
+    client's classes are all in the default package (MEASURED: 722 top-level .class entries, no
+    subdirectories), so a folder write lands them exactly where that glob looks.
+
+    ``tool`` is unused now and kept only so the call site's signature does not churn."""
+    sources.mkdir(parents=True, exist_ok=True)
+    vineflower = ensure_vineflower()
+    r = run([java, f"-Xmx{DECOMPILE_HEAP}", "-jar", vineflower, "--silent", "--folder",
+             deob_jar, sources])
     if r.returncode != 0:
         sys.stderr.write((r.stdout + r.stderr)[-6000:])
         raise SystemExit("decompile failed")

@@ -915,6 +915,58 @@ Four things were MEASURED, and the first is not about this routine at all:
   (item 4), the claim-and-pass branch (item 6), and any non-yew wood (item 7). Item 3 (the log
   balances) is now a designed crossing rather than an open question, unverified live.
 
+### Pre-fletched decorations out of the bank (2026-09-16, NOT RUN LIVE)
+
+USER: *"for vale totems i have about 1800 maple shortbows stocked up in the bank how do we code
+it so we use them in each lap together with maple logs"*, and on the shape of it: *"its not a big
+change its a addition to the bank stage where we first fill up the log basket but not the
+inventory and fill inventory with bows. leaving 1-2 slots empty for logs"*.
+
+- **A SHORTBOW DECORATES.** Wiki (`Maple totem`): "The totem can then be decorated with 4 of any
+  Fletching product made of maple logs", and that page's Creation tabber lists **Maple shortbow
+  (u)** and **Maple shortbow** beside the two longbows as interchangeable materials for the same
+  40 offerings. The routine had only ever counted `<wood> longbow`/`longbow (u)`, so a bank full
+  of shortbows was invisible to `bow_count`, to the keep list and to `vt.next_action`.
+  `WOODS[wood]["decor"]` is now all four variants (`_decor_variants`), and `bow_count`,
+  `_keep_substrings` and `_foreign_bows` all read that list. The knife and the spool keep the
+  narrow `_bows_for` pair -- what we MAKE is still the longbow; what DECORATES is wider.
+- **The bank stage is the only behaviour change.** The basket only ever holds logs, so logs and
+  bows never compete for a slot: the log rounds stop one short (`rounds = BANK_ROUNDS - 1`, since
+  that last round exists only to fill the HANDS with logs) and every round that does run fills
+  the basket, then `_load_decorations` deposits the loose logs, withdraws `BANK_LOOSE_LOGS` (2)
+  back, and shift-withdraws the bows into every remaining slot. Leaving the booth: ~28 logs in
+  the basket, ~23 bows and 2 logs in hand.
+- **The order is the safety argument.** The deposit HAS to come first -- there is no free slot
+  for a bow until it does -- so a withdraw that then failed would leave the lap holding neither
+  logs nor bows. Hence the logs are pulled straight back on a failed withdraw and the trip ends
+  exactly as it used to, and the 2 loose logs come back BEFORE the bows so the next site's build
+  does not depend on the leg's first basket `Empty` having landed.
+- **The variant is chosen by EXACT name off the bank memory** (`_banked_decor_name`), asked once
+  per trip at the open bank after the junk deposit. `"Maple shortbow"` is a substring of `"Maple
+  shortbow (u)"`, so a substring count reports one stack under both names and withdraws whichever
+  sorted first -- the same trap `_step_wood_down_if_bank_is_out` already carries for "Abyssal
+  lantern (yew logs)". A memory that has never seen a bank falls back to the open interface;
+  fewer than `MIN_BANKED_BOWS` (8) banked means no withdraw and the old trip.
+- **The fletch is deliberately left ON.** The wiki's strategy page says the same thing: "When
+  using pre-fletched decorations, the player will still have to fletch logs from the log basket
+  if they want to do eight totems in a single run without banking." `vt.fletch_budget` needed no
+  change -- it counts the bows in hand and simply asks for fewer. TRACED against the constants:
+  the early legs fletch nothing (the loose count sits below the 8-log build reserve), and from
+  ~site 4 the bows have freed enough slots that the basket tops up to 11-19 loose logs and the
+  fletch covers the tail of the lap. A lap costs ~17 logs instead of ~40, and ~23 of the 32
+  decorations come out of the bank -- 1800 bows is ~78 laps, ~5-6 hours.
+- **What a live session has to check**: (1) the shift-withdraw on a 1800-stack of unstackables
+  really fills the free slots (it is the same click the log withdraw already relies on); (2) the
+  loose-log deposit is one shift-click and lands; (3) the lap really does finish all eight sites
+  -- watch the `N bows in hand` in each site-outcome line, and a site leaving with fewer than 4
+  decorations is the signal to raise `BANK_LOOSE_LOGS` or lower the bow count; (4) that the
+  Fletching XP drop is what the user wants (the early legs now walk with idle hands, since
+  neither the fletch budget nor the spool has anything to do while the hands are full of bows).
+- **Not done, deliberately**: the spool still strings only longbows, so banked *unstrung*
+  shortbows are spent as they are rather than strung mid-walk for the extra XP. That would need
+  the make-menu option for `<wood> shortbow` and a bow-string stock, and it is not part of the
+  bank stage.
+
 ## Current state of routines/granite_3t.py
 
 **REWRITTEN 2026-09-09 FROM USER'S OWN RECORDINGS, AND THE CYCLE IS SETTLED. Everything below
@@ -2012,8 +2064,366 @@ throw/retrieve/hire primitives await the falcon varbit 14192 and INVENTORY_CHANG
 are exported for golem_crafting's fur trip (see that section), and the teleport landing is
 confirmed on `/player.regionId` after PLAYER_STOPPED instead of a 3s sleep.
 
+**2026-09-14 (live): getting off the fairy ring, and onto the right side of the fence.** USER:
+"Also we are stuck on other side of ring"; "It's an enclosed area stile makes I able to jump
+through". Two defects on the same leg, both MEASURED against the real collision map:
+
+- **The ring tile is an island.** `worldmap.reachable_from(2319, 3619, 0)` returns exactly **1**
+  tile — the fairy ring drops the player ON the ring and the ring object's own blocking is baked
+  into the same bits a wall's is (CLAUDE.md: the static map cannot tell furniture from a wall). So
+  `travel.walk_to` could not route a single step and the trip simply sat there. The east, north
+  and south neighbours are all in the same **738-tile** component, which reaches the stile in 55
+  steps, so one step OFF the ring is the entire fix: `_step_off_isolated_tile` shift-clicks a
+  cardinal neighbour, because routing is exactly what is unavailable while standing on a tile the
+  map believes is sealed. `is_isolated` is the reusable predicate — expect this at any fairy ring.
+- **`y < TILE_STILE["y"]` was a bad proxy for "already across the stile".** True just after
+  climbing; FALSE at the ring, which lands at y 3619 (under 3621) but fifty tiles WEST of the
+  fence — so the trip walked straight at the hunt tile from the wrong side. MEASURED: the ring-side
+  component is 738 tiles, the hunting enclosure **389**, and they are disjoint; the stile's own
+  tile is in neither. `_leg_walk_home` now asks the map whether the hunt tile is ROUTABLE, which is
+  the real question and also subsumes the 2026-08-24 climb-back-and-forth bug the y-check existed
+  to fix (once across, the hunt tile is reachable, so the stile is never touched again).
+  `SOUTH_OF_STILE_Y` still serves `_bank_trip`'s own coarser decision.
+
+### The hunt is LEASHED to TILE_HUNT — why the falcon kept getting lost (2026-09-15, live)
+
+USER, mid-run: "We somehow lost our falcon, because we clicked a kebbit and didn't retrieve it. We
+have to quick falcon the guy again". The mechanism, MEASURED with a freeze-frame off `/npcs` and
+`/player` at the moment the run stopped — **the falcon logic was never at fault**:
+
+- The player was at **(2364, 3581), 24 tiles from `TILE_HUNT` and outside the pen**, standing among
+  **Wild kebbit / Copper longtail** (the net-trap ground west of falconry), with **Dark kebbits at
+  (2369, 3580) and (2367, 3587) that are also outside the pen**.
+- `_nearest_npc` measured from the **player**, not from the hunt tile, and this species lives on
+  both sides of the fence. Every throw and retrieve walks the player a few tiles toward its target,
+  so "nearest kebbit" **re-centres the search further out each action and the error compounds**.
+  Nothing pulled it back — there was no leash.
+
+Two endings, both observed within six minutes:
+
+1. Drift into region 9272 → `golem_crafting.trip_leg` called it `walk_in` and walked back over the
+   stile **mid-retrieve**, abandoning a falcon sitting on a kill. It is then never collected and is
+   lost — and **the glove STAYS in the weapon slot** (measured: glove worn, varbit 14192 == 0, no
+   Gyr Falcon anywhere in the scene), so `glove_worn()` still answered "we have a falcon" and the
+   routine threw into nothing until `_throw_falcon`'s 6-failure gate re-hired. **Cost: 45s of spin
+   + ~26s of empty throws + 500gp + the catch.**
+2. Drift into region 9271 → no leg matched → **the run safety-stopped.**
+
+The 45s spin is its own defect: `_retrieve_falcon`'s "catch waiting but the falcon is out of range"
+branch walks to `TILE_HUNT`, **which is a no-op when we already stand there** — 54 iterations,
+ended only by the falcon despawning.
+
+The fixes, all in `falconry.py` unless noted:
+
+- **`HUNT_LEASH_TILES` (14), anchored on `TILE_HUNT`, not on the player** — a leash that moves with
+  the player is not a leash. 14 is the pen: flooding the collision map from `TILE_HUNT` gives 389
+  tiles spanning x 2374–2393, y 3576–3604, at most 14 Chebyshev from `TILE_HUNT`; the out-of-pen
+  kebbits measured live sit at 19–24, so it separates them cleanly.
+- **The falcon is NOT leashed** and no longer bounded by `maxKebbitDistance` (a throw distance,
+  which it never was): `FALCON_SEARCH_TILES` (20, from the player), because a kebbit can run before
+  it dies and the catch is still worth collecting.
+- **`_walk_back_into_leash` runs AFTER the retrieve and BEFORE the throw** — retrieving outranks the
+  leash, since walking home first is precisely what abandoned the falcon.
+- **`FALCON_OUT_OF_RANGE_TRIES` (6)** bounds the no-op spin, then treats the bird as lost.
+- **`falconry.PISCATORIS_REGIONS`** names the whole 2×3 region block around the pen
+  ({9271, 9272, 9273, 9527, 9528, 9529}); `trip_leg` maps any of it to `walk_in` (or `return` when
+  done). Being in the neighbourhood is a WALK, never a stop. Note the two older comments in
+  `falconry.py` above `FALCONRY_REGIONS` are a record of this same bug being fixed at the SYMPTOM
+  level twice (widening the region constant, after a two-hour "stuck at falco" stop) — the leash is
+  the cause-level fix, and the region set is now defence in depth rather than the fix.
+
+**VERIFIED LIVE the same session**: restarted with the character still standing at (2364, 3581) —
+the position that had just safety-stopped the run. It logged `leg=walk_in region=9271`, walked back
+to `TILE_HUNT` in **10s**, resumed hunting and completed the trip (pouch full, teleport home, bank,
+re-equip, mine) with no drift, no lost falcon and no stop.
+
+### Bones are DEFERRED and burst-dropped (2026-09-15, VERIFIED LIVE)
+
+USER: "Seems the fur collecting is rather slow in golem crafting ... Like letting bones accumulate
+until 1 slot left and we drop them all". MEASURED first, off three live golem fur-trip logs from
+that morning (`logs/gc_live_0915_{004101,043927,121222}.log`), taking each hunt action's cost as the
+gap to the next one — do not re-derive:
+
+| action | n | mean cost | share of hunt time |
+|---|---|---|---|
+| throw | 110 | 4.03–4.63s | ~60% |
+| retrieve | 56 | 3.30s | ~20% |
+| **bone drop** | **57** | **2.60 / 2.69 / 3.26s** | **17–22%** |
+
+The longest hunt was 582s for 30 catches, of which **94.7s was bones**, one at a time. The drop
+COUNT is not reducible (one bone per catch, and the inventory is where they land) but its per-drop
+overhead is: one bone per `hunt_step` is one bone per ENGINE LOOP ITERATION, each paying an
+`/inventory` read, a tab raise, a 1.6s confirm wait, a `human_delay` and the hand-back — ~2.7s of
+wall clock for a single click. Every drop line in all three logs read `(1 held)`, which is the tell
+that nothing was ever accumulating.
+
+`falconry._drop_junk` now lets them pile up and sends the lot through **`controller.drop_items`** —
+the primitive `gathering`/`granite_3t`/`vale_totems`/`shipwreck_salvaging` already share, so the
+three lessons baked into it are not re-learned here: it raises the inventory tab itself (the
+2026-09-14 "50+ shift-clicks landed on the equipment panel" bug), holds SHIFT **once** across the
+burst (a re-tapped SHIFT writes a machine-regular down-to-click gap into `EVENT_KEYBOARD`), and
+verifies the FIRST drop so an account with shift-click-drop switched off falls back to the
+right-click menu instead of dropping nothing twenty times over. At `DROP_CLICK_DELAY` (0.12–0.28s,
+the recordings' own inventory cadence) a burst is **~0.4s/bone against ~2.7s** — on that 582s hunt,
+~95s becomes ~12s.
+
+**The threshold is 4 free slots, not the user's literal 1, and the three extra slots are
+load-bearing:**
+
+- golem_crafting's fur trip ENDS on fur **spilling** into the inventory (`_hunt_done`) — the only
+  signal the fur pouch has reached 28. Let a bone take the last slot and the spill has nowhere to
+  go, the signal never fires, and the trip runs to its 25-minute time cap instead.
+- it must sit above falconry's own `bankAtFreeSlots` (3) so `_hunt` drops before it decides it is
+  full, rather than walking a load of bones to Castle Wars. The drop check is therefore ordered
+  BEFORE the bank check; once no junk is left, the fur and meat that genuinely filled the inventory
+  are what trip the bank, which is the intended trigger.
+
+Costs ~3 bones per burst out of ~19, at the same ~0.4s/bone either way.
+
+**Leftover bones ride home and are BANKED, not dropped** — `banker.deposit_inventory` deposits one
+distinct name per shift-click, so the ~13 still held when a trip ends cost exactly one click and no
+hunting time. The visible consequence is a growing Bones entry in the bank; dropping them before
+leaving would cost ~5s per trip for nothing.
+
+Pinned by `test_falconry.py`'s pure-predicate tests on `junk_drop_due`/`junk_names` (threshold above
+`bankAtFreeSlots`, never a `None` meat name) and the one-`drop_items`-call-per-pass assertions.
+
+**MEASURED LIVE 2026-09-15, first burst:** `4 slots free -- dropping 15 Bones in one pass`,
+13:44:56.697 → 13:45:07.138 = **10.44s for 15 bones, 0.70s each**, every one landing (no "did not
+drop" warning, so shift-drop worked and the right-click fallback never engaged), and straight back
+to throwing on the next loop. Against the 2.60–3.26s/bone measured that morning that is **~33s
+saved in a single burst**. The realised rate is 0.70s/bone rather than the predicted ~0.4s because
+each click costs its flight plus `DROP_CLICK_DELAY`, not the delay alone — still a **4x** cut, and
+~60s per trip at ~29 bones.
+
+**Not measured, and the obvious next cut if the hunt is still too slow:** a MISS spends the full
+`THROW_RESOLVE_S` (2.6s), because the only confirm is the catch varbit and a miss never sets it —
+~50% of throws paying a whole budget, worth ~30s a trip. The miss chat lines are in the recording
+("...but just misses catching it.", "...too quick for you.") so a pushed `CHAT_MESSAGE` could end
+the wait early, but `await_outcome`'s `shorten=` keys on event TYPE with **no predicate**, so any
+passing public chat would cut a real catch's wait short too. Needs a predicate on `shorten` first —
+do not bolt it on without one.
+
 
 ## Current state of routines/golem_crafting.py
+
+**2026-09-14 mining rewritten to mining_guild_iron's single-tile chain (NOT yet run live).**
+USER: "use the tile i stand on right now and keep mining the three adjacent nodes. exactly like we
+did with mining_guild iron"; "we click after each xp drop right now in mining we should just await
+node despawn like mining_guild". `mine_phase` now stands on ONE tile and rotates the rocks
+cardinally adjacent to it, swapping the instant one DEPLETES; `find_mining_target` and
+`_mine_swing_pending` (nearest-rock targeting + a per-XP-drop reclick gate) are deleted.
+
+MEASURED from the human's own hand-played stretch in `recordings/2026-09-14_164323_golem-carve-
+baseline.jsonl` (t=277-346s) -- do not re-derive:
+
+- Expert mining gloves: a rock survives the FIRST ore and depletes on the SECOND. Ore drops land
+  **1.80-1.83s** apart (3 ticks), the first **1.4-2.0s** after the click, so a rock is **~3.6s**.
+  The momentum proc only adds to that (one +56 XP / 3 sunstone drop observed).
+- A depleted rock is **"Rocks" id 11390** -- the same spent id iron uses -- and respawns in
+  **5.32-5.46s** (9 ticks), over six depletion->respawn pairs. Three rocks at 3.6s is a 10.8s
+  rotation, so one is always up. This is the user's point: with three in reach, never walk.
+- Live ids are **62393 and 62394** (model variants), fixed per tile, both spending to 11390.
+- CONFIRMED live off `/player` + `/objects` 2026-09-14: standing on **(2598, 2244)** puts rocks
+  west (2597,2244) 62393, north (2598,2245) 62394, east (2599,2244) 62393, nothing to the south.
+  That tile is now `locations.mining` (it was the monolith at 2599,2248, an unwalkable tile); the
+  three rocks are DISCOVERED from it at runtime, so moving the spot is a one-line config change.
+- The human's own waste, same capture: a rock depleted at t=284.6, they clicked one two tiles
+  away and walked, and the next ore did not land until t=289.5 -- 4.9s for a 1.8s swap.
+
+Shape: `discover_rocks`/`pick_rock`/`mine_rock` mirror `mining_guild_iron`'s (round-robin over the
+rocks that are up, oldest-spent first; `mine_rock` waits on XP_GAINED/OBJECT_DESPAWNED/
+INVENTORY_CHANGED confirmed by the uncached `/object/at`). The chain holds `tick()` across rocks
+(`MINE_CHAIN_MAX_S`/`MINE_CHAIN_MAX_ROCKS`) because mgi measured every hand-back at 1.0-1.5s, and
+checks safety/pause/`break_due` itself every iteration. `simulate_mistakes=False` on the rock click
+is load-bearing, not a style choice (mgi_live6: a near-miss beside an adjacent rock is a Walk-here
+one tile off, and then the other two rocks are out of reach). Position is checked before discovery,
+since a bank return is ~60 tiles out. All of the above was CONFIRMED on the first live run, below.
+
+### The fur trip's fairy ring: DIALLED, never "Last-destination" (2026-09-14, live)
+
+**The bug that stranded the run.** `falconry._leg_fairy_ring` clicked "Last-destination", which the
+2026-08-23 recording showed the human using because it happened to be AKQ for them. That is
+MUTABLE PER-ACCOUNT STATE. Live it was dialled elsewhere, so the trip landed in **region 12582**
+(a camphor-tree island ~800 tiles from Piscatoris) and safety-stopped with "not on any known leg".
+A one-click fast path that silently goes to the wrong continent is not a fast path.
+
+**The dial, MEASURED live against the open interface** — "Configure" on the ring opens group 398:
+
+| widget (CW/CCW) | varbit | letters |
+|---|---|---|
+| `398.19` / `398.20` | 3985 | **A D C B** |
+| `398.21` / `398.22` | 3986 | **I L K J** |
+| `398.23` / `398.24` | 3987 | **P S R Q** |
+
+Each dial is 0-3; one clockwise click adds 1 (mod 4), so three forward is one backward and no dial
+ever needs more than two clicks. **`398.26` (Confirm) carries the live destination NAME as its
+text** ("Invalid location" when the combination spells nothing) — that is the verification signal,
+and it has already paid for itself: the first attempt had dial 2 as the plausible "ILJK" and the
+button read back "Cave south of Dorgesh-Kaan" (AJQ per the travel log), which is how the real
+order ILKJ was found. Without the guard that would have been another silent trip to the wrong
+place. Verified end to end: dialling AKQ made it read "Piscatoris Hunter area" and confirming
+landed at (2319, 3619), region 9272 == `REGION_FAIRY_LANDING`.
+
+**The travel log (group 381) was tried first and rejected.** Its rows carry a "Use code" action and
+read beautifully — `381.30` is "Kandarin: Piscatoris Hunter area", `name` "A K Q" — but it is a
+SCROLLING list whose widget bounds are content-space: the Piscatoris row sat at canvasY 841 against
+a panel ending at 848, so the click landed on background and the menu offered only "Cancel".
+Driving it means solving scroll position first. The log also has a **Search** action (`381.7`),
+which the USER points out can be typed into; that remains a viable simpler route if the dial ever
+proves awkward — it was not taken because the dial is already verified and needs no typing (and
+`KT` uppercases everything, see the firmware notes).
+
+### Wyrmscraig's collision map is UNUSABLE; shortcuts are the real connections (2026-09-14, live)
+
+MEASURED with `worldmap.reachable_from` across the whole area: Wyrmscraig is fragmented into
+disconnected pockets of **1 to 841 tiles**. The cathedral the slayer ring's cavern exit lands
+beside is 123; the **mining tile's own component is 41**; the **bank anchor (2587, 2260) is a
+1-tile island**. `travel.walk_to` refuses without a route, so it cannot cross the region at all —
+the routine only ever worked because its short hops are direct clicks (`walk_to_exact_tile`),
+never routed walks. USER: "It should take the agility shortcut just ahead".
+
+`_travel_toward` layers three strategies: route when the map has one, else take a shortcut, else
+hop by minimap. Three things it got wrong first, each measured:
+
+- **A distance heuristic picks the wrong shortcut.** From (2542, 2213) the Rocks at (2551, 2209)
+  score 4 tiles WORSE on Chebyshev (the goal is at y 2260 and the rocks sit north of the line), so
+  "is it closer" rejected the only shortcut that works. The right question is whether its FAR SIDE
+  opens a route: tiles just east of those rocks — (2554, 2209), (2555, 2209) — are in a 190-tile
+  bank-routable component while nothing on our side is. `shortcut_opens_route` probes for that,
+  which also rejects the Cave we just walked out of (one tile away, carries "Enter").
+- **Ask and walk with the same adjacency.** It tested routability with `goal_adjacent=True` then
+  walked with `goal_adjacent=False`; since the bank anchor is a 1-tile island, it decided a route
+  existed while `travel.walk_to` answered "no walking route" once a tick until the cap stopped it.
+- **Progress has to reset the attempt budget.** Each shortcut attempt spent one of
+  `MAX_WALK_ATTEMPTS`, so the run safety-stopped *standing on the far side of the rocks*, having
+  just made the progress the cap exists to detect the absence of. It now resets when the player's
+  tile changed since the last attempt, and still gives up when nothing moves.
+
+Live result: cathedral → Rocks climb → walk → bank → mine tile, unattended.
+
+### Gear and the meat pouch (2026-09-14, user-reported)
+
+- **`falconry._ensure_hands_free` strips the weapon, shield and glove slots and nothing put them
+  back.** Correct going out (falconry needs both hands free), silently never undone coming home —
+  so the trip returned unable to mine at all (no pickaxe) and at half rate if it could (the Expert
+  gloves are what make a rock give TWO ores). They also sit in the inventory while unequipped, and
+  the batch's slot budget (25 stones + chisel + gem sack + fur pouch = 28) has no room for them.
+  `ensure_mining_gear` runs at the top of `mine_phase`, one item per call, and acts ONLY on an
+  empty slot with the item actually carried so it never overrides a deliberate setup.
+- **No meat pouch was carried**, so every catch spent a click dropping raw kebbit. `KIT_ITEMS` now
+  includes one (bank memory confirms "Large meat pouch (open)", id 29464), `_ensure_pouch_open`
+  takes a pouch name and is called for both, and the hunt's `drop_meat` decision asks what is
+  CARRIED rather than what was configured. A missing meat pouch is in `KIT_OPTIONAL` — it is an
+  optimisation with a working fallback, so it must not stop the run the way a missing teleport does.
+  **Then the hunt switched to the Dark kebbit and the pouch became moot**: MEASURED 16 retrieves,
+  16 bone drops, ZERO raw meat — it yields fur and bones only. `falconry.KEBBIT_SPECIES` carries
+  `meat: None` for it and `KIT_ITEMS` asks that table whether a pouch is wanted at all.
+- **The bank DEPOSITED the pickaxe and the mining gloves** (USER: "Oh shit we just deposited our
+  rune pickaxe. And also our gloves"). The gear is loose in the inventory for exactly one bank
+  visit — between the fur trip stripping it and `mine_phase` putting it back — and
+  `BANK_KEEP_ITEMS` named "hammer" but neither a pickaxe nor mining gloves, which is precisely why
+  the Imcando hammer came back and the other two did not. Mining then failed ten clicks in a row
+  and safety-stopped with nothing in hand. The keep list is now derived from `MINING_GEAR` so the
+  two cannot drift, and `_withdraw_missing_mining_gear` recovers at the open bank for an account
+  it already happened to. **Watch the tier**: recovery matches on the substring "pickaxe" and took
+  the Adamant one, which measured **4.1-4.3s per rock against the Rune pickaxe's 3.16s**.
+
+### Which kebbit (2026-09-14, user directive)
+
+USER: "It should actually catch dark kebbirs instead they are plentiful and faster to catch."
+CONFIRMED off /npcs at the hunting spot the same minute: **3x Dark kebbit (id 5532)** in range
+against 1x Dashing (5533) and 4x Spotted (5531). Dashing is the higher-tier fur but there is
+usually only one of them. Costs golem crafting nothing — "Dark kebbit fur" is already in
+`FUR_PRIORITY`, just a lower entry. `falconry.KEBBIT_SPECIES` keeps the NPC, fur and meat names
+together so they cannot drift; `DEFAULT_SPECIES` selects.
+
+### The slayer ring's destination dialogue is PAGED (2026-09-14, live)
+
+USER: "On slayer ring there is dialog options to tp or a second menu that expand when hovering
+tele". The ring's right-click has a "Teleport" entry, and it opens a dialogue whose first page
+does NOT hold Wyrmscraig:
+
+```
+page 1:  1 Stronghold Slayer Cave | 2 Morytania Slayer Tower | 3 Fremennik Slayer Dungeon
+         4 More options...
+page 2:  1 Tarn's Lair | 2 Dark Beasts | 3 the Wyrmscraig Cavern | 4 Previous options...
+```
+
+The single-page scan was looking for an entry that was never going to be on the page it read, so
+the return leg logged "no dialogue option containing 'wyrmscraig'" once a tick with the pouch
+already full. `_choose_dialogue_option` now pages through "More options..." (bounded by
+`DIALOGUE_MAX_PAGES`, and it never re-presses a page-forward that did not change the options), and
+`DIALOGUE_S` went 3.0 → 6.0 so the budget covers a page turn. Both the left-click and right-click
+paths go through it. Live: teleport → cavern → surface → bank, unattended.
+
+### Dropping needs the inventory tab up (2026-09-14, live)
+
+USER: "It doesn't have inventory up so It can't drop". `falconry._ensure_hands_free` taps "E" to
+reach the worn-equipment interface on the way in and nothing switched back, so every shift-click
+landed on the equipment panel. MEASURED 50+ attempts on one bone. `_drop_loose` now raises the
+inventory tab and CONFIRMS the item left — the loop was possible at all because it returned True
+unconditionally.
+
+**2026-09-14 FIRST LIVE RUN of the single-tile mining + chisel burst — both work.** MEASURED over
+two full trips: **20 rocks, mean 3.16s** (min 2.34, max 5.01; the spread is momentum procs giving
+1-3 ore), perfect three-rock rotation, every swap logged `in place (cursor already on it)`, **zero
+walking**, a 25-stone batch in ~45s. Discovery matched the predicted ids on the first read.
+**Chiselling while walking is CONFIRMED** — an external sampler caught all five cores converting
+with `moving=True` as the player walked (2598,2244) → (2603,2249); the routine's own log said
+"player was still" only because it sampled `moving` once, right after the hop click and before the
+walk began (fixed: it now samples every pair and reports `walked during it`). Three wastes found
+and fixed the same day:
+
+1. **~7s dead at the end of every batch** (6.7s and 6.8s, both trips): the 25th stone fills the
+   inventory to 28/28, the game refuses the rock's last ore, the rock never depletes and
+   `MINE_ORE_BUDGET_S` is burned. The budget was only checked BETWEEN rocks — one rock too late.
+   `mine_rock` now takes `stop_when` and ends the rock the moment the batch is full.
+2. **~25s walking back to the stand tile after banking** — one attempt per call plus an engine
+   hand-back, three attempts to arrive. `_return_to_stand` now retries inside one call
+   (`MINE_RETURN_BUDGET_S`), logging the gap per attempt. **Pacing is load-bearing**: without a
+   pause between attempts the loop spun 1.6M times when the walk returned instantly (caught by a
+   test, not in production).
+3. The chisel burst ran at 0.78s/core; deliberately slowed (USER: "we don't have to be that fast
+   when chiseling we still have time") to the ordinary fitted click model rather than
+   `tick_cycle`'s 3-tick-granite fast path — there is no tick to hit here, only the ~5s walk.
+
+**2026-09-14 chisel burst, run during the walk to the plinth (NOT yet run live).** USER: "why
+didnt we chisel while moving to the plinth?"; "1 tick per core so we should be able to chisel all
+5 before we are at the plinth". MEASURED record-by-record from the same recording (the human's
+five cores at t=16.8-27.1s):
+
+- A core is **two clicks**: `WIDGET_TARGET` ("Use" on the chisel, widget 9764864 child 1) then
+  `WIDGET_TARGET_ON_WIDGET` on the sunstone. Item selection is **client-side, no packet** (the
+  fact granite_3t's knife selection rests on), so only the second click costs a tick.
+- The conversion is on the **same tick** as that second click -- chat, +10 Crafting xp and the
+  inventory change all carry `dTick: 0` on four of five cores.
+- The stone converts **in its own slot** (`usedSlots` stayed 28 throughout), so slot positions
+  resolved before a burst stay valid for the whole burst. This is what makes a burst possible.
+- **No repeat action and no cooldown.** The human's 1.79-3.02s per core was their own click
+  latency (chisel click on tick N, stone on N+1 or N+2). One core per tick is the ceiling and
+  getting there is purely an input-speed problem.
+- Animation 7202 runs continuously across the burst and gates nothing.
+
+**Why it wasn't already happening: `chisel_phase`'s `isIdle` entry gate.** `isIdle = !moving &&
+anim == -1 && target == null` (CombatProvider), so it returned every tick for the whole ~9-tile
+walk and the first core only went out on arrival. It was also not protecting anything -- the
+per-core confirmation is what stops a re-click landing on an already-converted stone. Gone.
+
+Shape: slots resolved ONCE, stones ordered **nearest the chisel first** (tick_cycle's fitted reach
+model puts a 42px hop at 86ms against 205ms at 120px -- that ordering is the difference between
+one core per tick and one per two), pairs fired back to back through `tick_cycle.timed_click` at
+`PRACTISED_FLIGHT_SCALE` with **no HTTP between them**. `mine` joined `TICK_CHAIN_FROM` so the
+burst starts on the same tick as the hop toward the plinth. A post-burst settle
+(`CHISEL_BURST_SETTLE_S`) is load-bearing: `/inventory` is tick-cached, and an under-count there
+would make the next tick chisel the difference a second time and overshoot `CORES_PER_TRIP`.
+
+**Chiselling WHILE WALKING is the user's claim and is in no recording here** -- the human stood
+still at (2595, 2254) for all five. So the first burst that runs while moving spends ONE pair,
+confirms it (`CHISEL_MOVING_PROBE_S`), remembers the answer in `gc_chisel_moving_ok` and logs it
+loudly; a negative answer just falls back to chiselling on arrival, which is what the isIdle gate
+did anyway. **That log line is the first thing to read after the next live run**, along with the
+burst line (`N pair(s) in Xs -> M core(s), player was moving/still`).
 
 **2026-09-06 event-driven pass + falconry fur trip (spec `docs/superpowers/specs/2026-09-06-golem-
 crafting-events-and-falconry-design.md`, plan `docs/superpowers/plans/2026-09-06-golem-crafting-

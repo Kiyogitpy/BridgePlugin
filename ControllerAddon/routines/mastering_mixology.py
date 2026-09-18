@@ -207,6 +207,17 @@ HOVER_SETTLE_PX = 3             # two consecutive projection reads this close = 
 # Agitator -> Retort -> belt is the shortest walk, so that is the rank.
 STATION_RANK = {"Alembic": 0, "Agitator": 1, "Retort": 2}
 
+# Refined paste, bankable and stackable. Withdrawing it straight from the bank skips the whole
+# herb -> clean -> refine chain, so a hopper top-up costs one withdrawal instead of an inventory
+# of herbs plus a cleaning sweep plus a refiner loop (USER 2026-09-18: "make it able to withdraw
+# lye, mox and aga directly from the bank i have some stored up").
+#
+# EXACT names, never a "paste" substring: 'Swamp paste' is an unrelated item this account also
+# banks 547 of. Ids are the wiki's (Mox 30005 / Aga 30007 / Lye 30009), kept for the inventory
+# read where a name match would be just as ambiguous.
+PASTE_ITEM_NAMES = {"mox": "Mox paste", "aga": "Aga paste", "lye": "Lye paste"}
+PASTE_ITEM_IDS = {"mox": 30005, "aga": 30007, "lye": 30009}
+
 DEFAULT_CONFIG = {
     "enabled": True,
     "herbPriority": {
@@ -485,10 +496,6 @@ def bank_herbs_phase(ctx, config: dict) -> None:
     if not needed_types:
         ctx.state.data["mm_phase"] = "orders"
         return
-    # CORRECTED 2026-08-13 (user question: "why do we only pick 14 herbs cant we just clean 28
-    # at once?"): fill the whole inventory split evenly across whatever paste types are needed --
-    # every slot here holds a raw herb, nothing else competes for the space during this phase.
-    per_type_qty = 28 // len(needed_types)
 
     bank_cfg = {"teleportFallback": config.get("bank", {}).get("teleportFallback", False)}
     bank_obj = banker.find_nearby_bank(bank_cfg)
@@ -523,6 +530,20 @@ def bank_herbs_phase(ctx, config: dict) -> None:
                                     simulate_mistakes=False)
             _await(ctx, "INVENTORY_CHANGED", 1.5, confirm=lambda: not controller.get_inventory(),
                    since=mark)
+
+    # BANKED PASTE FIRST. It is already refined, so it goes straight to the hopper -- no herbs to
+    # withdraw, clean or refine. Whatever the bank cannot cover falls through to the herb path
+    # below, so a half-stocked paste type still works.
+    needed_types = _withdraw_banked_paste(ctx, needed_types, hopper, target)
+    if not needed_types:
+        banker.close_bank(ctx)
+        _refine_and_hopper_inventory(ctx)
+        return
+    # CORRECTED 2026-08-13 (user question: "why do we only pick 14 herbs cant we just clean 28
+    # at once?"): fill the whole inventory split evenly across whatever paste types are needed --
+    # every slot here holds a raw herb, nothing else competes for the space during this phase.
+    # Computed AFTER the paste step, over the types it could not cover.
+    per_type_qty = 28 // len(needed_types)
 
     # CONFIRMED live 2026-08-12 (user report): searching each configured herb name one at a
     # time raced against reality (a candidate in stock at selection time could be out of stock by
@@ -605,6 +626,71 @@ def bank_herbs_phase(ctx, config: dict) -> None:
     banker.close_bank(ctx)
 
     _refine_and_hopper_inventory(ctx)
+
+
+def _withdraw_banked_paste(ctx, needed_types, hopper, target):
+    """Withdraw already-refined paste for each needed type the bank can cover.
+
+    Returns the types still needing the herb path. Paste is stackable, so all three fit in three
+    inventory slots however much is taken -- the quantity asked for is the hopper's actual
+    shortfall rather than a slot count.
+
+    banker.search_bank is what scrolls the item into a clickable position (`/bank` only reports
+    what the interface is DRAWING), and the slot is then matched on EXACT name -- 'Mox paste' must
+    never select the 'Swamp paste' this account also banks 547 of.
+
+    The withdrawal is Withdraw-X with a typed amount, NOT banker.search_and_withdraw: that helper
+    sets quantity mode to "one" and clicks once per item, so asking it for a shortfall of 800
+    would fire 800 physical clicks. Same Withdraw-X shape the herb path below already uses.
+
+    A type the bank has none of is simply left in the returned list."""
+    remaining = []
+    withdrew = {}
+    for paste_type in needed_types:
+        name = PASTE_ITEM_NAMES[paste_type]
+        item_id = PASTE_ITEM_IDS[paste_type]
+        shortfall = max(0, target - (hopper.get(paste_type, 0) or 0))
+        if shortfall <= 0:
+            continue
+
+        def held(_id=item_id):
+            return sum((i.get("qty") or 1) for i in controller.get_inventory()
+                       if i.get("id") == _id)
+
+        if not banker.search_bank(ctx, name):
+            remaining.append(paste_type)
+            continue
+        slot = next(
+            (s for s in controller.get_bank(fresh=True).get("items", [])
+             if (s.get("name") or "").lower() == name.lower() and s.get("qty", 0) > 0),
+            None,
+        )
+        if slot is None:
+            debug_log.log("mixology", f"no '{name}' in the bank -- falling back to herbs for {paste_type}")
+            remaining.append(paste_type)
+            continue
+
+        before = held()
+        if not controller.click_menu_action(ctx.ser, slot, "Withdraw-X", check_ui_blockers=False):
+            debug_log.log("mixology", f"Withdraw-X menu entry not found for '{name}'")
+            remaining.append(paste_type)
+            continue
+        # The "Enter amount" chatbox needs a moment to render and take keyboard focus -- typing
+        # immediately drops the digits silently (CONFIRMED live 2026-08-12 on the herb path).
+        controller.human_delay(0.4, 0.6)
+        mark = _mark(ctx)
+        controller.type_digits_and_enter(ctx.ser, str(shortfall))
+        if _await(ctx, "INVENTORY_CHANGED", BANK_WITHDRAW_LAND_S,
+                  confirm=lambda b=before: held() > b, since=mark, reaction=False):
+            withdrew[paste_type] = held() - before
+        else:
+            debug_log.log("mixology", f"withdrawal of '{name}' didn't confirm landing")
+            remaining.append(paste_type)
+
+    banker.clear_bank_search(ctx)
+    if withdrew:
+        debug_log.log("mixology", f"withdrew banked paste {withdrew} -- straight to the hopper, no refining")
+    return remaining
 
 
 def _clean_grimy_herbs(ctx) -> None:

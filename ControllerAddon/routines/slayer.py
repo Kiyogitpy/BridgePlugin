@@ -18,6 +18,7 @@ import controller
 import debug_log
 import settings
 import travel
+import worldmap
 
 
 # Re-aim checkpoints for an engage click. MEASURED 2026-08-24 with bench_hover.py against a moving
@@ -35,6 +36,8 @@ def get_config(bridge_config):
 
 
 def on_event(ctx, event_type, payload):
+    if event_type == "CHAT_MESSAGE" and payload and is_bracelet_broken_message(payload.get("message")):
+        ctx.state.data["bracelet_check_at"] = 0.0     # check the gloves slot on the next tick
     if event_type == "NPC_DIED" and payload:
         # Matched by instance index, not type id -- a different monster of
         # the same species dying nearby must not clear our current target.
@@ -75,10 +78,8 @@ def tick(ctx):
         # on the same enabled flags maintain_supplies itself already checks, so this doesn't
         # withdraw food for a routine that has food handling turned off entirely.
         merged_bank_cfg["autoFood"] = config.get("food", {}).get("enabled", False)
-        merged_bank_cfg["autoPrayer"] = (
-            config.get("prayer", {}).get("enabled", False)
-            and config.get("potions", {}).get("prayerEnabled", False)
-        )
+        # Potions toggle alone, like maintain_prayer_potions (see its USER-REPORTED note).
+        merged_bank_cfg["autoPrayer"] = config.get("potions", {}).get("prayerEnabled", False)
         # Walk back to the tile we left from -- USER-REPORTED 2026-09-07 ("ends up stuck at
         # Ferox"). Opt-in because banker's default only walks home from the Ferox teleport
         # path, which left a trip to a bank inside maxBankDistance (40) simply fighting on
@@ -109,7 +110,9 @@ def tick(ctx):
     combat = controller.get_combat()
     maintain_defensive_prayer(ctx, combat)
     maintain_offensive_prayer(ctx, combat)
+    maintain_prayer_potions(ctx)
     maintain_supplies(ctx)
+    maintain_bracelet(ctx)
 
     # Still owed a walk home from a bank trip -- USER-REPORTED 2026-09-07 ("ends up stuck at
     # Ferox"). banker.bank_up walks back itself, but a walk that gives up partway (a long
@@ -174,7 +177,7 @@ def out_of_critical_supplies(ctx) -> bool:
 
     prayer_cfg = config.get("prayer", {})
     potions_cfg = config.get("potions", {})
-    if prayer_cfg.get("enabled") and potions_cfg.get("prayerEnabled"):
+    if potions_cfg.get("prayerEnabled"):
         current_prayer = player.get("prayer")
         restore_at = prayer_cfg.get("restoreAt", 18)
         if current_prayer is not None and current_prayer <= restore_at and not consumables.get("prayer"):
@@ -228,6 +231,7 @@ def protected_supply_names(config: dict) -> set:
     names.add("bonecrusher")
     names.add("ash sanctifier")
     names.add("ectoplasmator")
+    names.update(SLAYER_BRACELET_NAMES)   # spares for maintain_bracelet
     return names
 
 
@@ -264,13 +268,57 @@ def resolve_targets(config: dict):
     return ids, names
 
 
-def pick_target(npcs: list, config: dict):
+# Targets are ranked by WALKING distance, not the bridge's `distance` (a straight-line
+# WorldPoint.distanceTo that ignores walls). MEASURED live 2026-09-18 in the Kalphite cave (plane
+# 2, player 3487,9508): a Kalphite Worker 10 tiles away in a straight line was 112 steps round the
+# tunnel walls (the user's "35 sec walk"), while one 16 tiles away -- outside maxTargetDistance
+# 15, so never even a candidate -- was 27 steps. Where the offline map answers, this step budget
+# REPLACES maxTargetDistance: walking steps are never fewer than the straight-line tiles, so the
+# old limit would still have thrown the 27-step worker away. The flood is cardinal-only, so it
+# overcounts diagonal routes a little; that affects the budget, not the ranking much.
+DEFAULT_MAX_TARGET_WALK_STEPS = 40
+
+
+def _walk_steps(flood: dict, npc: dict):
+    """Fewest walking steps to stand on or beside `npc`, or None when the flood never got there.
+    Its own tile plus the 8 around it: the reported tile of a large NPC is its SW corner."""
+    x, y = npc.get("x"), npc.get("y")
+    if x is None or y is None:
+        return None
+    best = None
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            steps = flood.get((x + dx, y + dy))
+            if steps is not None and (best is None or steps < best):
+                best = steps
+    return best
+
+
+def _walk_flood(player: dict | None, config: dict, max_steps: int):
+    """{tile: steps} from the player, or None when walking distance does not apply here -- no
+    player, an instance (template coords do not index the world map), safespotting (we attack
+    from range, so the walk to the monster is not the cost), or a flood that went nowhere."""
+    if not player or player.get("inInstance"):
+        return None
+    if (config.get("safespot") or {}).get("enabled"):
+        return None
+    px, py, plane = player.get("x"), player.get("y"), player.get("plane")
+    if px is None or py is None or plane is None:
+        return None
+    side = 2 * max_steps + 1
+    flood = worldmap.reachable_from(px, py, plane, radius=max_steps, max_nodes=side * side)
+    return flood if len(flood) > 1 else None
+
+
+def pick_target(npcs: list, config: dict, player: dict | None = None):
     ids, names = resolve_targets(config)
     if not ids and not names:
         return None
 
     max_dist = config.get("maxTargetDistance", 15)
+    max_steps = config.get("maxTargetWalkSteps", DEFAULT_MAX_TARGET_WALK_STEPS)
     skip_in_combat = config.get("skipNpcInCombat", True)
+    flood = _walk_flood(player, config, max_steps)
 
     candidates = []
     for npc in npcs:
@@ -281,19 +329,27 @@ def pick_target(npcs: list, config: dict):
             continue
 
         dist = npc.get("distance", 9999)
-        if dist < 0 or dist > max_dist:
+        if dist < 0:
             continue
+        if flood is None:
+            if dist > max_dist:
+                continue
+            cost = dist
+        else:
+            cost = _walk_steps(flood, npc)
+            if cost is None or cost > max_steps:
+                continue
 
         if skip_in_combat and npc.get("inCombat") and not npc.get("interactingPlayer"):
             continue
 
-        candidates.append(npc)
+        candidates.append((cost, dist, npc))
 
     if not candidates:
         return None
 
-    candidates.sort(key=lambda n: n.get("distance", 9999))
-    return candidates[0]
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    return candidates[0][2]
 
 
 # Prayer level requirements, mirroring com.example.controller.DefensivePrayerChoice /
@@ -592,8 +648,19 @@ def maintain_defensive_prayer(ctx, combat: dict):
                                  f"{player.get('prayerReal')} -- nothing to toggle until it's leveled up.")
         ctx.state.data["warned_defensive_prayer_level_too_low"] = True
 
+
+def maintain_prayer_potions(ctx):
+    """Drink a prayer restore when prayer runs low. Gated ONLY on the potions toggle --
+    USER-REPORTED 2026-09-18 ("why arent we using prayer pots?"): this used to live at the end of
+    maintain_defensive_prayer, behind its `prayer.enabled` early return, so a player praying by
+    hand (Use Prayer off, prayer potions on) was never topped up -- live at 28/77 prayer with four
+    Prayer potions in the inventory. Who switches prayers on has nothing to do with whether the
+    points need restoring."""
+    config = ctx.state.config
+    prayer_cfg = config.get("prayer", {})
     potions_cfg = config.get("potions", {})
     if potions_cfg.get("prayerEnabled"):
+        player = controller.get_player()
         restore_at = prayer_cfg.get("restoreAt", 18)
         current_prayer, prayer_max = player.get("prayer"), player.get("prayerReal")
         if current_prayer is None:
@@ -722,6 +789,67 @@ def maintain_supplies(ctx):
         # endpoint), so we can't tell when a combat potion has expired.
         # Left as a no-op until a BuffProvider-style endpoint exists.
         pass
+
+
+# ---------------- slayer bracelets ----------------
+# Bracelet of slaughter / expeditious bracelet are worn in the GLOVES slot and crumble when their
+# charges run out, leaving that slot empty. maintain_bracelet puts a spare from the inventory back
+# on. USER request 2026-09-18. Triggered by the crumble chat message (an accelerator) and by a
+# slow periodic /equipment read (the source of truth, so a dropped UDP packet only costs time).
+# RECORDED live 2026-09-18 (expeditious): the charge that breaks it says "Your expeditious
+# bracelet helps you progress your slayer task faster. It then crumbles to dust." (the one before
+# it: "... It has 1 charge left."). The match stays loose (bracelet + crumble) to cover slaughter's
+# own wording unrecorded. There is NO charge varbit/varp: across both kills only varp 394 (task
+# count, -2 per kill with expeditious) and per-kill counters moved -- Item Charges plugins read
+# the chat, so chat is the only early signal there is.
+SLAYER_BRACELET_NAMES = ("bracelet of slaughter", "expeditious bracelet")
+BRACELET_CHECK_INTERVAL_S = 30.0    # periodic fallback when no chat message arrived
+BRACELET_RETRY_S = 3.0              # re-check this soon after a Wear click, to confirm it took
+
+
+def is_bracelet_broken_message(message) -> bool:
+    text = (message or "").lower()
+    return "bracelet" in text and "crumble" in text
+
+
+def _is_slayer_bracelet(name) -> bool:
+    name = (name or "").lower()
+    return any(b in name for b in SLAYER_BRACELET_NAMES)
+
+
+def maintain_bracelet(ctx):
+    """Re-wear a slayer bracelet once the worn one has crumbled. Only acts on an EMPTY gloves
+    slot, so real gloves the player chose to wear are never swapped off."""
+    if not ctx.state.config.get("bracelets", {}).get("reequip", True):
+        return
+    data = ctx.state.data
+    now = time.time()
+    if now < data.get("bracelet_check_at", 0.0):
+        return
+    data["bracelet_check_at"] = now + BRACELET_CHECK_INTERVAL_S
+
+    gloves = controller.get_equipment().get("gloves") or {}
+    if gloves.get("id") is not None:
+        if _is_slayer_bracelet(gloves.get("name")):
+            data["bracelet_worn_name"] = gloves["name"].lower()
+        return
+
+    spares = [i for i in controller.get_inventory() if _is_slayer_bracelet(i.get("name"))]
+    if not spares:
+        return
+    # Same kind as the one that just broke first, so a mixed inventory keeps doing what the
+    # player set it up to do.
+    last = data.get("bracelet_worn_name") or ""
+    spares.sort(key=lambda i: (i.get("name") or "").lower() != last)
+    spare = spares[0]
+
+    debug_log.log("bracelet", f"gloves slot empty -- wearing {spare.get('name')}")
+    controller.open_inventory_tab(ctx.ser)
+    fresh = next((i for i in controller.get_inventory()
+                  if i.get("slot") == spare.get("slot") and _is_slayer_bracelet(i.get("name"))), spare)
+    controller.click_entity(ctx.ser, fresh, check_ui_blockers=False, simulate_mistakes=False,
+                            expected_action="Wear")
+    data["bracelet_check_at"] = now + BRACELET_RETRY_S
 
 
 def maybe_loot(ctx):
@@ -1054,7 +1182,7 @@ def engage_target(ctx, combat: dict):
     if ctx.state.data.get("loot_pending_key") is not None:
         return
 
-    target = pick_target(npcs, config)
+    target = pick_target(npcs, config, controller.get_player())
     if not target:
         return
 

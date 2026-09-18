@@ -623,7 +623,7 @@ file of the form "see the X.py section/notes" point there. One-line status:
 | `guardians_of_the_rift.py` | Full rounds unattended; beat the human benchmark (run 75). Event-driven rewrite of 2026-09-04 not yet run live |
 | `deep_sea_trawling.py` | NOT run live; needs client rebuild. Banking is an unbuilt sub-project |
 | `wintertodt.py` | NOT run live; needs client rebuild |
-| `vale_totems.py` | At human parity live (2026-09-10); magic-log hold pass partially verified 2026-09-11 |
+| `vale_totems.py` | At human parity live (2026-09-10); magic-log hold pass partially verified 2026-09-11; banked pre-fletched decorations added 2026-09-16, NOT run live |
 | `granite_3t.py` | Cycle settled from recordings 2026-09-09; NOT run live in that form |
 | `mining_guild_iron.py` | Live-debugged to 1674 ore/hr (2026-09-11); 52-min unattended run clean |
 | `blast_furnace.py` | Live: gold 24-25s/trip, adamantite 2-trip cycle ~48s (2026-09-04) |
@@ -634,7 +634,7 @@ file of the form "see the X.py section/notes" point there. One-line status:
 | `shipwreck_salvaging.py` | Last live 2026-08-05; three offline passes since NOT run live, needs client rebuild |
 | `agility.py` | Written from a recording 2026-09-02; NOT run live |
 | `falconry.py` | Written from a recording 2026-08-23; 2026-09-06 event-driven pass NOT run live |
-| `golem_crafting.py` | Was running unattended live; 2026-09-06 event-driven + falconry fur-trip rewrite NOT run live |
+| `golem_crafting.py` | Was running unattended live; 2026-09-06 event-driven + falconry fur-trip rewrite and 2026-09-14 single-tile mining rewrite NOT run live |
 | `karambwan_fishing.py` | Full loop verified live 2026-09-06; later left-click/AFK passes NOT run live |
 | `slayer.py` | Bank-trip return rebuilt 2026-09-07, pinned in tests, NOT run live |
 | `chinchompa_hunting.py` | Working live 2026-08-21; known 7% collapsed-trap waste left deliberately |

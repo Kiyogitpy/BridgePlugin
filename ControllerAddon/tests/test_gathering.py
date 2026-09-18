@@ -5,6 +5,7 @@ so routines/woodcutting.py could share it. Every test below is the mining one it
 at gathering.*; the woodcutting-specific behaviour lives in test_woodcutting.py.
 """
 
+import dataclasses
 import os
 import sys
 import types
@@ -260,6 +261,40 @@ def test_gather_times_out(scene):
     outcome, _ = gathering.gather(P, ctx, a, ctx.state.config)
     assert outcome == "timeout"
     assert scene.now - 1000.0 >= gathering.GATHER_BUDGET_S
+
+
+def test_gather_honours_a_longer_per_profile_budget(scene):
+    """Amethyst's real per-swing success rate is slow enough that the generic GATHER_BUDGET_S
+    (12s) fires while the player is still busy mid-swing (isIdle stays False the whole time),
+    causing routines/amethyst_dart_tips.py to abandon and re-pick a vein that had not actually
+    despawned -- LIVE 2026-09-17, USER: "we swap before the ore despawn". A profile can opt
+    into a longer budget; one that does not is untouched (test_gather_times_out, above,
+    still hits the generic constant)."""
+    patient = dataclasses.replace(P, gather_budget_s=30.0)
+    a = _rock(1, 1, dist=1)
+    scene.objects = [a]
+    # Busy (isIdle False) the whole time and no signal ever arrives -- the exact shape measured
+    # live: still swinging, nothing gained, for longer than the generic budget.
+    scene.readings = [(True, 5000, False)]
+    ctx = make_ctx(scene.events([]))
+    outcome, _ = gathering.gather(patient, ctx, a, ctx.state.config)
+    assert outcome == "timeout"
+    assert scene.now - 1000.0 >= 30.0
+
+
+def test_gather_still_applies_idle_detection_under_a_longer_budget(scene):
+    """The longer budget only postpones the TIMEOUT branch -- genuine idleness (isIdle reads
+    True and sustains) must still be caught quickly, not held open for the whole longer budget."""
+    patient = dataclasses.replace(P, gather_budget_s=30.0)
+    a = _rock(1, 1, dist=1)
+    scene.objects = [a]
+    scene.readings = [(True, 5000, False), (True, 5000, True)]
+    ev = scene.events([None] * 200)
+    ctx = make_ctx(ev)
+    outcome, _ = gathering.gather(patient, ctx, a, ctx.state.config)
+    assert outcome == "idle"
+    elapsed = scene.now - 1000.0
+    assert gathering.IDLE_GRACE_S <= elapsed < 30.0
 
 
 def test_gather_no_click(scene, monkeypatch):

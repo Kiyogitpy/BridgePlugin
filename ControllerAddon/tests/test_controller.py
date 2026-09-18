@@ -10,6 +10,45 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import controller
 
+
+# --- The bank reads are heavy and must not use api_get's 0.3s default (2026-09-15, live) ------
+#
+# CONFIRMED live: /bank serialises all 948 items this account banks and measured 202ms on an IDLE
+# client. api_get swallows a timeout and returns None, so get_bank's `or {"open": False}` reported
+# the bank SHUT while it stood open -- banker.is_open() is that one field. open_bank then clicked
+# the chest for its whole 20s budget with the interface already up, and the run sat dead for 25
+# minutes behind the stall watchdog. get_bank_memory's None is worse still: bank_memory reads it
+# as "never seen", i.e. "you own no teleport".
+
+def _record_timeouts(monkeypatch):
+    seen = {}
+
+    def fake_api_get(path, params=None, timeout=0.3):
+        seen[path] = timeout
+        return {}
+    monkeypatch.setattr(controller, "api_get", fake_api_get)
+    return seen
+
+
+def test_get_bank_does_not_use_the_default_timeout(monkeypatch):
+    seen = _record_timeouts(monkeypatch)
+    controller.get_bank()
+    assert seen["/bank"] == controller.BANK_READ_TIMEOUT_S
+    assert seen["/bank"] > 0.3, "a 948-item bank does not fit in api_get's default budget"
+
+
+def test_get_bank_memory_does_not_use_the_default_timeout(monkeypatch):
+    seen = _record_timeouts(monkeypatch)
+    controller.get_bank_memory()
+    assert seen["/bank/memory"] == controller.BANK_READ_TIMEOUT_S
+
+
+def test_a_failed_bank_read_still_reports_shut_rather_than_raising(monkeypatch):
+    """The fallback itself is correct and stays -- the fix is to stop provoking it."""
+    monkeypatch.setattr(controller, "api_get", lambda *a, **kw: None)
+    assert controller.get_bank() == {"open": False}
+    assert controller.get_bank_memory() is None
+
 # Captured immediately, before pytest's collection phase can import test_mcp_debug_server.py --
 # that module replaces controller.make_udp_listener with a MagicMock at its own import time (to
 # avoid a real socket bind for its whole test session) and never restores it, since it isn't
@@ -1595,6 +1634,13 @@ def test_click_entity_departs_from_the_refreshed_position_not_the_stale_one(monk
     monkeypatch.setattr(controller, "_settle_on_target_before_click", lambda ser, rt: None)
     monkeypatch.setattr(controller, "get_cursor_pos", lambda: (10, 10))
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    # This test is about WHERE THE FLIGHT DEPARTS FROM, not about window bounds -- but
+    # is_point_within_window calls get_state(), a live HTTP read, so without this stub the result
+    # depends on how big the RuneLite window happens to be RIGHT NOW. CONFIRMED 2026-09-16: the
+    # user sized the client down to 844x910 to fit VS Code beside it and this started failing on
+    # the (1180, 660) aim, with "aim point is outside the RuneLite window" -- a green suite turning
+    # red because of a window layout.
+    monkeypatch.setattr(controller, "is_point_within_window", lambda x, y: True)
 
     stale = {"name": "Table", "screenX": 900, "screenY": 400}
 
@@ -1689,7 +1735,10 @@ def test_loop_stats_logs_slow_iterations_and_a_periodic_summary():
     assert stats.record(0.5, 0.3) == []       # window reset after the summary
 
 
+@pytest.mark.real_bridge_helper
 def test_inst_flag_is_forwarded_to_the_bridge(monkeypatch):
+    """Exercises get_collision itself (does it forward inst= to the bridge?), so the hermetic
+    no_live_bridge fixture must not replace it -- it stubs api_get instead, one layer lower."""
     calls = []
 
     def fake_api_get(path, params=None, timeout=None, **kw):

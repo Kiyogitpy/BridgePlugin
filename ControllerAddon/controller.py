@@ -220,6 +220,11 @@ _bridge_fail_count = 0
 # cuts per-call overhead to the local bridge.
 _session = requests.Session()
 
+# The bank endpoints serialise every item the bank holds (948 on this account), which is the same
+# class of heavy read /objects and /collision already carry their own raised timeouts for. See
+# get_bank for the live failure this was measured from.
+BANK_READ_TIMEOUT_S = 2.0
+
 
 def api_get(path, params=None, timeout=0.3):
     global _bridge_failing, _bridge_fail_count
@@ -828,8 +833,12 @@ def get_bank_memory(names=None):
     Not TickCache-gated on the Java side -- the snapshot is already-resolved plain data, so this
     is cheap to poll, unlike get_bank().
     """
+    # Same generous timeout as get_bank, and for a sharper reason: this endpoint returns the
+    # WHOLE remembered bank, and its None does not mean "empty" -- bank_memory.BankMemory reads
+    # it as "never seen". A timed-out read would therefore answer "you own no teleport" for a
+    # bank full of them, which is precisely the collapse that file exists to prevent.
     params = {"names": ",".join(names)} if names else None
-    return api_get("/bank/memory", params=params)
+    return api_get("/bank/memory", params=params, timeout=BANK_READ_TIMEOUT_S)
 
 
 def get_bank(fresh=False):
@@ -837,8 +846,21 @@ def get_bank(fresh=False):
     # action that just changed bank state (a withdrawal/deposit) instead of waiting out a full
     # game tick for BankProvider's cache to naturally reflect it. See banker.withdraw_loadout's
     # own fresh parameter for the motivating call site.
+    #
+    # timeout=2.0, not api_get's default 0.3 -- CONFIRMED live 2026-09-15, same class of bug the
+    # /objects call above already carries a note about. This user's bank holds 948 items, and
+    # serialising all of them measured 202ms on an IDLE client; under load it goes well past
+    # 300ms. api_get swallows the timeout and returns None, so `or {"open": False}` reports the
+    # bank as SHUT while it is standing wide open -- and banker.is_open() is that one field.
+    # The observed cost: open_bank clicked the Wyrmscraig chest ~30 times over its whole 20s
+    # budget with the interface already up, gave up, and bank_phase fell through to
+    # "bank found but off-screen" minimap hops and then the stall watchdog. The run sat dead for
+    # 25 minutes. The engine's own loop lines in that window read 22-27s per iteration, which is
+    # what pushed the read past the budget.
+    #
+    # Fails toward LATENCY, never a wrong click -- a slow read now waits instead of lying.
     params = {"fresh": "true"} if fresh else None
-    return api_get("/bank", params=params) or {"open": False}
+    return api_get("/bank", params=params, timeout=BANK_READ_TIMEOUT_S) or {"open": False}
 
 
 def get_sailing():

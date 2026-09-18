@@ -967,14 +967,22 @@ def test_insert_side_walk_is_a_no_op_after_the_full_carve(monkeypatch):
     assert len(station_clicks) == 1, "the Insert-core click itself must still happen"
 
 
-# --- mine_phase's reclick gate (XP-event driven, 2026-08-23) --------------------------
+# --- mine_phase: one tile, three rocks, swap on DEPLETION (2026-09-14) -----------------
 #
-# The gate answers one question -- "has the swing I last clicked for actually resolved?" -- and
-# used to answer it by inferring from raw sunstone appearing in the inventory. Mining XP is the
-# game's own direct answer to it (pushed over UDP the moment the client's StatChanged fires), so
-# XP is now the primary signal and the inventory count is the lossy-UDP fallback. Both paths are
-# asserted here: the fallback is not decoration, it is what runs whenever a packet is dropped or
-# ctx.events is None.
+# USER: "use the tile i stand on right now and keep mining the three adjacent nodes. exactly like
+# we did with mining_guild iron"; "we click after each xp drop right now in mining we should just
+# await node despawn like mining_guild". These pin the two rules that whole rewrite rests on:
+# the player never leaves the stand tile, and a rock is mined until it is GONE rather than
+# re-clicked on every XP drop (mining auto-repeats on its own, so those clicks bought nothing).
+#
+# The measured facts behind the numbers -- 2 ores per rock with expert gloves, 1.8s apart, a 5.4s
+# respawn against a ~10.8s three-rock rotation -- are in MINING_TARGET_NAMES's comment block, read
+# out of recordings/2026-09-14_164323_golem-carve-baseline.jsonl.
+
+STAND = (2598, 2244, 0)
+WEST = {"x": 2597, "y": 2244, "plane": 0, "id": 62393}
+NORTH = {"x": 2598, "y": 2245, "plane": 0, "id": 62394}
+EAST = {"x": 2599, "y": 2244, "plane": 0, "id": 62393}
 
 
 class _FakeSock:
@@ -990,374 +998,1407 @@ def _events(monkeypatch, batches):
     return bridge_events.EventStream(_FakeSock())
 
 
-def test_a_mining_xp_gain_resolves_the_swing():
-    assert not gc._mine_swing_pending(
-        last_raw=3, raw_count=3, mining_xp_seen=True, last_click_time=1000.0, now=1000.1)
+def _obj(tile, oid, **extra):
+    o = {"x": tile["x"], "y": tile["y"], "plane": tile.get("plane", 0), "id": oid,
+         "name": "Sunstone rocks" if oid in gc.SUNSTONE_ROCK_IDS else "Rocks",
+         "screenX": 100, "screenY": 100}
+    o.update(extra)
+    return o
 
 
-def test_raw_sunstone_appearing_resolves_the_swing_without_any_xp_event():
-    """The fallback path: UDP is lossy and ctx.events can be None, so a swing whose XP packet
-    never arrived must still resolve off the inventory read exactly as it did before."""
-    assert not gc._mine_swing_pending(
-        last_raw=3, raw_count=4, mining_xp_seen=False, last_click_time=1000.0, now=1000.1)
+# --- discovery: the rocks come from the stand tile, never a hardcoded list ---------------
+
+def test_discover_rocks_takes_the_three_cardinal_neighbours():
+    """CONFIRMED live 2026-09-14 off /objects: standing on (2598, 2244) puts rocks west, north and
+    east, and nothing on the south tile."""
+    objects = [_obj(WEST, 62393), _obj(NORTH, 62394), _obj(EAST, 62393)]
+    rocks = gc.discover_rocks(objects, STAND)
+    assert sorted((r["x"], r["y"], r["id"]) for r in rocks) == [
+        (2597, 2244, 62393), (2598, 2245, 62394), (2599, 2244, 62393)]
 
 
-def test_neither_signal_holds_the_reclick_until_the_timeout():
-    assert gc._mine_swing_pending(
-        last_raw=3, raw_count=3, mining_xp_seen=False, last_click_time=1000.0, now=1000.1)
+def test_discover_rocks_ignores_diagonals_and_rocks_further_out():
+    """A diagonal rock cannot be mined from the stand tile, and a rock two tiles away would
+    reintroduce the walking this rewrite exists to delete."""
+    objects = [
+        _obj(WEST, 62393),
+        _obj({"x": 2597, "y": 2245, "plane": 0}, 62393),   # diagonal
+        _obj({"x": 2601, "y": 2242, "plane": 0}, 62393),   # three tiles away
+    ]
+    assert [(r["x"], r["y"]) for r in gc.discover_rocks(objects, STAND)] == [(2597, 2244)]
 
 
-def test_a_swing_with_no_signal_at_all_is_reclicked_once_the_timeout_expires():
-    """click_entity's deliberate simulated misclick lands nowhere useful, so neither signal is
-    ever coming -- MINE_RECLICK_TIMEOUT_S is what stops that stalling the whole trip."""
-    assert not gc._mine_swing_pending(
-        last_raw=3, raw_count=3, mining_xp_seen=False,
-        last_click_time=1000.0, now=1000.0 + gc.MINE_RECLICK_TIMEOUT_S + 0.01)
+def test_discover_rocks_does_not_let_scenery_claim_a_rocks_tile():
+    """Two of the three rock tiles also carry a null-named decoration, and the scene lists it
+    first on one of them. Skipping a non-rock object must NOT mark the tile as decided."""
+    scenery = {"x": WEST["x"], "y": WEST["y"], "plane": 0, "id": 3710, "name": None}
+    rocks = gc.discover_rocks([scenery, _obj(WEST, 62393)], STAND)
+    assert [(r["x"], r["y"], r["id"]) for r in rocks] == [(2597, 2244, 62393)]
 
 
-def test_nothing_is_pending_before_the_first_click_of_a_trip():
-    """last_raw is None until mine_phase has clicked once -- the very first swing must not be
-    held back waiting for a swing that was never issued."""
-    assert not gc._mine_swing_pending(
-        last_raw=None, raw_count=0, mining_xp_seen=False, last_click_time=0.0, now=1000.0)
+def test_a_rock_that_was_spent_at_discovery_has_no_id_yet():
+    """11390 is the spent form of BOTH live variants, so it cannot say which one this tile
+    carries -- the tile is still registered, its id is filled in later."""
+    rocks = gc.discover_rocks([_obj(NORTH, gc.SPENT_ROCK_ID)], STAND)
+    assert [(r["x"], r["y"], r["id"]) for r in rocks] == [(2598, 2245, None)]
 
 
-def test_mining_xp_is_seen_when_the_event_is_in_the_buffer(monkeypatch):
-    ctx = _ctx()
-    ctx.events = _events(monkeypatch, [[("XP_GAINED", {"skill": "Mining", "delta": 35})]])
-    assert gc._mining_xp_seen(ctx)
+def test_resolve_rock_ids_fills_in_a_rock_that_has_since_respawned(monkeypatch):
+    rocks = [dict(NORTH, id=None)]
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [_obj(NORTH, 62394)])
+    assert gc._resolve_rock_ids(rocks)
+    assert rocks[0]["id"] == 62394
 
 
-def test_xp_in_another_skill_does_not_resolve_a_mining_swing(monkeypatch):
-    """Crafting XP arrives constantly in this routine (chiselling, Insert-core) and the fur-pouch
-    trip crosses other skills -- only Mining may satisfy the mining gate."""
-    ctx = _ctx()
-    ctx.events = _events(monkeypatch, [[("XP_GAINED", {"skill": "Crafting", "delta": 50})]])
-    assert not gc._mining_xp_seen(ctx)
+def test_resolve_rock_ids_costs_nothing_once_every_id_is_known(monkeypatch):
+    def boom(radius=None):
+        raise AssertionError("must not re-scan the scene when every rock id is already known")
+    monkeypatch.setattr(controller, "get_objects", boom)
+    assert gc._resolve_rock_ids([dict(WEST), dict(NORTH)])
 
 
-def test_mining_xp_is_not_seen_when_no_event_arrived(monkeypatch):
-    ctx = _ctx()
-    ctx.events = _events(monkeypatch, [])
-    assert not gc._mining_xp_seen(ctx)
+# --- the rotation ------------------------------------------------------------------------
+
+def test_pick_rock_prefers_a_rock_other_than_the_one_just_spent():
+    rocks = [dict(WEST), dict(NORTH), dict(EAST)]
+    picked = gc.pick_rock(rocks, up=lambda r: True, last=(WEST["x"], WEST["y"]), spent_at={})
+    assert (picked["x"], picked["y"]) != (WEST["x"], WEST["y"])
 
 
-def test_the_xp_check_tolerates_ctx_events_being_none():
-    """The routine contract: ctx.events is absent whenever the engine started no listener, and
-    every consumer must degrade to its HTTP fallback rather than raise."""
-    ctx = _ctx()
-    ctx.events = None
-    assert not gc._mining_xp_seen(ctx)
+def test_pick_rock_takes_the_one_spent_longest_ago():
+    rocks = [dict(WEST), dict(NORTH), dict(EAST)]
+    spent_at = {(WEST["x"], WEST["y"]): 100.0, (NORTH["x"], NORTH["y"]): 50.0,
+                (EAST["x"], EAST["y"]): 300.0}
+    picked = gc.pick_rock(rocks, up=lambda r: True, last=None, spent_at=spent_at)
+    assert (picked["x"], picked["y"]) == (NORTH["x"], NORTH["y"])
 
 
-def test_the_xp_check_does_not_block(monkeypatch):
-    """A zero timeout peek at the buffer, not a wait: mine_phase runs one bounded action per
-    call so the engine's safety/break checks keep their cadence. A sleeping peek would stall
-    them for the whole timeout on every unresolved swing."""
-    import bridge_events
-    monkeypatch.setattr(bridge_events.time, "sleep",
-                        lambda d: pytest.fail(f"the XP peek must not sleep (slept {d}s)"))
-    ctx = _ctx()
-    ctx.events = _events(monkeypatch, [])
-    assert not gc._mining_xp_seen(ctx)
+def test_pick_rock_returns_the_last_one_when_it_is_the_only_one_up():
+    """With three rocks on a 3.6s cycle against a 5.4s respawn this should not happen -- but if a
+    second player leaves only the rock we just finished, re-taking it beats standing still."""
+    rocks = [dict(WEST), dict(NORTH)]
+    up = lambda r: (r["x"], r["y"]) == (WEST["x"], WEST["y"])
+    picked = gc.pick_rock(rocks, up=up, last=(WEST["x"], WEST["y"]), spent_at={})
+    assert (picked["x"], picked["y"]) == (WEST["x"], WEST["y"])
 
 
-def _stub_mining_area(monkeypatch, inventory):
-    """Stubs the bridge reads mine_phase makes so it reaches its click, and records every click.
-    `inventory` is a live list the test mutates to simulate ore arriving (or not)."""
-    monkeypatch.setattr(controller, "get_inventory", lambda: inventory)
-    monkeypatch.setattr(
-        controller, "get_objects",
-        lambda radius=None: [{"id": 1, "name": "Sunstone rocks", "x": 10, "y": 20,
-                              "plane": 0, "distance": 2, "visible": True}],
-    )
-    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
-    clicks = []
-    monkeypatch.setattr(controller, "click_entity",
-                        lambda ser, entity, **kw: clicks.append(entity) or True)
-    return clicks
+def test_pick_rock_is_none_when_every_rock_is_spent():
+    assert gc.pick_rock([dict(WEST), dict(NORTH)], up=lambda r: False, last=None, spent_at={}) is None
 
 
-def test_a_mining_xp_event_frees_the_next_swing_before_the_inventory_read_would(monkeypatch):
-    """The point of the rewrite: the swing is resolved by the game's own XP signal, so the next
-    click goes out without waiting on raw sunstone showing up in an inventory poll -- and without
-    burning MINE_RECLICK_TIMEOUT_S when it never will."""
-    inventory = []
-    clicks = _stub_mining_area(monkeypatch, inventory)
-    ctx = _ctx()
-    # Two empty batches first: mine_phase pumps once for its gate check and once more to drop
-    # stale events immediately before clicking, so the XP has to land on the batch AFTER those
-    # to represent a gain caused by the swing this click just issued.
-    ctx.events = _events(monkeypatch,
-                         [[], [], [("XP_GAINED", {"skill": "Mining", "delta": 35})]])
+# --- the batch budget --------------------------------------------------------------------
 
-    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
-    assert len(clicks) == 1, "the first swing of the trip must click"
-
-    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
-    assert len(clicks) == 2, \
-        "a Mining XP gain proves the swing resolved -- the next one must not wait for the timeout"
+def test_the_batch_counts_raw_and_cores_together():
+    """CORRECTED 2026-08-08 live: chiselling converts raw into cores 1-for-1 and never changes the
+    sum, so a trip resuming with unspent cores must mine only the difference."""
+    assert gc.mine_batch_done(gc.SUNSTONE_PER_TRIP - 4, 4, 21)
+    assert not gc.mine_batch_done(gc.SUNSTONE_PER_TRIP - 5, 4, 20)
 
 
-def test_mine_phase_drops_a_stale_xp_event_before_issuing_its_click(monkeypatch):
-    """The race the pump-before-clear closes: the PREVIOUS swing's XP packet can still be sitting
-    unread in the socket while this click is being issued, and would otherwise resolve the swing
-    we have not even made yet -- turning the gate back into the "clicks all over" noise it exists
-    to prevent."""
-    inventory = []
-    _stub_mining_area(monkeypatch, inventory)
-    ctx = _ctx()
-    ctx.events = _events(monkeypatch, [[("XP_GAINED", {"skill": "Mining", "delta": 35})]])
-
-    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
-
-    assert not gc._mining_xp_seen(ctx), \
-        "the XP event that predates this click must not still be visible to the next gate check"
+def test_a_full_inventory_ends_the_batch_regardless_of_the_count():
+    assert gc.mine_batch_done(1, 0, controller.INVENTORY_SIZE)
 
 
-# --- mine_phase pre-hovers the next rock while a swing resolves (2026-08-24) -----------
+# --- Surplus fur, and the livelock it caused (2026-09-15, live) -------------------------------
 #
-# User directive, informed by two recorded human mining sessions: Sunstone's "momentum" mechanic
-# rewards fast, consistent click cadence, and the routine's own recorded cadence was ~2x the
-# human's even though a target was always found -- the lost time was click_entity's own
-# move-then-click travel, paid AFTER the swing was already confirmed done. Fix: rest the mouse on
-# a different ready rock while the current swing plays out (controller.hover_entity, the same
-# primitive routines/mastering_mixology.py's speedup functions already use this way), so the
-# click that resolves the swing only has to fire, not travel.
+# USER: "furr bag got deposit start again". A fur trip ends the moment fur SPILLS, which by
+# definition means the pouch is FULL and there is loose fur beside it. That surplus rode home,
+# survived the deposit (BANK_KEEP_ITEMS keeps "fur", for a different case), could not be packed
+# into an already-full pouch, and left the inventory full at 2 sunstone + 5 cores.
 
-# BUG, reported live 2026-08-24: "we hover before we stop moving so the cursor ends up wrong."
-#
-# The pre-hover fires straight after click_entity, while the player is usually still WALKING to
-# the rock it just clicked. Two coupled defects made that unsafe:
-#
-#   1. hover_entity was called with no refresh_target, so it flew to the screen position captured
-#      before the walk and the camera moved out from under it mid-flight.
-#   2. gc_mine_hover_screen recorded next_rock["screenX"/"screenY"] -- where the cursor was
-#      PREDICTED to land, never where it actually did. The next tick's staleness gate then
-#      measured drift against a value nothing had verified, so a drift under HOVER_STALE_PX could
-#      pass the gate while still sitting off the rock's clickbox, and click_human fired into bare
-#      ground.
+def test_surplus_fur_is_only_surplus_once_the_pouch_is_full():
+    inv = [{"name": "Dark kebbit fur"}, {"name": "Large fur pouch (open)"}, {"name": "Chisel"}]
+    assert gc.surplus_loose_fur(inv, gc.FUR_POUCH_CAPACITY) == [{"name": "Dark kebbit fur"}]
+    assert gc.surplus_loose_fur(inv, gc.FUR_POUCH_CAPACITY - 1) == [], \
+        "with room left the loose fur is about to be packed, not surplus"
 
-def test_pre_hover_waits_for_the_player_to_stop_before_hovering(monkeypatch):
-    """Defect 1, and the user's own description of the bug: the hover was issued while the player
-    was still walking to the rock it had just clicked, so the camera moved out from under it."""
-    inventory = []
-    rock_a = {"id": 1, "name": "Sunstone rocks", "x": 10, "y": 20, "plane": 0, "distance": 1,
-              "visible": True, "screenX": 100, "screenY": 100}
-    rock_b = {"id": 2, "name": "Sunstone rocks", "x": 11, "y": 20, "plane": 0, "distance": 2,
-              "visible": True, "screenX": 200, "screenY": 150}
-    monkeypatch.setattr(controller, "get_inventory", lambda: inventory)
-    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [rock_a, rock_b])
-    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
-    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (100, 100))
-    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
-    monkeypatch.setattr(controller, "click_human", lambda ser: None)
 
-    order = []
-    monkeypatch.setattr(controller, "wait_until_player_idle",
-                        lambda **kw: order.append("idle") or True)
-    monkeypatch.setattr(controller, "hover_entity",
-                        lambda ser, entity, **kw: order.append("hover") or True)
+def test_the_pouch_itself_is_never_counted_as_surplus_fur():
+    """Its name contains "fur" -- a substring rule that does not exclude it banks the pouch."""
+    inv = [{"name": "Large fur pouch (open)"}]
+    assert gc.surplus_loose_fur(inv, gc.FUR_POUCH_CAPACITY) == []
+
+
+def test_the_surplus_deposit_keeps_the_pouch_and_the_batch(monkeypatch):
+    import banker
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Dark kebbit fur"}] * 20)
+    seen = {}
+    monkeypatch.setattr(banker, "deposit_inventory",
+                        lambda ctx, cfg: seen.update(cfg) or None)
+    ctx = _ctx()
+    ctx.state.data["gc_fur_stock"] = gc.FUR_POUCH_CAPACITY
+
+    assert gc._deposit_surplus_fur(ctx) == 20
+    keep = seen["keepItems"]
+    assert "fur" not in keep, "the loose fur must become depositable"
+    assert banker.FUR_POUCH_NAME in keep, "the pouch must not go with it"
+    assert gc.RAW_SUNSTONE_NAME.lower() in keep and gc.CHISEL_NAME.lower() in keep
+
+
+def test_a_full_inventory_with_an_unfinished_batch_banks_instead_of_chiselling(monkeypatch):
+    """The livelock. mine flipped to chisel, which had its cores and flipped to craft, which had
+    too little raw and flipped back to mine -- for 23 minutes. The stall watchdog could not see it
+    because _progress_signature includes the phase, and the phase changed every iteration."""
+    full = ([{"name": "Dark kebbit fur"}] * 21 + [{"name": "Sunstone"}] * 2
+            + [{"name": "Sunstone core"}] * 5)
+    assert len(full) == controller.INVENTORY_SIZE
+    mined = _stub_chain(monkeypatch, full, ["depleted"])
 
     ctx = _ctx()
-    ctx.events = _events(monkeypatch, [[], []])
+    ctx.events = _events(monkeypatch, [[]])
     gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
 
-    assert "hover" in order, "no pre-hover happened"
-    assert order.index("idle") < order.index("hover"), \
-        "must wait for the player to stop BEFORE hovering -- a walking player invalidates the " \
-        "screen position continuously"
+    assert ctx.state.data["gc_phase"] == "bank", "must shed the surplus, not cycle through chisel"
+    assert mined == [], "and must not click a rock with no room for the ore"
 
 
-def test_pre_hover_is_skipped_when_the_player_never_stops(monkeypatch):
-    """If the wait times out the player is still moving, so any position resolved now is already
-    stale. Skipping costs nothing -- the next tick just does a normal move+click."""
-    inventory = []
-    rock_a = {"id": 1, "name": "Sunstone rocks", "x": 10, "y": 20, "plane": 0, "distance": 1,
-              "visible": True, "screenX": 100, "screenY": 100}
-    rock_b = {"id": 2, "name": "Sunstone rocks", "x": 11, "y": 20, "plane": 0, "distance": 2,
-              "visible": True, "screenX": 200, "screenY": 150}
-    monkeypatch.setattr(controller, "get_inventory", lambda: inventory)
-    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [rock_a, rock_b])
-    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
-    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (100, 100))
-    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
-    monkeypatch.setattr(controller, "click_human", lambda ser: None)
-    monkeypatch.setattr(controller, "wait_until_player_idle", lambda **kw: False)
-    hovers = []
-    monkeypatch.setattr(controller, "hover_entity",
-                        lambda ser, entity, **kw: hovers.append(entity) or True)
-
-    ctx = _ctx()
-    ctx.events = _events(monkeypatch, [[], []])
-    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
-
-    assert hovers == [], "must not hover while the player is still moving"
-    assert ctx.state.data.get("gc_mine_hover_screen") is None
+def _no_fur_bank(monkeypatch, inventory=None):
+    """An open bank holding no fur at all -- same stubs as the existing kit-up test."""
+    import banker
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inventory or []))
+    # Fully geared, so _withdraw_missing_mining_gear stays out of the way.
+    monkeypatch.setattr(controller, "get_equipment",
+                        lambda: {"weapon": {"name": "Rune pickaxe"},
+                                 "gloves": {"name": "Expert mining gloves"},
+                                 "shield": {"name": "Imcando hammer (off-hand)"}})
+    monkeypatch.setattr(controller, "get_bank", lambda **kw: {"items": []})
+    monkeypatch.setattr(banker, "deposit_inventory", lambda ctx, cfg: None)
+    monkeypatch.setattr(banker, "search_bank", lambda ctx, q: True)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+    # "the bank genuinely holds no fur" -- without this the veto added 2026-09-15 consults the
+    # real bridge's bank memory and (correctly) refuses to spend a trip.
+    monkeypatch.setattr(gc, "_remembered_bank_fur", lambda: None)
+    kitted = []
+    monkeypatch.setattr(gc, "_withdraw_kit", lambda ctx, config: kitted.append(True) or True)
+    return kitted
 
 
-def test_pre_hover_records_where_the_cursor_actually_LANDED(monkeypatch):
-    """Defect 2, and the one that actually mis-clicked.
+def test_an_empty_bank_does_not_burn_a_trip_before_the_pouch_is_ever_counted(monkeypatch):
+    """A pouch's contents are not readable anywhere, so gc_fur_stock is an estimate that resets on
+    restart while the pouch does not. CONFIRMED live 2026-09-15: restarting beside a FULL pouch
+    would have kitted up for a five-minute hunt because the bank held no loose fur."""
+    _fake_clock(monkeypatch)
+    kitted = _no_fur_bank(monkeypatch)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    assert "gc_fur_stock" not in ctx.state.data
 
-    The stored anchor must be the real cursor position, not next_rock's predicted screen point.
-    Here the cursor ends up at (177, 141) while the rock was predicted at (200, 150); recording
-    the prediction would leave the next tick measuring staleness against a fiction.
-    """
-    inventory = []
-    rock_a = {"id": 1, "name": "Sunstone rocks", "x": 10, "y": 20, "plane": 0, "distance": 1,
-              "visible": True, "screenX": 100, "screenY": 100}
-    rock_b = {"id": 2, "name": "Sunstone rocks", "x": 11, "y": 20, "plane": 0, "distance": 2,
-              "visible": True, "screenX": 200, "screenY": 150}
-    monkeypatch.setattr(controller, "get_inventory", lambda: inventory)
-    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [rock_a, rock_b])
-    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
-    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
-    monkeypatch.setattr(controller, "click_human", lambda ser: None)
-    monkeypatch.setattr(controller, "wait_until_player_idle", lambda **kw: True)
-    # (100,100) while the click is decided; (177,141) once the hover has actually flown. Keyed on
-    # the hover having happened rather than on a call count, so the test does not silently depend
-    # on how many times mine_phase reads the cursor.
-    hovered = []
-    monkeypatch.setattr(controller, "hover_entity",
-                        lambda ser, entity, **kw: hovered.append(True) or True)
-    monkeypatch.setattr(controller, "get_cursor_pos",
-                        lambda: (177, 141) if hovered else (100, 100))
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
 
-    ctx = _ctx()
-    ctx.events = _events(monkeypatch, [[], []])
-    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
-
-    assert ctx.state.data["gc_mine_hover_screen"] == (177, 141), (
-        "must store the ACTUAL post-hover cursor position; storing the rock's predicted "
-        "screenX/screenY is what let a drifted cursor pass the staleness gate")
+    assert kitted == [], "must not start a fur trip on an uncounted pouch"
+    assert ctx.state.data["gc_phase"] == "mine"
 
 
-def test_find_mining_target_excludes_the_given_position(monkeypatch):
-    rock_a = {"id": 1, "name": "Sunstone rocks", "x": 10, "y": 20, "distance": 1, "visible": True}
-    rock_b = {"id": 2, "name": "Sunstone rocks", "x": 11, "y": 20, "distance": 2, "visible": True}
-    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [rock_a, rock_b])
-    assert gc.find_mining_target(exclude_pos=(10, 20)) is rock_b
+def test_an_empty_bank_does_start_a_trip_once_the_game_has_said_we_are_out(monkeypatch):
+    """The game's own rejection message is the authoritative signal, and it must still win."""
+    _fake_clock(monkeypatch)
+    kitted = _no_fur_bank(monkeypatch)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    ctx.state.data["gc_fur_exhausted"] = True
+
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+
+    assert kitted == [True]
+    assert ctx.state.data["gc_phase"] == "fur_trip"
 
 
-def test_find_mining_target_returns_none_when_the_only_candidate_is_excluded(monkeypatch):
-    rock_a = {"id": 1, "name": "Sunstone rocks", "x": 10, "y": 20, "distance": 1, "visible": True}
-    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [rock_a])
-    assert gc.find_mining_target(exclude_pos=(10, 20)) is None
+def test_an_empty_bank_starts_a_trip_once_a_count_has_been_established(monkeypatch):
+    """A run that HAS counted the pouch and knows it is empty must still go hunting."""
+    _fake_clock(monkeypatch)
+    kitted = _no_fur_bank(monkeypatch)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    ctx.state.data["gc_fur_stock"] = 0
+
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+
+    assert kitted == [True]
+    assert ctx.state.data["gc_phase"] == "fur_trip"
 
 
-def _stub_mining_area_multi(monkeypatch, inventory, rocks, cursor_pos=(100, 100)):
-    """Like _stub_mining_area but with a configurable list of ready rock objects (needed to
-    exercise the pre-hover step, which requires more than one candidate to pick a 'next' rock
-    from), and records hover_entity/click_human calls alongside click_entity.
-
-    cursor_pos defaults to matching every test's hover screen position (100, 100) below -- pass a
-    different point to simulate something else having moved the cursor since the hover."""
-    monkeypatch.setattr(controller, "get_inventory", lambda: inventory)
-    monkeypatch.setattr(controller, "get_objects", lambda radius=None: list(rocks))
-    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
-    monkeypatch.setattr(controller, "get_cursor_pos", lambda: cursor_pos)
-    clicks = []
-    monkeypatch.setattr(controller, "click_entity",
-                        lambda ser, entity, **kw: clicks.append(entity) or True)
-    hovers = []
-    monkeypatch.setattr(controller, "hover_entity",
-                        lambda ser, entity, **kw: hovers.append(entity) or True)
-    bare_clicks = []
-    monkeypatch.setattr(controller, "click_human", lambda ser: bare_clicks.append(True))
-    return clicks, hovers, bare_clicks
-
-
-def test_mine_phase_hovers_a_different_ready_rock_after_a_successful_click(monkeypatch):
-    inventory = []
-    rock_a = {"id": 1, "name": "Sunstone rocks", "x": 10, "y": 20, "plane": 0, "distance": 1,
-              "visible": True, "screenX": 100, "screenY": 100}
-    rock_b = {"id": 2, "name": "Sunstone rocks", "x": 11, "y": 20, "plane": 0, "distance": 2,
-              "visible": True, "screenX": 200, "screenY": 150}
-    clicks, hovers, _ = _stub_mining_area_multi(monkeypatch, inventory, [rock_a, rock_b])
-    ctx = _ctx()
-    ctx.events = _events(monkeypatch, [[], []])
-
-    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
-
-    assert clicks == [rock_a], "must click the sticky/closest rock first"
-    assert hovers == [rock_b], "must pre-hover the OTHER ready rock, not the one just clicked"
-    assert ctx.state.data["gc_mine_hover_pos"] == (11, 20)
-    # (100, 100) is the stub's CURSOR position, not rock_b's screen point (200, 150). Before the
-    # 2026-08-24 fix this asserted the latter -- i.e. it encoded the bug: the anchor recorded
-    # where the cursor was predicted to land, never where it actually did.
-    assert ctx.state.data["gc_mine_hover_screen"] == (100, 100)
-
-
-def test_mine_phase_uses_the_fast_click_path_when_already_hovering_the_target(monkeypatch):
-    """Once hovered, the swing that resolves fires click_human directly -- no further
-    click_entity (a fresh move_to_human) call. This is the whole point of the pre-hover."""
-    inventory = []
-    rock_a = {"id": 1, "name": "Sunstone rocks", "x": 10, "y": 20, "plane": 0, "distance": 1,
-              "visible": True, "screenX": 100, "screenY": 100}
-    clicks, hovers, bare_clicks = _stub_mining_area_multi(monkeypatch, inventory, [rock_a])
-    ctx = _ctx()
-    ctx.state.data["gc_mine_hover_pos"] = (10, 20)
-    ctx.state.data["gc_mine_hover_screen"] = (100, 100)
-    ctx.events = _events(monkeypatch, [[], []])
-
-    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
-
-    assert bare_clicks == [True], "the fast path must fire a bare click_human"
-    assert clicks == [], "click_entity must not run a fresh move+click when already hovering it"
-
-
-def test_mine_phase_falls_back_to_a_fresh_click_when_the_hover_has_drifted_too_far(monkeypatch):
-    """A stale hover (screen position drifted past HOVER_STALE_PX since it was recorded) must
-    not fire a blind click_human -- fall back to click_entity's own move+click instead."""
-    inventory = []
-    rock_a = {"id": 1, "name": "Sunstone rocks", "x": 10, "y": 20, "plane": 0, "distance": 1,
-              "visible": True, "screenX": 100, "screenY": 100}
-    clicks, hovers, bare_clicks = _stub_mining_area_multi(monkeypatch, inventory, [rock_a])
-    ctx = _ctx()
-    ctx.state.data["gc_mine_hover_pos"] = (10, 20)
-    ctx.state.data["gc_mine_hover_screen"] = (100 + gc.HOVER_STALE_PX + 50, 100)
-    ctx.events = _events(monkeypatch, [[], []])
-
-    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
-
-    assert clicks == [rock_a], "a stale hover must fall back to click_entity"
-    assert bare_clicks == [], "must not blind-click through a stale hover"
-
-
-def test_mine_phase_falls_back_when_something_else_moved_the_cursor_since_the_hover(monkeypatch):
-    """The rock not having drifted on screen is not enough on its own -- if the CURSOR itself
-    moved away from the hover point (e.g. _shed_pit_junk dropping items, or an idle-mouse nudge),
-    blind-clicking would miss even though the rock's own reported position is unchanged."""
-    inventory = []
-    rock_a = {"id": 1, "name": "Sunstone rocks", "x": 10, "y": 20, "plane": 0, "distance": 1,
-              "visible": True, "screenX": 100, "screenY": 100}
-    clicks, hovers, bare_clicks = _stub_mining_area_multi(
-        monkeypatch, inventory, [rock_a], cursor_pos=(100 + gc.HOVER_STALE_PX + 50, 100))
-    ctx = _ctx()
-    ctx.state.data["gc_mine_hover_pos"] = (10, 20)
-    ctx.state.data["gc_mine_hover_screen"] = (100, 100)
-    ctx.events = _events(monkeypatch, [[], []])
-
-    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
-
-    assert clicks == [rock_a], "the cursor having moved away must fall back to click_entity"
-    assert bare_clicks == [], "must not blind-click from wherever the cursor actually ended up"
-
-
-def test_mine_phase_clears_hover_state_once_the_budget_is_reached(monkeypatch):
-    """A hover left over from the last swing of a trip must not leak into chisel_phase or the
-    next trip's mining."""
-    inventory = [{"name": "Sunstone"}] * gc.SUNSTONE_PER_TRIP
-    monkeypatch.setattr(controller, "get_inventory", lambda: inventory)
-    ctx = _ctx()
-    ctx.state.data["gc_mine_hover_pos"] = (10, 20)
-    ctx.state.data["gc_mine_hover_screen"] = (100, 100)
+def test_a_genuinely_full_batch_still_goes_to_chisel(monkeypatch):
+    """The ordinary end of mining must be untouched by that guard."""
+    inv = [{"name": "Sunstone"}] * 20 + [{"name": "Sunstone core"}] * 5
+    mined = _stub_chain(monkeypatch, inv, ["depleted"])
     monkeypatch.setattr(gc, "_step_toward_plinth", lambda ctx, config: None)
 
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[]])
     gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
 
-    assert ctx.state.data["gc_mine_hover_pos"] is None
-    assert ctx.state.data["gc_mine_hover_screen"] is None
+    assert ctx.state.data["gc_phase"] == "chisel"
+    assert mined == []
+
+
+# --- one rock, mined until it is gone ------------------------------------------------------
+
+def _stub_one_rock(monkeypatch, live_after):
+    """`live_after` is a list of /object/at answers consumed in order: a dict while the rock still
+    stands, None once it has depleted."""
+    answers = list(live_after)
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda x, y, plane, oid, **kw: answers.pop(0) if answers else None)
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **kw: None)
+    monkeypatch.setattr(controller, "hover_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": False})
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+
+
+def test_a_rock_is_mined_until_it_despawns_not_until_an_xp_drop(monkeypatch):
+    """The user's own correction. The first ore leaves the rock standing (expert gloves), and the
+    game keeps swinging on its own -- so that XP drop must NOT end the wait or produce a click."""
+    _fake_clock(monkeypatch)          # the ore/grace budgets are real seconds otherwise
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicks.append(entity) or True)
+    xp = [1000, 1000, 1023, 1023]     # base, still nothing, first ore, ...
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": xp.pop(0) if len(xp) > 1 else xp[0]})
+    _stub_one_rock(monkeypatch, [_obj(WEST, 62393), _obj(WEST, 62393), None])
+
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[], [], []])
+    assert gc.mine_rock(ctx, dict(WEST), _obj(WEST, 62393)) == "depleted"
+    assert len(clicks) == 1, "one click per rock -- the XP drop must not produce another"
+
+
+def test_a_click_that_produced_nothing_is_reported_as_failed(monkeypatch):
+    """No swing animation and no ore past MINE_CLICK_GRACE_S: the click did not take (another
+    player on the pixel, the rock taken as we clicked)."""
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": 1000})
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda x, y, plane, oid, **kw: _obj(WEST, 62393))
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **kw: None)
+    monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": True})
+    monkeypatch.setattr(gc.time, "sleep", lambda s: None)
+
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [])
+    monkeypatch.setattr(gc, "MINE_CLICK_GRACE_S", 0.0)
+    assert gc.mine_rock(ctx, dict(WEST), _obj(WEST, 62393)) == "failed"
+
+
+def test_the_rock_click_never_simulates_a_misclick(monkeypatch):
+    """MEASURED in mining_guild_iron (mgi_live6): a deliberate near-miss beside an ADJACENT rock
+    is a Walk-here onto a neighbouring tile, and one step off the stand tile leaves the other two
+    rocks out of reach. This is the single-tile design's load-bearing exception to
+    simulate_mistakes."""
+    _fake_clock(monkeypatch)
+    seen = {}
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: seen.update(kw) or True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": 1000})
+    _stub_one_rock(monkeypatch, [None])
+
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[]])
+    gc.mine_rock(ctx, dict(WEST), _obj(WEST, 62393))
+    assert seen.get("simulate_mistakes") is False
+
+
+def test_the_next_rock_is_hovered_while_the_current_one_is_still_being_mined(monkeypatch):
+    """The swap has to be a click IN PLACE, not a flight -- so the cursor is parked on the next
+    rock during the current rock's ~3.6s of mining. The next rock is usually still SPENT at that
+    moment (5.4s respawn), which is why the hover resolves the 11390 standing on its tile."""
+    _fake_clock(monkeypatch)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"miningXp": 1000})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **kw: None)
+    monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": False})
+
+    def object_at(x, y, plane, oid, **kw):
+        if (x, y) == (WEST["x"], WEST["y"]):
+            return None                                  # the rock we clicked: already gone
+        return _obj(NORTH, oid, screenX=200, screenY=150) if oid == gc.SPENT_ROCK_ID else None
+    monkeypatch.setattr(controller, "get_object_at", object_at)
+    hovers = []
+    monkeypatch.setattr(controller, "hover_entity",
+                        lambda ser, entity, **kw: hovers.append(entity) or True)
+
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[]])
+    gc.mine_rock(ctx, dict(WEST), _obj(WEST, 62393), hover_next=dict(NORTH))
+    assert [(h["x"], h["y"]) for h in hovers] == [(NORTH["x"], NORTH["y"])]
+    assert hovers[0]["screenX"] == 200, "the hover must use the SPENT rock's live screen position"
+
+
+# --- the chain ----------------------------------------------------------------------------
+
+def _stub_chain(monkeypatch, inventory, outcomes, up=None):
+    """Drives mine_phase's chain with mine_rock stubbed: `outcomes` is consumed one per rock, and
+    the rock it was called with is recorded. `up` decides which tiles report as ready."""
+    monkeypatch.setattr(controller, "get_inventory", lambda: inventory)
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": STAND[0], "y": STAND[1], "plane": STAND[2]})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [
+        _obj(WEST, 62393), _obj(NORTH, 62394), _obj(EAST, 62393)])
+    monkeypatch.setattr(controller, "get_object_at", lambda x, y, plane, oid, **kw:
+                        _obj({"x": x, "y": y, "plane": plane}, oid)
+                        if (up is None or up((x, y))) else None)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "fidget_once", lambda: None)
+    monkeypatch.setattr(gc, "_park_on_rock", lambda ctx, rock: True)
+    mined = []
+    queue = list(outcomes)
+
+    def fake_mine_rock(ctx, rock, target, hover_next=None, stop_when=None):
+        mined.append((rock["x"], rock["y"]))
+        return queue.pop(0) if queue else "no_click"
+    monkeypatch.setattr(gc, "mine_rock", fake_mine_rock)
+    return mined
+
+
+def test_the_chain_rotates_through_the_three_rocks_without_ever_walking(monkeypatch):
+    """The whole point (USER: "by the time we finished mining two one has already respawned
+    meaning no walking"). Three depletions in a row must hit three DIFFERENT tiles, and nothing
+    may walk."""
+    walks = []
+    monkeypatch.setattr(gc, "walk_to_exact_tile",
+                        lambda ctx, x, y, plane, **kw: walks.append((x, y)) or True)
+    monkeypatch.setattr(gc.travel, "walk_to", lambda *a, **kw: walks.append(a) or True)
+    mined = _stub_chain(monkeypatch, [], ["depleted", "depleted", "depleted", "no_click"])
+
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[]])
+    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert len(mined) == 4
+    assert len(set(mined[:3])) == 3, f"must rotate across all three rocks, got {mined}"
+    assert walks == [], "the stand tile is never left while rocks are in reach"
+
+
+def test_the_chain_keeps_mining_across_rocks_instead_of_handing_tick_back(monkeypatch):
+    """MEASURED in mining_guild_iron (mgi_live2): every hand-back to the engine loop cost 1.0-1.5s,
+    which against a 3.6s rock is a third of the mining rate."""
+    mined = _stub_chain(monkeypatch, [], ["depleted"] * 5 + ["no_click"])
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[]])
+    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
+    assert len(mined) == 6, "one call to mine_phase must mine many rocks, not one"
+
+
+def test_the_chain_stops_and_moves_on_once_the_batch_is_full(monkeypatch):
+    inventory = [{"name": "Sunstone"}] * gc.SUNSTONE_PER_TRIP
+    mined = _stub_chain(monkeypatch, inventory, ["depleted"])
+    steps = []
+    monkeypatch.setattr(gc, "_step_toward_plinth", lambda ctx, config: steps.append(True))
+
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[]])
+    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert mined == [], "the budget is checked BEFORE clicking, every iteration"
+    assert ctx.state.data["gc_phase"] == "chisel"
+    assert steps == [True], "the step toward the plinth is what breaks the mining animation"
+
+
+def test_the_chain_hands_tick_back_when_a_break_comes_due(monkeypatch):
+    """A break must not wait out a whole 25-stone batch. The gap between rocks is the safe place
+    to take it -- nothing is in flight."""
+    mined = _stub_chain(monkeypatch, [], ["depleted"] * 5)
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[]])
+    calls = {"n": 0}
+
+    def break_due(cfg):
+        calls["n"] += 1
+        return calls["n"] > 2
+    ctx.state.break_due = break_due
+
+    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
+    assert len(mined) == 2, f"must stop at the break instead of mining the batch out, got {mined}"
+    assert ctx.state.data.get("gc_phase") != "chisel", "the batch is unfinished -- stay in mine"
+
+
+def test_the_chain_waits_out_the_respawn_rather_than_walking_to_another_rock(monkeypatch):
+    """Every rock spent at once means another player is on the spot. The old behaviour -- go find
+    whichever rock is nearest -- is exactly what this rewrite removes: 5.4s of waiting beats a
+    walk that ends with the three adjacent rocks out of reach."""
+    mined = _stub_chain(monkeypatch, [], ["depleted"], up=lambda tile: False)
+    sleeps = []
+    monkeypatch.setattr(gc.time, "sleep", lambda s: sleeps.append(s))
+    walks = []
+    monkeypatch.setattr(gc, "walk_to_exact_tile",
+                        lambda ctx, x, y, plane, **kw: walks.append((x, y)) or True)
+    monkeypatch.setattr(gc, "MINE_CHAIN_MAX_ROCKS", 3)
+
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[]])
+    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert mined == [], "nothing is clickable, so nothing may be clicked"
+    assert sleeps and all(s == gc.MINE_RESPAWN_WAIT_S for s in sleeps)
+    assert walks == []
+
+
+def test_the_chain_walks_back_onto_the_stand_tile_when_it_is_off_it(monkeypatch):
+    """Arriving from the bank or a fur trip, and the one recovery this design actually needs: a
+    stray Walk-here leaves the other two rocks out of reach, so position is re-checked every
+    iteration."""
+    _stub_chain(monkeypatch, [], ["depleted"])
+    here = {"x": 2590, "y": 2240, "plane": 0}
+    monkeypatch.setattr(controller, "get_player", lambda: dict(here))
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, plane, **kw: {"onScreen": True})
+    walks = []
+
+    def walk(ctx, x, y, plane, **kw):
+        walks.append((x, y, plane))
+        here.update(x=x, y=y, plane=plane)      # this walk actually arrives
+        return True
+    monkeypatch.setattr(gc, "walk_to_exact_tile", walk)
+
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[]])
+    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert walks == [STAND], "must walk back to the exact stand tile, not near it"
+
+
+def test_the_walk_back_retries_inside_one_call_instead_of_one_try_per_tick(monkeypatch):
+    """MEASURED live 2026-09-14 on both bank trips: one attempt per call, then a hand-back to the
+    engine, cost ~25s to get home from the bank -- three attempts got there, so the walk worked
+    and the asking-once was the slow part."""
+    _stub_chain(monkeypatch, [], ["depleted"])
+    here = {"x": 2590, "y": 2240, "plane": 0}
+    monkeypatch.setattr(controller, "get_player", lambda: dict(here))
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, plane, **kw: {"onScreen": True})
+    walks = []
+
+    def walk(ctx, x, y, plane, **kw):
+        walks.append((x, y, plane))
+        if len(walks) >= 3:                     # the first two fall short, as they did live
+            here.update(x=x, y=y, plane=plane)
+        return True
+    monkeypatch.setattr(gc, "walk_to_exact_tile", walk)
+
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[]])
+    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert len(walks) == 3, f"must keep trying within the call, got {walks}"
+    assert not ctx.state.safety_stopped
+
+
+def test_the_walk_back_is_paced_so_a_no_op_walk_cannot_spin(monkeypatch):
+    """walk_to_exact_tile returns immediately when the tile cannot be projected at all. Without a
+    pause between attempts the retry loop spun 1.6 MILLION times against its budget -- caught by
+    this test, not in production."""
+    _stub_chain(monkeypatch, [], ["depleted"])
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2590, "y": 2240, "plane": 0})
+    monkeypatch.setattr(controller, "get_ground_walk_point",
+                        lambda x, y, plane, **kw: {"onScreen": True})
+    walks = []
+    monkeypatch.setattr(gc, "walk_to_exact_tile",
+                        lambda ctx, x, y, plane, **kw: walks.append((x, y)) or True)
+    pauses = []
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: pauses.append(a))
+
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[]])
+    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
+
+    assert len(walks) <= gc.MINE_RETURN_MAX_ATTEMPTS, f"unbounded retries: {len(walks)}"
+    assert gc.MINE_RETURN_RETRY_PAUSE_S in pauses, "retries must be paced"
+
+
+def test_the_mining_anchor_is_the_tile_the_rocks_are_discovered_from():
+    """Moving the spot is a one-line config change -- the three rocks are never hardcoded."""
+    assert gc._mine_stand(gc.DEFAULT_CONFIG) == STAND
+
+
+# --- The fur trip strips the mining gear; something has to put it back (2026-09-14) ----------
+#
+# USER: "Both weapon Slot and gloves need to be uneqiped and after route collected fur we need to
+# reequip". falconry._ensure_hands_free empties the weapon, shield and glove slots because
+# falconry needs both hands free -- correct going out, and never undone coming back. Mining with
+# no pickaxe does nothing at all, and without the Expert gloves a rock gives ONE ore instead of
+# two, which halves the whole activity.
+
+def _gear_world(monkeypatch, equipment, inventory):
+    monkeypatch.setattr(controller, "get_equipment", lambda: equipment)
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inventory))
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: clicked.append(entity.get("name")) or True)
+    return clicked
+
+
+def test_the_pickaxe_is_worn_back_after_the_trip(monkeypatch):
+    clicked = _gear_world(monkeypatch, equipment={"weapon": {}, "gloves": {}, "shield": {}},
+                          inventory=[{"name": "Rune pickaxe", "screenX": 1, "screenY": 1}])
+    assert gc.ensure_mining_gear(_ctx()) is True
+    assert clicked == ["Rune pickaxe"]
+
+
+def test_the_mining_gloves_are_worn_back_too(monkeypatch):
+    clicked = _gear_world(
+        monkeypatch,
+        equipment={"weapon": {"name": "Rune pickaxe"}, "gloves": {}, "shield": {}},
+        inventory=[{"name": "Expert mining gloves", "screenX": 1, "screenY": 1}])
+    assert gc.ensure_mining_gear(_ctx()) is True
+    assert clicked == ["Expert mining gloves"]
+
+
+def test_nothing_is_worn_back_when_every_slot_is_already_filled(monkeypatch):
+    clicked = _gear_world(
+        monkeypatch,
+        equipment={"weapon": {"name": "Rune pickaxe"}, "gloves": {"name": "Expert mining gloves"},
+                   "shield": {"name": "Imcando hammer (off-hand)"}},
+        inventory=[{"name": "Rune pickaxe", "screenX": 1, "screenY": 1}])
+    assert gc.ensure_mining_gear(_ctx()) is False
+    assert clicked == []
+
+
+def test_an_empty_slot_with_nothing_to_fill_it_is_left_alone(monkeypatch):
+    """Only ever acts on an empty slot with the item actually carried, so a deliberately
+    different setup is never overridden and a missing item never loops."""
+    clicked = _gear_world(monkeypatch, equipment={"weapon": {}, "gloves": {}, "shield": {}},
+                          inventory=[{"name": "Sunstone", "screenX": 1, "screenY": 1}])
+    assert gc.ensure_mining_gear(_ctx()) is False
+    assert clicked == []
+
+
+def test_the_bank_keeps_the_mining_gear_it_is_about_to_need():
+    """CONFIRMED live 2026-09-14 (USER: "Oh shit we just deposited our rune pickaxe. And also our
+    gloves"). The fur trip leaves the gear LOOSE in the inventory, and the bank trip home
+    deposited it because the keep list never named a pickaxe or mining gloves -- "hammer" was
+    there, which is exactly why the Imcando hammer came back and the other two did not."""
+    keep = [k.lower() for k in gc.BANK_KEEP_ITEMS]
+    for _slot, needle in gc.MINING_GEAR:
+        assert needle in keep, f"the bank would deposit the {needle}"
+
+
+def test_missing_gear_is_what_is_neither_worn_nor_carried():
+    worn = {"weapon": {"name": "Rune pickaxe"}, "shield": {}, "gloves": {}}
+    carried = [{"name": "Expert mining gloves"}]
+    assert gc.missing_mining_gear(worn, carried) == ["imcando hammer"]
+    assert gc.missing_mining_gear(
+        {"weapon": {"name": "Rune pickaxe"}, "gloves": {"name": "Expert mining gloves"},
+         "shield": {"name": "Imcando hammer (off-hand)"}}, []) == []
+
+
+def test_missing_gear_is_withdrawn_at_the_open_bank(monkeypatch):
+    """The recovery for an account this already happened to, and for a pickaxe lost any other
+    way -- the fixed keep list only stops it recurring."""
+    import banker
+    monkeypatch.setattr(controller, "get_equipment",
+                        lambda: {"weapon": {}, "shield": {"name": "Imcando hammer (off-hand)"},
+                                 "gloves": {}})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    pulled = []
+    monkeypatch.setattr(banker, "search_and_withdraw",
+                        lambda ctx, name, qty, contains=False: pulled.append(name) or True)
+
+    gc._withdraw_missing_mining_gear(_ctx())
+
+    assert pulled == ["pickaxe", "mining gloves"]
+
+
+def test_mine_phase_puts_the_gear_on_before_it_mines_anything(monkeypatch):
+    mined = _stub_chain(monkeypatch, [], ["depleted"])
+    monkeypatch.setattr(gc, "ensure_mining_gear", lambda ctx: True)
+    ctx = _ctx()
+    ctx.events = _events(monkeypatch, [[]])
+    gc.mine_phase(ctx, gc.DEFAULT_CONFIG)
+    assert mined == [], "must not click a rock while the pickaxe is still in the inventory"
+
+
+# --- The meat pouch (2026-09-14) --------------------------------------------------------------
+
+# --- A restart mid-trip resumes from the live position (2026-09-14, live) --------------------
+#
+# ctx.state.data resets on every restart and routine reload; the character's position does not.
+# CONFIRMED live: restarting while standing at Piscatoris defaulted to "bank", spent six walk
+# attempts hunting for the Wyrmscraig bank a thousand tiles away, and safety-stopped.
+
+def test_a_fresh_start_at_wyrmscraig_banks_as_before():
+    assert gc.resume_phase({"regionId": 10275, "y": 2244}, {}) == "bank"
+
+
+def test_a_fresh_start_at_the_piscatoris_landing_resumes_the_trip():
+    assert gc.resume_phase({"regionId": falconry.REGION_FAIRY_LANDING, "y": 3619}, {}) == "fur_trip"
+
+
+def test_a_fresh_start_in_the_cavern_resumes_the_trip():
+    assert gc.resume_phase({"regionId": 10275, "y": 8650}, {}) == "fur_trip"
+
+
+def test_a_fresh_start_somewhere_unrecognised_falls_back_to_bank():
+    """bank_phase's own walk-to-the-anchor recovery beats a trip leg that would have to guess."""
+    assert gc.resume_phase({"regionId": 12582, "y": 2447}, {}) == "bank"
+
+
+def test_tick_picks_the_starting_phase_from_position(monkeypatch):
+    calls = []
+    ctx = _tick_world(monkeypatch, {"fur_trip": lambda c, cfg: calls.append("fur_trip")})
+    # AFTER _tick_world, which stubs get_player itself -- the last setattr wins.
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"regionId": falconry.REGION_FAIRY_LANDING, "y": 3619})
+    ctx.state.data.pop("gc_phase", None)
+
+    gc.tick(ctx)
+
+    assert calls == ["fur_trip"], "a restart mid-trip must not start by looking for the bank"
+
+
+# --- Wyrmscraig's collision map is unusable; shortcuts are the real connections ---------------
+#
+# MEASURED live 2026-09-14 across the whole area: pockets of 1 to 841 tiles. The cathedral the
+# cavern exit lands beside is 123 tiles, the MINING tile's own component is 41, and the bank
+# anchor is a 1-tile island -- so travel.walk_to, which refuses without a route, cannot cross the
+# region. USER, stuck outside the cathedral: "It should take the agility shortcut just ahead".
+
+CATHEDRAL = {"x": 2530, "y": 2205, "plane": 0}
+BANK_ANCHOR = {"x": 2587, "y": 2260, "plane": 0}
+ROCKS = {"id": 62265, "name": "Rocks", "x": 2551, "y": 2209, "plane": 0, "distance": 21,
+         "actions": ["Climb"]}
+CAVE_BEHIND = {"id": 62219, "name": "Cave", "x": 2530, "y": 2206, "plane": 0, "distance": 1,
+               "actions": ["Enter"]}
+
+
+def _routes_from(*open_tiles):
+    """A find_path that only succeeds from the given tiles -- i.e. only those are on a component
+    that reaches the goal."""
+    allowed = set(open_tiles)
+    return lambda sx, sy, plane, gx, gy, **kw: ["step"] if (sx, sy) in allowed else []
+
+
+def test_the_rocks_shortcut_is_taken_because_its_far_side_opens_a_route():
+    """The real geometry, MEASURED: from (2542, 2213) the tiles just east of the Rocks --
+    (2554, 2209) and (2555, 2209) -- are in a 190-tile bank-routable component, and nothing on
+    our side is."""
+    here = {"x": 2542, "y": 2213, "plane": 0}
+    found = gc.find_shortcut_toward([CAVE_BEHIND, ROCKS], here, BANK_ANCHOR,
+                                    find_path=_routes_from((2554, 2209), (2555, 2209)))
+    assert found is ROCKS
+
+
+def test_the_rocks_are_taken_even_though_they_score_WORSE_on_distance():
+    """The regression this replaced. Chebyshev from (2542, 2213) to the bank is 47; from the
+    Rocks it is 51 -- they sit north of the goal line -- so a closer-is-better rule rejected the
+    one shortcut that works and hopped into the wall instead."""
+    here = {"x": 2542, "y": 2213, "plane": 0}
+    assert max(abs(here["x"] - BANK_ANCHOR["x"]), abs(here["y"] - BANK_ANCHOR["y"])) == 47
+    assert max(abs(ROCKS["x"] - BANK_ANCHOR["x"]), abs(ROCKS["y"] - BANK_ANCHOR["y"])) == 51
+    assert gc.find_shortcut_toward([ROCKS], here, BANK_ANCHOR,
+                                   find_path=_routes_from((2554, 2209))) is ROCKS
+
+
+def test_duplicate_objects_do_not_crowd_out_the_shortcut_that_works():
+    """CONFIRMED live 2026-09-15: /objects reports one object once per model it is built from, so
+    the cathedral Cave came back THREE times at distance 1. With the candidate list truncated
+    those copies ate the probe budget and the Rocks at distance 20 -- the only way out of that
+    pocket -- were never looked at. The trip hopped at a wall until the stall watchdog fired."""
+    here = {"x": 2531, "y": 2205, "plane": 0}
+    objects = [CAVE_BEHIND, dict(CAVE_BEHIND), dict(CAVE_BEHIND),
+               {"id": 62254, "name": "Staircase", "x": 2541, "y": 2213, "plane": 0,
+                "distance": 10, "actions": ["Climb-down"]},
+               {"id": 62250, "name": "Church pew", "x": 2538, "y": 2216, "plane": 0,
+                "distance": 11, "actions": ["Climb"]},
+               {"id": 62250, "name": "Church pew", "x": 2538, "y": 2216, "plane": 0,
+                "distance": 11, "actions": ["Climb"]},
+               dict(ROCKS, distance=20)]
+
+    found = gc.find_shortcut_toward(objects, here, BANK_ANCHOR,
+                                    find_path=_routes_from((2554, 2209), (2555, 2209)))
+
+    assert found is not None and found["name"] == "Rocks"
+
+
+def test_the_cave_we_just_came_out_of_is_not_taken():
+    """One tile away and carrying "Enter", so it wins on distance -- but its own side of the
+    world is the pocket we are trying to leave, so no probe tile routes anywhere."""
+    assert gc.find_shortcut_toward([CAVE_BEHIND], CATHEDRAL, BANK_ANCHOR,
+                                   find_path=_routes_from()) is None
+
+
+def test_an_object_with_no_shortcut_action_is_not_one():
+    tree = {"id": 1, "name": "Tree", "x": 2560, "y": 2230, "plane": 0, "distance": 5,
+            "actions": ["Chop down"]}
+    assert gc.find_shortcut_toward([tree], CATHEDRAL, BANK_ANCHOR,
+                                   find_path=_routes_from((2561, 2231))) is None
+
+
+def _missing_target_world(monkeypatch, positions):
+    """Drives handle_missing_target past its miss tolerance so every call reaches the walk step,
+    with the player standing at `positions[i]` on attempt i."""
+    seq = list(positions)
+    state = {"i": 0}
+
+    def get_player():
+        p = seq[min(state["i"], len(seq) - 1)]
+        return {"x": p[0], "y": p[1], "plane": 0}
+    monkeypatch.setattr(controller, "get_player", get_player)
+    walks = []
+
+    def travel_toward(ctx, target):
+        walks.append(state["i"])
+        state["i"] += 1
+        return True
+    monkeypatch.setattr(gc, "_travel_toward", travel_toward)
+    return walks
+
+
+def test_a_walk_that_is_actually_moving_does_not_exhaust_the_attempt_budget(monkeypatch):
+    """CONFIRMED live: the walk home takes an agility shortcut, and each attempt spent one of the
+    six tries -- so the run safety-stopped while standing on the far side of the rocks, having
+    just made exactly the progress the cap exists to detect the ABSENCE of."""
+    moving = [(2530 + i * 6, 2205 + i * 2) for i in range(gc.MAX_WALK_ATTEMPTS + 6)]
+    walks = _missing_target_world(monkeypatch, moving)
+    ctx = _ctx()
+    for _ in range(gc.MAX_WALK_ATTEMPTS + 5):
+        ctx.state.data["gc_mine_misses"] = gc.MAX_CONSECUTIVE_MISSES
+        assert gc.handle_missing_target(ctx, gc.DEFAULT_CONFIG, "bank",
+                                        "gc_mine_misses", "gc_mine_walks") is True
+    assert len(walks) == gc.MAX_WALK_ATTEMPTS + 5, "a moving walk must keep being allowed"
+
+
+def test_a_walk_that_never_moves_still_gives_up(monkeypatch):
+    """The cap must still bite when nothing is changing -- that is what it is for."""
+    stuck = [(2530, 2205)] * 40
+    _missing_target_world(monkeypatch, stuck)
+    ctx = _ctx()
+    results = []
+    for _ in range(gc.MAX_WALK_ATTEMPTS + 3):
+        ctx.state.data["gc_mine_misses"] = gc.MAX_CONSECUTIVE_MISSES
+        results.append(gc.handle_missing_target(ctx, gc.DEFAULT_CONFIG, "bank",
+                                                "gc_mine_misses", "gc_mine_walks"))
+    assert results[-1] is False, "a target that never gets closer must still be given up on"
+
+
+def test_the_probe_ring_walks_outward_from_the_object():
+    ring = list(gc._probe_ring(10, 10, 2))
+    assert (11, 10) in ring and (12, 12) in ring
+    assert (10, 10) not in ring, "the object's own tile is not its far side"
+    assert ring.index((11, 10)) < ring.index((12, 12)), "nearest ring first"
+
+
+def test_travel_toward_routes_when_the_map_actually_has_a_route(monkeypatch):
+    """The fallbacks must not displace an ordinary walk where routing works."""
+    monkeypatch.setattr(controller, "get_player", lambda: dict(CATHEDRAL))
+    monkeypatch.setattr(gc, "_nearest_walkable_tile", lambda t: t)
+    monkeypatch.setattr(gc.worldmap, "find_path", lambda *a, **kw: ["step"])
+    routed = []
+    monkeypatch.setattr(gc.travel, "walk_to",
+                        lambda ctx, t, **kw: routed.append((t["x"], t["y"])) or True)
+    hops = []
+    monkeypatch.setattr(gc, "_hop_toward_point", lambda ctx, x, y, p: hops.append((x, y)) or True)
+
+    assert gc._travel_toward(_ctx(), BANK_ANCHOR) is True
+    assert routed == [(2587, 2260)] and hops == []
+
+
+def test_travel_toward_walks_adjacent_when_the_goal_tile_itself_is_sealed(monkeypatch):
+    """CONFIRMED live: the bank anchor (2587, 2260) is a 1-TILE ISLAND on the map. Testing
+    routability with goal_adjacent=True and then walking with goal_adjacent=False made the
+    routine decide a route existed while travel.walk_to answered "no walking route" once a tick,
+    standing still until the attempt cap stopped it."""
+    monkeypatch.setattr(controller, "get_player", lambda: dict(CATHEDRAL))
+    monkeypatch.setattr(gc, "_nearest_walkable_tile", lambda t: t)
+    monkeypatch.setattr(gc.worldmap, "find_path",
+                        lambda sx, sy, p, gx, gy, **kw: ["step"] if kw.get("goal_adjacent") else [])
+    walked = []
+    monkeypatch.setattr(gc.travel, "walk_to",
+                        lambda ctx, t, **kw: walked.append(kw.get("goal_adjacent")) or True)
+
+    assert gc._travel_toward(_ctx(), BANK_ANCHOR) is True
+    assert walked == [True], "must walk with the adjacency that actually had a route"
+
+
+def test_travel_toward_takes_a_shortcut_when_there_is_no_route(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: dict(CATHEDRAL))
+    monkeypatch.setattr(gc, "_nearest_walkable_tile", lambda t: t)
+    # No route from where we stand, but the far side of the Rocks is on a routable component --
+    # the real measured shape of the cathedral pocket.
+    monkeypatch.setattr(gc.worldmap, "find_path", _routes_from((2554, 2209), (2555, 2209)))
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [CAVE_BEHIND, ROCKS])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **kw: None)
+    monkeypatch.setattr(gc, "_await_player_stopped", lambda ctx, s: True)
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: clicked.append(e.get("name")) or True)
+    hops = []
+    monkeypatch.setattr(gc, "_hop_toward_point", lambda ctx, x, y, p: hops.append((x, y)) or True)
+
+    assert gc._travel_toward(_ctx(), BANK_ANCHOR) is True
+    assert clicked == ["Rocks"], "the shortcut must be preferred over a blind hop"
+    assert hops == []
+
+
+def test_the_scan_radius_reaches_the_rocks_from_the_cavern_exit():
+    """MEASURED live 2026-09-15 from the tile the cavern exit drops you on, (2530, 2205): the
+    Rocks out of the cathedral pocket are 21 tiles away and the far pair 23. A radius-20 scan
+    returned Cave, Church pew and Staircase only, so the one shortcut that works was never even a
+    candidate. The previous stall was diagnosed one tile east, where the same rocks measure
+    exactly 20 -- that margin was luck."""
+    exit_tile = (2530, 2205)
+    rocks = (2551, 2209)
+    gap = max(abs(exit_tile[0] - rocks[0]), abs(exit_tile[1] - rocks[1]))
+    assert gap == 21
+    assert gc.SHORTCUT_SCAN_RADIUS > gap, "the way out has to be inside the scan"
+    assert gc.SHORTCUT_SCAN_RADIUS >= 23, "the far Rocks (23) should be reachable too"
+
+
+def test_a_failed_shortcut_search_reports_what_it_saw(monkeypatch):
+    """Three stalls in one pocket, three different causes, and every one of them logged the same
+    opaque line a few hundred times. The candidates it found are what tells them apart."""
+    monkeypatch.setattr(controller, "get_player", lambda: dict(CATHEDRAL))
+    monkeypatch.setattr(gc, "_nearest_walkable_tile", lambda t: t)
+    monkeypatch.setattr(gc.worldmap, "find_path", lambda *a, **kw: [])
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [CAVE_BEHIND])
+    monkeypatch.setattr(gc, "_hop_toward_point", lambda ctx, x, y, p: True)
+    logged = []
+    monkeypatch.setattr(gc.debug_log, "log", lambda cat, msg: logged.append(msg))
+
+    ctx = _ctx()
+    gc._travel_toward(ctx, BANK_ANCHOR)
+    assert any("Cave@(2530,2206)" in m for m in logged), f"got {logged}"
+
+    # Same situation again -- one line, not one per tick.
+    before = len(logged)
+    gc._travel_toward(ctx, BANK_ANCHOR)
+    assert len(logged) == before, "an unchanged situation must not re-log"
+
+
+def test_travel_toward_falls_back_to_a_hop_with_no_route_and_no_shortcut(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: dict(CATHEDRAL))
+    monkeypatch.setattr(gc, "_nearest_walkable_tile", lambda t: t)
+    monkeypatch.setattr(gc.worldmap, "find_path", lambda *a, **kw: [])
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None: [])
+    hops = []
+    monkeypatch.setattr(gc, "_hop_toward_point", lambda ctx, x, y, p: hops.append((x, y)) or True)
+
+    assert gc._travel_toward(_ctx(), BANK_ANCHOR) is True
+    assert hops == [(2587, 2260)]
+
+
+# --- The slayer ring's destination dialogue is PAGED (2026-09-14, live) ----------------------
+#
+# USER: "On slayer ring there is dialog options to tp or a second menu that expand when hovering
+# tele". MEASURED live off /api/ui/dialogue -- Wyrmscraig is not on page one:
+#   page 1: 1 Stronghold Slayer Cave | 2 Morytania Slayer Tower | 3 Fremennik Slayer Dungeon
+#           4 More options...
+#   page 2: 1 Tarn's Lair | 2 Dark Beasts | 3 the Wyrmscraig Cavern | 4 Previous options...
+# The single-page scan looked for an entry that was never going to be on the page it read, and
+# the return leg retried once a tick with the fur pouch already full.
+
+PAGE_1 = ["Teleport to the Stronghold Slayer Cave", "Teleport to the Morytania Slayer Tower",
+          "Teleport to the Fremennik Slayer Dungeon", "More options..."]
+PAGE_2 = ["Teleport to Tarn's Lair", "Teleport to Dark Beasts",
+          "Teleport to the Wyrmscraig Cavern", "Previous options..."]
+
+
+def _paged_dialogue(monkeypatch, pages):
+    """A dialogue whose 'More options...' key advances to the next page."""
+    state = {"page": 0}
+    keys = []
+
+    def options():
+        return pages[state["page"]]
+
+    def key_tap(ser, key):
+        keys.append(key)
+        chosen = pages[state["page"]][int(key) - 1]
+        if "more option" in chosen.lower():
+            state["page"] = min(state["page"] + 1, len(pages) - 1)
+    monkeypatch.setattr(gc, "_dialogue_options", options)
+    monkeypatch.setattr(controller, "key_tap", key_tap)
+    # Deliberately NOT stubbing sleep: _fake_clock's sleep is what ADVANCES the fake clock, so a
+    # no-op here freezes time and the bounded wait can never time out. That hung the suite once.
+    return keys
+
+
+def test_the_wyrmscraig_entry_is_found_on_the_second_page(monkeypatch):
+    _fake_clock(monkeypatch)
+    keys = _paged_dialogue(monkeypatch, [PAGE_1, PAGE_2])
+
+    assert gc._choose_dialogue_option(_ctx(), "wyrmscraig") is True
+    assert keys == ["4", "3"], "must take 'More options...' (4) then Wyrmscraig (3)"
+
+
+def test_a_first_page_hit_does_not_page_at_all(monkeypatch):
+    _fake_clock(monkeypatch)
+    keys = _paged_dialogue(monkeypatch, [PAGE_2, PAGE_1])
+    assert gc._choose_dialogue_option(_ctx(), "wyrmscraig") is True
+    assert keys == ["3"]
+
+
+def test_a_dialogue_that_never_advances_cannot_spin(monkeypatch):
+    """A page-forward that answers with the same options must not be pressed forever."""
+    _fake_clock(monkeypatch)
+    keys = _paged_dialogue(monkeypatch, [PAGE_1])          # 'More options...' goes nowhere
+
+    assert gc._choose_dialogue_option(_ctx(), "wyrmscraig") is False
+    assert keys.count("4") <= gc.DIALOGUE_MAX_PAGES, f"paged forever: {keys}"
+
+
+def test_find_dialogue_option_is_a_case_insensitive_substring():
+    assert gc.find_dialogue_option(PAGE_2, "wyrmscraig") == 2
+    assert gc.find_dialogue_option(PAGE_1, "wyrmscraig") is None
+
+
+def test_the_meat_pouch_is_carried_exactly_when_the_kebbit_drops_meat():
+    """USER: "we forgot a meat bad / pouch meaning we are going to have to drop a bunch extra
+    losing alot of time" -- CONFIRMED in this account's bank memory as "Large meat pouch (open)".
+    Then the hunt switched to the Dark kebbit, which MEASURED live drops no meat at all (16
+    retrieves, 16 bone drops, zero meat), so the pouch would be a withdrawal and a slot spent on
+    nothing. The rule, not the current species, is what is pinned here."""
+    wanted = falconry.MEAT_NAME is not None
+    assert (gc.MEAT_POUCH_NAME in gc.KIT_ITEMS) is wanted
+
+
+def test_a_missing_meat_pouch_does_not_stop_the_trip(monkeypatch):
+    """It is an optimisation with a working fallback (drop the meat, as before); only the travel
+    items strand the character."""
+    _fake_clock(monkeypatch)
+    import banker
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Ardougne cloak 4"}, {"name": "Slayer ring (8)"},
+                                 {"name": "Coins", "qty": 5000}])
+    monkeypatch.setattr(banker, "search_and_withdraw",
+                        lambda ctx, name, qty, contains=False: False)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+
+    gc._withdraw_kit(ctx, gc.DEFAULT_CONFIG)
+
+    assert not ctx.state.safety_stopped, "a missing meat pouch must not strand the run"
+
+
+# --- The container deposit empties the fur pouch (2026-09-16) -----------------------------------
+#
+# USER: "when it comes back from fur gathering trip it deposits all fur but never picks it up then
+# goes mining". banker.deposit_inventory ends with deposit_all_containers(), the bank's own
+# "Deposit Containers" button, which empties EVERY gatherer container -- including our fur pouch.
+# MEASURED live, the game chat said it outright: "You empty all of your containers into the bank."
+# / "Your fur pouch is empty." On ordinary visits the withdraw-all below hid it; on a fur-trip
+# return the "fur already stocked" short-circuit skipped the withdrawal, so the pouch was emptied
+# and never refilled and the run went mining against a tracked 28 that did not exist.
+
+def _bank_with_fur(monkeypatch, *, stock, bank_fur=29):
+    import banker
+    _fake_clock(monkeypatch)
+    monkeypatch.setattr(banker, "deposit_inventory", lambda ctx, cfg: None)
+    monkeypatch.setattr(banker, "search_bank", lambda ctx, q: True)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda ctx, m: True)
+    monkeypatch.setattr(gc, "_deposit_spare_chisel", lambda ctx: False)
+    monkeypatch.setattr(gc, "_deposit_surplus_fur", lambda ctx: 0)
+    monkeypatch.setattr(gc, "_withdraw_missing_mining_gear", lambda ctx: None)
+    monkeypatch.setattr(gc, "_make_room_for_fur", lambda ctx: False)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Dark kebbit fur", "qty": 1}])
+    monkeypatch.setattr(controller, "get_bank",
+                        lambda **kw: {"items": [{"name": "Dark kebbit fur", "qty": bank_fur,
+                                                 "screenX": 5, "screenY": 5}]})
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: clicks.append(e.get("name")) or True)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    ctx.state.data["gc_fur_stock"] = stock
+    return ctx, clicks
+
+
+def test_a_fur_trip_return_re_withdraws_the_fur_the_deposit_just_took(monkeypatch):
+    """The reported bug: stock reads a full pouch, so the withdrawal was skipped entirely."""
+    ctx, clicks = _bank_with_fur(monkeypatch, stock=gc.FUR_POUCH_CAPACITY)
+
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+
+    assert "Dark kebbit fur" in clicks, (
+        "the container deposit emptied the pouch, so the fur MUST be withdrawn again")
+    assert ctx.state.data["gc_phase"] == "mine"
+
+
+def test_the_tracked_stock_never_survives_a_container_deposit(monkeypatch):
+    """gc_fur_stock is an estimate the deposit invalidates; trusting it is what sent the run
+    mining against an empty pouch."""
+    ctx, _ = _bank_with_fur(monkeypatch, stock=gc.FUR_POUCH_CAPACITY)
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+    # Recounted from what actually ARRIVED in the inventory (1 here, per the stub) -- never the
+    # bank's stack size of 29, and never the stale 28 the emptied pouch was still being tracked
+    # at. That recount rule is itself a measured fix (2026-09-14): Withdraw-All moves only as many
+    # as there are free slots.
+    assert ctx.state.data["gc_fur_stock"] == 1
+    assert ctx.state.data["gc_fur_stock"] != gc.FUR_POUCH_CAPACITY
+
+
+# --- "Bank to shed it" must be able to shed something (2026-09-16) ------------------------------
+#
+# MEASURED LIVE (USER: "full inventory with sunstone open bank close bank click fur bag open bank
+# again looping forever"): 24 Sunstone + gem sack + Chisel + Jeweller's chisel + fur pouch = 28/28.
+# FOUR kit slots, not the three SUNSTONE_PER_TRIP=25 was sized against, so 25 is unreachable and
+# mine_phase's full-inventory guard fired every lap. The bank deposit shed nothing -- the keep list
+# protects sunstone, cores, and matches the second chisel on "chisel" -- so the remedy re-triggered
+# its own symptom about every 6 seconds.
+
+def _kit_only_full_inventory(stones=24):
+    return ([{"name": gc.RAW_SUNSTONE_NAME} for _ in range(stones)]
+            + [{"name": "Open gem sack"}, {"name": "Chisel"},
+               {"name": "Jeweller's chisel"}, {"name": "Large fur pouch (open)"}])
+
+
+def test_the_spare_chisel_is_the_plain_one_when_both_are_carried():
+    """USER 2026-09-16: "It had gotten an extra chisel from the golem drop list ... and because
+    chisel are protected it kept both chisel and started looping". The Jeweller's is the keeper --
+    chisel_burst_order prefers it and falls back to the plain Chisel only when it is absent."""
+    inv = [{"name": gc.JEWELLERS_CHISEL_NAME}, {"name": gc.CHISEL_NAME},
+           {"name": gc.RAW_SUNSTONE_NAME}]
+    spare = gc.spare_chisel(inv)
+    assert spare is not None and spare["name"] == gc.CHISEL_NAME
+
+
+def test_one_chisel_alone_is_never_banked():
+    for only in (gc.CHISEL_NAME, gc.JEWELLERS_CHISEL_NAME):
+        assert gc.spare_chisel([{"name": only}, {"name": gc.RAW_SUNSTONE_NAME}]) is None, only
+
+
+def test_spare_chisel_matches_exact_names_not_substrings():
+    """"Chisel" is a SUBSTRING of "Jeweller's chisel" -- which is exactly how one needle on the
+    substring-matched keep list came to protect two different items."""
+    assert gc.spare_chisel([{"name": gc.JEWELLERS_CHISEL_NAME}]) is None, (
+        "a lone Jeweller's chisel must not be read as 'both chisels carried'")
+
+
+def test_an_inventory_of_nothing_but_kit_sheds_nothing():
+    inv = _kit_only_full_inventory()
+    assert len(inv) == controller.INVENTORY_SIZE, "the measured loop state"
+    assert gc.sheddable_slots(inv) == 0, (
+        "every slot is on BANK_KEEP_ITEMS -- a bank trip cannot make this inventory smaller")
+
+
+def test_surplus_loose_fur_is_still_sheddable():
+    """The 2026-09-15 case this guard was written for must keep working: _deposit_surplus_fur
+    drops 'fur' from the keep list for exactly this, so the two have to agree."""
+    inv = ([{"name": gc.RAW_SUNSTONE_NAME} for _ in range(2)]
+           + [{"name": gc.SUNSTONE_CORE_NAME} for _ in range(5)]
+           + [{"name": "Dark kebbit fur"} for _ in range(18)]
+           + [{"name": "Chisel"}, {"name": "Open gem sack"}, {"name": "Large fur pouch (open)"}])
+    assert gc.sheddable_slots(inv) == 18
+
+
+def test_junk_the_bank_would_take_is_sheddable():
+    inv = [{"name": gc.RAW_SUNSTONE_NAME}, {"name": "Bones"}, {"name": "Bird nest"}]
+    assert gc.sheddable_slots(inv) == 2
+
+
+def test_a_kit_only_full_inventory_takes_the_batch_instead_of_banking(monkeypatch):
+    """The loop breaker: with nothing depositable, 24 IS the full batch for this loadout."""
+    assert gc.mine_batch_done(24, 0, controller.INVENTORY_SIZE) is True
+    assert 24 < gc.SUNSTONE_PER_TRIP, "the target really is unreachable here"
+    # sheddable == 0 is what routes this to chisel rather than to a no-op bank trip
+    assert gc.sheddable_slots(_kit_only_full_inventory()) == 0
+
+
+# --- A search box that refuses keystrokes stops the run, it does not spin (2026-09-16) ----------
+#
+# MEASURED LIVE: the Arduino's KEYBOARD HID interface died while its mouse and serial stayed
+# healthy (host-level probe: KD SHIFT sent, GetAsyncKeyState never saw it; serial answered "HB 3"
+# throughout, so the startup firmware probe cannot catch it). Nine keystrokes moved a 948-item
+# bank not at all. Once banker.search_bank began VERIFYING the query landed, its False return made
+# this previously-dead branch reachable and the routine cycled bank -> mine -> craft -> bank with
+# no progress (USER: "We are in a loop again, bank loop").
+
+def _search_always_fails(monkeypatch):
+    import banker
+    _fake_clock(monkeypatch)
+    monkeypatch.setattr(banker, "search_bank", lambda ctx, q: False)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+    monkeypatch.setattr(banker, "deposit_inventory", lambda ctx, cfg: None)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_bank", lambda **kw: {"items": []})
+    monkeypatch.setattr(controller, "get_equipment",
+                        lambda: {"weapon": {"name": "Rune pickaxe"},
+                                 "gloves": {"name": "Expert mining gloves"},
+                                 "shield": {"name": "Imcando hammer (off-hand)"}})
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    ctx.state.data["gc_fur_stock"] = 0
+    return ctx
+
+
+def test_a_refused_search_stops_instead_of_looping(monkeypatch):
+    ctx = _search_always_fails(monkeypatch)
+    for lap in range(gc.FUR_SEARCH_FAIL_LAPS - 1):
+        gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+        assert not ctx.state.safety_stopped, f"stopped too early on lap {lap + 1}"
+        assert ctx.state.data["gc_phase"] == "mine", "a lap or two of carrying on is fine"
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+    assert ctx.state.safety_stopped, "a search that never takes must not cycle forever"
+
+
+def test_the_stop_names_the_keyboard_not_the_bank(monkeypatch):
+    """The whole cost of this class of bug is the message pointing at the wrong subsystem: a dead
+    keyboard previously surfaced as 'bank has none of the usable fur types' and bought a 13-minute
+    hunting trip."""
+    ctx = _search_always_fails(monkeypatch)
+    for _ in range(gc.FUR_SEARCH_FAIL_LAPS):
+        gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+    reason = (ctx.state.safety_reason or "").lower()
+    assert "keyboard" in reason and "keystrokes" in reason
+    assert "none of the usable fur" not in reason
+
+
+def test_a_search_that_works_clears_the_failure_count(monkeypatch):
+    """Otherwise three unlucky laps spread over hours eventually stop a healthy run."""
+    import banker
+    ctx = _search_always_fails(monkeypatch)
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+    assert ctx.state.data.get("gc_fur_search_fails") == 1
+    monkeypatch.setattr(banker, "search_bank", lambda ctx, q: True)
+    monkeypatch.setattr(gc, "_remembered_bank_fur", lambda: None)
+    monkeypatch.setattr(gc, "_withdraw_kit", lambda ctx, config: False)
+    ctx.state.data["gc_fur_exhausted"] = True
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+    assert "gc_fur_search_fails" not in ctx.state.data
+
+
+# --- "No fur on screen" is never "no fur in the bank" (2026-09-15) ------------------------------
+#
+# MEASURED LIVE (USER: "He forgot to pickup furs after getting to the bank"): "fur" was typed into
+# the bank search at 17:34:24.0 and the bank read at 17:34:25.8 found nothing -- while the bank
+# held 29 Dark kebbit fur. /bank is a BULK endpoint behind TickCache and the search filters LIVE,
+# so a read within a tick of typing can still describe the pre-search bank. The routine kitted up
+# and spent ~13 minutes hunting fur it already owned.
+
+def test_the_fur_search_reads_the_bank_fresh(monkeypatch):
+    """The stale read IS the bug -- a cached /bank cannot see a search typed 1.8s ago."""
+    import banker
+    _fake_clock(monkeypatch)
+    monkeypatch.setattr(banker, "search_bank", lambda ctx, q: True)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+    monkeypatch.setattr(banker, "deposit_inventory", lambda ctx, cfg: None)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment",
+                        lambda: {"weapon": {"name": "Rune pickaxe"},
+                                 "gloves": {"name": "Expert mining gloves"},
+                                 "shield": {"name": "Imcando hammer (off-hand)"}})
+    reads = []
+
+    def get_bank(**kw):
+        reads.append(kw.get("fresh"))
+        return {"items": []}
+    monkeypatch.setattr(controller, "get_bank", get_bank)
+    monkeypatch.setattr(gc, "_remembered_bank_fur", lambda: None)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    ctx.state.data["gc_fur_stock"] = 0
+    ctx.state.data["gc_fur_exhausted"] = True
+    monkeypatch.setattr(gc, "_withdraw_kit", lambda ctx, config: False)
+
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+
+    assert True in reads, "the post-search bank read must bypass TickCache"
+
+
+def test_bank_memory_vetoes_a_fur_trip_when_the_bank_actually_holds_fur(monkeypatch):
+    """Cost asymmetry: re-searching costs one tick, believing a stale read costs ~13 minutes."""
+    import banker
+    _fake_clock(monkeypatch)
+    monkeypatch.setattr(banker, "search_bank", lambda ctx, q: True)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+    monkeypatch.setattr(controller, "get_bank", lambda **kw: {"items": []})   # interface shows none
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(gc, "_remembered_bank_fur", lambda: "Dark kebbit fur")
+    kitted = []
+    monkeypatch.setattr(gc, "_withdraw_kit", lambda ctx, config: kitted.append(True) or True)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    ctx.state.data["gc_fur_stock"] = 0
+    ctx.state.data["gc_fur_exhausted"] = True
+
+    for _ in range(gc.FUR_SEARCH_RETRIES):
+        gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+        assert kitted == [], "must re-search rather than spend a trip on fur we already own"
+        # The phase is left UNSET on purpose: bank_phase re-enters next tick and searches again.
+        assert ctx.state.data.get("gc_phase") != "fur_trip"
+
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+    assert kitted, "but a genuinely unsurfaceable fur must not block the run forever"
+
+
+def test_a_surfaced_fur_clears_the_search_retry_budget(monkeypatch):
+    import banker
+    _fake_clock(monkeypatch)
+    monkeypatch.setattr(banker, "search_bank", lambda ctx, q: True)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda ctx, m: True)
+    monkeypatch.setattr(controller, "get_bank",
+                        lambda **kw: {"items": [{"name": "Dark kebbit fur", "qty": 29,
+                                                 "screenX": 5, "screenY": 5}]})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Dark kebbit fur", "qty": 1}])
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    ctx.state.data["gc_fur_stock"] = 0
+    ctx.state.data["gc_fur_exhausted"] = True
+    ctx.state.data["gc_fur_search_retries"] = 2
+
+    gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
+
+    assert "gc_fur_search_retries" not in ctx.state.data
+
+
+def test_remembered_bank_fur_fails_open_when_memory_cannot_answer(monkeypatch):
+    """It only ever VETOES a trip, so an unavailable memory must leave the old behaviour intact."""
+    import bank_memory
+
+    class _Unseen:
+        seen = False
+
+        def quantity(self, name):
+            return None
+    monkeypatch.setattr(bank_memory, "load", lambda names=None: _Unseen())
+    assert gc._remembered_bank_fur() is None
+    monkeypatch.setattr(bank_memory, "load",
+                        lambda names=None: (_ for _ in ()).throw(RuntimeError("bridge down")))
+    assert gc._remembered_bank_fur() is None
+
+
+# --- The fur withdrawal makes room first (2026-09-15) -------------------------------------------
+#
+# MEASURED LIVE (USER: "It's looping"): bank -> mine -> chisel -> craft -> bank every ~40s forever,
+# logging `withdraw-all ... didn't land in inventory` then `fur ran out before inserting` each lap.
+# The inventory was 28/28: 20 Sunstone + 5 Sunstone core + chisel + gem sack + fur pouch. Withdraw-
+# All only moves into FREE slots, so it moved nothing. BANK_KEEP_ITEMS builds the trap itself -- it
+# protects a full batch through a bank trip, and a full batch plus the three containers IS 28.
+
+def _full_bank_inventory(stones=20, cores=5):
+    return ([{"name": gc.RAW_SUNSTONE_NAME, "screenX": 10, "screenY": 10} for _ in range(stones)]
+            + [{"name": gc.SUNSTONE_CORE_NAME} for _ in range(cores)]
+            + [{"name": "Chisel"}, {"name": "Open gem sack"}, {"name": "Large fur pouch (open)"}])
+
+
+def test_a_full_inventory_sheds_raw_sunstone_before_withdrawing_fur(monkeypatch):
+    _fake_clock(monkeypatch)
+    import banker
+    inventory = _full_bank_inventory()
+    assert len(inventory) == controller.INVENTORY_SIZE, "the measured deadlock state"
+    monkeypatch.setattr(controller, "get_inventory", lambda: inventory)
+    modes, clicks = [], []
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda ctx, m: modes.append(m) or True)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: clicks.append(e.get("name")) or True)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+
+    assert gc._make_room_for_fur(ctx) is True
+    assert clicks == [gc.RAW_SUNSTONE_NAME], "sheds raw sunstone, never the cores or a container"
+    assert modes == [gc.FUR_WITHDRAW_SHED_MODE]
+
+
+def test_room_is_not_made_when_there_already_is_some(monkeypatch):
+    _fake_clock(monkeypatch)
+    import banker
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: _full_bank_inventory(stones=10))
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: clicks.append(e) or True)
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda ctx, m: True)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    assert gc._make_room_for_fur(ctx) is False
+    assert clicks == []
+
+
+def test_a_full_inventory_with_nothing_sheddable_says_so_instead_of_clicking(monkeypatch):
+    """Without this it reports a bank problem for an inventory problem -- the exact misreading
+    that made the live loop hard to diagnose."""
+    _fake_clock(monkeypatch)
+    import banker
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Sunstone core"}] * controller.INVENTORY_SIZE)
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: clicks.append(e) or True)
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda ctx, m: True)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    assert gc._make_room_for_fur(ctx) is False
+    assert clicks == []
+
+
+def test_the_shed_leaves_enough_room_for_a_trips_worth_of_fur():
+    assert gc.FUR_WITHDRAW_MIN_FREE_SLOTS >= gc.CORES_PER_TRIP
+
+
+# --- A failed kit withdrawal is retried, and never reported as a missing item (2026-09-15) ------
+#
+# MEASURED LIVE: the run stopped on "'ardougne cloak' is not in the bank" and idled 52 MINUTES
+# while the bank held 7 of them. The client was disconnecting; widget positions went junk, the aim
+# landed off-window ("Skipping click ... aim point is outside the RuneLite window"), and one failed
+# click was read as a statement about the bank's contents. login.py recovered the session 30
+# minutes later, but nothing clears a safety stop.
+
+def _kit_bank(monkeypatch, *, withdraw_ok, memory=None):
+    import banker
+    _fake_clock(monkeypatch)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(banker, "search_and_withdraw",
+                        lambda ctx, name, qty, contains=False: withdraw_ok)
+    monkeypatch.setattr(gc, "_withdraw_coins", lambda ctx, amount: True)
+    import bank_memory
+    monkeypatch.setattr(bank_memory, "load", lambda names=None: memory)
+    ctx = _event_stream(monkeypatch, [])
+    ctx.state = controller.ControllerState()
+    return ctx
+
+
+class _Memory:
+    def __init__(self, seen, qty):
+        self.seen, self._qty = seen, qty
+
+    def quantity(self, name):
+        return self._qty if self.seen else None
+
+
+def test_a_failed_kit_withdrawal_retries_before_it_stops_the_run(monkeypatch):
+    ctx = _kit_bank(monkeypatch, withdraw_ok=False, memory=_Memory(True, 7))
+    for attempt in range(gc.KIT_WITHDRAW_TRIES - 1):
+        assert gc._withdraw_kit(ctx, gc.DEFAULT_CONFIG) is False
+        assert not ctx.state.safety_stopped, f"stopped on attempt {attempt + 1}"
+    gc._withdraw_kit(ctx, gc.DEFAULT_CONFIG)
+    assert ctx.state.safety_stopped, "must still give up eventually"
+
+
+def test_the_stop_message_says_the_bank_HAS_it_when_bank_memory_says_so(monkeypatch):
+    """The old message asserted the opposite of the truth, which is what made the real failure so
+    hard to read: it named the stock while the fault was the click."""
+    ctx = _kit_bank(monkeypatch, withdraw_ok=False, memory=_Memory(True, 7))
+    for _ in range(gc.KIT_WITHDRAW_TRIES):
+        gc._withdraw_kit(ctx, gc.DEFAULT_CONFIG)
+    reason = (ctx.state.safety_reason or "").lower()
+    assert "is in the bank" in reason and "7" in reason
+    assert "not in the bank" not in reason
+
+
+def test_the_stop_message_falls_back_to_not_in_the_bank_when_memory_cannot_answer(monkeypatch):
+    """Never-seen memory is not evidence of an empty bank, but it is genuinely all we know."""
+    ctx = _kit_bank(monkeypatch, withdraw_ok=False, memory=_Memory(False, None))
+    for _ in range(gc.KIT_WITHDRAW_TRIES):
+        gc._withdraw_kit(ctx, gc.DEFAULT_CONFIG)
+    assert "not in the bank" in (ctx.state.safety_reason or "").lower()
+
+
+def test_a_successful_withdrawal_clears_the_retry_count(monkeypatch):
+    """Otherwise a run that fails twice an hour apart eventually stops on an unrelated blip."""
+    ctx = _kit_bank(monkeypatch, withdraw_ok=False, memory=_Memory(True, 7))
+    gc._withdraw_kit(ctx, gc.DEFAULT_CONFIG)
+    assert any(k.startswith("gc_kit_tries_") for k in ctx.state.data)
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Ardougne cloak 3"}, {"name": "Slayer ring (8)"},
+                                 {"name": "Coins", "qty": 5000}])
+    assert gc._withdraw_kit(ctx, gc.DEFAULT_CONFIG) is True
+    assert not any(k.startswith("gc_kit_tries_") and ctx.state.data[k]
+                   for k in list(ctx.state.data))
 
 
 # --- craft_phase carves at human cadence (2026-08-23) ---------------------------------
@@ -2295,26 +3336,54 @@ def test_await_golem_complete_reads_on_the_count_varbit(monkeypatch):
 
 # --- Task 3: chisel chain, bank confirm, player-stopped await ------------------------------
 
-def _chisel_world(monkeypatch, raw=20, pause_after=None):
-    """Inventory of raw sunstone plus a chisel; a click on the raw sunstone converts one into a
-    core (the game does it on the next tick; the INVENTORY_CHANGED confirm is what the routine
-    waits for, and here the conversion is visible on the very next read)."""
-    inventory = [{"name": "Sunstone", "screenX": 10, "screenY": 10} for _ in range(raw)]
-    inventory.append({"name": "Chisel", "screenX": 50, "screenY": 50})
+# The 2026-09-14 burst (USER: "we can do that while moving and significantly faster. basicly 1
+# chisel per game tick"). The mechanic is MEASURED record-by-record in the recording -- see
+# golem_crafting's CHISEL_XP_PER_CORE comment block. What the tests below pin:
+#   * the isIdle entry gate is GONE, because `!moving` is part of it and that is precisely what
+#     kept the burst from running during the walk to the plinth;
+#   * slots are resolved ONCE and the pairs fire with no HTTP between them (the stone converts in
+#     its own slot, so nothing goes stale mid-burst);
+#   * the stones nearest the chisel are spent first -- two flights per core across that gap is
+#     the difference between one core per tick and one per two;
+#   * chiselling WHILE WALKING is the user's claim and is in no recording here, so the first
+#     moving burst probes with one pair and remembers the answer.
+
+CHISEL_PT = (1123, 637)          # slot 1, the chisel -- real geometry from a live /inventory
+
+
+def _slot_pt(slot):
+    """The real inventory grid measured off the live bridge: 42px columns, 36px rows, slot 0 at
+    (1081, 637)."""
+    return (1081 + 42 * (slot % 4), 637 + 36 * (slot // 4))
+
+
+def _chisel_world(monkeypatch, raw=20, pause_after=None, moving=False, convert=True):
+    """A chisel in slot 1 and `raw` sunstones from slot 4 on. A timed_click on a stone's point
+    converts THAT stone in place, which is what the recording shows (usedSlots never moved)."""
+    inventory = [{"name": "Chisel", "slot": 1, "screenX": CHISEL_PT[0], "screenY": CHISEL_PT[1]}]
+    for n in range(raw):
+        slot = 4 + n
+        pt = _slot_pt(slot)
+        inventory.append({"name": "Sunstone", "slot": slot, "screenX": pt[0], "screenY": pt[1]})
     clicks = []
     ctx = _ctx()
 
     def click_entity(ser, entity, **kw):
-        clicks.append(entity.get("name"))
-        if entity.get("name") == "Sunstone":
-            idx = next(i for i, it in enumerate(inventory) if it.get("name") == "Sunstone")
-            inventory[idx] = {"name": "Sunstone core", "screenX": 10, "screenY": 10}
-            cores = sum(1 for it in inventory if it.get("name") == "Sunstone core")
-            if pause_after is not None and cores >= pause_after:
-                ctx.state.paused = True
+        point = (int(entity["screenX"]), int(entity["screenY"]))
+        clicks.append(point)
+        if point == CHISEL_PT or not convert:
+            return True
+        for item in inventory:
+            if (item.get("screenX"), item.get("screenY")) == point and item["name"] == "Sunstone":
+                item["name"] = "Sunstone core"
+                break
+        cores = sum(1 for it in inventory if it["name"] == "Sunstone core")
+        if pause_after is not None and cores >= pause_after:
+            ctx.state.paused = True
         return True
-    monkeypatch.setattr(controller, "get_inventory", lambda: list(inventory))
-    monkeypatch.setattr(controller, "get_combat", lambda: {"isIdle": True})
+
+    monkeypatch.setattr(controller, "get_inventory", lambda: [dict(i) for i in inventory])
+    monkeypatch.setattr(controller, "get_player", lambda: {"moving": moving})
     monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
     monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
     monkeypatch.setattr(controller, "sample_human_delay", lambda a, b: 0.0)
@@ -2322,38 +3391,117 @@ def _chisel_world(monkeypatch, raw=20, pause_after=None):
     return ctx, inventory, clicks
 
 
+def _stones_clicked(clicks):
+    return [c for c in clicks if c != CHISEL_PT]
+
+
 def test_chisel_phase_chisels_the_whole_batch_in_one_call(monkeypatch):
     _fake_clock(monkeypatch)
     ctx, inventory, clicks = _chisel_world(monkeypatch)
     gc.chisel_phase(ctx, gc.DEFAULT_CONFIG)
-    assert sum(1 for it in inventory if it.get("name") == "Sunstone core") == gc.CORES_PER_TRIP
-    assert clicks.count("Sunstone") == gc.CORES_PER_TRIP
+    assert sum(1 for it in inventory if it["name"] == "Sunstone core") == gc.CORES_PER_TRIP
+    assert len(_stones_clicked(clicks)) == gc.CORES_PER_TRIP
     assert ctx.state.data["gc_phase"] == "craft"
+
+
+def test_every_core_is_a_chisel_click_then_a_stone_click(monkeypatch):
+    """Selecting the chisel is client-side and sends no packet, so it is re-selected for every
+    core -- there is no repeat action to lean on (MEASURED: the human re-clicked it all five
+    times)."""
+    _fake_clock(monkeypatch)
+    ctx, inventory, clicks = _chisel_world(monkeypatch)
+    gc.chisel_phase(ctx, gc.DEFAULT_CONFIG)
+    assert clicks[0::2] == [CHISEL_PT] * gc.CORES_PER_TRIP, "every core starts by selecting the chisel"
+    assert CHISEL_PT not in clicks[1::2], "every second click is the stone the chisel is used on"
+
+
+def test_the_burst_spends_the_stones_nearest_the_chisel_first(monkeypatch):
+    """Each core costs two flights across the chisel->stone gap; the fitted reach model puts 42px
+    at 86ms against 205ms at 120px, so the order is what decides one core per tick vs one per
+    two."""
+    inventory = [{"name": "Chisel", "slot": 1, "screenX": CHISEL_PT[0], "screenY": CHISEL_PT[1]},
+                 {"name": "Sunstone", "slot": 24, "screenX": _slot_pt(24)[0], "screenY": _slot_pt(24)[1]},
+                 {"name": "Sunstone", "slot": 5, "screenX": _slot_pt(5)[0], "screenY": _slot_pt(5)[1]},
+                 {"name": "Sunstone", "slot": 12, "screenX": _slot_pt(12)[0], "screenY": _slot_pt(12)[1]}]
+    chisel_pt, stones = gc.chisel_burst_order(
+        inventory, (gc.JEWELLERS_CHISEL_NAME, gc.CHISEL_NAME), gc.RAW_SUNSTONE_NAME, 3)
+    assert chisel_pt == CHISEL_PT
+    assert stones == [_slot_pt(5), _slot_pt(12), _slot_pt(24)]
+
+
+def test_the_burst_never_takes_more_stones_than_the_batch_still_needs(monkeypatch):
+    inventory = [{"name": "Chisel", "slot": 1, "screenX": CHISEL_PT[0], "screenY": CHISEL_PT[1]}]
+    inventory += [{"name": "Sunstone", "slot": 4 + n,
+                   "screenX": _slot_pt(4 + n)[0], "screenY": _slot_pt(4 + n)[1]} for n in range(20)]
+    _, stones = gc.chisel_burst_order(
+        inventory, (gc.CHISEL_NAME,), gc.RAW_SUNSTONE_NAME, 2)
+    assert len(stones) == 2
 
 
 def test_chisel_phase_stops_chaining_when_paused(monkeypatch):
     _fake_clock(monkeypatch)
     ctx, inventory, clicks = _chisel_world(monkeypatch, pause_after=1)
     gc.chisel_phase(ctx, gc.DEFAULT_CONFIG)
-    assert clicks.count("Sunstone") == 1
+    assert len(_stones_clicked(clicks)) == 1
     assert ctx.state.data.get("gc_phase") != "craft"
 
 
 def test_chisel_phase_retries_next_tick_when_a_core_does_not_appear(monkeypatch):
+    """A pair that converted nothing (a click that missed its slot) must NOT be retried inside
+    this call -- the next tick re-resolves the slots first. Re-clicking against the stale list is
+    the 2026-08-08 chisel-on-an-already-converted-stone bug."""
     _fake_clock(monkeypatch)
-    ctx, inventory, clicks = _chisel_world(monkeypatch)
-    # A misclick: the raw click lands but converts nothing.
-    monkeypatch.setattr(controller, "click_entity",
-                        lambda ser, entity, **kw: clicks.append(entity.get("name")) or True)
+    ctx, inventory, clicks = _chisel_world(monkeypatch, convert=False)
     gc.chisel_phase(ctx, gc.DEFAULT_CONFIG)
-    assert clicks.count("Sunstone") == 1
+    assert sum(1 for it in inventory if it["name"] == "Sunstone core") == 0
     assert ctx.state.data.get("gc_phase") != "craft"
+
+
+def test_chisel_phase_no_longer_waits_for_the_player_to_stop_moving(monkeypatch):
+    """The regression this rewrite exists for. isIdle = !moving && anim == -1 && no target
+    (CombatProvider), so the old entry gate returned every tick for the whole walk to the plinth
+    and the first core only went out on arrival."""
+    _fake_clock(monkeypatch)
+    ctx, inventory, clicks = _chisel_world(monkeypatch, moving=True)
+    ctx.state.data["gc_chisel_moving_ok"] = True      # already probed this process
+    monkeypatch.setattr(controller, "get_combat",
+                        lambda: (_ for _ in ()).throw(AssertionError("must not gate on isIdle")))
+    gc.chisel_phase(ctx, gc.DEFAULT_CONFIG)
+    assert len(_stones_clicked(clicks)) == gc.CORES_PER_TRIP
+
+
+def test_the_first_moving_burst_probes_with_one_pair_before_spending_the_rest(monkeypatch):
+    """Chiselling while walking is the user's claim and is in no recording here, so it is proven
+    once, cheaply, before the whole burst is committed to it."""
+    _fake_clock(monkeypatch)
+    ctx, inventory, clicks = _chisel_world(monkeypatch, moving=True, convert=False)
+    monkeypatch.setattr(gc.outcome_waits, "await_pre", lambda *a, **kw: None)
+    gc.chisel_phase(ctx, gc.DEFAULT_CONFIG)
+    assert len(_stones_clicked(clicks)) == 1, "a failed probe must cost ONE pair, not a burst"
+    assert ctx.state.data["gc_chisel_moving_ok"] is False
+
+
+def test_a_probe_that_took_bursts_the_rest_immediately(monkeypatch):
+    _fake_clock(monkeypatch)
+    ctx, inventory, clicks = _chisel_world(monkeypatch, moving=True)
+    monkeypatch.setattr(gc.outcome_waits, "await_pre", lambda *a, **kw: True)
+    gc.chisel_phase(ctx, gc.DEFAULT_CONFIG)
+    assert ctx.state.data["gc_chisel_moving_ok"] is True
+    assert len(_stones_clicked(clicks)) == gc.CORES_PER_TRIP
+
+
+def test_a_failed_probe_is_remembered_and_the_burst_waits_for_arrival(monkeypatch):
+    _fake_clock(monkeypatch)
+    ctx, inventory, clicks = _chisel_world(monkeypatch, moving=True)
+    ctx.state.data["gc_chisel_moving_ok"] = False
+    gc.chisel_phase(ctx, gc.DEFAULT_CONFIG)
+    assert clicks == [], "nothing may be clicked while walking once the probe said it does not take"
 
 
 def test_bank_trip_confirms_the_fur_withdrawal_on_the_inventory_event(monkeypatch):
     _fake_clock(monkeypatch)
     inventory = []
-    fur_slot = {"name": "Dashing kebbit fur", "qty": 17, "screenX": 300, "screenY": 300}
+    fur_slot = {"name": falconry.FUR_NAME, "qty": 17, "screenX": 300, "screenY": 300}
     monkeypatch.setattr(controller, "get_inventory", lambda: list(inventory))
     monkeypatch.setattr(controller, "get_bank", lambda **kw: {"items": [fur_slot]})
     import banker
@@ -2366,7 +3514,7 @@ def test_bank_trip_confirms_the_fur_withdrawal_on_the_inventory_event(monkeypatc
     ctx.state = controller.ControllerState()
 
     def click_entity(ser, entity, **kw):
-        inventory.append({"name": "Dashing kebbit fur", "qty": 17})
+        inventory.append({"name": falconry.FUR_NAME, "qty": 17})
         return True
     monkeypatch.setattr(controller, "click_entity", click_entity)
 
@@ -2490,7 +3638,11 @@ def test_tick_chains_bank_into_its_successor(monkeypatch):
     assert calls == ["bank", "mine"]
 
 
-def test_tick_never_chains_out_of_mine(monkeypatch):
+def test_tick_chains_straight_from_mine_into_the_chisel_burst(monkeypatch):
+    """CHANGED 2026-09-14: mine used to be excluded from TICK_CHAIN_FROM because it was one
+    bounded swing per call. It now ends by clicking a hop toward the plinth, and the whole point
+    of the chisel burst is that it runs DURING that walk -- an engine-loop iteration in between
+    spends ~1s of a ~3-5s walk standing at the rocks."""
     calls = []
 
     def mine(c, cfg):
@@ -2502,7 +3654,7 @@ def test_tick_never_chains_out_of_mine(monkeypatch):
     ctx = _tick_world(monkeypatch, {"mine": mine, "chisel": chisel})
     ctx.state.data["gc_phase"] = "mine"
     gc.tick(ctx)
-    assert calls == ["mine"]
+    assert calls == ["mine", "chisel"]
 
 
 def test_tick_chain_stops_when_paused(monkeypatch):
@@ -2575,7 +3727,11 @@ def test_withdraw_kit_stops_naming_a_missing_item(monkeypatch):
     monkeypatch.setattr(banker, "search_and_withdraw", lambda ctx, name, qty, contains=False: False)
     ctx = _event_stream(monkeypatch, [])
     ctx.state = controller.ControllerState()
-    assert gc._withdraw_kit(ctx, gc.DEFAULT_CONFIG) is False
+    # Since 2026-09-15 the stop comes only after KIT_WITHDRAW_TRIES: one failed click is not
+    # evidence about the bank's contents (a disconnect mid-withdrawal produced exactly that, and
+    # cost 52 minutes). The item is still named when it does stop, which is what this pins.
+    for _ in range(gc.KIT_WITHDRAW_TRIES):
+        assert gc._withdraw_kit(ctx, gc.DEFAULT_CONFIG) is False
     assert ctx.state.safety_stopped
     assert "slayer ring" in ctx.state.safety_reason
 
@@ -2612,7 +3768,7 @@ def test_withdraw_kit_confirms_each_item_and_tops_up_coins(monkeypatch):
 
 
 def test_hunt_done_on_spilled_fur_sets_a_full_pouch(monkeypatch):
-    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Dashing kebbit fur"}])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": falconry.FUR_NAME}])
     ctx = _ctx()
     trip = {"started": 0.0, "catches": 3}
     assert gc._hunt_done(ctx, gc.DEFAULT_CONFIG["furTrip"], trip) is True
@@ -2741,9 +3897,14 @@ def test_run_bank_trip_with_no_fur_kits_up_and_starts_the_trip(monkeypatch):
     monkeypatch.setattr(banker, "deposit_inventory", lambda ctx, cfg: deposits.append(cfg))
     monkeypatch.setattr(banker, "search_bank", lambda ctx, q: True)
     monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+    monkeypatch.setattr(gc, "_remembered_bank_fur", lambda: None)   # bank genuinely holds none
     monkeypatch.setattr(gc, "_withdraw_kit", lambda ctx, config: True)
     ctx = _event_stream(monkeypatch, [])
     ctx.state = controller.ControllerState()
+    # An established count of zero, i.e. this run KNOWS the pouch is empty. Added 2026-09-15:
+    # without it this exercises the never-counted case instead, which now deliberately declines
+    # to spend a five-minute trip on an unread pouch (see the tests beside _no_fur_bank).
+    ctx.state.data["gc_fur_stock"] = 0
 
     gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
 
@@ -2752,11 +3913,27 @@ def test_run_bank_trip_with_no_fur_kits_up_and_starts_the_trip(monkeypatch):
     assert "sunstone" not in deposits[-1]["keepItems"]
 
 
-def test_run_bank_trip_skips_the_fur_search_when_the_pouch_is_stocked(monkeypatch):
+def test_run_bank_trip_searches_for_fur_even_when_the_pouch_WAS_stocked(monkeypatch):
+    """REVERSED 2026-09-16, and the reversal is the bug fix. This used to assert the fur search
+    was SKIPPED when gc_fur_stock said the pouch was full -- an optimisation that was correct only
+    if the pouch survived the bank visit. It does not: banker.deposit_inventory ends with
+    deposit_all_containers(), the bank's "Deposit Containers" button, which empties the fur pouch
+    along with every other container. So the skip meant "empty the pouch, withdraw nothing, go
+    mining" (USER: "it deposits all fur but never picks it up then goes mining")."""
     _fake_clock(monkeypatch)
     import banker
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    # Fully geared, so the gear-recovery step added 2026-09-14 is a no-op here and the only search
+    # that can show up is the FUR one, which is what this test is about.
+    monkeypatch.setattr(controller, "get_equipment",
+                        lambda: {"weapon": {"name": "Rune pickaxe"},
+                                 "gloves": {"name": "Expert mining gloves"},
+                                 "shield": {"name": "Imcando hammer (off-hand)"}})
     monkeypatch.setattr(banker, "deposit_inventory", lambda ctx, cfg: None)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+    monkeypatch.setattr(controller, "get_bank", lambda **kw: {"items": []})
+    monkeypatch.setattr(gc, "_remembered_bank_fur", lambda: None)
+    monkeypatch.setattr(gc, "_withdraw_kit", lambda ctx, config: False)
     searched = []
     monkeypatch.setattr(banker, "search_bank", lambda ctx, q: searched.append(q) or True)
     ctx = _event_stream(monkeypatch, [])
@@ -2765,8 +3942,8 @@ def test_run_bank_trip_skips_the_fur_search_when_the_pouch_is_stocked(monkeypatc
 
     gc._run_bank_trip(ctx, gc.DEFAULT_CONFIG)
 
-    assert searched == []
-    assert ctx.state.data["gc_phase"] == "mine"
+    assert searched == ["fur"], "the pouch did not survive the deposit, so the fur must be re-taken"
+    assert ctx.state.data["gc_fur_stock"] == 0, "and the stale count must not persist"
 
 
 def test_bank_phase_underground_resumes_the_cavern_leg(monkeypatch):
@@ -2791,7 +3968,7 @@ def test_fur_trip_hunt_leg_counts_retrieves_and_ends_on_spill(monkeypatch):
     for _ in range(3):
         gc.fur_trip_phase(ctx, gc.DEFAULT_CONFIG)
     assert ctx.state.data["gc_trip"]["catches"] == 2
-    inventory.append({"name": "Dashing kebbit fur"})
+    inventory.append({"name": falconry.FUR_NAME})
     gc.fur_trip_phase(ctx, gc.DEFAULT_CONFIG)
     assert ctx.state.data["gc_trip"]["done"] is True
     assert ctx.state.data["gc_fur_stock"] == gc.FUR_POUCH_CAPACITY

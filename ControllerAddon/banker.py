@@ -916,6 +916,12 @@ def withdraw_all_shift(ctx, name: str, fresh: bool = False) -> bool:
 # toggle twice. MEASURED live 2026-09-03 (giants_foundry gf_live30, USER: "the search never
 # got typed adam"): misclick + reclick on the search icon opened and closed the search box
 # and the query was typed into nothing. simulate_mistakes=False on every one of them.
+# How many times the query is retyped when the bank list does not react to it. See search_bank:
+# the box demonstrably opens and the keystrokes are what go missing, so retyping into the
+# already-open box is the cheap fix; re-clicking the icon would TOGGLE it shut.
+SEARCH_TYPE_TRIES = 3
+
+
 def search_bank(ctx, query: str) -> bool:
     """Click the bank's search icon and type `query` into it -- filters the item grid live (no
     Enter needed), re-laying matches out starting from slot 0 so a caller can then find and
@@ -936,18 +942,57 @@ def search_bank(ctx, query: str) -> bool:
         debug_log.log("bank", "search button not found (bank open?)")
         return False
 
+    unfiltered = len(bank.get("items") or [])
+
     controller.click_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False,
                           simulate_mistakes=False)
     controller.human_delay(0.2, 0.4)
-    controller.type_text(ctx.ser, query)
-    # CONFIRMED live 2026-08-12 (Mastering Mixology live session): a 0.3-0.5s settle here --
-    # shorter than one full game tick (0.6s), with no margin -- reproduced a real bug twice in a
-    # row on the THIRD back-to-back search within one bank session: /bank's own read already
-    # reflected the new query (the caller's item-lookup found the right name/id), but the actual
-    # on-screen click still landed on the PREVIOUS search's result instead, silently withdrawing
-    # the wrong item. Bumped to comfortably clear a full tick with margin.
-    controller.human_delay(0.7, 0.9)
-    return True
+
+    # THE TYPING IS VERIFIED, NOT ASSUMED (2026-09-16). USER, watching the screen: "Second time i
+    # see it not writing anything when searching" / "the type never worked fur never came up in
+    # the searchbar" / "Yes it did open" -- so the icon click lands and the box opens, and the
+    # KEYSTROKES are what go missing. MEASURED live the same morning: 'f','u','r' were sent at
+    # 07:49:03.27/.36/.45, and a frame dumped straight after showed the bank holding all **948
+    # items, unfiltered**, with an empty search box. The routine then read the unfiltered list,
+    # found "Dark kebbit fur" at a screenY far below the window, and refused the click with "aim
+    # point is outside the RuneLite window" -- the off-window skip is the DOWNSTREAM SYMPTOM of a
+    # search that never filtered, not a problem with the fur slot.
+    #
+    # Dropped keystrokes are already a known hazard on this input path: _withdraw_coins carries
+    # "the 'Enter amount' chatbox needs a moment to take keyboard focus (CONFIRMED live in the
+    # mixology bank, 2026-08-12: digits typed immediately were dropped)". But the delay is NOT the
+    # discriminator here -- measured across 180 searches in the live logs, successful ones span
+    # 315-661ms between the click and the first keystroke, straddling the 460ms of the failure.
+    # So rather than guess at a longer sleep, this now checks the one thing that actually matters
+    # and retries: a search that filtered nothing has not happened, whatever the reason.
+    #
+    # Filtering is the signal because it is unambiguous and free: a real query cuts a ~950-item
+    # bank to a handful, while an empty box leaves the count exactly where it was.
+    for attempt in range(SEARCH_TYPE_TRIES):
+        controller.type_text(ctx.ser, query)
+        # CONFIRMED live 2026-08-12 (Mastering Mixology live session): a 0.3-0.5s settle here --
+        # shorter than one full game tick (0.6s), with no margin -- reproduced a real bug twice in
+        # a row on the THIRD back-to-back search within one bank session: /bank's own read already
+        # reflected the new query (the caller's item-lookup found the right name/id), but the
+        # actual on-screen click still landed on the PREVIOUS search's result instead, silently
+        # withdrawing the wrong item. Bumped to comfortably clear a full tick with margin.
+        controller.human_delay(0.7, 0.9)
+        # fresh=True: /bank is a BULK endpoint behind TickCache while the box filters LIVE, so a
+        # cached read here would answer with the pre-search list and fail every check.
+        # CHANGED, not merely smaller: a caller can search again while an earlier filter is still
+        # active (_withdraw_kit does, item after item), and the new query's match count can be
+        # larger than the old one's. An empty box is the case this has to catch, and that leaves
+        # the count EXACTLY where it was.
+        filtered = len(controller.get_bank(fresh=True).get("items") or [])
+        if filtered != unfiltered:
+            return True
+        if attempt + 1 < SEARCH_TYPE_TRIES:
+            debug_log.log("bank", f"searched '{query}' but the bank still lists {filtered} items "
+                                  f"-- the keystrokes did not reach the box, retyping "
+                                  f"({attempt + 1}/{SEARCH_TYPE_TRIES})")
+    debug_log.log("bank", f"[!] could not get '{query}' into the bank search box after "
+                          f"{SEARCH_TYPE_TRIES} attempts -- leaving the search alone")
+    return False
 
 
 def clear_bank_search(ctx) -> bool:

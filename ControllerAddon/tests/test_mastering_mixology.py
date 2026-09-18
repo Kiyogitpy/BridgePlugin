@@ -7,6 +7,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "routines"))
 
+import banker
 import bridge_events
 import controller
 import mastering_mixology as mm
@@ -222,6 +223,60 @@ def test_the_recovery_click_is_skipped_if_the_station_emptied_first(game, monkey
 def _finished_item(name):
     unfinished_id = next(k for k, v in mm.UNFINISHED_IDS.items() if v == name)
     return {"id": unfinished_id + 10, "name": name}
+
+
+# --- withdrawing already-refined paste straight from the bank ---------------------------
+#
+# USER 2026-09-18: "make it able to withdraw lye, mox and aga directly from the bank i have some
+# stored up". Paste is bankable and stackable, so a hopper top-up costs one withdrawal instead of
+# an inventory of herbs plus a cleaning sweep plus a refiner loop.
+
+def _paste_withdraw_harness(monkeypatch, game, stock):
+    """Stub the bank around _withdraw_banked_paste and record the typed Withdraw-X amounts.
+    Also asserts nothing uses banker.search_and_withdraw, which clicks once PER ITEM."""
+    typed = []
+    monkeypatch.setattr(banker, "search_bank", lambda _ctx, q: True)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda _ctx: True)
+    monkeypatch.setattr(banker, "search_and_withdraw",
+                        lambda *a, **k: pytest.fail("search_and_withdraw clicks once per item"))
+    # The bank always holds 'Swamp paste' -- an exact-name match must never select it.
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: {"items": (
+        [{"id": 1941, "name": "Swamp paste", "qty": 547}]
+        + [{"id": mm.PASTE_ITEM_IDS[t], "name": mm.PASTE_ITEM_NAMES[t], "qty": 5000}
+           for t in ("mox", "aga", "lye") if mm.PASTE_ITEM_NAMES[t] in stock]
+    )})
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, slot, action, **kw: True)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+
+    def type_digits_and_enter(_ser, digits):
+        typed.append(int(digits))
+        game.inventory.append({"id": 30005, "name": "placeholder", "qty": int(digits)})
+    monkeypatch.setattr(controller, "type_digits_and_enter", type_digits_and_enter)
+    monkeypatch.setattr(mm, "_await", lambda *a, **k: True)
+    return typed
+
+
+def test_banked_paste_is_withdrawn_by_shortfall_not_a_slot_count(game, monkeypatch):
+    """Paste stacks, so the amount asked for is the hopper's actual shortfall."""
+    ctx = FakeCtx()
+    typed = _paste_withdraw_harness(monkeypatch, game,
+                                    stock={"Mox paste", "Aga paste", "Lye paste"})
+
+    remaining = mm._withdraw_banked_paste(
+        ctx, ["mox", "aga", "lye"], {"mox": 200, "aga": 0, "lye": 950}, 1000)
+
+    assert remaining == [], "all three covered by banked paste -- no herb trip needed"
+    assert typed == [800, 1000, 50]
+
+
+def test_a_paste_type_the_bank_lacks_falls_through_to_herbs(game, monkeypatch):
+    ctx = FakeCtx()
+    _paste_withdraw_harness(monkeypatch, game, stock={"Mox paste"})   # only mox is banked
+
+    remaining = mm._withdraw_banked_paste(
+        ctx, ["mox", "aga", "lye"], {"mox": 0, "aga": 0, "lye": 0}, 1000)
+
+    assert remaining == ["aga", "lye"], "uncovered types must still take the herb path"
 
 
 def test_tick_does_nothing_while_not_in_the_lab(game, monkeypatch):

@@ -3265,3 +3265,169 @@ def test_the_legs_log_reserve_is_a_lap_of_builds_not_the_instants(monkeypatch):
     ctx.state.data["vt_fletch_due"] = True
     assert vtr_routine._fletch_on_the_move(ctx) == "fletch"
     assert ctx.state.data[vtr_routine.LOG_RESERVE_KEY] == len(route.SITES)
+
+
+# --- Pre-fletched decorations out of the bank (USER 2026-09-16) -------------------------
+#
+# "for vale totems i have about 1800 maple shortbows stocked up in the bank how do we code it
+# so we use them in each lap together with maple logs" -- and, on the shape of it: "its not a
+# big change its a addition to the bank stage where we first fill up the log basket but not
+# the inventory and fill inventory with bows. leaving 1-2 slots empty for logs".
+
+
+def _maple(ctx):
+    vtr_routine._apply_wood(ctx, "MAPLE")
+    return ctx
+
+
+def _stocked(*pairs):
+    """A seen bank holding exactly these (name, quantity) rows. NOT the _memory helper above:
+    that one is keyed by payload, and two helpers of one name in one module is how the wood
+    step-down tests started reading this one instead."""
+    return bank_memory.BankMemory(
+        {"seen": True, "itemCount": len(pairs),
+         "items": [{"name": name, "quantity": quantity} for name, quantity in pairs]})
+
+
+def _inventory(monkeypatch, *names):
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": n, "screenX": 10, "screenY": 20} for n in names])
+
+
+def test_a_banked_shortbow_counts_as_a_decoration(monkeypatch):
+    """Wiki (Maple totem): "decorated with 4 of any Fletching product made of maple logs" --
+    the Creation tabber lists the shortbow (u) and the shortbow beside the longbows. Counting
+    only the longbow we fletch ourselves is what made 1800 banked bows invisible."""
+    ctx = _maple(_ctx_only())
+    _inventory(monkeypatch, "Maple shortbow (u)", "Maple shortbow", "Maple longbow (u)",
+               "Maple longbow", "Maple logs", "Bow string spool")
+    assert vtr_routine.bow_count(ctx) == 4
+
+
+def test_a_shortbow_of_another_wood_is_shed_like_a_longbow(monkeypatch):
+    """The game refuses on the FIRST bow in slot order (run 24), so a leftover yew shortbow
+    blocks a maple totem exactly as a yew longbow does. The spool is not a bow."""
+    ctx = _maple(_ctx_only())
+    _inventory(monkeypatch, "Yew shortbow (u)", "Maple shortbow (u)", "Bow string spool")
+    foreign = [item["name"] for item in vtr_routine._foreign_bows(ctx, "MAPLE")]
+    assert foreign == ["Yew shortbow (u)"]
+
+
+def test_the_bank_keep_list_keeps_the_working_woods_shortbows():
+    """The round-0 deposit runs BEFORE the withdraw: a keep list of longbows only would bank
+    the shortbows this trip is about to top up, every lap."""
+    keep = vtr_routine._keep_substrings(_maple(_ctx_only()))
+    assert "maple shortbow (u)" in keep and "maple shortbow" in keep
+
+
+def test_the_banked_decoration_is_matched_by_exact_name_not_substring(monkeypatch):
+    """"Maple shortbow" is a substring of "Maple shortbow (u)": a substring count reports one
+    stack under both names and withdraws whichever sorted first."""
+    ctx = _maple(_ctx_only())
+    monkeypatch.setattr(bank_memory, "load",
+                        lambda names=None: _stocked(("Maple shortbow (u)", 1800),
+                                                   ("Maple longbow", 3)))
+    assert vtr_routine._banked_decor_name(ctx) == "Maple shortbow (u)"
+
+
+def test_a_bank_holding_only_a_handful_of_bows_is_not_worth_a_withdraw(monkeypatch):
+    ctx = _maple(_ctx_only())
+    monkeypatch.setattr(bank_memory, "load",
+                        lambda names=None: _stocked(("Maple shortbow (u)", 3)))
+    assert vtr_routine._banked_decor_name(ctx) is None
+
+
+def _bank_trip_seams(monkeypatch, bow_withdraw=True):
+    """Every seam bank_trip touches, recording what it asked the bank for."""
+    _at_the_bank(monkeypatch)
+    monkeypatch.setattr(controller, "get_object_at",
+                        lambda *a, **k: {"screenX": 1, "screenY": 2})
+    monkeypatch.setattr(banker, "open_bank", lambda ctx, obj, **k: True)
+    calls = {"withdrawals": [], "fills": [], "loadouts": [], "deposits": []}
+    monkeypatch.setattr(
+        banker, "withdraw_all_shift",
+        lambda ctx, name, fresh=False: (calls["withdrawals"].append(name)
+                                        or (bow_withdraw or "logs" in name.lower())))
+    monkeypatch.setattr(vtr_routine, "fill_basket", lambda ctx: calls["fills"].append(1) or True)
+    monkeypatch.setattr(banker, "withdraw_loadout",
+                        lambda ctx, cfg, fresh=False: calls["loadouts"].append(cfg["withdraw"]))
+    monkeypatch.setattr(vtr_routine, "_deposit_loose_logs",
+                        lambda ctx: calls["deposits"].append(1) or True)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, k: None)
+    return calls
+
+
+def test_the_bank_trip_loads_the_basket_with_logs_and_the_inventory_with_bows(monkeypatch):
+    """The whole addition, end to end: the log rounds stop one short (their last round exists
+    only to fill the HANDS with logs), every round they do run fills the basket, and the
+    inventory is then cleared of loose logs and filled with the banked bows -- keeping
+    BANK_LOOSE_LOGS back so the next build does not depend on the first basket Empty."""
+    ctx = _maple(_ctx_only())
+    monkeypatch.setattr(bank_memory, "load",
+                        lambda names=None: _stocked(("Maple shortbow (u)", 1800),
+                                                   ("Maple logs", 4910)))
+    calls = _bank_trip_seams(monkeypatch)
+    assert vtr_routine.bank_trip(ctx) is True
+    assert calls["withdrawals"] == (["Maple logs"] * (vtr_routine.BANK_ROUNDS - 1)
+                                    + ["Maple shortbow (u)"])
+    assert len(calls["fills"]) == vtr_routine.BANK_ROUNDS - 1, "the last log round fills too"
+    assert calls["deposits"] == [1], "the loose logs make room for the bows"
+    assert calls["loadouts"] == [[{"name": "Maple logs",
+                                  "quantity": vtr_routine.BANK_LOOSE_LOGS}]]
+
+
+def test_a_bank_with_no_pre_fletched_bows_makes_the_trip_it_always_made(monkeypatch):
+    ctx = _maple(_ctx_only())
+    monkeypatch.setattr(bank_memory, "load", lambda names=None: _stocked(("Maple logs", 4910)))
+    calls = _bank_trip_seams(monkeypatch)
+    assert vtr_routine.bank_trip(ctx) is True
+    assert calls["withdrawals"] == ["Maple logs"] * vtr_routine.BANK_ROUNDS
+    assert len(calls["fills"]) == vtr_routine.BANK_ROUNDS - 1
+    assert calls["deposits"] == [] and calls["loadouts"] == []
+
+
+def test_a_bow_withdraw_that_fails_puts_the_logs_back(monkeypatch):
+    """The deposit has to come first to free the slots, so a failed withdraw would otherwise
+    leave the lap holding neither logs nor bows -- the one outcome worse than not doing this."""
+    ctx = _maple(_ctx_only())
+    monkeypatch.setattr(bank_memory, "load",
+                        lambda names=None: _stocked(("Maple shortbow (u)", 1800),
+                                                    ("Maple logs", 4910)))
+    calls = _bank_trip_seams(monkeypatch, bow_withdraw=False)
+    assert vtr_routine.bank_trip(ctx) is True
+    assert calls["withdrawals"][-2:] == ["Maple shortbow (u)", "Maple logs"]
+
+
+def test_a_mid_trip_wood_switch_re_asks_for_the_new_woods_bows(monkeypatch):
+    """A totem takes only its own wood, and the game refuses on the FIRST bow in slot order --
+    so maple bows carried onto willow totems block the decorations we do have."""
+    ctx = _maple(_ctx_only())
+    calls = _bank_trip_seams(monkeypatch)
+    asked = []
+
+    reads = {"n": 0}
+
+    def bank(names=None):
+        # Run 22's shape: the start-of-trip check still sees maple, round 1 takes the last of
+        # it, and the memory has self-healed by the time the failed withdraw asks again.
+        reads["n"] += 1
+        maple = 4910 if reads["n"] <= 2 else 0
+        return _stocked(("Maple logs", maple), ("Maple shortbow (u)", 1800),
+                        ("Willow logs", 900), ("Willow shortbow (u)", 40))
+
+    monkeypatch.setattr(bank_memory, "load", bank)
+    real = vtr_routine._banked_decor_name
+    monkeypatch.setattr(vtr_routine, "_banked_decor_name",
+                        lambda c: asked.append(c.state.config["wood"]) or real(c))
+    # The first log withdraw fails (the slot is a placeholder now); the wood steps down.
+    withdrawals = calls["withdrawals"]
+    monkeypatch.setattr(
+        banker, "withdraw_all_shift",
+        lambda ctx, name, fresh=False: withdrawals.append(name) or name != "Maple logs")
+    assert vtr_routine.bank_trip(ctx) is True
+    # Asked for maple before the switch and for willow after it. (The re-ask happens twice when
+    # the switch lands on round 0 -- the round-0 block re-runs on the `continue`, which also
+    # re-deposits, banking the maple bows for good. Two memory reads, no extra click.)
+    assert asked[0] == "MAPLE" and asked[-1] == "WILLOW"
+    assert "Maple shortbow (u)" not in withdrawals, "never the old wood's bows"
+    assert withdrawals[-1] == "Willow shortbow (u)"

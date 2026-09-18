@@ -60,6 +60,24 @@ WOODS = {
     "MAGIC":   {"log": "Magic logs",   "bow": "Magic longbow (u)",   "strung": "Magic longbow",   "level": 80},
 }
 
+
+# EVERY FLETCHING PRODUCT OF THE WOOD DECORATES, not just the longbow we fletch ourselves.
+# Wiki (Maple totem): "The totem can then be decorated with 4 of any Fletching product made of
+# maple logs", and that page's Creation tabber lists the shortbow (u), the shortbow, the
+# longbow (u) and the longbow as interchangeable materials for the same 40 offerings.
+# USER 2026-09-16: "for vale totems i have about 1800 maple shortbows stocked up in the bank
+# how do we code it so we use them in each lap together with maple logs" -- so a bow the bank
+# already holds is counted, kept and spent exactly like one the leg fletched, and the bank
+# stage below carries them instead of a second inventory of logs.
+def _decor_variants(wood: str) -> tuple:
+    prefix = wood.capitalize()
+    return tuple("%s %s" % (prefix, suffix)
+                 for suffix in ("shortbow (u)", "shortbow", "longbow (u)", "longbow"))
+
+
+for _wood, _entry in WOODS.items():
+    _entry["decor"] = _decor_variants(_wood)
+
 DEFAULT_CONFIG = {"wood": "YEW"}
 
 # USER 2026-09-10: "we probably dont want to change camera angle on start since it puts
@@ -107,12 +125,20 @@ def _wood_override(ctx) -> None:
 
 
 def _bows_for(ctx, wood=None):
-    """(unstrung, strung) names for `wood`, default the wood being worked."""
+    """(unstrung, strung) LONGBOW names for `wood`, default the wood being worked -- what the
+    knife makes and what the spool strings. What DECORATES is the wider list; see
+    _decor_names."""
     if wood in WOODS:
         entry = WOODS[wood]
     else:
         entry = ctx.state.config
     return entry["bow"], entry["strung"]
+
+
+def _decor_names(ctx, wood=None) -> tuple:
+    """Every fletching product of `wood` that a totem of that wood accepts as a decoration."""
+    entry = WOODS[wood] if wood in WOODS else ctx.state.config
+    return tuple(entry.get("decor") or _decor_variants(entry.get("wood") or ""))
 
 # The engine posts these on load and after every login, and the bridge pushes VARBIT_CHANGED
 # for SUBSCRIBED IDS ONLY (EventsProvider.java). Without them every await_pre below waits its
@@ -1414,11 +1440,18 @@ def decorate(ctx, site, after_click=None) -> bool:
     return ok
 
 
+# Bows of ANY wood, by name. "Bow string spool" matches neither word, which is the whole
+# reason the two are spelled out rather than testing for a bare "bow".
+_BOW_WORDS = ("shortbow", "longbow")
+
+
 def _foreign_bows(ctx, wood):
-    """Inventory entries that are longbows of any wood but `wood`."""
-    keep = {name.lower() for name in _bows_for(ctx, wood)}
+    """Inventory entries that are bows of any wood but `wood` -- short or long, strung or
+    not, since a banked shortbow of the wrong wood blocks a decoration exactly as a longbow
+    does (the game refuses on the FIRST bow in slot order; see _shed_foreign_bows)."""
+    keep = {name.lower() for name in _decor_names(ctx, wood)}
     return [item for item in (controller.get_inventory() or [])
-            if "longbow" in (item.get("name") or "").lower()
+            if any(word in (item.get("name") or "").lower() for word in _BOW_WORDS)
             and (item.get("name") or "").lower() not in keep]
 
 
@@ -1469,10 +1502,10 @@ def _poll_prompt(predicate, budget_s: float, poll_s: float) -> bool:
 
 
 def bow_count(ctx, wood=None) -> int:
-    """Bows in hand for `wood` (default the wood being worked), strung or not -- both
-    decorate. A totem takes only bows of its OWN wood, so decorating asks for the site's."""
-    unstrung, strung = _bows_for(ctx, wood)
-    return count_item(unstrung) + count_item(strung)
+    """Decorations in hand for `wood` (default the wood being worked): shortbow or longbow,
+    strung or not -- all four decorate (wiki), and since 2026-09-16 the bank trip brings
+    pre-fletched ones. A totem takes only its OWN wood, so decorating asks for the site's."""
+    return sum(count_item(name) for name in _decor_names(ctx, wood))
 
 
 def find_spool():
@@ -1904,8 +1937,12 @@ KEEP_SUBSTRINGS = ("basket", "knife", "spool", "offerings", "logs")
 
 def _keep_substrings(ctx):
     """KEEP_SUBSTRINGS plus the WORKING wood's bows only -- a bow of another wood is
-    deposited (see _shed_foreign_bows for the game rule that makes it dead weight)."""
-    return list(KEEP_SUBSTRINGS) + [name.lower() for name in _bows_for(ctx)]
+    deposited (see _shed_foreign_bows for the game rule that makes it dead weight).
+
+    ALL FOUR VARIANTS, since 2026-09-16: the round-0 deposit runs BEFORE the withdraw, so a
+    list holding only the longbow names would bank the shortbows this trip is about to top
+    up -- and then withdraw them again, every lap."""
+    return list(KEEP_SUBSTRINGS) + [name.lower() for name in _decor_names(ctx)]
 BANK_SLOT_SETTLE_S = 2.0
 BANK_SLOT_POLL_S = 0.3
 
@@ -2044,9 +2081,96 @@ def _step_wood_down_if_bank_is_out(ctx):
     return True
 
 
+# THE BASKET CARRIES THE LOGS, THE HANDS CARRY THE BOWS. USER 2026-09-16: "its not a big
+# change its a addition to the bank stage where we first fill up the log basket but not the
+# inventory and fill inventory with bows. leaving 1-2 slots empty for logs".
+#
+# The two never compete for a slot, which is what makes this pay: the basket only ever holds
+# logs, so the lap's 8 build logs (and whatever the legs still fletch) ride in there while
+# every other inventory slot carries a decoration the bank already had. A lap owes 8 builds
+# and 32 decorations; ~23 of those decorations now come out of the bank instead of out of the
+# knife, and the logs a lap costs drop from ~40 to ~17.
+#
+# The fletch is deliberately left switched ON. The wiki's own strategy page says the same
+# thing -- "When using pre-fletched decorations, the player will still have to fletch logs
+# from the log basket if they want to do eight totems in a single run without banking" -- and
+# vt.fletch_budget already counts the bows in hand, so it simply asks for fewer.
+BANK_LOOSE_LOGS = 2     # logs to leave the booth holding; the basket tops these up as bows go
+MIN_BANKED_BOWS = 8     # fewer than two totems' worth in the bank is not worth the clicks
+
+
+def _banked_decor_name(ctx):
+    """Which pre-fletched decoration of the WORKING wood to withdraw, or None to fletch the
+    whole lap the way this routine always has.
+
+    THE BANK MEMORY ANSWERS FIRST -- every tab, whatever the interface happens to be showing
+    (CLAUDE.md, /bank/memory) -- and by EXACT name: "Maple shortbow" is a substring of "Maple
+    shortbow (u)", so a substring count reports one stack under both names and picks whichever
+    sorts first. A memory that has never seen a bank falls back to the interface we are
+    standing at, which is the one read that is certainly available here."""
+    names = _decor_names(ctx)
+    memory = bank_memory.load()
+    if memory is not None and memory.seen and (memory.items or []):
+        best_count, best_name = max((_exact_stock(memory, name), name) for name in names)
+        return best_name if best_count >= MIN_BANKED_BOWS else None
+    for name in names:
+        if _bank_slot(name):
+            return name
+    return None
+
+
+def _deposit_loose_logs(ctx) -> bool:
+    """Shift-deposit the loose logs -- one click for the lot, banker.deposit_inventory's own
+    rule. The BASKET keeps its own; only the hands are cleared, to make room for the bows."""
+    log = ctx.state.config["log"]
+    item = find_item(log)
+    if not item:
+        return True
+    controller.key_down(ctx.ser, "SHIFT")
+    try:
+        clicked = controller.click_entity(ctx.ser, item, offset=(0, 0), check_ui_blockers=False,
+                                          simulate_mistakes=False)
+    finally:
+        controller.key_up(ctx.ser, "SHIFT")
+    if not clicked:
+        return False
+    return bool(outcome_waits.await_pre(ctx, ["INVENTORY_CHANGED"], BASKET_BUDGET_S,
+                                        lambda: count_item(log) == 0,
+                                        now_fn=_now, sleep_fn=_sleep))
+
+
+def _load_decorations(ctx, booth, name: str) -> bool:
+    """Swap the trip's loose logs for pre-fletched bows, at the open bank.
+
+    THE ORDER IS THE SAFETY ARGUMENT. The deposit has to come first -- there is no free slot
+    for a bow until it does -- so a withdraw that then failed would leave the lap holding
+    neither logs nor bows, which is the one outcome worse than not doing this at all. Hence
+    the logs are pulled straight back on a failure and the trip ends exactly as it used to.
+    BANK_LOOSE_LOGS come back BEFORE the bows for the same reason: the next site's build then
+    does not depend on the first basket Empty of the leg having landed."""
+    if not banker.open_bank(ctx, booth):
+        return False
+    log = ctx.state.config["log"]
+    if not _deposit_loose_logs(ctx):
+        debug_log.log(LOG, "bank: the loose %s did not go back in -- leaving the hands as they "
+                           "are and fletching this lap" % log)
+        return False
+    banker.withdraw_loadout(ctx, {"withdraw": [{"name": log, "quantity": BANK_LOOSE_LOGS}]},
+                            fresh=True)
+    if not banker.withdraw_all_shift(ctx, name, fresh=True):
+        debug_log.log(LOG, "bank: no %s came out -- filling the hands with %s instead"
+                      % (name, log))
+        banker.withdraw_all_shift(ctx, log, fresh=True)
+        return False
+    debug_log.log(LOG, "bank: %d %s and %d loose %s aboard -- the basket carries the rest"
+                  % (count_item(name), name, count_item(log), log))
+    return True
+
+
 def bank_trip(ctx) -> bool:
     """Walk to the booth, then Withdraw-All logs / close / Fill the basket for three rounds --
-    the recording's own sequence.
+    the recording's own sequence -- and, when the bank holds pre-fletched decorations, spend
+    the last round's slots on those instead of on a second load of logs (_load_decorations).
 
     "You don't have enough inventory space to withdraw that many." is NORMAL here and must not
     be treated as a failure; fletching.py records the same thing for the same click.
@@ -2080,11 +2204,24 @@ def bank_trip(ctx) -> bool:
     slot = None
     round_index = 0
     switched = False
-    while round_index < BANK_ROUNDS:
+    decor = None
+    rounds = BANK_ROUNDS
+    while round_index < rounds:
         if not banker.open_bank(ctx, booth):
             return False
         if round_index == 0:
             _deposit_junk(ctx)
+            # ASKED ONCE, AT THE OPEN BANK: the memory read needs no interface, but the
+            # fallback does, and the junk deposit must have happened first or a bow of the
+            # previous wood could answer for this one.
+            decor = _banked_decor_name(ctx)
+            if decor:
+                # The LAST log round exists only to fill the HANDS with logs. With bows to
+                # carry, the hands are wanted for those, so the rounds stop as soon as the
+                # BASKET is loaded and _load_decorations does the rest.
+                rounds = BANK_ROUNDS - 1
+                debug_log.log(LOG, "bank: %s in the bank -- basket for the %s, inventory for "
+                                   "the bows" % (decor, ctx.state.config["log"]))
         # LET THE INTERFACE LAY OUT before aiming at a slot. MEASURED on the host 2026-09-09:
         # the first withdraw after the bank opened hit MOLTEN GLASS, not the yew logs the
         # fresh /bank read had placed there -- the same early-position trap CLAUDE.md records
@@ -2114,6 +2251,12 @@ def bank_trip(ctx) -> bool:
             if not switched and _step_wood_down_if_bank_is_out(ctx):
                 switched = True
                 slot = None
+                # THE BOWS BELONG TO THE OLD WOOD. A totem takes only its own wood's fletching
+                # products, so carrying maple bows onto willow totems is not merely useless --
+                # the game refuses on the FIRST bow in slot order and blocks the decorations we
+                # DO have (_shed_foreign_bows). Re-ask for the wood we are now working.
+                decor = _banked_decor_name(ctx)
+                rounds = BANK_ROUNDS - 1 if decor else BANK_ROUNDS
                 continue
             # CLOSE THE BANK ON THE WAY OUT. MEASURED run 23: a trip that failed here left the
             # interface OPEN, and every walk click of the leg after it was eaten by it -- six
@@ -2121,7 +2264,10 @@ def bank_trip(ctx) -> bool:
             banker.close_bank(ctx)
             return False
         _close_prompt(ctx, force=True)
-        if round_index < BANK_ROUNDS - 1:
+        # ...and with bows to load, the LAST round fills too: its logs are about to be
+        # deposited to make room for them, so anything that fits in the basket first is a log
+        # that stays with us.
+        if round_index < rounds - 1 or decor:
             # A FULL basket ends the trip with this round's withdraw already in hand: another
             # Fill would only draw "The basket is full." and the withdraw after it "You don't
             # have enough inventory space." -- MEASURED 2026-09-09, two wasted rounds (~15s)
@@ -2144,6 +2290,10 @@ def bank_trip(ctx) -> bool:
                               % (round_index + 1))
                 break
         round_index += 1
+    # The trip is a success either way: a failed load has already put the logs back, which is
+    # the trip the routine made before any of this existed.
+    if decor:
+        _load_decorations(ctx, booth, decor)
     return True
 
 

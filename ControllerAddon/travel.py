@@ -37,6 +37,7 @@ import time
 
 import controller
 import debug_log
+import outcome_waits
 import worldmap
 
 RING_OF_DUELING_NAME = "ring of dueling"
@@ -1375,4 +1376,187 @@ def maybe_approach_before_click(ctx, entity: dict, already_engaged: bool = False
     # Same force-walk reasoning as _hop_to, and this one aims deliberately at a tile part-way to
     # an entity -- i.e. near something interactive by construction.
     _click_walk_point(ctx, point, shift=not via_minimap)
+    return True
+
+# =============================================================================================
+# Fairy rings
+# =============================================================================================
+#
+# Lifted out of routines/falconry.py 2026-09-16 (USER: "The fairy ring implementation we made for
+# golem should probably be implemented as a generic function for fairy hopping inside travel.py").
+# It was never falconry's to own: nothing below knows about kebbits, and golem_crafting's fur trip
+# was reaching into `falconry._leg_fairy_ring` -- one routine calling another routine's PRIVATE
+# travel leg -- to get at it. Everything here is account- and destination-independent.
+#
+# THE CODE IS DIALLED, NEVER ASSUMED. CONFIRMED LIVE 2026-09-14: clicking "Last-destination" is a
+# one-click fast path that silently goes wherever the ring was last set to, which is MUTABLE
+# PER-ACCOUNT STATE -- on the live account it teleported a fur trip to region 12582, a camphor-tree
+# island ~800 tiles from Piscatoris, and stranded the run. Dialling costs at most six clicks and is
+# deterministic.
+#
+# The dial table, MEASURED live against the open interface (group 398):
+#
+#   | widget (CW / CCW) | varbit | letters |
+#   |-------------------|--------|---------|
+#   | 398.19 / 398.20   |  3985  | A D C B |
+#   | 398.21 / 398.22   |  3986  | I L K J |
+#   | 398.23 / 398.24   |  3987  | P S R Q |
+#
+# Each dial is 0-3 and one clockwise click adds 1 (mod 4), so three forward is one backward and no
+# dial ever needs more than two clicks. The middle dial's order was WRONG on the first attempt
+# ("ILJK" looked plausible) and the Confirm button is what caught it -- see confirm_names_the_stop.
+FAIRY_RING_ID = 29495
+FAIRY_GROUP = 398
+FAIRY_ROTATE_CW = (19, 21, 23)
+FAIRY_ROTATE_CCW = (20, 22, 24)
+FAIRY_CONFIRM_CHILD = 26
+FAIRY_DIAL_VARBITS = (3985, 3986, 3987)
+FAIRY_DIAL_LETTERS = ("ADCB", "ILKJ", "PSRQ")
+FAIRY_OPT_CONFIGURE = "Configure"
+
+FAIRY_INTERFACE_S = 3.0        # Configure click -> the dial interface being clickable
+FAIRY_DIAL_SETTLE_S = 0.4      # a rotation -> the varbit reading back (measured well under this)
+FAIRY_DIAL_TRIES = 3           # per dial: at most two rotations are ever needed, plus slack
+# Whole-combination passes, re-read from scratch, before giving up. The dial varbits can disagree
+# with the interface just after it opens and the VARBITS are the half that lies -- MEASURED live
+# 2026-09-15: every varbit already read as its target so ZERO rotations were made, and the button
+# then read "Cave south of Dorgesh-Kaan" (AJQ). Re-reading minutes later gave 3986 = 3 (J), which
+# agreed with the button. A second pass fixes in one click what the first could not see.
+FAIRY_DIAL_PASSES = 3
+FAIRY_TELEPORT_S = 8.0         # confirm -> the destination region loaded
+
+
+def fairy_dial_rotations(current, target_letter, letters):
+    """The cheapest rotation list to move one dial from `current` to `target_letter`: a list of
+    "cw"/"ccw" steps, never more than two. Pure, so the arithmetic is testable with no client.
+
+    Each dial cycles through four letters in a fixed order, so going 3 forward is 1 backward.
+    Returns None when the letter is not on this dial (a typo'd code, caught before any click), and
+    also when `current` is unknown -- an unreadable varbit must not be guessed at."""
+    try:
+        want = letters.index(target_letter)
+    except ValueError:
+        return None
+    if current is None:
+        return None
+    delta = (want - current) % 4
+    if delta == 0:
+        return []
+    if delta <= 2:
+        return ["cw"] * delta
+    return ["ccw"] * (4 - delta)
+
+
+def _fairy_dial_value(index):
+    data = controller.api_get("/varbit", params={"id": FAIRY_DIAL_VARBITS[index]})
+    return (data or {}).get("value")
+
+
+def confirm_names_the_stop(text, expect) -> bool:
+    """Whether the Confirm button's own label says we are about to go where we meant to. Pure.
+
+    THE GUARD THAT MAKES DIALLING SAFE, and it has already paid for itself twice: widget 398.26
+    carries the live destination NAME ("Invalid location" when the combination spells nothing), so
+    a wrong combination is caught BEFORE anything teleports. CONFIRMED live 2026-09-14 -- dial 2
+    ordered "ILJK" read back "Cave south of Dorgesh-Kaan" (AJQ per the travel log), which is how
+    the real order (ILKJ) was found. Without it that would have been a second silent trip to the
+    wrong continent."""
+    return bool(expect) and expect.lower() in (text or "").strip().lower()
+
+
+def hop_fairy_ring(ctx, code, expect, ring_tile=None, expect_region=None, log="travel"):
+    """Dial a fairy ring to `code` and take it. ONE bounded action per call, leg-style.
+
+    Returns True once the ring has been confirmed and the hop taken, False when it did something
+    else this call (walked toward the ring, could not open the interface, the interface closed
+    mid-dial) and the caller should come back next tick. A code the dials cannot spell, or a
+    destination that will not read back as `expect`, is a safety stop -- teleporting to the wrong
+    continent strands the character, which is exactly what this function exists to prevent.
+
+    `code`     three letters, e.g. "AKQ".
+    `expect`   substring the Confirm button must contain, e.g. "Piscatoris".
+    `ring_tile` where to walk when no ring is in view; None means "only act if one already is".
+    `expect_region` region id to confirm the landing on; None skips the confirmation wait.
+
+    The caller owns WHICH ring and WHERE to; everything below is the mechanic, identical at every
+    ring in the game."""
+    ring = next((o for o in controller.get_objects(radius=20)
+                 if o.get("id") == FAIRY_RING_ID and o.get("visible", True)), None)
+    if ring is None:
+        if ring_tile is None:
+            debug_log.log(log, "no fairy ring in view")
+            return False
+        debug_log.log(log, "walking to the fairy ring")
+        walk_to(ctx, ring_tile, goal_adjacent=False)
+        return False
+
+    debug_log.log(log, f"dialling the fairy ring to {code} ({expect})")
+    refresh = controller.object_refresh_target(
+        ring.get("x"), ring.get("y"), ring.get("plane", 0), ring.get("id"),
+    )
+    if not controller.click_menu_action(ctx.ser, ring, FAIRY_OPT_CONFIGURE, offset=(0, 0),
+                                        refresh_target=refresh):
+        debug_log.log(log, "could not open the fairy ring's Configure interface")
+        return False
+    outcome_waits.await_pre(
+        ctx, "WIDGET_LOADED", FAIRY_INTERFACE_S,
+        confirm=lambda: bool(controller.get_widget(
+            FAIRY_GROUP, FAIRY_CONFIRM_CHILD).get("clickable")),
+        now_fn=time.time, sleep_fn=time.sleep,
+    )
+
+    # THE BUTTON TEXT IS THE FEEDBACK SIGNAL, NOT JUST A FINAL GUARD. The dial varbits and the
+    # interface can disagree just after it opens (see FAIRY_DIAL_PASSES), so the whole combination
+    # is re-read and re-dialled until the BUTTON says the right place. Stopping on the first
+    # mismatch -- the pre-2026-09-15 behaviour -- was the wrong response to a disagreement that
+    # resolves itself on a re-read; refusing to CONFIRM one is still exactly right.
+    text = ""
+    for attempt in range(FAIRY_DIAL_PASSES):
+        for i, letter in enumerate(code):
+            for _ in range(FAIRY_DIAL_TRIES):
+                steps = fairy_dial_rotations(_fairy_dial_value(i), letter, FAIRY_DIAL_LETTERS[i])
+                if steps is None:
+                    ctx.state.trigger_safety_stop(
+                        f"'{letter}' is not a letter on fairy ring dial {i + 1}")
+                    return False
+                if not steps:
+                    break
+                child = (FAIRY_ROTATE_CW if steps[0] == "cw" else FAIRY_ROTATE_CCW)[i]
+                arrow = controller.get_widget(FAIRY_GROUP, child)
+                if not arrow.get("clickable"):
+                    debug_log.log(log, f"fairy ring dial {i + 1} arrow ({FAIRY_GROUP}.{child}) is "
+                                       f"not clickable -- interface closed?")
+                    return False
+                controller.click_entity(ctx.ser, arrow, offset=(0, 0), check_ui_blockers=False,
+                                        simulate_mistakes=False)
+                time.sleep(FAIRY_DIAL_SETTLE_S)
+
+        text = (controller.get_widget(FAIRY_GROUP, FAIRY_CONFIRM_CHILD).get("text") or "").strip()
+        if confirm_names_the_stop(text, expect):
+            break
+        debug_log.log(log, f"[!] fairy ring dialled {code} but the interface reads '{text}', not "
+                           f"'{expect}' -- re-reading the dials "
+                           f"(pass {attempt + 1}/{FAIRY_DIAL_PASSES})")
+        # The varbits were wrong a moment ago; give them the settle the rotations get before
+        # believing them again.
+        time.sleep(FAIRY_DIAL_SETTLE_S)
+    else:
+        ctx.state.trigger_safety_stop(
+            f"fairy ring dial reads '{text}' instead of '{expect}' after {FAIRY_DIAL_PASSES} "
+            f"passes")
+        return False
+
+    confirm = controller.get_widget(FAIRY_GROUP, FAIRY_CONFIRM_CHILD)
+    if not confirm.get("clickable"):
+        debug_log.log(log, "fairy ring Confirm is not clickable -- interface closed?")
+        return False
+    debug_log.log(log, f"fairy ring reads '{text}' -- confirming")
+    controller.click_entity(ctx.ser, confirm, offset=(0, 0), check_ui_blockers=False,
+                            simulate_mistakes=False)
+    if expect_region is not None:
+        outcome_waits.await_pre(
+            ctx, "VARBIT_CHANGED", FAIRY_TELEPORT_S,
+            confirm=lambda: (controller.get_player() or {}).get("regionId") == expect_region,
+            now_fn=time.time, sleep_fn=time.sleep,
+        )
     return True

@@ -32,7 +32,7 @@ DEBUG_UDP_PORT = 50556    # mcp_debug_server.py's poll_events -- a SEPARATE port
                            # bind can ever block the other's.
 
 # ---------------- Arduino serial connection ----------------
-SERIAL_PORT = os.environ.get("BRIDGE_SERIAL_PORT", "COM6")
+SERIAL_PORT = os.environ.get("BRIDGE_SERIAL_PORT", "COM3")
 SERIAL_BAUD = 115200
 
 # ---------------- Main loop pacing ----------------

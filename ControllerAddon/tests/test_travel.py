@@ -29,21 +29,6 @@ def no_sleeping(monkeypatch):
     monkeypatch.setattr(travel.time, "sleep", lambda _s: None)
 
 
-@pytest.fixture(autouse=True)
-def no_live_bridge(monkeypatch):
-    """Keep the suite hermetic. get_collision reaches the RUNNING CLIENT over HTTP when a test
-    does not stub it, so results depended on where the character happened to be standing --
-    MEASURED 2026-08-29: two door tests passed alone and failed in a full run, and the same test
-    flipped between runs as the live player moved between houses.
-
-    The default is the documented "client reports nothing" answer, which is also the safe one:
-    every consumer of get_collision (route_to, _collision_flags, can_reach, ...) reads an empty
-    result as "cannot tell" rather than "blocked". Tests that want a populated grid override it,
-    exactly as several already do."""
-    monkeypatch.setattr(controller, "get_collision",
-                        lambda x, y, plane, radius=2, inst=False: [])
-
-
 class _Ctx:
     def __init__(self):
         self.ser = object()
@@ -1502,3 +1487,114 @@ def test_hop_to_inst_short_hop_uses_ground_point_and_waits_in_instance_space(mon
     # x/y (1900, never within tolerance) would run all ten sleeps to the 6.0s timeout.
     assert len(sleeps) == 2, sleeps
     assert last["p"]["instX"] == 13064
+
+
+# --- Fairy rings, generic (moved out of routines/falconry.py 2026-09-16) ------------------------
+#
+# USER: "The fairy ring implementation we made for golem should probably be implemented as a
+# generic function for fairy hopping inside travel.py". It was never falconry's: golem_crafting's
+# fur trip was calling falconry._leg_fairy_ring -- one routine reaching into another routine's
+# PRIVATE travel leg -- and nothing in the mechanic knows about kebbits. These pin the parts that
+# are expensive knowledge: the dial arithmetic, and the Confirm-button guard.
+
+def test_fairy_dial_rotations_never_takes_the_long_way_round():
+    """Each dial is 0-3 and one CW click adds 1, so three forward is one backward."""
+    assert travel.fairy_dial_rotations(0, "A", "ADCB") == []
+    assert travel.fairy_dial_rotations(0, "D", "ADCB") == ["cw"]
+    assert travel.fairy_dial_rotations(0, "C", "ADCB") == ["cw", "cw"]
+    assert travel.fairy_dial_rotations(0, "B", "ADCB") == ["ccw"]
+    for start in range(4):
+        for letter in "ADCB":
+            steps = travel.fairy_dial_rotations(start, letter, "ADCB")
+            assert len(steps) <= 2, (start, letter, steps)
+
+
+def test_fairy_dial_rotations_refuses_what_it_cannot_know():
+    """A letter not on this dial is a typo'd code, caught before any click; an unreadable varbit
+    must not be guessed at -- the stale-varbit bug is what happens when a dial is misread."""
+    assert travel.fairy_dial_rotations(0, "Z", "ADCB") is None
+    assert travel.fairy_dial_rotations(None, "A", "ADCB") is None
+
+
+def test_the_middle_dial_order_is_ILKJ_not_ILJK():
+    """MEASURED live 2026-09-14, and the cost of getting it wrong is a trip to another continent:
+    "ILJK" looked plausible, dialled what should have been AKQ, and the Confirm button read back
+    "Cave south of Dorgesh-Kaan" (AJQ) -- which is how the real order was found."""
+    assert travel.FAIRY_DIAL_LETTERS == ("ADCB", "ILKJ", "PSRQ")
+    assert travel.FAIRY_DIAL_LETTERS[1].index("K") == 2
+
+
+def test_confirm_names_the_stop_is_what_licences_the_teleport():
+    assert travel.confirm_names_the_stop("Piscatoris Hunter area", "Piscatoris") is True
+    assert travel.confirm_names_the_stop("Cave south of Dorgesh-Kaan", "Piscatoris") is False
+    assert travel.confirm_names_the_stop("Invalid location", "Piscatoris") is False
+    assert travel.confirm_names_the_stop("", "Piscatoris") is False
+    assert travel.confirm_names_the_stop(None, "Piscatoris") is False
+
+
+def test_hop_fairy_ring_is_usable_for_a_destination_falconry_never_heard_of(monkeypatch):
+    """The point of the move: any routine can now dial any code without importing falconry."""
+    ring = {"id": travel.FAIRY_RING_ID, "x": 1, "y": 2, "plane": 0, "visible": True}
+    monkeypatch.setattr(controller, "get_objects", lambda radius=20: [ring])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **kw: True)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(travel.outcome_waits, "await_pre", lambda *a, **kw: True)
+    monkeypatch.setattr(travel.time, "sleep", lambda s: None)
+    # DKR = a different ring entirely; dials start at A/I/P and must reach D, K, R.
+    dials = [0, 0, 0]
+    want = ("D", "K", "R")
+
+    def api_get(path, params=None, **kw):
+        if path != "/varbit":
+            return None
+        return {"value": dials[travel.FAIRY_DIAL_VARBITS.index(params["id"])]}
+    monkeypatch.setattr(controller, "api_get", api_get)
+
+    def get_widget(group, child, index=None):
+        spelled = "".join(travel.FAIRY_DIAL_LETTERS[i][dials[i]] for i in range(3))
+        text = "Mort Myre Swamp" if spelled == "DKR" else "Invalid location"
+        return {"found": True, "clickable": True, "child": child,
+                "text": text if child == travel.FAIRY_CONFIRM_CHILD else "",
+                "screenX": 1, "screenY": 1}
+    monkeypatch.setattr(controller, "get_widget", get_widget)
+
+    confirmed = []
+
+    def click_entity(ser, entity, **kw):
+        child = entity.get("child")
+        if child in travel.FAIRY_ROTATE_CW:
+            i = travel.FAIRY_ROTATE_CW.index(child)
+            dials[i] = (dials[i] + 1) % 4
+        elif child in travel.FAIRY_ROTATE_CCW:
+            i = travel.FAIRY_ROTATE_CCW.index(child)
+            dials[i] = (dials[i] - 1) % 4
+        elif child == travel.FAIRY_CONFIRM_CHILD:
+            confirmed.append(True)
+        return True
+    monkeypatch.setattr(controller, "click_entity", click_entity)
+
+    class _S:
+        def __init__(self):
+            self.data = {}
+            self.safety_stopped = False
+            self.safety_reason = None
+
+        def trigger_safety_stop(self, reason):
+            self.safety_stopped = True
+            self.safety_reason = reason
+
+    class _C:
+        ser = None
+        events = None
+
+        def __init__(self):
+            self.state = _S()
+
+    ctx = _C()
+    assert travel.hop_fairy_ring(ctx, "DKR", "Mort Myre") is True
+    assert not ctx.state.safety_stopped
+    assert "".join(travel.FAIRY_DIAL_LETTERS[i][dials[i]] for i in range(3)) == "DKR"
+    assert confirmed
+    for i, letter in enumerate(want):
+        assert travel.FAIRY_DIAL_LETTERS[i][dials[i]] == letter

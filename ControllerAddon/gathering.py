@@ -72,6 +72,14 @@ class Profile:
     default_config: dict       # used only when the bridge cannot answer at all
     full_inventory: str = "bank"   # bank | drop | stop, unless the config says otherwise
     panel_section: str = "Gathering"   # named in the "nothing selected" log line
+    # None means "use the module's GATHER_BUDGET_S". A profile whose resource has a slower or
+    # more variable per-swing success rate than ordinary ore (routines/mining_guild_iron.py's
+    # ORE_BUDGET_S is the same idea for its own hand-rolled loop) sets its own here so a swing
+    # that just hasn't paid off yet is not mistaken for a dead click -- LIVE 2026-09-17, USER:
+    # "we swap before the ore despawn" (routines/amethyst_dart_tips.py re-picked a vein that was
+    # demonstrably still being mined, isIdle continuously False, because the generic 12s budget
+    # is shorter than Amethyst's measured 12-17s gaps between successful hits).
+    gather_budget_s: float = None
 
 
 FALLBACK_POLL_S = 0.25    # idle-check cadence past the grace; also the HTTP-only cadence with no events
@@ -245,6 +253,7 @@ def gather(profile, ctx, target, config, exclude=(), pick_next=None, stop=None):
     behaviour exactly, outcome "full" included (nothing can return it without a stop)."""
     since = ctx.events.mark() if ctx.events is not None else None
     xp_base = skill_xp(profile)
+    budget_s = profile.gather_budget_s if profile.gather_budget_s is not None else GATHER_BUDGET_S
     if not controller.click_entity(ctx.ser, target, refresh_target=_refresh(target)):
         return "no_click", None
     t_click = _now()
@@ -354,7 +363,7 @@ def gather(profile, ctx, target, config, exclude=(), pick_next=None, stop=None):
             return "arrived"
         return None
 
-    deadline = t_click + GATHER_BUDGET_S + walk_s
+    deadline = t_click + budget_s + walk_s
     idle_deadline = t_click + IDLE_GRACE_S + walk_s
     idle_since = None
     while True:
@@ -401,7 +410,7 @@ def gather(profile, ctx, target, config, exclude=(), pick_next=None, stop=None):
                 # the belt to arrival's braces, for an arrival signal we missed.
                 walking = False
                 prehover()
-            deadline = now + GATHER_BUDGET_S
+            deadline = now + budget_s
             idle_deadline = now + IDLE_GRACE_S
             idle_since = None
             since = ctx.events.mark() if ctx.events is not None else None
