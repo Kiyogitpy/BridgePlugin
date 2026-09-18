@@ -770,6 +770,19 @@ public interface ControllerConfig extends Config
 		return 0;
 	}
 
+	@ConfigItem(
+		keyName = "slayerBraceletReequip",
+		name = "Re-wear Slayer Bracelets",
+		description = "When a bracelet of slaughter / expeditious bracelet crumbles, wear a spare from the inventory. " +
+			"Only ever acts on an EMPTY gloves slot.",
+		section = slayerSection,
+		position = 20
+	)
+	default boolean slayerBraceletReequip()
+	{
+		return true;
+	}
+
 	// ============================================================
 	// Mining
 	// ============================================================

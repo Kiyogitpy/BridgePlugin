@@ -99,6 +99,12 @@ public final class ConfigExporter
 		safespot.put("plane", config.safespotPlane());
 		data.put("safespot", safespot);
 
+		// Read by combat_core.maintain_bracelet since 2026-09-18 (it defaulted to true because
+		// nothing exported the key -- found by the split survey).
+		Map<String, Object> bracelets = new LinkedHashMap<>();
+		bracelets.put("reequip", config.slayerBraceletReequip());
+		data.put("bracelets", bracelets);
+
 		data.put("poh", sharedPoh(config));
 		data.put("taskLocations", resolveTaskLocations(config));
 
