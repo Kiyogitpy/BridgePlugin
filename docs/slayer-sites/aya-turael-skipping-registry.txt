@@ -1,0 +1,175 @@
+## key=spiders | task=Spiders
+npcIds: [3019, 3017]
+info: null
+shortestPath: 3168,3244,0
+worldMap: 3168,3244,0 
+  loc: Outside H.A.M. Hideout | teleports=[Achievement diary cape: Twiggy O'Korn (Option G), Ornate Jewellery Box: Draynor Village (Option Q), Glory amulet: Draynor Village (Option 3)] | areas=[x=3152,y=3224,w=23,h=33,p=0] 
+
+## key=cave bugs | task=Cave bugs
+npcIds: [481]
+info: Bring a light source
+shortestPath: 2715,5235,0
+worldMap: 3206,3217,0 2786,5318,0 
+  loc: Dorgesh-Kaan South Dungeon | teleports=[Fairy ring: AJQ] | areas=[x=2708,y=5221,w=14,h=25,p=0] 
+
+## key=bats | task=Bats
+npcIds: [2827]
+info: null
+shortestPath: 3351,3490,0
+worldMap: 3351,3490,0 
+  loc: Silvarea, North of Digsite | teleports=[Ring of the elements: Earth Altar (Option 3), Digsite pendant (Option 1), Digsite/Lumberyard teleport] | areas=[x=3327,y=3475,w=72,h=33,p=0] 
+
+## key=rats | task=rats
+npcIds: [2854, 2865]
+info: null
+shortestPath: 3237,9866,0
+worldMap: 3240,3458,0 3237,9866,0 
+  loc: Varrock Sewers | teleports=[Achievement diary cape: Varrock (Option D), Varrock teleport] | areas=[x=3218,y=9857,w=35,h=19,p=0] 
+
+## key=lizards | task=Lizards
+npcIds: [463, 462]
+info: Bring Ice coolers
+shortestPath: 3413,3035,0
+worldMap: 3413,3035,0 
+  loc: North of Nardah Fairy Ring | teleports=[Fairy ring: DLQ] | areas=[x=3392,y=3027,w=32,h=23,p=0] [x=3392,y=3050,w=32,h=20,p=0] [x=3424,y=3050,w=28,h=20,p=0] [x=3424,y=3027,w=28,h=23,p=0] 
+
+## key=zombies | task=Zombies
+npcIds: [2992, 2993]
+info: null
+shortestPath: 3630,3530,0
+worldMap: 3630,3530,0 
+  loc: Alice's Farm, west of the Ectofuntus | teleports=[Ectophial: Empty] | areas=[x=3608,y=3521,w=30,h=14,p=0] 
+
+## key=monkeys | task=Monkeys
+npcIds: [7118]
+info: Run south and open the trapdoor, bring a light source
+shortestPath: 2715,2788,0
+worldMap: 2713,2794,0 
+  loc: Kruk's Dungeon | teleports=[Gnome Glider: Ookookolly Undri] | areas=[x=2306,y=9141,w=27,h=23,p=1] 
+
+## key=dwarves | task=Dwarves
+npcIds: [292]
+info: null
+shortestPath: 2863,9878,0
+worldMap: 2819,3490,0 2863,9878,0 
+  loc: White Wolf Tunnel pub | teleports=[Construction cape: Taverley (Option 3), Re-direct house tab (Option 2)] | areas=[x=2856,y=9867,w=17,h=19,p=0] 
+
+## key=crawling hands | task=Crawling Hands
+npcIds: [448, 449, 450, 451, 452, 453, 454, 455, 456, 457]
+info: null
+shortestPath: 3419,3571,0
+worldMap: 3419,3571,0 
+  loc: Morytania Slayer Tower | teleports=[Slayer Ring: Morytania Slayer Tower (Option 2)] | areas=[x=3408,y=3539,w=38,h=39,p=0] 
+
+## key=goblin | task=Goblin
+npcIds: [3029, 3030, 3031, 3033, 3034, 3035, 3036]
+info: South of the Sourhog Cave
+shortestPath: 3145,3301,0
+worldMap: 3145,3301,0 
+  loc: South-East of Draynor Manor | teleports=[Draynor manor teleport, Ornate Jewellery Box: Draynor Village (Option Q), Glory amulet: Draynor Village (Option 3)] | areas=[x=3132,y=3291,w=25,h=22,p=0] 
+
+## key=goblins | task=Goblins
+npcIds: [3029, 3030, 3031, 3033, 3034, 3035, 3036]
+info: South of the Sourhog Cave
+shortestPath: 3145,3301,0
+worldMap: 3145,3301,0 
+  loc: South-East of Draynor Manor | teleports=[Draynor manor teleport, Ornate Jewellery Box: Draynor Village (Option Q), Glory amulet: Draynor Village (Option 3)] | areas=[x=3132,y=3291,w=25,h=22,p=0] 
+
+## key=cave slimes | task=Cave slimes
+npcIds: [480]
+info: Bring a light source
+shortestPath: 2730,5234,0
+worldMap: 3206,3217,0 2786,5318,0 
+  loc: Dorgesh-Kaan South Dungeon | teleports=[Fairy ring: AJQ] | areas=[x=2692,y=5227,w=17,h=16,p=0] [x=2722,y=5232,w=14,h=8,p=0] 
+
+## key=minotaurs | task=Minotaurs
+npcIds: [2481]
+info: null
+shortestPath: 1875,5218,0
+worldMap: 3084,3417,0 1875,5218,0 
+  loc: Stronghold of Security | teleports=[Skull sceptre: Invoke] | areas=[x=1869,y=5210,w=17,h=14,p=0] 
+
+## key=bears | task=Bears
+npcIds: [2838]
+info: null
+shortestPath: 2700,3330,0
+worldMap: 2700,3330,0 
+  loc: South-west of Legends' Guild | teleports=[Fairy ring: BLR, Quest Cape teleport] | areas=[x=2687,y=3318,w=36,h=34,p=0] 
+
+## key=ghosts | task=Ghosts
+npcIds: [7263]
+info: null
+shortestPath: 1693,10063,0
+worldMap: 1639,3673,0 1693,10063,0 
+  loc: Catacombs of Kourend | teleports=[Achievement diary cape: Kourend Castle (Option A), Xeric's talisman: Xeric's Heart (Option 4)] | areas=[x=1680,y=10053,w=24,h=18,p=0] 
+
+## key=cave crawlers | task=Cave Crawlers
+npcIds: [406, 407, 408, 409]
+info: null
+shortestPath: 2795,9997,0
+worldMap: 2789,3617,0 2795,9997,0 
+  loc: Fremennik Slayer Dungeon | teleports=[Slayer ring: Fremennik Slayer Dungeon (Option 3), Fairy ring: AJR] | areas=[x=2777,y=9987,w=23,h=21,p=0] 
+
+## key=icefiends | task=Icefiends
+npcIds: [4813]
+info: null
+shortestPath: 3007,3475,0
+worldMap: 3007,3475,0 
+  loc: Ice Mountain | teleports=[Lassar teleport] | areas=[x=2990,y=3464,w=24,h=26,p=0] 
+
+## key=banshees | task=Banshees
+npcIds: [414]
+info: null
+shortestPath: 3442,3542,0
+worldMap: 3442,3542,0 
+  loc: Morytania Slayer Tower | teleports=[Slayer Ring: Morytania Slayer Tower (Option 2)] | areas=[x=3431,y=3530,w=22,h=38,p=0] 
+
+## key=wolves | task=Wolves
+npcIds: [107, 108, 109, 110]
+info: null
+shortestPath: 2847,3498,0
+worldMap: 2847,3498,0 
+  loc: White Wolf Mountain | teleports=[Gnome Glider: Sindarpos] | areas=[x=2828,y=3477,w=38,h=43,p=0] 
+
+## key=dogs | task=Dogs
+npcIds: [11583]
+info: null
+shortestPath: 3347,2783,0
+worldMap: 3347,2783,0 
+  loc: East of Sophanem | teleports=[Pharaoh's sceptre: Jaleustrophos (Option 2)] | areas=[x=3329,y=2770,w=23,h=19,p=0] 
+
+## key=skeletons | task=Skeletons
+npcIds: [70, 71, 72, 73]
+info: Bring a rope
+shortestPath: 3352,3417,0
+worldMap: 3352,3417,0 
+  loc: Digsite Dungeon | teleports=[Digsite pendant (Option 1), Digsite teleport] | areas=[x=3359,y=9739,w=29,h=19,p=0] 
+
+## key=birds | task=Birds
+npcIds: [1838, 1839, 2993]
+info: null
+shortestPath: 3630,3530,0
+worldMap: 3630,3530,0 
+  loc: Alice's Farm, west of the Ectofuntus | teleports=[Ectophial: Empty] | areas=[x=3608,y=3521,w=30,h=14,p=0] 
+
+## key=cows | task=Cows
+npcIds: [2992]
+info: null
+shortestPath: 3630,3530,0
+worldMap: 3630,3530,0 
+  loc: Alice's Farm, west of the Ectofuntus | teleports=[Ectophial: Empty] | areas=[x=3608,y=3521,w=30,h=14,p=0] 
+
+## key=kalphite | task=Kalphite
+npcIds: [956]
+info: null
+shortestPath: 3309,9526,0
+worldMap: 3326,3122,0 3372,9528,0 3324,9502,0 
+  loc: Kalphite Cave | teleports=[Desert amulet 4: Kalphite cave] | areas=[x=3314,y=9493,w=20,h=19,p=0] [x=3297,y=9513,w=23,h=27,p=0] 
+
+## key=scorpions | task=Scorpions
+npcIds: [3024]
+info: null
+shortestPath: 3049,9771,0
+worldMap: 3061,3376,0 3049,9771,0 
+  loc: Mining Guild | teleports=[Skill's Necklace: Mining Guild] | areas=[x=3025,y=9766,w=37,h=34,p=0] 
+

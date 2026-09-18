@@ -219,84 +219,93 @@ pins the mapping against the 24 Aya + 43 Kuradal names from the wiki tables).
 TaskSpec(
     name="banshees",                       # key = game task name, lowercase
     masters=("aya", "kuradal"),            # who can assign it (from the two tables)
-    targets=("Banshee",),                  # substrings for combat_core.resolve_targets
-    site=Site(x=3429, y=3564, plane=0, region=None, radius=12),  # where to stand; radius = "at the site" test
-    legs=(Leg.item("slayer ring", "Slayer Tower"),        # executed in order after banking
-          Leg.walk(3429, 3564, 0)),
+    disposition=FIGHT,                     # FIGHT | SKIP (cancel, 30 pts) | STOP (safety-stop, user does it by hand)
+    target_ids=(414,),                     # NPC ids (Aya tasks: from the Turael Skipping registry)
+    targets=("Banshee",),                  # name substrings (Kuradal tasks), for combat_core.resolve_targets
+    site=Site(x=3442, y=3542, plane=0,     # target tile; areas = the kill zone, "at the site" = inside any area
+              areas=((3431, 3530, 22, 38, 0),), region=None),
+    routes=(                               # ordered; the first whose first-leg item is OWNED is used
+        (Leg.item("slayer ring", "Slayer Tower"), Leg.walk(3442, 3542, 0)),
+    ),
     gear=(Gear.worn("earmuffs", alternatives=("slayer helmet",)),),  # required, checked before leaving the bank
     carry=(),                              # required inventory items (e.g. "ice cooler" x N)
     hazards=(),                            # informational: "poison", "light source"
-    doable=True,                           # False = cancel on assignment (Kuradal) / never expected (Aya blocked)
     verified=False,                        # flipped after a live run; tests do not depend on it
 )
 ```
 
 Leg kinds (`legs.py`, §8): `item(name, option)` inventory/worn teleport, `fairy(code, expect)`,
 `object(name, action, at=(x,y,plane), lands=(x,y,plane, radius))` for ladders/caves/stairs/
-trapdoors, `walk(x,y,plane)`. **Every entry's first leg must be a teleport or fairy ring**
-because the home bank is Ferox and Ferox is a sealed island on the collision map (CLAUDE.md,
-"Teleporting home from a bank trip"). A catalog test enforces it, and a second test checks
+trapdoors, `walk(x,y,plane)`. **Every route's first leg must be a teleport**, because trips
+start at a bank and the usual one (Ferox) is a sealed island on the collision map (CLAUDE.md,
+"Teleporting home from a bank trip"); for most routes that first leg is the house teleport,
+followed by the POH fairy ring or ornate jewellery box (§6.2). A catalog test enforces it, and a
+second test checks
 that each `walk` leg's target is `worldmap.find_path`-reachable from the previous leg's
 landing tile on the same plane (the "dungeon void" leak is why `walk` legs never span planes).
 
-### 6.1 Aya's 24 tasks -- first-wave choices
+### 6.1 Sites were decided by the user, task by task (2026-09-18)
 
-Kill spots chosen for: no Wilderness, no plane change where a surface option exists, reachable
-from a vendored teleport, no cannon. Coordinates marked ~ are from `SlayerLocations.java` or
-the wiki "Slayer Point Farming" column and are **unverified**; exact standing tiles are filled
-at implementation from the wiki's `{{LocLine}}` spawns and confirmed on the first visit.
+The first draft of this section picked one site per task by rule. The user replaced that with an
+interactive pass over every task; the result is **`docs/slayer-sites/decisions.md`**, which is
+the catalog's input and outranks anything reasoned here. The research it was decided from
+(wiki Location-comparison tables, spawn counts, safespots, access) is beside it in
+`docs/slayer-sites/`.
 
-| Task | Where | First leg | Gear / carry | Wave |
-|---|---|---|---|---|
-| Banshees | Slayer Tower ground floor ~3429,3564 | slayer ring → Slayer Tower | **earmuffs** (or slayer helm) | 1 |
-| Crawling hands | Slayer Tower ground floor ~3412,3549 | slayer ring → Slayer Tower | -- | 1 |
-| Bats | Giant bats outside Slayer Tower ~3418,3522 | slayer ring → Slayer Tower | -- | 1 |
-| Cave crawlers | Fremennik Slayer Dungeon ~2784,9998 (same plane as landing) | slayer ring → Fremennik | antipoison optional | 1 |
-| Cows | Lumbridge cow field ~3254,3255 | Lumbridge teleport tablet | -- | 1 |
-| Birds | Chickens, Fred's farm Lumbridge ~3171,3293 | Lumbridge teleport tablet | -- | 1 |
-| Goblins | East of Lumbridge ~3250,3230 | Lumbridge teleport tablet | -- | 1 |
-| Spiders | Giant spiders by H.A.M. hideout ~3160,3245 | Lumbridge teleport tablet | -- | 1 |
-| Rats | Giant rats, Lumbridge swamp ~3222,3215 | Lumbridge teleport tablet | -- | 1 |
-| Icefiends | Ice Mountain ~2995,3468 | Falador teleport tablet + walk | -- | 1 |
-| Scorpions | Al Kharid mine ~3300,3300 | ring of dueling → Emir's Arena + walk | -- | 1 |
-| Wolves | White Wolf Mountain surface ~2846,3492 | games necklace → Burthorpe + walk (or Catherby) | -- | 1 |
-| Kalphite | Kalphite Cave (workers) ~3220,9525 | POH fairy ring → BIQ if `poh.fairyRing` is set; else Shantay pass tablet + walk + `object` cave entrance | -- | 2 |
-| Bears | Grizzly bears SW of Legends' Guild | Ardougne teleport tablet + walk (or POH fairy ring → BLR) | -- | 2 |
-| Dogs | Jackals, desert near Nardah | Nardah teleport (desert amulet / tablet) + walk, or POH fairy ring → DLQ | -- | 2 |
-| Lizards | Small lizards north of Nardah | as Dogs | **ice coolers ×N** (carry) | 2 |
+**Aya's 24 tasks come from the Turael Skipping plugin, verbatim.** The user runs that Plugin
+Hub plugin and asked for its spots. `docs/slayer-sites/aya-turael-skipping-registry.txt` is a
+reflective dump of the plugin's own `SlayerTaskRegistry.TURAEL_TASKS` -- its data, not a
+reconstruction (the 231.6 dialogue-widget lesson in CLAUDE.md). Per task it carries exactly what
+a `TaskSpec` needs: the **NPC ids** that count, the named spot, the kill area as `WorldArea`
+rectangles, a target tile, a gear note, and the plugin's teleports **in preference order**. The
+catalog vendors that dump as data (`ControllerAddon/vendor/turael_skipping_tasks.json`, with a
+`VENDORED.md` naming the jar) and a test pins that every Aya task name resolves to an entry.
+Travel takes the first listed teleport bank memory says is owned. Three user overrides apply:
+dogs are **blocked at Aya**, monkeys are killed **on Karamja** instead of Kruk's Dungeon, and
+minotaurs are reached via the **ornate jewellery box to the Cooking Guild**. One site serves
+three tasks -- Alice's Farm by Ectophial covers zombies, birds and cows.
 
-A fairy-ring leg is never a FIRST leg: from Ferox the only way to any ring is a teleport
-first (the POH ring when configured, otherwise slayer ring → Fremennik dungeon → `object`
-exit → walk to AJR, which is three legs for one hop and is why the rows above prefer tablets).
-| Ghosts | Varrock Sewers or Catacombs | Varrock tablet + `object` leg (manhole/ladder), or Xeric's talisman | -- | 2 |
-| Skeletons | Edgeville Dungeon | glory → Edgeville + `object` trapdoor | -- | 2 |
-| Zombies | Varrock Sewers / Edgeville Dungeon | as above | -- | 2 |
-| Dwarves | Dwarven Mine ~2984,9807 | Falador tablet + `object` ladder | -- | 2 |
-| Minotaurs | Stronghold of Security floor 1 | Edgeville + `object` entrance | -- | 2 |
-| Cave bugs | Lumbridge Swamp Caves ~3149,9578 | Lumbridge tablet + `object` (rope/hole) | **light source** | 2 |
-| Cave slimes | Lumbridge Swamp Caves ~3150,9555 | as Cave bugs | light source, antipoison | 2 |
-| Monkeys | Karamja, NW of glider / Ardougne Zoo | brimhaven/ardougne teleport | -- | 2 |
+**Targets are NPC IDS for Aya tasks, names for Kuradal's.** `combat_core.resolve_targets`
+already accepts both (`targets` ids, `targetNames` substrings), so `combat_config` grows an
+`ids=` argument rather than the catalog inventing name lists the plugin already settled.
 
-Wave 1 (12 tasks, weight 92/172 ≈ 53% of Aya's rolls) needs only item legs and `walk`.
-Wave 2 needs `object` legs (§8) and per-task carry items. **Until wave 2 ships, a wave-2 Aya
-task is handled exactly like an undoable Kuradal task: cancelled for 30 points (§7.4).** The
-user may prefer to BLOCK the worst of them at Aya (40 points each, 6-7 slots, shared list);
-that is a manual decision, and the routine reads the outcome (a blocked task is simply never
-assigned) without needing to know about it.
+### 6.2 Kuradal's 43 tasks: 22 FIGHT, 1 STOP, 20 SKIP
 
-### 6.2 Kuradal's list
+Every row of `Duradel_Slayer assignments.txt` gets an entry so the game name always resolves,
+each with a **disposition**:
 
-Every row of `Duradel_Slayer assignments.txt` gets an entry so the game name always resolves;
-`doable` defaults to **False** and is flipped per task as a site + legs + gear are authored.
-The first Kuradal wave is the subset that reuses Aya sites or slayer-ring landings and needs no
-special gear: **Kalphite** (Kalphite Cave), **Bloodveld / Aberrant spectres (nose peg) /
-Nechryael / Gargoyles (rock hammer) / Abyssal demons** in the Slayer Tower if levels allow
-(upper floors need `object` stair legs), **Ankou** (Stronghold Slayer Cave, slayer ring
-landing is outside it: `object` cave leg), **Hellhounds / Fire giants / Bloodveld** in the
-Stronghold Slayer Cave, **Cave crawlers → Basilisks/Turoth/Kurask** in the Fremennik dungeon
-(mirror shield / leaf-bladed). Which of these the account can actually do (Slayer level, quest,
-gear in bank) is not knowable offline -- §7.3's doability check reads `/skills` and bank memory
-live, so an authored-but-unavailable entry degrades to a cancel, never a stuck routine.
+- **FIGHT** (22): aberrant spectres, ankou, bloodveld, fire giants, hellhounds (all
+  **Stronghold Slayer Cave**); abyssal demons, gargoyles, nechryael (**Slayer Tower
+  basement**); basilisks, kurask (**Fremennik Slayer Dungeon**); dagannoth, dust devils
+  (**Catacombs of Kourend**); black demons (Taverley Dungeon); elves (Lletya); kalphite
+  (Kalphite Cave, the Aya site); suqahs (Lunar Isle south-west); trolls (Death Plateau);
+  waterfiends (Ancient Cavern); wyrms (Karuulm task-only batch); cave horrors (Mos Le'Harmless
+  Cave); mutated zygomites (Zanaris, Cosmic Altar); gryphons (Great Conch eastern cave, fairy
+  ring **CJQ**). Four hubs cover twelve of them -- build those routes first.
+- **STOP** (1): greater demons. The user spends that task on tormented demons by hand, so the
+  routine safety-stops naming the task instead of cancelling or fighting it.
+- **SKIP** (20): everything else, including the boss task.
+
+Per-site access, required items and the user's reasoning are in `decisions.md`. Whether the
+account can actually do a FIGHT task (Slayer level, quest, gear in bank) is still not knowable
+offline -- §7.3's doability check reads `/skills` and bank memory live, so an
+authored-but-unavailable entry degrades to a cancel, never a stuck routine.
+
+**The skip list is expensive enough to change a default.** By task weight FIGHT is 140, STOP 9,
+SKIP 169 of 318; discounting point-unlock tasks the account probably lacks, a Kuradal roll is a
+SKIP about 40% of the time. Three in a row then happens once per ~16 milestones, which the
+shipped `slayerMaxSkips` default of 3 would turn into a safety stop. **Raise that default to 8**
+in the sub-project 2 plan (the points reserve is the real guard), and recommend the user block
+the heaviest skipped tasks at Kuradal -- metal dragons, dark beasts, araxytes, black dragons,
+cave kraken, smoke devils -- which takes the SKIP share to about 17%.
+
+**The POH is the travel hub, not Ferox.** The house has a fairy ring and an ornate jewellery
+box, and most routes above are "house teleport, then ring or box". Banking still happens at a
+bank (the box reaches Ferox and Castle Wars), so a task trip is: bank → house teleport → POH
+leg → walk. `legs.run_object_leg` / `pick_destination` (banker's POH legs, moved in
+sub-project 1) have **never run live**; the first fairy-ring or box leg is therefore a §12
+checklist item, and the panel's Player-Owned House section must have the ring and the ORNATE
+box set or `teleports.plan` will never route through the house.
 
 Superiors ("A superior foe has appeared") are not targeted specially -- the 2026-08-05
 superior spec was never implemented, and this design does not add it.
@@ -315,7 +324,10 @@ s = slayer_state.read()          # GET /slayer, one HTTP read
 if s is None: log + return       # bridge/endpoint unavailable: do nothing, never guess
 
 if s.count == 0:                                  -> ACQUIRE
-elif not spec(s.task).doable or user_skip(s.task):-> SKIP
+elif spec(s.task).disposition == STOP:            -> safety stop naming the task (greater demons:
+                                                     the user does tormented demons by hand)
+elif spec(s.task).disposition == SKIP
+     or not doable(spec) or user_skip(s.task):    -> SKIP
 elif at_site(spec, player):                       -> FIGHT
 elif not loadout_ok(spec):                        -> BANK      (home bank, then travel)
 else:                                             -> TRAVEL
@@ -569,14 +581,17 @@ logic is.
 
 ## 14. Decisions taken without the user (change any of these and the spec adapts)
 
-- **D1** Home bank = Ferox via ring of dueling. (Alternative: a POH with a jewellery box, if
-  the `poh` config is set -- the return planner already prefers it; would save the dueling
-  ring charge.)
+- **D1** ~~Home bank = Ferox via ring of dueling~~ **SUPERSEDED 2026-09-18**: the user's house
+  has a fairy ring and an ornate jewellery box, so the POH is the travel hub; a bank (Ferox or
+  Castle Wars via the box) is only where the loadout is taken (§6.2).
 - **D2** Undoable task = cancel for 30 points, not block. Blocking is the user's manual call.
+  **Extended 2026-09-18**: dispositions are FIGHT / SKIP / STOP, decided per task by the user
+  (`docs/slayer-sites/decisions.md`).
 - **D3** No cannon. The wiki calls it "strongly recommended" for boosting; it is a separate
   sub-project (placement, reloading, pickup before breaks) and out of scope here.
-- **D4** Wave-2 Aya tasks are cancelled until their legs are authored, rather than blocking
-  the whole routine on ladders. Costs ≤30 points per roll of a wave-2 task.
+- **D4** Tasks whose routes are not authored yet are cancelled rather than blocking the whole
+  routine on ladders. Costs ≤30 points per roll. (The "wave 1 / wave 2" split of the first
+  draft is gone: Aya's sites now come from the Turael Skipping registry, §6.1.)
 - **D5** Milestone master is Kuradal per the request, with Konar as the wiki-recommended
   alternative left as a later enum value (her location-locked tasks need a different catalog
   shape).
@@ -587,13 +602,12 @@ logic is.
 
 ## 15. Open questions for the user
 
-1. Which teleports does the account own for wave 1 -- slayer ring (charges?), games necklace,
-   Lumbridge/Falador/Varrock tablets, glory, Xeric's talisman? (Bank memory will answer live;
-   knowing now changes which sites go in wave 1.)
+1. ~~Which teleports does the account own?~~ ANSWERED in part 2026-09-18: POH fairy ring and
+   ornate jewellery box; the rest is answered live by bank memory, route by route.
 2. Is the account already on the Lunar spellbook with Lunar Diplomacy done and Magic ≥ 67, and
    does it meet Kuradal's combat 100 / Slayer 50? The spec assumes yes.
-3. Should wave-2 Aya tasks be blocked at Aya now (40 points each, up to 6-7 slots) instead of
-   cancelled per roll (D2/D4)? Candidates by nuisance: cave bugs, cave slimes, lizards,
-   monkeys.
-4. Which of Kuradal's 43 tasks do you actually want fought, and which should always be
-   skipped? That list is `slayerSkipTasks` and the initial `doable` flags.
+3. ~~Block nuisance Aya tasks?~~ ANSWERED: dogs are already blocked; the rest are fought at the
+   Turael Skipping plugin's spots.
+4. ~~Which Kuradal tasks to fight?~~ ANSWERED: 22 FIGHT, 1 STOP, 20 SKIP
+   (`docs/slayer-sites/decisions.md`). Still open: whether to block the heaviest skipped tasks
+   at Kuradal (§6.2) -- the user's manual call.
