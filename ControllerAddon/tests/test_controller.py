@@ -2339,3 +2339,13 @@ def test_get_varp_reads_the_varp_endpoint_and_returns_none_when_unreadable(monke
 
     monkeypatch.setattr(controller, "api_get", lambda *a, **k: None)
     assert controller.get_varp(394) is None
+
+
+def test_get_slayer_task_returns_the_endpoint_dict_or_none(monkeypatch):
+    """None means 'bridge/endpoint unavailable' (an un-rebuilt client 404s /slayer) and the
+    orchestrator must do nothing on it -- never guess a task from a missing read."""
+    monkeypatch.setattr(controller, "api_get",
+                        lambda path, params=None, timeout=0.3: {"count": 0, "hasTask": False, "streak": 9})
+    assert controller.get_slayer_task() == {"count": 0, "hasTask": False, "streak": 9}
+    monkeypatch.setattr(controller, "api_get", lambda *a, **k: None)
+    assert controller.get_slayer_task() is None

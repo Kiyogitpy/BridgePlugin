@@ -174,6 +174,7 @@ public class ControllerPlugin extends Plugin
 		new ScreenshotProvider(client, clientThread, server, drawManager).register();
 		new WidgetDumpProvider(client, clientThread, server).register();
 		new SlayerConfigProvider(client, clientThread, server, config).register();
+		new SlayerProvider(client, clientThread, server).register();
 		new MenuStateProvider(client, clientThread, server).register();
 		new WidgetProvider(client, clientThread, server).register();
 		new com.example.providers.WorldProvider(client, clientThread, server).register();

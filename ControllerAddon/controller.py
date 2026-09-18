@@ -1101,6 +1101,15 @@ def get_slayer_config():
     return api_get("/slayer-config") or {}
 
 
+def get_slayer_task():
+    """GET /slayer (SlayerProvider, added 2026-09-18): the current slayer task decoded from the
+    varps/varbits RuneLite's own Slayer plugin reads -- {count, originalCount, taskId, taskName,
+    areaId, areaName, masterId, streak, points, bossId, hasTask}. None when the bridge or the
+    endpoint is unavailable (an un-rebuilt client 404s it); a routine must do NOTHING on None
+    rather than infer a task. taskName is None (not "") when the DB lookup failed."""
+    return api_get("/slayer")
+
+
 def get_mining_config():
     """The Mining section of the config panel (ConfigExporter.exportMining), or None when the
     bridge cannot answer -- routines/mining.py keeps its own defaults for that case only."""
