@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import banker
 import controller
 import combat_core
-slayer = combat_core   # the fixture and the 19 moved tests keep the short name
+slayer = combat_core   # the fixture and the 21 moved tests keep the short name
 
 
 class _State:
@@ -329,4 +329,5 @@ def test_the_slayer_stub_stops_and_points_at_the_spec():
     ctx = _Ctx({})
     slayer.tick(ctx)
     assert ctx.state.stops and "Combat" in ctx.state.stops[0]
+    assert "routines/combat.py" in ctx.state.stops[0]
     assert slayer.SKIP_STRAY_DIALOG_CHECK is True

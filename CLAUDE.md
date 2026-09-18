@@ -614,7 +614,8 @@ steps above.
   (streak) / 4723, decoded through DB tables 113/115/116 exactly as RuneLite's own
   `SlayerPlugin.updateTask()` does. Completion is `count` going to 0 -- the plugin no longer
   parses chat for it, and neither do we. `taskName` is `null` (not `""`) when the DB lookup
-  failed, so "no task" and "could not decode" stay distinguishable. An un-rebuilt client 404s
+  failed (on the wire the key is simply ABSENT -- Gson drops null map values -- so read it with
+  `.get()`), so "no task" and "could not decode" stay distinguishable. An un-rebuilt client 404s
   it (`/slayer-config` is not a path prefix of `/slayer`), and `controller.get_slayer_task()`
   returns `None` -- a routine must do NOTHING on `None`. `GET /varp?id=` is the varp twin of
   `/varbit`, same null-means-unreadable rule.

@@ -1389,7 +1389,12 @@ def _withdraw_return_teleport(ctx, config):
 
 
 # Moved to legs.py (2026-09-18). Aliases so _use_return_teleport and the tests that monkeypatch
-# banker._run_leg keep working; the "bank" log tag becomes legs' default "travel".
+# banker._run_leg keep working; the "bank" log tag becomes legs' default "travel". Only
+# banker._run_leg is a meaningful monkeypatch point -- it's the one _use_return_teleport actually
+# calls. Patching banker._run_item_leg, banker._await_arrival, or the RETURN_TELEPORT_*/
+# PICKER_BUDGET_S constant copies further up this file has NO effect on behaviour: legs.run_leg
+# calls its OWN module's functions (legs.run_item_leg, legs.await_arrival, ...) and reads its
+# own constants, never these aliases -- patch legs.* instead.
 _await_arrival = legs.await_arrival
 _run_leg = legs.run_leg
 _run_item_leg = legs.run_item_leg

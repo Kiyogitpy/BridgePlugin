@@ -24,5 +24,8 @@ def tick(ctx):
     ctx.state.trigger_safety_stop(
         "the Slayer task routine is not built yet (docs/superpowers/specs/"
         "2026-09-18-slayer-task-loop-design.md) -- pick 'Combat' in Controller Settings "
-        "for the old fight-the-selected-monsters behaviour"
+        "for the old fight-the-selected-monsters behaviour. That panel entry needs a client "
+        "rebuild (./gradlew.bat run) before it appears in the dropdown; until then, run the "
+        "old behaviour directly with 'python controller.py routines/combat.py' "
+        "(or 'run-vm.bat combat')"
     )

@@ -12,6 +12,17 @@
 # short and a restart resumes at the leg it was on. Object legs by NAME/ACTION (ladders, caves,
 # stairs -- spec §8) are sub-project 3; "box"/"poh_portal" here are banker's POH legs, still
 # UNVERIFIED live.
+#
+# How each kind confirms it actually landed, not just that the click went in: item/box/portal
+# legs (run_leg) confirm through await_arrival against the leg's own dest. A fairy leg confirms
+# through await_arrival too, but ONLY when built with a dest (legs.fairy(code, expect, dest=...));
+# built with no dest it reports DONE straight off hop_fairy_ring's own True, same as before. A
+# walk leg's confirmation is travel.walk_to's own return value -- nothing further to check.
+#
+# PROGRESS is unbounded BY DESIGN: run_next does one bounded action per call and leaves bounding
+# repeated PROGRESS to the CALLER. A fairy ring that never comes into view, or a safety stop
+# raised from inside hop_fairy_ring, both surface as an endless stream of PROGRESS -- a routine
+# looping on run_next must cap its own retries.
 
 import time
 
@@ -20,6 +31,7 @@ import debug_log
 import travel
 
 ITEM_BUDGET_S = 6.0      # a teleport is ~4 ticks of animation plus a region load; falconry measured 2.4-3.2s
+FAIRY_BUDGET_S = 12.0    # dial + hop + region load; spec §8's fairy budget
 POLL_S = 0.3
 ARRIVAL_TILES = 12       # several teleports drop you on a small spread of tiles; the walk covers the rest
 PICKER_BUDGET_S = 4.0    # a transport's destination picker -> appeared and answered
@@ -39,7 +51,10 @@ def _base(kind, display, dest):
 
 
 def item(name: str, option: str, dest) -> dict:
-    """An inventory (or worn) teleport item: left-click verified against `option`, else the menu."""
+    """An INVENTORY teleport item: left-click verified against `option`, else the menu.
+
+    run_item_leg searches the inventory only -- a WORN teleport item is not found here.
+    Supporting a worn item as a leg is sub-project 3's work, not this one's."""
     leg = _base("item", f"{name}: {option}", dest)
     leg["item"] = name
     leg["option"] = option
@@ -55,7 +70,10 @@ def fairy(code: str, expect: str, dest=None) -> dict:
 
 
 def walk(x: int, y: int, plane: int) -> dict:
-    """A same-plane walk to an exact tile (travel.walk_to, goal_adjacent=False)."""
+    """A same-plane walk toward (x, y, plane) (travel.walk_to, goal_adjacent=False).
+
+    "Exact tile" overstates it -- walk_to uses its own default arrival tolerance (3 tiles),
+    not this leg's own dest, so landing can be a few tiles short of (x, y)."""
     return _base("walk", f"walk to {x},{y},{plane}", (x, y, plane))
 
 
@@ -99,7 +117,12 @@ def run_next(ctx, leg_list, cursor: int, log: str = "travel"):
     kind = leg.get("kind")
     if kind == "fairy":
         ok = travel.hop_fairy_ring(ctx, leg.get("code"), leg.get("expect"), log=log)
-        return (DONE, cursor + 1) if ok else (PROGRESS, cursor)
+        if not ok:
+            return PROGRESS, cursor
+        dest = leg.get("dest") or []
+        if len(dest) == 3 and not await_arrival(dest, FAIRY_BUDGET_S):
+            return FAILED, cursor
+        return DONE, cursor + 1
     if kind == "walk":
         dest = leg.get("dest") or []
         ok = len(dest) == 3 and travel.walk_to(

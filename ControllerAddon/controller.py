@@ -11,7 +11,7 @@
 # owns its own settings screen now, so there's no in-game dropdown to fall
 # back to):
 #
-#     python controller.py routines/slayer.py
+#     python controller.py routines/combat.py
 #     python controller.py routines/mining.py
 #
 # ---------------------------------------------------------------------------
@@ -1106,7 +1106,9 @@ def get_slayer_task():
     varps/varbits RuneLite's own Slayer plugin reads -- {count, originalCount, taskId, taskName,
     areaId, areaName, masterId, streak, points, bossId, hasTask}. None when the bridge or the
     endpoint is unavailable (an un-rebuilt client 404s it); a routine must do NOTHING on None
-    rather than infer a task. taskName is None (not "") when the DB lookup failed."""
+    rather than infer a task. taskName is None (not "") when the DB lookup failed. On the wire
+    taskName/areaName are ABSENT (not null) when undecoded -- Gson drops null map values -- so
+    read them with .get()."""
     return api_get("/slayer")
 
 
@@ -3734,7 +3736,7 @@ def main():
         nargs="?",
         default=None,
         help=(
-            "Path to a routine .py file, e.g. routines/slayer.py. Pins the controller to that "
+            "Path to a routine .py file, e.g. routines/combat.py. Pins the controller to that "
             "routine and ignores the HttpBridge plugin's Routine dropdown -- handy while "
             "developing a routine that isn't wired into ROUTINE_FILES yet. Omit this to pick "
             "the routine live from the RuneLite HttpBridge plugin's Routine setting instead."

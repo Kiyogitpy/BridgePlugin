@@ -69,6 +69,25 @@ def test_a_fairy_leg_reports_progress_not_failure_while_the_hop_is_still_underwa
     assert seen == [("cks", "Slayer Tower")] * 3
 
 
+def test_a_fairy_leg_with_a_dest_confirms_the_landing_before_reporting_done(monkeypatch):
+    """Unlike a fairy leg with no dest, one built WITH a dest (legs.fairy(code, expect, dest))
+    must not report DONE off the hop's Confirm click alone -- it has to confirm arrival."""
+    monkeypatch.setattr(travel, "hop_fairy_ring", lambda ctx, code, expect, **kw: True)
+    seen = []
+    monkeypatch.setattr(legs, "await_arrival",
+                        lambda dest, budget_s=legs.ITEM_BUDGET_S: seen.append((dest, budget_s)) or True)
+    chain = [legs.fairy("cks", "Slayer Tower", dest=(3421, 3537, 0))]
+    assert legs.run_next(_Ctx(), chain, 0) == (legs.DONE, 1)
+    assert seen == [([3421, 3537, 0], legs.FAIRY_BUDGET_S)]
+
+
+def test_a_fairy_leg_with_a_dest_fails_when_the_landing_never_confirms(monkeypatch):
+    monkeypatch.setattr(travel, "hop_fairy_ring", lambda ctx, code, expect, **kw: True)
+    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=legs.ITEM_BUDGET_S: False)
+    chain = [legs.fairy("cks", "Slayer Tower", dest=(3421, 3537, 0))]
+    assert legs.run_next(_Ctx(), chain, 0) == (legs.FAILED, 0)
+
+
 def test_a_walk_leg_walks_to_the_exact_tile(monkeypatch):
     walks = []
     monkeypatch.setattr(travel, "walk_to",
