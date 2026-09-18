@@ -564,6 +564,27 @@ One staple has a global floor because every task needs it: `slayerMinHouseTelepo
 **It never buys anything** -- no Grand Exchange restocking, by decision; an empty bank is a
 human's job.
 
+**What to take from Slayer Best in Bank** (FreeArcanes, BSD-2, the user's suggestion; surveyed
+2026-09-19 in `docs/slayer-sites/slayer-best-in-bank-survey.md`). **Port facts and formulas, do
+not vendor the plugin.** Unlike the m8aq readers it is not a set of pure functions: its scorer
+sits behind a stateful RuneLite plugin and needs 20+ live inputs supplied by hand, so an adapter
+would buy little. Its bank capture is also weaker than ours -- live `ItemContainerChanged` only,
+never persisted, cleared on logout -- where `/bank/memory` already survives restarts. It
+compiles on Java 11 (`options.release.set(11)`), so that was never the obstacle. Worth lifting:
+- **Its required / protective item rules per task**, as a cross-check on `decisions.md`.
+- **Its prayer-potion estimate**, a real drain-rate formula (restore per dose at the account's
+  Prayer level, prayer bonus of the worn gear, the prayers kept on, trip length). That is
+  better founded than a flat "6 potions", so `PRAYER` profiles should compute their count from
+  it, with the user's 5-6 as the sanity range and the floor.
+- Its **inventory capacity planning** as a model for the 28-slot packing check.
+Not worth lifting: its FOOD estimate is pure trip-length scaling with no per-task danger
+signal -- it would never have asked for 15 food at nechryael -- so the per-task food numbers
+stay the user's. It also recommends a different site than the user chose for 7 of the 22 FIGHT
+tasks, because it optimises for wiki best-xp, not this account's travel; the user's sites stand.
+Licence note: `slayer-targets.tsv` inside it is **CC BY-NC-SA 3.0** (from osrs-dps-calc), not
+BSD; it is monster defence data for DPS maths, which this routine does not need, so it is not
+copied.
+
 **Tests** (`tests/test_supplies.py`): the charge parser over real names incl. `Slayer ring
 (eternal)` and `Ring of dueling(8)` vs `Slayer ring (8)` spacing; `teleports_left` treats an
 unseen bank as unknown; lowest-charge-first selection; quantity rules; the base loadout is NOT
