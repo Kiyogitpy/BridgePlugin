@@ -594,10 +594,22 @@ Three things the task loop has to add, because a task loadout is nearly a full i
    splits the predicate: **out of supplies → RESTOCK; merely full → looting pauses** and the
    fight goes on. Slots free up by themselves as food is eaten. New public helper
    `combat_core.out_of_critical_supplies(ctx)` already exists for the first half.
-2. **Worth making room for.** With a full inventory and a ground item worth at least
-   `slayerMakeRoomValue` (default 50,000), eat one food to free a slot if HP is not full,
-   then take it. Below that value, or at full HP, it is left. Stackables (coins, runes, noted
-   items, ammo) are always taken when a stack is already held, since they cost no slot.
+2. **Worth making room for -- two tiers** (values confirmed by the USER 2026-09-19: "50k is a
+   good value. If it's above 150k make sure it drops or eats either food or prayer pot to pick
+   it up. Will not happen a lot anyway"). With a full inventory:
+   - **≥ `slayerMakeRoomValue` (50,000): opportunistic.** Eat one food to free a slot if HP is
+     not full, then take it. At full HP it is left.
+   - **≥ `slayerMustLootValue` (150,000): guaranteed.** A slot is freed whatever it costs:
+     eat a food if HP is missing; else finish a **1-dose** prayer potion if prayer is missing
+     (only the last dose frees a slot -- the vial is smashed automatically on this account);
+     else **DROP** one consumable, choosing the cheapest to lose (the lowest-dose prayer
+     potion, else one food). Never drops gear, a teleport item, or a task-required item.
+     The drop is confirmed by the slot emptying on `/inventory`, the pickup by the item
+     appearing there; the dropped consumable is not picked back up.
+   - Below 50,000 a full inventory simply leaves it. Stackables (coins, runes, noted items,
+     ammo) are always taken when a stack is already held, since they cost no slot.
+   Ground-item value is `totalValue` from `/ground-items` (GE value × quantity), the same figure
+   `minLootValue` already uses.
 3. **The "skip the bank between tasks" rule (§7.9) must count slots, not just supplies.** A
    bank visit is needed when supplies are short for the next task OR the free slots left after
    packing the next task's profile would be fewer than `LOOT_RESERVE_SLOTS` (4). Otherwise nine
@@ -608,14 +620,14 @@ nothing worth the clicks, and travel time dominates a 20-kill task; Kuradal task
 panel's `minLootValue`. Bones follow the panel's Bury Bones toggle; a bonecrusher or ash
 sanctifier stays protected as today.
 
-**Empty vials** are the other slot leak: six prayer potions become six vials. Recommend the
-user turn on automatic vial smashing (Barbarian guard, reachable by the same NPC Contact spell
--- `NPC Contact.txt:143-146`); the routine does not drop vials itself unless that proves
-necessary live.
+**Empty vials are not a problem on this account**: USER 2026-09-19, "they get automatically
+smashed" (the Barbarian guard toggle is already on). So a finished potion frees its slot, and
+the routine needs no vial handling.
 
-Tests: full-of-loot with supplies left does not derive RESTOCK; the make-room rule respects the
-value floor and full HP; the between-task bank decision counts free slots; TRIVIAL ignores
-`minLootValue`.
+Tests: full-of-loot with supplies left does not derive RESTOCK; the 50k tier respects full HP;
+the 150k tier always frees a slot and picks eat → finish-a-1-dose → drop in that order, never
+touching gear, teleports or task items; the between-task bank decision counts free slots;
+TRIVIAL ignores `minLootValue`.
 
 ## 8. Transport legs (`legs.py`)
 
