@@ -31,6 +31,19 @@ import debug_log
 import settings
 import travel
 
+# CONFIRMED LIVE 2026-09-18 (USER, watching: "the astral contact spell kept contacting kuradell
+# instead of the correct one"): controller.py's engine-level check_stray_dialog runs BEFORE
+# routine.tick() every single loop iteration and blind-presses Space the moment GET /state's
+# dialogOpen goes true. Casting NPC Contact opens exactly that kind of dialogue-widget interface
+# for the "who would you like to talk to" picker, and Space resolved it to whichever NPC this
+# account had most recently actually spoken to (Kuradal, from slayer.py sessions on this same
+# account) before _repair_pouches's own _find_dark_mage_widget() scan ever got a chance to run --
+# every logged cast was followed by the ENGINE's own "[!] Dismissing a stray dialogue box" line,
+# never a click on the Dark Mage widget. Opted out here and re-driven from tick() below, gated off
+# only during _repair_pouches's own NPC-Contact resolve window (_contact_resolving) -- everywhere
+# else in this routine keeps the same generic protection it always had.
+SKIP_STRAY_DIALOG_CHECK = True
+
 DEFAULT_CONFIG = {
     "use_large_remains": True,    # 56 Agility rubble shortcut to the east pocket
     "repair_pouches": True,       # NPC Contact -> Dark Mage between rounds when degraded
@@ -903,6 +916,19 @@ def _held_action(data, disabled, st=None):
     # the stones turned in -- so it never pins the ladder to a rung with no work.
     if hold in ("place_cell", "create_guardian") and (inv.get("chargedCellTier") or "NONE") == "NONE":
         return None
+    # create_guardian's OWN ladder condition also requires activeGuardians < guardianLimit
+    # (guardians is a SHARED count across every player in the GOTR world) -- re-check it here
+    # too, not just chargedCellTier. CONFIRMED LIVE 2026-09-18 (first live run): a hold taken at
+    # guardians=6/10 rode the count up to 9/10 then 10/10 across three ticks of the SAME held
+    # action, at which point every further Assemble click on the essence pile is a guaranteed
+    # no-op (someone else filled the last slot) -- it burned all CELL_MAX_CLICKS and hit the
+    # "rift guardian never created" safety stop instead of dropping the hold and falling through
+    # to place_cell, which is exactly what the ladder itself does for a charged cell once the
+    # guardian cap is full (see the ladder's own place_cell fallback just below create_guardian).
+    if (hold == "create_guardian"
+            and st is not None
+            and not (0 <= st.get("activeGuardians", -1) < st.get("guardianLimit", -1))):
+        return None
     if hold == "repair_barrier" and find_repairable((st or {}).get("barriers")) is None:
         return None
     if hold == "spend_stones" and total_stones(inv) == 0:
@@ -1147,6 +1173,18 @@ def _dialogue_options(d):
     for o in d.get("options") or []:
         out.append(o if isinstance(o, str) else (o.get("text") or ""))
     return out
+
+
+def _dialogue_wrong_npc(d, expected="dark mage"):
+    """True when a dialogue is showing a NAMED speaker that is not `expected` -- the m8aq
+    Dialogue reader's npcName field (Dialogue.java: ChatLeft.NAME) identifies who is actually
+    talking, which nothing here checked before CONFIRMED LIVE 2026-09-18: NPC Contact opened a
+    conversation with Kuradal (this account's most recently REAL-spoken-to NPC, from slayer.py
+    sessions) instead of Dark Mage. An empty/missing name is NOT treated as wrong -- it just means
+    the name widget has not rendered yet this tick, a normal single-tick race, not evidence of
+    anything."""
+    name = (d.get("npcName") or "").strip().lower()
+    return bool(name) and expected not in name
 
 
 def _choose_option(ctx, d, substrings):
@@ -1406,6 +1444,30 @@ def _repair_pouches(ctx):
     data = ctx.state.data
     d = _dialogue()
     if _dialogue_open(d):
+        if _dialogue_wrong_npc(d):
+            # Confirmed the wrong NPC is talking (see _dialogue_wrong_npc) -- never blind-press
+            # an option or Space into a stranger's dialogue tree (option "2" means something
+            # different to every NPC; for a Slayer master it could reassign or drop a task).
+            # ESCAPE is OSRS's universal close-current-interface key -- a bounded best-effort
+            # close, harmless if it does nothing. gotr_wrong_npc_dialogue keeps the generic
+            # engine dialogue check OFF too (see _suppress_stray_dialog_check) until this
+            # actually closes, so it can't race back in and blind-advance what's left of it.
+            # Reuses the existing gotr_contact_stuck/CONTACT_STUCK_LIMIT give-up, same as an
+            # unclickable NPC Contact widget below -- this is the same class of "this isn't
+            # working, stop trying" as that one.
+            data["gotr_wrong_npc_dialogue"] = True
+            data["gotr_contact_cast_at"] = 0
+            stuck = data.get("gotr_contact_stuck", 0) + 1
+            data["gotr_contact_stuck"] = stuck
+            debug_log.log("!", f"NPC Contact opened {d.get('npcName')!r}, not Dark Mage "
+                                f"({stuck}x) -- pressing Escape and abandoning this cast")
+            controller.key_tap(ctx.ser, "ESCAPE")
+            controller.human_delay(0.5, 0.9)
+            if stuck >= CONTACT_STUCK_LIMIT:
+                debug_log.log("gotr", "NPC Contact keeps reaching the wrong NPC -- pouch "
+                                      "repair disabled for this session")
+                data["gotr_repair_disabled"] = True
+            return
         if _dialogue_options(d):
             # USER 2026-09-01, twice: the repair choice is OPTION 2, literally.
             # A "repair" text match was tried first and picked option 3 (another
@@ -2411,11 +2473,37 @@ def before_break(ctx):
             controller.human_delay(3.0, 4.0)
 
 
+def _contact_resolving(data):
+    """True while _repair_pouches is actively waiting to resolve an NPC Contact cast (see
+    CONTACT_RESOLVE_S) -- one of two windows the generic engine dialogue-dismissal must stay off
+    of. See the SKIP_STRAY_DIALOG_CHECK note at module level for why."""
+    cast_at = data.get("gotr_contact_cast_at", 0)
+    return bool(cast_at) and time.time() - cast_at < CONTACT_RESOLVE_S
+
+
+def _suppress_stray_dialog_check(data):
+    """True whenever GOTR needs exclusive control of dialogue handling instead of the engine's
+    generic check_stray_dialog. Covers _contact_resolving AND a confirmed-wrong-NPC dialogue
+    (gotr_wrong_npc_dialogue, set by _repair_pouches) for as long as it stays open -- clears the
+    latter itself, the moment it observes the dialogue has actually closed, which is the ONLY
+    place that flag is cleared. Without this self-heal it would silently disable stray-dialogue
+    protection for the rest of the session after one wrong-NPC event, since _repair_pouches is not
+    guaranteed to run again soon (pouches may no longer be degraded, or repair may now be
+    disabled)."""
+    if data.get("gotr_wrong_npc_dialogue"):
+        if _dialogue_open(_dialogue()):
+            return True
+        data["gotr_wrong_npc_dialogue"] = False
+    return _contact_resolving(data)
+
+
 def tick(ctx):
     """One engine tick = one rung, PLUS every rung whose predecessor's outcome landed, up to
     CHAIN_MAX_ACTIONS / CHAIN_MAX_S (the mining/agility chaining shape). Every ceiling and the
     stuck watch count a chained action exactly as a ticked one."""
     data = ctx.state.data
+    if not _suppress_stray_dialog_check(data):
+        controller.check_stray_dialog(ctx)
     deadline = time.time() + CHAIN_MAX_S
     for _ in range(CHAIN_MAX_ACTIONS):
         data["gotr_outcome_hit"] = False

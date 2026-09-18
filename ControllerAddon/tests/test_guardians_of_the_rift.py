@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "routines"))
@@ -457,6 +458,61 @@ def test_held_action_pins_until_expiry():
     assert gotr._held_action(data, {"portal_trip"}) is None      # disabled rungs win
     data["gotr_hold_until"] = 0
     assert gotr._held_action(data, set()) is None
+
+
+def test_held_create_guardian_drops_when_the_shared_cap_fills():
+    # First live run, 2026-09-18: a hold taken at guardians=6/10 rode the count up to 9/10
+    # then 10/10 (activeGuardians is a SHARED count across the whole GOTR world) across three
+    # ticks of the SAME held action -- every further Assemble click was then a guaranteed no-op
+    # (someone else filled the last slot), burning all CELL_MAX_CLICKS into a "rift guardian
+    # never created" safety stop instead of falling through to place_cell like the ladder itself
+    # does once the cap is full (see test_action_guardian_before_cell_when_room elsewhere in this
+    # file, which covers the ladder's own version of the same condition).
+    data = {}
+    st = make_state(activeGuardians=6, guardianLimit=10,
+                    inventory=make_inv(chargedCellTier="STRONG"))
+    gotr._hold_action(data, "create_guardian", 5.0)
+    assert gotr._held_action(data, set(), st) == "create_guardian"
+    st["activeGuardians"] = 10          # someone else's guardian filled the last slot
+    assert gotr._held_action(data, set(), st) is None
+    # A charged cell with room in the limit still holds normally.
+    st["activeGuardians"] = 9
+    assert gotr._held_action(data, set(), st) == "create_guardian"
+
+
+# --- NPC Contact must never act on the wrong NPC's dialogue (USER 2026-09-18, watching live:
+# "the astral contact spell kept contacting kuradell instead of the correct one") ---
+
+def test_dialogue_wrong_npc_detects_a_different_speaker():
+    assert gotr._dialogue_wrong_npc({"npcName": "Kuradal"}) is True
+    assert gotr._dialogue_wrong_npc({"npcName": "Dark Mage"}) is False
+    assert gotr._dialogue_wrong_npc({"npcName": "the Dark Mage"}) is False   # substring match
+    # Not yet rendered this tick is NOT evidence of the wrong NPC -- see the function's own note.
+    assert gotr._dialogue_wrong_npc({"npcName": ""}) is False
+    assert gotr._dialogue_wrong_npc({}) is False
+
+
+def test_contact_resolving_window():
+    data = {}
+    assert gotr._contact_resolving(data) is False
+    data["gotr_contact_cast_at"] = time.time()
+    assert gotr._contact_resolving(data) is True
+    data["gotr_contact_cast_at"] = time.time() - gotr.CONTACT_RESOLVE_S - 1
+    assert gotr._contact_resolving(data) is False
+
+
+def test_suppress_stray_dialog_check_self_heals_once_the_wrong_dialogue_closes(monkeypatch):
+    # The engine's generic check_stray_dialog must stay off for as long as a confirmed-wrong-NPC
+    # dialogue is still open (else it would race back in and blind-advance a stranger's dialogue
+    # the moment _contact_resolving's window lapses) but must NOT stay off for the rest of the
+    # session once it actually closes -- _repair_pouches is not guaranteed to run again soon.
+    data = {"gotr_wrong_npc_dialogue": True}
+    monkeypatch.setattr(gotr, "_dialogue", lambda: {"npcName": "Kuradal", "npcText": "hello"})
+    assert gotr._suppress_stray_dialog_check(data) is True
+    assert data["gotr_wrong_npc_dialogue"] is True
+    monkeypatch.setattr(gotr, "_dialogue", lambda: {})
+    assert gotr._suppress_stray_dialog_check(data) is False
+    assert data["gotr_wrong_npc_dialogue"] is False
 
 
 def test_action_cell_does_not_leave_the_pocket_before_the_batch():
