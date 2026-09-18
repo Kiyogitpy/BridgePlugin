@@ -21,7 +21,7 @@ RuneLite client (Java plugin, src/main/java/com/example/)
 Python controller (ControllerAddon/)
   └─ controller.py     — engine: bridge polling, Arduino serial driving, panic key,
                           safety stops, human-movement realism (see settings.py)
-  └─ routines/*.py     — one file per activity (slayer, mining, golem_crafting, ...);
+  └─ routines/*.py     — one file per activity (combat, slayer, mining, golem_crafting, ...);
                           controller.py loads whichever is passed on the command line
   └─ banker.py         — shared banking helpers (deposit, withdraw, pouches/bags)
   └─ travel.py         — shared walking helpers (Shortest Path plugin integration,
@@ -609,6 +609,15 @@ steps above.
   already `LOGGED_IN` at the CLICK-HERE-TO-PLAY screen (see `LoginProvider.java`), and scene swaps
   from ordinary walking never change it at all. Dropped events past the cap are intentional — the
   Python mirror is an accelerator with an HTTP fallback.
+- **`GET /slayer` (2026-09-18) is the ONLY reader of slayer task state.** varps 394 (kills
+  remaining) / 395 (task id) / 4258 / 2096 and varbits 4067 (master) / 4068 (points) / 4069
+  (streak) / 4723, decoded through DB tables 113/115/116 exactly as RuneLite's own
+  `SlayerPlugin.updateTask()` does. Completion is `count` going to 0 -- the plugin no longer
+  parses chat for it, and neither do we. `taskName` is `null` (not `""`) when the DB lookup
+  failed, so "no task" and "could not decode" stay distinguishable. An un-rebuilt client 404s
+  it (`/slayer-config` is not a path prefix of `/slayer`), and `controller.get_slayer_task()`
+  returns `None` -- a routine must do NOTHING on `None`. `GET /varp?id=` is the varp twin of
+  `/varbit`, same null-means-unreadable rule.
 
 ## Routine status index
 
@@ -636,7 +645,8 @@ file of the form "see the X.py section/notes" point there. One-line status:
 | `falconry.py` | Written from a recording 2026-08-23; 2026-09-06 event-driven pass NOT run live |
 | `golem_crafting.py` | Was running unattended live; 2026-09-06 event-driven + falconry fur-trip rewrite and 2026-09-14 single-tile mining rewrite NOT run live |
 | `karambwan_fishing.py` | Full loop verified live 2026-09-06; later left-click/AFK passes NOT run live |
-| `slayer.py` | Bank-trip return rebuilt 2026-09-07, pinned in tests, NOT run live |
+| `combat.py` (`combat_core.py`) | The old "Slayer / Combat": bank-trip return rebuilt 2026-09-07, pinned in tests, NOT run live; split out 2026-09-18 |
+| `slayer.py` | STUB (safety-stops, points at the 2026-09-18 spec) until the task orchestrator ships; `GET /slayer`, `/varp`, `dialogue.py`, `legs.py`, `gear.py` are built |
 | `chinchompa_hunting.py` | Working live 2026-08-21; known 7% collapsed-trap waste left deliberately |
 | `mahogany_homes.py` | Extensively live-debugged (~40 contracts/hr over 7h, 2026-08-30) |
 

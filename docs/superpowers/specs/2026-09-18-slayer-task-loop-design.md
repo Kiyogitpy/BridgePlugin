@@ -1,7 +1,7 @@
 # Slayer task loop (Aya ↔ Kuradal boosting) and the combat/slayer split — design
 
 **Date:** 2026-09-18
-**Status:** DRAFT for user review. Nothing implemented. Every game fact below is cited to the
+**Status:** approved 2026-09-18; sub-project 1 (split + plumbing) implemented per docs/superpowers/plans/2026-09-18-slayer-split-and-plumbing.md; sub-projects 2-3 pending the §12 recording. Every game fact below is cited to the
 offline wiki dump (`osrs-wiki-data-master/raw/...`) or the RuneLite 1.12.39 sources in the
 Gradle cache; every "measure live" item is listed in §12.
 **Sources:** `raw/A/Aya.txt`, `raw/K/Kuradal.txt`, `raw/N/NPC Contact.txt`,

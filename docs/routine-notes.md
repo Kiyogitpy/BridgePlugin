@@ -2709,7 +2709,17 @@ right click equiped quest point cape -> teleport -> take fairy ring DKP -> click
   one retry for the next box neither check knows about -- a SPACE with nothing open does
   nothing, while an unread box is indistinguishable from a dropped keypress from Python.
 
-## Current state of routines/slayer.py
+## Current state of combat_core.py / routines/combat.py (was routines/slayer.py until 2026-09-18)
+
+**Split 2026-09-18** (docs/superpowers/specs/2026-09-18-slayer-task-loop-design.md): the file
+is now `combat_core.py` (git mv), `tick` is `fight_tick`, and `routines/combat.py` is the
+panel-config wrapper the "Combat" dropdown entry runs. Everything below still applies to it
+unchanged. Two latent bugs fixed in the move: `BANK_NO_PROGRESS_MAX` was referenced but never
+defined (NameError after two no-restock bank trips), and `bracelets.reequip` was read but
+never exported. `routines/slayer.py` is a stub until sub-project 2. The same pass moved
+banker's return-teleport leg runner to `legs.py`; doing so fixed a latent `NameError` --
+banker's old `_pick_destination` called `_now()`, a name that never existed in `banker.py`,
+in the POH destination-picker path that has never run live.
 
 **Bank trip return-to-spot rebuilt 2026-09-07 (USER: "a few bugs with slayer/combat mainly the
 banking and getting back to the spot we previously was at", and specifically "ends up stuck at
