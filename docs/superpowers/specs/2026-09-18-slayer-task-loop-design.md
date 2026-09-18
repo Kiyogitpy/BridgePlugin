@@ -328,7 +328,8 @@ elif spec(s.task).disposition == STOP:            -> safety stop naming the task
                                                      the user does tormented demons by hand)
 elif spec(s.task).disposition == SKIP
      or not doable(spec) or user_skip(s.task):    -> SKIP
-elif at_site(spec, player):                       -> FIGHT
+elif at_site(spec, player):                       -> FIGHT, or RESTOCK when
+                                                     combat_core.needs_banking(ctx) (§7.5)
 elif not loadout_ok(spec):                        -> BANK      (home bank, then travel)
 else:                                             -> TRAVEL
 ```
@@ -400,9 +401,36 @@ supports, with the pool for HP/prayer/run). Sequence, each step confirmed:
 5. `loadout_ok` re-derived; if still false → safety stop naming the missing item (this is the
    "bank has no earmuffs" case, and it must not loop).
 
-Mid-task banking (inventory full / out of food) is `combat_core`'s existing path, unchanged:
-nearest bank or Ferox, `returnToSpot=True`, the return-teleport planner. The orchestrator
-only notices it happened because `at_site` becomes true again.
+**Mid-task restock is the ORCHESTRATOR's job, not the fight loop's** (corrected 2026-09-19;
+the first draft delegated it to `combat_core`'s existing bank trip, which was wrong for the
+sites the user chose). `combat_core`'s trip returns with `banker.return_to_spot`: a teleport
+plan plus `travel.walk_to`, which is **same-plane walking only**. Most chosen sites are
+underground or behind an entrance object -- Stronghold Slayer Cave, Slayer Tower basement,
+Catacombs of Kourend, Taverley Dungeon, Fremennik Slayer Dungeon, Kalphite Cave -- so that
+return would fail three times and safety-stop "stranded" (`RETURN_WALK_MAX_ATTEMPTS`). The
+catalog already holds the one route that does get back in. So:
+
+- `combat_config` also sets `bank.enabled = False`, so `fight_tick` never banks on its own.
+- Before delegating each FIGHT tick the orchestrator calls the fight loop's own public
+  predicate `combat_core.needs_banking(ctx)` (out of food at low HP, out of prayer restores at
+  low prayer, or an inventory full of loot). True → phase **RESTOCK**.
+- **RESTOCK**: clear the current target; leave by the **escape teleport** -- every loadout
+  carries one (a ring of dueling, which `banker._bank_via_ferox` already drives live; the Ferox
+  pool then restores HP, prayer and run for free) -- deposit loot, withdraw back up to the
+  task's supply profile (§7.9), re-check worn gear.
+- Getting back needs no new code: the task is still active and the player is not at the site,
+  so §7.1 derives **TRAVEL** and the task's own route runs again -- house, pool, ring or box,
+  the entrance object, the walk. The kill count lives in varp 394, so nothing is lost by
+  leaving.
+- Guard: `RESTOCK_MAX_PER_TASK` (4). A task that needs a fifth trip is under-supplied or
+  over-matched; safety-stop naming the task and what ran out, rather than commuting forever.
+- The escape must fire while there is still margin. `needs_banking` triggers at the panel's
+  `eatAt` / `restoreAt` with nothing left to consume, which leaves that much HP/prayer for the
+  teleport itself. For `PRAYER` tasks `restoreAt` must therefore sit high enough to cover the
+  teleport animation under attack; §12 measures it on the first prayer-tanked task.
+
+`routines/combat.py` keeps the old behaviour (its own bank trip and `returnToSpot`), which is
+right for it: its spot is wherever the user parked, usually on the surface.
 
 ### 7.6 TRAVEL
 
