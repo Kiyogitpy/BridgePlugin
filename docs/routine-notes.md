@@ -3477,6 +3477,35 @@ taught:
 - A test that forgot to fake `dialogue.read()` read the LIVE client; `tests/test_npc_contact.py`
   now refuses any `api_get`.
 
+**2026-09-19, sub-project 3 PHASE A (travel from where we stand), NOT run live.** Plan:
+`docs/superpowers/plans/2026-09-19-slayer-travel-bank-loadout.md` (five live-gated phases; B-E are
+interface-level until the phase before them has run). What phase A does: with a task active and
+the player out in the world, `slayer_routes.plan` tries Aya's teleports in the Turael Skipping
+plugin's own order -- a `Fairy ring: XYZ` becomes walk-to-the-nearest-overworld-ring / dial /
+walk-to-the-site, a carried item (Ectophial today) becomes item / walk -- and the TRAVEL phase
+runs ONE bounded leg per tick with a cursor in `ctx.state.data`. Every failure is a stop that
+names the leg. A site within a 64-tile WALK is never teleported to, only walked to, and the
+plugin's tight kill rectangles get a 6-tile margin, so chasing a monster out of the rectangle
+does not re-run the journey. A task's required items (the registry's own gear notes: light
+source, ice coolers, rope) are checked BEFORE any teleport is spent.
+- **A lit and an unlit lantern share ONE NAME** (wiki dump: Bullseye lantern 4548 unlit / 4550
+  lit; Mining helmet 5014 / 5013), so the light check is by ITEM ID (`slayer_tasks.LIT_IDS`).
+- **A teleport lands the player ON its own object**, a tile the static map cannot route from
+  (`find_path` from the AJQ exit ring is None; from one tile north, 42 steps). `legs.walk_across`
+  steps onto the nearest walkable neighbour first (`STEP_OFF_MAX` 2). Found by the phase review
+  on the real map; without it every fairy journey strands at the exit ring.
+- `FAIRY_EXPECT` (the Confirm-button substring): only AJQ "Dorgesh" is MEASURED. AJR, BLR, DLQ,
+  BIQ, CKS are travel-log guesses, safe to be wrong -- a mismatch is a stop BEFORE the hop.
+- `combat_core.maybe_loot` reads `loot["minValue"]` (0 = no value looting) and `loot["items"]`;
+  Aya fights set `minValue` 0 so only the whitelist is looted. Herb sack / seed box bypasses
+  still fire.
+- Ticks BLOCK for a whole walk (25-45 s) plus ~15 s for a dial, exactly like banker's trips;
+  panic runs on its own threads.
+Phase A live gate (needs a fairy-ring or Ectophial Aya task and its required item carried):
+route line -> walk to the ring -> `dialling the fairy ring to <code>` -> `fairy ring reads '…'`
+-> landing -> the step-off line -> walk to the site -> first attack -> `/slayer` count falling ->
+at zero, the next ACQUIRE. Record each measured Confirm text into `FAIRY_EXPECT`.
+
 Remaining checklist, in order:
 1. The picker row's action really reads `Contact Aya` and the hover gate accepts it (a mismatch
    costs three casts, then a stop). Kuradal sat at slot 33: watch whether her row needs scrolling.
