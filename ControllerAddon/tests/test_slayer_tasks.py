@@ -96,3 +96,23 @@ def test_where_names_the_place_and_the_first_teleport():
     text = st.where("Bears")
     assert "Legends" in text and "BLR" in text
     assert st.where("Nechryael") == ""
+
+
+def test_required_items_come_from_the_plugins_own_gear_notes():
+    slimes = st.required_items("Cave slimes", 17)
+    assert [n.label for n in slimes] == ["a light source"]
+    assert "bullseye lantern" in slimes[0].any_of and slimes[0].quantity == 1
+    lizards = st.required_items("Lizards", 20)
+    assert lizards[0].label == "ice coolers" and lizards[0].quantity == 25, "one per kill plus five spare"
+    assert st.required_items("Skeletons", 15)[0].any_of == ("rope",)
+    assert st.required_items("Goblins", 15) == [], "'South of the Sourhog Cave' is a place, not an item"
+    assert st.required_items("Bears", 15) == [] and st.required_items("Nechryael", 90) == []
+
+
+def test_missing_items_names_what_to_fetch_and_accepts_any_alternative():
+    assert st.missing_items("Cave slimes", 17, {}) == ["a light source (e.g. bullseye lantern)"]
+    assert st.missing_items("Cave slimes", 17, {"bullseye lantern": 1}) == []
+    assert st.missing_items("Cave slimes", 17, {"kandarin headgear 3": 1}) == []
+    assert st.missing_items("Cave slimes", 17, {"unlit torch": 1}) != [], "an UNLIT source is not a light"
+    assert st.missing_items("Lizards", 20, {"ice cooler": 10}) == ["ice coolers x25 (have 10)"]
+    assert st.missing_items("Lizards", 20, {"ice cooler": 30}) == []

@@ -7,6 +7,8 @@
 # name is STOP, never SKIP: a cancel costs 30 points, and a name we do not recognise (new
 # content, a DB decode slip) must not be paid for on a guess.
 
+from collections import namedtuple
+
 import aya_tasks
 
 FIGHT, SKIP, STOP = "FIGHT", "SKIP", "STOP"
@@ -96,3 +98,54 @@ def where(task_name) -> str:
         return ""
     via = f" (via {aya.teleports[0]})" if aya.teleports else ""
     return f"{aya.location}{via}, around {aya.target}"
+
+
+# ---------------------------------------------------------------- what a task needs carried
+#
+# From the Turael Skipping registry's own gear note per task (aya_tasks.AyaTask.info). A dark
+# cave without a light is not a slow task, it is constant swarm damage -- so a missing item is a
+# STOP that names it, checked BEFORE any teleport is spent (phase A); the bank phase (C) will
+# fetch it instead once it exists.
+
+Need = namedtuple("Need", ("label", "any_of", "quantity"))
+
+# LIT sources only, matched as substrings of the lowercased item name. "unlit"/"empty" variants
+# share these words, so they are excluded explicitly.
+LIGHT_SOURCES = ("bullseye lantern", "oil lantern", "candle lantern", "lit torch", "lit candle",
+                 "lit black candle", "mining helmet", "kandarin headgear", "firemaking cape",
+                 "max cape", "bruma torch", "abyssal lantern", "emerald lantern", "sapphire lantern")
+_NOT_LIT = ("unlit", "empty", "(u)")
+
+
+def required_items(task_name, count) -> list:
+    aya = aya_tasks.get(_key(task_name))
+    note = ((aya.info if aya else None) or "").lower()
+    if "light source" in note:
+        return [Need("a light source", LIGHT_SOURCES, 1)]
+    if "ice cooler" in note:
+        return [Need("ice coolers", ("ice cooler",), int(count or 0) + 5)]
+    if "rope" in note:
+        return [Need("a rope", ("rope",), 1)]
+    return []
+
+
+def _have(need, carried) -> int:
+    total = 0
+    for name, quantity in (carried or {}).items():
+        lowered = (name or "").lower()
+        if any(bad in lowered for bad in _NOT_LIT):
+            continue
+        if any(option in lowered for option in need.any_of):
+            total += int(quantity or 0)
+    return total
+
+
+def missing_items(task_name, count, carried) -> list:
+    out = []
+    for need in required_items(task_name, count):
+        have = _have(need, carried)
+        if have >= need.quantity:
+            continue
+        out.append(f"{need.label} (e.g. {need.any_of[0]})" if need.quantity == 1
+                   else f"{need.label} x{need.quantity} (have {have})")
+    return out
