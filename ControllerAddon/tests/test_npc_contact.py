@@ -15,6 +15,15 @@ NO_TASK = {"count": 0, "hasTask": False, "streak": 12, "points": 24, "taskId": 5
 BEARS = {"count": 15, "hasTask": True, "taskName": "Bears", "taskId": 13, "streak": 12, "points": 24, "masterId": 1}
 
 
+@pytest.fixture(autouse=True)
+def _no_live_bridge(monkeypatch):
+    """HERMETIC, enforced. 2026-09-19: a test that forgot to fake dialogue.read() read the LIVE
+    client -- where Aya's greeting really was open -- and 'passed' or failed by what was on screen."""
+    def refuse(path, *a, **k):
+        raise AssertionError(f"a test reached the live bridge: GET {path}")
+    monkeypatch.setattr(controller, "api_get", refuse)
+
+
 class _Ctx:
     def __init__(self):
         self.ser = None
@@ -40,23 +49,49 @@ def _quiet(monkeypatch):
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
 
 
-def test_the_master_row_is_found_by_its_action_never_by_slot():
-    """MEASURED: a picker row's text and name are EMPTY; only its action names the master. The
-    slots seen (Aya 18, Kuradal 33) are not used -- they move when a master is unlocked."""
-    dump = [_row(33, "Contact Kuradal", 419), _row(18, "Contact Aya", 306), _row(2, "Contact Honest Jimmy", 120),
-            {"group": 218, "child": 113, "index": -1, "screenX": 1, "screenY": 1, "actions": ["Cast"]}]
-    assert npc_contact.find_master_row(dump, "AYA")["index"] == 18
-    assert npc_contact.find_master_row(dump, "KURADAL")["index"] == 33
-    assert npc_contact.find_master_row(dump, "KONAR") is None
+def _picker(monkeypatch, rows=None, children=None, box=None, open_after=0):
+    """Fake the picker as the bridge really serves it: the container 75.4 and a row BY INDEX
+    through /widget, and /widget/children (which on the current build lists no blank rows)."""
+    calls = {"n": 0}
+    box = box or {"found": True, "clickable": True, "screenX": 690, "screenY": 360, "height": 300}
+
+    def get_widget(group, child, index=None):
+        if (group, child) == npc_contact.SPELL:
+            return {"found": True, "clickable": True, "screenX": 1270, "screenY": 676}
+        if (group, child) == npc_contact.PICKER_LIST:
+            if index is None:
+                calls["n"] += 1
+                return box if calls["n"] > open_after else {"found": True, "clickable": False}
+            return (rows or {}).get(index, {"found": False})
+        return {"found": False}
+    monkeypatch.setattr(controller, "get_widget", get_widget)
+    monkeypatch.setattr(controller, "get_widget_children", lambda g, c: list(children or []))
 
 
-def test_the_other_name_of_the_same_master_matches_too():
-    """Aya is Turael's Varlamore twin and Kuradal is Duradel's; which name the picker shows
-    depends on the account, so both are accepted."""
-    assert npc_contact.find_master_row([_row(9, "Contact Turael")], "AYA")["index"] == 9
-    assert npc_contact.find_master_row([_row(9, "Contact Duradel")], "KURADAL")["index"] == 9
-    assert npc_contact.find_master_row([_row(9, "Contact Ayatollah")], "AYA") is None, "whole name, not a prefix"
+def test_live_run_1_the_row_is_addressed_by_index_because_the_picker_is_not_in_the_root_walk(monkeypatch):
+    """LIVE 2026-09-19: three pickers opened, /widgets/dump listed none of them. Rows have no text,
+    so the measured slot is the aim and the hover gate is the proof."""
+    rows = {18: {"found": True, "clickable": True, "screenX": 691, "screenY": 306},
+            33: {"found": True, "clickable": True, "screenX": 684, "screenY": 419}}
+    _picker(monkeypatch, rows=rows)
+    assert npc_contact.find_master_row("AYA")["index"] == 18
+    assert npc_contact.find_master_row("Turael")["index"] == 18
+    assert npc_contact.find_master_row("KURADAL")["screenY"] == 419
+    assert npc_contact.find_master_row("KONAR") is None, "no measured slot and no actions: refuse"
 
+
+def test_a_slot_scrolled_out_of_the_visible_list_is_refused(monkeypatch):
+    rows = {33: {"found": True, "clickable": True, "screenX": 684, "screenY": 900}}
+    _picker(monkeypatch, rows=rows)
+    assert npc_contact.find_master_row("KURADAL") is None
+
+
+def test_a_bridge_that_reports_actions_finds_the_row_by_action_and_ignores_the_hints(monkeypatch):
+    children = [{"index": 7, "screenX": 1, "screenY": 300, "actions": ["Contact Duradel"]},
+                {"index": 4, "screenX": 1, "screenY": 200, "actions": ["Contact Ayatollah"]}]
+    _picker(monkeypatch, children=children)
+    assert npc_contact.find_master_row("KURADAL")["index"] == 7
+    assert npc_contact.find_master_row("AYA") is None, "whole name, not a prefix; and no row at the hint"
 
 def test_get_task_refuses_aya_while_a_task_is_active_before_touching_anything(monkeypatch):
     _quiet(monkeypatch)
@@ -179,30 +214,115 @@ def test_an_unreadable_spellbook_does_not_block_the_cast(monkeypatch):
     assert npc_contact.missing_requirements("AYA") is None
 
 
+def _speaker_after_row_click(monkeypatch, name="Aya"):
+    """dialogue.read() is silent until a picker ROW (an entity with an index) has been clicked."""
+    said = {"open": False}
+    clicks = []
+
+    def click_entity(ser, entity, **kw):
+        clicks.append((entity.get("index"), kw.get("expected_action"), kw.get("check_ui_blockers"), kw.get("offset")))
+        if entity.get("index") is not None:
+            said["open"] = True
+        return True
+    monkeypatch.setattr(controller, "click_entity", click_entity)
+    monkeypatch.setattr(dialogue, "read", lambda: {"npcName": name} if said["open"] else {})
+    return clicks
+
+
 def test_contact_clicks_the_spell_then_the_row_with_the_hover_gate(monkeypatch):
     _quiet(monkeypatch)
     monkeypatch.setattr(controller, "get_slayer_task", lambda: dict(NO_TASK))
     monkeypatch.setattr(controller, "get_active_tab", lambda: 6)
     monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
-    monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None:
-                        {"found": True, "clickable": True, "screenX": 1270, "screenY": 676})
-    dumps = iter([[], [], [_row(18, "Contact Aya", 306), _row(33, "Contact Kuradal", 419)]])
-    last = {}
-
-    def get_widgets_dump(scan=False):
-        last["d"] = next(dumps, last.get("d", []))
-        return last["d"]
-    monkeypatch.setattr(controller, "get_widgets_dump", get_widgets_dump)
-    clicks = []
-
-    def click_entity(ser, entity, **kw):
-        clicks.append((entity.get("index"), kw.get("expected_action"), kw.get("check_ui_blockers"), kw.get("offset")))
-        return True
-    monkeypatch.setattr(controller, "click_entity", click_entity)
-    monkeypatch.setattr(dialogue, "read", lambda: {"npcName": "Aya", "npcText": "'Ello, and what are you after then?"})
+    _picker(monkeypatch, rows={18: {"found": True, "clickable": True, "screenX": 691, "screenY": 306}}, open_after=3)
+    clicks = _speaker_after_row_click(monkeypatch)
     assert npc_contact.contact(_Ctx(), "AYA", CFG) is True
     assert clicks[0] == (None, None, False, (0, 0)), "the spell: an interface click, no hover gate"
-    assert clicks[1] == (18, "Contact Aya", False, (0, 0))
+    assert clicks[1] == (18, ("contact aya", "contact turael"), False, (0, 0))
+
+
+def test_an_already_open_picker_is_not_cast_into_again(monkeypatch):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: dict(NO_TASK))
+    _picker(monkeypatch, rows={18: {"found": True, "clickable": True, "screenX": 691, "screenY": 306}})
+    clicks = _speaker_after_row_click(monkeypatch)
+    ctx = _Ctx()
+    assert npc_contact.contact(ctx, "AYA", CFG) is True
+    assert [c[0] for c in clicks] == [18] and ctx.state.data.get("npc_contact_casts", 0) == 0
+
+
+def test_live_run_2_a_cast_that_goes_straight_to_the_master_is_success(monkeypatch):
+    """LIVE 2026-09-19: the spell's left-click re-contacts the LAST NPC. Three casts each opened
+    Aya's greeting and were thrown away waiting for a picker that was never coming."""
+    _quiet(monkeypatch)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: dict(NO_TASK))
+    monkeypatch.setattr(controller, "get_active_tab", lambda: 6)
+    _picker(monkeypatch, open_after=10 ** 9)                       # the picker NEVER opens
+    cast = {"done": False}
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: cast.update(done=True) or True)
+    monkeypatch.setattr(dialogue, "read", lambda: {"npcName": "Aya", "npcText": "'Ello"} if cast["done"] else {})
+    ctx = _Ctx()
+    assert npc_contact.contact(ctx, "AYA", CFG) is True
+    assert ctx.state.data["npc_contact_casts"] == 1
+
+
+def test_a_masters_dialogue_that_is_already_open_costs_no_cast(monkeypatch):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: dict(NO_TASK))
+    monkeypatch.setattr(dialogue, "read", lambda: {"npcName": "Aya"})
+    touched = []
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: touched.append(1) or True)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: touched.append(key))
+    assert npc_contact.contact(_Ctx(), "AYA", CFG) is True
+    assert touched == []
+
+
+def test_a_cast_that_recontacts_the_wrong_npc_is_closed_and_the_picker_forced(monkeypatch):
+    """Task 20 wants Kuradal while the last contact was Aya: left-click reaches Aya, so her
+    dialogue is ESCAPED untouched and the spell's right-click 'Cast' opens the picker."""
+    _quiet(monkeypatch)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: dict(NO_TASK))
+    monkeypatch.setattr(controller, "get_active_tab", lambda: 6)
+    stage = {"s": "idle"}
+    rows = {33: {"found": True, "clickable": True, "screenX": 684, "screenY": 419}}
+
+    def get_widget(group, child, index=None):
+        if (group, child) == npc_contact.SPELL:
+            return {"found": True, "clickable": True, "screenX": 1270, "screenY": 676}
+        if (group, child) == npc_contact.PICKER_LIST:
+            if stage["s"] != "picker":
+                return {"found": False}
+            return rows.get(index, {"found": False}) if index is not None else \
+                {"found": True, "clickable": True, "screenX": 690, "screenY": 360, "height": 300}
+        return {"found": False}
+    monkeypatch.setattr(controller, "get_widget", get_widget)
+    monkeypatch.setattr(controller, "get_widget_children", lambda g, c: [])
+    events = []
+
+    def click_entity(ser, entity, **kw):
+        if entity.get("index") is None:
+            events.append("left-cast")
+            stage["s"] = "aya"
+        else:
+            events.append(f"row {entity['index']}")
+            stage["s"] = "kuradal"
+        return True
+
+    def click_menu_action(ser, entity, option, **kw):
+        events.append(f"menu {option}")
+        stage["s"] = "picker"
+        return True
+
+    def key_tap(ser, key):
+        events.append(key)
+        if key == "ESC":
+            stage["s"] = "idle"
+    monkeypatch.setattr(controller, "click_entity", click_entity)
+    monkeypatch.setattr(controller, "click_menu_action", click_menu_action)
+    monkeypatch.setattr(controller, "key_tap", key_tap)
+    monkeypatch.setattr(dialogue, "read", lambda: {"aya": {"npcName": "Aya"}, "kuradal": {"npcName": "Kuradal"}}.get(stage["s"], {}))
+    assert npc_contact.contact(_Ctx(), "KURADAL", CFG) is True
+    assert events == ["left-cast", "ESC", "menu Cast", "row 33"]
 
 
 def test_contact_fails_cleanly_when_the_spell_is_not_clickable(monkeypatch):
@@ -211,6 +331,7 @@ def test_contact_fails_cleanly_when_the_spell_is_not_clickable(monkeypatch):
     monkeypatch.setattr(controller, "get_active_tab", lambda: 6)
     monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
     monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: {"found": True, "clickable": False})
+    monkeypatch.setattr(dialogue, "read", lambda: {})
     clicked = []
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: clicked.append(1) or True)
     assert npc_contact.contact(_Ctx(), "AYA", CFG) is False

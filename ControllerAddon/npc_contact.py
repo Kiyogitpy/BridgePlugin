@@ -62,16 +62,48 @@ def _master(master) -> dict:
     return MASTERS.get(slayer_state.canonical_master(master)) or {"names": ((master or "").lower(),), "magic": 67}
 
 
-def find_master_row(dump, master):
-    """The picker row whose action is 'Contact <one of the master's names>', or None."""
-    wanted = {f"contact {name}" for name in _master(master)["names"]}
-    for entry in dump or ():
-        if entry.get("group") != PICKER_GROUP or entry.get("screenX") is None:
-            continue
-        if any((action or "").strip().lower() in wanted for action in entry.get("actions") or ()):
-            return entry
-    return None
+# LIVE RUN 1, 2026-09-19: three casts, three pickers on screen (USER: "dialog popped up 3 times"),
+# three runes spent -- and "the picker never appeared", because it was looked for in /widgets/dump,
+# which WALKS the attached roots, and interface 75 is not attached to them (the exact trap
+# CLAUDE.md warns about: such a root still resolves BY ID). /widget/children is no help on the
+# current build either: it skips rows with no item and blank text, and every row here is blank.
+# So: the list container 75.4 is asked for BY ID, a row is addressed by INDEX, and because a row
+# carries no text the measured slot is only the AIM -- the hover gate reading "Contact Aya" under
+# the cursor is the PROOF, and a miss withholds the click. If a rebuilt bridge ever reports
+# `actions` on children, the row is found by action and the hints are not used at all.
+PICKER_LIST = (75, 4)
+SLOT_HINTS = {"AYA": 18, "KURADAL": 33}      # MEASURED 2026-09-19 on this account; they move
 
+
+def picker_open() -> bool:
+    box = controller.get_widget(*PICKER_LIST)
+    return bool(box.get("found")) and bool(box.get("clickable"))
+
+
+def _contact_actions(master) -> tuple:
+    return tuple(f"contact {name}" for name in _master(master)["names"])
+
+
+def find_master_row(master):
+    """The picker row for `master`: by ACTION when the bridge reports actions, else the measured
+    slot -- refused when that slot lies outside the visible list (scrolled away). None if neither."""
+    wanted = set(_contact_actions(master))
+    for child in controller.get_widget_children(*PICKER_LIST) or ():
+        if child.get("screenX") is not None and any(
+                (action or "").strip().lower() in wanted for action in child.get("actions") or ()):
+            return child
+    hint = SLOT_HINTS.get(slayer_state.canonical_master(master))
+    if hint is None:
+        return None
+    row = controller.get_widget(PICKER_LIST[0], PICKER_LIST[1], index=hint)
+    if not row.get("clickable") or row.get("screenY") is None:
+        return None
+    box = controller.get_widget(*PICKER_LIST)
+    if box.get("screenY") is not None and box.get("height"):
+        if abs(row["screenY"] - box["screenY"]) > box["height"] / 2:
+            debug_log.log(LOG, f"slot {hint} is scrolled out of the visible list")
+            return None
+    return dict(row, index=hint)
 
 def _rune_counts() -> dict:
     counts = {}
@@ -114,57 +146,113 @@ def missing_requirements(master):
     return None
 
 
-def open_picker(ctx) -> bool:
-    """Magic tab -> cast -> the picker is readable. False (and no cast) when the spell is not
-    clickable: wrong spellbook, filtered spell, or an interface covering the tab."""
+# LIVE RUN 2, 2026-09-19: the cast opened NO picker. It opened AYA'S DIALOGUE directly -- the
+# spell's left-click re-contacts the last NPC spoken to (spec F6), and the human recording only
+# showed a picker because its previous contact had been someone else. Three good casts were
+# thrown away waiting for interface 75. So a cast has THREE outcomes: the picker; the wanted
+# master's dialogue (done); or someone else's dialogue, which is closed and the picker forced
+# through the spell's right-click "Cast".
+PICKER, SPEAKING, NOTHING = "picker", "speaking", "nothing"
+
+
+def _speaker() -> str:
+    return (dialogue.read().get("npcName") or "").strip().lower()
+
+
+def _await_cast_outcome():
+    """(PICKER, "") | (SPEAKING, name) | (NOTHING, "") within PICKER_BUDGET_S."""
+    deadline = time.time() + PICKER_BUDGET_S
+    while time.time() < deadline:
+        if picker_open():
+            return PICKER, ""
+        speaker = _speaker()
+        if speaker:
+            return SPEAKING, speaker
+        time.sleep(POLL_S)
+    return NOTHING, ""
+
+
+def _spell(ctx):
     if controller.get_active_tab() != MAGIC_TAB_INDEX:
         controller.key_tap(ctx.ser, MAGIC_TAB_KEY)
         controller.human_delay(0.3, 0.5)
     spell = controller.get_widget(*SPELL)
     if not spell or not spell.get("clickable"):
         debug_log.log(LOG, f"spell widget {SPELL[0]}.{SPELL[1]} is not clickable -- Lunar spellbook? spell filtered?")
-        return False
-    debug_log.log(LOG, "casting NPC Contact")
-    if not controller.click_entity(ctx.ser, spell, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False):
-        return False
+        return None
+    return spell
+
+
+def cast(ctx, force_picker: bool = False):
+    """Cast once and report what it opened. `force_picker` right-clicks the spell and takes 'Cast',
+    which always opens the picker instead of re-contacting the last NPC."""
+    spell = _spell(ctx)
+    if spell is None:
+        return NOTHING, ""
+    debug_log.log(LOG, "casting NPC Contact" + (" (right-click Cast, to get the picker)" if force_picker else ""))
+    if force_picker:
+        ok = controller.click_menu_action(ctx.ser, spell, "Cast", offset=(0, 0), check_ui_blockers=False)
+    else:
+        ok = controller.click_entity(ctx.ser, spell, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
+    if not ok:
+        return NOTHING, ""
     ctx.state.data["npc_contact_casts"] = ctx.state.data.get("npc_contact_casts", 0) + 1
-    deadline = time.time() + PICKER_BUDGET_S
-    while time.time() < deadline:
-        if any(entry.get("group") == PICKER_GROUP for entry in controller.get_widgets_dump() or ()):
-            return True
-        time.sleep(POLL_S)
-    debug_log.log(LOG, f"the contact picker (interface {PICKER_GROUP}) never appeared within {PICKER_BUDGET_S}s")
-    return False
+    outcome = _await_cast_outcome()
+    if outcome[0] == NOTHING:
+        debug_log.log(LOG, f"the cast opened neither the picker nor a dialogue within {PICKER_BUDGET_S}s")
+    return outcome
 
 
-def contact(ctx, master, tasks_cfg) -> bool:
-    """Cast and pick `master`. True once THEIR dialogue is open."""
-    slayer_state.assert_may_contact(master, slayer_state.from_bridge(controller.get_slayer_task()), tasks_cfg)
-    if not open_picker(ctx):
-        return False
-    row = find_master_row(controller.get_widgets_dump(), master)
+def _pick_row(ctx, master) -> bool:
+    row = find_master_row(master)
     if row is None:
         debug_log.log(LOG, f"no 'Contact {master}' row in the picker -- not unlocked, or scrolled out of view")
         dialogue.close(ctx)
         return False
-    action = (row.get("actions") or [""])[0]
+    action = _contact_actions(master)          # any of the master's names; matched case-insensitively
     clicked = controller.click_entity(ctx.ser, row, offset=(0, 0), check_ui_blockers=False,
                                       simulate_mistakes=False, expected_action=action)
     if not clicked:
-        debug_log.log(LOG, f"the click on '{action}' was withheld or failed")
+        debug_log.log(LOG, f"the click on slot {row.get('index')} was withheld (the hover did not read {action}) or failed")
         dialogue.close(ctx)
         return False
     names = _master(master)["names"]
     deadline = time.time() + CONTACT_BUDGET_S
     while time.time() < deadline:
-        speaker = (dialogue.read().get("npcName") or "").strip().lower()
-        if speaker in names:
+        if _speaker() in names:
             return True
         time.sleep(POLL_S)
     debug_log.log(LOG, f"{master}'s dialogue did not open within {CONTACT_BUDGET_S}s -- closing whatever did")
     dialogue.close(ctx)
     return False
 
+
+def contact(ctx, master, tasks_cfg) -> bool:
+    """Reach `master`. True once THEIR dialogue is open. Spends no cast when it already is, or
+    when the picker is already up."""
+    slayer_state.assert_may_contact(master, slayer_state.from_bridge(controller.get_slayer_task()), tasks_cfg)
+    names = _master(master)["names"]
+    if _speaker() in names:
+        debug_log.log(LOG, f"{master}'s dialogue is already open -- not casting")
+        return True
+    if picker_open():
+        return _pick_row(ctx, master)
+    kind, speaker = cast(ctx)
+    if kind == SPEAKING and speaker in names:
+        debug_log.log(LOG, f"the cast went straight to {speaker} (the last NPC contacted)")
+        return True
+    if kind == SPEAKING:
+        debug_log.log(LOG, f"the cast re-contacted {speaker!r}, not {master} -- closing it and forcing the picker")
+        dialogue.close(ctx)
+        controller.human_delay(0.6, 1.0)
+        kind, speaker = cast(ctx, force_picker=True)
+        if kind == SPEAKING and speaker in names:
+            return True
+    if kind != PICKER:
+        if kind == SPEAKING:
+            dialogue.close(ctx)
+        return False
+    return _pick_row(ctx, master)
 
 def _assigned():
     state = slayer_state.from_bridge(controller.get_slayer_task())
@@ -270,6 +358,10 @@ def find_cancel_control(dump):
 
 
 def _rewards_open() -> bool:
+    # By ID first: live run 1 showed an open interface can be missing from the root walk.
+    tab = controller.get_widget(TASKS_TAB[0], TASKS_TAB[1])
+    if tab.get("found") and tab.get("clickable"):
+        return True
     return any(e.get("group") == REWARDS_GROUP for e in controller.get_widgets_dump() or ())
 
 
