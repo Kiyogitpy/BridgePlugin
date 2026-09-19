@@ -226,13 +226,12 @@ def test_the_requirement_reads_wait_out_the_cooldown(monkeypatch):
     assert len(reads) == 1, "the second tick is inside the cooldown and reads nothing"
 
 
-def _carry(monkeypatch, names=()):
-    import gear
-    monkeypatch.setattr(gear, "carried_names", lambda: list(names))
-    monkeypatch.setattr(gear, "worn_names", lambda: [])
-    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": n, "qty": 1} for n in names])
+def _carry(monkeypatch, names=(), ids=()):
+    """Inventory as the bridge really serves it: a list of {"name", "qty", "id"}; equipment empty."""
+    items = [{"name": n, "qty": 1, "id": i} for n, i in zip(names, list(ids) + [None] * len(names))]
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(items))
+    monkeypatch.setattr(controller, "get_equipment", lambda: {})
     monkeypatch.setattr(legs, "skill_levels", lambda: {"Agility": 70})
-
 
 def test_travel_runs_one_leg_per_tick_and_keeps_its_cursor(monkeypatch):
     monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Bears", count=15))
@@ -286,17 +285,24 @@ def test_endless_progress_is_bounded(monkeypatch):
 
 
 def test_a_finished_route_replans_once_then_stops(monkeypatch):
+    """PHASE-A REVIEW: a real route never answers FINISHED at cursor 0 -- it answers DONE per leg
+    and FINISHED after the last. Resetting the counter on DONE made this stop unreachable and the
+    re-plan loop unbounded; the old test hid it by faking FINISHED every call."""
     monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Bears", count=15))
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})
     _carry(monkeypatch)
     plans = []
     monkeypatch.setattr(slayer_routes, "plan", lambda *a, **k: plans.append(1) or ([legs.walk(1, 1, 0)], ""))
-    monkeypatch.setattr(legs, "run_next", lambda ctx, legs_, cursor, log="travel": (legs.FINISHED, cursor))
-    ctx = _Ctx()
-    for _ in range(4):
-        routine.tick(ctx)
-    assert len(plans) == 2 and ctx.state.stops and "not reached" in ctx.state.stops[0]
 
+    def run_next(ctx, legs_, cursor, log="travel"):
+        return (legs.DONE, cursor + 1) if cursor < len(legs_) else (legs.FINISHED, cursor)
+    monkeypatch.setattr(legs, "run_next", run_next)
+    ctx = _Ctx()
+    for _ in range(8):
+        routine.tick(ctx)
+        if ctx.state.stops:
+            break
+    assert len(plans) == 2 and ctx.state.stops and "not reached" in ctx.state.stops[0]
 
 def _fighting(monkeypatch, target_index):
     monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Banshees"))
@@ -329,16 +335,18 @@ def test_having_a_target_resets_the_watch(monkeypatch):
 
 
 def test_an_aya_task_loots_only_the_whitelist(monkeypatch):
+    """combat_core.maybe_loot reads loot["minValue"] (0 = no value looting) and loot["items"] (the
+    whitelist). The first draft wrote "minLootValue", a key nothing reads."""
     seen = []
     monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Banshees"))
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3440, "y": 3545, "plane": 0})
     monkeypatch.setattr(controller, "check_stray_dialog", lambda ctx: None)
-    monkeypatch.setattr(combat_core, "fight_tick", lambda ctx: seen.append(ctx.state.config["loot"]["minLootValue"]))
+    monkeypatch.setattr(combat_core, "fight_tick", lambda ctx: seen.append(dict(ctx.state.config["loot"])))
     ctx = _Ctx()
-    ctx.state.config["loot"] = {"minLootValue": 5000, "names": ["Mystic gloves (dark)"]}
+    ctx.state.config["loot"] = {"minValue": 5000, "items": ["Mystic gloves (dark)"]}
     routine.tick(ctx)
-    assert seen[0] >= 10 ** 9 and ctx.state.config["loot"]["minLootValue"] == 5000
-
+    assert seen[0] == {"minValue": 0, "items": ["Mystic gloves (dark)"]}
+    assert ctx.state.config["loot"]["minValue"] == 5000, "the panel config is untouched"
 
 def test_no_usable_teleport_stops_with_the_reason(monkeypatch):
     monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Minotaurs", count=15))
@@ -347,3 +355,29 @@ def test_no_usable_teleport_stops_with_the_reason(monkeypatch):
     ctx = _Ctx()
     routine.tick(ctx)
     assert "Ornate Jewellery Box" in ctx.state.stops[0] and "minotaurs" in ctx.state.stops[0].lower()
+
+
+def test_chasing_a_monster_a_few_tiles_out_of_the_rectangle_is_still_the_fight(monkeypatch):
+    """PHASE-A REVIEW: the plugin's rectangles are tight (cave slimes 14x8). Two tiles outside must
+    not flip the routine into TRAVEL and re-run a teleport route."""
+    state = slayer_state.from_bridge(_task("Banshees"))
+    inside_margin = {"x": 3431 - 4, "y": 3545, "plane": 0}
+    far = {"x": 3431 - 20, "y": 3545, "plane": 0}
+    assert routine.derive_phase(state, TASKS, inside_margin) == routine.FIGHT
+    assert routine.derive_phase(state, TASKS, far) == routine.TRAVEL
+
+
+def test_the_carried_map_holds_item_ids_so_a_lit_lantern_can_be_told_from_an_unlit_one(monkeypatch):
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Cave slimes", count=17))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2700, "y": 3321, "plane": 0})
+    ran = []
+    monkeypatch.setattr(legs, "run_next", lambda *a, **k: ran.append(1) or (legs.DONE, 1))
+    monkeypatch.setattr(slayer_routes, "plan", lambda *a, **k: ([legs.walk(1, 1, 0)], ""))
+    _carry(monkeypatch, names=["Bullseye lantern"], ids=[4548])          # UNLIT: same name
+    ctx = _Ctx()
+    routine.tick(ctx)
+    assert ran == [] and "light source" in ctx.state.stops[0]
+    _carry(monkeypatch, names=["Bullseye lantern"], ids=[4550])          # lit
+    ctx = _Ctx()
+    routine.tick(ctx)
+    assert ran == [1] and ctx.state.stops == []

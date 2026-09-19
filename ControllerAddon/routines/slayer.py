@@ -41,6 +41,7 @@ GO_THERE = TRAVEL              # the pre-phase-A name; kept so old notes and log
 CONTACT_MAX_CASTS = 3          # each cast spends runes: a ceiling, not just a cooldown
 CONTACT_RETRY_COOLDOWN_S = 6.0
 
+SITE_MARGIN = 6                # tiles around the plugin's tight kill rectangles that still count as "there"
 TRAVEL_MAX_FAILS = 3           # a leg that fails three times strands us: stop and NAME it
 TRAVEL_MAX_PROGRESS = 40       # legs.run_next's PROGRESS is unbounded by design; the caller bounds it
 
@@ -66,7 +67,7 @@ def derive_phase(state, tasks_cfg, player) -> str:
         return SKIP
     if verdict == slayer_tasks.STOP:
         return STOP
-    return FIGHT if slayer_tasks.at_site(state.task, player) else TRAVEL
+    return FIGHT if slayer_tasks.at_site(state.task, player, margin=SITE_MARGIN) else TRAVEL
 
 
 def _reset_slot_counters(ctx, state) -> None:
@@ -77,7 +78,8 @@ def _reset_slot_counters(ctx, state) -> None:
         ctx.state.data.update({"slayer_streak_seen": state.streak, "slayer_casts": 0, "slayer_skips": 0,
                                "slayer_cancel_attempts": 0, "slayer_route": None, "slayer_route_for": None,
                                "slayer_leg": 0, "slayer_leg_fails": 0, "slayer_leg_progress": 0,
-                               "slayer_route_finished": 0, "slayer_no_target_walks": 0})
+                               "slayer_route_finished": 0, "slayer_no_target_walks": 0,
+                               "slayer_no_target": 0})
 
 
 def _acquire(ctx, state, tasks_cfg) -> None:
@@ -145,15 +147,26 @@ def _skip(ctx, state, tasks_cfg) -> None:
 
 
 def _carried() -> dict:
-    """Lowercased item name -> quantity, inventory plus worn. Built from gear.py's own readers so
-    the /equipment-is-a-dict shape is handled in exactly one place."""
+    """Lowercased item NAME -> quantity AND "#<item id>" -> quantity, inventory plus worn. The ids
+    matter: a lit and an unlit bullseye lantern share one name (phase-A review), so only the id
+    can prove a light source. /equipment is a dict keyed by slot."""
     counts = {}
-    for item in controller.get_inventory() or ():
+
+    def add(item):
+        quantity = int(item.get("qty") or item.get("quantity") or 1)
         name = (item.get("name") or "").lower()
         if name:
-            counts[name] = counts.get(name, 0) + int(item.get("qty") or item.get("quantity") or 1)
-    for name in gear.worn_names() or ():
-        counts[(name or "").lower()] = counts.get((name or "").lower(), 0) + 1
+            counts[name] = counts.get(name, 0) + quantity
+        if item.get("id") is not None:
+            key = f"#{item['id']}"
+            counts[key] = counts.get(key, 0) + quantity
+
+    for item in controller.get_inventory() or ():
+        add(item)
+    worn = controller.get_equipment() or {}
+    for item in (worn.values() if isinstance(worn, dict) else worn):
+        if isinstance(item, dict):
+            add(item)
     return counts
 
 
@@ -184,8 +197,10 @@ def _travel(ctx, state, player) -> None:
     status, cursor = legs.run_next(ctx, route, cursor, log=LOG)
     name = route[min(cursor, len(route) - 1)]["display"]
     if status == legs.DONE:
-        data.update({"slayer_leg": cursor, "slayer_leg_fails": 0, "slayer_leg_progress": 0,
-                     "slayer_route_finished": 0})
+        # slayer_route_finished is NOT reset here (phase-A review): a fresh route always starts
+        # with a DONE, so resetting on DONE made the "finished twice" stop unreachable and the
+        # re-plan loop unbounded. Only REACHING the site (the FIGHT branch) or a new slot clears it.
+        data.update({"slayer_leg": cursor, "slayer_leg_fails": 0, "slayer_leg_progress": 0})
     elif status == legs.PROGRESS:
         data["slayer_leg_progress"] = data.get("slayer_leg_progress", 0) + 1
         if data["slayer_leg_progress"] > TRAVEL_MAX_PROGRESS:
@@ -213,14 +228,16 @@ def _fight(ctx, state) -> None:
     # and the next tick sees the player off-site and safety-stops there (final review).
     cfg["bank"] = {**(cfg.get("bank") or {}), "enabled": False}
     # Aya's monsters drop nothing worth a click and travel dominates a 20-kill task (spec §7.10):
-    # only the panel's named whitelist is looted, never "anything over minLootValue".
-    cfg["loot"] = {**(cfg.get("loot") or {}), "minLootValue": 10 ** 9}
+    # only the panel's named whitelist ("items") is looted. maybe_loot reads "minValue" and treats
+    # 0 as "no value looting" (phase-A review: the first draft wrote a key nobody reads).
+    cfg["loot"] = {**(cfg.get("loot") or {}), "minValue": 0}
     ctx.state.config = cfg
     try:
         combat_core.fight_tick(ctx)
     finally:
         ctx.state.config = panel
     data = ctx.state.data
+    data["slayer_route_finished"] = 0          # we are AT the site: the journey is over
     if data.get("current_target_index") is not None:
         data["slayer_no_target"] = 0
         return

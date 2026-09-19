@@ -81,15 +81,20 @@ def target_names(task_name) -> list:
     return list(_TARGETS.get(key, [key]))
 
 
-def at_site(task_name, player):
-    """True/False for a task whose site we know (Aya's, today); None when we know no site."""
+def at_site(task_name, player, margin: int = 0):
+    """True/False for a task whose site we know (Aya's, today); None when we know no site.
+    `margin` widens every kill rectangle by that many tiles: the plugin's rectangles are tight
+    (cave slimes: 14x8 with the target 2 tiles from an edge) and a fight chases monsters out of
+    them, which must not read as "no longer at the site" (phase-A review)."""
     aya = aya_tasks.get(_key(task_name))
     if aya is None or not aya.areas:
         return None
     x, y = (player or {}).get("x"), (player or {}).get("y")
     if x is None or y is None:
         return False
-    return aya_tasks.contains(aya, x, y, player.get("plane", 0))
+    plane = player.get("plane", 0)
+    return any(ax - margin <= x < ax + w + margin and ay - margin <= y < ay + h + margin and plane == p
+               for ax, ay, w, h, p in aya.areas)
 
 
 def where(task_name) -> str:
@@ -107,13 +112,20 @@ def where(task_name) -> str:
 # STOP that names it, checked BEFORE any teleport is spent (phase A); the bank phase (C) will
 # fetch it instead once it exists.
 
-Need = namedtuple("Need", ("label", "any_of", "quantity"))
+Need = namedtuple("Need", ("label", "any_of", "quantity", "ids"), defaults=((),))
 
-# LIT sources only, matched as substrings of the lowercased item name. "unlit"/"empty" variants
-# share these words, so they are excluded explicitly.
-LIGHT_SOURCES = ("bullseye lantern", "oil lantern", "candle lantern", "lit torch", "lit candle",
-                 "lit black candle", "mining helmet", "kandarin headgear", "firemaking cape",
-                 "max cape", "bruma torch", "abyssal lantern", "emerald lantern", "sapphire lantern")
+# A LIT and an UNLIT lantern share ONE NAME (phase-A review, checked in the wiki dump: "Bullseye
+# lantern" is 4548 unlit and 4550 lit; "Mining helmet" is 5014 unlit and 5013 lit). A name can
+# therefore never prove a light. So the check is by ITEM ID where the item has an unlit twin, and
+# by name only for things that are always lit. `carried` may carry ids as "#<id>" keys.
+LIT_IDS = (4550,            # Bullseye lantern (lit)
+           5013,            # Mining helmet (lit)
+           4539,            # Oil lantern (lit)
+           4531, 4534,      # Candle lantern (lit, white / black candle)
+           4702, 9065,      # Sapphire / Emerald lantern (lit)
+           33, 32)          # Lit candle / Lit black candle        (all VERIFIED in the wiki dump)
+ALWAYS_LIT = ("kandarin headgear", "firemaking cape", "max cape", "bruma torch")
+LIGHT_SOURCES = ("bullseye lantern",) + ALWAYS_LIT      # display order for the stop message
 _NOT_LIT = ("unlit", "empty", "(u)")
 
 
@@ -121,7 +133,7 @@ def required_items(task_name, count) -> list:
     aya = aya_tasks.get(_key(task_name))
     note = ((aya.info if aya else None) or "").lower()
     if "light source" in note:
-        return [Need("a light source", LIGHT_SOURCES, 1)]
+        return [Need("a light source", ALWAYS_LIT, 1, LIT_IDS)]
     if "ice cooler" in note:
         return [Need("ice coolers", ("ice cooler",), int(count or 0) + 5)]
     if "rope" in note:
@@ -130,9 +142,14 @@ def required_items(task_name, count) -> list:
 
 
 def _have(need, carried) -> int:
+    """`carried` maps a lowercased item NAME to a quantity, and "#<item id>" to a quantity."""
     total = 0
     for name, quantity in (carried or {}).items():
         lowered = (name or "").lower()
+        if lowered.startswith("#"):
+            if lowered[1:].isdigit() and int(lowered[1:]) in need.ids:
+                total += int(quantity or 0)
+            continue
         if any(bad in lowered for bad in _NOT_LIT):
             continue
         if any(option in lowered for option in need.any_of):
@@ -146,6 +163,7 @@ def missing_items(task_name, count, carried) -> list:
         have = _have(need, carried)
         if have >= need.quantity:
             continue
-        out.append(f"{need.label} (e.g. {need.any_of[0]})" if need.quantity == 1
+        out.append(f"{need.label} (e.g. {LIGHT_SOURCES[0] if need.ids else need.any_of[0]}, LIT)" if need.ids
+                   else f"{need.label} (e.g. {need.any_of[0]})" if need.quantity == 1
                    else f"{need.label} x{need.quantity} (have {have})")
     return out

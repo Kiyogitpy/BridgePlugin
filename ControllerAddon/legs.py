@@ -40,6 +40,7 @@ LINK_ARRIVAL_TILES = 3   # a ladder lands you on (or beside) one tile -- far tig
 LINK_BUDGET_S = 10.0     # click -> landed, INCLUDING the last steps onto the object and a region load
 LINK_OBJECT_RADIUS = 6   # how far from the origin tile the transport's own object may sit
 WALK_ACROSS_MAX_LINKS = 6
+STEP_OFF_MAX = 2         # leaving a map-solid tile (a fairy ring's own) before any routing
 
 DONE = "done"            # the leg landed; cursor advanced
 PROGRESS = "progress"    # the leg did a bounded step and wants another call (fairy rings)
@@ -400,11 +401,27 @@ def walk_across(ctx, goal, log: str = "travel") -> bool:
     exact = {"x": goal[0], "y": goal[1], "plane": goal[2]}
     levels = skill_levels()
     previous = None
-    for _ in range(WALK_ACROSS_MAX_LINKS):
+    stepped_off = 0
+    taken = 0
+    for _ in range(WALK_ACROSS_MAX_LINKS + STEP_OFF_MAX + 1):
         player = controller.get_player() or {}
         if player.get("x") is None:
             return False
         here = (player["x"], player["y"], player.get("plane", 0))
+        # PHASE-A REVIEW, proven on the real map: a teleport lands the player ON its own object (a
+        # fairy ring), a tile the static map calls solid. crossfloor plans from the nearest
+        # walkable neighbour, but travel.walk_to routes from the LIVE tile and finds nothing --
+        # find_path from the AJQ exit ring is None, from one tile north it is 42 steps. So step
+        # off first: one shift-click onto that neighbour, no pathing needed.
+        foothold = crossfloor.walkable_start(here, toward=goal)
+        if foothold != here:
+            if stepped_off >= STEP_OFF_MAX:
+                debug_log.log(log, f"still on an unroutable tile {here} after {stepped_off} step-offs")
+                return False
+            stepped_off += 1
+            debug_log.log(log, f"{here} is not routable on the map -- stepping off to {foothold}")
+            travel.walk_to_exact_tile(ctx, foothold[0], foothold[1], foothold[2])
+            continue
         route = crossfloor.find_route(here, goal, skill_levels=levels)
         if route is None:
             if here[2] == goal[2] and abs(here[1] - goal[1]) < crossfloor.UNDERGROUND_DY // 2:
@@ -421,6 +438,9 @@ def walk_across(ctx, goal, log: str = "travel") -> bool:
             debug_log.log(log, f"refusing {link.step.object_info!r}: it leads straight back over "
                                f"{previous.object_info!r}")
             return False
+        if taken >= WALK_ACROSS_MAX_LINKS:
+            break
+        taken += 1
         if not run_transport(ctx, link.step, log=log, approach=link.approach):
             return False
         previous = link.step

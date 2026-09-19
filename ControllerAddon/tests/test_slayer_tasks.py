@@ -101,7 +101,7 @@ def test_where_names_the_place_and_the_first_teleport():
 def test_required_items_come_from_the_plugins_own_gear_notes():
     slimes = st.required_items("Cave slimes", 17)
     assert [n.label for n in slimes] == ["a light source"]
-    assert "bullseye lantern" in slimes[0].any_of and slimes[0].quantity == 1
+    assert 4550 in slimes[0].ids and 4548 not in slimes[0].ids and slimes[0].quantity == 1
     lizards = st.required_items("Lizards", 20)
     assert lizards[0].label == "ice coolers" and lizards[0].quantity == 25, "one per kill plus five spare"
     assert st.required_items("Skeletons", 15)[0].any_of == ("rope",)
@@ -110,9 +110,12 @@ def test_required_items_come_from_the_plugins_own_gear_notes():
 
 
 def test_missing_items_names_what_to_fetch_and_accepts_any_alternative():
-    assert st.missing_items("Cave slimes", 17, {}) == ["a light source (e.g. bullseye lantern)"]
-    assert st.missing_items("Cave slimes", 17, {"bullseye lantern": 1}) == []
-    assert st.missing_items("Cave slimes", 17, {"kandarin headgear 3": 1}) == []
-    assert st.missing_items("Cave slimes", 17, {"unlit torch": 1}) != [], "an UNLIT source is not a light"
+    assert st.missing_items("Cave slimes", 17, {}) == ["a light source (e.g. bullseye lantern, LIT)"]
+    assert st.missing_items("Cave slimes", 17, {"bullseye lantern": 1, "#4550": 1}) == []
+    assert st.missing_items("Cave slimes", 17, {"bullseye lantern": 1, "#4548": 1}) != [], \
+        "the UNLIT lantern has the SAME NAME (wiki: 4548 unlit, 4550 lit): only the id proves a light"
+    assert st.missing_items("Cave slimes", 17, {"bullseye lantern": 1}) != [], "a name alone proves nothing"
+    assert st.missing_items("Cave slimes", 17, {"mining helmet": 1, "#5013": 1}) == []
+    assert st.missing_items("Cave slimes", 17, {"kandarin headgear 3": 1}) == [], "always lit: the name is enough"
     assert st.missing_items("Lizards", 20, {"ice cooler": 10}) == ["ice coolers x25 (have 10)"]
     assert st.missing_items("Lizards", 20, {"ice cooler": 30}) == []

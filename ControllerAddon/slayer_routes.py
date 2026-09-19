@@ -20,6 +20,7 @@ import legs
 import transports
 
 RING_WALK_MAX = 150          # tiles, straight-line pre-filter before the real walk is costed
+NEAR_SITE_TILES = 64         # within this WALK of the site, never plan a teleport -- just walk back
 
 FAIRY_EXPECT = {
     "AJQ": "Dorgesh",        # MEASURED: "Cave south of Dorgesh-Kaan"
@@ -72,6 +73,13 @@ def plan(task_name, player, carried, skill_levels=None):
     if task is None or not task.target:
         return None, f"{task_name} has no site in the catalog yet"
     site = legs.walk(*task.target)
+    # PHASE-A REVIEW: chasing a monster two tiles out of the kill rectangle flips the routine to
+    # TRAVEL, and without this the "route" back was the whole journey again -- walk 41 tiles to
+    # the AJQ ring and dial AJQ while standing in the AJQ cave; for Alice's farm, fire the
+    # Ectophial. When the site is a short walk away, the route is that walk and nothing else.
+    near = crossfloor.find_route(here, tuple(task.target), skill_levels=skill_levels, max_links=0)
+    if near is not None and near.cost <= NEAR_SITE_TILES:
+        return [site], ""
     reasons = []
     for text in task.teleports:
         kind, value = parse(text)

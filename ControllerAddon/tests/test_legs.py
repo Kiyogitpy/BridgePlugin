@@ -406,3 +406,34 @@ def test_a_plain_fairy_leg_still_calls_the_hop_exactly_as_before(monkeypatch):
     monkeypatch.setattr(travel, "hop_fairy_ring", lambda ctx, code, expect, **kw: seen.update(kw) or True)
     assert legs.run_next(_Ctx(), [legs.fairy("cks", "Slayer Tower")], 0) == (legs.DONE, 1)
     assert set(seen) == {"log"}
+
+
+def test_landing_on_a_fairy_rings_own_tile_steps_off_before_any_routing(monkeypatch):
+    """PHASE-A REVIEW, proven on the REAL map: the player lands ON the AJQ exit ring (2735,5221),
+    a one-tile flood. crossfloor plans from its walkable neighbour, but travel.walk_to routes from
+    the LIVE tile and found nothing -- every fairy journey would have stranded at the exit ring."""
+    position = {"x": 2735, "y": 5221, "plane": 0}
+    monkeypatch.setattr(controller, "get_player", lambda: dict(position))
+    monkeypatch.setattr(controller, "get_skills", lambda: {})
+    calls = []
+
+    def walk_to_exact_tile(ctx, x, y, plane, wait_for_arrival=True):
+        calls.append(("step", x, y))
+        position.update(x=x, y=y)
+        return True
+    monkeypatch.setattr(travel, "walk_to_exact_tile", walk_to_exact_tile)
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, tolerance=3, goal_adjacent=True:
+                        calls.append(("walk", target["x"], target["y"])) or True)
+    assert legs.walk_across(_Ctx(), (2730, 5234, 0)) is True
+    assert calls[0][0] == "step" and max(abs(calls[0][1] - 2735), abs(calls[0][2] - 5221)) <= crossfloor.START_TOLERANCE
+    assert calls[1] == ("walk", 2730, 5234)
+
+
+def test_a_tile_that_never_becomes_routable_gives_up_instead_of_clicking_forever(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2735, "y": 5221, "plane": 0})   # never moves
+    monkeypatch.setattr(controller, "get_skills", lambda: {})
+    steps = []
+    monkeypatch.setattr(travel, "walk_to_exact_tile", lambda ctx, x, y, plane, wait_for_arrival=True: steps.append(1) or True)
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **k: True)
+    assert legs.walk_across(_Ctx(), (2730, 5234, 0)) is False
+    assert len(steps) == legs.STEP_OFF_MAX
