@@ -99,7 +99,21 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   already installed, so measuring a dumped frame needs no new dependency.
 - **Pathfinding**: `ControllerAddon/worldmap.py` holds a world-wide per-edge collision map
   (all four planes) and answers `find_path`/`reachable_from` offline in milliseconds. It is
-  the only routing engine; Shortest Path was removed 2026-08-29. Doors are baked open in that
+  the only routing engine; Shortest Path was removed 2026-08-29.
+  Since 2026-09-19 floors are no longer a dead end: `crossfloor.find_route` joins those same-plane
+  floods with Shortest Path's own `transports.tsv` (ladders, stairs, cave mouths, agility
+  shortcuts -- vendored in `ControllerAddon/vendor/`, loaded by `transports.py`), and
+  `legs.walk_across` executes the result through `legs.run_transport`, re-planning from the live
+  tile after every transport. `travel.walk_to` itself is unchanged and still same-plane.
+  Requirements fail closed (skills come from `/skills`; nothing supplies quests or varbits yet,
+  so the Ancient Cavern whirlpool is unusable), doors and the Wilderness ditch are never route
+  edges, and three tolerances exist because the first attempts failed without them: a
+  transport's ORIGIN is often a tile our map calls solid (a cave mouth), a research GOAL is a
+  cluster centre, and a START can be a fairy ring's own object tile (a one-tile flood). The
+  vendored tables have NO row for the Karuulm Slayer Dungeon or the Great Conch gryphon cave --
+  a catalog route there needs a hand-written transport leg. `tools/slayer_route_report.py`
+  writes `docs/slayer-sites/routes.md`; read it after changing any of this. UNVERIFIED LIVE.
+  Doors are baked open in that
   map by design -- `travel.open_door_toward` finds the shut one standing on the route. The map
   CANNOT tell furniture from a wall, so `travel.can_reach` still answers object-interaction
   adjacency from live collision flags, and must not be moved onto the map.

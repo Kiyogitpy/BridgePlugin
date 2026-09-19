@@ -712,8 +712,17 @@ headers asserted, requirements fail closed) and `tests/test_transports.py` pins 
 entrances, fairy-ring codes incl. CJQ → the Great Conch, and the row-count floors. The loader
 classifies the table's ~316 plain doors and ~668 Wilderness-ditch rows so a search can leave
 them out, and found one trap worth knowing: `fairy_rings.tsv` contains a DIAL SEQUENCE row
-(the Fairy Queen's hideout) that must not be read as aliases. **What is NOT built yet is
-everything below: the route search and the executor.**
+(the Fairy Queen's hideout) that must not be read as aliases. 
+
+**Built 2026-09-19, UNVERIFIED LIVE:** the route search (`crossfloor.py`), the executor
+(`legs.run_transport`) and the floor-crossing walker (`legs.walk_across`), per
+`docs/superpowers/plans/2026-09-19-crossfloor-travel-and-slayer-pure-pieces.md`. The routes it
+finds for the chosen sites are in `docs/slayer-sites/routes.md`, which also records what it
+could NOT route: the Karuulm Slayer Dungeon and the Great Conch gryphon cave have no row in the
+vendored tables (the catalog hand-writes those legs), the Ancient Cavern whirlpool is gated on
+varbit 3759 which nothing supplies yet, and Taverley's black demons need 80 Agility or the
+dusty-key gate. Also built from this spec the same day: `supplies.py` (§7.9's pure half),
+`slayer_state.py` (§7.2's `next_master`, the F2 guard, skip limits) and `aya_tasks.py` (§6.1).
 
 **Design:** vendor `transports.tsv`, `fairy_rings.tsv` and `bank.tsv` byte-identical beside the
 three already in `ControllerAddon/vendor/` (header names asserted, as `teleports.load_all`
