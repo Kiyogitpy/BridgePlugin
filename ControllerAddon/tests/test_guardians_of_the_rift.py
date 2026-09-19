@@ -719,6 +719,40 @@ def test_before_break_is_quick_between_rounds(monkeypatch):
     assert len(ticks) < gotr.BREAK_INACTIVE_READS
 
 
+def test_between_rounds_makes_room_regardless_of_cell_need(monkeypatch):
+    # CONFIRMED LIVE 2026-09-19 (USER, watching): a full inventory (slots=0) full of
+    # loose essence, with the colossal pouch ALSO full (27/27) and 9 uncharged cells
+    # already on hand (well above min_uncharged_cells=5), walked off toward the mining
+    # spot with zero free space instead of making room -- because the "make room" branch
+    # used to live nested inside "does it need cells", which was false here. It must
+    # fire on a full inventory alone, cell need or not.
+    import controller
+    ctx = _Ctx()
+    ctx.state.data["gotr_between_streak"] = 2
+    ctx.state.config["use_large_remains"] = False
+    ctx.state.config["repair_pouches"] = False
+    monkeypatch.setattr(controller, "get_player", lambda: {})
+    st = make_state(miningArea="NONE",
+                    inventory=make_inv(emptySlots=0, guardianEssence=23, unchargedCells=9))
+
+    dropped = []
+    filled = []
+    monkeypatch.setattr(gotr, "_drop_one", lambda c, name: dropped.append(name) or True)
+    monkeypatch.setattr(gotr, "_fill_pouches", lambda c, **k: filled.append(1))
+    monkeypatch.setattr(gotr, "read_pouches", lambda: {})
+
+    # Pouch already full (no free space): drop one essence to make a slot.
+    monkeypatch.setattr(gotr, "pouch_free_space", lambda api: 0)
+    gotr.between_rounds_phase(ctx, st)
+    assert dropped == ["guardian essence"]
+    assert filled == []
+
+    # Pouch has room: fill it instead of dropping.
+    monkeypatch.setattr(gotr, "pouch_free_space", lambda api: 5)
+    gotr.between_rounds_phase(ctx, st)
+    assert filled == [1]
+
+
 def test_choose_hop_world_prefers_listed_order_and_skips_current():
     rows = [{"world": 301}, {"world": 478}, {"world": 459}, {"world": 534}]
     assert gotr.choose_hop_world(rows, 301) == 459
@@ -782,7 +816,7 @@ class _ECtx:
         self.ser = object()
         self.events = events
         self.state = type("S", (), {"data": {}, "config": dict(gotr.DEFAULT_CONFIG),
-                                    "safety_stopped": False})()
+                                    "safety_stopped": False, "paused": False})()
         self.state.trigger_safety_stop = lambda reason: setattr(self.state, "safety_stopped", True)
 
 

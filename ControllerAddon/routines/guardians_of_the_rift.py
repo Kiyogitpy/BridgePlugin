@@ -1538,20 +1538,28 @@ def between_rounds_phase(ctx, st):
             _repair_pouches(ctx)
             return
 
+    if inv.get("emptySlots", 0) == 0 and inv.get("guardianEssence", 0) > 0:
+        # A full inventory of LEFTOVER essence (wiped at the next round start anyway)
+        # blocks EVERYTHING between rounds, not just cell restocking -- this used to be
+        # nested inside the "need cells" check below (run 55's original case: it left
+        # prep with 1 cell), so it only ever fired when cells ALSO happened to be low.
+        # CONFIRMED LIVE 2026-09-19 (USER: "it doesn't wait until full inventory to fill
+        # the [colossal] pouch"): a full inventory + a full 27/27 colossal pouch, with 9
+        # uncharged cells already on hand (well above min_uncharged_cells so the nested
+        # check never triggered), walked off toward the mining spot with ZERO free space
+        # instead of making room first. Make a slot -- into the pouches if they have
+        # room, else drop one essence -- unconditionally on cell need.
+        if (pouch_free_space(read_pouches()) or 0) > 0:
+            _fill_pouches(ctx)
+        else:
+            _drop_one(ctx, "guardian essence")
+        return
+
     if (inv.get("unchargedCells", 0) < cfg["min_uncharged_cells"]
-            and data.get("gotr_restock_clicks", 0) < RESTOCK_MAX_CLICKS):
-        if inv.get("emptySlots", 0) == 0 and inv.get("guardianEssence", 0) > 0:
-            # A full inventory of LEFTOVER essence (wiped at the next round start
-            # anyway) blocked the Take: run 55 left prep with 1 cell. Make a slot --
-            # into the pouches if they have room, else drop one essence.
-            if (pouch_free_space(read_pouches()) or 0) > 0:
-                _fill_pouches(ctx)
-            else:
-                _drop_one(ctx, "guardian essence")
-            return
-        if inv.get("emptySlots", 0) > 0:
-            _restock_cells(ctx, st)
-            return
+            and data.get("gotr_restock_clicks", 0) < RESTOCK_MAX_CLICKS
+            and inv.get("emptySlots", 0) > 0):
+        _restock_cells(ctx, st)
+        return
 
     if _runes_in_inventory():
         _deposit_runes(ctx)
@@ -2640,7 +2648,16 @@ def _suppress_stray_dialog_check(data):
 def tick(ctx):
     """One engine tick = one rung, PLUS every rung whose predecessor's outcome landed, up to
     CHAIN_MAX_ACTIONS / CHAIN_MAX_S (the mining/agility chaining shape). Every ceiling and the
-    stuck watch count a chained action exactly as a ticked one."""
+    stuck watch count a chained action exactly as a ticked one.
+
+    ctx.state.paused is checked here TOO, not just safety_stopped -- CONFIRMED LIVE
+    2026-09-19 (USER: "still run into an issue when pausing"): the main engine loop's own
+    `if state.paused: continue` gate only runs BETWEEN calls to routine.tick(), so once a
+    chain of landing outcomes is under way it used to run to its own ceiling (up to
+    CHAIN_MAX_ACTIONS=4 actions / CHAIN_MAX_S=15s) before the pause took effect --
+    F2 pressed mid-chain, and the log shows an entire altar trip (portal entry, walking,
+    imbuing) completing AFTER the "Paused (F2 pressed)" line. safety_stopped already broke
+    the chain early for exactly this reason; paused needed the same treatment."""
     data = ctx.state.data
     if not _suppress_stray_dialog_check(data):
         controller.check_stray_dialog(ctx)
@@ -2649,7 +2666,7 @@ def tick(ctx):
         data["gotr_outcome_hit"] = False
         _tick_once(ctx)
         if (not data.get("gotr_outcome_hit") or ctx.state.safety_stopped
-                or time.time() >= deadline):
+                or ctx.state.paused or time.time() >= deadline):
             return
 
 
