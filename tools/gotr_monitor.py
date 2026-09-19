@@ -74,6 +74,7 @@ constant's own note.
 """
 
 import collections
+import ctypes
 import datetime
 import glob
 import json
@@ -240,10 +241,9 @@ class Monitor:
     def refocus_runelite(title_substring="RuneLite"):
         """Bring the RuneLite window to the foreground. Same window-matching convention as
         controller.py's own find_runelite_window (EnumWindows + a title substring) -- reused
-        rather than reinvented. Returns True on a call that didn't raise; SetForegroundWindow
-        can still be silently refused by Windows (a background process isn't always allowed to
-        steal focus), so the caller re-checks via the next /state poll rather than trusting this
-        return value alone."""
+        rather than reinvented. Returns True when SetForegroundWindow itself succeeded, otherwise
+        a short string saying what happened (fallback used, window missing, or the exception) so
+        the caller can log it; either way the real answer is the next /state poll."""
         hwnds = []
 
         def enum_windows(hwnd, _):
@@ -253,14 +253,23 @@ class Monitor:
         try:
             win32gui.EnumWindows(enum_windows, None)
             if not hwnds:
-                return False
+                return "no window with %r in its title" % title_substring
             hwnd = hwnds[0]
             if win32gui.IsIconic(hwnd):
                 win32gui.ShowWindow(hwnd, 9)   # SW_RESTORE -- un-minimize before focusing
-            win32gui.SetForegroundWindow(hwnd)
-            return True
-        except Exception:
-            return False
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+                return True
+            except Exception as exc:
+                # CONFIRMED LIVE 2026-09-19 (first real focus loss after this was authorized):
+                # SetForegroundWindow raised pywintypes.error(0, ...) -- Windows' foreground
+                # lock refusing a background process, here with GetForegroundWindow() == 0 (no
+                # window owned the foreground at all). SwitchToThisWindow is not subject to that
+                # lock and restored focus at once, verified against /state windowFocused.
+                ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
+                return f"SetForegroundWindow refused ({exc}); used SwitchToThisWindow"
+        except Exception as exc:
+            return f"raised {exc!r}"
 
     # ---------------------------------------------------------------- local process control
 
@@ -581,9 +590,9 @@ class Monitor:
                 self.log("!", f"BUG: RuneLite window has lost focus (unfocused for "
                                f"{elapsed:.0f}s) -- this was not expected to happen. "
                                "Refocusing it (user-authorized 2026-09-19).")
-                refocused = self.refocus_runelite()
-                self.log("focus", f"SetForegroundWindow call {'issued' if refocused else 'FAILED (window not found or call raised)'} "
-                                   "-- confirming on the next /state poll")
+                outcome = self.refocus_runelite()
+                self.log("focus", "refocus: " + ("SetForegroundWindow issued" if outcome is True else outcome)
+                                   + " -- confirming on the next /state poll")
         else:
             if not self.was_focused:
                 self.log("focus", "window focus recovered")
