@@ -806,7 +806,26 @@ if you look into microbot").** Microbot-Hub's BSD slayer script (`SlayerScript.j
 
 **Inputs:** `docs/slayer-sites/decisions.md` (sites, access, needs, supply profile per task), `kuradal-1a/1b/2a/2b.md` (coordinates), `routes.md` (what `crossfloor` already routes and what it cannot: Karuulm and the Great Conch cave have NO transport row; the Ancient Cavern whirlpool needs varbit 3759; Taverley needs 80 Agility or the dusty key; the Trolls route is unverified).
 
+**Found 2026-09-19 in Microbot's core client** (`docs/slayer-sites/microbot-core-survey.md`, BSD-2,
+facts and data only -- never its input layer): its fork of the Shortest Path tables is NEWER and
+LARGER than the copy we vendored from the installed jar (transports.tsv 6,077 lines against our
+5,634) and **has the Karuulm Slayer Dungeon** -- `Activate;Elevator;34359` (1311,3806/3808,0) ->
+(1311/1312,10189,0), the `Climb;Rocks;34544` hops and the `Climb;Steps;34530/34531` floor changes
+-- which our copy lacks entirely. It also carries `blocked_edges.tsv`, `dangerous_tiles.tsv`,
+`restrictions.tsv`, `quetzals.tsv` and a dusty-key gate row (item 1590) for Taverley. It does NOT
+have a gryphon-cave entrance row (only the CJQ ring landing), so that leg is still hand-written.
+**Its format differs**: columns `Item IDs / Currency / isMembers / Varplayers`, and the object cell
+is `Option;Target;id` with semicolons where ours is `Option Target id`. MEASURED: our loader reads
+the file without error but mis-splits every object cell -- so it needs an ADAPTER, not a copy.
+
 **Tasks:**
+- **E-pre Vendor Microbot's transport tables through an adapter.** `vendor/microbot/` holds the
+  byte-identical TSVs plus a `VENDORED.md` naming the commit (`8bcc652` on 2026-09-19);
+  `transports.load_links` gains a second source read by header NAME with the semicolon object
+  cell, merged with ours by `(origin, dest, object id)` so nothing is double-counted. Tests pin
+  the Karuulm elevator, that every row our copy has still resolves identically, and re-run
+  `tools/slayer_route_report.py` -- Wyrms must route. Also port `Rs2DoorClassifier`'s name and
+  action lists (pure strings, broader than ours: barrier, stile, portcullis, archway, fence).
 - **E0 Detail the phase.** Decide with the user the per-task gear the research left open (one-handed weapon beside a mirror shield; ranged kit for waterfiends; heat boots for wyrms).
 - **E1 `slayer_catalog.py`**: `TaskSpec(name, site, areas, routes, gear, carry, supplies, targets)` as DATA; `slayer_tasks.at_site/where/target_names` and `slayer_routes.plan` read it for non-Aya tasks. Catalog tests: every FIGHT task has an entry; every route's first leg is a teleport; profile + carry + displaced gear + teleports fit 28 slots; no site with y ≥ 3520 on plane 0 unless tagged `wilderness=True`; every `walk` is `crossfloor`-routable from the previous landing (the routes report, as assertions, for entries marked `verified`).
 - **E2–E5 one hub per task, each gated by one live task at that hub before the next hub's entries are trusted:** Stronghold Slayer Cave (5 tasks) → Slayer Tower basement (3) → Catacombs (2) → Fremennik (2); then the singles. Hand-written `legs.from_transport` entrances for Karuulm and the Great Conch cave; `walk_across` gains `varbit_values` for the whirlpool (reads the handful of varbit ids the candidate links name, once per plan).
