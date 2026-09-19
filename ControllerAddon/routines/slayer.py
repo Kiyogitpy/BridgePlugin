@@ -16,6 +16,7 @@
 
 import time
 
+import aya_tasks
 import combat_core
 import controller
 import debug_log
@@ -42,6 +43,9 @@ CONTACT_RETRY_COOLDOWN_S = 6.0
 
 TRAVEL_MAX_FAILS = 3           # a leg that fails three times strands us: stop and NAME it
 TRAVEL_MAX_PROGRESS = 40       # legs.run_next's PROGRESS is unbounded by design; the caller bounds it
+
+NO_TARGET_TICKS = 30           # ~18s with nothing to fight before walking back to the site tile
+NO_TARGET_WALKS = 3            # that many walks back with still nothing found: stop, don't idle forever
 
 
 def get_config(bridge_config):
@@ -73,7 +77,7 @@ def _reset_slot_counters(ctx, state) -> None:
         ctx.state.data.update({"slayer_streak_seen": state.streak, "slayer_casts": 0, "slayer_skips": 0,
                                "slayer_cancel_attempts": 0, "slayer_route": None, "slayer_route_for": None,
                                "slayer_leg": 0, "slayer_leg_fails": 0, "slayer_leg_progress": 0,
-                               "slayer_route_finished": 0})
+                               "slayer_route_finished": 0, "slayer_no_target_walks": 0})
 
 
 def _acquire(ctx, state, tasks_cfg) -> None:
@@ -208,11 +212,34 @@ def _fight(ctx, state) -> None:
     # The orchestrator owns restocks (spec 7.5). Left on, fight_tick teleports to a bank by itself,
     # and the next tick sees the player off-site and safety-stops there (final review).
     cfg["bank"] = {**(cfg.get("bank") or {}), "enabled": False}
+    # Aya's monsters drop nothing worth a click and travel dominates a 20-kill task (spec §7.10):
+    # only the panel's named whitelist is looted, never "anything over minLootValue".
+    cfg["loot"] = {**(cfg.get("loot") or {}), "minLootValue": 10 ** 9}
     ctx.state.config = cfg
     try:
         combat_core.fight_tick(ctx)
     finally:
         ctx.state.config = panel
+    data = ctx.state.data
+    if data.get("current_target_index") is not None:
+        data["slayer_no_target"] = 0
+        return
+    data["slayer_no_target"] = data.get("slayer_no_target", 0) + 1
+    if data["slayer_no_target"] < NO_TARGET_TICKS:
+        return
+    data["slayer_no_target"] = 0
+    walks = data.get("slayer_no_target_walks", 0) + 1
+    data["slayer_no_target_walks"] = walks
+    site = aya_tasks.get(state.task)
+    if site is None or not site.target:
+        ctx.state.trigger_safety_stop(f"Slayer: nothing to fight for {state.task} and its site is "
+                                      f"not in the catalog -- cannot walk back to it")
+        return
+    debug_log.log(LOG, f"no target for {NO_TARGET_TICKS} ticks -- walking back to the site tile {site.target}")
+    legs.walk_across(ctx, site.target, log=LOG)
+    if walks >= NO_TARGET_WALKS:
+        ctx.state.trigger_safety_stop(f"Slayer: nothing to fight for {state.task} after "
+                                      f"{NO_TARGET_WALKS} walks back to the site")
 
 
 def tick(ctx):

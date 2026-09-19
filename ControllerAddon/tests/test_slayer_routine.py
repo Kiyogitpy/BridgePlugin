@@ -298,6 +298,48 @@ def test_a_finished_route_replans_once_then_stops(monkeypatch):
     assert len(plans) == 2 and ctx.state.stops and "not reached" in ctx.state.stops[0]
 
 
+def _fighting(monkeypatch, target_index):
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Banshees"))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3440, "y": 3545, "plane": 0})
+    monkeypatch.setattr(controller, "check_stray_dialog", lambda ctx: None)
+    monkeypatch.setattr(combat_core, "fight_tick", lambda ctx: ctx.state.data.__setitem__("current_target_index", target_index))
+
+
+def test_nothing_to_fight_for_long_walks_back_to_the_site_then_stops(monkeypatch):
+    """Targets wander and respawn at the site tile; 'stranded with nothing to fight' must not look
+    like idling (docs/routine-notes.md)."""
+    _fighting(monkeypatch, None)
+    walks = []
+    monkeypatch.setattr(legs, "walk_across", lambda ctx, goal, log="travel": walks.append(tuple(goal)) or True)
+    ctx = _Ctx()
+    for _ in range(routine.NO_TARGET_TICKS * routine.NO_TARGET_WALKS + 5):
+        routine.tick(ctx)
+        if ctx.state.stops:
+            break
+    assert walks == [(3442, 3542, 0)] * routine.NO_TARGET_WALKS
+    assert "banshees" in ctx.state.stops[0].lower() and "nothing to fight" in ctx.state.stops[0]
+
+
+def test_having_a_target_resets_the_watch(monkeypatch):
+    _fighting(monkeypatch, 4412)
+    ctx = _Ctx()
+    ctx.state.data["slayer_no_target"] = 29
+    routine.tick(ctx)
+    assert ctx.state.data["slayer_no_target"] == 0
+
+
+def test_an_aya_task_loots_only_the_whitelist(monkeypatch):
+    seen = []
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Banshees"))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3440, "y": 3545, "plane": 0})
+    monkeypatch.setattr(controller, "check_stray_dialog", lambda ctx: None)
+    monkeypatch.setattr(combat_core, "fight_tick", lambda ctx: seen.append(ctx.state.config["loot"]["minLootValue"]))
+    ctx = _Ctx()
+    ctx.state.config["loot"] = {"minLootValue": 5000, "names": ["Mystic gloves (dark)"]}
+    routine.tick(ctx)
+    assert seen[0] >= 10 ** 9 and ctx.state.config["loot"]["minLootValue"] == 5000
+
+
 def test_no_usable_teleport_stops_with_the_reason(monkeypatch):
     monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Minotaurs", count=15))
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})
