@@ -3,9 +3,10 @@
 # Sub-project 2 of docs/superpowers/specs/2026-09-18-slayer-task-loop-design.md (2026-09-19):
 # ACQUIRE through NPC Contact (Kuradal on every `milestoneEvery`-th task, Aya otherwise), SKIP an
 # unwanted task for 30 points, STOP on a task the user does by hand, and FIGHT when already
-# standing at a known site. What is NOT here yet is sub-project 3: travel, banking and loadouts.
-# So away from the site this routine STOPS and says where to go -- walk there and RELAUNCH (a
-# safety stop is terminal; F2 does not clear it), and it fights, finishes, and asks the next master.
+# standing at a known site. Sub-project 3 phase A (2026-09-19) adds TRAVEL: a fairy-ring or
+# carried-item route from where the player stands, for Aya tasks whose teleport list this phase
+# knows how to use. The house, the bank and Kuradal's sites are still to come -- until they exist,
+# a route TRAVEL cannot plan is a safety stop naming why.
 #
 # The phase is DERIVED from GET /slayer every tick (spec §7.1); ctx.state.data holds only
 # counters, so a restart mid-task resumes correctly. None from /slayer = do nothing.
@@ -18,7 +19,10 @@ import time
 import combat_core
 import controller
 import debug_log
+import gear
+import legs
 import npc_contact
+import slayer_routes
 import slayer_state
 import slayer_tasks
 
@@ -30,10 +34,14 @@ SKIP_STRAY_DIALOG_CHECK = True
 VARP_SUBSCRIPTIONS = (394, 395)
 VARBIT_SUBSCRIPTIONS = (4067, 4068, 4069)
 
-ACQUIRE, SKIP, STOP, FIGHT, GO_THERE = "ACQUIRE", "SKIP", "STOP", "FIGHT", "GO_THERE"
+ACQUIRE, SKIP, STOP, FIGHT, TRAVEL = "ACQUIRE", "SKIP", "STOP", "FIGHT", "TRAVEL"
+GO_THERE = TRAVEL              # the pre-phase-A name; kept so old notes and logs still read
 
 CONTACT_MAX_CASTS = 3          # each cast spends runes: a ceiling, not just a cooldown
 CONTACT_RETRY_COOLDOWN_S = 6.0
+
+TRAVEL_MAX_FAILS = 3           # a leg that fails three times strands us: stop and NAME it
+TRAVEL_MAX_PROGRESS = 40       # legs.run_next's PROGRESS is unbounded by design; the caller bounds it
 
 
 def get_config(bridge_config):
@@ -54,7 +62,7 @@ def derive_phase(state, tasks_cfg, player) -> str:
         return SKIP
     if verdict == slayer_tasks.STOP:
         return STOP
-    return FIGHT if slayer_tasks.at_site(state.task, player) else GO_THERE
+    return FIGHT if slayer_tasks.at_site(state.task, player) else TRAVEL
 
 
 def _reset_slot_counters(ctx, state) -> None:
@@ -63,7 +71,9 @@ def _reset_slot_counters(ctx, state) -> None:
     seen = ctx.state.data.get("slayer_streak_seen")
     if seen != state.streak:
         ctx.state.data.update({"slayer_streak_seen": state.streak, "slayer_casts": 0, "slayer_skips": 0,
-                               "slayer_cancel_attempts": 0})
+                               "slayer_cancel_attempts": 0, "slayer_route": None, "slayer_route_for": None,
+                               "slayer_leg": 0, "slayer_leg_fails": 0, "slayer_leg_progress": 0,
+                               "slayer_route_finished": 0})
 
 
 def _acquire(ctx, state, tasks_cfg) -> None:
@@ -130,6 +140,67 @@ def _skip(ctx, state, tasks_cfg) -> None:
         ctx.state.trigger_safety_stop(f"Slayer: {exc}")
 
 
+def _carried() -> dict:
+    """Lowercased item name -> quantity, inventory plus worn. Built from gear.py's own readers so
+    the /equipment-is-a-dict shape is handled in exactly one place."""
+    counts = {}
+    for item in controller.get_inventory() or ():
+        name = (item.get("name") or "").lower()
+        if name:
+            counts[name] = counts.get(name, 0) + int(item.get("qty") or item.get("quantity") or 1)
+    for name in gear.worn_names() or ():
+        counts[(name or "").lower()] = counts.get((name or "").lower(), 0) + 1
+    return counts
+
+
+def _stranded(ctx, state, why) -> None:
+    where = slayer_tasks.where(state.task)
+    ctx.state.trigger_safety_stop(
+        f"Slayer: task is {state.task} x{state.count} and I cannot get there -- {why}."
+        + (f" The site is {where}." if where else ""))
+
+
+def _travel(ctx, state, player) -> None:
+    data = ctx.state.data
+    carried = _carried()
+    missing = slayer_tasks.missing_items(state.task, state.count, carried)
+    if missing:
+        ctx.state.trigger_safety_stop(f"Slayer: {state.task} needs {', '.join(missing)} -- not carried")
+        return
+    key = (state.task, state.streak)
+    if data.get("slayer_route_for") != key or not data.get("slayer_route"):
+        route, why = slayer_routes.plan(state.task, player, carried, skill_levels=legs.skill_levels())
+        if route is None:
+            _stranded(ctx, state, why)
+            return
+        data.update({"slayer_route": route, "slayer_route_for": key, "slayer_leg": 0,
+                     "slayer_leg_fails": 0, "slayer_leg_progress": 0})
+        debug_log.log(LOG, f"route to {state.task}: " + " -> ".join(leg["display"] for leg in route))
+    route, cursor = data["slayer_route"], data.get("slayer_leg", 0)
+    status, cursor = legs.run_next(ctx, route, cursor, log=LOG)
+    name = route[min(cursor, len(route) - 1)]["display"]
+    if status == legs.DONE:
+        data.update({"slayer_leg": cursor, "slayer_leg_fails": 0, "slayer_leg_progress": 0,
+                     "slayer_route_finished": 0})
+    elif status == legs.PROGRESS:
+        data["slayer_leg_progress"] = data.get("slayer_leg_progress", 0) + 1
+        if data["slayer_leg_progress"] > TRAVEL_MAX_PROGRESS:
+            _stranded(ctx, state, f"leg '{name}' made no landing in {TRAVEL_MAX_PROGRESS} ticks")
+    elif status == legs.FAILED:
+        data["slayer_leg_fails"] = data.get("slayer_leg_fails", 0) + 1
+        if data["slayer_leg_fails"] >= TRAVEL_MAX_FAILS:
+            _stranded(ctx, state, f"leg '{name}' failed {TRAVEL_MAX_FAILS} times")
+    else:                                   # FINISHED, and derive_phase still says we are not there
+        first_finish = data.get("slayer_route_finished", 0) == 0
+        data["slayer_route_finished"] = data.get("slayer_route_finished", 0) + 1
+        if first_finish:
+            data["slayer_route"] = None    # drop it so the NEXT tick re-plans from here
+        if data["slayer_route_finished"] >= 2:
+            # already gave up: leave the exhausted route in place so a tick that still runs after
+            # the (terminal) safety stop cannot spend another plan() on it.
+            _stranded(ctx, state, "the route finished twice but the site is not reached")
+
+
 def _fight(ctx, state) -> None:
     controller.check_stray_dialog(ctx)
     panel = ctx.state.config
@@ -151,7 +222,8 @@ def tick(ctx):
         return
     tasks_cfg = (ctx.state.config or {}).get("tasks") or {}
     _reset_slot_counters(ctx, state)
-    phase = derive_phase(state, tasks_cfg, controller.get_player())
+    player = controller.get_player()
+    phase = derive_phase(state, tasks_cfg, player)
     if phase == ACQUIRE:
         _acquire(ctx, state, tasks_cfg)
     elif phase == SKIP:
@@ -159,11 +231,7 @@ def tick(ctx):
     elif phase == STOP:
         label = state.task or f"task id {state.task_id} (name did not decode)"
         ctx.state.trigger_safety_stop(f"Slayer: {label} x{state.count} is a task this routine leaves to you")
-    elif phase == GO_THERE:
-        where = slayer_tasks.where(state.task)
-        ctx.state.trigger_safety_stop(
-            f"Slayer: task is {state.task} x{state.count}. Travel is not built yet -- "
-            + (f"go to {where}, then start the routine again" if where
-               else "this task's site is not in the catalog yet (sub-project 3); use 'Combat' for it"))
+    elif phase == TRAVEL:
+        _travel(ctx, state, player)
     else:
         _fight(ctx, state)
