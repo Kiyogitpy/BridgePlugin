@@ -274,15 +274,51 @@ def find_transport_object(step):
     return min(matches, key=lambda m: m[0])[1] if matches else None
 
 
-def run_transport(ctx, step, log: str = "travel") -> bool:
-    """Take ONE Shortest Path transport: get beside its origin, click its object with the row's
-    own menu option, and confirm we landed at its destination. The generic replacement for a
-    hand-written ladder/cave/stairs step per site (spec §8.1). UNVERIFIED LIVE as of 2026-09-19.
+def landed(step, player) -> bool:
+    """Has `player` (a /player dict) come out the far side of `step`?
 
-    The origin may be a tile our map calls solid (a cave mouth), so an exact walk that finds no
-    route falls back to a goal-adjacent one. The hover gate is safe here: the walk has finished,
-    so the cursor reads the object's action from a standing player (CLAUDE.md warns only against
-    gating clicks made WHILE walking up)."""
+    Near the destination is NOT enough. FINAL REVIEW 2026-09-19, MEASURED: 610 of the 4312
+    usable transports move the player three tiles or less on one plane (stiles, "Climb Rocks",
+    the Fremennik dungeon's Strange floor, the Slayer Tower's broken window), so a player still
+    standing at the ORIGIN is already "within 3 of the destination" -- the first poll confirmed
+    a crossing that had not happened, the re-plan clicked the same obstacle again, and a click
+    planned before the crossing could land after it and jump straight back. So the player must
+    also be strictly NEARER the destination than the origin."""
+    px, py = (player or {}).get("x"), (player or {}).get("y")
+    if px is None or py is None or player.get("plane", step.dest[2]) != step.dest[2]:
+        return False
+    to_dest = max(abs(px - step.dest[0]), abs(py - step.dest[1]))
+    if to_dest > LINK_ARRIVAL_TILES:
+        return False
+    if step.origin[2] != step.dest[2]:
+        return True
+    return to_dest < max(abs(px - step.origin[0]), abs(py - step.origin[1]))
+
+
+def await_landing(step, budget_s: float = LINK_BUDGET_S) -> bool:
+    deadline = time.time() + budget_s
+    while time.time() < deadline:
+        if landed(step, controller.get_player()):
+            return True
+        time.sleep(POLL_S)
+    return False
+
+
+def run_transport(ctx, step, log: str = "travel", approach=None) -> bool:
+    """Take ONE Shortest Path transport: get beside its origin, click its object with the row's
+    own menu option, and confirm we came out the far side (`landed`). The generic replacement for
+    a hand-written ladder/cave/stairs step per site (spec §8.1). UNVERIFIED LIVE as of 2026-09-19.
+
+    `approach` is crossfloor's own reachable tile at or beside the origin (Link.approach). It is
+    tried FIRST: 141 usable transports have an origin our map calls solid and 87 of those have no
+    walkable cardinal neighbour either, so without it crossfloor promised routes this could not
+    walk. The exact origin and a goal-adjacent walk stay as fallbacks. The hover gate is safe
+    here: the walk has finished, so the cursor reads the object's action from a standing player
+    (CLAUDE.md warns only against gating clicks made WHILE walking up).
+
+    Known limits, all of which fail CLEANLY (False, no retry loop): an object that is off-screen
+    after the walk is reported "not found" -- no camera turn is attempted; a two-state object
+    (a SHUT trapdoor is a different id with an `Open` action) never matches its row."""
     ox, oy, plane = step.origin
     player = controller.get_player() or {}
     px, py = player.get("x"), player.get("y")
@@ -290,7 +326,9 @@ def run_transport(ctx, step, log: str = "travel") -> bool:
               and max(abs(px - ox), abs(py - oy)) <= 2)
     if not beside:
         target = {"x": ox, "y": oy, "plane": plane}
-        if not (travel.walk_to(ctx, target, goal_adjacent=False)
+        near = {"x": approach[0], "y": approach[1], "plane": approach[2]} if approach else None
+        if not ((near is not None and travel.walk_to(ctx, near, goal_adjacent=False))
+                or travel.walk_to(ctx, target, goal_adjacent=False)
                 or travel.walk_to(ctx, target, goal_adjacent=True)):
             debug_log.log(log, f"couldn't walk to {step.object_info!r} at {step.origin}")
             return False
@@ -312,7 +350,7 @@ def run_transport(ctx, step, log: str = "travel") -> bool:
         ok = controller.click_menu_action(ctx.ser, obj, step.option, refresh_target=refresh)
     if not ok:
         return False
-    return await_arrival(step.dest, LINK_BUDGET_S, LINK_ARRIVAL_TILES)
+    return await_landing(step, LINK_BUDGET_S)
 
 
 def skill_levels():
@@ -324,6 +362,12 @@ def skill_levels():
     return levels or None
 
 
+def _undoes(step, previous) -> bool:
+    """`step` lands back where `previous` started: same plane, within 2 tiles of its origin."""
+    return (step.dest[2] == previous.origin[2]
+            and max(abs(step.dest[0] - previous.origin[0]), abs(step.dest[1] - previous.origin[1])) <= 2)
+
+
 def walk_across(ctx, goal, log: str = "travel") -> bool:
     """Walk to `goal` (x, y, plane), taking ladders, stairs and cave mouths as needed.
 
@@ -331,14 +375,22 @@ def walk_across(ctx, goal, log: str = "travel") -> bool:
     tile we actually landed on is the truth. Bounded by WALK_ACROSS_MAX_LINKS so a transport
     that reports success without moving us cannot spin. UNVERIFIED LIVE as of 2026-09-19.
 
-    The last, link-free stretch aims at the EXACT goal first (what a walk leg always did) and only
-    then at crossfloor's relocated tile, which can sit up to GOAL_TOLERANCE away (task-3 review).
-    And when crossfloor finds nothing for a goal on our own plane and not a dungeon's y+6400
-    away, plain travel.walk_to still gets its try: its search is not bounded by FLOOD_RADIUS, so
-    a long surface walk that worked before this module existed keeps working."""
+    The last, link-free stretch walks to crossfloor's own destination tile. That IS the exact
+    goal whenever the goal is walkable (it was then in the flood); it is a tile up to
+    GOAL_TOLERANCE away only when the exact goal is not -- a research cluster centre inside a
+    wall -- where an exact attempt would just burn worldmap's whole 250k-node search (~0.8s,
+    MEASURED) to fail. And when crossfloor finds nothing for a goal on our own plane and not a
+    dungeon's y+6400 away, plain travel.walk_to still gets its try: its search is not bounded by
+    FLOOD_RADIUS, so a long surface walk that worked before this module existed keeps working
+    (it cannot wander into the Wilderness: MEASURED, find_path across the ditch is None).
+
+    A link that would carry us straight BACK over the one just taken is refused rather than
+    clicked: a re-plan starts from scratch, and a start snapped onto the wrong side of a short
+    obstacle would otherwise bounce across it until the cap."""
     goal = tuple(goal)
     exact = {"x": goal[0], "y": goal[1], "plane": goal[2]}
     levels = skill_levels()
+    previous = None
     for _ in range(WALK_ACROSS_MAX_LINKS):
         player = controller.get_player() or {}
         if player.get("x") is None:
@@ -353,14 +405,15 @@ def walk_across(ctx, goal, log: str = "travel") -> bool:
             return False
         link = next((s for s in route.steps if isinstance(s, crossfloor.Link)), None)
         if link is None:
-            if travel.walk_to(ctx, exact, goal_adjacent=False):
-                return True
             dest = route.steps[-1].dest
-            if dest == goal:
-                return False
             return bool(travel.walk_to(ctx, {"x": dest[0], "y": dest[1], "plane": dest[2]},
                                        goal_adjacent=False))
-        if not run_transport(ctx, link.step, log=log):
+        if previous is not None and _undoes(link.step, previous):
+            debug_log.log(log, f"refusing {link.step.object_info!r}: it leads straight back over "
+                               f"{previous.object_info!r}")
             return False
+        if not run_transport(ctx, link.step, log=log, approach=link.approach):
+            return False
+        previous = link.step
     debug_log.log(log, f"gave up after {WALK_ACROSS_MAX_LINKS} transports without reaching {tuple(goal)}")
     return False

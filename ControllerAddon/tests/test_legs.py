@@ -132,7 +132,7 @@ def test_walk_across_replans_from_the_live_position_after_every_transport(monkey
         return _route(crossfloor.Walk((2420, 9786, 0), 38))
     monkeypatch.setattr(crossfloor, "find_route", find_route)
     ran = []
-    monkeypatch.setattr(legs, "run_transport", lambda ctx, step, log="travel": ran.append(step.object_info) or True)
+    monkeypatch.setattr(legs, "run_transport", lambda ctx, step, log="travel", approach=None: ran.append(step.object_info) or True)
     walks = []
     monkeypatch.setattr(travel, "walk_to", lambda ctx, target, tolerance=3, goal_adjacent=True:
                         walks.append((target, goal_adjacent)) or True)
@@ -141,25 +141,90 @@ def test_walk_across_replans_from_the_live_position_after_every_transport(monkey
     assert ran == ["Enter Cave 26709"]
     assert [a[0] for a in asked] == [(2431, 3422, 0), (2429, 9824, 0)]
     assert asked[0][1] == {"Agility": 60}
-    assert walks == [({"x": 2420, "y": 9785, "plane": 0}, False)], \
-        "the pre-link walk is run_transport's job, and the last stretch aims at the EXACT goal first"
+    assert walks == [({"x": 2420, "y": 9786, "plane": 0}, False)], \
+        "the pre-link walk is run_transport's job; the last stretch walks to crossfloor's own tile"
 
 
-def test_the_last_stretch_falls_back_to_the_relocated_tile_when_the_exact_goal_is_unwalkable(monkeypatch):
-    """Task-3 review: a walk leg always meant the exact tile. crossfloor may relocate a goal by up
-    to GOAL_TOLERANCE, so that tile is the FALLBACK, not the first aim."""
-    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2429, "y": 9824, "plane": 0})
+def test_a_walkable_goal_is_walked_to_exactly_on_the_real_map():
+    """crossfloor only relocates a goal that is NOT walkable, so a walk leg to a walkable tile
+    still means that exact tile (the task-3 review's concern, answered by the search itself)."""
+    route = crossfloor.find_route((2899, 3553, 0), (2890, 3545, 0))
+    assert route is not None and route.steps[-1].dest == (2890, 3545, 0)
+
+
+def test_the_transport_is_handed_crossfloors_own_approach_tile(monkeypatch):
+    """FINAL REVIEW: 87 usable transports have a solid origin with no walkable cardinal neighbour.
+    crossfloor already knows a reachable tile beside each one; dropping it made those unwalkable."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2431, "y": 3422, "plane": 0})
     monkeypatch.setattr(controller, "get_skills", lambda: {})
     monkeypatch.setattr(crossfloor, "find_route", lambda start, goal, **kw:
-                        _route(crossfloor.Walk((2419, 9784, 0), 59)))
-    walks = []
+                        _route(crossfloor.Link(_step(), (2431, 3423, 0)), crossfloor.Walk((2420, 9786, 0), 38)))
+    seen = []
+    monkeypatch.setattr(legs, "run_transport", lambda ctx, step, log="travel", approach=None: seen.append(approach) or False)
+    legs.walk_across(_Ctx(), (2420, 9785, 0))
+    assert seen == [(2431, 3423, 0)]
 
-    def walk_to(ctx, target, tolerance=3, goal_adjacent=True):
-        walks.append((target["x"], target["y"]))
-        return (target["x"], target["y"]) == (2419, 9784)
-    monkeypatch.setattr(travel, "walk_to", walk_to)
-    assert legs.walk_across(_Ctx(), (2420, 9785, 0)) is True
-    assert walks == [(2420, 9785), (2419, 9784)]
+
+def test_run_transport_walks_to_the_approach_tile_first(monkeypatch):
+    walks = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2440, "y": 3420, "plane": 0})
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, tolerance=3, goal_adjacent=True:
+                        walks.append((target["x"], target["y"])) or True)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_cave_object()])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(legs, "await_landing", lambda step, budget_s=None: True)
+    assert legs.run_transport(_Ctx(), _step(), approach=(2431, 3423, 0)) is True
+    assert walks == [(2431, 3423)]
+
+
+def test_standing_at_the_origin_of_a_short_hop_is_not_a_landing():
+    """FINAL REVIEW, Critical: the Fremennik dungeon's Strange floor moves the player TWO tiles on
+    one plane, so 'within 3 of the destination' was already true before the click."""
+    hop = _step("Jump-over Strange floor 16544", origin=(2775, 10003, 0), dest=(2773, 10003, 0))
+    assert legs.landed(hop, {"x": 2775, "y": 10003, "plane": 0}) is False      # still at the origin
+    assert legs.landed(hop, {"x": 2776, "y": 10003, "plane": 0}) is False      # beside it, near side
+    assert legs.landed(hop, {"x": 2774, "y": 10003, "plane": 0}) is False      # mid-jump: equidistant
+    assert legs.landed(hop, {"x": 2773, "y": 10003, "plane": 0}) is True
+    assert legs.landed(hop, {"x": 2772, "y": 10003, "plane": 0}) is True       # a step past it
+    assert legs.landed(hop, {}) is False and legs.landed(hop, None) is False
+
+
+def test_a_floor_change_lands_on_the_plane_and_within_three_tiles():
+    ladder = _step("Climb-down Ladder 30191", origin=(3417, 3536, 0), dest=(3412, 9932, 3))
+    assert legs.landed(ladder, {"x": 3412, "y": 9932, "plane": 3}) is True
+    assert legs.landed(ladder, {"x": 3412, "y": 9932, "plane": 0}) is False
+    assert legs.landed(ladder, {"x": 3420, "y": 9932, "plane": 3}) is False
+    cave = _step()                                                              # same plane, 6400 north
+    assert legs.landed(cave, {"x": 2429, "y": 9825, "plane": 0}) is True
+    assert legs.landed(cave, {"x": 2430, "y": 3424, "plane": 0}) is False
+
+
+def test_await_landing_polls_until_landed_or_the_budget(monkeypatch):
+    hop = _step("Jump-over Strange floor 16544", origin=(2775, 10003, 0), dest=(2773, 10003, 0))
+    reads = iter([{"x": 2775, "y": 10003, "plane": 0}, {"x": 2774, "y": 10003, "plane": 0},
+                  {"x": 2773, "y": 10003, "plane": 0}])
+    monkeypatch.setattr(controller, "get_player", lambda: next(reads))
+    monkeypatch.setattr(legs.time, "sleep", lambda s: None)
+    assert legs.await_landing(hop, budget_s=2.0) is True
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2775, "y": 10003, "plane": 0})
+    assert legs.await_landing(hop, budget_s=0.3) is False
+
+
+def test_a_link_that_leads_straight_back_over_the_last_one_is_refused(monkeypatch):
+    """A re-plan starts from scratch; a start snapped onto the wrong side of a short obstacle
+    must not bounce the player back and forth until the cap."""
+    there = _step("Jump-over Strange floor 16544", origin=(2775, 10003, 0), dest=(2773, 10003, 0))
+    back = _step("Jump-over Strange floor 16544", origin=(2773, 10003, 0), dest=(2775, 10003, 0))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2775, "y": 10003, "plane": 0})
+    monkeypatch.setattr(controller, "get_skills", lambda: {})
+    plans = iter([_route(crossfloor.Link(there, (2775, 10003, 0)), crossfloor.Walk((2738, 10008, 0), 50)),
+                  _route(crossfloor.Link(back, (2773, 10003, 0)), crossfloor.Walk((2738, 10008, 0), 50))])
+    monkeypatch.setattr(crossfloor, "find_route", lambda start, goal, **kw: next(plans))
+    ran = []
+    monkeypatch.setattr(legs, "run_transport", lambda ctx, step, log="travel", approach=None: ran.append(step.dest) or True)
+    assert legs.walk_across(_Ctx(), (2738, 10008, 0)) is False
+    assert ran == [(2773, 10003, 0)], "the second, backward jump is never clicked"
 
 
 def test_walk_across_is_false_when_there_is_no_route(monkeypatch):
@@ -190,7 +255,7 @@ def test_walk_across_stops_when_a_transport_fails(monkeypatch):
     monkeypatch.setattr(controller, "get_skills", lambda: {})
     monkeypatch.setattr(crossfloor, "find_route", lambda start, goal, **kw:
                         _route(crossfloor.Link(_step(), (2430, 3423, 0)), crossfloor.Walk((2420, 9786, 0), 38)))
-    monkeypatch.setattr(legs, "run_transport", lambda ctx, step, log="travel": False)
+    monkeypatch.setattr(legs, "run_transport", lambda ctx, step, log="travel", approach=None: False)
     assert legs.walk_across(_Ctx(), (2420, 9785, 0)) is False
 
 
@@ -201,7 +266,7 @@ def test_walk_across_cannot_loop_forever(monkeypatch):
     monkeypatch.setattr(crossfloor, "find_route", lambda start, goal, **kw:
                         _route(crossfloor.Link(_step(), (2430, 3423, 0)), crossfloor.Walk((2420, 9786, 0), 38)))
     ran = []
-    monkeypatch.setattr(legs, "run_transport", lambda ctx, step, log="travel": ran.append(1) or True)
+    monkeypatch.setattr(legs, "run_transport", lambda ctx, step, log="travel", approach=None: ran.append(1) or True)
     assert legs.walk_across(_Ctx(), (2420, 9785, 0)) is False
     assert len(ran) == legs.WALK_ACROSS_MAX_LINKS
 
@@ -246,13 +311,13 @@ def test_run_transport_walks_clicks_the_object_by_id_and_confirms_the_landing(mo
         calls.append(("click", entity["id"], kw.get("expected_action"), kw.get("refresh_target"), kw.get("simulate_mistakes")))
         return True
     monkeypatch.setattr(controller, "click_entity", click_entity)
-    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=None, radius=None:
-                        calls.append(("await", tuple(dest), budget_s, radius)) or True)
+    monkeypatch.setattr(legs, "await_landing", lambda step, budget_s=None:
+                        calls.append(("await", step.dest)) or True)
 
     assert legs.run_transport(_Ctx(), _step()) is True
     assert calls[0] == ("walk", {"x": 2430, "y": 3424, "plane": 0}, False)
     assert calls[1] == ("click", 26709, "Enter", "REFRESH", False)
-    assert calls[2] == ("await", (2429, 9824, 0), legs.LINK_BUDGET_S, legs.LINK_ARRIVAL_TILES)
+    assert calls[2] == ("await", (2429, 9824, 0))
 
 
 def test_run_transport_falls_back_to_goal_adjacent_when_the_origin_tile_is_solid(monkeypatch):
@@ -263,7 +328,7 @@ def test_run_transport_falls_back_to_goal_adjacent_when_the_origin_tile_is_solid
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_cave_object()])
     monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
     monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
-    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=None, radius=None: True)
+    monkeypatch.setattr(legs, "await_landing", lambda step, budget_s=None: True)
     assert legs.run_transport(_Ctx(), _step()) is True
     assert walks == [False, True]
 
@@ -275,7 +340,7 @@ def test_run_transport_skips_the_walk_when_already_beside_the_origin(monkeypatch
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_cave_object()])
     monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
     monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
-    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=None, radius=None: True)
+    monkeypatch.setattr(legs, "await_landing", lambda step, budget_s=None: True)
     assert legs.run_transport(_Ctx(), _step()) is True
     assert walks == []
 
@@ -292,7 +357,7 @@ def test_run_transport_uses_the_menu_when_the_left_click_is_withheld(monkeypatch
     monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
     monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: _Withheld())
     monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: menu.append(option) or True)
-    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=None, radius=None: True)
+    monkeypatch.setattr(legs, "await_landing", lambda step, budget_s=None: True)
     assert legs.run_transport(_Ctx(), _step()) is True
     assert menu == ["Enter"]
 

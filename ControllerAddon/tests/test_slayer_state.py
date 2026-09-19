@@ -57,6 +57,14 @@ def test_aya_is_never_contacted_while_a_task_is_active():
     slayer_state.assert_may_contact("KURADAL", active, CFG)      # rewards / cancel through the milestone master is fine
 
 
+def test_the_guard_cannot_be_dodged_by_spelling():
+    active = slayer_state.from_bridge({"count": 12, "hasTask": True, "streak": 19, "points": 0})
+    for name in ("Aya", "aya", " AYA ", "Turael"):
+        with pytest.raises(slayer_state.StreakGuardError):
+            slayer_state.assert_may_contact(name, active, CFG)
+    slayer_state.assert_may_contact("Duradel", active, CFG)
+
+
 def test_the_guard_follows_the_configured_filler_master_and_refuses_an_unknown_state():
     active = slayer_state.from_bridge({"count": 12, "hasTask": True, "streak": 19, "points": 0})
     cfg = dict(CFG, fillerMaster="KONAR")

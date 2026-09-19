@@ -106,8 +106,11 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   `legs.walk_across` executes the result through `legs.run_transport`, re-planning from the live
   tile after every transport. `travel.walk_to` itself is unchanged and still same-plane.
   Requirements fail closed (skills come from `/skills`; nothing supplies quests or varbits yet,
-  so the Ancient Cavern whirlpool is unusable), doors and the Wilderness ditch are never route
-  edges, and three tolerances exist because the first attempts failed without them: a
+  so the Ancient Cavern whirlpool is unusable), doors and anything that ENTERS the Wilderness
+  (the ditch, and 13 other rows found in review) are never route edges, a transport counts as
+  taken only when the player is NEARER its destination than its origin (610 transports move
+  three tiles or less, so "near the destination" is true before the click), and three
+  tolerances exist because the first attempts failed without them: a
   transport's ORIGIN is often a tile our map calls solid (a cave mouth), a research GOAL is a
   cluster centre, and a START can be a fairy ring's own object tile (a one-tile flood). The
   vendored tables have NO row for the Karuulm Slayer Dungeon or the Great Conch gryphon cave --

@@ -7,9 +7,12 @@
 # it was written, and two of its constants exist because the first spike failed without them:
 #
 # - ORIGIN_TOLERANCE. A transport's Origin is the tile Shortest Path stands on, read off ITS
-#   collision map. On OURS the Stronghold Slayer Cave's origin (2430,3424) is the cave mouth and
-#   reads solid, so a flood never touches it: the first spike found NO ROUTE to a cave two tiles
-#   from the start. An origin counts as reached from any flooded tile within 2 of it.
+#   collision map, and ours disagrees often enough to matter: MEASURED 2026-09-19, 141 usable
+#   transports have an origin no flood on our map ever touches (Lumbridge's Ladder 16684 at
+#   (3229,3212,1) is one). An origin counts as reached from any flooded tile within 2 of it, and
+#   that tile travels with the Link as `approach` so the executor walks where the search meant.
+#   (The first spike's NO ROUTE to the Stronghold Slayer Cave was blamed on this; that origin is
+#   in fact reachable today, and the uninformed search running out of expansions is as likely.)
 # - GOAL_TOLERANCE. Site coordinates from research are cluster centres, often not walkable.
 #
 # A* rather than Dijkstra because uninformed search burns its expansions on the nearest stairs
@@ -91,14 +94,29 @@ def heuristic(tile, goal) -> int:
     return max(dx, dy) + PLANE_PENALTY * abs(tile[2] - goal[2])
 
 
+def in_wilderness(tile) -> bool:
+    """The Wilderness's bounding box, surface and its y+6400 underground twin. Deliberately
+    generous: a safe tile wrongly inside it (Ferox Enclave) costs one refused shortcut."""
+    x, y = tile[0], tile[1]
+    return 2944 <= x <= 3391 and (3525 <= y <= 3967 or 3525 + UNDERGROUND_DY <= y <= 3967 + UNDERGROUND_DY)
+
+
+def enters_wilderness(step) -> bool:
+    """The ditch by name, or ANY transport that starts outside the Wilderness and lands in it.
+    FINAL REVIEW 2026-09-19: filtering the ditch alone left 13 usable links that cross the line
+    (Trollheim's rocky handholds, a cave opening at (3294,3749), ...)."""
+    return step.enters_wilderness_ditch or (in_wilderness(step.dest) and not in_wilderness(step.origin))
+
+
 def usable_links(skill_levels=None, completed_quests=None, varbit_values=None,
                  varplayer_values=None, owned_item_names=None, use_agility=True) -> list:
-    """Every transport this account may take: no doors, no Wilderness ditch, requirements proven."""
+    """Every transport this account may take: no doors, nothing that ENTERS the Wilderness,
+    requirements proven."""
     steps = list(transports.load_links(include_doors=False))
     if use_agility:
         steps += transports.load_agility_shortcuts()
     return [s for s in steps
-            if not s.enters_wilderness_ditch and s.kind != transports.DOOR
+            if not enters_wilderness(s) and s.kind != transports.DOOR
             and transports.usable(s, skill_levels=skill_levels, completed_quests=completed_quests,
                                   varbit_values=varbit_values, varplayer_values=varplayer_values,
                                   owned_item_names=owned_item_names)]
@@ -138,13 +156,17 @@ def _nearest(flood, xy, tolerance):
     return (best[1] + 1, best[2]) if best else (None, None)
 
 
-def walkable_start(start):
+def walkable_start(start, toward=None):
     """`start`, or the nearest tile within START_TOLERANCE that the map can actually leave.
 
     MEASURED 2026-09-19 (tools/slayer_route_report.py): a flood from the Zanaris fairy ring
     (2412,4434) or the CJQ ring (3178,2447) is ONE tile. The ring is an object, the static map
     bakes an object's blocking into the same bits as a wall's, and yet the player really does
-    stand on that tile after the teleport. Stepping off it is one ordinary walk click."""
+    stand on that tile after the teleport. Stepping off it is one ordinary walk click.
+
+    With `toward` (the goal) the candidate nearest the GOAL wins, not the one nearest the start:
+    137 usable transport destinations are isolated like this, and after a two-tile hop the
+    nearest floodable tile can be back on the ORIGIN side of the obstacle just crossed."""
     start = tuple(start)
     if len(worldmap.reachable_from(start[0], start[1], start[2], radius=2, max_nodes=30)) > 1:
         return start
@@ -154,7 +176,7 @@ def walkable_start(start):
             tile = (start[0] + dx, start[1] + dy, start[2])
             if len(worldmap.reachable_from(tile[0], tile[1], tile[2], radius=4, max_nodes=60)) < 9:
                 continue
-            key = (max(abs(dx), abs(dy)), abs(dx) + abs(dy))
+            key = (heuristic(tile, toward) if toward else 0, max(abs(dx), abs(dy)), abs(dx) + abs(dy))
             if best is None or key < best[0]:
                 best = (key, tile)
     return best[1] if best else start
@@ -171,7 +193,7 @@ def find_route(start, goal, *, skill_levels=None, completed_quests=None, varbit_
     slightly dearer one."""
     index = _index(usable_links(skill_levels, completed_quests, varbit_values, varplayer_values,
                                 owned_item_names, use_agility)) if max_links > 0 else {}
-    start = walkable_start(start)
+    start = walkable_start(start, toward=goal)
     counter = itertools.count()
     goal_node = ("GOAL",)
     queue = [(heuristic(start, goal), next(counter), 0, tuple(start), ())]

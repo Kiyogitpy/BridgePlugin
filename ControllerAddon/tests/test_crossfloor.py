@@ -81,6 +81,17 @@ def test_the_usable_link_set_never_contains_doors_or_the_wilderness_ditch():
     assert not any(s.enters_wilderness_ditch for s in links)
 
 
+def test_no_usable_link_carries_the_player_into_the_wilderness():
+    """FINAL REVIEW: the ditch is not the only way in -- 13 other rows crossed the line."""
+    links = crossfloor.usable_links(skill_levels={"Agility": 99, "Strength": 99, "Ranged": 99})
+    crossing = [s for s in links if crossfloor.in_wilderness(s.dest) and not crossfloor.in_wilderness(s.origin)]
+    assert crossing == []
+    assert crossfloor.in_wilderness((3100, 3700, 0)) and crossfloor.in_wilderness((3100, 10100, 0))
+    assert not crossfloor.in_wilderness((3412, 9932, 3)), "the Slayer Tower basement is east of it"
+    assert not crossfloor.in_wilderness((3087, 3500, 0)), "Edgeville is south of the ditch"
+    assert any(crossfloor.in_wilderness(s.origin) for s in links), "links that stay inside or LEAVE are kept"
+
+
 def test_agility_shortcuts_only_join_the_link_set_when_the_level_is_proven():
     none = crossfloor.usable_links()
     assert not any(s.skills for s in none), "with no levels given, nothing skill-gated is usable"

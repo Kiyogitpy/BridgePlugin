@@ -18,6 +18,20 @@ FILLER_DEFAULT, MILESTONE_DEFAULT, EVERY_DEFAULT = "AYA", "KURADAL", 10
 TaskState = namedtuple("TaskState", ("count", "task", "task_id", "streak", "points", "master_id", "has_task"))
 
 
+# One master, two names: Aya is the Varlamore twin of Turael, Kuradal of Duradel (USER). The guard
+# must not be dodged by spelling -- "Aya", "AYA" and "Turael" are the same person to the streak.
+_ALIASES = {"TURAEL": "AYA", "DURADEL": "KURADAL"}
+
+
+def canonical_master(name) -> str:
+    key = (name or "").strip().upper()
+    return _ALIASES.get(key, key)
+
+
+def same_master(a, b) -> bool:
+    return canonical_master(a) == canonical_master(b)
+
+
 class StreakGuardError(Exception):
     """Raised instead of contacting a filler master while a task is active."""
 
@@ -60,7 +74,7 @@ def assert_may_contact(master: str, state, tasks_cfg) -> None:
     filler = (tasks_cfg or {}).get("fillerMaster") or FILLER_DEFAULT
     if state is None:
         raise StreakGuardError(f"refusing to contact {master}: slayer task state is unknown")
-    if state.has_task and master == filler:
+    if state.has_task and same_master(master, filler):
         raise StreakGuardError(
             f"refusing to contact {master} with a task active ({state.task or state.task_id}, "
             f"{state.count} left): a task change there resets the streak of {state.streak} to zero")
