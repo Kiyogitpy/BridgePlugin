@@ -3459,7 +3459,25 @@ hidden by test fixtures of the wrong shape: `/equipment` is a DICT keyed by slot
 sends `skipTasks` as a LIST (an empty list is falsy, so an empty skip list "worked"). Lesson for
 the next module: build fixtures from a real GET, not from memory.
 
-First-live-run checklist, in order:
+**LIVE 2026-09-19 (runs 1-4), ACQUIRE PROVEN for Aya:** one cast, straight to Aya, SPACE / 1 /
+SPACE / SPACE / 1 / ESC, `task: cave slimes x17 from AYA` confirmed from `/slayer` 9 s after the
+click, then the GO_THERE stop naming Dorgesh-Kaan via fairy ring AJQ. What the first three runs
+taught:
+- **The spell's left-click re-contacts the LAST NPC spoken to -- no picker opens.** Runs 1-2 threw
+  away six good casts waiting for interface 75 (USER: "dialog popped up 3 times"). A cast has
+  three outcomes: the picker, the wanted master's dialogue, or someone else's.
+- Interface 75 is NOT in `/widgets/dump`'s root walk, and `/widget/children` skips its blank
+  rows, so the picker is addressed by id (75.4) and a row by index with the hover gate as proof.
+  That path, and the right-click `Cast` that forces the picker when the last contact was someone
+  else, are STILL UNRUN -- the first Kuradal task (streak 19) exercises both.
+- Confirmed: the wiki's Vannaka-decline wording matches; ESC closes the dialogue; F6 is the Magic
+  tab; `missing_requirements` reads the Divine rune pouch.
+- A safety-stopped `controller.py` stays alive holding UDP 50555, so a relaunch fails with
+  WinError 10048 until the old process is killed.
+- A test that forgot to fake `dialogue.read()` read the LIVE client; `tests/test_npc_contact.py`
+  now refuses any `api_get`.
+
+Remaining checklist, in order:
 1. The picker row's action really reads `Contact Aya` and the hover gate accepts it (a mismatch
    costs three casts, then a stop). Kuradal sat at slot 33: watch whether her row needs scrolling.
 2. The wording of the option that declines Aya's "are you sure you don't want Vannaka" question
