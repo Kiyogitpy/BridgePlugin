@@ -19,7 +19,7 @@ import re
 from collections import namedtuple
 
 INVENTORY_SLOTS = 28
-UNLIMITED = 10 ** 9            # an uncharged or eternal copy: never the limiting factor
+UNLIMITED = 10 ** 9            # an eternal or never-spent copy: never the limiting factor
 _SUFFIX = re.compile(r"\s*\((\d+)\)\s*$")
 
 Supplies = namedtuple("Supplies", ("food", "prayer_potions", "extras"), defaults=((),))
@@ -49,27 +49,40 @@ def base_name(name) -> str:
 
 
 def _is(name, base) -> bool:
-    return base_name(name).startswith(base.lower())
+    """`name` is a copy of `base`: the same name once the charge count is stripped, or that name
+    plus a bracketed variant (`Slayer ring (eternal)`). NOT a bare prefix test -- "prayer" must
+    not match "Prayer book", nor "ring" every ring in the bank (task-5 review)."""
+    stripped, base = base_name(name), base.strip().lower()
+    return stripped == base or stripped.startswith(base + " (")
 
 
-def teleports_left(base, carried, banked):
+def _copy_charges(name, unlimited):
+    """Charges in one copy. A copy with NO count is worth nothing unless the caller says this
+    item never runs out, or it is an `(eternal)` variant. The suffix alone cannot tell the two
+    apart: an Ectophial and an UNCHARGED `Amulet of glory` both lack one, and calling the glory
+    unlimited would have a routine skip a restock and then fail to teleport (task-5 review)."""
+    c = charges(name)
+    if c is not None:
+        return c
+    return UNLIMITED if unlimited or "(eternal)" in (name or "").lower() else 0
+
+
+def teleports_left(base, carried, banked, unlimited=False):
     """Charges of `base` across what we carry/wear (`carried`, names) and the bank (`banked`,
-    (name, quantity) pairs, or None when the bank has never been seen). Unknown is None, never 0."""
+    (name, quantity) pairs, or None when the bank has never been seen). Unknown is None, never 0.
+    `unlimited=True` is the caller's statement that a count-less copy never runs out (Ectophial)."""
     total = 0
     for name in carried or ():
         if _is(name, base):
-            c = charges(name)
-            if c is None:
-                return UNLIMITED
-            total += c
+            total += _copy_charges(name, unlimited)
+    if banked is not None:
+        for name, quantity in banked:
+            if _is(name, base):
+                total += _copy_charges(name, unlimited) * max(0, quantity or 0)
+    if total >= UNLIMITED:
+        return UNLIMITED
     if banked is None:
         return total if total > 0 else None
-    for name, quantity in banked:
-        if _is(name, base):
-            c = charges(name)
-            if c is None:
-                return UNLIMITED
-            total += c * max(1, quantity)
     return total
 
 

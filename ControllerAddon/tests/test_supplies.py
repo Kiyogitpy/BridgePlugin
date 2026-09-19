@@ -35,7 +35,28 @@ def test_an_unseen_bank_is_unknown_not_zero():
 
 def test_an_unlimited_copy_answers_unlimited():
     assert supplies.teleports_left("slayer ring", ["Slayer ring (eternal)"], []) == supplies.UNLIMITED
-    assert supplies.teleports_left("ectophial", ["Ectophial"], []) == supplies.UNLIMITED
+    assert supplies.teleports_left("slayer ring", [], [("Slayer ring (eternal)", 1)]) == supplies.UNLIMITED
+    assert supplies.teleports_left("ectophial", ["Ectophial"], [], unlimited=True) == supplies.UNLIMITED
+
+
+def test_an_uncharged_copy_is_zero_teleports_not_unlimited():
+    """An uncharged `Amulet of glory` has no count either. Calling it unlimited would have the
+    routine skip its restock and then fail to teleport out."""
+    assert supplies.teleports_left("amulet of glory", ["Amulet of glory"], []) == 0
+    assert supplies.teleports_left("amulet of glory", ["Amulet of glory"], [("Amulet of glory(4)", 2)]) == 8
+    assert supplies.teleports_left("amulet of glory", ["Amulet of glory"], None) is None
+
+
+def test_a_banked_quantity_of_zero_counts_for_nothing():
+    assert supplies.teleports_left("slayer ring", [], [("Slayer ring (8)", 0)]) == 0
+
+
+def test_matching_is_by_whole_name_not_by_prefix():
+    names = ["Prayer book", "Ring of wealth (5)", "Prayer potion(3)", "Ring of dueling(2)"]
+    assert supplies.doses_carried(names, "prayer") == 0
+    assert supplies.doses_carried(names, "prayer potion") == 3
+    assert supplies.lowest_charge(names, "ring") is None
+    assert supplies.lowest_charge(names, "ring of dueling") == "Ring of dueling(2)"
 
 
 def test_lowest_charge_is_used_first_so_partly_spent_rings_get_finished():
