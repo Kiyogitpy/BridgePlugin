@@ -324,10 +324,8 @@ def test_combat_and_slayer_are_both_wired_into_routine_files_and_routine_choice(
         assert os.path.exists(os.path.join(os.path.dirname(__file__), "..", rel)), rel
 
 
-def test_the_slayer_stub_stops_and_points_at_the_spec():
+def test_the_slayer_routine_still_owns_its_dialogues():
+    """The stub this used to test was replaced 2026-09-19 (tests/test_slayer_routine.py). The
+    old test called tick() with nothing mocked, so it read the LIVE bridge when a client was up."""
     from routines import slayer
-    ctx = _Ctx({})
-    slayer.tick(ctx)
-    assert ctx.state.stops and "Combat" in ctx.state.stops[0]
-    assert "routines/combat.py" in ctx.state.stops[0]
     assert slayer.SKIP_STRAY_DIALOG_CHECK is True

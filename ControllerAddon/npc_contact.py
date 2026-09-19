@@ -48,7 +48,8 @@ MASTERS = {
 }
 
 ASSIGN_NEEDLES = ("another assignment", "need a task", "new assignment")
-DECLINE_NEEDLES = ("take a task from you", "no that's okay", "from you")   # Aya's Vannaka question
+DECLINE_NEEDLES = ("take a task from you", "no that's okay")   # Aya's Vannaka question. Deliberately
+# NARROW (task-2 review): a bare "from you" would also match "Yes, I'd like a new task from you".
 ASSIGNED_TEXT = "new task is to kill"
 STILL_HUNTING_TEXT = "still hunting"
 
@@ -76,7 +77,8 @@ def _rune_counts() -> dict:
     counts = {}
     for item in controller.get_inventory() or ():
         name = (item.get("name") or "").lower()
-        counts[name] = counts.get(name, 0) + int(item.get("quantity") or 1)
+        # InventoryProvider emits "qty" (task-2 review: reading "quantity" counted every stack as 1).
+        counts[name] = counts.get(name, 0) + int(item.get("qty") or item.get("quantity") or 1)
     pouch = controller.get_rune_pouch() or {}
     for rune in pouch.get("runes") or ():
         name = (rune.get("name") or "").lower()
@@ -171,6 +173,7 @@ def walk_to_assignment(ctx):
     from /slayer, so the tail of the dialogue (tips / 'Okay, great!') is simply closed."""
     deadline = time.time() + DIALOGUE_BUDGET_S
     steps = 0
+    answered = None
     while time.time() < deadline and steps < MAX_STEPS:
         state = _assigned()
         if state is not None:
@@ -178,6 +181,12 @@ def walk_to_assignment(ctx):
             return state
         d = dialogue.read()
         opts = dialogue.options(d)
+        if opts and opts == answered:
+            # The menu we already answered is still on screen (a slow tick). Pressing its number
+            # again would land on whatever menu comes NEXT -- wait for it to change (task-2 review,
+            # same rule as dialogue.choose's `seen`).
+            time.sleep(POLL_S)
+            continue
         if opts:
             hit = None
             for needle in ASSIGN_NEEDLES + DECLINE_NEEDLES:
@@ -190,6 +199,7 @@ def walk_to_assignment(ctx):
                 dialogue.close(ctx)
                 return None
             controller.key_tap(ctx.ser, str(hit + 1))
+            answered = opts
         elif STILL_HUNTING_TEXT in (d.get("npcText") or "").lower():
             debug_log.log(LOG, f"the master says a task is still active: {d.get('npcText')!r}")
             dialogue.close(ctx)
@@ -210,8 +220,16 @@ def walk_to_assignment(ctx):
 
 def get_task(ctx, master, tasks_cfg):
     """One full attempt: guard, cast, pick, take the assignment. TaskState on success, else None.
-    Raises slayer_state.StreakGuardError instead of contacting a filler master with a task active."""
-    slayer_state.assert_may_contact(master, slayer_state.from_bridge(controller.get_slayer_task()), tasks_cfg)
+    Raises slayer_state.StreakGuardError instead of contacting a filler master with a task active.
+
+    NO master is asked for a task while one is active (task-2 review): the milestone master
+    passes assert_may_contact -- she is the cancel path -- but walking her ASSIGNMENT dialogue
+    with a task already held has only bad outcomes."""
+    state = slayer_state.from_bridge(controller.get_slayer_task())
+    slayer_state.assert_may_contact(master, state, tasks_cfg)
+    if state.has_task:
+        debug_log.log(LOG, f"not asking {master} for a task: {state.task or state.task_id} is still active")
+        return None
     if not contact(ctx, master, tasks_cfg):
         return None
     return walk_to_assignment(ctx)

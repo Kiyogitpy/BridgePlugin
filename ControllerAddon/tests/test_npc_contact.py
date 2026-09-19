@@ -159,9 +159,9 @@ def test_missing_requirements_names_what_is_missing(monkeypatch):
     monkeypatch.setattr(controller, "get_equipment", lambda: [])
     monkeypatch.setattr(controller, "get_rune_pouch", lambda: {"carried": True, "runes": [
         {"name": "Astral rune", "quantity": 500}, {"name": "Cosmic rune", "quantity": 500}]})
-    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Air rune", "quantity": 1}])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Air rune", "qty": 1}])
     assert "air" in npc_contact.missing_requirements("AYA").lower(), "2 air runes per cast, 1 held"
-    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Air rune", "quantity": 40}])
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Air rune", "qty": 40}])
     assert npc_contact.missing_requirements("AYA") is None
     monkeypatch.setattr(controller, "get_skills", lambda: {"Magic": {"level": 60}})
     assert "67" in npc_contact.missing_requirements("AYA")
@@ -175,7 +175,7 @@ def test_an_unreadable_spellbook_does_not_block_the_cast(monkeypatch):
     monkeypatch.setattr(controller, "get_equipment", lambda: [])
     monkeypatch.setattr(controller, "get_rune_pouch", lambda: None)
     monkeypatch.setattr(controller, "get_inventory", lambda: [
-        {"name": "Astral rune", "quantity": 9}, {"name": "Cosmic rune", "quantity": 9}, {"name": "Air rune", "quantity": 9}])
+        {"name": "Astral rune", "qty": 9}, {"name": "Cosmic rune", "qty": 9}, {"name": "Air rune", "qty": 9}])
     assert npc_contact.missing_requirements("AYA") is None
 
 
@@ -293,3 +293,39 @@ def test_cancel_task_is_false_when_the_task_survives_the_click(monkeypatch):
     monkeypatch.setattr(controller, "get_widgets_dump", lambda scan=False: [_w(426, 26, 3, text="Cancel task")])
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
     assert npc_contact.cancel_task(_Ctx(), "KURADAL", CFG) is False
+
+
+def test_a_menu_that_is_still_on_screen_is_not_answered_twice(monkeypatch):
+    """Task-2 review: a slow tick leaves the answered menu up; a second '1' would land on the
+    NEXT menu, whatever it is."""
+    _quiet(monkeypatch)
+    menu = {"options": ["Select an option", "I need another assignment.", "Er... nothing..."]}
+    reads = {"n": 0}
+
+    def read():
+        reads["n"] += 1
+        return menu if reads["n"] <= 4 else {"npcName": "Aya", "npcText": "Your new task is to kill 15 Bears."}
+    monkeypatch.setattr(dialogue, "read", read)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: dict(BEARS if reads["n"] > 5 else NO_TASK))
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
+    assert npc_contact.walk_to_assignment(_Ctx()).task == "bears"
+    assert keys.count("1") == 1
+
+
+def test_a_loose_from_you_never_matches(monkeypatch):
+    _quiet(monkeypatch)
+    stages = [{"options": ["Select an option", "Yes, I'd like a new task from you.", "No thanks."]}]
+    keys = _dialogue_script(monkeypatch, stages, BEARS)
+    assert npc_contact.walk_to_assignment(_Ctx()) is None
+    assert keys == ["ESC"]
+
+
+def test_no_master_is_asked_for_a_task_while_one_is_active(monkeypatch):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: dict(BEARS))
+    touched = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: touched.append(key))
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: touched.append("click"))
+    assert npc_contact.get_task(_Ctx(), "KURADAL", CFG) is None
+    assert touched == []
