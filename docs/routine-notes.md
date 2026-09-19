@@ -3436,3 +3436,40 @@ today's map (a set bit means BLOCKED, not passable); (3) re-measurement of every
 lengths there come from the current (EthanApi) map, not this one. Not done here -- recorded as
 its own follow-up task.
 
+
+## routines/slayer.py -- the task loop (sub-project 2, 2026-09-19, NOT run live)
+
+Measured facts it is built on: `docs/slayer-sites/recordings-2026-09-19.md`. Plan and review
+ledger: `docs/superpowers/plans/2026-09-19-slayer-acquire-and-skip.md`.
+
+What it does today: no task -> NPC Contact to the master the streak calls for (Kuradal when
+`(streak + 1) % milestoneEvery == 0`, else Aya) and take the assignment; a skip-list task ->
+cancel for 30 points through the MILESTONE master's rewards; a STOP task (Greater demons, or a
+name that did not decode) -> safety stop; standing inside a known Aya site -> fight through
+`combat_core` with the task's monsters and the panel's own banking switched OFF; anywhere else ->
+safety stop saying where to go. A safety stop is terminal, so "walk there" means RELAUNCH.
+
+`npc_contact.py` finds the master in the picker by its ACTION (`Contact Aya`) from
+`/widgets/dump` -- a row's text and name are EMPTY, measured -- and walks the dialogue by option
+TEXT. An options menu with none of the expected options is ESCAPED and its options are printed
+in the safety stop; that rule is what makes every unverified wording below safe to get wrong.
+
+**Two engine crashes were caught only by probing the LIVE bridge in the final review**, both
+hidden by test fixtures of the wrong shape: `/equipment` is a DICT keyed by slot, and the bridge
+sends `skipTasks` as a LIST (an empty list is falsy, so an empty skip list "worked"). Lesson for
+the next module: build fixtures from a real GET, not from memory.
+
+First-live-run checklist, in order:
+1. The picker row's action really reads `Contact Aya` and the hover gate accepts it (a mismatch
+   costs three casts, then a stop). Kuradal sat at slot 33: watch whether her row needs scrolling.
+2. The wording of the option that declines Aya's "are you sure you don't want Vannaka" question
+   (`DECLINE_NEEDLES` is the wiki's guess; a miss is one escaped menu and a stop naming the options).
+3. ESC really closes a chat dialogue (`dialogue.close`).
+4. The first CANCEL must be supervised and needs >= 90 points (30 + the 60 reserve): the rewards
+   option's wording, the cancel control in interface 426 (found by the word "cancel", refused
+   unless exactly one control matches) and the confirmation step are all unmeasured. A likely
+   outcome is that the confirmation is a button inside 426 rather than a chat menu, in which case
+   it times out three times, spends three casts and no points, and stops.
+5. A task completing mid-fight goes straight to ACQUIRE: the last kill's loot is left, and the
+   cast happens with aggressive monsters possibly still attacking.
+6. After a successful ACQUIRE the Magic tab is left open when the next phase is FIGHT.

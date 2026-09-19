@@ -876,7 +876,9 @@ logic is.
 2. **Acquire + skip**: recording session (§12.1-2), `npc_contact.py`, `slayer_state.py`, the
    orchestrator with ACQUIRE/SKIP/FIGHT only and a catalog whose sites are "wherever you are
    standing" -- i.e. the user parks at a spot and the routine gets and completes tasks there.
-   This is already useful and proves F1/F2/F4 live.
+   This is already useful and proves F1/F2/F4 live. **Built 2026-09-19**
+   (`docs/superpowers/plans/2026-09-19-slayer-acquire-and-skip.md`), NOT run live; FIGHT is limited
+   to Aya sites the player is already standing in, and away from one the routine stops and says where to go.
 3. **Catalog + travel + loadout**: wave-1 sites, BANK and TRAVEL phases, object legs, wave 2.
 
 ## 14. Decisions taken without the user (change any of these and the spec adapts)

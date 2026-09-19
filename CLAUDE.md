@@ -664,7 +664,7 @@ file of the form "see the X.py section/notes" point there. One-line status:
 | `golem_crafting.py` | Was running unattended live; 2026-09-06 event-driven + falconry fur-trip rewrite and 2026-09-14 single-tile mining rewrite NOT run live |
 | `karambwan_fishing.py` | Full loop verified live 2026-09-06; later left-click/AFK passes NOT run live |
 | `combat.py` (`combat_core.py`) | The old "Slayer / Combat": bank-trip return rebuilt 2026-09-07, pinned in tests, NOT run live; split out 2026-09-18 |
-| `slayer.py` | STUB (safety-stops, points at the 2026-09-18 spec) until the task orchestrator ships; `GET /slayer`, `/varp`, `dialogue.py`, `legs.py`, `gear.py` are built |
+| `slayer.py` | Task loop, sub-project 2 (2026-09-19): gets tasks by NPC Contact (Kuradal every 10th, Aya otherwise), cancels skip-list tasks, fights at a known Aya site, otherwise STOPS and says where to go -- travel/banking are sub-project 3. NOT run live; first-run checklist in `docs/routine-notes.md` |
 | `chinchompa_hunting.py` | Working live 2026-08-21; known 7% collapsed-trap waste left deliberately |
 | `mahogany_homes.py` | Extensively live-debugged (~40 contracts/hr over 7h, 2026-08-30) |
 
