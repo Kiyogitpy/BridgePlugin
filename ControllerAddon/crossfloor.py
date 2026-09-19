@@ -164,9 +164,9 @@ def walkable_start(start, toward=None):
     bakes an object's blocking into the same bits as a wall's, and yet the player really does
     stand on that tile after the teleport. Stepping off it is one ordinary walk click.
 
-    With `toward` (the goal) the candidate nearest the GOAL wins, not the one nearest the start:
-    137 usable transport destinations are isolated like this, and after a two-tile hop the
-    nearest floodable tile can be back on the ORIGIN side of the obstacle just crossed."""
+    Among equally near candidates the one nearest `toward` (the goal) wins: 137 usable transport
+    destinations are isolated like this, and after a two-tile hop a floodable tile back on the
+    ORIGIN side of the obstacle just crossed is as near as one on the far side."""
     start = tuple(start)
     if len(worldmap.reachable_from(start[0], start[1], start[2], radius=2, max_nodes=30)) > 1:
         return start
@@ -176,7 +176,10 @@ def walkable_start(start, toward=None):
             tile = (start[0] + dx, start[1] + dy, start[2])
             if len(worldmap.reachable_from(tile[0], tile[1], tile[2], radius=4, max_nodes=60)) < 9:
                 continue
-            key = (heuristic(tile, toward) if toward else 0, max(abs(dx), abs(dy)), abs(dx) + abs(dy))
+            # Nearness FIRST: a tile 3 away can be the far side of a wall, and this check sees only
+            # local openness, not a connection back to the start. The goal only breaks ties within
+            # one ring; legs.walk_across's bounce-back guard covers what that leaves (re-review).
+            key = (max(abs(dx), abs(dy)), heuristic(tile, toward) if toward else 0, abs(dx) + abs(dy))
             if best is None or key < best[0]:
                 best = (key, tile)
     return best[1] if best else start
