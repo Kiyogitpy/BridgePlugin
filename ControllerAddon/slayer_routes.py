@@ -13,6 +13,16 @@
 # teleports. Only AJQ is MEASURED ("Cave south of Dorgesh-Kaan", travel.py). The rest are the
 # travel log's place names and are safe to get wrong: a mismatch is a safety stop BEFORE the
 # hop, never a trip to the wrong continent.
+#
+# PHASE B (2026-09-20): the house (tablet -> pool -> ornate box / house fairy ring) joins the
+# teleport order as a fallback behind an overworld ring, never ahead of one -- see plan()'s own
+# comment. `has_tablet` gates every house route UNLESS the player is already standing inside the
+# instance (`player["inInstance"]`), in which case poh.enter's own no-op-when-already-inside
+# makes a tablet moot -- and, per the phase B brief, `nearest_ring` must not even be CALLED in
+# that case: an in-house player's template x/y are meaningless distances (see poh.py's own
+# instX/instY note), so consulting it there would compare real tiles against instance geometry.
+
+import re
 
 import aya_tasks
 import crossfloor
@@ -36,8 +46,43 @@ ITEMS = {
     "ectophial": ("ectophial", "Empty", (3660, 3522, 0)),
 }
 
+# Ornate jewellery box destination -> landing tile. UNVERIFIED coordinates -- the 12-tile
+# await_arrival radius (legs.ARRIVAL_TILES) absorbs small errors. The box serves every teleport
+# item that also names one of these destinations (a glory amulet, a skills necklace, ...), not
+# just the box itself -- see parse()'s own stripping of the item name before the colon.
+BOX_LANDINGS = {
+    "Cooking Guild": (3143, 3442, 0),
+    "Draynor Village": (3105, 3251, 0),
+    "Karamja": (2918, 3176, 0),
+    "Burthorpe": (2899, 3553, 0),
+    "Barbarian Outpost": (2520, 3571, 0),
+    "Ferox Enclave": (3151, 3635, 0),
+    "Castle Wars": (2441, 3090, 0),
+    "Edgeville": (3087, 3496, 0),
+    "Al Kharid": (3293, 3163, 0),
+    "Mining Guild": (3049, 9763, 0),
+    "Fishing Guild": (2611, 3390, 0),
+    "Crafting Guild": (2933, 3295, 0),
+    "Grand Exchange": (3164, 3478, 0),
+    "Falador Park": (2996, 3375, 0),
+    "Warriors' Guild": (2882, 3548, 0),
+    "Champions' Guild": (3191, 3368, 0),
+    "Monastery": (3052, 3488, 0),
+    "Ranging Guild": (2655, 3441, 0),
+    "Woodcutting Guild": (1662, 3505, 0),
+    "Farming Guild": (1249, 3718, 0),
+}
+_BOX_LANDINGS_BY_LOWER = {name.lower(): name for name in BOX_LANDINGS}
+_TRAILING_OPTION = re.compile(r"\s*\(option\s+\d+\)\s*$", re.IGNORECASE)
+
 
 def parse(teleport_text):
+    """("fairy", CODE) | ("item", key) | ("box", destination) | ("unsupported", text).
+
+    fairy/item are checked FIRST and are unchanged from phase A. "box" is new: whatever the item
+    NAME before the colon is (the box itself, a glory amulet, a skills necklace, ...), the text
+    AFTER the colon -- with any trailing " (Option N)" paging suffix stripped -- names a
+    BOX_LANDINGS destination. The box serves all of those, so the item name is not checked."""
     text = (teleport_text or "").strip()
     head, _, tail = text.partition(":")
     key = head.strip().lower()
@@ -45,6 +90,10 @@ def parse(teleport_text):
         return "fairy", tail.strip().upper()
     if key in ITEMS:
         return "item", key
+    destination = _TRAILING_OPTION.sub("", tail).strip()
+    canonical = _BOX_LANDINGS_BY_LOWER.get(destination.lower())
+    if canonical is not None:
+        return "box", canonical
     return "unsupported", text
 
 
@@ -77,9 +126,13 @@ def plan(task_name, player, carried, skill_levels=None):
     # TRAVEL, and without this the "route" back was the whole journey again -- walk 41 tiles to
     # the AJQ ring and dial AJQ while standing in the AJQ cave; for Alice's farm, fire the
     # Ectophial. When the site is a short walk away, the route is that walk and nothing else.
+    # Unchanged by phase B, including when the player happens to be in the house (its own
+    # comment explains why THAT combination is not worth special-casing here).
     near = crossfloor.find_route(here, tuple(task.target), skill_levels=skill_levels, max_links=0)
     if near is not None and near.cost <= NEAR_SITE_TILES:
         return [site], ""
+    in_house = bool((player or {}).get("inInstance"))
+    has_tablet = any("teleport to house" in (held or "").lower() for held in (carried or {}))
     reasons = []
     for text in task.teleports:
         kind, value = parse(text)
@@ -88,19 +141,38 @@ def plan(task_name, player, carried, skill_levels=None):
                 reasons.append(f"{text}: no Confirm-text check is known for {value}")
                 continue
             exit_tile = transports.load_fairy_rings().exit_for(value)
-            ring = nearest_ring(here, skill_levels)
-            if exit_tile is None or ring is None:
-                reasons.append(f"{text}: no fairy ring within a {RING_WALK_MAX}-tile walk of {here}")
+            if exit_tile is None:
+                reasons.append(f"{text}: no exit tile known for {value}")
                 continue
-            return [legs.walk(*ring.origin),
-                    legs.fairy(value, FAIRY_EXPECT[value], dest=exit_tile,
-                               ring_tile=ring.origin, ring_id=ring.object_id),
-                    site], ""
+            # An overworld ring within walking range is preferred over the house -- never
+            # consulted at all while already inside the house, where template coordinates are
+            # meaningless distances (phase B brief).
+            ring = None if in_house else nearest_ring(here, skill_levels)
+            if ring is not None:
+                return [legs.walk(*ring.origin),
+                        legs.fairy(value, FAIRY_EXPECT[value], dest=exit_tile,
+                                   ring_tile=ring.origin, ring_id=ring.object_id),
+                        site], ""
+            if not has_tablet and not in_house:
+                reasons.append(f"{text}: no fairy ring within a {RING_WALK_MAX}-tile walk of "
+                               f"{here} and no house tablet")
+                continue
+            return [legs.house(), legs.pool(),
+                    legs.house_ring(value, FAIRY_EXPECT[value], dest=exit_tile), site], ""
         if kind == "item":
             name, option, landing = ITEMS[value]
             if not any(name in (held or "").lower() for held in (carried or {})):
                 reasons.append(f"{text}: not carried")
                 continue
             return [legs.item(name, option, landing), site], ""
-        reasons.append(f"{text}: not supported until the house/bank phases")
+        if kind == "box":
+            landing = BOX_LANDINGS.get(value)
+            if landing is None:
+                reasons.append(f"{text}: no landing tile known for {value}")
+                continue
+            if not has_tablet and not in_house:
+                reasons.append(f"{text}: needs a house tablet")
+                continue
+            return [legs.house(), legs.pool(), legs.house_box(value, landing), site], ""
+        reasons.append(f"{text}: not supported until the bank phase")
     return None, "; ".join(reasons) or f"{task_name} lists no teleport"
