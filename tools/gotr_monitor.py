@@ -56,12 +56,15 @@ SIGNAL DESIGN (why each check exists, and why some require TWO agreeing signals 
   A run of identical click coordinates (from [action] "... at (x,y)" lines) is only escalated to
   a restart when it is CORROBORATED by frozen [snapshot] position+animation over the same window
   -- clicking a stationary rock repeatedly while mining is normal and must not trip this alone.
-- Focus loss is flagged, not silently fixed. controller.py's own main loop already pauses
-  gracefully while unfocused and resumes on its own once focus returns (it never crashes or
-  stalls from this alone), so no restart is needed for it. What IS needed, per the user, is
-  making it loud: this is running on the user's real desktop, not an isolated VM, so this monitor
-  does NOT simulate a SetForegroundWindow to grab focus back on their machine -- that would be an
-  independent, visible action on their own desktop the user did not ask for. It only alerts.
+- Focus loss is flagged AND corrected. controller.py's own main loop already pauses gracefully
+  while unfocused and resumes on its own once focus returns (it never crashes or stalls from
+  this alone), so no restart is needed for it -- but it also never gets back on its own without
+  a click somewhere. USER, 2026-09-19: "If you run into an issue with window focus you have
+  permission to use win32 to refocus again" -- explicit authorization for exactly the
+  SetForegroundWindow this monitor previously refused to do on the user's real desktop. See
+  refocus_runelite(): reuses controller.py's own find_runelite_window() window-matching
+  convention (EnumWindows + a "RuneLite" title substring), tried once per cycle for as long as
+  the bridge keeps reporting unfocused, logged either way.
 
 Everything else (bridge unreachable, controller.py process gone, an unexpected logout) is checked
 every cycle via the local process handle and the direct /state poll, and treated as an immediate
@@ -72,6 +75,7 @@ import collections
 import datetime
 import glob
 import json
+import win32gui
 import os
 import re
 import subprocess
@@ -223,6 +227,32 @@ class Monitor:
                 return json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, ValueError, OSError):
             return None
+
+    @staticmethod
+    def refocus_runelite(title_substring="RuneLite"):
+        """Bring the RuneLite window to the foreground. Same window-matching convention as
+        controller.py's own find_runelite_window (EnumWindows + a title substring) -- reused
+        rather than reinvented. Returns True on a call that didn't raise; SetForegroundWindow
+        can still be silently refused by Windows (a background process isn't always allowed to
+        steal focus), so the caller re-checks via the next /state poll rather than trusting this
+        return value alone."""
+        hwnds = []
+
+        def enum_windows(hwnd, _):
+            if title_substring in win32gui.GetWindowText(hwnd):
+                hwnds.append(hwnd)
+
+        try:
+            win32gui.EnumWindows(enum_windows, None)
+            if not hwnds:
+                return False
+            hwnd = hwnds[0]
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, 9)   # SW_RESTORE -- un-minimize before focusing
+            win32gui.SetForegroundWindow(hwnd)
+            return True
+        except Exception:
+            return False
 
     # ---------------------------------------------------------------- local process control
 
@@ -541,10 +571,11 @@ class Monitor:
             elapsed = time.time() - self.unfocused_since
             if elapsed >= FOCUS_LOST_GRACE_S:
                 self.log("!", f"BUG: RuneLite window has lost focus (unfocused for "
-                               f"{elapsed:.0f}s) -- this was not expected to happen. Not "
-                               "stealing focus back automatically (this is the real desktop); "
-                               "click into the game window to resume. controller.py will "
-                               "resume on its own once focus returns.")
+                               f"{elapsed:.0f}s) -- this was not expected to happen. "
+                               "Refocusing it (user-authorized 2026-09-19).")
+                refocused = self.refocus_runelite()
+                self.log("focus", f"SetForegroundWindow call {'issued' if refocused else 'FAILED (window not found or call raised)'} "
+                                   "-- confirming on the next /state poll")
         else:
             if not self.was_focused:
                 self.log("focus", "window focus recovered")
