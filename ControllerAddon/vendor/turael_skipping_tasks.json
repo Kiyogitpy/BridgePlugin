@@ -1,0 +1,1065 @@
+{
+ "source": "turael-skipping Plugin Hub jar, SlayerTaskRegistry.TURAEL_TASKS",
+ "tasks": {
+  "banshees": {
+   "info": null,
+   "key": "banshees",
+   "locations": [
+    {
+     "areas": [
+      [
+       3431,
+       3530,
+       22,
+       38,
+       0
+      ]
+     ],
+     "name": "Morytania Slayer Tower",
+     "teleports": [
+      "Slayer Ring: Morytania Slayer Tower (Option 2)"
+     ]
+    }
+   ],
+   "name": "Banshees",
+   "npcIds": [
+    414
+   ],
+   "target": [
+    3442,
+    3542,
+    0
+   ],
+   "worldMap": [
+    [
+     3442,
+     3542,
+     0
+    ]
+   ]
+  },
+  "bats": {
+   "info": null,
+   "key": "bats",
+   "locations": [
+    {
+     "areas": [
+      [
+       3327,
+       3475,
+       72,
+       33,
+       0
+      ]
+     ],
+     "name": "Silvarea, North of Digsite",
+     "teleports": [
+      "Ring of the elements: Earth Altar (Option 3)",
+      "Digsite pendant (Option 1)",
+      "Digsite/Lumberyard teleport"
+     ]
+    }
+   ],
+   "name": "Bats",
+   "npcIds": [
+    2827
+   ],
+   "target": [
+    3351,
+    3490,
+    0
+   ],
+   "worldMap": [
+    [
+     3351,
+     3490,
+     0
+    ]
+   ]
+  },
+  "bears": {
+   "info": null,
+   "key": "bears",
+   "locations": [
+    {
+     "areas": [
+      [
+       2687,
+       3318,
+       36,
+       34,
+       0
+      ]
+     ],
+     "name": "South-west of Legends' Guild",
+     "teleports": [
+      "Fairy ring: BLR",
+      "Quest Cape teleport"
+     ]
+    }
+   ],
+   "name": "Bears",
+   "npcIds": [
+    2838
+   ],
+   "target": [
+    2700,
+    3330,
+    0
+   ],
+   "worldMap": [
+    [
+     2700,
+     3330,
+     0
+    ]
+   ]
+  },
+  "birds": {
+   "info": null,
+   "key": "birds",
+   "locations": [
+    {
+     "areas": [
+      [
+       3608,
+       3521,
+       30,
+       14,
+       0
+      ]
+     ],
+     "name": "Alice's Farm, west of the Ectofuntus",
+     "teleports": [
+      "Ectophial: Empty"
+     ]
+    }
+   ],
+   "name": "Birds",
+   "npcIds": [
+    1838,
+    1839,
+    2993
+   ],
+   "target": [
+    3630,
+    3530,
+    0
+   ],
+   "worldMap": [
+    [
+     3630,
+     3530,
+     0
+    ]
+   ]
+  },
+  "cave bugs": {
+   "info": "Bring a light source",
+   "key": "cave bugs",
+   "locations": [
+    {
+     "areas": [
+      [
+       2708,
+       5221,
+       14,
+       25,
+       0
+      ]
+     ],
+     "name": "Dorgesh-Kaan South Dungeon",
+     "teleports": [
+      "Fairy ring: AJQ"
+     ]
+    }
+   ],
+   "name": "Cave bugs",
+   "npcIds": [
+    481
+   ],
+   "target": [
+    2715,
+    5235,
+    0
+   ],
+   "worldMap": [
+    [
+     3206,
+     3217,
+     0
+    ],
+    [
+     2786,
+     5318,
+     0
+    ]
+   ]
+  },
+  "cave crawlers": {
+   "info": null,
+   "key": "cave crawlers",
+   "locations": [
+    {
+     "areas": [
+      [
+       2777,
+       9987,
+       23,
+       21,
+       0
+      ]
+     ],
+     "name": "Fremennik Slayer Dungeon",
+     "teleports": [
+      "Slayer ring: Fremennik Slayer Dungeon (Option 3)",
+      "Fairy ring: AJR"
+     ]
+    }
+   ],
+   "name": "Cave Crawlers",
+   "npcIds": [
+    406,
+    407,
+    408,
+    409
+   ],
+   "target": [
+    2795,
+    9997,
+    0
+   ],
+   "worldMap": [
+    [
+     2789,
+     3617,
+     0
+    ],
+    [
+     2795,
+     9997,
+     0
+    ]
+   ]
+  },
+  "cave slimes": {
+   "info": "Bring a light source",
+   "key": "cave slimes",
+   "locations": [
+    {
+     "areas": [
+      [
+       2692,
+       5227,
+       17,
+       16,
+       0
+      ],
+      [
+       2722,
+       5232,
+       14,
+       8,
+       0
+      ]
+     ],
+     "name": "Dorgesh-Kaan South Dungeon",
+     "teleports": [
+      "Fairy ring: AJQ"
+     ]
+    }
+   ],
+   "name": "Cave slimes",
+   "npcIds": [
+    480
+   ],
+   "target": [
+    2730,
+    5234,
+    0
+   ],
+   "worldMap": [
+    [
+     3206,
+     3217,
+     0
+    ],
+    [
+     2786,
+     5318,
+     0
+    ]
+   ]
+  },
+  "cows": {
+   "info": null,
+   "key": "cows",
+   "locations": [
+    {
+     "areas": [
+      [
+       3608,
+       3521,
+       30,
+       14,
+       0
+      ]
+     ],
+     "name": "Alice's Farm, west of the Ectofuntus",
+     "teleports": [
+      "Ectophial: Empty"
+     ]
+    }
+   ],
+   "name": "Cows",
+   "npcIds": [
+    2992
+   ],
+   "target": [
+    3630,
+    3530,
+    0
+   ],
+   "worldMap": [
+    [
+     3630,
+     3530,
+     0
+    ]
+   ]
+  },
+  "crawling hands": {
+   "info": null,
+   "key": "crawling hands",
+   "locations": [
+    {
+     "areas": [
+      [
+       3408,
+       3539,
+       38,
+       39,
+       0
+      ]
+     ],
+     "name": "Morytania Slayer Tower",
+     "teleports": [
+      "Slayer Ring: Morytania Slayer Tower (Option 2)"
+     ]
+    }
+   ],
+   "name": "Crawling Hands",
+   "npcIds": [
+    448,
+    449,
+    450,
+    451,
+    452,
+    453,
+    454,
+    455,
+    456,
+    457
+   ],
+   "target": [
+    3419,
+    3571,
+    0
+   ],
+   "worldMap": [
+    [
+     3419,
+     3571,
+     0
+    ]
+   ]
+  },
+  "dogs": {
+   "info": null,
+   "key": "dogs",
+   "locations": [
+    {
+     "areas": [
+      [
+       3329,
+       2770,
+       23,
+       19,
+       0
+      ]
+     ],
+     "name": "East of Sophanem",
+     "teleports": [
+      "Pharaoh's sceptre: Jaleustrophos (Option 2)"
+     ]
+    }
+   ],
+   "name": "Dogs",
+   "npcIds": [
+    11583
+   ],
+   "target": [
+    3347,
+    2783,
+    0
+   ],
+   "worldMap": [
+    [
+     3347,
+     2783,
+     0
+    ]
+   ]
+  },
+  "dwarves": {
+   "info": null,
+   "key": "dwarves",
+   "locations": [
+    {
+     "areas": [
+      [
+       2856,
+       9867,
+       17,
+       19,
+       0
+      ]
+     ],
+     "name": "White Wolf Tunnel pub",
+     "teleports": [
+      "Construction cape: Taverley (Option 3)",
+      "Re-direct house tab (Option 2)"
+     ]
+    }
+   ],
+   "name": "Dwarves",
+   "npcIds": [
+    292
+   ],
+   "target": [
+    2863,
+    9878,
+    0
+   ],
+   "worldMap": [
+    [
+     2819,
+     3490,
+     0
+    ],
+    [
+     2863,
+     9878,
+     0
+    ]
+   ]
+  },
+  "ghosts": {
+   "info": null,
+   "key": "ghosts",
+   "locations": [
+    {
+     "areas": [
+      [
+       1680,
+       10053,
+       24,
+       18,
+       0
+      ]
+     ],
+     "name": "Catacombs of Kourend",
+     "teleports": [
+      "Achievement diary cape: Kourend Castle (Option A)",
+      "Xeric's talisman: Xeric's Heart (Option 4)"
+     ]
+    }
+   ],
+   "name": "Ghosts",
+   "npcIds": [
+    7263
+   ],
+   "target": [
+    1693,
+    10063,
+    0
+   ],
+   "worldMap": [
+    [
+     1639,
+     3673,
+     0
+    ],
+    [
+     1693,
+     10063,
+     0
+    ]
+   ]
+  },
+  "goblin": {
+   "info": "South of the Sourhog Cave",
+   "key": "goblin",
+   "locations": [
+    {
+     "areas": [
+      [
+       3132,
+       3291,
+       25,
+       22,
+       0
+      ]
+     ],
+     "name": "South-East of Draynor Manor",
+     "teleports": [
+      "Draynor manor teleport",
+      "Ornate Jewellery Box: Draynor Village (Option Q)",
+      "Glory amulet: Draynor Village (Option 3)"
+     ]
+    }
+   ],
+   "name": "Goblin",
+   "npcIds": [
+    3029,
+    3030,
+    3031,
+    3033,
+    3034,
+    3035,
+    3036
+   ],
+   "target": [
+    3145,
+    3301,
+    0
+   ],
+   "worldMap": [
+    [
+     3145,
+     3301,
+     0
+    ]
+   ]
+  },
+  "goblins": {
+   "info": "South of the Sourhog Cave",
+   "key": "goblins",
+   "locations": [
+    {
+     "areas": [
+      [
+       3132,
+       3291,
+       25,
+       22,
+       0
+      ]
+     ],
+     "name": "South-East of Draynor Manor",
+     "teleports": [
+      "Draynor manor teleport",
+      "Ornate Jewellery Box: Draynor Village (Option Q)",
+      "Glory amulet: Draynor Village (Option 3)"
+     ]
+    }
+   ],
+   "name": "Goblins",
+   "npcIds": [
+    3029,
+    3030,
+    3031,
+    3033,
+    3034,
+    3035,
+    3036
+   ],
+   "target": [
+    3145,
+    3301,
+    0
+   ],
+   "worldMap": [
+    [
+     3145,
+     3301,
+     0
+    ]
+   ]
+  },
+  "icefiends": {
+   "info": null,
+   "key": "icefiends",
+   "locations": [
+    {
+     "areas": [
+      [
+       2990,
+       3464,
+       24,
+       26,
+       0
+      ]
+     ],
+     "name": "Ice Mountain",
+     "teleports": [
+      "Lassar teleport"
+     ]
+    }
+   ],
+   "name": "Icefiends",
+   "npcIds": [
+    4813
+   ],
+   "target": [
+    3007,
+    3475,
+    0
+   ],
+   "worldMap": [
+    [
+     3007,
+     3475,
+     0
+    ]
+   ]
+  },
+  "kalphite": {
+   "info": null,
+   "key": "kalphite",
+   "locations": [
+    {
+     "areas": [
+      [
+       3314,
+       9493,
+       20,
+       19,
+       0
+      ],
+      [
+       3297,
+       9513,
+       23,
+       27,
+       0
+      ]
+     ],
+     "name": "Kalphite Cave",
+     "teleports": [
+      "Desert amulet 4: Kalphite cave"
+     ]
+    }
+   ],
+   "name": "Kalphite",
+   "npcIds": [
+    956
+   ],
+   "target": [
+    3309,
+    9526,
+    0
+   ],
+   "worldMap": [
+    [
+     3326,
+     3122,
+     0
+    ],
+    [
+     3372,
+     9528,
+     0
+    ],
+    [
+     3324,
+     9502,
+     0
+    ]
+   ]
+  },
+  "lizards": {
+   "info": "Bring Ice coolers",
+   "key": "lizards",
+   "locations": [
+    {
+     "areas": [
+      [
+       3392,
+       3027,
+       32,
+       23,
+       0
+      ],
+      [
+       3392,
+       3050,
+       32,
+       20,
+       0
+      ],
+      [
+       3424,
+       3050,
+       28,
+       20,
+       0
+      ],
+      [
+       3424,
+       3027,
+       28,
+       23,
+       0
+      ]
+     ],
+     "name": "North of Nardah Fairy Ring",
+     "teleports": [
+      "Fairy ring: DLQ"
+     ]
+    }
+   ],
+   "name": "Lizards",
+   "npcIds": [
+    463,
+    462
+   ],
+   "target": [
+    3413,
+    3035,
+    0
+   ],
+   "worldMap": [
+    [
+     3413,
+     3035,
+     0
+    ]
+   ]
+  },
+  "minotaurs": {
+   "info": null,
+   "key": "minotaurs",
+   "locations": [
+    {
+     "areas": [
+      [
+       1869,
+       5210,
+       17,
+       14,
+       0
+      ]
+     ],
+     "name": "Stronghold of Security",
+     "teleports": [
+      "Skull sceptre: Invoke"
+     ]
+    }
+   ],
+   "name": "Minotaurs",
+   "npcIds": [
+    2481
+   ],
+   "target": [
+    1875,
+    5218,
+    0
+   ],
+   "worldMap": [
+    [
+     3084,
+     3417,
+     0
+    ],
+    [
+     1875,
+     5218,
+     0
+    ]
+   ]
+  },
+  "monkeys": {
+   "info": "Run south and open the trapdoor, bring a light source",
+   "key": "monkeys",
+   "locations": [
+    {
+     "areas": [
+      [
+       2306,
+       9141,
+       27,
+       23,
+       1
+      ]
+     ],
+     "name": "Kruk's Dungeon",
+     "teleports": [
+      "Gnome Glider: Ookookolly Undri"
+     ]
+    }
+   ],
+   "name": "Monkeys",
+   "npcIds": [
+    7118
+   ],
+   "target": [
+    2715,
+    2788,
+    0
+   ],
+   "worldMap": [
+    [
+     2713,
+     2794,
+     0
+    ]
+   ]
+  },
+  "rats": {
+   "info": null,
+   "key": "rats",
+   "locations": [
+    {
+     "areas": [
+      [
+       3218,
+       9857,
+       35,
+       19,
+       0
+      ]
+     ],
+     "name": "Varrock Sewers",
+     "teleports": [
+      "Achievement diary cape: Varrock (Option D)",
+      "Varrock teleport"
+     ]
+    }
+   ],
+   "name": "rats",
+   "npcIds": [
+    2854,
+    2865
+   ],
+   "target": [
+    3237,
+    9866,
+    0
+   ],
+   "worldMap": [
+    [
+     3240,
+     3458,
+     0
+    ],
+    [
+     3237,
+     9866,
+     0
+    ]
+   ]
+  },
+  "scorpions": {
+   "info": null,
+   "key": "scorpions",
+   "locations": [
+    {
+     "areas": [
+      [
+       3025,
+       9766,
+       37,
+       34,
+       0
+      ]
+     ],
+     "name": "Mining Guild",
+     "teleports": [
+      "Skill's Necklace: Mining Guild"
+     ]
+    }
+   ],
+   "name": "Scorpions",
+   "npcIds": [
+    3024
+   ],
+   "target": [
+    3049,
+    9771,
+    0
+   ],
+   "worldMap": [
+    [
+     3061,
+     3376,
+     0
+    ],
+    [
+     3049,
+     9771,
+     0
+    ]
+   ]
+  },
+  "skeletons": {
+   "info": "Bring a rope",
+   "key": "skeletons",
+   "locations": [
+    {
+     "areas": [
+      [
+       3359,
+       9739,
+       29,
+       19,
+       0
+      ]
+     ],
+     "name": "Digsite Dungeon",
+     "teleports": [
+      "Digsite pendant (Option 1)",
+      "Digsite teleport"
+     ]
+    }
+   ],
+   "name": "Skeletons",
+   "npcIds": [
+    70,
+    71,
+    72,
+    73
+   ],
+   "target": [
+    3352,
+    3417,
+    0
+   ],
+   "worldMap": [
+    [
+     3352,
+     3417,
+     0
+    ]
+   ]
+  },
+  "spiders": {
+   "info": null,
+   "key": "spiders",
+   "locations": [
+    {
+     "areas": [
+      [
+       3152,
+       3224,
+       23,
+       33,
+       0
+      ]
+     ],
+     "name": "Outside H.A.M. Hideout",
+     "teleports": [
+      "Achievement diary cape: Twiggy O'Korn (Option G)",
+      "Ornate Jewellery Box: Draynor Village (Option Q)",
+      "Glory amulet: Draynor Village (Option 3)"
+     ]
+    }
+   ],
+   "name": "Spiders",
+   "npcIds": [
+    3019,
+    3017
+   ],
+   "target": [
+    3168,
+    3244,
+    0
+   ],
+   "worldMap": [
+    [
+     3168,
+     3244,
+     0
+    ]
+   ]
+  },
+  "wolves": {
+   "info": null,
+   "key": "wolves",
+   "locations": [
+    {
+     "areas": [
+      [
+       2828,
+       3477,
+       38,
+       43,
+       0
+      ]
+     ],
+     "name": "White Wolf Mountain",
+     "teleports": [
+      "Gnome Glider: Sindarpos"
+     ]
+    }
+   ],
+   "name": "Wolves",
+   "npcIds": [
+    107,
+    108,
+    109,
+    110
+   ],
+   "target": [
+    2847,
+    3498,
+    0
+   ],
+   "worldMap": [
+    [
+     2847,
+     3498,
+     0
+    ]
+   ]
+  },
+  "zombies": {
+   "info": null,
+   "key": "zombies",
+   "locations": [
+    {
+     "areas": [
+      [
+       3608,
+       3521,
+       30,
+       14,
+       0
+      ]
+     ],
+     "name": "Alice's Farm, west of the Ectofuntus",
+     "teleports": [
+      "Ectophial: Empty"
+     ]
+    }
+   ],
+   "name": "Zombies",
+   "npcIds": [
+    2992,
+    2993
+   ],
+   "target": [
+    3630,
+    3530,
+    0
+   ],
+   "worldMap": [
+    [
+     3630,
+     3530,
+     0
+    ]
+   ]
+  }
+ }
+}
