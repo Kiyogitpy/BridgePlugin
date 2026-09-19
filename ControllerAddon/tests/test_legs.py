@@ -4,6 +4,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import controller
+import crossfloor
 import legs
 import travel
 
@@ -88,12 +89,6 @@ def test_a_fairy_leg_with_a_dest_fails_when_the_landing_never_confirms(monkeypat
     assert legs.run_next(_Ctx(), chain, 0) == (legs.FAILED, 0)
 
 
-def test_a_walk_leg_walks_to_the_exact_tile(monkeypatch):
-    walks = []
-    monkeypatch.setattr(travel, "walk_to",
-                        lambda ctx, target, tolerance=3, goal_adjacent=True: walks.append((target, goal_adjacent)) or True)
-    assert legs.run_next(_Ctx(), [legs.walk(3429, 3564, 0)], 0) == (legs.DONE, 1)
-    assert walks == [({"x": 3429, "y": 3564, "plane": 0}, False)]
 
 
 def test_await_arrival_polls_the_player_until_within_the_landing_radius(monkeypatch):
@@ -107,6 +102,88 @@ def test_await_arrival_gives_up_at_the_budget(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 1, "y": 1, "plane": 0})
     monkeypatch.setattr(legs.time, "sleep", lambda s: None)
     assert legs.await_arrival((3421, 3537, 0), budget_s=1.0) is False
+
+
+def _route(*steps):
+    return crossfloor.Route(steps, 0)
+
+
+def test_walk_across_replans_from_the_live_position_after_every_transport(monkeypatch):
+    """The plan is a hint, the player's real tile is the truth: after each transport the route is
+    asked for again from wherever we actually landed."""
+    cave = _step()
+    positions = iter([{"x": 2431, "y": 3422, "plane": 0},      # at the ring landing
+                      {"x": 2429, "y": 9824, "plane": 0},      # after the cave
+                      {"x": 2420, "y": 9786, "plane": 0}])     # arrived
+    current = {}
+
+    def get_player():
+        current.update(next(positions, current))
+        return dict(current)
+    monkeypatch.setattr(controller, "get_player", get_player)
+    monkeypatch.setattr(controller, "get_skills", lambda: {"Agility": {"level": 60}})
+    asked = []
+
+    def find_route(start, goal, **kw):
+        asked.append((start, kw.get("skill_levels")))
+        if start[1] < 9000:
+            return _route(crossfloor.Walk((2430, 3423, 0), 2), crossfloor.Link(cave, (2430, 3423, 0)),
+                          crossfloor.Walk((2420, 9786, 0), 38))
+        return _route(crossfloor.Walk((2420, 9786, 0), 38))
+    monkeypatch.setattr(crossfloor, "find_route", find_route)
+    ran = []
+    monkeypatch.setattr(legs, "run_transport", lambda ctx, step, log="travel": ran.append(step.object_info) or True)
+    walks = []
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, tolerance=3, goal_adjacent=True:
+                        walks.append((target, goal_adjacent)) or True)
+
+    assert legs.walk_across(_Ctx(), (2420, 9785, 0)) is True
+    assert ran == ["Enter Cave 26709"]
+    assert [a[0] for a in asked] == [(2431, 3422, 0), (2429, 9824, 0)]
+    assert asked[0][1] == {"Agility": 60}
+    assert walks == [({"x": 2420, "y": 9786, "plane": 0}, False)], "the pre-link walk is run_transport's job"
+
+
+def test_walk_across_is_false_when_there_is_no_route(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3221, "y": 3218, "plane": 0})
+    monkeypatch.setattr(controller, "get_skills", lambda: {})
+    monkeypatch.setattr(crossfloor, "find_route", lambda start, goal, **kw: None)
+    assert legs.walk_across(_Ctx(), (3178, 2447, 0)) is False
+
+
+def test_walk_across_stops_when_a_transport_fails(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2431, "y": 3422, "plane": 0})
+    monkeypatch.setattr(controller, "get_skills", lambda: {})
+    monkeypatch.setattr(crossfloor, "find_route", lambda start, goal, **kw:
+                        _route(crossfloor.Link(_step(), (2430, 3423, 0)), crossfloor.Walk((2420, 9786, 0), 38)))
+    monkeypatch.setattr(legs, "run_transport", lambda ctx, step, log="travel": False)
+    assert legs.walk_across(_Ctx(), (2420, 9785, 0)) is False
+
+
+def test_walk_across_cannot_loop_forever(monkeypatch):
+    """A transport that 'succeeds' but never moves us must not spin."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2431, "y": 3422, "plane": 0})
+    monkeypatch.setattr(controller, "get_skills", lambda: {})
+    monkeypatch.setattr(crossfloor, "find_route", lambda start, goal, **kw:
+                        _route(crossfloor.Link(_step(), (2430, 3423, 0)), crossfloor.Walk((2420, 9786, 0), 38)))
+    ran = []
+    monkeypatch.setattr(legs, "run_transport", lambda ctx, step, log="travel": ran.append(1) or True)
+    assert legs.walk_across(_Ctx(), (2420, 9785, 0)) is False
+    assert len(ran) == legs.WALK_ACROSS_MAX_LINKS
+
+
+def test_skill_levels_is_none_when_the_bridge_gave_nothing(monkeypatch):
+    monkeypatch.setattr(controller, "get_skills", lambda: {})
+    assert legs.skill_levels() is None
+    monkeypatch.setattr(controller, "get_skills", lambda: {"Agility": {"level": 71, "boosted": 74}, "Mining": {"level": 60}})
+    assert legs.skill_levels() == {"Agility": 71, "Mining": 60}
+
+
+def test_a_walk_leg_now_goes_through_walk_across(monkeypatch):
+    seen = []
+    monkeypatch.setattr(legs, "walk_across", lambda ctx, goal, log="travel": seen.append(tuple(goal)) or True)
+    assert legs.run_next(_Ctx(), [legs.walk(3434, 9938, 3)], 0) == (legs.DONE, 1)
+    assert seen == [(3434, 9938, 3)]
 
 
 import transports

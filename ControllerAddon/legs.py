@@ -27,6 +27,7 @@
 import time
 
 import controller
+import crossfloor
 import debug_log
 import travel
 
@@ -38,6 +39,7 @@ PICKER_BUDGET_S = 4.0    # a transport's destination picker -> appeared and answ
 LINK_ARRIVAL_TILES = 3   # a ladder lands you on (or beside) one tile -- far tighter than a teleport
 LINK_BUDGET_S = 10.0     # click -> landed, INCLUDING the last steps onto the object and a region load
 LINK_OBJECT_RADIUS = 6   # how far from the origin tile the transport's own object may sit
+WALK_ACROSS_MAX_LINKS = 6
 
 DONE = "done"            # the leg landed; cursor advanced
 PROGRESS = "progress"    # the leg did a bounded step and wants another call (fairy rings)
@@ -128,8 +130,7 @@ def run_next(ctx, leg_list, cursor: int, log: str = "travel"):
         return DONE, cursor + 1
     if kind == "walk":
         dest = leg.get("dest") or []
-        ok = len(dest) == 3 and travel.walk_to(
-            ctx, {"x": dest[0], "y": dest[1], "plane": dest[2]}, goal_adjacent=False)
+        ok = len(dest) == 3 and walk_across(ctx, tuple(dest), log=log)
         return (DONE, cursor + 1) if ok else (FAILED, cursor)
     ok = run_leg(ctx, leg, log=log)
     return (DONE, cursor + 1) if ok else (FAILED, cursor)
@@ -312,3 +313,40 @@ def run_transport(ctx, step, log: str = "travel") -> bool:
     if not ok:
         return False
     return await_arrival(step.dest, LINK_BUDGET_S, LINK_ARRIVAL_TILES)
+
+
+def skill_levels():
+    """{"Agility": 71, ...} from GET /skills (REAL levels -- a boost that wears off mid-route must
+    not unlock a shortcut), or None when the bridge gave nothing, so requirements fail closed."""
+    raw = controller.get_skills() or {}
+    levels = {name: data.get("level") for name, data in raw.items()
+              if isinstance(data, dict) and data.get("level") is not None}
+    return levels or None
+
+
+def walk_across(ctx, goal, log: str = "travel") -> bool:
+    """Walk to `goal` (x, y, plane), taking ladders, stairs and cave mouths as needed.
+
+    The route is re-planned from the LIVE position after every transport: a plan is a hint, the
+    tile we actually landed on is the truth. A same-plane trip is exactly one travel.walk_to.
+    Bounded by WALK_ACROSS_MAX_LINKS so a transport that reports success without moving us
+    cannot spin. UNVERIFIED LIVE as of 2026-09-19."""
+    levels = skill_levels()
+    for _ in range(WALK_ACROSS_MAX_LINKS):
+        player = controller.get_player() or {}
+        if player.get("x") is None:
+            return False
+        here = (player["x"], player["y"], player.get("plane", 0))
+        route = crossfloor.find_route(here, tuple(goal), skill_levels=levels)
+        if route is None:
+            debug_log.log(log, f"no route from {here} to {tuple(goal)}")
+            return False
+        link = next((s for s in route.steps if isinstance(s, crossfloor.Link)), None)
+        if link is None:
+            dest = route.steps[-1].dest
+            return bool(travel.walk_to(ctx, {"x": dest[0], "y": dest[1], "plane": dest[2]},
+                                       goal_adjacent=False))
+        if not run_transport(ctx, link.step, log=log):
+            return False
+    debug_log.log(log, f"gave up after {WALK_ACROSS_MAX_LINKS} transports without reaching {tuple(goal)}")
+    return False
