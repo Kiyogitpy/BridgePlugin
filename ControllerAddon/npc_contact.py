@@ -215,3 +215,104 @@ def get_task(ctx, master, tasks_cfg):
     if not contact(ctx, master, tasks_cfg):
         return None
     return walk_to_assignment(ctx)
+
+
+# ------------------------------------------------------------------ cancelling a task (30 points)
+#
+# MEASURED 2026-09-19: rewards = interface 426, the Tasks tab = 426.14 dynamic child 6. USER the
+# same day: "You can cancel from the spell too". NOT measured: the dialogue option's wording, the
+# cancel button's widget, the confirmation step (the account had 9 points). So the button is
+# found by the WORD "cancel" inside group 426 and nothing is clicked unless exactly ONE control
+# matches. Success is /slayer reading no task -- never the click. UNVERIFIED LIVE.
+
+REWARDS_GROUP = 426
+TASKS_TAB = (426, 14, 6)
+REWARD_NEEDLES = ("reward",)
+CONFIRM_NEEDLES = ("yes", "confirm")     # NOT "cancel": "No, don't cancel" would match it
+REWARDS_BUDGET_S = 6.0
+CANCEL_BUDGET_S = 6.0
+
+
+def find_cancel_control(dump):
+    """The ONE control in the rewards interface whose text or action says 'cancel', else None."""
+    hits = []
+    for entry in dump or ():
+        if entry.get("group") != REWARDS_GROUP or entry.get("screenX") is None:
+            continue
+        words = [entry.get("text") or ""] + list(entry.get("actions") or ())
+        if any("cancel" in (w or "").lower() for w in words):
+            hits.append(entry)
+    return hits[0] if len(hits) == 1 else None
+
+
+def _rewards_open() -> bool:
+    return any(e.get("group") == REWARDS_GROUP for e in controller.get_widgets_dump() or ())
+
+
+def open_rewards(ctx, master, tasks_cfg) -> bool:
+    if not contact(ctx, master, tasks_cfg):
+        return False
+    deadline = time.time() + REWARDS_BUDGET_S
+    while time.time() < deadline:
+        if _rewards_open():
+            return True
+        d = dialogue.read()
+        opts = dialogue.options(d)
+        if opts:
+            hit = next((h for h in (dialogue.find_option(opts, n) for n in REWARD_NEEDLES) if h is not None), None)
+            if hit is None:
+                ctx.state.data["npc_contact_unknown_menu"] = " | ".join(opts)
+                debug_log.log(LOG, f"no rewards option in {opts} -- escaping")
+                dialogue.close(ctx)
+                return False
+            controller.key_tap(ctx.ser, str(hit + 1))
+        elif dialogue.is_open(d):
+            controller.key_tap(ctx.ser, "SPACE")
+        controller.human_delay(0.5, 0.9)
+    return _rewards_open()
+
+
+def cancel_task(ctx, master, tasks_cfg) -> bool:
+    """Cancel the active task for 30 points through `master`'s rewards screen. True only when
+    /slayer then reads no task. Never through the filler master; never without the points."""
+    state = slayer_state.from_bridge(controller.get_slayer_task())
+    slayer_state.assert_may_contact(master, state, tasks_cfg)
+    ok, why = slayer_state.can_skip(state.points, ctx.state.data.get("slayer_skips", 0), tasks_cfg)
+    if not ok:
+        debug_log.log(LOG, f"not cancelling: {why}")
+        return False
+    if not open_rewards(ctx, master, tasks_cfg):
+        return False
+    tab = controller.get_widget(*TASKS_TAB)
+    if not tab or not tab.get("clickable"):
+        debug_log.log(LOG, f"the Tasks tab {TASKS_TAB} is not clickable")
+        dialogue.close(ctx)
+        return False
+    controller.click_entity(ctx.ser, tab, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
+    controller.human_delay(0.5, 0.9)
+    button = find_cancel_control(controller.get_widgets_dump())
+    if button is None:
+        debug_log.log(LOG, "no single 'cancel' control in the rewards interface -- closing it untouched")
+        dialogue.close(ctx)
+        return False
+    debug_log.log(LOG, f"cancelling {state.task or state.task_id} for {slayer_state.CANCEL_COST} points "
+                       f"(widget {button.get('group')}.{button.get('child')}[{button.get('index')}])")
+    controller.click_entity(ctx.ser, button, offset=(0, 0), check_ui_blockers=False, simulate_mistakes=False)
+    deadline = time.time() + CANCEL_BUDGET_S
+    confirmed_once = False
+    while time.time() < deadline:
+        after = slayer_state.from_bridge(controller.get_slayer_task())
+        if after is not None and not after.has_task:
+            ctx.state.data["slayer_skips"] = ctx.state.data.get("slayer_skips", 0) + 1
+            dialogue.close(ctx)
+            return True
+        opts = dialogue.options()
+        if opts and not confirmed_once:
+            hit = next((h for h in (dialogue.find_option(opts, n) for n in CONFIRM_NEEDLES) if h is not None), None)
+            if hit is not None:
+                controller.key_tap(ctx.ser, str(hit + 1))
+                confirmed_once = True
+        time.sleep(POLL_S)
+    debug_log.log(LOG, "the task is still active after the cancel click")
+    dialogue.close(ctx)
+    return False

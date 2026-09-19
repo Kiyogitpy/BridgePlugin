@@ -215,3 +215,81 @@ def test_contact_fails_cleanly_when_the_spell_is_not_clickable(monkeypatch):
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: clicked.append(1) or True)
     assert npc_contact.contact(_Ctx(), "AYA", CFG) is False
     assert clicked == []
+
+
+def _w(group, child, index=-1, text=None, actions=None, x=500, y=300):
+    entry = {"group": group, "child": child, "index": index, "screenX": x, "screenY": y}
+    if text:
+        entry["text"] = text
+    if actions:
+        entry["actions"] = actions
+    return entry
+
+
+def test_the_cancel_control_is_found_by_word_inside_the_rewards_interface_only():
+    dump = [_w(426, 14, 6, actions=["Tasks"]), _w(426, 26, 3, text="Cancel task", actions=["Cancel"]),
+            _w(162, 5, text="Cancel"), _w(426, 30, 1, text="Block task", actions=["Block"])]
+    assert npc_contact.find_cancel_control(dump)["child"] == 26
+    assert npc_contact.find_cancel_control([_w(162, 5, text="Cancel")]) is None
+
+
+def test_two_cancel_candidates_is_a_refusal_not_a_coin_toss():
+    dump = [_w(426, 26, 3, text="Cancel task"), _w(426, 40, 0, text="Cancel block")]
+    assert npc_contact.find_cancel_control(dump) is None
+
+
+def test_cancel_task_is_refused_without_the_points(monkeypatch):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: dict(BEARS, points=24))
+    touched = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: touched.append(key))
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: touched.append("click") or True)
+    assert npc_contact.cancel_task(_Ctx(), "KURADAL", CFG) is False
+    assert touched == []
+
+
+def test_cancel_task_never_goes_through_the_filler_master(monkeypatch):
+    """Rewards from Aya is harmless, but the DIALOGUE to get there passes her assignment option.
+    With a task active (always true for a cancel) she is simply not contacted."""
+    _quiet(monkeypatch)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: dict(BEARS, points=300))
+    with pytest.raises(slayer_state.StreakGuardError):
+        npc_contact.cancel_task(_Ctx(), "AYA", CFG)
+
+
+def test_cancel_task_confirms_from_the_slayer_state_not_from_the_click(monkeypatch):
+    _quiet(monkeypatch)
+    state = {"s": dict(BEARS, points=300)}
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: dict(state["s"]))
+    monkeypatch.setattr(npc_contact, "contact", lambda ctx, master, cfg: True)
+    monkeypatch.setattr(dialogue, "read", lambda: {"options": ["Select an option", "I need another assignment.",
+                                                               "Have you any rewards for me?"]})
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
+    monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None:
+                        {"found": True, "clickable": True, "screenX": 614, "screenY": 214})
+    monkeypatch.setattr(controller, "get_widgets_dump", lambda scan=False:
+                        [_w(426, 14, 6, actions=["Tasks"]), _w(426, 26, 3, text="Cancel task", actions=["Cancel"])])
+    clicks = []
+
+    def click_entity(ser, entity, **kw):
+        clicks.append(entity.get("child", "tab"))
+        if entity.get("child") == 26:
+            state["s"] = dict(NO_TASK, points=270)
+        return True
+    monkeypatch.setattr(controller, "click_entity", click_entity)
+    assert npc_contact.cancel_task(_Ctx(), "KURADAL", CFG) is True
+    assert 26 in clicks
+
+
+def test_cancel_task_is_false_when_the_task_survives_the_click(monkeypatch):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(npc_contact, "CANCEL_BUDGET_S", 0.05)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: dict(BEARS, points=300))
+    monkeypatch.setattr(npc_contact, "contact", lambda ctx, master, cfg: True)
+    monkeypatch.setattr(dialogue, "read", lambda: {"options": ["Select an option", "Have you any rewards for me?"]})
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
+    monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None:
+                        {"found": True, "clickable": True, "screenX": 614, "screenY": 214})
+    monkeypatch.setattr(controller, "get_widgets_dump", lambda scan=False: [_w(426, 26, 3, text="Cancel task")])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    assert npc_contact.cancel_task(_Ctx(), "KURADAL", CFG) is False
