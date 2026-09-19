@@ -23,6 +23,31 @@ Nechryael 92/213, streak 11, 9 points. `GET /slayer` answered correctly live for
 - NOT captured: the option LIST text (the recorder logs the key, not the menu). `dialogue.options()` reads it live.
 - NOT captured: a real assignment line. That is the `contact-aya` recording, after this task ends.
 
+## NPC Contact -> Aya, a REAL assignment (contact-aya, no task active, streak 12)
+
+Same spell and picker; **Aya is `75.4` slot 18** (Kuradal 33). Slots are never hardcoded: the
+orchestrator reads the picker's children and clicks the one whose action is `Contact <master>`.
+
+| Step | Key | Chat |
+|---|---|---|
+| greeting | Space | `Aya|'Ello, and what are you after then?` (varbit `5006` = 6 for Aya, 11 for Kuradal) |
+| option list | **1** | `07 Kiyo|I need another assignment.` |
+| **EXTRA STEP a strong account gets** | Space | `Aya|You're actually very strong, are you sure you don't want Vannaka under Edgeville to assign you a task?` |
+| option list (texts not captured) | **1** | -- insists on Aya |
+| **the assignment** | Space | `Aya|Excellent, you're doing great. Your new task is to kill 15 Bears.` |
+| option list (texts not captured) | **2** | `07 Kiyo|Okay, great!` (option 1 is presumably the tips question) |
+| close | Space, Space | `Aya|Good luck! Don't forget to come back when you need a new assignment.` |
+
+- **The assignment lands on the tick the task LINE appears, before the dialogue is finished:**
+  varbit `4067` (master) = 1, varp `394` = 15, varp `395` = 13 all on tick 3892. `/slayer` then read
+  `Bears`, 15/15, `masterId` 1, streak still 12, `hasTask` true. So success is confirmed from
+  `/slayer`, and the remaining Space/2/Space presses are only tidying up.
+- Assignment regex candidate: `Your new task is to kill (\d+) (.+)\.` -- used for logging only;
+  the state read is the truth.
+- The option lists must be answered by TEXT through `dialogue.choose` ("assignment", then whatever
+  declines Vannaka, then "Okay"), never by number: the Vannaka question shifts what "1" means.
+- 38s cast-to-assigned at human pace, 46s to fully closed.
+
 ## The house (house-box-and-ring)
 
 - `Break` a `Teleport to house` tablet (item 8013): anim `4069` -> `4071`, spotanim `678`, tablet gone at +1.5s,
