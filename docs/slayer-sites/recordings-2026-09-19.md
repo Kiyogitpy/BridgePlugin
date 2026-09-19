@@ -54,7 +54,9 @@ Nechryael 92/213, streak 11, 9 points. `GET /slayer` answered correctly live for
 
 1. **Cancelling does not need NPC Contact.** Games necklace -> Burthorpe -> `Rewards` on Aya is a
    two-click, dialogue-free path, and it is safe with a task active (Rewards is not a task change).
-   Whether a master reached by NPC Contact offers rewards at all is still unmeasured.
+   USER 2026-09-19: "You can cancel from the spell too" -- the NPC Contact dialogue also reaches
+   the rewards screen, so the spell stays the PRIMARY cancel path (no travel, no necklace charge)
+   and the Burthorpe walk is the fallback. Which dialogue option opens it is not yet measured.
 2. **Aya can also be reached on foot** from the same necklace, which is a fallback for the 9 filler
    tasks if the spell path fails (no runes, wrong spellbook).
 3. The POH hub is simpler than §8.1 feared: fixed coordinates, objects clickable from the landing tile.
