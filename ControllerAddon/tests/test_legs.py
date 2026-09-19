@@ -385,3 +385,24 @@ def test_await_arrival_honours_a_tighter_radius(monkeypatch):
     monkeypatch.setattr(legs.time, "sleep", lambda s: None)
     assert legs.await_arrival((2429, 9824, 0), budget_s=0.6) is True          # default radius 12
     assert legs.await_arrival((2429, 9824, 0), budget_s=0.6, radius=3) is False
+
+
+def test_a_fairy_leg_carries_its_ring_tile_and_id_through_to_the_hop(monkeypatch):
+    seen = {}
+
+    def hop(ctx, code, expect, **kw):
+        seen.update(kw, code=code, expect=expect)
+        return True
+    monkeypatch.setattr(travel, "hop_fairy_ring", hop)
+    leg = legs.fairy("AJQ", "Dorgesh", ring_tile=(2740, 3351, 0), ring_id=29495)
+    assert leg["ring_tile"] == [2740, 3351, 0] and leg["ring_id"] == 29495
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.DONE, 1)
+    assert seen["ring_tile"] == {"x": 2740, "y": 3351, "plane": 0} and seen["ring_ids"] == (29495,)
+
+
+def test_a_plain_fairy_leg_still_calls_the_hop_exactly_as_before(monkeypatch):
+    """banker and karambwan build fairy legs with no ring: nothing new may be passed."""
+    seen = {}
+    monkeypatch.setattr(travel, "hop_fairy_ring", lambda ctx, code, expect, **kw: seen.update(kw) or True)
+    assert legs.run_next(_Ctx(), [legs.fairy("cks", "Slayer Tower")], 0) == (legs.DONE, 1)
+    assert set(seen) == {"log"}

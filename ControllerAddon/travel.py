@@ -1464,7 +1464,7 @@ def confirm_names_the_stop(text, expect) -> bool:
     return bool(expect) and expect.lower() in (text or "").strip().lower()
 
 
-def hop_fairy_ring(ctx, code, expect, ring_tile=None, expect_region=None, log="travel"):
+def hop_fairy_ring(ctx, code, expect, ring_tile=None, expect_region=None, log="travel", ring_ids=None):
     """Dial a fairy ring to `code` and take it. ONE bounded action per call, leg-style.
 
     Returns True once the ring has been confirmed and the hop taken, False when it did something
@@ -1477,11 +1477,13 @@ def hop_fairy_ring(ctx, code, expect, ring_tile=None, expect_region=None, log="t
     `expect`   substring the Confirm button must contain, e.g. "Piscatoris".
     `ring_tile` where to walk when no ring is in view; None means "only act if one already is".
     `expect_region` region id to confirm the landing on; None skips the confirmation wait.
+    `ring_ids` object ids that count as the ring; None = the ordinary overworld ring.
 
     The caller owns WHICH ring and WHERE to; everything below is the mechanic, identical at every
     ring in the game."""
+    wanted = tuple(ring_ids) if ring_ids else (FAIRY_RING_ID,)      # Zanaris is 29560, a POH ring 29228
     ring = next((o for o in controller.get_objects(radius=20)
-                 if o.get("id") == FAIRY_RING_ID and o.get("visible", True)), None)
+                 if o.get("id") in wanted and o.get("visible", True)), None)
     if ring is None:
         if ring_tile is None:
             debug_log.log(log, "no fairy ring in view")

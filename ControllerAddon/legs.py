@@ -66,11 +66,14 @@ def item(name: str, option: str, dest) -> dict:
     return leg
 
 
-def fairy(code: str, expect: str, dest=None) -> dict:
-    """A fairy-ring hop, delegated to travel.hop_fairy_ring (dialled, never Last-destination)."""
+def fairy(code: str, expect: str, dest=None, ring_tile=None, ring_id=None) -> dict:
+    """A fairy-ring hop, delegated to travel.hop_fairy_ring (dialled, never Last-destination).
+    `ring_tile`/`ring_id` name WHICH ring when it is not an ordinary one already in view."""
     leg = _base("fairy", f"fairy ring {code}", dest)
     leg["code"] = code
     leg["expect"] = expect
+    leg["ring_tile"] = list(ring_tile) if ring_tile else None
+    leg["ring_id"] = ring_id
     return leg
 
 
@@ -121,7 +124,13 @@ def run_next(ctx, leg_list, cursor: int, log: str = "travel"):
     leg = leg_list[cursor]
     kind = leg.get("kind")
     if kind == "fairy":
-        ok = travel.hop_fairy_ring(ctx, leg.get("code"), leg.get("expect"), log=log)
+        extra = {}
+        tile = leg.get("ring_tile")
+        if tile:
+            extra["ring_tile"] = {"x": tile[0], "y": tile[1], "plane": tile[2]}
+        if leg.get("ring_id"):
+            extra["ring_ids"] = (leg["ring_id"],)
+        ok = travel.hop_fairy_ring(ctx, leg.get("code"), leg.get("expect"), log=log, **extra)
         if not ok:
             return PROGRESS, cursor
         dest = leg.get("dest") or []
