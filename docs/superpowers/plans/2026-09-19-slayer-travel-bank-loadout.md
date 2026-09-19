@@ -748,6 +748,22 @@ and after the `try/finally`:
 
 **Measured (recordings-2026-09-19.md):** `Break` a `Teleport to house` tablet (item 8013): anim 4069→4071, spotanim 678, two LOADING flickers, settled ~4.1 s later **inside at (1922,7051) plane 1**, varbit 6719 = 2 while loading. **Fairy Ring id 29228 at (1963,7044) p1**, **Ornate Jewellery Box id 29156 at (1934,7105) p1** — identical on two visits, both clicked from the landing tile (41 and 54 tiles away) with the game walking there itself. Ring: `Last-destination` observed NOTHING; `Configure` → interface 398 is the same dial as any ring. Box: `Teleport Menu` → interface **590**, destination = dynamic child of `590.5` whose TEXT is `"H: Cooking Guild"` (slot 8) — the letter is its keyboard shortcut. Pool: NOT yet recorded (object name/id/action unknown).
 
+**Settled from open source instead of a recording (USER 2026-09-19: "you should have all this data
+if you look into microbot").** Microbot-Hub's BSD slayer script (`SlayerScript.java`, surveyed in
+`docs/slayer-sites/microbot-slayer-survey.md`; facts ported, no code and never its input layer):
+- **The pool**: object ids `29241` ornate, `29240` fancy, `29239` rejuvenation, `29238`
+  revitalisation, `29237` restoration; action **`Drink`**. The user's pool restores prayer and run
+  but not HP, i.e. rejuvenation or fancy -- so match ANY of the five by id, and confirm by
+  `/player` prayer rising. No recording needed.
+- **The cancel**: inside interface 426, `Tasks` -> a control reading `Cancel` -> a control reading
+  **`Confirm`** on an overlay in the SAME interface (not a chat menu). `npc_contact.cancel_task`
+  now clicks it. The dialogue-driven variant (`Assignment` -> `Cancel current task` -> `Yes`) is
+  what a master reached by dialogue offers; keep both.
+- Source alone CANNOT settle what is specific to this account or to OUR bridge: the house LAYOUT
+  (already measured: ring (1963,7044), box (1934,7105), landing (1922,7051), all plane 1), whether
+  interfaces 590 and 426 appear in our `/widgets/dump` root walk (75 did not), and whether
+  `/objects` inside the POH serves stable coordinates. Those are one read-only probe each.
+
 **Open facts to measure at the start of the phase (the "detail the phase" step):** (1) are `/objects` coordinates inside the POH stable template coordinates or instance coordinates — read `/player` + `/objects?fresh=true` inside the house and compare with the recording; (2) is interface 590 in `/widgets/dump`'s root walk or, like 75, only addressable by id — probe both with the box open; (3) the pool's object (one `recorder.py house-pool` recording); (4) `hop_fairy_ring` sees a ring only within `radius=20` and the POH ring is 41 tiles from the landing — either walk first (is the POH on the collision map? almost certainly NOT: it is an instance) or click from afar the way the human did, which needs the ring in `/objects` at radius ≥ 45 and on screen.
 
 **Tasks (expanded to Phase-A granularity in this file once the four facts above are measured):**

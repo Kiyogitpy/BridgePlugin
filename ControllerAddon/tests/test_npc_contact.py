@@ -465,3 +465,34 @@ def test_a_worn_air_staff_stands_in_for_air_runes_with_the_real_equipment_shape(
     assert "air" in npc_contact.missing_requirements("AYA").lower()
     monkeypatch.setattr(controller, "get_equipment", lambda: None)
     assert "air" in npc_contact.missing_requirements("AYA").lower()
+
+
+def test_the_cancel_is_confirmed_by_the_button_inside_the_rewards_interface(monkeypatch):
+    """Microbot-Hub's open-source slayer script: Tasks -> Cancel -> CONFIRM, all in interface 426.
+    The first draft waited for a chat menu that never comes and would have timed out three times."""
+    _quiet(monkeypatch)
+    state = {"s": dict(BEARS, points=300), "overlay": False}
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: dict(state["s"]))
+    monkeypatch.setattr(npc_contact, "contact", lambda ctx, master, cfg: True)
+    monkeypatch.setattr(dialogue, "read", lambda: {})
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
+    monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None:
+                        {"found": True, "clickable": True, "screenX": 614, "screenY": 214})
+
+    def dump(scan=False):
+        if state["overlay"]:
+            return [_w(426, 50, 0, text="Confirm", actions=["Confirm"]), _w(426, 51, 0, text="Back")]
+        return [_w(426, 14, 6, actions=["Tasks"]), _w(426, 26, 3, text="Cancel task", actions=["Cancel"])]
+    monkeypatch.setattr(controller, "get_widgets_dump", dump)
+    clicks = []
+
+    def click_entity(ser, entity, **kw):
+        clicks.append(entity.get("child", "tab"))
+        if entity.get("child") == 26:
+            state["overlay"] = True
+        if entity.get("child") == 50:
+            state["s"] = dict(NO_TASK, points=270)
+        return True
+    monkeypatch.setattr(controller, "click_entity", click_entity)
+    assert npc_contact.cancel_task(_Ctx(), "KURADAL", CFG) is True
+    assert clicks == ["tab", 26, 50]

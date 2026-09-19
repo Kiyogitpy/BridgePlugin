@@ -345,16 +345,21 @@ REWARDS_BUDGET_S = 6.0
 CANCEL_BUDGET_S = 6.0
 
 
-def find_cancel_control(dump):
-    """The ONE control in the rewards interface whose text or action says 'cancel', else None."""
+def find_control(dump, word):
+    """The ONE control in the rewards interface whose text or action contains `word`, else None.
+    Two matches is a refusal, not a coin toss: this interface also sells, blocks and extends."""
     hits = []
     for entry in dump or ():
         if entry.get("group") != REWARDS_GROUP or entry.get("screenX") is None:
             continue
         words = [entry.get("text") or ""] + list(entry.get("actions") or ())
-        if any("cancel" in (w or "").lower() for w in words):
+        if any(word in (w or "").lower() for w in words):
             hits.append(entry)
     return hits[0] if len(hits) == 1 else None
+
+
+def find_cancel_control(dump):
+    return find_control(dump, "cancel")
 
 
 def _rewards_open() -> bool:
@@ -431,12 +436,23 @@ def cancel_task(ctx, master, tasks_cfg) -> bool:
             ctx.state.data["slayer_skips"] = ctx.state.data.get("slayer_skips", 0) + 1
             dialogue.close(ctx)
             return True
-        opts = dialogue.options()
-        if opts and not confirmed_once:
-            hit = next((h for h in (dialogue.find_option(opts, n) for n in CONFIRM_NEEDLES) if h is not None), None)
-            if hit is not None:
-                controller.key_tap(ctx.ser, str(hit + 1))
+        if not confirmed_once:
+            # Microbot-Hub's open-source slayer script (SlayerScript.handleSlayerRewardsInterface,
+            # surveyed in docs/slayer-sites/) does Tasks -> "Cancel" -> "Confirm", all INSIDE
+            # interface 426: the confirmation is a button on an overlay, not a chat menu. The
+            # chat-menu "Yes" is kept for the dialogue-driven variant it also handles.
+            confirm = find_control(controller.get_widgets_dump(), "confirm")
+            if confirm is not None:
+                controller.click_entity(ctx.ser, confirm, offset=(0, 0), check_ui_blockers=False,
+                                        simulate_mistakes=False)
                 confirmed_once = True
+            else:
+                opts = dialogue.options()
+                hit = next((h for h in (dialogue.find_option(opts, n) for n in CONFIRM_NEEDLES)
+                            if h is not None), None) if opts else None
+                if hit is not None:
+                    controller.key_tap(ctx.ser, str(hit + 1))
+                    confirmed_once = True
         time.sleep(POLL_S)
     debug_log.log(LOG, "the task is still active after the cancel click")
     dialogue.close(ctx)
