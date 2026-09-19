@@ -50,9 +50,17 @@ def next_master(streak: int, tasks_cfg) -> str:
     return cfg.get("fillerMaster") or FILLER_DEFAULT
 
 
-def assert_may_contact(master: str, state, tasks_cfg=None) -> None:
+def assert_may_contact(master: str, state, tasks_cfg) -> None:
+    """Raise rather than let a filler master be contacted while a task is active.
+
+    `tasks_cfg` is REQUIRED (pass None for the defaults): with it optional, a caller who forgot
+    it compared against "AYA" whatever the panel said, and a configured filler master was then
+    contacted mid-task without a murmur (task-6 review). An UNKNOWN state refuses too -- a lost
+    bridge read is exactly when guessing "no task" costs the streak."""
     filler = (tasks_cfg or {}).get("fillerMaster") or FILLER_DEFAULT
-    if state is not None and state.has_task and master == filler:
+    if state is None:
+        raise StreakGuardError(f"refusing to contact {master}: slayer task state is unknown")
+    if state.has_task and master == filler:
         raise StreakGuardError(
             f"refusing to contact {master} with a task active ({state.task or state.task_id}, "
             f"{state.count} left): a task change there resets the streak of {state.streak} to zero")

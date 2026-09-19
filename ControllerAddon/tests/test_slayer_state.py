@@ -51,10 +51,22 @@ def test_aya_is_never_contacted_while_a_task_is_active():
     """The one invariant (spec F2): asking Aya to REPLACE a task resets the streak to zero."""
     active = slayer_state.from_bridge({"count": 12, "hasTask": True, "taskName": "Gargoyles", "streak": 19, "points": 0})
     with pytest.raises(slayer_state.StreakGuardError):
-        slayer_state.assert_may_contact("AYA", active)
+        slayer_state.assert_may_contact("AYA", active, CFG)
     idle = slayer_state.from_bridge({"count": 0, "hasTask": False, "streak": 19, "points": 0})
-    slayer_state.assert_may_contact("AYA", idle)
-    slayer_state.assert_may_contact("KURADAL", active)      # rewards / cancel through the milestone master is fine
+    slayer_state.assert_may_contact("AYA", idle, CFG)
+    slayer_state.assert_may_contact("KURADAL", active, CFG)      # rewards / cancel through the milestone master is fine
+
+
+def test_the_guard_follows_the_configured_filler_master_and_refuses_an_unknown_state():
+    active = slayer_state.from_bridge({"count": 12, "hasTask": True, "streak": 19, "points": 0})
+    cfg = dict(CFG, fillerMaster="KONAR")
+    with pytest.raises(slayer_state.StreakGuardError):
+        slayer_state.assert_may_contact("KONAR", active, cfg)
+    slayer_state.assert_may_contact("AYA", active, cfg)          # not the filler under this config
+    with pytest.raises(slayer_state.StreakGuardError):
+        slayer_state.assert_may_contact("AYA", active, None)     # None = defaults, where Aya IS the filler
+    with pytest.raises(slayer_state.StreakGuardError):
+        slayer_state.assert_may_contact("KURADAL", None, CFG)    # bridge unavailable: contact nobody
 
 
 def test_skipping_respects_the_points_reserve_and_the_per_slot_ceiling():
