@@ -842,14 +842,15 @@ public interface ControllerConfig extends Config
 	@ConfigItem(
 		keyName = "slayerMaxSkips",
 		name = "Max Skips Per Slot",
-		description = "Consecutive 30-point cancels allowed for one task slot before the routine stops and asks a human.",
+		description = "Consecutive 30-point cancels allowed for one task slot before the routine stops. " +
+			"With the chosen skip list about 40% of Kuradal rolls are skips, so 3 in a row is routine; 8 is not.",
 		section = slayerTasksSection,
 		position = 4
 	)
-	@Range(min = 0, max = 10)
+	@Range(min = 0, max = 20)
 	default int slayerMaxSkips()
 	{
-		return 3;
+		return 8;
 	}
 
 	@ConfigItem(
