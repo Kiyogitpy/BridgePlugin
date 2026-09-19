@@ -70,7 +70,8 @@ def test_the_guard_follows_the_configured_filler_master_and_refuses_an_unknown_s
     cfg = dict(CFG, fillerMaster="KONAR")
     with pytest.raises(slayer_state.StreakGuardError):
         slayer_state.assert_may_contact("KONAR", active, cfg)
-    slayer_state.assert_may_contact("AYA", active, cfg)          # not the filler under this config
+    with pytest.raises(slayer_state.StreakGuardError):
+        slayer_state.assert_may_contact("AYA", active, cfg)      # Aya is refused as a game FACT, not a setting
     with pytest.raises(slayer_state.StreakGuardError):
         slayer_state.assert_may_contact("AYA", active, None)     # None = defaults, where Aya IS the filler
     with pytest.raises(slayer_state.StreakGuardError):

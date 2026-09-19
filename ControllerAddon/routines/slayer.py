@@ -4,8 +4,8 @@
 # ACQUIRE through NPC Contact (Kuradal on every `milestoneEvery`-th task, Aya otherwise), SKIP an
 # unwanted task for 30 points, STOP on a task the user does by hand, and FIGHT when already
 # standing at a known site. What is NOT here yet is sub-project 3: travel, banking and loadouts.
-# So away from the site this routine STOPS and says where to go -- walk there, press F2/relaunch,
-# and it fights, finishes, and asks the next master.
+# So away from the site this routine STOPS and says where to go -- walk there and RELAUNCH (a
+# safety stop is terminal; F2 does not clear it), and it fights, finishes, and asks the next master.
 #
 # The phase is DERIVED from GET /slayer every tick (spec §7.1); ctx.state.data holds only
 # counters, so a restart mid-task resumes correctly. None from /slayer = do nothing.
@@ -62,11 +62,15 @@ def _reset_slot_counters(ctx, state) -> None:
     new slot."""
     seen = ctx.state.data.get("slayer_streak_seen")
     if seen != state.streak:
-        ctx.state.data.update({"slayer_streak_seen": state.streak, "slayer_casts": 0, "slayer_skips": 0})
+        ctx.state.data.update({"slayer_streak_seen": state.streak, "slayer_casts": 0, "slayer_skips": 0,
+                               "slayer_cancel_attempts": 0})
 
 
 def _acquire(ctx, state, tasks_cfg) -> None:
     master = slayer_state.next_master(state.streak, tasks_cfg)
+    # Cooldown FIRST: missing_requirements is five bridge reads, not something to repeat every tick.
+    if time.time() - ctx.state.data.get("slayer_contact_at", 0.0) < CONTACT_RETRY_COOLDOWN_S:
+        return
     problem = npc_contact.missing_requirements(master)
     if problem:
         ctx.state.trigger_safety_stop(f"Slayer: cannot contact {master} -- {problem}")
@@ -76,8 +80,6 @@ def _acquire(ctx, state, tasks_cfg) -> None:
         ctx.state.trigger_safety_stop(
             f"Slayer: cast NPC Contact {casts} times for task {state.streak + 1} and no task ever "
             f"registered with {master} -- see the [npc_contact] lines above")
-        return
-    if time.time() - ctx.state.data.get("slayer_contact_at", 0.0) < CONTACT_RETRY_COOLDOWN_S:
         return
     ctx.state.data["slayer_contact_at"] = time.time()
     ctx.state.data["slayer_casts"] = casts + 1
@@ -107,11 +109,11 @@ def _skip(ctx, state, tasks_cfg) -> None:
         ctx.state.trigger_safety_stop(f"Slayer: {state.task} is on the skip list but {why}")
         return
     master = (tasks_cfg or {}).get("milestoneMaster") or slayer_state.MILESTONE_DEFAULT
+    if time.time() - ctx.state.data.get("slayer_contact_at", 0.0) < CONTACT_RETRY_COOLDOWN_S:
+        return
     problem = npc_contact.missing_requirements(master)
     if problem:
         ctx.state.trigger_safety_stop(f"Slayer: cannot cancel {state.task} -- {problem}")
-        return
-    if time.time() - ctx.state.data.get("slayer_contact_at", 0.0) < CONTACT_RETRY_COOLDOWN_S:
         return
     ctx.state.data["slayer_contact_at"] = time.time()
     attempts = ctx.state.data.get("slayer_cancel_attempts", 0) + 1
@@ -131,7 +133,11 @@ def _skip(ctx, state, tasks_cfg) -> None:
 def _fight(ctx, state) -> None:
     controller.check_stray_dialog(ctx)
     panel = ctx.state.config
-    ctx.state.config = combat_core.combat_config(panel, slayer_tasks.target_names(state.task))
+    cfg = combat_core.combat_config(panel, slayer_tasks.target_names(state.task))
+    # The orchestrator owns restocks (spec 7.5). Left on, fight_tick teleports to a bank by itself,
+    # and the next tick sees the player off-site and safety-stops there (final review).
+    cfg["bank"] = {**(cfg.get("bank") or {}), "enabled": False}
+    ctx.state.config = cfg
     try:
         combat_core.fight_tick(ctx)
     finally:

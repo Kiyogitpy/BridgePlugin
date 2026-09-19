@@ -45,6 +45,14 @@ def test_the_panels_skip_list_overrides_a_fight():
     assert st.user_skips(None) == set() and st.user_skips({"skipTasks": None}) == set()
 
 
+def test_the_bridge_sends_the_skip_list_as_a_list():
+    """MEASURED live: GET /slayer-config -> "skipTasks": []. The string form crashed on it."""
+    cfg = {"skipTasks": ["Abyssal demons", " kurask "]}
+    assert st.user_skips(cfg) == {"abyssal demons", "kurask"}
+    assert st.disposition("Kurask", cfg) == st.SKIP
+    assert st.user_skips({"skipTasks": []}) == set()
+
+
 def test_the_skip_list_cannot_turn_a_stop_into_a_paid_cancel_by_accident():
     assert st.disposition("Greater demons", {"skipTasks": "greater demons"}) == st.SKIP, \
         "an explicit user entry IS a decision to pay"

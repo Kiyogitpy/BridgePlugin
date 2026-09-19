@@ -99,7 +99,12 @@ def missing_requirements(master):
     if level is not None and level < need:
         return f"NPC Contact needs {need} Magic (have {level})"
     counts = _rune_counts()
-    worn = [(item.get("name") or "").lower() for item in controller.get_equipment() or ()]
+    # /equipment is a DICT keyed by slot ({"weapon": {"name": "Arclight", ...}, ...}). FINAL REVIEW,
+    # reproduced live: iterating it as a list raised AttributeError and killed the engine on the
+    # first tick -- hidden by a test fixture of [].
+    equipment = controller.get_equipment() or {}
+    slots = equipment.values() if isinstance(equipment, dict) else equipment
+    worn = [(slot.get("name") or "").lower() for slot in slots if isinstance(slot, dict)]
     has_air_staff = any(staff in name for name in worn for staff in AIR_STAVES)
     for rune, per_cast in RUNES_PER_CAST.items():
         if rune == "air rune" and has_air_staff:
@@ -156,7 +161,8 @@ def contact(ctx, master, tasks_cfg) -> bool:
         if speaker in names:
             return True
         time.sleep(POLL_S)
-    debug_log.log(LOG, f"{master}'s dialogue did not open within {CONTACT_BUDGET_S}s")
+    debug_log.log(LOG, f"{master}'s dialogue did not open within {CONTACT_BUDGET_S}s -- closing whatever did")
+    dialogue.close(ctx)
     return False
 
 
@@ -271,12 +277,17 @@ def open_rewards(ctx, master, tasks_cfg) -> bool:
     if not contact(ctx, master, tasks_cfg):
         return False
     deadline = time.time() + REWARDS_BUDGET_S
+    answered = None
     while time.time() < deadline:
         if _rewards_open():
             return True
         d = dialogue.read()
         opts = dialogue.options(d)
+        if opts and opts == answered:          # same rule as walk_to_assignment: never answer twice
+            time.sleep(POLL_S)
+            continue
         if opts:
+            answered = opts
             hit = next((h for h in (dialogue.find_option(opts, n) for n in REWARD_NEEDLES) if h is not None), None)
             if hit is None:
                 ctx.state.data["npc_contact_unknown_menu"] = " | ".join(opts)
@@ -287,7 +298,11 @@ def open_rewards(ctx, master, tasks_cfg) -> bool:
         elif dialogue.is_open(d):
             controller.key_tap(ctx.ser, "SPACE")
         controller.human_delay(0.5, 0.9)
-    return _rewards_open()
+    if _rewards_open():
+        return True
+    debug_log.log(LOG, f"the rewards interface {REWARDS_GROUP} never opened -- closing the dialogue")
+    dialogue.close(ctx)
+    return False
 
 
 def cancel_task(ctx, master, tasks_cfg) -> bool:

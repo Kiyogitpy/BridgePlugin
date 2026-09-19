@@ -49,8 +49,12 @@ def _key(task_name) -> str:
 
 
 def user_skips(tasks_cfg) -> set:
+    """The panel's skip list. The bridge sends a LIST (ConfigExporter.parseList); a hand-written
+    config may send the comma string. FINAL REVIEW, reproduced live: .split on the list killed the
+    engine the moment the user typed one task -- hidden because an EMPTY list is falsy."""
     raw = (tasks_cfg or {}).get("skipTasks") or ""
-    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+    parts = raw if isinstance(raw, (list, tuple, set)) else str(raw).split(",")
+    return {str(part).strip().lower() for part in parts if str(part).strip()}
 
 
 def disposition(task_name, tasks_cfg) -> str:

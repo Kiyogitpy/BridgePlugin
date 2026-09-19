@@ -167,3 +167,42 @@ def test_a_new_task_resets_the_per_slot_counters(monkeypatch):
     ctx.state.data.update({"slayer_casts": 2, "slayer_skips": 3, "slayer_streak_seen": 12})
     routine.tick(ctx)
     assert ctx.state.data["slayer_casts"] == 0 and ctx.state.data["slayer_skips"] == 0
+
+
+def test_the_fight_never_banks_on_its_own(monkeypatch):
+    """Spec 7.5 / final review: with the panel's bank on, fight_tick teleports to a bank by itself
+    and the next tick safety-stops there, off-site."""
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Banshees"))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3440, "y": 3545, "plane": 0})
+    monkeypatch.setattr(controller, "check_stray_dialog", lambda ctx: None)
+    seen = []
+    monkeypatch.setattr(combat_core, "fight_tick", lambda ctx: seen.append(dict(ctx.state.config["bank"])))
+    ctx = _Ctx()
+    ctx.state.config["bank"] = {"enabled": True, "returnToSpot": True}
+    routine.tick(ctx)
+    assert seen == [{"enabled": False, "returnToSpot": True}]
+    assert ctx.state.config["bank"]["enabled"] is True, "the panel config itself is untouched"
+
+
+def test_the_bridges_list_shaped_skip_list_reaches_the_phase(monkeypatch):
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Bloodveld", points=300))
+    monkeypatch.setattr(controller, "get_player", lambda: {})
+    monkeypatch.setattr(npc_contact, "missing_requirements", lambda master: None)
+    used = []
+    monkeypatch.setattr(npc_contact, "cancel_task", lambda ctx, master, cfg: used.append(master) or True)
+    ctx = _Ctx()
+    ctx.state.config["tasks"] = dict(TASKS, skipTasks=["Bloodveld"])
+    routine.tick(ctx)
+    assert used == ["KURADAL"]
+
+
+def test_the_requirement_reads_wait_out_the_cooldown(monkeypatch):
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task(None, count=0))
+    monkeypatch.setattr(controller, "get_player", lambda: {})
+    reads = []
+    monkeypatch.setattr(npc_contact, "missing_requirements", lambda master: reads.append(1))
+    monkeypatch.setattr(npc_contact, "get_task", lambda *a: None)
+    ctx = _Ctx()
+    routine.tick(ctx)
+    routine.tick(ctx)
+    assert len(reads) == 1, "the second tick is inside the cooldown and reads nothing"

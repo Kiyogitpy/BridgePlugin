@@ -156,7 +156,7 @@ def test_missing_requirements_names_what_is_missing(monkeypatch):
     assert "Lunar" in npc_contact.missing_requirements("AYA")
     monkeypatch.setattr(controller, "get_api", lambda g, r: {"spellbook": "LUNAR"})
     monkeypatch.setattr(controller, "get_skills", lambda: {"Magic": {"level": 89}})
-    monkeypatch.setattr(controller, "get_equipment", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": "Arclight", "qty": 1}, "shield": {"name": "Dragon defender", "qty": 1}})
     monkeypatch.setattr(controller, "get_rune_pouch", lambda: {"carried": True, "runes": [
         {"name": "Astral rune", "quantity": 500}, {"name": "Cosmic rune", "quantity": 500}]})
     monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Air rune", "qty": 1}])
@@ -172,7 +172,7 @@ def test_an_unreadable_spellbook_does_not_block_the_cast(monkeypatch):
     a non-Lunar book has no clickable 218.113."""
     monkeypatch.setattr(controller, "get_api", lambda g, r: None)
     monkeypatch.setattr(controller, "get_skills", lambda: {})
-    monkeypatch.setattr(controller, "get_equipment", lambda: [])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": "Arclight", "qty": 1}, "shield": {"name": "Dragon defender", "qty": 1}})
     monkeypatch.setattr(controller, "get_rune_pouch", lambda: None)
     monkeypatch.setattr(controller, "get_inventory", lambda: [
         {"name": "Astral rune", "qty": 9}, {"name": "Cosmic rune", "qty": 9}, {"name": "Air rune", "qty": 9}])
@@ -329,3 +329,18 @@ def test_no_master_is_asked_for_a_task_while_one_is_active(monkeypatch):
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: touched.append("click"))
     assert npc_contact.get_task(_Ctx(), "KURADAL", CFG) is None
     assert touched == []
+
+
+def test_a_worn_air_staff_stands_in_for_air_runes_with_the_real_equipment_shape(monkeypatch):
+    """FINAL REVIEW, reproduced live: /equipment is a dict keyed by slot, and iterating it as a
+    list killed the engine on the first tick."""
+    monkeypatch.setattr(controller, "get_api", lambda g, r: {"spellbook": "LUNAR"})
+    monkeypatch.setattr(controller, "get_skills", lambda: {"Magic": {"level": 89}})
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: None)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Astral rune", "qty": 5}, {"name": "Cosmic rune", "qty": 5}])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": "Mystic air staff", "qty": 1}})
+    assert npc_contact.missing_requirements("AYA") is None
+    monkeypatch.setattr(controller, "get_equipment", lambda: {"weapon": {"name": "Arclight", "qty": 1}})
+    assert "air" in npc_contact.missing_requirements("AYA").lower()
+    monkeypatch.setattr(controller, "get_equipment", lambda: None)
+    assert "air" in npc_contact.missing_requirements("AYA").lower()

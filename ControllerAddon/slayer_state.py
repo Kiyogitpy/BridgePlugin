@@ -74,7 +74,9 @@ def assert_may_contact(master: str, state, tasks_cfg) -> None:
     filler = (tasks_cfg or {}).get("fillerMaster") or FILLER_DEFAULT
     if state is None:
         raise StreakGuardError(f"refusing to contact {master}: slayer task state is unknown")
-    if state.has_task and same_master(master, filler):
+    # Aya/Turael is refused as a FACT of the game, whatever the panel names as filler: she is the
+    # one master who offers to replace a task, and that offer is what resets the streak.
+    if state.has_task and (same_master(master, filler) or canonical_master(master) == "AYA"):
         raise StreakGuardError(
             f"refusing to contact {master} with a task active ({state.task or state.task_id}, "
             f"{state.count} left): a task change there resets the streak of {state.streak} to zero")
