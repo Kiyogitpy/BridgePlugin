@@ -1,0 +1,60 @@
+# Slayer loop: facts MEASURED from the 2026-09-19 human recordings
+
+Source: `ControllerAddon/recordings/2026-09-19_1317*_contact-kuradal`, `_1318*_house-box-and-ring`,
+`_1321*_rewards-open` (gitignored; these are the facts worth keeping). Account state at the time:
+Nechryael 92/213, streak 11, 9 points. `GET /slayer` answered correctly live for the first time
+(`taskName` decoded, `masterId` 5, `hasTask` true).
+
+## NPC Contact -> a master (contact-kuradal)
+
+| Step | Measured |
+|---|---|
+| Open spellbook | `Magic` tab = widget `161.65` (F-key is the cheaper route) |
+| Cast | widget `218.113`, option `Cast`. Outcome +0.3s: player anim `4413`, spotanim `728`, varbit `12393` = 1 |
+| Picker appears | ~4.4s after the cast (varbits 1624-1626 and varp 261 change on the same tick); Magic +63 xp lands then too |
+| Pick the master | widget `75.4`, **dynamic child slot 33 = Kuradal**, option `Contact Kuradal`. Aya's slot: NOT yet measured |
+| Dialogue opens | +0.7s: chat `Kuradal|'Ello, and what are you after then?`, varbit `5006` = 11, varbit `10670` = 1 |
+| Ask for a task | Space, then option **1** = `I need another assignment.` |
+| With a task active | `Kuradal|You're still hunting nechryael; you have 92 to go. Come back when you've finished your task.` |
+| Closed | Space; varbit `12393` back to 0 |
+
+- Whole exchange: 17s cast-to-closed at human pace.
+- varbit `12393` is 1 for the duration of every teleport AND this dialogue -- a "busy" flag, not slayer-specific.
+- NOT captured: the option LIST text (the recorder logs the key, not the menu). `dialogue.options()` reads it live.
+- NOT captured: a real assignment line. That is the `contact-aya` recording, after this task ends.
+
+## The house (house-box-and-ring)
+
+- `Break` a `Teleport to house` tablet (item 8013): anim `4069` -> `4071`, spotanim `678`, tablet gone at +1.5s,
+  two LOADING flickers, settled ~4.1s after the click. Lands INSIDE at **(1922,7051) plane 1** both times
+  (varbit `6719` = 2 while loading, 0 once in).
+- Coordinates inside were stable across two visits: **Fairy Ring id 29228 at (1963,7044) p1**,
+  **Ornate Jewellery Box id 29156 at (1934,7105) p1**. Both were clicked from the landing tile
+  (41 and 54 tiles away) and the game walked there itself -- no routing inside the house is needed,
+  only the object being on screen.
+- Fairy ring: `Last-destination (BLR)` (third option) observed NOTHING when clicked from 41 tiles.
+  What worked: `Configure` (second option) -> travel-log entry widget `381.20` (`Use code A J P`)
+  -> `Confirm` widget `398.26`. Then anim `3265`, spotanim `569`, anim `3266`, landed (1651,3010) p0 ~3.3s later.
+  The dialled code shows in varbits `3985`/`3986`/`3987`.
+- Jewellery box: `Teleport Menu` (second option) -> interface **590**, destination = widget `590.5`
+  dynamic child, **slot 8 = `H: Cooking Guild`** (the text carries its keyboard shortcut letter).
+  Click -> anim `714`, spotanim `111`, landed beside the Cooking Guild ~2.8s later.
+- The pool was not used in this recording.
+
+## Slayer rewards (rewards-open)
+
+- The user did NOT use NPC Contact for this: **Aya stands in Burthorpe** -- npc id **13619** at
+  (2932,3536), 35 tiles from the games necklace landing (2897,3554) -- and has a right-click
+  **`Rewards`** (NPC fifth option). Opening Rewards with a task active does not touch the task.
+- Rewards interface = group **426**; the `Tasks` tab is widget **`426.14` slot 6**.
+- The cancel button was not clicked (9 points, 30 needed), so its widget id is still unknown.
+- varp `261` = kills left and varp `262` = task id were pushed when the Rewards option fired.
+
+## What this changes in the spec
+
+1. **Cancelling does not need NPC Contact.** Games necklace -> Burthorpe -> `Rewards` on Aya is a
+   two-click, dialogue-free path, and it is safe with a task active (Rewards is not a task change).
+   Whether a master reached by NPC Contact offers rewards at all is still unmeasured.
+2. **Aya can also be reached on foot** from the same necklace, which is a fallback for the 9 filler
+   tasks if the spell path fails (no runes, wrong spellbook).
+3. The POH hub is simpler than §8.1 feared: fixed coordinates, objects clickable from the landing tile.
