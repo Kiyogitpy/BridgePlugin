@@ -66,9 +66,11 @@ SIGNAL DESIGN (why each check exists, and why some require TWO agreeing signals 
   convention (EnumWindows + a "RuneLite" title substring), tried once per cycle for as long as
   the bridge keeps reporting unfocused, logged either way.
 
-Everything else (bridge unreachable, controller.py process gone, an unexpected logout) is checked
-every cycle via the local process handle and the direct /state poll, and treated as an immediate
-restart condition -- see ensure_running().
+Everything else (bridge unreachable, controller.py process gone) is checked every cycle via the
+local process handle and the direct /state poll, and treated as an immediate restart condition --
+see ensure_running(). An unexpected logout is the one exception: it gets LOGOUT_GRACE_S to
+self-heal via controller.py's own reconnect logic before this monitor restarts anything -- see the
+constant's own note.
 """
 
 import collections
@@ -100,6 +102,12 @@ STALE_LOG_S = 90          # debug_log.tick() fires well under 1s apart whenever 
 BRIDGE_DOWN_GRACE_CYCLES = 3   # ~90s of /state failures before treating the client as gone
 FOCUS_LOST_GRACE_S = 5     # matches the engine's own "say so after a few seconds" threshold
 PROCESS_START_GRACE_S = 10  # ignore a "process died" reading in the first few seconds after spawn
+LOGOUT_GRACE_S = 90        # controller.py's own login.attempt_login retries CONNECTION_LOST on
+                           # its own (LOGIN_RETRY_INTERVAL_S-paced) -- CONFIRMED LIVE 2026-09-19:
+                           # a transient CONNECTION_LOST self-healed within one retry cycle, but
+                           # this monitor restarted the whole process before it got the chance,
+                           # burning a restart for nothing a few seconds would have fixed on its
+                           # own. Same grace-then-act shape as BRIDGE_DOWN_GRACE_CYCLES.
 
 CLICK_WINDOW_MIN_SPAN_S = 45    # same-spot clicks must span at least this long to count
 CLICK_WINDOW_MIN_COUNT = 6
@@ -200,7 +208,7 @@ class Monitor:
         self.consecutive_bridge_failures = 0
         self.unfocused_since = None
         self.was_focused = True
-        self.was_logged_in = True
+        self.logged_out_since = None
 
         # Set on a CLEAN exit (return code 0) -- the panic key's os._exit(0) signature. CONFIRMED
         # 2026-09-18 (USER: "yes I hit F1 to stop it"): auto-restarting over a deliberate manual
@@ -582,11 +590,22 @@ class Monitor:
             self.unfocused_since = None
         self.was_focused = focused
 
-        if self.was_logged_in and not logged_in:
-            self.log("!", "unexpected logout detected (was logged in, now is not)")
-            self.ensure_running("unexpected logout")
-            return
-        self.was_logged_in = logged_in
+        if not logged_in:
+            if self.logged_out_since is None:
+                self.logged_out_since = time.time()
+                self.log("!", "unexpected logout detected (was logged in, now is not) -- "
+                               f"giving controller.py's own reconnect logic {LOGOUT_GRACE_S:.0f}s "
+                               "before restarting")
+            elif time.time() - self.logged_out_since >= LOGOUT_GRACE_S:
+                self.log("!", f"still logged out after {LOGOUT_GRACE_S:.0f}s -- restarting")
+                self.ensure_running("logout did not self-heal within the grace window")
+                self.logged_out_since = None
+                return
+        else:
+            if self.logged_out_since is not None:
+                self.log("!", f"logged back in on its own after "
+                               f"{time.time() - self.logged_out_since:.0f}s -- no restart needed")
+            self.logged_out_since = None
 
         lines = self.scan_new_lines()
         if lines:
