@@ -107,3 +107,105 @@ def test_await_arrival_gives_up_at_the_budget(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 1, "y": 1, "plane": 0})
     monkeypatch.setattr(legs.time, "sleep", lambda s: None)
     assert legs.await_arrival((3421, 3537, 0), budget_s=1.0) is False
+
+
+import transports
+
+
+def _step(info="Enter Cave 26709", origin=(2430, 3424, 0), dest=(2429, 9824, 0)):
+    return transports.Step(origin, dest, info, {}, "", (), (), (), 0, "")
+
+
+def _cave_object(**over):
+    obj = {"id": 26709, "name": "Cave", "x": 2429, "y": 3425, "plane": 0, "screenX": 500, "screenY": 300}
+    obj.update(over)
+    return obj
+
+
+def test_run_transport_walks_clicks_the_object_by_id_and_confirms_the_landing(monkeypatch):
+    calls = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2440, "y": 3420, "plane": 0})
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, tolerance=3, goal_adjacent=True:
+                        calls.append(("walk", target, goal_adjacent)) or True)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False:
+                        [_cave_object(id=1, name="Tree"), _cave_object()])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, obj_id, radius=None, inst=False: "REFRESH")
+
+    def click_entity(ser, entity, **kw):
+        calls.append(("click", entity["id"], kw.get("expected_action"), kw.get("refresh_target"), kw.get("simulate_mistakes")))
+        return True
+    monkeypatch.setattr(controller, "click_entity", click_entity)
+    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=None, radius=None:
+                        calls.append(("await", tuple(dest), budget_s, radius)) or True)
+
+    assert legs.run_transport(_Ctx(), _step()) is True
+    assert calls[0] == ("walk", {"x": 2430, "y": 3424, "plane": 0}, False)
+    assert calls[1] == ("click", 26709, "Enter", "REFRESH", False)
+    assert calls[2] == ("await", (2429, 9824, 0), legs.LINK_BUDGET_S, legs.LINK_ARRIVAL_TILES)
+
+
+def test_run_transport_falls_back_to_goal_adjacent_when_the_origin_tile_is_solid(monkeypatch):
+    walks = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2440, "y": 3420, "plane": 0})
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, tolerance=3, goal_adjacent=True:
+                        walks.append(goal_adjacent) or goal_adjacent)     # only the adjacent walk succeeds
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_cave_object()])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=None, radius=None: True)
+    assert legs.run_transport(_Ctx(), _step()) is True
+    assert walks == [False, True]
+
+
+def test_run_transport_skips_the_walk_when_already_beside_the_origin(monkeypatch):
+    walks = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2431, "y": 3423, "plane": 0})
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **k: walks.append(1) or True)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_cave_object()])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=None, radius=None: True)
+    assert legs.run_transport(_Ctx(), _step()) is True
+    assert walks == []
+
+
+def test_run_transport_uses_the_menu_when_the_left_click_is_withheld(monkeypatch):
+    class _Withheld:
+        withheld = True
+
+        def __bool__(self):
+            return False
+    menu = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2431, "y": 3423, "plane": 0})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [_cave_object()])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: _Withheld())
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: menu.append(option) or True)
+    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=None, radius=None: True)
+    assert legs.run_transport(_Ctx(), _step()) is True
+    assert menu == ["Enter"]
+
+
+def test_run_transport_fails_cleanly_when_the_object_is_not_there(monkeypatch):
+    clicked = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2431, "y": 3423, "plane": 0})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: clicked.append(1) or True)
+    assert legs.run_transport(_Ctx(), _step()) is False
+    assert not clicked
+
+
+def test_an_id_less_row_finds_its_object_by_name_nearest_the_origin(monkeypatch):
+    far = {"id": 5, "name": "Staircase", "x": 2810, "y": 2793, "plane": 0, "screenX": 1, "screenY": 1}
+    near = {"id": 6, "name": "Staircase", "x": 2795, "y": 2794, "plane": 0, "screenX": 2, "screenY": 2}
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False, interactable=False: [far, near])
+    step = _step("Climb-up Staircase", origin=(2795, 2793, 0), dest=(2795, 2797, 1))
+    assert step.object_id is None
+    assert legs.find_transport_object(step)["id"] == 6
+
+
+def test_await_arrival_honours_a_tighter_radius(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2435, "y": 9824, "plane": 0})
+    monkeypatch.setattr(legs.time, "sleep", lambda s: None)
+    assert legs.await_arrival((2429, 9824, 0), budget_s=0.6) is True          # default radius 12
+    assert legs.await_arrival((2429, 9824, 0), budget_s=0.6, radius=3) is False

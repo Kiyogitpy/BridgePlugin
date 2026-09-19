@@ -35,6 +35,9 @@ FAIRY_BUDGET_S = 12.0    # dial + hop + region load; spec §8's fairy budget
 POLL_S = 0.3
 ARRIVAL_TILES = 12       # several teleports drop you on a small spread of tiles; the walk covers the rest
 PICKER_BUDGET_S = 4.0    # a transport's destination picker -> appeared and answered
+LINK_ARRIVAL_TILES = 3   # a ladder lands you on (or beside) one tile -- far tighter than a teleport
+LINK_BUDGET_S = 10.0     # click -> landed, INCLUDING the last steps onto the object and a region load
+LINK_OBJECT_RADIUS = 6   # how far from the origin tile the transport's own object may sit
 
 DONE = "done"            # the leg landed; cursor advanced
 PROGRESS = "progress"    # the leg did a bounded step and wants another call (fairy rings)
@@ -132,7 +135,7 @@ def run_next(ctx, leg_list, cursor: int, log: str = "travel"):
     return (DONE, cursor + 1) if ok else (FAILED, cursor)
 
 
-def await_arrival(dest, budget_s: float = ITEM_BUDGET_S) -> bool:
+def await_arrival(dest, budget_s: float = ITEM_BUDGET_S, radius: int = ARRIVAL_TILES) -> bool:
     """True once we are standing near `dest`. Polled, never slept off -- karambwan_fishing
     MEASURED that a teleport's own signals fire on the tick the LOADING screen starts, when the
     bridge answers nothing at all."""
@@ -145,8 +148,8 @@ def await_arrival(dest, budget_s: float = ITEM_BUDGET_S) -> bool:
         if px is None:
             continue
         if (player.get("plane", 0) == dest[2]
-                and abs(px - dest[0]) <= ARRIVAL_TILES
-                and abs(py - dest[1]) <= ARRIVAL_TILES):
+                and abs(px - dest[0]) <= radius
+                and abs(py - dest[1]) <= radius):
             return True
     return False
 
@@ -247,3 +250,65 @@ def pick_destination(ctx, option, log: str = "travel") -> bool:
 
     debug_log.log(log, f"destination menu never offered '{option}'")
     return False
+
+
+# ---------------------------------------------------------------- transports (ladders, caves, stairs)
+
+def find_transport_object(step):
+    """The scene object a transport row means: by ID when the row has one, else by NAME, and
+    always the match nearest the row's origin tile (a building has many identical staircases)."""
+    ox, oy, plane = step.origin
+    matches = []
+    for obj in controller.get_objects(radius=LINK_OBJECT_RADIUS * 3, fresh=True) or []:
+        if obj.get("plane", plane) != plane or obj.get("screenX") is None:
+            continue
+        if step.object_id is not None:
+            if obj.get("id") != step.object_id:
+                continue
+        elif (obj.get("name") or "").lower() != (step.target or "").lower():
+            continue
+        distance = max(abs(obj.get("x", 0) - ox), abs(obj.get("y", 0) - oy))
+        if distance <= LINK_OBJECT_RADIUS:
+            matches.append((distance, obj))
+    return min(matches, key=lambda m: m[0])[1] if matches else None
+
+
+def run_transport(ctx, step, log: str = "travel") -> bool:
+    """Take ONE Shortest Path transport: get beside its origin, click its object with the row's
+    own menu option, and confirm we landed at its destination. The generic replacement for a
+    hand-written ladder/cave/stairs step per site (spec §8.1). UNVERIFIED LIVE as of 2026-09-19.
+
+    The origin may be a tile our map calls solid (a cave mouth), so an exact walk that finds no
+    route falls back to a goal-adjacent one. The hover gate is safe here: the walk has finished,
+    so the cursor reads the object's action from a standing player (CLAUDE.md warns only against
+    gating clicks made WHILE walking up)."""
+    ox, oy, plane = step.origin
+    player = controller.get_player() or {}
+    px, py = player.get("x"), player.get("y")
+    beside = (px is not None and player.get("plane", plane) == plane
+              and max(abs(px - ox), abs(py - oy)) <= 2)
+    if not beside:
+        target = {"x": ox, "y": oy, "plane": plane}
+        if not (travel.walk_to(ctx, target, goal_adjacent=False)
+                or travel.walk_to(ctx, target, goal_adjacent=True)):
+            debug_log.log(log, f"couldn't walk to {step.object_info!r} at {step.origin}")
+            return False
+
+    obj = find_transport_object(step)
+    if obj is None:
+        debug_log.log(log, f"{step.object_info!r} not found near {step.origin}")
+        return False
+
+    debug_log.log(log, f"transport: {step.object_info} {step.origin} -> {step.dest}")
+    refresh = None
+    if obj.get("id") is not None:
+        refresh = controller.object_refresh_target(obj["x"], obj["y"], plane, obj["id"],
+                                                   radius=LINK_OBJECT_RADIUS * 3)
+    ok = controller.click_entity(ctx.ser, obj, simulate_mistakes=False, refresh_target=refresh,
+                                 expected_action=step.option)
+    if not ok and getattr(ok, "withheld", False):
+        debug_log.log(log, f"left-click on {step.target} isn't '{step.option}' -- using the menu")
+        ok = controller.click_menu_action(ctx.ser, obj, step.option, refresh_target=refresh)
+    if not ok:
+        return False
+    return await_arrival(step.dest, LINK_BUDGET_S, LINK_ARRIVAL_TILES)
