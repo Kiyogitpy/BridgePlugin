@@ -328,22 +328,36 @@ def walk_across(ctx, goal, log: str = "travel") -> bool:
     """Walk to `goal` (x, y, plane), taking ladders, stairs and cave mouths as needed.
 
     The route is re-planned from the LIVE position after every transport: a plan is a hint, the
-    tile we actually landed on is the truth. A same-plane trip is exactly one travel.walk_to.
-    Bounded by WALK_ACROSS_MAX_LINKS so a transport that reports success without moving us
-    cannot spin. UNVERIFIED LIVE as of 2026-09-19."""
+    tile we actually landed on is the truth. Bounded by WALK_ACROSS_MAX_LINKS so a transport
+    that reports success without moving us cannot spin. UNVERIFIED LIVE as of 2026-09-19.
+
+    The last, link-free stretch aims at the EXACT goal first (what a walk leg always did) and only
+    then at crossfloor's relocated tile, which can sit up to GOAL_TOLERANCE away (task-3 review).
+    And when crossfloor finds nothing for a goal on our own plane and not a dungeon's y+6400
+    away, plain travel.walk_to still gets its try: its search is not bounded by FLOOD_RADIUS, so
+    a long surface walk that worked before this module existed keeps working."""
+    goal = tuple(goal)
+    exact = {"x": goal[0], "y": goal[1], "plane": goal[2]}
     levels = skill_levels()
     for _ in range(WALK_ACROSS_MAX_LINKS):
         player = controller.get_player() or {}
         if player.get("x") is None:
             return False
         here = (player["x"], player["y"], player.get("plane", 0))
-        route = crossfloor.find_route(here, tuple(goal), skill_levels=levels)
+        route = crossfloor.find_route(here, goal, skill_levels=levels)
         if route is None:
-            debug_log.log(log, f"no route from {here} to {tuple(goal)}")
+            if here[2] == goal[2] and abs(here[1] - goal[1]) < crossfloor.UNDERGROUND_DY // 2:
+                debug_log.log(log, f"no cross-floor route from {here} to {goal} -- trying a plain walk")
+                return bool(travel.walk_to(ctx, exact, goal_adjacent=False))
+            debug_log.log(log, f"no route from {here} to {goal}")
             return False
         link = next((s for s in route.steps if isinstance(s, crossfloor.Link)), None)
         if link is None:
+            if travel.walk_to(ctx, exact, goal_adjacent=False):
+                return True
             dest = route.steps[-1].dest
+            if dest == goal:
+                return False
             return bool(travel.walk_to(ctx, {"x": dest[0], "y": dest[1], "plane": dest[2]},
                                        goal_adjacent=False))
         if not run_transport(ctx, link.step, log=log):

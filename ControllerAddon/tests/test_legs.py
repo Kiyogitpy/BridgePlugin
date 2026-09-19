@@ -141,14 +141,48 @@ def test_walk_across_replans_from_the_live_position_after_every_transport(monkey
     assert ran == ["Enter Cave 26709"]
     assert [a[0] for a in asked] == [(2431, 3422, 0), (2429, 9824, 0)]
     assert asked[0][1] == {"Agility": 60}
-    assert walks == [({"x": 2420, "y": 9786, "plane": 0}, False)], "the pre-link walk is run_transport's job"
+    assert walks == [({"x": 2420, "y": 9785, "plane": 0}, False)], \
+        "the pre-link walk is run_transport's job, and the last stretch aims at the EXACT goal first"
+
+
+def test_the_last_stretch_falls_back_to_the_relocated_tile_when_the_exact_goal_is_unwalkable(monkeypatch):
+    """Task-3 review: a walk leg always meant the exact tile. crossfloor may relocate a goal by up
+    to GOAL_TOLERANCE, so that tile is the FALLBACK, not the first aim."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2429, "y": 9824, "plane": 0})
+    monkeypatch.setattr(controller, "get_skills", lambda: {})
+    monkeypatch.setattr(crossfloor, "find_route", lambda start, goal, **kw:
+                        _route(crossfloor.Walk((2419, 9784, 0), 59)))
+    walks = []
+
+    def walk_to(ctx, target, tolerance=3, goal_adjacent=True):
+        walks.append((target["x"], target["y"]))
+        return (target["x"], target["y"]) == (2419, 9784)
+    monkeypatch.setattr(travel, "walk_to", walk_to)
+    assert legs.walk_across(_Ctx(), (2420, 9785, 0)) is True
+    assert walks == [(2420, 9785), (2419, 9784)]
 
 
 def test_walk_across_is_false_when_there_is_no_route(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3221, "y": 3218, "plane": 0})
     monkeypatch.setattr(controller, "get_skills", lambda: {})
     monkeypatch.setattr(crossfloor, "find_route", lambda start, goal, **kw: None)
+    walks = []
+    monkeypatch.setattr(travel, "walk_to", lambda ctx, target, tolerance=3, goal_adjacent=True:
+                        walks.append(target) or False)
     assert legs.walk_across(_Ctx(), (3178, 2447, 0)) is False
+    assert walks == [{"x": 3178, "y": 2447, "plane": 0}], "same plane: the plain walk still gets its try"
+
+
+def test_no_route_to_another_floor_or_a_dungeon_never_tries_a_plain_walk(monkeypatch):
+    """A dungeon is drawn 6400 tiles north on the SAME plane; a plain walk there is nonsense."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 2431, "y": 3422, "plane": 0})
+    monkeypatch.setattr(controller, "get_skills", lambda: {})
+    monkeypatch.setattr(crossfloor, "find_route", lambda start, goal, **kw: None)
+    walks = []
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **k: walks.append(1) or True)
+    assert legs.walk_across(_Ctx(), (2420, 9785, 0)) is False
+    assert legs.walk_across(_Ctx(), (2431, 3422, 1)) is False
+    assert walks == []
 
 
 def test_walk_across_stops_when_a_transport_fails(monkeypatch):

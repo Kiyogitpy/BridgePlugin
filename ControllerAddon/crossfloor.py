@@ -40,6 +40,7 @@ MAX_EXPANSIONS = 40
 LINK_COST = 6            # tiles-equivalent for the click, the animation and the load
 GOAL_TOLERANCE = 12
 ORIGIN_TOLERANCE = 2
+START_TOLERANCE = 3      # a teleport can land us ON its own object (a fairy ring); see walkable_start
 PLANE_PENALTY = 40
 UNDERGROUND_DY = 6400
 _CELL = 64
@@ -137,12 +138,40 @@ def _nearest(flood, xy, tolerance):
     return (best[1] + 1, best[2]) if best else (None, None)
 
 
+def walkable_start(start):
+    """`start`, or the nearest tile within START_TOLERANCE that the map can actually leave.
+
+    MEASURED 2026-09-19 (tools/slayer_route_report.py): a flood from the Zanaris fairy ring
+    (2412,4434) or the CJQ ring (3178,2447) is ONE tile. The ring is an object, the static map
+    bakes an object's blocking into the same bits as a wall's, and yet the player really does
+    stand on that tile after the teleport. Stepping off it is one ordinary walk click."""
+    start = tuple(start)
+    if len(worldmap.reachable_from(start[0], start[1], start[2], radius=2, max_nodes=30)) > 1:
+        return start
+    best = None
+    for dx in range(-START_TOLERANCE, START_TOLERANCE + 1):
+        for dy in range(-START_TOLERANCE, START_TOLERANCE + 1):
+            tile = (start[0] + dx, start[1] + dy, start[2])
+            if len(worldmap.reachable_from(tile[0], tile[1], tile[2], radius=4, max_nodes=60)) < 9:
+                continue
+            key = (max(abs(dx), abs(dy)), abs(dx) + abs(dy))
+            if best is None or key < best[0]:
+                best = (key, tile)
+    return best[1] if best else start
+
+
 def find_route(start, goal, *, skill_levels=None, completed_quests=None, varbit_values=None,
                varplayer_values=None, owned_item_names=None, use_agility=True,
                max_links=MAX_LINKS):
-    """Cheapest walk-and-transport route from `start` to within GOAL_TOLERANCE of `goal`, or None."""
+    """A cheap walk-and-transport route from `start` to within GOAL_TOLERANCE of `goal`, or None.
+
+    Best-first under an expansion budget, NOT a shortest-path guarantee: PLANE_PENALTY is far
+    above LINK_COST on purpose (it is what keeps the search off staircases that climb away from
+    the goal), which makes the heuristic inadmissible. Between two valid routes it may return the
+    slightly dearer one."""
     index = _index(usable_links(skill_levels, completed_quests, varbit_values, varplayer_values,
                                 owned_item_names, use_agility)) if max_links > 0 else {}
+    start = walkable_start(start)
     counter = itertools.count()
     goal_node = ("GOAL",)
     queue = [(heuristic(start, goal), next(counter), 0, tuple(start), ())]

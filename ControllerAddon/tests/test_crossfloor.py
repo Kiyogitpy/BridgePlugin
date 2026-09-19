@@ -57,6 +57,17 @@ def test_a_cluster_centre_goal_resolves_to_a_reachable_tile_nearby():
     assert max(abs(dest[0] - 2420), abs(dest[1] - 9785)) <= crossfloor.GOAL_TOLERANCE
 
 
+def test_a_start_on_a_fairy_rings_own_tile_still_routes():
+    """MEASURED: a flood from the Zanaris ring's tile is one tile -- the ring is an object and the
+    static map cannot tell an object from a wall -- but the player stands exactly there after the
+    teleport. Without walkable_start every fairy-ring route was NO ROUTE in 0.00s."""
+    ring = (2412, 4434, 0)
+    assert crossfloor.walkable_start(ring) != ring
+    assert max(abs(a - b) for a, b in zip(crossfloor.walkable_start(ring), ring)) <= crossfloor.START_TOLERANCE
+    assert crossfloor.find_route(ring, (2400, 4440, 0)) is not None
+    assert crossfloor.walkable_start((2431, 3422, 0)) == (2431, 3422, 0), "an ordinary tile is left alone"
+
+
 def test_an_impossible_trip_is_none_and_fast():
     t0 = time.perf_counter()
     assert crossfloor.find_route((3221, 3218, 0), (3178, 2447, 0)) is None    # Lumbridge -> Great Conch
