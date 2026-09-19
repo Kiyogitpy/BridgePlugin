@@ -50,6 +50,28 @@ Nechryael 92/213, streak 11, 9 points. `GET /slayer` answered correctly live for
 - The cancel button was not clicked (9 points, 30 needed), so its widget id is still unknown.
 - varp `261` = kills left and varp `262` = task id were pushed when the Rewards option fired.
 
+## The end of a task (slayer-task-end, captured by a watcher while `combat.py` fought)
+
+`GET /slayer` was polled ~3x/s through the last 12 Nechryael kills (Slayer Tower top floor, plane 2)
+with the recorder running; `ControllerAddon/logs/slayer_watch.log` has every state change.
+
+- **Each kill**: varp `394` drops by one on the SAME tick as the Slayer xp drop (+113), which is the
+  tick the NPC dies -- 1-2 ticks BEFORE its `npc gone`. `XP_GAINED` (Slayer) is therefore the pushed
+  signal for "a kill counted"; `/slayer` agreed on the next poll every time.
+- **The last kill, all on tick 3567**: varp `394` = 0, varbit `4069` (streak) 11 -> 12, varbit `4068`
+  (points) 9 -> 24. One tick later, two chat lines:
+  `You have completed your task! You killed 186 Nechryael. You gained 20,980 xp.` and
+  `You've completed 12 tasks and received 15 points, giving you a total of 24; return to a Slayer master.`
+- `/slayer` after it: `count` 0, `hasTask` false, `streak` 12, `points` 24, **`taskName` ABSENT** and
+  **`taskId` still 52** -- varp 395 is NOT cleared. "No task" must be read from `count`/`hasTask`,
+  never from the task id. `slayer_state.from_bridge` already does this.
+- 15 points for task 12 from master id 5: a plain (non-milestone) reward, matching spec F4.
+- The chat says 186 killed against `originalCount` 213. Not explained; do not build on either number.
+- **`combat.py` kept attacking after completion** (it clicked a Nechryael 1.1s later). Expected --
+  it knows nothing about tasks -- and it is the orchestrator's job to stop the fight on `count == 0`.
+- Pace at this site with this gear: ~22s per kill (12 kills in 4m26s), close to the 18s default
+  the prayer-dose formula assumes.
+
 ## What this changes in the spec
 
 1. **Cancelling does not need NPC Contact.** Games necklace -> Burthorpe -> `Rewards` on Aya is a
