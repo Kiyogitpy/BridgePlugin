@@ -764,7 +764,39 @@ if you look into microbot").** Microbot-Hub's BSD slayer script (`SlayerScript.j
   interfaces 590 and 426 appear in our `/widgets/dump` root walk (75 did not), and whether
   `/objects` inside the POH serves stable coordinates. Those are one read-only probe each.
 
-**Open facts to measure at the start of the phase (the "detail the phase" step):** (1) are `/objects` coordinates inside the POH stable template coordinates or instance coordinates — read `/player` + `/objects?fresh=true` inside the house and compare with the recording; (2) is interface 590 in `/widgets/dump`'s root walk or, like 75, only addressable by id — probe both with the box open; (3) the pool's object (one `recorder.py house-pool` recording); (4) `hop_fairy_ring` sees a ring only within `radius=20` and the POH ring is 41 tiles from the landing — either walk first (is the POH on the collision map? almost certainly NOT: it is an instance) or click from afar the way the human did, which needs the ring in `/objects` at radius ≥ 45 and on screen.
+**MEASURED LIVE 2026-09-20, player standing in the house with the box menu open** (read-only GETs):
+- **TEMPLATE x/y lie about distance inside the house; INSTANCE coordinates are the geometry.**
+  Player template (1933,7105) p1 / instance (11669,1449), `instPlane` 0, `inInstance` true, region
+  7791. Box template (1934,7105) inst (11670,1449) -- 1 tile away. Pool template (1967,7040) inst
+  (11671,1447) -- **2 tiles away**, not 65. Fairy ring template (1964,7043) inst (11668,1444) -- 5
+  tiles. A POH's rooms are template chunks laid out anywhere, so the recording's "dist 41 / 54"
+  was template arithmetic, not a walk. Every in-house distance uses `instX`/`instY`.
+- **`distance` is 2147483647 on EVERY object in the house** (all 3,674). Nothing may sort or filter
+  by it there (`banker.find_nearby_bank`-style code would pick at random). `?radius=` still
+  filters (radius 10 -> 245 objects).
+- Template x/y + id still ADDRESS an object: `/object/at?x=1967&y=7040&plane=1&id=29239` answers
+  `found`, `clickable`, `onScreen`. Multi-tile objects appear once per tile in the bulk list.
+- Objects and actions: **Ornate Jewellery Box 29156** (impostor 37538) `Teleport Menu / Farming
+  Guild / Remove` -- the middle action is the LAST DESTINATION, so a plain left-click may teleport
+  there: always take `Teleport Menu` from the menu (the NPC Contact lesson again). **Fairy Ring
+  29228** `Zanaris / Configure / Last-destination / Favourites / Remove`. **Pool of Rejuvenation
+  29239** `Drink / Upgrade / Remove`. **Portal 4525** (exit) at template (1923,7052). Portal Nexus
+  33408 `Teleport / Teleport Menu / ...` also exists. House-location varbit 2187 = 3.
+- **Interface 590 IS in `/widgets/dump`'s root walk** (104 entries; unlike 75). Each destination is
+  a dynamic child of `590.2`..`590.7` (one container per jewellery type) whose **ACTION is the
+  destination's plain name** and whose text carries the keyboard shortcut: `1` Emir's Arena, `2`
+  Castle Wars, `3` Ferox Enclave, `4` Fortis Colosseum (**struck through `<str>` = locked**), `5`
+  Burthorpe, `6` Barbarian Outpost, `7` Corporeal Beast, `8` Tears of Guthix, `9` Wintertodt Camp,
+  `A` Warriors' Guild, `B` Champions' Guild, `C` Monastery, `D` Ranging Guild, `E` Fishing Guild,
+  `F` Mining Guild, `G` Crafting Guild, `H` Cooking Guild, `I` Woodcutting Guild, `J` Farming
+  Guild, `K` Miscellania, `L` Grand Exchange, `M` Falador Park, `N` Dondakan's Rock, `O`
+  Edgeville, `P` Karamja, `Q` Draynor Village, `R` Al Kharid. So a box leg = menu `Teleport Menu`
+  -> find the entry whose action equals the destination and whose text has no `<str>` -> press
+  its KEY (or click it) -> `await_arrival`. No slot numbers.
+
+**Open facts to measure at the start of the phase (the "detail the phase" step) -- (1), (2) and
+(3) are now ANSWERED above; (4) is answered too: the ring is 5 instance tiles from the box, so
+"click from afar" is simply an ordinary nearby click:** (1) are `/objects` coordinates inside the POH stable template coordinates or instance coordinates — read `/player` + `/objects?fresh=true` inside the house and compare with the recording; (2) is interface 590 in `/widgets/dump`'s root walk or, like 75, only addressable by id — probe both with the box open; (3) the pool's object (one `recorder.py house-pool` recording); (4) `hop_fairy_ring` sees a ring only within `radius=20` and the POH ring is 41 tiles from the landing — either walk first (is the POH on the collision map? almost certainly NOT: it is an instance) or click from afar the way the human did, which needs the ring in `/objects` at radius ≥ 45 and on screen.
 
 **Tasks (expanded to Phase-A granularity in this file once the four facts above are measured):**
 - **B0 Detail the phase.** Measure (1)–(4) read-only against the live client with the user standing in the house; rewrite B1–B5 with code.
