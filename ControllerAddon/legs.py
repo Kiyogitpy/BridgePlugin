@@ -29,6 +29,7 @@ import time
 import controller
 import crossfloor
 import debug_log
+import poh
 import travel
 
 ITEM_BUDGET_S = 6.0      # a teleport is ~4 ticks of animation plus a region load; falconry measured 2.4-3.2s
@@ -84,6 +85,33 @@ def walk(x: int, y: int, plane: int) -> dict:
     "Exact tile" overstates it -- walk_to uses its own default arrival tolerance (3 tiles),
     not this leg's own dest, so landing can be a few tiles short of (x, y)."""
     return _base("walk", f"walk to {x},{y},{plane}", (x, y, plane))
+
+
+def house() -> dict:
+    """Break a house tablet (poh.enter) -- a no-op if already inside."""
+    return _base("poh_enter", "house tablet", None)
+
+
+def pool() -> dict:
+    """Drink from the house pool (poh.drink_pool) -- never fails the chain on its own."""
+    return _base("poh_pool", "house pool", None)
+
+
+def house_box(destination: str, dest) -> dict:
+    """Leave through the ornate jewellery box's Teleport Menu to `destination` (poh.use_box),
+    landing confirmed against `dest` (BOX_LANDINGS' tile for that destination)."""
+    leg = _base("poh_box", f"jewellery box: {destination}", dest)
+    leg["option"] = destination
+    return leg
+
+
+def house_ring(code: str, expect: str, dest=None) -> dict:
+    """Leave through the house's own fairy ring (poh.use_ring), same dial/confirm mechanic as
+    an ordinary `fairy` leg."""
+    leg = _base("poh_ring", f"house fairy ring {code}", dest)
+    leg["code"] = code
+    leg["expect"] = expect
+    return leg
 
 
 def from_transport(t) -> dict:
@@ -142,6 +170,25 @@ def run_next(ctx, leg_list, cursor: int, log: str = "travel"):
         dest = leg.get("dest") or []
         ok = len(dest) == 3 and walk_across(ctx, tuple(dest), log=log)
         return (DONE, cursor + 1) if ok else (FAILED, cursor)
+    if kind == "poh_enter":
+        return (DONE, cursor + 1) if poh.enter(ctx, log) else (FAILED, cursor)
+    if kind == "poh_pool":
+        return (DONE, cursor + 1) if poh.drink_pool(ctx, log) else (FAILED, cursor)
+    if kind == "poh_box":
+        if not poh.use_box(ctx, leg.get("option"), log):
+            return FAILED, cursor
+        dest = leg.get("dest") or []
+        if len(dest) != 3 or not await_arrival(dest):
+            return FAILED, cursor
+        return DONE, cursor + 1
+    if kind == "poh_ring":
+        ok = poh.use_ring(ctx, leg.get("code"), leg.get("expect"), log=log)
+        if not ok:
+            return PROGRESS, cursor
+        dest = leg.get("dest") or []
+        if len(dest) == 3 and not await_arrival(dest, FAIRY_BUDGET_S):
+            return FAILED, cursor
+        return DONE, cursor + 1
     ok = run_leg(ctx, leg, log=log)
     return (DONE, cursor + 1) if ok else (FAILED, cursor)
 

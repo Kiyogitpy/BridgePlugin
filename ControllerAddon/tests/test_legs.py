@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import controller
 import crossfloor
 import legs
+import poh
 import travel
 
 
@@ -34,6 +35,91 @@ def test_builders_produce_the_flat_dict_shape_banker_already_stores():
     assert legs.walk(3429, 3564, 0)["dest"] == [3429, 3564, 0]
     f = legs.fairy("cks", "Slayer Tower")
     assert f["kind"] == "fairy" and f["code"] == "cks" and f["expect"] == "Slayer Tower"
+
+
+def test_house_builders_produce_the_flat_dict_shape():
+    assert legs.house() == {
+        "kind": "poh_enter", "display": "house tablet", "dest": None,
+        "item": None, "option": None, "origin": None, "object_id": None, "object_info": ""}
+    assert legs.pool() == {
+        "kind": "poh_pool", "display": "house pool", "dest": None,
+        "item": None, "option": None, "origin": None, "object_id": None, "object_info": ""}
+    box = legs.house_box("Cooking Guild", (3143, 3442, 0))
+    assert box["kind"] == "poh_box" and box["display"] == "jewellery box: Cooking Guild"
+    assert box["option"] == "Cooking Guild" and box["dest"] == [3143, 3442, 0]
+    ring = legs.house_ring("AJQ", "Dorgesh", dest=(2735, 5221, 0))
+    assert ring["kind"] == "poh_ring" and ring["display"] == "house fairy ring AJQ"
+    assert ring["code"] == "AJQ" and ring["expect"] == "Dorgesh" and ring["dest"] == [2735, 5221, 0]
+    assert legs.house_ring("AJQ", "Dorgesh")["dest"] is None
+
+
+def test_a_poh_enter_leg_delegates_to_poh_enter(monkeypatch):
+    seen = []
+    monkeypatch.setattr(poh, "enter", lambda ctx, log: seen.append(log) or True)
+    assert legs.run_next(_Ctx(), [legs.house()], 0) == (legs.DONE, 1)
+    assert seen == ["travel"]
+    monkeypatch.setattr(poh, "enter", lambda ctx, log: False)
+    assert legs.run_next(_Ctx(), [legs.house()], 0) == (legs.FAILED, 0)
+
+
+def test_a_poh_pool_leg_delegates_to_poh_drink_pool_and_never_fails_when_it_returns_true(monkeypatch):
+    seen = []
+    monkeypatch.setattr(poh, "drink_pool", lambda ctx, log: seen.append(log) or True)
+    assert legs.run_next(_Ctx(), [legs.pool()], 0) == (legs.DONE, 1)
+    assert seen == ["travel"]
+    monkeypatch.setattr(poh, "drink_pool", lambda ctx, log: False)
+    assert legs.run_next(_Ctx(), [legs.pool()], 0) == (legs.FAILED, 0)
+
+
+def test_a_poh_box_leg_confirms_arrival_after_use_box_succeeds(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(poh, "use_box", lambda ctx, option, log: seen.setdefault("option", option) or True)
+    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=legs.ITEM_BUDGET_S: seen.setdefault("dest", dest) or True)
+    leg = legs.house_box("Cooking Guild", (3143, 3442, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.DONE, 1)
+    assert seen == {"option": "Cooking Guild", "dest": [3143, 3442, 0]}
+
+
+def test_a_poh_box_leg_fails_when_use_box_fails(monkeypatch):
+    monkeypatch.setattr(poh, "use_box", lambda ctx, option, log: False)
+    leg = legs.house_box("Cooking Guild", (3143, 3442, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
+
+
+def test_a_poh_box_leg_fails_when_the_landing_never_confirms(monkeypatch):
+    monkeypatch.setattr(poh, "use_box", lambda ctx, option, log: True)
+    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=legs.ITEM_BUDGET_S: False)
+    leg = legs.house_box("Cooking Guild", (3143, 3442, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
+
+
+def test_a_poh_ring_leg_reports_progress_while_the_hop_is_underway(monkeypatch):
+    answers = iter([False, False, True])
+    seen = []
+    monkeypatch.setattr(poh, "use_ring", lambda ctx, code, expect, log: seen.append((code, expect)) or next(answers))
+    leg = legs.house_ring("AJQ", "Dorgesh")
+    ctx = _Ctx()
+    assert legs.run_next(ctx, [leg], 0) == (legs.PROGRESS, 0)
+    assert legs.run_next(ctx, [leg], 0) == (legs.PROGRESS, 0)
+    assert legs.run_next(ctx, [leg], 0) == (legs.DONE, 1)
+    assert seen == [("AJQ", "Dorgesh")] * 3
+
+
+def test_a_poh_ring_leg_with_a_dest_confirms_the_landing(monkeypatch):
+    monkeypatch.setattr(poh, "use_ring", lambda ctx, code, expect, log: True)
+    seen = []
+    monkeypatch.setattr(legs, "await_arrival",
+                        lambda dest, budget_s=legs.ITEM_BUDGET_S: seen.append((dest, budget_s)) or True)
+    leg = legs.house_ring("AJQ", "Dorgesh", dest=(2735, 5221, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.DONE, 1)
+    assert seen == [([2735, 5221, 0], legs.FAIRY_BUDGET_S)]
+
+
+def test_a_poh_ring_leg_with_a_dest_fails_when_the_landing_never_confirms(monkeypatch):
+    monkeypatch.setattr(poh, "use_ring", lambda ctx, code, expect, log: True)
+    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=legs.ITEM_BUDGET_S: False)
+    leg = legs.house_ring("AJQ", "Dorgesh", dest=(2735, 5221, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
 
 
 def test_run_next_advances_only_on_done_and_reports_finished_past_the_end(monkeypatch):
