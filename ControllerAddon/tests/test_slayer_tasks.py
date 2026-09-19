@@ -63,6 +63,20 @@ def test_target_names_are_what_combat_core_matches_by_substring():
     assert st.target_names(None) == []
 
 
+def test_every_fight_task_has_a_name_combat_core_can_actually_match():
+    """Task-1 review: 'Zombies' fell back to ['zombies'], combat_core's singular of that is
+    'zomby', and the monsters at the site are 'Undead cow' / 'Undead chicken' -- nothing would
+    ever have matched. Run the real matcher's name expansion over a real NPC name per task."""
+    import combat_core
+    samples = {"Zombies": "Undead cow", "Birds": "Undead chicken", "Cows": "Undead cow", "Bears": "Grizzly bear",
+               "Aberrant spectres": "Aberrant spectre", "Elves": "Elf warrior", "Trolls": "Mountain troll",
+               "Mutated zygomites": "Zygomite", "Wolves": "White wolf", "Dwarves": "Dwarf", "Suqahs": "Suqah",
+               "Lizards": "Desert Lizard", "Crawling hands": "Crawling Hand", "Fire giants": "Fire giant"}
+    for task, npc in samples.items():
+        _, names = combat_core.resolve_targets({"targetNames": st.target_names(task), "targets": []})
+        assert any(n in npc.lower() for n in names if n), f"{task}: nothing in {sorted(names)} matches {npc!r}"
+
+
 def test_at_site_is_known_only_for_aya_tasks():
     assert st.at_site("Banshees", {"x": 3440, "y": 3545, "plane": 0}) is True
     assert st.at_site("Banshees", {"x": 3200, "y": 3200, "plane": 0}) is False

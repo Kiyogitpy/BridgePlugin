@@ -33,6 +33,9 @@ KURADAL = {**{t: FIGHT for t in _KURADAL_FIGHT}, **{t: SKIP for t in _KURADAL_SK
 # a lowercased substring of the NPC name (and adds its own singular), so most tasks need nothing.
 _TARGETS = {
     "birds": ["chicken", "rooster", "seagull", "duck", "penguin", "terrorbird"],
+    # Aya's Zombies are killed at Alice's Farm, where they are UNDEAD COWS AND CHICKENS (ids 2992,
+    # 2993 in the Turael Skipping data) -- and combat_core's singular of "zombies" is "zomby".
+    "zombies": ["zombie", "undead cow", "undead chicken"],
     "dwarves": ["dwarf"],
     "wolves": ["wolf"],
     "elves": ["elf"],
