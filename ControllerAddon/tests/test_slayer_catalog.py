@@ -290,3 +290,30 @@ def test_wolves_are_reached_by_the_gnome_glider_from_the_grand_tree():
     assert legs_[2]["dest"] == [2850, 3498, 0]
     none, why = slayer_routes.plan("Wolves", lumbridge, {})
     assert none is None and "slayer ring" in why.lower()
+
+
+def test_dwarves_route_through_the_house_once_fishing_contest_is_proven_by_its_varplayer():
+    """The tunnel stairs are gated on VARPLAYER 11 == 5, not on a quest name -- which is why an
+    earlier check that 'proved the quest' by name still found no route. legs.requirement_values
+    reads varplayers, so at run time the gate is provable; unread, the hop is refused."""
+    mine, tablets = {"x": 3000, "y": 9800, "plane": 0}, {"teleport to house": 3}
+    none, why = slayer_routes.plan("Dwarves", mine, tablets)
+    assert none is None and "no walking route" in why
+    legs_, why = slayer_routes.plan("Dwarves", mine, tablets, proven={"varplayer_values": {11: 5}})
+    assert why == "" and [l["kind"] for l in legs_] == ["poh_enter", "poh_pool", "poh_box", "walk"]
+    assert legs_[2]["option"] == "Burthorpe"
+    tab, why = slayer_routes.plan("Dwarves", mine, {"taverley teleport": 2}, proven={"varplayer_values": {11: 5}})
+    assert why == "" and tab[0]["kind"] == "item" and tab[0]["dest"] == [2893, 3465, 0]
+
+
+def test_zanaris_is_the_house_fairy_rings_own_menu_action():
+    """'Fairy ring: Zanaris' is not a three-letter code: it is the ring's ZANARIS ACTION. MEASURED
+    LIVE 2026-09-20 on the house ring (29228): 'Zanaris / Configure / Last-destination /
+    Favourites / Remove'. So it is the same leg as the mounted pendant -- a named house object
+    plus a menu action -- and a real code still parses as a code."""
+    assert slayer_routes.parse("Fairy ring: Zanaris") == ("poh_mounted", "fairy ring")
+    assert slayer_routes.parse("Fairy ring: BIQ") == ("fairy", "BIQ")
+    legs_, why = slayer_routes.plan("Mutated zygomites", {"x": 3000, "y": 9800, "plane": 0},
+                                    {"teleport to house": 3}, skill_levels={"Agility": 77})
+    assert why == "" and [l["kind"] for l in legs_] == ["poh_enter", "poh_pool", "poh_mounted", "walk"]
+    assert (legs_[2]["item"], legs_[2]["option"], legs_[2]["dest"]) == ("fairy ring", "Zanaris", [2412, 4434, 0])

@@ -3520,3 +3520,34 @@ Remaining checklist, in order:
 5. A task completing mid-fight goes straight to ACQUIRE: the last kill's loot is left, and the
    cast happens with aggressive monsters possibly still attacking.
 6. After a successful ACQUIRE the Magic tab is left open when the next phase is FIGHT.
+
+### 2026-09-20: a long offline day -- what exists now, and what a live session must check first
+
+Read `docs/slayer-handoff.md` and the ledger `docs/superpowers/ledgers/2026-09-19-slayer-travel-bank-loadout--progress.md`
+for the rulings; this is the short version for someone about to run it.
+
+- **Run the preflight first.** `python slayer_preflight.py` (live task), `--task "Cows"`, `--aya`,
+  `--all`. Read-only. It prints what the routine WOULD decide -- disposition, site, missing items,
+  the route or the reason there is none, the pack, the bank verdict -- and the route AFTER a bank
+  trip, because `plan()` works from what is CARRIED and phase A stops on a teleport that is
+  sitting in the bank. Live on the user's account 2026-09-20: Aya 24 of 24, Kuradal 20 of 22.
+- **Found live with it, still true until the user changes them:** the panel has NO food and NO
+  prayer potion chosen (`food.name` / `potions.prayerPotion` are null in `GET /config`); the bank
+  holds 4 `Prayer potion(4)` against the 8 a 150-kill prayer task asks for.
+- **`plan()` never spends a teleport toward a walk it cannot prove.** The walk from each
+  teleport's landing to the site is proven with `crossfloor` for THIS account (levels plus
+  `legs.requirement_values()`: varbits, varplayers, item ids, coins) before the route is offered.
+- **New legs, all UNRUN, each copied from something already proven live:** `dialogue_item` (the
+  slayer ring -- `golem_crafting._teleport_home`'s pattern), `spell` (Moonclan -- `npc_contact.cast`'s
+  pattern; widget 218:116), `glider` (Microbot's `handleGlider`; interface 138), `poh_mounted` (the
+  digsite pendant and the house ring's Zanaris action, found by NAME + the ACTION offered).
+- **First things to watch in a live run:** does the hover gate read the ring's left-click as one
+  of (destination, Teleport, Rub); does the ring's dialogue offer "Stronghold" / "Slayer Tower" /
+  "Fremennik" by those words; does `poh.find_named` see the mounted pendant (its name in
+  `/objects` is assumed to contain "Digsite Pendant"); does interface 138's child 7 read as
+  clickable once the glider map opens.
+- **Lessons this day paid for:** GREP THE REPO before calling a mechanic unmeasured (the ring and
+  Xeric's talisman were both already live in other routines); check a NO ROUTE's goal coordinate
+  against spawn data before blaming the search (two research coordinates were wrong); read an
+  upstream EVALUATOR, not just its parser; a requirement may be a VARPLAYER, not a quest name
+  (the White Wolf Tunnel stairs need varp 11 == 5).

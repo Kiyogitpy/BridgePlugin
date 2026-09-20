@@ -66,3 +66,14 @@ def test_contains_answers_am_i_at_the_site():
     assert not aya_tasks.contains(banshees, 3440, 3545, 1)
     assert not aya_tasks.contains(banshees, 3400, 3545, 0)
     assert aya_tasks.contains(aya_tasks.get("Lizards"), 3430, 3060, 0), "a site may be several rectangles"
+
+
+def test_dwarves_keep_the_plugins_teleports_and_gain_two_a_leg_can_run():
+    """The plugin lists a construction cape and a re-directed house tablet for the White Wolf
+    Tunnel pub; no leg runs either. APPENDED, never replacing (this is not a user override of the
+    site): the Taverley tablet (59 tiles, MEASURED with crossfloor) and the house box's Burthorpe
+    (137). The tunnel stairs need varplayer 11 == 5 (Fishing Contest) -- the account reads 5."""
+    dwarves = aya_tasks.get("dwarves")
+    assert dwarves.teleports[:2] == ("Construction cape: Taverley (Option 3)", "Re-direct house tab (Option 2)")
+    assert dwarves.teleports[2:] == ("Taverley teleport: Taverley", "Ornate Jewellery Box: Burthorpe")
+    assert dwarves.target == (2863, 9878, 0), "the site is untouched"

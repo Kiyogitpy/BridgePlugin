@@ -45,6 +45,16 @@ _OVERRIDES = {
     },
 }
 
+# Teleports APPENDED after the plugin's own -- NOT a user override of anything: the plugin's
+# order and the site are untouched, these only give the planner something a leg can run when the
+# plugin's picks have none. Each is proven by crossfloor from its landing before it is offered.
+_EXTRA_TELEPORTS = {
+    # White Wolf Tunnel pub. The plugin lists a construction cape and a re-directed house tablet.
+    # MEASURED 2026-09-20: 59 tiles from the Taverley tablet's landing, 137 from the house box's
+    # Burthorpe, both through 'Climb-down Stairs 57', gated on varplayer 11 == 5 (Fishing Contest).
+    "dwarves": ("Taverley teleport: Taverley", "Ornate Jewellery Box: Burthorpe"),
+}
+
 _cache = {}
 
 
@@ -63,6 +73,8 @@ def _build(raw):
         "note": "",
     }
     fields.update(_OVERRIDES.get(raw["key"], {}))
+    extra = tuple(t for t in _EXTRA_TELEPORTS.get(raw["key"], ()) if t not in fields["teleports"])
+    fields["teleports"] = tuple(fields["teleports"]) + extra
     return AyaTask(**fields)
 
 

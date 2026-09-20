@@ -97,6 +97,11 @@ SPELLS = {
 # or being in the house already. UNVERIFIED LIVE.
 MOUNTED = {
     "digsite pendant": ("digsite pendant", "Digsite", (3341, 3445, 0)),
+    # "Fairy ring: Zanaris" is not a code, it is the ring's own ZANARIS ACTION -- MEASURED LIVE
+    # 2026-09-20 on the house ring (29228): "Zanaris / Configure / Last-destination / Favourites /
+    # Remove". A named house object plus a menu action, exactly like the pendant. A three-letter
+    # code is caught earlier in parse() and never reaches this row.
+    "fairy ring": ("fairy ring", "Zanaris", (2412, 4434, 0)),
 }
 
 # Gnome gliders (legs.glider): destination -> (map widget, landing). Widgets are Microbot's packed
