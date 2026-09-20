@@ -1,4 +1,5 @@
 import pytest
+import requests
 
 import controller
 
@@ -45,3 +46,27 @@ def no_live_bridge(request, monkeypatch):
                         lambda x, y, plane, radius=2, inst=False: [], raising=False)
     monkeypatch.setattr(controller, "is_point_within_window",
                         lambda x, y: True, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_real_http(monkeypatch):
+    """The ROOT of what no_live_bridge above patches helper by helper: inside a test, a real HTTP
+    request behaves exactly like a bridge that is DOWN.
+
+    MEASURED 2026-09-20 with RuneLite running, by spying on requests for one full run: 88 tests
+    across 9 files made real GETs (/state 29, /equipment 14, /bank 9, /objects 8,
+    /api/player/movement 8, ...). They pass either way only because controller.api_get swallows
+    the error and answers None -- so each of them was reading the user's live screen, inventory
+    and bank whenever the client happened to be open. One finally failed on a clean HEAD:
+    test_travel's hop test, whose fake click point (50,50) landed on one of the user's REAL
+    minimap orbs from GET /state. That was the FOURTH bite of this bug (see no_live_bridge).
+
+    ConnectionError is what a closed client raises, so nothing changes for a run without a
+    client, and a run WITH one now sees the same world. A test that fakes HTTP replaces
+    controller._session / api_get itself, and that still wins (fixtures run before the body).
+    Files with a stricter _no_live_bridge (api_get raises AssertionError) keep it: refusing
+    loudly is better where every read is meant to be faked."""
+    def refuse(self, method, url, *args, **kwargs):
+        raise requests.ConnectionError(f"tests are hermetic: no real {method} {url}")
+    monkeypatch.setattr(requests.sessions.Session, "request", refuse)
+

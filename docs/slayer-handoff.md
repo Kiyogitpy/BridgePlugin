@@ -90,6 +90,10 @@ ledger. Lessons this project paid for, all recorded in the ledgers:
   lied behind a wrong-shaped fixture.
 - **Every new test file carries the `_no_live_bridge` autouse fixture** (it makes
   `controller.api_get` raise). Three tests were caught reading the user's live screen.
+  Since 2026-09-20 `tests/conftest.py` also makes EVERY real HTTP request raise
+  `ConnectionError` (a spy run found 88 tests in 9 files reading the live client), so the
+  suite sees the same world with RuneLite open or closed. Keep the per-file fixture anyway:
+  it fails LOUDLY on a forgotten fake, where the conftest one only answers "bridge down".
 - **The plan's own tests and snippets were wrong more often than the implementers.**
 - **Live runs overturn reasoning.** The NPC Contact spell's left-click re-contacts the LAST NPC
   (no picker opens); interface 75 is not in `/widgets/dump`'s root walk; inside the house
