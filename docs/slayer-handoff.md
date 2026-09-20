@@ -70,8 +70,10 @@ observations over a clean log.
 | **D2** loot tiers | `combat_core.maybe_loot`'s `makeRoom` hook -> `routines/slayer._make_room` | **built 2026-09-21, UNRUN**: with a FULL inventory, a drop under 50k is left; from 50k one food is eaten for it only when HP is missing; from 150k it is always taken -- eat, else finish a 1-dose prayer potion, else drop the least costly consumable. Never gear, a teleport, or what the task needs. **The hook absent = combat_core's behaviour is byte-for-byte what it was**, pinned by test |
 | The remaining ACTING halves: E0 gear decisions; E2-E6 hub live runs | — | NOT built -- these wait for the user or a live run |
 
-Tests: `python -m pytest tests/ -q` from `ControllerAddon/` → 3087 passed; the ONLY failures are 4
-known ones in `tests/test_mastering_mixology.py`. `test_crossfloor::test_an_impossible_trip_is_none_and_fast`
+Tests: `python -m pytest tests/ -q` from `ControllerAddon/` → **3359 passed, 0 failed** (2026-09-21).
+The four long-standing `test_mastering_mixology.py` failures are GONE: they were stale tests written
+before that routine's 'do nothing outside the lab' guard, not a bug. **The suite is green, so treat
+any failure as real.** `test_crossfloor::test_an_impossible_trip_is_none_and_fast`
 has an 8 s wall-clock bound and failed once under load.
 
 ## Before any live gate: run the preflight

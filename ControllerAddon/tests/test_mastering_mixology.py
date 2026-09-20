@@ -1379,6 +1379,12 @@ def test_on_event_ignores_unrelated_varbits():
 def test_tick_chains_phase_transitions_inside_one_call(monkeypatch):
     """deposit -> orders -> mix used to cost an engine-loop iteration (~1s) per arrow; a human
     reads the new orders and pulls the first lever the moment the belt takes the potions."""
+    # tick() does NOTHING outside the lab since a7fa94c (2026-09-18, after these tests were
+    # written): a live run pulled the Mox lever three times against an empty world while
+    # auto-login was still clicking the welcome screen away. get_mixology_state defaults to
+    # inLab False when the bridge is unavailable, so these four chained-phase tests stopped
+    # at that guard and saw no phases run at all. The GUARD is right; the tests were stale.
+    monkeypatch.setattr(controller, "get_mixology_state", lambda: {"inLab": True, "stations": {}})
     ctx = FakeCtx()
     ctx.state.config = dict(mm.DEFAULT_CONFIG)
     ctx.state.data["mm_level_checked"] = True
@@ -1403,6 +1409,12 @@ def test_tick_chains_phase_transitions_inside_one_call(monkeypatch):
 
 
 def test_tick_chain_is_bounded(monkeypatch):
+    # tick() does NOTHING outside the lab since a7fa94c (2026-09-18, after these tests were
+    # written): a live run pulled the Mox lever three times against an empty world while
+    # auto-login was still clicking the welcome screen away. get_mixology_state defaults to
+    # inLab False when the bridge is unavailable, so these four chained-phase tests stopped
+    # at that guard and saw no phases run at all. The GUARD is right; the tests were stale.
+    monkeypatch.setattr(controller, "get_mixology_state", lambda: {"inLab": True, "stations": {}})
     ctx = FakeCtx()
     ctx.state.config = dict(mm.DEFAULT_CONFIG)
     ctx.state.data["mm_level_checked"] = True
@@ -1424,6 +1436,12 @@ def test_tick_chain_is_bounded(monkeypatch):
 
 
 def test_tick_chain_stops_when_paused(monkeypatch):
+    # tick() does NOTHING outside the lab since a7fa94c (2026-09-18, after these tests were
+    # written): a live run pulled the Mox lever three times against an empty world while
+    # auto-login was still clicking the welcome screen away. get_mixology_state defaults to
+    # inLab False when the bridge is unavailable, so these four chained-phase tests stopped
+    # at that guard and saw no phases run at all. The GUARD is right; the tests were stale.
+    monkeypatch.setattr(controller, "get_mixology_state", lambda: {"inLab": True, "stations": {}})
     ctx = FakeCtx()
     ctx.state.config = dict(mm.DEFAULT_CONFIG)
     ctx.state.data["mm_level_checked"] = True
@@ -1596,6 +1614,12 @@ def test_missing_lever_still_fails_immediately(game):
 
 
 def test_tick_checks_digweed_before_every_chained_phase(monkeypatch):
+    # tick() does NOTHING outside the lab since a7fa94c (2026-09-18, after these tests were
+    # written): a live run pulled the Mox lever three times against an empty world while
+    # auto-login was still clicking the welcome screen away. get_mixology_state defaults to
+    # inLab False when the bridge is unavailable, so these four chained-phase tests stopped
+    # at that guard and saw no phases run at all. The GUARD is right; the tests were stale.
+    monkeypatch.setattr(controller, "get_mixology_state", lambda: {"inLab": True, "stations": {}})
     ctx = FakeCtx()
     ctx.state.config = dict(mm.DEFAULT_CONFIG)
     ctx.state.data["mm_level_checked"] = True

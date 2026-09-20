@@ -27,7 +27,7 @@ Phase A is specified to the line: tests, code, commands. **Phases B–E are spec
 - Do not change `travel.walk_to`, `travel.route_to`, `worldmap.py`. Additive keyword parameters on other shared functions are allowed when every existing caller's behaviour is unchanged and a test pins that.
 - Never hand-edit `ControllerAddon/vendor/`. Never edit `src/main/java/net/runelite/client/plugins/m8aq/api/`.
 - `controller.py` is loaded twice: no new module-level mutable state in it.
-- `py_compile` every touched file; `python -m pytest tests/<file> -q` from `ControllerAddon/`. Whole-suite baseline: exactly 4 failures in `tests/test_mastering_mixology.py`; three known-flaky tests (`test_travel.py::test_the_open_budget_is_capped...`, `test_human_move.py::test_two_flushes...`, one in `test_falconry.py`).
+- `py_compile` every touched file; `python -m pytest tests/<file> -q` from `ControllerAddon/`. Whole-suite baseline since 2026-09-21: **GREEN, 0 failures** (those 4 mixology tests were stale, not a bug -- see the ledger); three known-flaky tests (`test_travel.py::test_the_open_budget_is_capped...`, `test_human_move.py::test_two_flushes...`, one in `test_falconry.py`).
 - Another session commits unrelated files on this branch: stage by exact path, never `git add -A`.
 - A safety-stopped `controller.py` stays alive holding UDP 50555: kill it before a relaunch.
 - Commit after every task; messages end with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
