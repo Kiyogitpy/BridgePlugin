@@ -20,6 +20,7 @@ ControllerAddon/recordings/
 __pycache__/
 _vm_focus.ps1
 _vm_task.cmd
+bin/
 build
 client_run.log
 data/
