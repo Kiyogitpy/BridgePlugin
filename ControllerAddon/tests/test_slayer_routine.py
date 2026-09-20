@@ -415,3 +415,36 @@ def test_a_carried_rune_pouchs_runes_are_carried_and_a_banked_pouchs_are_not(mon
     monkeypatch.setattr(controller, "get_rune_pouch", lambda: dict(pouch, carried=True))
     carried = routine._carried()
     assert carried["cosmic rune"] == 8949 and carried["law rune"] == 1
+
+
+# --- 2026-09-21, self-review: the FIGHT phase predates Kuradal's catalog -------------------------
+
+def test_a_kuradal_task_with_nothing_to_fight_walks_back_to_its_own_site(monkeypatch):
+    """_fight looked the site up in aya_tasks ONLY, so for a Kuradal task it stopped with 'its
+    site is not in the catalog' -- untrue since slayer_catalog arrived. It now reads the same
+    site record at_site and plan() read, and walks to the WALK GOAL."""
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Nechryael", count=150))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3412, "y": 9962, "plane": 3})
+    monkeypatch.setattr(controller, "check_stray_dialog", lambda ctx: None)
+    monkeypatch.setattr(combat_core, "fight_tick", lambda ctx: None)
+    walks = []
+    monkeypatch.setattr(legs, "walk_across", lambda ctx, goal, log="travel": walks.append(tuple(goal)) or True)
+    ctx = _Ctx()
+    for _ in range(routine.NO_TARGET_TICKS + 1):
+        routine.tick(ctx)
+    assert walks == [(3412, 9962, 3)]
+    assert ctx.state.stops == []
+
+
+def test_a_kuradal_task_loots_by_the_panels_value_not_ayas_whitelist_only_rule(monkeypatch):
+    """'Aya's monsters drop nothing worth a click' was applied to EVERY task. Gargoyles and
+    nechryael drop plenty: a Kuradal task keeps the panel's minValue."""
+    seen = []
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Nechryael", count=150))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3412, "y": 9962, "plane": 3})
+    monkeypatch.setattr(controller, "check_stray_dialog", lambda ctx: None)
+    monkeypatch.setattr(combat_core, "fight_tick", lambda ctx: seen.append(dict(ctx.state.config["loot"])))
+    ctx = _Ctx()
+    ctx.state.config["loot"] = {"minValue": 5000, "items": ["Rune boots"]}
+    routine.tick(ctx)
+    assert seen[0] == {"minValue": 5000, "items": ["Rune boots"]}

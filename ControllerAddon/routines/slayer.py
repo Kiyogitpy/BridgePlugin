@@ -23,6 +23,7 @@ import debug_log
 import gear
 import legs
 import npc_contact
+import slayer_catalog
 import slayer_routes
 import slayer_state
 import slayer_tasks
@@ -239,7 +240,10 @@ def _fight(ctx, state) -> None:
     # Aya's monsters drop nothing worth a click and travel dominates a 20-kill task (spec §7.10):
     # only the panel's named whitelist ("items") is looted. maybe_loot reads "minValue" and treats
     # 0 as "no value looting" (phase-A review: the first draft wrote a key nobody reads).
-    cfg["loot"] = {**(cfg.get("loot") or {}), "minValue": 0}
+    # ONLY for a task that is not in Kuradal's catalog (self-review 2026-09-21: this was applied to
+    # every task, and gargoyles and nechryael drop plenty) -- hers keep the panel's value.
+    if slayer_catalog.get(state.task) is None:
+        cfg["loot"] = {**(cfg.get("loot") or {}), "minValue": 0}
     ctx.state.config = cfg
     try:
         combat_core.fight_tick(ctx)
@@ -256,13 +260,17 @@ def _fight(ctx, state) -> None:
     data["slayer_no_target"] = 0
     walks = data.get("slayer_no_target_walks", 0) + 1
     data["slayer_no_target_walks"] = walks
-    site = aya_tasks.get(state.task)
+    # The SAME site record at_site and plan() read: Aya's registry, then Kuradal's catalog (self-
+    # review 2026-09-21: this read aya_tasks only and stopped every Kuradal task as 'not in the
+    # catalog'). The walk goes to the WALK GOAL -- the kill area when the target lies outside it.
+    site = aya_tasks.get(state.task) or slayer_catalog.get(state.task)
     if site is None or not site.target:
         ctx.state.trigger_safety_stop(f"Slayer: nothing to fight for {state.task} and its site is "
                                       f"not in the catalog -- cannot walk back to it")
         return
-    debug_log.log(LOG, f"no target for {NO_TARGET_TICKS} ticks -- walking back to the site tile {site.target}")
-    legs.walk_across(ctx, site.target, log=LOG)
+    goal = slayer_routes.walk_goal(site)
+    debug_log.log(LOG, f"no target for {NO_TARGET_TICKS} ticks -- walking back to the site tile {goal}")
+    legs.walk_across(ctx, goal, log=LOG)
     if walks >= NO_TARGET_WALKS:
         ctx.state.trigger_safety_stop(f"Slayer: nothing to fight for {state.task} after "
                                       f"{NO_TARGET_WALKS} walks back to the site")
