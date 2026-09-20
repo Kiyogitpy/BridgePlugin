@@ -19,40 +19,22 @@ sys.path.insert(0, os.path.join(REPO, "ControllerAddon"))
 
 import crossfloor  # noqa: E402
 
-RING_STRONGHOLD = (2431, 3422, 0)
+import slayer_catalog  # noqa: E402
+
 RING_TOWER = (3421, 3537, 0)
 RING_FREMENNIK = (2802, 9999, 0)
 XERICS_HEART = (1644, 3673, 0)
 
 # (task, landing name, landing tile, site tile)
-SITES = [
-    ("Aberrant spectres", "slayer ring: Stronghold Slayer Cave", RING_STRONGHOLD, (2440, 9790, 0)),
-    ("Ankou", "slayer ring: Stronghold Slayer Cave", RING_STRONGHOLD, (2470, 9805, 0)),
-    ("Bloodveld", "slayer ring: Stronghold Slayer Cave", RING_STRONGHOLD, (2450, 9820, 0)),
-    ("Fire giants", "slayer ring: Stronghold Slayer Cave", RING_STRONGHOLD, (2400, 9780, 0)),
-    ("Hellhounds", "slayer ring: Stronghold Slayer Cave", RING_STRONGHOLD, (2420, 9785, 0)),
-    ("Abyssal demons (basement)", "slayer ring: Slayer Tower", RING_TOWER, (3420, 9965, 3)),
-    ("Gargoyles (basement)", "slayer ring: Slayer Tower", RING_TOWER, (3434, 9938, 3)),
-    ("Nechryael (basement)", "slayer ring: Slayer Tower", RING_TOWER, (3412, 9962, 3)),
+# Kuradal's 22 come from slayer_catalog -- ONE source of truth, so a corrected target (black
+# demons, abyssal demons) cannot leave this report aiming at the old tile. Aya's sites below are
+# the handful worth a human look; the full Aya registry is vendor/turael_skipping_tasks.json.
+SITES = [(spec.name, spec.teleports[0], spec.landing, spec.target)
+         for spec in slayer_catalog.CATALOG.values()] + [
     ("Banshees (Aya)", "slayer ring: Slayer Tower", RING_TOWER, (3442, 3542, 0)),
     ("Crawling hands (Aya)", "slayer ring: Slayer Tower", RING_TOWER, (3419, 3571, 0)),
-    ("Basilisks", "slayer ring: Fremennik Slayer Dungeon", RING_FREMENNIK, (2738, 10008, 0)),
-    ("Kurask", "slayer ring: Fremennik Slayer Dungeon", RING_FREMENNIK, (2705, 9980, 0)),
     ("Cave crawlers (Aya)", "slayer ring: Fremennik Slayer Dungeon", RING_FREMENNIK, (2795, 9997, 0)),
-    ("Dagannoth", "Xeric's talisman: Xeric's Heart", XERICS_HEART, (1665, 9995, 0)),
-    ("Dust devils", "Xeric's talisman: Xeric's Heart", XERICS_HEART, (1710, 10020, 0)),
     ("Ghosts (Aya)", "Xeric's talisman: Xeric's Heart", XERICS_HEART, (1693, 10063, 0)),
-    # Centre of the spawn cluster 2826-2875 x 9763-9801 (kuradal-1a.md, cross-checked against the
-    # osrs-wiki spawn table 2026-09-20). The first draft had (2860, 9835): ~50 tiles NORTH of every
-    # demon, which alone pushed the pipe route past the search budget.
-    ("Black demons", "Taverley teleport", (2893, 3465, 0), (2852, 9784, 0)),
-    ("Trolls", "games necklace: Burthorpe", (2899, 3553, 0), (2864, 3590, 0)),
-    ("Waterfiends", "games necklace: Barbarian Outpost", (2520, 3571, 0), (1750, 5350, 0)),
-    ("Kalphite", "desert amulet 4: Kalphite cave", (3322, 3122, 0), (3309, 9526, 0)),
-    ("Wyrms", "Rada's blessing: Mount Karuulm", (1311, 3806, 0), (1265, 10170, 0)),
-    ("Suqahs (south-west)", "Moonclan teleport", (2113, 3915, 0), (2085, 3868, 0)),
-    ("Mutated zygomites", "fairy ring: Zanaris", (2412, 4434, 0), (2416, 4373, 0)),
-    ("Gryphons (eastern cave)", "fairy ring: CJQ", (3178, 2447, 0), (3225, 8860, 0)),
     ("Zombies / Birds / Cows (Aya)", "Ectophial", (3660, 3522, 0), (3630, 3530, 0)),
     ("Minotaurs (Aya)", "skills necklace: Cooking Guild", (3143, 3442, 0), (1875, 5218, 0)),
     ("Scorpions (Aya)", "skills necklace: Mining Guild", (3049, 9763, 0), (3049, 9771, 0)),

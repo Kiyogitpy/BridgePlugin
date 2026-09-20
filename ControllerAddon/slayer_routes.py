@@ -25,6 +25,7 @@
 import re
 
 import aya_tasks
+import slayer_catalog
 import crossfloor
 import legs
 import poh
@@ -45,6 +46,14 @@ FAIRY_EXPECT = {
 # Carried items phase A knows how to use: registry text prefix -> (item name, menu option, landing).
 ITEMS = {
     "ectophial": ("ectophial", "Empty", (3660, 3522, 0)),
+    # Added 2026-09-20 with the Kuradal catalog: inventory items whose teleport is a DIRECT menu
+    # option, the mechanism the Ectophial already proves. Options and landings are UNVERIFIED LIVE
+    # (landings from the vendored teleportation_items.tsv); a wrong option is a withheld left-click,
+    # then a menu miss, then a clean stop -- never a wrong teleport.
+    "taverley teleport": ("taverley teleport", "Break", (2893, 3465, 0)),
+    "teleport crystal": ("teleport crystal", "Lletya", (2330, 3171, 0)),
+    "rada's blessing": ("rada's blessing", "Mount Karuulm", (1311, 3806, 0)),
+    "mos le'harmless teleport": ("mos le'harmless teleport", "Teleport", (3701, 2996, 0)),
 }
 
 # Ornate jewellery box destination -> landing tile. UNVERIFIED coordinates -- the 12-tile
@@ -119,7 +128,7 @@ def plan(task_name, player, carried, skill_levels=None):
     if x is None or y is None:
         return None, "the player's position is unknown"
     here = (x, y, player.get("plane", 0))
-    task = aya_tasks.get(task_name)
+    task = aya_tasks.get(task_name) or slayer_catalog.get(task_name)
     if task is None or not task.target:
         return None, f"{task_name} has no site in the catalog yet"
     site = legs.walk(*task.target)

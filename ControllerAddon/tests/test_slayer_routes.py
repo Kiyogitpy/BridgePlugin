@@ -128,8 +128,12 @@ def test_every_unusable_teleport_is_named_in_the_reason():
 
 
 def test_a_task_with_no_site_has_no_plan():
-    route, why = sr.plan("Nechryael", {"x": 3200, "y": 3200, "plane": 0}, carried={})
+    # A SKIP task has no site anywhere. (Nechryael stood here until Kuradal's catalog arrived.)
+    route, why = sr.plan("Dark beasts", {"x": 3200, "y": 3200, "plane": 0}, carried={})
     assert route is None and "catalog" in why
+    # ...and a task WITH a site whose teleport no leg can run yet stops naming that teleport.
+    route, why = sr.plan("Nechryael", {"x": 3200, "y": 3200, "plane": 0}, carried={})
+    assert route is None and "Slayer ring: Slayer Tower" in why
     assert sr.plan("Cave slimes", {}, carried={}) == (None, "the player's position is unknown")
 
 

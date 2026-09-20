@@ -85,17 +85,22 @@ def test_every_fight_task_has_a_name_combat_core_can_actually_match():
         assert any(n in npc.lower() for n in names if n), f"{task}: nothing in {sorted(names)} matches {npc!r}"
 
 
-def test_at_site_is_known_only_for_aya_tasks():
+def test_at_site_is_known_for_every_task_with_a_site():
     assert st.at_site("Banshees", {"x": 3440, "y": 3545, "plane": 0}) is True
     assert st.at_site("Banshees", {"x": 3200, "y": 3200, "plane": 0}) is False
-    assert st.at_site("Nechryael", {"x": 3440, "y": 3570, "plane": 2}) is None, "Kuradal sites are sub-project 3"
+    # Kuradal's sites arrived with slayer_catalog (2026-09-20): a known site answers True/False,
+    # and only a task with NO site anywhere (a SKIP task) is still None.
+    assert st.at_site("Nechryael", {"x": 3440, "y": 3570, "plane": 2}) is False
+    assert st.at_site("Nechryael", {"x": 3412, "y": 9962, "plane": 3}) is True
+    assert st.at_site("Dark beasts", {"x": 3440, "y": 3570, "plane": 2}) is None
     assert st.at_site("Banshees", {}) is False
 
 
 def test_where_names_the_place_and_the_first_teleport():
     text = st.where("Bears")
     assert "Legends" in text and "BLR" in text
-    assert st.where("Nechryael") == ""
+    assert "Slayer Tower basement" in st.where("Nechryael") and "Slayer ring" in st.where("Nechryael")
+    assert st.where("Dark beasts") == "", "a SKIP task has no site"
 
 
 def test_required_items_come_from_the_plugins_own_gear_notes():

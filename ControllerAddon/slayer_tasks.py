@@ -10,6 +10,7 @@
 from collections import namedtuple
 
 import aya_tasks
+import slayer_catalog
 
 FIGHT, SKIP, STOP = "FIGHT", "SKIP", "STOP"
 
@@ -81,12 +82,19 @@ def target_names(task_name) -> list:
     return list(_TARGETS.get(key, [key]))
 
 
+def _site(task_name):
+    """The task's site record: Aya's registry first (unchanged), then Kuradal's catalog. Both
+    carry target / areas / teleports / location, so every caller reads one shape."""
+    key = _key(task_name)
+    return aya_tasks.get(key) or slayer_catalog.get(key)
+
+
 def at_site(task_name, player, margin: int = 0):
     """True/False for a task whose site we know (Aya's, today); None when we know no site.
     `margin` widens every kill rectangle by that many tiles: the plugin's rectangles are tight
     (cave slimes: 14x8 with the target 2 tiles from an edge) and a fight chases monsters out of
     them, which must not read as "no longer at the site" (phase-A review)."""
-    aya = aya_tasks.get(_key(task_name))
+    aya = _site(task_name)
     if aya is None or not aya.areas:
         return None
     x, y = (player or {}).get("x"), (player or {}).get("y")
@@ -98,7 +106,7 @@ def at_site(task_name, player, margin: int = 0):
 
 
 def where(task_name) -> str:
-    aya = aya_tasks.get(_key(task_name))
+    aya = _site(task_name)
     if aya is None or not aya.location:
         return ""
     via = f" (via {aya.teleports[0]})" if aya.teleports else ""
