@@ -135,9 +135,22 @@ def test_plan_uses_a_carried_tablet_for_a_kuradal_task():
     assert legs_[0]["dest"] == [2893, 3465, 0]
 
 
-def test_plan_names_what_it_cannot_do_yet_for_a_slayer_ring_task():
-    """12 of the 22 start with a slayer ring, whose Rub -> Teleport -> destination dialogue has
-    never been measured. Until a hub's live run, the routine must STOP naming it, not guess."""
+def test_plan_uses_a_carried_slayer_ring_through_its_destination_dialogue():
+    """12 of the 22 start with a slayer ring. Its paged destination menu was PROVEN LIVE in
+    golem_crafting (2026-09-14), so the leg reuses that pattern instead of waiting for a recording."""
     legs_, why = slayer_routes.plan("Hellhounds", {"x": 3200, "y": 3200, "plane": 0},
-                                    {"Slayer ring (8)": 1})
-    assert legs_ is None and "Slayer ring" in why
+                                    {"slayer ring (8)": 1})
+    assert why == "" and [l["kind"] for l in legs_] == ["dialogue_item", "walk"]
+    assert legs_[0]["option"] == "stronghold" and legs_[0]["dest"] == [2431, 3422, 0]
+    tower, _ = slayer_routes.plan("Nechryael", {"x": 3200, "y": 3200, "plane": 0}, {"slayer ring (2)": 1})
+    assert tower[0]["option"] == "slayer tower" and tower[1]["dest"] == [3412, 9962, 3]
+    none, why = slayer_routes.plan("Hellhounds", {"x": 3200, "y": 3200, "plane": 0}, {})
+    assert none is None and "not carried" in why
+
+
+def test_plan_names_what_it_cannot_do_yet():
+    """Xeric's talisman opens its own INTERFACE, not a chat menu, and has never been measured:
+    the routine must STOP naming it, not guess."""
+    legs_, why = slayer_routes.plan("Dagannoth", {"x": 3200, "y": 3200, "plane": 0},
+                                    {"xeric's talisman": 1})
+    assert legs_ is None and "Xeric's talisman" in why

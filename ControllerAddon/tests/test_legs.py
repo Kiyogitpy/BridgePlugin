@@ -588,3 +588,66 @@ def test_walk_across_hands_the_requirement_values_to_the_search(monkeypatch):
     assert legs.walk_across(None, (3200, 9200, 0)) is False
     assert seen["varbit_values"] == {3759: 3} and seen["owned_item_ids"] == {1590}
     assert seen["currency_held"] == {"Coins": 10} and seen["skill_levels"] == {"Agility": 50}
+
+
+# --- 2026-09-20: an item whose destination is chosen in a chat menu (the slayer ring) ----------
+#
+# The pattern is golem_crafting._teleport_home's, PROVEN LIVE there (2026-09-06 / 09-14): a
+# verified left-click, else the item's own menu, then the PAGED destination dialogue picked by
+# text. Cache obj 11866: iop2=Rub iop3=Teleport, sub-options Stronghold / Slayer Tower /
+# Fremennik Dungeon / Tarn's Lair / Dark Beasts / Wyrmscraig Cavern.
+
+RING = {"name": "Slayer ring (6)", "id": 11868, "slot": 3, "qty": 1, "screenX": 10, "screenY": 10}
+
+
+def _ring_world(monkeypatch, left_click, menu=None, choose=True, arrived=True):
+    calls = {"click": [], "menu": [], "choose": []}
+    monkeypatch.setattr(controller, "get_inventory", lambda: [RING])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: None)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: calls["click"].append(kw.get("expected_action")) or left_click)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, e, action, **kw: calls["menu"].append(action) or (menu or {}).get(str(action), False))
+    monkeypatch.setattr(legs.dialogue, "choose",
+                        lambda ctx, needle, budget_s=None, log="dialogue": calls["choose"].append(needle) or choose)
+    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=legs.ITEM_BUDGET_S: arrived)
+    monkeypatch.setattr(legs, "_standing_near", lambda dest: False)
+    return calls
+
+
+def test_a_dialogue_item_leg_left_clicks_then_picks_the_destination_by_text(monkeypatch):
+    calls = _ring_world(monkeypatch, left_click=True)
+    leg = legs.dialogue_item("slayer ring", "Stronghold", "stronghold", (2431, 3422, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.DONE, 1)
+    assert calls["click"] == [("Stronghold", "Teleport", "Rub")], "the hover gate accepts any of the three"
+    assert calls["choose"] == ["stronghold"] and calls["menu"] == []
+
+
+def test_a_left_click_that_teleports_directly_skips_the_dialogue(monkeypatch):
+    calls = _ring_world(monkeypatch, left_click=True)
+    monkeypatch.setattr(legs, "_standing_near", lambda dest: True)
+    leg = legs.dialogue_item("slayer ring", "Stronghold", "stronghold", (2431, 3422, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.DONE, 1)
+    assert calls["choose"] == []
+
+
+def test_a_withheld_left_click_falls_back_to_the_items_own_menu(monkeypatch):
+    calls = _ring_world(monkeypatch, left_click=False, menu={"('Teleport', 'Rub')": True})
+    leg = legs.dialogue_item("slayer ring", "Slayer Tower", "slayer tower", (3421, 3537, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.DONE, 1)
+    assert calls["menu"] == ["Slayer Tower", ("Teleport", "Rub")], "the direct sub-option first, then the menu"
+    assert calls["choose"] == ["slayer tower"]
+
+
+def test_a_dialogue_that_never_offers_the_destination_fails_the_leg(monkeypatch):
+    _ring_world(monkeypatch, left_click=False, menu={"('Teleport', 'Rub')": True}, choose=False)
+    leg = legs.dialogue_item("slayer ring", "Slayer Tower", "slayer tower", (3421, 3537, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
+
+
+def test_a_dialogue_item_leg_without_the_item_or_without_a_landing_fails(monkeypatch):
+    _ring_world(monkeypatch, left_click=True, arrived=False)
+    leg = legs.dialogue_item("slayer ring", "Stronghold", "stronghold", (2431, 3422, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0), "clicked, never landed"
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0), "no ring carried"

@@ -29,6 +29,7 @@ import time
 import controller
 import crossfloor
 import debug_log
+import dialogue
 import poh
 import travel
 
@@ -65,6 +66,19 @@ def item(name: str, option: str, dest) -> dict:
     leg = _base("item", f"{name}: {option}", dest)
     leg["item"] = name
     leg["option"] = option
+    return leg
+
+
+def dialogue_item(name: str, label: str, needle: str, dest) -> dict:
+    """An INVENTORY item whose destination is CHOSEN in a chat menu -- the slayer ring.
+
+    `label` is the destination as the item's own right-click sub-option spells it (cache obj
+    11866: Stronghold / Slayer Tower / Fremennik Dungeon); `needle` is the lowercase text matched
+    against the paged destination dialogue. See run_dialogue_item_leg."""
+    leg = _base("dialogue_item", f"{name}: {label}", dest)
+    leg["item"] = name
+    leg["label"] = label
+    leg["option"] = needle
     return leg
 
 
@@ -219,8 +233,10 @@ def run_leg(ctx, leg, log: str = "travel") -> bool:
     dest = leg.get("dest") or []
     if len(dest) != 3:
         return False
-    return (run_item_leg(ctx, leg, log) if leg.get("kind") == "item"
-            else run_object_leg(ctx, leg, log)) and await_arrival(dest)
+    kind = leg.get("kind")
+    runner = (run_item_leg if kind == "item" else run_dialogue_item_leg if kind == "dialogue_item"
+              else run_object_leg)
+    return runner(ctx, leg, log) and await_arrival(dest)
 
 
 def run_item_leg(ctx, leg, log: str = "travel") -> bool:
@@ -248,6 +264,50 @@ def run_item_leg(ctx, leg, log: str = "travel") -> bool:
         ok = controller.click_menu_action(ctx.ser, it, option or "Teleport",
                                           check_ui_blockers=False)
     return bool(ok)
+
+
+def _standing_near(dest) -> bool:
+    player = controller.get_player() or {}
+    px, py = player.get("x"), player.get("y")
+    return (px is not None and player.get("plane", 0) == dest[2]
+            and abs(px - dest[0]) <= ARRIVAL_TILES and abs(py - dest[1]) <= ARRIVAL_TILES)
+
+
+def run_dialogue_item_leg(ctx, leg, log: str = "travel") -> bool:
+    """The slayer ring: a verified LEFT-click, else the item's own menu, then the destination
+    picked by TEXT in a dialogue that is PAGED ("More options...", dialogue.choose walks it).
+
+    The pattern is routines/golem_crafting._teleport_home's, proven live there 2026-09-06 and
+    2026-09-14 for the ring's Wyrmscraig entry; only the destination differs. The hover gate
+    accepts the destination, `Teleport` or `Rub` (cache obj 11866: iop2=Rub, iop3=Teleport with
+    the destinations as its sub-options), so an un-swapped left-click ("Wear") is WITHHELD, never
+    clicked. UNVERIFIED LIVE for these three destinations; the caller confirms the landing, and
+    a dialogue that never offers the destination fails the leg rather than picking a neighbour."""
+    name = (leg.get("item") or "").lower()
+    it = next((i for i in (controller.get_inventory() or [])
+               if name and name in (i.get("name") or "").lower()), None)
+    if it is None:
+        debug_log.log(log, f"no {leg.get('item')} in inventory -- leg '{leg.get('display')}' cannot run")
+        return False
+    label, needle, dest = leg.get("label"), leg.get("option"), leg.get("dest")
+    debug_log.log(log, f"leg: {leg.get('display')}")
+    controller.open_inventory_tab(ctx.ser)
+    clicked = controller.click_entity(ctx.ser, it, check_ui_blockers=False, simulate_mistakes=False,
+                                      expected_action=(label, "Teleport", "Rub"))
+    if clicked:
+        # A swapped left-click either teleports at once or opens the destination dialogue.
+        if not _standing_near(dest):
+            dialogue.choose(ctx, needle, log=log)
+        return True
+    if controller.click_menu_action(ctx.ser, it, label, check_ui_blockers=False):
+        return True
+    if not controller.click_menu_action(ctx.ser, it, ("Teleport", "Rub"), check_ui_blockers=False):
+        debug_log.log(log, f"{leg.get('item')}: no {label}/Teleport/Rub entry in its menu")
+        return False
+    if not dialogue.choose(ctx, needle, log=log):
+        debug_log.log(log, f"{leg.get('item')}: the dialogue never offered '{needle}'")
+        return False
+    return True
 
 
 def run_object_leg(ctx, leg, log: str = "travel") -> bool:

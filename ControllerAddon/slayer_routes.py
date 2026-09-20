@@ -56,6 +56,19 @@ ITEMS = {
     "mos le'harmless teleport": ("mos le'harmless teleport", "Teleport", (3701, 2996, 0)),
 }
 
+# Items whose destination is chosen in a CHAT MENU (legs.dialogue_item). registry text head ->
+# {destination as the registries spell it, lowercased: (right-click sub-option label, dialogue
+# needle, landing)}. Labels are cache obj 11866's own sub-options; landings are the vendored
+# teleportation_items.tsv rows. Added 2026-09-20: the ring's paged menu was already proven live in
+# golem_crafting, so 12 of Kuradal's 22 tasks no longer wait on a recording.
+DIALOGUE_ITEMS = {
+    "slayer ring": {
+        "stronghold slayer cave": ("Stronghold", "stronghold", (2431, 3422, 0)),
+        "slayer tower": ("Slayer Tower", "slayer tower", (3421, 3537, 0)),
+        "fremennik slayer dungeon": ("Fremennik Dungeon", "fremennik", (2802, 9999, 0)),
+    },
+}
+
 # Ornate jewellery box destination -> landing tile. UNVERIFIED coordinates -- the 12-tile
 # await_arrival radius (legs.ARRIVAL_TILES) absorbs small errors. The box serves every teleport
 # item that also names one of these destinations (a glory amulet, a skills necklace, ...), not
@@ -101,6 +114,8 @@ def parse(teleport_text):
     if key in ITEMS:
         return "item", key
     destination = _TRAILING_OPTION.sub("", tail).strip()
+    if destination.lower() in DIALOGUE_ITEMS.get(key, {}):
+        return "dialogue_item", (key, destination.lower())
     canonical = _BOX_LANDINGS_BY_LOWER.get(destination.lower())
     if canonical is not None:
         return "box", canonical
@@ -177,6 +192,13 @@ def plan(task_name, player, carried, skill_levels=None):
                 reasons.append(f"{text}: not carried")
                 continue
             return [legs.item(name, option, landing), site], ""
+        if kind == "dialogue_item":
+            name, destination = value
+            if not any(name in (held or "").lower() for held in (carried or {})):
+                reasons.append(f"{text}: not carried")
+                continue
+            label, needle, landing = DIALOGUE_ITEMS[name][destination]
+            return [legs.dialogue_item(name, label, needle, landing), site], ""
         if kind == "box":
             landing = BOX_LANDINGS.get(value)
             if landing is None:
@@ -186,5 +208,5 @@ def plan(task_name, player, carried, skill_levels=None):
                 reasons.append(f"{text}: needs a house tablet")
                 continue
             return [legs.house(), legs.pool(), legs.house_box(value, landing), site], ""
-        reasons.append(f"{text}: not supported until the bank phase")
+        reasons.append(f"{text}: no leg can run this teleport yet")
     return None, "; ".join(reasons) or f"{task_name} lists no teleport"
