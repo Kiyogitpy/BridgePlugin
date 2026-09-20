@@ -112,7 +112,10 @@ def _rune_counts() -> dict:
         # InventoryProvider emits "qty" (task-2 review: reading "quantity" counted every stack as 1).
         counts[name] = counts.get(name, 0) + int(item.get("qty") or item.get("quantity") or 1)
     pouch = controller.get_rune_pouch() or {}
-    for rune in pouch.get("runes") or ():
+    # ONLY a CARRIED pouch. Its contents are varbits and are reported wherever the pouch is: FOUND
+    # LIVE 2026-09-20, {"carried": false, "runes": [... Cosmic rune x8949 ...]} with the pouch in
+    # the bank -- the check passed on runes the player did not have.
+    for rune in (pouch.get("runes") or ()) if pouch.get("carried") else ():
         name = (rune.get("name") or "").lower()
         if name:
             counts[name] = counts.get(name, 0) + int(rune.get("quantity") or 0)

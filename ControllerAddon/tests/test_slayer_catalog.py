@@ -174,7 +174,8 @@ def test_a_talisman_line_for_another_destination_is_not_sent_to_xerics_heart():
 
 
 def test_suqahs_are_reached_by_casting_moonclan_teleport():
-    legs_, why = slayer_routes.plan("Suqahs", {"x": 3200, "y": 3200, "plane": 0}, {})
+    legs_, why = slayer_routes.plan("Suqahs", {"x": 3200, "y": 3200, "plane": 0},
+                                    {"law rune": 1, "astral rune": 2, "earth rune": 2})
     assert why == "" and [l["kind"] for l in legs_] == ["spell", "walk"]
     assert legs_[0]["widget"] == [218, 116] and legs_[0]["dest"] == [2113, 3915, 0]
 
@@ -317,3 +318,16 @@ def test_zanaris_is_the_house_fairy_rings_own_menu_action():
                                     {"teleport to house": 3}, skill_levels={"Agility": 77})
     assert why == "" and [l["kind"] for l in legs_] == ["poh_enter", "poh_pool", "poh_mounted", "walk"]
     assert (legs_[2]["item"], legs_[2]["option"], legs_[2]["dest"]) == ("fairy ring", "Zanaris", [2412, 4434, 0])
+
+
+def test_a_spell_is_not_planned_without_its_runes():
+    """Moonclan Teleport costs 1 law, 2 astral, 2 earth (cache obj 9111). Casting without them
+    clicks and does nothing, and the leg only failed by never landing. plan() now refuses up
+    front and NAMES the rune. An earth staff stands in for the earth runes."""
+    lumbridge = {"x": 3200, "y": 3200, "plane": 0}
+    none, why = slayer_routes.plan("Suqahs", lumbridge, {"law rune": 5, "astral rune": 1, "earth rune": 9})
+    assert none is None and "astral rune" in why and "2" in why
+    full = {"law rune": 5, "astral rune": 9, "earth rune": 9}
+    assert slayer_routes.plan("Suqahs", lumbridge, full)[0][0]["kind"] == "spell"
+    staff = {"law rune": 5, "astral rune": 9, "mystic earth staff": 1}
+    assert slayer_routes.plan("Suqahs", lumbridge, staff)[0][0]["kind"] == "spell"

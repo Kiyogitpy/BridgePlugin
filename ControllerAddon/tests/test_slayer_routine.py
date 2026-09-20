@@ -235,6 +235,7 @@ def _carry(monkeypatch, names=(), ids=()):
     items = [{"name": n, "qty": 1, "id": i} for n, i in zip(names, list(ids) + [None] * len(names))]
     monkeypatch.setattr(controller, "get_inventory", lambda: list(items))
     monkeypatch.setattr(controller, "get_equipment", lambda: {})
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: None)      # no pouch, unless a test says so
     monkeypatch.setattr(legs, "skill_levels", lambda: {"Agility": 70})
 
 def test_travel_runs_one_leg_per_tick_and_keeps_its_cursor(monkeypatch):
@@ -403,3 +404,14 @@ def test_travel_hands_the_planner_what_the_account_proves(monkeypatch):
     monkeypatch.setattr(slayer_routes, "plan", plan)
     routine.tick(_Ctx())
     assert seen == {"skill_levels": {"Agility": 77}, "proven": {"varbit_values": {3759: 3}}}
+
+
+def test_a_carried_rune_pouchs_runes_are_carried_and_a_banked_pouchs_are_not(monkeypatch):
+    """The real GET /rune-pouch of 2026-09-20 reported its runes with carried=false."""
+    _carry(monkeypatch, names=["Law rune"])
+    pouch = {"carried": False, "total": 9, "runes": [{"quantity": 8949, "name": "Cosmic rune", "id": 564}]}
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: pouch)
+    assert "cosmic rune" not in routine._carried()
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: dict(pouch, carried=True))
+    carried = routine._carried()
+    assert carried["cosmic rune"] == 8949 and carried["law rune"] == 1

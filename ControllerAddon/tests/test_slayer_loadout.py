@@ -189,3 +189,15 @@ def test_a_glider_task_packs_the_ring_that_reaches_the_pilot():
     starts with a slayer ring to the Stronghold -- THAT is what the trip must carry."""
     want = _want(sl.build("Wolves", 30, PANEL, 70, 10, {}, BANK))
     assert want.get("Slayer ring (2)") == 1
+
+
+def test_a_spell_teleport_packs_its_runes_as_stacks():
+    """Suqahs: Moonclan Teleport. The runes are what the trip must carry -- two casts' worth, so
+    one unconfirmed landing does not strand the routine -- and each rune is ONE slot."""
+    bank = dict(BANK, **{"law rune": 300, "astral rune": 900, "earth rune": 5000})
+    lo = sl.build("Suqahs", 60, PANEL, 70, 10, {}, bank)
+    want = _want(lo)
+    assert (want["Law rune"], want["Astral rune"], want["Earth rune"]) == (2, 4, 4)
+    assert lo.problems == [] and lo.slots <= 28
+    short = sl.build("Suqahs", 60, PANEL, 70, 10, {}, dict(BANK, **{"law rune": 300, "earth rune": 50}))
+    assert any("astral rune" in p.lower() for p in short.problems)

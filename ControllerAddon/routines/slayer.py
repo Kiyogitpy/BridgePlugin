@@ -167,6 +167,12 @@ def _carried() -> dict:
     for item in (worn.values() if isinstance(worn, dict) else worn):
         if isinstance(item, dict):
             add(item)
+    # A CARRIED rune pouch's runes count as carried (a teleport spell needs them). Only when
+    # carried: its contents are varbits and are reported wherever the pouch is (found live).
+    pouch = controller.get_rune_pouch() or {}
+    if pouch.get("carried"):
+        for rune in pouch.get("runes") or ():
+            add({"name": rune.get("name"), "qty": rune.get("quantity")})
     return counts
 
 

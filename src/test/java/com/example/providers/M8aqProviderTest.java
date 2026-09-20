@@ -77,6 +77,29 @@ public class M8aqProviderTest
 	}
 
 	@Test
+	public void aReaderThatDiesWithAnErrorReportsItInsteadOfAnEmptyObject()
+	{
+		// FOUND LIVE 2026-09-20: GET /api/progression/quests answered {} in 13 ms. The client log
+		// had "NoClassDefFoundError: ...Quests$QuestEntry" -- an ERROR, not an exception, so nothing
+		// caught it; runOnClientThread released its latch in a finally, the result stayed null, and
+		// the server wrote {}. Python reads {} as "this reader has nothing", which is a lie.
+		Object result = M8aqProvider.guarded("Quests", () -> {
+			throw new NoClassDefFoundError("net/runelite/client/plugins/m8aq/api/progression/Quests$QuestEntry");
+		});
+		assertTrue(result instanceof java.util.Map);
+		java.util.Map<?, ?> error = (java.util.Map<?, ?>) result;
+		assertEquals("Quests", error.get("reader"));
+		assertTrue(String.valueOf(error.get("error")).contains("NoClassDefFoundError"));
+
+		Object assertion = M8aqProvider.guarded("X", () -> {
+			throw new AssertionError("must be called on client thread");
+		});
+		assertTrue(String.valueOf(((java.util.Map<?, ?>) assertion).get("error")).contains("AssertionError"));
+
+		assertEquals("fine", M8aqProvider.guarded("Y", () -> "fine"));
+	}
+
+	@Test
 	public void kebabSplitsOnWordBoundariesOnly()
 	{
 		assertEquals("rune-pouch", M8aqProvider.kebab("RunePouch"));

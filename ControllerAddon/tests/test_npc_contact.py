@@ -496,3 +496,17 @@ def test_the_cancel_is_confirmed_by_the_button_inside_the_rewards_interface(monk
     monkeypatch.setattr(controller, "click_entity", click_entity)
     assert npc_contact.cancel_task(_Ctx(), "KURADAL", CFG) is True
     assert clicks == ["tab", 26, 50]
+
+
+def test_a_rune_pouch_that_is_not_carried_supplies_no_runes(monkeypatch):
+    """FOUND LIVE 2026-09-20: GET /rune-pouch answered {"carried": false, "runes": [... Cosmic
+    rune x8949 ...]} -- the contents are VARBITS and are reported wherever the pouch is. With the
+    pouch in the bank the check passed and the cast would have failed. The real shape, verbatim."""
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: {"carried": False, "total": 26072, "runes": [
+        {"quantity": 8949, "name": "Cosmic rune", "slot": 4, "id": 564, "type": 9},
+        {"quantity": 500, "name": "Astral rune", "slot": 1, "id": 9075, "type": 14}]})
+    assert npc_contact._rune_counts() == {}
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: {"carried": True, "runes": [
+        {"quantity": 8949, "name": "Cosmic rune", "slot": 4, "id": 564, "type": 9}]})
+    assert npc_contact._rune_counts() == {"cosmic rune": 8949}

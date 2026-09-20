@@ -25,6 +25,7 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "get_varp", lambda vid: None)
     monkeypatch.setattr(controller, "get_inventory", lambda: None)
     monkeypatch.setattr(controller, "get_equipment", lambda: None)
+    monkeypatch.setattr(controller, "get_api", lambda group, reader: None)
 
 
 class _State:
@@ -787,3 +788,34 @@ def test_a_stale_object_id_falls_back_to_the_sibling_rows_id(monkeypatch):
     own = dict(new_ladder, id=16683)
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [new_ladder, own])
     assert legs.find_transport_object(ours) is own
+
+
+# --- 2026-09-20: finished quests reach the search -----------------------------------------------
+#
+# 120 transports are gated on a quest NAME across 24 quests and nothing supplied them, so all 120
+# failed closed. The bridge has a reader: GET /api/progression/quests. Its shape below is from the
+# vendored SOURCE (Quests.State: quests[{id, name, state}], completedCount, ...; QuestState is an
+# enum, which Gson writes by name) -- NOT from a live GET: on 2026-09-20 the running client's copy
+# of that reader was dying with NoClassDefFoundError until a restart.
+
+QUESTS = {"quests": [{"id": 1, "name": "Fishing Contest", "state": "FINISHED"},
+                     {"id": 2, "name": "The Grand Tree", "state": "FINISHED"},
+                     {"id": 3, "name": "Monkey Madness II", "state": "IN_PROGRESS"},
+                     {"id": 4, "name": "Dragon Slayer II", "state": "NOT_STARTED"}],
+          "completedCount": 2, "inProgressCount": 1, "notStartedCount": 1}
+
+
+def test_finished_quests_are_read_by_name_and_only_finished_ones_count(monkeypatch):
+    monkeypatch.setattr(legs.crossfloor, "requirement_ids", lambda: (set(), set()))
+    monkeypatch.setattr(controller, "get_api", lambda group, reader: QUESTS if (group, reader) == ("progression", "quests") else None)
+    assert legs.requirement_values()["completed_quests"] == {"Fishing Contest", "The Grand Tree"}
+
+
+def test_an_unreadable_quest_list_proves_no_quest(monkeypatch):
+    """None (no bridge), an {"reader", "error"} map (the reader died) and an EMPTY list (logged
+    out: the reader answers quests=[]) all mean UNKNOWN -- never 'no quests done', and never a
+    set that would let a quest gate pass."""
+    monkeypatch.setattr(legs.crossfloor, "requirement_ids", lambda: (set(), set()))
+    for answer in (None, {"reader": "Quests", "error": "NoClassDefFoundError: ..."}, {}, {"quests": []}):
+        monkeypatch.setattr(controller, "get_api", lambda group, reader, a=answer: a)
+        assert legs.requirement_values()["completed_quests"] is None, answer

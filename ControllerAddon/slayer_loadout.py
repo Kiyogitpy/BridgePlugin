@@ -38,6 +38,7 @@ Loadout = namedtuple("Loadout", ("withdraw", "keep", "slots", "problems", "unche
 HOUSE_TABLET = "teleport to house"
 HOUSE_TABLETS_CARRIED = 2          # one spare: a tablet is spent per unconfirmed landing (phase B)
 ESCAPE_RING = "ring of dueling"
+SPELL_CASTS_CARRIED = 2            # a teleport spell's runes, for one retry
 
 # A catalog `carry` label -> the item names that satisfy it, best first.
 CARRY_ITEMS = {
@@ -167,7 +168,16 @@ def _teleport(pack, site, task_name) -> None:
     wanted = []
     for text in texts:
         kind, value = slayer_routes.parse(text)
-        if kind in ("fairy", "box", "spell", "poh_mounted"):
+        if kind == "spell":
+            # The runes ARE the teleport. Two casts' worth: a cast that never lands is retried, and
+            # being one rune short on Lunar Isle is a strand. Each rune is a stack: one slot.
+            staves = slayer_routes.RUNE_STAVES
+            for rune, per_cast in slayer_routes.SPELL_RUNES.get(value, {}).items():
+                if any(staff in name for name in _names(pack.carried) for staff in staves.get(rune, ())):
+                    continue
+                pack.exact(f"runes ({text})", rune, per_cast * SPELL_CASTS_CARRIED, stackable=True)
+            return
+        if kind in ("fairy", "box", "poh_mounted"):
             return
         if kind == "unsupported":
             continue

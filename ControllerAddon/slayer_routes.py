@@ -89,6 +89,29 @@ DIALOGUE_ITEMS = {
 SPELLS = {
     "moonclan teleport": ("Moonclan Teleport", (218, 116), (2113, 3915, 0)),
 }
+# Runes per cast, from the cache (obj 9111: lawrune 1, astralrune 2, earthrune 2). `carried` is
+# expected to include a CARRIED rune pouch's runes (routines/slayer._carried). A worn elemental
+# staff stands in for its rune, the rule npc_contact already applies to air.
+SPELL_RUNES = {
+    "moonclan teleport": {"law rune": 1, "astral rune": 2, "earth rune": 2},
+}
+RUNE_STAVES = {
+    "earth rune": ("staff of earth", "earth battlestaff", "mystic earth staff", "mud battlestaff",
+                   "mystic mud staff", "dust battlestaff", "mystic dust staff", "lava battlestaff",
+                   "mystic lava staff"),
+}
+
+
+def missing_runes(spell_key, carried) -> list:
+    """['2 astral rune (have 1)', ...] for one cast of `spell_key`, or []."""
+    held = {(n or "").lower(): int(q or 0) for n, q in (carried or {}).items()}
+    out = []
+    for rune, per_cast in SPELL_RUNES.get(spell_key, {}).items():
+        if any(staff in name for name in held for staff in RUNE_STAVES.get(rune, ())):
+            continue
+        if held.get(rune, 0) < per_cast:
+            out.append(f"{per_cast} {rune} (have {held.get(rune, 0)})")
+    return out
 
 # Items MOUNTED in the house (legs.house_mounted): registry head -> (object name fragment, menu
 # action, landing). USER 2026-09-20: "There is a digsite pendant mounted in poh". The row is the
@@ -326,6 +349,10 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
             continue
         if kind == "spell":
             name, widget, landing = SPELLS[value]
+            short = missing_runes(value, carried)
+            if short:
+                reasons.append(f"{text}: needs " + ", ".join(short))
+                continue
             route = [legs.spell(name, widget, landing), site]
             if offer(route, text):
                 return route, ""

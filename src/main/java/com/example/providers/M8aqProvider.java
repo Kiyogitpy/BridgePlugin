@@ -150,18 +150,41 @@ public class M8aqProvider extends BridgeProvider
 	 */
 	private Object capture(Class<?> type)
 	{
+		return guarded(type.getSimpleName(), () -> ReaderCatalog.capture(type, client));
+	}
+
+	/**
+	 * Runs one reader and turns ANY failure into an {@code error} map.
+	 *
+	 * <p>One reader throwing must not 500 the endpoint in a way that reads as "bridge is down":
+	 * several readers are interface-dependent and legitimately unhappy when the interface is
+	 * closed or the player is logged out.
+	 *
+	 * <p>{@link LinkageError} and {@link AssertionError} are caught too, deliberately. FOUND LIVE
+	 * 2026-09-20: {@code GET /api/progression/quests} answered {@code {}} in 13 ms while the
+	 * client log said {@code NoClassDefFoundError: ...Quests$QuestEntry}. That is an ERROR, so
+	 * nothing caught it; {@code RuneLiteUtil.runOnClientThread} releases its latch in a
+	 * {@code finally}, the result stayed {@code null}, and the server writes {@code null} as
+	 * {@code {}} -- which Python reads as "this reader has nothing". A crash must never look like
+	 * an empty answer. Other {@code Error}s (out of memory, stack overflow) are left to propagate.
+	 *
+	 * @param readerName reader's simple name, for the error map
+	 * @param call the read
+	 * @return the reader's state, or an {@code error} map when it failed
+	 */
+	static Object guarded(String readerName, java.util.concurrent.Callable<Object> call)
+	{
 		try
 		{
-			return ReaderCatalog.capture(type, client);
+			return call.call();
 		}
-		catch (ReflectiveOperationException | RuntimeException e)
+		catch (Exception | LinkageError | AssertionError e)
 		{
-			// One reader throwing must not 500 the endpoint in a way that reads as "bridge is
-			// down". Several readers are interface-dependent and legitimately unhappy when the
-			// interface is closed or the player is logged out.
+			Throwable cause = e instanceof java.lang.reflect.InvocationTargetException && e.getCause() != null
+				? e.getCause() : e;
 			Map<String, Object> error = new LinkedHashMap<>();
-			error.put("reader", type.getSimpleName());
-			error.put("error", e.getClass().getSimpleName() + ": " + e.getMessage());
+			error.put("reader", readerName);
+			error.put("error", cause.getClass().getSimpleName() + ": " + cause.getMessage());
 			return error;
 		}
 	}

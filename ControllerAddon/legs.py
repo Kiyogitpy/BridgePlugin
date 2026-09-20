@@ -623,7 +623,26 @@ def requirement_values() -> dict:
             owned |= {worn["id"] for worn in equipment.values()
                       if isinstance(worn, dict) and worn.get("id") is not None}
     return {"varbit_values": varbits, "varplayer_values": varps,
-            "owned_item_ids": owned, "currency_held": currency}
+            "owned_item_ids": owned, "currency_held": currency,
+            "completed_quests": completed_quests()}
+
+
+def completed_quests():
+    """The names of FINISHED quests from GET /api/progression/quests, or None when that cannot be
+    read. 120 transports are gated on a quest name and, until 2026-09-20, nothing supplied them,
+    so all of them failed closed.
+
+    UNKNOWN IS NOT EMPTY: no bridge (None), a dead reader ({"reader", "error"}) and an EMPTY quest
+    list (the reader answers quests=[] when logged out) all return None, never an empty set --
+    and an empty set would still fail closed, so nothing here can open a gate by accident."""
+    answer = controller.get_api("progression", "quests")
+    if not isinstance(answer, dict) or answer.get("error"):
+        return None
+    quests = answer.get("quests")
+    if not isinstance(quests, list) or not quests:
+        return None
+    return {q.get("name") for q in quests
+            if isinstance(q, dict) and q.get("name") and str(q.get("state")).upper() == "FINISHED"}
 
 
 def _undoes(step, previous) -> bool:
