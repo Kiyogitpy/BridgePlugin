@@ -75,7 +75,7 @@ points Zombies, Scorpions and Wolves at Wilderness or poorly documented spots.
 | Abyssal demons | Slayer Tower basement (task-only) | slayer ring → Slayer Tower, basement stairs | Slayer 85 | the only "hard" task kept; their teleport can move the player a few tiles |
 | Ankou | Stronghold Slayer Cave | as above | — | 50-80 kills |
 | Basilisks | Fremennik Slayer Dungeon | slayer ring → Fremennik | mirror shield; 80-point unlock | defaulted (one sensible site) |
-| Black demons | Taverley Dungeon | Taverley tablet / house → box, then the dungeon | — | 24 spawns, safespot; long walk without agility shortcuts |
+| Black demons | Taverley Dungeon | Taverley tablet / house → box, then the dungeon | — | 24 spawns, safespot. **USER 2026-09-20: obstacle pipe (70 Agility, account has 77) to the blue dragons, then run** — `crossfloor` routes it at the default budget: ladder 16680, pipe 16509, 92 tiles to the cluster centre (2852,9784) |
 | Bloodveld | Stronghold Slayer Cave | slayer ring | — | Protect from Melee negates them |
 | Cave horrors | Mos Le'Harmless Cave | (no close item teleport found — settle at implementation) | witchwood icon, light source; Cabin Fever | defaulted (only site) |
 | Dagannoth | Catacombs of Kourend | Xeric's talisman → Xeric's Heart, statue down | Horror from the Deep (task req) | melee-only variant, three safespots |

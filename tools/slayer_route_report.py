@@ -42,7 +42,10 @@ SITES = [
     ("Dagannoth", "Xeric's talisman: Xeric's Heart", XERICS_HEART, (1665, 9995, 0)),
     ("Dust devils", "Xeric's talisman: Xeric's Heart", XERICS_HEART, (1710, 10020, 0)),
     ("Ghosts (Aya)", "Xeric's talisman: Xeric's Heart", XERICS_HEART, (1693, 10063, 0)),
-    ("Black demons", "Taverley teleport", (2893, 3465, 0), (2860, 9835, 0)),
+    # Centre of the spawn cluster 2826-2875 x 9763-9801 (kuradal-1a.md, cross-checked against the
+    # osrs-wiki spawn table 2026-09-20). The first draft had (2860, 9835): ~50 tiles NORTH of every
+    # demon, which alone pushed the pipe route past the search budget.
+    ("Black demons", "Taverley teleport", (2893, 3465, 0), (2852, 9784, 0)),
     ("Trolls", "games necklace: Burthorpe", (2899, 3553, 0), (2864, 3590, 0)),
     ("Waterfiends", "games necklace: Barbarian Outpost", (2520, 3571, 0), (1750, 5350, 0)),
     ("Kalphite", "desert amulet 4: Kalphite cave", (3322, 3122, 0), (3309, 9526, 0)),
@@ -64,6 +67,8 @@ ALL_99 = {"Agility": 99, "Mining": 99, "Strength": 99, "Thieving": 99, "Ranged":
 # the key route through Taverley needs ~400 expansions from the surface (MEASURED), the default 40.
 PASSES = [("no requirements proven", {}),
           ("all skills 99", {"skill_levels": ALL_99}),
+          ("the user's account, read live 2026-09-20: Agility 77, varbit 3759=3",
+           {"skill_levels": {"Agility": 77}, "varbit_values": {3759: 3}}),
           ("varbit 3759=3 and a dusty key, no skills, deep search",
            {"varbit_values": {3759: 3}, "owned_item_ids": {1590}, "max_expansions": 450})]
 
@@ -95,10 +100,11 @@ def main():
            "  legs.requirement_values reads it at run time (the user's account: 3); the third pass",
            "  below supplies it. It also needed a search fix: the whirlpool LANDS on a tile the map",
            "  cannot leave, as 149 usable links do, and those were dead ends until 2026-09-20.",
-           "- **Black demons**: the 80 Agility Strange floor, or the dusty-key gate (item 1590, proven",
-           "  by id). The key route is long and winding (cost ~620 from the surface) and the default",
-           "  search budget of 40 expansions does NOT find it -- the third pass asks for 450. A",
-           "  catalog entry using it must pass max_expansions, or the search must get smarter.",
+           "- **Black demons**: USER 2026-09-20 -- take the obstacle pipe (70 Agility; the account",
+           "  has 77) to the blue dragons and run from there. It routes at the DEFAULT budget once the",
+           "  site is the real spawn cluster: walk 86, ladder, walk 3, pipe, walk 92. Without 70",
+           "  Agility the only way is the dusty-key gate (item 1590, proven by id), long and winding,",
+           "  which the default 40 expansions do NOT find -- the third pass asks for 450.",
            "- **Trolls** (185 tiles): UNVERIFIED. It climbs from the west and north rather than the",
            "  eastern main path and may be the quest-gated back route. Check it by eye before use.",
            "- **Banshees** (156 tiles without the window shortcut) and **Kurask** (355) were checked",
