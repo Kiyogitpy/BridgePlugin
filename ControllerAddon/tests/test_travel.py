@@ -25,6 +25,20 @@ import travel
 
 
 @pytest.fixture(autouse=True)
+def _no_live_bridge(monkeypatch):
+    """HERMETIC, enforced: a forgotten fake must fail loudly, not read the user's live client.
+    FOUND 2026-09-20: with RuneLite running, a hop test's fake screen point (50,50) landed on one
+    of the user's REAL minimap orbs read from GET /state, and the test failed on a clean HEAD --
+    passing two hours earlier only because the client's orbs sat elsewhere. /state answers "no
+    orbs" here by default; a test about orbs fakes its own."""
+    def refuse(path, *a, **k):
+        if path == "/state":
+            return {}
+        raise AssertionError(f"a test reached the live bridge: GET {path}")
+    monkeypatch.setattr(controller, "api_get", refuse)
+
+
+@pytest.fixture(autouse=True)
 def no_sleeping(monkeypatch):
     monkeypatch.setattr(travel.time, "sleep", lambda _s: None)
 
