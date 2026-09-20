@@ -167,3 +167,30 @@ def test_usable_links_pass_item_ids_and_currency_through():
     toll = lambda links: [s for s in links if s.object_id == 2786 and s.currency]
     assert not toll(crossfloor.usable_links())
     assert toll(crossfloor.usable_links(currency_held={"Coins": 10}))
+
+
+# --- 2026-09-20: two defects parked by the final review ---------------------------------------
+
+def test_a_transport_that_goes_nowhere_is_not_offered():
+    """The Mining Guild's ladders 30367 and 17386 have origin == dest in the vendored data, so
+    legs.landed() can never be True for them: a leg that burns its whole budget and fails."""
+    links = crossfloor.usable_links(skill_levels={"Mining": 99})
+    assert not [s for s in links if s.origin == s.dest]
+    assert [s for s in links if s.object_id == 30191], "ordinary ladders are untouched"
+
+
+def test_the_wilderness_slayer_cave_counts_as_wilderness_and_the_slayer_tower_does_not():
+    """The cave's stairs (3293,3749) land at (3406,10145): EAST of the Wilderness box, whose
+    underground twin stops at x 3391. MEASURED: they were the only transports leaving the surface
+    Wilderness for a tile the classifier called safe. The box cannot simply be widened -- the
+    Slayer Tower basement (3412,9932,3) sits at the same x just south of it."""
+    assert crossfloor.in_wilderness((3406, 10145, 0))
+    stairs = [s for s in crossfloor.transports.load_links() if s.object_id == 40390 and s.dest == (3406, 10145, 0)]
+    assert stairs
+    assert not crossfloor.in_wilderness((3412, 9932, 3)), "Slayer Tower basement"
+    tower = next(s for s in crossfloor.transports.load_links() if s.object_id == 30191)
+    assert not crossfloor.enters_wilderness(tower)
+    # walking out of Ferox-side safety into the cave must be refused like the ditch is
+    outside = next((s for s in crossfloor.transports.load_links()
+                    if s.dest == (3406, 10145, 0) and not crossfloor.in_wilderness(s.origin)), None)
+    assert outside is None or crossfloor.enters_wilderness(outside)

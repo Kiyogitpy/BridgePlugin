@@ -106,7 +106,13 @@ def in_wilderness(tile) -> bool:
     """The Wilderness's bounding box, surface and its y+6400 underground twin. Deliberately
     generous: a safe tile wrongly inside it (Ferox Enclave) costs one refused shortcut."""
     x, y = tile[0], tile[1]
-    return 2944 <= x <= 3391 and (3525 <= y <= 3967 or 3525 + UNDERGROUND_DY <= y <= 3967 + UNDERGROUND_DY)
+    if 2944 <= x <= 3391 and (3525 <= y <= 3967 or 3525 + UNDERGROUND_DY <= y <= 3967 + UNDERGROUND_DY):
+        return True
+    # The Wilderness Slayer Cave lies EAST of that box: its stairs at (3293,3749) land on
+    # (3406,10145). MEASURED 2026-09-20, they were the only transports leaving the surface
+    # Wilderness for a tile this called safe. Its own box, not a wider one: the Slayer Tower
+    # basement (3412,9932,3) sits at the same x just south and must stay usable.
+    return 3328 <= x <= 3470 and 10040 <= y <= 10190
 
 
 def enters_wilderness(step) -> bool:
@@ -135,6 +141,7 @@ def usable_links(skill_levels=None, completed_quests=None, varbit_values=None,
         steps += transports.load_agility_shortcuts()
     return [s for s in steps
             if not enters_wilderness(s) and s.kind != transports.DOOR
+            and s.origin != s.dest      # two Mining Guild ladder rows go nowhere: landed() could never be True
             and transports.usable(s, skill_levels=skill_levels, completed_quests=completed_quests,
                                   varbit_values=varbit_values, varplayer_values=varplayer_values,
                                   owned_item_names=owned_item_names, owned_item_ids=owned_item_ids,
