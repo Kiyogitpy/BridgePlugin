@@ -41,6 +41,10 @@ FAIRY_EXPECT = {
     "DLQ": "Nardah",         # Kharidian Desert, north of Nardah         (unverified)
     "BIQ": "Kalphite",       # Near the Kalphite Hive                    (unverified)
     "CKS": "Canifis",        # Morytania: Canifis                        (unverified)
+    # 2026-09-20, from the wiki's per-code Location text -- a usable source because AJQ's
+    # ("Cave south of Dorgesh-Kaan") is exactly what was MEASURED on the Confirm button.
+    "CJQ": "Conch",          # The Great Conch (gryphons)                (unverified)
+    "CIR": "Karuulm",        # at the base of Mount Karuulm (wyrms)      (unverified)
 }
 
 # Carried items phase A knows how to use: registry text prefix -> (item name, menu option, landing).
@@ -75,6 +79,15 @@ DIALOGUE_ITEMS = {
         "slayer tower": ("Slayer Tower", "slayer tower", (3421, 3537, 0)),
         "fremennik slayer dungeon": ("Fremennik Dungeon", "fremennik", (2802, 9999, 0)),
     },
+}
+
+# Teleport SPELLS (legs.spell): registry text head -> (spell name, (group, child), landing). The
+# widget id is cache interface 218 `tele_moonclan`; the same read gives npc_contact as 218:113,
+# the constant already measured live, which is what makes the mapping trustworthy. Needs 1 law,
+# 2 astral, 2 earth runes -- NOT checked here: a rune pouch is invisible to `carried`, and a cast
+# without runes simply never lands, which fails the leg.
+SPELLS = {
+    "moonclan teleport": ("Moonclan Teleport", (218, 116), (2113, 3915, 0)),
 }
 
 # Ornate jewellery box destination -> landing tile. UNVERIFIED coordinates -- the 12-tile
@@ -121,6 +134,8 @@ def parse(teleport_text):
         return "fairy", tail.strip().upper()
     if key in ITEMS and _ITEM_DESTINATION.get(key, "") in tail.lower():
         return "item", key
+    if key in SPELLS:
+        return "spell", key
     destination = _TRAILING_OPTION.sub("", tail).strip()
     if destination.lower() in DIALOGUE_ITEMS.get(key, {}):
         return "dialogue_item", (key, destination.lower())
@@ -145,8 +160,25 @@ def nearest_ring(player_tile, skill_levels=None):
     return best[1] if best else None
 
 
-def plan(task_name, player, carried, skill_levels=None):
-    """(legs, "") for the first usable teleport, else (None, why)."""
+def _unroutable(route, target, skill_levels, proven):
+    """None when the walk after the LAST teleport in `route` can be made, else why not.
+
+    Added 2026-09-20. A teleport is spent the moment it is clicked, and the walk leg after it
+    fails only on arrival -- a strand with a task active. So before a route is offered, the walk
+    from the teleport's landing to the site is proven with crossfloor, using what THIS account
+    proves (its levels, and `proven` = legs.requirement_values()). A landing we do not know
+    (dest None) cannot be checked and is let through, as before."""
+    landing = next((leg.get("dest") for leg in reversed(route[:-1]) if leg.get("dest")), None)
+    if not landing or len(landing) != 3:
+        return None
+    if crossfloor.find_route(tuple(landing), tuple(target), skill_levels=skill_levels, **(proven or {})) is None:
+        return f"no walking route from its landing {tuple(landing)} to {tuple(target)} for this account"
+    return None
+
+
+def plan(task_name, player, carried, skill_levels=None, proven=None):
+    """(legs, "") for the first usable teleport, else (None, why). `proven` is
+    legs.requirement_values(): the varbits, item ids and coins that open gated transports."""
     x, y = (player or {}).get("x"), (player or {}).get("y")
     if x is None or y is None:
         return None, "the player's position is unknown"
@@ -169,7 +201,23 @@ def plan(task_name, player, carried, skill_levels=None):
     in_house = poh.is_house_player(player)
     has_tablet = any("teleport to house" in (held or "").lower() for held in (carried or {}))
     reasons = []
-    for text in task.teleports:
+    # The near-site walk above costs nothing, so it stays available. Past it, a catalog entry
+    # marked not routable is REFUSED before any teleport: its last walk cannot succeed (gryphons:
+    # the cave entrance is in no table), and spending the hop would strand us with a task active.
+    spec = slayer_catalog.get(task_name)
+    if spec is not None and not spec.routable and aya_tasks.get(task_name) is None:
+        return None, f"{task_name} is not routable yet -- {spec.note}"
+    # A task BOTH masters assign (kalphite) is offered both registries' teleports, Aya's first:
+    # same cave, and Aya's list alone stopped at a desert amulet no leg can run.
+    other = slayer_catalog.get(task_name)
+    teleports = list(dict.fromkeys(tuple(task.teleports) + tuple(other.teleports if other else ())))
+    def offer(route, text):
+        problem = _unroutable(route, task.target, skill_levels, proven)
+        if problem is not None:
+            reasons.append(f"{text}: {problem}")
+        return problem is None
+
+    for text in teleports:
         kind, value = parse(text)
         if kind == "fairy":
             if value not in FAIRY_EXPECT:
@@ -184,29 +232,47 @@ def plan(task_name, player, carried, skill_levels=None):
             # meaningless distances (phase B brief).
             ring = None if in_house else nearest_ring(here, skill_levels)
             if ring is not None:
-                return [legs.walk(*ring.origin),
-                        legs.fairy(value, FAIRY_EXPECT[value], dest=exit_tile,
-                                   ring_tile=ring.origin, ring_id=ring.object_id),
-                        site], ""
+                route = [legs.walk(*ring.origin),
+                         legs.fairy(value, FAIRY_EXPECT[value], dest=exit_tile,
+                                    ring_tile=ring.origin, ring_id=ring.object_id),
+                         site]
+                if offer(route, text):
+                    return route, ""
+                continue
             if not has_tablet and not in_house:
                 reasons.append(f"{text}: no fairy ring within a {RING_WALK_MAX}-tile walk of "
                                f"{here} and no house tablet")
                 continue
-            return [legs.house(), legs.pool(),
-                    legs.house_ring(value, FAIRY_EXPECT[value], dest=exit_tile), site], ""
+            route = [legs.house(), legs.pool(),
+                     legs.house_ring(value, FAIRY_EXPECT[value], dest=exit_tile), site]
+            if offer(route, text):
+                return route, ""
+            continue
         if kind == "item":
             name, option, landing = ITEMS[value]
             if not any(name in (held or "").lower() for held in (carried or {})):
                 reasons.append(f"{text}: not carried")
                 continue
-            return [legs.item(name, option, landing), site], ""
+            route = [legs.item(name, option, landing), site]
+            if offer(route, text):
+                return route, ""
+            continue
+        if kind == "spell":
+            name, widget, landing = SPELLS[value]
+            route = [legs.spell(name, widget, landing), site]
+            if offer(route, text):
+                return route, ""
+            continue
         if kind == "dialogue_item":
             name, destination = value
             if not any(name in (held or "").lower() for held in (carried or {})):
                 reasons.append(f"{text}: not carried")
                 continue
             label, needle, landing = DIALOGUE_ITEMS[name][destination]
-            return [legs.dialogue_item(name, label, needle, landing), site], ""
+            route = [legs.dialogue_item(name, label, needle, landing), site]
+            if offer(route, text):
+                return route, ""
+            continue
         if kind == "box":
             landing = BOX_LANDINGS.get(value)
             if landing is None:
@@ -215,6 +281,9 @@ def plan(task_name, player, carried, skill_levels=None):
             if not has_tablet and not in_house:
                 reasons.append(f"{text}: needs a house tablet")
                 continue
-            return [legs.house(), legs.pool(), legs.house_box(value, landing), site], ""
+            route = [legs.house(), legs.pool(), legs.house_box(value, landing), site]
+            if offer(route, text):
+                return route, ""
+            continue
         reasons.append(f"{text}: no leg can run this teleport yet")
     return None, "; ".join(reasons) or f"{task_name} lists no teleport"

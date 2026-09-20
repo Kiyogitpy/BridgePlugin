@@ -28,6 +28,10 @@ def _no_live_bridge(monkeypatch):
     def refuse(path, *a, **k):
         raise AssertionError(f"a test reached the live bridge: GET {path}")
     monkeypatch.setattr(controller, "api_get", refuse)
+    # TRAVEL hands plan() what the account can PROVE (legs.requirement_values: varbits, item ids,
+    # coins). By default a test proves nothing; a test about those reads fakes its own.
+    monkeypatch.setattr(legs, "requirement_values", lambda: {
+        "varbit_values": {}, "varplayer_values": {}, "owned_item_ids": None, "currency_held": None})
 
 
 class _State:
@@ -239,7 +243,7 @@ def test_travel_runs_one_leg_per_tick_and_keeps_its_cursor(monkeypatch):
     _carry(monkeypatch)
     route = [legs.walk(2740, 3351, 0), legs.fairy("BLR", "Legends"), legs.walk(2700, 3330, 0)]
     planned = []
-    monkeypatch.setattr(slayer_routes, "plan", lambda task, player, carried, skill_levels=None: planned.append(task) or (route, ""))
+    monkeypatch.setattr(slayer_routes, "plan", lambda task, player, carried, skill_levels=None, proven=None: planned.append(task) or (route, ""))
     ran = []
     monkeypatch.setattr(legs, "run_next", lambda ctx, legs_, cursor, log="travel": ran.append(cursor) or (legs.DONE, cursor + 1))
     ctx = _Ctx()
@@ -381,3 +385,21 @@ def test_the_carried_map_holds_item_ids_so_a_lit_lantern_can_be_told_from_an_unl
     ctx = _Ctx()
     routine.tick(ctx)
     assert ran == [1] and ctx.state.stops == []
+
+
+def test_travel_hands_the_planner_what_the_account_proves(monkeypatch):
+    """The whirlpool's varbit and a dusty key open gated transports; plan() refuses a teleport
+    whose onward walk it cannot prove, so TRAVEL must pass the proof along."""
+    seen = {}
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Bears", count=15))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})
+    _carry(monkeypatch)
+    monkeypatch.setattr(legs, "skill_levels", lambda: {"Agility": 77})
+    monkeypatch.setattr(legs, "requirement_values", lambda: {"varbit_values": {3759: 3}})
+
+    def plan(task, player, carried, skill_levels=None, proven=None):
+        seen.update(skill_levels=skill_levels, proven=proven)
+        return None, "stop here"
+    monkeypatch.setattr(slayer_routes, "plan", plan)
+    routine.tick(_Ctx())
+    assert seen == {"skill_levels": {"Agility": 77}, "proven": {"varbit_values": {3759: 3}}}

@@ -651,3 +651,51 @@ def test_a_dialogue_item_leg_without_the_item_or_without_a_landing_fails(monkeyp
     assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0), "clicked, never landed"
     monkeypatch.setattr(controller, "get_inventory", lambda: [])
     assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0), "no ring carried"
+
+
+# --- 2026-09-20: a teleport SPELL, cast the way npc_contact casts NPC Contact ------------------
+#
+# npc_contact.cast is proven live (2026-09-19): magic tab, GET /widget for the spell, one click at
+# offset (0,0). Moonclan Teleport is child 116 of the same interface 218 -- read from the cache,
+# which gives NPC Contact as 218:113, the very constant measured live, so the mapping is checked.
+
+def _spell_world(monkeypatch, tab=6, widget=None, click=True, arrived=True):
+    calls = {"keys": [], "click": []}
+    monkeypatch.setattr(controller, "get_active_tab", lambda: tab)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: calls["keys"].append(key))
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: widget)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, e, **kw: calls["click"].append(kw) or click)
+    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=legs.ITEM_BUDGET_S: arrived)
+    return calls
+
+
+SPELL_WIDGET = {"found": True, "clickable": True, "screenX": 700, "screenY": 300}
+
+
+def test_a_spell_leg_opens_the_magic_tab_and_casts_with_one_gated_click(monkeypatch):
+    import npc_contact
+    calls = _spell_world(monkeypatch, tab=0, widget=SPELL_WIDGET)
+    leg = legs.spell("Moonclan Teleport", (218, 116), (2113, 3915, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.DONE, 1)
+    assert calls["keys"] == [npc_contact.MAGIC_TAB_KEY], "the tab was not the magic tab"
+    assert calls["click"][0]["offset"] == (0, 0) and calls["click"][0]["expected_action"] == "Cast"
+
+
+def test_a_spell_leg_does_not_touch_the_tab_key_when_the_book_is_already_open(monkeypatch):
+    import npc_contact
+    calls = _spell_world(monkeypatch, tab=npc_contact.MAGIC_TAB_INDEX, widget=SPELL_WIDGET)
+    assert legs.run_next(_Ctx(), [legs.spell("Moonclan Teleport", (218, 116), (2113, 3915, 0))], 0)[0] == legs.DONE
+    assert calls["keys"] == []
+
+
+def test_a_spell_that_is_not_clickable_or_never_lands_fails_the_leg(monkeypatch):
+    """Wrong spellbook, a filtered spell, or no runes: the click does nothing and no landing comes."""
+    leg = legs.spell("Moonclan Teleport", (218, 116), (2113, 3915, 0))
+    _spell_world(monkeypatch, widget={"found": True, "clickable": False})
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
+    _spell_world(monkeypatch, widget=None)
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
+    _spell_world(monkeypatch, widget=SPELL_WIDGET, arrived=False)
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)

@@ -186,7 +186,10 @@ def _travel(ctx, state, player) -> None:
         return
     key = (state.task, state.streak)
     if data.get("slayer_route_for") != key or not data.get("slayer_route"):
-        route, why = slayer_routes.plan(state.task, player, carried, skill_levels=legs.skill_levels())
+        # `proven` is what opens gated transports (the whirlpool's varbit, a dusty key): plan()
+        # refuses a teleport whose onward walk this account cannot make, so it must be told.
+        route, why = slayer_routes.plan(state.task, player, carried, skill_levels=legs.skill_levels(),
+                                        proven=legs.requirement_values())
         if route is None:
             _stranded(ctx, state, why)
             return

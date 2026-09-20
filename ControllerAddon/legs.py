@@ -69,6 +69,14 @@ def item(name: str, option: str, dest) -> dict:
     return leg
 
 
+def spell(name: str, widget, dest) -> dict:
+    """A teleport SPELL cast from the spellbook: `widget` is its (group, child) in interface 218."""
+    leg = _base("spell", f"cast {name}", dest)
+    leg["option"] = "Cast"
+    leg["widget"] = list(widget)
+    return leg
+
+
 def dialogue_item(name: str, label: str, needle: str, dest) -> dict:
     """An INVENTORY item whose destination is CHOSEN in a chat menu -- the slayer ring.
 
@@ -235,7 +243,7 @@ def run_leg(ctx, leg, log: str = "travel") -> bool:
         return False
     kind = leg.get("kind")
     runner = (run_item_leg if kind == "item" else run_dialogue_item_leg if kind == "dialogue_item"
-              else run_object_leg)
+              else run_spell_leg if kind == "spell" else run_object_leg)
     return runner(ctx, leg, log) and await_arrival(dest)
 
 
@@ -264,6 +272,30 @@ def run_item_leg(ctx, leg, log: str = "travel") -> bool:
         ok = controller.click_menu_action(ctx.ser, it, option or "Teleport",
                                           check_ui_blockers=False)
     return bool(ok)
+
+
+def run_spell_leg(ctx, leg, log: str = "travel") -> bool:
+    """Cast a teleport spell exactly as npc_contact.cast casts NPC Contact (proven live
+    2026-09-19): the magic tab, GET /widget for the spell, ONE click at offset (0,0) -- the icons
+    are packed, the default nudge lands on a neighbour. The hover gate demands `Cast`.
+
+    A spell that is not clickable (wrong spellbook, filtered out) fails here; one with no runes
+    clicks and does nothing, and the caller's landing check fails the leg. UNVERIFIED LIVE for
+    Moonclan Teleport; its widget id is from the cache, cross-checked against NPC Contact's."""
+    import npc_contact                      # local: keeps legs importable without the contact module
+    widget = leg.get("widget") or []
+    if len(widget) != 2:
+        return False
+    if controller.get_active_tab() != npc_contact.MAGIC_TAB_INDEX:
+        controller.key_tap(ctx.ser, npc_contact.MAGIC_TAB_KEY)
+        controller.human_delay(0.3, 0.5)
+    icon = controller.get_widget(widget[0], widget[1])
+    if not icon or not icon.get("clickable"):
+        debug_log.log(log, f"spell widget {widget[0]}.{widget[1]} is not clickable -- wrong spellbook, or filtered?")
+        return False
+    debug_log.log(log, f"leg: {leg.get('display')}")
+    return bool(controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False,
+                                        simulate_mistakes=False, expected_action="Cast"))
 
 
 def _standing_near(dest) -> bool:

@@ -130,7 +130,7 @@ def test_plan_uses_a_carried_tablet_for_a_kuradal_task():
     """The Taverley tablet is an inventory item with a direct option -- the mechanism the
     Ectophial already uses."""
     legs_, why = slayer_routes.plan("Black demons", {"x": 3200, "y": 3200, "plane": 0},
-                                    {"Taverley teleport": 3})
+                                    {"Taverley teleport": 3}, skill_levels={"Agility": 77})
     assert why == "" and [l["kind"] for l in legs_] == ["item", "walk"]
     assert legs_[0]["dest"] == [2893, 3465, 0]
 
@@ -161,7 +161,8 @@ def test_plan_uses_xerics_talisman_by_its_direct_menu_option():
 def test_plan_names_what_it_cannot_do_yet():
     """The desert amulet's Kalphite cave teleport has no measured mechanism anywhere in the repo:
     with no fairy ring in walking range and no tablet, the routine must STOP naming both."""
-    legs_, why = slayer_routes.plan("Kalphite", {"x": 3200, "y": 3200, "plane": 0},
+    # Deep in the Dwarven Mine: no fairy ring within walking range (nearest_ring is None there).
+    legs_, why = slayer_routes.plan("Kalphite", {"x": 3000, "y": 9800, "plane": 0},
                                     {"desert amulet 4": 1})
     assert legs_ is None and "Desert amulet 4" in why
 
@@ -170,3 +171,68 @@ def test_a_talisman_line_for_another_destination_is_not_sent_to_xerics_heart():
     assert slayer_routes.parse("Xeric's talisman: Xeric's Heart (Option 4)") == ("item", "xeric's talisman")
     assert slayer_routes.parse("Xeric's talisman: Xeric's Glade")[0] == "unsupported"
     assert slayer_routes.parse("Ectophial") == ("item", "ectophial"), "an item with one destination is untouched"
+
+
+def test_suqahs_are_reached_by_casting_moonclan_teleport():
+    legs_, why = slayer_routes.plan("Suqahs", {"x": 3200, "y": 3200, "plane": 0}, {})
+    assert why == "" and [l["kind"] for l in legs_] == ["spell", "walk"]
+    assert legs_[0]["widget"] == [218, 116] and legs_[0]["dest"] == [2113, 3915, 0]
+
+
+def test_a_task_both_masters_assign_is_offered_both_registries_teleports():
+    """Kalphite is in Aya's registry AND Kuradal's catalog, same cave. Aya's list alone stops at
+    the desert amulet (no leg); the catalog adds fairy ring BIQ, which a carried tablet serves
+    through the house ring."""
+    mine = {"x": 3000, "y": 9800, "plane": 0}        # no fairy ring in walking range
+    none, why = slayer_routes.plan("Kalphite", mine, {})
+    assert none is None and "BIQ" in why and "Desert amulet" in why, "both were considered"
+    legs_, why = slayer_routes.plan("Kalphite", mine, {"teleport to house": 2})
+    assert why == "" and [l["kind"] for l in legs_][:3] == ["poh_enter", "poh_pool", "poh_ring"]
+    # ...and from Lumbridge an OVERWORLD ring is a walk away, which beats the house.
+    near, _ = slayer_routes.plan("Kalphite", {"x": 3200, "y": 3200, "plane": 0}, {})
+    assert [l["kind"] for l in near] == ["walk", "fairy", "walk"] and near[1]["code"] == "BIQ"
+
+
+def test_the_great_conch_and_karuulm_rings_have_a_confirm_text():
+    """The wiki's Location text per code; AJQ's matches what was MEASURED on the Confirm button,
+    which is what makes it a usable source. A wrong guess is a stop before the hop, never a trip."""
+    assert slayer_routes.FAIRY_EXPECT["CJQ"] == "Conch"
+    assert slayer_routes.FAIRY_EXPECT["CIR"] == "Karuulm"
+
+
+def test_a_task_whose_last_walk_cannot_be_routed_is_refused_before_any_teleport_is_spent():
+    """Gryphons: CJQ is dialable, but the cave entrance is in no table, so the walk leg could
+    never succeed. Planning it would spend the hop and strand the routine on the Great Conch
+    with a task active. `routable=False` in the catalog must stop the plan, naming why."""
+    legs_, why = slayer_routes.plan("Gryphons", {"x": 3200, "y": 3200, "plane": 0},
+                                    {"teleport to house": 5})
+    assert legs_ is None and "recording" in why
+    # Standing AT the site is still just a walk: nothing is spent.
+    at_site, _ = slayer_routes.plan("Gryphons", {"x": 3222, "y": 8861, "plane": 0}, {})
+    assert [l["kind"] for l in at_site] == ["walk"]
+
+
+def test_no_teleport_is_spent_toward_a_walk_this_account_cannot_make():
+    """The catalog tests prove routability for the USER's account. The planner must prove it for
+    whoever is running: under 70 Agility (and with no dusty key) there is no way from Taverley to
+    the black demons, and landing there with a task active is a strand, not a route."""
+    lumbridge = {"x": 3200, "y": 3200, "plane": 0}
+    tablet = {"Taverley teleport": 3}
+    ok, why = slayer_routes.plan("Black demons", lumbridge, tablet, skill_levels={"Agility": 77})
+    assert ok is not None and why == ""
+    none, why = slayer_routes.plan("Black demons", lumbridge, tablet, skill_levels={"Agility": 50})
+    assert none is None and "no walking route" in why and "Taverley teleport" in why
+    # The dusty key, proven by item id, opens the other way in -- for the same low-Agility account.
+    keyed, why = slayer_routes.plan("Black demons", lumbridge, tablet, skill_levels={"Agility": 50},
+                                    proven={"owned_item_ids": {1590}})
+    assert keyed is not None and why == ""
+
+
+def test_what_the_account_proves_reaches_the_routability_check():
+    """Waterfiends: the whirlpool needs varbit 3759 > 1. Unread, the walk from Barbarian Outpost
+    cannot be proven and the house-box hop is refused; read (the account: 3), it plans."""
+    lumbridge, tablets = {"x": 3200, "y": 3200, "plane": 0}, {"teleport to house": 5}
+    none, why = slayer_routes.plan("Waterfiends", lumbridge, tablets)
+    assert none is None and "no walking route" in why
+    legs_, why = slayer_routes.plan("Waterfiends", lumbridge, tablets, proven={"varbit_values": {3759: 3}})
+    assert why == "" and legs_[-1]["kind"] == "walk"

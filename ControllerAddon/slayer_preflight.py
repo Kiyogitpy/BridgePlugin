@@ -34,7 +34,7 @@ def _tablets_total(carried, banked):
 
 
 def report(task, count, streak, points, player, carried, banked, panel_cfg, tasks_cfg,
-           skill_levels, prayer_level, prayer_bonus) -> list:
+           skill_levels, prayer_level, prayer_bonus, proven=None) -> list:
     lines = []
     master = slayer_state.next_master(streak, tasks_cfg)
     if not task:
@@ -61,7 +61,7 @@ def report(task, count, streak, points, player, carried, banked, panel_cfg, task
     if missing:
         lines.append(f"STOP before any teleport -- not carried: {', '.join(missing)}")
 
-    legs_, why = slayer_routes.plan(task, player, carried, skill_levels=skill_levels)
+    legs_, why = slayer_routes.plan(task, player, carried, skill_levels=skill_levels, proven=proven)
     if legs_ is None:
         lines.append(f"cannot get there from {tuple((player or {}).get(k) for k in ('x', 'y', 'plane'))}: {why}")
     else:
@@ -80,7 +80,8 @@ def report(task, count, streak, points, player, carried, banked, panel_cfg, task
         after = dict(carried or {})
         for w in loadout.withdraw:
             after[w["name"].lower()] = after.get(w["name"].lower(), 0) + w["quantity"]
-        legs_after, why_after = slayer_routes.plan(task, player, after, skill_levels=skill_levels)
+        legs_after, why_after = slayer_routes.plan(task, player, after, skill_levels=skill_levels,
+                                                   proven=proven)
         lines.append("after the bank trip: " + ("  ->  ".join(leg["display"] for leg in legs_after)
                                                 if legs_after else f"still no route -- {why_after}"))
     for problem in loadout.problems:
@@ -99,7 +100,8 @@ def report(task, count, streak, points, player, carried, banked, panel_cfg, task
     return lines
 
 
-def overview(count, player, carried, banked, panel_cfg, skill_levels, prayer_level, prayer_bonus) -> list:
+def overview(count, player, carried, banked, panel_cfg, skill_levels, prayer_level, prayer_bonus,
+             proven=None) -> list:
     """One line per Kuradal FIGHT task: does it plan once the pack is fetched, and what is short.
     The whole catalog against one account, so a gap shows up here and not at the site."""
     lines, planned = [], 0
@@ -108,7 +110,7 @@ def overview(count, player, carried, banked, panel_cfg, skill_levels, prayer_lev
         after = dict(carried or {})
         for w in loadout.withdraw:
             after[w["name"].lower()] = after.get(w["name"].lower(), 0) + w["quantity"]
-        route, why = slayer_routes.plan(key, player, after, skill_levels=skill_levels)
+        route, why = slayer_routes.plan(key, player, after, skill_levels=skill_levels, proven=proven)
         planned += 1 if route else 0
         lines.append(f"{key:18} " + ("ROUTE " + " > ".join(leg["display"] for leg in route) if route
                                       else "NO ROUTE: " + why))
@@ -139,7 +141,7 @@ def _main(argv) -> int:
     if args.all:
         for line in overview(args.count, controller.get_player() or {}, routine._carried(),
                              slayer_loadout.banked_from_memory(bank_memory.load()), config,
-                             legs.skill_levels(), prayer, 0):
+                             legs.skill_levels(), prayer, 0, proven=legs.requirement_values()):
             print(line)
         return 0
     task = args.task if args.task else (state.task if state.has_task else None)
@@ -148,7 +150,8 @@ def _main(argv) -> int:
         print(f"(pretending the task is {args.task} x{count}; the live task is {state.task} x{state.count})")
     for line in report(task, count, state.streak, state.points, controller.get_player() or {},
                        routine._carried(), slayer_loadout.banked_from_memory(bank_memory.load()),
-                       config, config.get("tasks") or {}, legs.skill_levels(), prayer, 0):
+                       config, config.get("tasks") or {}, legs.skill_levels(), prayer, 0,
+                       proven=legs.requirement_values()):
         print(line)
     return 0
 
