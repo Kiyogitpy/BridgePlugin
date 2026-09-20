@@ -167,11 +167,12 @@ def _teleport(pack, site, task_name) -> None:
     wanted = []
     for text in texts:
         kind, value = slayer_routes.parse(text)
-        if kind in ("fairy", "box", "spell"):
+        if kind in ("fairy", "box", "spell", "poh_mounted"):
             return
         if kind == "unsupported":
             continue
-        head = value[0] if kind == "dialogue_item" else slayer_routes.item_row(value)[0]
+        head = (slayer_routes.GLIDER_APPROACH[0] if kind == "glider"      # the ring that reaches the pilot
+                else value[0] if kind == "dialogue_item" else slayer_routes.item_row(value)[0])
         wanted.append((text, head))
         if any(supplies._is(n, head) or head in n for n in _names(pack.carried)):
             pack.keep.append(head)

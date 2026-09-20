@@ -74,10 +74,13 @@ def test_an_impossible_trip_is_none_and_fast():
     assert time.perf_counter() - t0 < 8.0
 
 
-def test_the_usable_link_set_never_contains_doors_or_the_wilderness_ditch():
+def test_the_usable_link_set_never_contains_a_plain_door_or_the_wilderness_ditch():
+    """A PLAIN door -- one tile across, or one the map already walks through -- is travel.py's
+    job. Since 2026-09-20 the only door rows admitted are crossfloor.pass_through_doors()."""
     links = crossfloor.usable_links()
     assert links
-    assert all(s.kind != transports.DOOR for s in links)
+    allowed = set(map(id, crossfloor.pass_through_doors()))
+    assert all(s.kind != transports.DOOR or id(s) in allowed for s in links)
     assert not any(s.enters_wilderness_ditch for s in links)
 
 
@@ -194,3 +197,35 @@ def test_the_wilderness_slayer_cave_counts_as_wilderness_and_the_slayer_tower_do
     outside = next((s for s in crossfloor.transports.load_links()
                     if s.dest == (3406, 10145, 0) and not crossfloor.in_wilderness(s.origin)), None)
     assert outside is None or crossfloor.enters_wilderness(outside)
+
+
+# --- 2026-09-20: a pass-through door the map does not bake open is a transport -----------------
+
+RING_STRONGHOLD = (2431, 3422, 0)
+GLIDER_PILOT = (2465, 3501, 3)          # Captain Errdo, on top of the Grand Tree
+
+
+def test_the_grand_tree_can_be_entered_and_climbed():
+    """MEASURED: the Grand Tree's ground floor is a sealed 20-tile island on the static map -- its
+    Tree Door is not one the map bakes open -- and the door's own row ('Open Tree Door 1967',
+    a TWO-tile hop) was discarded as 'a plain door'. Inside, the climb always routed. Found
+    looking for the gnome glider the user asked about."""
+    route = crossfloor.find_route(RING_STRONGHOLD, GLIDER_PILOT)
+    assert route is not None
+    objects = [s.step.target for s in route.steps if isinstance(s, crossfloor.Link)]
+    assert objects[0] == "Tree Door" and objects.count("Ladder") == 3
+
+
+def test_only_a_pass_through_the_map_blocks_becomes_a_transport():
+    """'Open' on an ordinary shut door does not carry you across it, so a ONE-tile door row stays
+    travel.py's job even where the map blocks it (65 rows): offering it would swap a working long
+    route for a short one that fails at run time. A door the map already walks through stays out
+    too. Only the 18 two-tile pass-throughs the map blocks come in."""
+    links = crossfloor.usable_links()
+    doors = [s for s in links if s.kind == crossfloor.transports.DOOR]
+    assert 10 <= len(doors) <= 30, len(doors)
+    assert all(max(abs(s.origin[0] - s.dest[0]), abs(s.origin[1] - s.dest[1])) >= 2 for s in doors)
+    assert any(s.target == "Tree Door" for s in doors)
+    plain = next(s for s in crossfloor.transports.load_links()
+                 if s.origin == (3097, 3107, 0) and s.dest == (3098, 3107, 0))
+    assert plain not in links

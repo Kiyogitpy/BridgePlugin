@@ -440,3 +440,39 @@ def test_the_pool_waits_for_run_energy_too(monkeypatch):
     monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
     assert poh.drink_pool(_Ctx()) is True
     assert seen[-1] == 100, "it kept polling until run energy read full"
+
+
+# --- 2026-09-20: an item MOUNTED in the house (USER: "there is a digsite pendant mounted in poh") --
+
+PENDANT = {"id": 33418, "name": "Digsite Pendant", "actions": ["Digsite", "Fossil Island", "Remove"],
+           "clickable": True, "screenX": 400, "screenY": 300, "x": 1950, "y": 7060, "plane": 1,
+           "instX": 11670, "instY": 1450, "distance": 2147483647}
+
+
+def test_a_mounted_item_is_found_by_name_and_action_not_by_a_guessed_id(monkeypatch):
+    """The vendored table lists the mounted pendant under ids 33417-33419 (one per unlock tier).
+    Which one a given house holds is not knowable offline, so the object is matched by NAME and by
+    OFFERING the action, the way travel.py identifies a door."""
+    junk = dict(PENDANT, name="Mounted glory", actions=["Edgeville", "Remove"])
+    monkeypatch.setattr(controller, "get_player", lambda: {"instX": 11669, "instY": 1449})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [junk, PENDANT])
+    assert poh.find_named("digsite pendant", "Digsite") is PENDANT
+    assert poh.find_named("digsite pendant", "Lithkren") is None, "not unlocked on this pendant"
+    assert poh.find_named("xeric", "Digsite") is None
+
+
+def test_use_mounted_takes_the_destination_from_the_menu(monkeypatch):
+    seen = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"instX": 11669, "instY": 1449})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [PENDANT])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, oid: "refresh")
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, obj, action, **kw: seen.append((obj["name"], action, kw.get("refresh_target"))) or True)
+    assert poh.use_mounted(_Ctx(), "digsite pendant", "Digsite") is True
+    assert seen == [("Digsite Pendant", "Digsite", "refresh")], "the MENU entry: a left-click may be another destination"
+
+
+def test_use_mounted_without_the_object_in_view_is_false(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"instX": 1, "instY": 1})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [])
+    assert poh.use_mounted(_Ctx(), "digsite pendant", "Digsite") is False

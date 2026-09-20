@@ -699,3 +699,91 @@ def test_a_spell_that_is_not_clickable_or_never_lands_fails_the_leg(monkeypatch)
     assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
     _spell_world(monkeypatch, widget=SPELL_WIDGET, arrived=False)
     assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
+
+
+def test_a_mounted_house_item_leg_is_confirmed_by_leaving_the_house(monkeypatch):
+    seen = []
+    monkeypatch.setattr(poh, "use_mounted", lambda ctx, name, action, log: seen.append((name, action)) or True)
+    monkeypatch.setattr(poh, "await_left_house", lambda budget_s: True)
+    leg = legs.house_mounted("digsite pendant", "Digsite", (3341, 3445, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.DONE, 1)
+    assert seen == [("digsite pendant", "Digsite")]
+    monkeypatch.setattr(poh, "await_left_house", lambda budget_s: False)
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
+    monkeypatch.setattr(poh, "use_mounted", lambda ctx, name, action, log: False)
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
+
+
+# --- 2026-09-20: the gnome glider (USER: "for glider pathing cant you check microbot?") --------
+#
+# Microbot's Rs2Walker.handleGlider: interact the pilot with the action `Glider`, wait for
+# interface 138, click the destination widget. Its packed ids decode as (138 << 16) | child:
+# Sindarpos 9043975 -> 138.7. The pilot (Captain Errdo 10467 at (2465,3501,3)) and the landing
+# (2850,3498,0) are our own vendored gnome_gliders.tsv.
+
+ERRDO = {"name": "Captain Errdo", "id": 10467, "index": 4412, "clickable": True,
+         "screenX": 500, "screenY": 300, "x": 2465, "y": 3501, "plane": 3}
+MAP_ENTRY = {"found": True, "clickable": True, "screenX": 320, "screenY": 210}
+
+
+def _glider_world(monkeypatch, npcs, widget_answers, arrived=True):
+    calls = {"menu": [], "click": []}
+    answers = iter(widget_answers)
+    monkeypatch.setattr(controller, "get_npcs", lambda fresh=False: npcs)
+    monkeypatch.setattr(controller, "npc_index_refresh_target", lambda index: f"npc{index}")
+    monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: next(answers, None))
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, e, action, **kw: calls["menu"].append((e.get("name"), action, kw.get("refresh_target"))) or True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: calls["click"].append(kw) or True)
+    monkeypatch.setattr(legs.time, "sleep", lambda s: None)
+    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=legs.ITEM_BUDGET_S: arrived)
+    return calls
+
+
+def test_a_glider_leg_talks_to_the_pilot_then_clicks_the_destination_on_the_map(monkeypatch):
+    calls = _glider_world(monkeypatch, [ERRDO], [None, None, MAP_ENTRY])
+    leg = legs.glider("Captain Errdo", "Sindarpos", (138, 7), (2850, 3498, 0))
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.DONE, 1)
+    assert calls["menu"] == [("Captain Errdo", "Glider", "npc4412")], "the pilot, tracked by index"
+    assert len(calls["click"]) == 1 and calls["click"][0]["offset"] == (0, 0)
+
+
+def test_a_glider_map_already_open_is_not_reopened(monkeypatch):
+    calls = _glider_world(monkeypatch, [ERRDO], [MAP_ENTRY, MAP_ENTRY])
+    assert legs.run_next(_Ctx(), [legs.glider("Captain Errdo", "Sindarpos", (138, 7), (2850, 3498, 0))], 0)[0] == legs.DONE
+    assert calls["menu"] == []
+
+
+def test_a_glider_leg_fails_cleanly_without_the_pilot_the_map_or_the_landing(monkeypatch):
+    leg = legs.glider("Captain Errdo", "Sindarpos", (138, 7), (2850, 3498, 0))
+    _glider_world(monkeypatch, [], [None])
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0), "no pilot in view"
+    _glider_world(monkeypatch, [ERRDO], [None] * 200)
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0), "the map never opened (The Grand Tree not done?)"
+    _glider_world(monkeypatch, [ERRDO], [None, MAP_ENTRY], arrived=False)
+    assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0), "clicked, never landed"
+
+
+# --- 2026-09-20: the two tables can name ONE ladder by two object ids ---------------------------
+
+def test_a_stale_object_id_falls_back_to_the_sibling_rows_id(monkeypatch):
+    """MEASURED on the Grand Tree: every ladder is in the merged table twice -- 'Climb-up Ladder
+    16683' from the jar and 'Climb-up Ladder 4458' from Microbot's newer fork, same origin, same
+    destination. The search takes the first; if that id is the stale one, the object is 'not
+    found', the walk fails, and every retry re-plans the same way until the routine stops. The
+    sibling row's id names the same physical ladder."""
+    import transports
+    rows = [s for s in transports.load_links() if s.origin == (2466, 3494, 0) and s.dest == (2466, 3494, 1)]
+    assert {r.object_id for r in rows} == {16683, 4458}, "the premise: two ids, one ladder"
+    ours = next(r for r in rows if r.object_id == 16683)
+    new_ladder = {"id": 4458, "name": "Ladder", "x": 2466, "y": 3495, "plane": 0, "screenX": 300, "screenY": 200}
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [new_ladder])
+    assert legs.find_transport_object(ours) is new_ladder
+    # An unrelated object with some other id is still not a match.
+    other = dict(new_ladder, id=999)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [other])
+    assert legs.find_transport_object(ours) is None
+    # And the row's OWN id still wins when it is there.
+    own = dict(new_ladder, id=16683)
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [new_ladder, own])
+    assert legs.find_transport_object(ours) is own

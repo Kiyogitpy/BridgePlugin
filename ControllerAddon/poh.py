@@ -264,6 +264,47 @@ def use_box(ctx, destination, log: str = "poh") -> bool:
     return True
 
 
+def find_named(name_fragment, action, player=None):
+    """A clickable house object whose NAME contains `name_fragment` and which OFFERS `action`,
+    nearest by instance distance. For things MOUNTED in the house (a digsite pendant, a glory):
+    the vendored table lists several ids per item (one per unlock tier) and which one a given
+    house holds is not knowable offline, so identify it the way travel.py identifies a door --
+    by name and by the action it offers."""
+    if player is None:
+        player = controller.get_player() or {}
+    fragment, wanted = (name_fragment or "").lower(), (action or "").lower()
+    candidates = [o for o in (controller.get_objects(radius=SCAN_RADIUS, fresh=True) or [])
+                  if fragment and fragment in (o.get("name") or "").lower()
+                  and any((a or "").lower() == wanted for a in (o.get("actions") or []))
+                  and o.get("clickable") and o.get("screenX") is not None]
+    if not candidates:
+        return None
+
+    def sort_key(o):
+        d = inst_distance(player, o)
+        return (d is None, d if d is not None else 0)
+
+    candidates.sort(key=sort_key)
+    return candidates[0]
+
+
+def use_mounted(ctx, name_fragment, action, log: str = "poh") -> bool:
+    """Teleport by an item MOUNTED in the house: take `action` from its right-click menu. The MENU
+    entry, never a left-click -- a mounted item's default may be another destination (the
+    jewellery box's 'last destination' lesson). The caller confirms by leaving the house.
+    UNVERIFIED LIVE (2026-09-20: built from the vendored house table on the user's word that a
+    digsite pendant is mounted); an object not in view fails cleanly, inside a safe house."""
+    obj = find_named(name_fragment, action)
+    if obj is None:
+        debug_log.log(log, f"no mounted {name_fragment!r} offering {action!r} in view")
+        return False
+    refresh = controller.object_refresh_target(obj.get("x"), obj.get("y"), obj.get("plane", 0), obj.get("id"))
+    if not controller.click_menu_action(ctx.ser, obj, action, refresh_target=refresh):
+        debug_log.log(log, f"couldn't take {action!r} from the mounted {obj.get('name')}")
+        return False
+    return True
+
+
 def await_left_house(budget_s: float) -> bool:
     """True once /player no longer reads as inside the house. How a jewellery-box hop is confirmed:
     landing tiles disagree between our own vendored tables (Mining Guild is 28 tiles apart in

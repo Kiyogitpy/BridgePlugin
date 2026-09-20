@@ -131,16 +131,44 @@ def requirement_ids():
             {v for s in steps for v, _, _ in s.varplayers})
 
 
+_pass_through_cache = []
+
+
+def pass_through_doors() -> list:
+    """DOOR rows that are really TRANSPORTS: the game carries the player TWO or more tiles across
+    them, and the static map will not walk that gap.
+
+    worldmap bakes ordinary doors open, which is why door rows are left out of the search. But
+    MEASURED 2026-09-20, the map blocks 83 of the 291 door rows. 65 are ONE-tile doors, where
+    'Open' only opens the leaf and does not carry you across -- travel.py's job, and offering
+    them here would swap a working long route for a short one that fails at run time. The other
+    18 are genuine pass-throughs (Tree Door, Pyramid entrance, Guild door): clicking them moves
+    the player two tiles. Without them the Grand Tree's ground floor is a sealed 20-tile island
+    and the gnome glider pilot on its top floor is unreachable. Computed once."""
+    if not _pass_through_cache:
+        found = []
+        for step in transports.load_links():
+            if step.kind != transports.DOOR:
+                continue
+            if max(abs(step.origin[0] - step.dest[0]), abs(step.origin[1] - step.dest[1])) < 2:
+                continue
+            if worldmap.find_path(step.origin[0], step.origin[1], step.origin[2],
+                                  step.dest[0], step.dest[1], max_nodes=400) is None:
+                found.append(step)
+        _pass_through_cache.append(found)
+    return list(_pass_through_cache[0])
+
+
 def usable_links(skill_levels=None, completed_quests=None, varbit_values=None,
                  varplayer_values=None, owned_item_names=None, use_agility=True,
                  owned_item_ids=None, currency_held=None) -> list:
     """Every transport this account may take: no doors, nothing that ENTERS the Wilderness,
     requirements proven."""
-    steps = list(transports.load_links(include_doors=False))
+    steps = list(transports.load_links(include_doors=False)) + pass_through_doors()
     if use_agility:
         steps += transports.load_agility_shortcuts()
     return [s for s in steps
-            if not enters_wilderness(s) and s.kind != transports.DOOR
+            if not enters_wilderness(s)
             and s.origin != s.dest      # two Mining Guild ladder rows go nowhere: landed() could never be True
             and transports.usable(s, skill_levels=skill_levels, completed_quests=completed_quests,
                                   varbit_values=varbit_values, varplayer_values=varplayer_values,

@@ -90,6 +90,29 @@ SPELLS = {
     "moonclan teleport": ("Moonclan Teleport", (218, 116), (2113, 3915, 0)),
 }
 
+# Items MOUNTED in the house (legs.house_mounted): registry head -> (object name fragment, menu
+# action, landing). USER 2026-09-20: "There is a digsite pendant mounted in poh". The row is the
+# vendored teleportation_boxes.tsv's ("Digsite Digsite Pendant 33417" -> 3341 3445 0); the object
+# is found by NAME + ACTION, not by that id. Like the box and the house ring it needs a tablet
+# or being in the house already. UNVERIFIED LIVE.
+MOUNTED = {
+    "digsite pendant": ("digsite pendant", "Digsite", (3341, 3445, 0)),
+}
+
+# Gnome gliders (legs.glider): destination -> (map widget, landing). Widgets are Microbot's packed
+# ids decoded as (138 << 16) | child; landings are the vendored gnome_gliders.tsv. Every flight
+# here starts from Ta Quir Priw: the pilot stands on TOP of the Grand Tree, a walk and three
+# ladders from the Stronghold slayer ring's landing -- enterable only since
+# crossfloor.pass_through_doors (the Tree Door). Needs The Grand Tree. UNVERIFIED LIVE.
+GLIDER_PILOT = ("Captain Errdo", (2465, 3501, 3))
+GLIDER_APPROACH = ("slayer ring", "stronghold slayer cave")        # a DIALOGUE_ITEMS entry
+GLIDERS = {
+    "sindarpos": ("Sindarpos", (138, 7), (2850, 3498, 0)),
+    "gandius": ("Gandius", (138, 16), (2971, 2968, 0)),
+    "kar-hewo": ("Kar-Hewo", (138, 13), (3284, 3210, 0)),
+    "lemanto andra": ("Lemanto Andra", (138, 10), (3321, 3429, 0)),
+}
+
 # Ornate jewellery box destination -> landing tile. UNVERIFIED coordinates -- the 12-tile
 # await_arrival radius (legs.ARRIVAL_TILES) absorbs small errors. The box serves every teleport
 # item that also names one of these destinations (a glory amulet, a skills necklace, ...), not
@@ -164,6 +187,12 @@ def parse(teleport_text):
         return "item", key
     if key in SPELLS:
         return "spell", key
+    if key == "gnome glider" and _TRAILING_OPTION.sub("", tail).strip().lower() in GLIDERS:
+        return "glider", _TRAILING_OPTION.sub("", tail).strip().lower()
+    # "Digsite pendant (Option 1)" has NO colon: the paging suffix sits on the head.
+    bare = _TRAILING_OPTION.sub("", key).strip()
+    if bare in MOUNTED and (not tail.strip() or MOUNTED[bare][1].lower() in tail.lower()):
+        return "poh_mounted", bare
     if not tail.strip() and consumable(key) is not None:
         return "item", key
     destination = _TRAILING_OPTION.sub("", tail).strip()
@@ -303,6 +332,33 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
                 continue
             label, needle, landing = DIALOGUE_ITEMS[name][destination]
             route = [legs.dialogue_item(name, label, needle, landing), site]
+            if offer(route, text):
+                return route, ""
+            continue
+        if kind == "glider":
+            label, widget, landing = GLIDERS[value]
+            ring, ring_dest = GLIDER_APPROACH
+            if not any(ring in (held or "").lower() for held in (carried or {})):
+                reasons.append(f"{text}: needs a {ring} to reach the pilot on the Grand Tree -- not carried")
+                continue
+            ring_label, needle, ring_landing = DIALOGUE_ITEMS[ring][ring_dest]
+            pilot, pilot_tile = GLIDER_PILOT
+            # The climb is part of the route, so it is proven too: ring landing -> the pilot.
+            if crossfloor.find_route(ring_landing, pilot_tile, skill_levels=skill_levels,
+                                     **(proven or {})) is None:
+                reasons.append(f"{text}: no walking route from {ring_landing} up to {pilot} at {pilot_tile}")
+                continue
+            route = [legs.dialogue_item(ring, ring_label, needle, ring_landing), legs.walk(*pilot_tile),
+                     legs.glider(pilot, label, widget, landing), site]
+            if offer(route, text):
+                return route, ""
+            continue
+        if kind == "poh_mounted":
+            name, action, landing = MOUNTED[value]
+            if not has_tablet and not in_house:
+                reasons.append(f"{text}: needs a house tablet (it is mounted in the house)")
+                continue
+            route = [legs.house(), legs.pool(), legs.house_mounted(name, action, landing), site]
             if offer(route, text):
                 return route, ""
             continue

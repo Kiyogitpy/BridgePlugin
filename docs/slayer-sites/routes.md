@@ -28,7 +28,7 @@ Known findings (2026-09-19, kept here so a regeneration does not lose them):
 
 ## Aberrant spectres
 Slayer ring: Stronghold Slayer Cave (2431, 3422, 0) -> site (2440, 9790, 0)
-- *no requirements proven* (0.11s, cost 92):
+- *no requirements proven* (0.12s, cost 92):
   - walk 3 tiles to (2430, 3424, 0)
   - **Enter Cave 26709** (2430, 3424, 0) -> (2429, 9824, 0)
   - walk 83 tiles to (2440, 9787, 0)
@@ -180,7 +180,7 @@ Taverley teleport: Taverley (2893, 3465, 0) -> site (2852, 9784, 0)
   - walk 3 tiles to (2886, 9799, 0)
   - **Squeeze-through Obstacle pipe 16509** (2886, 9799, 0) -> (2892, 9799, 0) [needs {'Agility': 70}]
   - walk 92 tiles to (2853, 9783, 0)
-- *varbit 3759=3 and a dusty key, no skills* (1.02s, cost 538):
+- *varbit 3759=3 and a dusty key, no skills* (1.01s, cost 538):
   - walk 86 tiles to (2884, 3398, 0)
   - **Climb-down Ladder 16680** (2884, 3398, 0) -> (2884, 9798, 0)
   - walk 317 tiles to (2924, 9803, 0)
@@ -223,11 +223,11 @@ Fairy ring: CJQ (3178, 2447, 0) -> site (3225, 8860, 0)
 
 ## Kalphite
 Desert amulet 4: Kalphite cave (3322, 3122, 0) -> site (3309, 9526, 0)
-- *no requirements proven* (0.07s, cost 46):
+- *no requirements proven* (0.06s, cost 46):
   - walk 1 tiles to (3321, 3122, 0)
   - **Enter Cave 30180** (3321, 3122, 0) -> (3305, 9497, 0)
   - walk 39 tiles to (3309, 9526, 0)
-- *all skills 99*: same (0.07s)
+- *all skills 99*: same (0.06s)
 - *the user's account, read live 2026-09-20: Agility 77, varbit 3759=3*: same (0.07s)
 - *varbit 3759=3 and a dusty key, no skills*: same (0.07s)
 
@@ -247,8 +247,8 @@ Fairy ring: Zanaris (2412, 4434, 0) -> site (2416, 4373, 0)
 Moonclan teleport: Moonclan (2113, 3915, 0) -> site (2085, 3868, 0)
 - *no requirements proven* (0.02s, cost 141):
   - walk 141 tiles to (2085, 3868, 0)
-- *all skills 99*: same (0.03s)
-- *the user's account, read live 2026-09-20: Agility 77, varbit 3759=3*: same (0.03s)
+- *all skills 99*: same (0.02s)
+- *the user's account, read live 2026-09-20: Agility 77, varbit 3759=3*: same (0.02s)
 - *varbit 3759=3 and a dusty key, no skills*: same (0.02s)
 
 ## Trolls
@@ -261,9 +261,9 @@ Ornate Jewellery Box: Burthorpe (2899, 3553, 0) -> site (2864, 3590, 0)
 
 ## Waterfiends
 Ornate Jewellery Box: Barbarian Outpost (2520, 3571, 0) -> site (1750, 5350, 0)
-- *no requirements proven* (1.76s, cost -):
+- *no requirements proven* (1.54s, cost -):
   - NO ROUTE
-- *all skills 99*: same (1.58s)
+- *all skills 99*: same (1.33s)
 - *the user's account, read live 2026-09-20: Agility 77, varbit 3759=3* (0.02s, cost 112):
   - walk 74 tiles to (2512, 3511, 0)
   - **Jump-into Whirlpool 25274** (2512, 3511, 0) -> (1768, 5366, 0)
@@ -325,7 +325,7 @@ Ectophial (3660, 3522, 0) -> site (3630, 3530, 0)
 - *no requirements proven* (0.03s, cost 40):
   - walk 40 tiles to (3630, 3530, 0)
 - *all skills 99*: same (0.03s)
-- *the user's account, read live 2026-09-20: Agility 77, varbit 3759=3*: same (0.03s)
+- *the user's account, read live 2026-09-20: Agility 77, varbit 3759=3*: same (0.04s)
 - *varbit 3759=3 and a dusty key, no skills*: same (0.03s)
 
 ## Minotaurs (Aya)
@@ -336,7 +336,7 @@ skills necklace: Cooking Guild (3143, 3442, 0) -> site (1875, 5218, 0)
   - walk 41 tiles to (1875, 5218, 0)
 - *all skills 99*: same (0.07s)
 - *the user's account, read live 2026-09-20: Agility 77, varbit 3759=3*: same (0.07s)
-- *varbit 3759=3 and a dusty key, no skills*: same (0.07s)
+- *varbit 3759=3 and a dusty key, no skills*: same (0.08s)
 
 ## Scorpions (Aya)
 skills necklace: Mining Guild (3049, 9763, 0) -> site (3049, 9771, 0)

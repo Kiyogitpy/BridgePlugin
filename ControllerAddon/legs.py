@@ -31,6 +31,7 @@ import crossfloor
 import debug_log
 import dialogue
 import poh
+import transports
 import travel
 
 ITEM_BUDGET_S = 6.0      # a teleport is ~4 ticks of animation plus a region load; falconry measured 2.4-3.2s
@@ -128,6 +129,23 @@ def house_box(destination: str, dest) -> dict:
     return leg
 
 
+def glider(pilot: str, destination: str, widget, dest) -> dict:
+    """A gnome glider flight: talk to `pilot`, click `destination` on the map (interface 138)."""
+    leg = _base("glider", f"glider: {destination}", dest)
+    leg["item"] = pilot
+    leg["option"] = "Glider"
+    leg["widget"] = list(widget)
+    return leg
+
+
+def house_mounted(name: str, action: str, dest) -> dict:
+    """An item MOUNTED in the house (a digsite pendant): take `action` from its menu."""
+    leg = _base("poh_mounted", f"mounted {name}: {action}", dest)
+    leg["item"] = name
+    leg["option"] = action
+    return leg
+
+
 def house_ring(code: str, expect: str, dest=None) -> dict:
     """Leave through the house's own fairy ring (poh.use_ring), same dial/confirm mechanic as
     an ordinary `fairy` leg."""
@@ -205,6 +223,13 @@ def run_next(ctx, leg_list, cursor: int, log: str = "travel"):
         if not poh.await_left_house(ITEM_BUDGET_S):
             return FAILED, cursor
         return DONE, cursor + 1
+    if kind == "poh_mounted":
+        if not poh.use_mounted(ctx, leg.get("item"), leg.get("option"), log):
+            return FAILED, cursor
+        # Confirmed by LEAVING THE HOUSE, like the box: the walk leg re-plans from the live tile.
+        if not poh.await_left_house(ITEM_BUDGET_S):
+            return FAILED, cursor
+        return DONE, cursor + 1
     if kind == "poh_ring":
         ok = poh.use_ring(ctx, leg.get("code"), leg.get("expect"), log=log)
         if not ok:
@@ -243,7 +268,8 @@ def run_leg(ctx, leg, log: str = "travel") -> bool:
         return False
     kind = leg.get("kind")
     runner = (run_item_leg if kind == "item" else run_dialogue_item_leg if kind == "dialogue_item"
-              else run_spell_leg if kind == "spell" else run_object_leg)
+              else run_spell_leg if kind == "spell" else run_glider_leg if kind == "glider"
+              else run_object_leg)
     return runner(ctx, leg, log) and await_arrival(dest)
 
 
@@ -296,6 +322,47 @@ def run_spell_leg(ctx, leg, log: str = "travel") -> bool:
     debug_log.log(log, f"leg: {leg.get('display')}")
     return bool(controller.click_entity(ctx.ser, icon, offset=(0, 0), check_ui_blockers=False,
                                         simulate_mistakes=False, expected_action="Cast"))
+
+
+GLIDER_MAP_BUDGET_S = 10.0      # Microbot waits 10 s for interface 138; the pilot may be a walk away
+
+
+def run_glider_leg(ctx, leg, log: str = "travel") -> bool:
+    """A gnome glider: the pilot's `Glider` action opens the map (interface 138), and the
+    destination is one widget on it. The mechanism is Microbot's Rs2Walker.handleGlider (facts
+    only, never its input layer): its packed widget ids decode as (138 << 16) | child. The pilot
+    is tracked by NPC INDEX through the click, like every other NPC click here.
+
+    UNVERIFIED LIVE. Needs The Grand Tree; without it the map never opens and the leg fails
+    within GLIDER_MAP_BUDGET_S. The caller confirms the landing."""
+    widget = leg.get("widget") or []
+    if len(widget) != 2:
+        return False
+    entry = controller.get_widget(widget[0], widget[1])
+    if not (entry and entry.get("clickable")):
+        pilot = (leg.get("item") or "").lower()
+        npc = next((n for n in (controller.get_npcs(fresh=True) or [])
+                    if pilot and pilot in (n.get("name") or "").lower() and n.get("clickable")), None)
+        if npc is None:
+            debug_log.log(log, f"no {leg.get('item')} in view -- leg '{leg.get('display')}' cannot run")
+            return False
+        debug_log.log(log, f"leg: {leg.get('display')}")
+        refresh = controller.npc_index_refresh_target(npc.get("index"))
+        if not controller.click_menu_action(ctx.ser, npc, leg.get("option") or "Glider", refresh_target=refresh):
+            debug_log.log(log, f"couldn't take 'Glider' from {npc.get('name')}")
+            return False
+        waited = 0.0
+        while waited < GLIDER_MAP_BUDGET_S:
+            entry = controller.get_widget(widget[0], widget[1])
+            if entry and entry.get("clickable"):
+                break
+            time.sleep(POLL_S)
+            waited += POLL_S
+        else:
+            debug_log.log(log, "the glider map never opened -- is The Grand Tree done?")
+            return False
+    return bool(controller.click_entity(ctx.ser, entry, offset=(0, 0), check_ui_blockers=False,
+                                        simulate_mistakes=False))
 
 
 def _standing_near(dest) -> bool:
@@ -410,19 +477,30 @@ def find_transport_object(step):
     """The scene object a transport row means: by ID when the row has one, else by NAME, and
     always the match nearest the row's origin tile (a building has many identical staircases)."""
     ox, oy, plane = step.origin
-    matches = []
-    for obj in controller.get_objects(radius=LINK_OBJECT_RADIUS * 3, fresh=True) or []:
-        if obj.get("plane", plane) != plane or obj.get("screenX") is None:
-            continue
-        if step.object_id is not None:
-            if obj.get("id") != step.object_id:
+    objects = controller.get_objects(radius=LINK_OBJECT_RADIUS * 3, fresh=True) or []
+
+    def nearest(accept):
+        matches = []
+        for obj in objects:
+            if obj.get("plane", plane) != plane or obj.get("screenX") is None or not accept(obj):
                 continue
-        elif (obj.get("name") or "").lower() != (step.target or "").lower():
-            continue
-        distance = max(abs(obj.get("x", 0) - ox), abs(obj.get("y", 0) - oy))
-        if distance <= LINK_OBJECT_RADIUS:
-            matches.append((distance, obj))
-    return min(matches, key=lambda m: m[0])[1] if matches else None
+            distance = max(abs(obj.get("x", 0) - ox), abs(obj.get("y", 0) - oy))
+            if distance <= LINK_OBJECT_RADIUS:
+                matches.append((distance, obj))
+        return min(matches, key=lambda m: m[0])[1] if matches else None
+
+    if step.object_id is None:
+        return nearest(lambda obj: (obj.get("name") or "").lower() == (step.target or "").lower())
+    found = nearest(lambda obj: obj.get("id") == step.object_id)
+    if found is not None:
+        return found
+    # The merged table can name ONE physical object by TWO ids: the jar's and Microbot's newer
+    # fork's (MEASURED on the Grand Tree, reworked since the jar: Ladder 16683 and 4458, same
+    # origin, same destination). The search takes the first row; a stale id there would read as
+    # "not found" on every re-plan until the routine stopped. A sibling row's id is the same thing.
+    siblings = {s.object_id for s in list(transports.load_links()) + list(transports.load_agility_shortcuts())
+                if s.origin == step.origin and s.dest == step.dest and s.object_id not in (None, step.object_id)}
+    return nearest(lambda obj: obj.get("id") in siblings) if siblings else None
 
 
 def landed(step, player) -> bool:

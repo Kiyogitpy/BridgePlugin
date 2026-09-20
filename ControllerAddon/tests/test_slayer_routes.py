@@ -24,7 +24,8 @@ def test_the_plugins_teleport_strings_are_parsed_not_guessed():
     # Was "unsupported -- paged dialogue: phase B" until 2026-09-20: legs.dialogue_item now runs the
     # ring's paged menu (golem_crafting had already proven it live).
     assert sr.parse("Slayer Ring: Morytania Slayer Tower (Option 2)") == ("dialogue_item", ("slayer ring", "slayer tower"))
-    assert sr.parse("Gnome Glider: Sindarpos")[0] == "unsupported", "no leg runs a glider"
+    assert sr.parse("Gnome Glider: Sindarpos") == ("glider", "sindarpos")
+    assert sr.parse("Construction cape: Taverley (Option 3)")[0] == "unsupported", "no leg runs a cape teleport"
     assert sr.parse("")[0] == "unsupported"
 
 

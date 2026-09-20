@@ -94,9 +94,9 @@ def test_the_overview_can_sweep_ayas_list_and_names_what_must_be_carried():
     keys = pf.aya_keys()
     assert "cows" in keys and "dogs" not in keys, "a task blocked at Aya is never assigned"
     lines = pf.overview(30, LUMBRIDGE, {}, dict(BANK, **{"ice cooler": 500}), PANEL,
-                        {"Agility": 77}, 77, 0, keys=["cows", "lizards", "cave slimes", "wolves"])
+                        {"Agility": 77}, 77, 0, keys=["cows", "lizards", "cave slimes", "dwarves"])
     text = " | ".join(lines)
     assert "cows" in text and "ectophial: Empty" in text
     assert "NEEDS" in text and "light source" in text, "cave slimes: a LIT light source, by item id"
-    assert "wolves" in text and "NO ROUTE" in text
+    assert "dwarves" in text and "NO ROUTE" in text
     assert lines[-1] == "2 of 4 plan after a bank trip"

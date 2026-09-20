@@ -171,8 +171,15 @@ def test_a_teleport_the_house_serves_is_not_a_missing_item():
 
 
 def test_a_teleport_no_leg_can_run_is_never_packed():
-    """Wolves list only 'Gnome Glider: Sindarpos'. It is not an item and no leg runs it: nothing
-    to withdraw, and the pack says so once rather than asking the banker for a 'Gnome glider'."""
-    lo = sl.build("Wolves", 30, PANEL, 70, 10, {}, BANK)
-    assert not any("glider" in w["name"].lower() for w in lo.withdraw)
+    """Dwarves list a construction cape and a redirected house tablet. No leg runs either: nothing
+    to withdraw, and the pack says so once rather than asking the banker for a 'Construction cape'."""
+    lo = sl.build("Dwarves", 30, PANEL, 70, 10, {}, BANK)
+    assert not any("cape" in w["name"].lower() or "re-direct" in w["name"].lower() for w in lo.withdraw)
     assert any("no usable teleport" in p.lower() for p in lo.problems)
+
+
+def test_a_glider_task_packs_the_ring_that_reaches_the_pilot():
+    """Wolves: 'Gnome Glider: Sindarpos'. The glider is not an item, but the route to its pilot
+    starts with a slayer ring to the Stronghold -- THAT is what the trip must carry."""
+    want = _want(sl.build("Wolves", 30, PANEL, 70, 10, {}, BANK))
+    assert want.get("Slayer ring (2)") == 1

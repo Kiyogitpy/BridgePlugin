@@ -260,3 +260,33 @@ def test_a_plain_teleport_tablet_is_an_item_leg_with_its_landing_from_the_vendor
     ice, why = slayer_routes.plan("Icefiends", {"x": 2700, "y": 3300, "plane": 0}, {"lassar teleport": 2})
     assert why == "" and ice[0]["dest"] == [3004, 3470, 0]
     assert slayer_routes.parse("Nonsense teleport")[0] == "unsupported", "only what the table knows"
+
+
+def test_a_digsite_pendant_mounted_in_the_house_serves_bats_and_skeletons():
+    """USER 2026-09-20: 'There is a digsite pendant mounted in poh'. The registry line has NO
+    colon -- 'Digsite pendant (Option 1)' -- and the vendored house table has the mounted object
+    with the direct action 'Digsite' landing on (3341,3445,0)."""
+    assert slayer_routes.parse("Digsite pendant (Option 1)") == ("poh_mounted", "digsite pendant")
+    mine = {"x": 3000, "y": 9800, "plane": 0}
+    for task in ("Skeletons", "Bats"):
+        legs_, why = slayer_routes.plan(task, mine, {"teleport to house": 3})
+        assert why == "", (task, why)
+        assert [l["kind"] for l in legs_] == ["poh_enter", "poh_pool", "poh_mounted", "walk"], task
+        assert legs_[2]["option"] == "Digsite" and legs_[2]["dest"] == [3341, 3445, 0]
+    none, why = slayer_routes.plan("Skeletons", mine, {})
+    assert none is None and "house tablet" in why
+
+
+def test_wolves_are_reached_by_the_gnome_glider_from_the_grand_tree():
+    """'Gnome Glider: Sindarpos'. The pilot stands on top of the Grand Tree, a walk and three
+    ladders from the Stronghold slayer ring landing -- so the route is ring, walk UP the tree,
+    glider, walk. It needs the ring carried; the whole onward walk is proven before any hop."""
+    lumbridge = {"x": 3200, "y": 3200, "plane": 0}
+    assert slayer_routes.parse("Gnome Glider: Sindarpos") == ("glider", "sindarpos")
+    legs_, why = slayer_routes.plan("Wolves", lumbridge, {"slayer ring (8)": 1})
+    assert why == "", why
+    assert [l["kind"] for l in legs_] == ["dialogue_item", "walk", "glider", "walk"]
+    assert legs_[1]["dest"] == [2465, 3501, 3] and legs_[2]["widget"] == [138, 7]
+    assert legs_[2]["dest"] == [2850, 3498, 0]
+    none, why = slayer_routes.plan("Wolves", lumbridge, {})
+    assert none is None and "slayer ring" in why.lower()
