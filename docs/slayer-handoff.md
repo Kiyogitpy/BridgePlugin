@@ -135,6 +135,13 @@ ledger. Lessons this project paid for, all recorded in the ledgers:
 
 ## Still wanted from the user
 
+- **The one-handed weapon for basilisks (E0), now URGENT rather than theoretical.** MEASURED LIVE
+  2026-09-21: the account fights in RANGED gear with a **Toxic blowpipe**, which is TWO-HANDED.
+  Putting the mirror shield on takes it off, so a basilisk task STOPS by design until a
+  one-handed weapon is chosen. The same read showed the slayer helmet already covers the nose
+  peg and the facemask, and that the mirror shield, a leaf-bladed weapon or broad ammo, the
+  witchwood icon and heat boots are none of them worn (they are fetched and equipped).
+
 - The remaining live gates above.
 - Per-task gear decisions the research left open (Phase E0): a one-handed weapon beside the
   mirror shield, ranged kit for waterfiends, heat boots for wyrms.

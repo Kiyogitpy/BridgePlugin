@@ -173,6 +173,14 @@ def _bank_config(panel, loadout, base=None) -> dict:
     return cfg
 
 
+def _holds(equipment, slot) -> bool:
+    """Is `slot` actually filled? MEASURED LIVE 2026-09-21: GET /equipment reports an EMPTY slot as
+    `{}` -- present, with no name -- so `slot in equipment` is True either way. The slot holds
+    something only when its value is a dict with a name."""
+    worn = (equipment or {}).get(slot)
+    return isinstance(worn, dict) and bool(worn.get("name"))
+
+
 def _base_gear(ctx):
     """The saved base gear ({slot: name}) for this account, or None. Read once per process."""
     data = ctx.state.data
@@ -248,7 +256,7 @@ def _wear(ctx, state) -> bool:
         if pick is None:
             ctx.state.trigger_safety_stop(f"Slayer: {state.task} needs {label} WORN and none is carried")
             return True
-        had_weapon = "weapon" in (controller.get_equipment() or {})
+        had_weapon = _holds(controller.get_equipment(), "weapon")
         debug_log.log(LOG, f"{state.task}: putting on the {pick} ({label})")
         if not gear.equip_from_inventory(ctx, pick):
             fails = data.get("slayer_wear_fails", 0) + 1
@@ -258,7 +266,7 @@ def _wear(ctx, state) -> bool:
                                               f"after {fails} tries -- see the [gear] lines above")
             return True
         data["slayer_wear_fails"] = 0
-        if had_weapon and "weapon" not in (controller.get_equipment() or {}):
+        if had_weapon and not _holds(controller.get_equipment(), "weapon"):
             ctx.state.trigger_safety_stop(
                 f"Slayer: putting on the {pick} for {state.task} took the weapon OFF (a two-handed "
                 f"weapon). Choose a one-handed weapon for this task and wear it -- stopping rather "

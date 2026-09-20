@@ -756,3 +756,33 @@ def test_displaced_base_gear_is_on_the_keep_list_so_the_bank_never_swallows_it()
                                base={"weapon": "Arclight", "shield": "Dragon defender"})
     assert "dragon defender" in cfg["keepItems"] and "arclight" in cfg["keepItems"]
     assert "rune pouch" in cfg["keepItems"] and "shark" in cfg["keepItems"]
+
+
+def test_an_empty_equipment_slot_is_an_empty_dict_not_a_missing_key(monkeypatch):
+    """FOUND LIVE 2026-09-21, the verbatim GET /equipment of an account in ranged gear: an empty
+    slot is {} -- PRESENT with no name. The two-handed check tested `"weapon" in equipment`, which
+    is True either way, so it could never have fired. The account's Toxic blowpipe IS two-handed,
+    so this is the exact case it was written for."""
+    live = {"weapon": {"qty": 1, "name": "Toxic blowpipe", "id": 12926}, "shield": {},
+            "gloves": {"qty": 1, "name": "Barrows gloves", "id": 7462},
+            "helmet": {"qty": 1, "name": "Slayer helmet (i)", "id": 26674}}
+    assert routine._holds(live, "weapon") and not routine._holds(live, "shield")
+    assert not routine._holds({}, "weapon") and not routine._holds(None, "weapon")
+
+    # ...and end to end: the blowpipe comes off when the mirror shield goes on, and that STOPS.
+    world = {"eq": {k: dict(v) for k, v in live.items()}}
+    monkeypatch.setattr(routine, "_wear", REAL_WEAR)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Basilisks", count=150))
+    monkeypatch.setattr(controller, "get_player", lambda: dict(LUMBRIDGE))
+    monkeypatch.setattr(controller, "get_equipment", lambda: {k: dict(v) for k, v in world["eq"].items()})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": "Mirror shield", "qty": 1, "id": 4156}])
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: None)
+
+    def equip(ctx, name):
+        world["eq"]["shield"] = {"qty": 1, "name": "Mirror shield", "id": 4156}
+        world["eq"]["weapon"] = {}                     # two-handed: it comes off
+        return True
+    monkeypatch.setattr(routine.gear, "equip_from_inventory", equip)
+    ctx = _Ctx()
+    routine.tick(ctx)
+    assert ctx.state.stops and "weapon" in ctx.state.stops[0].lower()
