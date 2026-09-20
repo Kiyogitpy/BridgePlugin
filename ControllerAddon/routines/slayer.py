@@ -458,6 +458,83 @@ def _travel(ctx, state, player) -> None:
             _stranded(ctx, state, "the route finished twice but the site is not reached")
 
 
+# What to give up FIRST when a big drop needs a slot. The bridge does not price an INVENTORY
+# item (only ground items carry a value), so this is a stated preference, not a guessed price:
+# an almost-empty potion costs least, a full one most. Anything not listed ranks last.
+GIVE_UP_ORDER = ("antipoison", "antidote", "anti-venom", "(1)", "(2)", "(3)")
+
+
+def _give_up_rank(name) -> int:
+    lowered = (name or "").lower()
+    for rank, fragment in enumerate(GIVE_UP_ORDER):
+        if fragment in lowered:
+            return rank
+    return len(GIVE_UP_ORDER)
+
+
+def _protected_names(task_name) -> tuple:
+    """Item-name fragments that must NEVER be dropped to make room: the task's own required items,
+    the teleports that get us there and home, and the escape ring. Dropping the rock hammer to
+    hold a whip would end the task; dropping the last tablet would strand the run."""
+    spec = slayer_catalog.get(task_name)
+    names = [slayer_loadout.HOUSE_TABLET, slayer_loadout.ESCAPE_RING, "slayer ring", "ectophial",
+             "teleport", "talisman", "blessing", "crystal", "scroll"]
+    for label in (tuple(spec.carry) + tuple(spec.worn)) if spec else ():
+        names.extend(slayer_catalog.REQUIREMENT_ITEMS.get(label, ()))
+    return tuple(dict.fromkeys(n.lower() for n in names if n))
+
+
+def _use_inventory_item(ctx, name) -> bool:
+    """Drink/eat one named inventory item -- the specific copy, not 'the first prayer potion'
+    (controller.consume_first cannot tell a (1) from a (4), and the point here is to FREE A SLOT)."""
+    lowered = (name or "").lower()
+    item = next((i for i in (controller.get_inventory() or [])
+                 if lowered == (i.get("name") or "").lower()), None)
+    if item is None:
+        return False
+    controller.open_inventory_tab(ctx.ser)
+    return bool(controller.click_entity(ctx.ser, item, check_ui_blockers=False, simulate_mistakes=False,
+                                        expected_action=("Drink", "Eat")))
+
+
+def _make_room(ctx, item) -> bool:
+    """combat_core's makeRoom hook (plan task D2). True = take it, room has been made or none is
+    needed. UNVERIFIED LIVE.
+
+    The decision is slayer_policy.loot_decision (pure, tested): below the make-room value a full
+    inventory leaves the drop; from there one food is eaten for it ONLY when HP is missing; from
+    the must-loot value it is always taken -- eat, else finish a 1-dose prayer potion, else drop
+    the least costly consumable. Never gear, never a teleport, never what the task needs."""
+    data, panel = ctx.state.data, (ctx.state.config or {})
+    tasks_cfg = panel.get("tasks") or {}
+    inventory = controller.get_inventory() or []
+    stackable_held = bool(item.get("stackable")) and any(i.get("id") == item.get("id") for i in inventory)
+    player = controller.get_player() or {}
+    hp, hp_max = player.get("hp"), player.get("hpReal")
+    food = (panel.get("food") or {}).get("name")
+    consumables = controller.get_consumables() or {}
+    protected = _protected_names(data.get("slayer_task"))
+    action, what = slayer_policy.loot_decision(
+        int(item.get("totalValue") or 0), stackable_held,
+        max(0, slayer_loadout.supplies.INVENTORY_SLOTS - len(inventory)),
+        max(0, (hp_max or 0) - (hp or 0)),
+        food, len(consumables.get("food") or []),
+        slayer_policy.one_dose_potion(inventory, (panel.get("potions") or {}).get("prayerPotion")),
+        slayer_policy.cheapest_consumable(inventory, food, protected, _give_up_rank),
+        tasks_cfg=tasks_cfg)
+    if action == slayer_policy.TAKE:
+        return True
+    if action == slayer_policy.LEAVE:
+        return False
+    debug_log.log(LOG, f"{item.get('name')} is worth {item.get('totalValue')}: {action} {what}")
+    if action == slayer_policy.EAT_THEN_TAKE:
+        return bool(controller.consume_first(ctx.ser, "food"))
+    if action == slayer_policy.DRINK_THEN_TAKE:
+        return _use_inventory_item(ctx, what)
+    dropped = next((i for i in inventory if (i.get("name") or "").lower() == (what or "").lower()), None)
+    return bool(dropped is not None and controller.drop_items(ctx.ser, [dropped]))
+
+
 def _fight(ctx, state) -> None:
     controller.check_stray_dialog(ctx)
     panel = ctx.state.config
@@ -472,6 +549,11 @@ def _fight(ctx, state) -> None:
     # every task, and gargoyles and nechryael drop plenty) -- hers keep the panel's value.
     if slayer_catalog.get(state.task) is None:
         cfg["loot"] = {**(cfg.get("loot") or {}), "minValue": 0}
+    else:
+        # A catalog task's drops are worth giving a slot up for; Aya's are not, so there is
+        # nothing to make room FOR there. _make_room reads the task from ctx.state.data.
+        ctx.state.data["slayer_task"] = state.task
+        cfg["loot"] = {**(cfg.get("loot") or {}), "makeRoom": lambda item: _make_room(ctx, item)}
     ctx.state.config = cfg
     try:
         combat_core.fight_tick(ctx)

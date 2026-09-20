@@ -329,3 +329,55 @@ def test_the_slayer_routine_still_owns_its_dialogues():
     old test called tick() with nothing mocked, so it read the LIVE bridge when a client was up."""
     from routines import slayer
     assert slayer.SKIP_STRAY_DIALOG_CHECK is True
+
+
+# --- 2026-09-21: the make-room hook (plan task D2) ----------------------------------------------
+#
+# ABSENT = today's behaviour, exactly. combat_core stays dumb: with a full inventory it asks the
+# caller's callable whether to bother, and the caller owns every threshold and every click.
+
+def _looting_world(monkeypatch, ground, inventory, loot_cfg):
+    taken = []
+    monkeypatch.setattr(controller, "get_ground_items", lambda: list(ground))
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inventory))
+    monkeypatch.setattr(controller, "get_ground_item_at", lambda x, y, plane, item_id: None)
+    monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, item, action, **kw: taken.append(item.get("name")) or True)
+    monkeypatch.setattr(controller, "ground_item_refresh_target", lambda *a, **k: None)
+    ctx = _Ctx({"loot": loot_cfg})
+    return ctx, taken
+
+
+DROP = {"name": "Rune platebody", "id": 1127, "x": 3200, "y": 3200, "plane": 0, "qty": 1,
+        "totalValue": 38000, "stackable": False, "clickable": True, "ownership": 0,
+        "screenX": 100, "screenY": 100}
+FULL = [{"name": f"Junk {i}", "id": 100 + i, "qty": 1} for i in range(28)]
+
+
+def test_with_no_make_room_hook_a_full_inventory_behaves_exactly_as_before(monkeypatch):
+    ctx, taken = _looting_world(monkeypatch, [DROP], FULL, {"minValue": 5000})
+    combat_core.maybe_loot(ctx)
+    assert taken == ["Rune platebody"], "unchanged: it still tries, as it always did"
+
+
+def test_a_make_room_hook_that_says_no_leaves_the_drop(monkeypatch):
+    asked = []
+    ctx, taken = _looting_world(monkeypatch, [DROP], FULL,
+                                {"minValue": 5000, "makeRoom": lambda item: asked.append(item["name"]) or False})
+    combat_core.maybe_loot(ctx)
+    assert taken == [] and asked == ["Rune platebody"]
+
+
+def test_a_make_room_hook_that_says_yes_takes_it(monkeypatch):
+    ctx, taken = _looting_world(monkeypatch, [DROP], FULL, {"minValue": 5000, "makeRoom": lambda item: True})
+    combat_core.maybe_loot(ctx)
+    assert taken == ["Rune platebody"]
+
+
+def test_the_hook_is_not_consulted_when_there_is_room(monkeypatch):
+    asked = []
+    ctx, taken = _looting_world(monkeypatch, [DROP], FULL[:10],
+                                {"minValue": 5000, "makeRoom": lambda item: asked.append(1) or False})
+    combat_core.maybe_loot(ctx)
+    assert taken == ["Rune platebody"] and asked == []

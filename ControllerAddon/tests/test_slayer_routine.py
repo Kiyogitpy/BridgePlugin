@@ -467,7 +467,8 @@ def test_a_kuradal_task_loots_by_the_panels_value_not_ayas_whitelist_only_rule(m
     ctx = _Ctx()
     ctx.state.config["loot"] = {"minValue": 5000, "items": ["Rune boots"]}
     routine.tick(ctx)
-    assert seen[0] == {"minValue": 5000, "items": ["Rune boots"]}
+    assert seen[0]["minValue"] == 5000 and seen[0]["items"] == ["Rune boots"]
+    assert callable(seen[0].get("makeRoom")), "...and a catalog task may give a slot up for a big drop"
 
 
 # --- 2026-09-21: the BANK step before TRAVEL (plan task C2), acting through banker.bank_up --------
@@ -786,3 +787,105 @@ def test_an_empty_equipment_slot_is_an_empty_dict_not_a_missing_key(monkeypatch)
     ctx = _Ctx()
     routine.tick(ctx)
     assert ctx.state.stops and "weapon" in ctx.state.stops[0].lower()
+
+
+# --- 2026-09-21: loot tiers (plan task D2) ------------------------------------------------------
+
+BIG = {"name": "Abyssal whip", "id": 4151, "totalValue": 1_500_000, "stackable": False}
+MID = {"name": "Rune platebody", "id": 1127, "totalValue": 60_000, "stackable": False}
+SMALL = {"name": "Rune dagger", "id": 1213, "totalValue": 15_000, "stackable": False}
+COINS = {"name": "Coins", "id": 995, "totalValue": 40_000, "stackable": True}
+
+
+def _room(monkeypatch, inventory, hp=(99, 99), consumables=None, task="Nechryael"):
+    acts = {"eat": [], "drink": [], "drop": []}
+    monkeypatch.setattr(controller, "get_inventory", lambda: [dict(i) for i in inventory])
+    monkeypatch.setattr(controller, "get_player", lambda: {"hp": hp[0], "hpReal": hp[1]})
+    monkeypatch.setattr(controller, "get_consumables", lambda: consumables or {"food": [], "prayer": []})
+    monkeypatch.setattr(controller, "consume_first",
+                        lambda ser, category: acts["eat" if category == "food" else "drink"].append(category) or True)
+    monkeypatch.setattr(controller, "drop_items", lambda ser, items: acts["drop"].extend(i["name"] for i in items) or True)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, item, **kw: acts["drink"].append(item["name"]) or True)
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: None)
+    ctx = _Ctx()
+    ctx.state.config = dict(PANEL, tasks={"makeRoomValue": 50_000, "mustLootValue": 150_000})
+    ctx.state.data["slayer_task"] = task
+    return ctx, acts
+
+
+def _junk(n, name="Junk"):
+    return [{"name": f"{name} {i}", "id": 900 + i, "qty": 1} for i in range(n)]
+
+
+def test_a_cheap_drop_into_a_full_inventory_is_left(monkeypatch):
+    ctx, acts = _room(monkeypatch, _junk(28), hp=(50, 99))
+    assert routine._make_room(ctx, SMALL) is False
+    assert acts == {"eat": [], "drink": [], "drop": []}
+
+
+def test_a_make_room_drop_eats_only_when_hp_is_missing(monkeypatch):
+    held = _junk(27) + [{"name": "Shark", "id": 385, "qty": 1}]
+    ctx, acts = _room(monkeypatch, held, hp=(50, 99), consumables={"food": [{"name": "Shark"}]})
+    assert routine._make_room(ctx, MID) is True and acts["eat"] == ["food"]
+    full_hp, acts2 = _room(monkeypatch, held, hp=(99, 99), consumables={"food": [{"name": "Shark"}]})
+    assert routine._make_room(full_hp, MID) is False and acts2["eat"] == []
+
+
+def test_a_must_loot_drop_is_taken_even_at_full_health(monkeypatch):
+    held = _junk(27) + [{"name": "Shark", "id": 385, "qty": 1}]
+    ctx, acts = _room(monkeypatch, held, hp=(99, 99), consumables={"food": [{"name": "Shark"}]})
+    assert routine._make_room(ctx, BIG) is True and acts["eat"] == ["food"]
+
+
+def test_a_must_loot_drop_with_no_food_finishes_a_one_dose_potion(monkeypatch):
+    held = _junk(27) + [{"name": "Prayer potion(1)", "id": 143, "qty": 1}]
+    ctx, acts = _room(monkeypatch, held, hp=(99, 99))
+    assert routine._make_room(ctx, BIG) is True and acts["drink"] == ["Prayer potion(1)"]
+
+
+def test_a_must_loot_drop_with_nothing_to_consume_drops_the_cheapest_consumable(monkeypatch):
+    held = _junk(26) + [{"name": "Antipoison(2)", "id": 177, "qty": 1},
+                        {"name": "Prayer potion(4)", "id": 2434, "qty": 1}]
+    ctx, acts = _room(monkeypatch, held, hp=(99, 99))
+    assert routine._make_room(ctx, BIG) is True and acts["drop"] == ["Antipoison(2)"]
+
+
+def test_nothing_safe_to_give_up_leaves_even_a_huge_drop(monkeypatch):
+    ctx, acts = _room(monkeypatch, _junk(28), hp=(99, 99))
+    assert routine._make_room(ctx, BIG) is False
+    assert acts == {"eat": [], "drink": [], "drop": []}
+
+
+def test_an_item_the_task_needs_is_never_dropped_for_loot(monkeypatch):
+    """Gargoyles: the rock hammer finishes them. Dropping it to make room for loot would end the
+    task. The teleport home and the house tablets are protected the same way."""
+    held = _junk(25) + [{"name": "Rock hammer", "id": 4162, "qty": 1},
+                        {"name": "Teleport to house", "id": 8013, "qty": 3},
+                        {"name": "Slayer ring (2)", "id": 11871, "qty": 1}]
+    ctx, acts = _room(monkeypatch, held, hp=(99, 99), task="Gargoyles")
+    assert routine._make_room(ctx, BIG) is False, "nothing droppable: the rest is gear or the way home"
+    assert acts["drop"] == []
+
+
+def test_a_stack_already_held_needs_no_room_at_all(monkeypatch):
+    held = _junk(27) + [{"name": "Coins", "id": 995, "qty": 5000}]
+    ctx, acts = _room(monkeypatch, held, hp=(99, 99))
+    assert routine._make_room(ctx, COINS) is True
+    assert acts == {"eat": [], "drink": [], "drop": []}, "it simply stacks"
+
+
+def test_the_fight_passes_the_hook_only_for_a_catalog_task(monkeypatch):
+    """Aya's tasks loot the whitelist only, so there is nothing to make room FOR."""
+    seen = []
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Nechryael", count=150))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3412, "y": 9962, "plane": 3})
+    monkeypatch.setattr(controller, "check_stray_dialog", lambda ctx: None)
+    monkeypatch.setattr(combat_core, "fight_tick", lambda ctx: seen.append(ctx.state.config["loot"]))
+    ctx = _Ctx()
+    ctx.state.config = dict(ctx.state.config, loot={"minValue": 5000, "items": []})
+    routine.tick(ctx)
+    assert callable(seen[0].get("makeRoom"))
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Cows", count=20))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3630, "y": 3530, "plane": 0})
+    routine.tick(ctx)
+    assert seen[1].get("makeRoom") is None and seen[1]["minValue"] == 0

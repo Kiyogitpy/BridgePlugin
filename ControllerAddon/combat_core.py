@@ -986,6 +986,14 @@ def maybe_loot(ctx):
             seed_bypass = seed_box_open and name in SEED_BOX_BYPASS_NAMES
 
             if name_match or value_match or herb_bypass or seed_bypass:
+                # MAKE ROOM (2026-09-21, spec §7.10): with a FULL inventory the caller may decide
+                # whether this drop is worth giving something up for, and do it. ABSENT = today's
+                # behaviour exactly -- the take is attempted regardless, as it always was (pinned
+                # by test). Every threshold and every click lives in the caller; this stays dumb.
+                make_room = loot_cfg.get("makeRoom")
+                if callable(make_room) and inventory_full() and not make_room(item):
+                    continue
+
                 key = (item.get("id"), item.get("x"), item.get("y"))
                 same_target = key == ctx.state.data.get("loot_stuck_key")
 
