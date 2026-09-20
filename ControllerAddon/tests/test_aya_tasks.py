@@ -55,8 +55,22 @@ def test_the_users_three_overrides_are_applied():
     assert minotaurs.teleports[0] == "Ornate Jewellery Box: Cooking Guild"
 
 
+# USER 2026-09-20: "Aya blocklist atm is: Dwarves, Cave Crawlers, Lizards, Skeletons, Kalphites".
+# Dogs were recorded as blocked on 2026-09-19 and are not on that list; they stay blocked here
+# until the user says otherwise -- a task wrongly marked blocked costs a STOP, never a bad trip.
+BLOCKED_AT_AYA = ("Dogs", "Dwarves", "Cave crawlers", "Lizards", "Skeletons", "Kalphite")
+
+
+def test_the_users_aya_block_list_is_never_fought_as_an_aya_task():
+    for name in BLOCKED_AT_AYA:
+        assert aya_tasks.get(name).disposition == aya_tasks.BLOCKED, name
+        assert "blocked" in aya_tasks.get(name).note.lower(), name
+    assert aya_tasks.get("kalphites").disposition == aya_tasks.BLOCKED, "the user wrote the plural"
+
+
 def test_everything_else_is_fought():
-    others = [t for t in AYA_TASKS if t not in ("Dogs",)]
+    others = [t for t in AYA_TASKS if t not in BLOCKED_AT_AYA]
+    assert len(others) == 18
     assert all(aya_tasks.get(t).disposition == aya_tasks.FIGHT for t in others)
 
 

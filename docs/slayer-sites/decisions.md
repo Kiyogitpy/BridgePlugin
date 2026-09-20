@@ -20,6 +20,11 @@ compiled. This file is the input to the task catalog (`slayer_tasks.py`, spec §
 - Aya and Kuradal are the post-*While Guthix Sleeps* names for Turael and Duradel; one task list
   each (`Turael_Slayer assignments`, `Duradel_Slayer assignments`).
 - **Dogs are blocked at Aya**, so that task is never assigned.
+- **USER 2026-09-20: "Aya blocklist atm is: Dwarves, Cave Crawlers, Lizards, Skeletons,
+  Kalphites".** All five are `BLOCKED` in `aya_tasks._OVERRIDES`: never assigned, and the routine
+  STOPS if one ever turns up. Dogs are NOT on that list but stay marked blocked until the user
+  says otherwise (a wrongly blocked task costs a stop, never a bad trip) -- **to confirm with
+  the user: is dogs still blocked?** Kalphite stays one of KURADAL's 22 FIGHT tasks.
 - The user runs the **Turael Skipping** Plugin Hub plugin, and wants its spots used for Aya.
 
 ## Aya (Turael list) — source of truth is the Turael Skipping plugin

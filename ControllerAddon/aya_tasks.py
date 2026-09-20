@@ -27,6 +27,20 @@ AyaTask = namedtuple("AyaTask", ("key", "name", "npc_ids", "target", "location",
 
 _OVERRIDES = {
     "dogs": {"disposition": BLOCKED, "note": "blocked at Aya by the user; never assigned"},
+    # USER 2026-09-20: "Aya blocklist atm is: Dwarves, Cave Crawlers, Lizards, Skeletons,
+    # Kalphites". A blocked task is never assigned; if one turns up anyway the routine STOPS rather
+    # than travel (slayer_tasks.disposition). Their sites and teleports stay in the data so the
+    # name resolves and so unblocking one is a one-line change. Dogs are not on that list but were
+    # recorded as blocked on 2026-09-19 and stay so until the user says otherwise -- a task wrongly
+    # marked blocked costs a stop, never a bad trip. NOTE kalphite is ALSO one of Kuradal's 22
+    # FIGHT tasks: slayer_tasks reads Kuradal's table first, so it is still fought for her.
+    "dwarves": {"disposition": BLOCKED, "note": "blocked at Aya by the user (2026-09-20); never assigned"},
+    "cave crawlers": {"disposition": BLOCKED, "note": "blocked at Aya by the user (2026-09-20); never assigned"},
+    "lizards": {"disposition": BLOCKED, "note": "blocked at Aya by the user (2026-09-20); never assigned"},
+    "skeletons": {"disposition": BLOCKED, "note": "blocked at Aya by the user (2026-09-20); never assigned. "
+                  "(Its kill area is the Digsite Dungeon, which no transport table can reach.)"},
+    "kalphite": {"disposition": BLOCKED, "note": "blocked at Aya by the user (2026-09-20); never assigned "
+                 "BY AYA. Kuradal still assigns it and it is fought for her."},
     "monkeys": {
         "location": "Karamja, near the volcano",
         "target": (2873, 3148, 0),

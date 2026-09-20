@@ -100,3 +100,13 @@ def test_the_overview_can_sweep_ayas_list_and_names_what_must_be_carried():
     assert "NEEDS" in text and "light source" in text, "cave slimes: a LIT light source, by item id"
     assert "dwarves" in text and "NO ROUTE" in text
     assert lines[-1] == "2 of 4 plan after a bank trip"
+
+
+def test_the_aya_sweep_leaves_out_what_is_blocked_at_aya():
+    """Kalphite reads FIGHT overall (Kuradal assigns it), but it is BLOCKED at Aya, so it has no
+    place in a sweep of what AYA can hand out."""
+    keys = pf.aya_keys()
+    for blocked in ("dwarves", "cave crawlers", "lizards", "skeletons", "kalphite", "dogs"):
+        assert blocked not in keys, blocked
+    # 25 registry keys ("goblin" and "goblins" are both keys) minus the six blocked ones.
+    assert "cows" in keys and "wolves" in keys and len(keys) == 19

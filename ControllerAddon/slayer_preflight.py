@@ -104,7 +104,9 @@ def report(task, count, streak, points, player, carried, banked, panel_cfg, task
 def aya_keys() -> list:
     """Aya's tasks the routine would FIGHT (a blocked one, like dogs, is never assigned)."""
     import aya_tasks
-    return [key for key in aya_tasks.load() if slayer_tasks.disposition(key, {}) == slayer_tasks.FIGHT]
+    # The AYA task's own disposition, not the overall one: kalphite reads FIGHT overall because
+    # Kuradal assigns it, yet it is blocked at Aya and she will never hand it out.
+    return [key for key, task in aya_tasks.load().items() if task.disposition == aya_tasks.FIGHT]
 
 
 def overview(count, player, carried, banked, panel_cfg, skill_levels, prayer_level, prayer_bonus,

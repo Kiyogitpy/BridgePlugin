@@ -140,7 +140,8 @@ ledger. Lessons this project paid for, all recorded in the ledgers:
   upstream Shortest Path's current master (5,780 lines, zero rows on the Great Conch), and the
   wiki gives no tile (the cave map centres on (3232,8865), i.e. under surface (3232,2465); Elder
   Kelmo stands just inside). Everything else about that task is already data.
-- **One short recording into the Digsite Dungeon** (`python -u recorder.py digsite-dungeon`): from the
+- ~~One short recording into the Digsite Dungeon~~ **NOT NEEDED since 2026-09-20: skeletons is on
+  the user's Aya block list.** Kept for the day it is unblocked: from the
   digsite (the house-mounted pendant lands at (3341,3445)) down to the SKELETONS, around
   (3373,9748). CHECKED 2026-09-20: no row in the merged jar + Microbot tables lands anywhere in
   that dungeon -- the winch is simply absent -- so skeletons is refused before the pendant is

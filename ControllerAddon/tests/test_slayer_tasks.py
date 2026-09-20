@@ -124,3 +124,13 @@ def test_missing_items_names_what_to_fetch_and_accepts_any_alternative():
     assert st.missing_items("Cave slimes", 17, {"kandarin headgear 3": 1}) == [], "always lit: the name is enough"
     assert st.missing_items("Lizards", 20, {"ice cooler": 10}) == ["ice coolers x25 (have 10)"]
     assert st.missing_items("Lizards", 20, {"ice cooler": 30}) == []
+
+
+def test_a_task_blocked_at_aya_stops_but_kuradals_kalphite_is_still_fought():
+    """USER 2026-09-20: dwarves, cave crawlers, lizards, skeletons and kalphites are on Aya's block
+    list, so she never assigns them; if one ever turns up the routine STOPS rather than travel.
+    Kalphite is ALSO one of Kuradal's 22 FIGHT tasks -- the block is Aya's, not Kuradal's."""
+    for task in ("Dwarves", "Cave crawlers", "Lizards", "Skeletons"):
+        assert st.disposition(task, {}) == st.STOP, task
+    assert st.disposition("Kalphite", {}) == st.FIGHT
+    assert st.disposition("Cows", {}) == st.FIGHT

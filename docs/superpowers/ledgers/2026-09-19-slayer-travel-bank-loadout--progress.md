@@ -124,4 +124,9 @@ E-pre: complete -- controller, inline TDD (11 new tests, all watched fail first)
   MONKEYS: the user's Karamja override is a wiki pin with 'UNVERIFIED id'. The spawn table has Monkey id 2848 on EXACTLY that tile plus (2877,3154) and (2879,3161). npc_ids = (2848,), area grown 6 tiles north to cover the third. (aya_tasks' npc_ids are not consumed by the routine -- targets go by name -- so this is documentation and the audit's input.)
   tools/slayer_site_audit.py now audits Aya's tasks too (walk goal vs spawns by NPC id; Wilderness check). Clean.
   Honest live counts: Aya 23 of 24 (skeletons), Kuradal 19 of 22 (cave horrors = no scroll owned, gryphons = recording, zygomites = no fungicide spray owned).
+2026-09-20, sixteenth piece -- USER: "Aya blocklist atm is: Dwarves, Cave Crawlers, Lizards, Skeletons, Kalphites". All five BLOCKED in aya_tasks._OVERRIDES (the dogs mechanism): never assigned, and slayer_tasks.disposition answers STOP if one ever turns up. Their sites and teleports stay in the data so the name resolves and unblocking is one line.
+  Ruling: DOGS are not on the user's list but were recorded as blocked on 2026-09-19; they STAY blocked until the user says otherwise -- a wrongly blocked task costs a stop, never a bad trip. ASKED the user to confirm.
+  Kalphite is blocked AT AYA but is one of Kuradal's 22 FIGHT tasks: slayer_tasks.disposition reads Kuradal's table first, so it is still fought for her (pinned). slayer_preflight.aya_keys now filters on the AYA task's own disposition, not the overall one, or kalphite would sit in a sweep of what Aya can hand out.
+  This RETIRES two problems: skeletons (the Digsite Dungeon recording is no longer needed) and dwarves. The appended dwarves teleports and walk_goal stay -- both are correct and cost nothing.
+  Live: **Aya 19 of 19 plan** (25 registry keys -- 'goblin' and 'goblins' are both keys -- minus six blocked). Kuradal 19 of 22.
 
