@@ -43,6 +43,9 @@ def _pack_is_already_met(monkeypatch):
     is about travel or the fight, so by default the pack is already met; the tests ABOUT packing
     put the real function back with monkeypatch.setattr(routine, "_pack", REAL_PACK)."""
     monkeypatch.setattr(routine, "_pack", lambda ctx, state, tasks_cfg, player: False)
+    # ...and RESTOCK (2026-09-21) asks combat_core whether supplies ran out before every fight
+    # tick. By default they have not; the restock tests say otherwise.
+    monkeypatch.setattr(combat_core, "out_of_critical_supplies", lambda ctx: False)
 
 
 class _State:
@@ -577,3 +580,67 @@ def test_a_bank_trip_that_keeps_failing_is_a_stop(monkeypatch):
         if ctx.state.stops:
             break
     assert len(calls["bank"]) == routine.BANK_MAX_FAILS and "bank" in ctx.state.stops[0].lower()
+
+
+# --- 2026-09-21: RESTOCK (plan task D1) -- out of food or prayer AT the site --------------------
+
+AT_THE_FARM = {"x": 3630, "y": 3530, "plane": 0}
+
+
+def _restocking(monkeypatch, out_of_supplies=True, banked=BANKED, bank_ok=True):
+    ctx, calls = _packing(monkeypatch, _inv(("Ectophial", 1), ("Teleport to house", 2), ("Ring of dueling(8)", 1)), banked)
+    world = {"player": dict(AT_THE_FARM)}
+    calls["fight"] = []
+    monkeypatch.setattr(controller, "get_player", lambda: dict(world["player"]))
+    monkeypatch.setattr(controller, "check_stray_dialog", lambda ctx: None)
+    monkeypatch.setattr(combat_core, "out_of_critical_supplies", lambda ctx: out_of_supplies)
+    monkeypatch.setattr(combat_core, "fight_tick", lambda ctx: calls["fight"].append(1))
+
+    def bank_up(ctx, cfg):
+        calls["bank"].append(cfg)
+        world["player"] = {"x": 3150, "y": 3635, "plane": 0}          # Ferox: the ring of dueling
+        return bank_ok
+    monkeypatch.setattr(routine.banker, "bank_up", bank_up)
+    return ctx, calls, world
+
+
+def test_out_of_supplies_at_the_site_leaves_banks_to_the_same_pack_and_does_not_fight(monkeypatch):
+    ctx, calls, _ = _restocking(monkeypatch)
+    ctx.state.data["current_target_index"] = 4412
+    routine.tick(ctx)
+    assert calls["fight"] == [] and len(calls["bank"]) == 1
+    want = {w["name"]: w["quantity"] for w in calls["bank"][0]["withdraw"]}
+    assert want["Shark"] == 3, "the SAME profile the task was packed to"
+    assert ctx.state.data["slayer_restocks"] == 1 and ctx.state.data.get("current_target_index") is None
+    assert ctx.state.data.get("slayer_restocking") is None, "done: the next tick travels back"
+    assert ctx.state.stops == []
+
+
+def test_a_restock_that_fails_halfway_keeps_banking_instead_of_walking_back_empty(monkeypatch):
+    """bank_up can teleport to Ferox and THEN fail to open the bank. The player is no longer at
+    the site, so the phase reads TRAVEL -- and without the flag the routine would travel back to
+    the fight with nothing to eat."""
+    ctx, calls, _ = _restocking(monkeypatch, bank_ok=False)
+    routine.tick(ctx)                                   # at the site: starts the restock, fails
+    assert ctx.state.data["slayer_restocking"] == ("cows", 12)
+    routine.tick(ctx)                                   # now at Ferox: STILL the restock
+    assert len(calls["bank"]) == 2 and not ctx.state.data.get("slayer_route")
+
+
+def test_the_fifth_restock_of_one_task_is_a_stop_naming_it(monkeypatch):
+    ctx, calls, world = _restocking(monkeypatch)
+    ctx.state.data.update({"slayer_streak_seen": 12, "slayer_restocks": routine.RESTOCK_MAX_PER_TASK})
+    routine.tick(ctx)
+    assert calls["bank"] == [] and "restock" in ctx.state.stops[0].lower() and "cows" in ctx.state.stops[0].lower()
+
+
+def test_a_restock_the_bank_cannot_supply_stops_naming_what_ran_out(monkeypatch):
+    ctx, calls, _ = _restocking(monkeypatch, banked=dict(BANKED, shark=0))
+    routine.tick(ctx)
+    assert calls["bank"] == [] and "shark" in ctx.state.stops[0].lower()
+
+
+def test_with_supplies_left_the_fight_goes_on(monkeypatch):
+    ctx, calls, _ = _restocking(monkeypatch, out_of_supplies=False)
+    routine.tick(ctx)
+    assert calls["fight"] == [1] and calls["bank"] == []

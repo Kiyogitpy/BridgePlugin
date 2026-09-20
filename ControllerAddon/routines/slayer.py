@@ -50,6 +50,7 @@ SITE_MARGIN = 6                # tiles around the plugin's tight kill rectangles
 TRAVEL_MAX_FAILS = 3           # a leg that fails three times strands us: stop and NAME it
 TRAVEL_MAX_PROGRESS = 40       # legs.run_next's PROGRESS is unbounded by design; the caller bounds it
 
+RESTOCK_MAX_PER_TASK = 4       # plan D1: a task that needs a fifth restock is losing; stop and say so
 BANK_MAX_FAILS = 3             # banker.bank_up returning False that many times for one task: stop
 
 NO_TARGET_TICKS = 30           # ~18s with nothing to fight before walking back to the site tile
@@ -87,7 +88,8 @@ def _reset_slot_counters(ctx, state) -> None:
                                "slayer_leg": 0, "slayer_leg_fails": 0, "slayer_leg_progress": 0,
                                "slayer_route_finished": 0, "slayer_no_target_walks": 0,
                                "slayer_no_target": 0, "slayer_pack_ok": None,
-                               "slayer_banked_for": None, "slayer_bank_fails": 0})
+                               "slayer_banked_for": None, "slayer_bank_fails": 0,
+                               "slayer_restocks": 0, "slayer_restocking": None})
 
 
 def _acquire(ctx, state, tasks_cfg) -> None:
@@ -154,6 +156,65 @@ def _skip(ctx, state, tasks_cfg) -> None:
         ctx.state.trigger_safety_stop(f"Slayer: {exc}")
 
 
+def _bank_config(panel, loadout) -> dict:
+    """banker.bank_up's config for one slayer bank visit: the panel's own bank block (bankNames,
+    keepItems, teleportFallback) with the loadout's withdraw and keep lists laid over it. Never
+    returnToSpot: TRAVEL re-derives the way back from wherever the bank was."""
+    cfg = dict((panel or {}).get("bank") or {})
+    cfg.update({"enabled": True, "withdraw": loadout.withdraw, "returnToSpot": False,
+                "keepItems": list(dict.fromkeys(list(cfg.get("keepItems") or []) + loadout.keep)),
+                "teleportFallback": cfg.get("teleportFallback", True)})
+    return cfg
+
+
+def _restock(ctx, state) -> bool:
+    """RESTOCK (plan task D1). True when this tick was spent on it. UNVERIFIED LIVE.
+
+    Out of food or prayer AT the site (combat_core.out_of_critical_supplies -- written after a
+    live session fought on with nothing left): drop the target, bank to the SAME pack the task was
+    packed to (the ring of dueling to Ferox is the escape, banker's own fallback), and let TRAVEL
+    bring us back. 'Merely full of loot' is NOT a restock.
+
+    `slayer_restocking` holds the task's key from the moment a restock starts until bank_up
+    succeeds. bank_up can teleport and THEN fail; the player is then off-site, the phase reads
+    TRAVEL, and without the flag the routine would walk back to the fight with nothing to eat.
+    RESTOCK_MAX_PER_TASK restocks is the ceiling: past it, stop and name the task."""
+    data = ctx.state.data
+    key = (state.task, state.streak)
+    if data.get("slayer_restocking") != key:
+        if not combat_core.out_of_critical_supplies(ctx):
+            return False
+        done = data.get("slayer_restocks", 0)
+        if done >= RESTOCK_MAX_PER_TASK:
+            ctx.state.trigger_safety_stop(f"Slayer: {state.task} x{state.count} has needed more than "
+                                          f"{RESTOCK_MAX_PER_TASK} restocks -- stopping rather than grind it out")
+            return True
+    panel = ctx.state.config or {}
+    banked = slayer_loadout.banked_from_memory(bank_memory.load())
+    prayer = ((controller.get_skills() or {}).get("Prayer") or {}).get("level") or 1
+    loadout = slayer_loadout.build(state.task, state.count, panel, prayer, 0, _carried(), banked)
+    if loadout.problems:
+        ctx.state.trigger_safety_stop(f"Slayer: {state.task} x{state.count} ran out of supplies and the "
+                                      f"bank cannot restock it -- " + "; ".join(loadout.problems))
+        return True
+    if data.get("slayer_bank_fails", 0) >= BANK_MAX_FAILS:
+        ctx.state.trigger_safety_stop(f"Slayer: the restock trip for {state.task} failed {BANK_MAX_FAILS} "
+                                      f"times -- see the [bank] lines above")
+        return True
+    if data.get("slayer_restocking") != key:
+        debug_log.log(LOG, f"out of supplies on {state.task} x{state.count}: restock "
+                           f"{data.get('slayer_restocks', 0) + 1} of {RESTOCK_MAX_PER_TASK}")
+    data["slayer_restocking"] = key
+    data["current_target_index"] = None
+    if banker.bank_up(ctx, _bank_config(panel, loadout)):
+        data.update({"slayer_restocking": None, "slayer_restocks": data.get("slayer_restocks", 0) + 1,
+                     "slayer_bank_fails": 0, "slayer_route": None, "slayer_route_for": None,
+                     "slayer_leg": 0, "slayer_route_finished": 0})
+    else:
+        data["slayer_bank_fails"] = data.get("slayer_bank_fails", 0) + 1
+    return True
+
+
 def _pack(ctx, state, tasks_cfg, player) -> bool:
     """The BANK step before TRAVEL (plan task C2). True when this tick was spent on it -- a bank
     trip or a safety stop -- and TRAVEL must not also run. UNVERIFIED LIVE as of 2026-09-21.
@@ -197,11 +258,7 @@ def _pack(ctx, state, tasks_cfg, player) -> bool:
                                       f"times ({why}) -- see the [bank] lines above")
         return True
     debug_log.log(LOG, f"banking for {state.task} x{state.count}: {why}")
-    cfg = dict(panel.get("bank") or {})
-    cfg.update({"enabled": True, "withdraw": loadout.withdraw, "returnToSpot": False,
-                "keepItems": list(dict.fromkeys(list(cfg.get("keepItems") or []) + loadout.keep)),
-                "teleportFallback": cfg.get("teleportFallback", True)})
-    if banker.bank_up(ctx, cfg):
+    if banker.bank_up(ctx, _bank_config(panel, loadout)):
         data["slayer_banked_for"] = key
         data["slayer_bank_fails"] = 0
     else:
@@ -354,8 +411,10 @@ def tick(ctx):
     elif phase == STOP:
         label = state.task or f"task id {state.task_id} (name did not decode)"
         ctx.state.trigger_safety_stop(f"Slayer: {label} x{state.count} is a task this routine leaves to you")
+    elif ctx.state.data.get("slayer_restocking") == (state.task, state.streak):
+        _restock(ctx, state)                 # a restock under way outranks TRAVEL and FIGHT alike
     elif phase == TRAVEL:
         if not _pack(ctx, state, tasks_cfg, player):
             _travel(ctx, state, player)
-    else:
+    elif not _restock(ctx, state):
         _fight(ctx, state)

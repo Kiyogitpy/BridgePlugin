@@ -49,6 +49,7 @@ class World:
         self.inventory = {}                              # display name -> quantity
         self.player = {"x": start[0], "y": start[1], "plane": start[2]}
         self.task, self.count, self.streak, self.points = None, 0, 8, 200
+        self.eats_per_tick = 0                           # sharks eaten per fight tick; 0 = never hungry
         self.log = []
 
     # --- what the bridge would answer
@@ -82,6 +83,7 @@ class World:
             self.bank[key] -= entry["quantity"]
             self.inventory[entry["name"]] = self.inventory.get(entry["name"], 0) + entry["quantity"]
         self.log.append("BANK " + ", ".join(f"{e['quantity']} {e['name']}" for e in cfg["withdraw"]))
+        self.player = {"x": 3150, "y": 3635, "plane": 0}     # a bank trip ENDS at a bank: Ferox Enclave
         return True
 
     def run_next(self, ctx, route, cursor, log="travel"):
@@ -96,8 +98,17 @@ class World:
         self.log.append(f"LEG {leg['display']}")
         return legs.DONE, cursor + 1
 
+    def out_of_supplies(self, ctx):
+        """Out of food with a task still running -- what combat_core reports when HP is low and
+        nothing is left to eat."""
+        return self.count > 0 and self.eats_per_tick > 0 and not any("shark" in n.lower() for n in self.inventory)
+
     def fight_tick(self, ctx):
         ctx.state.data["current_target_index"] = 77
+        for name in [n for n in self.inventory if "shark" in n.lower()][:1]:
+            self.inventory[name] -= self.eats_per_tick
+            if self.inventory[name] <= 0:
+                del self.inventory[name]
         self.count -= 5
         if self.count <= 0:
             self.count, self.task = 0, None
@@ -135,6 +146,7 @@ def _install(monkeypatch, world):
     monkeypatch.setattr(npc_contact, "missing_requirements", lambda master: None)
     monkeypatch.setattr(npc_contact, "get_task", world.get_task)
     monkeypatch.setattr(combat_core, "fight_tick", world.fight_tick)
+    monkeypatch.setattr(combat_core, "out_of_critical_supplies", world.out_of_supplies)
     monkeypatch.setattr(routine.time, "time", _Clock())
 
 
@@ -204,3 +216,33 @@ def test_a_stop_task_is_left_alone_and_nothing_is_contacted(monkeypatch):
     ctx = _Ctx()
     _run(ctx, ticks=5)
     assert "leaves to you" in ctx.state.stops[0] and world.log == []
+
+
+def test_a_long_task_runs_out_of_food_restocks_and_comes_back_to_finish(monkeypatch):
+    """Nechryael x100, fifteen sharks, one eaten a tick and five kills a tick: the food is gone
+    before the kills are. The routine must leave, bank to the same pack, travel back and finish --
+    and the restocks must be counted per task."""
+    world = World([("KURADAL", "Nechryael", 100)], BANK)
+    world.streak, world.eats_per_tick = 9, 1
+    _install(monkeypatch, world)
+    ctx = _Ctx()
+    _run(ctx, ticks=200, world=world)
+    assert ctx.state.stops == [], (ctx.state.stops, world.log)
+    assert world.log[-1].startswith("TASK DONE")
+    banks = [l for l in world.log if l.startswith("BANK")]
+    assert len(banks) >= 2, "one pack, at least one restock"
+    assert all("Shark" in b for b in banks[1:]), "every restock tops the food back up"
+    # After each restock it TRAVELLED back before fighting on: a slayer ring leg follows every bank.
+    for index, line in enumerate(world.log):
+        if line.startswith("BANK") and index + 1 < len(world.log):
+            assert world.log[index + 1].startswith("LEG slayer ring"), world.log[index:index + 3]
+
+
+def test_a_task_that_keeps_running_dry_stops_after_the_restock_ceiling(monkeypatch):
+    world = World([("KURADAL", "Nechryael", 5000)], BANK)
+    world.streak, world.eats_per_tick = 9, 15             # a whole pack of food every fight tick
+    _install(monkeypatch, world)
+    ctx = _Ctx()
+    _run(ctx, ticks=300, world=world)
+    assert ctx.state.stops and "restocks" in ctx.state.stops[0] and "nechryael" in ctx.state.stops[0].lower()
+    assert len([l for l in world.log if l.startswith("BANK")]) == 1 + routine.RESTOCK_MAX_PER_TASK
