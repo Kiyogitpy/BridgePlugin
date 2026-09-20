@@ -331,3 +331,39 @@ def test_a_spell_is_not_planned_without_its_runes():
     assert slayer_routes.plan("Suqahs", lumbridge, full)[0][0]["kind"] == "spell"
     staff = {"law rune": 5, "astral rune": 9, "mystic earth staff": 1}
     assert slayer_routes.plan("Suqahs", lumbridge, staff)[0][0]["kind"] == "spell"
+
+
+# --- 2026-09-20, self-review: what a Kuradal task needs is CHECKED before any teleport ----------
+
+def test_a_kuradal_tasks_requirements_stop_the_trip_before_any_teleport():
+    """FOUND reviewing the day's work across pieces: slayer_tasks.required_items only knew Aya's
+    registry, so every Kuradal task reported nothing missing -- the routine would teleport to
+    basilisks with no mirror shield, to gargoyles with no rock hammer. The catalog already had
+    the requirements as prose; they are now checkable alternatives."""
+    assert slayer_tasks.missing_items("Gargoyles", 150, {}) and "rock hammer" in slayer_tasks.missing_items("Gargoyles", 150, {})[0].lower()
+    assert slayer_tasks.missing_items("Gargoyles", 150, {"rock hammer": 1}) == []
+    shield = slayer_tasks.missing_items("Basilisks", 150, {})
+    assert shield and "mirror shield" in shield[0].lower()
+    assert slayer_tasks.missing_items("Basilisks", 150, {"v's shield": 1}) == [], "V's shield serves too"
+    assert slayer_tasks.missing_items("Aberrant spectres", 150, {"slayer helmet (i)": 1}) == []
+    assert slayer_tasks.missing_items("Aberrant spectres", 150, {"nose peg": 1}) == []
+    assert slayer_tasks.missing_items("Aberrant spectres", 150, {"abyssal whip": 1})
+    assert slayer_tasks.missing_items("Kurask", 150, {"leaf-bladed battleaxe": 1}) == []
+    assert slayer_tasks.missing_items("Kurask", 150, {"broad bolts": 500}) == []
+
+
+def test_a_task_both_masters_assign_is_held_to_the_stricter_list():
+    """Kalphite is in Aya's registry (no gear note) AND the catalog (antipoison: the soldiers'
+    poison ignores prayer). The stricter list applies whoever assigned it."""
+    assert any("antipoison" in m.lower() for m in slayer_tasks.missing_items("Kalphite", 40, {}))
+    assert slayer_tasks.missing_items("Kalphite", 40, {"superantipoison(2)": 1}) == []
+
+
+def test_a_requirement_nobody_can_check_by_name_is_not_invented():
+    """Waterfiends want 'a ranged kit' -- which weapon is the USER's open decision (E0). It is
+    shown as a note, never enforced as an item name we made up."""
+    assert slayer_tasks.missing_items("Waterfiends", 150, {}) == []
+    assert slayer_tasks.missing_items("Cows", 20, {}) == [], "an Aya task with no gear note is untouched"
+    lit = slayer_tasks.missing_items("Cave horrors", 150, {"witchwood icon": 1})
+    assert lit and "light" in lit[0].lower(), "cave horrors still need a LIT light source, by item id"
+    assert slayer_tasks.missing_items("Cave horrors", 150, {"witchwood icon": 1, "kandarin headgear 3": 1}) == []

@@ -45,6 +45,24 @@ TaskSpec = namedtuple("TaskSpec", (
 # Moonclan teleport is a Lunar spell the account already has.
 _NOT_AN_ITEM = ("fairy ring", "ornate jewellery box", "moonclan teleport")
 
+# A `carry` / `worn` LABEL -> the item-name fragments that satisfy it, best first. A label that
+# maps to () is the user's OPEN decision (plan E0: which ranged kit) and is shown as a note, never
+# enforced as an item name we made up. "lit light source" is special: a lit and an unlit lantern
+# share one NAME, so slayer_tasks checks it by item id (its own LIT_IDS rule).
+REQUIREMENT_ITEMS = {
+    "rock hammer": ("rock hammer", "granite hammer", "rock thrownhammer"),
+    "antipoison": ("antipoison", "superantipoison", "antidote", "anti-venom"),
+    "fungicide spray": ("fungicide spray",),
+    "nose peg or slayer helmet": ("nose peg", "slayer helmet"),
+    "facemask or slayer helmet": ("facemask", "slayer helmet"),
+    "mirror shield": ("mirror shield", "v's shield"),
+    "witchwood icon": ("witchwood icon",),
+    "leaf-bladed weapon or broad ammo": ("leaf-bladed", "broad arrow", "broad bolt", "amethyst broad"),
+    "boots of stone, brimstone or granite": ("boots of stone", "boots of brimstone", "granite boots"),
+    "ranged weapon and ammo": (),
+}
+LIGHT_LABEL = "lit light source"
+
 RING_STRONGHOLD = (2431, 3422, 0)
 RING_TOWER = (3421, 3537, 0)
 RING_FREMENNIK = (2802, 9999, 0)

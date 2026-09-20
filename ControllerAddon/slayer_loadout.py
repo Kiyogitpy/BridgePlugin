@@ -40,13 +40,9 @@ HOUSE_TABLETS_CARRIED = 2          # one spare: a tablet is spent per unconfirme
 ESCAPE_RING = "ring of dueling"
 SPELL_CASTS_CARRIED = 2            # a teleport spell's runes, for one retry
 
-# A catalog `carry` label -> the item names that satisfy it, best first.
-CARRY_ITEMS = {
-    "rock hammer": ("rock hammer",),
-    "antipoison": ("antipoison", "superantipoison", "antidote"),
-    "fungicide spray": ("fungicide spray",),
-    "lit light source": slayer_tasks.LIGHT_SOURCES,
-}
+# A catalog `carry` / `worn` label -> the item names that satisfy it: slayer_catalog's table, the
+# SAME one slayer_tasks.missing_items enforces, so the pack and the check cannot disagree.
+CARRY_ITEMS = dict(slayer_catalog.REQUIREMENT_ITEMS, **{slayer_catalog.LIGHT_LABEL: slayer_tasks.LIGHT_SOURCES})
 _NOT_AN_ITEM = ("fairy ring", "ornate jewellery box", "moonclan teleport")
 _STACKABLE_WORDS = ("teleport", "scroll")     # tablets and scrolls share one slot
 
@@ -232,8 +228,13 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
             pack.doses("prayer potions", potion, supplies.prayer_potions_for(profile, doses))
 
     if spec is not None:
-        for label in spec.carry:
-            pack.one_of(label, CARRY_ITEMS.get(label, (label,)), prefer_spent=False)
+        # `worn` too: `carried` merges inventory and equipment, so a worn mirror shield is already
+        # held and a banked one is fetched. A label with no checkable item (the user's open gear
+        # decision) is skipped, never invented.
+        for label in tuple(spec.carry) + tuple(spec.worn):
+            options = CARRY_ITEMS.get(label, (label,))
+            if options:
+                pack.one_of(label, options, prefer_spent=False)
     else:
         for need in slayer_tasks.required_items(task_name, count):
             if slayer_tasks._have(need, pack.carried) >= need.quantity:

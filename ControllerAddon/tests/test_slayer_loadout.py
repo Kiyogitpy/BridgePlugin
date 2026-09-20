@@ -201,3 +201,12 @@ def test_a_spell_teleport_packs_its_runes_as_stacks():
     assert lo.problems == [] and lo.slots <= 28
     short = sl.build("Suqahs", 60, PANEL, 70, 10, {}, dict(BANK, **{"law rune": 300, "earth rune": 50}))
     assert any("astral rune" in p.lower() for p in short.problems)
+
+
+def test_a_worn_requirement_is_fetched_when_it_is_neither_worn_nor_carried():
+    bank = dict(BANK, **{"mirror shield": 1})
+    assert _want(sl.build("Basilisks", 150, PANEL, 70, 10, {}, bank))["Mirror shield"] == 1
+    worn = sl.build("Basilisks", 150, PANEL, 70, 10, {"mirror shield": 1}, bank)
+    assert "Mirror shield" not in _want(worn)
+    none = sl.build("Basilisks", 150, PANEL, 70, 10, {}, BANK)
+    assert any("mirror shield" in p.lower() for p in none.problems)

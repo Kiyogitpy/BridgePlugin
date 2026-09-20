@@ -138,15 +138,31 @@ _NOT_LIT = ("unlit", "empty", "(u)")
 
 
 def required_items(task_name, count) -> list:
+    """What must be carried OR worn before a teleport is spent. Aya's registry supplies a gear
+    note; Kuradal's catalog supplies `carry` and `worn`. A task both masters assign (kalphite) is
+    held to BOTH lists -- the stricter reading, whoever assigned it.
+
+    SELF-REVIEW 2026-09-20: until then only Aya's note was read, so every Kuradal task reported
+    nothing missing and the routine would have teleported to basilisks with no mirror shield."""
+    needs = []
     aya = aya_tasks.get(_key(task_name))
     note = ((aya.info if aya else None) or "").lower()
     if "light source" in note:
-        return [Need("a light source", ALWAYS_LIT, 1, LIT_IDS)]
+        needs.append(Need("a light source", ALWAYS_LIT, 1, LIT_IDS))
     if "ice cooler" in note:
-        return [Need("ice coolers", ("ice cooler",), int(count or 0) + 5)]
+        needs.append(Need("ice coolers", ("ice cooler",), int(count or 0) + 5))
     if "rope" in note:
-        return [Need("a rope", ("rope",), 1)]
-    return []
+        needs.append(Need("a rope", ("rope",), 1))
+    spec = slayer_catalog.get(_key(task_name))
+    for label in (tuple(spec.carry) + tuple(spec.worn)) if spec else ():
+        if label == slayer_catalog.LIGHT_LABEL:
+            if not any(n.ids for n in needs):
+                needs.append(Need("a light source", ALWAYS_LIT, 1, LIT_IDS))
+            continue
+        options = slayer_catalog.REQUIREMENT_ITEMS.get(label, ())
+        if options:                                  # () = the user's open decision: never enforced
+            needs.append(Need(label, options, 1))
+    return needs
 
 
 def _have(need, carried) -> int:
