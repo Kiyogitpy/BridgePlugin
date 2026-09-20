@@ -7,6 +7,10 @@ files it points at. Nothing below depends on the old conversation.
 ## Where the work is
 
 - Repo `BridgePlugin`, branch **`crossfloor-travel`** (pushed; `dev` is pushed too and is its base).
+  CHECKED 2026-09-20: 70 commits ahead of `dev`, `dev` 1 ahead (a2929d5), and a dry-run
+  `git merge-tree origin/dev HEAD` is CLEAN -- no conflicts. On 2026-09-20 the MAIN checkout was
+  switched to `dev` by someone else mid-session; work continued in the worktree
+  `.claude/worktrees/crossfloor-travel` (self-sufficient: the collision map is tracked).
   NOT merged to `dev` — the merge is the user's call. Another session also committed Guardians of
   the Rift work onto this branch; it rides along.
 - `ZombieLite`, branch `no-packets` on the user's fork (remote name `fork`), pushed.
