@@ -268,6 +268,19 @@ def walk_goal(task):
     return (ax + w // 2, ay + h // 2, p)
 
 
+def near_site(task_name, player, skill_levels=None) -> bool:
+    """Is the player a short WALK (no transports) from the task's site? The test plan() uses to
+    walk back instead of re-teleporting, and the one routines/slayer._pack uses to leave a task in
+    progress alone."""
+    x, y = (player or {}).get("x"), (player or {}).get("y")
+    task = aya_tasks.get(task_name) or slayer_catalog.get(task_name)
+    if x is None or y is None or task is None or not task.target:
+        return False
+    near = crossfloor.find_route((x, y, player.get("plane", 0)), walk_goal(task),
+                                 skill_levels=skill_levels, max_links=0)
+    return near is not None and near.cost <= NEAR_SITE_TILES
+
+
 def _unroutable(route, target, skill_levels, proven):
     """None when the walk after the LAST teleport in `route` can be made, else why not.
 
@@ -302,8 +315,7 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
     # Ectophial. When the site is a short walk away, the route is that walk and nothing else.
     # Unchanged by phase B, including when the player happens to be in the house (its own
     # comment explains why THAT combination is not worth special-casing here).
-    near = crossfloor.find_route(here, goal, skill_levels=skill_levels, max_links=0)
-    if near is not None and near.cost <= NEAR_SITE_TILES:
+    if near_site(task_name, player, skill_levels=skill_levels):
         return [site], ""
     # The house, not just "an instance": a raid, Pest Control or a Sailing boat is an instance too
     # and must not be offered a tablet-less house route (phase-B review).

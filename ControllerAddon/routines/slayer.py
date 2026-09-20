@@ -17,6 +17,8 @@
 import time
 
 import aya_tasks
+import bank_memory
+import banker
 import combat_core
 import controller
 import debug_log
@@ -24,6 +26,8 @@ import gear
 import legs
 import npc_contact
 import slayer_catalog
+import slayer_loadout
+import slayer_policy
 import slayer_routes
 import slayer_state
 import slayer_tasks
@@ -45,6 +49,8 @@ CONTACT_RETRY_COOLDOWN_S = 6.0
 SITE_MARGIN = 6                # tiles around the plugin's tight kill rectangles that still count as "there"
 TRAVEL_MAX_FAILS = 3           # a leg that fails three times strands us: stop and NAME it
 TRAVEL_MAX_PROGRESS = 40       # legs.run_next's PROGRESS is unbounded by design; the caller bounds it
+
+BANK_MAX_FAILS = 3             # banker.bank_up returning False that many times for one task: stop
 
 NO_TARGET_TICKS = 30           # ~18s with nothing to fight before walking back to the site tile
 NO_TARGET_WALKS = 3            # that many walks back with still nothing found: stop, don't idle forever
@@ -80,7 +86,8 @@ def _reset_slot_counters(ctx, state) -> None:
                                "slayer_cancel_attempts": 0, "slayer_route": None, "slayer_route_for": None,
                                "slayer_leg": 0, "slayer_leg_fails": 0, "slayer_leg_progress": 0,
                                "slayer_route_finished": 0, "slayer_no_target_walks": 0,
-                               "slayer_no_target": 0})
+                               "slayer_no_target": 0, "slayer_pack_ok": None,
+                               "slayer_banked_for": None, "slayer_bank_fails": 0})
 
 
 def _acquire(ctx, state, tasks_cfg) -> None:
@@ -145,6 +152,61 @@ def _skip(ctx, state, tasks_cfg) -> None:
             ctx.state.data["slayer_cancel_attempts"] = 0
     except slayer_state.StreakGuardError as exc:
         ctx.state.trigger_safety_stop(f"Slayer: {exc}")
+
+
+def _pack(ctx, state, tasks_cfg, player) -> bool:
+    """The BANK step before TRAVEL (plan task C2). True when this tick was spent on it -- a bank
+    trip or a safety stop -- and TRAVEL must not also run. UNVERIFIED LIVE as of 2026-09-21.
+
+    The DECISION is slayer_loadout.build + slayer_policy.bank_verdict (pure, tested); the ACTING is
+    banker.bank_up, live-proven in other routines -- a nearby bank, else Ferox by ring of dueling,
+    deposit per keepItems, withdraw the list. Rules, each about NOT doing something:
+    - never while a journey is under way, and never when already a short walk from the site: two
+      sharks eaten must not pull the routine off a task. Running out AT the site is RESTOCK (D1).
+    - bank ONCE per task. Still short afterwards is a STOP naming the items, never a loop.
+    - a missing item is ALWAYS a stop. The plan allows a 30-point SKIP there; bank memory can be
+      stale, and points are not spent on a guess (ruling 2026-09-21).
+    - the panel's own bank settings and keepItems ride along, so a rune pouch is not deposited."""
+    data = ctx.state.data
+    key = (state.task, state.streak)
+    if data.get("slayer_route") or data.get("slayer_pack_ok") == key:
+        return False
+    if slayer_routes.near_site(state.task, player, skill_levels=legs.skill_levels()):
+        data["slayer_pack_ok"] = key
+        return False
+    panel = ctx.state.config or {}
+    carried = _carried()
+    banked = slayer_loadout.banked_from_memory(bank_memory.load())
+    prayer = ((controller.get_skills() or {}).get("Prayer") or {}).get("level") or 1
+    loadout = slayer_loadout.build(state.task, state.count, panel, prayer, 0, carried, banked)
+    inventory = controller.get_inventory()
+    free = slayer_loadout.supplies.INVENTORY_SLOTS - len(inventory) if isinstance(inventory, list) else None
+    tablets = None if banked is None else sum(
+        int(q or 0) for source in (carried, banked) for n, q in source.items()
+        if not n.startswith("#") and slayer_loadout.HOUSE_TABLET in n)
+    verdict, why = slayer_policy.bank_verdict(loadout, free, tasks_cfg, tablets, skippable=False,
+                                              visited_bank=data.get("slayer_banked_for") == key)
+    if verdict == slayer_policy.GO:
+        data["slayer_pack_ok"] = key
+        return False
+    if verdict != slayer_policy.BANK:
+        ctx.state.trigger_safety_stop(f"Slayer: {state.task} x{state.count} -- {why}")
+        return True
+    if data.get("slayer_bank_fails", 0) >= BANK_MAX_FAILS:
+        ctx.state.trigger_safety_stop(f"Slayer: the bank trip for {state.task} failed {BANK_MAX_FAILS} "
+                                      f"times ({why}) -- see the [bank] lines above")
+        return True
+    debug_log.log(LOG, f"banking for {state.task} x{state.count}: {why}")
+    cfg = dict(panel.get("bank") or {})
+    cfg.update({"enabled": True, "withdraw": loadout.withdraw, "returnToSpot": False,
+                "keepItems": list(dict.fromkeys(list(cfg.get("keepItems") or []) + loadout.keep)),
+                "teleportFallback": cfg.get("teleportFallback", True)})
+    if banker.bank_up(ctx, cfg):
+        data["slayer_banked_for"] = key
+        data["slayer_bank_fails"] = 0
+    else:
+        data["slayer_bank_fails"] = data.get("slayer_bank_fails", 0) + 1
+    return True
 
 
 def _carried() -> dict:
@@ -293,6 +355,7 @@ def tick(ctx):
         label = state.task or f"task id {state.task_id} (name did not decode)"
         ctx.state.trigger_safety_stop(f"Slayer: {label} x{state.count} is a task this routine leaves to you")
     elif phase == TRAVEL:
-        _travel(ctx, state, player)
+        if not _pack(ctx, state, tasks_cfg, player):
+            _travel(ctx, state, player)
     else:
         _fight(ctx, state)

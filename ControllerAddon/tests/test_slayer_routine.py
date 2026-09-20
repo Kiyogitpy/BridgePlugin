@@ -34,6 +34,17 @@ def _no_live_bridge(monkeypatch):
         "varbit_values": {}, "varplayer_values": {}, "owned_item_ids": None, "currency_held": None})
 
 
+REAL_PACK = routine._pack
+
+
+@pytest.fixture(autouse=True)
+def _pack_is_already_met(monkeypatch):
+    """The BANK step (routine._pack, 2026-09-21) runs before TRAVEL. Every test written before it
+    is about travel or the fight, so by default the pack is already met; the tests ABOUT packing
+    put the real function back with monkeypatch.setattr(routine, "_pack", REAL_PACK)."""
+    monkeypatch.setattr(routine, "_pack", lambda ctx, state, tasks_cfg, player: False)
+
+
 class _State:
     def __init__(self):
         self.data, self.stops, self.config = {}, [], dict(CONFIG)
@@ -448,3 +459,121 @@ def test_a_kuradal_task_loots_by_the_panels_value_not_ayas_whitelist_only_rule(m
     ctx.state.config["loot"] = {"minValue": 5000, "items": ["Rune boots"]}
     routine.tick(ctx)
     assert seen[0] == {"minValue": 5000, "items": ["Rune boots"]}
+
+
+# --- 2026-09-21: the BANK step before TRAVEL (plan task C2), acting through banker.bank_up --------
+
+PANEL = {"food": {"name": "Shark"}, "potions": {"prayerPotion": "Prayer potion"},
+         "bank": {"keepItems": ["rune pouch"], "bankNames": ["Bank chest"]}}
+BANKED = {"shark": 500, "prayer potion(4)": 80, "teleport to house": 40, "ring of dueling(8)": 6,
+          "ectophial": 1}
+LUMBRIDGE = {"x": 3200, "y": 3200, "plane": 0}
+
+
+class _Memory:
+    def __init__(self, items):
+        self.seen = items is not None
+        self.items = [{"name": n, "quantity": q} for n, q in (items or {}).items()]
+
+
+def _packing(monkeypatch, inventory, banked, task="Cows", count=20):
+    """The REAL _pack, over a fake world. `inventory` is the bridge's own shape."""
+    calls = {"bank": []}
+    monkeypatch.setattr(routine, "_pack", REAL_PACK)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task(task, count=count))
+    monkeypatch.setattr(controller, "get_player", lambda: dict(LUMBRIDGE))
+    monkeypatch.setattr(controller, "get_inventory", lambda: list(inventory))
+    monkeypatch.setattr(controller, "get_equipment", lambda: {})
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: None)
+    monkeypatch.setattr(controller, "get_skills", lambda: {"Prayer": {"level": 70}})
+    monkeypatch.setattr(legs, "skill_levels", lambda: {"Agility": 70})
+    monkeypatch.setattr(routine.bank_memory, "load", lambda names=None: _Memory(banked))
+    monkeypatch.setattr(routine.banker, "bank_up", lambda ctx, cfg: calls["bank"].append(cfg) or True)
+    monkeypatch.setattr(slayer_routes, "plan", lambda *a, **k: ([legs.walk(1, 1, 0)], ""))
+    monkeypatch.setattr(legs, "run_next", lambda ctx, legs_, cursor, log="travel": (legs.DONE, cursor + 1))
+    ctx = _Ctx()
+    ctx.state.config = dict(PANEL)
+    return ctx, calls
+
+
+def _inv(*pairs):
+    return [{"name": n, "qty": q, "id": None} for n, q in pairs]
+
+
+def test_a_pack_that_is_short_banks_once_with_the_loadout_and_does_not_travel_that_tick(monkeypatch):
+    ctx, calls = _packing(monkeypatch, _inv(("Bones", 1)), BANKED)
+    routine.tick(ctx)
+    assert len(calls["bank"]) == 1 and ctx.state.stops == []
+    cfg = calls["bank"][0]
+    want = {w["name"]: w["quantity"] for w in cfg["withdraw"]}
+    assert want["Shark"] == 3 and want["Ectophial"] == 1 and want["Teleport to house"] == 2
+    assert cfg["returnToSpot"] is False and cfg["enabled"] is True
+    assert "rune pouch" in cfg["keepItems"], "the panel's own keep list is kept"
+    assert "shark" in cfg["keepItems"] and "ectophial" in cfg["keepItems"]
+    assert cfg["bankNames"] == ["Bank chest"], "the panel's bank settings ride along"
+    assert not ctx.state.data.get("slayer_route"), "no journey was planned on the banking tick"
+
+
+def test_a_met_pack_travels_at_once_and_is_not_asked_again(monkeypatch):
+    held = _inv(("Shark", 1), ("Shark", 1), ("Shark", 1), ("Ectophial", 1), ("Teleport to house", 5),
+                ("Ring of dueling(8)", 1))
+    ctx, calls = _packing(monkeypatch, held, BANKED)
+    routine.tick(ctx)
+    assert calls["bank"] == [] and ctx.state.data.get("slayer_route"), "straight to TRAVEL"
+    assert ctx.state.data["slayer_pack_ok"] == ("cows", 12)
+
+
+def test_still_short_after_the_bank_visit_is_a_stop_naming_the_items_never_a_loop(monkeypatch):
+    ctx, calls = _packing(monkeypatch, _inv(("Bones", 1)), BANKED)
+    routine.tick(ctx)                       # banks
+    routine.tick(ctx)                       # the inventory never changed: still short
+    assert len(calls["bank"]) == 1, "banked ONCE"
+    assert ctx.state.stops and "still short" in ctx.state.stops[0] and "Shark" in ctx.state.stops[0]
+
+
+def test_an_item_nobody_holds_stops_before_any_bank_trip_and_never_spends_points(monkeypatch):
+    """The plan allows a SKIP here; bank memory can be stale and a skip costs 30 points, so a
+    missing item is always a STOP (ruling 2026-09-21)."""
+    ctx, calls = _packing(monkeypatch, _inv(), {k: v for k, v in BANKED.items() if k != "ectophial"})
+    routine.tick(ctx)
+    assert calls["bank"] == [] and "ectophial" in ctx.state.stops[0].lower()
+
+
+def test_no_food_chosen_in_the_panel_is_a_stop_that_says_so(monkeypatch):
+    ctx, calls = _packing(monkeypatch, _inv(), BANKED)
+    ctx.state.config = {"food": {}, "potions": {}}
+    routine.tick(ctx)
+    assert calls["bank"] == [] and "food" in ctx.state.stops[0].lower()
+
+
+def test_a_bank_never_seen_is_visited_on_faith_then_judged_on_what_it_really_holds(monkeypatch):
+    ctx, calls = _packing(monkeypatch, _inv(), None)
+    routine.tick(ctx)
+    assert len(calls["bank"]) == 1 and ctx.state.stops == [], "unknown is not empty: go and look"
+
+
+def test_near_the_site_the_pack_is_never_reconsidered(monkeypatch):
+    """Two sharks eaten and a monster chased out of the rectangle must not send the routine to a
+    bank mid-task. Running out AT the site is the RESTOCK phase's job, not this one's."""
+    ctx, calls = _packing(monkeypatch, _inv(("Shark", 1)), BANKED)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3655, "y": 3525, "plane": 0})   # by Alice's farm
+    routine.tick(ctx)
+    assert calls["bank"] == [] and ctx.state.stops == []
+
+
+def test_a_journey_under_way_is_never_turned_back_to_the_bank(monkeypatch):
+    ctx, calls = _packing(monkeypatch, _inv(("Bones", 1)), BANKED)
+    ctx.state.data.update({"slayer_streak_seen": 12, "slayer_route": [legs.walk(1, 1, 0)],
+                           "slayer_route_for": ("cows", 12), "slayer_leg": 0})
+    routine.tick(ctx)
+    assert calls["bank"] == []
+
+
+def test_a_bank_trip_that_keeps_failing_is_a_stop(monkeypatch):
+    ctx, calls = _packing(monkeypatch, _inv(("Bones", 1)), BANKED)
+    monkeypatch.setattr(routine.banker, "bank_up", lambda ctx, cfg: calls["bank"].append(cfg) and False)
+    for _ in range(routine.BANK_MAX_FAILS + 2):
+        routine.tick(ctx)
+        if ctx.state.stops:
+            break
+    assert len(calls["bank"]) == routine.BANK_MAX_FAILS and "bank" in ctx.state.stops[0].lower()

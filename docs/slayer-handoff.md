@@ -63,7 +63,8 @@ observations over a clean log.
 | **C1** the loadout calculator | `slayer_loadout.py` | **built 2026-09-20 ahead of the live gates** (pure): task + carried + bank memory -> withdraw list, keep list, slots, named problems. Run read-only on the real bank. Nothing calls it yet |
 | The DECISIONS of C2, D2, C3 | `slayer_policy.py` | **built 2026-09-20** (pure): bank / carry on / skip / stop; the loot tiers; base-gear persistence and the slot diff. Nothing calls it yet |
 | C4 + D3 Java config | `slayerMinHouseTeleports` 5, `slayerMakeRoomValue` 50k, `slayerMustLootValue` 150k, exported in the `tasks` block | **built 2026-09-20**, gradle test passes; **needs a client rebuild** to appear in the panel |
-| The ACTING halves: the BANK and RESTOCK phases, eating/dropping for loot, equipping gear; E0 gear decisions; E2-E6 hub live runs | — | NOT built -- these click, so they wait for a live run |
+| **C2** the BANK step before TRAVEL | `routines/slayer._pack` -> `banker.bank_up` | **built 2026-09-21, UNRUN**: decides with `slayer_loadout` + `slayer_policy`, acts through the live-proven banker. Bank ONCE per task; still short is a stop naming the items; never mid-journey and never near the site; a missing item is always a STOP, never an automatic 30-point skip |
+| The remaining ACTING halves: RESTOCK under attack, eating/dropping for loot, equipping gear; E0 gear decisions; E2-E6 hub live runs | — | NOT built -- these click, so they wait for a live run |
 
 Tests: `python -m pytest tests/ -q` from `ControllerAddon/` → 3087 passed; the ONLY failures are 4
 known ones in `tests/test_mastering_mixology.py`. `test_crossfloor::test_an_impossible_trip_is_none_and_fast`
@@ -79,8 +80,9 @@ has an 8 s wall-clock bound and failed once under load.
 
 Read-only, safe beside a running `controller.py`. It prints what the routine WOULD decide:
 disposition, site, missing items, the route or the reason there is none, the pack, and the bank
-verdict -- plus the route as it stands AFTER the bank trip, because `plan()` works from what is
-carried and phase A therefore stops on a teleport that is sitting in the bank. FOUND with it on
+verdict -- plus the route as it stands AFTER the bank trip. Since 2026-09-21 the routine has a
+BANK step before TRAVEL, so a teleport sitting in the bank is fetched first rather than stopping
+the run; the 'cannot get there ... not carried' line is what TRAVEL would say WITHOUT that trip. FOUND with it on
 2026-09-20: **the panel has no food and no prayer potion chosen** (`food.name` and
 `potions.prayerPotion` are null in `GET /config`), which would stop every task at the bank.
 
