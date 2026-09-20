@@ -851,7 +851,8 @@ is `Option;Target;id` with semicolons where ours is `Option Target id`. MEASURED
 the file without error but mis-splits every object cell -- so it needs an ADAPTER, not a copy.
 
 **Tasks:**
-- **E-pre Vendor Microbot's transport tables through an adapter.** `vendor/microbot/` holds the
+- **E-pre Vendor Microbot's transport tables through an adapter.** **DONE 2026-09-20** (see the
+  ledger's E-pre entry; `tests/test_transports.py` "the Microbot table" block). `vendor/microbot/` holds the
   byte-identical TSVs plus a `VENDORED.md` naming the commit (`8bcc652` on 2026-09-19);
   `transports.load_links` gains a second source read by header NAME with the semicolon object
   cell, merged with ours by `(origin, dest, object id)` so nothing is double-counted. Tests pin

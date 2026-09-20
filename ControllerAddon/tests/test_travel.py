@@ -601,6 +601,38 @@ def test_finds_a_curtain():
     assert travel.first_door_on_route(route, 0, [curtain], flags) is curtain
 
 
+def test_finds_a_portcullis_and_a_barrier_from_the_microbot_name_list():
+    """Ported 2026-09-20 from Microbot's Rs2DoorClassifier (barrier, stile, portcullis, archway,
+    cattlegate, fence) -- pure strings, broader than the Vitalite list we had."""
+    route = [(1746, 3533), (1746, 3534)]
+    flags = _open_grid(route, blocked=[((1746, 3533), BLOCK_MOVEMENT_NORTH),
+                                       ((1746, 3534), BLOCK_MOVEMENT_SOUTH)])
+    for name in ("Portcullis", "Barrier", "Archway", "Stile"):
+        obj = _route_door(1746, 3534, name=name)
+        assert travel.first_door_on_route(route, 0, [obj], flags) is obj, name
+
+
+def test_fence_is_a_door_name_only_as_a_whole_word():
+    """`fence` inside `Defence` is the trap Microbot's own regex guards against."""
+    assert travel.is_door_name("Fence")
+    assert travel.is_door_name("Broken fence")
+    assert not travel.is_door_name("Defence cape rack")
+    assert travel.is_door_name("Cattlegate") and travel.is_door_name("Large door")
+    assert not travel.is_door_name("Drawers") and not travel.is_door_name("")
+
+
+def test_the_door_walk_action_is_the_highest_priority_one_and_never_a_close():
+    """Microbot's DOOR_ACTION_PRIORITY: pay-toll before pick-lock before ... before open; a
+    Close/Shut is never chosen, so an OPEN door (only Close left) answers None."""
+    assert travel.door_walk_action(["Close", "Open"]) == "Open"
+    assert travel.door_walk_action(["Open", "Pick-lock"]) == "Pick-lock"
+    assert travel.door_walk_action(["Pay-toll(10gp)", "Open"]) == "Pay-toll(10gp)"
+    assert travel.door_walk_action(["Close"]) is None
+    assert travel.door_walk_action(["Shut", None]) is None
+    assert travel.door_walk_action(["Examine"]) is None
+    assert travel.door_walk_action(None) is None
+
+
 def test_ignores_furniture_that_also_offers_open():
     """Drawers and cupboards fill every Mahogany Homes house and all offer Open. A live scan
     beside Falador's door returned Drawers and a Cupboard within 7 tiles."""

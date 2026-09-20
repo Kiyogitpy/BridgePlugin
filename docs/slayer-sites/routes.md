@@ -7,12 +7,15 @@ requirement we could not prove, a gate that needs an item, or a wrong coordinate
 
 Known findings (2026-09-19, kept here so a regeneration does not lose them):
 
-- **Wyrms** and **Gryphons**: the vendored tables have NO row for the Karuulm Slayer
-  Dungeon or the Great Conch cave entrance. The catalog must hand-write those legs.
+- **Wyrms** ROUTES since 2026-09-20: Microbot's transports table (vendor/microbot/,
+  merged by transports.load_links) has the Karuulm elevator and rock climbs the jar's
+  copy lacks. **Gryphons**: still NO row for the Great Conch cave entrance in either
+  table -- the catalog must hand-write that leg.
 - **Waterfiends**: the whirlpool into the Ancient Cavern is gated on varbit 3759 > 1 and
   nothing supplies varbits to the search yet, so it fails closed.
-- **Black demons**: needs the 80 Agility Strange floor, or the dusty-key gate which the
-  tables do not offer as usable.
+- **Black demons**: needs the 80 Agility Strange floor, or the dusty-key gate. Both
+  tables have that gate row (ours `DUSTY_KEY=1`, Microbot's item 1590); it fails closed
+  until the catalog supplies the owned item, so this is not offered as usable here.
 - **Trolls** (185 tiles): UNVERIFIED. It climbs from the west and north rather than the
   eastern main path and may be the quest-gated back route. Check it by eye before use.
 - **Banshees** (156 tiles without the window shortcut) and **Kurask** (355) were checked
@@ -21,88 +24,88 @@ Known findings (2026-09-19, kept here so a regeneration does not lose them):
 
 ## Aberrant spectres
 slayer ring: Stronghold Slayer Cave (2431, 3422, 0) -> site (2440, 9790, 0)
-- *no requirements proven* (0.33s, cost 92):
+- *no requirements proven* (0.19s, cost 92):
   - walk 3 tiles to (2430, 3424, 0)
   - **Enter Cave 26709** (2430, 3424, 0) -> (2429, 9824, 0)
   - walk 83 tiles to (2440, 9787, 0)
-- *all skills 99*: same (0.33s)
+- *all skills 99*: same (0.16s)
 
 ## Ankou
 slayer ring: Stronghold Slayer Cave (2431, 3422, 0) -> site (2470, 9805, 0)
-- *no requirements proven* (0.28s, cost 92):
+- *no requirements proven* (0.12s, cost 92):
   - walk 3 tiles to (2430, 3424, 0)
   - **Enter Cave 26709** (2430, 3424, 0) -> (2429, 9824, 0)
   - walk 83 tiles to (2471, 9806, 0)
-- *all skills 99*: same (0.39s)
+- *all skills 99*: same (0.18s)
 
 ## Bloodveld
 slayer ring: Stronghold Slayer Cave (2431, 3422, 0) -> site (2450, 9820, 0)
-- *no requirements proven* (0.10s, cost 54):
+- *no requirements proven* (0.05s, cost 54):
   - walk 3 tiles to (2430, 3424, 0)
   - **Enter Cave 26709** (2430, 3424, 0) -> (2429, 9824, 0)
   - walk 45 tiles to (2450, 9820, 0)
-- *all skills 99*: same (0.11s)
+- *all skills 99*: same (0.05s)
 
 ## Fire giants
 slayer ring: Stronghold Slayer Cave (2431, 3422, 0) -> site (2400, 9780, 0)
-- *no requirements proven* (0.14s, cost 82):
+- *no requirements proven* (0.07s, cost 82):
   - walk 3 tiles to (2430, 3424, 0)
   - **Enter Cave 26709** (2430, 3424, 0) -> (2429, 9824, 0)
   - walk 73 tiles to (2400, 9780, 0)
-- *all skills 99*: same (0.21s)
+- *all skills 99*: same (0.10s)
 
 ## Hellhounds
 slayer ring: Stronghold Slayer Cave (2431, 3422, 0) -> site (2420, 9785, 0)
-- *no requirements proven* (0.10s, cost 68):
+- *no requirements proven* (0.05s, cost 68):
   - walk 3 tiles to (2430, 3424, 0)
   - **Enter Cave 26709** (2430, 3424, 0) -> (2429, 9824, 0)
   - walk 59 tiles to (2419, 9784, 0)
-- *all skills 99*: same (0.14s)
+- *all skills 99*: same (0.07s)
 
 ## Abyssal demons (basement)
 slayer ring: Slayer Tower (3421, 3537, 0) -> site (3420, 9965, 3)
-- *no requirements proven* (0.08s, cost 53):
+- *no requirements proven* (0.04s, cost 53):
   - walk 5 tiles to (3417, 3536, 0)
   - **Climb-down Ladder 30191** (3417, 3536, 0) -> (3412, 9932, 3)
   - walk 42 tiles to (3419, 9964, 3)
-- *all skills 99*: same (0.08s)
+- *all skills 99*: same (0.04s)
 
 ## Gargoyles (basement)
 slayer ring: Slayer Tower (3421, 3537, 0) -> site (3434, 9938, 3)
-- *no requirements proven* (0.08s, cost 53):
+- *no requirements proven* (0.04s, cost 53):
   - walk 5 tiles to (3417, 3536, 0)
   - **Climb-down Ladder 30191** (3417, 3536, 0) -> (3412, 9932, 3)
   - walk 42 tiles to (3434, 9938, 3)
-- *all skills 99*: same (0.08s)
+- *all skills 99*: same (0.04s)
 
 ## Nechryael (basement)
 slayer ring: Slayer Tower (3421, 3537, 0) -> site (3412, 9962, 3)
-- *no requirements proven* (0.09s, cost 48):
+- *no requirements proven* (0.04s, cost 48):
   - walk 5 tiles to (3417, 3536, 0)
   - **Climb-down Ladder 30191** (3417, 3536, 0) -> (3412, 9932, 3)
   - walk 37 tiles to (3413, 9961, 3)
-- *all skills 99*: same (0.08s)
+- *all skills 99*: same (0.04s)
 
 ## Banshees (Aya)
 slayer ring: Slayer Tower (3421, 3537, 0) -> site (3442, 3542, 0)
-- *no requirements proven* (0.08s, cost 156):
+- *no requirements proven* (0.17s, cost 156):
   - walk 156 tiles to (3442, 3542, 0)
-- *all skills 99* (0.14s, cost 46):
+- *all skills 99* (0.07s, cost 46):
   - walk 29 tiles to (3442, 3531, 0)
   - **Climb-through Broken window 2173** (3442, 3531, 0) -> (3444, 3533, 0) [needs {'Agility': 18}]
   - walk 11 tiles to (3442, 3542, 0)
 
 ## Crawling hands (Aya)
 slayer ring: Slayer Tower (3421, 3537, 0) -> site (3419, 3571, 0)
-- *no requirements proven* (0.07s, cost 80):
+- *no requirements proven* (0.03s, cost 80):
   - walk 80 tiles to (3419, 3571, 0)
-- *all skills 99*: same (0.14s)
+- *all skills 99*: same (0.07s)
 
 ## Basilisks
 slayer ring: Fremennik Slayer Dungeon (2802, 9999, 0) -> site (2738, 10008, 0)
-- *no requirements proven* (0.21s, cost 215):
+- *no requirements proven* (0.10s, cost 215):
   - walk 215 tiles to (2738, 10008, 0)
-- *all skills 99* (0.18s, cost 95):
+- *all skills 99* (0.09s, cost 95):
   - walk 31 tiles to (2775, 10003, 0)
   - **Jump-over Strange floor 16544** (2775, 10003, 0) -> (2773, 10003, 0) [needs {'Agility': 43}]
   - walk 4 tiles to (2770, 10002, 0)
@@ -111,9 +114,9 @@ slayer ring: Fremennik Slayer Dungeon (2802, 9999, 0) -> site (2738, 10008, 0)
 
 ## Kurask
 slayer ring: Fremennik Slayer Dungeon (2802, 9999, 0) -> site (2705, 9980, 0)
-- *no requirements proven* (0.22s, cost 355):
+- *no requirements proven* (0.11s, cost 355):
   - walk 355 tiles to (2714, 9989, 0)
-- *all skills 99* (0.64s, cost 140):
+- *all skills 99* (0.23s, cost 140):
   - walk 31 tiles to (2775, 10003, 0)
   - **Jump-over Strange floor 16544** (2775, 10003, 0) -> (2773, 10003, 0) [needs {'Agility': 43}]
   - walk 4 tiles to (2770, 10002, 0)
@@ -124,17 +127,17 @@ slayer ring: Fremennik Slayer Dungeon (2802, 9999, 0) -> site (2705, 9980, 0)
 
 ## Cave crawlers (Aya)
 slayer ring: Fremennik Slayer Dungeon (2802, 9999, 0) -> site (2795, 9997, 0)
-- *no requirements proven* (0.03s, cost 9):
+- *no requirements proven* (0.01s, cost 9):
   - walk 9 tiles to (2795, 9997, 0)
-- *all skills 99*: same (0.03s)
+- *all skills 99*: same (0.01s)
 
 ## Dagannoth
 Xeric's talisman: Xeric's Heart (1644, 3673, 0) -> site (1665, 9995, 0)
-- *no requirements proven* (0.57s, cost 117):
+- *no requirements proven* (0.20s, cost 117):
   - walk 5 tiles to (1639, 3673, 0)
   - **Investigate Statue 27785** (1639, 3673, 0) -> (1666, 10050, 0)
   - walk 106 tiles to (1665, 9995, 0)
-- *all skills 99* (0.72s, cost 101):
+- *all skills 99* (0.24s, cost 101):
   - walk 5 tiles to (1639, 3673, 0)
   - **Investigate Statue 27785** (1639, 3673, 0) -> (1666, 10050, 0)
   - walk 59 tiles to (1647, 10010, 0)
@@ -143,25 +146,25 @@ Xeric's talisman: Xeric's Heart (1644, 3673, 0) -> site (1665, 9995, 0)
 
 ## Dust devils
 Xeric's talisman: Xeric's Heart (1644, 3673, 0) -> site (1710, 10020, 0)
-- *no requirements proven* (0.59s, cost 95):
+- *no requirements proven* (0.20s, cost 95):
   - walk 5 tiles to (1639, 3673, 0)
   - **Investigate Statue 27785** (1639, 3673, 0) -> (1666, 10050, 0)
   - walk 84 tiles to (1711, 10020, 0)
-- *all skills 99*: same (0.40s)
+- *all skills 99*: same (0.20s)
 
 ## Ghosts (Aya)
 Xeric's talisman: Xeric's Heart (1644, 3673, 0) -> site (1693, 10063, 0)
-- *no requirements proven* (0.23s, cost 55):
+- *no requirements proven* (0.11s, cost 55):
   - walk 5 tiles to (1639, 3673, 0)
   - **Investigate Statue 27785** (1639, 3673, 0) -> (1666, 10050, 0)
   - walk 44 tiles to (1693, 10063, 0)
-- *all skills 99*: same (0.23s)
+- *all skills 99*: same (0.11s)
 
 ## Black demons
 Taverley teleport (2893, 3465, 0) -> site (2860, 9835, 0)
-- *no requirements proven* (2.53s, cost -):
+- *no requirements proven* (1.10s, cost -):
   - NO ROUTE
-- *all skills 99* (2.93s, cost 189):
+- *all skills 99* (1.16s, cost 189):
   - walk 86 tiles to (2884, 3398, 0)
   - **Climb-down Ladder 16680** (2884, 3398, 0) -> (2884, 9798, 0)
   - walk 19 tiles to (2880, 9813, 0)
@@ -170,68 +173,72 @@ Taverley teleport (2893, 3465, 0) -> site (2860, 9835, 0)
 
 ## Trolls
 games necklace: Burthorpe (2899, 3553, 0) -> site (2864, 3590, 0)
-- *no requirements proven* (1.77s, cost 185):
+- *no requirements proven* (0.78s, cost 185):
   - walk 185 tiles to (2865, 3591, 0)
-- *all skills 99*: same (1.75s)
+- *all skills 99*: same (0.78s)
 
 ## Waterfiends
 games necklace: Barbarian Outpost (2520, 3571, 0) -> site (1750, 5350, 0)
-- *no requirements proven* (1.79s, cost -):
+- *no requirements proven* (0.79s, cost -):
   - NO ROUTE
-- *all skills 99*: same (1.79s)
+- *all skills 99*: same (0.74s)
 
 ## Kalphite
 desert amulet 4: Kalphite cave (3322, 3122, 0) -> site (3309, 9526, 0)
-- *no requirements proven* (0.26s, cost 46):
+- *no requirements proven* (0.12s, cost 46):
   - walk 1 tiles to (3321, 3122, 0)
   - **Enter Cave 30180** (3321, 3122, 0) -> (3305, 9497, 0)
   - walk 39 tiles to (3309, 9526, 0)
-- *all skills 99*: same (0.30s)
+- *all skills 99*: same (0.12s)
 
 ## Wyrms
 Rada's blessing: Mount Karuulm (1311, 3806, 0) -> site (1265, 10170, 0)
-- *no requirements proven* (3.23s, cost -):
-  - NO ROUTE
-- *all skills 99*: same (1.53s)
+- *no requirements proven* (0.13s, cost 98):
+  - walk 0 tiles to (1311, 3806, 0)
+  - **Activate Elevator 34359** (1311, 3806, 0) -> (1311, 10189, 0)
+  - walk 24 tiles to (1303, 10205, 0)
+  - **Climb Rocks 34544** (1303, 10205, 0) -> (1301, 10205, 0)
+  - walk 62 tiles to (1270, 10175, 0)
+- *all skills 99*: same (0.34s)
 
 ## Suqahs (south-west)
 Moonclan teleport (2113, 3915, 0) -> site (2085, 3868, 0)
-- *no requirements proven* (0.09s, cost 141):
+- *no requirements proven* (0.05s, cost 141):
   - walk 141 tiles to (2085, 3868, 0)
-- *all skills 99*: same (0.09s)
+- *all skills 99*: same (0.05s)
 
 ## Mutated zygomites
 fairy ring: Zanaris (2412, 4434, 0) -> site (2416, 4373, 0)
-- *no requirements proven* (0.05s, cost 150):
-  - walk 150 tiles to (2416, 4373, 0)
-- *all skills 99* (0.15s, cost 96):
-  - walk 46 tiles to (2409, 4402, 0)
+- *no requirements proven* (0.03s, cost 152):
+  - walk 152 tiles to (2416, 4373, 0)
+- *all skills 99* (0.08s, cost 98):
+  - walk 48 tiles to (2409, 4402, 0)
   - **Squeeze-past Jutting wall 17002** (2409, 4402, 0) -> (2409, 4400, 0) [needs {'Agility': 66}]
   - walk 44 tiles to (2416, 4373, 0)
 
 ## Gryphons (eastern cave)
 fairy ring: CJQ (3178, 2447, 0) -> site (3225, 8860, 0)
-- *no requirements proven* (0.13s, cost -):
+- *no requirements proven* (0.07s, cost -):
   - NO ROUTE
-- *all skills 99*: same (0.14s)
+- *all skills 99*: same (0.07s)
 
 ## Zombies / Birds / Cows (Aya)
 Ectophial (3660, 3522, 0) -> site (3630, 3530, 0)
-- *no requirements proven* (0.08s, cost 40):
+- *no requirements proven* (0.03s, cost 40):
   - walk 40 tiles to (3630, 3530, 0)
-- *all skills 99*: same (0.08s)
+- *all skills 99*: same (0.03s)
 
 ## Minotaurs (Aya)
 skills necklace: Cooking Guild (3143, 3442, 0) -> site (1875, 5218, 0)
-- *no requirements proven* (0.16s, cost 138):
+- *no requirements proven* (0.07s, cost 138):
   - walk 91 tiles to (3081, 3421, 0)
   - **Climb-down Entrance 20790** (3081, 3421, 0) -> (1859, 5243, 0)
   - walk 41 tiles to (1875, 5218, 0)
-- *all skills 99*: same (0.16s)
+- *all skills 99*: same (0.07s)
 
 ## Scorpions (Aya)
 skills necklace: Mining Guild (3049, 9763, 0) -> site (3049, 9771, 0)
-- *no requirements proven* (0.03s, cost 10):
+- *no requirements proven* (0.02s, cost 10):
   - walk 10 tiles to (3049, 9771, 0)
-- *all skills 99*: same (0.03s)
+- *all skills 99*: same (0.02s)
 

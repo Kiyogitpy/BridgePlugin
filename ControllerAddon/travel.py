@@ -31,6 +31,7 @@
 #     to resolve to it, add "Ferox Enclave" to Controller Settings ->
 #     Clicking -> Forced Actions. (Confirmed correct.)
 
+import re
 import math
 import random
 import time
@@ -180,8 +181,45 @@ _door_failures: dict = {}     # (x, y, plane) -> time.time() of the last confirm
 # the routine simply could not get in. The name + "Open" action filter is what keeps this tight
 # -- nearby GameObjects such as Drawers also offer "Open" and are excluded by name.
 DOOR_OBJECT_TYPES = ("WallObject", "GameObject")
-DOOR_NAME_HINTS = ("door", "gate", "curtain")   # "curtain" taken from Vitalite's own list
+# "curtain" is Vitalite's; barrier/stile/portcullis/archway/cattlegate/fence are Microbot's
+# Rs2DoorClassifier (ported 2026-09-20, strings only). "fence" is matched as a WHOLE WORD by
+# is_door_name, the way Microbot does, because "defence" contains it.
+DOOR_NAME_HINTS = ("door", "gate", "curtain", "barrier", "stile", "portcullis", "archway", "cattlegate")
+_FENCE_AS_WORD = re.compile(r"\bfence\b")
 DOOR_OPEN_ACTION = "open"
+# Microbot's DOOR_ACTION_PRIORITY, highest first: the menu action that gets you THROUGH a door
+# when several are offered. first_door_on_route still demands a plain "Open" (a shut door is
+# what worldmap routes through and _open_door clicks); door_walk_action is for an executor that
+# meets a toll gate, a pick-lock door or a stile on a transport row.
+DOOR_ACTION_PRIORITY = ("pay-toll", "pick-lock", "walk-through", "go-through", "open", "pass", "enter",
+                        "push", "climb-over", "climb-through", "squeeze-through", "cross", "force", "exit")
+
+
+def is_door_name(name) -> bool:
+    """Door-like by name: any hint as a substring, or `fence` as a whole word."""
+    lowered = (name or "").lower()
+    return any(hint in lowered for hint in DOOR_NAME_HINTS) or bool(_FENCE_AS_WORD.search(lowered))
+
+
+def is_door_close_action(action) -> bool:
+    lowered = (action or "").lower().strip()
+    return lowered.startswith("close") or lowered.startswith("shut")
+
+
+def door_walk_action(actions):
+    """The highest-priority pass-through action among `actions`, never a Close/Shut; None when
+    nothing qualifies -- which is what an already-OPEN door (only Close left) answers."""
+    best, best_rank = None, None
+    for action in actions or ():
+        if not action or is_door_close_action(action):
+            continue
+        lowered = action.lower()
+        for rank, prefix in enumerate(DOOR_ACTION_PRIORITY):
+            if lowered.startswith(prefix):
+                if best_rank is None or rank < best_rank:
+                    best, best_rank = action, rank
+                break
+    return best
 
 # net.runelite.api.CollisionDataFlag, mirrored from the client. ObjectProvider reports the whole
 # entry for an object's TILE as `collisionFlags`; these are the bits meaning "you cannot get past
@@ -312,8 +350,7 @@ def first_door_on_route(route, plane: int, objects: list, flags: dict, start: in
             continue
         if (obj.get("x"), obj.get("y")) not in tiles:
             continue
-        name = (obj.get("name") or "").lower()
-        if not any(hint in name for hint in DOOR_NAME_HINTS):
+        if not is_door_name(obj.get("name")):
             continue
         actions = obj.get("actions")
         if not actions or not any((a or "").lower() == DOOR_OPEN_ACTION for a in actions):

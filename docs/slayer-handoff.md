@@ -54,7 +54,8 @@ observations over a clean log.
 | Floor-crossing walking | `crossfloor.py`, `legs.walk_across`, `legs.run_transport` | built, UNRUN |
 | **Phase A** travel from where we stand | `slayer_routes.py`, TRAVEL phase in `routines/slayer.py` | built, reviewed, fixed, **UNRUN** |
 | **Phase B** the house hub | `poh.py`, house legs in `legs.py` | built, reviewed, fixed, **UNRUN** |
-| Phase C bank + loadout, D restock + loot, E Kuradal's 22 sites | — | NOT built (interface-level in the plan) |
+| **E-pre** Microbot transports adapter | `vendor/microbot/`, `transports.load_microbot_links`, `tools/vendor_microbot_tables.py` | **built 2026-09-20**, Wyrms route in `routes.md`; door lists ported into `travel.py` |
+| Phase C bank + loadout, D restock + loot, E0-E6 Kuradal's 22 sites | — | NOT built (interface-level in the plan) |
 
 Tests: `python -m pytest tests/ -q` from `ControllerAddon/` → 3087 passed; the ONLY failures are 4
 known ones in `tests/test_mastering_mixology.py`. `test_crossfloor::test_an_impossible_trip_is_none_and_fast`
@@ -70,13 +71,11 @@ has an 8 s wall-clock bound and failed once under load.
 2. **Phase B live gate**: one Aya task reached through the house. Watch: is the fairy ring within
    `radius=20` of the tablet landing (nothing walks inside the house yet); does the hover gate
    read a jewellery-box entry's name; does `object_refresh_target` answer inside the instance.
-3. **E-pre: the Microbot transports adapter** — needs nothing from the user. Microbot's fork of
-   the Shortest Path tables HAS the Karuulm Slayer Dungeon (our vendored copy does not) but uses
-   different columns and `Option;Target;id` object cells; details in the plan's Phase E and in
-   `docs/slayer-sites/microbot-core-survey.md`. The sparse clone lived in the laptop's temp folder:
-   re-clone `github.com/chsami/Microbot` (sparse: `runelite-client/src/main/resources/net/runelite/client/plugins/microbot/shortestpath`
-   and `.../java/.../microbot/{util/poh,util/walker,util/magic,util/dialogues,shortestpath}`;
-   set `core.longpaths true` first) — the commit surveyed was `8bcc652`.
+3. ~~E-pre: the Microbot transports adapter~~ **DONE 2026-09-20** on the desktop:
+   `ControllerAddon/vendor/microbot/VENDORED.md` pins commit `8bcc652`; `tools/vendor_microbot_tables.py <clone>`
+   re-vendors. Still open from it: the Great Conch (gryphon) cave has no row in EITHER table
+   (hand-write that leg in E1); the dusty-key gate exists in both but fails closed until the
+   catalog supplies owned item ids; the whirlpool still needs `varbit_values`.
 4. **Phase C** (bank + loadout): start with its "detail the phase" step; it depends on
    `bank_memory`, whose own six-item live checklist in `CLAUDE.md` has never been run.
 

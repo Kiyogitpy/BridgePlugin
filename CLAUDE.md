@@ -981,7 +981,11 @@ first-session checklist: **`docs/teleports.md`**. Shape:
 
 - Shortest Path's own transport TSVs are vendored byte-identical
   (`ControllerAddon/vendor/`, header names ASSERTED since column order differs between
-  files): teleportation items, jewellery boxes, POH portals. Item rows key on ITEM IDS,
+  files): teleportation items, jewellery boxes, POH portals. Since 2026-09-20
+  `vendor/microbot/` holds Microbot's NEWER fork of `transports.tsv` (has the Karuulm
+  Slayer Dungeon; `Option;Target;id` cells, numeric item ids, a Currency column) which
+  `transports.load_links` merges in through an adapter, ours first -- read
+  `vendor/microbot/VENDORED.md` before touching either copy. Item rows key on ITEM IDS,
   which joins directly with bank memory; the Items column is pure OR (charge variants of
   one item); wilderness level is filtered (a teleport does not fire above its own level,
   and Krystilia tasks make this a common case, not a corner).

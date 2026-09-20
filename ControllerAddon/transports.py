@@ -28,6 +28,21 @@
 # The header of every table is asserted by column NAME (layouts differ between Shortest Path's own
 # files -- see teleports.py). Never hand-edit the TSVs: tools/extract_shortest_path_tables.py
 # re-extracts them from a newer jar, then diff.
+#
+# A SECOND transports source since 2026-09-20 (slayer sub-project 3, E-pre): Microbot's fork of
+# the same table (vendor/microbot/transports.tsv, tools/vendor_microbot_tables.py, pinned commit in
+# vendor/microbot/VENDORED.md) is newer and larger -- MEASURED 5731 rows against our 5168, 5043
+# shared by (origin, dest, object id), 649 only there -- and has the Karuulm Slayer Dungeon, which
+# ours lacks entirely. Its layout differs: the object cell is `Option;Target;id`, `Item IDs` are
+# NUMERIC ("1 2;3" = (1 or 2) and 3, exactly as its Transport.java splits it), and it adds
+# `Currency` ("10 Coins"), `Varplayers` and `isMembers`. load_links() reads it through an adapter
+# and APPENDS the rows whose key we do not already hold; every row of ours resolves exactly as
+# before, and a Microbot row's object_info is normalised to our space form so every consumer
+# (legs.trailing_int, crossfloor's keys, the logs) sees one format. The same physical edge can
+# still appear twice when the two tables disagree on the object id (the Al Kharid toll gate is
+# 44050 in ours, 2788 there) -- the executor finds the object by id, so the stale one fails
+# cleanly and the other is taken. Item ids and currency FAIL CLOSED like every other requirement
+# (`usable(owned_item_ids=, currency_held=)`); isMembers is recorded, not gated.
 
 import os
 import re
@@ -39,9 +54,23 @@ VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
 LINK = "link"      # changes plane, enters/leaves a dungeon, or crosses something walking cannot
 DOOR = "door"      # "Open <x>" between adjacent same-plane tiles -- travel.py's job, not a route edge
 
+SHORTEST_PATH = "shortest-path"   # Step.source: the Plugin Hub jar's table (vendor/*.tsv)
+MICROBOT = "microbot"             # Step.source: Microbot's fork (vendor/microbot/*.tsv)
+MICROBOT_SUBDIR = "microbot"
+
 _OBJECT_COLUMN = "menuOption menuTarget objectID"
 _DOOR_MAX_TILES = 2
 _SKILL = re.compile(r"(\d+)\s+([A-Za-z ]+)")
+_CURRENCY = re.compile(r"(\d+)\s+(.+)")
+
+# Column names per source. The two spell the varplayers column differently; only Microbot has
+# numeric item ids and a currency column, and our jar copy's Items are symbolic names.
+_LAYOUT = {
+    SHORTEST_PATH: {"items": "Items", "item_ids": None, "currency": None, "varplayers": "VarPlayers",
+                    "required": ("Origin", "Destination", _OBJECT_COLUMN)},
+    MICROBOT: {"items": None, "item_ids": "Item IDs", "currency": "Currency", "varplayers": "Varplayers",
+               "required": ("Origin", "Destination", _OBJECT_COLUMN, "Item IDs", "Currency", "Varplayers")},
+}
 
 _cache = {}
 
@@ -50,14 +79,18 @@ class Step:
     """One transport row: stand on `origin`, take `option` on the object, arrive at `dest`."""
 
     __slots__ = ("origin", "dest", "option", "target", "object_id", "object_info", "skills",
-                 "items", "quests", "varbits", "varplayers", "duration", "display", "kind")
+                 "items", "quests", "varbits", "varplayers", "duration", "display", "kind",
+                 "item_ids", "currency", "source")
 
     def __init__(self, origin, dest, object_info, skills, items, quests, varbits, varplayers,
-                 duration, display):
+                 duration, display, *, item_ids=(), currency=None, source=SHORTEST_PATH):
         self.origin = origin
         self.dest = dest
-        self.object_info = object_info
-        self.option, self.target, self.object_id = split_object_info(object_info)
+        self.object_info = normalise_object_info(object_info)
+        self.item_ids = item_ids          # ((1, 2), (3,)) = (1 or 2) and 3 -- Microbot rows only
+        self.currency = currency          # (amount, name) -- Microbot rows only
+        self.source = source
+        self.option, self.target, self.object_id = split_object_info(self.object_info)
         self.skills = skills
         self.items = items
         self.quests = quests
@@ -80,6 +113,41 @@ class Step:
 
     def __repr__(self):
         return f"Step({self.origin} -> {self.dest}, {self.object_info!r})"
+
+
+def normalise_object_info(text):
+    """Microbot's `Enter;Cave Entrance;3759` -> our `Enter Cave Entrance 3759`; ours unchanged.
+    Safe because no Microbot option contains whitespace (pinned by test against the data)."""
+    text = (text or "").strip()
+    if ";" in text:
+        return " ".join(part.strip() for part in text.split(";") if part.strip())
+    return text
+
+
+def parse_item_ids(field):
+    """`1 2;3` -> ((1, 2), (3,)): semicolon is AND, space is OR (Transport.java's split order).
+    A non-numeric token is dropped; a group left empty by that can never be satisfied."""
+    out = []
+    for group in (field or "").split(";"):
+        if not group.strip():
+            continue
+        ids = []
+        for token in group.split():
+            try:
+                ids.append(int(token))
+            except ValueError:
+                pass
+        out.append(tuple(ids))
+    return tuple(out)
+
+
+def parse_currency(field):
+    """`10 Coins` -> (10, "Coins"); empty -> None; anything else -> (None, text), unsatisfiable."""
+    field = (field or "").strip()
+    if not field:
+        return None
+    m = _CURRENCY.fullmatch(field)
+    return (int(m.group(1)), m.group(2).strip()) if m else (None, field)
 
 
 def split_object_info(text):
@@ -129,11 +197,12 @@ def _read_table(filename, directory, required):
     return cols, rows
 
 
-def _load_steps(filename, directory):
-    key = (filename, directory or VENDOR_DIR)
+def _load_steps(filename, directory, source=SHORTEST_PATH):
+    key = (filename, directory or VENDOR_DIR, source)
     if key in _cache:
         return _cache[key]
-    cols, rows = _read_table(filename, directory, ("Origin", "Destination", _OBJECT_COLUMN))
+    layout = _LAYOUT[source]
+    cols, rows = _read_table(filename, directory, layout["required"])
     steps = []
     for row in rows:
         origin = _parse_dest(_cell(cols, row, "Origin"))
@@ -145,20 +214,37 @@ def _load_steps(filename, directory):
             dest=dest,
             object_info=_cell(cols, row, _OBJECT_COLUMN),
             skills=_parse_skills(_cell(cols, row, "Skills")),
-            items=_cell(cols, row, "Items"),
+            items=_cell(cols, row, layout["items"]) if layout["items"] else "",
             quests=_parse_quests(_cell(cols, row, "Quests")),
             varbits=_parse_varbits(_cell(cols, row, "Varbits")),
-            varplayers=_parse_varbits(_cell(cols, row, "VarPlayers")),
+            varplayers=_parse_varbits(_cell(cols, row, layout["varplayers"])),
             duration=_parse_int(_cell(cols, row, "Duration"), 0),
             display=_cell(cols, row, "Display info"),
+            item_ids=parse_item_ids(_cell(cols, row, layout["item_ids"])) if layout["item_ids"] else (),
+            currency=parse_currency(_cell(cols, row, layout["currency"])) if layout["currency"] else None,
+            source=source,
         ))
     _cache[key] = steps
     return steps
 
 
-def load_links(directory=None, include_doors=True):
-    """transports.tsv: ladders, stairs, cave mouths, trapdoors, gates, ditches, ..."""
+def load_microbot_links(directory=None):
+    """Microbot's transports.tsv alone (vendor/microbot/), every row, through the adapter."""
+    return _load_steps("transports.tsv", os.path.join(directory or VENDOR_DIR, MICROBOT_SUBDIR), MICROBOT)
+
+
+def load_links(directory=None, include_doors=True, microbot=True):
+    """transports.tsv: ladders, stairs, cave mouths, trapdoors, gates, ditches, ... -- our jar
+    copy first, then every Microbot row whose (origin, dest, object id) we do not already hold.
+    `microbot=False` is the jar table alone, exactly as before 2026-09-20."""
     steps = _load_steps("transports.tsv", directory)
+    if microbot:
+        key = ("merged", directory or VENDOR_DIR)
+        if key not in _cache:
+            held = {(s.origin, s.dest, s.object_id) for s in steps}
+            _cache[key] = steps + [s for s in load_microbot_links(directory)
+                                   if (s.origin, s.dest, s.object_id) not in held]
+        steps = _cache[key]
     return steps if include_doors else [s for s in steps if s.kind != DOOR]
 
 
@@ -194,9 +280,30 @@ def _items_met(field, owned_item_names):
     return True
 
 
+def _item_ids_met(groups, owned_item_ids):
+    if not groups:
+        return True
+    if owned_item_ids is None:
+        return False
+    owned = set(owned_item_ids)
+    return all(any(i in owned for i in group) for group in groups)
+
+
+def _currency_met(currency, currency_held):
+    if currency is None:
+        return True
+    amount, name = currency
+    if amount is None or currency_held is None:
+        return False
+    return currency_held.get(name, 0) >= amount
+
+
 def usable(step, skill_levels=None, completed_quests=None, varbit_values=None,
-           varplayer_values=None, owned_item_names=None) -> bool:
-    """True only when EVERY requirement on the row is proven. Unknown means no."""
+           varplayer_values=None, owned_item_names=None, owned_item_ids=None,
+           currency_held=None) -> bool:
+    """True only when EVERY requirement on the row is proven. Unknown means no.
+    `owned_item_ids` (a set of ids) and `currency_held` ({"Coins": 10}) answer the Microbot
+    rows' numeric requirements; the jar rows' symbolic Items still need `owned_item_names`."""
     if step.skills:
         if skill_levels is None:
             return False
@@ -208,6 +315,10 @@ def usable(step, skill_levels=None, completed_quests=None, varbit_values=None,
     if not _vars_met(step.varbits, varbit_values):
         return False
     if not _vars_met(step.varplayers, varplayer_values):
+        return False
+    if not _item_ids_met(step.item_ids, owned_item_ids):
+        return False
+    if not _currency_met(step.currency, currency_held):
         return False
     return _items_met(step.items, owned_item_names)
 
