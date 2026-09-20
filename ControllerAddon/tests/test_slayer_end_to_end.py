@@ -246,3 +246,88 @@ def test_a_task_that_keeps_running_dry_stops_after_the_restock_ceiling(monkeypat
     _run(ctx, ticks=300, world=world)
     assert ctx.state.stops and "restocks" in ctx.state.stops[0] and "nechryael" in ctx.state.stops[0].lower()
     assert len([l for l in world.log if l.startswith("BANK")]) == 1 + routine.RESTOCK_MAX_PER_TASK
+
+
+# --- restarts: ctx.state.data is WIPED, the game is not (CLAUDE.md's standing warning) ----------
+
+def _restart(ctx):
+    fresh = _Ctx()
+    fresh.state.stops = ctx.state.stops
+    return fresh
+
+
+def test_a_restart_in_the_middle_of_a_fight_carries_on_without_a_needless_bank_trip(monkeypatch):
+    """Killed and relaunched at the site with two sharks eaten: the bookkeeping is gone, the task
+    is not. It must FIGHT on -- not decide the pack is short and walk off to a bank."""
+    world = World([("KURADAL", "Nechryael", 100)], BANK)
+    world.streak = 9
+    _install(monkeypatch, world)
+    ctx = _Ctx()
+    _run(ctx, ticks=6, world=world)                       # asked, packed, travelled, fighting
+    assert world.count < 100 and world.count > 0, world.log
+    world.inventory["Shark"] -= 2
+    banks_before = len([l for l in world.log if l.startswith("BANK")])
+    ctx = _restart(ctx)
+    _run(ctx, ticks=60, world=world)
+    assert ctx.state.stops == [] and world.log[-1].startswith("TASK DONE")
+    assert len([l for l in world.log if l.startswith("BANK")]) == banks_before, "no bank trip after the restart"
+
+
+def test_a_restart_at_the_bank_with_the_pack_in_hand_just_travels(monkeypatch):
+    world = World([("AYA", "Cows", 20)], BANK)
+    _install(monkeypatch, world)
+    ctx = _Ctx()
+    _run(ctx, ticks=2, world=world)                       # asked, then banked: standing at Ferox
+    assert world.log[-1].startswith("BANK"), world.log
+    ctx = _restart(ctx)
+    _run(ctx, ticks=60, world=world)
+    assert ctx.state.stops == [] and world.log[-1].startswith("TASK DONE")
+    assert len([l for l in world.log if l.startswith("BANK")]) == 1, "the pack was complete: not banked twice"
+
+
+def test_a_restart_in_the_middle_of_a_half_failed_restock_heals_itself(monkeypatch):
+    """The restocking flag lives in ctx.state.data and dies with the process. Standing at Ferox
+    with no food and no flag, the ordinary BANK step must still see the pack is short."""
+    world = World([("KURADAL", "Nechryael", 100)], BANK)
+    world.streak, world.eats_per_tick = 9, 1
+    _install(monkeypatch, world)
+    ctx = _Ctx()
+    real_bank, failures = world.bank_up, {"left": 1}
+
+    def flaky(ctx_, cfg):
+        if world.count < 100 and failures["left"]:        # the RESTOCK trip: teleports, then fails
+            failures["left"] -= 1
+            world.player = {"x": 3150, "y": 3635, "plane": 0}
+            world.log.append("BANK FAILED at Ferox")
+            return False
+        return real_bank(ctx_, cfg)
+    monkeypatch.setattr(routine.banker, "bank_up", flaky)
+    for _ in range(200):
+        if world.log and world.log[-1] == "BANK FAILED at Ferox":
+            break
+        routine.tick(ctx)
+    ctx = _restart(ctx)                                   # the flag is gone with the process
+    _run(ctx, ticks=200, world=world)
+    assert ctx.state.stops == [] and world.log[-1].startswith("TASK DONE"), (ctx.state.stops, world.log)
+    after = world.log[world.log.index("BANK FAILED at Ferox") + 1]
+    assert after.startswith("BANK") and "Shark" in after, "it banked BEFORE travelling back"
+
+
+# --- a task on the skip list ---------------------------------------------------------------------
+
+def test_a_skip_list_task_is_cancelled_through_kuradal_and_the_next_one_is_taken(monkeypatch):
+    world = World([("KURADAL", "Drakes", 120), ("KURADAL", "Hellhounds", 10)], BANK)
+    world.streak = 9
+
+    def cancel_task(ctx, master, tasks_cfg):
+        assert master == "KURADAL", "the cancel goes through the milestone master, never Aya"
+        world.log.append(f"CANCEL {world.task}")
+        world.task, world.count, world.points = None, 0, world.points - 30
+        return True
+    _install(monkeypatch, world)
+    monkeypatch.setattr(npc_contact, "cancel_task", cancel_task)
+    ctx = _Ctx()
+    _run(ctx, ticks=80, world=world)
+    assert ctx.state.stops == [], (ctx.state.stops, world.log)
+    assert world.log[:3] == ["ACQUIRE Drakes x120 from KURADAL", "CANCEL Drakes", "ACQUIRE Hellhounds x10 from KURADAL"]
+    assert world.points == 200 - 30 + 15 and world.log[-1].startswith("TASK DONE")
