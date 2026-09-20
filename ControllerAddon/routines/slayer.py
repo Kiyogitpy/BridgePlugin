@@ -1,18 +1,37 @@
 # routines/slayer.py -- the Slayer TASK routine: get a task, deal with it, get the next one.
 #
-# Sub-project 2 of docs/superpowers/specs/2026-09-18-slayer-task-loop-design.md (2026-09-19):
-# ACQUIRE through NPC Contact (Kuradal on every `milestoneEvery`-th task, Aya otherwise), SKIP an
-# unwanted task for 30 points, STOP on a task the user does by hand, and FIGHT when already
-# standing at a known site. Sub-project 3 phase A (2026-09-19) adds TRAVEL: a fairy-ring or
-# carried-item route from where the player stands, for Aya tasks whose teleport list this phase
-# knows how to use. The house, the bank and Kuradal's sites are still to come -- until they exist,
-# a route TRAVEL cannot plan is a safety stop naming why.
+# docs/superpowers/specs/2026-09-18-slayer-task-loop-design.md. ACQUIRE a task through NPC Contact
+# (Kuradal on every `milestoneEvery`-th task, Aya otherwise), SKIP an unwanted one for 30 points,
+# STOP on a task the user does by hand, PACK it at the bank, WEAR what it requires, TRAVEL to the
+# site, FIGHT, RESTOCK when the food runs out, and take the next task.
 #
-# The phase is DERIVED from GET /slayer every tick (spec §7.1); ctx.state.data holds only
-# counters, so a restart mid-task resumes correctly. None from /slayer = do nothing.
+# THE PHASE IS DERIVED FROM GET /slayer EVERY TICK (spec §7.1). ctx.state.data holds only counters
+# and cursors, so a restart mid-task resumes correctly -- pinned by tests/test_slayer_end_to_end.py,
+# which drives whole tasks (and restarts, and a skip) through one simulated world. None from
+# /slayer means do nothing.
+#
+# The ORDER inside a tick, and why each step can refuse the next:
+#
+#   no task          -> _restore_base_gear (put back what a gear task displaced) THEN _acquire
+#   skip-list task   -> _skip
+#   a STOP task      -> a safety stop naming it
+#   restock running  -> _restock, outranking everything: bank_up can teleport and THEN fail, and
+#                       the player is then off-site with nothing to eat
+#   not at the site  -> _pack (bank for the loadout) -> _wear (put the gear ON) -> _travel
+#   at the site      -> _restock (only if supplies ran out) -> _wear -> _fight
+#
+# Each step returns True when it SPENT the tick, so the next one does not also run. Every failure
+# is a safety stop that NAMES what went wrong -- never a loop, never a guess.
+#
+# What is decided where: the pure modules own every judgement (slayer_tasks disposition,
+# slayer_catalog the sites and requirements, slayer_routes the route, slayer_loadout the pack,
+# slayer_policy the bank/loot/gear verdicts); this file only sequences them and calls the
+# primitives that click (npc_contact, banker, legs, gear, combat_core). Before a live run,
+# `python slayer_preflight.py [--task X | --aya | --all]` prints what all of that WOULD decide
+# without touching the mouse.
 #
 # The old "fight the monsters picked in the panel" behaviour is routines/combat.py.
-# UNVERIFIED LIVE as of 2026-09-19.
+# ACQUIRE from Aya is LIVE-PROVEN (2026-09-19, one cast). Everything else here is UNVERIFIED LIVE.
 
 import time
 
