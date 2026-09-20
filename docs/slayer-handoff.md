@@ -57,7 +57,9 @@ observations over a clean log.
 | **E-pre** Microbot transports adapter | `vendor/microbot/`, `transports.load_microbot_links`, `tools/vendor_microbot_tables.py` | **built 2026-09-20**, Wyrms route in `routes.md`; door lists ported into `travel.py` |
 | **E1** Kuradal's 22 tasks as data | `slayer_catalog.py`; `slayer_tasks.at_site/where` and `slayer_routes.plan` fall through to it | **built 2026-09-20 ahead of the live gates at the user's say-so** (pure data): 21 of 22 route from their landing in tests; gryphons wait on one recording. 12 start with a SLAYER RING, which no leg can run yet -- the routine stops naming it |
 | **C1** the loadout calculator | `slayer_loadout.py` | **built 2026-09-20 ahead of the live gates** (pure): task + carried + bank memory -> withdraw list, keep list, slots, named problems. Run read-only on the real bank. Nothing calls it yet |
-| Phase C2-C5 (the BANK phase that acts on it, gear on/off, Java), D restock + loot, E0 gear decisions, E2-E6 hub live runs | — | NOT built -- these click, so they wait for a live run |
+| The DECISIONS of C2, D2, C3 | `slayer_policy.py` | **built 2026-09-20** (pure): bank / carry on / skip / stop; the loot tiers; base-gear persistence and the slot diff. Nothing calls it yet |
+| C4 + D3 Java config | `slayerMinHouseTeleports` 5, `slayerMakeRoomValue` 50k, `slayerMustLootValue` 150k, exported in the `tasks` block | **built 2026-09-20**, gradle test passes; **needs a client rebuild** to appear in the panel |
+| The ACTING halves: the BANK and RESTOCK phases, eating/dropping for loot, equipping gear; E0 gear decisions; E2-E6 hub live runs | — | NOT built -- these click, so they wait for a live run |
 
 Tests: `python -m pytest tests/ -q` from `ControllerAddon/` → 3087 passed; the ONLY failures are 4
 known ones in `tests/test_mastering_mixology.py`. `test_crossfloor::test_an_impossible_trip_is_none_and_fast`

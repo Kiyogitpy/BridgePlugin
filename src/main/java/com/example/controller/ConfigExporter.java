@@ -114,6 +114,9 @@ public final class ConfigExporter
 		tasks.put("skipTasks", parseList(config.slayerSkipTasks()));
 		tasks.put("maxSkips", config.slayerMaxSkips());
 		tasks.put("pointsReserve", config.slayerPointsReserve());
+		tasks.put("minHouseTeleports", config.slayerMinHouseTeleports());
+		tasks.put("makeRoomValue", config.slayerMakeRoomValue());
+		tasks.put("mustLootValue", config.slayerMustLootValue());
 		data.put("tasks", tasks);
 
 		data.put("poh", sharedPoh(config));

@@ -866,6 +866,48 @@ public interface ControllerConfig extends Config
 		return 60;
 	}
 
+	@ConfigItem(
+		keyName = "slayerMinHouseTeleports",
+		name = "Min House Teleports",
+		description = "Stop (with the list to buy) when fewer than this many Teleport to house tablets are left in the " +
+			"inventory and bank together. The house is the travel hub, so running out strands the routine. It never buys anything.",
+		section = slayerTasksSection,
+		position = 6
+	)
+	@Range(min = 0, max = 1000)
+	default int slayerMinHouseTeleports()
+	{
+		return 5;
+	}
+
+	@ConfigItem(
+		keyName = "slayerMakeRoomValue",
+		name = "Make Room Value",
+		description = "With a full inventory, a drop worth at least this many coins is worth EATING one food for -- " +
+			"only when HP is actually missing. Below it, a full inventory just leaves the drop.",
+		section = slayerTasksSection,
+		position = 7
+	)
+	@Range(min = 0, max = 100000000)
+	default int slayerMakeRoomValue()
+	{
+		return 50000;
+	}
+
+	@ConfigItem(
+		keyName = "slayerMustLootValue",
+		name = "Must Loot Value",
+		description = "With a full inventory, a drop worth at least this many coins is always taken: eat a food, else finish a " +
+			"1-dose prayer potion, else DROP the cheapest consumable. Never gear, a teleport item or an item the task requires.",
+		section = slayerTasksSection,
+		position = 8
+	)
+	@Range(min = 0, max = 100000000)
+	default int slayerMustLootValue()
+	{
+		return 150000;
+	}
+
 	// ============================================================
 	// Mining
 	// ============================================================
