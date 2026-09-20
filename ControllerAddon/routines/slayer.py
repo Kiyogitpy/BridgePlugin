@@ -89,7 +89,8 @@ def _reset_slot_counters(ctx, state) -> None:
                                "slayer_route_finished": 0, "slayer_no_target_walks": 0,
                                "slayer_no_target": 0, "slayer_pack_ok": None,
                                "slayer_banked_for": None, "slayer_bank_fails": 0,
-                               "slayer_restocks": 0, "slayer_restocking": None})
+                               "slayer_restocks": 0, "slayer_restocking": None,
+                               "slayer_worn_ok": None, "slayer_wear_fails": 0})
 
 
 def _acquire(ctx, state, tasks_cfg) -> None:
@@ -156,15 +157,115 @@ def _skip(ctx, state, tasks_cfg) -> None:
         ctx.state.trigger_safety_stop(f"Slayer: {exc}")
 
 
-def _bank_config(panel, loadout) -> dict:
+def _bank_config(panel, loadout, base=None) -> dict:
     """banker.bank_up's config for one slayer bank visit: the panel's own bank block (bankNames,
     keepItems, teleportFallback) with the loadout's withdraw and keep lists laid over it. Never
-    returnToSpot: TRAVEL re-derives the way back from wherever the bank was."""
+    returnToSpot: TRAVEL re-derives the way back from wherever the bank was.
+
+    `base` is the saved base gear ({slot: name}). Every base item is KEPT: the defender a mirror
+    shield displaced rides in the inventory for the whole task, and banker deposits everything
+    that is not on this list."""
     cfg = dict((panel or {}).get("bank") or {})
+    keep = list(cfg.get("keepItems") or []) + list(loadout.keep) + [n.lower() for n in (base or {}).values() if n]
     cfg.update({"enabled": True, "withdraw": loadout.withdraw, "returnToSpot": False,
-                "keepItems": list(dict.fromkeys(list(cfg.get("keepItems") or []) + loadout.keep)),
+                "keepItems": list(dict.fromkeys(keep)),
                 "teleportFallback": cfg.get("teleportFallback", True)})
     return cfg
+
+
+def _base_gear(ctx):
+    """The saved base gear ({slot: name}) for this account, or None. Read once per process."""
+    data = ctx.state.data
+    if "slayer_base_gear" not in data:
+        path = slayer_policy.base_gear_path(bank_memory.load().account_hash)
+        data["slayer_base_gear_path"] = path
+        data["slayer_base_gear"] = slayer_policy.load_base_gear(path)
+    return data["slayer_base_gear"]
+
+
+def _capture_base_gear(ctx, state) -> None:
+    """Save what is worn as the BASE, once per process and only while no gear task is active
+    (slayer_policy.may_capture_base): mid-basilisks the mirror shield is on, and it is not the
+    base gear. An empty /equipment read is never saved (the bridge answers {} when it is down)."""
+    data = ctx.state.data
+    if data.get("slayer_base_captured"):
+        return
+    if not slayer_policy.may_capture_base(state.has_task, slayer_catalog.get(state.task)):
+        return
+    _base_gear(ctx)                                        # resolves the path
+    if slayer_policy.save_base_gear(data.get("slayer_base_gear_path"), controller.get_equipment()):
+        data["slayer_base_gear"] = slayer_policy.load_base_gear(data["slayer_base_gear_path"])
+        debug_log.log(LOG, f"base gear saved: {data['slayer_base_gear']}")
+    data["slayer_base_captured"] = True
+
+
+def _restore_base_gear(ctx) -> bool:
+    """With NO task held: put back any base item a task's gear displaced, one equip per tick. True
+    when this tick was spent on it. An item that is not in the inventory (banked, or the base was
+    saved in odd gear) is logged once and left -- never a stop, never a bank trip of its own."""
+    base = _base_gear(ctx)
+    if not base:                               # nothing saved yet: no reads, nothing to put back
+        return False
+    todo = slayer_policy.gear_to_restore(base, controller.get_equipment())
+    if not todo:
+        return False
+    carried = gear.carried_names()
+    for slot, name in todo.items():
+        if any(name.lower() in held for held in carried):
+            debug_log.log(LOG, f"task done: putting the {name} back on ({slot})")
+            gear.equip_from_inventory(ctx, name)
+            return True
+    missing = sorted(todo.values())
+    if missing and ctx.state.data.get("slayer_base_missing_logged") != missing:
+        ctx.state.data["slayer_base_missing_logged"] = missing
+        debug_log.log(LOG, f"base gear not in the inventory, left as it is: {missing}")
+    return False
+
+
+def _wear(ctx, state) -> bool:
+    """WEAR what the task requires (plan task C3). True when this tick was spent on it -- one equip,
+    or a safety stop. UNVERIFIED LIVE; the click is gear.equip_from_inventory, the pattern
+    combat_core.maintain_bracelet proves live.
+
+    slayer_tasks.missing_items accepts a requirement that is carried OR worn, and a mirror shield
+    in the inventory does nothing against a basilisk. So before the journey and before every fight
+    tick, a catalog task's checkable `worn` requirements are put ON.
+
+    Equipping a shield knocks a TWO-HANDED weapon off. Which one-handed weapon to bring beside the
+    mirror shield is an open gear decision (plan E0); until it is made the routine STOPS rather
+    than walk into basilisks bare-handed."""
+    data = ctx.state.data
+    key = (state.task, state.streak)
+    if data.get("slayer_worn_ok") == key:
+        return False
+    spec = slayer_catalog.get(state.task)
+    for label in (spec.worn if spec else ()):
+        options = slayer_catalog.REQUIREMENT_ITEMS.get(label, ())
+        if not options or gear.is_worn(options[0], options[1:]):
+            continue
+        carried = gear.carried_names()
+        pick = next((o for o in options if any(o in held for held in carried)), None)
+        if pick is None:
+            ctx.state.trigger_safety_stop(f"Slayer: {state.task} needs {label} WORN and none is carried")
+            return True
+        had_weapon = "weapon" in (controller.get_equipment() or {})
+        debug_log.log(LOG, f"{state.task}: putting on the {pick} ({label})")
+        if not gear.equip_from_inventory(ctx, pick):
+            fails = data.get("slayer_wear_fails", 0) + 1
+            data["slayer_wear_fails"] = fails
+            if fails >= TRAVEL_MAX_FAILS:
+                ctx.state.trigger_safety_stop(f"Slayer: could not put on the {pick} for {state.task} "
+                                              f"after {fails} tries -- see the [gear] lines above")
+            return True
+        data["slayer_wear_fails"] = 0
+        if had_weapon and "weapon" not in (controller.get_equipment() or {}):
+            ctx.state.trigger_safety_stop(
+                f"Slayer: putting on the {pick} for {state.task} took the weapon OFF (a two-handed "
+                f"weapon). Choose a one-handed weapon for this task and wear it -- stopping rather "
+                f"than fight bare-handed")
+        return True
+    data["slayer_worn_ok"] = key
+    return False
 
 
 def _restock(ctx, state) -> bool:
@@ -206,7 +307,7 @@ def _restock(ctx, state) -> bool:
                            f"{data.get('slayer_restocks', 0) + 1} of {RESTOCK_MAX_PER_TASK}")
     data["slayer_restocking"] = key
     data["current_target_index"] = None
-    if banker.bank_up(ctx, _bank_config(panel, loadout)):
+    if banker.bank_up(ctx, _bank_config(panel, loadout, _base_gear(ctx))):
         data.update({"slayer_restocking": None, "slayer_restocks": data.get("slayer_restocks", 0) + 1,
                      "slayer_bank_fails": 0, "slayer_route": None, "slayer_route_for": None,
                      "slayer_leg": 0, "slayer_route_finished": 0})
@@ -258,7 +359,7 @@ def _pack(ctx, state, tasks_cfg, player) -> bool:
                                       f"times ({why}) -- see the [bank] lines above")
         return True
     debug_log.log(LOG, f"banking for {state.task} x{state.count}: {why}")
-    if banker.bank_up(ctx, _bank_config(panel, loadout)):
+    if banker.bank_up(ctx, _bank_config(panel, loadout, _base_gear(ctx))):
         data["slayer_banked_for"] = key
         data["slayer_bank_fails"] = 0
     else:
@@ -404,8 +505,10 @@ def tick(ctx):
     _reset_slot_counters(ctx, state)
     player = controller.get_player()
     phase = derive_phase(state, tasks_cfg, player)
+    _capture_base_gear(ctx, state)
     if phase == ACQUIRE:
-        _acquire(ctx, state, tasks_cfg)
+        if not _restore_base_gear(ctx):        # a finished task's gear comes off before the next ask
+            _acquire(ctx, state, tasks_cfg)
     elif phase == SKIP:
         _skip(ctx, state, tasks_cfg)
     elif phase == STOP:
@@ -414,7 +517,7 @@ def tick(ctx):
     elif ctx.state.data.get("slayer_restocking") == (state.task, state.streak):
         _restock(ctx, state)                 # a restock under way outranks TRAVEL and FIGHT alike
     elif phase == TRAVEL:
-        if not _pack(ctx, state, tasks_cfg, player):
+        if not _pack(ctx, state, tasks_cfg, player) and not _wear(ctx, state):
             _travel(ctx, state, player)
-    elif not _restock(ctx, state):
+    elif not _restock(ctx, state) and not _wear(ctx, state):
         _fight(ctx, state)

@@ -35,6 +35,7 @@ def _no_live_bridge(monkeypatch):
 
 
 REAL_PACK = routine._pack
+REAL_WEAR = routine._wear
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +47,11 @@ def _pack_is_already_met(monkeypatch):
     # ...and RESTOCK (2026-09-21) asks combat_core whether supplies ran out before every fight
     # tick. By default they have not; the restock tests say otherwise.
     monkeypatch.setattr(combat_core, "out_of_critical_supplies", lambda ctx: False)
+    # ...and WEARING a task's required gear / restoring the base gear (2026-09-21). By default
+    # everything is already worn and there is no saved base.
+    monkeypatch.setattr(routine, "_wear", lambda ctx, state: False)
+    monkeypatch.setattr(routine, "_base_gear", lambda ctx: None)
+    monkeypatch.setattr(routine, "_capture_base_gear", lambda ctx, state: None)
 
 
 class _State:
@@ -644,3 +650,109 @@ def test_with_supplies_left_the_fight_goes_on(monkeypatch):
     ctx, calls, _ = _restocking(monkeypatch, out_of_supplies=False)
     routine.tick(ctx)
     assert calls["fight"] == [1] and calls["bank"] == []
+
+
+# --- 2026-09-21: WEARING what a task requires, and putting the base gear back (plan task C3) ------
+
+BASE = {"weapon": {"name": "Arclight", "id": 19675, "qty": 1},
+        "shield": {"name": "Dragon defender", "id": 12954, "qty": 1},
+        "helmet": {"name": "Slayer helmet (i)", "id": 26674, "qty": 1}}
+
+
+def _gearing(monkeypatch, task, worn, inventory, player=None):
+    """The REAL _wear over a fake wardrobe: equipping moves an item from the inventory to its slot
+    and drops whatever was there back into the inventory, as the game does."""
+    world = {"worn": {k: dict(v) for k, v in worn.items()}, "inv": list(inventory), "equips": []}
+    monkeypatch.setattr(routine, "_wear", REAL_WEAR)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task(task, count=150))
+    monkeypatch.setattr(controller, "get_player", lambda: dict(player or LUMBRIDGE))
+    monkeypatch.setattr(controller, "get_equipment", lambda: {k: dict(v) for k, v in world["worn"].items()})
+    monkeypatch.setattr(controller, "get_inventory", lambda: [{"name": n, "qty": 1, "id": None} for n in world["inv"]])
+    monkeypatch.setattr(controller, "get_rune_pouch", lambda: None)
+    slots = {"mirror shield": "shield", "v's shield": "shield", "boots of stone": "boots", "dragon defender": "shield",
+             "leaf-bladed battleaxe": "weapon", "godsword": "weapon"}
+
+    def equip(ctx, name):
+        item = next((n for n in world["inv"] if name.lower() in n.lower()), None)
+        if item is None:
+            return False
+        slot = slots[name.lower()]
+        world["inv"].remove(item)
+        if slot in world["worn"]:
+            world["inv"].append(world["worn"][slot]["name"])
+        world["worn"][slot] = {"name": item, "id": None, "qty": 1}
+        if slot == "shield" and "godsword" in (world["worn"].get("weapon", {}).get("name") or "").lower():
+            world["inv"].append(world["worn"].pop("weapon")["name"])       # a 2h weapon comes off
+        world["equips"].append(item)
+        return True
+    monkeypatch.setattr(routine.gear, "equip_from_inventory", equip)
+    monkeypatch.setattr(legs, "skill_levels", lambda: {"Agility": 77})
+    monkeypatch.setattr(legs, "requirement_values", lambda: {"varbit_values": {}, "varplayer_values": {}})
+    monkeypatch.setattr(slayer_routes, "plan", lambda *a, **k: ([legs.walk(1, 1, 0)], ""))
+    monkeypatch.setattr(legs, "run_next", lambda ctx, legs_, cursor, log="travel": (legs.DONE, cursor + 1))
+    return _Ctx(), world
+
+
+def test_a_required_item_in_the_pack_is_put_ON_before_travelling(monkeypatch):
+    """'Carried or worn' passes the requirement check, but a mirror shield in the inventory does
+    nothing against a basilisk. It is worn before the journey starts -- one equip per tick."""
+    ctx, world = _gearing(monkeypatch, "Basilisks", BASE, ["Mirror shield", "Shark"])
+    routine.tick(ctx)
+    assert world["equips"] == ["Mirror shield"] and not ctx.state.data.get("slayer_route")
+    assert world["worn"]["shield"]["name"] == "Mirror shield" and "Dragon defender" in world["inv"]
+    routine.tick(ctx)
+    assert ctx.state.data.get("slayer_route"), "now it travels"
+    assert ctx.state.stops == []
+
+
+def test_what_is_already_worn_costs_nothing(monkeypatch):
+    ctx, world = _gearing(monkeypatch, "Aberrant spectres", BASE, ["Shark"])
+    routine.tick(ctx)
+    assert world["equips"] == [] and ctx.state.data.get("slayer_route"), "the slayer helmet IS the nose peg"
+
+
+def test_a_shield_that_knocks_a_two_handed_weapon_off_is_a_stop_not_a_fist_fight(monkeypatch):
+    """The user's OPEN gear decision (plan E0): a one-handed weapon beside the mirror shield.
+    Until it is made, the routine must never walk into basilisks bare-handed."""
+    two_handed = dict(BASE, weapon={"name": "Armadyl godsword", "id": 11802, "qty": 1})
+    two_handed.pop("shield")
+    ctx, world = _gearing(monkeypatch, "Basilisks", two_handed, ["Mirror shield"])
+    routine.tick(ctx)
+    assert ctx.state.stops and "weapon" in ctx.state.stops[0].lower() and "basilisks" in ctx.state.stops[0].lower()
+
+
+def test_a_requirement_that_cannot_be_worn_is_a_stop_naming_it(monkeypatch):
+    ctx, world = _gearing(monkeypatch, "Basilisks", BASE, ["Shark"])
+    routine.tick(ctx)
+    assert ctx.state.stops and "mirror shield" in ctx.state.stops[0].lower()
+
+
+def test_an_aya_task_wears_nothing_special(monkeypatch):
+    ctx, world = _gearing(monkeypatch, "Cows", BASE, ["Shark"])
+    routine.tick(ctx)
+    assert world["equips"] == [] and ctx.state.data.get("slayer_route")
+
+
+def test_the_base_gear_is_put_back_before_the_next_task_is_asked_for(monkeypatch, tmp_path):
+    """The defender the mirror shield displaced rides in the inventory for the whole task. With
+    the task done it goes back on BEFORE the next master is contacted."""
+    ctx, world = _gearing(monkeypatch, "Basilisks", dict(BASE, shield={"name": "Mirror shield", "id": 4156, "qty": 1}),
+                          ["Dragon defender", "Shark"])
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task(None, count=0))
+    contacted = []
+    monkeypatch.setattr(npc_contact, "missing_requirements", lambda master: contacted.append(master) or "stop here")
+    monkeypatch.setattr(routine, "_base_gear", lambda ctx: {"weapon": "Arclight", "shield": "Dragon defender",
+                                                           "helmet": "Slayer helmet (i)"})
+    routine.tick(ctx)
+    assert world["equips"] == ["Dragon defender"] and contacted == [], "gear first, the master after"
+    routine.tick(ctx)
+    assert contacted, "restored: now it asks for the next task"
+
+
+def test_displaced_base_gear_is_on_the_keep_list_so_the_bank_never_swallows_it():
+    class Lo:
+        withdraw, keep = [], ["shark"]
+    cfg = routine._bank_config({"bank": {"keepItems": ["rune pouch"]}}, Lo,
+                               base={"weapon": "Arclight", "shield": "Dragon defender"})
+    assert "dragon defender" in cfg["keepItems"] and "arclight" in cfg["keepItems"]
+    assert "rune pouch" in cfg["keepItems"] and "shark" in cfg["keepItems"]

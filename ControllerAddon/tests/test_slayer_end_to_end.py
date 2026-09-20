@@ -38,6 +38,7 @@ PANEL = {"tasks": TASKS, "food": {"name": "Shark"}, "potions": {"prayerPotion": 
 class _Memory:
     def __init__(self, items):
         self.seen, self.items = True, [{"name": n, "quantity": q} for n, q in items.items()]
+        self.account_hash = None       # no hash = no base-gear file, the rule bank memory follows
 
 
 class World:
