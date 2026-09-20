@@ -2,6 +2,7 @@
 #
 #     python slayer_preflight.py                        # the live task
 #     python slayer_preflight.py --task "Nechryael" --count 150     # what if this were the task
+#     python slayer_preflight.py --all                              # all 22 Kuradal tasks, one line each
 #
 # Added 2026-09-20. Every slayer live gate so far has been spent discovering a fact the routine
 # could have told us before a single click: the account holds a STOP task, no leg can run the
@@ -98,10 +99,29 @@ def report(task, count, streak, points, player, carried, banked, panel_cfg, task
     return lines
 
 
+def overview(count, player, carried, banked, panel_cfg, skill_levels, prayer_level, prayer_bonus) -> list:
+    """One line per Kuradal FIGHT task: does it plan once the pack is fetched, and what is short.
+    The whole catalog against one account, so a gap shows up here and not at the site."""
+    lines, planned = [], 0
+    for key in slayer_catalog.CATALOG:
+        loadout = slayer_loadout.build(key, count, panel_cfg, prayer_level, prayer_bonus, carried, banked)
+        after = dict(carried or {})
+        for w in loadout.withdraw:
+            after[w["name"].lower()] = after.get(w["name"].lower(), 0) + w["quantity"]
+        route, why = slayer_routes.plan(key, player, after, skill_levels=skill_levels)
+        planned += 1 if route else 0
+        lines.append(f"{key:18} " + ("ROUTE " + " > ".join(leg["display"] for leg in route) if route
+                                      else "NO ROUTE: " + why))
+        lines.extend(f"{'':18}   short: {problem}" for problem in loadout.problems)
+    lines.append(f"{planned} of {len(slayer_catalog.CATALOG)} plan after a bank trip")
+    return lines
+
+
 def _main(argv) -> int:
     parser = argparse.ArgumentParser(description="What the slayer routine would decide right now. Read-only.")
     parser.add_argument("--task", help="pretend this is the task instead of the live one")
     parser.add_argument("--count", type=int, default=150)
+    parser.add_argument("--all", action="store_true", help="every Kuradal FIGHT task, one line each")
     args = parser.parse_args(argv)
 
     import bank_memory
@@ -116,6 +136,12 @@ def _main(argv) -> int:
     config = controller.api_get("/config") or {}
     skills = controller.get_skills() or {}
     prayer = (skills.get("Prayer") or {}).get("level") or 1
+    if args.all:
+        for line in overview(args.count, controller.get_player() or {}, routine._carried(),
+                             slayer_loadout.banked_from_memory(bank_memory.load()), config,
+                             legs.skill_levels(), prayer, 0):
+            print(line)
+        return 0
     task = args.task if args.task else (state.task if state.has_task else None)
     count = args.count if args.task else state.count
     if args.task:

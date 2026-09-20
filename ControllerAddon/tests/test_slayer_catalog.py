@@ -148,9 +148,25 @@ def test_plan_uses_a_carried_slayer_ring_through_its_destination_dialogue():
     assert none is None and "not carried" in why
 
 
-def test_plan_names_what_it_cannot_do_yet():
-    """Xeric's talisman opens its own INTERFACE, not a chat menu, and has never been measured:
-    the routine must STOP naming it, not guess."""
+def test_plan_uses_xerics_talisman_by_its_direct_menu_option():
+    """MEASURED, from a recording, in routines/mahogany_homes.py (live for hours): the talisman's
+    destination is a DIRECT right-click option named after the place ("Xeric's Glade" there).
+    "Xeric's Heart" is its sibling -- the plain item leg, no new mechanism."""
     legs_, why = slayer_routes.plan("Dagannoth", {"x": 3200, "y": 3200, "plane": 0},
                                     {"xeric's talisman": 1})
-    assert legs_ is None and "Xeric's talisman" in why
+    assert why == "" and [l["kind"] for l in legs_] == ["item", "walk"]
+    assert legs_[0]["option"] == "Xeric's Heart" and legs_[0]["dest"] == [1644, 3673, 0]
+
+
+def test_plan_names_what_it_cannot_do_yet():
+    """The desert amulet's Kalphite cave teleport has no measured mechanism anywhere in the repo:
+    with no fairy ring in walking range and no tablet, the routine must STOP naming both."""
+    legs_, why = slayer_routes.plan("Kalphite", {"x": 3200, "y": 3200, "plane": 0},
+                                    {"desert amulet 4": 1})
+    assert legs_ is None and "Desert amulet 4" in why
+
+
+def test_a_talisman_line_for_another_destination_is_not_sent_to_xerics_heart():
+    assert slayer_routes.parse("Xeric's talisman: Xeric's Heart (Option 4)") == ("item", "xeric's talisman")
+    assert slayer_routes.parse("Xeric's talisman: Xeric's Glade")[0] == "unsupported"
+    assert slayer_routes.parse("Ectophial") == ("item", "ectophial"), "an item with one destination is untouched"

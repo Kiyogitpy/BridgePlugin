@@ -54,7 +54,15 @@ ITEMS = {
     "teleport crystal": ("teleport crystal", "Lletya", (2330, 3171, 0)),
     "rada's blessing": ("rada's blessing", "Mount Karuulm", (1311, 3806, 0)),
     "mos le'harmless teleport": ("mos le'harmless teleport", "Teleport", (3701, 2996, 0)),
+    # MEASURED, not guessed: routines/mahogany_homes.py takes "Xeric's Glade" straight off the
+    # talisman's right-click menu (from a recording: "Xeric's Glade -> widget 149.0 [Xeric's
+    # talisman]"; live for hours). "Xeric's Heart" is the sibling option. The left-click default
+    # is NOT a destination, so the hover gate withholds it and the menu entry is taken.
+    "xeric's talisman": ("xeric's talisman", "Xeric's Heart", (1644, 3673, 0)),
 }
+# An ITEMS row is ONE destination of an item that may have several. A registry line naming a
+# different one (a talisman to Xeric's Glade) must not be sent to this row's landing.
+_ITEM_DESTINATION = {"xeric's talisman": "xeric's heart"}
 
 # Items whose destination is chosen in a CHAT MENU (legs.dialogue_item). registry text head ->
 # {destination as the registries spell it, lowercased: (right-click sub-option label, dialogue
@@ -111,7 +119,7 @@ def parse(teleport_text):
     key = head.strip().lower()
     if key == "fairy ring" and len(tail.strip()) == 3:
         return "fairy", tail.strip().upper()
-    if key in ITEMS:
+    if key in ITEMS and _ITEM_DESTINATION.get(key, "") in tail.lower():
         return "item", key
     destination = _TRAILING_OPTION.sub("", tail).strip()
     if destination.lower() in DIALOGUE_ITEMS.get(key, {}):

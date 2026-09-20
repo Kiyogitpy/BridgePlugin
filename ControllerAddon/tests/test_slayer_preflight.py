@@ -77,3 +77,12 @@ def test_a_teleport_that_is_only_in_the_bank_is_planned_as_after_the_bank_trip()
     text = _report("Cows", 20)
     assert "cannot get there" in text.lower()
     assert "after the bank trip" in text.lower() and "ectophial" in text.lower().split("after the bank trip")[1]
+
+
+def test_the_overview_covers_every_kuradal_task_and_counts_what_plans():
+    lines = pf.overview(150, LUMBRIDGE, {}, BANK, PANEL, {"Agility": 77}, 77, 0)
+    text = " | ".join(lines)
+    assert sum(1 for line in lines if "ROUTE" in line) == 22, "one verdict per catalog task"
+    assert "hellhounds" in text and "slayer ring: Stronghold" in text, "fetched from the bank, then planned"
+    assert "gryphons" in text and "NO ROUTE" in text
+    assert lines[-1].endswith("of 22 plan after a bank trip")

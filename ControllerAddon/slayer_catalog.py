@@ -23,11 +23,12 @@
 #   potions are the user's own figures; the rest are PROPOSED there and are theirs to correct.
 #
 # WHAT IS NOT HERE YET, on purpose:
-# - Xeric's talisman (dagannoth, dust devils) and the desert amulet open their own INTERFACE, not
-#   a chat menu, and have never been measured: slayer_routes.plan answers None naming the
-#   teleport and the routine stops. The SLAYER RING (12 of the 22) is different -- its paged
-#   destination menu was already proven live in golem_crafting, so legs.dialogue_item runs it;
-#   UNVERIFIED for these three destinations, each hub still proven by one live task (plan E2-E5).
+# - The DESERT AMULET's Kalphite cave teleport has no measured mechanism anywhere in the repo;
+#   kalphite falls through to fairy ring BIQ, and with neither usable slayer_routes.plan answers
+#   None naming them and the routine stops. Everything else has a leg: the SLAYER RING (12 of the
+#   22) through legs.dialogue_item (golem_crafting proved its paged menu live), XERIC'S TALISMAN
+#   through the plain item leg (mahogany_homes takes its destinations off the right-click menu,
+#   from a recording). UNVERIFIED for these destinations; each hub is proven by one live task.
 # - Gear the research left open (plan E0): a one-handed weapon beside the mirror shield, a ranged
 #   kit for waterfiends, heat boots for wyrms. `worn` names the REQUIREMENT, not the user's item.
 
