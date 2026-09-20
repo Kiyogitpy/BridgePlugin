@@ -51,6 +51,7 @@ class World:
         self.player = {"x": start[0], "y": start[1], "plane": start[2]}
         self.task, self.count, self.streak, self.points = None, 0, 8, 200
         self.eats_per_tick = 0                           # sharks eaten per fight tick; 0 = never hungry
+        self.worn = {"weapon": "Abyssal whip", "helmet": "Slayer helmet (i)"}
         self.log = []
 
     # --- what the bridge would answer
@@ -99,6 +100,29 @@ class World:
         self.log.append(f"LEG {leg['display']}")
         return legs.DONE, cursor + 1
 
+    def equipment(self):
+        """GET /equipment's real shape: EVERY slot is present, an empty one as {} (measured live
+        2026-09-21). The routine's two-handed check depends on that distinction."""
+        slots = {"weapon": {}, "shield": {}, "helmet": {}, "boots": {}}
+        for slot, name in self.worn.items():
+            slots[slot] = {"name": name, "id": None, "qty": 1}
+        return slots
+
+    def equip(self, ctx, name):
+        item = next((n for n in self.inventory if name.lower() in n.lower()), None)
+        if item is None:
+            return False
+        slot = next((sl for frag, sl in (("shield", "shield"), ("boots", "boots"), ("helm", "helmet"))
+                     if frag in item.lower()), "weapon")
+        self.inventory[item] -= 1
+        if self.inventory[item] <= 0:
+            del self.inventory[item]
+        if slot in self.worn:
+            self.inventory[self.worn[slot]] = self.inventory.get(self.worn[slot], 0) + 1
+        self.worn[slot] = item
+        self.log.append(f"EQUIP {item}")
+        return True
+
     def out_of_supplies(self, ctx):
         """Out of food with a task still running -- what combat_core reports when HP is low and
         nothing is left to eat."""
@@ -135,7 +159,8 @@ def _install(monkeypatch, world):
     monkeypatch.setattr(controller, "get_slayer_task", world.slayer)
     monkeypatch.setattr(controller, "get_player", lambda: dict(world.player))
     monkeypatch.setattr(controller, "get_inventory", world.inventory_list)
-    monkeypatch.setattr(controller, "get_equipment", lambda: {"helmet": {"name": "Slayer helmet (i)", "id": 1, "qty": 1}})
+    monkeypatch.setattr(controller, "get_equipment", world.equipment)
+    monkeypatch.setattr(routine.gear, "equip_from_inventory", world.equip)
     monkeypatch.setattr(controller, "get_rune_pouch", lambda: None)
     monkeypatch.setattr(controller, "get_skills", lambda: {"Prayer": {"level": 77}})
     monkeypatch.setattr(controller, "check_stray_dialog", lambda ctx: None)
@@ -332,3 +357,65 @@ def test_a_skip_list_task_is_cancelled_through_kuradal_and_the_next_one_is_taken
     assert ctx.state.stops == [], (ctx.state.stops, world.log)
     assert world.log[:3] == ["ACQUIRE Drakes x120 from KURADAL", "CANCEL Drakes", "ACQUIRE Hellhounds x10 from KURADAL"]
     assert world.points == 200 - 30 + 15 and world.log[-1].startswith("TASK DONE")
+
+
+# --- the gear seam: fetched at the bank, WORN, then travelled with -------------------------------
+
+GEAR_BANK = dict(BANK, **{"mirror shield": 1, "boots of stone": 1})
+
+
+def test_a_task_whose_gear_is_in_the_bank_fetches_it_wears_it_then_travels(monkeypatch):
+    """Basilisks: the mirror shield is banked. The order must be pack -> wear -> travel, because a
+    shield in the INVENTORY does nothing, and because it cannot be worn before it is fetched."""
+    world = World([("KURADAL", "Basilisks", 20)], GEAR_BANK)
+    world.streak = 9
+    _install(monkeypatch, world)
+    ctx = _Ctx()
+    _run(ctx, ticks=60, world=world)
+    assert ctx.state.stops == [], (ctx.state.stops, world.log)
+    kinds = [l.split()[0] for l in world.log]
+    assert kinds.index("BANK") < kinds.index("EQUIP") < kinds.index("LEG"), world.log
+    assert "EQUIP Mirror shield" in world.log
+    assert world.worn["shield"] == "Mirror shield" and world.worn["weapon"] == "Abyssal whip"
+    assert "Abyssal whip" not in world.inventory, "a one-handed weapon is not displaced"
+    assert world.log[-1].startswith("TASK DONE")
+
+
+def test_a_two_handed_weapon_stops_the_task_rather_than_fight_bare_handed(monkeypatch):
+    world = World([("KURADAL", "Basilisks", 20)], GEAR_BANK)
+    world.streak = 9
+    world.worn = {"weapon": "Toxic blowpipe", "helmet": "Slayer helmet (i)"}
+    _install(monkeypatch, world)
+
+    def two_handed_equip(ctx, name):
+        ok = world.equip(ctx, name)
+        if ok and "shield" in name.lower():
+            world.inventory[world.worn.pop("weapon")] = 1        # the blowpipe comes off
+        return ok
+    monkeypatch.setattr(routine.gear, "equip_from_inventory", two_handed_equip)
+    ctx = _Ctx()
+    _run(ctx, ticks=60, world=world)
+    assert ctx.state.stops and "weapon" in ctx.state.stops[0].lower()
+    assert not any(l.startswith("TASK DONE") for l in world.log), "it stopped instead of fighting"
+
+
+def test_the_base_gear_goes_back_on_before_the_next_task_is_asked_for(monkeypatch, tmp_path):
+    """The whip the mirror shield did not displace stays; the HELMET a heat-boots task swaps is
+    what proves the restore. Wyrms want boots of stone, so the base boots come back afterwards."""
+    world = World([("KURADAL", "Wyrms", 10), ("AYA", "Cows", 20)], GEAR_BANK)
+    world.streak = 9
+    world.worn = {"weapon": "Abyssal whip", "helmet": "Slayer helmet (i)", "boots": "Dragon boots"}
+    _install(monkeypatch, world)
+    # A real account has a hash and a file; the fake bank memory has neither. Give the save/load
+    # path a temp file so the REAL slayer_policy capture and restore run.
+    monkeypatch.setattr(routine.slayer_policy, "base_gear_path",
+                        lambda account_hash, root=None: str(tmp_path / "base-gear.json"))
+    ctx = _Ctx()
+    _run(ctx, ticks=90, world=world)
+    assert ctx.state.stops == [], (ctx.state.stops, world.log)
+    assert "EQUIP Boots of stone" in world.log
+    # The base was captured on tick 1 (no task held), so the displaced Dragon boots go back on
+    # once the wyrms are done -- BEFORE the cows are asked for.
+    restore = world.log.index("EQUIP Dragon boots")
+    assert restore < world.log.index("ACQUIRE Cows x20 from AYA"), world.log
+    assert world.worn["boots"] == "Dragon boots"
