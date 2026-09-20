@@ -65,6 +65,19 @@ Tests: `python -m pytest tests/ -q` from `ControllerAddon/` → 3087 passed; the
 known ones in `tests/test_mastering_mixology.py`. `test_crossfloor::test_an_impossible_trip_is_none_and_fast`
 has an 8 s wall-clock bound and failed once under load.
 
+## Before any live gate: run the preflight
+
+    cd ControllerAddon
+    python slayer_preflight.py                              # the live task
+    python slayer_preflight.py --task "Cows" --count 20      # what if this were the task
+
+Read-only, safe beside a running `controller.py`. It prints what the routine WOULD decide:
+disposition, site, missing items, the route or the reason there is none, the pack, and the bank
+verdict -- plus the route as it stands AFTER the bank trip, because `plan()` works from what is
+carried and phase A therefore stops on a teleport that is sitting in the bank. FOUND with it on
+2026-09-20: **the panel has no food and no prayer potion chosen** (`food.name` and
+`potions.prayerPotion` are null in `GET /config`), which would stop every task at the bank.
+
 ## What to do next, in order
 
 1. **Phase A live gate.** Needs an Aya task reached by fairy ring or Ectophial (bears, cave bugs,
