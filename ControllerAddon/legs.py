@@ -421,6 +421,41 @@ def skill_levels():
     return levels or None
 
 
+COINS_ITEM_ID = 995
+
+
+def requirement_values() -> dict:
+    """What this account can PROVE to the route search, read once per journey: the varbits and
+    varplayers any link names (crossfloor.requirement_ids), the item ids carried or worn, and the
+    coins carried. A value the bridge cannot read is LEFT OUT -- unknown fails closed in
+    transports.usable -- and never written as 0; with no inventory read at all, no item and no
+    coin is proven. Shapes are the real GETs of 2026-09-20: /inventory a list of {id, qty},
+    /equipment a dict keyed by slot."""
+    varbit_ids, varp_ids = crossfloor.requirement_ids()
+    varbits, varps = {}, {}
+    for vid in sorted(varbit_ids):
+        value = controller.get_varbit(vid)
+        if value is not None:
+            varbits[vid] = value
+    for vid in sorted(varp_ids):
+        value = controller.get_varp(vid)
+        if value is not None:
+            varps[vid] = value
+    inventory = controller.get_inventory()
+    owned, currency = None, None
+    if isinstance(inventory, list):
+        owned = {item["id"] for item in inventory if isinstance(item, dict) and item.get("id") is not None}
+        coins = sum(item.get("qty") or 0 for item in inventory
+                    if isinstance(item, dict) and item.get("id") == COINS_ITEM_ID)
+        currency = {"Coins": coins}
+        equipment = controller.get_equipment()
+        if isinstance(equipment, dict):
+            owned |= {worn["id"] for worn in equipment.values()
+                      if isinstance(worn, dict) and worn.get("id") is not None}
+    return {"varbit_values": varbits, "varplayer_values": varps,
+            "owned_item_ids": owned, "currency_held": currency}
+
+
 def _undoes(step, previous) -> bool:
     """`step` lands back where `previous` started: same plane, within 2 tiles of its origin."""
     return (step.dest[2] == previous.origin[2]
@@ -449,6 +484,7 @@ def walk_across(ctx, goal, log: str = "travel") -> bool:
     goal = tuple(goal)
     exact = {"x": goal[0], "y": goal[1], "plane": goal[2]}
     levels = skill_levels()
+    proven = requirement_values()
     previous = None
     stepped_off = 0
     taken = 0
@@ -471,7 +507,7 @@ def walk_across(ctx, goal, log: str = "travel") -> bool:
             debug_log.log(log, f"{here} is not routable on the map -- stepping off to {foothold}")
             travel.walk_to_exact_tile(ctx, foothold[0], foothold[1], foothold[2])
             continue
-        route = crossfloor.find_route(here, goal, skill_levels=levels)
+        route = crossfloor.find_route(here, goal, skill_levels=levels, **proven)
         if route is None:
             if here[2] == goal[2] and abs(here[1] - goal[1]) < crossfloor.UNDERGROUND_DY // 2:
                 debug_log.log(log, f"no cross-floor route from {here} to {goal} -- trying a plain walk")

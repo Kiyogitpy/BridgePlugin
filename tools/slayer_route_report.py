@@ -56,9 +56,16 @@ SITES = [
 ]
 
 # Proven levels are unknown offline, so the report is run twice: nothing proven, and everything.
-PASSES = [("no requirements proven", None), ("all skills 99", {"Agility": 99, "Mining": 99, "Strength": 99,
-                                                                 "Thieving": 99, "Ranged": 99, "Prayer": 99,
-                                                                 "Magic": 99, "Firemaking": 99, "Woodcutting": 99})]
+ALL_99 = {"Agility": 99, "Mining": 99, "Strength": 99, "Thieving": 99, "Ranged": 99, "Prayer": 99,
+          "Magic": 99, "Firemaking": 99, "Woodcutting": 99}
+# The third pass is what legs.requirement_values proves at run time, written down from a live read
+# of the user's account on 2026-09-20 (varbit 3759 = 3) plus a dusty key (item 1590) in hand. No
+# skills, so it shows what the KEY and the VARBIT buy on their own. It asks for a deeper search:
+# the key route through Taverley needs ~400 expansions from the surface (MEASURED), the default 40.
+PASSES = [("no requirements proven", {}),
+          ("all skills 99", {"skill_levels": ALL_99}),
+          ("varbit 3759=3 and a dusty key, no skills, deep search",
+           {"varbit_values": {3759: 3}, "owned_item_ids": {1590}, "max_expansions": 450})]
 
 
 def describe(route):
@@ -84,11 +91,14 @@ def main():
            "  merged by transports.load_links) has the Karuulm elevator and rock climbs the jar's",
            "  copy lacks. **Gryphons**: still NO row for the Great Conch cave entrance in either",
            "  table -- the catalog must hand-write that leg.",
-           "- **Waterfiends**: the whirlpool into the Ancient Cavern is gated on varbit 3759 > 1 and",
-           "  nothing supplies varbits to the search yet, so it fails closed.",
-           "- **Black demons**: needs the 80 Agility Strange floor, or the dusty-key gate. Both",
-           "  tables have that gate row (ours `DUSTY_KEY=1`, Microbot's item 1590); it fails closed",
-           "  until the catalog supplies the owned item, so this is not offered as usable here.",
+           "- **Waterfiends**: the whirlpool into the Ancient Cavern is gated on varbit 3759 > 1.",
+           "  legs.requirement_values reads it at run time (the user's account: 3); the third pass",
+           "  below supplies it. It also needed a search fix: the whirlpool LANDS on a tile the map",
+           "  cannot leave, as 149 usable links do, and those were dead ends until 2026-09-20.",
+           "- **Black demons**: the 80 Agility Strange floor, or the dusty-key gate (item 1590, proven",
+           "  by id). The key route is long and winding (cost ~620 from the surface) and the default",
+           "  search budget of 40 expansions does NOT find it -- the third pass asks for 450. A",
+           "  catalog entry using it must pass max_expansions, or the search must get smarter.",
            "- **Trolls** (185 tiles): UNVERIFIED. It climbs from the west and north rather than the",
            "  eastern main path and may be the quest-gated back route. Check it by eye before use.",
            "- **Banshees** (156 tiles without the window shortcut) and **Kurask** (355) were checked",
@@ -98,9 +108,9 @@ def main():
         out.append(f"## {task}")
         out.append(f"{landing_name} {landing} -> site {site}")
         previous = None
-        for label, levels in PASSES:
+        for label, proven in PASSES:
             t0 = time.perf_counter()
-            route = crossfloor.find_route(landing, site, skill_levels=levels)
+            route = crossfloor.find_route(landing, site, **proven)
             dt = time.perf_counter() - t0
             text = describe(route) if route else ["NO ROUTE"]
             if text == previous:

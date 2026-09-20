@@ -34,7 +34,9 @@
 # vendor/microbot/VENDORED.md) is newer and larger -- MEASURED 5731 rows against our 5168, 5043
 # shared by (origin, dest, object id), 649 only there -- and has the Karuulm Slayer Dungeon, which
 # ours lacks entirely. Its layout differs: the object cell is `Option;Target;id`, `Item IDs` are
-# NUMERIC ("1 2;3" = (1 or 2) and 3, exactly as its Transport.java splits it), and it adds
+# NUMERIC and every id in the cell is an ALTERNATIVE (its evaluator, PathfinderConfig
+# .hasRequiredItems, is flatMap + anyMatch -- the first draft here read ';' as AND from the
+# parser alone and would have demanded all seven Crafting Guild capes at once), and it adds
 # `Currency` ("10 Coins"), `Varplayers` and `isMembers`. load_links() reads it through an adapter
 # and APPENDS the rows whose key we do not already hold; every row of ours resolves exactly as
 # before, and a Microbot row's object_info is normalised to our space form so every consumer
@@ -43,7 +45,14 @@
 # 44050 in ours, 2788 there) -- the executor finds the object by id, so the stale one fails
 # cleanly and the other is taken. Item ids and currency FAIL CLOSED like every other requirement
 # (`usable(owned_item_ids=, currency_held=)`); isMembers is recorded, not gated.
+# Where BOTH tables hold a row and ours names its item symbolically (DUSTY_KEY=1 -- a NAME no
+# inventory read can prove), the merged row BORROWS Microbot's numeric ids: 122 of our 190
+# symbolic rows, MEASURED. Either proof passes. load_links(microbot=False) is left untouched.
+#
+# A door WITH a requirement (a key, a level, a quest, a toll) is a LINK, not a DOOR: the map
+# only bakes plain doors open, and MEASURED the dusty-key gate is blocked on it.
 
+import copy
 import os
 import re
 
@@ -62,6 +71,7 @@ _OBJECT_COLUMN = "menuOption menuTarget objectID"
 _DOOR_MAX_TILES = 2
 _SKILL = re.compile(r"(\d+)\s+([A-Za-z ]+)")
 _CURRENCY = re.compile(r"(\d+)\s+(.+)")
+_UNSATISFIABLE_ITEM = -1      # a non-empty Item IDs cell with nothing numeric in it
 
 # Column names per source. The two spell the varplayers column differently; only Microbot has
 # numeric item ids and a currency column, and our jar copy's Items are symbolic names.
@@ -87,7 +97,7 @@ class Step:
         self.origin = origin
         self.dest = dest
         self.object_info = normalise_object_info(object_info)
-        self.item_ids = item_ids          # ((1, 2), (3,)) = (1 or 2) and 3 -- Microbot rows only
+        self.item_ids = item_ids          # (1590,) -- ANY one suffices; Microbot's, or borrowed
         self.currency = currency          # (amount, name) -- Microbot rows only
         self.source = source
         self.option, self.target, self.object_id = split_object_info(self.object_info)
@@ -103,6 +113,9 @@ class Step:
     def _is_door(self):
         if self.option != "Open" or self.origin is None or self.dest is None:
             return False
+        if (self.skills or self.items or self.item_ids or self.quests or self.varbits
+                or self.varplayers or self.currency):
+            return False          # a gate, not a plain door: the map may block it
         if self.origin[2] != self.dest[2]:
             return False
         return max(abs(self.origin[0] - self.dest[0]), abs(self.origin[1] - self.dest[1])) <= _DOOR_MAX_TILES
@@ -125,19 +138,18 @@ def normalise_object_info(text):
 
 
 def parse_item_ids(field):
-    """`1 2;3` -> ((1, 2), (3,)): semicolon is AND, space is OR (Transport.java's split order).
-    A non-numeric token is dropped; a group left empty by that can never be satisfied."""
+    """`1 2;3` -> (1, 2, 3): every id is an ALTERNATIVE, whichever separator sits between them
+    (Microbot evaluates the cell with flatMap + anyMatch). A non-empty cell with nothing numeric
+    in it becomes an id nobody owns, so it fails closed instead of reading as 'no requirement'."""
+    text = (field or "").strip()
     out = []
-    for group in (field or "").split(";"):
-        if not group.strip():
-            continue
-        ids = []
-        for token in group.split():
-            try:
-                ids.append(int(token))
-            except ValueError:
-                pass
-        out.append(tuple(ids))
+    for token in text.replace(";", " ").split():
+        try:
+            out.append(int(token))
+        except ValueError:
+            pass
+    if text and not out:
+        return (_UNSATISFIABLE_ITEM,)
     return tuple(out)
 
 
@@ -233,6 +245,26 @@ def load_microbot_links(directory=None):
     return _load_steps("transports.tsv", os.path.join(directory or VENDOR_DIR, MICROBOT_SUBDIR), MICROBOT)
 
 
+def _merge(ours, theirs):
+    """Ours first and never reordered; a row of ours that names its item symbolically borrows the
+    numeric ids of Microbot's row for the same key (a COPY -- the jar-only list stays as it was);
+    then every Microbot row whose key we do not hold."""
+    key = lambda s: (s.origin, s.dest, s.object_id)
+    ids_by_key = {}
+    for step in theirs:
+        if step.item_ids:
+            ids_by_key.setdefault(key(step), step.item_ids)
+    merged = []
+    for step in ours:
+        ids = ids_by_key.get(key(step)) if step.items and not step.item_ids else None
+        if ids:
+            step = copy.copy(step)
+            step.item_ids = ids
+        merged.append(step)
+    held = {key(s) for s in ours}
+    return merged + [s for s in theirs if key(s) not in held]
+
+
 def load_links(directory=None, include_doors=True, microbot=True):
     """transports.tsv: ladders, stairs, cave mouths, trapdoors, gates, ditches, ... -- our jar
     copy first, then every Microbot row whose (origin, dest, object id) we do not already hold.
@@ -241,9 +273,7 @@ def load_links(directory=None, include_doors=True, microbot=True):
     if microbot:
         key = ("merged", directory or VENDOR_DIR)
         if key not in _cache:
-            held = {(s.origin, s.dest, s.object_id) for s in steps}
-            _cache[key] = steps + [s for s in load_microbot_links(directory)
-                                   if (s.origin, s.dest, s.object_id) not in held]
+            _cache[key] = _merge(steps, load_microbot_links(directory))
         steps = _cache[key]
     return steps if include_doors else [s for s in steps if s.kind != DOOR]
 
@@ -280,13 +310,11 @@ def _items_met(field, owned_item_names):
     return True
 
 
-def _item_ids_met(groups, owned_item_ids):
-    if not groups:
-        return True
+def _item_ids_met(item_ids, owned_item_ids):
     if owned_item_ids is None:
         return False
     owned = set(owned_item_ids)
-    return all(any(i in owned for i in group) for group in groups)
+    return any(i in owned for i in item_ids)
 
 
 def _currency_met(currency, currency_held):
@@ -302,8 +330,9 @@ def usable(step, skill_levels=None, completed_quests=None, varbit_values=None,
            varplayer_values=None, owned_item_names=None, owned_item_ids=None,
            currency_held=None) -> bool:
     """True only when EVERY requirement on the row is proven. Unknown means no.
-    `owned_item_ids` (a set of ids) and `currency_held` ({"Coins": 10}) answer the Microbot
-    rows' numeric requirements; the jar rows' symbolic Items still need `owned_item_names`."""
+    `owned_item_ids` (a set of ids) and `currency_held` ({"Coins": 10}) answer the numeric
+    requirements. A row carrying BOTH a symbolic Items clause and numeric ids (a merged row that
+    borrowed them) passes on either proof; a row with one kind needs that kind proven."""
     if step.skills:
         if skill_levels is None:
             return False
@@ -316,11 +345,13 @@ def usable(step, skill_levels=None, completed_quests=None, varbit_values=None,
         return False
     if not _vars_met(step.varplayers, varplayer_values):
         return False
-    if not _item_ids_met(step.item_ids, owned_item_ids):
-        return False
     if not _currency_met(step.currency, currency_held):
         return False
-    return _items_met(step.items, owned_item_names)
+    if step.items or step.item_ids:
+        by_name = bool(step.items) and _items_met(step.items, owned_item_names)
+        by_id = bool(step.item_ids) and _item_ids_met(step.item_ids, owned_item_ids)
+        return by_name or by_id
+    return True
 
 
 # ---------------------------------------------------------------- fairy rings

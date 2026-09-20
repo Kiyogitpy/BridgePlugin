@@ -19,6 +19,12 @@ def _no_live_bridge(monkeypatch):
     def refuse(path, *a, **k):
         raise AssertionError(f"a test reached the live bridge: GET {path}")
     monkeypatch.setattr(controller, "api_get", refuse)
+    # walk_across reads what the account can prove (legs.requirement_values). By default a test
+    # proves nothing: no varbit, no inventory. A test about those reads overrides these.
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: None)
+    monkeypatch.setattr(controller, "get_varp", lambda vid: None)
+    monkeypatch.setattr(controller, "get_inventory", lambda: None)
+    monkeypatch.setattr(controller, "get_equipment", lambda: None)
 
 
 class _State:
@@ -535,3 +541,50 @@ def test_a_tile_that_never_becomes_routable_gives_up_instead_of_clicking_forever
     monkeypatch.setattr(travel, "walk_to", lambda *a, **k: True)
     assert legs.walk_across(_Ctx(), (2730, 5234, 0)) is False
     assert len(steps) == legs.STEP_OFF_MAX
+
+
+# --- 2026-09-20: walk_across proves what it can about the account before planning -------------
+
+def test_requirement_values_come_from_the_bridge_and_unknown_stays_unknown(monkeypatch):
+    """Fixture shapes are the REAL GETs of 2026-09-20: /inventory is a list of {id, qty, name},
+    /equipment a dict keyed by slot. A varbit the bridge cannot read is LEFT OUT (unknown fails
+    closed in transports.usable); it is never written as 0."""
+    monkeypatch.setattr(legs.crossfloor, "requirement_ids", lambda: ({3759, 487}, {11}))
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: {3759: 3}.get(vid))
+    monkeypatch.setattr(controller, "get_varp", lambda vid: 0)
+    monkeypatch.setattr(controller, "get_inventory", lambda: [
+        {"qty": 1, "name": "Dusty key", "slot": 0, "id": 1590},
+        {"qty": 2500, "name": "Coins", "slot": 1, "id": 995}])
+    monkeypatch.setattr(controller, "get_equipment", lambda: {
+        "ring": {"qty": 1, "name": "Ring of shadows (uncharged)", "id": 28329}})
+    values = legs.requirement_values()
+    assert values["varbit_values"] == {3759: 3}
+    assert values["varplayer_values"] == {11: 0}, "0 is a real answer for a varp"
+    assert values["owned_item_ids"] == {1590, 995, 28329}
+    assert values["currency_held"] == {"Coins": 2500}
+
+
+def test_requirement_values_with_no_inventory_read_prove_no_items(monkeypatch):
+    monkeypatch.setattr(legs.crossfloor, "requirement_ids", lambda: (set(), set()))
+    monkeypatch.setattr(controller, "get_inventory", lambda: None)
+    monkeypatch.setattr(controller, "get_equipment", lambda: None)
+    values = legs.requirement_values()
+    assert values["owned_item_ids"] is None and values["currency_held"] is None
+
+
+def test_walk_across_hands_the_requirement_values_to_the_search(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(legs, "skill_levels", lambda: {"Agility": 50})
+    monkeypatch.setattr(legs, "requirement_values", lambda: {
+        "varbit_values": {3759: 3}, "varplayer_values": {}, "owned_item_ids": {1590},
+        "currency_held": {"Coins": 10}})
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3200, "y": 3200, "plane": 0})
+    monkeypatch.setattr(legs.crossfloor, "walkable_start", lambda here, toward=None: here)
+
+    def find_route(start, goal, **kwargs):
+        seen.update(kwargs)
+        return None
+    monkeypatch.setattr(legs.crossfloor, "find_route", find_route)
+    assert legs.walk_across(None, (3200, 9200, 0)) is False
+    assert seen["varbit_values"] == {3759: 3} and seen["owned_item_ids"] == {1590}
+    assert seen["currency_held"] == {"Coins": 10} and seen["skill_levels"] == {"Agility": 50}

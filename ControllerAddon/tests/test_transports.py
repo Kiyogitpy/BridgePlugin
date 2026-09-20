@@ -210,17 +210,17 @@ def test_microbot_item_ids_are_numeric_and_fail_closed():
     """The Taverley dusty-key gate: Microbot's row carries item 1590 in `Item IDs`. Ours holds
     the SAME key (origin, dest, 2623) with the symbolic clause `DUSTY_KEY=1`, so the merge keeps
     our row and the Microbot copy is only reachable through load_microbot_links -- which is
-    where the numeric grammar is pinned. `A B;C` is (A or B) and C, as Transport.java splits it."""
+    where the numeric grammar is pinned."""
     merged = _link((2924, 9803, 0), (2923, 9803, 0))
     assert merged.source == transports.SHORTEST_PATH and merged.items == "DUSTY_KEY=1"
     gate = next(s for s in transports.load_microbot_links()
                 if s.origin == (2924, 9803, 0) and s.dest == (2923, 9803, 0))
-    assert gate.object_id == 2623 and gate.item_ids == ((1590,),) and gate.items == ""
+    assert gate.object_id == 2623 and gate.item_ids == (1590,) and gate.items == ""
     assert not transports.usable(gate)
     assert not transports.usable(gate, owned_item_ids={1591})
     assert transports.usable(gate, owned_item_ids={1590})
-    assert transports.parse_item_ids("1 2;3") == ((1, 2), (3,))
     assert transports.parse_item_ids("") == ()
+    assert transports.parse_item_ids("junk") == (-1,), "an unreadable cell must not read as 'needs nothing'"
 
 
 def test_microbot_currency_fails_closed_until_the_coins_are_proven():
@@ -248,3 +248,40 @@ def test_a_microbot_table_whose_header_changed_refuses_to_load(tmp_path):
         encoding="utf-8")
     with pytest.raises(ValueError, match="Item IDs"):
         transports.load_links(directory=str(tmp_path))
+
+
+# --- 2026-09-20, corrections after reading Microbot's EVALUATOR, not just its parser ------------
+
+def test_microbot_item_ids_are_alternatives_any_one_suffices():
+    """PathfinderConfig.hasRequiredItems is `flatMap(...).anyMatch(...)`: every id in the cell,
+    across both separators, is an ALTERNATIVE. The Crafting Guild door lists a brown apron and
+    six capes with ';' between them -- reading that as AND would demand all seven."""
+    assert transports.parse_item_ids("1 2;3") == (1, 2, 3)
+    door = next(s for s in transports.load_microbot_links() if s.object_id == 14910 and s.item_ids)
+    assert 1757 in door.item_ids and len(door.item_ids) >= 7
+    crafting = {"Crafting": 40}                      # the door's own level requirement
+    assert door.skills == crafting
+    assert transports.usable(door, owned_item_ids={1757}, skill_levels=crafting)
+    assert not transports.usable(door, owned_item_ids={4151}, skill_levels=crafting)
+
+
+def test_our_symbolic_item_rows_borrow_microbots_numeric_ids_in_the_merge():
+    """Ours wins the merge, and ours says DUSTY_KEY=1 -- a NAME nothing at run time can prove.
+    Microbot's row for the same (origin, dest, object id) says 1590. The merged row keeps our
+    fields and gains the ids; either proof passes. The jar-only table is left untouched."""
+    gate = _link((2924, 9803, 0), (2923, 9803, 0))
+    assert gate.source == transports.SHORTEST_PATH and gate.items == "DUSTY_KEY=1"
+    assert gate.item_ids == (1590,)
+    assert transports.usable(gate, owned_item_ids={1590})
+    assert transports.usable(gate, owned_item_names={"DUSTY_KEY"})
+    assert not transports.usable(gate) and not transports.usable(gate, owned_item_ids={1})
+    jar = next(s for s in _ours_only() if s.origin == (2924, 9803, 0) and s.dest == (2923, 9803, 0))
+    assert jar.item_ids == () and not transports.usable(jar, owned_item_ids={1590})
+
+
+def test_a_door_with_a_requirement_is_a_link_not_a_plain_door():
+    """A plain door is travel.py's job because the map bakes it open. A door that needs a key, a
+    level or a quest is a GATE: the map may well block it (the dusty-key gate does), so it has to
+    stay in the route search."""
+    assert _link((2924, 9803, 0), (2923, 9803, 0)).kind == transports.LINK
+    assert _link((3097, 3107, 0), (3098, 3107, 0)).kind == transports.DOOR      # still a plain door

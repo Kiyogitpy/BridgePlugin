@@ -108,8 +108,18 @@ def enters_wilderness(step) -> bool:
     return step.enters_wilderness_ditch or (in_wilderness(step.dest) and not in_wilderness(step.origin))
 
 
+def requirement_ids():
+    """(varbit ids, varplayer ids) that ANY link names -- 32 and 10 at the 2026-09-20 vendoring.
+    What legs.requirement_values reads from the bridge once per journey, so a gate like the
+    Ancient Cavern whirlpool (varbit 3759 > 1) can be PROVEN instead of failing closed."""
+    steps = list(transports.load_links(include_doors=False)) + list(transports.load_agility_shortcuts())
+    return ({v for s in steps for v, _, _ in s.varbits},
+            {v for s in steps for v, _, _ in s.varplayers})
+
+
 def usable_links(skill_levels=None, completed_quests=None, varbit_values=None,
-                 varplayer_values=None, owned_item_names=None, use_agility=True) -> list:
+                 varplayer_values=None, owned_item_names=None, use_agility=True,
+                 owned_item_ids=None, currency_held=None) -> list:
     """Every transport this account may take: no doors, nothing that ENTERS the Wilderness,
     requirements proven."""
     steps = list(transports.load_links(include_doors=False))
@@ -119,7 +129,8 @@ def usable_links(skill_levels=None, completed_quests=None, varbit_values=None,
             if not enters_wilderness(s) and s.kind != transports.DOOR
             and transports.usable(s, skill_levels=skill_levels, completed_quests=completed_quests,
                                   varbit_values=varbit_values, varplayer_values=varplayer_values,
-                                  owned_item_names=owned_item_names)]
+                                  owned_item_names=owned_item_names, owned_item_ids=owned_item_ids,
+                                  currency_held=currency_held)]
 
 
 def _index(links):
@@ -187,15 +198,24 @@ def walkable_start(start, toward=None):
 
 def find_route(start, goal, *, skill_levels=None, completed_quests=None, varbit_values=None,
                varplayer_values=None, owned_item_names=None, use_agility=True,
-               max_links=MAX_LINKS):
+               max_links=MAX_LINKS, owned_item_ids=None, currency_held=None,
+               max_expansions=None):
     """A cheap walk-and-transport route from `start` to within GOAL_TOLERANCE of `goal`, or None.
 
     Best-first under an expansion budget, NOT a shortest-path guarantee: PLANE_PENALTY is far
     above LINK_COST on purpose (it is what keeps the search off staircases that climb away from
     the goal), which makes the heuristic inadmissible. Between two valid routes it may return the
-    slightly dearer one."""
+    slightly dearer one.
+
+    `max_expansions` (default MAX_EXPANSIONS) is for a caller that KNOWS its route is long and
+    winding. MEASURED 2026-09-20: Taverley's ladder landing to the black demons through the
+    dusty-key gate costs 527 against 45 in a straight line, and the heuristic rates the surface
+    overhead as near, so it takes ~250 expansions (3.8s) where the default 40 gives up in 1s.
+    The default stays low because every IMPOSSIBLE trip pays the whole budget."""
+    budget = MAX_EXPANSIONS if max_expansions is None else max_expansions
     index = _index(usable_links(skill_levels, completed_quests, varbit_values, varplayer_values,
-                                owned_item_names, use_agility)) if max_links > 0 else {}
+                                owned_item_names, use_agility, owned_item_ids=owned_item_ids,
+                                currency_held=currency_held)) if max_links > 0 else {}
     start = walkable_start(start, toward=goal)
     counter = itertools.count()
     goal_node = ("GOAL",)
@@ -211,9 +231,17 @@ def find_route(start, goal, *, skill_levels=None, completed_quests=None, varbit_
             continue
         seen.add(tile)
         expansions += 1
-        if expansions > MAX_EXPANSIONS:
+        if expansions > budget:
             return None
 
+        # A link may LAND on a tile the static map cannot leave: MEASURED 2026-09-20, 149 usable
+        # links do (the whirlpool's (1768,5366,0) floods to ONE tile), and every one of them was a
+        # dead end here. The player really stands there and steps off -- legs.walk_across already
+        # does -- so plan from the same walkable neighbour it will step to.
+        if steps:
+            foothold = walkable_start(tile, toward=goal)
+            cost += max(abs(foothold[0] - tile[0]), abs(foothold[1] - tile[1]))
+            tile = foothold
         flood = worldmap.reachable_from(tile[0], tile[1], tile[2],
                                         radius=FLOOD_RADIUS, max_nodes=FLOOD_NODES)
         if tile[2] == goal[2]:

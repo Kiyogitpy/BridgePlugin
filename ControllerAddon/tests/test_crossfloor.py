@@ -111,3 +111,44 @@ def test_heuristic_folds_the_underground_offset_and_penalises_the_wrong_plane():
     cave_goal = (2420, 9785, 0)
     assert crossfloor.heuristic(surface, cave_goal) < 100, "y+6400 is the same place underground"
     assert crossfloor.heuristic((3421, 3537, 1), (3421, 3537, 0)) == crossfloor.PLANE_PENALTY
+
+
+# --- 2026-09-20: requirements reach the search, and a link may land on an unroutable tile -------
+
+BARBARIAN_OUTPOST = (2520, 3571, 0)
+WATERFIENDS = (1750, 5350, 0)
+
+
+def _objects(route):
+    return [s.step.object_id for s in route.steps if isinstance(s, crossfloor.Link)]
+
+
+def test_a_link_that_lands_on_an_isolated_tile_is_not_a_dead_end():
+    """MEASURED: the whirlpool lands on (1768,5366,0), a tile whose flood is ONE tile, like 149
+    of the usable links' destinations. The player really stands there and steps off (walk_across
+    already does); the search has to plan from the walkable neighbour too, or every such link is
+    a dead end -- which is why Waterfiends read NO ROUTE even with varbit 3759 supplied."""
+    assert crossfloor.find_route(BARBARIAN_OUTPOST, WATERFIENDS) is None, "3759 unread must fail closed"
+    route = crossfloor.find_route(BARBARIAN_OUTPOST, WATERFIENDS, varbit_values={3759: 3})
+    assert route is not None and _objects(route) == [25274]
+    assert not crossfloor.find_route(BARBARIAN_OUTPOST, WATERFIENDS, varbit_values={3759: 1})
+
+
+def test_the_dusty_key_gate_routes_black_demons_without_agility():
+    """The map does NOT bake this gate open (find_path across it is None) and the row is an
+    'Open' between adjacent tiles, so it used to be dropped as a plain door. With the key proven
+    by ITEM ID -- all an inventory read can prove -- it is the route for an account under 80
+    Agility."""
+    landing, site = (2884, 9798, 0), (2860, 9835, 0)          # the foot of Taverley's ladder
+    assert crossfloor.find_route(landing, site, max_expansions=300) is None, "no key, no route"
+    route = crossfloor.find_route(landing, site, owned_item_ids={1590}, max_expansions=300)
+    assert route is not None and _objects(route) == [2623]
+    # MEASURED: the route costs 527 against 45 in a straight line and needs ~250 expansions, so
+    # the DEFAULT budget does not find it. Pinned so a smarter search shows up as this failing.
+    assert crossfloor.find_route(landing, site, owned_item_ids={1590}) is None
+
+
+def test_usable_links_pass_item_ids_and_currency_through():
+    toll = lambda links: [s for s in links if s.object_id == 2786 and s.currency]
+    assert not toll(crossfloor.usable_links())
+    assert toll(crossfloor.usable_links(currency_held={"Coins": 10}))

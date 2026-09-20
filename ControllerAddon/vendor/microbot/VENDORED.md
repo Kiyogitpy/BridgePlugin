@@ -35,8 +35,13 @@ does not mix commits.
 - The object cell is `Option;Target;id` (`Activate;Elevator;34359`), where the jar's is
   space-separated. `transports.normalise_object_info` rewrites it to the space form at load so
   every consumer sees one format; no Microbot option contains whitespace (pinned by test).
-- `Item IDs` are NUMERIC. `1 2;3` means (1 or 2) and 3 -- semicolon is AND, space is OR, the
-  order `Transport.java` splits them in. The jar's `Items` column is symbolic (`DUSTY_KEY=1`).
+- `Item IDs` are NUMERIC and **every id in the cell is an alternative** -- space or semicolon
+  between them makes no difference, because Microbot evaluates the cell with
+  `flatMap(...).anyMatch(...)` (`PathfinderConfig.hasRequiredItems`). The Crafting Guild door
+  lists a brown apron and six capes with `;`; reading that as AND (which the PARSER alone
+  suggests, and which the first draft here did) would demand all seven. The jar's `Items`
+  column is symbolic (`DUSTY_KEY=1`), which nothing at run time can prove, so a merged row
+  borrows Microbot's numeric ids for the same (origin, destination, object id).
 - `Currency` is `<amount> <name>` (`10 Coins`). One row carries `3741=1` there by mistake; the
   parser makes that unsatisfiable rather than guessing.
 - `Varplayers` (jar: `VarPlayers`) uses the same `id>value` grammar. `isMembers` is `Y` on 6
