@@ -250,6 +250,24 @@ def nearest_ring(player_tile, skill_levels=None):
     return best[1] if best else None
 
 
+def walk_goal(task):
+    """Where the last walk goes: the task's `target`, unless that tile lies OUTSIDE every kill
+    area -- then the first area's centre.
+
+    FOUND 2026-09-20 auditing all 24 Aya sites against the spawn table: the Turael Skipping
+    registry's target for SKELETONS is the SURFACE tile by the Digsite Dungeon's entrance, while
+    its kill area (ten skeleton spawns) is underground. Walking to the target meant arriving,
+    reading 'not at the site', and stopping with the teleport already spent."""
+    target = tuple(task.target)
+    for ax, ay, w, h, p in task.areas or ():
+        if ax <= target[0] < ax + w and ay <= target[1] < ay + h and target[2] == p:
+            return target
+    if not task.areas:
+        return target
+    ax, ay, w, h, p = task.areas[0]
+    return (ax + w // 2, ay + h // 2, p)
+
+
 def _unroutable(route, target, skill_levels, proven):
     """None when the walk after the LAST teleport in `route` can be made, else why not.
 
@@ -276,14 +294,15 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
     task = aya_tasks.get(task_name) or slayer_catalog.get(task_name)
     if task is None or not task.target:
         return None, f"{task_name} has no site in the catalog yet"
-    site = legs.walk(*task.target)
+    goal = walk_goal(task)
+    site = legs.walk(*goal)
     # PHASE-A REVIEW: chasing a monster two tiles out of the kill rectangle flips the routine to
     # TRAVEL, and without this the "route" back was the whole journey again -- walk 41 tiles to
     # the AJQ ring and dial AJQ while standing in the AJQ cave; for Alice's farm, fire the
     # Ectophial. When the site is a short walk away, the route is that walk and nothing else.
     # Unchanged by phase B, including when the player happens to be in the house (its own
     # comment explains why THAT combination is not worth special-casing here).
-    near = crossfloor.find_route(here, tuple(task.target), skill_levels=skill_levels, max_links=0)
+    near = crossfloor.find_route(here, goal, skill_levels=skill_levels, max_links=0)
     if near is not None and near.cost <= NEAR_SITE_TILES:
         return [site], ""
     # The house, not just "an instance": a raid, Pest Control or a Sailing boat is an instance too
@@ -302,7 +321,7 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
     other = slayer_catalog.get(task_name)
     teleports = list(dict.fromkeys(tuple(task.teleports) + tuple(other.teleports if other else ())))
     def offer(route, text):
-        problem = _unroutable(route, task.target, skill_levels, proven)
+        problem = _unroutable(route, goal, skill_levels, proven)
         if problem is not None:
             reasons.append(f"{text}: {problem}")
         return problem is None

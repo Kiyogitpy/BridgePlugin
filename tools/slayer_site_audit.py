@@ -96,8 +96,54 @@ def main():
         flag = "" if dist <= MAX_TILES else "  <-- CHECK"
         bad += 1 if flag else 0
         print(f"{task:30} {str(site):20} {str((x, y)):20} {int(dist):5} {near:5}{flag}")
+    bad += audit_aya(db)
     print("all sites sit on their monster" if not bad else f"{bad} site(s) to check")
     return 1 if bad else 0
+
+
+def audit_aya(db) -> int:
+    """Every Aya task the routine would fight, by the registry's own NPC IDS (names as a fallback):
+    the WALK GOAL -- the target, or the kill area's centre when the target lies outside it -- must
+    be near a spawn on its plane and must not be in the Wilderness.
+
+    Added 2026-09-20. The first run found the registry's SKELETONS target is the surface tile by
+    the Digsite Dungeon's entrance while its kill area is underground, which is what made
+    slayer_routes.walk_goal necessary."""
+    sys.path.insert(0, os.path.join(REPO, "ControllerAddon"))
+    import aya_tasks
+    import crossfloor
+    import slayer_routes
+    import slayer_tasks
+
+    print()
+    print(f"{'aya task':30} {'walk goal':20} {'nearest spawn':20} {'dist':>5}")
+    bad = 0
+    for key, task in aya_tasks.load().items():
+        if slayer_tasks.disposition(key, {}) != slayer_tasks.FIGHT or not task.target:
+            continue
+        goal = slayer_routes.walk_goal(task)
+        rows = []
+        for npc_id in task.npc_ids:
+            rows += db.execute("select x, y, plane from spawns where entity_type = 'npc' and entity_id = ? "
+                               "and x is not null", (npc_id,)).fetchall()
+        if not rows:
+            for name in slayer_tasks.target_names(key):
+                rows += db.execute("select x, y, plane from spawns where entity_type = 'npc' "
+                                   "and lower(name) like ? and x is not null", (name.lower() + "%",)).fetchall()
+        on_plane = [(max(abs(x - goal[0]), abs(y - goal[1])), int(x), int(y)) for x, y, p in rows if p == goal[2]]
+        moved = "" if goal == tuple(task.target) else f"  (target {tuple(task.target)} is outside its area)"
+        if crossfloor.in_wilderness(goal):
+            print(f"{key:30} {str(goal):20} IN THE WILDERNESS  <-- CHECK")
+            bad += 1
+        elif not on_plane:
+            print(f"{key:30} {str(goal):20} NO SPAWN on plane {goal[2]}  <-- CHECK{moved}")
+            bad += 1
+        else:
+            dist, x, y = min(on_plane)
+            flag = "" if dist <= MAX_TILES else "  <-- CHECK"
+            bad += 1 if flag else 0
+            print(f"{key:30} {str(goal):20} {str((x, y)):20} {int(dist):5}{flag}{moved}")
+    return bad
 
 
 if __name__ == "__main__":

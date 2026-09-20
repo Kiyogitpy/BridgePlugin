@@ -263,19 +263,20 @@ def test_a_plain_teleport_tablet_is_an_item_leg_with_its_landing_from_the_vendor
     assert slayer_routes.parse("Nonsense teleport")[0] == "unsupported", "only what the table knows"
 
 
-def test_a_digsite_pendant_mounted_in_the_house_serves_bats_and_skeletons():
+def test_a_digsite_pendant_mounted_in_the_house_serves_bats():
     """USER 2026-09-20: 'There is a digsite pendant mounted in poh'. The registry line has NO
     colon -- 'Digsite pendant (Option 1)' -- and the vendored house table has the mounted object
     with the direct action 'Digsite' landing on (3341,3445,0)."""
     assert slayer_routes.parse("Digsite pendant (Option 1)") == ("poh_mounted", "digsite pendant")
     mine = {"x": 3000, "y": 9800, "plane": 0}
-    for task in ("Skeletons", "Bats"):
-        legs_, why = slayer_routes.plan(task, mine, {"teleport to house": 3})
-        assert why == "", (task, why)
-        assert [l["kind"] for l in legs_] == ["poh_enter", "poh_pool", "poh_mounted", "walk"], task
-        assert legs_[2]["option"] == "Digsite" and legs_[2]["dest"] == [3341, 3445, 0]
-    none, why = slayer_routes.plan("Skeletons", mine, {})
+    legs_, why = slayer_routes.plan("Bats", mine, {"teleport to house": 3})
+    assert why == "", why
+    assert [l["kind"] for l in legs_] == ["poh_enter", "poh_pool", "poh_mounted", "walk"]
+    assert legs_[2]["option"] == "Digsite" and legs_[2]["dest"] == [3341, 3445, 0]
+    none, why = slayer_routes.plan("Bats", mine, {})
     assert none is None and "house tablet" in why
+    # Skeletons list the same pendant, but their kill area is the Digsite DUNGEON and no table has
+    # a way in: see test_skeletons_are_refused_before_the_pendant_is_spent.
 
 
 def test_wolves_are_reached_by_the_gnome_glider_from_the_grand_tree():
@@ -367,3 +368,32 @@ def test_a_requirement_nobody_can_check_by_name_is_not_invented():
     lit = slayer_tasks.missing_items("Cave horrors", 150, {"witchwood icon": 1})
     assert lit and "light" in lit[0].lower(), "cave horrors still need a LIT light source, by item id"
     assert slayer_tasks.missing_items("Cave horrors", 150, {"witchwood icon": 1, "kandarin headgear 3": 1}) == []
+
+
+# --- 2026-09-20: every Aya site audited against the spawn table by NPC id ------------------------
+
+def test_the_walk_aims_at_the_kill_area_when_the_registrys_target_is_outside_it():
+    """Skeletons: the plugin's `target` (3352,3417,0) is the SURFACE tile by the Digsite Dungeon's
+    entrance, while its kill area is underground -- the only Aya task whose target is outside its
+    own area (found auditing all 24 against the spawn table). Walking to the target meant
+    arriving, reading 'not at the site', and stopping with the teleport spent."""
+    assert slayer_routes.walk_goal(aya_tasks.get("skeletons")) == (3373, 9748, 0), "the area's centre"
+    assert slayer_routes.walk_goal(aya_tasks.get("cows")) == (3630, 3530, 0), "a target inside its area is kept"
+    assert slayer_routes.walk_goal(slayer_catalog.get("black demons")) == (2852, 9784, 0)
+
+
+def test_skeletons_are_refused_before_the_pendant_is_spent():
+    """No table has ANY way into the Digsite Dungeon (checked: the merged jar + Microbot tables
+    hold no row landing there -- the winch is absent). Until a recording supplies it, the trip is
+    refused up front, naming the walk it cannot make."""
+    none, why = slayer_routes.plan("Skeletons", {"x": 3000, "y": 9800, "plane": 0}, {"teleport to house": 3})
+    assert none is None and "no walking route" in why and "3373" in why
+
+
+def test_the_karamja_monkeys_are_where_the_override_says():
+    """The user's override is a wiki pin; the spawn table has Monkey id 2848 on exactly that tile
+    and two more beside it. The area covers all three."""
+    monkeys = aya_tasks.get("monkeys")
+    assert monkeys.npc_ids == (2848,)
+    for tile in ((2873, 3148), (2877, 3154), (2879, 3161)):
+        assert aya_tasks.contains(monkeys, tile[0], tile[1], 0), tile

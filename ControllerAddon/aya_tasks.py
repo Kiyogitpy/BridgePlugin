@@ -30,13 +30,14 @@ _OVERRIDES = {
     "monkeys": {
         "location": "Karamja, near the volcano",
         "target": (2873, 3148, 0),
-        "areas": ((2863, 3138, 21, 21, 0),),
+        "areas": ((2863, 3138, 21, 27, 0),),
         "teleports": ("Ornate Jewellery Box: Karamja", "Glory amulet: Karamja"),
         "info": None,
-        "npc_ids": (),
-        "note": "user override of Kruk's Dungeon. UNVERIFIED: the tile is a wiki pin (4 spawns) and "
-                "the plugin's npc id (7118) is the Kruk's Dungeon monkey, so targets fall back to the "
-                "name 'Monkey' until the first visit confirms the id.",
+        "npc_ids": (2848,),
+        "note": "user override of Kruk's Dungeon. CHECKED 2026-09-20 against the wiki spawn table: "
+                "Monkey id 2848 stands on exactly this tile, with two more at (2877,3154) and "
+                "(2879,3161) -- the area was grown 6 tiles north to cover the third. The plugin's own "
+                "id (7118) is the Kruk's Dungeon monkey. Still UNVERIFIED LIVE.",
     },
     "minotaurs": {
         "teleports": ("Ornate Jewellery Box: Cooking Guild", "Skull sceptre: Invoke"),
