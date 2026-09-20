@@ -111,3 +111,11 @@ ledger. Lessons this project paid for, all recorded in the ledgers:
 - Per-task gear decisions the research left open (Phase E0): a one-handed weapon beside the
   mirror shield, ranged kit for waterfiends, heat boots for wyrms.
 - "Tormented demons later": Greater demons stays a STOP task until the user says otherwise.
+- **One short recording for the gryphon cave** (`python -u recorder.py gryphon-cave`): fairy ring
+  CJQ, walk to the TASK-ONLY south-eastern cave, enter, walk to the gryphons. CHECKED 2026-09-20:
+  no source has that entrance -- not our jar's transports table, not Microbot's fork, not
+  upstream Shortest Path's current master (5,780 lines, zero rows on the Great Conch), and the
+  wiki gives no tile (the cave map centres on (3232,8865), i.e. under surface (3232,2465); Elder
+  Kelmo stands just inside). Everything else about that task is already data.
+- **A look at the Trolls route** in `docs/slayer-sites/routes.md` (185 tiles from Burthorpe,
+  climbing from the west and north): is that the way you walk it, or the quest-gated back route?
