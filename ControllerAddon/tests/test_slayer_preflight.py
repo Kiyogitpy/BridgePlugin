@@ -86,3 +86,17 @@ def test_the_overview_covers_every_kuradal_task_and_counts_what_plans():
     assert "hellhounds" in text and "slayer ring: Stronghold" in text, "fetched from the bank, then planned"
     assert "gryphons" in text and "NO ROUTE" in text
     assert lines[-1].endswith("of 22 plan after a bank trip")
+
+
+def test_the_overview_can_sweep_ayas_list_and_names_what_must_be_carried():
+    """The live gates are Aya tasks. Sweeping her list on 2026-09-20 found four defects in an
+    afternoon-old planner; this keeps the sweep one command away."""
+    keys = pf.aya_keys()
+    assert "cows" in keys and "dogs" not in keys, "a task blocked at Aya is never assigned"
+    lines = pf.overview(30, LUMBRIDGE, {}, dict(BANK, **{"ice cooler": 500}), PANEL,
+                        {"Agility": 77}, 77, 0, keys=["cows", "lizards", "cave slimes", "wolves"])
+    text = " | ".join(lines)
+    assert "cows" in text and "ectophial: Empty" in text
+    assert "NEEDS" in text and "light source" in text, "cave slimes: a LIT light source, by item id"
+    assert "wolves" in text and "NO ROUTE" in text
+    assert lines[-1] == "2 of 4 plan after a bank trip"

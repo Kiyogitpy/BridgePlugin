@@ -70,6 +70,8 @@ has an 8 s wall-clock bound and failed once under load.
     cd ControllerAddon
     python slayer_preflight.py                              # the live task
     python slayer_preflight.py --task "Cows" --count 20      # what if this were the task
+    python slayer_preflight.py --aya                         # all of Aya's tasks (the gates are Aya tasks)
+    python slayer_preflight.py --all                         # all 22 Kuradal tasks
 
 Read-only, safe beside a running `controller.py`. It prints what the routine WOULD decide:
 disposition, site, missing items, the route or the reason there is none, the pack, and the bank

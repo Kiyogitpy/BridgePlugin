@@ -148,3 +148,31 @@ def test_the_bank_memory_adapter_keeps_unknown_unknown():
     got = sl.banked_from_memory(Mem(True, [{"name": "Shark", "quantity": 5, "id": 385},
                                             {"name": "Shark", "quantity": 2, "id": 385}]))
     assert got == {"shark": 7}
+
+
+# --- 2026-09-20: found by sweeping Aya's 24 tasks on the live account --------------------------
+
+def test_ice_coolers_stack_so_thirty_five_of_them_are_one_slot():
+    """Lizards need count + 5 ice coolers. They are STACKABLE; counting each as a slot said the
+    pack needed 37 of 28 and refused a trivial task."""
+    bank = dict(BANK, **{"ice cooler": 500})
+    lo = sl.build("Lizards", 30, PANEL, 70, 10, {}, bank)
+    assert _want(lo)["Ice cooler"] == 35
+    assert lo.slots <= 10 and lo.problems == []
+
+
+def test_a_teleport_the_house_serves_is_not_a_missing_item():
+    """Scorpions list 'Skill's necklace: Mining Guild' first. The PLANNER serves that through the
+    ornate jewellery box (it reads the destination, not the item), so the pack must not call the
+    necklace missing -- the loadout reads teleports with the planner's own parse()."""
+    lo = sl.build("Scorpions", 30, PANEL, 70, 10, {}, BANK)
+    assert not any("necklace" in p.lower() or "teleport:" in p.lower() for p in lo.problems), lo.problems
+    assert not any("necklace" in w["name"].lower() for w in lo.withdraw)
+
+
+def test_a_teleport_no_leg_can_run_is_never_packed():
+    """Wolves list only 'Gnome Glider: Sindarpos'. It is not an item and no leg runs it: nothing
+    to withdraw, and the pack says so once rather than asking the banker for a 'Gnome glider'."""
+    lo = sl.build("Wolves", 30, PANEL, 70, 10, {}, BANK)
+    assert not any("glider" in w["name"].lower() for w in lo.withdraw)
+    assert any("no usable teleport" in p.lower() for p in lo.problems)

@@ -116,6 +116,34 @@ BOX_LANDINGS = {
     "Woodcutting Guild": (1662, 3505, 0),
     "Farming Guild": (1249, 3718, 0),
 }
+def consumable(key):
+    """A plain teleport TABLET or SCROLL named by a registry line with no colon ("Varrock
+    teleport", "Lassar teleport", "Digsite teleport") -> (item name, option, landing), or None.
+
+    The vendored teleportation_items.tsv calls a tablet "<X> tablet" while the in-game item is
+    "<X> teleport", whose default action is Break (MEASURED in routines/mahogany_homes.py); a
+    scroll keeps its own name and its action is Teleport. Only what that table knows is accepted,
+    and its landing is the table's. A tablet redirected elsewhere (Varrock -> GE) lands outside
+    the arrival radius and fails the leg cleanly."""
+    key = (key or "").strip().lower()
+    if not key.endswith(" teleport"):
+        return None
+    import teleports                       # local: the table is only needed for these few lines
+    tablet = key[:-len(" teleport")] + " tablet"
+    for row in teleports.load():
+        display = (row.display or "").strip().lower()
+        if display == tablet:
+            return key, "Break", tuple(row.dest)
+        if display == key:
+            return key, "Teleport", tuple(row.dest)
+    return None
+
+
+def item_row(key):
+    """ITEMS first (hand-written, measured options), then a tablet/scroll the table knows."""
+    return ITEMS.get(key) or consumable(key)
+
+
 _BOX_LANDINGS_BY_LOWER = {name.lower(): name for name in BOX_LANDINGS}
 _TRAILING_OPTION = re.compile(r"\s*\(option\s+\w+\)\s*$", re.IGNORECASE)   # "(Option 3)" AND "(Option Q)"
 
@@ -136,9 +164,14 @@ def parse(teleport_text):
         return "item", key
     if key in SPELLS:
         return "spell", key
+    if not tail.strip() and consumable(key) is not None:
+        return "item", key
     destination = _TRAILING_OPTION.sub("", tail).strip()
-    if destination.lower() in DIALOGUE_ITEMS.get(key, {}):
-        return "dialogue_item", (key, destination.lower())
+    # CONTAINMENT, not equality: Aya's registry writes "Morytania Slayer Tower" for the ring's
+    # "Slayer Tower" (found by sweeping her 24 tasks live, 2026-09-20).
+    known = next((d for d in DIALOGUE_ITEMS.get(key, {}) if d in destination.lower()), None)
+    if known is not None:
+        return "dialogue_item", (key, known)
     canonical = _BOX_LANDINGS_BY_LOWER.get(destination.lower())
     if canonical is not None:
         return "box", canonical
@@ -249,7 +282,7 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
                 return route, ""
             continue
         if kind == "item":
-            name, option, landing = ITEMS[value]
+            name, option, landing = item_row(value)
             if not any(name in (held or "").lower() for held in (carried or {})):
                 reasons.append(f"{text}: not carried")
                 continue

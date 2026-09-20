@@ -29,6 +29,7 @@ import math
 from collections import namedtuple
 
 import slayer_catalog
+import slayer_routes
 import slayer_tasks
 import supplies
 
@@ -90,11 +91,12 @@ class _Pack:
     def _take(self, bank_name, quantity):
         self.withdraw.append({"name": _display(bank_name), "quantity": quantity})
 
-    def exact(self, label, name, wanted):
-        """A plain item by its exact name (food): top up to `wanted`."""
+    def exact(self, label, name, wanted, stackable=False):
+        """A plain item by its exact name (food): top up to `wanted`. `stackable` items share
+        one slot whatever the quantity (35 ice coolers are ONE slot, not 35)."""
         base = name.lower()
         self.keep.append(base)
-        self.slots += 1 if _stackable(base) else wanted
+        self.slots += 1 if stackable or _stackable(base) else wanted
         held = int(self.carried.get(base) or 0)
         short = wanted - held
         if short <= 0:
@@ -154,15 +156,23 @@ class _Pack:
         return False
 
 
-def _teleport(pack, site) -> None:
-    """The FIRST teleport that can actually be used: a place (fairy ring, house box, a spell) costs
-    no slot; an item is carried, else fetched. Alternatives stay in the bank."""
-    items = []
-    for text in site.teleports or ():
-        head = text.partition(":")[0].strip().lower()
-        if head in _NOT_AN_ITEM:
+def _teleport(pack, site, task_name) -> None:
+    """The FIRST teleport the PLANNER could actually run, read with the planner's own parse() so
+    the two never disagree (scorpions list a skills necklace; the planner serves its destination
+    through the house jewellery box, so no necklace is needed). A place -- fairy ring, house box,
+    spell -- costs no slot. An item is carried, else fetched; alternatives stay in the bank. A
+    line no leg can run is never packed."""
+    other = slayer_catalog.get(task_name)
+    texts = list(dict.fromkeys(tuple(site.teleports or ()) + tuple(other.teleports if other else ())))
+    wanted = []
+    for text in texts:
+        kind, value = slayer_routes.parse(text)
+        if kind in ("fairy", "box", "spell"):
             return
-        items.append(head)
+        if kind == "unsupported":
+            continue
+        head = value[0] if kind == "dialogue_item" else slayer_routes.item_row(value)[0]
+        wanted.append((text, head))
         if any(supplies._is(n, head) or head in n for n in _names(pack.carried)):
             pack.keep.append(head)
             pack.slots += 1
@@ -171,10 +181,13 @@ def _teleport(pack, site) -> None:
                                            for n, q in pack.banked.items()):
             pack.one_of(f"teleport ({text})", (head,), prefer_spent=True)
             return
-    if items and pack.banked is None:
-        pack.one_of(f"teleport ({site.teleports[0]})", (items[0],), prefer_spent=True)
-    elif items:
-        pack.problems.append(f"teleport: none of {', '.join(_display(i) for i in items)} is carried or banked")
+    if not wanted:
+        pack.problems.append("no usable teleport: no leg can run " + (", ".join(texts) or "anything (none listed)"))
+    elif pack.banked is None:
+        pack.one_of(f"teleport ({wanted[0][0]})", (wanted[0][1],), prefer_spent=True)
+    else:
+        pack.problems.append("teleport: none of " + ", ".join(_display(h) for _, h in wanted)
+                             + " is carried or banked")
 
 
 def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, banked,
@@ -220,9 +233,11 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
             if need.quantity == 1:
                 pack.one_of(need.label, options, prefer_spent=False)
             else:
-                pack.exact(need.label, options[0], need.quantity)
+                # A required item wanted in bulk is a STACK (ice coolers: count + 5). Found by
+                # sweeping Aya's tasks live: lizards "needed 37 of 28 slots".
+                pack.exact(need.label, options[0], need.quantity, stackable=True)
 
-    _teleport(pack, site)
+    _teleport(pack, site, task_name)
 
     pack.exact("house tablets", HOUSE_TABLET, HOUSE_TABLETS_CARRIED)
     pack.one_of("escape ring", (ESCAPE_RING,), prefer_spent=True)

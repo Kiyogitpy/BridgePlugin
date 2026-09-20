@@ -236,3 +236,27 @@ def test_what_the_account_proves_reaches_the_routability_check():
     assert none is None and "no walking route" in why
     legs_, why = slayer_routes.plan("Waterfiends", lumbridge, tablets, proven={"varbit_values": {3759: 3}})
     assert why == "" and legs_[-1]["kind"] == "walk"
+
+
+# --- 2026-09-20: found by sweeping Aya's 24 tasks on the live account --------------------------
+
+def test_the_registrys_own_spelling_of_a_slayer_ring_destination_is_understood():
+    """Aya's registry says 'Slayer Ring: Morytania Slayer Tower (Option 2)' -- capital R, a
+    region prefix, a paging suffix. Banshees and crawling hands could not plan."""
+    assert slayer_routes.parse("Slayer Ring: Morytania Slayer Tower (Option 2)") ==         ("dialogue_item", ("slayer ring", "slayer tower"))
+    assert slayer_routes.parse("Slayer ring: Fremennik Slayer Dungeon (Option 3)")[1][1] == "fremennik slayer dungeon"
+    legs_, why = slayer_routes.plan("Banshees", {"x": 3200, "y": 3200, "plane": 0}, {"slayer ring (8)": 1})
+    assert why == "" and legs_[0]["kind"] == "dialogue_item" and legs_[0]["option"] == "slayer tower"
+
+
+def test_a_plain_teleport_tablet_is_an_item_leg_with_its_landing_from_the_vendored_table():
+    """'Varrock teleport' / 'Lassar teleport': the table calls them 'Varrock tablet' / 'Lassar
+    tablet'; the in-game item is '<x> teleport' and its default action is Break (MEASURED in
+    routines/mahogany_homes.py). Rats and icefiends could not plan."""
+    assert slayer_routes.parse("Varrock teleport") == ("item", "varrock teleport")
+    legs_, why = slayer_routes.plan("Rats", {"x": 2700, "y": 3300, "plane": 0}, {"varrock teleport": 5})
+    assert why == "" and legs_[0]["kind"] == "item"
+    assert (legs_[0]["item"], legs_[0]["option"], legs_[0]["dest"]) == ("varrock teleport", "Break", [3213, 3424, 0])
+    ice, why = slayer_routes.plan("Icefiends", {"x": 2700, "y": 3300, "plane": 0}, {"lassar teleport": 2})
+    assert why == "" and ice[0]["dest"] == [3004, 3470, 0]
+    assert slayer_routes.parse("Nonsense teleport")[0] == "unsupported", "only what the table knows"
