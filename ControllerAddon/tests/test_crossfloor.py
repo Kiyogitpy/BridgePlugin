@@ -143,9 +143,24 @@ def test_the_dusty_key_gate_routes_black_demons_without_agility():
     assert crossfloor.find_route(landing, site, max_expansions=300) is None, "no key, no route"
     route = crossfloor.find_route(landing, site, owned_item_ids={1590}, max_expansions=300)
     assert route is not None and _objects(route) == [2623]
-    # MEASURED: the route costs 527 against 45 in a straight line and needs ~250 expansions, so
-    # the DEFAULT budget does not find it. Pinned so a smarter search shows up as this failing.
-    assert crossfloor.find_route(landing, site, owned_item_ids={1590}) is None
+    # MEASURED before dominance pruning: 527 against 45 in a straight line took ~250 expansions,
+    # 133 of 193 of them tiles already inside an earlier flood (the ladder alone has four rows
+    # landing within two tiles of each other). With dominated nodes skipped, the DEFAULT budget
+    # finds it -- from the ladder's foot and from the surface teleport.
+    default = crossfloor.find_route(landing, site, owned_item_ids={1590})
+    assert default is not None and default.cost == route.cost
+    surface = crossfloor.find_route((2893, 3465, 0), site, owned_item_ids={1590})
+    assert surface is not None and _objects(surface) == [16680, 2623]
+
+
+def test_a_dominated_node_is_skipped_but_a_cheaper_landing_is_not():
+    """Dominance is about COST, not place: a link that lands inside an already-flooded area more
+    cheaply than walking there is exactly what a shortcut is, and must still be expanded."""
+    taverley, demons = (2893, 3465, 0), (2852, 9784, 0)
+    walked = crossfloor.find_route(taverley, demons, owned_item_ids={1590})
+    piped = crossfloor.find_route(taverley, demons, skill_levels={"Agility": 77})
+    assert piped is not None and 16509 in _objects(piped)
+    assert walked is None or piped.cost < walked.cost
 
 
 def test_usable_links_pass_item_ids_and_currency_through():

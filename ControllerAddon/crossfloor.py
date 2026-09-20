@@ -39,7 +39,15 @@ import worldmap
 FLOOD_RADIUS = 160
 FLOOD_NODES = 40_000
 MAX_LINKS = 4
-MAX_EXPANSIONS = 40
+# 160 since 2026-09-20 (was 40): with dominated nodes skipped (_dominated) an expansion is a NEW
+# area, not a re-flood, so the budget buys far more ground for the same money -- MEASURED an
+# impossible trip costs about what it did at the old 40 without pruning (~1 s). 120 finds the
+# dusty-key route from the ladder's foot; from the surface teleport it needs 160.
+MAX_EXPANSIONS = 160
+# _dominated only prunes within this of the earlier node; the outer 32 tiles of a flood are a
+# rim band where a landing keeps its own flood. MEASURED: 128 and 160 give identical routes on
+# all 27 report sites x 4 passes; 64 prunes too little to find the dusty-key route.
+DOMINANCE_RADIUS = 128
 LINK_COST = 6            # tiles-equivalent for the click, the animation and the load
 GOAL_TOLERANCE = 12
 ORIGIN_TOLERANCE = 2
@@ -196,6 +204,30 @@ def walkable_start(start, toward=None):
     return best[1] if best else start
 
 
+def _dominated(floods, tile, cost) -> bool:
+    """An earlier node already WALKS to `tile` for no more than `cost`, from close by.
+
+    MEASURED 2026-09-20 on the dusty-key route: 133 of 193 expansions were tiles already inside an
+    earlier flood -- Taverley's ladder alone is four rows landing within two tiles of each other,
+    each re-flooded from scratch. Such a node can push nothing the earlier one did not already
+    push at least as cheaply (walking distances obey the triangle inequality), so it is skipped
+    and does not spend budget. COST decides, never place: a link that lands inside a flooded area
+    more cheaply than walking there is what a shortcut IS, and is expanded as before.
+
+    Only within DOMINANCE_RADIUS of the earlier node's own tile: floods stop at FLOOD_RADIUS and a
+    link's landing is the only way the search reaches past that rim, so a node near the rim keeps
+    its own flood even when the walk to it is cheaper."""
+    for centre, base, flood in floods:
+        if centre[2] != tile[2]:
+            continue
+        if max(abs(centre[0] - tile[0]), abs(centre[1] - tile[1])) > DOMINANCE_RADIUS:
+            continue
+        walk = flood.get((tile[0], tile[1]))
+        if walk is not None and base + walk <= cost:
+            return True
+    return False
+
+
 def find_route(start, goal, *, skill_levels=None, completed_quests=None, varbit_values=None,
                varplayer_values=None, owned_item_names=None, use_agility=True,
                max_links=MAX_LINKS, owned_item_ids=None, currency_held=None,
@@ -207,11 +239,10 @@ def find_route(start, goal, *, skill_levels=None, completed_quests=None, varbit_
     the goal), which makes the heuristic inadmissible. Between two valid routes it may return the
     slightly dearer one.
 
-    `max_expansions` (default MAX_EXPANSIONS) is for a caller that KNOWS its route is long and
-    winding. MEASURED 2026-09-20: Taverley's ladder landing to the black demons through the
-    dusty-key gate costs 527 against 45 in a straight line, and the heuristic rates the surface
-    overhead as near, so it takes ~250 expansions (3.8s) where the default 40 gives up in 1s.
-    The default stays low because every IMPOSSIBLE trip pays the whole budget."""
+    `max_expansions` (default MAX_EXPANSIONS) lets a caller ask for a deeper search. The case
+    that motivated it -- Taverley's ladder to the black demons through the dusty-key gate, 527
+    against 45 in a straight line -- is found at the default since dominance pruning; every
+    IMPOSSIBLE trip pays the whole budget, so raise it only for a route known to exist."""
     budget = MAX_EXPANSIONS if max_expansions is None else max_expansions
     index = _index(usable_links(skill_levels, completed_quests, varbit_values, varplayer_values,
                                 owned_item_names, use_agility, owned_item_ids=owned_item_ids,
@@ -221,6 +252,7 @@ def find_route(start, goal, *, skill_levels=None, completed_quests=None, varbit_
     goal_node = ("GOAL",)
     queue = [(heuristic(start, goal), next(counter), 0, tuple(start), ())]
     seen = set()
+    floods = []
     expansions = 0
 
     while queue:
@@ -230,9 +262,6 @@ def find_route(start, goal, *, skill_levels=None, completed_quests=None, varbit_
         if tile in seen:
             continue
         seen.add(tile)
-        expansions += 1
-        if expansions > budget:
-            return None
 
         # A link may LAND on a tile the static map cannot leave: MEASURED 2026-09-20, 149 usable
         # links do (the whirlpool's (1768,5366,0) floods to ONE tile), and every one of them was a
@@ -242,8 +271,14 @@ def find_route(start, goal, *, skill_levels=None, completed_quests=None, varbit_
             foothold = walkable_start(tile, toward=goal)
             cost += max(abs(foothold[0] - tile[0]), abs(foothold[1] - tile[1]))
             tile = foothold
+        if _dominated(floods, tile, cost):
+            continue
+        expansions += 1
+        if expansions > budget:
+            return None
         flood = worldmap.reachable_from(tile[0], tile[1], tile[2],
                                         radius=FLOOD_RADIUS, max_nodes=FLOOD_NODES)
+        floods.append((tile, cost, flood))
         if tile[2] == goal[2]:
             d, at = _nearest(flood, (goal[0], goal[1]), GOAL_TOLERANCE)
             if d is not None:

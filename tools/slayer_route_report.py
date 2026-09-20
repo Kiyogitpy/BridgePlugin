@@ -63,14 +63,13 @@ ALL_99 = {"Agility": 99, "Mining": 99, "Strength": 99, "Thieving": 99, "Ranged":
           "Magic": 99, "Firemaking": 99, "Woodcutting": 99}
 # The third pass is what legs.requirement_values proves at run time, written down from a live read
 # of the user's account on 2026-09-20 (varbit 3759 = 3) plus a dusty key (item 1590) in hand. No
-# skills, so it shows what the KEY and the VARBIT buy on their own. It asks for a deeper search:
-# the key route through Taverley needs ~400 expansions from the surface (MEASURED), the default 40.
+# skills, so it shows what the KEY and the VARBIT buy on their own.
 PASSES = [("no requirements proven", {}),
           ("all skills 99", {"skill_levels": ALL_99}),
           ("the user's account, read live 2026-09-20: Agility 77, varbit 3759=3",
            {"skill_levels": {"Agility": 77}, "varbit_values": {3759: 3}}),
-          ("varbit 3759=3 and a dusty key, no skills, deep search",
-           {"varbit_values": {3759: 3}, "owned_item_ids": {1590}, "max_expansions": 450})]
+          ("varbit 3759=3 and a dusty key, no skills",
+           {"varbit_values": {3759: 3}, "owned_item_ids": {1590}})]
 
 
 def describe(route):
@@ -103,8 +102,8 @@ def main():
            "- **Black demons**: USER 2026-09-20 -- take the obstacle pipe (70 Agility; the account",
            "  has 77) to the blue dragons and run from there. It routes at the DEFAULT budget once the",
            "  site is the real spawn cluster: walk 86, ladder, walk 3, pipe, walk 92. Without 70",
-           "  Agility the only way is the dusty-key gate (item 1590, proven by id), long and winding,",
-           "  which the default 40 expansions do NOT find -- the third pass asks for 450.",
+           "  Agility the only way is the dusty-key gate (item 1590, proven by id), long and winding",
+           "  (cost 538). Found at the default budget since the search skips dominated nodes.",
            "- **Trolls** (185 tiles): UNVERIFIED. It climbs from the west and north rather than the",
            "  eastern main path and may be the quest-gated back route. Check it by eye before use.",
            "- **Banshees** (156 tiles without the window shortcut) and **Kurask** (355) were checked",
