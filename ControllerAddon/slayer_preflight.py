@@ -34,8 +34,43 @@ def _tablets_total(carried, banked):
     return held + sum(int(q or 0) for n, q in banked.items() if slayer_loadout.HOUSE_TABLET in n)
 
 
+def wear_plan(task, worn, carried, banked) -> list:
+    """What routines/slayer._wear would DO for each of the task's worn requirements, from the same
+    tables it uses. `worn` is a GET /equipment dict; an EMPTY SLOT IS `{}`, not a missing key
+    (measured live 2026-09-21 -- the bug that check was written against).
+
+    A task whose shield would knock a TWO-HANDED weapon off is called out here, because that is a
+    safety stop at run time and the fix (choose a one-handed weapon) is the user's."""
+    spec = slayer_catalog.get(task)
+    if spec is None or not spec.worn:
+        return []
+    names = {(v.get("name") or "").lower() for v in (worn or {}).values()
+             if isinstance(v, dict) and v.get("name")}
+    held = {(n or "").lower() for n in (carried or {}) if not str(n).startswith("#")}
+    two_handed = [w for w in ("blowpipe", "godsword", "bow", "2h sword", "scythe", "halberd", "maul")
+                  if any(w in n for n in names)]
+    lines = []
+    for label in spec.worn:
+        options = slayer_catalog.REQUIREMENT_ITEMS.get(label, ())
+        if not options:
+            lines.append(f"WORN: {label} -- an open gear decision, never enforced")
+            continue
+        if any(o in n for n in names for o in options):
+            lines.append(f"WORN: {label} -- already on")
+            continue
+        where = ("carried, would be equipped" if any(o in h for h in held for o in options)
+                 else "in the bank, would be fetched and equipped" if banked is not None
+                 and any(o in b for b in banked for o in options)
+                 else "NOT carried and NOT in the bank -- a STOP")
+        lines.append(f"WORN: {label} -- {where}")
+        if "shield" in label and two_handed:
+            lines.append(f"       ...and the {two_handed[0]} is TWO-HANDED: equipping it takes the weapon "
+                         f"off, which is a STOP until a one-handed weapon is chosen")
+    return lines
+
+
 def report(task, count, streak, points, player, carried, banked, panel_cfg, tasks_cfg,
-           skill_levels, prayer_level, prayer_bonus, proven=None) -> list:
+           skill_levels, prayer_level, prayer_bonus, proven=None, worn=None) -> list:
     lines = []
     master = slayer_state.next_master(streak, tasks_cfg)
     if not task:
@@ -89,8 +124,7 @@ def report(task, count, streak, points, player, carried, banked, panel_cfg, task
         lines.append(f"  problem: {problem}")
 
     spec = slayer_catalog.get(task)
-    if spec is not None and spec.worn:
-        lines.append(f"must be WORN (not checked here): {', '.join(spec.worn)}")
+    lines.extend(wear_plan(task, worn, carried, banked))
     if spec is not None and spec.note:
         lines.append(f"note: {spec.note}")
 
@@ -167,7 +201,7 @@ def _main(argv) -> int:
     for line in report(task, count, state.streak, state.points, controller.get_player() or {},
                        routine._carried(), slayer_loadout.banked_from_memory(bank_memory.load()),
                        config, config.get("tasks") or {}, legs.skill_levels(), prayer, 0,
-                       proven=legs.requirement_values()):
+                       proven=legs.requirement_values(), worn=controller.get_equipment()):
         print(line)
     return 0
 

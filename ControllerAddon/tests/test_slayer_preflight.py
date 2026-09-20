@@ -110,3 +110,20 @@ def test_the_aya_sweep_leaves_out_what_is_blocked_at_aya():
         assert blocked not in keys, blocked
     # 25 registry keys ("goblin" and "goblins" are both keys) minus the six blocked ones.
     assert "cows" in keys and "wolves" in keys and len(keys) == 19
+
+
+def test_the_wear_plan_says_what_would_happen_to_each_worn_requirement():
+    """The verbatim GET /equipment of 2026-09-21: an EMPTY slot is {}, and the Toxic blowpipe is
+    two-handed. The slayer helmet covers both the nose peg and the facemask."""
+    live = {"weapon": {"qty": 1, "name": "Toxic blowpipe", "id": 12926}, "shield": {},
+            "helmet": {"qty": 1, "name": "Slayer helmet (i)", "id": 26674}}
+    assert pf.wear_plan("Aberrant spectres", live, {}, {})[0].endswith("already on")
+    assert pf.wear_plan("Dust devils", live, {}, {})[0].endswith("already on")
+    basilisks = " | ".join(pf.wear_plan("Basilisks", live, {}, {"mirror shield": 1}))
+    assert "fetched and equipped" in basilisks and "TWO-HANDED" in basilisks and "blowpipe" in basilisks
+    assert "NOT carried and NOT in the bank" in " | ".join(pf.wear_plan("Basilisks", live, {}, {}))
+    assert "carried, would be equipped" in " | ".join(pf.wear_plan("Basilisks", live, {"mirror shield": 1}, {}))
+    assert "open gear decision" in " | ".join(pf.wear_plan("Waterfiends", live, {}, {}))
+    assert pf.wear_plan("Cows", live, {}, {}) == [], "an Aya task wears nothing special"
+    one_handed = dict(live, weapon={"qty": 1, "name": "Abyssal whip", "id": 4151})
+    assert "TWO-HANDED" not in " | ".join(pf.wear_plan("Basilisks", one_handed, {}, {"mirror shield": 1}))
