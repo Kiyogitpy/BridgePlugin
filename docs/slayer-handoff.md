@@ -1,0 +1,110 @@
+# Slayer task loop — handoff (written 2026-09-20 for a move from the laptop to the desktop)
+
+A Claude Code conversation lives on the machine it ran on, so the laptop session that built all
+of this cannot be resumed elsewhere. **A fresh session should read this file first**, then the
+files it points at. Nothing below depends on the old conversation.
+
+## Where the work is
+
+- Repo `BridgePlugin`, branch **`crossfloor-travel`** (pushed; `dev` is pushed too and is its base).
+  NOT merged to `dev` — the merge is the user's call. Another session also committed Guardians of
+  the Rift work onto this branch; it rides along.
+- `ZombieLite`, branch `no-packets` on the user's fork (remote name `fork`), pushed.
+- NOT in git, by choice: `bin/`, `.vscode/`, `gradle-run.log`, and `osrs-wiki-data-master/` (a
+  117 MB raw OSRS wiki dump used for offline lookups — re-download or copy it if wanted).
+- The `osrs-wiki` / `osrs-debug` MCP servers failed on the laptop because `.mcp.json` points at
+  another user's folder; expect to fix paths per machine.
+
+## What the user asked for (the standing goal)
+
+Split the old "Slayer / Combat" routine in two. `combat.py` keeps killing whatever is picked in
+the panel. `slayer.py` runs slayer TASKS end to end: get a task by the Lunar spell NPC Contact,
+**Aya (= Turael) for 9 tasks then Kuradal (= Duradel) on every 10th** so the streak bonus comes
+from the high master, fight it at the user's chosen site, and repeat — travel, banking, restock
+and loot included. The user is hands-on, tests live, and corrects facts; trust their live
+observations over a clean log.
+
+## Documents, in reading order
+
+1. **Spec**: `docs/superpowers/specs/2026-09-18-slayer-task-loop-design.md`.
+2. **The user's decisions**: `docs/slayer-sites/decisions.md` (22 Kuradal FIGHT tasks with sites,
+   1 STOP = Greater demons, 20 SKIP; supply profiles; Aya's sites come from the Turael Skipping
+   plugin with three overrides).
+3. **Measured facts** (these OUTRANK the spec): `docs/slayer-sites/recordings-2026-09-19.md`,
+   the slayer section of `docs/routine-notes.md`, and the "MEASURED LIVE 2026-09-20" block in the
+   sub-project 3 plan.
+4. **Plans** (`docs/superpowers/plans/`): `2026-09-18-slayer-split-and-plumbing.md` (done),
+   `2026-09-19-crossfloor-travel-and-slayer-pure-pieces.md` (done),
+   `2026-09-19-slayer-acquire-and-skip.md` (done, ACQUIRE proven live),
+   **`2026-09-19-slayer-travel-bank-loadout.md` (IN PROGRESS — five live-gated phases A–E)**.
+5. **Ledgers** (rulings, review findings, what each fix wave changed):
+   `docs/superpowers/ledgers/` — copies of the git-ignored `.superpowers/sdd/*/progress.md`,
+   plus the Phase B brief.
+6. **Research**: `docs/slayer-sites/` — `microbot-slayer-survey.md`, `microbot-core-survey.md`,
+   `slayer-best-in-bank-survey.md`, `tormented-demon-comparison.md`, `routes.md`.
+
+## State of the code
+
+| Piece | File(s) | State |
+|---|---|---|
+| Slayer task state | `GET /slayer`, `slayer_state.py` | live-proven |
+| Take a task from Aya by NPC Contact | `npc_contact.py`, `routines/slayer.py` | **live-proven 2026-09-19** (one cast, 9 s) |
+| Picker path, Kuradal, right-click `Cast` | `npc_contact.py` | built, UNRUN (first Kuradal task exercises it) |
+| Cancel a task (30 points) | `npc_contact.cancel_task` | built, UNRUN; needs ≥ 90 points and a supervised first run |
+| Floor-crossing walking | `crossfloor.py`, `legs.walk_across`, `legs.run_transport` | built, UNRUN |
+| **Phase A** travel from where we stand | `slayer_routes.py`, TRAVEL phase in `routines/slayer.py` | built, reviewed, fixed, **UNRUN** |
+| **Phase B** the house hub | `poh.py`, house legs in `legs.py` | built, reviewed, fixed, **UNRUN** |
+| Phase C bank + loadout, D restock + loot, E Kuradal's 22 sites | — | NOT built (interface-level in the plan) |
+
+Tests: `python -m pytest tests/ -q` from `ControllerAddon/` → 3087 passed; the ONLY failures are 4
+known ones in `tests/test_mastering_mixology.py`. `test_crossfloor::test_an_impossible_trip_is_none_and_fast`
+has an 8 s wall-clock bound and failed once under load.
+
+## What to do next, in order
+
+1. **Phase A live gate.** Needs an Aya task reached by fairy ring or Ectophial (bears, cave bugs,
+   cave slimes, lizards, zombies, birds, cows) left ACTIVE, and for the two cave tasks a LIT
+   lantern carried (the check is by item id — a lit and an unlit bullseye lantern share one name).
+   At handoff the account held **Greater Demons x153, streak 19** — the task the user does by
+   hand, so the routine stops on it by design. Checklist: slayer section of `docs/routine-notes.md`.
+2. **Phase B live gate**: one Aya task reached through the house. Watch: is the fairy ring within
+   `radius=20` of the tablet landing (nothing walks inside the house yet); does the hover gate
+   read a jewellery-box entry's name; does `object_refresh_target` answer inside the instance.
+3. **E-pre: the Microbot transports adapter** — needs nothing from the user. Microbot's fork of
+   the Shortest Path tables HAS the Karuulm Slayer Dungeon (our vendored copy does not) but uses
+   different columns and `Option;Target;id` object cells; details in the plan's Phase E and in
+   `docs/slayer-sites/microbot-core-survey.md`. The sparse clone lived in the laptop's temp folder:
+   re-clone `github.com/chsami/Microbot` (sparse: `runelite-client/src/main/resources/net/runelite/client/plugins/microbot/shortestpath`
+   and `.../java/.../microbot/{util/poh,util/walker,util/magic,util/dialogues,shortestpath}`;
+   set `core.longpaths true` first) — the commit surveyed was `8bcc652`.
+4. **Phase C** (bank + loadout): start with its "detail the phase" step; it depends on
+   `bank_memory`, whose own six-item live checklist in `CLAUDE.md` has never been run.
+
+## How this project is built (process the user chose and liked)
+
+Spec → plan → **subagent-driven execution**: cheap implementer per task from a written brief
+(exact tests and code), a Sonnet task review, then a **Fable whole-phase review with read-only
+probes of the LIVE bridge**, a fix wave, and a re-review of the fix wave. Rulings go in the
+ledger. Lessons this project paid for, all recorded in the ledgers:
+- **Build test fixtures from a real GET, never from memory.** `/equipment` is a dict keyed by
+  slot; the bridge sends `skipTasks` as a list; inventory quantity is `qty`. Each crashed or
+  lied behind a wrong-shaped fixture.
+- **Every new test file carries the `_no_live_bridge` autouse fixture** (it makes
+  `controller.api_get` raise). Three tests were caught reading the user's live screen.
+- **The plan's own tests and snippets were wrong more often than the implementers.**
+- **Live runs overturn reasoning.** The NPC Contact spell's left-click re-contacts the LAST NPC
+  (no picker opens); interface 75 is not in `/widgets/dump`'s root walk; inside the house
+  TEMPLATE x/y lie about distance and `distance` is 2147483647 on every object — use
+  `instX`/`instY`; a teleport lands the player ON its own object, a tile the static map cannot
+  route from.
+- A safety-stopped `controller.py` stays alive holding UDP 50555 — kill it before a relaunch.
+- Absolute rules: input ONLY through the physical Arduino; never edit `m8aq/api/`; never
+  hand-edit `ControllerAddon/vendor/`; Aya is NEVER contacted while a task is active (it resets
+  the streak) — `slayer_state.assert_may_contact` raises.
+
+## Still wanted from the user
+
+- The remaining live gates above.
+- Per-task gear decisions the research left open (Phase E0): a one-handed weapon beside the
+  mirror shield, ranged kit for waterfiends, heat boots for wyrms.
+- "Tormented demons later": Greater demons stays a STOP task until the user says otherwise.
