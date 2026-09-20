@@ -51,6 +51,10 @@ BOX_MENU_OPTION = "Teleport Menu"
 ENTER_BUDGET_S, POOL_BUDGET_S, BOX_MENU_BUDGET_S = 10.0, 6.0, 8.0
 POLL_S = 0.3
 SCAN_RADIUS = 40
+TABLET_COOLDOWN_S = 60.0       # never break a second tablet this soon after the last one
+HOUSE_REGIONS = (7791,)        # MEASURED 2026-09-20 on this account's house
+HOUSE_TEMPLATE_BOX = (1850, 2050, 7000, 7200)   # x0, x1, y0, y1 -- the POH template chunks
+TELEPORT_INSIDE_VARBIT = 4744  # vendor/teleportation_items.tsv: 0 = a plain Break lands INSIDE
 
 
 def inst_distance(a, b):
@@ -83,15 +87,29 @@ def find(ids, player=None):
     return candidates[0]
 
 
-def in_house(player=None) -> bool:
-    """True only when `player` is inside an instance AND a house-specific object (the exit
-    portal, the box, the ring, or a pool) is in the scene -- an instance alone is not a house
-    (raids, Pest Control and the Gauntlet are instances too)."""
-    if player is None:
-        player = controller.get_player()
+def is_house_player(player) -> bool:
+    """PURE: does this /player record say "inside a player-owned house"? An instance alone is not
+    a house (raids, Pest Control, the Gauntlet and a Sailing boat are instances too), so it must
+    also sit in a POH template region or inside the POH template box.
+
+    PHASE-B REVIEW: the first draft proved a house by scanning /objects for house furniture --
+    3,674 objects and 1.1 MB per read, polled every 0.3 s, with a 1 s timeout whose [] reads
+    exactly like "no house object". A stuttering client during the two LOADING flickers would
+    have left in_house() False after a GOOD teleport, and the travel ceiling would then have
+    broken three tablets. /player alone answers it, and costs nothing."""
     if not player or not player.get("inInstance"):
         return False
-    return find((EXIT_PORTAL_ID, BOX_ID, RING_ID) + POOL_IDS, player=player) is not None
+    if player.get("regionId") in HOUSE_REGIONS:
+        return True
+    x, y = player.get("x"), player.get("y")
+    x0, x1, y0, y1 = HOUSE_TEMPLATE_BOX
+    return x is not None and y is not None and x0 <= x <= x1 and y0 <= y <= y1
+
+
+def in_house(player=None) -> bool:
+    if player is None:
+        player = controller.get_player()
+    return is_house_player(player)
 
 
 def enter(ctx, log: str = "poh") -> bool:
@@ -102,6 +120,20 @@ def enter(ctx, log: str = "poh") -> bool:
                  if TABLET in (i.get("name") or "").lower()), None)
     if item is None:
         debug_log.log(log, "no house tablet in inventory")
+        return False
+    # A tablet is spent by the click, whether or not the landing confirms. The travel phase
+    # retries a FAILED leg, so without this a landing we cannot confirm costs three tablets.
+    since = time.time() - ctx.state.data.get("poh_tablet_at", 0.0)
+    if since < TABLET_COOLDOWN_S:
+        debug_log.log(log, f"a house tablet was broken {since:.0f}s ago and the house was never "
+                           f"confirmed -- not breaking another")
+        return False
+    # 4744 = 1 means a plain Break lands OUTSIDE at the portal (its "(Inside)" row is a separate
+    # menu option), where in_house() stays False forever. None = unreadable: carry on.
+    setting = controller.get_varbit(TELEPORT_INSIDE_VARBIT)
+    if setting not in (None, 0):
+        debug_log.log(log, f"varbit {TELEPORT_INSIDE_VARBIT} = {setting}: house teleports land "
+                           f"OUTSIDE the portal on this account -- refusing to break a tablet")
         return False
     controller.open_inventory_tab(ctx.ser)
     ok = controller.click_entity(ctx.ser, item, check_ui_blockers=False,
@@ -117,6 +149,7 @@ def enter(ctx, log: str = "poh") -> bool:
             return False
     # The tablet is consumed by the click itself, whether or not the landing later confirms.
     ctx.state.data["poh_tablets_used"] = ctx.state.data.get("poh_tablets_used", 0) + 1
+    ctx.state.data["poh_tablet_at"] = time.time()
     deadline = time.time() + ENTER_BUDGET_S
     while time.time() < deadline:
         if in_house():
@@ -160,13 +193,14 @@ def drink_pool(ctx, log: str = "poh") -> bool:
     risen = False
     while time.time() < deadline:
         p = controller.get_player() or {}
-        cur_prayer, cur_real = p.get("prayer"), p.get("prayerReal")
-        if cur_prayer is not None and cur_real is not None and cur_prayer >= cur_real:
+        # BOTH bars: with only run energy low, breaking out on a full prayer bar returned before
+        # the player had even reached the pool, and the next leg's click cancelled the drink.
+        if not _needs_drink(p) and p:
             risen = True
             break
         time.sleep(POLL_S)
     if not risen:
-        debug_log.log(log, "prayer never rose to full after drinking -- carrying on anyway")
+        debug_log.log(log, "prayer/run never read full after drinking -- carrying on anyway")
     return True
 
 
@@ -219,8 +253,29 @@ def use_box(ctx, destination, log: str = "poh") -> bool:
         debug_log.log(log, f"the jewellery box menu never offered {destination!r}")
         controller.key_tap(ctx.ser, "ESC")
         return False
-    return bool(controller.click_entity(ctx.ser, entry, offset=(0, 0), check_ui_blockers=False,
-                                        simulate_mistakes=False, expected_action=destination))
+    clicked = controller.click_entity(ctx.ser, entry, offset=(0, 0), check_ui_blockers=False,
+                                      simulate_mistakes=False, expected_action=destination)
+    if not clicked:
+        # Leave nothing open: a retry right-clicks the box, and with 590 still up that click
+        # lands on the interface instead (phase-B review).
+        debug_log.log(log, f"the click on {destination!r} was withheld or failed -- closing the menu")
+        controller.key_tap(ctx.ser, "ESC")
+        return False
+    return True
+
+
+def await_left_house(budget_s: float) -> bool:
+    """True once /player no longer reads as inside the house. How a jewellery-box hop is confirmed:
+    landing tiles disagree between our own vendored tables (Mining Guild is 28 tiles apart in
+    teleportation_boxes.tsv and teleportation_items.tsv), but "we left the house" is unambiguous,
+    and the walk leg that follows re-plans from wherever we really are."""
+    deadline = time.time() + budget_s
+    while time.time() < deadline:
+        player = controller.get_player()
+        if player and player.get("x") is not None and not is_house_player(player):
+            return True
+        time.sleep(POLL_S)
+    return False
 
 
 def use_ring(ctx, code, expect, log: str = "poh") -> bool:

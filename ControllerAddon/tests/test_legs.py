@@ -10,6 +10,17 @@ import poh
 import travel
 
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_live_bridge(monkeypatch):
+    """HERMETIC, enforced: a forgotten fake must fail loudly, not read the user's live client."""
+    def refuse(path, *a, **k):
+        raise AssertionError(f"a test reached the live bridge: GET {path}")
+    monkeypatch.setattr(controller, "api_get", refuse)
+
+
 class _State:
     def __init__(self):
         self.data = {}
@@ -74,10 +85,11 @@ def test_a_poh_pool_leg_delegates_to_poh_drink_pool_and_never_fails_when_it_retu
 def test_a_poh_box_leg_confirms_arrival_after_use_box_succeeds(monkeypatch):
     seen = {}
     monkeypatch.setattr(poh, "use_box", lambda ctx, option, log: seen.setdefault("option", option) or True)
-    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=legs.ITEM_BUDGET_S: seen.setdefault("dest", dest) or True)
+    monkeypatch.setattr(poh, "await_left_house", lambda budget_s: seen.setdefault("budget", budget_s) or True)
     leg = legs.house_box("Cooking Guild", (3143, 3442, 0))
     assert legs.run_next(_Ctx(), [leg], 0) == (legs.DONE, 1)
-    assert seen == {"option": "Cooking Guild", "dest": [3143, 3442, 0]}
+    assert seen == {"option": "Cooking Guild", "budget": legs.ITEM_BUDGET_S}, \
+        "confirmed by LEAVING THE HOUSE, not by a landing tile our own tables disagree about"
 
 
 def test_a_poh_box_leg_fails_when_use_box_fails(monkeypatch):
@@ -88,7 +100,7 @@ def test_a_poh_box_leg_fails_when_use_box_fails(monkeypatch):
 
 def test_a_poh_box_leg_fails_when_the_landing_never_confirms(monkeypatch):
     monkeypatch.setattr(poh, "use_box", lambda ctx, option, log: True)
-    monkeypatch.setattr(legs, "await_arrival", lambda dest, budget_s=legs.ITEM_BUDGET_S: False)
+    monkeypatch.setattr(poh, "await_left_house", lambda budget_s: False)
     leg = legs.house_box("Cooking Guild", (3143, 3442, 0))
     assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
 

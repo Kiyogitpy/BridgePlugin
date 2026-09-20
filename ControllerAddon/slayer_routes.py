@@ -27,6 +27,7 @@ import re
 import aya_tasks
 import crossfloor
 import legs
+import poh
 import transports
 
 RING_WALK_MAX = 150          # tiles, straight-line pre-filter before the real walk is costed
@@ -60,7 +61,7 @@ BOX_LANDINGS = {
     "Castle Wars": (2441, 3090, 0),
     "Edgeville": (3087, 3496, 0),
     "Al Kharid": (3293, 3163, 0),
-    "Mining Guild": (3049, 9763, 0),
+    "Mining Guild": (3046, 9735, 0),      # teleportation_boxes.tsv; the ITEMS table says (3049,9763)
     "Fishing Guild": (2611, 3390, 0),
     "Crafting Guild": (2933, 3295, 0),
     "Grand Exchange": (3164, 3478, 0),
@@ -73,7 +74,7 @@ BOX_LANDINGS = {
     "Farming Guild": (1249, 3718, 0),
 }
 _BOX_LANDINGS_BY_LOWER = {name.lower(): name for name in BOX_LANDINGS}
-_TRAILING_OPTION = re.compile(r"\s*\(option\s+\d+\)\s*$", re.IGNORECASE)
+_TRAILING_OPTION = re.compile(r"\s*\(option\s+\w+\)\s*$", re.IGNORECASE)   # "(Option 3)" AND "(Option Q)"
 
 
 def parse(teleport_text):
@@ -131,7 +132,9 @@ def plan(task_name, player, carried, skill_levels=None):
     near = crossfloor.find_route(here, tuple(task.target), skill_levels=skill_levels, max_links=0)
     if near is not None and near.cost <= NEAR_SITE_TILES:
         return [site], ""
-    in_house = bool((player or {}).get("inInstance"))
+    # The house, not just "an instance": a raid, Pest Control or a Sailing boat is an instance too
+    # and must not be offered a tablet-less house route (phase-B review).
+    in_house = poh.is_house_player(player)
     has_tablet = any("teleport to house" in (held or "").lower() for held in (carried or {}))
     reasons = []
     for text in task.teleports:

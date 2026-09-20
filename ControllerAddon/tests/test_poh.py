@@ -36,6 +36,7 @@ class _Ctx:
 def _quiet(monkeypatch):
     monkeypatch.setattr(poh.time, "sleep", lambda s: None)
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
+    monkeypatch.setattr(controller, "get_varbit", lambda varbit_id: 0)     # 4744 = 0: lands INSIDE
 
 
 PLAYER = {"x": 1933, "y": 7105, "plane": 1, "instPlane": 0, "inInstance": True,
@@ -65,20 +66,29 @@ def test_find_skips_unclickable_and_screenless_records(monkeypatch):
     assert poh.find(poh.POOL_IDS, player=PLAYER) is None
 
 
-def test_in_house_needs_both_an_instance_and_a_house_object(monkeypatch):
-    monkeypatch.setattr(controller, "get_objects", lambda **kw: [])
-    assert poh.in_house({"inInstance": False, "instX": 1, "instY": 1}) is False
-    assert poh.in_house({"inInstance": True, "instX": 1, "instY": 1}) is False
-    monkeypatch.setattr(controller, "get_objects", lambda **kw: [BOX])
-    assert poh.in_house(PLAYER) is True
+def test_the_house_is_recognised_from_the_player_record_alone(monkeypatch):
+    """PHASE-B REVIEW: proving a house by scanning 3,674 objects (1.1 MB) every 0.3 s, behind a
+    1 s timeout whose [] reads like "no house", would have burned tablets after a GOOD teleport."""
+    scans = []
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: scans.append(1) or [])
+    assert poh.in_house(PLAYER) is True                                   # the measured record
+    assert poh.in_house(dict(PLAYER, regionId=1234)) is True, "another POH region: the template box decides"
+    assert poh.in_house({"inInstance": False, "x": 1933, "y": 7105, "regionId": 7791}) is False
+    assert scans == [], "no scene scan, ever"
+
+
+def test_an_instance_that_is_not_a_house_is_not_a_house():
+    """Raids, Pest Control, the Gauntlet and a Sailing boat are instances too."""
+    assert poh.is_house_player({"inInstance": True, "x": 2657, "y": 2639, "plane": 0, "regionId": 10536}) is False
+    assert poh.is_house_player({"inInstance": True}) is False
+    assert poh.is_house_player(None) is False and poh.is_house_player({}) is False
 
 
 def test_in_house_defaults_to_a_fresh_player_read_and_fails_closed_on_nothing(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {})
-    touched = []
-    monkeypatch.setattr(controller, "get_objects", lambda **kw: touched.append(1) or [])
     assert poh.in_house() is False
-    assert touched == [], "an empty player read must not even reach the scene scan"
+    monkeypatch.setattr(controller, "get_player", lambda: dict(PLAYER))
+    assert poh.in_house() is True
 
 
 # --------------------------------------------------------------------------------------- enter
@@ -338,3 +348,95 @@ def test_use_ring_forwards_the_house_rings_own_id(monkeypatch):
     monkeypatch.setattr(travel, "hop_fairy_ring", hop)
     assert poh.use_ring(_Ctx(), "AJQ", "Dorgesh") is True
     assert seen == {"log": "poh", "ring_ids": (poh.RING_ID,), "code": "AJQ", "expect": "Dorgesh"}
+
+
+# ------------------------------------------------------------------- phase-B review: the guards
+
+def _tablet(monkeypatch):
+    monkeypatch.setattr(controller, "get_inventory", lambda: [
+        {"name": "Teleport to house", "qty": 143, "id": 8013, "screenX": 1357, "screenY": 614}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+
+
+def test_a_landing_that_never_confirms_costs_ONE_tablet_not_three(monkeypatch):
+    """The travel phase retries a FAILED leg up to three times; a tablet is spent by the click."""
+    _quiet(monkeypatch)
+    monkeypatch.setattr(poh, "ENTER_BUDGET_S", 0.05)
+    monkeypatch.setattr(poh, "in_house", lambda player=None: False)
+    _tablet(monkeypatch)
+    breaks = []
+    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: breaks.append(1) or True)
+    ctx = _Ctx()
+    for _ in range(3):
+        assert poh.enter(ctx) is False
+    assert len(breaks) == 1 and ctx.state.data["poh_tablets_used"] == 1
+
+
+def test_a_house_teleport_that_lands_outside_is_refused_before_a_tablet_is_spent(monkeypatch):
+    """vendor/teleportation_items.tsv: varbit 4744 = 1 -> a plain Break lands OUTSIDE at the portal,
+    where in_house() is False forever."""
+    _quiet(monkeypatch)
+    monkeypatch.setattr(controller, "get_varbit", lambda varbit_id: 1)
+    monkeypatch.setattr(poh, "in_house", lambda player=None: False)
+    _tablet(monkeypatch)
+    breaks = []
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: breaks.append(1) or True)
+    assert poh.enter(_Ctx()) is False and breaks == []
+
+
+def test_an_unreadable_setting_does_not_block_the_tablet(monkeypatch):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(controller, "get_varbit", lambda varbit_id: None)
+    state = {"in": False}
+    monkeypatch.setattr(poh, "in_house", lambda player=None: state["in"])
+    _tablet(monkeypatch)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: state.update({"in": True}) or True)
+    assert poh.enter(_Ctx()) is True
+
+
+def test_a_failed_entry_click_closes_the_menu_it_opened(monkeypatch):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(controller, "get_player", lambda: dict(PLAYER))
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [BOX])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, entity, option, **kw: True)
+    monkeypatch.setattr(controller, "get_widgets_dump", lambda scan=False: [
+        {"group": 590, "child": 5, "index": 8, "screenX": 776, "screenY": 415,
+         "text": "<col=ccccff>H:</col> Cooking Guild", "actions": ["Cooking Guild"]}])
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: False)
+    keys = []
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
+    assert poh.use_box(_Ctx(), "Cooking Guild") is False
+    assert keys == ["ESC"]
+
+
+def test_leaving_the_house_is_what_confirms_a_box_hop(monkeypatch):
+    """Our own vendored tables put the Mining Guild landing 28 tiles apart; 'no longer in the
+    house' is unambiguous."""
+    _quiet(monkeypatch)
+    reads = iter([dict(PLAYER), {}, {"x": 3046, "y": 9735, "plane": 0, "inInstance": False}])
+    monkeypatch.setattr(controller, "get_player", lambda: next(reads))
+    assert poh.await_left_house(2.0) is True
+    monkeypatch.setattr(controller, "get_player", lambda: dict(PLAYER))
+    assert poh.await_left_house(0.05) is False
+
+
+def test_the_pool_waits_for_run_energy_too(monkeypatch):
+    """With only run low, breaking out on a full prayer bar returned before the player reached the
+    pool, and the next leg's click cancelled the drink."""
+    _quiet(monkeypatch)
+    reads = iter([dict(PLAYER, prayer=77, prayerReal=77, runEnergy=20),      # needs a drink
+                  dict(PLAYER, prayer=77, prayerReal=77, runEnergy=20),      # walking to the pool
+                  dict(PLAYER, prayer=77, prayerReal=77, runEnergy=100)])    # drunk
+    seen = []
+
+    def get_player():
+        record = next(reads)
+        seen.append(record["runEnergy"])
+        return record
+    monkeypatch.setattr(controller, "get_player", get_player)
+    monkeypatch.setattr(controller, "get_objects", lambda **kw: [POOL_NEAR])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    assert poh.drink_pool(_Ctx()) is True
+    assert seen[-1] == 100, "it kept polling until run energy read full"

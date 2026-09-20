@@ -99,7 +99,8 @@ def pool() -> dict:
 
 def house_box(destination: str, dest) -> dict:
     """Leave through the ornate jewellery box's Teleport Menu to `destination` (poh.use_box),
-    landing confirmed against `dest` (BOX_LANDINGS' tile for that destination)."""
+    confirmed by the player no longer being in the house. `dest` is informational (the expected
+    landing, for logs and for planning the walk that follows)."""
     leg = _base("poh_box", f"jewellery box: {destination}", dest)
     leg["option"] = destination
     return leg
@@ -177,8 +178,9 @@ def run_next(ctx, leg_list, cursor: int, log: str = "travel"):
     if kind == "poh_box":
         if not poh.use_box(ctx, leg.get("option"), log):
             return FAILED, cursor
-        dest = leg.get("dest") or []
-        if len(dest) != 3 or not await_arrival(dest):
+        # Confirmed by LEAVING THE HOUSE, not by a landing tile: our own vendored tables disagree
+        # about where the box lands (phase-B review), and the walk leg re-plans from the live tile.
+        if not poh.await_left_house(ITEM_BUDGET_S):
             return FAILED, cursor
         return DONE, cursor + 1
     if kind == "poh_ring":
