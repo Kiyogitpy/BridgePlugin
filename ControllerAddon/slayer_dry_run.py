@@ -54,8 +54,16 @@ for name in ("click_entity", "click_menu_action", "key_tap", "drop_items", "cons
     if hasattr(controller, name):
         setattr(controller, name, _record(f"controller.{name}"))
 banker.bank_up = _record("banker.bank_up")
-legs.run_next = lambda ctx, route, cursor, log="travel": (ACTIONS.append(f"leg {route[cursor]['display']}")
-                                                          or (legs.DONE, cursor + 1))
+def _fake_run_next(ctx, route, cursor, log="travel"):
+    """The real run_next answers FINISHED once the cursor runs off the end; the stub did not, so a
+    route shorter than the tick budget raised IndexError instead of finishing the journey."""
+    if cursor >= len(route or []):
+        return legs.FINISHED, cursor
+    ACTIONS.append(f"leg {route[cursor]['display']}")
+    return legs.DONE, cursor + 1
+
+
+legs.run_next = _fake_run_next
 gear.equip_from_inventory = lambda ctx, name: ACTIONS.append(f"equip {name}") or True
 # ACQUIRE returns a TaskState, not a bool. A plain _record stub answered True and the routine
 # then read `got.task` off it -- an AttributeError that only fires when the account holds NO TASK,
