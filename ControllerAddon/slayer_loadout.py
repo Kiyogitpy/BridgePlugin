@@ -38,6 +38,36 @@ Loadout = namedtuple("Loadout", ("withdraw", "keep", "slots", "problems", "unche
 HOUSE_TABLET = "teleport to house"
 HOUSE_TABLETS_CARRIED = 2          # one spare: a tablet is spent per unconfirmed landing (phase B)
 ESCAPE_RING = "ring of dueling"
+
+# The ROUTINE's own tools, as opposed to any task's supplies. Kept on every bank trip whatever the
+# task needs, and never charged a slot -- they are already carried and simply stay.
+#
+# FOUND LIVE 2026-09-21 on the first real bank trip. USER: "it deposited the rune pouch all the
+# prayer pots and our slayer ring??" The keep list held only what THAT task needed, and zombies
+# needs none of it, so the trip correctly deposited everything else -- including the rune pouch.
+# But NPC Contact is how this routine gets its NEXT task and the pouch carries the runes for it, so
+# depositing it strands the run: finish the task, then be unable to ask for another.
+#
+# The runes are listed individually because banker matches keepItems by SUBSTRING and the pouch's
+# contents are separate items when they are loose in the inventory. Dust/mist/smoke are here
+# because they pay for the spell's air cost -- see runes.py.
+ESSENTIALS = ("rune pouch", "divine rune pouch", "astral rune", "cosmic rune", "air rune",
+              "dust rune", "mist rune", "smoke rune", "law rune")
+
+# USER 2026-09-21: "we should have all teleports on us instead of doing banking runs after each.
+# like slayer ring, ectophial, House teleport etc."
+#
+# The pack only ever fetched the ONE teleport the current task needed, so the next task wanting a
+# different one meant another trip. Standing at a bank already, the others cost a few slots and no
+# extra walking -- and between them these five reach most of both masters' lists: the house tablet
+# opens every jewellery-box destination, the slayer ring twelve of Kuradal's, and the other three
+# cover what the box cannot.
+#
+# OPPORTUNISTIC, and that is the whole contract. A kit item missing from the bank is NEVER a
+# problem (unlike a task's own required item, which always is), and the kit gives way entirely
+# rather than push a pack past the inventory -- walking to a bank again later beats refusing a
+# trip that would have worked.
+TRAVEL_KIT = ("slayer ring", "ectophial", "xeric's talisman")
 SPELL_CASTS_CARRIED = 2            # a teleport spell's runes, for one retry
 
 # A catalog `carry` / `worn` label -> the item names that satisfy it: slayer_catalog's table, the
@@ -181,6 +211,39 @@ def _teleport(pack, site, task_name) -> None:
     line no leg can run is never packed."""
     other = slayer_catalog.get(task_name)
     texts = list(dict.fromkeys(tuple(site.teleports or ()) + tuple(other.teleports if other else ())))
+
+    # FREE ONES FIRST. FOUND LIVE 2026-09-21, twice in a row. USER: "why do we need to bank? ...
+    # we have all the components on us." This walked the list IN ORDER and packed the first
+    # teleport it could run; for icefiends that order starts with "Lassar teleport", which was in
+    # the bank, so it packed a whole bank trip -- while the NEXT entry was the jewellery box, which
+    # the account reaches with house tablets it already carries, for no inventory slot.
+    #
+    # Order should not decide that. A teleport needing nothing fetched wins wherever it sits, and
+    # only when none is free does anything get fetched. This is a stable sort, so with nothing free
+    # the order -- and therefore every existing decision -- is exactly what it was.
+    #
+    # A house-hub teleport counts as free only while a tablet is actually CARRIED: without one the
+    # house is itself something to fetch, and calling it free would pack nothing and strand the
+    # trip.
+    carried_names = _names(pack.carried)
+    has_tablet = any(HOUSE_TABLET in n for n in carried_names)
+
+    def _free(text) -> bool:
+        kind, value = slayer_routes.parse(text)
+        if kind == "fairy":
+            return True
+        if kind in ("box", "poh_mounted"):
+            return has_tablet
+        if kind in ("unsupported", "spell"):
+            return False
+        try:
+            head = (slayer_routes.GLIDER_APPROACH[0] if kind == "glider"
+                    else value[0] if kind == "dialogue_item" else slayer_routes.item_row(value)[0])
+        except Exception:
+            return False
+        return any(supplies._is(n, head) or head in n for n in carried_names)
+
+    texts.sort(key=lambda t: 0 if _free(t) else 1)
     wanted = []
     for text in texts:
         kind, value = slayer_routes.parse(text)
@@ -218,6 +281,33 @@ def _teleport(pack, site, task_name) -> None:
 
 
 
+
+def _top_up_kit(pack) -> None:
+    """Fetch the TRAVEL_KIT teleports this trip is not already carrying, while there is room.
+
+    Runs LAST, after everything the task itself needs, so the kit can only ever use slots nothing
+    else wanted. It adds no problems: a kit item the bank does not have is simply not taken.
+    """
+    for name in TRAVEL_KIT:
+        held = [n for n in _names(pack.carried) if supplies._is(n, name) or name in n]
+        pack.keep.append(name)                     # never deposit one once it is carried
+        if held:
+            continue
+        if pack.banked is None:
+            continue
+        if any(name in (w.get("name") or "").lower() for w in pack.withdraw):
+            continue
+        if pack.slots + 1 > supplies.INVENTORY_SLOTS - slayer_catalog.LOOT_RESERVE_SLOTS:
+            continue                               # no room: walk to a bank again another time
+        options = tuple(n for n, q in pack.banked.items()
+                        if int(q or 0) > 0 and (supplies._is(n, name) or name in n))
+        if not options:
+            continue
+        before = len(pack.problems)
+        pack.one_of(f"travel kit ({name})", (name,), prefer_spent=True)
+        del pack.problems[before:]                 # opportunistic: never a reason to stop
+
+
 def _available(pack, name):
     """How many of `name` the account can draw on -- carried plus banked. A bank never seen
     (banked is None) answers None, which means "cannot tell" and must not read as zero."""
@@ -243,7 +333,7 @@ def _choose(pack, choices, wanted, suffix=""):
     return best if best_count > 0 else None
 
 def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, banked,
-          keep_carried=False) -> Loadout:
+          keep_carried=False, skip_teleport=False) -> Loadout:
     """See the module header. `carried` is routines/slayer.py's _carried() dict (lowercased name
     -> quantity, plus "#<id>" keys); `banked` is banked_from_memory()'s dict, or None.
     `keep_carried` counts what is already held and NOT part of the trip toward `slots` -- for a
@@ -311,10 +401,27 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
                 # sweeping Aya's tasks live: lizards "needed 37 of 28 slots".
                 pack.exact(need.label, options[0], need.quantity, stackable=True)
 
-    _teleport(pack, site, task_name)
+    # A teleport is for covering DISTANCE. When the caller can already reach the site from where
+    # it stands, there is nothing to fetch. FOUND LIVE 2026-09-21: the routine teleported to
+    # Varrock, walked to the sewer manhole, stopped on an unrelated bug, and on RESTART -- which
+    # wipes the in-progress journey, since it lives in memory -- re-planned from scratch and set
+    # off 40 tiles to a bank for another Varrock tablet while standing on the entrance.
+    #
+    # The caller decides, because it has the player's position and the planner's answer and this
+    # function has neither.
+    if not skip_teleport:
+        _teleport(pack, site, task_name)
 
     pack.exact("house tablets", HOUSE_TABLET, HOUSE_TABLETS_CARRIED)
-    pack.one_of("escape ring", (ESCAPE_RING,), prefer_spent=True)
+    # FULL, not nearly spent. FOUND LIVE 2026-09-21 -- USER: "it should be able to get both from
+    # banks im not helping it." prefer_spent takes the LOWEST-charge copy, which is good
+    # housekeeping for an ordinary teleport and the wrong call for this one: the account holds 15
+    # Ring of dueling(8) and the pack kept taking a (3), then a (2), then a (1), running out every
+    # few teleports. That run ended with no ring at all. Running out is a DEAD END here, not an
+    # inconvenience -- banker stops with "no bank in range, and no ring of dueling left to reach
+    # one". Every other teleport still drains its part-charges first.
+    pack.one_of("escape ring", (ESCAPE_RING,), prefer_spent=False)
+    _top_up_kit(pack)
 
     slots = pack.slots
     if keep_carried:
@@ -324,5 +431,7 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
     if slots > supplies.INVENTORY_SLOTS:
         pack.problems.append(f"the pack needs {slots} slots and the inventory has {supplies.INVENTORY_SLOTS}")
 
-    keep = list(dict.fromkeys(pack.keep))
+    # ESSENTIALS last and slot-free: they are already carried, so counting them would make every
+    # pack read larger than it is and could refuse a trip that fits.
+    keep = list(dict.fromkeys(list(pack.keep) + list(ESSENTIALS)))
     return Loadout(pack.withdraw, keep, slots, pack.problems, unchecked)

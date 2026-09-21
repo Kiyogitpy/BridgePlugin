@@ -543,9 +543,19 @@ def test_still_short_after_the_bank_visit_is_a_stop_naming_the_items_never_a_loo
 
 def test_an_item_nobody_holds_stops_before_any_bank_trip_and_never_spends_points(monkeypatch):
     """The plan allows a SKIP here; bank memory can be stale and a skip costs 30 points, so a
-    missing item is always a STOP (ruling 2026-09-21)."""
+    missing item is always a STOP (ruling 2026-09-21).
+
+    The route is stubbed to one that ACTUALLY USES the ectophial. _packing's default is a plain
+    walk, and since 2026-09-21 a walking route makes the pack skip the teleport entirely -- quite
+    correctly, since nothing needs fetching for a walk. This test is about a teleport the route
+    depends on, so the fixture has to say so rather than leave the old default contradicting the
+    assertion."""
     ctx, calls = _packing(monkeypatch, _inv(), {k: v for k, v in BANKED.items() if k != "ectophial"})
+    monkeypatch.setattr(slayer_routes, "plan",
+                        lambda *a, **k: ([legs.item("ectophial", "Teleport", (3660, 3522, 0))], ""))
+
     routine.tick(ctx)
+
     assert calls["bank"] == [] and "ectophial" in ctx.state.stops[0].lower()
 
 
@@ -971,3 +981,19 @@ def test_a_break_never_runs_while_the_bridge_is_silent(monkeypatch):
     monkeypatch.setattr(controller, "get_slayer_task", lambda: None)
     routine.before_break(ctx)
     assert calls["teleport"] == []
+
+
+# --- 2026-09-21: don't fetch a teleport the chosen route does not use ----------------------------
+
+def test_only_a_route_that_actually_teleports_makes_the_pack_fetch_one():
+    """FOUND LIVE 2026-09-21. Standing ON the Varrock sewer manhole, the pack set off 40 tiles to a
+    bank to fetch another Varrock tablet -- for a journey that was one transport from done.
+
+    The first attempt asked "did the planner find a route", which is the wrong question: a walk is
+    a route. The right one is whether the route it chose actually TELEPORTS. Walks and transports
+    need nothing packed; an item, spell, dialogue-item or glider leg does."""
+    assert routine._route_teleports([legs.item("ectophial", "Teleport", (1, 1, 0))]) is True
+    assert routine._route_teleports([legs.spell("Moonclan", (218, 116), (1, 1, 0))]) is True
+    assert routine._route_teleports([legs.walk(1, 1, 0)]) is False
+    assert routine._route_teleports([]) is False
+    assert routine._route_teleports(None) is False

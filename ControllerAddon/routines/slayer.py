@@ -344,6 +344,24 @@ def _restock(ctx, state) -> bool:
     return True
 
 
+
+#: Leg kinds that SPEND a teleport item, spell runes or a charge -- the ones slayer_loadout._teleport
+#: exists to pack for. A walk or a transport (a ladder, a manhole) needs nothing carried, and the
+#: house hub's own legs are paid for by the house tablets the pack always keeps.
+TELEPORT_LEG_KINDS = ("item", "spell", "dialogue_item", "glider", "poh_mounted")
+
+
+def _route_teleports(route) -> bool:
+    """Does this route actually TELEPORT, or is it just walking?
+
+    FOUND LIVE 2026-09-21: standing ON the Varrock sewer manhole, the pack set off 40 tiles to a
+    bank for another Varrock tablet -- one transport from done. The first fix asked "did the
+    planner find a route", which is the wrong question, because a walk is a route. This is the
+    right one.
+    """
+    return any((leg or {}).get("kind") in TELEPORT_LEG_KINDS for leg in route or ())
+
+
 def _pack(ctx, state, tasks_cfg, player) -> bool:
     """The BANK step before TRAVEL (plan task C2). True when this tick was spent on it -- a bank
     trip or a safety stop -- and TRAVEL must not also run. UNVERIFIED LIVE as of 2026-09-21.
@@ -368,7 +386,11 @@ def _pack(ctx, state, tasks_cfg, player) -> bool:
     carried = _carried()
     banked = slayer_loadout.banked_from_memory(bank_memory.load())
     prayer = ((controller.get_skills() or {}).get("Prayer") or {}).get("level") or 1
-    loadout = slayer_loadout.build(state.task, state.count, panel, prayer, 0, carried, banked)
+    # Only pack a teleport if the route we would actually take USES one. A walk or a transport
+    # needs nothing fetched, and asking merely "is there a route" answers yes to a walk.
+    route, _why = slayer_routes.plan(state.task, player, carried, skill_levels=legs.skill_levels())
+    loadout = slayer_loadout.build(state.task, state.count, panel, prayer, 0, carried, banked,
+                                   skip_teleport=route is not None and not _route_teleports(route))
     inventory = controller.get_inventory()
     free = slayer_loadout.supplies.INVENTORY_SLOTS - len(inventory) if isinstance(inventory, list) else None
     tablets = None if banked is None else sum(

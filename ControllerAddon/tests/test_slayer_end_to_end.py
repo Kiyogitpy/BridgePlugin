@@ -223,7 +223,7 @@ def test_two_aya_tasks_then_a_kuradal_task_run_with_no_human_touch(monkeypatch):
 
     # Kuradal's task was reached by her slayer ring leg, Aya's by the Ectophial.
     text = " | ".join(world.log)
-    assert "LEG ectophial: Empty" in text and "LEG slayer ring: Slayer Tower" in text
+    assert "LEG ectophial: Teleport" in text and "LEG slayer ring: Slayer Tower" in text
 
 
 def test_a_task_the_bank_cannot_pack_stops_the_run_and_names_the_item(monkeypatch):

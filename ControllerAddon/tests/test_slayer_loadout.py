@@ -75,11 +75,15 @@ def test_a_part_used_potion_counts_by_its_doses():
 
 
 def test_the_teleport_copy_taken_is_the_most_spent_one():
-    """supplies.lowest_charge: finish a part-used ring off rather than strand it in the bank."""
+    """supplies.lowest_charge: finish a part-used ring off rather than strand it in the bank.
+
+    AMENDED 2026-09-21: still true of a task's own teleport, no longer true of the ESCAPE ring.
+    That one is now taken FULL -- see test_the_escape_ring_is_taken_FULL_not_nearly_spent for the
+    live run where taking a (3), then a (2), then a (1) ended with no ring at all."""
     lo = sl.build("Nechryael", 150, PANEL, 70, 10, carried={}, banked=BANK)
     want = _want(lo)
     assert want.get("Slayer ring (2)") == 1 and "Slayer ring (8)" not in want
-    assert want.get("Ring of dueling(3)") == 1
+    assert want.get("Ring of dueling(8)") == 1, "the escape ring is the exception"
 
 
 def test_what_a_task_needs_carried_is_on_the_list():
@@ -331,3 +335,199 @@ def test_a_blighted_restore_is_never_chosen():
     out = sl.build("nechryael", 150, _panel(), 70, 0, {}, banked)
 
     assert not any("blighted" in w["name"].lower() for w in out.withdraw)
+
+
+# --- 2026-09-21 LIVE: the bank trip deposited the routine's own means of working ----------------
+
+def test_the_rune_pouch_and_its_runes_are_ALWAYS_kept():
+    """FOUND LIVE, first real bank trip. USER: "it deposited the rune pouch all the prayer pots and
+    our slayer ring??"
+
+    The keep list held only what THIS task needs, and zombies needs none of it -- so the trip
+    correctly deposited everything else, including the rune pouch. But NPC Contact is how the
+    routine gets its NEXT task, and the pouch carries the runes for it. Depositing it strands the
+    run: it would finish zombies and then be unable to ask for anything.
+
+    These are the routine's own tools rather than any task's supplies, so they are kept for every
+    task, always."""
+    out = sl.build("cows", 20, PANEL, 70, 10, carried={}, banked=BANK)
+
+    keep = {k.lower() for k in out.keep}
+    assert "rune pouch" in keep
+    for rune in ("astral rune", "cosmic rune", "air rune", "dust rune"):
+        assert rune in keep, rune
+
+
+def test_keeping_the_pouch_does_not_charge_the_pack_a_slot_for_it():
+    """It is already in the inventory and stays there -- counting it again would make every pack
+    read one slot larger and could refuse a trip that fits."""
+    with_pouch = sl.build("cows", 20, PANEL, 70, 10, carried={"rune pouch": 1}, banked=BANK)
+    without = sl.build("cows", 20, PANEL, 70, 10, carried={}, banked=BANK)
+
+    assert with_pouch.slots == without.slots
+
+
+def test_the_escape_ring_and_house_teleports_were_already_kept_and_still_are():
+    """A regression guard around the change: the things the pack fetches must not fall off the
+    keep list while adding the ones it does not."""
+    out = sl.build("cows", 20, PANEL, 70, 10, carried={}, banked=BANK)
+
+    keep = {k.lower() for k in out.keep}
+    assert any("ring of dueling" in k for k in keep)
+    assert any("teleport to house" in k for k in keep)
+
+
+def test_a_teleport_that_needs_no_fetching_is_preferred_over_one_that_does():
+    """FOUND LIVE 2026-09-21, twice. USER: "why do we need to bank? ... we have all the
+    components on us."
+
+    _teleport walks the task's teleports IN ORDER and packs the first it can run. For icefiends
+    that order begins with "Lassar teleport", which was in the bank, so it packed a bank trip --
+    even though the very next entry is the jewellery box, which the account reaches with the house
+    tablets it already carries and which costs no inventory slot at all.
+
+    Order should not decide this. A teleport needing nothing fetched wins over one that does,
+    wherever it sits in the list; only if none is free does the fetch happen."""
+    carried = {"teleport to house": 119}
+    banked = dict(BANK, **{"lassar teleport": 20})
+
+    out = sl.build("icefiends", 17, PANEL, 70, 10, carried=carried, banked=banked)
+
+    taken = {w["name"].lower() for w in out.withdraw}
+    assert not any("lassar" in n for n in taken), "the box is free; nothing to fetch"
+
+
+def test_a_teleport_IS_fetched_when_no_free_one_exists():
+    """The preference is not a refusal. With no house tablet there is no box route, so the listed
+    tablet is packed exactly as before."""
+    out = sl.build("icefiends", 17, PANEL, 70, 10, carried={},
+                   banked=dict(BANK, **{"lassar teleport": 20}))
+
+    taken = {w["name"].lower() for w in out.withdraw}
+    assert any("lassar" in n for n in taken)
+
+
+# --- 2026-09-21: a TRAVEL KIT, so one bank trip stocks many tasks --------------------------------
+
+def test_a_bank_visit_tops_up_the_travel_kit_not_just_this_task():
+    """USER 2026-09-21: "we should have all teleports on us instead of doing banking runs after
+    each. like slayer ring, ectophial, House teleport etc."
+
+    Right: the pack only ever fetched the ONE teleport this task needed, so the next task with a
+    different teleport meant another trip. Since we are standing at a bank anyway, the marginal
+    cost of the others is a few slots and no extra walking."""
+    carried = {"teleport to house": 119}
+    banked = dict(BANK, **{"slayer ring(8)": 22, "ectophial": 1, "xeric's talisman": 1,
+                           "ring of dueling(8)": 15})
+
+    out = sl.build("cows", 20, PANEL, 70, 10, carried=carried, banked=banked)
+
+    taken = " | ".join(w["name"].lower() for w in out.withdraw)
+    for wanted in ("slayer ring", "ectophial", "xeric's talisman"):
+        assert wanted in taken, wanted
+
+
+def test_the_kit_is_never_deposited_once_carried():
+    carried = {"teleport to house": 119, "slayer ring(8)": 1, "ectophial": 1}
+
+    out = sl.build("cows", 20, PANEL, 70, 10, carried=carried, banked=BANK)
+
+    keep = " | ".join(out.keep)
+    assert "slayer ring" in keep and "ectophial" in keep
+
+
+def test_a_kit_item_already_carried_is_not_fetched_again():
+    carried = {"teleport to house": 119, "ectophial": 1}
+    banked = dict(BANK, **{"ectophial": 1})
+
+    out = sl.build("cows", 20, PANEL, 70, 10, carried=carried, banked=banked)
+
+    assert sum(1 for w in out.withdraw if "ectophial" in w["name"].lower()) == 0
+
+
+def test_the_kit_gives_way_as_the_task_itself_gets_heavier():
+    """The task's own food, potions and required items come first; the kit only ever uses slots
+    nothing else wanted, and stops short of the reserve the loot hook needs.
+
+    Measured against the two ends of the range: a 20-kill Aya task carries 8 slots of its own and
+    takes the whole kit; a 150-kill nechryael trip carries 26 and takes what still fits. Neither
+    is pushed past the inventory, which is the outcome that matters -- walking to a bank again
+    later beats refusing a trip that would have worked."""
+    banked = dict(BANK, **{"slayer ring(8)": 22, "ectophial": 1, "xeric's talisman": 1})
+
+    def kit_of(task, count):
+        out = sl.build(task, count, PANEL, 70, 10, carried={}, banked=banked)
+        assert not any("the pack needs" in p for p in out.problems), task
+        return [w["name"] for w in out.withdraw
+                if any(k in w["name"].lower() for k in ("slayer ring", "ectophial", "xeric"))]
+
+    light, heavy = kit_of("cows", 20), kit_of("nechryael", 150)
+
+    assert len(light) == 3, "a small task has room for all of it"
+    assert len(heavy) < len(light), "a heavy one takes only what fits"
+
+
+def test_a_kit_item_the_bank_does_not_have_is_not_a_problem():
+    """The kit is opportunistic. Missing one must never read as a reason to stop -- unlike a task's
+    own required item, which always does."""
+    out = sl.build("cows", 20, PANEL, 70, 10, carried={"teleport to house": 119}, banked=BANK)
+
+    assert not any("slayer ring" in p.lower() or "xeric" in p.lower() for p in out.problems)
+
+
+def test_the_escape_ring_is_taken_FULL_not_nearly_spent():
+    """FOUND LIVE 2026-09-21. USER: "it should be able to get both from banks im not helping it."
+
+    The escape ring was fetched with prefer_spent=True, which takes the LOWEST-charge copy -- good
+    housekeeping for an ordinary teleport, since partial charges are otherwise dead weight. For
+    the ESCAPE ring it is the wrong call: the account holds 15 Ring of dueling(8) and the pack kept
+    taking a (3), then a (2), then a (1), so it ran out every few teleports and needed another bank
+    trip to fix. That run ended with no ring at all.
+
+    Running out is not an inconvenience here, it is a dead end -- banker's own stop says "no bank
+    in range, and no ring of dueling left to reach one". Take the fullest one."""
+    banked = dict(BANK, **{"ring of dueling(1)": 1, "ring of dueling(8)": 15})
+
+    out = sl.build("cows", 20, PANEL, 70, 10, carried={"teleport to house": 119}, banked=banked)
+
+    rings = [w["name"] for w in out.withdraw if "dueling" in w["name"].lower()]
+    assert rings == ["Ring of dueling(8)"], rings
+
+
+def test_an_ordinary_teleport_still_uses_up_its_part_charges():
+    """The change is to the escape ring alone. A task's own teleport item keeps draining the
+    nearly-spent copies first, which is what stops a bank filling with 1-charge leftovers."""
+    banked = dict(BANK, **{"slayer ring(1)": 1, "slayer ring(8)": 22})
+
+    out = sl.build("bloodveld", 150, PANEL, 70, 10, carried={"teleport to house": 119},
+                   banked=banked)
+
+    rings = [w["name"] for w in out.withdraw if "slayer ring" in w["name"].lower()]
+    assert rings and all("(1)" in r for r in rings), rings
+
+
+def test_no_teleport_is_packed_when_the_site_is_already_reachable_on_foot():
+    """FOUND LIVE 2026-09-21. The routine teleported to Varrock, walked to the sewer manhole, and
+    stopped there on an unrelated bug. On RESTART -- which wipes the in-progress journey, since it
+    lives in memory -- the pack re-planned from scratch, decided it needed another Varrock
+    teleport, and set off 40 tiles to a bank to fetch one while standing on the entrance.
+
+    A teleport is for covering distance. When the site is already reachable from here without one,
+    there is nothing to fetch, and `skip_teleport` is how the caller says so -- it has the player's
+    position and the planner's answer, and the loadout does not."""
+    carried = {"teleport to house": 119}
+    banked = dict(BANK, **{"varrock teleport": 48})
+
+    walked = sl.build("rats", 27, PANEL, 70, 10, carried, banked, skip_teleport=True)
+    flown = sl.build("rats", 27, PANEL, 70, 10, carried, banked)
+
+    assert not any("varrock" in w["name"].lower() for w in walked.withdraw)
+    assert any("varrock" in w["name"].lower() for w in flown.withdraw), "still packed when needed"
+
+
+def test_skipping_the_teleport_does_not_skip_the_rest_of_the_pack():
+    """Food, the escape ring and the house tablets are not travel -- they are still wanted."""
+    out = sl.build("rats", 27, PANEL, 70, 10, {"teleport to house": 119}, BANK, skip_teleport=True)
+
+    keep = " | ".join(out.keep)
+    assert "ring of dueling" in keep and "teleport to house" in keep
