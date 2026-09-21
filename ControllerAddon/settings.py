@@ -32,7 +32,11 @@ DEBUG_UDP_PORT = 50556    # mcp_debug_server.py's poll_events -- a SEPARATE port
                            # bind can ever block the other's.
 
 # ---------------- Arduino serial connection ----------------
-SERIAL_PORT = os.environ.get("BRIDGE_SERIAL_PORT", "COM3")
+SERIAL_PORT = os.environ.get("BRIDGE_SERIAL_PORT", "COM6")
+                           # COM6 is the Leonardo on the HOST. The VM guest sees it as
+                           # COM3 and every guest launcher under tools/ exports
+                           # BRIDGE_SERIAL_PORT=COM3 explicitly, so this default only
+                           # governs a host-side run.
 SERIAL_BAUD = 115200
 
 # ---------------- Main loop pacing ----------------

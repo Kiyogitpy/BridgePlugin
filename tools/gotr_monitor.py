@@ -17,9 +17,10 @@ does, and this script only ever starts/stops that process, never opens the port 
 DIRECT-LOCAL, NOT THE VM SETUP CLAUDE.md DESCRIBES. CLAUDE.md documents controller.py, the
 Arduino and the RuneLite client all living inside a VirtualBox guest reached over SSH
 (tools/vmexec.py). CHECKED LIVE 2026-09-18 on this machine before writing this script: no
-VBoxManage.exe anywhere on the box, no Z:\Httpbridge share, but COM3 answers as an Arduino
-Leonardo directly and http://localhost:8080/state answers directly too (already loggedIn, already
-windowFocused) -- i.e. everything settings.py already defaults to (SERIAL_PORT=COM3,
+VBoxManage.exe anywhere on the box, no Z:\Httpbridge share, but the Arduino Leonardo answers
+directly on its COM port and http://localhost:8080/state answers directly too (already loggedIn,
+already windowFocused) -- i.e. everything settings.py already defaults to (SERIAL_PORT, COM3 when
+this was written and COM6 since 2026-09-20 when the Leonardo re-enumerated;
 API_BASE=http://localhost:8080) with no BRIDGE_SERIAL_PORT/BRIDGE_API_BASE override needed. So
 whatever this machine's actual setup is right now, it is a direct one, and this monitor drives
 controller.py as a normal local child process (subprocess.Popen) rather than over SSH into a

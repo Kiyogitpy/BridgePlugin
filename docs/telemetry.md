@@ -89,18 +89,41 @@ VirtualBox NAT forward lands on the guest's NAT adapter, never on its loopback.
 - **`IDLE`**: sent after 15 000 client cycles (20 ms each, 5 min) with NO mouse AND NO keyboard
   input -- the AFK-logout signal. **`NO_TIMEOUT`** is a keepalive every ~50 cycles that needs no
   input, so nothing has to nudge the mouse to hold the connection.
-- **`REFLECTION_CHECK_REPLY`**: the server names classes, fields and methods; the client resolves
-  them by reflection and replies with field values, modifiers and invoke results. RuneLite
-  answers these against the vanilla jar named by `runelite.reflectcheck.jar` (the property is
-  read in `client.java`), which is why an injected client reads as vanilla. We never modify
-  injected classes, so nothing here changes it. **`DETECT_MODIFIED_CLIENT`** is one constant int
+- **`REFLECTION_CHECK_REPLY` -- the one PULL channel, and the only thing that can see our
+  plugins.** The server names a class, a member and an op; the client resolves and replies.
+  `classZJ.method14092` implements five ops on any class the server names: read a static int
+  field (`getInt(null)`), **write** one (`setInt(null, v)`), field modifiers, method modifiers,
+  and **invoke a static method** with arguments the server supplies as serialized bytes
+  (`ObjectInputStream.readObject`). The only refusal is `getClassLoader() == null` -- bootstrap
+  (`java.*`) classes throw `SecurityException`; every application class is fair game.
+  **CORRECTED 2026-09-20 against 1.12.39** (this section previously claimed the opposite, and it
+  was wrong): the check does **NOT** answer against a pristine jar. `runelite.reflectcheck.jar`
+  feeds `client.field1039`, which is read by exactly ONE method (`client.method2291`,
+  `Class.forName(name, true, field1039)`) -- and that method has **zero callers in the jar**. The
+  live path resolves through `classCD.method1428`, ending in a plain `Class.forName(name)` on the
+  **client's own classloader**. So the reply describes the classes actually loaded in THIS JVM.
+  **Whether that reaches ZombieLite and `com.example` is purely a classloader question, and our
+  launch shape is the permissive case.** Plugin Hub installs load each plugin in a
+  `PluginClassLoader` whose parent is deliberately **null**, so client code cannot `Class.forName`
+  them. Our `run` task is one flat `JavaExec` classpath (`sourceSets.test.runtimeClasspath +
+  configurations.zombieLite`, build.gradle) -- injected client, `com.example.*` and ZombieLite's
+  jar share one loader, so `Class.forName("com.salvation.plugins...")` from client code RESOLVES.
+  What limits this: there is **no enumeration**. The server must already know the exact
+  fully-qualified class and member name; it cannot ask "what is loaded". It is a confirm-by-name
+  channel, where `-1` (ClassNotFound) versus a returned value is the whole tell. The exposure is
+  identical for our own bridge plugin and predates ZombieLite -- renaming packages is the only
+  lever, and it is worth nothing unless the names were guessable to begin with.
+  **`DETECT_MODIFIED_CLIENT`** is one constant int
   sent on scene load whenever the client runs inside a top-level `Frame` (every RuneLite
   instance does), so it is not a differentiator. **`CONNECTION_TELEMETRY`** is login-connection
   timing counters (three longs, four ints). `SEND_SNAPSHOT` is the abuse report, `BUG_REPORT` and
   `CLIENT_CHEAT` (`::` commands) are user-initiated.
 
 **What is NOT in any packet:** the plugin list, the sidebar, overlays, ZombieLite, the HTTP
-bridge, the UDP stream, the serial port, other processes, the second monitor. The only channel
+bridge, the UDP stream, the serial port, other processes, the second monitor. That is a statement
+about what the client VOLUNTEERS; `REFLECTION_CHECK_REPLY` above is the one channel that can
+confirm a plugin class the server already knows the name of, and in our flat-classpath launch it
+can. The only channel
 that carries our behaviour is the input stream itself -- which is exactly the channel a physical
 Arduino feeds. Separately, RuneLite's own `TelemetryClient` (`client-1.12.33/.../TelemetryClient.java`)
 sends the OS / Java / launcher-version strings and a "is a Jagex account" boolean to

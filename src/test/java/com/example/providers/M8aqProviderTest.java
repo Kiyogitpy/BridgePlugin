@@ -1,7 +1,7 @@
 package com.example.providers;
 
-import net.runelite.client.plugins.m8aq.api.export.GameOutput;
-import net.runelite.client.plugins.m8aq.api.export.ReaderCatalog;
+import com.example.m8aq.api.export.GameOutput;
+import com.example.m8aq.api.export.ReaderCatalog;
 import org.junit.Test;
 
 import java.util.Arrays;

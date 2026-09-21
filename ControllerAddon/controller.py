@@ -963,7 +963,7 @@ def get_api(group: str, reader: str):
     """One vendored m8aq game-state reader (M8aqProvider's /api/<group>/<reader>).
 
     These are the RLitePlus/m8aq-plugins readers vendored under
-    src/main/java/net/runelite/client/plugins/m8aq/api/ -- 66 snapshot endpoints covering things
+    src/main/java/com/example/m8aq/api/ -- 66 snapshot endpoints covering things
     this bridge never exposed: every storage container (rune pouch, herb sack, log basket, gem/
     coal bag, seed box, fish barrel, looting bag, essence pouches, potion storage, seed vault,
     group/house storage, death recovery), run energy/weight/destination (player/movement),
