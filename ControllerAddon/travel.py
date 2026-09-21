@@ -1483,6 +1483,14 @@ FAIRY_DIAL_LETTERS = ("ADCB", "ILKJ", "PSRQ")
 FAIRY_OPT_CONFIGURE = "Configure"
 
 FAIRY_INTERFACE_S = 3.0        # Configure click -> the dial interface being clickable
+#: ...plus the WALK the game performs first. FOUND LIVE 2026-09-21 on bears: the ring was found
+#: 9 tiles away (well inside the radius-20 scan, so nothing walked to it first), Configure was
+#: taken from there, and the flat 3 s expired mid-approach. Each retry then RE-CLICKED, which
+#: restarts the walk -- the same redirect loop open_bank's docstring describes -- so four
+#: attempts never once let the player arrive, and the leg stopped the task. 0.7 s/tile is the
+#: figure banker._click_resolve_budget already uses for exactly this.
+FAIRY_WALK_ALLOWANCE_S = 0.7
+FAIRY_INTERFACE_MAX_S = 12.0
 FAIRY_DIAL_SETTLE_S = 0.4      # a rotation -> the varbit reading back (measured well under this)
 FAIRY_DIAL_TRIES = 3           # per dial: at most two rotations are ever needed, plus slack
 # Whole-combination passes, re-read from scratch, before giving up. The dial varbits can disagree
@@ -1568,8 +1576,11 @@ def hop_fairy_ring(ctx, code, expect, ring_tile=None, expect_region=None, log="t
                                         refresh_target=refresh):
         debug_log.log(log, "could not open the fairy ring's Configure interface")
         return False
+    # Budget the walk: see FAIRY_WALK_ALLOWANCE_S.
+    interface_budget = min(FAIRY_INTERFACE_S + max(0, ring.get("distance") or 0) * FAIRY_WALK_ALLOWANCE_S,
+                           FAIRY_INTERFACE_MAX_S)
     outcome_waits.await_pre(
-        ctx, "WIDGET_LOADED", FAIRY_INTERFACE_S,
+        ctx, "WIDGET_LOADED", interface_budget,
         confirm=lambda: bool(controller.get_widget(
             FAIRY_GROUP, FAIRY_CONFIRM_CHILD).get("clickable")),
         now_fn=time.time, sleep_fn=time.sleep,

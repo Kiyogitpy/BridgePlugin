@@ -1011,6 +1011,30 @@ def test_a_door_that_talks_for_ever_still_gives_up(monkeypatch):
     assert any("still shut" in m for m in logged)
 
 
+def test_the_fairy_dial_wait_budgets_the_walk_to_the_ring(monkeypatch):
+    """FOUND LIVE 2026-09-21 on bears. The ring was 9 tiles away -- well inside the radius-20
+    scan, so nothing walked to it first -- Configure was taken from there, and the flat 3 s
+    expired mid-approach. Each retry RE-CLICKED, restarting the walk, so four attempts never
+    once let the player arrive and the leg stopped the task."""
+    budgets = []
+    ring = {"id": travel.FAIRY_RING_ID, "x": 3082, "y": 3206, "plane": 0, "distance": 9,
+            "visible": True, "screenX": 715, "screenY": 446}
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [ring])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a: None)
+    monkeypatch.setattr(controller, "click_menu_action", lambda *a, **k: True)
+    monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: {"clickable": False})
+    monkeypatch.setattr(travel.outcome_waits, "await_pre",
+                        lambda ctx, sig, budget, **k: budgets.append(budget))
+    monkeypatch.setattr(travel, "_fairy_dial_value", lambda i: 0)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    travel.hop_fairy_ring(_Ctx(), "BLR", "Legends")
+
+    assert budgets, "the interface wait must happen"
+    assert budgets[0] > travel.FAIRY_INTERFACE_S, "9 tiles of walking has to be paid for"
+    assert budgets[0] <= travel.FAIRY_INTERFACE_MAX_S
+
+
 def test_an_upper_plane_route_that_leaves_the_loaded_scene_is_discarded(walker, monkeypatch):
     """Risk 1 from the design doc. Above ground the map has no data outside a building and no
     data reads as PASSABLE, so one missing exterior wall lets BFS escape into open sky. A route
