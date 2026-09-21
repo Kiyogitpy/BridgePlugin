@@ -3781,7 +3781,7 @@ carried" while the pack set off 40 tiles to a bank for a tablet that lands 71 ti
   `travel.py`/`worldmap.py` are untouched, and `near_site` keeps its exact old meaning because
   `_pack` uses it for a different question ("leave a task in progress alone").
 
-### 2026-09-21, UNATTENDED LIVE SESSION: the whole loop ran, and the thirteen bugs it found
+### 2026-09-21, UNATTENDED LIVE SESSION: the whole loop ran, and the fourteen bugs it found
 
 **The headline: the task loop works end to end.** In one run it acquired from Aya, banked for the
 loadout, equipped the task's gear, travelled through the house to a fairy ring, fought, and took
@@ -4052,6 +4052,58 @@ kills, so a 139-kill task uses most of the four-restock ceiling. That ceiling is
 death, so the behaviour is safe -- but the elves profile plus this account's six-slot travel kit
 genuinely do not fit a 28-slot inventory, and freeing the prayer slots (bug 9) is what made it
 comfortable rather than marginal.
+
+#### 14. Two monsters, one name: the level-96 cave bug
+
+USER, after watching the session: *"Cave bugs that are significantly more powerful -- with a
+combat level of 96. Routine should skip these altogether and instead focus on the lower level
+ones."*
+
+They are two different NPCs wearing one name. From the game cache:
+
+| id | symbol | level | hp | att | def |
+|---|---|---|---|---|---|
+| 481 | `swamp_cave_bug` | **6** | 5 | 6 | 6 |
+| 483 | `molanisk_giant_cave_bug` | **96** | 93 | 82 | 84 |
+
+Both are called exactly `Cave bug`, both carry `op2=Attack`, and both spawn in the Dorgesh-Kaan
+South Dungeon. This session's logs show the routine attacking each of them
+(`attacking Cave bug (id=481...)` and `(id=483...)`), and the strong one tends to WIN the race
+because `pick_target` ranks by distance and 483 is size 2 -- big, close, and an age to kill on a
+task whose other monsters die in one hit.
+
+**The data already knew.** Aya's registry carries `npc_ids`, and cave bugs is `(481,)`. Nothing
+read it: `slayer_tasks.target_names` went to `combat_core` and the ids did not. `combat_config`
+also *empties* the panel's `targets`, on the sound reasoning that panel ids are resolved from
+whatever is in the scene -- but that key would not have helped anyway, because **`targets` is
+ADDITIVE** (an id there matches a monster the names miss) and what is needed here **SUBTRACTS**.
+
+So `combat_config` takes `task_npc_ids` and `pick_target` enforces it as an allow-list, after
+the name match. The key is left **out of the config entirely** when there is nothing to say, so
+`combat.py` and every Kuradal task -- the catalog carries no ids at all -- are byte-for-byte
+unchanged.
+
+**Checked before shipping, because an allow-list that is too narrow starves a task rather than
+fixing it:**
+- every one of Aya's 19 FIGHT tasks has `npc_ids` (a test asserts it, so a new task cannot
+  quietly arrive without them);
+- in the cave bugs kill area (x 2708-2722, y 5221-5246) the mejrs spawn data holds **seven 481s
+  against two 483s**, so the weak ones are the bulk of the site;
+- **cave slimes, the sibling task in the same dungeon, has only one id** (480, level 23) -- there
+  is no strong twin, so cave bugs is the only one of the pair affected.
+
+The failure mode if an id list ever *is* wrong is a safe one: no target, a walk back, and
+eventually the "nothing to fight" stop -- never the wrong monster.
+
+**NOT VERIFIED LIVE.** The account is parked on Greater demons, which the routine refuses by
+design, so there was no way to be handed a cave bugs task. Cache, spawn data and unit tests only.
+The thing to watch on the first live cave bugs task is simply that every `[combat] attacking
+Cave bug` line reads `id=481`.
+
+**The general lesson:** the earlier audit recorded in this file checked name collisions and
+cleared them -- *"'cave bugs' matches Cave bug larva, but the cache shows neither larva has an
+Attack option at all"*. It looked for a weaker same-named NPC and found a harmless one. It did
+not look for a STRONGER one, and that is the case that costs you.
 
 #### Still unverified after this session
 
