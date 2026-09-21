@@ -8,7 +8,7 @@
 # get_widget/get_widget_children, a different mechanism for a different dialogue surface, and
 # have nothing to delegate here. Two measured facts shape this module:
 #
-# - The reader has NO open/visible field (net.runelite.client.plugins.m8aq.api.ui.Dialogue has
+# - The reader has NO open/visible field (com.example.m8aq.api.ui.Dialogue has
 #   only npcName/npcText/playerText/options/itemText/...). "Open" is therefore "any of those is
 #   set". Collapsing it to bool(options) reads a "click here to continue" stage as CLOSED --
 #   giants_foundry re-clicked Kovac mid-dialogue because of exactly that (2026-09-03).

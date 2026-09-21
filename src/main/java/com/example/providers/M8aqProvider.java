@@ -3,8 +3,8 @@ package com.example.providers;
 import com.example.bridge.BridgeHttpServer;
 import net.runelite.api.Client;
 import net.runelite.client.callback.ClientThread;
-import net.runelite.client.plugins.m8aq.api.export.GameOutput;
-import net.runelite.client.plugins.m8aq.api.export.ReaderCatalog;
+import com.example.m8aq.api.export.GameOutput;
+import com.example.m8aq.api.export.ReaderCatalog;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -17,10 +17,11 @@ import java.util.TreeMap;
 /**
  * Exposes the vendored RLitePlus/m8aq-plugins game-state readers as bridge endpoints.
  *
- * <p>The readers themselves live under {@code net.runelite.client.plugins.m8aq.api} and are a
- * byte-identical copy of upstream in their ORIGINAL package -- see that tree's VENDORED.md.
- * Nothing there may be edited; this class is the only adapter between them and our bridge, so
- * a re-sync (tools/sync-m8aq.sh) stays a clean overwrite.
+ * <p>The readers themselves live under {@code com.example.m8aq.api}, an otherwise-verbatim copy
+ * of upstream repackaged out of {@code net.runelite.client.plugins.m8aq} on 2026-09-20 -- see
+ * that tree's VENDORED.md for why. Nothing there may be edited beyond that rename; this class is
+ * the only adapter between them and our bridge, so a re-sync (tools/sync-m8aq.sh) stays a clean
+ * overwrite plus a rename pass.
  *
  * <p><b>Discovery is by reflection, on purpose.</b> {@link ReaderCatalog} finds every public
  * class under that package with a {@code public static State getState(Client)} method, so a

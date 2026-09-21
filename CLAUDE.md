@@ -251,19 +251,38 @@ The facts that shape day-to-day work:
   machine; (4) re-derive after every client build bump: `python tools/deobfuscate.py` does
   the whole thing, `ControllerAddon/deob_guard.py` refuses to drive input against an
   unanalyzed build, and `tools/telemetry_fingerprint.py` diffs the telemetry surface
-  between builds (1.12.37 -> 1.12.38: nothing collected changed).
+  between builds (1.12.37 -> 1.12.38 and 1.12.38 -> 1.12.39: nothing collected changed).
+  **A `~ X referenced N -> M places` line is decompiler noise, not a finding** -- 6 of the 8
+  in the 1.12.39 diff were an exact round-trip of the 1.12.38 ones, back to their 1.12.37
+  values. The 39 "changes" there were that plus obfuscated FIELD NAMES shifting; all 101
+  named packets kept their id and length, and every `exec`/property/mouse-recorder value was
+  byte-identical. Diff the two `telemetry-*.json` directly before believing the markdown.
 - The plugin list, overlays, ZombieLite, the bridge, the UDP stream and the serial port
-  are in NO packet -- the input stream is the only channel that carries our behaviour,
+  are in NO packet the client VOLUNTEERS. The one PULL channel is `REFLECTION_CHECK_REPLY`:
+  the server names a class and member, and the client resolves it with a plain `Class.forName`
+  on its OWN classloader (the `runelite.reflectcheck.jar` "answer as vanilla" story is dead code
+  in 1.12.39 -- verified, zero callers). Our `run` task puts the injected client, `com.example.*`
+  and ZombieLite's jar on ONE flat classpath, so those names resolve where a Plugin Hub install's
+  null-parent `PluginClassLoader` would hide them. There is no enumeration -- the server must
+  already know the exact name -- so this confirms, it does not discover. Details in
+  `docs/telemetry.md`. The input stream is still the only channel that carries our behaviour,
   which is exactly the channel the physical Arduino feeds. RuneLite's own telemetry goes
   to runelite.net, not Jagex.
 
 ## Vendored m8aq readers (`GET /api/...`)
 
-Added 2026-08-29. `src/main/java/net/runelite/client/plugins/m8aq/api/` is a **byte-identical
-copy of RLitePlus/m8aq-plugins' reader tree**, kept in its ORIGINAL package on purpose, and
-`com.example.providers.M8aqProvider` is the only adapter between it and our bridge. This is the
-one place in the repo where third-party source sits on the build path -- everything else under
-`data/decompiled/` is still documentation only.
+Added 2026-08-29. `src/main/java/com/example/m8aq/api/` is a copy of RLitePlus/m8aq-plugins'
+reader tree, and `com.example.providers.M8aqProvider` is the only adapter between it and our
+bridge. This is the one place in the repo where third-party source sits on the build path --
+everything else under `data/decompiled/` is still documentation only.
+
+**REPACKAGED 2026-09-20 out of `net.runelite.client.plugins.m8aq`** (the one sanctioned edit to
+the tree; nothing else changed). `REFLECTION_CHECK_REPLY` resolves server-named classes with a
+plain `Class.forName` on the client's own classloader, and our flat `run` classpath puts this
+tree on it -- so a publicly-known name in the `net.runelite.client.plugins.*` namespace that is
+NOT a real RuneLite built-in was a clean one-probe positive. The old "original package keeps a
+re-sync clean" argument died with the upstream repo, which now 404s. Details in the file's own
+`VENDORED.md` and `docs/telemetry.md`.
 
 66 endpoints, `GET /api/<group>/<reader>` (kebab-cased), plus `GET /api/all` (every reader in one
 snapshot, which is `export/GameOutput`) and `GET /api/index` (the live path list). Read
@@ -281,17 +300,20 @@ and Soul Wars.
 
 Five things to know before touching any of it:
 
-- **Never edit a file under `api/`.** The no-edits rule is what makes `tools/sync-m8aq.sh` a
-  clean overwrite instead of a conflict-ridden rewrite of 71 files, and it is the whole reason
-  the package was not renamed to `com.example`. Wrap behaviour in `M8aqProvider` instead. See
-  `src/main/java/net/runelite/client/plugins/m8aq/VENDORED.md` for the pinned upstream commit.
+- **Never edit a file under `api/`** beyond the 2026-09-20 package rename already applied.
+  Keeping it otherwise verbatim is what makes a future diff against upstream readable. Wrap
+  behaviour in `M8aqProvider` instead. See `src/main/java/com/example/m8aq/VENDORED.md` for the
+  pinned commit, the dead upstream, and the repackage step any future sync has to add.
 - **Discovery is reflection, deliberately.** `ReaderCatalog` finds every public class with a
   `public static State getState(Client)` via a Guava classpath scan, so a reader added upstream
   becomes an endpoint on the next client rebuild with **no code change**. That is the payoff for
   vendoring verbatim. The cost: a scan that walks nothing yields zero endpoints and no error --
   a bridge that is up and serves none of this. Hence the startup count log, the `stderr` warning
   below `MINIMUM_EXPECTED_READERS`, and `M8aqProviderTest`'s floor assertion. MEASURED under the
-  Gradle test classloader: 67 discovered, 66 endpoints.
+  Gradle test classloader: 67 discovered, 66 endpoints. **`ReaderCatalog.API_PACKAGE` is the
+  single point of failure here** -- it drives both the scan root and `getGroupName`'s prefix
+  stripping, so it must move with the tree; the 2026-09-20 rename was verified by re-running
+  `M8aqProviderTest` (5/5, floor and path-stability both green), not by compiling alone.
 - **Namespaced under `/api/` because eight names collide.** `Bank`, `Inventory`, `Equipment`,
   `Prayer`, `Npcs`, `Skills`, `GroundItems` and `TileObjects` are all readers here AND existing
   endpoints of ours with a different JSON shape. The two coexist and mean different things --

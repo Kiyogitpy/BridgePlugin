@@ -2,9 +2,12 @@
 #
 # Re-sync the vendored m8aq api readers from upstream.
 #
-# The vendored tree at src/main/java/net/runelite/client/plugins/m8aq/api/ is a byte-identical
-# copy of upstream in its ORIGINAL package, so this is a clean overwrite -- see that directory's
-# VENDORED.md for why that property matters and must not be broken.
+# The vendored tree at src/main/java/com/example/m8aq/api/ is an upstream copy, REPACKAGED
+# (see VENDORED.md): every file's package and import lines were rewritten from
+# net.runelite.client.plugins.m8aq to com.example.m8aq on 2026-09-20, so it is no longer
+# byte-identical to upstream. It is otherwise verbatim, and that is what keeps this a clean
+# overwrite plus one rename pass rather than a conflict-ridden rewrite of 71 files -- see that
+# directory's VENDORED.md for the rename step this script's output still has to go through.
 #
 # New upstream reader classes become new /api/... endpoints with no code change on our side.
 # An upstream FIELD RENAME silently changes JSON keys the Python side may depend on, which is
@@ -16,12 +19,12 @@
 set -euo pipefail
 
 UPSTREAM="https://github.com/RLitePlus/m8aq-plugins"
-SUBTREE="src/main/java/net/runelite/client/plugins/m8aq/api"
+SUBTREE="src/main/java/com/example/m8aq/api"
 REF="${1:-main}"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 DEST="$REPO_ROOT/$SUBTREE"
-STAMP="$REPO_ROOT/src/main/java/net/runelite/client/plugins/m8aq/VENDORED.md"
+STAMP="$REPO_ROOT/src/main/java/com/example/m8aq/VENDORED.md"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
