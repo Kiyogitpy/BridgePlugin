@@ -20,3 +20,6 @@ def get_config(bridge_config):
 
 on_event = combat_core.on_event
 tick = combat_core.fight_tick
+# A break is taken at a bank rather than among the monsters: tick() is skipped for the whole
+# break, so nothing eats or prays. See combat_core.bank_before_break.
+before_break = combat_core.bank_before_break

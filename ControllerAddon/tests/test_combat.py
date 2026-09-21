@@ -381,3 +381,72 @@ def test_the_hook_is_not_consulted_when_there_is_room(monkeypatch):
                                 {"minValue": 5000, "makeRoom": lambda item: asked.append(1) or False})
     combat_core.maybe_loot(ctx)
     assert taken == ["Rune platebody"] and asked == []
+
+
+# --- 2026-09-21: a break is spent at the BANK, not next to the monster ---------------------------
+
+def _break_world(monkeypatch, bank_enabled=True, banked_ok=True, spot=None, anchor=None):
+    calls = {"bank": [], "saved": 0}
+    monkeypatch.setattr(combat_core.travel, "save_location",
+                        lambda: calls.__setitem__("saved", calls["saved"] + 1) or spot)
+    monkeypatch.setattr(combat_core.banker, "bank_up",
+                        lambda ctx, cfg: calls["bank"].append(cfg) or banked_ok)
+    config = {"bank": {"enabled": bank_enabled, "keepItems": ["rune pouch"]},
+              "food": {"enabled": True}, "potions": {"prayerEnabled": True}}
+    ctx = _Ctx(config)
+    ctx.state.data["current_target_index"] = 4412
+    if anchor is not None:
+        ctx.state.data[combat_core.banker.RETURN_LOCATION_KEY] = anchor
+    return ctx, calls
+
+
+SPOT = {"x": 2440, "y": 9790, "plane": 0}
+
+
+def test_a_break_banks_first_and_stays_there_so_nothing_attacks_during_it(monkeypatch):
+    """tick() is skipped for the WHOLE break (3-12 minutes), so nothing eats and nothing prays --
+    standing among aggressive monsters for that long is a death. The bank is safe, and the trip
+    also puts the loot away. returnToSpot is FALSE so the break is taken AT the bank; the anchor
+    is put back afterwards, and combat_core's own per-tick return_to_spot walks home once the
+    break ends."""
+    ctx, calls = _break_world(monkeypatch, spot=SPOT)
+    combat_core.bank_before_break(ctx)
+    assert len(calls["bank"]) == 1
+    cfg = calls["bank"][0]
+    assert cfg["returnToSpot"] is False and cfg["enabled"] is True
+    assert "rune pouch" in cfg["keepItems"], "the caller's own keep list survives"
+    assert ctx.state.data.get("current_target_index") is None, "the fight is let go of first"
+    assert ctx.state.data[combat_core.banker.RETURN_LOCATION_KEY] == SPOT, "the way home is remembered"
+    assert ctx.state.data[combat_core.banker.RETURN_ATTEMPTS_KEY] == 0
+
+
+def test_with_banking_switched_off_the_break_is_taken_where_we_stand(monkeypatch):
+    """No bank trip is possible, so there is nothing safe to do -- exactly today's behaviour."""
+    ctx, calls = _break_world(monkeypatch, bank_enabled=False, spot=SPOT)
+    combat_core.bank_before_break(ctx)
+    assert calls["bank"] == [] and calls["saved"] == 0
+
+
+def test_a_break_during_a_return_trip_changes_nothing(monkeypatch):
+    """Already walking home from a bank: we are not among the monsters, and a second trip would
+    throw the anchor away."""
+    ctx, calls = _break_world(monkeypatch, spot=SPOT, anchor={"x": 1, "y": 2, "plane": 0})
+    combat_core.bank_before_break(ctx)
+    assert calls["bank"] == []
+    assert ctx.state.data[combat_core.banker.RETURN_LOCATION_KEY] == {"x": 1, "y": 2, "plane": 0}
+
+
+def test_a_failed_bank_trip_leaves_no_anchor_to_walk_from(monkeypatch):
+    """bank_up failed, so we are somewhere unknown -- inventing a way home from here would send
+    the routine walking off after the break. It just fights on, as it does today."""
+    ctx, calls = _break_world(monkeypatch, banked_ok=False, spot=SPOT)
+    combat_core.bank_before_break(ctx)
+    assert len(calls["bank"]) == 1
+    assert combat_core.banker.RETURN_LOCATION_KEY not in ctx.state.data
+
+
+def test_an_unrecorded_position_still_banks_but_promises_no_way_back(monkeypatch):
+    ctx, calls = _break_world(monkeypatch, spot=None)
+    combat_core.bank_before_break(ctx)
+    assert len(calls["bank"]) == 1
+    assert combat_core.banker.RETURN_LOCATION_KEY not in ctx.state.data

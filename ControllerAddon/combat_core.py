@@ -59,19 +59,13 @@ def fight_tick(ctx):
         # it" decision -- it was never wired into what actually gets deposited once a trip
         # starts). Merge it into the keepItems this call site actually passes down instead of
         # trusting the two to somehow already agree.
-        merged_bank_cfg = dict(bank_cfg)
-        merged_bank_cfg["keepItems"] = sorted(
-            {*(n.lower() for n in bank_cfg.get("keepItems", [])), *protected_supply_names(config)}
-        )
+        merged_bank_cfg = bank_config(config)
         # Auto-pick whatever food/prayer restore is actually in the bank rather than relying
         # solely on Controller Settings' explicit withdraw list -- CONFIRMED (user request
         # 2026-08-06), and directly closes the gap that let a bank trip "succeed" without ever
         # restocking anything (see out_of_critical_supplies/BANK_NO_PROGRESS_MAX above). Gated
         # on the same enabled flags maintain_supplies itself already checks, so this doesn't
         # withdraw food for a routine that has food handling turned off entirely.
-        merged_bank_cfg["autoFood"] = config.get("food", {}).get("enabled", False)
-        # Potions toggle alone, like maintain_prayer_potions (see its USER-REPORTED note).
-        merged_bank_cfg["autoPrayer"] = config.get("potions", {}).get("prayerEnabled", False)
         # Walk back to the tile we left from -- USER-REPORTED 2026-09-07 ("ends up stuck at
         # Ferox"). Opt-in because banker's default only walks home from the Ferox teleport
         # path, which left a trip to a bank inside maxBankDistance (40) simply fighting on
@@ -134,6 +128,67 @@ def inventory_full() -> bool:
 # the routine stops and asks a human to fix the withdraw list. Referenced by fight_tick's bank
 # branch since 2026-08-06; DEFINED only on 2026-09-18 (it raised NameError before that).
 BANK_NO_PROGRESS_MAX = 3
+
+
+def bank_config(config: dict) -> dict:
+    """The bank_up config this routine banks with. Extracted 2026-09-21 so the break path banks
+    on exactly the same terms as an ordinary trip -- two copies of this would drift.
+
+    deposit_inventory only ever reads keepItems off the config dict passed in -- it has no idea
+    protected_supply_names() exists. CONFIRMED live 2026-08-06 (user's Slayer ring, herb sack,
+    seed box, bonecrusher, ash sanctifier and ectoplasmator all got deposited on the very first
+    bank trip after adding them to protected_supply_names(): that function is only ever consulted
+    by has_bankable_loot, for the "is banking even worth it" decision -- it was never wired into
+    what actually gets deposited once a trip starts). Merge it into the keepItems the call site
+    actually passes down instead of trusting the two to somehow already agree.
+
+    autoFood/autoPrayer let the banker pick whatever food or prayer restore is really in the bank
+    rather than relying solely on the explicit withdraw list (USER 2026-08-06) -- gated on the same
+    enabled flags maintain_supplies itself checks, so a routine with food handling off withdraws
+    none.
+    """
+    bank_cfg = config.get("bank", {})
+    merged = dict(bank_cfg)
+    merged["keepItems"] = sorted(
+        {*(n.lower() for n in bank_cfg.get("keepItems", [])), *protected_supply_names(config)}
+    )
+    merged["autoFood"] = config.get("food", {}).get("enabled", False)
+    merged["autoPrayer"] = config.get("potions", {}).get("prayerEnabled", False)
+    return merged
+
+
+def bank_before_break(ctx) -> None:
+    """The engine's before_break hook: spend the break AT A BANK, not among the monsters.
+
+    tick() is SKIPPED for the whole break -- 3 to 12 minutes with this project's default settings
+    -- so nothing eats, nothing drinks and nothing retaliates. Standing among aggressive monsters
+    for that long is a death and an item loss, which is what an unattended run must not risk. This
+    hook runs fully live, before the break starts, and the break waits for it to return.
+
+    So: let the target go, bank on the routine's own terms with returnToSpot FALSE (the break is
+    taken at the bank, which is safe and where the loot belongs anyway), then put the return anchor
+    back. combat_core's own per-tick return_to_spot -- which already handles the Ferox case with a
+    teleport the trip withdrew, because Ferox is a sealed island on the collision map -- walks home
+    once the break ends.
+
+    It does NOTHING when banking is switched off (there is no safe place to go, so the break is
+    taken where we stand, exactly as before), when a return trip is already under way, or when the
+    trip fails -- inventing a way home from an unknown position would send the routine walking off
+    after the break. UNVERIFIED LIVE as of 2026-09-21."""
+    config = ctx.state.config or {}
+    if not (config.get("bank") or {}).get("enabled"):
+        return
+    if ctx.state.data.get(banker.RETURN_LOCATION_KEY) is not None:
+        return
+    spot = travel.save_location()
+    debug_log.log("bank", "a break is due -- banking first and taking it there")
+    ctx.state.data["current_target_index"] = None
+    merged = bank_config(config)
+    merged["enabled"] = True
+    merged["returnToSpot"] = False
+    if banker.bank_up(ctx, merged) and spot is not None:
+        ctx.state.data[banker.RETURN_LOCATION_KEY] = spot
+        ctx.state.data[banker.RETURN_ATTEMPTS_KEY] = 0
 
 
 def needs_banking(ctx) -> bool:
