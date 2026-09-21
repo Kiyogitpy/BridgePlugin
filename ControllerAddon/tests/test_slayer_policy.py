@@ -206,3 +206,44 @@ def test_every_new_setting_falls_back_to_its_default_on_an_un_rebuilt_client():
     assert sp.loot_decision(1, False, 0, 30, "Shark", 3, None, None, tasks_cfg=LIVE_TASKS) == (sp.LEAVE, None)
     assert sp.loot_decision(60_000, False, 0, 30, "Shark", 3, None, None, tasks_cfg=LIVE_TASKS)[0] == sp.EAT_THEN_TAKE
     assert sp.loot_decision(200_000, False, 0, 0, "Shark", 3, None, None, tasks_cfg=LIVE_TASKS)[0] == sp.EAT_THEN_TAKE
+
+
+# --- a full inventory costs food, not the run (FOUND LIVE 2026-09-21) --------------------------
+#
+# The first Kuradal task ever run (elves x139) wanted 15 food, 8 prayer potions and a teleport
+# crystal. The inventory filled on slot 28 and the trip STOPPED over the one prayer potion that
+# would not fit -- a potion the bank had. RESTOCK exists precisely to come back for more.
+
+def _short(*entries):
+    return slayer_loadout.Loadout(
+        withdraw=[{"name": n, "quantity": q, "bulk": b} for n, q, b in entries],
+        keep=[], slots=28, problems=[], unchecked=())
+
+
+def test_a_bulk_only_shortfall_with_a_full_inventory_goes_and_fights():
+    verdict, why = sp.bank_verdict(_short(("Prayer potion(4)", 1, True)), 0, {}, 50,
+                                   visited_bank=True)
+    assert verdict == sp.GO
+    assert "full" in why and "restock" in why.lower()
+
+
+def test_a_missing_teleport_still_stops_even_with_a_full_inventory():
+    """The thing RESTOCK cannot fix. Running out of food is a trip back; running out of the way
+    there is a stranding, so the two must never compete for the last slot on equal terms."""
+    verdict, _ = sp.bank_verdict(_short(("Teleport crystal (1)", 1, False)), 0, {}, 50,
+                                 visited_bank=True)
+    assert verdict == sp.STOP
+
+
+def test_a_bulk_shortfall_with_room_to_spare_still_stops():
+    """Short WITH free slots means the bank did not have it, which is a real problem."""
+    verdict, _ = sp.bank_verdict(_short(("Prayer potion(4)", 1, True)), 4, {}, 50,
+                                 visited_bank=True)
+    assert verdict == sp.STOP
+
+
+def test_a_mixed_shortfall_stops_on_the_non_bulk_half():
+    verdict, _ = sp.bank_verdict(
+        _short(("Prayer potion(4)", 1, True), ("Teleport crystal (1)", 1, False)),
+        0, {}, 50, visited_bank=True)
+    assert verdict == sp.STOP

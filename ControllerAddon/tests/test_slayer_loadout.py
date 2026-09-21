@@ -632,3 +632,29 @@ def test_a_part_used_potion_still_leaves_room_for_the_rest_of_the_budget():
     out = sl.build("Gargoyles", 183, _panel(), 77, 0, carried, banked)
 
     assert _want(out)["Super restore(4)"] == 6
+
+
+# --- the way there is withdrawn before the food (FOUND LIVE 2026-09-21) -----------------------
+
+def test_the_withdraw_list_puts_the_journey_before_the_bulk_consumables():
+    """The first Kuradal task ever run (elves x139) withdrew food, then potions, then the
+    `Teleport crystal (1)` -- and the inventory filled on slot 28, so the only way to Lletya was
+    the one thing that did not fit. Running out of food is a RESTOCK; running out of the way
+    there is a stranding, so they must not compete for the last slot on equal terms."""
+    pack = sl._Pack(carried={}, banked=None)
+    pack._take("cooked karambwan", 15, bulk=True)
+    pack._take("teleport crystal (1)", 1)
+    pack._take("prayer potion(4)", 8, bulk=True)
+    pack._take("ring of dueling(8)", 1)
+    pack.withdraw.sort(key=lambda w: bool(w.get("bulk")))
+    assert [w["name"] for w in pack.withdraw] == [
+        "Teleport crystal (1)", "Ring of dueling(8)", "Cooked karambwan", "Prayer potion(4)"],         "non-bulk first, and stable within each half"
+
+
+def test_food_and_prayer_restores_are_marked_bulk_and_a_teleport_is_not():
+    pack = sl._Pack(carried={}, banked=None)
+    pack.exact("food", "cooked karambwan", 3, bulk=True)
+    pack.one_of("escape ring", ("ring of dueling",), prefer_spent=False)
+    by_name = {w["name"].lower(): w for w in pack.withdraw}
+    assert by_name["cooked karambwan"]["bulk"] is True
+    assert any(not w.get("bulk") for w in pack.withdraw), "the ring is not a bulk consumable"

@@ -136,10 +136,14 @@ class _Pack:
         self.banked = banked
         self.withdraw, self.keep, self.problems, self.slots = [], [], [], 0
 
-    def _take(self, bank_name, quantity):
-        self.withdraw.append({"name": _display(bank_name), "quantity": quantity})
+    def _take(self, bank_name, quantity, bulk=False):
+        """`bulk` marks a RESTOCKABLE CONSUMABLE (food, prayer restores) -- something a trip can
+        carry less of and top up later, as against the one teleport that reaches the site or the
+        gear the task cannot be fought without. build() withdraws the non-bulk entries FIRST and
+        slayer_policy treats a bulk-only shortfall differently. See BULK_FIRST in build()."""
+        self.withdraw.append({"name": _display(bank_name), "quantity": quantity, "bulk": bulk})
 
-    def exact(self, label, name, wanted, stackable=False):
+    def exact(self, label, name, wanted, stackable=False, bulk=False):
         """A plain item by its exact name (food): top up to `wanted`. `stackable` items share
         one slot whatever the quantity (35 ice coolers are ONE slot, not 35)."""
         base = name.lower()
@@ -150,13 +154,13 @@ class _Pack:
         if short <= 0:
             return
         if self.banked is None:
-            self._take(base, short)
+            self._take(base, short, bulk=bulk)
             return
         available = int(self.banked.get(base) or 0)
         if available < short:
             self.problems.append(f"{label}: need {wanted} {_display(base)}, hold {held}, bank has {available}")
         if available > 0:
-            self._take(base, min(short, available))
+            self._take(base, min(short, available), bulk=bulk)
 
     def doses(self, label, base, potions, floor=None):
         """A dosed potion: count DOSES held, then fill the trip's slot budget from the bank,
@@ -198,7 +202,7 @@ class _Pack:
         room = min(math.ceil((wanted - held) / supplies.DOSES_PER_POTION),
                    max(0, potions - containers))
         if room and self.banked is None:
-            self._take(f"{base}({supplies.DOSES_PER_POTION})", room)
+            self._take(f"{base}({supplies.DOSES_PER_POTION})", room, bulk=True)
             return
         copies = sorted(((supplies.charges(n) or 0, n, int(q or 0)) for n, q in (self.banked or {}).items()
                          if int(q or 0) > 0 and supplies._is(n, base) and supplies.charges(n)),
@@ -208,7 +212,7 @@ class _Pack:
             if room <= 0:
                 break
             take = min(room, available)
-            self._take(name, take)
+            self._take(name, take, bulk=True)
             room -= take
             total += take * dose
         if self.banked is None:
@@ -431,7 +435,7 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
             pack.problems.append("no food is chosen in the panel (food.name) and the bank holds no "
                                  "ordinary food to choose instead")
     if food and profile.food:
-        pack.exact("food", food, profile.food)
+        pack.exact("food", food, profile.food, bulk=True)
 
     if profile.prayer_potions:
         potion = (panel_cfg.get("potions") or {}).get("prayerPotion")
@@ -506,4 +510,14 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
     # ESSENTIALS last and slot-free: they are already carried, so counting them would make every
     # pack read larger than it is and could refuse a trip that fits.
     keep = list(dict.fromkeys(list(pack.keep) + list(ESSENTIALS)))
+    # BULK_FIRST, inverted: the teleport that REACHES the site, and the gear the task needs, are
+    # withdrawn before the food and the prayer restores.
+    #
+    # FOUND LIVE 2026-09-21 on the first Kuradal task ever run (elves x139). The order was food,
+    # potions, crystal; the inventory filled on the 28th slot; and what did not fit was the
+    # `Teleport crystal (1)` -- the only way to Lletya. The trip then stopped one item short of a
+    # journey it could otherwise make, having spent its whole bank visit. Running out of food is
+    # a RESTOCK; running out of the way there is a stranding, so the two must not compete for the
+    # last slot on equal terms. Stable, so everything else keeps the order it was added in.
+    pack.withdraw.sort(key=lambda w: bool(w.get("bulk")))
     return Loadout(pack.withdraw, keep, slots, pack.problems, unchecked)

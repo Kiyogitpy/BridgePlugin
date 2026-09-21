@@ -54,6 +54,21 @@ def bank_verdict(loadout, free_slots, tasks_cfg, tablets_total, skippable=False,
     if loadout.withdraw:
         wanted = ", ".join(f"{w['quantity']} {w['name']}" for w in loadout.withdraw)
         if visited_bank:
+            # SHORT BECAUSE THERE IS NO ROOM is not the same as short because the bank is empty.
+            #
+            # FOUND LIVE 2026-09-21 on the first Kuradal task (elves x139): the pack wanted 15
+            # food, 8 prayer potions and a teleport crystal, the inventory filled on slot 28, and
+            # the trip stopped over the one prayer potion that would not fit. The bank had it;
+            # there was simply nowhere to put it. Stopping a 139-kill task for that is the wrong
+            # trade when RESTOCK exists precisely to come back for more.
+            #
+            # So: with NO free slots and every remaining shortfall a restockable consumable, go
+            # and fight on what fits. Anything else -- a missing teleport, gear, a task's own
+            # required item, or any shortfall at all while slots remain -- is still a stop,
+            # because those are the things RESTOCK cannot fix and the spec refuses to guess at.
+            if free_slots == 0 and all(w.get("bulk") for w in loadout.withdraw):
+                return GO, (f"short {wanted} but the inventory is full -- going with what fits; "
+                            f"restock will top it up")
             return STOP, f"still short after a full bank visit: {wanted}"
         return BANK, f"to fetch {wanted}"
     if free_slots is not None and free_slots < slayer_catalog.LOOT_RESERVE_SLOTS and not visited_bank:

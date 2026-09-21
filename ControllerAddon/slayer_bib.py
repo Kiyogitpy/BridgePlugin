@@ -143,7 +143,12 @@ def _confirm_changed(ctx, before_n: int, want_active: bool) -> bool:
     outcome = bridge_events.await_outcome(
         getattr(ctx, "events", None), ("WIDGET_LOADED",), 3.0,
         confirm=lambda: view_is_active() == want_active and len(bank_items() or []) != before_n)
-    return bool(outcome and outcome.ok)
+    # Outcome exposes .hit, not .ok, and its __bool__ already returns it -- so this is just
+    # bool(outcome). FOUND LIVE 2026-09-21 on the first Kuradal task: the atBank hook raised
+    # AttributeError("'Outcome' object has no attribute 'ok'") every time it ran. The hook is
+    # deliberately allowed to fail without aborting the trip, which is why this survived to the
+    # first live gear-up instead of failing a test.
+    return bool(outcome)
 
 
 def recommendations(ctx):
