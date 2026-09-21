@@ -506,6 +506,28 @@ HUMAN_BOMB_REACTION_MS = 578
 BOMB_DODGE_BUDGET_TICKS = 2
 BOMB_DODGE_BUDGET_MS = 1200
 
+#: Our own viewport hop, from settings.py's fitted movement model plus a ~98 ms click hold.
+VIEWPORT_HOP_MS = 440
+VIEWPORT_HOP_P90_MS = 650
+
+#: USER, 2026-09-21: "my reaction speed should be 150-220 ms, I've tested it repeatedly."
+#:
+#: Consistent with the recordings, and never contradicted by them -- HUMAN_BOMB_REACTION_MS above
+#: measures stimulus to CLICK, which is reaction PLUS the mouse flight PLUS the click. Pure
+#: reaction could not be isolated from this data and the attempt is recorded rather than hidden:
+#: mouse samples are batched, so a window with no samples means "cannot tell" and not "the cursor
+#: was still", and the stimulus stamp sits ~580 ms into its own tick with recorder.py's own docs
+#: warning that stamp can be stale. Filters that looked reasonable produced sub-50 ms reactions,
+#: which are not physiologically possible, so the filter was wrong rather than the user.
+#:
+#: THIS IS A FLOOR, NOT A CEILING, and that is the correction it exists to make. Our viewport hop
+#: costs ~440 ms, so firing the instant the event arrives would beat the human every single time by
+#: a constant margin -- and the whole cursor trajectory is transmitted. There is 1200 ms of budget
+#: and the human spends 578, so the headroom is there. A range rather than a number because
+#: settings.py's rule is that a fitted distribution is fine on the wire and a CONSTANT is a
+#: fingerprint.
+DODGE_REACTION_MS = (150, 220)
+
 
 def gear_switch_budget_ms(items):
     """How long a whole gear switch may take, for `items` pieces.

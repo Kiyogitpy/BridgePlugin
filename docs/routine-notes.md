@@ -3535,7 +3535,20 @@ be slower by spending time BETWEEN clicks, and there is exactly one setting big 
 into roughly 3 s. So a gear switch fires all five and confirms ONCE at the end; `gear_switch_budget_ms`
 states the budget for the whole burst precisely so a per-item confirm cannot fit inside it.
 
-The dodge has 1200 ms and our viewport hop costs 440 ms median, 650 at p90. That fits, but only
-with no reaction delay and **no hover gate** -- the gate reads the cursor position right now, and
-this click is issued while the player is still being bound. Same trap the Gauntlet and Motherlode
-both paid for.
+The dodge has 1200 ms and our viewport hop costs 440 ms median, 650 at p90. **No hover gate** on
+that click -- the gate reads the cursor position right now, and it is issued while the player is
+still being bound. Same trap the Gauntlet and Motherlode both paid for.
+
+**The dodge should be SLOWED, though, not run flat out.** USER, 2026-09-21: "my reaction speed
+should be 150-220 ms, I've tested it repeatedly." That is consistent with the recordings and was
+never contradicted by them -- the 578 ms above is stimulus to CLICK, which bundles reaction, mouse
+flight and the click itself. Pure reaction could NOT be isolated from this data: mouse samples are
+batched, so a window with no samples means "cannot tell" rather than "still", and the stimulus
+stamp sits ~580 ms into its own tick with recorder.py's own docs warning it can be stale. Every
+filter that looked reasonable produced sub-50 ms reactions, which are impossible, so the filter was
+wrong and not the user.
+
+What follows is the correction that matters: firing the instant the event arrives would land the
+dodge at ~440 ms against the human's 578, every time, by a constant margin -- and the whole cursor
+trajectory is transmitted. `DODGE_REACTION_MS` is therefore a FLOOR drawn from the user's own
+range, not a ceiling, and a range rather than a number because a constant is a fingerprint.

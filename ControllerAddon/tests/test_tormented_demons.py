@@ -472,9 +472,46 @@ def test_a_gear_switch_must_not_pay_a_reaction_delay_per_item():
 
 
 def test_the_dodge_budget_leaves_room_for_the_click_to_actually_land():
-    """Two ticks is 1200 ms and our viewport hop costs about 440 ms median, 650 at p90. That fits
-    only with no hover gate and no reaction delay on the dodge click -- the gate reads the cursor
-    position RIGHT NOW and this click is issued while the player is still being bound."""
+    """Two ticks is 1200 ms and our viewport hop costs about 440 ms median, 650 at p90.
+
+    SUPERSEDED IN PART: the "and no reaction delay" this once said was wrong, and the correction is
+    in test_the_dodge_pays_a_human_reaction_because_it_has_the_headroom -- there is enough budget to
+    pay a human reaction and we should, or the dodge beats the human by a constant margin. The HOVER
+    GATE half still stands: the gate reads the cursor position RIGHT NOW and this click is issued
+    while the player is still being bound."""
     assert td.BOMB_DODGE_BUDGET_MS == 1200
     assert td.BOMB_DODGE_BUDGET_MS - td.HUMAN_BOMB_REACTION_MS > 500, \
         "the human leaves this much room; so must we"
+
+
+# --- the dodge should be SLOWED to human speed, not run flat out ---------------------------------
+
+def test_the_dodge_pays_a_human_reaction_because_it_has_the_headroom():
+    """CORRECTION, after the USER said their reaction is 150-220 ms, tested repeatedly.
+
+    That is consistent with the recordings and was never contradicted by them: the 578 ms figure
+    measured stimulus-to-CLICK, which is reaction plus mouse flight plus the click. Pure reaction
+    could not be isolated from this data -- mouse samples are batched, so an empty window is "we
+    cannot tell" rather than "the cursor was still", and the stimulus stamp sits ~580 ms into its
+    own tick with recorder.py's own docs warning that stamp can be stale.
+
+    What IS robust is the end to end: 578 ms median, stable under every filter tried. Our own
+    viewport hop costs about 440 ms, so firing the moment the event arrives would be FASTER than
+    the human, every single time, by a constant margin. That is a fingerprint, not an advantage --
+    the whole cursor trajectory is transmitted. There is 1200 ms of budget and the human uses 578,
+    so the headroom is there to spend."""
+    assert td.DODGE_REACTION_MS == (150, 220), "the user's own tested range"
+
+    slowest = td.DODGE_REACTION_MS[1] + td.VIEWPORT_HOP_P90_MS
+    assert slowest < td.BOMB_DODGE_BUDGET_MS, "still lands inside two ticks at p90"
+
+    typical = td.DODGE_REACTION_MS[0] + td.VIEWPORT_HOP_MS
+    assert abs(typical - td.HUMAN_BOMB_REACTION_MS) < 120, \
+        "and lands near where the human lands, rather than visibly before them"
+
+
+def test_the_reaction_is_a_range_so_it_is_never_a_constant_on_the_wire():
+    """settings.py's rule, and the reason it is a pair rather than a number: timing drawn from a
+    human distribution is fine on the wire, a constant is a fingerprint."""
+    low, high = td.DODGE_REACTION_MS
+    assert high > low, "a draw, not a constant"
