@@ -898,6 +898,12 @@ def search_query(name: str) -> str:
     return max(distinctive or words, key=len)
 
 
+#: The bank's left-click withdraw action, as /hover reports it. A SUBSTRING (hover_matches is
+#: case-insensitive substring), so it covers Withdraw-1 / -5 / -10 / -All and whatever quantity
+#: mode the trip happens to be in.
+WITHDRAW_HOVER_ACTION = "withdraw"
+
+
 def _reachable(slot) -> bool:
     """Is this bank slot's drawn position somewhere we could actually click?
 
@@ -966,8 +972,58 @@ def withdraw_loadout(ctx, config: dict, fresh: bool = False) -> None:
             debug_log.log("bank", f"{slot.get('name')} is still off-screen after searching, skipping")
             continue
 
+        # THE PIXEL IS PROVEN BEFORE IT IS CLICKED, because _reachable cannot prove it.
+        #
+        # FOUND LIVE 2026-09-21 (cave bugs, Ferox): "Kandarin headgear 3" is slot 819 of 933 and
+        # /bank reported it at screenY 1109. The bank window's bottom edge is y~1012 -- MEASURED
+        # off a dumped frame -- so that point is below the whole interface, on the game world
+        # behind it. _reachable only asks "is this inside the RuneLite window", which it is, so no
+        # search was done and the click went to the world: the player walked, THE BANK CLOSED, and
+        # every later item in the same trip reported "search button not found (bank open?)" and
+        # "not found in bank". The trip then declared itself short of things the account owns.
+        #
+        # A scrolled-out slot whose position lands off-window is the case _reachable catches; this
+        # is the same bug wearing an in-window coordinate, and no bound derived from /bank can
+        # separate the two (it reports positions, not the container's clip). So ask the game
+        # instead: hover says what is really under the cursor, and a mismatch withholds the click
+        # rather than spending it on the world. Safe here in a way it is not mid-walk (the CLAUDE.md
+        # rule) because a bank withdraw is issued standing still at the bank.
+        def _take(target_slot):
+            return controller.click_entity(ctx.ser, target_slot, check_ui_blockers=False,
+                                           expected_action=WITHDRAW_HOVER_ACTION,
+                                           expected_target=target_slot.get("name"))
+
+        result = _take(slot)
+        if getattr(result, "withheld", False) and not searched:
+            # The slot is drawn somewhere else than /bank claims. Searching re-lays the matches
+            # from slot 0, which is the same rescue the off-window branch above already uses.
+            debug_log.log("bank", f"{slot.get('name')} is not under its own reported position "
+                                  f"-- searching to bring it onto the first page")
+            searched = search_bank(ctx, search_query(entry["name"]))
+            if searched:
+                bank = controller.get_bank(fresh=True)
+                slot = next(
+                    (s for s in bank.get("items", []) if name in (s.get("name") or "").lower()),
+                    None,
+                )
+            if slot is None or not _reachable(slot):
+                debug_log.log("bank", f"{entry.get('name')} still not clickable after searching, "
+                                      f"skipping")
+                if searched:
+                    clear_bank_search(ctx)
+                continue
+            result = _take(slot)
+        if getattr(result, "withheld", False):
+            debug_log.log("bank", f"{slot.get('name')} never came under the cursor, skipping "
+                                  f"rather than clicking whatever is there")
+            if searched:
+                clear_bank_search(ctx)
+            continue
+
         debug_log.log("bank", f"withdrawing {quantity}x {slot.get('name')}")
-        for _ in range(quantity):
+        controller.human_delay(0.15, 0.3)
+        # The first unit is already taken and its position is now PROVEN, so the rest go ungated.
+        for _ in range(quantity - 1):
             controller.click_entity(ctx.ser, slot, check_ui_blockers=False)
             controller.human_delay(0.15, 0.3)
 

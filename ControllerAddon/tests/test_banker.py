@@ -1312,3 +1312,108 @@ def test_open_bank_stops_clicking_once_the_pin_keypad_is_up(monkeypatch):
            "screenX": 1301, "screenY": 744}
     assert banker.open_bank(_Ctx(), obj, timeout_s=5.0) is False
     assert clicks == [], "not one click should be spent on a keypad"
+
+
+# --- the withdraw click is hover-gated (FOUND LIVE 2026-09-21) -----------------------------------
+#
+# "Kandarin headgear 3" was slot 819 of 933 and /bank reported it at screenY 1109, while the bank
+# window's bottom edge measured y~1012 -- so the point was below the whole interface, on the game
+# world behind it. _reachable only asks "inside the RuneLite window", which it was, so the click
+# walked the player and CLOSED THE BANK; every later item in the trip then read "search button not
+# found (bank open?)" and the trip reported itself short of items the account owns.
+
+def _bank_with(slot, **extra):
+    body = {"open": True, "items": [slot],
+            "searchButton": {"screenX": 1123, "screenY": 1006}}
+    body.update(extra)
+    return body
+
+
+_HEADGEAR = {"name": "Kandarin headgear 3", "id": 13139, "slot": 819,
+             "screenX": 1350, "screenY": 1109}
+_HEADGEAR_FOUND = {"name": "Kandarin headgear 3", "id": 13139, "slot": 0,
+                   "screenX": 657, "screenY": 219}
+
+
+def test_a_withdraw_click_is_verified_against_the_hover(monkeypatch):
+    """The click must carry the gate at all -- without it there is nothing between a wrong
+    coordinate and a click on the world behind the bank."""
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: _bank_with(_HEADGEAR))
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "is_point_within_window", lambda x, y: True)
+    seen = {}
+
+    def click(ser, ent, **kw):
+        seen.update(kw)
+        return True
+
+    monkeypatch.setattr(controller, "click_entity", click)
+    banker.withdraw_loadout(_Ctx(), {"withdraw": [{"name": "Kandarin headgear 3", "quantity": 1}]})
+    assert seen.get("expected_action") == banker.WITHDRAW_HOVER_ACTION
+    assert seen.get("expected_target") == "Kandarin headgear 3"
+
+
+def test_a_withheld_withdraw_searches_and_retries_instead_of_clicking_the_world(monkeypatch):
+    """The live failure, end to end: the reported pixel does not hold the item, so searching
+    re-lays it onto the first page and the second click takes it."""
+    state = {"searched": False}
+
+    def get_bank(fresh=False):
+        return _bank_with(_HEADGEAR_FOUND if state["searched"] else _HEADGEAR)
+
+    monkeypatch.setattr(controller, "get_bank", get_bank)
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "is_point_within_window", lambda x, y: True)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+
+    def search(ctx, query):
+        state["searched"] = True
+        return True
+
+    monkeypatch.setattr(banker, "search_bank", search)
+    clicked = []
+
+    def click(ser, ent, **kw):
+        clicked.append((ent.get("screenX"), ent.get("screenY")))
+        # The world-behind-the-bank pixel never holds the item.
+        if ent.get("screenY") == 1109:
+            return controller.CLICK_WITHHELD
+        return True
+
+    monkeypatch.setattr(controller, "click_entity", click)
+    banker.withdraw_loadout(_Ctx(), {"withdraw": [{"name": "Kandarin headgear 3", "quantity": 1}]})
+    assert state["searched"], "a withheld click must fall back to searching"
+    assert clicked[-1] == (657, 219), "and then click the re-laid slot"
+
+
+def test_a_withdraw_that_is_never_under_the_cursor_is_skipped_not_forced(monkeypatch):
+    """If even the searched position does not hold it, take nothing. Clicking anyway is what
+    closed the bank and wrecked the rest of the trip."""
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: _bank_with(_HEADGEAR))
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "is_point_within_window", lambda x, y: True)
+    monkeypatch.setattr(banker, "search_bank", lambda ctx, q: True)
+    monkeypatch.setattr(banker, "clear_bank_search", lambda ctx: True)
+    clicked = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **kw: clicked.append(1) or controller.CLICK_WITHHELD)
+    banker.withdraw_loadout(_Ctx(), {"withdraw": [{"name": "Kandarin headgear 3", "quantity": 3}]})
+    assert len(clicked) == 2, "one gated try, one after the search, then stop"
+
+
+def test_the_remaining_units_of_a_proven_slot_go_ungated(monkeypatch):
+    """The gate costs a hover read per click; once the first unit is taken the position is proven,
+    so a quantity of 8 must not pay for eight verifications."""
+    slot = {"name": "Super restore(4)", "id": 3024, "slot": 3, "screenX": 855, "screenY": 219}
+    monkeypatch.setattr(controller, "get_bank", lambda fresh=False: _bank_with(slot))
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "is_point_within_window", lambda x, y: True)
+    gated = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **kw: gated.append(bool(kw.get("expected_action"))) or True)
+    banker.withdraw_loadout(_Ctx(), {"withdraw": [{"name": "Super restore(4)", "quantity": 4}]})
+    assert gated == [True, False, False, False]
