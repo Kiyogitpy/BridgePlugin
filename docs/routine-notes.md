@@ -3873,11 +3873,107 @@ ever -- a worse failure than the one it fixes. `DOOR_MAX_TALKS` (6) caps it.
   so looks like a successful filter. NOT fixed: the hover gate now stops the bank closing underneath
   it, but this is a live trap for anyone who makes that function load-bearing again.
 
+#### The first Kuradal task, and the five more bugs it found
+
+**It completed.** streak 39 -> 40, points 174 -> 249 (+75 for the milestone). The milestone
+ACQUIRE worked first try -- the picker path and Kuradal's own row had never run live and both
+did, silently, which is their success path -- and the task then exercised a 30-slot pack, the
+Teleport crystal to Lletya, 139 kills over four RESTOCKs, and `_restore_base_gear` ("task done:
+putting the War blessing back on (ammo)") before asking Aya for the next one.
+
+**6. A mounted item may offer a MENU, not one action per destination.** The bats task planned
+`mounted digsite pendant: Digsite` and the pendant was right there in the house -- offering
+`['Teleport menu', 'Configuration', 'Remove']`. `poh.find_named` requires the action to be
+PRESENT on the object, so it matched nothing and reported "no mounted 'digsite pendant' offering
+'Digsite' in view" three times about an object in plain sight. `use_mounted` now tries the direct
+action first (the house fairy ring really does offer `Zanaris` that way) and falls back to the
+menu. The menu entry is matched case-insensitively because the two objects disagree:
+the pendant says `Teleport menu`, the Ornate Jewellery Box says `Teleport Menu`.
+**And the box's second action, `Mining Guild`, is only its LAST-USED shortcut** -- not a
+destination anything may rely on.
+
+**The menu is an INTERFACE, not a chat dialogue**, which the first fix got wrong.
+MEASURED by dumping widgets while it was open: **group 187, child 3**, one indexed row per
+destination -- `<col=735a28>1</col>: Digsite` / `2: Fossil Island` / `3: Lithkren` / `4: Nowhere`
+-- with the title on child 0 reading `Digsite Pendant teleport` and a Close button on child 4.
+The rows carry NO actions, so there is nothing for the hover gate to verify; they are matched by
+text and clicked at their own position, exactly as `use_box` handles group 590. **The title is
+the trap**: it contains the word "Digsite" too, so a plain substring search over the dump picks
+the heading. Matching is anchored on the row NUMBER. A failed right-click now also presses ESC --
+with 187 still up from a previous attempt the retry landed on the interface instead of the
+pendant, the lesson `use_box` already carried for 590 and this path had not inherited.
+
+**7. The elves pack could never fit, and did not know it.** It reported **26 of 28 slots** against
+a MEASURED real **28 of 28**. `one_of()` charges a slot for a kit item it FETCHES, and
+`_top_up_kit` skipped straight past that branch for one already CARRIED -- but being carried is
+exactly why it occupies a slot -- and ESSENTIALS (the rune pouch) were never counted at all.
+Truthfully the pack wanted **30 slots in a 28-slot inventory**, so no ordering could have saved
+it; what actually failed to fit was the `Teleport crystal (1)`, the only way to Lletya.
+
+Three changes came out of it. The withdraw list now puts the journey and the gear **before** the
+bulk consumables (running out of food is a restock; running out of the way there is a stranding,
+so they must not compete for the last slot on equal terms). `slayer_policy` distinguishes short
+because the bank is EMPTY from short because there is NOWHERE TO PUT IT -- with no free slots and
+every remaining shortfall restockable, the trip goes and fights on what fits. And `trim_food`
+caps the food at what actually fits, bounded by `FOOD_TRIM_FLOOR` so that "fits" never becomes
+"goes out with nothing to eat". The surplus already carried is shed by dropping the food off the
+KEEP list so the deposit banks it -- banker deposits a whole item name at a time, there is no
+deposit-N.
+
+An existing test asserted the opposite of the slot fix ("keeping the pouch does not charge the
+pack a slot for it") on the reasoning that counting it "could refuse a trip that fits". The
+measurement inverts that: **not** counting it ACCEPTS a trip that does not fit. Rewritten with
+the reason, not reverted.
+
+**8. `slayer_bib._confirm_changed` read `outcome.ok`.** `bridge_events.Outcome` has no such
+attribute -- it is `.hit`, and `__bool__` already returns it -- so the `atBank` gear-up hook
+raised `AttributeError` **every single time it ran**. It survived to the first live gear-up only
+because that hook is deliberately allowed to fail without aborting the trip.
+`routines/wintertodt.py` already carries a comment about this exact trap.
+**Fixing it revived a dead code path**: the Best-in-Bank gear-up had never actually done
+anything, and now does. On its first outing it equipped a proselyte tasset (already worn),
+Rada's blessing 3, then a **War blessing over it**, and tried to equip a `Super combat potion(3)`
+-- correctly withheld by the hover gate. Nothing harmful, but that path is now live, unverified,
+and changes worn gear from a third-party plugin's recommendations. Worth a deliberate look.
+
+**9. Eight of 28 slots were prayer potions nothing would ever drink.** The panel reads
+`prayer.enabled: true` with `defensivePrayer: NONE`, `offensivePrayer: NONE` and
+`useQuickPrayers: false`, and `combat_core` says so itself every run: *"nothing to toggle"*.
+MEASURED across the whole fight: **prayer sat at 77/77 and never moved**, while the food was
+trimmed to its floor and a restock fired every ~35 kills. `slayer_loadout.prayer_is_used` now
+asks the question `combat_core` already asks, and the elves pack drops from 30 slots to 22 with
+full food and no trim. `enabled` alone is not the test -- it is on by default and means only
+"manage prayer if there is one to manage". This does not touch the user's "any food any prayer"
+ruling, which was about WHICH restore to choose when one is needed, and it cannot cause spurious
+restocks: `out_of_critical_supplies` only consults prayer once it falls below `restoreAt`.
+
+**10. "nothing to fight after 3 walks back" stopped a run that was working** -- 86 of 139 elves
+already killed at that very tile. `slayer_no_target_walks` was reset when a dry spell ended in
+ticks but **never when a target was actually found**, so it accumulated across a whole task until
+it tripped. Lletya has three elves on the ground floor (`slayer_catalog` says so and the
+preflight prints "expect a slow task"), so running the site dry and waiting for a respawn is
+normal there. Finding a target now resets it: the guard is for "there is nothing here to fight,
+ever", and a target in view is proof that there is.
+
+#### RESTOCK, proven live
+
+"out of supplies on elves x102: restock 1 of 4" -> walked to the **Lletya bank counter** ->
+withdrew food and a teleport crystal -> walked back -> resumed. HP was 25/93 at the trigger and
+back to 60 within 90 s of resuming. HP handling is correct throughout: it eats at the panel's
+threshold and restocks when the food is gone.
+
+**A real number for whoever tunes the supply profiles:** at Lletya the player is in combat
+continuously against three elves, and burns roughly one food per 30 s. Nine food is about 35
+kills, so a 139-kill task uses most of the four-restock ceiling. That ceiling is a stop, not a
+death, so the behaviour is safe -- but the elves profile plus this account's six-slot travel kit
+genuinely do not fit a 28-slot inventory, and freeing the prayer slots (bug 9) is what made it
+comfortable rather than marginal.
+
 #### Still unverified after this session
 
-Breaks and `before_break` (no break fell during it), RESTOCK (no task ran the supplies down), the
-**Kuradal milestone** (fires at streak 39 -> task 40), `npc_contact.cancel_task`, the loot
-`makeRoom` hook, and the Stronghold question table above. The base-gear capture also picked up
+Breaks and `before_break` (none fell during it), `npc_contact.cancel_task`, the loot
+`makeRoom` hook, the Stronghold question table above, and the Best-in-Bank gear-up hook, which
+this session REVIVED from a dead code path and which has now run exactly once. The base-gear capture also picked up
 `Dragon scimitar` as the base weapon after a restart mid-gear-task -- the documented "captured while
 a gear task is active" hazard doing exactly what the notes predicted.
 
