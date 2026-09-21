@@ -304,12 +304,12 @@ Start-GuestDesktop ($argv -join " ") "OSRSRoutine"
 # on the desktop and then raises the client; see its header for how to tell this apart from a
 # click that genuinely missed.
 Start-Sleep -Seconds 2
-Start-GuestDesktop "cmd /c $sharem-guest-hide-console.cmd" "OSRSHideConsole"
+Start-GuestDesktop "cmd /c $share\vm-guest-hide-console.cmd" "OSRSHideConsole"
 Start-Sleep -Seconds 2
 $st = Get-Bridge "/state"
 for ($i = 0; $i -lt 3 -and $st -and -not $st.windowFocused; $i++) {
     Write-Host "  the routine's console took the focus -- giving it back to the client"
-    Start-GuestDesktop "cmd /c $sharem-guest-hide-console.cmd" "OSRSHideConsole"
+    Start-GuestDesktop "cmd /c $share\vm-guest-hide-console.cmd" "OSRSHideConsole"
     Start-Sleep -Seconds 3
     $st = Get-Bridge "/state"
 }

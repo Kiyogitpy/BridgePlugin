@@ -449,9 +449,13 @@ def dungeon_recovery(ctx, course) -> None:
 # --- routine contract -------------------------------------------------------------
 
 def setup(ctx):
-    course = ac.course_by_key(ctx.state.config.get("course"))
+    # CONFIG IS NOT AVAILABLE HERE: the engine calls setup() before resolve_config()
+    # populates ctx.state.config (see tormented_demon.py/vale_totems.py's own setup()
+    # comments for the same gap) -- resolve the same way get_config() will instead.
+    config = get_config(None)
+    course = ac.course_by_key(config.get("course"))
     if course is None:
-        ctx.state.trigger_safety_stop(f"unknown course {ctx.state.config.get('course')!r}")
+        ctx.state.trigger_safety_stop(f"unknown course {config.get('course')!r}")
         return
     debug_log.log("agility", f"course: {course.label}; steps: "
                              + " > ".join(s.key for s in course.all_steps()))
