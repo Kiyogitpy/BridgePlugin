@@ -187,3 +187,22 @@ def test_gear_to_restore_is_the_slots_that_differ_from_the_base():
     bare = {k: v for k, v in WORN.items() if k != "helmet"}
     assert sp.gear_to_restore(base, bare) == {"helmet": "Slayer helmet (i)"}
     assert sp.gear_to_restore(None, WORN) == {}, "no base known: restore nothing"
+
+
+# --- the client has NOT been rebuilt yet (2026-09-21) -------------------------------------------
+
+LIVE_TASKS = {"fillerMaster": "AYA", "milestoneMaster": "KURADAL", "milestoneEvery": 10,
+              "skipTasks": [], "maxSkips": 8, "pointsReserve": 60}
+
+
+def test_every_new_setting_falls_back_to_its_default_on_an_un_rebuilt_client():
+    """The verbatim `tasks` block GET /slayer-config answers today: the three settings added on
+    2026-09-20 (minHouseTeleports, makeRoomValue, mustLootValue) are NOT there until the client is
+    rebuilt. Absent must mean the documented default, never zero -- a zero make-room value would
+    have the routine eat a shark for a 1gp bone."""
+    assert "makeRoomValue" not in LIVE_TASKS and "minHouseTeleports" not in LIVE_TASKS
+    assert sp.bank_verdict(_loadout(), 8, LIVE_TASKS, tablets_total=4)[0] == sp.STOP, "the floor is 5"
+    assert sp.bank_verdict(_loadout(), 8, LIVE_TASKS, tablets_total=9)[0] == sp.GO
+    assert sp.loot_decision(1, False, 0, 30, "Shark", 3, None, None, tasks_cfg=LIVE_TASKS) == (sp.LEAVE, None)
+    assert sp.loot_decision(60_000, False, 0, 30, "Shark", 3, None, None, tasks_cfg=LIVE_TASKS)[0] == sp.EAT_THEN_TAKE
+    assert sp.loot_decision(200_000, False, 0, 0, "Shark", 3, None, None, tasks_cfg=LIVE_TASKS)[0] == sp.EAT_THEN_TAKE
