@@ -41,6 +41,7 @@ import time
 
 import controller
 import debug_log
+import dialogue
 import travel
 
 TABLET = "teleport to house"
@@ -51,6 +52,14 @@ BOX_MENU_OPTION = "Teleport Menu"
 ENTER_BUDGET_S, POOL_BUDGET_S, BOX_MENU_BUDGET_S = 10.0, 6.0, 8.0
 POLL_S = 0.3
 SCAN_RADIUS = 40
+
+#: A mounted item that offers a DESTINATION MENU rather than one action per destination.
+#: MEASURED LIVE 2026-09-21 in this account's house: the mounted Digsite Pendant (33420) offers
+#: ['Teleport menu', 'Configuration', 'Remove'] -- no 'Digsite' action anywhere -- while the
+#: Ornate Jewellery Box (29156) offers ['Teleport Menu', 'Mining Guild', 'Remove'], where the
+#: second entry is only the LAST-USED shortcut and not a destination we can count on. Matched
+#: case-insensitively: the two objects disagree about capitalising "menu".
+MENU_ACTION = "teleport menu"
 TABLET_COOLDOWN_S = 60.0       # never break a second tablet this soon after the last one
 HOUSE_REGIONS = (7791,)        # MEASURED 2026-09-20 on this account's house
 HOUSE_TEMPLATE_BOX = (1850, 2050, 7000, 7200)   # x0, x1, y0, y1 -- the POH template chunks
@@ -288,19 +297,44 @@ def find_named(name_fragment, action, player=None):
     return candidates[0]
 
 
+def _take(ctx, obj, action, log):
+    refresh = controller.object_refresh_target(obj.get("x"), obj.get("y"), obj.get("plane", 0),
+                                               obj.get("id"))
+    if controller.click_menu_action(ctx.ser, obj, action, refresh_target=refresh):
+        return True
+    debug_log.log(log, f"couldn't take {action!r} from the mounted {obj.get('name')}")
+    return False
+
+
 def use_mounted(ctx, name_fragment, action, log: str = "poh") -> bool:
-    """Teleport by an item MOUNTED in the house: take `action` from its right-click menu. The MENU
-    entry, never a left-click -- a mounted item's default may be another destination (the
-    jewellery box's 'last destination' lesson). The caller confirms by leaving the house.
-    UNVERIFIED LIVE (2026-09-20: built from the vendored house table on the user's word that a
-    digsite pendant is mounted); an object not in view fails cleanly, inside a safe house."""
+    """Teleport by an item MOUNTED in the house, to `action`'s destination.
+
+    The MENU entry, never a left-click -- a mounted item's default may be another destination
+    (the jewellery box's 'last destination' lesson). The caller confirms by leaving the house.
+
+    TWO SHAPES, because mounted items do not agree on one. Some offer the destination as its own
+    right-click action (the house fairy ring's 'Zanaris'); others offer only a destination MENU
+    and the choice is a dialogue option behind it. FOUND LIVE 2026-09-21: the bats task planned
+    'mounted digsite pendant: Digsite', and the pendant was right there in view -- offering
+    ['Teleport menu', 'Configuration', 'Remove']. find_named requires the action to be present,
+    so it matched nothing and the leg failed three times on an object that was working. The
+    direct shape is tried first (it costs one scan and no dialogue), then the menu."""
     obj = find_named(name_fragment, action)
+    if obj is not None:
+        return _take(ctx, obj, action, log)
+
+    obj = find_named(name_fragment, MENU_ACTION)
     if obj is None:
-        debug_log.log(log, f"no mounted {name_fragment!r} offering {action!r} in view")
+        debug_log.log(log, f"no mounted {name_fragment!r} offering {action!r} or a "
+                           f"{MENU_ACTION!r} in view")
         return False
-    refresh = controller.object_refresh_target(obj.get("x"), obj.get("y"), obj.get("plane", 0), obj.get("id"))
-    if not controller.click_menu_action(ctx.ser, obj, action, refresh_target=refresh):
-        debug_log.log(log, f"couldn't take {action!r} from the mounted {obj.get('name')}")
+    # Its own spelling, not ours: the menu entry has to match what the client drew.
+    spelling = next((a for a in (obj.get("actions") or [])
+                     if (a or "").lower() == MENU_ACTION), MENU_ACTION)
+    if not _take(ctx, obj, spelling, log):
+        return False
+    if not dialogue.choose(ctx, action, log=log):
+        debug_log.log(log, f"the mounted {obj.get('name')} opened no menu offering {action!r}")
         return False
     return True
 

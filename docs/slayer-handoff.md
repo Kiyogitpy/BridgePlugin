@@ -6,13 +6,18 @@ files it points at. Nothing below depends on the old conversation.
 
 ## Where the work is
 
-- Repo `BridgePlugin`, branch **`crossfloor-travel`** (pushed; `dev` is pushed too and is its base).
-  CHECKED 2026-09-20: 70 commits ahead of `dev`, `dev` 1 ahead (a2929d5), and a dry-run
-  `git merge-tree origin/dev HEAD` is CLEAN -- no conflicts. On 2026-09-20 the MAIN checkout was
-  switched to `dev` by someone else mid-session; work continued in the worktree
-  `.claude/worktrees/crossfloor-travel` (self-sufficient: the collision map is tracked).
-  NOT merged to `dev` — the merge is the user's call. Another session also committed Guardians of
-  the Rift work onto this branch; it rides along.
+- Repo `BridgePlugin`, branch **`crossfloor-travel`**. **CHECKED 2026-09-21 and this changed:
+  `origin/crossfloor-travel` is now an ANCESTOR of `dev`** -- the branch was merged, and `dev`
+  then went further (the m8aq repackage). So the 2026-09-20 note below it ("70 commits ahead")
+  is history, not the current shape. That session's live work therefore fast-forwarded the local
+  `crossfloor-travel` to `dev`'s HEAD (a pure fast-forward; `dev` itself was not touched) and
+  committed on top of it, which is where the slayer fixes of 2026-09-21 live. Still NOT merged
+  back to `dev` -- that stays the user's call.
+- **Work in the MAIN checkout, not a worktree.** `ControllerAddon/.hm2_calibration.json` and
+  `ControllerAddon/map-output/` (the collision map) are GITIGNORED and exist only there, so a
+  fresh worktree cannot move the mouse correctly or route at all. The 2026-09-20 note that the
+  worktree is "self-sufficient: the collision map is tracked" is wrong on this machine.
+- Another session also committed Guardians of the Rift work onto this branch; it rides along.
 - `ZombieLite`, branch `no-packets` on the user's fork (remote name `fork`), pushed.
 - NOT in git, by choice: `bin/`, `.vscode/`, `gradle-run.log`, and `osrs-wiki-data-master/` (a
   117 MB raw OSRS wiki dump used for offline lookups — re-download or copy it if wanted).
@@ -55,25 +60,28 @@ observations over a clean log.
 | Take a task from Aya by NPC Contact | `npc_contact.py`, `routines/slayer.py` | **live-proven 2026-09-19** (one cast, 9 s) |
 | Picker path, Kuradal, right-click `Cast` | `npc_contact.py` | built, UNRUN (first Kuradal task exercises it) |
 | Cancel a task (30 points) | `npc_contact.cancel_task` | built, UNRUN; needs ≥ 90 points and a supervised first run |
-| Floor-crossing walking | `crossfloor.py`, `legs.walk_across`, `legs.run_transport` | built, UNRUN |
-| **Phase A** travel from where we stand | `slayer_routes.py`, TRAVEL phase in `routines/slayer.py` | built, reviewed, fixed, **UNRUN** |
+| Floor-crossing walking | `crossfloor.py`, `legs.walk_across`, `legs.run_transport` | **LIVE-PROVEN 2026-09-21**: the Cooking Guild -> Stronghold of Security climb-down transport ran, as did the teleport-tile step-off (`(2735,5221) is not routable -- stepping off to (2734,5221)`) |
+| **Phase A** travel from where we stand | `slayer_routes.py`, TRAVEL phase in `routines/slayer.py` | **LIVE-PROVEN 2026-09-21** (monkeys, cave bugs x2, minotaurs, scorpions) |
 | Walking instead of teleporting | `slayer_routes.walk_route` / `walk_leg`, `plan()` | **built 2026-09-21, UNRUN**: a walk-and-transport route from where we stand is a candidate beside the task's teleports, capped at 400 tiles and biased toward the teleport (it must be beaten by `MIN_SAVING_TILES`). Closes 713ce7a's recorded caveat -- standing on the Varrock sewer manhole, rats is 16 tiles and one manhole away and the pack was banking for a tablet. Over all 41 fightable tasks x 3 starts, exactly that one decision changes |
-| **Phase B** the house hub | `poh.py`, house legs in `legs.py` | built, reviewed, fixed, **UNRUN** |
+| **Phase B** the house hub | `poh.py`, house legs in `legs.py` | **LIVE-PROVEN 2026-09-21, first attempt**: tablet -> pool -> ornate jewellery box (Karamja, Cooking Guild, Mining Guild) AND the house fairy ring (AJQ, `FAIRY_EXPECT` matched "Cave south of Dorgesh-Kaan"). The whole chain lands in ~35 s |
 | **E-pre** Microbot transports adapter | `vendor/microbot/`, `transports.load_microbot_links`, `tools/vendor_microbot_tables.py` | **built 2026-09-20**, Wyrms route in `routes.md`; door lists ported into `travel.py` |
 | **E1** Kuradal's 22 tasks as data | `slayer_catalog.py`; `slayer_tasks.at_site/where` and `slayer_routes.plan` fall through to it | **built 2026-09-20 ahead of the live gates at the user's say-so** (pure data): 21 of 22 route from their landing in tests; gryphons wait on one recording. The 12 SLAYER RING tasks are planned through `legs.dialogue_item` (the ring's paged menu was already proven live in `golem_crafting`); Xeric's talisman runs through the plain item leg (`mahogany_homes` had measured it) and Moonclan Teleport through `legs.spell`. **Live preflight 2026-09-20: 19 of 22 plan, each with its onward walk PROVEN for the account** -- `plan()` refuses a teleport whose walk it cannot prove, so none is spent toward a strand. Open: cave horrors (no scroll owned), gryphons (one recording), zygomites (the ring's Zanaris action has no leg; no fungicide spray owned). **Aya: 23 of 24 plan** (`--aya`) -- the house-mounted digsite pendant (`legs.house_mounted`) and the gnome glider (`legs.glider`, from Microbot's walker) were added on the user's pointers; only dwarves (White Wolf Tunnel pub) is open |
 | **C1** the loadout calculator | `slayer_loadout.py` | **built 2026-09-20 ahead of the live gates** (pure): task + carried + bank memory -> withdraw list, keep list, slots, named problems. Run read-only on the real bank. Nothing calls it yet |
 | The DECISIONS of C2, D2, C3 | `slayer_policy.py` | **built 2026-09-20** (pure): bank / carry on / skip / stop; the loot tiers; base-gear persistence and the slot diff. Nothing calls it yet |
 | C4 + D3 Java config | `slayerMinHouseTeleports` 5, `slayerMakeRoomValue` 50k, `slayerMustLootValue` 150k, exported in the `tasks` block | **built 2026-09-20**, gradle test passes; **needs a client rebuild** to appear in the panel |
-| **C2** the BANK step before TRAVEL | `routines/slayer._pack` -> `banker.bank_up` | **built 2026-09-21, UNRUN**: decides with `slayer_loadout` + `slayer_policy`, acts through the live-proven banker. Bank ONCE per task; still short is a stop naming the items; never mid-journey and never near the site; a missing item is always a STOP, never an automatic 30-point skip |
+| **C2** the BANK step before TRAVEL | `routines/slayer._pack` -> `banker.bank_up` | **LIVE-PROVEN 2026-09-21** (it found two banker bugs on the way -- the PIN keypad and a slot drawn below the bank window; see routine-notes). Decides with `slayer_loadout` + `slayer_policy`, acts through the banker. Bank ONCE per task; still short is a stop naming the items; never mid-journey and never near the site; a missing item is always a STOP, never an automatic 30-point skip |
 | **D1** RESTOCK | `routines/slayer._restock` -> `banker.bank_up` | **built 2026-09-21, UNRUN**: out of food or prayer AT the site (`combat_core.out_of_critical_supplies`) -> drop the target, bank to the same pack, TRAVEL brings us back. A `slayer_restocking` flag keeps a half-failed bank trip from walking back empty-handed. Ceiling 4 per task, then a stop naming it |
 | `tests/test_slayer_end_to_end.py` | the routine through WHOLE tasks in one simulated world | three tasks in a row (Kuradal on the 10th), a long task that restocks and comes back, the restock ceiling. Every decision real; only clicks faked. **Read its log, not just its asserts** |
-| **C3** wearing a task's gear, and the base gear | `routines/slayer._wear`, `_capture_base_gear`, `_restore_base_gear` | **built 2026-09-21, UNRUN**: a catalog task's `worn` requirements are put ON before travelling and before every fight tick; the base gear is saved once per process (never while a gear task is active, never from an empty read) and put back when the task ends, before the next master is asked. A shield that knocks a TWO-HANDED weapon off is a STOP -- the one-handed weapon is the user's open decision (E0) |
+| **C3** wearing a task's gear, and the base gear | `routines/slayer._wear`, `_capture_base_gear`, `_restore_base_gear` | **LIVE-PROVEN 2026-09-21** (`cave bugs: putting on the dragon scimitar`): a catalog task's `worn` requirements are put ON before travelling and before every fight tick; the base gear is saved once per process (never while a gear task is active, never from an empty read) and put back when the task ends, before the next master is asked. A shield that knocks a TWO-HANDED weapon off is a STOP -- the one-handed weapon is the user's open decision (E0) |
+| **Bank PIN** | `banker.pin_prompt_open`, `routines/slayer._waiting_on_bank_pin` | **built + hit live 2026-09-21.** A fresh login's first bank trip opens the PIN keypad (widget 213.7), which `is_open()` reads as "not open" -- so the chest was re-clicked five times and three failed trips safety-stopped the run on a click that had worked. Now detected: `open_bank` leaves at once, the routine HOLDS the phase instead of spending its failure budget. **No PIN is ever entered or guessed**; one human entry unblocks the whole login session |
+| **Out-of-combat settle before a cast** | `routines/slayer._settle_before_contact` | **LIVE-PROVEN 2026-09-21.** A task finishing mid-fight cast NPC Contact ~1 s after a combat click: three casts fired (the runes went) and opened nothing, because the pending interaction closed the interface under them -- three is `CONTACT_MAX_CASTS`, so the run died. Now the target is dropped and `/combat` must go quiet (8 s budget, then cast anyway) |
+| **Doors that TALK** | `stronghold.py`, `travel._open_door` hook | **LIVE-PROVEN 2026-09-21** for the Stronghold of Security. The Gate of War does not swing -- it opens a three-page greeting, and until that is dismissed the blocked edge never clears (seven clicks, leg failed 3x, minotaurs unreachable). Spacing through it is the whole fix; all four gates then opened and minotaurs were reached in 23 s. The ported question/answer table is **untested insurance** -- this account has completed the Stronghold, so its gates no longer ask (wiki, 3 Mar 2016) |
 | **D2** loot tiers | `combat_core.maybe_loot`'s `makeRoom` hook -> `routines/slayer._make_room` | **built 2026-09-21, UNRUN**: with a FULL inventory, a drop under 50k is left; from 50k one food is eaten for it only when HP is missing; from 150k it is always taken -- eat, else finish a 1-dose prayer potion, else drop the least costly consumable. Never gear, a teleport, or what the task needs. **The hook absent = combat_core's behaviour is byte-for-byte what it was**, pinned by test |
 | **Breaks** | `routines/slayer.before_break`, `combat_core.bank_before_break` | **built 2026-09-21, UNRUN.** Breaks are ON (45-75 min apart, 3-12 min long) and `tick()` is skipped for the WHOLE break, so nothing eats, prays or retaliates -- a break falling mid-fight is a death. Slayer teleports to Ferox when AT the site (it always leaves by a proven teleport anyway); `combat.py` cannot, because it walks home and **Ferox is a sealed 413-tile island on the collision map** -- it BANKS and takes the break there instead. Slayer costs one ring of dueling charge per break |
 | **Many varbits in one read** | `GET /varbits/<csv>`, `/varps/<csv>`, `controller.get_vars` | **built 2026-09-21; needs a client rebuild to be fast.** `legs.requirement_values` cost **1.16 s** per route plan (45 varbits + 10 varplayers at ~20 ms each). One hop answers them all; `get_vars` falls back to one-per-id on an un-rebuilt client, so nothing breaks meanwhile. Ids go in the PATH -- `requests` percent-encodes a comma, the trap `subscribe_varbits` records |
 | The remaining ACTING halves: E0 gear decisions; E2-E6 hub live runs | — | NOT built -- these wait for the user or a live run |
 
-Tests: `python -m pytest tests/ -q` from `ControllerAddon/` → **3379 passed, 1 skipped, 0 failed**
+Tests: `python -m pytest tests/ -q` from `ControllerAddon/` → **3519 passed, 0 failed** (2026-09-21, after the unattended live session; was 3489 at its start)
 (2026-09-21, after the day's work).
 The four long-standing `test_mastering_mixology.py` failures are GONE: they were stale tests written
 before that routine's 'do nothing outside the lab' guard, not a bug. **The suite is green, so treat
@@ -100,14 +108,14 @@ is the general block and carries no slayer keys at all) answers `food.name: ""` 
 
 ## What to do next, in order
 
-1. **Phase A live gate.** Needs an Aya task reached by fairy ring or Ectophial (bears, cave bugs,
-   cave slimes, lizards, zombies, birds, cows) left ACTIVE, and for the two cave tasks a LIT
-   lantern carried (the check is by item id — a lit and an unlit bullseye lantern share one name).
-   At handoff the account held **Greater Demons x153, streak 19** — the task the user does by
-   hand, so the routine stops on it by design. Checklist: slayer section of `docs/routine-notes.md`.
-2. **Phase B live gate**: one Aya task reached through the house. Watch: is the fairy ring within
-   `radius=20` of the tablet landing (nothing walks inside the house yet); does the hover gate
-   read a jewellery-box entry's name; does `object_refresh_target` answer inside the instance.
+1. ~~**Phase A live gate**~~ **DONE 2026-09-21** -- monkeys, cave bugs x2, minotaurs and
+   scorpions all travelled and were killed unattended.
+2. ~~**Phase B live gate**~~ **DONE 2026-09-21, first attempt** -- the house chain and the house
+   fairy ring both work. The mounted digsite pendant needed a fix first: it offers a
+   `Teleport menu`, not a `Digsite` action (see `poh.MENU_ACTION`).
+2b. **What is still unproven live, in the order it will come up:** the Kuradal milestone (streak
+   39 -> task 40, which exercises the picker and the right-click `Cast`), RESTOCK, breaks and
+   `before_break`, `cancel_task`, and the loot `makeRoom` hook.
 3. ~~E-pre: the Microbot transports adapter~~ **DONE 2026-09-20** on the desktop:
    `ControllerAddon/vendor/microbot/VENDORED.md` pins commit `8bcc652`; `tools/vendor_microbot_tables.py <clone>`
    re-vendors. Still open from it: the Great Conch (gryphon) cave has no row in EITHER table

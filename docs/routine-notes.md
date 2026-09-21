@@ -3781,6 +3781,106 @@ carried" while the pack set off 40 tiles to a bank for a tablet that lands 71 ti
   `travel.py`/`worldmap.py` are untouched, and `near_site` keeps its exact old meaning because
   `_pack` uses it for a different question ("leave a task in progress alone").
 
+### 2026-09-21, UNATTENDED LIVE SESSION: the whole loop ran, and the five bugs it found
+
+**The headline: the task loop works end to end.** In one run it acquired from Aya, banked for the
+loadout, equipped the task's gear, travelled through the house to a fairy ring, fought, and took
+the next task -- then repeated that on its own for several tasks. Before this session only ACQUIRE
+had ever run live. Proven live for the first time here: **phase A** (travel from where we stand),
+**phase B** (the house hub -- tablet -> pool -> ornate jewellery box, AND the house fairy ring),
+**C2** (the bank trip), **C3** (wearing a task's gear), the teleport-tile step-off, and
+back-to-back task cycling.
+
+Tasks completed live: monkeys x20 (Karamja), cave bugs x25 and x30 (Dorgesh-Kaan via house fairy
+ring AJQ), minotaurs x10 (Vault of War), scorpions x26 (Mining Guild).
+
+**Measured timings.** Acquire from Aya: one cast, ~11 s. The house chain (tablet -> pool -> box ->
+landing): ~35 s. A two-item bank trip at Ferox: ~20 s. Monkeys x20 took 4.5 min of fighting; cave
+bugs x25 took 3 min. A whole small-task cycle is about five minutes.
+
+#### The five bugs, and the mechanism of each
+
+**1. The bank PIN read as a missed click.** On the first bank trip of a fresh login the Ferox chest
+click WORKED and the bank answered -- with the PIN keypad. `is_open()` reads False for that, so
+`open_bank` re-clicked the chest five times, `bank_up` counted a failed trip, and three of those
+safety-stopped on *"failed to open the Ferox Enclave bank"* -- a message that sends the next reader
+hunting a targeting bug that never existed. The cache settles it: object 26711 `fairy_chest_bank`
+has **op1=Use, op3=Collect and no "Bank" action at all**, so the plain left-click was right all
+along. `banker.pin_prompt_open()` now reads widget **213.7**; `open_bank` leaves the moment it is up
+(no number of clicks can clear a keypad) and `routines/slayer._waiting_on_bank_pin` holds the phase
+instead of spending the failure budget. **Nothing enters or guesses a PIN** -- the codebase has
+never held one, and a guessed digit is an account-security action, not a retry. OSRS asks once per
+login session, so one human entry unblocks every later trip.
+
+**2. A bank slot drawn BELOW the bank window.** `Kandarin headgear 3` is slot 819 of 933 and `/bank`
+reported it at **screenY 1109**, while the bank window's bottom edge measures **y~1012** on a dumped
+frame. That point is below the whole interface, on the game world behind it -- so the click walked
+the player and **closed the bank**. Every later item in the trip then logged "search button not
+found (bank open?)" and "not found in bank", and the trip declared itself short of a
+`Ring of dueling(8)` the account has fourteen of. `banker._reachable` only asks whether the point is
+inside the RuneLite WINDOW; a scrolled-out slot landing off-window is the case it was written for,
+and **this is the same bug wearing an in-window coordinate**. No bound derived from `/bank` can
+separate the two -- it reports positions, not the container's clip -- so the withdraw click is now
+**hover-gated** (`expected_action="withdraw"`, `expected_target=` the slot's own name); a withheld
+click falls back to `search_bank` and retries once, and still-withheld means skip rather than click
+the world. Remaining units of a proven slot stay ungated, so a quantity of 8 does not pay for eight
+hover reads. Safe here in a way CLAUDE.md warns it is not mid-walk: a withdraw is issued standing
+still at the bank.
+
+**3. ACQUIRE cast while still in combat.** A task finishing mid-fight goes straight to ACQUIRE, and
+three casts fired ~1 s after a combat click, with cave bugs still on the player, opened **neither
+the picker nor a dialogue**. The rune pouch proves every one of them FIRED: -5 astral / -5 cosmic /
+-10 dust across the session is exactly five casts, two good and three lost. So the spell went off
+and the pending interaction closed the interface under it. Three is `CONTACT_MAX_CASTS`, so a
+finished task became a dead run; the same cast worked on the next launch once the bugs had lost
+interest. **This was already item 5 on the handoff's open checklist as a predicted risk.**
+`_settle_before_contact` drops the target and waits up to `ACQUIRE_SETTLE_S` (8 s) for `/combat` to
+go quiet, then casts ANYWAY -- a monster that will not disengage costs one retry, never a hang.
+VERIFIED: the cast straight after the minotaurs kill worked first try, inside the Stronghold.
+
+**4. A door that TALKS instead of swinging.** Minotaurs' site is the Vault of War.
+`travel._open_door` clicked the Gate of War at (1859,5238) **seven times over two ticks**, the
+blocked edge never cleared, the leg failed three times, and the task stopped with a route it could
+never walk. The gate was working perfectly -- it does not swing, it opens a dialogue.
+`stronghold.py` answers one, hooked into `_open_door`'s existing confirm loop so the blocked edge is
+still what proves the door open.
+
+**The live result corrected the theory the fix was built on.** No question was ever asked -- only a
+three-page greeting, and spacing through it was the entire fix. That matches the wiki changelog
+(*"the gates will no longer ask questions once the Stronghold has been completed"*, 3 March 2016),
+so this account has completed it. The ported question/answer table is therefore **untested
+insurance**, not the thing that worked. Its facts come from the Plugin Hub plugin
+`stronghold-of-security` (8058ca0, BSD-2-Clause), ported not vendored; its mechanism is deliberately
+not copied, because upstream keys a HashMap on the question text with **two entries keyed
+`"respond?"` carrying different answers**, so one silently overwrites the other and that question can
+never be answered. Matching here intersects the candidate answers with the options on screen, which
+is unambiguous even when the question tail is not. After the fix all four gates opened and the
+minotaurs were reached in 23 s.
+
+**5. (Self-inflicted, caught before it bit.)** The gate handling reset the door's open budget on
+every dialogue with no bound, so a dialogue that never cleared would have hung `_open_door` for
+ever -- a worse failure than the one it fixes. `DOOR_MAX_TALKS` (6) caps it.
+
+#### Two facts worth keeping
+
+- **`/widgets/dump` mixes coordinate spaces.** `screenX`/`screenY` are SCREEN space but
+  `width`/`height` are REAL (pre-stretch). Verified against the bank title bar: 476 real x 2.061 =
+  981, against 986 measured off the frame. That is the CLAUDE.md two-pixel-spaces trap living inside
+  WidgetProvider's own output -- do not build bounds from those fields without scaling it first. It
+  is why bug 2 was fixed with the hover gate instead of geometry.
+- **`search_bank`'s "did it filter?" test is fooled by a CLOSED bank.** It compares the item count
+  before and after, and a closed bank reads 0 items -- which differs from the unfiltered count and
+  so looks like a successful filter. NOT fixed: the hover gate now stops the bank closing underneath
+  it, but this is a live trap for anyone who makes that function load-bearing again.
+
+#### Still unverified after this session
+
+Breaks and `before_break` (no break fell during it), RESTOCK (no task ran the supplies down), the
+**Kuradal milestone** (fires at streak 39 -> task 40), `npc_contact.cancel_task`, the loot
+`makeRoom` hook, and the Stronghold question table above. The base-gear capture also picked up
+`Dragon scimitar` as the base weapon after a restart mid-gear-task -- the documented "captured while
+a gear task is active" hazard doing exactly what the notes predicted.
+
 ### 2026-09-20: a long offline day -- what exists now, and what a live session must check first
 
 Read `docs/slayer-handoff.md` and the ledger `docs/superpowers/ledgers/2026-09-19-slayer-travel-bank-loadout--progress.md`

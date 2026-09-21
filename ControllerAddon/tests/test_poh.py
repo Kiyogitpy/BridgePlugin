@@ -472,6 +472,72 @@ def test_use_mounted_takes_the_destination_from_the_menu(monkeypatch):
     assert seen == [("Digsite Pendant", "Digsite", "refresh")], "the MENU entry: a left-click may be another destination"
 
 
+# --- a mounted item that offers a MENU, not one action per destination (FOUND LIVE 2026-09-21) --
+#
+# The bats task planned "mounted digsite pendant: Digsite" and the pendant was right there in the
+# house -- offering ['Teleport menu', 'Configuration', 'Remove']. find_named requires the action to
+# be PRESENT, so it matched nothing and the leg failed three times on an object that was working.
+
+MENU_PENDANT = dict(PENDANT, actions=["Teleport menu", "Configuration", "Remove"])
+
+
+def test_a_menu_only_mounted_item_is_used_through_its_menu(monkeypatch):
+    clicked, chosen = [], []
+    monkeypatch.setattr(controller, "get_player", lambda: {"instX": 11669, "instY": 1449})
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda radius=None, fresh=False: [MENU_PENDANT])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, oid: "refresh")
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, obj, action, **kw: clicked.append(action) or True)
+    monkeypatch.setattr(poh.dialogue, "choose",
+                        lambda ctx, needle, **kw: chosen.append(needle) or True)
+
+    assert poh.use_mounted(_Ctx(), "digsite pendant", "Digsite") is True
+    assert clicked == ["Teleport menu"], "the object's OWN spelling of the menu entry"
+    assert chosen == ["Digsite"], "and the destination comes from the dialogue behind it"
+
+
+def test_the_direct_action_still_wins_when_the_item_offers_one(monkeypatch):
+    """The house fairy ring offers 'Zanaris' directly. That path must not start paying for a
+    dialogue it does not need."""
+    chosen = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"instX": 11669, "instY": 1449})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [PENDANT])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, oid: "refresh")
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, obj, action, **kw: True)
+    monkeypatch.setattr(poh.dialogue, "choose",
+                        lambda ctx, needle, **kw: chosen.append(needle) or True)
+
+    assert poh.use_mounted(_Ctx(), "digsite pendant", "Digsite") is True
+    assert chosen == [], "no dialogue when the destination is its own action"
+
+
+def test_a_menu_that_never_offers_the_destination_fails_cleanly(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {"instX": 11669, "instY": 1449})
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda radius=None, fresh=False: [MENU_PENDANT])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, oid: "refresh")
+    monkeypatch.setattr(controller, "click_menu_action", lambda ser, obj, action, **kw: True)
+    monkeypatch.setattr(poh.dialogue, "choose", lambda ctx, needle, **kw: False)
+    assert poh.use_mounted(_Ctx(), "digsite pendant", "Lithkren") is False
+
+
+def test_the_menu_entry_is_matched_whatever_its_capitalisation(monkeypatch):
+    """MEASURED: the pendant says 'Teleport menu' and the Ornate Jewellery Box says
+    'Teleport Menu'."""
+    box = dict(PENDANT, name="Ornate Jewellery Box",
+               actions=["Teleport Menu", "Mining Guild", "Remove"])
+    clicked = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"instX": 11669, "instY": 1449})
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [box])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, oid: "refresh")
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, obj, action, **kw: clicked.append(action) or True)
+    monkeypatch.setattr(poh.dialogue, "choose", lambda ctx, needle, **kw: True)
+    assert poh.use_mounted(_Ctx(), "ornate jewellery box", "Edgeville") is True
+    assert clicked == ["Teleport Menu"]
+
+
 def test_use_mounted_without_the_object_in_view_is_false(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {"instX": 1, "instY": 1})
     monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [])
