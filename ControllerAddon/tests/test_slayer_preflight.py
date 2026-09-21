@@ -127,3 +127,20 @@ def test_the_wear_plan_says_what_would_happen_to_each_worn_requirement():
     assert pf.wear_plan("Cows", live, {}, {}) == [], "an Aya task wears nothing special"
     one_handed = dict(live, weapon={"qty": 1, "name": "Abyssal whip", "id": 4151})
     assert "TWO-HANDED" not in " | ".join(pf.wear_plan("Basilisks", one_handed, {}, {"mirror shield": 1}))
+
+
+def test_the_preflight_reads_the_same_config_the_routine_does(monkeypatch):
+    """FOUND LIVE 2026-09-21: the preflight read GET /config, which on this client carries no
+    food, no potions and no tasks at all (it is the general panel block, and the panel was on
+    another routine). routines/slayer.get_config reads controller.get_slayer_config() --
+    GET /slayer-config -- and that is where food.name, potions.prayerPotion, tasks, bank and loot
+    live. Reading the wrong one made the tool describe a world the routine never sees."""
+    from routines import slayer as routine
+    reads = []
+    monkeypatch.setattr(controller, "get_slayer_config",
+                        lambda: reads.append("/slayer-config") or {"food": {"name": "Shark"}})
+    monkeypatch.setattr(controller, "api_get",
+                        lambda path, *a, **k: reads.append(path) or {} if path != "/slayer" else None)
+    assert routine.get_config(None) == {"food": {"name": "Shark"}}
+    assert pf.panel_config() == {"food": {"name": "Shark"}}
+    assert "/config" not in reads, reads

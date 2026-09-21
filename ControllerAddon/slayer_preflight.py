@@ -135,6 +135,17 @@ def report(task, count, streak, points, player, carried, banked, panel_cfg, task
     return lines
 
 
+def panel_config() -> dict:
+    """The config routines/slayer.get_config reads -- GET /slayer-config, NOT /config.
+
+    FOUND LIVE 2026-09-21: /config is the general panel block and on this client carried no food,
+    no potions and no tasks at all (the panel was set to another routine), while /slayer-config
+    carries food.name, potions.prayerPotion, tasks, bank and loot. Reading the wrong one made this
+    tool describe a world the routine never sees."""
+    import controller
+    return controller.get_slayer_config() or {}
+
+
 def aya_keys() -> list:
     """Aya's tasks the routine would FIGHT (a blocked one, like dogs, is never assigned)."""
     import aya_tasks
@@ -183,7 +194,7 @@ def _main(argv) -> int:
     if state is None:
         print("the bridge (or GET /slayer) is unavailable -- is the client running, and rebuilt?")
         return 1
-    config = controller.api_get("/config") or {}
+    config = panel_config()
     skills = controller.get_skills() or {}
     prayer = (skills.get("Prayer") or {}).get("level") or 1
     if args.all or args.aya:

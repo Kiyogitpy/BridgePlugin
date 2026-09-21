@@ -88,9 +88,11 @@ Read-only, safe beside a running `controller.py`. It prints what the routine WOU
 disposition, site, missing items, the route or the reason there is none, the pack, and the bank
 verdict -- plus the route as it stands AFTER the bank trip. Since 2026-09-21 the routine has a
 BANK step before TRAVEL, so a teleport sitting in the bank is fetched first rather than stopping
-the run; the 'cannot get there ... not carried' line is what TRAVEL would say WITHOUT that trip. FOUND with it on
-2026-09-20: **the panel has no food and no prayer potion chosen** (`food.name` and
-`potions.prayerPotion` are null in `GET /config`), which would stop every task at the bank.
+the run; the 'cannot get there ... not carried' line is what TRAVEL would say WITHOUT that trip. FOUND with it and
+re-checked on 2026-09-21 against the RIGHT endpoint: **the panel has no food and no prayer potion
+chosen** -- `GET /slayer-config` (the one `routines/slayer.get_config` reads; NOT `/config`, which
+is the general block and carries no slayer keys at all) answers `food.name: ""` and
+`potions.prayerPotion: ""`. Every task stops at the pack until both are set in Controller Settings.
 
 ## What to do next, in order
 
