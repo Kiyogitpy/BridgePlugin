@@ -38,6 +38,7 @@ import crossfloor
 import legs
 import poh
 import transports
+import worldmap
 
 RING_WALK_MAX = 150          # tiles, straight-line pre-filter before the real walk is costed
 NEAR_SITE_TILES = 64         # within this WALK of the site, never plan a teleport -- just walk back
@@ -331,7 +332,28 @@ def nearest_ring_costed(player_tile, skill_levels=None):
         if max(abs(ox - player_tile[0]), abs(oy - player_tile[1])) > RING_WALK_MAX:
             continue
         route = crossfloor.find_route(tuple(player_tile), ring.origin, skill_levels=skill_levels, max_links=0)
-        if route is not None and (best is None or route.cost < best[0]):
+        if route is None:
+            continue
+        # BOTH ENGINES HAVE TO AGREE. FOUND LIVE 2026-09-21 on bears: crossfloor answered with a
+        # route to the BLR ring at (3082,3206) and worldmap could not reach it from ANYWHERE on
+        # the mainland -- not that tile, not one of its neighbours, not a tile three away, from
+        # the spiders site or Draynor bank or where the walk actually stopped. The game agreed
+        # with worldmap, saying "I can't reach that!" in the chatbox three times while the leg
+        # re-clicked a Configure that registered perfectly every time (/last-action confirmed
+        # it). The walk leg had meanwhile reported SUCCESS nine tiles short.
+        #
+        # Which engine is wrong is a separate question and a real one; until it is answered, a
+        # ring only counts as walkable when the map that executes the walk also says so. This can
+        # only ever REJECT a route, so the worst case is falling back to the house ring -- which
+        # is what this task's route was before the walk branch existed, and which works.
+        # ADJACENT, not the tile itself: a fairy ring BLOCKS its own tile in the static map, the
+        # same fact legs.walk_across's step-off exists for. Asking for the tile rejects every
+        # ring in the game (measured: the perfectly good BLR ring at (2740,3351) answers None
+        # that way and 70 steps this way), which three existing tests caught immediately.
+        if worldmap.find_path(player_tile[0], player_tile[1], player_tile[2],
+                              ring.origin[0], ring.origin[1], goal_adjacent=True) is None:
+            continue
+        if best is None or route.cost < best[0]:
             best = (route.cost, ring)
     return (best[1], best[0]) if best else (None, None)
 

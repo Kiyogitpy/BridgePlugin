@@ -310,3 +310,24 @@ def test_a_site_thousands_of_tiles_away_never_starts_a_walk_search(monkeypatch):
     assert "Teleport crystal" in why and "at least 904 tiles" in why and "400-tile cap" in why
     # folded, not naive: the Varrock sewers are 6408 tiles away in raw y and 16 on foot
     assert sr.straight_line((3237, 3458, 0), (3237, 9866, 0)) == 8
+
+
+# --- a ring only counts as walkable when BOTH engines say so (FOUND LIVE 2026-09-21) ----------
+
+def test_a_ring_crossfloor_likes_but_worldmap_cannot_reach_is_not_offered(monkeypatch):
+    """On bears, crossfloor answered with a route to the BLR ring at (3082,3206) and worldmap
+    could not reach it from anywhere on the mainland. The GAME agreed with worldmap -- "I can't
+    reach that!" three times -- while the leg re-clicked a Configure that registered perfectly
+    every time, and the walk leg had reported SUCCESS nine tiles short. Until it is known which
+    engine is wrong, the map that executes the walk has a veto."""
+    ring = type("R", (), {"origin": (3082, 3206, 0), "object_id": 29495})()
+    table = type("T", (), {"entrances": [ring]})()
+    monkeypatch.setattr(sr.transports, "load_fairy_rings", lambda: table)
+    monkeypatch.setattr(sr.crossfloor, "find_route",
+                        lambda *a, **k: type("Rt", (), {"cost": 9})())
+
+    monkeypatch.setattr(sr.worldmap, "find_path", lambda *a, **k: None)
+    assert sr.nearest_ring_costed((3090, 3215, 0)) == (None, None)
+
+    monkeypatch.setattr(sr.worldmap, "find_path", lambda *a, **k: [(1, 1)] * 9)
+    assert sr.nearest_ring_costed((3090, 3215, 0))[0] is ring
