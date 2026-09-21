@@ -45,7 +45,11 @@ side never touches RuneLite internals directly — only these HTTP endpoints.
   `ExamplePluginTest.main`, which loads the Controller plugin and starts the bridge -- and,
   when the `../ZombieLite` checkout exists (branch `no-packets` on the user's fork, an
   overlay-only boss-helper bundle), builds and loads every ZombieLite plugin into the SAME
-  client. **The no-packets rule is absolute**: nothing loaded next to the bridge may inject
+  client. From a git WORKTREE `../ZombieLite` does not exist, so `build.gradle` follows the
+  worktree's `.git` file back to the main checkout and looks for ZombieLite beside THAT --
+  before that fix a client rebuilt from a worktree silently came up with no overlays at all.
+  Either way the build prints one `ZombieLite: ...` line saying which it found, or that it
+  found none; read it after a rebuild rather than assuming. **The no-packets rule is absolute**: nothing loaded next to the bridge may inject
   input -- the "physical Arduino, never software-injected" rule in "What this is" applies to
   every plugin. Upstream ZombieLite commits are cherry-picked onto `no-packets` (skip any
   that touch `com.salvation.packets` or re-add an input-sending plugin), read-only-ness is

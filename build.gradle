@@ -42,8 +42,48 @@ tasks.withType(JavaCompile).configureEach {
 // reflection ahead of ControllerPlugin. Nothing here is a compile-time dependency, so a machine
 // without the checkout gets the bridge alone, exactly as before. Added 2026-09-05 so a Hunllef
 // kill can be played by hand with ZombieLite's counters up while /recorder captures it.
-def zombieLiteDir = file('../ZombieLite')
+//
+// `../ZombieLite` is relative to the MAIN checkout. A git WORKTREE lives at
+// <repo>/.claude/worktrees/<name>, so there the same expression names a sibling of the worktree
+// that does not exist -- `zombieLitePresent` is simply false, nothing fails, and the client comes
+// up with the bridge alone and no overlays. FOUND 2026-09-21 rebuilding the slayer client out of
+// the crossfloor-travel worktree; the symptom is an absence, which is why it is worth a log line
+// rather than only a comment.
+//
+// In a worktree `.git` is a FILE reading `gitdir: <repo>/.git/worktrees/<name>`, so the main
+// checkout's root is three parents up from that gitdir and ZombieLite is ITS sibling.
+def zombieLiteDir = {
+	def sibling = file('../ZombieLite')
+	if (sibling.isDirectory()) {
+		return sibling
+	}
+	def dotGit = file('.git')
+	if (dotGit.isFile()) {
+		def match = (dotGit.text =~ /(?m)^\s*gitdir:\s*(.+?)\s*$/)
+		if (match) {
+			def gitDir = new File(match[0][1])
+			if (!gitDir.isAbsolute()) {
+				gitDir = new File(rootDir, match[0][1])
+			}
+			// <repo>/.git/worktrees/<name> -> <repo>, whose sibling is the checkout we want.
+			def mainRoot = gitDir.parentFile?.parentFile?.parentFile
+			if (mainRoot != null && mainRoot.parentFile != null) {
+				def viaMainCheckout = new File(mainRoot.parentFile, 'ZombieLite')
+				if (viaMainCheckout.isDirectory()) {
+					return viaMainCheckout
+				}
+			}
+		}
+	}
+	return sibling
+}()
 def zombieLitePresent = zombieLiteDir.isDirectory()
+if (zombieLitePresent) {
+	logger.lifecycle("ZombieLite: ${zombieLiteDir} -- its plugins will be loaded next to the bridge")
+} else {
+	logger.lifecycle("ZombieLite: no checkout found (looked for ${file('../ZombieLite')}) -- "
+			+ "the client will come up with the bridge alone, no overlays")
+}
 
 configurations {
 	zombieLite
