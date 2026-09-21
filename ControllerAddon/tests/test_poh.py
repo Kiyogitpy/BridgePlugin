@@ -481,20 +481,49 @@ def test_use_mounted_takes_the_destination_from_the_menu(monkeypatch):
 MENU_PENDANT = dict(PENDANT, actions=["Teleport menu", "Configuration", "Remove"])
 
 
-def test_a_menu_only_mounted_item_is_used_through_its_menu(monkeypatch):
-    clicked, chosen = [], []
+# The teleport interface as the client really draws it, MEASURED LIVE 2026-09-21 by dumping
+# widgets while it was open. Note the TITLE also contains the word "Digsite" -- a plain substring
+# search over the dump picks it instead of the destination, which is why matching is anchored on
+# the row number.
+MENU_DUMP = [
+    {"group": 187, "child": 0, "index": 1, "screenX": 985, "screenY": 305,
+     "text": "Digsite Pendant teleport"},
+    {"group": 187, "child": 3, "index": 0, "screenX": 989, "screenY": 357,
+     "text": "<col=735a28>1</col>: Digsite"},
+    {"group": 187, "child": 3, "index": 1, "screenX": 989, "screenY": 390,
+     "text": "<col=735a28>2</col>: Fossil Island"},
+    {"group": 187, "child": 3, "index": 2, "screenX": 989, "screenY": 423,
+     "text": "<col=735a28>3</col>: Lithkren"},
+    {"group": 187, "child": 3, "index": 3, "screenX": 989, "screenY": 456,
+     "text": "<col=735a28>4</col>: Nowhere"},
+]
+
+
+def test_the_teleport_interface_rows_are_parsed_and_the_title_is_not_one():
+    assert [label for label, _ in poh.menu_rows(MENU_DUMP)] == [
+        "Digsite", "Fossil Island", "Lithkren", "Nowhere"]
+    assert poh.menu_entry(MENU_DUMP, "Digsite")["screenY"] == 357
+    assert poh.menu_entry(MENU_DUMP, "Lithkren")["screenY"] == 423
+    assert poh.menu_entry(MENU_DUMP, "Nonesuch") is None
+
+
+def test_a_menu_only_mounted_item_is_used_through_its_teleport_interface(monkeypatch):
+    clicked, picked = [], []
     monkeypatch.setattr(controller, "get_player", lambda: {"instX": 11669, "instY": 1449})
     monkeypatch.setattr(controller, "get_objects",
                         lambda radius=None, fresh=False: [MENU_PENDANT])
     monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, oid: "refresh")
     monkeypatch.setattr(controller, "click_menu_action",
                         lambda ser, obj, action, **kw: clicked.append(action) or True)
+    monkeypatch.setattr(controller, "get_widgets_dump", lambda: MENU_DUMP)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **kw: picked.append((ent["screenX"], ent["screenY"])) or True)
     monkeypatch.setattr(poh.dialogue, "choose",
-                        lambda ctx, needle, **kw: chosen.append(needle) or True)
+                        lambda ctx, needle, **kw: pytest.fail("the interface answered already"))
 
     assert poh.use_mounted(_Ctx(), "digsite pendant", "Digsite") is True
     assert clicked == ["Teleport menu"], "the object's OWN spelling of the menu entry"
-    assert chosen == ["Digsite"], "and the destination comes from the dialogue behind it"
+    assert picked == [(989, 357)], "the Digsite ROW, not the title that also says Digsite"
 
 
 def test_the_direct_action_still_wins_when_the_item_offers_one(monkeypatch):
@@ -512,14 +541,34 @@ def test_the_direct_action_still_wins_when_the_item_offers_one(monkeypatch):
     assert chosen == [], "no dialogue when the destination is its own action"
 
 
-def test_a_menu_that_never_offers_the_destination_fails_cleanly(monkeypatch):
+def test_a_menu_that_never_offers_the_destination_closes_what_it_opened(monkeypatch):
+    """LEAVE NOTHING OPEN. MEASURED 2026-09-21: with group 187 still up from a previous attempt,
+    the retry's right-click landed on the interface instead of the pendant."""
+    keys = []
     monkeypatch.setattr(controller, "get_player", lambda: {"instX": 11669, "instY": 1449})
     monkeypatch.setattr(controller, "get_objects",
                         lambda radius=None, fresh=False: [MENU_PENDANT])
     monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, oid: "refresh")
     monkeypatch.setattr(controller, "click_menu_action", lambda ser, obj, action, **kw: True)
+    monkeypatch.setattr(controller, "get_widgets_dump", lambda: MENU_DUMP)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
+    monkeypatch.setattr(poh, "MENU_BUDGET_S", 0.01)
     monkeypatch.setattr(poh.dialogue, "choose", lambda ctx, needle, **kw: False)
-    assert poh.use_mounted(_Ctx(), "digsite pendant", "Lithkren") is False
+    assert poh.use_mounted(_Ctx(), "digsite pendant", "Karamja") is False
+    assert "ESC" in keys
+
+
+def test_a_refused_menu_click_also_closes_the_interface(monkeypatch):
+    keys = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"instX": 11669, "instY": 1449})
+    monkeypatch.setattr(controller, "get_objects",
+                        lambda radius=None, fresh=False: [MENU_PENDANT])
+    monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, oid: "refresh")
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda ser, obj, action, **kw: False)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: keys.append(key))
+    assert poh.use_mounted(_Ctx(), "digsite pendant", "Digsite") is False
+    assert keys == ["ESC"], "a failed right-click must not leave an interface up for the retry"
 
 
 def test_the_menu_entry_is_matched_whatever_its_capitalisation(monkeypatch):
@@ -533,6 +582,9 @@ def test_the_menu_entry_is_matched_whatever_its_capitalisation(monkeypatch):
     monkeypatch.setattr(controller, "object_refresh_target", lambda x, y, plane, oid: "refresh")
     monkeypatch.setattr(controller, "click_menu_action",
                         lambda ser, obj, action, **kw: clicked.append(action) or True)
+    monkeypatch.setattr(controller, "get_widgets_dump", lambda: [])
+    monkeypatch.setattr(poh, "MENU_BUDGET_S", 0.01)
+    monkeypatch.setattr(controller, "key_tap", lambda ser, key: None)
     monkeypatch.setattr(poh.dialogue, "choose", lambda ctx, needle, **kw: True)
     assert poh.use_mounted(_Ctx(), "ornate jewellery box", "Edgeville") is True
     assert clicked == ["Teleport Menu"]

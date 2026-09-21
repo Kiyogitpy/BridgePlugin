@@ -37,6 +37,7 @@
 # the pool, a convenience that never blocks travel) so the caller's own ceilings stop loudly
 # instead of this module silently pretending an unconfirmed click worked.
 
+import re
 import time
 
 import controller
@@ -52,6 +53,21 @@ BOX_MENU_OPTION = "Teleport Menu"
 ENTER_BUDGET_S, POOL_BUDGET_S, BOX_MENU_BUDGET_S = 10.0, 6.0, 8.0
 POLL_S = 0.3
 SCAN_RADIUS = 40
+
+#: The mounted pendant's teleport interface, MEASURED LIVE 2026-09-21 by dumping widgets while it
+#: was open: group 187, child 3, one indexed row per destination --
+#:   '<col=735a28>1</col>: Digsite' / '2: Fossil Island' / '3: Lithkren' / '4: Nowhere'
+#: plus a title row on child 0 reading 'Digsite Pendant teleport' and a Close button on child 4.
+#: The rows carry NO actions, so there is nothing for the hover gate to verify -- they are matched
+#: by text and clicked at their own screen position, the way use_box handles group 590.
+MENU_GROUP = 187
+MENU_ROW_CHILD = 3
+MENU_BUDGET_S = 6.0
+#: '<col=735a28>1</col>: Digsite' -> 'Digsite'. Anchored on the NUMBER so the interface's own
+#: title ('Digsite Pendant teleport', which also contains "Digsite") can never match a
+#: destination -- the trap this shape sets for a plain substring search.
+MENU_ROW = re.compile(r"^\s*(\d+)\s*:\s*(.+?)\s*$")
+
 
 #: A mounted item that offers a DESTINATION MENU rather than one action per destination.
 #: MEASURED LIVE 2026-09-21 in this account's house: the mounted Digsite Pendant (33420) offers
@@ -297,6 +313,55 @@ def find_named(name_fragment, action, player=None):
     return candidates[0]
 
 
+def strip_tags(text) -> str:
+    """'<col=735a28>1</col>: Digsite' -> '1: Digsite'."""
+    return re.sub(r"<[^>]*>", "", text or "")
+
+
+def menu_rows(dump):
+    """The teleport interface's numbered destination rows, as (label, widget). Pure."""
+    out = []
+    for w in dump or []:
+        if w.get("group") != MENU_GROUP or w.get("child") != MENU_ROW_CHILD:
+            continue
+        if w.get("screenX") is None:
+            continue
+        match = MENU_ROW.match(strip_tags(w.get("text")))
+        if match:
+            out.append((match.group(2), w))
+    return out
+
+
+def menu_entry(dump, destination):
+    """The ONE row offering `destination`, refusing two matches rather than guessing. Pure."""
+    wanted = (destination or "").strip().lower()
+    hits = [w for label, w in menu_rows(dump) if label.lower() == wanted]
+    if len(hits) != 1:
+        hits = [w for label, w in menu_rows(dump) if wanted and wanted in label.lower()]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _use_menu_interface(ctx, obj, destination, log) -> bool:
+    """Pick `destination` out of the mounted item's teleport interface (group 187)."""
+    deadline = time.time() + MENU_BUDGET_S
+    entry = None
+    while time.time() < deadline:
+        entry = menu_entry(controller.get_widgets_dump() or [], destination)
+        if entry is not None:
+            break
+        time.sleep(POLL_S)
+    if entry is None:
+        debug_log.log(log, f"the mounted {obj.get('name')} menu never offered {destination!r}")
+        controller.key_tap(ctx.ser, "ESC")
+        return False
+    if not controller.click_entity(ctx.ser, entry, offset=(0, 0), check_ui_blockers=False,
+                                   simulate_mistakes=False):
+        debug_log.log(log, f"the click on {destination!r} failed -- closing the menu")
+        controller.key_tap(ctx.ser, "ESC")
+        return False
+    return True
+
+
 def _take(ctx, obj, action, log):
     refresh = controller.object_refresh_target(obj.get("x"), obj.get("y"), obj.get("plane", 0),
                                                obj.get("id"))
@@ -332,11 +397,20 @@ def use_mounted(ctx, name_fragment, action, log: str = "poh") -> bool:
     spelling = next((a for a in (obj.get("actions") or [])
                      if (a or "").lower() == MENU_ACTION), MENU_ACTION)
     if not _take(ctx, obj, spelling, log):
+        # LEAVE NOTHING OPEN. MEASURED 2026-09-21: with group 187 still up from a previous
+        # attempt, the retry's right-click landed on the interface instead of the pendant and
+        # logged "couldn't take 'Teleport menu'" -- the same lesson use_box already carries for
+        # group 590.
+        controller.key_tap(ctx.ser, "ESC")
         return False
-    if not dialogue.choose(ctx, action, log=log):
-        debug_log.log(log, f"the mounted {obj.get('name')} opened no menu offering {action!r}")
-        return False
-    return True
+    # The interface first (that is what this pendant opens), then a chat menu, because a mounted
+    # item we have not met yet may well use one.
+    if _use_menu_interface(ctx, obj, action, log):
+        return True
+    if dialogue.choose(ctx, action, log=log):
+        return True
+    debug_log.log(log, f"the mounted {obj.get('name')} opened no menu offering {action!r}")
+    return False
 
 
 def await_left_house(budget_s: float) -> bool:
