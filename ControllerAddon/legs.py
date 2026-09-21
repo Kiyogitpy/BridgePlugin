@@ -602,15 +602,11 @@ def requirement_values() -> dict:
     coin is proven. Shapes are the real GETs of 2026-09-20: /inventory a list of {id, qty},
     /equipment a dict keyed by slot."""
     varbit_ids, varp_ids = crossfloor.requirement_ids()
-    varbits, varps = {}, {}
-    for vid in sorted(varbit_ids):
-        value = controller.get_varbit(vid)
-        if value is not None:
-            varbits[vid] = value
-    for vid in sorted(varp_ids):
-        value = controller.get_varp(vid)
-        if value is not None:
-            varps[vid] = value
+    # ONE read each, not 55 (controller.get_vars): MEASURED 1.16 s before, and a route is planned
+    # every time the routine re-plans. The fallback inside get_vars keeps an un-rebuilt client
+    # working at the old speed.
+    varbits = controller.get_vars(sorted(varbit_ids))
+    varps = controller.get_vars(sorted(varp_ids), kind="varp")
     inventory = controller.get_inventory()
     owned, currency = None, None
     if isinstance(inventory, list):

@@ -23,6 +23,7 @@ def _no_live_bridge(monkeypatch):
     # proves nothing: no varbit, no inventory. A test about those reads overrides these.
     monkeypatch.setattr(controller, "get_varbit", lambda vid: None)
     monkeypatch.setattr(controller, "get_varp", lambda vid: None)
+    monkeypatch.setattr(controller, "get_vars", lambda ids, kind="varbit": {})
     monkeypatch.setattr(controller, "get_inventory", lambda: None)
     monkeypatch.setattr(controller, "get_equipment", lambda: None)
     monkeypatch.setattr(controller, "get_api", lambda group, reader: None)
@@ -551,8 +552,10 @@ def test_requirement_values_come_from_the_bridge_and_unknown_stays_unknown(monke
     /equipment a dict keyed by slot. A varbit the bridge cannot read is LEFT OUT (unknown fails
     closed in transports.usable); it is never written as 0."""
     monkeypatch.setattr(legs.crossfloor, "requirement_ids", lambda: ({3759, 487}, {11}))
-    monkeypatch.setattr(controller, "get_varbit", lambda vid: {3759: 3}.get(vid))
-    monkeypatch.setattr(controller, "get_varp", lambda vid: 0)
+    # ONE read per kind since 2026-09-21 (controller.get_vars). An id the client cannot read is
+    # ABSENT from the reply -- 487 below -- and must stay absent, never become 0.
+    monkeypatch.setattr(controller, "get_vars",
+                        lambda ids, kind="varbit": {3759: 3} if kind == "varbit" else {11: 0})
     monkeypatch.setattr(controller, "get_inventory", lambda: [
         {"qty": 1, "name": "Dusty key", "slot": 0, "id": 1590},
         {"qty": 2500, "name": "Coins", "slot": 1, "id": 995}])

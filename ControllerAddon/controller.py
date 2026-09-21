@@ -301,6 +301,45 @@ def get_varp(varp_id: int):
     return resp.get("value")
 
 
+def get_vars(ids, kind: str = "varbit") -> dict:
+    """{id: value} for MANY varbits (or varplayers) in ONE client-thread hop.
+
+    MEASURED live 2026-09-21: a client-thread read costs ~20 ms whatever it reads, and
+    legs.requirement_values needs 45 varbits plus 10 varplayers before the route planner can prove
+    which transports this account may take -- 55 reads, 1.16 SECONDS, on every route plan. This
+    answers them all at once (PlayerProvider's /varbits/<csv>, added the same day).
+
+    The ids go in the PATH because `requests` percent-encodes a comma in a query value and an
+    un-decoding bridge then reads one unparseable id -- silently, with a well-formed 200. That cost
+    this project every varbit subscription for weeks; see subscribe_varbits.
+
+    An id the client cannot read is ABSENT from the result, never 0 -- unknown is not zero, and the
+    route planner needs an unknown gate to fail closed. A client without the endpoint (not rebuilt
+    since 2026-09-21) answers None, and this falls back to one read per id: slower, same answer.
+    """
+    wanted = [int(i) for i in (ids or ())]
+    if not wanted:
+        return {}
+    path = "/varbits/" if kind == "varbit" else "/varps/"
+    reply = api_get(path + ",".join(str(i) for i in wanted))
+    values = (reply or {}).get("values")
+    if isinstance(values, dict):
+        out = {}
+        for key, value in values.items():
+            try:
+                out[int(key)] = value
+            except (TypeError, ValueError):
+                pass
+        return out
+    read = get_varbit if kind == "varbit" else get_varp
+    out = {}
+    for var_id in wanted:
+        value = read(var_id)
+        if value is not None:
+            out[var_id] = value
+    return out
+
+
 def get_trawling():
     """GET /trawling (TrawlingProvider.java, added 2026-09-06): the deep-sea-trawling item
     containers and varbits. netFish is None (not 0) when the container does not exist, i.e. the

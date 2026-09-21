@@ -2349,3 +2349,37 @@ def test_get_slayer_task_returns_the_endpoint_dict_or_none(monkeypatch):
     assert controller.get_slayer_task() == {"count": 0, "hasTask": False, "streak": 9}
     monkeypatch.setattr(controller, "api_get", lambda *a, **k: None)
     assert controller.get_slayer_task() is None
+
+
+# --- 2026-09-21: many varbits in ONE read -------------------------------------------------------
+
+def test_many_varbits_come_back_in_one_read_and_unknown_stays_absent(monkeypatch):
+    """MEASURED live: every client-thread read costs ~20 ms, and requirement_values needs 45
+    varbits plus 10 varplayers -- 55 reads, 1.16 s, on every route plan. GET /varbits/<csv> answers
+    them in one hop. An id the client cannot read is OMITTED, never reported as 0: unknown must
+    keep failing every gate closed."""
+    seen = []
+    monkeypatch.setattr(controller, "api_get",
+                        lambda path, *a, **k: seen.append(path) or {"values": {"3759": 3, "487": 0}})
+    assert controller.get_vars((3759, 487, 999)) == {3759: 3, 487: 0}
+    assert seen == ["/varbits/3759,487,999"], "a CSV in the PATH: requests would percent-encode a comma"
+    assert controller.get_vars((), kind="varp") == {}, "nothing asked, nothing read"
+    seen.clear()
+    controller.get_vars((11,), kind="varp")
+    assert seen == ["/varps/11"]
+
+
+def test_an_un_rebuilt_client_falls_back_to_one_read_per_id(monkeypatch):
+    """The endpoint is new, so a client that has not been rebuilt 404s it -- api_get answers None.
+    The caller must still get its values, just slowly, rather than losing every gate."""
+    monkeypatch.setattr(controller, "api_get", lambda path, *a, **k: None)
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: {3759: 3}.get(vid))
+    assert controller.get_vars((3759, 487)) == {3759: 3}, "487 unreadable: absent, not zero"
+    monkeypatch.setattr(controller, "get_varp", lambda vid: 5)
+    assert controller.get_vars((11,), kind="varp") == {11: 5}
+
+
+def test_a_malformed_bulk_reply_falls_back_rather_than_inventing_values(monkeypatch):
+    monkeypatch.setattr(controller, "api_get", lambda path, *a, **k: {"values": "nonsense"})
+    monkeypatch.setattr(controller, "get_varbit", lambda vid: 7)
+    assert controller.get_vars((1, 2)) == {1: 7, 2: 7}

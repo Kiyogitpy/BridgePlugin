@@ -397,3 +397,25 @@ def test_the_karamja_monkeys_are_where_the_override_says():
     assert monkeys.npc_ids == (2848,)
     for tile in ((2873, 3148), (2877, 3154), (2879, 3161)):
         assert aya_tasks.contains(monkeys, tile[0], tile[1], 0), tile
+
+
+# --- 2026-09-21: the PANEL has its own task locations, and they are NOT what we use --------------
+
+# MEASURED from the live GET /slayer-config: its `taskLocations` map has 113 entries, and for the
+# 18 that overlap Kuradal's FIGHT list it points somewhere ELSE for 14 -- SEVEN of them in the
+# WILDERNESS. travel.task_location reads that map and has NO callers; the catalog is the authority,
+# because the user chose these sites (docs/slayer-sites/decisions.md) and the spec forbids a
+# Wilderness site outright (§7.8). This is here so that anyone tempted to "just use the panel's
+# locations" sees what that would do.
+PANEL_WILDERNESS_SITES = {
+    "ankou": (2981, 3756, 0), "fire giants": (3046, 10341, 0), "hellhounds": (3439, 10082, 0),
+    "abyssal demons": (3335, 10161, 0), "nechryael": (3335, 10114, 0),
+    "dust devils": (3431, 10117, 0), "black demons": (3084, 9957, 0),
+}
+
+
+def test_the_panels_own_task_locations_would_send_seven_tasks_into_the_wilderness():
+    for task, tile in PANEL_WILDERNESS_SITES.items():
+        assert crossfloor.in_wilderness(tile), f"{task} {tile} is the panel's site"
+        assert not crossfloor.in_wilderness(slayer_catalog.get(task).target), task
+    assert len(PANEL_WILDERNESS_SITES) == 7

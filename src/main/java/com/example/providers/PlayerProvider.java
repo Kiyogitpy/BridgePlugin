@@ -50,6 +50,8 @@ public class PlayerProvider extends BridgeProvider
 		server.register("/player", () -> onClient(this::getPlayer));
 		server.registerQuery("/varbit", query -> onClient(() -> getVarbit(query)));
 		server.registerQuery("/varp", query -> onClient(() -> getVarp(query)));
+		server.registerPrefix("/varbits/", suffix -> onClient(() -> readVars(suffix, client::getVarbitValue)));
+		server.registerPrefix("/varps/", suffix -> onClient(() -> readVars(suffix, client::getVarpValue)));
 	}
 
 	// ADDED 2026-08-22 (user directive, Blast Furnace live session): generic passthrough to
@@ -71,6 +73,56 @@ public class PlayerProvider extends BridgeProvider
 	private Object getVarp(Map<String, String> query)
 	{
 		return readVar(query, client::getVarpValue);
+	}
+
+	/**
+	 * Reads MANY varbits (or varplayers) in ONE client-thread hop: {@code GET /varbits/3759,487,496}.
+	 *
+	 * <p>MEASURED 2026-09-21: every client-thread read costs ~20 ms (the hop, not the work), and
+	 * the slayer route planner needs 45 varbits plus 10 varplayers before it can prove which
+	 * transports this account may take -- 55 separate requests, 1.16 SECONDS, every time it plans
+	 * a route. One hop answers all of them.
+	 *
+	 * <p>The ids go in the PATH, not a query value, for the reason
+	 * {@code controller.subscribe_varbits} records in full: {@code requests} percent-encodes a
+	 * comma, and a bridge that does not URL-decode its query reads {@code 1%2C2} as one
+	 * unparseable id -- silently, with a well-formed 200. A path needs no decoding.
+	 *
+	 * <p>An id that cannot be read is OMITTED rather than reported as 0: unknown is never zero
+	 * here, and {@code legs.requirement_values} relies on an absent value failing every gate
+	 * closed. Anything unparseable is skipped the same way.
+	 *
+	 * @param suffix comma-separated ids from the path
+	 * @param read {@code client::getVarbitValue} or {@code client::getVarpValue}
+	 * @return {@code {"values": {id: value, ...}}}, only for the ids that answered
+	 */
+	private static Object readVars(String suffix, java.util.function.IntFunction<Integer> read)
+	{
+		Map<String, Object> values = new java.util.LinkedHashMap<>();
+		for (String part : (suffix == null ? "" : suffix).split(","))
+		{
+			String trimmed = part.trim();
+			if (trimmed.isEmpty())
+			{
+				continue;
+			}
+			try
+			{
+				int id = Integer.parseInt(trimmed);
+				Integer value = read.apply(id);
+				if (value != null)
+				{
+					values.put(String.valueOf(id), value);
+				}
+			}
+			catch (RuntimeException ignored)
+			{
+				// Unparseable or unreadable: omitted, so the caller treats it as unknown.
+			}
+		}
+		Map<String, Object> result = new HashMap<>();
+		result.put("values", values);
+		return result;
 	}
 
 	private static Object readVar(Map<String, String> query, java.util.function.IntFunction<Integer> read)
