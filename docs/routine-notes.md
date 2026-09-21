@@ -3542,9 +3542,19 @@ supervised test, not a run.
 4. **Rebuild the client** if you want the three new panel settings (min house teleports, make-room
    value, must-loot value) and the bridge fix that stops a crashed reader from looking like an
    empty answer. Without a rebuild the code uses its documented defaults -- pinned by test.
-5. Stock check from the same read: the bank held **4** `Prayer potion(4)` against the **8** a
-   150-kill prayer task asks for; no fungicide spray (zygomites stop); no Mos Le'Harmless scroll
-   (cave horrors stop).
+5. **Stock, read from the real bank 2026-09-21 -- the panel's two settings must match it:**
+   - Prayer restore: there is **no `Prayer potion(4)` at all**. There are **27 `Super restore(4)`**
+     and 149 `Blighted super restore(4)`. Choose **Super restore**.
+   - Food: **no sharks**. There are 416 `Cooked karambwan`, 561 `Tuna`, and over a thousand
+     BLIGHTED anglerfish/manta/karambwan.
+   - **Blighted food and blighted restores only work in the Wilderness** (wiki), and every site
+     here is outside it, so the pack REFUSES them with a named problem rather than carrying food
+     that cannot be eaten. Choose an ordinary food.
+   - Carried right now: **121 `Teleport to house`** (none banked). Banked: 16 `Ring of dueling(8)`,
+     23 `Slayer ring (8)`. No fungicide spray (zygomites stop); no Mos Le'Harmless scroll (cave
+     horrors stop).
+6. `python slayer_dry_run.py` runs the REAL tick() against live data with every click stubbed --
+   a last check that the read path matches reality before the mouse is ever involved.
 
 **What to watch, in the order it will happen**
 

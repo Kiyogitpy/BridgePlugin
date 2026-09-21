@@ -210,3 +210,18 @@ def test_a_worn_requirement_is_fetched_when_it_is_neither_worn_nor_carried():
     assert "Mirror shield" not in _want(worn)
     none = sl.build("Basilisks", 150, PANEL, 70, 10, {}, BANK)
     assert any("mirror shield" in p.lower() for p in none.problems)
+
+
+def test_blighted_supplies_are_refused_because_no_site_here_is_in_the_wilderness():
+    """FOUND 2026-09-21 in the user's real bank: 1319 Blighted anglerfish, 149 Blighted super
+    restore(4), and only 27 ordinary Super restore(4). Blighted items can ONLY be consumed in the
+    Wilderness (wiki: Blighted), and every site in this routine is outside it -- the catalog
+    asserts that. Packing one means carrying food that cannot be eaten when HP drops, so it is a
+    named problem BEFORE the trip, not a discovery at the site."""
+    bank = dict(BANK, **{"blighted anglerfish": 1319, "blighted super restore(4)": 149})
+    panel = {"food": {"name": "Blighted anglerfish"}, "potions": {"prayerPotion": "Blighted super restore"}}
+    lo = sl.build("Nechryael", 150, panel, 70, 10, {}, bank)
+    assert any("blighted" in p.lower() and "wilderness" in p.lower() for p in lo.problems), lo.problems
+    assert not any("blighted" in w["name"].lower() for w in lo.withdraw), "never withdrawn"
+    ok = sl.build("Nechryael", 150, PANEL, 70, 10, {}, BANK)
+    assert not any("blighted" in p.lower() for p in ok.problems)

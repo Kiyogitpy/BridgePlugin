@@ -44,6 +44,12 @@ SPELL_CASTS_CARRIED = 2            # a teleport spell's runes, for one retry
 # SAME one slayer_tasks.missing_items enforces, so the pack and the check cannot disagree.
 CARRY_ITEMS = dict(slayer_catalog.REQUIREMENT_ITEMS, **{slayer_catalog.LIGHT_LABEL: slayer_tasks.LIGHT_SOURCES})
 _NOT_AN_ITEM = ("fairy ring", "ornate jewellery box", "moonclan teleport")
+# Blighted food and blighted super restores can ONLY be consumed in the Wilderness (wiki:
+# Blighted). EVERY site this routine uses is outside it -- slayer_catalog asserts that -- so a
+# blighted supply is food that cannot be eaten when HP drops. FOUND 2026-09-21 in the user's real
+# bank: 1319 Blighted anglerfish and 149 Blighted super restore(4) against 27 ordinary ones, so
+# choosing one in the panel is an easy mistake to make.
+WILDERNESS_ONLY = "blighted"
 _STACKABLE_WORDS = ("teleport", "scroll")     # tablets and scrolls share one slot
 
 
@@ -214,6 +220,10 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
     panel_cfg = panel_cfg or {}
 
     food = (panel_cfg.get("food") or {}).get("name")
+    if food and WILDERNESS_ONLY in food.lower():
+        pack.problems.append(f"{food} can only be eaten in the WILDERNESS and no site here is in it "
+                             f"-- choose an ordinary food in the panel")
+        food = None
     if not food:
         pack.problems.append("no food is chosen in the panel (food.name)")
     elif profile.food:
@@ -221,6 +231,10 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
 
     if profile.prayer_potions:
         potion = (panel_cfg.get("potions") or {}).get("prayerPotion")
+        if potion and WILDERNESS_ONLY in potion.lower():
+            pack.problems.append(f"{potion} can only be drunk in the WILDERNESS and no site here is in "
+                                 f"it -- choose an ordinary prayer restore in the panel")
+            potion = None
         if not potion:
             pack.problems.append("no prayer potion is chosen in the panel (potions.prayerPotion)")
         else:
