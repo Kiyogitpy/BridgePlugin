@@ -38,6 +38,7 @@ import time
 
 import controller
 import debug_log
+import stronghold
 import outcome_waits
 import worldmap
 
@@ -633,6 +634,17 @@ def _open_door(ctx, door: dict, recheck) -> bool:
         waited += DOOR_CONFIRM_POLL_S
         if recheck() is None or _crossed(door, here_x, here_y):
             return True
+        # A DOOR THAT TALKS INSTEAD OF SWINGING. FOUND LIVE 2026-09-21: the Stronghold of
+        # Security's Gate of War answered the click with an account-security question, so the
+        # blocked edge never cleared and the leg failed three times on a gate that was working
+        # perfectly. Answering it is what opens it; the loop then confirms the edge exactly as it
+        # does for every other door, so nothing about the door model changes. Cheap to ask -- one
+        # dialogue read per poll, and only while a door is already known to be in the way.
+        if stronghold.at_gate():
+            stronghold.handle(ctx)
+            waited = 0.0          # the talking was not the door refusing to open
+            still_polls = 0
+            continue
         now = controller.get_player() or {}
         pos = (now.get("x"), now.get("y"))
         if pos[0] is None or pos == last_pos:

@@ -66,6 +66,15 @@ GO_THERE = TRAVEL              # the pre-phase-A name; kept so old notes and log
 
 CONTACT_MAX_CASTS = 3          # each cast spends runes: a ceiling, not just a cooldown
 CONTACT_RETRY_COOLDOWN_S = 6.0
+#: Seconds to let a fight break off before spending a cast. CONFIRMED LIVE 2026-09-21: a task
+#: finishing mid-fight goes straight to ACQUIRE, and three casts fired ~1s after a combat click
+#: with cave bugs still on the player opened NEITHER the picker nor a dialogue -- the runes were
+#: spent every time (-5 astral/-5 cosmic/-10 dust across the session, exactly five casts), so the
+#: spell went off and the interface was closed under it by the pending interaction. Three of those
+#: is the CONTACT_MAX_CASTS stop, which is how a finished task turned into a dead run. The same
+#: cast succeeded on the next launch, once the bugs had lost interest. This was already item 5 on
+#: the handoff's open checklist as a predicted risk; it is measured now.
+ACQUIRE_SETTLE_S = 8.0
 
 SITE_MARGIN = 6                # tiles around the plugin's tight kill rectangles that still count as "there"
 TRAVEL_MAX_FAILS = 3           # a leg that fails three times strands us: stop and NAME it
@@ -134,6 +143,7 @@ def _acquire(ctx, state, tasks_cfg) -> None:
     ctx.state.data.pop("npc_contact_unknown_menu", None)
     debug_log.log(LOG, f"no task: asking {master} for task {state.streak + 1} (streak {state.streak}, "
                        f"{state.points} points)")
+    _settle_before_contact(ctx)
     try:
         got = npc_contact.get_task(ctx, master, tasks_cfg)
     except slayer_state.StreakGuardError as exc:
@@ -149,6 +159,26 @@ def _acquire(ctx, state, tasks_cfg) -> None:
         ctx.state.data["slayer_casts"] = 0
         debug_log.log(LOG, f"task: {got.task or got.task_id} x{got.count} from {master} "
                            f"(streak {got.streak}, {got.points} points)")
+
+
+def _settle_before_contact(ctx) -> None:
+    """Let the fight break off before the cast -- see ACQUIRE_SETTLE_S for the live failure.
+
+    Bounded, and it CASTS ANYWAY when the budget runs out: a monster that will not disengage must
+    cost one retry, never a routine that waits for ever. The target is dropped first so the
+    routine stops feeding the fight it is waiting to end."""
+    ctx.state.data["current_target_index"] = None
+    deadline = time.time() + ACQUIRE_SETTLE_S
+    told = False
+    while time.time() < deadline:
+        combat = controller.get_combat() or {}
+        if not combat.get("inCombat") and not combat.get("underAttack") and combat.get("isIdle", True):
+            return
+        if not told:
+            debug_log.log(LOG, "still in combat -- letting it break off before casting NPC Contact")
+            told = True
+        time.sleep(0.3)
+    debug_log.log(LOG, f"still in combat after {ACQUIRE_SETTLE_S:.0f}s -- casting anyway")
 
 
 def _skip(ctx, state, tasks_cfg) -> None:

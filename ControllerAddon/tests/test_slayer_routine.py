@@ -32,6 +32,10 @@ def _no_live_bridge(monkeypatch):
     # coins). By default a test proves nothing; a test about those reads fakes its own.
     monkeypatch.setattr(legs, "requirement_values", lambda: {
         "varbit_values": {}, "varplayer_values": {}, "owned_item_ids": None, "currency_held": None})
+    # ACQUIRE lets a fight break off before it spends a cast (_settle_before_contact, 2026-09-21).
+    # The default world is NOT in combat, so that gate is a no-op; the tests about it say so.
+    monkeypatch.setattr(controller, "get_combat",
+                        lambda: {"inCombat": False, "underAttack": False, "isIdle": True})
 
 
 REAL_PACK = routine._pack
@@ -656,6 +660,40 @@ def test_the_pin_wait_clears_and_normal_failures_still_stop(monkeypatch):
         if ctx.state.stops:
             break
     assert ctx.state.stops and "bank" in ctx.state.stops[0].lower()
+
+
+def test_acquire_lets_the_fight_break_off_before_spending_a_cast(monkeypatch):
+    """CONFIRMED LIVE 2026-09-21: a task finishing mid-fight cast NPC Contact ~1s after a combat
+    click, three times, with cave bugs still on the player. The runes were spent every time and
+    neither the picker nor a dialogue ever opened -- the pending interaction closed the interface
+    under the cast -- and three of those is the CONTACT_MAX_CASTS stop."""
+    ctx = _Ctx()
+    ctx.state.config = dict(PANEL)
+    ctx.state.data["current_target_index"] = 4242
+    reads = [{"inCombat": True, "underAttack": True, "isIdle": False},
+             {"inCombat": True, "underAttack": False, "isIdle": False},
+             {"inCombat": False, "underAttack": False, "isIdle": True}]
+    monkeypatch.setattr(controller, "get_combat", lambda: reads.pop(0) if reads else
+                        {"inCombat": False, "underAttack": False, "isIdle": True})
+    monkeypatch.setattr(routine.time, "sleep", lambda s: None)
+    routine._settle_before_contact(ctx)
+    assert reads == [], "it waits for the fight to actually end"
+    assert ctx.state.data["current_target_index"] is None, "and stops feeding that fight"
+
+
+def test_acquire_casts_anyway_when_the_fight_never_breaks_off(monkeypatch):
+    """A monster that will not disengage costs one retry, never a routine that waits for ever."""
+    ctx = _Ctx()
+    ctx.state.config = dict(PANEL)
+    monkeypatch.setattr(controller, "get_combat",
+                        lambda: {"inCombat": True, "underAttack": True, "isIdle": False})
+    clock = {"t": 0.0}
+    monkeypatch.setattr(routine.time, "time", lambda: clock["t"])
+    def advance(s):
+        clock["t"] += max(s, 0.3)
+    monkeypatch.setattr(routine.time, "sleep", advance)
+    routine._settle_before_contact(ctx)          # returns rather than hanging
+    assert clock["t"] >= routine.ACQUIRE_SETTLE_S
 
 
 # --- 2026-09-21: RESTOCK (plan task D1) -- out of food or prayer AT the site --------------------

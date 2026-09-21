@@ -36,6 +36,9 @@ def _no_live_bridge(monkeypatch):
             return {}
         raise AssertionError(f"a test reached the live bridge: GET {path}")
     monkeypatch.setattr(controller, "api_get", refuse)
+    # A door that TALKS instead of swinging (stronghold.py, 2026-09-21) is checked once per
+    # confirm poll. No Stronghold gate in this world by default; the tests about one say so.
+    monkeypatch.setattr(travel.stronghold, "at_gate", lambda: False)
 
 
 @pytest.fixture(autouse=True)
@@ -963,6 +966,29 @@ def test_a_door_that_never_opens_is_reported_not_silently_accepted(monkeypatch):
     travel._open_door(_Ctx(), door, lambda: door)
 
     assert any("still shut" in m for m in logged), f"a failed open must say so: {logged}"
+
+
+def test_a_door_that_talks_is_answered_and_the_talking_does_not_count_against_the_budget(monkeypatch):
+    """FOUND LIVE 2026-09-21. The Stronghold of Security's Gate of War answers a click with an
+    account-security question instead of swinging, so the blocked edge never cleared and the leg
+    failed three times on a gate that was working perfectly. Answering is what opens it."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1859, "y": 5239, "plane": 0})
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    door = _route_door(1859, 5238, flags=BLOCK_MOVEMENT_NORTH)
+    state = {"talking": True, "shut": True}
+    monkeypatch.setattr(travel.stronghold, "at_gate", lambda: state["talking"])
+    handled = []
+
+    def handle(ctx, budget_s=None):
+        handled.append(1)
+        state["talking"] = False
+        state["shut"] = False          # answering is what opens it
+        return True
+    monkeypatch.setattr(travel.stronghold, "handle", handle)
+
+    assert travel._open_door(_Ctx(), door, lambda: None if not state["shut"] else door) is True
+    assert handled, "the question must actually be answered"
 
 
 def test_an_upper_plane_route_that_leaves_the_loaded_scene_is_discarded(walker, monkeypatch):
