@@ -220,3 +220,261 @@ def test_a_demon_is_recognised_by_name_not_by_id():
     assert td.is_demon({"name": "Greater Demon", "id": 13599}) is False
     assert td.is_demon({}) is False
     assert td.is_demon(None) is False
+
+
+# --- reading the demon's protection prayer off an /npcs row --------------------------------------
+
+def test_the_reliable_read_is_preferred_and_the_api_read_is_the_fallback():
+    """The bridge reports the same question twice since 2026-09-21. `protectionPrayer` comes from
+    OverheadPrayer, which reads the client's own head icon; `overheadPrayer` comes from the public
+    API and is only correct when the sprite happened to come from the prayer archive. Prefer the
+    reliable one, fall back rather than give up."""
+    assert td.protected_style({"protectionPrayer": "MELEE", "overheadPrayer": "MAGIC"}) == td.MELEE
+    assert td.protected_style({"overheadPrayer": "RANGED"}) == td.RANGED, "fallback still answers"
+    assert td.protected_style({"protectionPrayer": "MAGIC"}) == td.MAGIC
+
+
+def test_a_demon_with_no_overhead_at_all_reads_as_no_prayer():
+    """Both keys absent is the shape of an npc praying nothing, and of a client that could not
+    decode it. Neither is a style, and the caller decides what to do about it."""
+    assert td.protected_style({}) is None
+    assert td.protected_style({"protectionPrayer": None, "overheadPrayer": None}) is None
+    assert td.protected_style(None) is None
+
+
+def test_an_unrecognised_overhead_is_not_silently_turned_into_a_style():
+    """Retribution, smite and redemption are real overheads and none of them protect from anything.
+    Reading one as a style would swap gear for no reason."""
+    assert td.protected_style({"protectionPrayer": "RETRIBUTION"}) is None
+    assert td.protected_style({"protectionPrayer": "SMITE", "overheadPrayer": "MELEE"}) == td.MELEE, \
+        "an unusable reliable answer still lets the fallback speak"
+
+
+def test_the_whole_chain_answers_which_style_to_hold():
+    """The one question a routine actually asks each tick, end to end: an /npcs row in, the weapon
+    to be holding out."""
+    pair = td.SwapPair(td.MELEE, td.RANGED)
+    demon = {"name": "Tormented Demon", "id": 13599, "protectionPrayer": "MELEE",
+             "animationId": td.ANIM_ATTACK_RANGED}
+
+    assert td.is_demon(demon) is True
+    assert pair.required(td.protected_style(demon)) == td.RANGED, "it prays melee, so hit it ranged"
+    assert td.style_from_animation(demon["animationId"]) == td.RANGED, \
+        "and it is attacking ranged, so protect from missiles"
+
+
+# --- refinements 2026-09-21: two defects found by reading the module back ------------------------
+
+def test_a_bomb_is_timed_from_the_tick_it_SPAWNED_not_the_tick_we_noticed_it():
+    """DEFECT. `GRAPHICS_OBJECT_CREATED` carries its own `tick`, and the routine may read it a tick
+    or two after it fired -- UDP is an accelerator with an HTTP fallback, so late is normal. Timing
+    the five ticks from "now" instead of from the spawn would hand the routine a deadline LATER
+    than the real one, which is the direction that gets you hit.
+
+    The event's tick wins when it has one; `now_tick` is only the fallback for a caller reading
+    graphics objects straight off a scan with no tick attached."""
+    spawned_late = [{"id": td.FIREBALL_GRAPHICS_OBJECT_ID, "x": 40, "y": 50, "plane": 0, "tick": 900}]
+    bombs = td.bombs_from(spawned_late, now_tick=903)
+
+    assert bombs[0].detonates_tick == 905, "900 + 5, not 903 + 5"
+
+    no_tick = [{"id": td.FIREBALL_GRAPHICS_OBJECT_ID, "x": 40, "y": 50, "plane": 0}]
+    assert td.bombs_from(no_tick, now_tick=903)[0].detonates_tick == 908, "fallback only"
+
+
+def test_the_dodge_breaks_a_tie_by_a_STATED_rule_not_by_hash_order():
+    """DEFECT. The first version iterated a SET and kept the first nearest tile, so the choice among
+    equally good candidates fell out of hash order -- stable within one process, which is exactly
+    why a "call it twice and compare" test cannot catch it, and arbitrary between a set and a list.
+    A routine whose choice is unreproducible from its own log is not debuggable.
+
+    So the tie-break is a RULE: lowest x, then lowest y. Asserting the rule is what makes it real;
+    asserting that two calls agree would pass against the broken version."""
+    bombs = [td.Bomb(40, 50, 0, 105)]
+    equally_near = [(39, 50, 0), (41, 50, 0), (40, 49, 0), (40, 51, 0)]
+
+    assert td.dodge((40, 50, 0), bombs, equally_near) == (39, 50, 0)
+    assert td.dodge((40, 50, 0), bombs, list(reversed(equally_near))) == (39, 50, 0)
+    assert td.dodge((40, 50, 0), bombs, set(equally_near)) == (39, 50, 0), "a set answers the same"
+
+
+def test_the_dodge_stays_as_close_to_the_demon_as_it_can():
+    """Stepping away from the demon costs the fight: out of range it walks after you, and every tick
+    it spends walking pushes the next bomb further out. Among equally near safe tiles, prefer the
+    one that keeps the demon closest."""
+    bombs = [td.Bomb(40, 50, 0, 105)]
+    walkable = {(39, 50, 0), (41, 50, 0)}
+    demon = (43, 50, 0)
+
+    assert td.dodge((40, 50, 0), bombs, walkable, keep_near=demon) == (41, 50, 0)
+
+
+def test_staying_near_the_demon_never_beats_actually_being_safe():
+    """The demon is standing next to the other bomb. Being safe outranks being in range, always."""
+    bombs = [td.Bomb(40, 50, 0, 105), td.Bomb(41, 50, 0, 105)]
+    walkable = {(39, 50, 0), (41, 50, 0)}
+    demon = (43, 50, 0)
+
+    assert td.dodge((40, 50, 0), bombs, walkable, keep_near=demon) == (39, 50, 0)
+
+
+# --- the punish window: when the shield is down and when attacks cannot miss ---------------------
+
+def test_the_fire_bomb_drops_the_shield_and_it_stays_down_until_you_hit_it():
+    """USER, 2026-09-20, correcting the wiki: after a bomb the shield is down INDEFINITELY -- a
+    countdown running while the player is still dodging was measuring nothing. It is the player's
+    own landed hit that starts the 4-tick window a second hit can fit inside."""
+    demon = td.DemonState()
+    demon.on_animation(td.ANIM_FIRE_BOMB, tick=100)
+
+    assert demon.shield_down(tick=100) is True
+    assert demon.shield_down(tick=140) is True, "still down 40 ticks later: nothing has hit it"
+    assert demon.punish_ticks_left(tick=140) is None, "no window open yet, so no number to give"
+
+    demon.on_player_hit(tick=140)
+    assert demon.punish_ticks_left(tick=140) == td.SHIELD_DOWN_WINDOW_TICKS
+    assert demon.punish_ticks_left(tick=143) == 1
+    assert demon.shield_down(tick=144) is False, "window spent"
+
+
+def test_a_miss_does_not_open_the_punish_window():
+    """ZombieLite keys the window on a LANDED hit -- hitpoints XP is what tells it one happened. An
+    attack that splashed leaves the shield down, waiting."""
+    demon = td.DemonState()
+    demon.on_animation(td.ANIM_FIRE_BOMB, tick=100)
+
+    demon.on_player_hit(tick=110, landed=False)
+    assert demon.punish_ticks_left(tick=110) is None
+    assert demon.shield_down(tick=110) is True, "still waiting for a real hit"
+
+    demon.on_player_hit(tick=112, landed=True)
+    assert demon.punish_ticks_left(tick=112) == td.SHIELD_DOWN_WINDOW_TICKS
+
+
+def test_the_demon_becomes_defenceless_thirty_ticks_after_a_bomb_until_you_hit_it():
+    """Wiki, "Defencelessness": 100% accuracy, indicated by the flames on its back going out, and
+    it lasts until the player's first hit. ZombieLite marks the 30 UNVERIFIED LIVE, so this is the
+    softest number in the module."""
+    demon = td.DemonState()
+    demon.on_animation(td.ANIM_FIRE_BOMB, tick=100)
+
+    assert demon.defenceless(tick=129) is False
+    assert demon.defenceless(tick=130) is True, "100 + DEFENCELESS_AFTER_TICKS"
+    assert demon.defenceless(tick=200) is True, "it lasts until something lands"
+
+    demon.on_player_hit(tick=200)
+    assert demon.defenceless(tick=201) is False
+
+
+def test_the_bomb_counter_counts_the_demons_attacks_and_the_bomb_resets_it():
+    """The cycle rides the attack COUNT. Each ordinary attack advances it; the bomb ends the cycle
+    and starts the next one from zero."""
+    demon = td.DemonState()
+    for tick, animation in ((10, td.ANIM_ATTACK_MELEE), (16, td.ANIM_ATTACK_MELEE),
+                            (22, td.ANIM_ATTACK_RANGED)):
+        demon.on_animation(animation, tick=tick)
+
+    assert demon.attacks_since_bomb == 3
+    assert demon.last_attack_tick == 22
+    assert demon.style == td.RANGED, "the last style it swung with"
+
+    demon.on_animation(td.ANIM_FIRE_BOMB, tick=29)
+    assert demon.attacks_since_bomb == 0
+
+
+def test_a_leashed_fight_forgets_the_cycle_rather_than_aiming_at_a_bomb_that_is_not_coming():
+    """Neither side has swung for ENGAGEMENT_TIMEOUT_TICKS, so the demon leashes and heals to full.
+    Carrying a part-spent counter into the next fight would point the bomb warning at nothing."""
+    demon = td.DemonState()
+    demon.on_animation(td.ANIM_ATTACK_MELEE, tick=10)
+    demon.on_animation(td.ANIM_ATTACK_MELEE, tick=16)
+    assert demon.attacks_since_bomb == 2
+
+    demon.on_tick(16 + td.ENGAGEMENT_TIMEOUT_TICKS + 1)
+
+    assert demon.attacks_since_bomb == 0
+    assert demon.shield_down(tick=100) is False
+    assert demon.defenceless(tick=200) is False
+
+
+def test_the_bomb_warning_comes_from_the_state_rather_than_the_caller_doing_the_sums():
+    """The one call a routine makes to decide whether to commit to anything long."""
+    demon = td.DemonState()
+    for i in range(8):
+        demon.on_animation(td.ANIM_ATTACK_MELEE, tick=10 + i * td.ATTACK_SPEED_TICKS)
+
+    assert demon.bomb_window().imminent is True
+
+
+# --- predicting the NEXT style, so the prayer is up before the hit lands -------------------------
+
+def test_a_demon_closing_the_distance_is_going_to_use_melee():
+    """Wiki, Fight overview: "If it approaches the player, it will use melee." ZombieLite reads the
+    same thing off movement -- the player standing still, the gap shrinking, and the demon in its
+    WALK pose."""
+    assert td.predict_style(previous=6, current=4, moving=True) == td.MELEE
+
+
+def test_a_demon_that_is_not_closing_is_going_to_use_magic_or_ranged():
+    """The other half of the same wiki rule. Which of the two is NOT knowable from movement, so the
+    answer is "not melee" rather than a guess dressed up as a style."""
+    assert td.predict_style(previous=4, current=6, moving=True) == td.NOT_MELEE
+    assert td.predict_style(previous=6, current=6, moving=False) == td.NOT_MELEE
+
+
+def test_a_demon_already_standing_on_top_of_you_tells_you_nothing_by_not_moving():
+    """Holding still at distance 1 is just melee range -- there is no information in it, and reading
+    it as "not melee" would drop Protect from Melee at exactly the wrong moment. ZombieLite guards
+    this with `currentDistance > 1`."""
+    assert td.predict_style(previous=1, current=1, moving=False) is None
+
+
+def test_an_unknown_previous_distance_predicts_nothing():
+    """The first tick of a fight has nothing to compare against."""
+    assert td.predict_style(previous=None, current=4, moving=True) is None
+
+
+def test_the_predictor_never_claims_to_know_which_of_magic_or_ranged():
+    """The wiki is explicit that after a melee phase the player has to guess and correct. A module
+    that returned MAGIC here would be inventing certainty the game does not offer."""
+    assert td.predict_style(previous=8, current=8, moving=False) != td.MAGIC
+    assert td.predict_style(previous=8, current=8, moving=False) != td.RANGED
+
+
+# --- speed: what the human actually does, so the routine has a target ---------------------------
+
+def test_the_human_speed_budgets_are_the_measured_ones():
+    """USER, mid-build: "might need to speed up our routine, look at how fast I play." MEASURED
+    across all three recordings, so the routine has a number to hit rather than a feeling.
+
+    These are pinned because the whole point is that a future call site cannot quietly drift off
+    them -- the gear switch is the tightest sequence in the fight and the dodge is the one with a
+    hard deadline."""
+    assert td.HUMAN_GEAR_CLICK_MS == 222, "median inventory-slot to inventory-slot, n=213"
+    assert td.HUMAN_GEAR_CLICK_FAST_MS == 143, "their fastest single one"
+    assert td.HUMAN_BOMB_REACTION_MS == 578, "median bind chat -> first action, n=45"
+    assert td.BOMB_DODGE_BUDGET_TICKS == 2, "the wiki's move window, 1.2 s"
+
+
+def test_a_gear_switch_must_not_pay_a_reaction_delay_per_item():
+    """This is the one that would make the routine visibly slower than the user.
+
+    Our own click costs about 235 ms for an inventory hop (137 ms flight plus a ~98 ms hold), which
+    is already human -- they measure 222. But `REACTION_DELAY_S` is 200-500 ms and confirming each
+    equip separately would add it five times, turning a 1.0 s switch into roughly 3 s.
+
+    So the budget is stated for the WHOLE burst, and a routine that fits it cannot be confirming
+    item by item."""
+    whole_burst = td.gear_switch_budget_ms(items=5)
+
+    assert whole_burst <= 1500, "the human does five in about a second"
+    assert whole_burst >= 5 * td.HUMAN_GEAR_CLICK_FAST_MS, "but not faster than they ever were"
+
+
+def test_the_dodge_budget_leaves_room_for_the_click_to_actually_land():
+    """Two ticks is 1200 ms and our viewport hop costs about 440 ms median, 650 at p90. That fits
+    only with no hover gate and no reaction delay on the dodge click -- the gate reads the cursor
+    position RIGHT NOW and this click is issued while the player is still being bound."""
+    assert td.BOMB_DODGE_BUDGET_MS == 1200
+    assert td.BOMB_DODGE_BUDGET_MS - td.HUMAN_BOMB_REACTION_MS > 500, \
+        "the human leaves this much room; so must we"

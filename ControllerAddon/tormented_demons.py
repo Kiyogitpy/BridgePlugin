@@ -133,8 +133,14 @@ def bombs_from(graphics_objects, now_tick):
     for obj in graphics_objects or ():
         if (obj or {}).get("id") != FIREBALL_GRAPHICS_OBJECT_ID:
             continue
+        # The SPAWN tick, not the tick we happened to read it. GRAPHICS_OBJECT_CREATED carries its
+        # own, and the routine may process it late -- UDP is an accelerator with an HTTP fallback,
+        # so late is ordinary. Timing from "now" would put the deadline LATER than it really is,
+        # which is the direction that gets the player hit.
+        spawned = obj.get("tick")
+        spawned = now_tick if spawned is None else spawned
         bombs.append(Bomb(obj.get("x"), obj.get("y"), obj.get("plane") or 0,
-                          now_tick + FIREBALL_DELAY_TICKS))
+                          spawned + FIREBALL_DELAY_TICKS))
     return bombs
 
 
@@ -154,7 +160,7 @@ def in_danger(player, bombs, now_tick=None):
     return False
 
 
-def dodge(player, bombs, walkable, now_tick=None):
+def dodge(player, bombs, walkable, now_tick=None, keep_near=None):
     """The tile to step to, or None when the player is already safe or nothing safe is reachable.
 
     Nearest first, because the step has to happen inside two ticks and one tile is a complete
@@ -168,17 +174,30 @@ def dodge(player, bombs, walkable, now_tick=None):
     pending = [b for b in bombs or ()
                if now_tick is None or now_tick < b.detonates_tick]
     unsafe = {(b.x, b.y, b.plane) for b in pending}
-    best = None
+    near = _tile(keep_near) if keep_near is not None else None
+
+    candidates = []
     for tile in walkable or ():
         tx, ty, tplane = _tile(tile)
         if tplane != pplane or (tx, ty, tplane) in unsafe:
             continue
-        distance = max(abs(tx - px), abs(ty - py))
-        if distance == 0:
+        step = max(abs(tx - px), abs(ty - py))
+        if step == 0:
             continue
-        if best is None or distance < best[0]:
-            best = (distance, (tx, ty, tplane))
-    return best[1] if best else None
+        # Ranked, in this order and no other:
+        #   1. the shortest step, because it has to happen inside two ticks;
+        #   2. then the tile that keeps the demon closest -- stepping out of range costs the fight,
+        #      the demon walks after you, and every tick it spends walking pushes the next bomb
+        #      out with it. SAFETY IS ALREADY DECIDED ABOVE, so this can never trade safety away;
+        #   3. then lowest x, then lowest y, as a STATED tie-break. Keeping the first match out of
+        #      a set put this at the mercy of hash order, which made the choice unreproducible
+        #      from a log -- and stable enough within one process that re-calling could not catch
+        #      it.
+        reach = (max(abs(tx - near[0]), abs(ty - near[1])) if near else 0)
+        candidates.append((step, reach, tx, ty, (tx, ty, tplane)))
+    if not candidates:
+        return None
+    return min(candidates)[-1]
 
 
 def _tile(value):
@@ -309,3 +328,189 @@ def is_demon(npc):
     """
     name = (npc or {}).get("name") if isinstance(npc, dict) else None
     return bool(name) and NPC_NAME.lower() in name.lower()
+
+
+def protected_style(npc):
+    """An `/npcs` row -> the style that demon is PROTECTED FROM, or None if it cannot be read.
+
+    The bridge answers this question twice, on purpose, and they are not equally good:
+
+    - `protectionPrayer` comes from `OverheadPrayer`, which reads the head icon out of the client's
+      own fields. Ported from ZombieLite, which runs it in production. This is the reliable one.
+    - `overheadPrayer` comes from the public API, and is only a real prayer when the overhead sprite
+      happened to come from the PRAYER archive -- an assumption nobody has ever verified per state.
+
+    So: prefer the reliable answer, fall back to the API one rather than giving up, and treat
+    anything that is not one of the three combat overheads as None. Retribution, smite and
+    redemption are real overheads that protect from nothing, and reading one as a style would swap
+    gear for no reason.
+    """
+    row = npc or {}
+    if not isinstance(row, dict):
+        return None
+    for key in ("protectionPrayer", "overheadPrayer"):
+        style = style_from_overhead(row.get(key))
+        if style is not None:
+            return style
+    return None
+
+
+class DemonState(object):
+    """One demon's fight state, fed the demon's animations and the player's landed hits.
+
+    Ported from ZombieLite's `TormentedDemon` tracker, keeping the phase rules and dropping
+    everything that only existed to draw an overlay. A routine feeds it three things -- the demon's
+    animation, whether the player's attack landed, and the current tick -- and asks it when to
+    punish, when attacks cannot miss, and whether a bomb is close.
+
+    It is deliberately NOT a source of truth for the protection prayer: that is read live from the
+    overhead every tick (`protected_style`), because an estimate that drifts would swap gear wrong.
+    """
+
+    def __init__(self):
+        self.attacks_since_bomb = 0
+        self.last_attack_tick = None
+        self.style = None
+        self._shield_until_hit = False
+        self._shield_until_tick = None
+        self._defenceless_from = None
+        self._last_activity_tick = None
+
+    # --- what the demon did ---------------------------------------------------------------------
+
+    def on_animation(self, animation_id, tick):
+        """The demon's animation for this tick."""
+        self._last_activity_tick = tick
+        if is_fire_bomb(animation_id):
+            # The bomb ENDS a cycle and drops the shield, which then stays down until something
+            # lands on it. The defenceless timer restarts from here too.
+            self.attacks_since_bomb = 0
+            self._shield_until_hit = True
+            self._shield_until_tick = None
+            self._defenceless_from = tick + DEFENCELESS_AFTER_TICKS
+            return
+        style = style_from_animation(animation_id)
+        if style is not None:
+            self.attacks_since_bomb += 1
+            self.last_attack_tick = tick
+            self.style = style
+
+    def on_player_hit(self, tick, landed=True):
+        """The player attacked. Only a LANDED hit opens the punish window -- a splash leaves the
+        shield down, still waiting, which is why this takes the outcome and not just the click."""
+        self._last_activity_tick = tick
+        if not landed:
+            return
+        if self._shield_until_hit:
+            self._shield_until_hit = False
+            self._shield_until_tick = tick + SHIELD_DOWN_WINDOW_TICKS
+        # Defencelessness lasts until the first thing that lands, then ends.
+        self._defenceless_from = None
+
+    def on_tick(self, tick):
+        """A tick passed with nothing happening. Ends the fight once neither side has swung for
+        ENGAGEMENT_TIMEOUT_TICKS: the demon leashes and heals to full, so a part-spent bomb counter
+        carried into the next fight would aim the warning at a bomb that is not coming."""
+        if self._last_activity_tick is None:
+            return
+        if tick - self._last_activity_tick > ENGAGEMENT_TIMEOUT_TICKS:
+            self.__init__()
+
+    # --- what a routine asks ---------------------------------------------------------------------
+
+    def shield_down(self, tick):
+        """Is the fire shield down right now? Non-demonbane damage is reduced by 20% while it is up."""
+        if self._shield_until_hit:
+            return True
+        return self._shield_until_tick is not None and tick < self._shield_until_tick
+
+    def punish_ticks_left(self, tick):
+        """Ticks left in the open punish window, or None when no window is open.
+
+        None while the shield is merely down-and-waiting is the point: there is genuinely no number
+        yet, and inventing one would be a countdown measuring nothing.
+        """
+        if self._shield_until_tick is None:
+            return None
+        left = self._shield_until_tick - tick
+        return left if left > 0 else None
+
+    def defenceless(self, tick):
+        """Do attacks currently have 100% accuracy? The best moment to spend a special attack."""
+        return self._defenceless_from is not None and tick >= self._defenceless_from
+
+    def bomb_window(self):
+        """When the next bomb can land, as a bound. See `bomb_window` for why it is never a number."""
+        return bomb_window(self.attacks_since_bomb, self.last_attack_tick or 0)
+
+
+#: "Not melee" -- a real answer, and all the game offers. The wiki is explicit that after a melee
+#: phase the player has to guess between magic and ranged and correct, so a predictor returning one
+#: of them would be inventing certainty. A caller pairs this with the overhead and its own last
+#: observation.
+NOT_MELEE = "not_melee"
+
+
+def predict_style(previous, current, moving):
+    """The demon's NEXT attack style from how it is moving, or None when movement says nothing.
+
+    Wiki, Fight overview: "If it approaches the player, it will use melee. If it does not approach
+    the player, it will use magic or ranged." ZombieLite reads exactly this off the distance
+    between ticks plus the demon's pose.
+
+    `previous` and `current` are the distance to the player on consecutive ticks and `moving` is
+    whether it is in its walking pose. Holding still at distance 1 is NOT evidence -- that is
+    simply melee range, and reading it as "not melee" would drop Protect from Melee at the worst
+    possible moment.
+
+    NOT PORTED, deliberately: ZombieLite also narrows the next style by excluding the one just
+    used, which contradicts its OWN measured note that "the style is constant within a cycle and
+    changes at the bomb". Two of its rules cannot both be right, and the measured one wins here.
+    """
+    if previous is None or current is None:
+        return None
+    if current < previous and moving:
+        return MELEE
+    if current > previous and moving:
+        return NOT_MELEE
+    if current == previous and not moving and current > 1:
+        return NOT_MELEE
+    return None
+
+
+# --- speed: the human's own numbers, so the routine has a target rather than a feeling -----------
+#
+# USER, 2026-09-21: "might need to speed up our routine, look at how fast I play."
+#
+# MEASURED from all three recordings. The comparison that matters is against OUR OWN click cost,
+# computed from settings.py's fitted movement model for the same motions:
+#
+#   motion                          ours (flight + ~98 ms hold)     the user
+#   inventory slot -> slot          137 ms median, 223 p90          222 ms median, 143 fastest
+#   viewport tile hop               344 ms median, 549 p90          --
+#
+# So a single click is ALREADY at human speed. The routine will only be slower if it spends time
+# between clicks, and there is exactly one setting big enough to matter: REACTION_DELAY_S, at
+# 200-500 ms per confirmed outcome. Paying it per equip turns a 1 s gear switch into about 3 s.
+# That is the thing to avoid, not the click itself.
+
+#: Median gap between consecutive inventory clicks in a gear switch, n=213.
+HUMAN_GEAR_CLICK_MS = 222
+#: Their single fastest. A floor: going below this is no longer imitating anyone.
+HUMAN_GEAR_CLICK_FAST_MS = 143
+#: Median from the bind chat line to the player's next action of any kind, n=45. Their own min was
+#: 82 ms and their p75 was 704 ms, so this is a comfortable middle rather than a reflex.
+HUMAN_BOMB_REACTION_MS = 578
+
+#: The wiki's window to move off a bomb tile, and the hard deadline in this fight.
+BOMB_DODGE_BUDGET_TICKS = 2
+BOMB_DODGE_BUDGET_MS = 1200
+
+
+def gear_switch_budget_ms(items):
+    """How long a whole gear switch may take, for `items` pieces.
+
+    Stated for the WHOLE burst on purpose. A routine that confirms each equip separately cannot
+    fit this, which is the point: the measured human fires all five and looks once at the end.
+    """
+    return int(items * HUMAN_GEAR_CLICK_MS)

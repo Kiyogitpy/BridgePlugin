@@ -3436,3 +3436,106 @@ today's map (a set bit means BLOCKED, not passable); (3) re-measurement of every
 lengths there come from the current (EthanApi) map, not this one. Not done here -- recorded as
 its own follow-up task.
 
+
+## Tormented Demons (`tormented_demons.py`, 2026-09-21) -- mechanics ported, NO routine yet
+
+The user fights these by hand as their Greater demons slayer task, which is why that task is a
+STOP. Three recordings were made on 2026-09-20 and 2026-09-21 (9.5, 14.5 and 24.7 minutes, 93k
+records) and analysed here. `ControllerAddon/tormented_demons.py` is the result: PURE decisions,
+no HTTP and no clicking. **Nothing acts yet.**
+
+**The facts are PORTED from ZombieLite, not derived.** `com.salvation.plugins.tormenteddemons` is
+a 641-line model of this exact fight, it runs in the same client, and the USER has already
+corrected it against live play. Copying its source rather than reconstructing the mechanic from the
+wiki is the standing rule here, and it paid immediately: see the shield note below, where the wiki
+is wrong and ZombieLite is right.
+
+**Two findings that removed most of the expected work.** Neither needed a bridge change:
+
+- **The fire bomb** is already streamed. `GRAPHICS_OBJECT_CREATED` carries id, x, y, plane and
+  tick, which is exactly what `bombs_from` needs.
+- **The demon's attack style** is already on `/npcs` as `animationId`, which has been there since
+  the Gauntlet work. ZombieLite keys its whole state machine on those same animation ids.
+
+**MEASURED across the three recordings, 45 binds out of 45 identical:**
+
+| Signal | What it is |
+|---|---|
+| chat "The demon's spell binds you!" | fires in the SAME instant as the graphics, either is a valid trigger |
+| 4 ground-graphics records | TWO bomb tiles: ids 2856 and 1446 arrive in a PAIR on each tile |
+| interval between binds | median 37.3 / 38.4 / 37.8 s across the three sessions |
+| detonation | spawn tick + 5 (ZombieLite); the wiki's "2 ticks" is the time to MOVE, not to land |
+| blast | the SINGLE tile you stand on, so one step is a complete dodge |
+
+The user's own escape lands between +0.6 s and +1.8 s against that window and usually ends one
+tile from the nearest bomb. In the longest session they finished ON a bomb tile once and ate it.
+
+**The gear switch: 100 switches, 87% alternating melee and ranged.** The demon changes its
+protection prayer to the last style that damaged it, every 150 damage taken. So the answer is
+always the other half of your pair, which is what `SwapPair.required` returns. Bursts are four or
+five equips in about 0.75 s, roughly every 21 to 31 s.
+
+**Nothing in the recording predicts a switch, and that is the correct result** -- the trigger is
+the demon's overhead prayer, and `recorder.py` does not capture overheads at all (its per-NPC
+memory holds id and animation only). Worth adding if these are recorded again.
+
+**The one real bridge gap, now closed: reading that overhead reliably.**
+`com.example.providers.OverheadPrayer` ports ZombieLite's `NpcsHook.getOverheadPrayer` -- a
+reflection cascade over the client's own fields, three strategies deep. It is PORTED rather than
+called across, because ZombieLite is only loaded when its checkout exists beside ours and a hard
+reference would fail to LINK on a client built without it. Three deliberate changes from upstream:
+the resolved `Method` is cached per class (upstream tracks one boss; `/npcs` is a bulk scan), the
+sprite ordinal is bounds-checked before indexing `HeadIcon.values()` (upstream throws on a sprite
+from another archive), and every path returns null rather than throwing.
+
+`/npcs` now reports **both** `protectionPrayer` (the reliable read) and the existing
+`overheadPrayer` (the public API's). That is on purpose: agreeing answers finally pair an
+`overheadArchiveId` with each state, which closes the open Gauntlet checklist item, and a
+disagreement is the signal that the archive assumption was wrong. `protected_style()` prefers the
+reliable one and falls back.
+
+**Ids, every one observed in the recordings.** Animations: 11387 fire bomb, 11388 magic, 11389
+ranged, 11392 melee, plus walk, ready, defend, death and summon. Spot animations: 2849 shield
+active, 2850 shield spawning, 2851 melee, 2858 ranged. The two agree to within one observation in
+the longest session, which is what makes either safe to key on.
+
+**Three gotchas that would break a naive implementation:**
+
+- **The demon id is NOT stable.** 13600 for one whole session, 13599 for two others, and 13604
+  transforming into 13600 at one npc index. ZombieLite's own id table stops at 13602, so an id
+  list would have missed a demon the user actually fought. `is_demon` matches on the NAME.
+- **The bomb rides the ATTACK COUNT, not a clock.** ZombieLite logged six cycles at 10, 9, 8, 10,
+  8, 9 attacks and could tie the count to nothing observable. `bomb_window` therefore reports a
+  BOUND with an `imminent` flag and never a single tick. Every prayer swap freezes the demon for 6
+  ticks and pushes the bomb along, which is why a wall-clock timer drifts.
+- **The shield is a 4-tick WINDOW, not one attack.** USER, 2026-09-20: "it is actually a 4t window,
+  if you time your attacks correctly you can land 2 hits during this window as weapon speed changes
+  if you land an attack with the shield down." The wiki's "remains down until they are attacked
+  once" is the other half: after a bomb it stays down indefinitely and the player's first LANDED
+  hit opens the window. A miss does not.
+
+**What is left.** The routine itself: nothing here clicks. It also wants a client rebuild before
+`protectionPrayer` appears, and the reflection has never run from our package -- it is proven
+inside ZombieLite only. Watch the first live read for `protectionPrayer` and `overheadPrayer`
+disagreeing, and record what `overheadArchiveId` says when they do.
+
+**SPEED, measured 2026-09-21 after the USER asked "might need to speed up our routine, look at how
+fast I play".** Their numbers, from all three recordings, against our own click cost computed from
+`settings.py`'s fitted movement model for the same motions:
+
+| motion | ours (flight + ~98 ms hold) | the user |
+|---|---|---|
+| inventory slot to slot | 137 ms median, 223 p90 | 222 ms median, 143 fastest, n=213 |
+| viewport tile hop | 344 ms median, 549 p90 | -- |
+| bind chat to next action | -- | 578 ms median, 82 fastest, n=45 |
+
+**A single click is already at human speed, so the click is not the problem.** The routine can only
+be slower by spending time BETWEEN clicks, and there is exactly one setting big enough to matter:
+`REACTION_DELAY_S` at 200-500 ms per confirmed outcome. Paying it per equip turns a 1 s gear switch
+into roughly 3 s. So a gear switch fires all five and confirms ONCE at the end; `gear_switch_budget_ms`
+states the budget for the whole burst precisely so a per-item confirm cannot fit inside it.
+
+The dodge has 1200 ms and our viewport hop costs 440 ms median, 650 at p90. That fits, but only
+with no reaction delay and **no hover gate** -- the gate reads the cursor position right now, and
+this click is issued while the player is still being bound. Same trap the Gauntlet and Motherlode
+both paid for.

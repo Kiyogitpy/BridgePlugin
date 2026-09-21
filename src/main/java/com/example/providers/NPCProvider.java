@@ -281,6 +281,17 @@ public class NPCProvider extends BridgeProvider
 		data.put("overheadPrayer", overheadId >= 0 && overheadId < icons.length
 			? icons[overheadId].name()
 			: null);
+		// The SAME question asked a second way, and the reliable one: OverheadPrayer reads the head
+		// icon out of the client's own fields instead of assuming the sprite came from the prayer
+		// archive, so it answers where the line above cannot. Ported from ZombieLite, which has run
+		// it in production for the Hunllef, Demonic Gorillas and Tormented Demons.
+		//
+		// BOTH are reported on purpose. Agreeing answers finally pair an `overheadArchiveId` with
+		// each state, which is the open Gauntlet checklist item the comment above describes; a
+		// disagreement is the signal that the archive assumption was wrong all along. Same Gson
+		// convention as every field here: an ABSENT key means "could not read it", never a prayer.
+		net.runelite.api.HeadIcon protection = OverheadPrayer.read(npc);
+		data.put("protectionPrayer", protection != null ? protection.name() : null);
 		// Aim at a point inside the npc's actual on-screen model (Actor.getConvexHull()), not at
 		// the ground-tile projection under its feet -- the same correction ObjectProvider has made
 		// via TileObject.getClickbox() since 2026-08-01. Added 2026-08-24 after bench_hover.py
