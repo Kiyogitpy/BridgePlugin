@@ -133,6 +133,11 @@ def bombs_from(graphics_objects, now_tick):
     for obj in graphics_objects or ():
         if (obj or {}).get("id") != FIREBALL_GRAPHICS_OBJECT_ID:
             continue
+        # `GET /graphics-objects` reports `finished` once the animation has run out: that bomb has
+        # already gone off, and keeping it would have a routine dancing away from a scorch mark.
+        # The UDP event has no such field, and does not need one -- it fires at the spawn.
+        if obj.get("finished"):
+            continue
         # The SPAWN tick, not the tick we happened to read it. GRAPHICS_OBJECT_CREATED carries its
         # own, and the routine may process it late -- UDP is an accelerator with an HTTP fallback,
         # so late is ordinary. Timing from "now" would put the deadline LATER than it really is,

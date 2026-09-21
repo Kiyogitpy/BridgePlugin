@@ -3552,3 +3552,14 @@ What follows is the correction that matters: firing the instant the event arrive
 dodge at ~440 ms against the human's 578, every time, by a constant margin -- and the whole cursor
 trajectory is transmitted. `DODGE_REACTION_MS` is therefore a FLOOR drawn from the user's own
 range, not a ceiling, and a range rather than a number because a constant is a fingerprint.
+
+**NEXT STEP, deferred 2026-09-21 at the user's call: a read-only live probe.** The equivalent of
+`slayer_preflight.py` -- read `/npcs` and `/graphics-objects`, print what the model says about each
+demon (style from its animation, both prayer reads, the required style, the cadence) and about any
+bomb on the ground. To be run the next time demons are up, since nothing here has met one.
+
+Two things the probe must say out loud rather than paper over. `GET /graphics-objects` carries id,
+x, y, plane, `finished` and distance but **no tick**, while the UDP event does -- so an HTTP read
+can only date a bomb from when it was read, which is later than the truth and therefore optimistic.
+And `protectionPrayer` needs a client rebuild before it appears at all; until then `protected_style`
+is running on the API fallback alone.

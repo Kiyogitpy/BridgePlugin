@@ -559,3 +559,34 @@ def test_there_is_time_to_get_a_prayer_up_between_attacks():
     thing under time pressure in this fight -- the bomb dodge is."""
     window_ms = td.ATTACK_SPEED_TICKS * 600
     assert window_ms - td.INTERFACE_CLICK_MS > 3000, "not remotely tight"
+
+
+# --- reading bombs over HTTP rather than off the event stream ------------------------------------
+
+def test_a_finished_fireball_is_not_a_threat():
+    """`GET /graphics-objects` reports `finished` for an object whose animation has run out. That
+    one has already gone off, and treating it as pending would keep a routine dancing away from a
+    scorch mark."""
+    objects = [
+        {"id": td.FIREBALL_GRAPHICS_OBJECT_ID, "x": 40, "y": 50, "plane": 0, "finished": True},
+        {"id": td.FIREBALL_GRAPHICS_OBJECT_ID, "x": 41, "y": 50, "plane": 0, "finished": False},
+    ]
+    bombs = td.bombs_from(objects, now_tick=100)
+
+    assert [(b.x, b.y) for b in bombs] == [(41, 50)]
+
+
+def test_the_http_endpoint_carries_no_tick_so_the_fallback_is_the_honest_answer():
+    """MEASURED from the provider: `/graphics-objects` returns id, x, y, plane, finished and
+    distance -- no tick. The UDP event DOES carry one. So an HTTP read can only date a bomb from
+    when it was read, which is later than the truth and therefore optimistic.
+
+    That is a reason to prefer the event stream for the dodge, and the probe says so rather than
+    quietly reporting a deadline it cannot actually know."""
+    http_shaped = [{"id": td.FIREBALL_GRAPHICS_OBJECT_ID, "x": 40, "y": 50, "plane": 0,
+                    "finished": False, "distance": 2}]
+
+    bomb = td.bombs_from(http_shaped, now_tick=100)[0]
+
+    assert bomb.detonates_tick == 105, "read tick + delay, the best it can do"
+    assert td.bombs_from(http_shaped, now_tick=100)[0].plane == 0
