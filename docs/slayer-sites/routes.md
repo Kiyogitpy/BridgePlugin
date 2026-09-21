@@ -117,7 +117,7 @@ Slayer ring: Fremennik Slayer Dungeon (2802, 9999, 0) -> site (2738, 10008, 0)
   - **Jump-over Strange floor 16544** (2770, 10002, 0) -> (2768, 10002, 0) [needs {'Agility': 43}]
   - walk 48 tiles to (2738, 10008, 0)
 - *the user's account, read live 2026-09-20: Agility 77, varbit 3759=3*: same (0.07s)
-- *varbit 3759=3 and a dusty key, no skills* (0.07s, cost 215):
+- *varbit 3759=3 and a dusty key, no skills* (0.06s, cost 215):
   - walk 215 tiles to (2738, 10008, 0)
 
 ## Kurask
@@ -166,9 +166,9 @@ Xeric's talisman: Xeric's Heart (1644, 3673, 0) -> site (1710, 10020, 0)
 
 ## Black demons
 Taverley teleport: Taverley (2893, 3465, 0) -> site (2852, 9784, 0)
-- *no requirements proven* (1.39s, cost -):
+- *no requirements proven* (1.38s, cost -):
   - NO ROUTE
-- *all skills 99* (0.13s, cost 172):
+- *all skills 99* (0.12s, cost 172):
   - walk 86 tiles to (2884, 3398, 0)
   - **Climb-down Ladder 16680** (2884, 3398, 0) -> (2884, 9798, 0)
   - walk 19 tiles to (2880, 9813, 0)
@@ -180,7 +180,7 @@ Taverley teleport: Taverley (2893, 3465, 0) -> site (2852, 9784, 0)
   - walk 3 tiles to (2886, 9799, 0)
   - **Squeeze-through Obstacle pipe 16509** (2886, 9799, 0) -> (2892, 9799, 0) [needs {'Agility': 70}]
   - walk 92 tiles to (2853, 9783, 0)
-- *varbit 3759=3 and a dusty key, no skills* (1.01s, cost 538):
+- *varbit 3759=3 and a dusty key, no skills* (1.00s, cost 538):
   - walk 86 tiles to (2884, 3398, 0)
   - **Climb-down Ladder 16680** (2884, 3398, 0) -> (2884, 9798, 0)
   - walk 317 tiles to (2924, 9803, 0)
@@ -229,7 +229,7 @@ Desert amulet 4: Kalphite cave (3322, 3122, 0) -> site (3309, 9526, 0)
   - walk 39 tiles to (3309, 9526, 0)
 - *all skills 99*: same (0.06s)
 - *the user's account, read live 2026-09-20: Agility 77, varbit 3759=3*: same (0.07s)
-- *varbit 3759=3 and a dusty key, no skills*: same (0.07s)
+- *varbit 3759=3 and a dusty key, no skills*: same (0.06s)
 
 ## Mutated zygomites
 Fairy ring: Zanaris (2412, 4434, 0) -> site (2416, 4373, 0)
@@ -261,9 +261,9 @@ Ornate Jewellery Box: Burthorpe (2899, 3553, 0) -> site (2864, 3590, 0)
 
 ## Waterfiends
 Ornate Jewellery Box: Barbarian Outpost (2520, 3571, 0) -> site (1750, 5350, 0)
-- *no requirements proven* (1.54s, cost -):
+- *no requirements proven* (1.52s, cost -):
   - NO ROUTE
-- *all skills 99*: same (1.33s)
+- *all skills 99*: same (1.31s)
 - *the user's account, read live 2026-09-20: Agility 77, varbit 3759=3* (0.02s, cost 112):
   - walk 74 tiles to (2512, 3511, 0)
   - **Jump-into Whirlpool 25274** (2512, 3511, 0) -> (1768, 5366, 0)
@@ -336,7 +336,7 @@ skills necklace: Cooking Guild (3143, 3442, 0) -> site (1875, 5218, 0)
   - walk 41 tiles to (1875, 5218, 0)
 - *all skills 99*: same (0.07s)
 - *the user's account, read live 2026-09-20: Agility 77, varbit 3759=3*: same (0.07s)
-- *varbit 3759=3 and a dusty key, no skills*: same (0.08s)
+- *varbit 3759=3 and a dusty key, no skills*: same (0.07s)
 
 ## Scorpions (Aya)
 skills necklace: Mining Guild (3049, 9763, 0) -> site (3049, 9771, 0)

@@ -115,10 +115,22 @@ def in_wilderness(tile) -> bool:
     return 3328 <= x <= 3470 and 10040 <= y <= 10190
 
 
+# The Ferox Enclave barriers -- the boundary between that safe enclave and the OPEN Wilderness,
+# in both directions. MEASURED 2026-09-21: eight rows use them, and every destination is a tile
+# in_wilderness calls Wilderness. They were allowed because in_wilderness deliberately calls
+# FEROX ITSELF Wilderness (it sits inside the bounding box), so enters_wilderness' "already
+# inside" exemption covered them. Both routines now PARK at Ferox during a break, and neither ever
+# arrives or leaves on foot -- always a teleport -- so refusing these costs nothing and closes the
+# only walking route from a place we deliberately stand into the Wilderness.
+FEROX_BARRIER_IDS = (39652, 39653)
+
+
 def enters_wilderness(step) -> bool:
     """The ditch by name, or ANY transport that starts outside the Wilderness and lands in it.
     FINAL REVIEW 2026-09-19: filtering the ditch alone left 13 usable links that cross the line
     (Trollheim's rocky handholds, a cave opening at (3294,3749), ...)."""
+    if step.object_id in FEROX_BARRIER_IDS:
+        return True
     return step.enters_wilderness_ditch or (in_wilderness(step.dest) and not in_wilderness(step.origin))
 
 

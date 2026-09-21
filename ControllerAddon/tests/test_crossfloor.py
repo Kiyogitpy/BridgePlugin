@@ -229,3 +229,24 @@ def test_only_a_pass_through_the_map_blocks_becomes_a_transport():
     plain = next(s for s in crossfloor.transports.load_links()
                  if s.origin == (3097, 3107, 0) and s.dest == (3098, 3107, 0))
     assert plain not in links
+
+
+def test_no_route_ever_walks_out_of_ferox_through_a_barrier():
+    """FOUND 2026-09-21, and it matters because both routines now PARK at Ferox during a break.
+    Ferox Enclave is a safe zone that sits INSIDE the Wilderness bounding box, so in_wilderness
+    calls it Wilderness -- deliberately, and the comment says so. The consequence was not
+    intended: enters_wilderness exempts a link whose ORIGIN is already in the Wilderness, so the
+    eight 'Pass-Through Barrier' rows that step out of Ferox into the OPEN Wilderness read as
+    'already inside' and were allowed.
+
+    The barriers are exactly that boundary, in both directions, and the routine only ever arrives
+    at Ferox and leaves it by teleport -- so refusing them costs nothing and closes the only
+    on-foot way from a place we deliberately stand into the Wilderness."""
+    links = crossfloor.usable_links(skill_levels={"Agility": 99})
+    assert not [s for s in links if s.object_id in crossfloor.FEROX_BARRIER_IDS]
+    # ...and they really are in the table, leaving Ferox for tiles the classifier calls Wilderness.
+    rows = [s for s in transports.load_links() if s.object_id in crossfloor.FEROX_BARRIER_IDS]
+    assert len(rows) >= 8
+    assert any(crossfloor.in_wilderness(s.dest) for s in rows)
+    # Nothing else changed: an ordinary link is still there.
+    assert [s for s in links if s.object_id == 26709], "the Stronghold cave entrance"
