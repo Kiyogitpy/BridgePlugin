@@ -4016,11 +4016,28 @@ Two details worth keeping from getting it wrong first:
   ring's menu has eight entries, not seven. `click_menu_action` reads `/menu`'s own `screenY` and
   was unaffected -- but anything that ever counts menu rows by index needs to know.
 
-**A walk leg can report SUCCESS without arriving.** In the same failure `legs.run_next` advanced
-past `walk to 3082,3206` with the player nine tiles short and unable to reach it, which is how
-the fairy leg came to be attempted from there at all. Not fixed; the arrival tolerance is shared
-by every walk and tightening it blind is the wrong move without measuring what the tolerance is
-there for.
+**A walk leg can report SUCCESS without arriving -- and it is the SAME root cause.** In the same
+failure `legs.run_next` advanced past `walk to 3082,3206` with the player nine tiles short, which
+is how the fairy leg came to be attempted from there at all. `legs.walk_across` (around
+`legs.py:749`) does this, for a route with no transport link:
+
+```python
+link = next((s for s in route.steps if isinstance(s, crossfloor.Link)), None)
+if link is None:
+    dest = route.steps[-1].dest          # <- crossfloor's TOLERANCE endpoint, not `goal`
+    return bool(travel.walk_to(ctx, {...dest...}, goal_adjacent=False))
+```
+
+`route.steps[-1].dest` is wherever crossfloor stopped, which is within `GOAL_TOLERANCE` (12) of
+the goal and can be twelve tiles away from it. The walk then genuinely succeeds -- to that tile --
+and the leg reports DONE.
+
+**NOT FIXED, deliberately.** Walking to crossfloor's endpoint is usually the RIGHT behaviour: a
+site coordinate is a cluster centre and often not a tile you can stand on at all, which is what
+the tolerance is for. Making `walk_across` fail there would break routes that work today. The
+real fix is probably "close the remaining gap with a plain walk, and only accept the endpoint if
+that fails", and it belongs to a session that can test it live -- this one found it with the game
+already parked on a task the routine refuses.
 
 #### RESTOCK, proven live
 
