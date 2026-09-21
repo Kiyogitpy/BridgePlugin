@@ -3781,7 +3781,7 @@ carried" while the pack set off 40 tiles to a bank for a tablet that lands 71 ti
   `travel.py`/`worldmap.py` are untouched, and `near_site` keeps its exact old meaning because
   `_pack` uses it for a different question ("leave a task in progress alone").
 
-### 2026-09-21, UNATTENDED LIVE SESSION: the whole loop ran, and the five bugs it found
+### 2026-09-21, UNATTENDED LIVE SESSION: the whole loop ran, and the thirteen bugs it found
 
 **The headline: the task loop works end to end.** In one run it acquired from Aya, banked for the
 loadout, equipped the task's gear, travelled through the house to a fairy ring, fought, and took
@@ -3954,6 +3954,62 @@ it tripped. Lletya has three elves on the ground floor (`slayer_catalog` says so
 preflight prints "expect a slow task"), so running the site dry and waiting for a respawn is
 normal there. Finding a target now resets it: the guard is for "there is nothing here to fight,
 ever", and a target in view is proof that there is.
+
+#### Three more from the long soak: a tablet, and a ring that could not be reached
+
+**11. A house tablet broken into a pending interaction.** The routine banked at Ferox, used
+Ferox's own Pool of Refreshment, and broke a house tablet roughly three seconds later with that
+interaction still resolving. The house never confirmed, the leg failed three times, and the task
+stopped -- on a route that had worked a dozen times the same session. `poh.enter` now lets the
+player settle first (bounded, and it breaks anyway at the end), and **`TABLET_COOLDOWN_S` only
+bites when a tablet was actually SPENT**: that guard exists so an unconfirmable LANDING cannot
+cost three tablets, and it has nothing to say about a break that never happened. Refusing to
+retry a free attempt turns a transient into a dead run.
+
+**12 and 13. A fairy ring the player could not reach, and how long it took to believe it.**
+On bears, the leg logged `fairy ring dial 1 arrow (398.20) is not clickable -- interface closed?`
+four times and stopped. Two things were wrong and the first fix was aimed at the wrong one.
+
+The first theory was the walk: the ring was 9 tiles away, inside `hop_fairy_ring`'s radius-20
+view so nothing walked to it, and the interface wait was a flat 3 s. Budgeting the walk (0.7 s a
+tile, the figure `banker._click_resolve_budget` already uses) is a real fix and is kept -- but it
+did not help, because **the player never moved at all**.
+
+What settled it was `/last-action`, which read
+`GAME_OBJECT_SECOND_OPTION option=Configure target=Fairy ring id=29495` on **every** attempt --
+the game received exactly the right action each time -- and then a screenshot, whose chatbox said
+**"I can't reach that!"** three times over. The ring at **(3082,3206)** sits across water from
+where the walk had stopped. `travel.can_reach` agreed, and so did `worldmap.find_path`: no route
+to that tile, to a neighbour, or to a tile three away, from the spiders site, from Draynor bank,
+or from where the player actually stood.
+
+So `hop_fairy_ring` now walks rather than right-clicking a ring `can_reach` refuses. That ended
+the useless clicking but left the leg nowhere to go, because the walker could not path there
+either -- the real bug is in the PLANNER. `nearest_ring_costed` proved the ring with
+`crossfloor.find_route`, which answered with a 107-cost route to a tile `worldmap` calls
+unreachable. **A ring now has to satisfy the map that EXECUTES the walk as well as the one that
+plans it.** Bears then falls back to the house fairy ring -- the route it had before the walk
+branch existed -- and from the live position the planner picks a different, reachable overworld
+ring at (3108,3149) instead. Bears completed on the next run.
+
+**Which engine is wrong about (3082,3206) is NOT answered here, and it is worth answering.**
+`crossfloor` and `worldmap` disagree about a real tile; the game sides with `worldmap`.
+
+Two details worth keeping from getting it wrong first:
+- **The adjacency check has to be `goal_adjacent=True`.** A fairy ring blocks its own tile in the
+  static map -- the same fact `legs.walk_across`'s step-off exists for -- so asking `worldmap`
+  for the ring tile itself rejects EVERY ring in the game. The perfectly good BLR ring at
+  (2740,3351) answers None that way and 70 steps adjacent. Three existing tests caught that
+  immediately, which is exactly what they are for.
+- **Our own SafespotMarker adds a "Mark Safespot" row to every right-click menu**, so a fairy
+  ring's menu has eight entries, not seven. `click_menu_action` reads `/menu`'s own `screenY` and
+  was unaffected -- but anything that ever counts menu rows by index needs to know.
+
+**A walk leg can report SUCCESS without arriving.** In the same failure `legs.run_next` advanced
+past `walk to 3082,3206` with the player nine tiles short and unable to reach it, which is how
+the fairy leg came to be attempted from there at all. Not fixed; the arrival tolerance is shared
+by every walk and tightening it blind is the wrong move without measuring what the tolerance is
+there for.
 
 #### RESTOCK, proven live
 
