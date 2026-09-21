@@ -25,6 +25,7 @@
 # A task both masters assign (kalphite) takes the CATALOG's heavier profile: build() is not told
 # who assigned it, and over-packing a short task is the safe side of that ignorance.
 
+import debug_log
 import math
 from collections import namedtuple
 
@@ -69,6 +70,11 @@ ESSENTIALS = ("rune pouch", "divine rune pouch", "astral rune", "cosmic rune", "
 # trip that would have worked.
 TRAVEL_KIT = ("slayer ring", "ectophial", "xeric's talisman")
 SPELL_CASTS_CARRIED = 2            # a teleport spell's runes, for one retry
+#: How far the food may be trimmed to make a pack fit: a FRACTION of the profile's own figure,
+#: with an absolute floor under it. Below this the pack is refused instead -- "fits" must never
+#: become "goes out with nothing to eat". See _Pack.trim_food.
+FOOD_TRIM_FLOOR = 0.6
+FOOD_TRIM_MIN = 5
 
 # A catalog `carry` / `worn` label -> the item names that satisfy it: slayer_catalog's table, the
 # SAME one slayer_tasks.missing_items enforces, so the pack and the check cannot disagree.
@@ -135,6 +141,8 @@ class _Pack:
         self.carried = {(n or "").lower(): q for n, q in (carried or {}).items()}
         self.banked = banked
         self.withdraw, self.keep, self.problems, self.slots = [], [], [], 0
+        #: The bulk FOOD line, so build() can trim it to fit. See trim_food.
+        self.food_line = None
 
     def _take(self, bank_name, quantity, bulk=False):
         """`bulk` marks a RESTOCKABLE CONSUMABLE (food, prayer restores) -- something a trip can
@@ -148,8 +156,11 @@ class _Pack:
         one slot whatever the quantity (35 ice coolers are ONE slot, not 35)."""
         base = name.lower()
         self.keep.append(base)
-        self.slots += 1 if stackable or _stackable(base) else wanted
+        per_slot = 1 if stackable or _stackable(base) else wanted
+        self.slots += per_slot
         held = int(self.carried.get(base) or 0)
+        if bulk and per_slot == wanted:
+            self.food_line = {"base": base, "wanted": wanted, "held": held}
         short = wanted - held
         if short <= 0:
             return
@@ -232,6 +243,51 @@ class _Pack:
         if total <= 0:
             self.problems.append(f"{label}: out of {_display(base)} -- none carried and none in "
                                  f"the bank (blighted ones do not count outside the Wilderness)")
+
+    def trim_food(self, overflow):
+        """Carry `overflow` fewer food, so the pack fits the inventory. Returns what it freed.
+
+        FOUND LIVE 2026-09-21 on the first Kuradal task (elves x139): 15 food, 8 prayer potions,
+        a teleport crystal and the six-item travel kit come to 30 slots in a 28-slot inventory,
+        so the pack could NEVER fit however it was ordered. Carrying two fewer sharks is not a
+        decision worth stopping a 139-kill task over -- and `doses` already settled the same
+        question the same way for a thin bank ("packs the fullest copies it can find, fights on
+        what that gives, and RESTOCK brings it back for the rest").
+
+        BOUNDED: never below FOOD_TRIM_FLOOR of the profile, because "fits" must not become
+        "goes out with nothing to eat". Under that, the caller is left with its slots problem and
+        stops, which is the right answer for a pack that genuinely cannot be carried.
+
+        The SURPLUS ALREADY CARRIED is the other half. Reducing the target alone changes nothing
+        when more is already in the inventory, so the food comes OFF THE KEEP LIST: the deposit
+        pass then banks all of it and the withdraw takes the new target back. banker deposits a
+        whole item name at a time -- there is no deposit-N -- so this is the only way to shed it.
+        """
+        line = self.food_line
+        if not line or overflow <= 0:
+            return 0
+        floor = max(FOOD_TRIM_MIN, math.ceil(line["wanted"] * FOOD_TRIM_FLOOR))
+        target = max(line["wanted"] - overflow, floor)
+        freed = line["wanted"] - target
+        if freed <= 0:
+            return 0
+        base, held = line["base"], line["held"]
+        self.slots -= freed
+        entry = next((w for w in self.withdraw if (w.get("name") or "").lower() == base), None)
+        if held > target:
+            # Shed the surplus: off the keep list so the deposit banks it, then take the target
+            # back fresh.
+            self.keep = [k for k in self.keep if k != base]
+            if entry is None:
+                entry = {"name": _display(base), "quantity": 0, "bulk": True}
+                self.withdraw.append(entry)
+            entry["quantity"] = target
+        elif entry is not None:
+            entry["quantity"] = max(0, entry["quantity"] - freed)
+            if entry["quantity"] == 0:
+                self.withdraw.remove(entry)
+        line["wanted"] = target
+        return freed
 
     def one_of(self, label, options, prefer_spent):
         """One copy of any of `options`. `prefer_spent` takes the lowest-charge copy (a teleport
@@ -348,6 +404,12 @@ def _top_up_kit(pack) -> None:
         held = [n for n in _names(pack.carried) if supplies._is(n, name) or name in n]
         pack.keep.append(name)                     # never deposit one once it is carried
         if held:
+            # COUNT IT. one_of() below adds a slot for a kit item it FETCHES, and this branch
+            # skipped straight past that for one already carried -- but being carried is exactly
+            # why it occupies a slot. MEASURED live 2026-09-21: the elves pack read "26 of 28"
+            # against a real 28 of 28, the missing two being kit already in the inventory, and
+            # the trip set off believing it had room it did not have.
+            pack.slots += 1
             continue
         if pack.banked is None:
             continue
@@ -504,11 +566,32 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
         kept = set(pack.keep)
         slots += sum(int(q or 0) for n, q in pack.carried.items()
                      if not n.startswith("#") and not any(k in n for k in kept))
+    # The rune pouch and anything else on the ESSENTIALS list is carried, and carried things
+    # take slots. They are never FETCHED, which is why nothing counted them.
+    slots += sum(1 for n in _names(pack.carried)
+                 if any(e in n for e in ESSENTIALS) and not n.startswith("#"))
+
+    # FIT IT. Trimming the food is the last resort before refusing the trip -- see trim_food for
+    # the live pack that needed 30 slots in a 28-slot inventory, and for the floor that stops
+    # this becoming "goes out with nothing to eat".
+    overflow = slots - supplies.INVENTORY_SLOTS
+    if overflow > 0:
+        freed = pack.trim_food(overflow)
+        if freed:
+            slots -= freed
+            pack.problems.append(f"@note carrying {freed} less food so the pack fits")
+
     if slots > supplies.INVENTORY_SLOTS:
         pack.problems.append(f"the pack needs {slots} slots and the inventory has {supplies.INVENTORY_SLOTS}")
 
     # ESSENTIALS last and slot-free: they are already carried, so counting them would make every
     # pack read larger than it is and could refuse a trip that fits.
+    # A "@note" line records a decision, not a refusal: slayer_policy stops on any problem, and
+    # trimming the food is the pack SUCCEEDING at fitting itself.
+    notes = [x[len("@note "):] for x in pack.problems if x.startswith("@note ")]
+    pack.problems = [x for x in pack.problems if not x.startswith("@note ")]
+    for note in notes:
+        debug_log.log("slayer", f"pack: {note}")
     keep = list(dict.fromkeys(list(pack.keep) + list(ESSENTIALS)))
     # BULK_FIRST, inverted: the teleport that REACHES the site, and the gear the task needs, are
     # withdrawn before the food and the prayer restores.

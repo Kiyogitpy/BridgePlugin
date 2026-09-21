@@ -3,6 +3,7 @@
 PURE -- nothing here reads the bridge or clicks. Plan task C1
 (docs/superpowers/plans/2026-09-19-slayer-travel-bank-loadout.md).
 """
+import math
 import os
 import sys
 
@@ -358,13 +359,20 @@ def test_the_rune_pouch_and_its_runes_are_ALWAYS_kept():
         assert rune in keep, rune
 
 
-def test_keeping_the_pouch_does_not_charge_the_pack_a_slot_for_it():
-    """It is already in the inventory and stays there -- counting it again would make every pack
-    read one slot larger and could refuse a trip that fits."""
+def test_carrying_the_pouch_DOES_cost_the_pack_a_slot():
+    """REWRITTEN 2026-09-21 against a live measurement, not reverted.
+
+    This asserted the opposite, reasoning that counting a carried pouch "would make every pack
+    read one slot larger and could refuse a trip that fits". The fear is inverted: a rune pouch
+    in the inventory occupies a slot whether or not the pack fetched it, and NOT counting it is
+    what let a pack accept a trip that did not fit. MEASURED on the first Kuradal task (elves
+    x139): the pack reported "26 of 28" against a real 28 of 28, and the two it had lost were
+    exactly this -- carried essentials and carried travel kit. It then set off, filled the
+    inventory, and could not fit the teleport crystal that was the only way to the site."""
     with_pouch = sl.build("cows", 20, PANEL, 70, 10, carried={"rune pouch": 1}, banked=BANK)
     without = sl.build("cows", 20, PANEL, 70, 10, carried={}, banked=BANK)
 
-    assert with_pouch.slots == without.slots
+    assert with_pouch.slots == without.slots + 1
 
 
 def test_the_escape_ring_and_house_teleports_were_already_kept_and_still_are():
@@ -658,3 +666,59 @@ def test_food_and_prayer_restores_are_marked_bulk_and_a_teleport_is_not():
     by_name = {w["name"].lower(): w for w in pack.withdraw}
     assert by_name["cooked karambwan"]["bulk"] is True
     assert any(not w.get("bulk") for w in pack.withdraw), "the ring is not a bulk consumable"
+
+
+# --- the pack fits itself into the inventory (FOUND LIVE 2026-09-21) --------------------------
+#
+# The first Kuradal task ever run (elves x139) wanted 15 food, 8 prayer potions, a teleport
+# crystal and the six-item travel kit: 30 slots in a 28-slot inventory, so it could NEVER fit
+# however it was ordered. Worse, the pack did not know -- it read "26 of 28" against a real
+# 28 of 28, because a kit item ALREADY CARRIED was kept but never counted.
+
+def test_a_kit_item_already_carried_still_costs_a_slot():
+    """one_of() counts a slot for a kit item it FETCHES; the already-carried branch skipped
+    straight past it. Being carried is exactly why it occupies a slot."""
+    empty = sl._Pack(carried={}, banked={})
+    sl._top_up_kit(empty)
+    held = sl._Pack(carried={n: 1 for n in sl.TRAVEL_KIT}, banked={})
+    sl._top_up_kit(held)
+    assert held.slots == len(sl.TRAVEL_KIT), "every carried kit item is a slot"
+    assert held.withdraw == [], "and none of them needs fetching"
+
+
+def test_trim_food_frees_slots_and_sheds_the_surplus_already_carried():
+    pack = sl._Pack(carried={"shark": 15}, banked={"shark": 100})
+    pack.exact("food", "shark", 15, bulk=True)
+    assert pack.slots == 15 and "shark" in pack.keep
+    freed = pack.trim_food(2)
+    assert freed == 2 and pack.slots == 13
+    # Reducing the target alone changes nothing while more is already carried, and banker has no
+    # deposit-N: the food comes off the keep list so the deposit banks it all, then 13 come back.
+    assert "shark" not in pack.keep
+    assert [(w["name"], w["quantity"]) for w in pack.withdraw] == [("Shark", 13)]
+
+
+def test_trim_food_only_shrinks_the_withdraw_when_nothing_is_carried():
+    pack = sl._Pack(carried={}, banked={"shark": 100})
+    pack.exact("food", "shark", 15, bulk=True)
+    assert pack.trim_food(3) == 3
+    assert "shark" in pack.keep, "nothing carried, so nothing to shed"
+    assert [(w["name"], w["quantity"]) for w in pack.withdraw] == [("Shark", 12)]
+
+
+def test_the_trim_has_a_floor_so_fits_never_becomes_nothing_to_eat():
+    pack = sl._Pack(carried={}, banked={"shark": 100})
+    pack.exact("food", "shark", 15, bulk=True)
+    freed = pack.trim_food(99)
+    floor = max(sl.FOOD_TRIM_MIN, math.ceil(15 * sl.FOOD_TRIM_FLOOR))
+    assert 15 - freed == floor
+    assert floor >= sl.FOOD_TRIM_MIN
+
+
+def test_a_pack_that_cannot_fit_even_after_trimming_is_still_a_problem():
+    """The floor holding means the trip is refused, which is the right answer for a pack that
+    genuinely cannot be carried."""
+    pack = sl._Pack(carried={}, banked={"shark": 100})
+    pack.exact("food", "shark", 6, bulk=True)
+    pack.trim_food(20)
+    assert pack.slots >= sl.FOOD_TRIM_MIN
