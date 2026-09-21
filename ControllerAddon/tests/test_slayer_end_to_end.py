@@ -419,3 +419,34 @@ def test_the_base_gear_goes_back_on_before_the_next_task_is_asked_for(monkeypatc
     restore = world.log.index("EQUIP Dragon boots")
     assert restore < world.log.index("ACQUIRE Cows x20 from AYA"), world.log
     assert world.worn["boots"] == "Dragon boots"
+
+
+# --- a break in the middle of a task -------------------------------------------------------------
+
+def test_a_break_mid_fight_leaves_for_ferox_and_the_task_finishes_afterwards(monkeypatch):
+    """The engine calls before_break fully live, then skips tick() for 3-12 minutes. The routine
+    must come back from Ferox by itself -- and from Ferox that is always a teleport, because it is
+    a sealed island on the collision map."""
+    world = World([("KURADAL", "Nechryael", 30)], BANK)
+    world.streak = 9
+    _install(monkeypatch, world)
+
+    def teleport(ctx):
+        world.player = {"x": 3151, "y": 3635, "plane": 0}       # Ferox Enclave
+        world.log.append("TELEPORT to Ferox for the break")
+        return True
+    monkeypatch.setattr(routine.travel, "teleport_to_ferox", teleport)
+    ctx = _Ctx()
+    for _ in range(5):                                          # get to the site and start fighting
+        routine.tick(ctx)
+    assert world.count < 30, world.log
+
+    routine.before_break(ctx)                                   # the break falls mid-fight
+    assert "TELEPORT to Ferox for the break" in world.log
+    assert world.player["x"] == 3151, "we are away from the monsters for the whole break"
+
+    _run(ctx, ticks=60, world=world)                            # the break ends; carry on
+    assert ctx.state.stops == [], (ctx.state.stops, world.log)
+    assert world.log[-1].startswith("TASK DONE")
+    after = world.log[world.log.index("TELEPORT to Ferox for the break") + 1:]
+    assert any(l.startswith("LEG slayer ring") for l in after), "it teleported back, not walked"
