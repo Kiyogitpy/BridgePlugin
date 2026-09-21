@@ -1130,6 +1130,58 @@ def test_the_ferox_trip_walks_to_the_bank_instead_of_re_teleporting(monkeypatch)
     assert calls["teleport"] == 0, "already there: nothing to teleport for"
 
 
+def test_already_inside_ferox_WALKS_to_the_chest_rather_than_failing_the_trip():
+    """FOUND LIVE 2026-09-21, the first Aya task after the gargoyles (zombies x16):
+
+        [bank] no bank found at Ferox Enclave -- did the teleport actually land?
+        [bank] already inside Ferox -- not teleporting again, the chest is a walk
+        [bank] already inside Ferox -- not teleporting again, the chest is a walk
+        [!] Safety stop: the bank trip for zombies failed 3 times (to fetch 1 Cooked karambwan)
+
+    The guard said "the chest is a walk" and then returned FAILURE without walking, so the
+    caller's three-strike counter stopped the run over one karambwan. The chest is ~21 tiles from
+    where the ring lands and FEROX_MAX_BANK_DISTANCE is 20, so the first scan misses it by a tile
+    or two -- earlier trips the same morning survived on that margin, logging "bank object 20
+    tiles away".
+    """
+    seen = []
+
+    def scan(cfg):
+        seen.append(cfg.get("maxBankDistance"))
+        return {"name": "Bank chest", "id": 26711} if cfg.get("maxBankDistance") > 20 else None
+
+    import types
+    saved = {}
+    for name, stub in (("_find_nearby_bank_retrying", scan),
+                       ("open_bank", lambda ctx, obj: seen.append("open") or True),
+                       ("deposit_inventory", lambda ctx, cfg: None),
+                       ("withdraw_loadout", lambda ctx, cfg: None),
+                       ("_withdraw_return_teleport", lambda ctx, cfg: None),
+                       ("_at_bank_hook", lambda ctx, cfg: None),
+                       ("close_bank", lambda ctx: None)):
+        saved[name] = getattr(banker, name)
+        setattr(banker, name, stub)
+    saved_player, saved_tp, saved_fountain = (controller.get_player, banker.travel.teleport_to_ferox,
+                                              banker.travel.use_fountain)
+    controller.get_player = lambda: {"x": 3150, "y": 3636, "plane": 0}
+    banker.travel.teleport_to_ferox = lambda ctx: seen.append("TELEPORTED") or True
+    banker.travel.use_fountain = lambda ctx: None
+    try:
+        out = banker._bank_via_ferox(_Ctx(), {})
+    finally:
+        for name, original in saved.items():
+            setattr(banker, name, original)
+        controller.get_player = saved_player
+        banker.travel.teleport_to_ferox = saved_tp
+        banker.travel.use_fountain = saved_fountain
+
+    assert "TELEPORTED" not in seen, "already inside: never spend another ring charge"
+    assert "open" in seen, "it WALKS to the chest and banks -- the trip is not a failure"
+    assert out is True
+    assert seen[0] == banker.FEROX_MAX_BANK_DISTANCE, "the teleport question keeps its 20 tiles"
+    assert banker.FEROX_INSIDE_BANK_DISTANCE in seen, "the inside-the-enclave question is wider"
+
+
 def test_a_search_is_cleared_AFTER_its_withdraw_so_the_next_item_starts_clean(monkeypatch):
     """FOUND LIVE 2026-09-21, the first bank trip needing more than one search:
 

@@ -68,6 +68,18 @@ DEFAULT_BANK_NAMES = ("bank booth", "bank chest", "bank counter", "grand exchang
 FEROX_BANK_NAMES = ("bank chest", "bank booth")
 FEROX_MAX_BANK_DISTANCE = 20
 
+# ...but once we KNOW we are inside the enclave, the chest is looked for across the whole of it.
+# FOUND LIVE 2026-09-21, the first Aya task after the gargoyles: the ring landed, the 20-tile scan
+# missed the chest by a tile or two, and the "already inside Ferox" guard below returned FAILURE
+# instead of the walk its own message promises -- three ticks later the trip was a safety stop
+# ("the bank trip for zombies failed 3 times ... to fetch 1 Cooked karambwan"). Earlier trips the
+# same morning had survived on the margin, logging "bank object 20 tiles away".
+#
+# 20 stays the radius for the question "is a bank close enough that I need not teleport at all",
+# which is asked from anywhere in the world. This one is only ever used once `in_ferox` is true,
+# so it can safely span the enclave (FEROX_AREA is 37 x 42) without loosening that decision.
+FEROX_INSIDE_BANK_DISTANCE = 45
+
 #: Ferox Enclave, as a box. FOUND LIVE 2026-09-21 -- USER: "the bug is it teleported twice to
 #: ferox". The guard below asks "is a bank within FEROX_MAX_BANK_DISTANCE", which is not the same
 #: question as "am I already there": the ring lands at (3150, 3636) and the enclave's bank chests
@@ -1684,13 +1696,26 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
     # re-teleporting to a place the player never actually left. A few retries with a short pause
     # costs nothing when we really aren't there yet, but avoids spending an actually-finite
     # resource on what was just a slow poll.
+    ferox_inside_config = dict(ferox_search_config)
+    ferox_inside_config["maxBankDistance"] = FEROX_INSIDE_BANK_DISTANCE
+
     bank_obj = _find_nearby_bank_retrying(ferox_search_config)
     if bank_obj is None and in_ferox(controller.get_player()):
         # ALREADY THERE. The scan missing the chest is not evidence of being somewhere else, and
         # teleporting again lands in the same square a charge poorer. See FEROX_AREA for the live
         # run that spent a whole ring this way.
-        debug_log.log("bank", "already inside Ferox -- not teleporting again, the chest is a walk")
-        return False
+        #
+        # ...and then WALK TO IT, which is what this branch used to promise and not do: it
+        # returned failure, the caller counted a failed bank trip, and three of those is a safety
+        # stop. See FEROX_INSIDE_BANK_DISTANCE for the run that hit it. open_bank does the walk
+        # itself for anything past a dozen tiles.
+        bank_obj = _find_nearby_bank_retrying(ferox_inside_config)
+        if bank_obj is None:
+            debug_log.log("bank", "already inside Ferox but no chest in sight even at "
+                                  f"{FEROX_INSIDE_BANK_DISTANCE} tiles -- waiting for the scene "
+                                  "rather than teleporting again")
+            return False
+        debug_log.log("bank", "already inside Ferox -- walking to the chest, not teleporting again")
     if bank_obj is None:
         if not travel.teleport_to_ferox(ctx):
             if not any(
@@ -1711,7 +1736,9 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
         # branch on the Ferox chest itself.
         ctx.state.data[TELEPORTED_KEY] = True
 
-        bank_obj = _find_nearby_bank_retrying(ferox_search_config)
+        # The wider radius here too: we have just landed, so "is the chest in sight" is the only
+        # question left, and the 20-tile answer is the one that missed it live.
+        bank_obj = _find_nearby_bank_retrying(ferox_inside_config)
         if bank_obj is None:
             debug_log.log("bank", "no bank found at Ferox Enclave -- did the teleport actually land?")
             return False
