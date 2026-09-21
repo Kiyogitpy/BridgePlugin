@@ -3555,6 +3555,14 @@ supervised test, not a run.
      horrors stop).
 6. `python slayer_dry_run.py` runs the REAL tick() against live data with every click stubbed --
    a last check that the read path matches reality before the mouse is ever involved.
+7. **With `Cooked karambwan` + `Super restore` chosen, 19 of Kuradal's 22 are fully ready on this
+   bank** (checked 2026-09-21). The three that are not, and what each needs:
+   - **cave horrors** -- a `Mos le'harmless teleport` scroll (none owned).
+   - **mutated zygomites** -- a `Fungicide spray` (none owned).
+   - **gryphons** -- not an item: one recording into the task-only cave, whose entrance is in no
+     transport table. Until then the trip is REFUSED before any teleport is spent.
+   Each of the three stops with that exact reason rather than travelling, so they are safe to
+   leave unfixed -- Kuradal simply cannot be completed on them.
 
 **What to watch, in the order it will happen**
 

@@ -225,3 +225,21 @@ def test_blighted_supplies_are_refused_because_no_site_here_is_in_the_wilderness
     assert not any("blighted" in w["name"].lower() for w in lo.withdraw), "never withdrawn"
     ok = sl.build("Nechryael", 150, PANEL, 70, 10, {}, BANK)
     assert not any("blighted" in p.lower() for p in ok.problems)
+
+
+def test_a_super_restore_is_counted_as_a_super_restore_not_a_prayer_potion():
+    """The account has NO prayer potions at all -- 27 Super restore(4) instead, measured from the
+    real bank 2026-09-21 -- so the panel's choice has to be a super restore, and the pack must
+    withdraw it by that name.
+
+    MEASURED, and the reason there is no super_restore flag threaded through here: at these
+    numbers it would change nothing. prayer_doses_needed saturates at MAX_DOSES (32) for any task
+    over ~40 kills, and prayer_potions_for caps at 8, so a dose that restores one point more
+    lands on the same count. The invariant below is what actually matters."""
+    bank = dict(BANK, **{"super restore(4)": 27})
+    panel = {"food": {"name": "Shark"}, "potions": {"prayerPotion": "Super restore"}}
+    lo = sl.build("Nechryael", 150, panel, 70, 10, {}, bank)
+    want = _want(lo)
+    assert "Super restore(4)" in want and lo.problems == []
+    plain = sl.build("Nechryael", 150, PANEL, 70, 10, {}, BANK)
+    assert want["Super restore(4)"] <= _want(plain)["Prayer potion(4)"], "a stronger dose is never MORE potions"
