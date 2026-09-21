@@ -395,6 +395,14 @@ def teleport_to_ferox(ctx) -> bool:
         debug_log.log("travel", "no ring of dueling in inventory")
         return False
 
+    # THE TAB FIRST. FOUND LIVE 2026-09-21: the routine cast NPC Contact (which presses F6 for the
+    # spellbook), took its task, then came here and clicked the ring at the coordinates /inventory
+    # reports for it -- while the SPELLBOOK was still on screen. USER: "it didnt click inventory
+    # ... we were still on spellbock". Three misses, then a clean stop blaming the teleport for not
+    # landing, which it never had a chance to. An item's reported position is only where it IS
+    # while its own tab is displayed. open_inventory_tab is idempotent, so this is free when the
+    # tab is already up.
+    controller.open_inventory_tab(ctx.ser)
     debug_log.log("travel", "teleporting to Ferox Enclave")
     # check_ui_blockers=False: inventory-item click, same reasoning as every other inventory
     # click in this codebase (see banker.py's coal bag notes) -- CONFIRMED live 2026-08-06 (user

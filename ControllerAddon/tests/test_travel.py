@@ -1644,3 +1644,39 @@ def test_hop_fairy_ring_is_usable_for_a_destination_falconry_never_heard_of(monk
     assert confirmed
     for i, letter in enumerate(want):
         assert travel.FAIRY_DIAL_LETTERS[i][dials[i]] == letter
+
+
+# --- 2026-09-21 LIVE: the ring was clicked while the spellbook tab was showing -------------------
+
+def test_the_inventory_tab_is_opened_before_the_ring_is_clicked(monkeypatch):
+    """FOUND LIVE 2026-09-21. The routine cast NPC Contact (which presses F6 for the spellbook),
+    took its task, then went to bank -- and clicked the Ring of dueling at the coordinates
+    /inventory reports for it while the SPELLBOOK was still displayed. USER: "it didnt click
+    inventory ... we were still on spellbook".
+
+    Three attempts, three misses, then a clean safety stop saying "no bank found at Ferox Enclave
+    -- did the teleport actually land?". It had not: the clicks went into the spellbook panel.
+
+    An item's reported position is only where it IS while its own tab is the one on screen.
+    open_inventory_tab is idempotent, so this costs nothing when the tab is already up."""
+    order = []
+    monkeypatch.setattr(controller, "get_inventory",
+                        lambda: [{"name": "Ring of dueling(3)", "screenX": 10, "screenY": 20}])
+    monkeypatch.setattr(controller, "open_inventory_tab",
+                        lambda ser: order.append("tab") or True)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, ent, **k: order.append("click") or True)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+
+    assert travel.teleport_to_ferox(_Ctx()) is True
+    assert order == ["tab", "click"], "the tab first, then the item"
+
+
+def test_no_ring_means_no_tab_switch_either(monkeypatch):
+    """Nothing to click, so nothing to open -- a pointless tab flick is a visible tell."""
+    order = []
+    monkeypatch.setattr(controller, "get_inventory", lambda: [])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: order.append("tab") or True)
+
+    assert travel.teleport_to_ferox(_Ctx()) is False
+    assert order == []
