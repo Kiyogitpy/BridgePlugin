@@ -3592,6 +3592,99 @@ of it is always a teleport.
 **Two things that will NOT happen, by design:** a task on the user's Aya block list (dwarves, cave
 crawlers, lizards, skeletons, kalphites) is never fought for Aya, and Greater demons always stops.
 
+### 2026-09-21: the facts the code was built on -- read before changing any of it
+
+The live-run checklist is the section above. This is what was MEASURED or ruled on that day, and
+none of it is re-derivable from the code. Full reasoning:
+`docs/superpowers/ledgers/2026-09-19-slayer-travel-bank-loadout--progress.md`.
+
+**The phase order is the contract**, and it is documented at the top of `routines/slayer.py`:
+no task -> restore base gear THEN acquire; a skip-list task -> skip; a STOP task -> stop naming
+it; a restock already running -> restock, outranking everything; not at the site -> pack, wear,
+travel; at the site -> restock, wear, fight. The two `_wear` calls are deliberate: a shield that
+was in the bank cannot be equipped before the pack fetches it.
+
+- `_pack` banks ONCE per task and a missing item is ALWAYS a stop (`skippable=False`). Bank memory
+  can be stale, so slayer points are never spent on a guess.
+- `_restock` is for running out AT the site, not for a full inventory. `slayer_restocking` holds
+  the task key from the moment a restock begins until `bank_up` succeeds, because `bank_up` can
+  teleport and THEN fail -- without the flag the routine reads as TRAVEL and walks back to the
+  fight with nothing to eat.
+- Base gear is saved once per process, never while a gear task is active and never from an empty
+  `/equipment` read. Every base item rides the bank KEEP list so a displaced defender survives the
+  task, and it goes back on BEFORE the next master is contacted.
+
+**Three shape bugs, all found by reading the LIVE bridge within an hour of writing the code, all
+with a fully green suite:**
+- `GET /equipment` reports an EMPTY slot as `{}` -- present, with no name -- so `"weapon" in
+  equipment` is True either way and the two-handed check could NEVER have fired. Use
+  `routines/slayer._holds`, which asks whether the slot's value is a dict carrying a name.
+- `GET /rune-pouch` reports its runes with `carried: false` while the pouch is BANKED, so runes
+  were counted that are not in the inventory.
+- `slayer_preflight` read `GET /config`; the routine reads `GET /slayer-config`. On this client
+  `/config` is the general panel block and carries no food, potions or tasks at all, so the tool
+  was describing a world the routine never sees.
+
+**The lesson: check new code against the live bridge the same day it is written.** A green suite
+caught none of the three.
+
+**MEASURED read costs (live, read-only):** every client-thread read is ~20 ms whatever it reads
+(`/slayer`, `/player`, `/inventory`, `/equipment`, `/skills`, `/rune-pouch`, `/slayer-config` all
+19-22 ms), while `/bank/memory` is **1.1 ms** -- confirming its design note that it touches
+neither the client thread nor `TickCache`. So `legs.requirement_values` cost **1.16 SECONDS** per
+route plan: 45 varbits plus 10 varplayers, one request each. `GET /varbits/<csv>` and
+`/varps/<csv>` (`PlayerProvider.readVars`) answer them in one hop and `controller.get_vars` falls
+back to one-per-id on an un-rebuilt client. **The ids go in the PATH, not a query value** -- the
+trap `subscribe_varbits` records, where `requests` percent-encodes a comma and an un-decoding
+bridge silently reads one unparseable id. An unreadable id is OMITTED, never reported as 0,
+because the route planner needs an unknown gate to fail closed.
+
+**`combat.py` had the same break exposure and is fixed DIFFERENTLY, forced by a measured fact:**
+Ferox Enclave is a sealed 413-tile island on our collision map (re-checked 2026-09-21: no walking
+route out, and `crossfloor` finds none either). Slayer can teleport there because `plan()` always
+leaves by a teleport it has proven first; `combat.py` walks home with `banker.return_to_spot`, so
+teleporting it to Ferox would STRAND it. `combat_core.bank_before_break` therefore BANKS and takes
+the break at the bank, putting the loot away in the same trip. It does nothing when banking is
+off, when a return trip is already under way, or when the trip FAILS -- inventing a way home from
+an unknown position would send the routine walking off after the break. The merged bank config was
+extracted to `combat_core.bank_config` so the break path banks on exactly the same terms as an
+ordinary trip.
+
+**A hole that only became reachable once both routines park at Ferox:** eight usable Pass-Through
+Barrier links (object ids 39652/39653) stepped straight out of Ferox into the open Wilderness.
+They were allowed because `in_wilderness` deliberately classifies Ferox ITSELF as Wilderness, so
+`enters_wilderness`'s "origin is already inside" exemption covered them. Both ids are now refused
+outright -- they are exactly that boundary in both directions, and the routine only ever arrives
+and leaves by teleport. No route in the report changed. Re-checked at the same time: the
+classifier is right about the Lava Maze dungeon, the Revenant caves, the Mage Arena and the
+Wilderness Slayer Cave.
+
+**A landmine, not a bug:** `GET /slayer-config` carries its own `taskLocations` map of 113
+entries. For the 18 overlapping Kuradal's fight list it points somewhere ELSE for 14, and SEVEN
+are in the WILDERNESS (ankou, fire giants, hellhounds, abyssal demons, nechryael, dust devils,
+black demons). `travel.task_location` reads that map and has NO callers -- the catalog is the
+authority, because the user chose these sites and the spec forbids a Wilderness site. A test
+carries the seven measured tiles so anyone tempted to "just use the panel's locations" sees what
+that would do.
+
+**Two audits, both clean:** every one of Kuradal's 22 and Aya's 19 fightable tasks has target
+names matching a monster that really spawns in its own kill area. Two look like false matches and
+are not -- "kalphite" also matches Kalphite Larva and "cave bugs" matches Cave bug larva, but the
+cache shows neither larva has an Attack option at all, so `combat_core` can never target them.
+
+**The ONE change to shared `combat_core`** is a single branch in `maybe_loot`: with a FULL
+inventory, if `loot["makeRoom"]` is callable, ask it and skip the drop when it says no. Absent,
+it is today's behaviour byte for byte -- pinned by its own test, because `combat.py` and every
+other routine share that function. Every threshold and every click lives in
+`routines/slayer._make_room` over `slayer_policy.loot_decision`. Only a CATALOG task gets the
+hook; Aya's tasks loot a whitelist, so there is nothing to make room for.
+
+**Two more watch-list items** beyond the section above: a base gear file is only captured while NO
+gear task is active, so starting the routine mid-basilisks means no base is saved for that process
+and the displaced defender is deposited on the next bank trip (recoverable, but it will sit in the
+bank); and a worn requirement still counts one slot in the pack's size even when already worn, so
+the pack only ever reads slightly larger than it is.
+
 ### 2026-09-20: a long offline day -- what exists now, and what a live session must check first
 
 Read `docs/slayer-handoff.md` and the ledger `docs/superpowers/ledgers/2026-09-19-slayer-travel-bank-loadout--progress.md`

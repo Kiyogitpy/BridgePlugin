@@ -1,4 +1,4 @@
-# Slayer task loop — handoff (written 2026-09-20 for a move from the laptop to the desktop)
+# Slayer task loop — handoff (written 2026-09-20 for a move from the laptop to the desktop; brought up to date 2026-09-21)
 
 A Claude Code conversation lives on the machine it ran on, so the laptop session that built all
 of this cannot be resumed elsewhere. **A fresh session should read this file first**, then the
@@ -68,9 +68,12 @@ observations over a clean log.
 | `tests/test_slayer_end_to_end.py` | the routine through WHOLE tasks in one simulated world | three tasks in a row (Kuradal on the 10th), a long task that restocks and comes back, the restock ceiling. Every decision real; only clicks faked. **Read its log, not just its asserts** |
 | **C3** wearing a task's gear, and the base gear | `routines/slayer._wear`, `_capture_base_gear`, `_restore_base_gear` | **built 2026-09-21, UNRUN**: a catalog task's `worn` requirements are put ON before travelling and before every fight tick; the base gear is saved once per process (never while a gear task is active, never from an empty read) and put back when the task ends, before the next master is asked. A shield that knocks a TWO-HANDED weapon off is a STOP -- the one-handed weapon is the user's open decision (E0) |
 | **D2** loot tiers | `combat_core.maybe_loot`'s `makeRoom` hook -> `routines/slayer._make_room` | **built 2026-09-21, UNRUN**: with a FULL inventory, a drop under 50k is left; from 50k one food is eaten for it only when HP is missing; from 150k it is always taken -- eat, else finish a 1-dose prayer potion, else drop the least costly consumable. Never gear, a teleport, or what the task needs. **The hook absent = combat_core's behaviour is byte-for-byte what it was**, pinned by test |
+| **Breaks** | `routines/slayer.before_break`, `combat_core.bank_before_break` | **built 2026-09-21, UNRUN.** Breaks are ON (45-75 min apart, 3-12 min long) and `tick()` is skipped for the WHOLE break, so nothing eats, prays or retaliates -- a break falling mid-fight is a death. Slayer teleports to Ferox when AT the site (it always leaves by a proven teleport anyway); `combat.py` cannot, because it walks home and **Ferox is a sealed 413-tile island on the collision map** -- it BANKS and takes the break there instead. Slayer costs one ring of dueling charge per break |
+| **Many varbits in one read** | `GET /varbits/<csv>`, `/varps/<csv>`, `controller.get_vars` | **built 2026-09-21; needs a client rebuild to be fast.** `legs.requirement_values` cost **1.16 s** per route plan (45 varbits + 10 varplayers at ~20 ms each). One hop answers them all; `get_vars` falls back to one-per-id on an un-rebuilt client, so nothing breaks meanwhile. Ids go in the PATH -- `requests` percent-encodes a comma, the trap `subscribe_varbits` records |
 | The remaining ACTING halves: E0 gear decisions; E2-E6 hub live runs | — | NOT built -- these wait for the user or a live run |
 
-Tests: `python -m pytest tests/ -q` from `ControllerAddon/` → **3359 passed, 0 failed** (2026-09-21).
+Tests: `python -m pytest tests/ -q` from `ControllerAddon/` → **3379 passed, 1 skipped, 0 failed**
+(2026-09-21, after the day's work).
 The four long-standing `test_mastering_mixology.py` failures are GONE: they were stale tests written
 before that routine's 'do nothing outside the lab' guard, not a bug. **The suite is green, so treat
 any failure as real.** `test_crossfloor::test_an_impossible_trip_is_none_and_fast`
@@ -109,8 +112,18 @@ is the general block and carries no slayer keys at all) answers `food.name: ""` 
    re-vendors. Still open from it: the Great Conch (gryphon) cave has no row in EITHER table
    (hand-write that leg in E1); the dusty-key gate exists in both but fails closed until the
    catalog supplies owned item ids; the whirlpool still needs `varbit_values`.
-4. **Phase C** (bank + loadout): start with its "detail the phase" step; it depends on
-   `bank_memory`, whose own six-item live checklist in `CLAUDE.md` has never been run.
+4. ~~**Phase C** (bank + loadout)~~ **DONE 2026-09-21** -- C1 through C4, D1 through D3 and the
+   gear seam are all built and tested; see the table above. It still depends on `bank_memory`,
+   whose own six-item live checklist in `CLAUDE.md` has never been run, so watch it on the first
+   bank trip.
+5. **Rebuild the client** (`./gradlew.bat run`). Three things wait on it: the three panel settings
+   (`slayerMinHouseTeleports`, `slayerMakeRoomValue`, `slayerMustLootValue`), the bulk varbit
+   endpoints that take route planning from 1.16 s to roughly 20 ms, and `M8aqProvider.guarded`
+   catching `LinkageError` so one crashed reader cannot take the endpoint down.
+6. **Set the panel's food and prayer restore before any live gate.** Every task stops at the pack
+   until both are chosen, and the bank holds neither of the obvious defaults -- Cooked karambwan
+   and Super restore are what this account actually has. Do NOT pick a blighted one; the loadout
+   refuses them by name because they only work in the Wilderness.
 
 ## How this project is built (process the user chose and liked)
 
@@ -147,6 +160,17 @@ ledger. Lessons this project paid for, all recorded in the ledgers:
   peg and the facemask, and that the mirror shield, a leaf-bladed weapon or broad ammo, the
   witchwood icon and heat boots are none of them worn (they are fetched and equipped).
 
+- **Set `food.name` and `potions.prayerPotion` in Controller Settings.** MEASURED 2026-09-21:
+  both are empty strings in `GET /slayer-config`, so every task stops at the pack. The bank has
+  no sharks and no Prayer potion(4); it has 416 Cooked karambwan, 561 Tuna and 27 Super
+  restore(4). Its 1319 Blighted anglerfish and 149 Blighted super restore(4) are refused by the
+  loadout on purpose -- blighted supplies only work in the Wilderness, and no site here is.
+- **A client rebuild**, for the three panel settings, the bulk varbit endpoints and the
+  crashed-reader fix.
+- **A Mos Le'Harmless scroll and a fungicide spray**, the only two items standing between
+  Kuradal's cave horrors and zygomites tasks and a planned route.
+- **Merging `crossfloor-travel`.** The branch is pushed and a dry-run merge into `dev` was clean;
+  the merge itself is deliberately left as the user's call.
 - The remaining live gates above.
 - Per-task gear decisions the research left open (Phase E0): a one-handed weapon beside the
   mirror shield, ranged kit for waterfiends, heat boots for wyrms.
