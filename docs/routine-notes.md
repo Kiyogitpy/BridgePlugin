@@ -3521,6 +3521,52 @@ Remaining checklist, in order:
    cast happens with aggressive monsters possibly still attacking.
 6. After a successful ACQUIRE the Magic tab is left open when the next phase is FIGHT.
 
+### 2026-09-21: the routine is CODE-COMPLETE -- the first live run, step by step
+
+The whole task loop now exists (acquire, skip, pack at the bank, wear the gear, travel, fight,
+restock, loot) and **only acquiring a task from Aya has ever run live.** Everything else is written
+from measurements, recordings and other routines' proven patterns. Treat the first session as a
+supervised test, not a run.
+
+**Before you start**
+
+1. `python slayer_preflight.py` -- read-only, safe beside anything. It prints what every phase WOULD
+   decide for the live task; `--task "X"` asks "what if", `--aya` and `--all` sweep a whole master's
+   list. **Nothing below is worth doing until this reads sensibly.**
+2. **Set food and a prayer potion in Controller Settings.** MEASURED 2026-09-21: `GET /slayer-config`
+   answers `food.name: ""` and `potions.prayerPotion: ""`. Every task stops at the pack until both
+   are chosen.
+3. **Pick a one-handed weapon, or expect basilisks to stop.** The account fights with a Toxic
+   blowpipe (two-handed); putting the mirror shield on takes it off, and the routine stops rather
+   than fight bare-handed.
+4. **Rebuild the client** if you want the three new panel settings (min house teleports, make-room
+   value, must-loot value) and the bridge fix that stops a crashed reader from looking like an
+   empty answer. Without a rebuild the code uses its documented defaults -- pinned by test.
+5. Stock check from the same read: the bank held **4** `Prayer potion(4)` against the **8** a
+   150-kill prayer task asks for; no fungicide spray (zygomites stop); no Mos Le'Harmless scroll
+   (cave horrors stop).
+
+**What to watch, in the order it will happen**
+
+- **The pack.** It banks ONCE per task. Watch that `banker` withdraws what the log said it would --
+  its name matching is a SUBSTRING, so "Shark" would also match "Raw shark" if both are banked.
+- **The gear.** One equip per tick, confirmed on `/equipment`. Watch the hover gate accept the
+  item's Wear/Wield.
+- **The journey.** One bounded leg per tick. The legs that have NEVER run: the slayer ring's paged
+  destination menu, the Xeric's talisman menu, Moonclan Teleport as a spell, the gnome glider
+  (interface 138), and anything mounted in the house (the digsite pendant, the ring's Zanaris
+  action). Each confirms its landing and fails cleanly, but this is where a wrong id or option
+  shows up first.
+- **The fight.** Unchanged from combat.py except the loot hook.
+- **The restock.** Only fires when HP or prayer is low AND nothing is left. Four per task, then a
+  stop.
+- **A big drop with a full inventory.** It may eat a food, finish a 1-dose prayer potion, or drop
+  the least costly consumable. EAT-THEN-TAKE is a race in principle: the eat and the take clicks go
+  in the same tick. If a valuable drop is ever left on the ground right after eating, that is why.
+
+**Two things that will NOT happen, by design:** a task on the user's Aya block list (dwarves, cave
+crawlers, lizards, skeletons, kalphites) is never fought for Aya, and Greater demons always stops.
+
 ### 2026-09-20: a long offline day -- what exists now, and what a live session must check first
 
 Read `docs/slayer-handoff.md` and the ledger `docs/superpowers/ledgers/2026-09-19-slayer-travel-bank-loadout--progress.md`
