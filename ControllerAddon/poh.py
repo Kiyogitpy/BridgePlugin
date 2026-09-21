@@ -53,6 +53,8 @@ BOX_MENU_OPTION = "Teleport Menu"
 ENTER_BUDGET_S, POOL_BUDGET_S, BOX_MENU_BUDGET_S = 10.0, 6.0, 8.0
 POLL_S = 0.3
 SCAN_RADIUS = 40
+#: Seconds to let a pending interaction resolve before breaking a house tablet. See enter().
+SETTLE_BEFORE_TABLET_S = 4.0
 
 #: The mounted pendant's teleport interface, MEASURED LIVE 2026-09-21 by dumping widgets while it
 #: was open: group 187, child 3, one indexed row per destination --
@@ -137,6 +139,12 @@ def in_house(player=None) -> bool:
     return is_house_player(player)
 
 
+def tablets_held() -> int:
+    """How many house tablets the inventory holds right now."""
+    return sum(int(i.get("qty") or 1) for i in (controller.get_inventory() or [])
+               if TABLET in (i.get("name") or "").lower())
+
+
 def enter(ctx, log: str = "poh") -> bool:
     """Break a house tablet if we are not already inside. True once `in_house` confirms it."""
     if in_house():
@@ -150,9 +158,19 @@ def enter(ctx, log: str = "poh") -> bool:
     # retries a FAILED leg, so without this a landing we cannot confirm costs three tablets.
     since = time.time() - ctx.state.data.get("poh_tablet_at", 0.0)
     if since < TABLET_COOLDOWN_S:
-        debug_log.log(log, f"a house tablet was broken {since:.0f}s ago and the house was never "
-                           f"confirmed -- not breaking another")
-        return False
+        # ...but only if one was actually SPENT. FOUND LIVE 2026-09-21: the routine used Ferox's
+        # Pool of Refreshment and broke a tablet ~3 s later, while that interaction was still
+        # resolving; the house never confirmed and the leg stopped the task. The cooldown is
+        # there so an unconfirmable LANDING cannot cost three tablets -- it has nothing to say
+        # about a break that never happened, and refusing to retry a free attempt turns a
+        # transient into a dead run.
+        before = ctx.state.data.get("poh_tablets_before")
+        if before is not None and tablets_held() >= before:
+            debug_log.log(log, "the last house tablet was never actually spent -- trying again")
+        else:
+            debug_log.log(log, f"a house tablet was broken {since:.0f}s ago and the house was "
+                               f"never confirmed -- not breaking another")
+            return False
     # 4744 = 1 means a plain Break lands OUTSIDE at the portal (its "(Inside)" row is a separate
     # menu option), where in_house() stays False forever. None = unreadable: carry on.
     setting = controller.get_varbit(TELEPORT_INSIDE_VARBIT)
@@ -160,7 +178,14 @@ def enter(ctx, log: str = "poh") -> bool:
         debug_log.log(log, f"varbit {TELEPORT_INSIDE_VARBIT} = {setting}: house teleports land "
                            f"OUTSIDE the portal on this account -- refusing to break a tablet")
         return False
+    # LET THE LAST INTERACTION FINISH. FOUND LIVE 2026-09-21: the tick before this one clicked
+    # Ferox's Pool of Refreshment, and the tablet went three seconds later with the player still
+    # resolving it -- the tablet was spent and the teleport never landed. Same shape as the
+    # ACQUIRE cast that fired mid-fight. Bounded, and it breaks anyway at the end: a player who
+    # will not settle must cost a retry, never the run.
+    controller.wait_until_player_idle(timeout_s=SETTLE_BEFORE_TABLET_S)
     controller.open_inventory_tab(ctx.ser)
+    ctx.state.data["poh_tablets_before"] = tablets_held()
     ok = controller.click_entity(ctx.ser, item, check_ui_blockers=False,
                                  simulate_mistakes=False, expected_action="Break")
     if not ok:

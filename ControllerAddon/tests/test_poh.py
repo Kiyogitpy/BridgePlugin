@@ -15,6 +15,9 @@ def _no_live_bridge(monkeypatch):
     def refuse(path, *a, **k):
         raise AssertionError(f"a test reached the live bridge: GET {path}")
     monkeypatch.setattr(controller, "api_get", refuse)
+    # enter() lets a pending interaction resolve before breaking a tablet (2026-09-21), which
+    # reads /player. Nothing is moving in these worlds; the tests about it fake their own.
+    monkeypatch.setattr(controller, "wait_until_player_idle", lambda **k: True)
 
 
 class _State:
@@ -364,12 +367,43 @@ def test_a_landing_that_never_confirms_costs_ONE_tablet_not_three(monkeypatch):
     monkeypatch.setattr(poh, "ENTER_BUDGET_S", 0.05)
     monkeypatch.setattr(poh, "in_house", lambda player=None: False)
     _tablet(monkeypatch)
+    # The break CONSUMES a tablet, which is the whole reason the cooldown exists -- and since
+    # 2026-09-21 the cooldown checks exactly that, so the fake has to model it. A world whose
+    # inventory never changes would look like "the tablet was never spent" and rightly retry.
+    held = {"qty": 143}
+    monkeypatch.setattr(controller, "get_inventory", lambda: [
+        {"name": "Teleport to house", "qty": held["qty"], "id": 8013,
+         "screenX": 1357, "screenY": 614}])
     breaks = []
-    monkeypatch.setattr(controller, "click_entity", lambda ser, entity, **kw: breaks.append(1) or True)
+
+    def break_it(ser, entity, **kw):
+        breaks.append(1)
+        held["qty"] -= 1
+        return True
+
+    monkeypatch.setattr(controller, "click_entity", break_it)
     ctx = _Ctx()
     for _ in range(3):
         assert poh.enter(ctx) is False
     assert len(breaks) == 1 and ctx.state.data["poh_tablets_used"] == 1
+
+
+def test_a_tablet_that_was_never_actually_spent_is_retried(monkeypatch):
+    """FOUND LIVE 2026-09-21: the routine used Ferox's Pool of Refreshment and broke a tablet
+    ~3 s later while that interaction was still resolving; the house never confirmed and the
+    task stopped. The cooldown exists so an unconfirmable LANDING cannot cost three tablets --
+    it has nothing to say about a break that never happened."""
+    _quiet(monkeypatch)
+    monkeypatch.setattr(poh, "ENTER_BUDGET_S", 0.05)
+    monkeypatch.setattr(poh, "in_house", lambda player=None: False)
+    _tablet(monkeypatch)                       # a stock that never drops: nothing is consumed
+    breaks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, entity, **kw: breaks.append(1) or True)
+    ctx = _Ctx()
+    for _ in range(3):
+        assert poh.enter(ctx) is False
+    assert len(breaks) == 3, "a free attempt must not be rationed like a spent one"
 
 
 def test_a_house_teleport_that_lands_outside_is_refused_before_a_tablet_is_spent(monkeypatch):
