@@ -1568,6 +1568,24 @@ def hop_fairy_ring(ctx, code, expect, ring_tile=None, expect_region=None, log="t
         walk_to(ctx, ring_tile, goal_adjacent=False)
         return False
 
+    # A RING IN VIEW IS NOT A RING WE CAN REACH. FOUND LIVE 2026-09-21 on bears: the scan found
+    # the BLR ring 9 tiles away and Configure was right-clicked from there, over and over. The
+    # click was perfect every time -- /last-action read
+    # `GAME_OBJECT_SECOND_OPTION Configure Fairy ring 29495` on each attempt -- and the game
+    # answered "I can't reach that!" in the chatbox, because the ring sits across a water inlet
+    # from where the walk had stopped. The player never moved, so no budget was ever going to
+    # help; the leg just spent its forty ticks re-clicking and stopped the task.
+    #
+    # `can_reach` asks the LIVE collision flags whether this object is interactable from here,
+    # which is exactly the question the game just answered. When it is not, walk -- walk_to
+    # paths the long way round -- and come back next tick. `ring_tile` is the caller's own tile
+    # for the ring; without one there is nothing to walk to and the old behaviour stands, since
+    # can_reach answering False must never be worse than not asking.
+    if ring_tile is not None and (ring.get("distance") or 0) > 1 and not can_reach(ring):
+        debug_log.log(log, "the fairy ring is in view but not reachable from here -- walking to it")
+        walk_to(ctx, ring_tile, goal_adjacent=False)
+        return False
+
     debug_log.log(log, f"dialling the fairy ring to {code} ({expect})")
     refresh = controller.object_refresh_target(
         ring.get("x"), ring.get("y"), ring.get("plane", 0), ring.get("id"),

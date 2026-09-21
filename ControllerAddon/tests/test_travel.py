@@ -1011,6 +1011,47 @@ def test_a_door_that_talks_for_ever_still_gives_up(monkeypatch):
     assert any("still shut" in m for m in logged)
 
 
+def test_a_fairy_ring_in_view_but_unreachable_is_walked_to_not_clicked(monkeypatch):
+    """FOUND LIVE 2026-09-21 on bears. The scan found the BLR ring 9 tiles away and Configure was
+    right-clicked from there, over and over. The click was PERFECT every time -- /last-action read
+    `GAME_OBJECT_SECOND_OPTION Configure Fairy ring 29495` on each attempt -- and the game
+    answered "I can't reach that!" in the chatbox, because the ring sits across a water inlet
+    from where the walk had stopped. The player never moved, so no budget could have helped."""
+    ring = {"id": travel.FAIRY_RING_ID, "x": 3082, "y": 3206, "plane": 0, "distance": 9,
+            "visible": True, "screenX": 715, "screenY": 446}
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [ring])
+    monkeypatch.setattr(travel, "can_reach", lambda obj: False)
+    walked = []
+    monkeypatch.setattr(travel, "walk_to",
+                        lambda ctx, goal, **kw: walked.append(tuple(goal)) or True)
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda *a, **k: pytest.fail("never right-click a ring we cannot reach"))
+
+    assert travel.hop_fairy_ring(_Ctx(), "BLR", "Legends", ring_tile=(3082, 3206, 0)) is False
+    assert walked == [(3082, 3206, 0)]
+
+
+def test_a_reachable_ring_is_still_dialled_where_it_stands(monkeypatch):
+    """can_reach answering False must never be worse than not asking: the ordinary case, and the
+    house ring underfoot, still go straight to Configure."""
+    ring = {"id": travel.FAIRY_RING_ID, "x": 3082, "y": 3206, "plane": 0, "distance": 4,
+            "visible": True, "screenX": 715, "screenY": 446}
+    monkeypatch.setattr(controller, "get_objects", lambda radius=None, fresh=False: [ring])
+    monkeypatch.setattr(travel, "can_reach", lambda obj: True)
+    monkeypatch.setattr(travel, "walk_to", lambda *a, **k: pytest.fail("no walk needed"))
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a: None)
+    configured = []
+    monkeypatch.setattr(controller, "click_menu_action",
+                        lambda *a, **k: configured.append(1) or True)
+    monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: {"clickable": False})
+    monkeypatch.setattr(travel.outcome_waits, "await_pre", lambda *a, **k: None)
+    monkeypatch.setattr(travel, "_fairy_dial_value", lambda i: 0)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    travel.hop_fairy_ring(_Ctx(), "BLR", "Legends", ring_tile=(3082, 3206, 0))
+    assert configured, "a reachable ring is configured, not walked to"
+
+
 def test_the_fairy_dial_wait_budgets_the_walk_to_the_ring(monkeypatch):
     """FOUND LIVE 2026-09-21 on bears. The ring was 9 tiles away -- well inside the radius-20
     scan, so nothing walked to it first -- Configure was taken from there, and the flat 3 s
