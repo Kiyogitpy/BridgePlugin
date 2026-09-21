@@ -68,6 +68,29 @@ DEFAULT_BANK_NAMES = ("bank booth", "bank chest", "bank counter", "grand exchang
 FEROX_BANK_NAMES = ("bank chest", "bank booth")
 FEROX_MAX_BANK_DISTANCE = 20
 
+#: Ferox Enclave, as a box. FOUND LIVE 2026-09-21 -- USER: "the bug is it teleported twice to
+#: ferox". The guard below asks "is a bank within FEROX_MAX_BANK_DISTANCE", which is not the same
+#: question as "am I already there": the ring lands at (3150, 3636) and the enclave's bank chests
+#: sit around x 3129, right on that 20-tile boundary. Miss it and the trip decides it never
+#: arrived and teleports AGAIN into the same square, spending another charge -- that run ended
+#: with no ring of dueling left at all.
+#:
+#: Drawn to the enclave's walls rather than generously: a box too wide would refuse the teleport
+#: somewhere that genuinely needs it.
+FEROX_AREA = (3122, 3617, 3159, 3659)      # x1, y1, x2, y2 on plane 0
+
+
+def in_ferox(player) -> bool:
+    """Is the player standing inside Ferox Enclave? Unknown position answers False -- never claim
+    to be somewhere we cannot see, since that would refuse a teleport the trip depends on."""
+    if not isinstance(player, dict):
+        return False
+    x, y = player.get("x"), player.get("y")
+    if x is None or y is None or (player.get("plane") or 0) != 0:
+        return False
+    x1, y1, x2, y2 = FEROX_AREA
+    return x1 <= x <= x2 and y1 <= y <= y2
+
 # Past this many tiles open_bank walks toward the bank before clicking it -- see the
 # comment at that branch. Deliberately generous: a normal "arrived at the bank" position
 # is a handful of tiles out, and this must never add a walk to a trip that already works.
@@ -787,6 +810,61 @@ def wait_until_bank_item_gone(ctx, name_substring: str, timeout_s: float = 1.5, 
         time.sleep(poll_interval_s)
 
 
+
+
+#: Category words that describe WHAT an item is rather than WHICH one. Searching one of these
+#: matches half the bank, so search_query drops them when anything else is left.
+GENERIC_ITEM_WORDS = frozenset((
+    "teleport", "teleports", "ring", "rings", "potion", "potions", "scroll", "scrolls",
+    "amulet", "necklace", "staff", "cape", "talisman", "tablet", "pouch", "seed", "of", "to",
+    "the", "a", "an",
+))
+
+
+def search_query(name: str) -> str:
+    """The text to type into the bank search to bring `name` into view: its one distinctive WORD.
+
+    FOUND LIVE 2026-09-21. The first time the search fallback fired it typed the full item name,
+    "Ring of dueling(3)", and the box received `ring of dueling3` -- the USER read it off the
+    screen. The firmware's keyFromName has no parentheses (a shifted digit) and no apostrophe, so
+    those characters vanish silently and the mangled query matches nothing.
+
+    USER: "just search like this: dueling". One word is right for more reasons than the
+    parentheses. It contains nothing the firmware can mangle, it is short to type, and it matches
+    every charge variant at once -- the caller then picks the exact item out of the filtered list
+    the way it already does, because the bank search is a substring match.
+
+    The LONGEST alphabetic word is reliably the distinctive one: "dueling" over "ring",
+    "karambwan" over "cooked", "talisman" over "xeric". A name with no typeable word at all falls
+    back to itself rather than to an empty query, which would clear the filter and show the whole
+    bank.
+    """
+    words = [w.lower() for w in re.findall(r"[A-Za-z]+", name or "")]
+    if not words:
+        return name
+    # Skip the CATEGORY half of the name. FOUND LIVE 2026-09-21: "longest" sent "teleport" for
+    # "Varrock teleport", a query matching hundreds of items in a 909-item bank, and the withdraw
+    # took nothing -- the trip stopped with "no varrock teleport in inventory". Longest was only
+    # ever a proxy for MOST DISTINCTIVE, and it breaks whenever the generic half is the longer
+    # one. Item names pair a place or a kind with a category word, so dropping the category words
+    # is what makes the proxy hold: "Varrock teleport" -> varrock, "Teleport to house" -> house,
+    # "Slayer ring" -> slayer, while the live-proven "Ring of dueling" -> dueling is unchanged.
+    distinctive = [w for w in words if w not in GENERIC_ITEM_WORDS]
+    return max(distinctive or words, key=len)
+
+
+def _reachable(slot) -> bool:
+    """Is this bank slot's drawn position somewhere we could actually click?
+
+    Fails OPEN when the position is missing -- the same rule controller.is_point_within_window
+    itself follows, since "cannot tell" must not block a withdraw that would have worked.
+    """
+    x, y = slot.get("screenX"), slot.get("screenY")
+    if x is None or y is None:
+        return True
+    return controller.is_point_within_window(x, y)
+
+
 def withdraw_loadout(ctx, config: dict, fresh: bool = False) -> None:
     """fresh: forces this call's /bank reads to bypass the bridge's per-tick cache -- pass True
     when the bank state may have just changed from something outside this call (e.g. a separate
@@ -817,14 +895,48 @@ def withdraw_loadout(ctx, config: dict, fresh: bool = False) -> None:
             (s for s in bank.get("items", []) if name in (s.get("name") or "").lower()),
             None,
         )
+        # SCROLLED OUT OF VIEW, found live 2026-09-21 on the first slayer bank trip: "Skipping
+        # click on Ring of dueling(3) -- aim point is outside the RuneLite window", and the trip
+        # then reported itself short. /bank gives an item's DRAWN position, and in a ~900-item bank
+        # a single low-charge ring sits far down a scrolled list, so that position is off-window.
+        # search_bank re-lays the matches from slot 0 -- the same mechanism giants_foundry has used
+        # live since 2026-09-03. USER: "just search for it".
+        #
+        # A FALLBACK, not the normal path: every routine shares this function, and searching costs
+        # a click and a retype on every withdraw that never needed one.
+        searched = False
+        if slot is None or not _reachable(slot):
+            searched = search_bank(ctx, search_query(entry["name"]))
+            if searched:
+                bank = controller.get_bank(fresh=True)
+                slot = next(
+                    (s for s in bank.get("items", []) if name in (s.get("name") or "").lower()),
+                    None,
+                )
+
         if slot is None:
             debug_log.log("bank", f"{entry.get('name')} not found in bank, skipping")
+            continue
+        if not _reachable(slot):
+            debug_log.log("bank", f"{slot.get('name')} is still off-screen after searching, skipping")
             continue
 
         debug_log.log("bank", f"withdrawing {quantity}x {slot.get('name')}")
         for _ in range(quantity):
             controller.click_entity(ctx.ser, slot, check_ui_blockers=False)
             controller.human_delay(0.15, 0.3)
+
+        # CLEAR THE FILTER WE PUT UP, now that this item is taken. The search icon is a TOGGLE, so
+        # a filter left active means the NEXT item's lookup sees only this query's matches, and
+        # the click that would start its search closes this box instead of opening a new one.
+        # FOUND LIVE 2026-09-21: "withdrawing 1x Ectophial", then "Ring of dueling(8) not found in
+        # bank" for a ring the account holds fifteen of.
+        #
+        # AFTER, not before. Clearing first was tried and the next run showed it is worse: with no
+        # filter up, clear turns one ON and search turns it straight back OFF. This is the side
+        # golem_crafting and giants_foundry already clear on.
+        if searched:
+            clear_bank_search(ctx)
 
     # Auto-pick fallback, independent of the explicit list above -- CONFIRMED (user request
     # 2026-08-06): "just let it pick any prayer restore/food, prioritising the one with the
@@ -1551,6 +1663,12 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
     # costs nothing when we really aren't there yet, but avoids spending an actually-finite
     # resource on what was just a slow poll.
     bank_obj = _find_nearby_bank_retrying(ferox_search_config)
+    if bank_obj is None and in_ferox(controller.get_player()):
+        # ALREADY THERE. The scan missing the chest is not evidence of being somewhere else, and
+        # teleporting again lands in the same square a charge poorer. See FEROX_AREA for the live
+        # run that spent a whole ring this way.
+        debug_log.log("bank", "already inside Ferox -- not teleporting again, the chest is a walk")
+        return False
     if bank_obj is None:
         if not travel.teleport_to_ferox(ctx):
             if not any(

@@ -977,3 +977,233 @@ def test_refresh_bank_object_still_falls_back_to_any_booth_with_the_id(monkeypat
     monkeypatch.setattr(controller, "get_objects", lambda radius=15: booths)
     fresh = banker._refresh_bank_object({"id": 57330, "x": 1416, "y": 3351})
     assert (fresh["x"], fresh["y"]) == (1414, 3351)
+
+
+# --- 2026-09-21 LIVE: an item scrolled out of the bank view could not be withdrawn ---------------
+
+class _Ctx:
+    def __init__(self):
+        self.ser, self.events = None, None
+        self.state = type("S", (), {"data": {}, "config": {}})()
+
+
+def _bank_world(monkeypatch, positions, searchable=True):
+    """A bank whose `Ring of dueling(3)` sits at `positions[0]`, and at positions[1] once searched."""
+    state = {"searched": None, "clicks": []}
+
+    def get_bank(fresh=False):
+        i = 1 if state["searched"] else 0
+        x, y = positions[i]
+        return {"items": [{"name": "Ring of dueling(3)", "screenX": x, "screenY": y, "slot": 0}]}
+
+    def search(ctx, query):
+        if not searchable:
+            return False
+        state["searched"] = query
+        return True
+
+    monkeypatch.setattr(controller, "get_bank", get_bank)
+    monkeypatch.setattr(banker, "search_bank", search)
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, slot, **k: state["clicks"].append((slot["screenX"], slot["screenY"])) or True)
+    monkeypatch.setattr(controller, "is_point_within_window",
+                        lambda x, y: 0 <= x <= 2529 and 23 <= y <= 1400)
+    return state
+
+
+def test_an_item_scrolled_out_of_view_is_SEARCHED_for_rather_than_skipped(monkeypatch):
+    """FOUND LIVE 2026-09-21, the first real slayer bank trip: "Skipping click on Ring of
+    dueling(3) -- aim point is outside the RuneLite window", and the trip then failed as "still
+    short after a full bank visit".
+
+    /bank reports an item's DRAWN position, and in a 909-item bank a single low-charge ring sits
+    far down a scrolled list, so its position lands outside the window. search_bank re-lays the
+    matches from slot 0, which is what giants_foundry has used live since 2026-09-03. USER: "just
+    search for it"."""
+    state = _bank_world(monkeypatch, positions=[(1300, 9000), (1300, 800)])
+
+    banker.withdraw_loadout(_Ctx(), {"withdraw": [{"name": "Ring of dueling(3)", "quantity": 1}]})
+
+    assert state["searched"] == "dueling", "one typeable word, not the full name"
+    assert state["clicks"] == [(1300, 800)], "clicked the position it had AFTER the search"
+
+
+def test_an_item_already_in_view_is_not_searched_for(monkeypatch):
+    """The search costs clicks and a retype, and every other routine shares this function. It must
+    stay a fallback rather than becoming the normal path."""
+    state = _bank_world(monkeypatch, positions=[(1300, 800), (1300, 800)])
+
+    banker.withdraw_loadout(_Ctx(), {"withdraw": [{"name": "Ring of dueling(3)", "quantity": 1}]})
+
+    assert state["searched"] is None
+    assert state["clicks"] == [(1300, 800)]
+
+
+def test_an_item_that_is_still_unreachable_after_searching_is_skipped_not_clicked(monkeypatch):
+    """Clicking a point outside the window is what the guard exists to prevent; the search failing
+    must not talk it into doing that anyway."""
+    state = _bank_world(monkeypatch, positions=[(1300, 9000), (1300, 9000)])
+
+    banker.withdraw_loadout(_Ctx(), {"withdraw": [{"name": "Ring of dueling(3)", "quantity": 1}]})
+
+    assert state["clicks"] == []
+
+
+def test_the_search_query_is_the_one_distinctive_WORD_of_the_name():
+    """FOUND LIVE 2026-09-21, immediately after the search fallback first fired. It searched the
+    full name "Ring of dueling(3)" and the box received `ring of dueling3` -- USER confirmed the
+    typed text. The firmware's keyFromName has no parentheses (they need a shifted digit) so they
+    vanish silently, and `ring of dueling3` matches nothing in any bank.
+
+    USER: "just search like this: dueling". One word is the right answer for more reasons than the
+    parentheses: it types nothing the firmware can mangle, it is short, it matches every charge
+    variant at once, and the bank search is a substring match so the caller still picks the exact
+    item out of the filtered list afterwards.
+
+    The rule is the LONGEST alphabetic word, which is reliably the distinctive one -- "dueling"
+    over "ring", "karambwan" over "cooked"."""
+    assert banker.search_query("Ring of dueling(3)") == "dueling"
+    assert banker.search_query("Cooked karambwan") == "karambwan"
+    assert banker.search_query("Super restore(4)") == "restore"
+
+
+def test_apostrophes_and_digits_never_reach_the_keyboard():
+    """Xeric's talisman, Rada's blessing 3. The firmware has no apostrophe key either, and a lone
+    digit is not a word."""
+    # "xeric" since 2026-09-21: "talisman" is a CATEGORY word and gets skipped -- see
+    # test_the_search_word_skips_the_generic_half_of_a_name for the live failure that caused it.
+    assert banker.search_query("Xeric's talisman") == "xeric"
+    assert banker.search_query("Rada's blessing 3") == "blessing"
+
+
+def test_a_one_word_name_is_simply_itself():
+    assert banker.search_query("Ectophial") == "ectophial"
+
+
+def test_a_name_with_nothing_typeable_falls_back_to_the_whole_thing():
+    """Rather than searching an empty string, which clears the filter and shows the whole bank."""
+    assert banker.search_query("(4)") == "(4)"
+    assert banker.search_query("") == ""
+
+
+# --- 2026-09-21 LIVE: it teleported to Ferox while standing in Ferox -----------------------------
+
+def test_standing_inside_ferox_is_never_a_reason_to_teleport_to_ferox(monkeypatch):
+    """USER 2026-09-21, watching it happen: "the bug is it teleported twice to ferox".
+
+    The existing guard asks "is there a bank within FEROX_MAX_BANK_DISTANCE (20)", not "am I
+    already there". MEASURED that run: the ring lands at (3150, 3636) and Ferox's bank chests sit
+    around x 3129 -- right on the 20-tile boundary. Miss it and the trip concludes it never
+    arrived and teleports AGAIN, into the same square, spending another charge. It did that until
+    the ring crumbled: the inventory finished the run with no ring of dueling at all.
+
+    Position is the honest question. Inside the enclave there is nothing to teleport for, whether
+    or not the bank happens to be in scan range this tick."""
+    assert banker.in_ferox({"x": 3150, "y": 3636, "plane": 0}) is True
+    assert banker.in_ferox({"x": 3129, "y": 3636, "plane": 0}) is True, "by the bank chests"
+    assert banker.in_ferox({"x": 3151, "y": 3635, "plane": 0}) is True, "the teleport's own landing"
+
+
+def test_places_that_are_not_ferox_still_teleport():
+    """The Wilderness edge is just outside, and so is everywhere else -- a box drawn too wide would
+    strand a trip that genuinely needed the teleport."""
+    assert banker.in_ferox({"x": 3200, "y": 3636, "plane": 0}) is False
+    assert banker.in_ferox({"x": 3150, "y": 3700, "plane": 0}) is False
+    assert banker.in_ferox({"x": 3619, "y": 3525, "plane": 0}) is False, "the Ectofuntus"
+    assert banker.in_ferox({"x": 3150, "y": 3636, "plane": 1}) is False, "a different plane"
+    assert banker.in_ferox(None) is False, "position unknown: do not claim to be there"
+
+
+def test_the_ferox_trip_walks_to_the_bank_instead_of_re_teleporting(monkeypatch):
+    """The behaviour the box exists for: already inside, out of scan range of the chest, and the
+    trip must NOT spend another charge to arrive where it already is."""
+    calls = {"teleport": 0}
+    monkeypatch.setattr(banker, "_find_nearby_bank_retrying", lambda cfg: None)
+    monkeypatch.setattr(banker.travel, "teleport_to_ferox",
+                        lambda ctx: calls.__setitem__("teleport", calls["teleport"] + 1) or True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3150, "y": 3636, "plane": 0})
+
+    banker._bank_via_ferox(_Ctx(), {})
+
+    assert calls["teleport"] == 0, "already there: nothing to teleport for"
+
+
+def test_a_search_is_cleared_AFTER_its_withdraw_so_the_next_item_starts_clean(monkeypatch):
+    """FOUND LIVE 2026-09-21, the first bank trip needing more than one search:
+
+        withdrawing 1x Ectophial                       <- searched "ectophial", worked
+        Ring of dueling(8) not found in bank, skipping <- the next click toggled that filter OFF
+        search button not found (bank open?)
+
+    The search icon is a TOGGLE. A filter left up means the next item's lookup only sees the
+    previous query's matches, and clicking the icon to begin a new search CLOSES the old box
+    rather than opening a new one -- the query then goes into the game, the bank comes back
+    unfiltered, and a scrolled-away item is not drawn there at all, so it is not in /bank's list.
+
+    I first tried clearing BEFORE each search, and the next live run said plainly that was worse:
+    with no filter up, clear turned one ON and search turned it straight back OFF. Two clicks, a
+    closed box, and the query typed into the world. clear_bank_search is a toggle too.
+
+    AFTER is the correct side, and it is how golem_crafting and giants_foundry already use it. It
+    leaves the box shut and the icon visible for whatever comes next.
+    """
+    order, state = [], {"filtered": False}
+
+    def search(ctx, query):
+        order.append(f"search {query}")
+        state["filtered"] = True              # a real search re-lays matches from slot 0
+        return True
+
+    def clear(ctx):
+        order.append("clear")
+        state["filtered"] = False
+        return True
+
+    def bank(fresh=False):
+        y = 800 if state["filtered"] else 9000      # off-window until searched, as live
+        return {"items": [{"name": "Ring of dueling(8)", "screenX": 10, "screenY": y},
+                          {"name": "Slayer ring (2)", "screenX": 10, "screenY": y}]}
+
+    monkeypatch.setattr(banker, "clear_bank_search", clear)
+    monkeypatch.setattr(banker, "search_bank", search)
+    monkeypatch.setattr(banker, "set_quantity_mode", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "human_delay", lambda *a, **k: None)
+    monkeypatch.setattr(controller, "is_point_within_window", lambda x, y: y < 1400)
+    monkeypatch.setattr(controller, "click_entity", lambda ser, slot, **k: True)
+    monkeypatch.setattr(controller, "get_bank", bank)
+
+    banker.withdraw_loadout(_Ctx(), {"withdraw": [
+        {"name": "Ring of dueling(8)", "quantity": 1},
+        {"name": "Slayer ring (2)", "quantity": 1}]})
+
+    assert order == ["search dueling", "clear", "search slayer", "clear"], order
+
+
+def test_the_search_word_skips_the_generic_half_of_a_name():
+    """FOUND LIVE 2026-09-21. The longest-word rule sent "teleport" for "Varrock teleport" -- a
+    query matching hundreds of items in a 909-item bank. The withdraw then took nothing and the
+    trip stopped with "no varrock teleport in inventory".
+
+    "Longest" was only ever a proxy for "most distinctive", and it breaks whenever the generic
+    half of a name is the longer one. Item names pair a place or a kind with a category word, so
+    skipping the category words is what makes the proxy hold."""
+    assert banker.search_query("Varrock teleport") == "varrock"
+    assert banker.search_query("Teleport to house") == "house"
+    assert banker.search_query("Lassar teleport") == "lassar"
+    assert banker.search_query("Slayer ring (2)") == "slayer"
+    assert banker.search_query("Xeric's talisman") == "xeric"
+
+
+def test_the_words_that_were_already_right_stay_right():
+    """The live-proven ones from earlier tonight must not move."""
+    assert banker.search_query("Ring of dueling(3)") == "dueling"
+    assert banker.search_query("Cooked karambwan") == "karambwan"
+    assert banker.search_query("Super restore(4)") == "restore"
+    assert banker.search_query("Ectophial") == "ectophial"
+
+
+def test_a_name_that_is_all_generic_words_still_searches_something():
+    """Rather than an empty query, which clears the filter and shows the whole bank."""
+    assert banker.search_query("Teleport scroll") in ("teleport", "scroll")
