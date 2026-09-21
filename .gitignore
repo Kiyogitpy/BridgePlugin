@@ -23,6 +23,7 @@ _vm_task.cmd
 bin/
 build
 client_run.log
+gradle-run.log
 data/
 hs_err_pid*.log
 logs/
