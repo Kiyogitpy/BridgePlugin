@@ -23,7 +23,12 @@ def _no_live_bridge(monkeypatch):
 
 
 # The panel's own keys (ConfigExporter.java: food.name, potions.prayerPotion).
+# A prayer IS selected here: every test below about prayer packing is asking what the pack does
+# for an account that actually prays. ADDED 2026-09-21 -- the pack now refuses to carry restores
+# nothing will ever drink (slayer_loadout.prayer_is_used), and without this block the whole
+# prayer half of this file would be exercising the "no prayer" path by accident.
 PANEL = {"food": {"enabled": True, "name": "Shark", "eatAt": 50},
+         "prayer": {"enabled": True, "defensivePrayer": "Protect from Melee"},
          "potions": {"prayerEnabled": True, "prayerPotion": "Prayer potion"}}
 
 # A bank that holds plenty of everything, name (lowercased) -> quantity.
@@ -127,7 +132,11 @@ def test_an_empty_panel_is_only_a_problem_when_the_BANK_cannot_answer_it():
 
     A bank holding nothing but Wilderness supplies is exactly that case, and it is the real one:
     the account holds over a thousand blighted anglerfish."""
-    empty_panel = {"food": {}, "potions": {}}
+    # The panel's ITEM NAMES are empty (which is what this test is about) but a prayer IS
+    # selected -- otherwise, since 2026-09-21, no restore is packed at all and there is nothing
+    # to choose. See slayer_loadout.prayer_is_used.
+    empty_panel = {"food": {}, "potions": {},
+                   "prayer": {"enabled": True, "defensivePrayer": "Protect from Melee"}}
 
     chosen = sl.build("Nechryael", 150, empty_panel, 70, 10, {}, BANK)
     assert not any("is chosen in the panel" in p for p in chosen.problems),         "the bank could answer, so nothing to complain about"
@@ -257,7 +266,10 @@ def test_a_super_restore_is_counted_as_a_super_restore_not_a_prayer_potion():
     over ~40 kills, and prayer_potions_for caps at 8, so a dose that restores one point more
     lands on the same count. The invariant below is what actually matters."""
     bank = dict(BANK, **{"super restore(4)": 27})
-    panel = {"food": {"name": "Shark"}, "potions": {"prayerPotion": "Super restore"}}
+    # A prayer is selected: this test is about WHICH restore is packed, and since 2026-09-21 an
+    # account that never prays is packed none at all (slayer_loadout.prayer_is_used).
+    panel = {"food": {"name": "Shark"}, "potions": {"prayerPotion": "Super restore"},
+             "prayer": {"enabled": True, "defensivePrayer": "Protect from Melee"}}
     lo = sl.build("Nechryael", 150, panel, 70, 10, {}, bank)
     want = _want(lo)
     assert "Super restore(4)" in want and lo.problems == []
@@ -269,8 +281,12 @@ def test_a_super_restore_is_counted_as_a_super_restore_not_a_prayer_potion():
 # USER: "do it any food any prayer but not wilderness food". The panel's two names were a hard
 # blocker -- both were empty strings on the live account and every task stopped at the pack.
 
-def _panel(food=None, potion=None):
-    cfg = {"food": {"enabled": True}, "potions": {"prayerEnabled": True}}
+def _panel(food=None, potion=None, prays=True):
+    # prays: a prayer IS selected by default, because every caller below is asking what the pack
+    # does for an account that actually prays. See slayer_loadout.prayer_is_used (2026-09-21).
+    cfg = {"food": {"enabled": True}, "potions": {"prayerEnabled": True},
+           "prayer": {"enabled": True,
+                      "defensivePrayer": "Protect from Melee" if prays else "NONE"}}
     if food is not None:
         cfg["food"]["name"] = food
     if potion is not None:
@@ -722,3 +738,51 @@ def test_a_pack_that_cannot_fit_even_after_trimming_is_still_a_problem():
     pack.exact("food", "shark", 6, bulk=True)
     pack.trim_food(20)
     assert pack.slots >= sl.FOOD_TRIM_MIN
+
+
+# --- do not pack prayer restores nothing will ever drink (FOUND LIVE 2026-09-21) --------------
+#
+# On the first Kuradal task the panel read prayer.enabled true with defensivePrayer NONE,
+# offensivePrayer NONE and useQuickPrayers false -- and combat_core says so itself every run
+# ("nothing to toggle"). Nothing was ever going to be prayed, yet the pack reserved EIGHT of 28
+# slots for prayer potions while the food was trimmed to its floor and the task burned through
+# restocks. Prayer stayed 77/77 the whole fight.
+
+def test_no_prayer_selected_means_no_prayer_restores_are_packed():
+    assert sl.prayer_is_used({"prayer": {"enabled": True, "defensivePrayer": "NONE",
+                                         "offensivePrayer": "NONE",
+                                         "useQuickPrayers": False}}) is False
+
+
+def test_quick_prayers_alone_is_enough_to_pack_restores():
+    assert sl.prayer_is_used({"prayer": {"enabled": True, "defensivePrayer": "NONE",
+                                         "offensivePrayer": "NONE",
+                                         "useQuickPrayers": True}}) is True
+
+
+def test_either_prayer_slot_being_set_is_enough():
+    assert sl.prayer_is_used({"prayer": {"enabled": True, "defensivePrayer": "Protect from Melee"}})
+    assert sl.prayer_is_used({"prayer": {"enabled": True, "offensivePrayer": "Piety"}})
+
+
+def test_prayer_switched_off_entirely_packs_nothing():
+    assert sl.prayer_is_used({"prayer": {"enabled": False,
+                                         "defensivePrayer": "Protect from Melee"}}) is False
+
+
+def test_an_absent_prayer_block_is_not_treated_as_praying():
+    """enabled defaults ON (it means "manage prayer if there is one to manage"), but with no
+    prayer named there is still nothing to drink for."""
+    assert sl.prayer_is_used({}) is False
+
+
+def test_the_pack_frees_the_prayer_slots_for_food_when_nothing_prays():
+    no_prayer = dict(PANEL, prayer={"enabled": True, "defensivePrayer": "NONE",
+                                    "offensivePrayer": "NONE", "useQuickPrayers": False})
+    praying = dict(PANEL, prayer={"enabled": True, "defensivePrayer": "Protect from Melee",
+                                  "useQuickPrayers": False})
+    lean = sl.build("cows", 20, no_prayer, 70, 10, carried={}, banked=BANK)
+    full = sl.build("cows", 20, praying, 70, 10, carried={}, banked=BANK)
+    assert lean.slots <= full.slots
+    assert not any("potion" in (w["name"] or "").lower() or "restore" in (w["name"] or "").lower()
+                   for w in lean.withdraw), lean.withdraw

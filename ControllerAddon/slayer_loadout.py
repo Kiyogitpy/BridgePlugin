@@ -468,6 +468,33 @@ def _choose(pack, choices, wanted, suffix="", count_doses=False):
             best, best_count = choice, count
     return best if best_count > 0 else None
 
+def prayer_is_used(panel_cfg) -> bool:
+    """Will this account actually switch a prayer on? If not, do not pack restores for it.
+
+    FOUND LIVE 2026-09-21 on the first Kuradal task. The panel reads
+    `prayer.enabled: true` with `defensivePrayer: NONE`, `offensivePrayer: NONE` and
+    `useQuickPrayers: false`, and combat_core says so itself every run:
+
+        usePrayer is on with useQuickPrayers off, but Defensive Prayer is set to None in
+        Controller Settings -- nothing to toggle.
+
+    So nothing was ever going to be prayed, and the pack was still reserving EIGHT slots for
+    prayer potions on a 28-slot inventory -- while the food was being trimmed to its floor and
+    the task burned through restock after restock. Prayer stayed 77/77 the whole fight.
+
+    `enabled` alone is not the question, because it is on by default and means only "manage
+    prayer if there is one to manage". The question is whether any prayer would ever be
+    activated, which is the same test combat_core.maintain_defensive_prayer applies.
+    """
+    prayer = (panel_cfg or {}).get("prayer") or {}
+    if not prayer.get("enabled", True):
+        return False
+    if prayer.get("useQuickPrayers"):
+        return True
+    return any((prayer.get(k) or "NONE").upper() != "NONE"
+               for k in ("defensivePrayer", "offensivePrayer"))
+
+
 def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, banked,
           keep_carried=False, skip_teleport=False) -> Loadout:
     """See the module header. `carried` is routines/slayer.py's _carried() dict (lowercased name
@@ -499,7 +526,7 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
     if food and profile.food:
         pack.exact("food", food, profile.food, bulk=True)
 
-    if profile.prayer_potions:
+    if profile.prayer_potions and prayer_is_used(panel_cfg):
         potion = (panel_cfg.get("potions") or {}).get("prayerPotion")
         if potion and WILDERNESS_ONLY in potion.lower():
             pack.problems.append(f"{potion} can only be drunk in the WILDERNESS and no site here is in "

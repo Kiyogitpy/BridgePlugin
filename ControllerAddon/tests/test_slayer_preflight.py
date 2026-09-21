@@ -17,7 +17,10 @@ def _no_live_bridge(monkeypatch):
     monkeypatch.setattr(controller, "api_get", refuse)
 
 
-PANEL = {"food": {"name": "Shark"}, "potions": {"prayerPotion": "Prayer potion"}}
+# A prayer IS selected: since 2026-09-21 an account that never activates one is packed no
+# restores at all (slayer_loadout.prayer_is_used), and these tests read the pack's own report.
+PANEL = {"food": {"name": "Shark"}, "potions": {"prayerPotion": "Prayer potion"},
+         "prayer": {"enabled": True, "defensivePrayer": "Protect from Melee"}}
 BANK = {"shark": 500, "prayer potion(4)": 80, "teleport to house": 40, "ring of dueling(8)": 6,
         "slayer ring (8)": 2, "taverley teleport": 30, "ectophial": 1}
 LUMBRIDGE = {"x": 3222, "y": 3218, "plane": 0}

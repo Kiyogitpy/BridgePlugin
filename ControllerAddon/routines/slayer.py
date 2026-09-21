@@ -753,7 +753,15 @@ def _fight(ctx, state) -> None:
     data = ctx.state.data
     data["slayer_route_finished"] = 0          # we are AT the site: the journey is over
     if data.get("current_target_index") is not None:
+        # FINDING ONE ANSWERS THE QUESTION. FOUND LIVE 2026-09-21 on elves at Lletya: the walk-back
+        # counter was never reset, so it accumulated over a whole task and stopped a run that was
+        # working -- 86 elves already killed at that very tile. Lletya has THREE elves on the
+        # ground floor (slayer_catalog says so, and the preflight prints "expect a slow task"), so
+        # running the site dry and waiting for a respawn is NORMAL there, not evidence of being in
+        # the wrong place. The guard is for "there is nothing here to fight, ever"; a target in
+        # view is proof that there is.
         data["slayer_no_target"] = 0
+        data["slayer_no_target_walks"] = 0
         return
     data["slayer_no_target"] = data.get("slayer_no_target", 0) + 1
     if data["slayer_no_target"] < NO_TARGET_TICKS:

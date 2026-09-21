@@ -355,6 +355,37 @@ def test_nothing_to_fight_for_long_walks_back_to_the_site_then_stops(monkeypatch
     assert "banshees" in ctx.state.stops[0].lower() and "nothing to fight" in ctx.state.stops[0]
 
 
+def test_a_target_found_between_dry_spells_resets_the_WALK_counter_too(monkeypatch):
+    """FOUND LIVE 2026-09-21: elves at Lletya. The walk-back counter was never reset once a
+    target WAS found, so it accumulated over a whole task and stopped a run that was working --
+    86 of 139 elves already killed at that very tile. Lletya has three elves on the ground
+    floor, so running the site dry and waiting for a respawn is normal there. The guard is for
+    "there is nothing here to fight, ever"; a target in view is proof that there is."""
+    found = {"target": None}
+    _fighting(monkeypatch, None)
+    monkeypatch.setattr(combat_core, "fight_tick",
+                        lambda ctx: ctx.state.data.__setitem__("current_target_index",
+                                                               found["target"]))
+    monkeypatch.setattr(legs, "walk_across", lambda ctx, goal, log="travel": True)
+    ctx = _Ctx()
+
+    # Two dry spells, each ending in a walk back -- one short of the stop.
+    for _ in range(routine.NO_TARGET_TICKS * (routine.NO_TARGET_WALKS - 1) + 2):
+        routine.tick(ctx)
+    assert not ctx.state.stops
+    assert ctx.state.data.get("slayer_no_target_walks", 0) > 0
+
+    found["target"] = 4412            # an elf respawns and is engaged
+    routine.tick(ctx)
+    assert ctx.state.data["slayer_no_target_walks"] == 0, "the site plainly works"
+
+    # ...so the next dry spell starts the budget over rather than tripping the stop.
+    found["target"] = None
+    for _ in range(routine.NO_TARGET_TICKS + 2):
+        routine.tick(ctx)
+    assert not ctx.state.stops
+
+
 def test_having_a_target_resets_the_watch(monkeypatch):
     _fighting(monkeypatch, 4412)
     ctx = _Ctx()
