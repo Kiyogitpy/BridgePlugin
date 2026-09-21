@@ -3985,15 +3985,26 @@ or from where the player actually stood.
 
 So `hop_fairy_ring` now walks rather than right-clicking a ring `can_reach` refuses. That ended
 the useless clicking but left the leg nowhere to go, because the walker could not path there
-either -- the real bug is in the PLANNER. `nearest_ring_costed` proved the ring with
-`crossfloor.find_route`, which answered with a 107-cost route to a tile `worldmap` calls
-unreachable. **A ring now has to satisfy the map that EXECUTES the walk as well as the one that
-plans it.** Bears then falls back to the house fairy ring -- the route it had before the walk
-branch existed -- and from the live position the planner picks a different, reachable overworld
-ring at (3108,3149) instead. Bears completed on the next run.
+either -- the real bug is in the PLANNER.
 
-**Which engine is wrong about (3082,3206) is NOT answered here, and it is worth answering.**
-`crossfloor` and `worldmap` disagree about a real tile; the game sides with `worldmap`.
+**And the planner's bug is a misread contract, not a broken pathfinder.** `nearest_ring_costed`
+proved the ring with `crossfloor.find_route` and treated a non-None Route as "reachable".
+Reading the Route instead of its truthiness settles it: its single step is
+`Walk(107 tiles -> (3091, 3215, 0))` -- **nine tiles from the ring, and
+`crossfloor.GOAL_TOLERANCE` is 12**. `find_route` did exactly what its docstring says, "a route
+to WITHIN GOAL_TOLERANCE of `goal`", because (as its own header notes) site coordinates from
+research are cluster centres and often not walkable at all. That tolerance is right for a SITE
+and wrong for a fairy ring, which has to be stood next to.
+
+So the ring is now also checked against `worldmap`, which has no tolerance -- it either reaches
+the ring or it does not. Bears falls back to the house fairy ring (the route it had before the
+walk branch existed), and from the live position the planner picks a different, reachable
+overworld ring at (3108,3149). Bears completed on the next run.
+
+**The general lesson, which is worth more than the fix:** anything using
+`crossfloor.find_route` as a REACHABILITY TEST is asking the wrong question -- it answers "can I
+get within 12 tiles", which for a precise target is not the same thing. Other callers should be
+read with that in mind.
 
 Two details worth keeping from getting it wrong first:
 - **The adjacency check has to be `goal_adjacent=True`.** A fairy ring blocks its own tile in the

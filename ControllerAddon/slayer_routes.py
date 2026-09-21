@@ -334,18 +334,22 @@ def nearest_ring_costed(player_tile, skill_levels=None):
         route = crossfloor.find_route(tuple(player_tile), ring.origin, skill_levels=skill_levels, max_links=0)
         if route is None:
             continue
-        # BOTH ENGINES HAVE TO AGREE. FOUND LIVE 2026-09-21 on bears: crossfloor answered with a
-        # route to the BLR ring at (3082,3206) and worldmap could not reach it from ANYWHERE on
-        # the mainland -- not that tile, not one of its neighbours, not a tile three away, from
-        # the spiders site or Draynor bank or where the walk actually stopped. The game agreed
-        # with worldmap, saying "I can't reach that!" in the chatbox three times while the leg
-        # re-clicked a Configure that registered perfectly every time (/last-action confirmed
-        # it). The walk leg had meanwhile reported SUCCESS nine tiles short.
+        # CROSSFLOOR REACHES WITHIN GOAL_TOLERANCE, NOT THE GOAL -- and that is the whole bug.
         #
-        # Which engine is wrong is a separate question and a real one; until it is answered, a
-        # ring only counts as walkable when the map that executes the walk also says so. This can
-        # only ever REJECT a route, so the worst case is falling back to the house ring -- which
-        # is what this task's route was before the walk branch existed, and which works.
+        # FOUND LIVE 2026-09-21 on bears. This offered the BLR ring at (3082,3206) on the
+        # strength of a find_route that came back with cost 107; the game then said "I can't
+        # reach that!" three times while the leg re-clicked a Configure that registered
+        # perfectly every time (/last-action confirmed each one). Reading the Route rather than
+        # its truthiness settles it: its single step is `Walk(107 tiles -> (3091, 3215, 0))`,
+        # nine tiles from the ring, and crossfloor.GOAL_TOLERANCE is 12. find_route did exactly
+        # what it documents -- "a route to WITHIN GOAL_TOLERANCE of goal" -- because site
+        # coordinates from research are cluster centres and often not walkable at all.
+        #
+        # That tolerance is right for a SITE and wrong for a fairy ring, which has to be stood
+        # next to. worldmap is asked because it has no tolerance: it either reaches the ring or
+        # it does not. This can only ever REJECT a route, so the worst case is falling back to
+        # the house ring -- which is what this task's route was before the walk branch existed,
+        # and which works.
         # ADJACENT, not the tile itself: a fairy ring BLOCKS its own tile in the static map, the
         # same fact legs.walk_across's step-off exists for. Asking for the tile rejects every
         # ring in the game (measured: the perfectly good BLR ring at (2740,3351) answers None
