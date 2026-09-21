@@ -50,6 +50,20 @@ _NOT_AN_ITEM = ("fairy ring", "ornate jewellery box", "moonclan teleport")
 # bank: 1319 Blighted anglerfish and 149 Blighted super restore(4) against 27 ordinary ones, so
 # choosing one in the panel is an easy mistake to make.
 WILDERNESS_ONLY = "blighted"
+
+# USER 2026-09-21: "do it any food any prayer but not wilderness food." The panel's two names were
+# a HARD BLOCKER -- both were empty strings on the live account, so every task stopped at the pack
+# without ever reaching a bank. An explicit panel choice still wins; these are the fallback.
+#
+# Ordered best-healing first, and the pick is the first one the account actually has ENOUGH of --
+# not simply the best, which would report a shortfall while a perfectly good food sat beside it.
+# Nothing containing WILDERNESS_ONLY can ever be chosen, however plentiful: the account holds over
+# a thousand blighted anglerfish and not one of them can be eaten at any site in the catalog.
+FOOD_CHOICES = ("anglerfish", "manta ray", "sea turtle", "shark", "cooked karambwan", "monkfish",
+                "swordfish", "bass", "lobster", "tuna", "salmon", "trout")
+
+#: Same idea for prayer. Dosed, so availability is counted in full (4)s the way `doses` fetches.
+RESTORE_CHOICES = ("super restore", "sanfew serum", "prayer potion")
 _STACKABLE_WORDS = ("teleport", "scroll")     # tablets and scrolls share one slot
 
 
@@ -203,6 +217,31 @@ def _teleport(pack, site, task_name) -> None:
                              + " is carried or banked")
 
 
+
+def _available(pack, name):
+    """How many of `name` the account can draw on -- carried plus banked. A bank never seen
+    (banked is None) answers None, which means "cannot tell" and must not read as zero."""
+    held = int((pack.carried or {}).get(name) or 0)
+    if pack.banked is None:
+        return None
+    return held + int(pack.banked.get(name) or 0)
+
+
+def _choose(pack, choices, wanted, suffix=""):
+    """The first of `choices` the account has at least `wanted` of, else whichever it has most of,
+    else None. Never anything Wilderness-only, whatever the count."""
+    usable = [c for c in choices if WILDERNESS_ONLY not in c]
+    best, best_count = None, -1
+    for choice in usable:
+        count = _available(pack, choice + suffix)
+        if count is None:
+            return choice          # bank unseen: cannot compare, so take the best-ranked one
+        if count >= wanted and wanted > 0:
+            return choice
+        if count > best_count:
+            best, best_count = choice, count
+    return best if best_count > 0 else None
+
 def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, banked,
           keep_carried=False) -> Loadout:
     """See the module header. `carried` is routines/slayer.py's _carried() dict (lowercased name
@@ -224,9 +263,14 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
         pack.problems.append(f"{food} can only be eaten in the WILDERNESS and no site here is in it "
                              f"-- choose an ordinary food in the panel")
         food = None
-    if not food:
-        pack.problems.append("no food is chosen in the panel (food.name)")
-    elif profile.food:
+    if not food and profile.food:
+        # Nothing usable named: choose one. See FOOD_CHOICES for why this is a fallback and not an
+        # override, and why the best-healing food is not automatically the right answer.
+        food = _choose(pack, FOOD_CHOICES, profile.food)
+        if not food:
+            pack.problems.append("no food is chosen in the panel (food.name) and the bank holds no "
+                                 "ordinary food to choose instead")
+    if food and profile.food:
         pack.exact("food", food, profile.food)
 
     if profile.prayer_potions:
@@ -235,11 +279,15 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
             pack.problems.append(f"{potion} can only be drunk in the WILDERNESS and no site here is in "
                                  f"it -- choose an ordinary prayer restore in the panel")
             potion = None
+        doses = supplies.prayer_doses_needed(int(count or 0), int(prayer_level or 1), int(prayer_bonus or 0))
+        potions = supplies.prayer_potions_for(profile, doses)
         if not potion:
-            pack.problems.append("no prayer potion is chosen in the panel (potions.prayerPotion)")
-        else:
-            doses = supplies.prayer_doses_needed(int(count or 0), int(prayer_level or 1), int(prayer_bonus or 0))
-            pack.doses("prayer potions", potion, supplies.prayer_potions_for(profile, doses))
+            potion = _choose(pack, RESTORE_CHOICES, potions, suffix="(4)")
+            if not potion:
+                pack.problems.append("no prayer restore is chosen in the panel "
+                                     "(potions.prayerPotion) and the bank holds no ordinary one")
+        if potion:
+            pack.doses("prayer potions", potion, potions)
 
     if spec is not None:
         # `worn` too: `carried` merges inventory and equipment, so a worn mirror shield is already

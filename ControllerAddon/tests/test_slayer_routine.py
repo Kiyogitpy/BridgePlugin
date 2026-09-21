@@ -549,11 +549,35 @@ def test_an_item_nobody_holds_stops_before_any_bank_trip_and_never_spends_points
     assert calls["bank"] == [] and "ectophial" in ctx.state.stops[0].lower()
 
 
-def test_no_food_chosen_in_the_panel_is_a_stop_that_says_so(monkeypatch):
+def test_an_empty_panel_now_banks_for_whatever_the_bank_holds(monkeypatch):
+    """SUPERSEDED 2026-09-21 by the USER: "do it any food any prayer but not wilderness food."
+
+    This used to assert a STOP. That was the single biggest blocker on the live account: both panel
+    names were empty strings, so no task ever reached a bank. The pack now chooses a food itself
+    and gets on with the trip."""
     ctx, calls = _packing(monkeypatch, _inv(), BANKED)
     ctx.state.config = {"food": {}, "potions": {}}
+
     routine.tick(ctx)
-    assert calls["bank"] == [] and "food" in ctx.state.stops[0].lower()
+
+    assert calls["bank"], "it goes, instead of stopping"
+    assert ctx.state.stops == []
+
+
+def test_a_bank_with_nothing_but_wilderness_food_still_stops(monkeypatch):
+    """The other half of the same change: choosing is not the same as settling. Blighted supplies
+    cannot be eaten at any site in the catalog, so a bank holding only those is still a stop."""
+    # The real bank MINUS its ordinary food, so the stop is about the food and not about the
+    # teleports BANKED also supplies.
+    wilderness_only = {k: v for k, v in BANKED.items() if k != "shark"}
+    wilderness_only["blighted anglerfish"] = 1319
+    ctx, calls = _packing(monkeypatch, _inv(), wilderness_only)
+    ctx.state.config = {"food": {}, "potions": {}}
+
+    routine.tick(ctx)
+
+    assert calls["bank"] == []
+    assert "food" in ctx.state.stops[0].lower()
 
 
 def test_a_bank_never_seen_is_visited_on_faith_then_judged_on_what_it_really_holds(monkeypatch):

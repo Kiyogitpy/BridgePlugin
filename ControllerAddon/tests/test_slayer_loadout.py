@@ -1,4 +1,4 @@
-"""slayer_loadout.build: a task plus what is carried and banked becomes a withdraw list.
+"""sl.build: a task plus what is carried and banked becomes a withdraw list.
 
 PURE -- nothing here reads the bridge or clicks. Plan task C1
 (docs/superpowers/plans/2026-09-19-slayer-travel-bank-loadout.md).
@@ -113,10 +113,25 @@ def test_a_bank_never_seen_is_not_an_empty_bank():
     assert seen.unchecked is False
 
 
-def test_no_food_or_potion_name_in_the_panel_is_a_problem():
-    lo = sl.build("Nechryael", 150, {"food": {}, "potions": {}}, 70, 10, {}, BANK)
-    assert any("food" in p.lower() for p in lo.problems)
-    assert any("prayer potion" in p.lower() for p in lo.problems)
+def test_an_empty_panel_is_only_a_problem_when_the_BANK_cannot_answer_it():
+    """SUPERSEDED 2026-09-21 by the USER: "do it any food any prayer but not wilderness food."
+
+    An empty panel used to be a flat stop, and on the live account BOTH names were empty strings,
+    so every task stopped at the pack without ever reaching a bank. It now chooses -- so the
+    problem fires only when there is genuinely nothing ordinary to choose.
+
+    A bank holding nothing but Wilderness supplies is exactly that case, and it is the real one:
+    the account holds over a thousand blighted anglerfish."""
+    empty_panel = {"food": {}, "potions": {}}
+
+    chosen = sl.build("Nechryael", 150, empty_panel, 70, 10, {}, BANK)
+    assert not any("is chosen in the panel" in p for p in chosen.problems),         "the bank could answer, so nothing to complain about"
+
+    only_wilderness = {"blighted anglerfish": 1319, "blighted super restore(4)": 149}
+    stuck = sl.build("Nechryael", 150, empty_panel, 70, 10, {}, only_wilderness)
+    assert any("food" in p.lower() for p in stuck.problems)
+    assert any("prayer" in p.lower() for p in stuck.problems)
+    assert not any("blighted" in w["name"].lower() for w in stuck.withdraw)
 
 
 def test_a_pack_that_does_not_fit_is_refused():
@@ -243,3 +258,76 @@ def test_a_super_restore_is_counted_as_a_super_restore_not_a_prayer_potion():
     assert "Super restore(4)" in want and lo.problems == []
     plain = sl.build("Nechryael", 150, PANEL, 70, 10, {}, BANK)
     assert want["Super restore(4)"] <= _want(plain)["Prayer potion(4)"], "a stronger dose is never MORE potions"
+
+
+# --- 2026-09-21: ANY food, ANY prayer restore, never a Wilderness one ----------------------------
+# USER: "do it any food any prayer but not wilderness food". The panel's two names were a hard
+# blocker -- both were empty strings on the live account and every task stopped at the pack.
+
+def _panel(food=None, potion=None):
+    cfg = {"food": {"enabled": True}, "potions": {"prayerEnabled": True}}
+    if food is not None:
+        cfg["food"]["name"] = food
+    if potion is not None:
+        cfg["potions"]["prayerPotion"] = potion
+    return cfg
+
+
+def test_with_no_food_named_it_picks_one_out_of_the_bank():
+    """An empty panel used to be a STOP. It now chooses, because the user does not care which food
+    it takes as long as it is not a Wilderness one."""
+    banked = {"cooked karambwan": 376, "tuna": 561}
+
+    out = sl.build("cows", 20, _panel(), 70, 0, {}, banked)
+
+    taken = {w["name"].lower() for w in out.withdraw}
+    assert "cooked karambwan" in taken, "the better food of the two it actually has"
+    assert not any("food is chosen" in p for p in out.problems)
+
+
+def test_it_refuses_a_blighted_food_even_when_that_is_all_there_is():
+    """The account holds 1319 blighted anglerfish and they CANNOT be eaten outside the Wilderness.
+    Picking the best-healing thing in the bank would pick exactly the one that does not work."""
+    banked = {"blighted anglerfish": 1319, "blighted manta ray": 200}
+
+    out = sl.build("cows", 20, _panel(), 70, 0, {}, banked)
+
+    assert not any("blighted" in w["name"].lower() for w in out.withdraw)
+    assert any("food" in p.lower() for p in out.problems), "and it says so rather than packing none"
+
+
+def test_a_food_named_in_the_panel_still_wins():
+    """Choosing for the user is a fallback, not an override -- an explicit choice is still a choice."""
+    banked = {"cooked karambwan": 376, "shark": 50}
+
+    out = sl.build("cows", 20, _panel(food="Shark"), 70, 0, {}, banked)
+
+    assert any(w["name"].lower() == "shark" for w in out.withdraw)
+
+
+def test_a_blighted_food_named_in_the_panel_falls_through_to_a_real_one():
+    """It used to name the problem and pack nothing. Saying what is wrong AND carrying on with
+    something edible is strictly better."""
+    banked = {"blighted anglerfish": 1319, "cooked karambwan": 376}
+
+    out = sl.build("cows", 20, _panel(food="Blighted anglerfish"), 70, 0, {}, banked)
+
+    assert any("WILDERNESS" in p for p in out.problems), "still says why"
+    assert any(w["name"].lower() == "cooked karambwan" for w in out.withdraw), "and still packs"
+
+
+def test_the_prayer_restore_is_chosen_the_same_way():
+    banked = {"super restore(4)": 7, "prayer potion(4)": 20}
+
+    out = sl.build("nechryael", 150, _panel(), 70, 0, {}, banked)
+
+    taken = {w["name"].lower() for w in out.withdraw}
+    assert "prayer potion(4)" in taken, "the one it has enough of, rather than the nicer one it does not"
+
+
+def test_a_blighted_restore_is_never_chosen():
+    banked = {"blighted super restore(4)": 149}
+
+    out = sl.build("nechryael", 150, _panel(), 70, 0, {}, banked)
+
+    assert not any("blighted" in w["name"].lower() for w in out.withdraw)

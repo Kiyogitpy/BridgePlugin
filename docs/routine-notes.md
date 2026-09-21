@@ -3685,6 +3685,60 @@ and the displaced defender is deposited on the next bank trip (recoverable, but 
 bank); and a worn requirement still counts one slot in the pack's size even when already worn, so
 the pack only ever reads slightly larger than it is.
 
+### 2026-09-21, later: the panel's two names stop being a blocker, and what the live reads said
+
+**USER: "do it any food any prayer but not wilderness food."** This removed the single biggest
+thing standing between the routine and a live run. Both panel names were EMPTY STRINGS on the live
+account, and the pack treated that as a flat stop, so **no task ever reached a bank**. The loadout
+now chooses: `FOOD_CHOICES` and `RESTORE_CHOICES` in `slayer_loadout.py`, best-healing first, and
+the pick is the first one the account actually has ENOUGH of rather than simply the best -- picking
+the best would report a shortfall while a perfectly good food sat beside it in the bank. An
+explicit panel name still wins; this is a fallback, not an override. Nothing containing
+`WILDERNESS_ONLY` can ever be chosen however plentiful.
+
+**MEASURED before and after, live:** all 19 of Aya's assignable tasks were short on food; all 19
+now plan clean with no shortage lines at all.
+
+Two old tests asserted the behaviour this replaced and were rewritten rather than reverted, each
+carrying the reason: `test_an_empty_panel_is_only_a_problem_when_the_BANK_cannot_answer_it` and
+`test_an_empty_panel_now_banks_for_whatever_the_bank_holds`. A bank holding nothing but blighted
+supplies is still a stop, and that case is pinned -- choosing is not the same as settling.
+
+**TWO BUGS IN THE TOOLS, both found only by running them against the live client:**
+
+- `slayer_dry_run.py` CRASHED outright with no task held: `npc_contact.get_task` was stubbed with a
+  recorder returning `True`, and the routine then read `got.task` off a bool. That path had never
+  been exercised because every previous run happened to hold a task. The stub now returns a real
+  `TaskState`.
+- The same tool pretended the panel held `Shark` and `Prayer potion`, and this bank holds NEITHER.
+  Every task it tried "failed" on supplies that were never going to be there, which is testing the
+  pack against a fiction. Its defaults are now `Cooked karambwan` and `Super restore`, measured
+  against the real bank.
+
+**Live account facts, 2026-09-21 after the user's tormented demon session -- these MOVED:**
+
+- **`Super restore(4)` is down to 7** (it was 27 earlier the same day). Every Kuradal task wants 8,
+  so all 22 now report one short. It only bites on the milestone task, which is ten away.
+- **The base gear is now a Dragon scimitar with a Dragon defender.** That is ONE-HANDED, so the
+  "basilisks stops by design because the account fights with a two-handed Toxic blowpipe" finding
+  is **RESOLVED** -- the mirror shield displaces only the defender, which base-gear save/restore
+  already handles. `V's shield` is in the bank.
+- `bank.enabled` was FALSE in the panel and the user has since enabled it. Worth knowing that this
+  never blocked slayer: `_bank_config` forces `enabled: True` for its own trip, and deliberately
+  switches combat's own banking OFF during the fight. It matters to `combat.py`'s break handling.
+- Still 15 `Ring of dueling(8)`, and the loadout deliberately takes the single `Ring of dueling(3)`
+  first (`prefer_spent=True`) to use up partial charges. Not a bug.
+
+**KNOWN GAP, not fixed:** `_Pack.doses` only ever withdraws full `(4)` potions, so partial doses
+sitting in the bank are invisible to it -- 23 `Prayer potion(1)` and 9 partial Super restores are
+not counted. Drawing on them would need more slots for the same doses, which is a real design
+decision rather than an oversight.
+
+**READING THE DRY RUN:** it reports "still short after a full bank visit" on tasks that are
+actually fine. `banker.bank_up` is STUBBED, so nothing is withdrawn and the post-bank re-check sees
+an empty inventory. The signal that matters is that the bank trip HAPPENS. Making the stub feed its
+withdraw list back into a pretend inventory would fix this and has not been done.
+
 ### 2026-09-20: a long offline day -- what exists now, and what a live session must check first
 
 Read `docs/slayer-handoff.md` and the ledger `docs/superpowers/ledgers/2026-09-19-slayer-travel-bank-loadout--progress.md`

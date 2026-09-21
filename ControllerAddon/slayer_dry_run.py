@@ -31,6 +31,13 @@ import npc_contact
 import slayer_state
 import slayer as routine
 
+# What the panel SHOULD be set to, measured against this account's real bank 2026-09-21: it holds
+# 416 Cooked karambwan and 27 Super restore(4), and NO sharks and NO Prayer potion(4) at all. The
+# tool used to pretend Shark and Prayer potion, so every task it tried "failed" on supplies that
+# were never going to be there -- testing the pack against a fiction.
+DEFAULT_PRETEND_FOOD = "Cooked karambwan"
+DEFAULT_PRETEND_POTION = "Super restore"
+
 ACTIONS = []
 
 
@@ -50,7 +57,24 @@ banker.bank_up = _record("banker.bank_up")
 legs.run_next = lambda ctx, route, cursor, log="travel": (ACTIONS.append(f"leg {route[cursor]['display']}")
                                                           or (legs.DONE, cursor + 1))
 gear.equip_from_inventory = lambda ctx, name: ACTIONS.append(f"equip {name}") or True
-npc_contact.get_task = _record("npc_contact.get_task")
+# ACQUIRE returns a TaskState, not a bool. A plain _record stub answered True and the routine
+# then read `got.task` off it -- an AttributeError that only fires when the account holds NO TASK,
+# which is exactly the state this tool had never been run in until 2026-09-21. The stub hands back
+# the task the caller asked to pretend was assigned, so the ACQUIRE -> PACK -> TRAVEL path can be
+# walked end to end without a real cast.
+PRETEND_ASSIGNED = {"task": "cave slimes", "count": 17}
+
+
+def _fake_get_task(ctx, master, tasks_cfg):
+    ACTIONS.append(f"npc_contact.get_task from {master}")
+    live = slayer_state.from_bridge(controller.get_slayer_task())
+    return slayer_state.TaskState(
+        count=PRETEND_ASSIGNED["count"], task=PRETEND_ASSIGNED["task"], task_id=0,
+        streak=(live.streak if live else 0) + 1, points=(live.points if live else 0),
+        master_id=getattr(live, "master_id", 0), has_task=True)
+
+
+npc_contact.get_task = _fake_get_task
 npc_contact.cancel_task = _record("npc_contact.cancel_task")
 npc_contact.missing_requirements = lambda master: None
 combat_core.fight_tick = _record("combat_core.fight_tick")
@@ -77,7 +101,8 @@ def run(task_name=None, count=150, ticks=3, food=None, potion=None):
     config = controller.get_slayer_config() or {}
     if food:                       # pretend the user has set these in Controller Settings
         config = dict(config, food=dict(config.get("food") or {}, name=food),
-                      potions=dict(config.get("potions") or {}, prayerPotion=potion or "Prayer potion"))
+                      potions=dict(config.get("potions") or {},
+                                   prayerPotion=potion or DEFAULT_PRETEND_POTION))
     real_task = controller.get_slayer_task()
     if task_name:
         def fake(_real=real_task):
@@ -109,4 +134,4 @@ if __name__ == "__main__":
     print("=== as if food and a prayer potion WERE set in the panel ===")
     for name, kills in (("Cows", 20), ("Nechryael", 150), ("Basilisks", 20), ("Suqahs", 40),
                         ("Bloodveld", 150), ("Trolls", 80)):
-        run(name, kills, ticks=5, food="Shark")
+        run(name, kills, ticks=5, food=DEFAULT_PRETEND_FOOD)
