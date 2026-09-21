@@ -187,6 +187,30 @@ def is_open() -> bool:
     return controller.get_bank().get("open", False)
 
 
+#: The OSRS bank-PIN keypad. FOUND LIVE 2026-09-21 on the first slayer bank trip of a fresh
+#: login: the Ferox chest click WORKED, the PIN keypad came up instead of the bank, and
+#: `is_open()` answered False -- so open_bank re-clicked the chest five times, bank_up counted a
+#: failed trip, and three of those safety-stopped the run on "failed to open the Ferox Enclave
+#: bank". The click was never the problem, which is exactly what that message sent the reader off
+#: to look for. Group 213 is in /widgets/dump's root walk, and child 7 is the prompt line.
+BANK_PIN_GROUP = 213
+BANK_PIN_PROMPT_CHILD = 7
+
+
+def pin_prompt_open() -> bool:
+    """True while the bank PIN keypad is asking for a digit.
+
+    NOTHING HERE ENTERS A PIN, deliberately: this codebase has never held one, and a guessed
+    digit is an account-security action, not a retry. The point of the predicate is to stop
+    callers mistaking "a human must type four digits" for "the click missed" -- clicking the
+    chest again cannot clear it, so every extra attempt is noise, and a caller that can wait
+    should wait rather than burn its failure budget. OSRS asks once per login session, so a
+    single human entry unblocks every later trip."""
+    widget = controller.get_widget(BANK_PIN_GROUP, BANK_PIN_PROMPT_CHILD) or {}
+    return bool(widget.get("found") and not widget.get("hidden")
+                and widget.get("clickable"))
+
+
 def _refresh_bank_object(bank_obj: dict) -> dict:
     """Re-find `bank_obj` (matched by id) among currently visible objects, so a retry click
     aims at its actual current screen position instead of a position captured once and now
@@ -308,6 +332,15 @@ def open_bank(ctx, bank_obj, timeout_s: float = 20.0) -> bool:
         # landed 140px from where the booth projected by the time the cursor arrived (the
         # player was walking), the click bought nothing, and the loop paid a full idle-wait
         # before re-clicking: ~9s for what should be one click.
+        # The chest may already have done its job: a PIN keypad means the bank ANSWERED and is
+        # waiting on a human. Re-clicking cannot clear it, so leave at once and let the caller
+        # decide whether to wait -- see pin_prompt_open.
+        if pin_prompt_open():
+            debug_log.log("bank", "the bank PIN keypad is up -- the chest opened fine, but a "
+                                  "human has to enter the PIN (asked once per login session). "
+                                  "Not clicking again and not guessing digits.")
+            return False
+
         refresh = None
         if fresh.get("x") is not None and fresh.get("id") is not None:
             refresh = controller.object_refresh_target(

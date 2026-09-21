@@ -169,6 +169,8 @@ def _install(monkeypatch, world):
     monkeypatch.setattr(legs, "run_next", world.run_next)
     monkeypatch.setattr(routine.bank_memory, "load", lambda names=None: _Memory(world.bank))
     monkeypatch.setattr(routine.banker, "bank_up", world.bank_up)
+    # This world has no bank PIN keypad. A failed trip asks (GET /widget 213.7).
+    monkeypatch.setattr(routine.banker, "pin_prompt_open", lambda: False)
     monkeypatch.setattr(npc_contact, "missing_requirements", lambda master: None)
     monkeypatch.setattr(npc_contact, "get_task", world.get_task)
     monkeypatch.setattr(combat_core, "fight_tick", world.fight_tick)

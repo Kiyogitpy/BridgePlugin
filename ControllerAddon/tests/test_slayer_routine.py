@@ -499,6 +499,9 @@ def _packing(monkeypatch, inventory, banked, task="Cows", count=20):
     monkeypatch.setattr(legs, "skill_levels", lambda: {"Agility": 70})
     monkeypatch.setattr(routine.bank_memory, "load", lambda names=None: _Memory(banked))
     monkeypatch.setattr(routine.banker, "bank_up", lambda ctx, cfg: calls["bank"].append(cfg) or True)
+    # No PIN keypad in this world by default. A failed bank trip asks (GET /widget 213.7), and
+    # leaving it live let the hermetic fixture catch the read rather than the test describing it.
+    monkeypatch.setattr(routine.banker, "pin_prompt_open", lambda: False)
     monkeypatch.setattr(slayer_routes, "plan", lambda *a, **k: ([legs.walk(1, 1, 0)], ""))
     monkeypatch.setattr(legs, "run_next", lambda ctx, legs_, cursor, log="travel": (legs.DONE, cursor + 1))
     ctx = _Ctx()
@@ -621,6 +624,38 @@ def test_a_bank_trip_that_keeps_failing_is_a_stop(monkeypatch):
         if ctx.state.stops:
             break
     assert len(calls["bank"]) == routine.BANK_MAX_FAILS and "bank" in ctx.state.stops[0].lower()
+
+
+def test_a_bank_trip_waiting_on_the_pin_keypad_never_counts_as_a_failure(monkeypatch):
+    """FOUND LIVE 2026-09-21, the first bank trip of a fresh login. The Ferox chest opened onto
+    the PIN keypad; bank_up returned False three times and the task was thrown away on
+    BANK_MAX_FAILS. A PIN is not a failure to retry past and not one to guess at -- it is cleared
+    by a human in seconds and then stays cleared all session, so the phase must simply hold."""
+    ctx, calls = _packing(monkeypatch, _inv(("Bones", 1)), BANKED)
+    monkeypatch.setattr(routine.banker, "bank_up", lambda ctx, cfg: calls["bank"].append(cfg) and False)
+    monkeypatch.setattr(routine.banker, "pin_prompt_open", lambda: True)
+    for _ in range(routine.BANK_MAX_FAILS + 3):
+        routine.tick(ctx)
+    assert not ctx.state.stops, "a PIN must never safety-stop the task"
+    assert ctx.state.data.get("slayer_bank_fails", 0) == 0
+    assert len(calls["bank"]) > routine.BANK_MAX_FAILS, "it keeps trying, so it resumes by itself"
+
+
+def test_the_pin_wait_clears_and_normal_failures_still_stop(monkeypatch):
+    """The waiver lasts exactly as long as the keypad does -- otherwise a real broken bank trip
+    would spin forever behind a flag that was only ever meant to cover a human typing digits."""
+    ctx, calls = _packing(monkeypatch, _inv(("Bones", 1)), BANKED)
+    monkeypatch.setattr(routine.banker, "bank_up", lambda ctx, cfg: calls["bank"].append(cfg) and False)
+    pin = {"up": True}
+    monkeypatch.setattr(routine.banker, "pin_prompt_open", lambda: pin["up"])
+    routine.tick(ctx)
+    assert ctx.state.data.get("slayer_bank_fails", 0) == 0
+    pin["up"] = False
+    for _ in range(routine.BANK_MAX_FAILS + 2):
+        routine.tick(ctx)
+        if ctx.state.stops:
+            break
+    assert ctx.state.stops and "bank" in ctx.state.stops[0].lower()
 
 
 # --- 2026-09-21: RESTOCK (plan task D1) -- out of food or prayer AT the site --------------------

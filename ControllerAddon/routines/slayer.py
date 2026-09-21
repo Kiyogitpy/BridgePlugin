@@ -419,7 +419,7 @@ def _restock(ctx, state) -> bool:
         data.update({"slayer_restocking": None, "slayer_restocks": data.get("slayer_restocks", 0) + 1,
                      "slayer_bank_fails": 0, "slayer_route": None, "slayer_route_for": None,
                      "slayer_leg": 0, "slayer_route_finished": 0})
-    else:
+    elif not _waiting_on_bank_pin(ctx):
         data["slayer_bank_fails"] = data.get("slayer_bank_fails", 0) + 1
     return True
 
@@ -492,8 +492,30 @@ def _pack(ctx, state, tasks_cfg, player) -> bool:
                                         _gear_worth_keeping(), _held_names(), banked)):
         data["slayer_banked_for"] = key
         data["slayer_bank_fails"] = 0
-    else:
+    elif not _waiting_on_bank_pin(ctx):
         data["slayer_bank_fails"] = data.get("slayer_bank_fails", 0) + 1
+    return True
+
+
+def _waiting_on_bank_pin(ctx) -> bool:
+    """A failed bank trip that is really "a human has not typed the PIN yet".
+
+    FOUND LIVE 2026-09-21, the first bank trip of a fresh login: the Ferox chest opened onto the
+    PIN keypad, bank_up returned False three times, and the run safety-stopped on what looked
+    like a missed click. A PIN is not a failure this routine can retry its way out of and not one
+    it may guess at, but it IS cleared by a human in seconds and then stays cleared for the whole
+    login session -- so the right behaviour is to hold the phase, spend the tick, and let the very
+    next one sail through. Counting it toward BANK_MAX_FAILS instead throws the task away three
+    ticks after a problem that fixes itself.
+
+    Logged only on the transition, because this is checked every tick while it waits."""
+    if not banker.pin_prompt_open():
+        ctx.state.data["slayer_bank_pin_wait"] = False
+        return False
+    if not ctx.state.data.get("slayer_bank_pin_wait"):
+        debug_log.log(LOG, "the bank PIN keypad is up -- waiting for a human to enter it (once "
+                           "per login session). Not counting this as a failed bank trip.")
+        ctx.state.data["slayer_bank_pin_wait"] = True
     return True
 
 

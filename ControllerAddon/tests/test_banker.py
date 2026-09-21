@@ -1259,3 +1259,56 @@ def test_the_words_that_were_already_right_stay_right():
 def test_a_name_that_is_all_generic_words_still_searches_something():
     """Rather than an empty query, which clears the filter and shows the whole bank."""
     assert banker.search_query("Teleport scroll") in ("teleport", "scroll")
+
+
+# --- the bank PIN keypad (FOUND LIVE 2026-09-21) -------------------------------------------------
+#
+# The Ferox chest click WORKED and the PIN keypad came up instead of the bank. is_open() answered
+# False, so open_bank re-clicked the chest five times and the run safety-stopped on "failed to open
+# the Ferox Enclave bank" -- a message that sends the reader hunting a targeting bug that was never
+# there. Nothing here enters a PIN: the codebase holds none, and a guessed digit is an
+# account-security action rather than a retry.
+
+def _pin_widget(found=True, hidden=False, clickable=True):
+    return {"found": found, "hidden": hidden, "clickable": clickable,
+            "text": "Please enter your PIN using the buttons below."}
+
+
+def test_pin_prompt_open_reads_the_keypad_prompt(monkeypatch):
+    seen = []
+
+    def fake_widget(group, child, index=None):
+        seen.append((group, child))
+        return _pin_widget()
+
+    monkeypatch.setattr(controller, "get_widget", fake_widget)
+    assert banker.pin_prompt_open()
+    assert seen == [(banker.BANK_PIN_GROUP, banker.BANK_PIN_PROMPT_CHILD)]
+
+
+@pytest.mark.parametrize("widget", [
+    {"found": False},                                   # no such widget
+    _pin_widget(hidden=True),                           # present but not drawn
+    _pin_widget(clickable=False),                       # present, interface closed
+    {},                                                 # bridge answered nothing useful
+])
+def test_pin_prompt_closed_for_anything_but_a_drawn_keypad(monkeypatch, widget):
+    monkeypatch.setattr(controller, "get_widget", lambda g, c, index=None: widget)
+    assert not banker.pin_prompt_open()
+
+
+def test_open_bank_stops_clicking_once_the_pin_keypad_is_up(monkeypatch):
+    """The click already worked. Re-clicking cannot clear a PIN, so leave at once -- the live run
+    spent five clicks and a third of its failure budget discovering that."""
+    monkeypatch.setattr(banker, "is_open", lambda: False)
+    monkeypatch.setattr(banker, "pin_prompt_open", lambda: True)
+    monkeypatch.setattr(banker, "_refresh_bank_object", lambda obj: obj)
+    clicks = []
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda *a, **k: clicks.append(1) or True)
+    monkeypatch.setattr(controller, "wait_until_player_idle", lambda **k: True)
+
+    obj = {"id": 26711, "x": 3130, "y": 3632, "plane": 0, "onScreen": True, "distance": 1,
+           "screenX": 1301, "screenY": 744}
+    assert banker.open_bank(_Ctx(), obj, timeout_s=5.0) is False
+    assert clicks == [], "not one click should be spent on a keypad"
