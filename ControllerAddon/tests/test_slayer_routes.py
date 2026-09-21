@@ -113,7 +113,10 @@ def test_a_player_already_in_the_house_gets_the_house_route_with_no_tablet_at_al
 
     def refuse(*a, **k):
         raise AssertionError("nearest_ring must not be consulted while already in the house")
+    # BOTH entry points: plan() has called nearest_ring_costed since 2026-09-21 (it needs the walk
+    # to the ring to cost the route), so patching the wrapper alone would leave this pin inert.
     monkeypatch.setattr(sr, "nearest_ring", refuse)
+    monkeypatch.setattr(sr, "nearest_ring_costed", refuse)
     route, why = sr.plan("Cave slimes", house_player, carried={})
     assert why == ""
     assert [leg["kind"] for leg in route] == ["poh_enter", "poh_pool", "poh_ring", "walk"]
@@ -200,3 +203,110 @@ def test_icefiends_can_be_reached_with_a_house_tablet_and_no_bank_trip():
 
     assert any("Monastery" in t for t in task.teleports)
     assert "Lassar teleport" in task.teleports, "the listed one is still offered first"
+
+
+# --- 2026-09-21: a journey that needs no teleport at all -----------------------------------------
+# The caveat commit 713ce7a recorded rather than hid: plan() only ever built routes from a task's
+# registered teleports plus near_site's transport-free flood, so a site one manhole away read as
+# unreachable and the pack went to a bank for a tablet. Every number in these tests is MEASURED
+# against the real collision map and the real vendored data (no bridge, no client).
+
+
+def test_rats_from_the_varrock_manhole_needs_no_teleport_at_all():
+    """FOUND LIVE 2026-09-21. Standing ON the manhole with the rats task and no Varrock tablet,
+    plan() answered "Varrock teleport: not carried" and the pack set off 40 tiles to a bank.
+
+    MEASURED: the walk is 16 tiles and ONE transport (the manhole itself), 0.07s to find. The
+    tablet it was banking for lands at (3213,3424) -- 71 tiles from the rats, or 137 from the
+    Grand Exchange when this account's diary redirect moves it."""
+    here = {"x": 3237, "y": 3458, "plane": 0}
+
+    assert sr.near_site("Rats", here) is False, "the transport-free flood cannot see the manhole"
+    route, why = sr.plan("Rats", here, carried={})
+
+    assert why == "" and [leg["kind"] for leg in route] == ["walk"]
+    assert route[0]["dest"] == [3237, 9866, 0]
+    assert "16 tiles" in route[0]["display"] and "1 transport" in route[0]["display"]
+
+
+def test_a_carried_tablet_loses_to_a_sixteen_tile_walk():
+    """The same tile, now carrying the tablet -- which the travel kit means we usually are. The
+    walk still wins: 16 tiles against the tablet's 71-tile onward walk plus its own cost.
+
+    This is the comparison firing, not the no-teleport fallback: with the tablet in hand the
+    Varrock teleport IS usable, and is refused because walking clearly beats it."""
+    route, why = sr.plan("Rats", {"x": 3237, "y": 3458, "plane": 0},
+                         carried={"varrock teleport": 3})
+
+    assert why == "" and [leg["kind"] for leg in route] == ["walk"]
+
+
+def test_icefiends_still_takes_the_jewellery_box_rather_than_walk_159_tiles():
+    """The walk must not swallow the decision the USER found live on 2026-09-21 ("take house
+    tablet then exit jewlry box: C edgeville monastery").
+
+    MEASURED from Edgeville: walking the whole way is 159 tiles, while the box lands 68 tiles
+    out. A teleport is the PROVEN path here and the walk is the new one, so the walk has to beat
+    it by MIN_SAVING_TILES to be taken -- 159 + 40 against 68 + two hops, and it does not."""
+    route, why = sr.plan("Icefiends", {"x": 3087, "y": 3496, "plane": 0},
+                         carried={"teleport to house": 119})
+
+    assert why == ""
+    assert [leg["kind"] for leg in route] == ["poh_enter", "poh_pool", "poh_box", "walk"]
+    assert route[2]["option"] == "Monastery"
+
+
+def test_with_no_usable_teleport_a_walk_under_the_cap_is_offered():
+    """USER's choice 2026-09-21: cap the last-resort walk at about 400 tiles. Goblins from the
+    Varrock manhole is 384 tiles and two transports, and no goblins teleport is usable carrying
+    nothing -- so the run walks it instead of stopping."""
+    route, why = sr.plan("Goblins", {"x": 3237, "y": 3458, "plane": 0}, carried={})
+
+    assert why == "" and [leg["kind"] for leg in route] == ["walk"]
+    assert "384 tiles" in route[0]["display"]
+
+
+def test_a_walk_over_the_cap_is_refused_and_its_length_named():
+    """Wolves from the same tile is 976 tiles -- roughly five minutes of unattended running in one
+    blocking tick. Over the cap it stays a safety stop, and the stop says how far the walk was so
+    the reason is readable instead of just "no teleport"."""
+    route, why = sr.plan("Wolves", {"x": 3237, "y": 3458, "plane": 0}, carried={})
+
+    assert route is None
+    assert "976 tiles" in why and str(sr.WALK_MAX_TILES) in why
+
+
+def test_the_walk_is_never_measured_from_a_house_players_template_tile(monkeypatch):
+    """Inside the house, template x/y are meaningless distances (poh.py's instX/instY note), which
+    is why nearest_ring is not consulted there either. The walk candidate must keep the same rule:
+    consulting it would compare real tiles against instance geometry."""
+    def refuse(*a, **k):
+        raise AssertionError("walk_route must not be consulted while already in the house")
+    monkeypatch.setattr(sr, "walk_route", refuse)
+
+    route, why = sr.plan("Minotaurs", {"x": 1933, "y": 7105, "plane": 1, "inInstance": True,
+                                       "instX": 11669, "instY": 1449}, carried={})
+
+    assert why == ""
+    assert [leg["kind"] for leg in route] == ["poh_enter", "poh_pool", "poh_box", "walk"]
+
+
+def test_a_site_thousands_of_tiles_away_never_starts_a_walk_search(monkeypatch):
+    """A crossfloor search that finds nothing spends its whole expansion budget -- MEASURED 1.3s --
+    and most slayer sites are nowhere near us. Lletya is 904 tiles from the Varrock manhole in a
+    straight line, so no route can be inside the 400-tile cap and there is nothing to look for;
+    the stop says that instead of only naming the teleport nobody is carrying.
+
+    The bound folds the y+6400 dungeon convention, so a cave under our feet still gets searched,
+    and it leaves out crossfloor.heuristic's plane penalty -- which is there to ORDER that search
+    and would overstate a climb, skipping a real short walk up the Slayer Tower."""
+    def refuse(*a, **k):
+        raise AssertionError("the walk search must not start for a site past the cap")
+    monkeypatch.setattr(sr, "walk_route", refuse)
+
+    route, why = sr.plan("Elves", {"x": 3237, "y": 3458, "plane": 0}, carried={})
+
+    assert route is None
+    assert "Teleport crystal" in why and "at least 904 tiles" in why and "400-tile cap" in why
+    # folded, not naive: the Varrock sewers are 6408 tiles away in raw y and 16 on foot
+    assert sr.straight_line((3237, 3458, 0), (3237, 9866, 0)) == 8

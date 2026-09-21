@@ -14,6 +14,13 @@
 # travel log's place names and are safe to get wrong: a mismatch is a safety stop BEFORE the
 # hop, never a trip to the wrong continent.
 #
+# 2026-09-21: WALKING THE WHOLE WAY is a candidate too, not just a teleport's onward walk. The
+# caveat commit 713ce7a recorded rather than hid: standing ON the Varrock sewer manhole with the
+# rats task, plan() answered "no route" and the pack set off to a bank for a Varrock tablet, one
+# transport from done. plan() had no "walk and take a transport from here" branch at all -- only a
+# task's registered teleports and near_site's transport-free flood. walk_route() is that branch;
+# WALK_MAX_TILES and the cost comparison below decide when it wins.
+#
 # PHASE B (2026-09-20): the house (tablet -> pool -> ornate box / house fairy ring) joins the
 # teleport order as a fallback behind an overworld ring, never ahead of one -- see plan()'s own
 # comment. `has_tablet` gates every house route UNLESS the player is already standing inside the
@@ -34,6 +41,44 @@ import transports
 
 RING_WALK_MAX = 150          # tiles, straight-line pre-filter before the real walk is costed
 NEAR_SITE_TILES = 64         # within this WALK of the site, never plan a teleport -- just walk back
+
+# --- walking the whole way ----------------------------------------------------------------------
+#
+# The furthest we will WALK to a site. USER's choice 2026-09-21: about 400 tiles, roughly two
+# minutes of running. It caps BOTH jobs the walk candidate has -- the last resort when no
+# registered teleport is usable, and the comparison below -- because a walk longer than this is
+# not worth taking whatever the alternative is, and it runs inside ONE blocking tick, where no
+# break and no before_break can fire. MEASURED from the Varrock sewer manhole: rats 16 tiles,
+# goblins 384, wolves 976.
+WALK_MAX_TILES = 400
+
+# A teleport is not free -- the click, the dialogue and the ~4-tick animation cost real time -- so
+# a route's cost is the walking it was measured at plus TELEPORT_COST_TILES a hop. Both numbers are
+# teleports.py's, which has made the same judgement for bank returns since 2026-09-07 and calls
+# them first-draft guesses; they want a live session here too.
+#
+# THE BIAS IS THE OTHER WAY ROUND FROM teleports.py, deliberately. There walking is the default and
+# a teleport must beat it, because the teleport spends a consumable and the walk is the proven
+# path. Here it is reversed: every teleport route has been built and reviewed for this account,
+# while a long cross-country walk is the thing nothing has run yet -- so the WALK must beat the
+# teleport by MIN_SAVING_TILES before it is taken. That is not hair-splitting. MEASURED 2026-09-21:
+# read the other way, icefiends-from-Edgeville came down to ONE tile (159 walking against 68 plus
+# two hops), and no map or vendored table should be trusted to a margin that thin. This way round
+# the same decision has 81 tiles of slack, and the motivating case still walks (16 against 96).
+TELEPORT_COST_TILES = 25
+MIN_SAVING_TILES = 40
+
+#: Legs that cost a teleport's worth of WAITING -- what a route is charged for. A different
+#: question from TELEPORT_LEG_KINDS below, which asks what a route SPENDS and so must be packed
+#: for: the house pool is neither (free, and nothing to fetch), while breaking a house tablet is
+#: both.
+HOP_KINDS = ("item", "spell", "dialogue_item", "glider", "poh_mounted", "fairy", "poh_ring",
+             "poh_box", "poh_enter")
+
+#: Leg kinds that SPEND a teleport item, spell runes or a charge -- the ones slayer_loadout._teleport
+#: exists to pack for. A walk or a transport (a ladder, a manhole) needs nothing carried, and the
+#: house hub's own legs are paid for by the house tablets the pack always keeps.
+TELEPORT_LEG_KINDS = ("item", "spell", "dialogue_item", "glider", "poh_mounted")
 
 FAIRY_EXPECT = {
     "AJQ": "Dorgesh",        # MEASURED: "Cave south of Dorgesh-Kaan"
@@ -258,8 +303,26 @@ def parse(teleport_text):
     return "unsupported", text
 
 
-def nearest_ring(player_tile, skill_levels=None):
-    """The overworld fairy ring with the shortest WALK from `player_tile`, or None."""
+def spends_a_teleport(route) -> bool:
+    """Does this route actually TELEPORT, or is it just walking?
+
+    FOUND LIVE 2026-09-21: standing ON the Varrock sewer manhole, the pack set off 40 tiles to a
+    bank for another Varrock tablet -- one transport from done. The first fix asked "did the
+    planner find a route", which is the wrong question, because a walk is a route. This is the
+    right one.
+
+    Lived in routines/slayer.py until 2026-09-21, and moved here so slayer_preflight can ask it
+    too: the tool exists to print what the routine WOULD do, and without this it printed a bank
+    trip the routine was not going to make."""
+    return any((leg or {}).get("kind") in TELEPORT_LEG_KINDS for leg in route or ())
+
+
+def nearest_ring_costed(player_tile, skill_levels=None):
+    """(ring, walk in tiles) for the nearest overworld fairy ring, or (None, None).
+
+    The cost was always measured here and thrown away; since 2026-09-21 it is returned, because
+    the walk to the ring is part of what a ring-and-hop route costs when it is compared against
+    walking the whole way."""
     best = None
     for ring in transports.load_fairy_rings().entrances:
         ox, oy, plane = ring.origin
@@ -270,7 +333,12 @@ def nearest_ring(player_tile, skill_levels=None):
         route = crossfloor.find_route(tuple(player_tile), ring.origin, skill_levels=skill_levels, max_links=0)
         if route is not None and (best is None or route.cost < best[0]):
             best = (route.cost, ring)
-    return best[1] if best else None
+    return (best[1], best[0]) if best else (None, None)
+
+
+def nearest_ring(player_tile, skill_levels=None):
+    """The overworld fairy ring with the shortest WALK from `player_tile`, or None."""
+    return nearest_ring_costed(player_tile, skill_levels)[0]
 
 
 def walk_goal(task):
@@ -304,25 +372,92 @@ def near_site(task_name, player, skill_levels=None) -> bool:
     return near is not None and near.cost <= NEAR_SITE_TILES
 
 
-def _unroutable(route, target, skill_levels, proven):
-    """None when the walk after the LAST teleport in `route` can be made, else why not.
+def walk_route(here, goal, skill_levels=None, proven=None):
+    """The whole journey ON FOOT from `here`: worldmap's floods joined by every transport this
+    account may take (ladders, manholes, cave mouths). A crossfloor.Route, or None.
 
-    Added 2026-09-20. A teleport is spent the moment it is clicked, and the walk leg after it
-    fails only on arrival -- a strand with a task active. So before a route is offered, the walk
-    from the teleport's landing to the site is proven with crossfloor, using what THIS account
-    proves (its levels, and `proven` = legs.requirement_values()). A landing we do not know
-    (dest None) cannot be checked and is let through, as before."""
+    This is the question near_site deliberately does not ask -- it passes max_links=0, so no
+    transport is ever on the table and a site one manhole away reads as unreachable. FOUND LIVE
+    2026-09-21 with the rats task: standing ON the Varrock sewer manhole, plan() answered "Varrock
+    teleport: not carried" and the pack walked 40 tiles to a bank for one, while the site was 16
+    tiles and a single manhole away.
+
+    MEASURED: 0.07s when a route exists, up to ~2s when none does -- an impossible search spends
+    crossfloor's whole expansion budget. plan() pays that once.
+
+    WALK_MAX_TILES is applied by the CALLER, not here, so a refused walk can still be named with
+    its real length in the safety stop."""
+    return crossfloor.find_route(tuple(here), tuple(goal), skill_levels=skill_levels,
+                                 **(proven or {}))
+
+
+def straight_line(here, goal) -> int:
+    """A LOWER BOUND on walking from `here` to `goal`, in tiles: the Chebyshev distance, with
+    OSRS's dungeon convention folded in the way crossfloor's own heuristic folds it -- a dungeon is
+    drawn at (x, y + 6400), so a cave under our feet must not read as 6400 tiles away.
+
+    crossfloor.heuristic would do this and also penalise a plane mismatch by 40 a floor, which is
+    not a bound on anything -- it exists to ORDER that search. Overstating the distance here would
+    skip a real short walk (the Slayer Tower basement is three floors up from its own entrance), so
+    the penalty is left out and this stays a true lower bound.
+
+    Why it exists: a search that finds nothing spends crossfloor's whole expansion budget, ~1.3 s
+    MEASURED, and most slayer sites are thousands of tiles away -- Mount Karuulm is 1926 from the
+    Varrock manhole. No route can be shorter than this, so when the bound alone is past
+    WALK_MAX_TILES there is nothing to look for."""
+    dy = min(abs(here[1] - goal[1]),
+             abs(here[1] + crossfloor.UNDERGROUND_DY - goal[1]),
+             abs(here[1] - crossfloor.UNDERGROUND_DY - goal[1]))
+    return max(abs(here[0] - goal[0]), dy)
+
+
+def walk_leg(goal, route):
+    """The whole journey as ONE walk leg. legs.walk_across re-plans from the LIVE tile after every
+    transport, so nothing about `route` is baked into the leg -- the measured cost and transport
+    count go in the display, where the routine's own travel log prints them."""
+    leg = legs.walk(*goal)
+    links = len(route.links)
+    leg["display"] += f" on foot ({route.cost} tiles, {links} transport{'' if links == 1 else 's'})"
+    return leg
+
+
+def _hops(route) -> int:
+    """How many legs of `route` cost a teleport's worth of waiting."""
+    return sum(1 for leg in route or () if (leg or {}).get("kind") in HOP_KINDS)
+
+
+def _onward(route, target, skill_levels, proven):
+    """(walk in tiles from the LAST teleport's landing to the site, problem). `problem` is None
+    when that walk can be made, else why not.
+
+    Added 2026-09-20 as _unroutable, which answered the problem alone. A teleport is spent the
+    moment it is clicked, and the walk leg after it fails only on arrival -- a strand with a task
+    active. So before a route is offered, the walk from the teleport's landing to the site is
+    proven with crossfloor, using what THIS account proves (its levels, and `proven` =
+    legs.requirement_values()). A landing we do not know (dest None) cannot be checked and is let
+    through, as before -- with a cost of None, which plan() reads as "cannot compare" and keeps the
+    teleport.
+
+    Since 2026-09-21 it returns the cost it already measured, so comparing the route against
+    walking the whole way costs no second search."""
     landing = next((leg.get("dest") for leg in reversed(route[:-1]) if leg.get("dest")), None)
     if not landing or len(landing) != 3:
-        return None
-    if crossfloor.find_route(tuple(landing), tuple(target), skill_levels=skill_levels, **(proven or {})) is None:
-        return f"no walking route from its landing {tuple(landing)} to {tuple(target)} for this account"
-    return None
+        return None, None
+    onward = crossfloor.find_route(tuple(landing), tuple(target), skill_levels=skill_levels,
+                                   **(proven or {}))
+    if onward is None:
+        return None, f"no walking route from its landing {tuple(landing)} to {tuple(target)} for this account"
+    return onward.cost, None
 
 
 def plan(task_name, player, carried, skill_levels=None, proven=None):
-    """(legs, "") for the first usable teleport, else (None, why). `proven` is
-    legs.requirement_values(): the varbits, item ids and coins that open gated transports."""
+    """(legs, "") for the best route we can run, else (None, why). `proven` is
+    legs.requirement_values(): the varbits, item ids and coins that open gated transports.
+
+    In order: a short walk back when we are already near the site; else the first usable
+    teleport from the task's own list, UNLESS walking the whole way beats it by
+    MIN_SAVING_TILES; else that walk on its own when it is inside WALK_MAX_TILES; else None,
+    naming every teleport that could not be used and how far the walk would have been."""
     x, y = (player or {}).get("x"), (player or {}).get("y")
     if x is None or y is None:
         return None, "the player's position is unknown"
@@ -355,11 +490,22 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
     # same cave, and Aya's list alone stopped at a desert amulet no leg can run.
     other = slayer_catalog.get(task_name)
     teleports = list(dict.fromkeys(tuple(task.teleports) + tuple(other.teleports if other else ())))
-    def offer(route, text):
-        problem = _unroutable(route, goal, skill_levels, proven)
+    # The first usable teleport, costed -- a list so the closure fills it without `nonlocal`.
+    chosen = []
+
+    def offer(route, text, extra=0):
+        """True when `route` can be run, and then it is THE teleport candidate (the loop breaks).
+
+        `extra` is walking this branch has already measured -- the walk to a fairy ring, the climb
+        to the glider pilot. The onward walk and the hops are costed here. A cost of None means
+        the landing is unknown, and plan() then keeps the teleport rather than guess."""
+        onward, problem = _onward(route, goal, skill_levels, proven)
         if problem is not None:
             reasons.append(f"{text}: {problem}")
-        return problem is None
+            return False
+        chosen.append((None if onward is None else int(extra) + onward + TELEPORT_COST_TILES * _hops(route),
+                       route))
+        return True
 
     for text in teleports:
         kind, value = parse(text)
@@ -374,14 +520,14 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
             # An overworld ring within walking range is preferred over the house -- never
             # consulted at all while already inside the house, where template coordinates are
             # meaningless distances (phase B brief).
-            ring = None if in_house else nearest_ring(here, skill_levels)
+            ring, ring_walk = (None, None) if in_house else nearest_ring_costed(here, skill_levels)
             if ring is not None:
                 route = [legs.walk(*ring.origin),
                          legs.fairy(value, FAIRY_EXPECT[value], dest=exit_tile,
                                     ring_tile=ring.origin, ring_id=ring.object_id),
                          site]
-                if offer(route, text):
-                    return route, ""
+                if offer(route, text, extra=ring_walk):
+                    break
                 continue
             if not has_tablet and not in_house:
                 reasons.append(f"{text}: no fairy ring within a {RING_WALK_MAX}-tile walk of "
@@ -390,7 +536,7 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
             route = [legs.house(), legs.pool(),
                      legs.house_ring(value, FAIRY_EXPECT[value], dest=exit_tile), site]
             if offer(route, text):
-                return route, ""
+                break
             continue
         if kind == "item":
             name, option, landing = item_row(value)
@@ -399,7 +545,7 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
                 continue
             route = [legs.item(name, option, landing), site]
             if offer(route, text):
-                return route, ""
+                break
             continue
         if kind == "spell":
             name, widget, landing = SPELLS[value]
@@ -409,7 +555,7 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
                 continue
             route = [legs.spell(name, widget, landing), site]
             if offer(route, text):
-                return route, ""
+                break
             continue
         if kind == "dialogue_item":
             name, destination = value
@@ -419,7 +565,7 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
             label, needle, landing = DIALOGUE_ITEMS[name][destination]
             route = [legs.dialogue_item(name, label, needle, landing), site]
             if offer(route, text):
-                return route, ""
+                break
             continue
         if kind == "glider":
             label, widget, landing = GLIDERS[value]
@@ -430,14 +576,15 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
             ring_label, needle, ring_landing = DIALOGUE_ITEMS[ring][ring_dest]
             pilot, pilot_tile = GLIDER_PILOT
             # The climb is part of the route, so it is proven too: ring landing -> the pilot.
-            if crossfloor.find_route(ring_landing, pilot_tile, skill_levels=skill_levels,
-                                     **(proven or {})) is None:
+            climb = crossfloor.find_route(ring_landing, pilot_tile, skill_levels=skill_levels,
+                                          **(proven or {}))
+            if climb is None:
                 reasons.append(f"{text}: no walking route from {ring_landing} up to {pilot} at {pilot_tile}")
                 continue
             route = [legs.dialogue_item(ring, ring_label, needle, ring_landing), legs.walk(*pilot_tile),
                      legs.glider(pilot, label, widget, landing), site]
-            if offer(route, text):
-                return route, ""
+            if offer(route, text, extra=climb.cost):
+                break
             continue
         if kind == "poh_mounted":
             name, action, landing = MOUNTED[value]
@@ -446,7 +593,7 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
                 continue
             route = [legs.house(), legs.pool(), legs.house_mounted(name, action, landing), site]
             if offer(route, text):
-                return route, ""
+                break
             continue
         if kind == "box":
             landing = BOX_LANDINGS.get(value)
@@ -458,7 +605,29 @@ def plan(task_name, player, carried, skill_levels=None, proven=None):
                 continue
             route = [legs.house(), legs.pool(), legs.house_box(value, landing), site]
             if offer(route, text):
-                return route, ""
+                break
             continue
         reasons.append(f"{text}: no leg can run this teleport yet")
+
+    # WALKING THE WHOLE WAY, measured once and used by both outcomes: as the thing a usable
+    # teleport has to beat, and as the last resort when none is usable. Never from inside the
+    # house -- template x/y are meaningless distances there, the rule nearest_ring already follows.
+    # `straight_line` is a lower bound, so a site further off than the cap skips the search
+    # altogether: a search that finds nothing is the expensive one (~1.3 s), and most sites are
+    # thousands of tiles away.
+    bound = straight_line(here, goal)
+    walk = None if in_house or bound > WALK_MAX_TILES else walk_route(here, goal, skill_levels, proven)
+    walkable = walk is not None and walk.cost <= WALK_MAX_TILES
+    if chosen:
+        cost, route = chosen[0]
+        if not walkable or cost is None or walk.cost + MIN_SAVING_TILES > cost:
+            return route, ""
+        return [walk_leg(goal, walk)], ""
+    if walkable:
+        return [walk_leg(goal, walk)], ""
+    if walk is not None:
+        reasons.append(f"walking the whole way is {walk.cost} tiles, over the {WALK_MAX_TILES}-tile cap")
+    elif not in_house and bound > WALK_MAX_TILES:
+        reasons.append(f"the site is at least {bound} tiles away on foot, over the "
+                       f"{WALK_MAX_TILES}-tile cap")
     return None, "; ".join(reasons) or f"{task_name} lists no teleport"

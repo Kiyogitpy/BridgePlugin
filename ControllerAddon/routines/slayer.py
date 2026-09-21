@@ -345,21 +345,14 @@ def _restock(ctx, state) -> bool:
 
 
 
-#: Leg kinds that SPEND a teleport item, spell runes or a charge -- the ones slayer_loadout._teleport
-#: exists to pack for. A walk or a transport (a ladder, a manhole) needs nothing carried, and the
-#: house hub's own legs are paid for by the house tablets the pack always keeps.
-TELEPORT_LEG_KINDS = ("item", "spell", "dialogue_item", "glider", "poh_mounted")
+TELEPORT_LEG_KINDS = slayer_routes.TELEPORT_LEG_KINDS
 
 
 def _route_teleports(route) -> bool:
-    """Does this route actually TELEPORT, or is it just walking?
-
-    FOUND LIVE 2026-09-21: standing ON the Varrock sewer manhole, the pack set off 40 tiles to a
-    bank for another Varrock tablet -- one transport from done. The first fix asked "did the
-    planner find a route", which is the wrong question, because a walk is a route. This is the
-    right one.
-    """
-    return any((leg or {}).get("kind") in TELEPORT_LEG_KINDS for leg in route or ())
+    """Does this route actually TELEPORT, or is it just walking? See slayer_routes, which owns the
+    question now -- slayer_preflight asks it as well, and answering it differently in two places
+    would print a bank trip this routine is not going to make."""
+    return slayer_routes.spends_a_teleport(route)
 
 
 def _pack(ctx, state, tasks_cfg, player) -> bool:
@@ -388,7 +381,13 @@ def _pack(ctx, state, tasks_cfg, player) -> bool:
     prayer = ((controller.get_skills() or {}).get("Prayer") or {}).get("level") or 1
     # Only pack a teleport if the route we would actually take USES one. A walk or a transport
     # needs nothing fetched, and asking merely "is there a route" answers yes to a walk.
-    route, _why = slayer_routes.plan(state.task, player, carried, skill_levels=legs.skill_levels())
+    #
+    # `proven` is passed for the same reason TRAVEL passes it: without it every GATED transport
+    # fails closed, so this step would see a shorter list of links than the journey itself will and
+    # could fetch a teleport for a walk that TRAVEL then takes anyway. It is one bulk read per task
+    # (MEASURED 1.16 s on an un-rebuilt client, ~20 ms once GET /varbits/<csv> exists).
+    route, _why = slayer_routes.plan(state.task, player, carried, skill_levels=legs.skill_levels(),
+                                     proven=legs.requirement_values())
     loadout = slayer_loadout.build(state.task, state.count, panel, prayer, 0, carried, banked,
                                    skip_teleport=route is not None and not _route_teleports(route))
     inventory = controller.get_inventory()

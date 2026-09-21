@@ -3739,6 +3739,48 @@ actually fine. `banker.bank_up` is STUBBED, so nothing is withdrawn and the post
 an empty inventory. The signal that matters is that the bank trip HAPPENS. Making the stub feed its
 withdraw list back into a pretend inventory would fix this and has not been done.
 
+### 2026-09-21, later still: a journey that needs no teleport at all
+
+`plan()` had no "walk and take a transport from here" branch -- only a task's registered teleports
+plus `near_site`'s transport-free flood (`max_links=0`, 64 tiles). That is the caveat commit
+713ce7a recorded rather than hid. MEASURED: standing ON the Varrock sewer manhole with the rats
+task, the site is **16 tiles and ONE transport** away, and `plan()` answered "Varrock teleport: not
+carried" while the pack set off 40 tiles to a bank for a tablet that lands 71 tiles from the rats
+(137 through this account's diary redirect).
+
+- `slayer_routes.walk_route` is that branch: one `crossfloor` search with transports ON. `walk_leg`
+  turns it into a single `walk` leg, which `legs.walk_across` already executes -- re-planning from
+  the LIVE tile after every transport, so nothing about the route is baked into the leg. No new
+  executor, and `spends_a_teleport` already answers False for it, so `_pack` fetches nothing.
+- The walk is compared against the first usable teleport. `_onward` (was `_unroutable`) already
+  measured that teleport's onward walk to prove it, and now returns the cost as well, so the
+  comparison costs **no second search**. A route is charged `TELEPORT_COST_TILES` (25) per hop, so
+  a house chain pays for two.
+- **The bias is toward the TELEPORT -- the opposite way round from `teleports.py`'s bank-return
+  rule, deliberately.** There walking is the default because a teleport spends a consumable and the
+  walk is proven; here every teleport route has been built and reviewed for this account while a
+  long cross-country walk is the path nothing has run yet. Read the other way it ALSO came down to
+  a one-tile decision on icefiends-from-Edgeville (159 walking against 68 plus two hops); this way
+  round the same decision has 81 tiles of slack, and the motivating case still walks (16 against
+  96).
+- **USER's choice: the walk is capped at 400 tiles** (`WALK_MAX_TILES`) -- roughly two minutes of
+  running, and it happens inside ONE blocking tick where no break and no `before_break` can fire.
+  The cap covers both jobs (the comparison and the last resort when no teleport is usable at all).
+  Over it, the safety stop now says how far the walk would have been instead of only naming
+  teleports.
+- **MEASURED over all 41 fightable tasks x 3 starts** (Ferox, the manhole, Lumbridge) carrying the
+  travel kit: **exactly one decision changes** -- rats from the manhole. Every other task keeps the
+  teleport it had, which is the conservative outcome the bias was chosen for. `plan()` costs
+  0.1-1.6 s, worst case 4.5 s (waterfiends, where both the onward and the whole-way searches fail
+  and each spends its full expansion budget).
+- Two seams moved with it: `_pack` passes `proven` now, so the bank step sees the same gated links
+  the journey will rather than failing them closed and fetching a teleport for a walk TRAVEL then
+  takes; and `spends_a_teleport` lives in `slayer_routes`, so `slayer_preflight` mirrors the
+  skip-teleport rule instead of printing a bank trip the routine will not make.
+- What is still NOT generalised, and is deliberately out of scope: this is the slayer planner only.
+  `travel.py`/`worldmap.py` are untouched, and `near_site` keeps its exact old meaning because
+  `_pack` uses it for a different question ("leave a task in progress alone").
+
 ### 2026-09-20: a long offline day -- what exists now, and what a live session must check first
 
 Read `docs/slayer-handoff.md` and the ledger `docs/superpowers/ledgers/2026-09-19-slayer-travel-bank-loadout--progress.md`

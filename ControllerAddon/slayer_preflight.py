@@ -107,7 +107,10 @@ def report(task, count, streak, points, player, carried, banked, panel_cfg, task
     bank_note = "bank NEVER SEEN -- the pack below is built on faith, open the bank once" if banked is None \
         else f"bank seen ({len(banked)} item names)"
     lines.append(bank_note)
-    loadout = slayer_loadout.build(task, count, panel_cfg, prayer_level, prayer_bonus, carried, banked)
+    # The routine's own rule (routines/slayer._pack): a route that does not TELEPORT needs no
+    # teleport fetched. Mirrored here, or this tool prints a bank trip the routine will not make.
+    loadout = slayer_loadout.build(task, count, panel_cfg, prayer_level, prayer_bonus, carried, banked,
+                                   skip_teleport=legs_ is not None and not slayer_routes.spends_a_teleport(legs_))
     lines.append("withdraw: " + (", ".join(f"{w['quantity']} {w['name']}" for w in loadout.withdraw) or "nothing"))
     lines.append(f"pack: {loadout.slots} of 28 slots")
     if route_now is None and loadout.withdraw:

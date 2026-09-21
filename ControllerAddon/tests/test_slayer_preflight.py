@@ -144,3 +144,16 @@ def test_the_preflight_reads_the_same_config_the_routine_does(monkeypatch):
     assert routine.get_config(None) == {"food": {"name": "Shark"}}
     assert pf.panel_config() == {"food": {"name": "Shark"}}
     assert "/config" not in reads, reads
+
+
+def test_a_route_that_only_walks_prints_no_teleport_to_fetch():
+    """The tool's whole job is to print what the routine WOULD do, and routines/slayer._pack skips
+    the teleport when the route does not use one. Standing on the Varrock sewer manhole with the
+    rats task, the route is a 16-tile walk through the manhole -- so the Varrock tablet sitting in
+    the bank must not appear in the withdraw list (before 2026-09-21 this printed a bank trip the
+    routine was not going to make)."""
+    text = _report("Rats", 90, player={"x": 3237, "y": 3458, "plane": 0},
+                   banked={**BANK, "varrock teleport": 5})
+
+    assert "on foot (16 tiles, 1 transport)" in text
+    assert "varrock teleport" not in text.lower()
