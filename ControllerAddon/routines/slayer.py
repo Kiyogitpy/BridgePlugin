@@ -50,6 +50,7 @@ import slayer_policy
 import slayer_routes
 import slayer_state
 import slayer_tasks
+import travel
 
 LOG = "slayer"
 
@@ -603,6 +604,37 @@ def _fight(ctx, state) -> None:
     if walks >= NO_TARGET_WALKS:
         ctx.state.trigger_safety_stop(f"Slayer: nothing to fight for {state.task} after "
                                       f"{NO_TARGET_WALKS} walks back to the site")
+
+
+def before_break(ctx) -> None:
+    """Called by the engine right before a break starts, while everything is still live (the
+    routine contract in controller.py). UNVERIFIED LIVE as of 2026-09-21.
+
+    tick() is SKIPPED for the whole break -- 3 to 12 minutes on this account -- so nothing eats,
+    nothing prays and nothing retaliates. Standing next to a nechryael for that long is a death and
+    an item loss, which is exactly what an unattended run must not risk. So if the break falls
+    while we are AT THE SITE, let the target go and leave: Ferox Enclave, which nothing attacks and
+    which has a pool and a bank. The break is then spent somewhere safe, and TRAVEL re-plans the
+    way back afterwards -- from Ferox that is always a teleport, and plan() proves the walk from
+    its landing before spending one.
+
+    Away from the site (travelling, banking, at the house) nothing is attacking us, so the break
+    costs nothing and this does nothing. A failed escape -- no ring of dueling left -- lets the
+    break happen anyway, exactly as it does today: refusing a break is not this hook's call."""
+    state = slayer_state.from_bridge(controller.get_slayer_task())
+    if state is None or not state.has_task or not state.task:
+        return
+    player = controller.get_player() or {}
+    if not slayer_tasks.at_site(state.task, player, margin=SITE_MARGIN):
+        return
+    debug_log.log(LOG, f"a break is due while fighting {state.task} -- leaving for Ferox first")
+    ctx.state.data["current_target_index"] = None
+    if travel.teleport_to_ferox(ctx):
+        # The way back is re-planned from wherever the break leaves us, not from the site.
+        ctx.state.data.update({"slayer_route": None, "slayer_route_for": None, "slayer_leg": 0,
+                               "slayer_route_finished": 0})
+    else:
+        debug_log.log(LOG, "could not leave before the break -- taking it where we stand")
 
 
 def tick(ctx):

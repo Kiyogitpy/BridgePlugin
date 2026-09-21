@@ -889,3 +889,61 @@ def test_the_fight_passes_the_hook_only_for_a_catalog_task(monkeypatch):
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3630, "y": 3530, "plane": 0})
     routine.tick(ctx)
     assert seen[1].get("makeRoom") is None and seen[1]["minValue"] == 0
+
+
+# --- 2026-09-21: a BREAK must not be taken standing next to the monster --------------------------
+
+def _breaking(monkeypatch, at_site=True, task="Nechryael", teleport=True):
+    calls = {"teleport": []}
+    tile = {"x": 3412, "y": 9962, "plane": 3} if at_site else {"x": 3200, "y": 3200, "plane": 0}
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task(task, count=150))
+    monkeypatch.setattr(controller, "get_player", lambda: dict(tile))
+    monkeypatch.setattr(routine.travel, "teleport_to_ferox",
+                        lambda ctx: calls["teleport"].append(1) or teleport)
+    ctx = _Ctx()
+    ctx.state.data.update({"current_target_index": 4412, "slayer_route": [legs.walk(1, 1, 0)],
+                           "slayer_route_for": ("nechryael", 12), "slayer_leg": 0})
+    return ctx, calls
+
+
+def test_a_break_at_the_site_leaves_for_somewhere_nothing_attacks(monkeypatch):
+    """tick() is skipped for the WHOLE break (3-12 minutes on this account), so nothing eats and
+    nothing prays. Standing next to a nechryael for that long is a death. before_break runs fully
+    live, before the break starts, so it teleports out -- Ferox Enclave, which is safe and has a
+    pool and a bank."""
+    ctx, calls = _breaking(monkeypatch)
+    routine.before_break(ctx)
+    assert calls["teleport"] == [1]
+    assert ctx.state.data.get("current_target_index") is None, "the fight is let go of first"
+    assert not ctx.state.data.get("slayer_route"), "the way back is re-planned after the break"
+
+
+def test_a_break_while_travelling_or_banking_costs_nothing(monkeypatch):
+    """Away from the site nothing is attacking us, so a break needs no teleport and no charge."""
+    ctx, calls = _breaking(monkeypatch, at_site=False)
+    routine.before_break(ctx)
+    assert calls["teleport"] == []
+    assert ctx.state.data.get("slayer_route"), "the journey is left exactly as it was"
+
+
+def test_a_break_with_no_task_does_nothing(monkeypatch):
+    ctx, calls = _breaking(monkeypatch, task=None)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task(None, count=0))
+    routine.before_break(ctx)
+    assert calls["teleport"] == []
+
+
+def test_a_failed_escape_does_not_stop_the_run(monkeypatch):
+    """No ring of dueling left: the break happens anyway, exactly as it does today. Saying so in
+    the log is all that can be done -- refusing the break is not this hook's call."""
+    ctx, calls = _breaking(monkeypatch, teleport=False)
+    routine.before_break(ctx)
+    assert calls["teleport"] == [1] and ctx.state.stops == []
+
+
+def test_a_break_never_runs_while_the_bridge_is_silent(monkeypatch):
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: None)
+    ctx, calls = _breaking(monkeypatch)
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: None)
+    routine.before_break(ctx)
+    assert calls["teleport"] == []

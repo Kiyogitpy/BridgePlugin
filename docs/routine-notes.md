@@ -3574,6 +3574,13 @@ supervised test, not a run.
   the least costly consumable. EAT-THEN-TAKE is a race in principle: the eat and the take clicks go
   in the same tick. If a valuable drop is ever left on the ground right after eating, that is why.
 
+**Breaks.** They are ON in this account's config (every 45-75 min, lasting 3-12 min) and `tick()`
+is skipped for the whole break -- nothing eats, nothing prays. So `before_break` teleports out to
+Ferox Enclave when the break falls while standing AT the site, and does nothing when it falls
+while travelling or banking. Watch the first one: it costs a ring of dueling charge, and the way
+back is re-planned from Ferox, which is a sealed island on the collision map -- so the route out
+of it is always a teleport.
+
 **Two things that will NOT happen, by design:** a task on the user's Aya block list (dwarves, cave
 crawlers, lizards, skeletons, kalphites) is never fought for Aya, and Greater demons always stops.
 
