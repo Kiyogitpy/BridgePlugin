@@ -515,3 +515,47 @@ def test_the_reaction_is_a_range_so_it_is_never_a_constant_on_the_wire():
     human distribution is fine on the wire, a constant is a fingerprint."""
     low, high = td.DODGE_REACTION_MS
     assert high > low, "a draw, not a constant"
+
+
+# --- the prayer is TIMED off the demon's cadence, not reacted to ---------------------------------
+
+def test_the_demon_attacks_on_a_fixed_cadence_so_the_next_one_is_known():
+    """This is what makes the prayer automatable, and it is not reaction speed.
+
+    The demon's attack speed is 6 ticks, taken from CACHE DATA (config/npc param_14 on all four
+    ids) rather than wiki prose. So the moment one attack animation fires, the next one's tick is
+    arithmetic -- the prayer can simply BE up by then, with a whole 3.6 s to arrange it.
+
+    The wiki backs this up from the other side: with two demons "they will not attack
+    simultaneously as to allow players to prayer flick their attacks"."""
+    demon = td.DemonState()
+    demon.on_animation(td.ANIM_ATTACK_MELEE, tick=100)
+
+    assert demon.next_attack_tick() == 106
+    assert demon.ticks_until_attack(tick=100) == 6
+    assert demon.ticks_until_attack(tick=105) == 1
+
+
+def test_a_demon_that_has_not_attacked_yet_promises_no_tick():
+    """The first attack of a fight has no cadence to project from, so there is no number. A caller
+    must keep the prayer up on the predicted style instead of waiting for one."""
+    demon = td.DemonState()
+    assert demon.next_attack_tick() is None
+    assert demon.ticks_until_attack(tick=100) is None
+
+
+def test_the_bomb_resets_the_cadence_because_it_is_not_an_ordinary_attack():
+    """The demon's style always changes after the bomb, so a cadence projected across it would aim
+    the prayer at the wrong style as well as the wrong tick."""
+    demon = td.DemonState()
+    demon.on_animation(td.ANIM_ATTACK_MELEE, tick=100)
+    demon.on_animation(td.ANIM_FIRE_BOMB, tick=107)
+
+    assert demon.next_attack_tick() is None, "the next cycle's first attack is not on the old clock"
+
+
+def test_there_is_time_to_get_a_prayer_up_between_attacks():
+    """6 ticks is 3600 ms and an interface click costs us about 235 ms. The prayer is never the
+    thing under time pressure in this fight -- the bomb dodge is."""
+    window_ms = td.ATTACK_SPEED_TICKS * 600
+    assert window_ms - td.INTERFACE_CLICK_MS > 3000, "not remotely tight"

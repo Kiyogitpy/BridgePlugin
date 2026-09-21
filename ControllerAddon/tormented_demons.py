@@ -385,6 +385,11 @@ class DemonState(object):
             # The bomb ENDS a cycle and drops the shield, which then stays down until something
             # lands on it. The defenceless timer restarts from here too.
             self.attacks_since_bomb = 0
+            # The cadence dies with the cycle. The demon's style ALWAYS changes after the bomb, so
+            # projecting the old clock across it would aim the prayer at the wrong tick AND the
+            # wrong style.
+            self.last_attack_tick = None
+            self.style = None
             self._shield_until_hit = True
             self._shield_until_tick = None
             self._defenceless_from = tick + DEFENCELESS_AFTER_TICKS
@@ -438,6 +443,28 @@ class DemonState(object):
     def defenceless(self, tick):
         """Do attacks currently have 100% accuracy? The best moment to spend a special attack."""
         return self._defenceless_from is not None and tick >= self._defenceless_from
+
+    def next_attack_tick(self):
+        """The tick the demon's next ordinary attack lands on, or None if it has not attacked yet.
+
+        THIS, not reaction speed, is what makes the prayer automatable. The demon's attack speed is
+        a fixed 6 ticks (cache data, config/npc param_14 on all four ids), so one attack animation
+        fixes the next one by arithmetic and the prayer can simply BE up by then -- 3.6 s of
+        warning against an interface click costing us about 235 ms. The wiki says the same thing
+        from the other side: with two demons "they will not attack simultaneously as to allow
+        players to prayer flick their attacks".
+
+        None before the first attack of a cycle, and after a bomb, because there is genuinely no
+        cadence to project. A caller then holds the PREDICTED style instead of waiting for a tick.
+        """
+        if self.last_attack_tick is None:
+            return None
+        return self.last_attack_tick + ATTACK_SPEED_TICKS
+
+    def ticks_until_attack(self, tick):
+        """Ticks until the next ordinary attack, or None when there is no cadence yet."""
+        due = self.next_attack_tick()
+        return None if due is None else due - tick
 
     def bomb_window(self):
         """When the next bomb can land, as a bound. See `bomb_window` for why it is never a number."""
@@ -505,6 +532,9 @@ HUMAN_BOMB_REACTION_MS = 578
 #: The wiki's window to move off a bomb tile, and the hard deadline in this fight.
 BOMB_DODGE_BUDGET_TICKS = 2
 BOMB_DODGE_BUDGET_MS = 1200
+
+#: One interface click of ours -- a prayer or an inventory slot. Flight plus a ~98 ms hold.
+INTERFACE_CLICK_MS = 235
 
 #: Our own viewport hop, from settings.py's fitted movement model plus a ~98 ms click hold.
 VIEWPORT_HOP_MS = 440
