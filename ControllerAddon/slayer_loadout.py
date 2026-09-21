@@ -92,7 +92,8 @@ WILDERNESS_ONLY = "blighted"
 FOOD_CHOICES = ("anglerfish", "manta ray", "sea turtle", "shark", "cooked karambwan", "monkfish",
                 "swordfish", "bass", "lobster", "tuna", "salmon", "trout")
 
-#: Same idea for prayer. Dosed, so availability is counted in full (4)s the way `doses` fetches.
+#: Same idea for prayer. Dosed, so availability is counted in DOSES across every part-used
+#: variant, the way `doses` fetches -- see _doses_available for the live stop that cost.
 RESTORE_CHOICES = ("super restore", "sanfew serum", "prayer potion")
 _STACKABLE_WORDS = ("teleport", "scroll")     # tablets and scrolls share one slot
 
@@ -157,25 +158,76 @@ class _Pack:
         if available > 0:
             self._take(base, min(short, available))
 
-    def doses(self, label, base, potions):
-        """A dosed potion: count DOSES held, fetch full (4)s for the difference."""
+    def doses(self, label, base, potions, floor=None):
+        """A dosed potion: count DOSES held, then fill the trip's slot budget from the bank,
+        FULLEST COPY FIRST.
+
+        The bank is read by DOSE, not by full potions alone. FOUND LIVE 2026-09-21 on the first
+        Kuradal task (gargoyles x183):
+
+            [!] Safety stop: ... prayer potions: need 8 more Super restore(4), bank has 7
+
+        The bank held 7 Super restore(4) AND a (3), five (2)s and three (1)s -- 16 containers,
+        44 doses, comfortably enough. A part-used potion CARRIED was already counted by its
+        doses; a part-used potion BANKED was invisible, because the fetch only ever asked for
+        `<base>(4)`. That asymmetry, not a real shortage, stopped the run.
+
+        `potions` is how many SLOTS the trip set aside, so the fetch is bounded by BOTH the dose
+        deficit and the slots still free in that budget -- fullest copy first, which is the most
+        doses that budget can hold, and a bank too thin to fill it is packed anyway rather than
+        refused (see the `total <= 0` check below for the user's ruling on that).
+        doses the budget can hold. FOUND LIVE the same day, on the bank trip straight after the
+        fix above: eight containers holding 31 doses left a 1-dose deficit, the fetch asked for a
+        NINTH container, and slayer_policy turns any withdraw list surviving a bank visit into a
+        STOP ("still short after a full bank visit: 1 Super restore(2)"). `floor` is the
+        profile's own minimum (supplies.PROFILES[...].prayer_potions) and is what a shortfall is
+        measured against: `potions` is itself a cap (supplies.MAX_DOSES, "one trip's worth") and
+        RESTOCK exists for a task that outlasts it, so stopping one dose under an estimate would
+        refuse a trip the account can plainly make. Under the floor it is still a named problem.
+        """
         base = base.lower()
         self.keep.append(base)
         self.slots += potions
         held = sum(int(q or 0) * (supplies.charges(n) or 0) for n, q in self.carried.items()
                    if not n.startswith("#") and supplies._is(n, base))
-        short = math.ceil(max(0, potions * supplies.DOSES_PER_POTION - held) / supplies.DOSES_PER_POTION)
-        if short <= 0:
+        wanted = potions * supplies.DOSES_PER_POTION
+        if held >= wanted:
             return
-        full = f"{base}(4)"
+        containers = sum(int(q or 0) for n, q in self.carried.items()
+                         if not n.startswith("#") and supplies._is(n, base))
+        room = min(math.ceil((wanted - held) / supplies.DOSES_PER_POTION),
+                   max(0, potions - containers))
+        if room and self.banked is None:
+            self._take(f"{base}({supplies.DOSES_PER_POTION})", room)
+            return
+        copies = sorted(((supplies.charges(n) or 0, n, int(q or 0)) for n, q in (self.banked or {}).items()
+                         if int(q or 0) > 0 and supplies._is(n, base) and supplies.charges(n)),
+                        key=lambda c: -c[0])
+        total = held
+        for dose, name, available in copies:
+            if room <= 0:
+                break
+            take = min(room, available)
+            self._take(name, take)
+            room -= take
+            total += take * dose
         if self.banked is None:
-            self._take(full, short)
             return
-        available = int(self.banked.get(full) or 0)
-        if available < short:
-            self.problems.append(f"{label}: need {short} more {_display(full)}, bank has {available}")
-        if available > 0:
-            self._take(full, min(short, available))
+        # OUT is the only shortfall. USER 2026-09-21, told that the bank's best eight containers
+        # came to ~22 doses against a 24-dose floor: "Use up the ones in the inventory first then
+        # if they are out safety stop."
+        #
+        # So a thin bank is not a reason to refuse the trip -- it packs the fullest copies it can
+        # find, fights on what that gives, and RESTOCK brings it back for the rest. The stop comes
+        # when there is genuinely nothing left to drink: carried and banked both empty. That is a
+        # real safety stop (a PRAYER task with no prayer is how an unattended account dies), and
+        # it names the item so the fix is obvious.
+        #
+        # `floor` is kept in the signature and unused for now -- the profile minimum is still the
+        # right question to ask if this ever wants a middle setting -- see supplies.PROFILES.
+        if total <= 0:
+            self.problems.append(f"{label}: out of {_display(base)} -- none carried and none in "
+                                 f"the bank (blighted ones do not count outside the Wilderness)")
 
     def one_of(self, label, options, prefer_spent):
         """One copy of any of `options`. `prefer_spent` takes the lowest-charge copy (a teleport
@@ -317,13 +369,31 @@ def _available(pack, name):
     return held + int(pack.banked.get(name) or 0)
 
 
-def _choose(pack, choices, wanted, suffix=""):
+def _doses_available(pack, base):
+    """DOSES of `base` across every dosed variant, carried and banked -- 7 (4)s, a (3), five (2)s
+    and three (1)s is 44, not 7. None when the bank was never seen, which means "cannot tell".
+
+    FOUND LIVE 2026-09-21, the second half of the same bug `_Pack.doses` had: asking for
+    `<base>(4)` alone made a bank holding 4 Super restore(1) answer "no ordinary prayer restore"
+    and stop the task. It also picked the WRONG restore -- this account's 37 doses of part-used
+    Prayer potion lost to 9 doses of Super restore, because neither had a single (4).
+    """
+    held = sum(int(q or 0) * (supplies.charges(n) or 0) for n, q in (pack.carried or {}).items()
+               if not n.startswith("#") and supplies._is(n, base))
+    if pack.banked is None:
+        return None
+    return held + sum(int(q or 0) * (supplies.charges(n) or 0) for n, q in pack.banked.items()
+                      if supplies._is(n, base) and supplies.charges(n))
+
+
+def _choose(pack, choices, wanted, suffix="", count_doses=False):
     """The first of `choices` the account has at least `wanted` of, else whichever it has most of,
-    else None. Never anything Wilderness-only, whatever the count."""
+    else None. Never anything Wilderness-only, whatever the count. `count_doses` measures a dosed
+    potion by its doses (see _doses_available), so `wanted` is then doses too."""
     usable = [c for c in choices if WILDERNESS_ONLY not in c]
     best, best_count = None, -1
     for choice in usable:
-        count = _available(pack, choice + suffix)
+        count = _doses_available(pack, choice) if count_doses else _available(pack, choice + suffix)
         if count is None:
             return choice          # bank unseen: cannot compare, so take the best-ranked one
         if count >= wanted and wanted > 0:
@@ -372,12 +442,14 @@ def build(task_name, count, panel_cfg, prayer_level, prayer_bonus, carried, bank
         doses = supplies.prayer_doses_needed(int(count or 0), int(prayer_level or 1), int(prayer_bonus or 0))
         potions = supplies.prayer_potions_for(profile, doses)
         if not potion:
-            potion = _choose(pack, RESTORE_CHOICES, potions, suffix="(4)")
+            potion = _choose(pack, RESTORE_CHOICES, potions * supplies.DOSES_PER_POTION,
+                             count_doses=True)
             if not potion:
                 pack.problems.append("no prayer restore is chosen in the panel "
                                      "(potions.prayerPotion) and the bank holds no ordinary one")
         if potion:
-            pack.doses("prayer potions", potion, potions)
+            pack.doses("prayer potions", potion, potions,
+                       floor=profile.prayer_potions)
 
     if spec is not None:
         # `worn` too: `carried` merges inventory and equipment, so a worn mirror shield is already

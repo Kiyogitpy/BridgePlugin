@@ -44,6 +44,7 @@ import debug_log
 import gear
 import legs
 import npc_contact
+import slayer_bib
 import slayer_catalog
 import slayer_loadout
 import slayer_policy
@@ -177,7 +178,42 @@ def _skip(ctx, state, tasks_cfg) -> None:
         ctx.state.trigger_safety_stop(f"Slayer: {exc}")
 
 
-def _bank_config(panel, loadout, base=None) -> dict:
+AYA_WEAPON = "dragon scimitar"
+
+
+def _held_names() -> set:
+    """Everything worn or carried, lowercased. Read at the call site so `_bank_config` stays a
+    pure function of its arguments -- its tests depend on that."""
+    return gear.worn_names() | gear.carried_names()
+
+
+def _gear_worth_keeping() -> list:
+    """Task gear already on us, which a deposit must not take (USER 2026-09-21: "keep any gear
+    from previous task").
+
+    Reads the live bridge, so it is called at the BANK-TRIP call sites and its result passed into
+    `_bank_config` as `keep_extra` -- `_bank_config` itself stays pure, which its tests rely on
+    and which a first draft of this broke.
+
+    Two sources, both about NOT re-fetching something we already hold:
+    - everything WORN. banker deposits whatever is not on keepItems, and worn gear is by
+      definition gear we chose; depositing it would strip the player at the bank.
+    - anything CARRIED that satisfies some task's gear requirement, anywhere in the catalog --
+      not just this task's. That is the whole point: a mirror shield fetched for basilisks, heat
+      boots for wyrms, a witchwood icon for cave horrors should ride along to the next task
+      rather than be banked and withdrawn again a task later.
+
+    Names are lowercased fragments, matching keepItems' own substring convention."""
+    keep = list(gear.worn_names())
+    carried = gear.carried_names()
+    for options in slayer_catalog.REQUIREMENT_ITEMS.values():
+        for option in options:
+            if any(option in held for held in carried):
+                keep.append(option)
+    return keep
+
+
+def _bank_config(panel, loadout, base=None, task=None, keep_extra=(), held=(), banked=None) -> dict:
     """banker.bank_up's config for one slayer bank visit: the panel's own bank block (bankNames,
     keepItems, teleportFallback) with the loadout's withdraw and keep lists laid over it. Never
     returnToSpot: TRAVEL re-derives the way back from wherever the bank was.
@@ -187,9 +223,41 @@ def _bank_config(panel, loadout, base=None) -> dict:
     that is not on this list."""
     cfg = dict((panel or {}).get("bank") or {})
     keep = list(cfg.get("keepItems") or []) + list(loadout.keep) + [n.lower() for n in (base or {}).values() if n]
+    keep += [n.lower() for n in (keep_extra or ()) if n]
     cfg.update({"enabled": True, "withdraw": loadout.withdraw, "returnToSpot": False,
                 "keepItems": list(dict.fromkeys(keep)),
                 "teleportFallback": cfg.get("teleportFallback", True)})
+
+    # GEAR UP FROM THE SLAYER BEST IN BANK PLUGIN, while the bank is open (USER 2026-09-21:
+    # "make gearing up before a kuradal task using slayer best in bank ... opens the widget and
+    # picks up all missing pieces swaps out the gear").
+    #
+    # The plugin is installed and already decides the loadout for the live task, so we do not
+    # duplicate its judgement -- slayer_bib clicks its bank button and withdraws what it shows.
+    # The division of labour: SBIB says WHICH items, our own loadout says HOW MANY, because the
+    # recommended counts live in plugin state no widget exposes.
+    #
+    # It runs BESIDE the ordinary withdraw list rather than replacing it: `withdraw` still fetches
+    # the teleport and supplies this routine knows it needs, so a missing/disabled plugin costs us
+    # nothing and the trip behaves exactly as it did before.
+    # ONLY FOR KURADAL'S TASKS (USER 2026-09-21: "for aya task all we gotta pickup is a dragon
+    # scimmy"). Aya's monsters are cows, rats and goblins -- running a whole best-in-slot loadout
+    # out to them would cost a bank trip's worth of clicks for nothing, and her tasks are ~20
+    # kills where travel already dominates. slayer_catalog holds exactly Kuradal's FIGHT tasks, so
+    # membership in it IS the question being asked.
+    if slayer_catalog.get(task) is not None:
+        quantities = {e["name"].lower(): e.get("quantity", 1)
+                      for e in (loadout.withdraw or []) if e.get("name")}
+        cfg["atBank"] = lambda hook_ctx: slayer_bib.gear_up(hook_ctx, quantities=quantities)
+    elif (not any(AYA_WEAPON in h for h in (held or ()))
+          and any(AYA_WEAPON in n for n in (banked or {}))):
+        # MEASURED live 2026-09-21: the account was wearing a Zombie axe with its only Dragon
+        # scimitar banked, so this is a real fetch and not a no-op. _wear puts it on.
+        #
+        # Only asked for when bank memory says there IS one. Never-seen bank memory answers None
+        # and we ask for nothing -- an Aya task is fightable with whatever is already wielded, so
+        # a speculative withdraw would only add a click and a "not found in bank" line.
+        cfg["withdraw"] = list(cfg.get("withdraw") or []) + [{"name": AYA_WEAPON, "quantity": 1}]
     return cfg
 
 
@@ -267,6 +335,17 @@ def _wear(ctx, state) -> bool:
     if data.get("slayer_worn_ok") == key:
         return False
     spec = slayer_catalog.get(state.task)
+    # AYA'S TASKS take the scimitar and nothing else (USER 2026-09-21). Withdrawn by _bank_config;
+    # put on here, because _wear is the only place that equips and a weapon sitting in the
+    # inventory kills nothing. Silent no-op once it is on, and when it was never fetched -- an Aya
+    # task is fightable bare-handed, so a missing scimitar is slower, never a reason to stop.
+    if spec is None:
+        if not gear.is_worn(AYA_WEAPON) and any(AYA_WEAPON in c for c in gear.carried_names()):
+            debug_log.log(LOG, f"{state.task}: putting on the {AYA_WEAPON}")
+            gear.equip_from_inventory(ctx, AYA_WEAPON)
+            return True
+        data["slayer_worn_ok"] = key
+        return False
     for label in (spec.worn if spec else ()):
         options = slayer_catalog.REQUIREMENT_ITEMS.get(label, ())
         if not options or gear.is_worn(options[0], options[1:]):
@@ -335,7 +414,8 @@ def _restock(ctx, state) -> bool:
                            f"{data.get('slayer_restocks', 0) + 1} of {RESTOCK_MAX_PER_TASK}")
     data["slayer_restocking"] = key
     data["current_target_index"] = None
-    if banker.bank_up(ctx, _bank_config(panel, loadout, _base_gear(ctx))):
+    if banker.bank_up(ctx, _bank_config(panel, loadout, _base_gear(ctx), state.task,
+                                        _gear_worth_keeping(), _held_names(), banked)):
         data.update({"slayer_restocking": None, "slayer_restocks": data.get("slayer_restocks", 0) + 1,
                      "slayer_bank_fails": 0, "slayer_route": None, "slayer_route_for": None,
                      "slayer_leg": 0, "slayer_route_finished": 0})
@@ -408,7 +488,8 @@ def _pack(ctx, state, tasks_cfg, player) -> bool:
                                       f"times ({why}) -- see the [bank] lines above")
         return True
     debug_log.log(LOG, f"banking for {state.task} x{state.count}: {why}")
-    if banker.bank_up(ctx, _bank_config(panel, loadout, _base_gear(ctx))):
+    if banker.bank_up(ctx, _bank_config(panel, loadout, _base_gear(ctx), state.task,
+                                        _gear_worth_keeping(), _held_names(), banked)):
         data["slayer_banked_for"] = key
         data["slayer_bank_fails"] = 0
     else:
@@ -580,6 +661,23 @@ def _fight(ctx, state) -> None:
     controller.check_stray_dialog(ctx)
     panel = ctx.state.config
     cfg = combat_core.combat_config(panel, slayer_tasks.target_names(state.task))
+    # The TASK picks the protection prayer, not the panel. USER 2026-09-21, live on the first
+    # gargoyle task: "this is a dangerous task, i cant configure this for every task so it needs
+    # to be decided for this task specifically we need pray for melee". The panel holds one
+    # Defensive Prayer for every monster in the game and it was NONE, so a PRAYER-profile task
+    # walked in carrying eight super restores it could never spend. A catalog task that states
+    # its prayer overrides the panel; one that does not is left exactly as it was, and so is
+    # combat.py, which never comes through here.
+    #
+    # `prayer.enabled` stays the user's: this decides WHICH prayer, never whether to pray.
+    # ... and it is HELD on between kills, not flicked off the moment a gargoyle dies (USER
+    # 2026-09-21: "Leave the protection on for the duration of the task. since its a very short
+    # time between fights anyway"). The drain that buys is small on this account's travel: a bank
+    # trip goes through Ferox, whose Pool of Refreshment restores prayer in full on the way past.
+    spec = slayer_catalog.get(state.task)
+    if spec is not None and spec.protect:
+        cfg["prayer"] = {**(cfg.get("prayer") or {}),
+                         "defensivePrayer": spec.protect, "holdDefensive": True}
     # The orchestrator owns restocks (spec 7.5). Left on, fight_tick teleports to a bank by itself,
     # and the next tick sees the player off-site and safety-stops there (final review).
     cfg["bank"] = {**(cfg.get("bank") or {}), "enabled": False}
@@ -588,7 +686,7 @@ def _fight(ctx, state) -> None:
     # 0 as "no value looting" (phase-A review: the first draft wrote a key nobody reads).
     # ONLY for a task that is not in Kuradal's catalog (self-review 2026-09-21: this was applied to
     # every task, and gargoyles and nechryael drop plenty) -- hers keep the panel's value.
-    if slayer_catalog.get(state.task) is None:
+    if spec is None:
         cfg["loot"] = {**(cfg.get("loot") or {}), "minValue": 0}
     else:
         # A catalog task's drops are worth giving a slot up for; Aya's are not, so there is

@@ -536,6 +536,25 @@ ENGAGE_STUCK_WINDOW_S = 10
 # rest of that commitment, same as today.
 ENGAGE_NEVER_CONFIRMED_TIMEOUT_S = 20
 
+# The other half of that backstop, and the one that was missing. Past ENGAGE_STUCK_WINDOW_S a
+# commitment that HAS connected was trusted forever -- `return` with no deadline of any kind --
+# so a fight that ends WITHOUT the NPC dying (it loses aggro, wanders off, a re-attack never
+# lands) left the routine committed to a monster it was not fighting, for as long as that monster
+# stayed in the scene.
+#
+# FOUND LIVE 2026-09-21, gargoyles. USER: "why are we idle?" Last attack 07:31:03 on index 29328;
+# four minutes later the log held nothing but idle drift, one eat and three prayer sips, while
+# /npcs still listed 29328 three tiles away, /combat said inCombat:false isIdle:true
+# animation:-1, and ELEVEN gargoyles within 13 tiles went untouched.
+#
+# So past the window the commitment is still trusted, but only while the player is doing
+# SOMETHING -- in combat, moving, or mid-animation. This is deliberately long: the window exists
+# because a mid-fight eat or drink makes inCombat misread (2026-08-06), and those last a tick or
+# two, nowhere near this. It is read off the `combat` dict already in hand, so it costs no extra
+# request. Giving up early merely re-clicks the same target, which is harmless; the bug it
+# replaces was an unbounded hang.
+ENGAGE_IDLE_GIVE_UP_S = 12
+
 # maybe_loot ignores minLootValue for these grimy herbs whenever an open herb sack is carried --
 # it auto-stores them for free regardless of GE value, so the value gate only exists to avoid
 # clutter for someone who isn't carrying one. Sourced from the herb sack's own storage list
@@ -691,7 +710,17 @@ def maintain_defensive_prayer(ctx, combat: dict):
             if ox is not None and oy is not None:
                 controller.click_entity(ctx.ser, {"screenX": ox, "screenY": oy}, offset=(0, 0))
     elif defensive_prayer:
-        want_on = still_fighting
+        # `holdDefensive` keeps the prayer on for the WHOLE trip instead of flicking it off the
+        # moment there is no target. USER 2026-09-21, having watched the first gargoyle task do
+        # exactly that: "Leave the protection on for the duration of the task. since its a very
+        # short time between fights anyway."
+        #
+        # MEASURED in that run: off at 07:16:23, the next gargoyle engaged at 07:16:24, back on at
+        # 07:16:26 -- about 2.5 s unprotected at melee range on EVERY kill, plus two clicks a kill
+        # over a 183-kill task. Nothing but routines/slayer.py sets this key, and only for a
+        # catalog task that names its own prayer, so with it absent this is the lazy flick it has
+        # always been and combat.py is unchanged.
+        want_on = still_fighting or bool(prayer_cfg.get("holdDefensive"))
         is_on = prayers.get("active", {}).get(defensive_prayer, False)
         if want_on != is_on:
             # Prayer icons only get live screen coords while the Prayer tab is open --
@@ -1205,9 +1234,28 @@ def engage_target(ctx, combat: dict):
                 # skip re-checking if we've EITHER seen real combat evidence at some point, OR
                 # we're still within the more generous backstop deadline (a legitimate walk-up
                 # to a distant target can take a while to land its first hit).
-                if ctx.state.data.get("engage_ever_confirmed") or elapsed < ENGAGE_NEVER_CONFIRMED_TIMEOUT_S:
+                # Doing anything at all -- fighting, walking, mid-swing -- keeps the
+                # commitment; a dead stop for ENGAGE_IDLE_GIVE_UP_S releases it. See that
+                # constant for the live hang this catches.
+                busy = (connected or bool(combat.get("isMoving"))
+                        or (combat.get("animation") not in (None, -1)))
+                if busy:
+                    ctx.state.data["engage_idle_since"] = 0
+                    idle_for = 0.0
+                else:
+                    since = ctx.state.data.get("engage_idle_since") or time.time()
+                    ctx.state.data["engage_idle_since"] = since
+                    idle_for = time.time() - since
+                if idle_for >= ENGAGE_IDLE_GIVE_UP_S:
+                    debug_log.log("combat", f"giving up on target index={current_target_index} -- "
+                                             f"committed {elapsed:.0f}s ago and in combat at some "
+                                             f"point, but {idle_for:.0f}s since ANY sign of life "
+                                             f"(no combat, no movement, no animation) -- the fight "
+                                             f"ended without the monster dying")
+                elif ctx.state.data.get("engage_ever_confirmed") or elapsed < ENGAGE_NEVER_CONFIRMED_TIMEOUT_S:
                     return
-                debug_log.log("combat", f"giving up on target index={current_target_index} -- "
+                else:
+                    debug_log.log("combat", f"giving up on target index={current_target_index} -- "
                                          f"committed {elapsed:.0f}s ago and never once showed "
                                          f"real combat evidence (inCombat/interactingPlayer), "
                                          f"only whatever kept resetting the early stuck-tick "
@@ -1242,6 +1290,7 @@ def engage_target(ctx, combat: dict):
         ctx.state.data["engage_stuck_ticks"] = 0
         ctx.state.data["engage_committed_at"] = 0
         ctx.state.data["engage_ever_confirmed"] = False
+        ctx.state.data["engage_idle_since"] = 0
 
     if config.get("onlyAttackWhenIdle") and not combat.get("isIdle", True):
         return

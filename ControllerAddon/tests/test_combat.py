@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 
 import pytest
 
@@ -450,3 +451,119 @@ def test_an_unrecorded_position_still_banks_but_promises_no_way_back(monkeypatch
     combat_core.bank_before_break(ctx)
     assert len(calls["bank"]) == 1
     assert combat_core.banker.RETURN_LOCATION_KEY not in ctx.state.data
+
+
+# --- 2026-09-21: holding a protection prayer on between kills ----------------------------------
+
+def _prayer_ctx(monkeypatch, prayer_cfg, is_on):
+    """maintain_defensive_prayer against fake prayer state. Returns (ctx, clicks)."""
+    clicks = []
+    monkeypatch.setattr(controller, "get_player", lambda: {"prayerReal": 77, "prayer": 60})
+    monkeypatch.setattr(controller, "get_prayers", lambda: {
+        "active": {"PROTECT_FROM_MELEE": is_on},
+        "icons": {"PROTECT_FROM_MELEE": {"screenX": 10, "screenY": 20}},
+        "quickPrayerEnabled": False})
+    monkeypatch.setattr(controller, "open_prayer_tab", lambda ser: None)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda ser, target, **kw: clicks.append(target))
+    return _Ctx({"prayer": prayer_cfg}), clicks
+
+
+def test_without_the_hold_the_prayer_still_flicks_off_with_no_target(monkeypatch):
+    """combat.py's behaviour, unchanged: no key, no hold."""
+    cfg = {"enabled": True, "defensivePrayer": "PROTECT_FROM_MELEE", "useQuickPrayers": False}
+    ctx, clicks = _prayer_ctx(monkeypatch, cfg, is_on=True)
+
+    combat_core.maintain_defensive_prayer(ctx, {"inCombat": False})
+
+    assert len(clicks) == 1, "it turns the prayer off, exactly as before"
+
+
+def test_holdDefensive_keeps_the_prayer_on_between_kills(monkeypatch):
+    """USER 2026-09-21: "Leave the protection on for the duration of the task. since its a very
+    short time between fights anyway." MEASURED in the run that prompted it: off at 07:16:23, the
+    next gargoyle engaged at :24, back on at :26 -- 2.5 s unprotected at melee range every kill."""
+    cfg = {"enabled": True, "defensivePrayer": "PROTECT_FROM_MELEE", "useQuickPrayers": False,
+           "holdDefensive": True}
+    ctx, clicks = _prayer_ctx(monkeypatch, cfg, is_on=True)
+
+    combat_core.maintain_defensive_prayer(ctx, {"inCombat": False})
+
+    assert clicks == [], "already on and staying on: nothing to click"
+
+
+def test_holdDefensive_still_turns_the_prayer_ON_when_it_is_off(monkeypatch):
+    """Holding is not "never touch it" -- an unprotected trip must still get the prayer up."""
+    cfg = {"enabled": True, "defensivePrayer": "PROTECT_FROM_MELEE", "useQuickPrayers": False,
+           "holdDefensive": True}
+    ctx, clicks = _prayer_ctx(monkeypatch, cfg, is_on=False)
+
+    combat_core.maintain_defensive_prayer(ctx, {"inCombat": False})
+
+    assert clicks == [{"screenX": 10, "screenY": 20}]
+
+
+# --- 2026-09-21 LIVE: a confirmed fight that ends without a death used to hang forever ----------
+
+def _engaged(monkeypatch, combat, committed_s_ago, confirmed=True):
+    """engage_target already committed to index 7, which is still in the scene and alive."""
+    npcs = [{"name": "Gargoyle", "id": 1543, "index": 7, "x": 3432, "y": 9938, "plane": 3,
+             "hpRatio": -1, "distance": 3},
+            {"name": "Gargoyle", "id": 1543, "index": 8, "x": 3433, "y": 9939, "plane": 3,
+             "hpRatio": -1, "distance": 3}]
+    monkeypatch.setattr(controller, "get_npcs", lambda *a, **k: npcs)
+    picked = []
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 3433, "y": 9935, "plane": 3, "hp": 58, "hpReal": 93})
+    monkeypatch.setattr(combat_core, "_pick_target", lambda *a, **k: picked.append(1) or None,
+                        raising=False)
+    ctx = _Ctx({"targetNames": ["gargoyles"], "maxTargetDistance": 15})
+    ctx.state.data.update({"current_target_index": 7,
+                           "engage_committed_at": time.time() - committed_s_ago,
+                           "engage_ever_confirmed": confirmed})
+    return ctx
+
+
+def test_a_confirmed_fight_that_goes_completely_dead_releases_its_target(monkeypatch):
+    """FOUND LIVE 2026-09-21 on gargoyles. USER: "why are we idle?" Last attack 07:31:03 on index
+    29328; four minutes later the log held only idle drift, an eat and three prayer sips, while
+    /npcs still listed 29328 three tiles away and ELEVEN gargoyles sat untouched within 13 tiles.
+
+    engage_ever_confirmed latched True, and past ENGAGE_STUCK_WINDOW_S the code returned with no
+    deadline at all for as long as the NPC existed -- so a fight ending WITHOUT the monster dying
+    never released the commitment.
+    """
+    dead = {"inCombat": False, "isMoving": False, "animation": -1}
+    ctx = _engaged(monkeypatch, dead, committed_s_ago=60)
+    # First pass starts the idle clock; wind it back past the give-up threshold.
+    combat_core.engage_target(ctx, dead)
+    assert ctx.state.data["current_target_index"] == 7, "not released on the very first dead tick"
+    ctx.state.data["engage_idle_since"] = time.time() - combat_core.ENGAGE_IDLE_GIVE_UP_S - 1
+
+    combat_core.engage_target(ctx, dead)
+
+    assert ctx.state.data["current_target_index"] is None, "the commitment is released"
+
+
+def test_a_mid_fight_sip_does_not_release_the_target(monkeypatch):
+    """The reason the stuck check was switched off past the window in the first place (2026-08-06):
+    inCombat misreads for a tick or two during an eat or drink. Nowhere near the give-up clock,
+    and the swing animation alone keeps the commitment anyway."""
+    sipping = {"inCombat": False, "isMoving": False, "animation": 829}
+    ctx = _engaged(monkeypatch, sipping, committed_s_ago=60)
+    ctx.state.data["engage_idle_since"] = time.time() - combat_core.ENGAGE_IDLE_GIVE_UP_S - 1
+
+    combat_core.engage_target(ctx, sipping)
+
+    assert ctx.state.data["current_target_index"] == 7
+    assert not ctx.state.data["engage_idle_since"], "any sign of life resets the clock"
+
+
+def test_walking_to_a_distant_target_keeps_the_commitment(monkeypatch):
+    moving = {"inCombat": False, "isMoving": True, "animation": -1}
+    ctx = _engaged(monkeypatch, moving, committed_s_ago=60)
+    ctx.state.data["engage_idle_since"] = time.time() - combat_core.ENGAGE_IDLE_GIVE_UP_S - 1
+
+    combat_core.engage_target(ctx, moving)
+
+    assert ctx.state.data["current_target_index"] == 7

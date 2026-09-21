@@ -1575,6 +1575,27 @@ def return_to_spot(ctx) -> bool:
     return False
 
 
+def _at_bank_hook(ctx, config: dict) -> None:
+    """Run `config["atBank"]` while the bank is still OPEN, if a caller supplied one.
+
+    Added 2026-09-21 so routines/slayer.py can gear up from the Slayer Best in Bank plugin's own
+    bank view (slayer_bib.gear_up), which can only be read and clicked with the interface up. Same
+    shape as combat_core.maybe_loot's `makeRoom` hook: absent, behaviour is byte-for-byte what it
+    was, so no existing caller changes.
+
+    Placed AFTER the withdraw steps: the teleport home is taken first, so a hook that fills the
+    inventory can never cost us the way back. It is also deliberately not allowed to fail the
+    trip -- a gear-up that cannot find its button should leave the routine to its own checks
+    rather than abort a bank trip that otherwise succeeded."""
+    hook = config.get("atBank")
+    if hook is None:
+        return
+    try:
+        hook(ctx)
+    except Exception as exc:                        # noqa: BLE001 -- see the docstring
+        debug_log.log("bank", f"atBank hook raised, continuing the trip: {exc!r}")
+
+
 def bank_up(ctx, config: dict) -> bool:
     """
     Full cycle: bank at whatever's within walking distance if anything is,
@@ -1618,6 +1639,7 @@ def bank_up(ctx, config: dict) -> bool:
             # Chosen and withdrawn HERE because an open bank is the only moment we can take the
             # item; return_to_spot uses it and walks whatever is left.
             _withdraw_return_teleport(ctx, config)
+            _at_bank_hook(ctx, config)
             close_bank(ctx)
         elif not config.get("teleportFallback", True):
             return False
@@ -1708,6 +1730,7 @@ def _bank_via_ferox(ctx, config: dict) -> bool:
     deposit_inventory(ctx, deposit_config)
     withdraw_loadout(ctx, config)
     _withdraw_return_teleport(ctx, config)
+    _at_bank_hook(ctx, config)
     close_bank(ctx)
 
     travel.use_fountain(ctx)

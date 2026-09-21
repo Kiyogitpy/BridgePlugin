@@ -3401,6 +3401,47 @@ def consume_first(ser: serial.Serial, category: str) -> bool:
     return click_entity(ser, items[0], check_ui_blockers=False)
 
 
+def use_item_on_entity(ser: serial.Serial, item: dict, entity: dict, refresh_target=None,
+                       simulate_mistakes=False) -> bool:
+    """Use an inventory ITEM on a world ENTITY (an NPC or an object): arm the item, then click
+    the target. Returns False if either click could not be made; a True is "both clicks went
+    out", NOT "the game accepted it" -- the caller confirms the outcome.
+
+    Added 2026-09-21 for the slayer FINISHING-BLOW monsters (gargoyles/rock hammer,
+    zygomites/fungicide spray, lizards/ice cooler), which cannot be killed by damage alone.
+    Shared rather than routine-local because four tasks across two masters need the identical
+    two-click gesture; `routines/corrupted_gauntlet.use_on` is the item-on-ITEM sibling and
+    stays where it is, since its second click is another inventory slot, not the world.
+
+    Three choices worth knowing:
+
+    - `expected_action="Use"` on the FIRST click only. Arming an item is verifiable (a rock
+      hammer's cache entry carries no `iop` line at all, so its left-click resolves to Use), and
+      the gate reads the cursor's position right now, which is safe for a stationary inventory
+      slot. The SECOND click is deliberately ungated: once an item is armed the hover reads
+      "Use <item> -> <target>", not any action name we could predict per monster, and
+      hover_matches would either withhold a correct click or have to be fed a pattern per task.
+      The outcome check the caller runs is the real verification.
+    - `simulate_mistakes=False` by default. A deliberate misclick (see MISTAKE_MISCLICK_CHANCE)
+      that lands beside an ARMED item cancels the arming silently, so the pair would come apart
+      with the routine believing it acted -- the same class of bug the golem_crafting mining
+      reclick gate records. The humanisation is not lost, only moved: the flight itself, its
+      timing and the hold are all still drawn from the fitted distributions.
+    - `check_ui_blockers=False` on the item, because an inventory slot sits inside the floating
+      panel uiBlockers flags -- every inventory-item click in this codebase does this. The
+      ENTITY click keeps the blocker check: it is out in the world, where a blocker is real.
+    """
+    if not item or not entity:
+        return False
+    open_inventory_tab(ser)
+    armed = click_entity(ser, item, offset=(0, 0), check_ui_blockers=False,
+                         simulate_mistakes=False, expected_action="Use")
+    if not armed:
+        return False
+    return bool(click_entity(ser, entity, offset=(0, 0), refresh_target=refresh_target,
+                             simulate_mistakes=simulate_mistakes))
+
+
 def _draw_idle_still_segment() -> float:
     """Next allowed still-period length, from the SAME measured human distribution the in-wait
     fidgeter uses (median 1.5s, p90 2.3s, capped at the human's observed 4.5s maximum)."""

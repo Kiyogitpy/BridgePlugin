@@ -39,7 +39,21 @@ STAPLE_SLOTS = 2              # a house tablet and an escape ring of dueling, ev
 
 TaskSpec = namedtuple("TaskSpec", (
     "key", "name", "location", "target", "areas", "teleports", "landing", "profile",
-    "carry", "worn", "routable", "wilderness", "task_only", "note"))
+    "carry", "worn", "routable", "wilderness", "task_only", "note", "protect"), defaults=(None,))
+
+# `protect`: the PROTECTION PRAYER this task is fought under, as combat_core.PRAYER_LEVELS names
+# it, or None to leave the panel's own Defensive Prayer alone.
+#
+# USER 2026-09-21, watching the first gargoyle task fight with the panel's prayer set to NONE:
+# "this is a dangerous task, i cant configure this for every task so it needs to be decided for
+# this task specifically we need pray for melee." The panel has ONE defensive prayer for every
+# task, and which prayer is right is a property of the MONSTER -- so it belongs here, beside the
+# monster's site and its supply profile, not in a setting the user would have to change by hand
+# between tasks and would get wrong the moment the routine moved on unattended.
+#
+# Filled only where a source states it: four of these were already written in this catalog's own
+# notes, and gargoyles is the user's live call. Everything else stays None and behaves exactly as
+# before -- an invented prayer is worse than the panel's.
 
 # Teleports that are NOT an inventory slot: a fairy ring and the house box are places, the
 # Moonclan teleport is a Lunar spell the account already has.
@@ -59,6 +73,10 @@ REQUIREMENT_ITEMS = {
     "witchwood icon": ("witchwood icon",),
     "leaf-bladed weapon or broad ammo": ("leaf-bladed", "broad arrow", "broad bolt", "amethyst broad"),
     "boots of stone, brimstone or granite": ("boots of stone", "boots of brimstone", "granite boots"),
+    # Finishing-blow items (slayer_finishers.py, plan E0). A granite hammer EQUIPPED smashes
+    # gargoyles by itself, which is why it stays first in the "rock hammer" row above.
+    "ice cooler": ("ice cooler",),
+    "bag of salt": ("bag of salt",),
     "ranged weapon and ammo": (),
 }
 LIGHT_LABEL = "lit light source"
@@ -70,11 +88,11 @@ XERICS_HEART = (1644, 3673, 0)
 
 
 def _spec(key, location, target, area, teleports, landing, profile, carry=(), worn=(),
-          routable=True, task_only=False, note=""):
+          routable=True, task_only=False, note="", protect=None):
     return TaskSpec(key=key, name=key.capitalize(), location=location, target=target,
                     areas=(area,), teleports=tuple(teleports), landing=landing, profile=profile,
                     carry=tuple(carry), worn=tuple(worn), routable=routable, wilderness=False,
-                    task_only=task_only, note=note)
+                    task_only=task_only, note=note, protect=protect)
 
 
 _STRONGHOLD = ("Slayer ring: Stronghold Slayer Cave",)
@@ -86,11 +104,12 @@ CATALOG = {spec.key: spec for spec in (
     # --- Stronghold Slayer Cave (5) ------------------------------------------------------------
     _spec("aberrant spectres", "Stronghold Slayer Cave", (2440, 9790, 0), (2437, 9770, 39, 29, 0),
           _STRONGHOLD, RING_STRONGHOLD, "PRAYER", worn=("nose peg or slayer helmet",),
-          note="Protect from Magic; safespots."),
+          protect="PROTECT_FROM_MAGIC", note="Protect from Magic; safespots."),
     _spec("ankou", "Stronghold Slayer Cave", (2470, 9805, 0), (2464, 9793, 24, 20, 0),
           _STRONGHOLD, RING_STRONGHOLD, "PRAYER"),
     _spec("bloodveld", "Stronghold Slayer Cave", (2450, 9820, 0), (2430, 9813, 64, 26, 0),
-          _STRONGHOLD, RING_STRONGHOLD, "PRAYER", note="Protect from Melee negates them."),
+          _STRONGHOLD, RING_STRONGHOLD, "PRAYER", protect="PROTECT_FROM_MELEE",
+          note="Protect from Melee negates them."),
     _spec("fire giants", "Stronghold Slayer Cave", (2400, 9780, 0), (2387, 9765, 33, 25, 0),
           _STRONGHOLD, RING_STRONGHOLD, "PRAYER", task_only=True),
     _spec("hellhounds", "Stronghold Slayer Cave", (2420, 9785, 0), (2405, 9766, 33, 40, 0),
@@ -102,10 +121,11 @@ CATALOG = {spec.key: spec for spec in (
                "it. Target is the MEDIAN SPAWN: the research tile (3420,9965) sat 3 tiles west of "
                "the whole cluster, caught by the target-in-its-own-area test."),
     _spec("gargoyles", "Slayer Tower basement", (3434, 9938, 3), (3423, 9924, 26, 29, 3),
-          _TOWER, RING_TOWER, "PRAYER", carry=("rock hammer",),
+          _TOWER, RING_TOWER, "PRAYER", carry=("rock hammer",), protect="PROTECT_FROM_MELEE",
           note="Rock hammer finish, or a granite hammer as the weapon, or the auto-smash unlock."),
     _spec("nechryael", "Slayer Tower basement", (3412, 9962, 3), (3399, 9950, 30, 26, 3),
           _TOWER, RING_TOWER, "PRAYER_PLUS_DAMAGE", task_only=True,
+          protect="PROTECT_FROM_MELEE",
           note="USER: at least 15 food -- the death spawns hit through Protect from Melee."),
     # --- Fremennik Slayer Dungeon (2) -----------------------------------------------------------
     _spec("basilisks", "Fremennik Slayer Dungeon", (2738, 10008, 0), (2734, 9998, 17, 25, 0),
@@ -169,7 +189,8 @@ CATALOG = {spec.key: spec for spec in (
           (1248, 10143, 37, 59, 0), ("Rada's blessing: Mount Karuulm", "Fairy ring: CIR"),
           (1311, 3806, 0), "PRAYER", worn=("boots of stone, brimstone or granite",), task_only=True,
           note="The elevator and rock climbs come from Microbot's transports table. OPEN (E0): heat "
-               "boots unless the elite Kourend diary is done. Protect from Magic at range."),
+               "boots unless the elite Kourend diary is done. Protect from Magic at range.",
+          protect="PROTECT_FROM_MAGIC"),
 )}
 
 

@@ -997,3 +997,121 @@ def test_only_a_route_that_actually_teleports_makes_the_pack_fetch_one():
     assert routine._route_teleports([legs.walk(1, 1, 0)]) is False
     assert routine._route_teleports([]) is False
     assert routine._route_teleports(None) is False
+
+
+# --- 2026-09-21 LIVE: the task picks the protection prayer, not the panel -----------------------
+
+def test_a_catalog_task_fights_under_its_OWN_protection_prayer(monkeypatch):
+    """USER 2026-09-21, watching the first gargoyle task fight: "this is a dangerous task, i cant
+    configure this for every task so it needs to be decided for this task specifically we need
+    pray for melee".
+
+    The panel carries ONE Defensive Prayer for every monster in the game, and on this account it
+    was NONE -- so combat_core logged "nothing to toggle" and a PRAYER-profile task fought with
+    eight super restores it could never spend. Which prayer is right is a property of the monster,
+    so the catalog decides it.
+    """
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Gargoyles"))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3434, "y": 9938, "plane": 3})
+    monkeypatch.setattr(controller, "check_stray_dialog", lambda ctx: None)
+    seen = []
+    monkeypatch.setattr(combat_core, "fight_tick",
+                        lambda ctx: seen.append(dict(ctx.state.config.get("prayer") or {})))
+    ctx = _Ctx()
+    ctx.state.config["prayer"] = {"enabled": True, "defensivePrayer": "NONE", "useQuickPrayers": False}
+
+    routine.tick(ctx)
+
+    assert seen and seen[0]["defensivePrayer"] == "PROTECT_FROM_MELEE", seen
+    assert seen[0]["enabled"] is True, "WHICH prayer is the catalog's call; WHETHER to pray is the user's"
+    assert ctx.state.config["prayer"]["defensivePrayer"] == "NONE", "the panel config comes back"
+
+
+def test_a_task_with_no_prayer_of_its_own_leaves_the_panel_alone(monkeypatch):
+    """Only a task that STATES its prayer overrides. An invented one is worse than the panel's."""
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Banshees"))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3440, "y": 3545, "plane": 0})
+    monkeypatch.setattr(controller, "check_stray_dialog", lambda ctx: None)
+    seen = []
+    monkeypatch.setattr(combat_core, "fight_tick",
+                        lambda ctx: seen.append(dict(ctx.state.config.get("prayer") or {})))
+    ctx = _Ctx()
+    ctx.state.config["prayer"] = {"enabled": True, "defensivePrayer": "PROTECT_FROM_MAGIC"}
+
+    routine.tick(ctx)
+
+    assert seen and seen[0]["defensivePrayer"] == "PROTECT_FROM_MAGIC", seen
+
+
+def test_the_tasks_prayer_is_HELD_on_for_the_whole_trip(monkeypatch):
+    """USER 2026-09-21, after watching it flick off at every kill boundary: "Leave the protection
+    on for the duration of the task. since its a very short time between fights anyway"."""
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Gargoyles"))
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3434, "y": 9938, "plane": 3})
+    monkeypatch.setattr(controller, "check_stray_dialog", lambda ctx: None)
+    seen = []
+    monkeypatch.setattr(combat_core, "fight_tick",
+                        lambda ctx: seen.append(dict(ctx.state.config.get("prayer") or {})))
+    ctx = _Ctx()
+    ctx.state.config["prayer"] = {"enabled": True, "defensivePrayer": "NONE"}
+
+    routine.tick(ctx)
+
+    assert seen and seen[0].get("holdDefensive") is True, seen
+    assert "holdDefensive" not in (ctx.state.config.get("prayer") or {}), "the panel config comes back"
+
+
+# ---------------- gearing up: Kuradal uses the plugin, Aya takes a scimitar ----------------
+# USER 2026-09-21: "make gearing up before a kuradal task using slayer best in bank ... opens the
+# widget and picks up all missing pieces swaps out the gear", then "for aya task all we gotta
+# pickup is a dragon scimmy", then "keep any gear from previous task".
+
+class _Lo:
+    withdraw, keep = [], []
+
+
+def test_a_kuradal_task_gears_up_from_the_best_in_bank_plugin():
+    cfg = routine._bank_config({}, _Lo, task="gargoyles")
+    assert callable(cfg.get("atBank")), "a catalog task must run the plugin's bank view"
+
+
+def test_an_aya_task_does_not_run_the_plugin_and_just_takes_the_scimitar():
+    """Aya's monsters are cows and goblins on ~20-kill tasks where travel dominates; a whole
+    best-in-slot loadout would be a bank trip's worth of clicks for nothing."""
+    cfg = routine._bank_config({}, _Lo, task="cows", held=set(),
+                               banked={"dragon scimitar": 1})
+    assert cfg.get("atBank") is None
+    assert [e["name"] for e in cfg["withdraw"]] == [routine.AYA_WEAPON]
+
+
+def test_the_scimitar_is_not_re_fetched_when_it_is_already_held():
+    for held in ({"dragon scimitar"}, {"dragon scimitar(or)"}):
+        cfg = routine._bank_config({}, _Lo, task="cows", held=held,
+                                   banked={"dragon scimitar": 1})
+        assert cfg["withdraw"] == [], f"already holding {held}"
+
+
+def test_the_scimitar_is_not_asked_for_when_the_bank_has_not_got_one():
+    """Bank memory answers None for a bank never seen; asking anyway buys a click and a 'not
+    found in bank' line. An Aya task is fightable with whatever is already wielded."""
+    assert routine._bank_config({}, _Lo, task="cows", held=set(), banked=None)["withdraw"] == []
+    assert routine._bank_config({}, _Lo, task="cows", held=set(), banked={})["withdraw"] == []
+
+
+def test_gear_from_a_previous_task_stays_out_of_the_deposit():
+    """banker deposits whatever is not on keepItems, so a mirror shield fetched for basilisks
+    must ride along to the next task rather than be banked and withdrawn again."""
+    cfg = routine._bank_config({}, _Lo, task="cows",
+                               keep_extra=["Mirror shield", "Boots of stone", "Slayer helmet (i)"])
+    for name in ("mirror shield", "boots of stone", "slayer helmet (i)"):
+        assert name in cfg["keepItems"]
+
+
+def test_bank_config_stays_a_pure_function_of_its_arguments(monkeypatch):
+    """It was briefly made to read /equipment and /inventory itself, which broke every test that
+    builds a config without a bridge. The live reads belong at the call sites."""
+    def refuse(path, *a, **k):
+        raise AssertionError(f"_bank_config reached the live bridge: GET {path}")
+    monkeypatch.setattr(controller, "api_get", refuse)
+    routine._bank_config({}, _Lo, task="gargoyles")
+    routine._bank_config({}, _Lo, task="cows", held=set(), banked={"dragon scimitar": 1})

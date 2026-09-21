@@ -531,3 +531,104 @@ def test_skipping_the_teleport_does_not_skip_the_rest_of_the_pack():
 
     keep = " | ".join(out.keep)
     assert "ring of dueling" in keep and "teleport to house" in keep
+
+
+# --- 2026-09-21 LIVE: the first Kuradal task stopped on a bank that was not actually short ------
+
+def test_the_bank_is_read_by_DOSE_not_only_by_full_potions():
+    """FOUND LIVE 2026-09-21, the very first Kuradal task (gargoyles x183, streak 29 -> 30).
+
+        [!] Safety stop: Slayer: gargoyles x183 -- cannot be packed -- prayer potions:
+            need 8 more Super restore(4), bank has 7
+
+    The real bank holds 7 Super restore(4) AND a (3), five (2)s and three (1)s: 16 containers,
+    44 doses. A part-used potion CARRIED was already counted by its doses; a part-used potion
+    BANKED was invisible, because the fetch only ever looked at `<base>(4)`. That asymmetry --
+    not a real shortage -- is what stopped the run.
+    """
+    banked = {"super restore(4)": 7, "super restore(3)": 1, "super restore(2)": 5,
+              "super restore(1)": 3, "cooked karambwan": 376, "rock hammer": 1,
+              "ring of dueling(8)": 6, "slayer ring (8)": 2, "teleport to house": 114}
+
+    out = sl.build("Gargoyles", 183, _panel(), 77, 0, {}, banked)
+
+    assert out.problems == [], out.problems
+    want = _want(out)
+    assert want["Super restore(4)"] == 7, "every full one first"
+    assert want["Super restore(3)"] == 1, "then the fullest part-used one, to fill the slot budget"
+    assert "Super restore(2)" not in want, "and no further: the trip has room for 8 containers"
+
+
+def test_a_thin_bank_is_packed_anyway_rather_than_refused():
+    """AMENDED 2026-09-21 by the user, told the bank's best eight containers came to ~22 doses
+    against a 24-dose floor: "Use up the ones in the inventory first then if they are out safety
+    stop." Four one-dose potions is a poor trip; it is not a reason to refuse to go."""
+    banked = {"super restore(1)": 4, "cooked karambwan": 376, "rock hammer": 1,
+              "ring of dueling(8)": 6, "slayer ring (8)": 2, "teleport to house": 114}
+
+    out = sl.build("Gargoyles", 183, _panel(), 77, 0, {}, banked)
+
+    assert out.problems == [], out.problems
+    assert _want(out)["Super restore(1)"] == 4, "it takes every one of them"
+
+
+def test_being_genuinely_OUT_of_prayer_restore_is_the_safety_stop():
+    """The other half of the same ruling: nothing carried and nothing in the bank IS the stop. A
+    PRAYER task fought with no prayer is how an unattended account dies."""
+    banked = {"blighted super restore(4)": 149, "cooked karambwan": 376, "rock hammer": 1,
+              "ring of dueling(8)": 6, "slayer ring (8)": 2, "teleport to house": 114}
+
+    out = sl.build("Gargoyles", 183, _panel(), 77, 0, {}, banked)
+
+    assert any("prayer restore" in p.lower() or "out of" in p.lower()
+               for p in out.problems), out.problems
+    assert not any("blighted" in w["name"].lower() for w in out.withdraw)
+
+
+def test_what_is_still_carried_counts_before_the_bank_is_asked():
+    """"Use up the ones in the inventory first": eight containers already held is a full budget,
+    however few doses are left in them, so the thin bank is not touched at all."""
+    carried = {"super restore(1)": 8}
+    banked = {"super restore(1)": 3, "cooked karambwan": 376, "rock hammer": 1,
+              "ring of dueling(8)": 6, "slayer ring (8)": 2, "teleport to house": 114}
+
+    out = sl.build("Gargoyles", 183, _panel(), 77, 0, carried, banked)
+
+    assert not any("restore" in w["name"].lower() for w in out.withdraw), _want(out)
+    assert out.problems == [], out.problems
+
+
+def test_the_potion_slot_budget_is_never_topped_up_past_its_own_slots():
+    """FOUND LIVE 2026-09-21, the bank trip immediately after the fix above.
+
+        [bank] withdrawing 1x Super restore(3)   ... the trip is packed, 8 containers ...
+        [!] Safety stop: gargoyles x183 -- still short after a full bank visit: 1 Super restore(2)
+
+    The trip set aside 8 slots and came back with 8 containers holding 31 doses. Asking for the
+    32nd dose asks for a NINTH container there is no room for, and slayer_policy turns any
+    withdraw list surviving a bank visit into a STOP -- so the run stopped one dose under an
+    estimate that is itself capped (supplies.MAX_DOSES).
+
+    The fetch is bounded by BOTH the dose deficit and the slots the trip actually reserved.
+    """
+    carried = {"super restore(4)": 7, "super restore(3)": 1, "cooked karambwan": 5,
+               "rock hammer": 1, "ring of dueling(7)": 1, "slayer ring (1)": 1,
+               "teleport to house": 114}
+    banked = {"super restore(2)": 5, "super restore(1)": 3, "cooked karambwan": 375,
+              "ring of dueling(8)": 6, "slayer ring (8)": 2, "teleport to house": 114}
+
+    out = sl.build("Gargoyles", 183, _panel(), 77, 0, carried, banked)
+
+    assert not any("restore" in w["name"].lower() for w in out.withdraw), _want(out)
+    assert out.problems == [], out.problems
+
+
+def test_a_part_used_potion_still_leaves_room_for_the_rest_of_the_budget():
+    """The cap is on the budget, not on fetching: holding two of eight potions still fetches six."""
+    carried = {"super restore(4)": 2}
+    banked = {"super restore(4)": 20, "cooked karambwan": 376, "rock hammer": 1,
+              "ring of dueling(8)": 6, "slayer ring (8)": 2, "teleport to house": 114}
+
+    out = sl.build("Gargoyles", 183, _panel(), 77, 0, carried, banked)
+
+    assert _want(out)["Super restore(4)"] == 6
