@@ -6,6 +6,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import controller
+import aya_tasks
 import slayer_routes as sr
 
 
@@ -59,7 +60,8 @@ def test_cave_slimes_from_the_bears_site_is_walk_ring_walk():
 def test_a_carried_item_teleport_is_used_when_the_task_lists_one():
     route, why = sr.plan("Zombies", {"x": 3200, "y": 3200, "plane": 0}, carried={"ectophial": 1})
     assert why == "" and [leg["kind"] for leg in route] == ["item", "walk"]
-    assert route[0]["item"] == "ectophial" and route[0]["option"] == "Empty"
+    # "Teleport", MEASURED LIVE 2026-09-21 -- this line said "Empty", which was never run.
+    assert route[0]["item"] == "ectophial" and route[0]["option"] == "Teleport"
     no_item, why = sr.plan("Zombies", {"x": 3200, "y": 3200, "plane": 0}, carried={})
     assert no_item is None and "Ectophial" in why
 
@@ -146,3 +148,55 @@ def test_an_unverified_ring_code_still_plans_because_the_dial_refuses_a_wrong_na
     teleports -- so a wrong guess in FAIRY_EXPECT costs a stop, never a trip to the wrong place."""
     for code in ("AJQ", "AJR", "BLR", "DLQ"):
         assert sr.FAIRY_EXPECT[code]
+
+
+def test_the_ectophials_menu_action_is_Teleport_measured_live():
+    """MEASURED LIVE 2026-09-21, first real travel leg. The registry said "Empty" and the routine
+    stopped with the whole menu printed:
+
+        No 'Empty' entry in menu for Ectophial (['Cancel', 'Examine', 'Drop', 'Use', 'Teleport'])
+
+    "Empty" was a guess that had been carried since the row was written, under a comment calling
+    the Ectophial the PROVEN mechanism that the other rows were modelled on. It had never been
+    run. Every other row in ITEMS is still unverified for exactly the same reason, so this test
+    exists as much to mark that as to pin the value."""
+    name, option, landing = sr.ITEMS["ectophial"]
+
+    assert option == "Teleport"
+    assert name == "ectophial"
+    assert landing == (3660, 3522, 0)
+
+
+# --- 2026-09-21 LIVE: icefiends banked for a tablet it did not need ------------------------------
+
+def test_the_jewellery_box_reaches_edgeville_monastery():
+    """USER 2026-09-21: "shortest path currently gives us a very easy option. take house tablet
+    then exit jewlry box: C edgeville monastery".
+
+    The landing is the vendored teleportation_boxes.tsv row, and the walk from it is MEASURED at
+    71 tiles -- against 160 from Edgeville and 277 from Falador Park.
+
+    The KEY is "Monastery", from the USER's own screenshot of the box: the combat bracelet's third
+    entry reads "C: Monastery", where C is the keybind and "Monastery" is the label. The vendored
+    TSV calls the same row "C: Edgeville Monastery", which is Shortest Path's naming and NOT what
+    the interface says -- taking the TSV at its word would have looked for an entry that does not
+    exist. poh._box_matches compares the widget ACTION exactly, so "Monastery" also cannot collide
+    with the glory's "Edgeville"."""
+    assert sr.BOX_LANDINGS["Monastery"] == (3052, 3488, 0)
+
+
+def test_icefiends_can_be_reached_with_a_house_tablet_and_no_bank_trip():
+    """FOUND LIVE. The vendored task data lists exactly ONE way into Ice Mountain:
+
+        "locations": [{"name": "Ice Mountain", "teleports": ["Lassar teleport"]}]
+
+    The planner only ever tries the teleports a task lists, so with no Lassar tablet carried it
+    gave up -- and the pack went to fetch one, teleporting to Ferox to do it. Meanwhile the account
+    was carrying 119 house tablets, which reach the same place through the jewellery box.
+
+    This is the vendored list being incomplete rather than the planner being wrong, so the fix is
+    an entry in aya_tasks._EXTRA_TELEPORTS, the seam that already exists for exactly this."""
+    task = aya_tasks.get("icefiends")
+
+    assert any("Monastery" in t for t in task.teleports)
+    assert "Lassar teleport" in task.teleports, "the listed one is still offered first"

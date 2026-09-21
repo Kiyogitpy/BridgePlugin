@@ -822,3 +822,105 @@ def test_an_unreadable_quest_list_proves_no_quest(monkeypatch):
     for answer in (None, {"reader": "Quests", "error": "NoClassDefFoundError: ..."}, {}, {"quests": []}):
         monkeypatch.setattr(controller, "get_api", lambda group, reader, a=answer: a)
         assert legs.requirement_values()["completed_quests"] is None, answer
+
+
+def test_an_id_match_with_no_name_is_not_the_transport_and_falls_through(monkeypatch):
+    """FOUND LIVE 2026-09-21 at the Slayer Tower. The merged table names that window TWICE, at the
+    same origin and destination, with two ids -- 2173 (the jar's) and 57679 (Microbot's newer
+    fork). The planner took the 2173 row.
+
+    There IS an object with id 2173 in that scene, but it is NAMELESS scenery: the routine aimed
+    at it, the hover gate refused, the right-click menu came back ['Cancel', 'Mark Safespot',
+    'Walk here'], and because the id had "matched" the sibling fallback never ran. It looped until
+    the give-up counter stopped it.
+
+    A transport's object has a NAME -- that is how the nameless case is told apart from the real
+    one, and it costs nothing when the id is right."""
+    step = _step("Climb-through Broken window 2173", (3442, 3531, 0), (3444, 3533, 0))
+    scene = [
+        # MEASURED: the decoy's name is the literal string "null", not a JSON null -- a
+        # non-empty check passes it, which is why the first attempt at this fix did nothing.
+        {"id": 2173, "name": "null", "x": 3442, "y": 3531, "plane": 0, "screenX": 10, "screenY": 10},
+        {"id": 57679, "name": "Broken window", "x": 3442, "y": 3531, "plane": 0,
+         "screenX": 20, "screenY": 20},
+    ]
+    monkeypatch.setattr(controller, "get_objects", lambda **k: scene)
+    monkeypatch.setattr(legs.transports, "load_links", lambda **k: [])
+    monkeypatch.setattr(legs.transports, "load_agility_shortcuts",
+                        lambda **k: [_step("Climb-through Broken window 57679",
+                                           (3442, 3531, 0), (3444, 3533, 0))])
+
+    found = legs.find_transport_object(step)
+
+    assert found is not None and found["id"] == 57679
+
+
+def test_a_named_object_at_the_right_id_is_still_taken_directly(monkeypatch):
+    """The guard must not cost anything when the table's id is the live one."""
+    step = _step("Climb-through Broken window 57679", (3442, 3531, 0), (3444, 3533, 0))
+    scene = [{"id": 57679, "name": "Broken window", "x": 3442, "y": 3531, "plane": 0,
+              "screenX": 20, "screenY": 20}]
+    monkeypatch.setattr(controller, "get_objects", lambda **k: scene)
+
+    assert legs.find_transport_object(step)["id"] == 57679
+
+
+def test_arrival_accepts_any_of_several_landings(monkeypatch):
+    """FOUND LIVE 2026-09-21 on the rats task. The Varrock teleport BROKE and landed the player at
+    the Grand Exchange (3162, 3479), not Varrock square (3213, 3424) -- this account has the
+    Varrock diary reward that REDIRECTS that tablet. The table carries the un-redirected tile, so
+    the leg judged a teleport that worked perfectly as a failure, retried, and burned another
+    tablet each time.
+
+    A redirect is a per-account setting, so the honest answer is to accept either landing rather
+    than pick one and be wrong for somebody. The onward walk is proven from whichever tile we
+    actually reach, so nothing downstream cares which it was."""
+    monkeypatch.setattr(legs.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3162, "y": 3479, "plane": 0})
+
+    assert legs.await_arrival([(3213, 3424, 0), (3164, 3487, 0)]) is True
+    assert legs.await_arrival((3213, 3424, 0), budget_s=0.2) is False, "one tile still means one"
+
+
+def test_the_varrock_tablet_lists_its_diary_redirect():
+    """The Grand Exchange landing, MEASURED live on this account."""
+    import slayer_routes
+    assert (3164, 3487, 0) in slayer_routes.LANDING_REDIRECTS["varrock teleport"]
+
+
+def test_a_shut_two_state_object_is_OPENED_then_used(monkeypatch):
+    """FOUND LIVE 2026-09-21 at the Varrock sewers. USER: "gotta right click it".
+
+        No 'Climb-down' entry in menu for Manhole
+        (['Cancel', 'Mark Safespot', 'Examine', 'Walk here', 'Open'])
+
+    The manhole was SHUT. A shut manhole is id 881 offering only Open; the transport row names 882,
+    the open one, with Climb-down. run_transport's own docstring already listed this as a known
+    limit -- "a SHUT trapdoor is a different id with an `Open` action never matches its row".
+
+    It is the door model this project already uses everywhere else: route through it, then open it
+    when you arrive. One open, then the row's own option, and no retry loop if that fails."""
+    clicks = []
+    monkeypatch.setattr(legs.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 3236, "y": 3458, "plane": 0})
+    monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: None)
+    monkeypatch.setattr(legs, "await_landing", lambda step, budget: True)
+
+    shut = {"id": 881, "name": "Manhole", "x": 3236, "y": 3458, "plane": 0,
+            "screenX": 10, "screenY": 10, "actions": ["Open"]}
+    monkeypatch.setattr(legs, "find_transport_object", lambda step: shut)
+
+    def menu(ser, obj, option, **k):
+        clicks.append(option)
+        return option == "Open"          # the row's own option is not on a SHUT manhole
+
+    monkeypatch.setattr(controller, "click_menu_action", menu)
+    monkeypatch.setattr(controller, "click_entity",
+                        lambda *a, **k: type("R", (), {"__bool__": lambda s: False,
+                                                       "withheld": True})())
+
+    step = _step("Climb-down Manhole 882", (3236, 3458, 0), (3237, 9858, 0))
+    legs.run_transport(_Ctx(), step)
+
+    assert "Open" in clicks, f"it never tried to open the manhole: {clicks}"
+    assert clicks.index("Open") < len(clicks) - 1 or clicks.count("Climb-down") >= 1, clicks

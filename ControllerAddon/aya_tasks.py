@@ -68,6 +68,13 @@ _EXTRA_TELEPORTS = {
     # MEASURED 2026-09-20: 59 tiles from the Taverley tablet's landing, 137 from the house box's
     # Burthorpe, both through 'Climb-down Stairs 57', gated on varplayer 11 == 5 (Fishing Contest).
     "dwarves": ("Taverley teleport: Taverley", "Ornate Jewellery Box: Burthorpe"),
+    # FOUND LIVE 2026-09-21. The vendored data lists ONE way into Ice Mountain, "Lassar teleport",
+    # so with no such tablet carried the planner gave up and the pack went to FETCH one -- by
+    # teleporting to Ferox to reach a bank -- while the account carried 119 house tablets.
+    # USER: "why do we need to bank? ... shortest path currently gives us a very easy option. take
+    # house tablet then exit jewlry box: C edgeville monastery". MEASURED: 71 tiles from that
+    # landing, against 160 from Edgeville and 277 from Falador Park.
+    "icefiends": ("Ornate Jewellery Box: Monastery",),
 }
 
 _cache = {}

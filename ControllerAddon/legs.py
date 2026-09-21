@@ -24,6 +24,7 @@
 # raised from inside hop_fairy_ring, both surface as an endless stream of PROGRESS -- a routine
 # looping on run_next must cap its own retries.
 
+import slayer_routes
 import time
 
 import controller
@@ -246,6 +247,13 @@ def await_arrival(dest, budget_s: float = ITEM_BUDGET_S, radius: int = ARRIVAL_T
     """True once we are standing near `dest`. Polled, never slept off -- karambwan_fishing
     MEASURED that a teleport's own signals fire on the tick the LOADING screen starts, when the
     bridge answers nothing at all."""
+    # `dest` may be SEVERAL landings. FOUND LIVE 2026-09-21: the Varrock teleport broke and put
+    # the player at the Grand Exchange, not Varrock square -- this account holds the Varrock diary
+    # reward that REDIRECTS that tablet. The table carries the un-redirected tile, so a teleport
+    # that worked perfectly read as a failure and the retry burned another tablet each time. A
+    # redirect is per-account, so accepting either beats picking one and being wrong for somebody;
+    # the onward walk is proven from whichever tile we actually reach.
+    targets = list(dest) if dest and isinstance(dest[0], (list, tuple)) else [dest]
     waited = 0.0
     while waited < budget_s:
         time.sleep(POLL_S)
@@ -254,10 +262,11 @@ def await_arrival(dest, budget_s: float = ITEM_BUDGET_S, radius: int = ARRIVAL_T
         px, py = player.get("x"), player.get("y")
         if px is None:
             continue
-        if (player.get("plane", 0) == dest[2]
-                and abs(px - dest[0]) <= radius
-                and abs(py - dest[1]) <= radius):
-            return True
+        for target in targets:
+            if (player.get("plane", 0) == target[2]
+                    and abs(px - target[0]) <= radius
+                    and abs(py - target[1]) <= radius):
+                return True
     return False
 
 
@@ -270,7 +279,13 @@ def run_leg(ctx, leg, log: str = "travel") -> bool:
     runner = (run_item_leg if kind == "item" else run_dialogue_item_leg if kind == "dialogue_item"
               else run_spell_leg if kind == "spell" else run_glider_leg if kind == "glider"
               else run_object_leg)
-    return runner(ctx, leg, log) and await_arrival(dest)
+    # A diary reward can MOVE where a teleport lands, so accept the recorded tile or any known
+    # redirect for this item. See slayer_routes.LANDING_REDIRECTS for the live case: the Varrock
+    # tablet put the player at the Grand Exchange and a working teleport read as a failure.
+    landings = [tuple(dest)] + [tuple(t) for t in
+                                slayer_routes.LANDING_REDIRECTS.get(
+                                    (leg.get("item") or "").strip().lower(), ())]
+    return runner(ctx, leg, log) and await_arrival(landings)
 
 
 def run_item_leg(ctx, leg, log: str = "travel") -> bool:
@@ -491,7 +506,19 @@ def find_transport_object(step):
 
     if step.object_id is None:
         return nearest(lambda obj: (obj.get("name") or "").lower() == (step.target or "").lower())
-    found = nearest(lambda obj: obj.get("id") == step.object_id)
+    # The NAME has to match the table's too, not just the id. FOUND LIVE 2026-09-21 at the Slayer
+    # Tower: the merged table names that window twice, same origin and destination, ids 2173 (the
+    # jar's) and 57679 (Microbot's newer fork), and the planner took the 2173 row. There IS an
+    # object with id 2173 in that scene -- decorative scenery whose name is the literal string
+    # "null" -- so the id "matched", the sibling fallback below never ran, and the routine aimed at
+    # bare ground. Its right-click menu was ['Cancel', 'Mark Safespot', 'Walk here'].
+    #
+    # A first attempt only required the name to be non-empty, and "null" sails through that. The
+    # table already says what the object should be called, so compare against it: an id match that
+    # is not the named thing is not the transport, and the stale-id fallback should get its turn.
+    want = (step.target or "").strip().lower()
+    found = nearest(lambda obj: obj.get("id") == step.object_id
+                    and (not want or (obj.get("name") or "").strip().lower() == want))
     if found is not None:
         return found
     # The merged table can name ONE physical object by TWO ids: the jar's and Microbot's newer
@@ -531,6 +558,19 @@ def await_landing(step, budget_s: float = LINK_BUDGET_S) -> bool:
             return True
         time.sleep(POLL_S)
     return False
+
+
+
+OPEN_ACTION = "Open"
+#: A tick and a bit for the opened object to replace the shut one in the scene.
+OPEN_SETTLE_S = 0.9
+
+
+def _offers_open(obj) -> bool:
+    """Does this object have an `Open` action? Then it is the SHUT half of a two-state pair --
+    a manhole, trapdoor or gate whose row names the OPEN id."""
+    return any((a or "").strip().lower() == OPEN_ACTION.lower()
+               for a in (obj or {}).get("actions") or ())
 
 
 def run_transport(ctx, step, log: str = "travel", approach=None) -> bool:
@@ -577,6 +617,20 @@ def run_transport(ctx, step, log: str = "travel", approach=None) -> bool:
     if not ok and getattr(ok, "withheld", False):
         debug_log.log(log, f"left-click on {step.target} isn't '{step.option}' -- using the menu")
         ok = controller.click_menu_action(ctx.ser, obj, step.option, refresh_target=refresh)
+    if not ok and _offers_open(obj):
+        # SHUT, so OPEN IT FIRST. FOUND LIVE 2026-09-21 at the Varrock sewers -- USER: "gotta right
+        # click it". A shut manhole is id 881 offering only Open; the row names 882, the open one,
+        # with Climb-down. The docstring above already listed this as a known limit.
+        #
+        # This is the door model the project uses everywhere else (CLAUDE.md: route through it,
+        # then open it when you arrive). Opening CHANGES the object's id, so the object is
+        # re-found afterwards rather than reusing a handle that no longer exists. One attempt,
+        # never a loop: if the row's option still is not there, the leg fails cleanly as before.
+        debug_log.log(log, f"{step.target} is shut -- opening it first")
+        if controller.click_menu_action(ctx.ser, obj, OPEN_ACTION, refresh_target=refresh):
+            time.sleep(OPEN_SETTLE_S)
+            reopened = find_transport_object(step) or obj
+            ok = controller.click_menu_action(ctx.ser, reopened, step.option)
     if not ok:
         return False
     return await_landing(step, LINK_BUDGET_S)

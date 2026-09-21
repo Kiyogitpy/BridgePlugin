@@ -22,6 +22,7 @@
 # that case: an in-house player's template x/y are meaningless distances (see poh.py's own
 # instX/instY note), so consulting it there would compare real tiles against instance geometry.
 
+import runes
 import re
 
 import aya_tasks
@@ -48,10 +49,24 @@ FAIRY_EXPECT = {
 }
 
 # Carried items phase A knows how to use: registry text prefix -> (item name, menu option, landing).
+#: Teleports whose landing an ACHIEVEMENT DIARY reward can move. MEASURED LIVE 2026-09-21 on this
+#: account: the Varrock tablet broke and landed at the Grand Exchange, not Varrock square, so the
+#: leg judged a working teleport a failure -- retrying and burning another tablet each time.
+#: A redirect is a per-account setting, so BOTH landings are accepted rather than one chosen.
+LANDING_REDIRECTS = {
+    "varrock teleport": ((3164, 3487, 0),),
+}
+
+
 ITEMS = {
-    "ectophial": ("ectophial", "Empty", (3660, 3522, 0)),
+    # MEASURED LIVE 2026-09-21, the first real travel leg: the action is "Teleport". It said
+    # "Empty" and the run stopped with the whole menu printed -- ['Cancel', 'Examine', 'Drop',
+    # 'Use', 'Teleport'] -- so "Empty" had been a guess all along, under a comment calling this
+    # the PROVEN row the others were modelled on. It had never been run.
+    "ectophial": ("ectophial", "Teleport", (3660, 3522, 0)),
     # Added 2026-09-20 with the Kuradal catalog: inventory items whose teleport is a DIRECT menu
-    # option, the mechanism the Ectophial already proves. Options and landings are UNVERIFIED LIVE
+    # option. The Ectophial above was described here as proving the mechanism; it did not, so
+    # every option below is still a GUESS. Options and landings are UNVERIFIED LIVE
     # (landings from the vendored teleportation_items.tsv); a wrong option is a withheld left-click,
     # then a menu miss, then a clean stop -- never a wrong teleport.
     "taverley teleport": ("taverley teleport", "Break", (2893, 3465, 0)),
@@ -109,8 +124,11 @@ def missing_runes(spell_key, carried) -> list:
     for rune, per_cast in SPELL_RUNES.get(spell_key, {}).items():
         if any(staff in name for name in held for staff in RUNE_STAVES.get(rune, ())):
             continue
-        if held.get(rune, 0) < per_cast:
-            out.append(f"{per_cast} {rune} (have {held.get(rune, 0)})")
+        # Combination runes pay for their elements -- a dust rune IS an air rune. See runes.py for
+        # the live case that found this: 11,477 dust and zero plain air read as "cannot cast".
+        have = runes.available(held, rune)
+        if have < per_cast:
+            out.append(f"{per_cast} {rune} (have {have})")
     return out
 
 # Items MOUNTED in the house (legs.house_mounted): registry head -> (object name fragment, menu
@@ -162,6 +180,11 @@ BOX_LANDINGS = {
     "Falador Park": (2996, 3375, 0),
     "Warriors' Guild": (2882, 3548, 0),
     "Champions' Guild": (3191, 3368, 0),
+    # The combat bracelet's third entry, and ALREADY HERE -- the gap was never this table. USER's
+    # screenshot of the box 2026-09-21 confirms the label: "C: Monastery", where C is the KEYBIND.
+    # (The vendored teleportation_boxes.tsv calls the row "C: Edgeville Monastery", which is
+    # Shortest Path's naming and not what the interface says.) MEASURED 71 tiles from here to the
+    # icefiends, against 160 from Edgeville -- see aya_tasks._EXTRA_TELEPORTS["icefiends"].
     "Monastery": (3052, 3488, 0),
     "Ranging Guild": (2655, 3441, 0),
     "Woodcutting Guild": (1662, 3505, 0),
