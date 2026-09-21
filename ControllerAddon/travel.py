@@ -158,6 +158,10 @@ DOOR_OPEN_WAIT_S = 2.0        # a door opens in a tick or two; long enough that 
 DOOR_WALK_ALLOWANCE_S = 0.7   # per tile between us and the door. 0.6s is one walking tile per
                               # game tick; the extra covers click-to-first-step latency.
 DOOR_OPEN_WAIT_MAX_S = 9.0    # ceiling, so a door that genuinely never opens still fails fast.
+#: How many times ONE door may answer with a dialogue before we stop crediting it. The
+#: Stronghold's greeting is three pages, so a handful of stages is normal; an unbounded
+#: count would let a dialogue that never clears hold the open budget at zero for ever.
+DOOR_MAX_TALKS = 6
 DOOR_FAILURE_MEMORY_S = 1800.0  # how long a door that refused to open is deprioritized when
                               # another candidate route exists -- see open_door_toward. It only
                               # reorders PREFERENCE; a door that is the sole way in is still
@@ -629,6 +633,7 @@ def _open_door(ctx, door: dict, recheck) -> bool:
     waited = 0.0
     last_pos = (here_x, here_y)
     still_polls = 0
+    talks = 0
     while True:
         time.sleep(DOOR_CONFIRM_POLL_S)
         waited += DOOR_CONFIRM_POLL_S
@@ -640,9 +645,15 @@ def _open_door(ctx, door: dict, recheck) -> bool:
         # perfectly. Answering it is what opens it; the loop then confirms the edge exactly as it
         # does for every other door, so nothing about the door model changes. Cheap to ask -- one
         # dialogue read per poll, and only while a door is already known to be in the way.
-        if stronghold.at_gate():
+        if stronghold.at_gate() and talks < DOOR_MAX_TALKS:
+            talks += 1
             stronghold.handle(ctx)
-            waited = 0.0          # the talking was not the door refusing to open
+            # The talking was not the door refusing to open, so it does not spend the open
+            # budget -- but the RESET is bounded (DOOR_MAX_TALKS). Without the bound a dialogue
+            # that never clears would hold `waited` at zero and this loop would never exit,
+            # which is a worse failure than the one being fixed: the run would hang rather than
+            # report a door it could not open.
+            waited = 0.0
             still_polls = 0
             continue
         now = controller.get_player() or {}

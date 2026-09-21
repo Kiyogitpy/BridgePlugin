@@ -991,6 +991,26 @@ def test_a_door_that_talks_is_answered_and_the_talking_does_not_count_against_th
     assert handled, "the question must actually be answered"
 
 
+def test_a_door_that_talks_for_ever_still_gives_up(monkeypatch):
+    """The talking does not spend the open budget, so the reset has to be bounded -- otherwise a
+    dialogue that never clears holds `waited` at zero and _open_door never returns, which is a
+    worse failure than the one the gate handling fixes."""
+    monkeypatch.setattr(controller, "get_player", lambda: {"x": 1859, "y": 5239, "plane": 0})
+    monkeypatch.setattr(controller, "click_entity", lambda ser, e, **kw: True)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    door = _route_door(1859, 5238, flags=BLOCK_MOVEMENT_NORTH)
+    monkeypatch.setattr(travel.stronghold, "at_gate", lambda: True)
+    calls = []
+    monkeypatch.setattr(travel.stronghold, "handle",
+                        lambda ctx, budget_s=None: calls.append(1) or False)
+    logged = []
+    monkeypatch.setattr(travel.debug_log, "log", lambda cat, msg: logged.append(msg))
+
+    assert travel._open_door(_Ctx(), door, lambda: door) is False
+    assert len(calls) == travel.DOOR_MAX_TALKS
+    assert any("still shut" in m for m in logged)
+
+
 def test_an_upper_plane_route_that_leaves_the_loaded_scene_is_discarded(walker, monkeypatch):
     """Risk 1 from the design doc. Above ground the map has no data outside a building and no
     data reads as PASSABLE, so one missing exterior wall lets BFS escape into open sky. A route
