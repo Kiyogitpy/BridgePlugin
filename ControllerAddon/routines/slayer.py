@@ -712,7 +712,8 @@ def _make_room(ctx, item) -> bool:
 def _fight(ctx, state) -> None:
     controller.check_stray_dialog(ctx)
     panel = ctx.state.config
-    cfg = combat_core.combat_config(panel, slayer_tasks.target_names(state.task))
+    cfg = combat_core.combat_config(panel, slayer_tasks.target_names(state.task),
+                                    task_npc_ids=slayer_tasks.target_ids(state.task))
     # The TASK picks the protection prayer, not the panel. USER 2026-09-21, live on the first
     # gargoyle task: "this is a dangerous task, i cant configure this for every task so it needs
     # to be decided for this task specifically we need pray for melee". The panel holds one

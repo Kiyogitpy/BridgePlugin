@@ -305,6 +305,55 @@ def test_combat_config_targets_resolve_through_the_normal_singularizing_matcher(
     assert "banshee" in names and "banshees" in names
 
 
+# --- two monsters, one name (FOUND LIVE 2026-09-21) -------------------------------------------
+#
+# USER, watching the cave bugs task: "Cave bugs that are significantly more powerful -- with a
+# combat level of 96. Routine should skip these altogether and instead focus on the lower level
+# ones." MEASURED in the game cache: 481 `swamp_cave_bug` is level 6 with 5 hitpoints, 483
+# `molanisk_giant_cave_bug` is level 96 with 93 hitpoints and 84 defence -- both named exactly
+# "Cave bug", both with an Attack option, both in the Dorgesh-Kaan South Dungeon. The session
+# logs show the routine attacking both, and the strong one is nearly always the one it reached
+# first because it is bigger and slower to kill.
+
+CAVE_BUG_WEAK = {"id": 481, "name": "Cave bug", "attackable": True, "distance": 6}
+CAVE_BUG_STRONG = {"id": 483, "name": "Cave bug", "attackable": True, "distance": 1}
+
+
+def _unflooded(cfg):
+    """pick_target without the walking flood, so these test the MATCH and not the pathfinder."""
+    return dict(cfg, maxTargetWalkSteps=None)
+
+
+def test_the_level_96_cave_bug_is_never_picked_even_when_it_is_closer():
+    cfg = combat_core.combat_config({}, ("cave bugs",), task_npc_ids=(481,))
+    picked = combat_core.pick_target([CAVE_BUG_STRONG, CAVE_BUG_WEAK], _unflooded(cfg))
+    assert picked is CAVE_BUG_WEAK, "the name matches both; only the id tells them apart"
+
+
+def test_without_the_allow_list_the_old_behaviour_stands():
+    """Every Kuradal task, and combat.py, pass no ids -- they must be byte-for-byte unchanged."""
+    cfg = combat_core.combat_config({}, ("cave bugs",))
+    assert "onlyNpcIds" not in cfg, "absent, not empty: no caller should see a new key"
+    picked = combat_core.pick_target([CAVE_BUG_STRONG, CAVE_BUG_WEAK], _unflooded(cfg))
+    assert picked is CAVE_BUG_STRONG, "nearest wins, as it always did"
+
+
+def test_the_allow_list_restricts_and_never_adds():
+    """`targets` is additive; this one subtracts. A monster the NAMES never matched must not be
+    dragged in by being on the id list."""
+    cfg = combat_core.combat_config({}, ("cave bugs",), task_npc_ids=(481, 9999))
+    other = {"id": 9999, "name": "Bloodveld", "attackable": True, "distance": 1}
+    picked = combat_core.pick_target([other, CAVE_BUG_WEAK], _unflooded(cfg))
+    assert picked is CAVE_BUG_WEAK
+
+
+def test_an_allow_list_that_matches_nothing_present_finds_no_target():
+    """Better no target -- which walks back, then stops with "nothing to fight" -- than the wrong
+    one. The stop is safe; fighting a level 96 on a level 6 task is not."""
+    cfg = combat_core.combat_config({}, ("cave bugs",), task_npc_ids=(481,))
+    assert combat_core.pick_target([CAVE_BUG_STRONG], _unflooded(cfg)) is None
+
+
 def test_combat_routine_is_a_thin_wrapper_over_combat_core():
     from routines import combat
     assert combat.tick is combat_core.fight_tick

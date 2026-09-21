@@ -134,3 +134,37 @@ def test_a_task_blocked_at_aya_stops_but_kuradals_kalphite_is_still_fought():
         assert st.disposition(task, {}) == st.STOP, task
     assert st.disposition("Kalphite", {}) == st.FIGHT
     assert st.disposition("Cows", {}) == st.FIGHT
+
+
+# --- two monsters, one name (FOUND LIVE 2026-09-21) -------------------------------------------
+#
+# USER, watching the cave bugs task: "Cave bugs that are significantly more powerful -- with a
+# combat level of 96. Routine should skip these altogether and instead focus on the lower level
+# ones." MEASURED in the game cache: 481 `swamp_cave_bug` is level 6 with 5 hitpoints, 483
+# `molanisk_giant_cave_bug` is level 96 with 93 hitpoints and 84 defence -- both named exactly
+# "Cave bug", both with an Attack option, both in the Dorgesh-Kaan South Dungeon. The session
+# logs show the routine attacking both.
+
+def test_cave_bugs_names_only_the_weak_one():
+    """Aya's registry already knew; nothing was reading it."""
+    assert st.target_ids("cave bugs") == (481,)
+    assert 483 not in st.target_ids("cave bugs"), "the level-96 Cave bug is not this task"
+
+
+def test_every_aya_fight_task_can_say_which_monsters_are_its_own():
+    """The allow-list is only protection where the data exists, so it has to exist."""
+    import aya_tasks
+    for key, task in aya_tasks.load().items():
+        if task.disposition != aya_tasks.FIGHT:
+            continue
+        assert st.target_ids(key), f"{key} has no npc_ids to restrict by"
+
+
+def test_a_kuradal_task_has_no_opinion_and_is_left_unrestricted():
+    """The catalog carries no ids, and () must read as "no opinion", never "match nothing"."""
+    assert st.target_ids("nechryael") == ()
+    assert st.target_ids("gargoyles") == ()
+
+
+def test_an_unknown_task_has_no_opinion():
+    assert st.target_ids("no such monster") == ()

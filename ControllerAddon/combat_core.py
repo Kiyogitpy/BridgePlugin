@@ -309,6 +309,16 @@ def _singularize(word: str) -> str:
     return w
 
 
+def only_ids(config: dict) -> set:
+    """Ids a target MUST have, or an empty set meaning "no opinion".
+
+    Distinct from `targets`, which is ADDITIVE (an id there matches a monster the names miss).
+    This one SUBTRACTS: it is how a task says "these monsters and no others", which names alone
+    cannot express when two different monsters share one.
+    """
+    return set(config.get("onlyNpcIds") or ())
+
+
 def resolve_targets(config: dict):
     ids = set(config.get("targets") or [])
     names = set()
@@ -321,7 +331,7 @@ def resolve_targets(config: dict):
     return ids, names
 
 
-def combat_config(base_config: dict, target_names) -> dict:
+def combat_config(base_config: dict, target_names, task_npc_ids=None) -> dict:
     """The panel config with a task's monsters substituted in -- what the Slayer task
     orchestrator hands fight_tick for each FIGHT tick (spec §5).
 
@@ -332,6 +342,21 @@ def combat_config(base_config: dict, target_names) -> dict:
     cfg = dict(base_config or {})
     cfg["targetNames"] = list(target_names or ())
     cfg["targets"] = []
+    # `task_npc_ids` is the opposite of `targets`: an ALLOW-LIST, and the only way to say "the
+    # weak one, not the strong one with the same name". USER 2026-09-21, watching the cave bugs
+    # task: "Cave bugs that are significantly more powerful -- with a combat level of 96.
+    # Routine should skip these altogether and instead focus on the lower level ones."
+    #
+    # MEASURED in the cache: 481 `swamp_cave_bug` is level 6 with 5 hitpoints, 483
+    # `molanisk_giant_cave_bug` is level 96 with 93 hitpoints and 84 defence -- and BOTH are
+    # named exactly "Cave bug" with an Attack option, both in the Dorgesh-Kaan South Dungeon.
+    # The session logs show the routine attacking both (`id=481` and `id=483`). Aya's registry
+    # already knew the answer (npc_ids for cave bugs is (481,)); nothing was reading it.
+    #
+    # Left OUT of the config entirely when empty, so a task with no id data (all of Kuradal's)
+    # is byte-for-byte what it was.
+    if task_npc_ids:
+        cfg["onlyNpcIds"] = list(task_npc_ids)
     safespot = dict(cfg.get("safespot") or {})
     safespot["enabled"] = False
     safespot["marked"] = False
@@ -385,6 +410,7 @@ def pick_target(npcs: list, config: dict, player: dict | None = None):
     ids, names = resolve_targets(config)
     if not ids and not names:
         return None
+    allowed = only_ids(config)
 
     max_dist = config.get("maxTargetDistance", 15)
     max_steps = config.get("maxTargetWalkSteps", DEFAULT_MAX_TARGET_WALK_STEPS)
@@ -397,6 +423,10 @@ def pick_target(npcs: list, config: dict, player: dict | None = None):
             continue
         npc_name = (npc.get("name") or "").lower()
         if npc.get("id") not in ids and not any(n in npc_name for n in names if n):
+            continue
+        # The name matched but the id is not one this task fights: a same-named monster of a
+        # different strength. See combat_config's task_npc_ids.
+        if allowed and npc.get("id") not in allowed:
             continue
 
         dist = npc.get("distance", 9999)

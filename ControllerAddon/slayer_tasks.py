@@ -82,6 +82,18 @@ def target_names(task_name) -> list:
     return list(_TARGETS.get(key, [key]))
 
 
+def target_ids(task_name) -> tuple:
+    """The NPC ids this task's monsters really are, or () when we do not know.
+
+    Aya's registry carries them (`npc_ids`, from the Turael Skipping plugin's own data) and
+    Kuradal's catalog does not, so this restricts Aya's tasks and leaves Kuradal's exactly as
+    they were. () means "no opinion" and must never be read as "match nothing" -- see
+    combat_core.pick_target.
+    """
+    site = _site(task_name)
+    return tuple(getattr(site, "npc_ids", ()) or ())
+
+
 def _site(task_name):
     """The task's site record: Aya's registry first (unchanged), then Kuradal's catalog. Both
     carry target / areas / teleports / location, so every caller reads one shape."""
