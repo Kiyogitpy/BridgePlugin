@@ -22,6 +22,7 @@
 # recorder logs keys, not menus); DECLINE_NEEDLES is the wiki's wording and the first live run
 # will confirm or correct it -- safely, by rule (2).
 
+import runes
 import time
 
 import controller
@@ -50,6 +51,12 @@ MASTERS = {
 ASSIGN_NEEDLES = ("another assignment", "need a task", "new assignment")
 DECLINE_NEEDLES = ("take a task from you", "no that's okay")   # Aya's Vannaka question. Deliberately
 # NARROW (task-2 review): a bare "from you" would also match "Yes, I'd like a new task from you".
+#: The client's placeholder for an option that has not rendered yet. FOUND LIVE 2026-09-21, six
+#: tasks into an unattended run: the menu read ["Please wait...", "Oh okay then, I'll go talk to
+#: Vannaka."] and the routine escaped it as UNKNOWN -- but the option it wanted, the one that keeps
+#: the task with Aya, simply had not appeared. A half-built menu is not an unknown one.
+LOADING_OPTION = "please wait"
+
 ASSIGNED_TEXT = "new task is to kill"
 STILL_HUNTING_TEXT = "still hunting"
 
@@ -72,7 +79,16 @@ def _master(master) -> dict:
 # the cursor is the PROOF, and a miss withholds the click. If a rebuilt bridge ever reports
 # `actions` on children, the row is found by action and the hints are not used at all.
 PICKER_LIST = (75, 4)
-SLOT_HINTS = {"AYA": 18, "KURADAL": 33}      # MEASURED 2026-09-19 on this account; they move
+# MEASURED LIVE 2026-09-21 by hovering every row of this account's picker and reading what the
+# client reported under each one. The previous values (Aya 18, Kuradal 33) were wrong: 18 is not a
+# row at all, it hovers "Walk here" -- the game world behind the interface.
+#
+# USER, watching the first scan sweep the grid: "We can't have it jump each entry in the contact
+# ui, aya wont move in that window so just always pick nr 6." Right on both counts -- the slots are
+# fixed for an account, and sweeping them is slow and looks nothing like a person. So these are
+# tried FIRST and the scan is only what happens when the seed does not hover as the master, which
+# is exactly what the old wrong values would have hit on every cast.
+SLOT_HINTS = {"AYA": 6, "KURADAL": 11}
 
 
 def picker_open() -> bool:
@@ -80,30 +96,86 @@ def picker_open() -> bool:
     return bool(box.get("found")) and bool(box.get("clickable"))
 
 
+
+def still_loading(options) -> bool:
+    """Is this options menu still rendering? Then it is not an unknown menu, just an early read.
+
+    The client shows LOADING_OPTION in place of an option it has not built yet, so escaping here
+    throws away a menu that was about to be answerable AND reports a wording problem that does not
+    exist. Waiting is the same rule the dialogue loop already applies to a menu it has answered.
+    """
+    return any(LOADING_OPTION in (o or "").strip().lower() for o in options or ())
+
+
 def _contact_actions(master) -> tuple:
     return tuple(f"contact {name}" for name in _master(master)["names"])
 
 
-def find_master_row(master):
-    """The picker row for `master`: by ACTION when the bridge reports actions, else the measured
-    slot -- refused when that slot lies outside the visible list (scrolled away). None if neither."""
+#: An upper bound on the scan, not a measurement. MEASURED LIVE 2026-09-21 this account's picker
+#: is a 7-wide grid resolving 23 rows, of which 14 are real; an earlier session recorded a row at
+#: index 33. Rows that do not resolve cost one cheap widget read and NO cursor move, so a generous
+#: bound is nearly free and a tight one silently skips a master.
+MAX_PICKER_ROWS = 42
+#: Long enough for the client to build the menu entry under the moved cursor before /hover is read.
+HOVER_SETTLE_S = 0.35
+
+#: Master -> the slot its row was found at, remembered for the process. The list does not reorder
+#: inside a session, so a second ask costs ONE confirming hover instead of another scan.
+_ROW_CACHE = {}
+
+
+def forget_rows():
+    """Drop the remembered slots (tests, and anything that suspects the picker has changed)."""
+    _ROW_CACHE.clear()
+
+
+def _hover_reads(ctx, row, wanted) -> bool:
+    """Move the cursor onto `row` and ask what the client thinks is under it."""
+    controller.move_to_human(ctx.ser, row["screenX"], row["screenY"])
+    time.sleep(HOVER_SETTLE_S)
+    option = ((controller.api_get("/hover") or {}).get("option") or "").strip().lower()
+    return option in wanted
+
+
+def find_master_row(ctx, master):
+    """The picker row for `master`, found by HOVERING it. None when the master is not in the list.
+
+    MEASURED LIVE 2026-09-21, the first real run of this routine. The picker's rows carry NO text,
+    NO name and NO actions -- scanning all of group 75 for anything with text found only the title
+    "Choose a character". So nothing in the widget tree can say which row is which master, and the
+    only thing that can is what /hover reads once the cursor is actually over one.
+
+    The slot HINTS this used to fall back on were Aya 18 and Kuradal 33. Live they are 6 and 11,
+    and slot 18 is not a row at all -- it hovers "Walk here", the game world behind the picker. The
+    hover gate refused that click three times and was right to; the bug was aiming there at all.
+    The file's own comment already warned "they move", so a measured scan replaces the guess.
+
+    Cost: one cursor move per row until the match, once per master per process.
+    """
     wanted = set(_contact_actions(master))
+    # The free path first, in case the bridge ever does report actions for these rows.
     for child in controller.get_widget_children(*PICKER_LIST) or ():
         if child.get("screenX") is not None and any(
                 (action or "").strip().lower() in wanted for action in child.get("actions") or ()):
             return child
-    hint = SLOT_HINTS.get(slayer_state.canonical_master(master))
-    if hint is None:
-        return None
-    row = controller.get_widget(PICKER_LIST[0], PICKER_LIST[1], index=hint)
-    if not row.get("clickable") or row.get("screenY") is None:
-        return None
-    box = controller.get_widget(*PICKER_LIST)
-    if box.get("screenY") is not None and box.get("height"):
-        if abs(row["screenY"] - box["screenY"]) > box["height"] / 2:
-            debug_log.log(LOG, f"slot {hint} is scrolled out of the visible list")
-            return None
-    return dict(row, index=hint)
+
+    key = slayer_state.canonical_master(master)
+    # The remembered slot, then the measured one, then everything else. Normally the first hover
+    # is the answer and nothing is swept.
+    first = [i for i in (_ROW_CACHE.get(key), SLOT_HINTS.get(key)) if i is not None]
+    seeds = list(dict.fromkeys(first))
+    order = seeds + [i for i in range(MAX_PICKER_ROWS) if i not in seeds]
+    for index in order:
+        row = controller.get_widget(PICKER_LIST[0], PICKER_LIST[1], index=index)
+        if not (isinstance(row, dict) and row.get("found") and row.get("clickable")
+                and row.get("screenX") is not None):
+            continue
+        if _hover_reads(ctx, row, wanted):
+            _ROW_CACHE[key] = index
+            return dict(row, index=index)
+    _ROW_CACHE.pop(key, None)
+    debug_log.log(LOG, f"no row in the picker hovers as one of {sorted(wanted)}")
+    return None
 
 def _rune_counts() -> dict:
     counts = {}
@@ -144,8 +216,11 @@ def missing_requirements(master):
     for rune, per_cast in RUNES_PER_CAST.items():
         if rune == "air rune" and has_air_staff:
             continue
-        if counts.get(rune, 0) < per_cast:
-            return f"NPC Contact needs {per_cast} {rune}(s) per cast (have {counts.get(rune, 0)})"
+        # Combination runes pay for their elements: FOUND LIVE 2026-09-21, the account had 11,477
+        # DUST runes (air + earth) and zero plain air, and this refused a cast it could afford.
+        have = runes.available(counts, rune)
+        if have < per_cast:
+            return f"NPC Contact needs {per_cast} {rune}(s) per cast (have {have})"
     return None
 
 
@@ -207,7 +282,7 @@ def cast(ctx, force_picker: bool = False):
 
 
 def _pick_row(ctx, master) -> bool:
-    row = find_master_row(master)
+    row = find_master_row(ctx, master)
     if row is None:
         debug_log.log(LOG, f"no 'Contact {master}' row in the picker -- not unlocked, or scrolled out of view")
         dialogue.close(ctx)
@@ -282,6 +357,10 @@ def walk_to_assignment(ctx):
             # The menu we already answered is still on screen (a slow tick). Pressing its number
             # again would land on whatever menu comes NEXT -- wait for it to change (task-2 review,
             # same rule as dialogue.choose's `seen`).
+            time.sleep(POLL_S)
+            continue
+        if still_loading(opts):
+            # Half-built, not unknown: the wanted option has not rendered yet. See LOADING_OPTION.
             time.sleep(POLL_S)
             continue
         if opts:

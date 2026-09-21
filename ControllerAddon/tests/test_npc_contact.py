@@ -66,32 +66,40 @@ def _picker(monkeypatch, rows=None, children=None, box=None, open_after=0):
         return {"found": False}
     monkeypatch.setattr(controller, "get_widget", get_widget)
     monkeypatch.setattr(controller, "get_widget_children", lambda g, c: list(children or []))
+    # Since 2026-09-21 the row is found by HOVERING it (the rows carry no text or actions -- see
+    # the hover-scan tests at the end of this file). These older tests are about what happens
+    # AROUND that step, so the hover itself is stubbed: any row the fake serves is the right one.
+    monkeypatch.setattr(npc_contact, "_hover_reads", lambda ctx, row, wanted: True)
+    npc_contact.forget_rows()
 
 
-def test_live_run_1_the_row_is_addressed_by_index_because_the_picker_is_not_in_the_root_walk(monkeypatch):
-    """LIVE 2026-09-19: three pickers opened, /widgets/dump listed none of them. Rows have no text,
-    so the measured slot is the aim and the hover gate is the proof."""
-    rows = {18: {"found": True, "clickable": True, "screenX": 691, "screenY": 306},
-            33: {"found": True, "clickable": True, "screenX": 684, "screenY": 419}}
-    _picker(monkeypatch, rows=rows)
-    assert npc_contact.find_master_row("AYA")["index"] == 18
-    assert npc_contact.find_master_row("Turael")["index"] == 18
-    assert npc_contact.find_master_row("KURADAL")["screenY"] == 419
-    assert npc_contact.find_master_row("KONAR") is None, "no measured slot and no actions: refuse"
+
+class _HoverCtx:
+    """The scan drives the cursor, so find_master_row needs a ctx with a serial handle."""
+    def __init__(self):
+        self.ser = object()
 
 
-def test_a_slot_scrolled_out_of_the_visible_list_is_refused(monkeypatch):
-    rows = {33: {"found": True, "clickable": True, "screenX": 684, "screenY": 900}}
-    _picker(monkeypatch, rows=rows)
-    assert npc_contact.find_master_row("KURADAL") is None
+def _ctx():
+    return _HoverCtx()
 
 
-def test_a_bridge_that_reports_actions_finds_the_row_by_action_and_ignores_the_hints(monkeypatch):
+def test_the_action_path_is_kept_for_a_bridge_that_ever_reports_them(monkeypatch):
+    """SUPERSEDED IN PART 2026-09-21 by the first live run. Three tests here used to pin the
+    MEASURED SLOT fallback -- Aya 18, Kuradal 33. Live, Aya is 6 and Kuradal is 11, and slot 18 is
+    not a row at all: it hovers "Walk here", the game world behind the picker. The hover gate
+    refused that click three times and was right to. The hint fallback is gone; see the hover-scan
+    tests at the end of this file.
+
+    This half survives because it costs nothing and is still correct: if the bridge ever does
+    report actions for these rows, that is a free and exact answer.
+    """
     children = [{"index": 7, "screenX": 1, "screenY": 300, "actions": ["Contact Duradel"]},
                 {"index": 4, "screenX": 1, "screenY": 200, "actions": ["Contact Ayatollah"]}]
     _picker(monkeypatch, children=children)
-    assert npc_contact.find_master_row("KURADAL")["index"] == 7
-    assert npc_contact.find_master_row("AYA") is None, "whole name, not a prefix; and no row at the hint"
+
+    assert npc_contact.find_master_row(_ctx(), "KURADAL")["index"] == 7
+
 
 def test_get_task_refuses_aya_while_a_task_is_active_before_touching_anything(monkeypatch):
     _quiet(monkeypatch)
@@ -321,6 +329,10 @@ def test_a_cast_that_recontacts_the_wrong_npc_is_closed_and_the_picker_forced(mo
     monkeypatch.setattr(controller, "click_menu_action", click_menu_action)
     monkeypatch.setattr(controller, "key_tap", key_tap)
     monkeypatch.setattr(dialogue, "read", lambda: {"aya": {"npcName": "Aya"}, "kuradal": {"npcName": "Kuradal"}}.get(stage["s"], {}))
+        # This test is about the cast being re-forced, not about finding the row: since
+    # 2026-09-21 the row is identified by HOVERING it, so that step is stubbed.
+    monkeypatch.setattr(npc_contact, "_hover_reads", lambda ctx, row, wanted: True)
+    npc_contact.forget_rows()
     assert npc_contact.contact(_Ctx(), "KURADAL", CFG) is True
     assert events == ["left-cast", "ESC", "menu Cast", "row 33"]
 
@@ -510,3 +522,125 @@ def test_a_rune_pouch_that_is_not_carried_supplies_no_runes(monkeypatch):
     monkeypatch.setattr(controller, "get_rune_pouch", lambda: {"carried": True, "runes": [
         {"quantity": 8949, "name": "Cosmic rune", "slot": 4, "id": 564, "type": 9}]})
     assert npc_contact._rune_counts() == {"cosmic rune": 8949}
+
+
+# --- 2026-09-21, FIRST LIVE RUN: the slot hints were wrong and the rows carry nothing -----------
+
+def _blank_picker(monkeypatch, rows, hovers, ser=object()):
+    """A picker of `rows` blank rows; `hovers` maps a slot index to what /hover reads over it."""
+    moved = []
+
+    def widget(group, child, index=None):
+        if index is None:
+            return {"found": True, "clickable": True, "screenX": 989, "screenY": 790, "height": 500}
+        if index >= rows:
+            return {"found": False}
+        return {"found": True, "clickable": True, "index": index,
+                "screenX": 500 + index * 100, "screenY": 400, "text": None, "actions": []}
+
+    monkeypatch.setattr(controller, "get_widget", widget)
+    monkeypatch.setattr(controller, "get_widget_children", lambda *a, **k: [])
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda s, x, y, **k: moved.append((x, y)))
+    monkeypatch.setattr(controller, "api_get",
+                        lambda path, *a, **k: {"option": hovers.get((moved[-1][0] - 500) // 100)}
+                        if path == "/hover" and moved else {"option": "Cancel"})
+    monkeypatch.setattr(npc_contact.time, "sleep", lambda *_a, **_k: None)
+    npc_contact.forget_rows()
+    return moved
+
+
+def test_the_row_is_found_by_HOVERING_because_the_rows_carry_no_text_or_actions(monkeypatch):
+    """MEASURED LIVE 2026-09-21, the first real run. The picker is a 7-column grid of rows whose
+    text, name and actions are ALL empty -- confirmed by scanning group 75 for anything with text,
+    which found only the title "Choose a character". So the ONLY thing that can identify a row is
+    what /hover reads over it.
+
+    The hardcoded hints were Aya 18 and Kuradal 33. Live, Aya is slot 6 and Kuradal is slot 11, and
+    slot 18 is not a row at all -- it hovers "Walk here", the game world BEHIND the picker. The
+    hover gate refused that click three times and was right to."""
+    moved = _blank_picker(monkeypatch, rows=14,
+                    hovers={0: "Contact Honest Jimmy", 6: "Contact Aya", 11: "Contact Kuradal"})
+
+    row = npc_contact.find_master_row(_ctx(), "AYA")
+
+    assert row is not None and row["index"] == 6
+    assert len(moved) <= 7, "it stops at the match rather than sweeping the whole grid"
+
+
+def test_the_found_row_is_remembered_so_the_scan_happens_once(monkeypatch):
+    """A scan costs a cursor move per row. The list does not reorder inside a session, so the
+    second ask must cost one hover, not seven."""
+    moved = _blank_picker(monkeypatch, rows=14, hovers={6: "Contact Aya"})
+    npc_contact.find_master_row(_ctx(), "AYA")
+    first = len(moved)
+
+    npc_contact.find_master_row(_ctx(), "AYA")
+
+    assert len(moved) - first == 1, "one confirming hover, no rescan"
+
+
+def test_a_master_that_is_not_in_the_picker_answers_None(monkeypatch):
+    """Krystilia is a real master this account may not have unlocked. Returning some other row
+    would contact the wrong master and take the wrong task."""
+    _blank_picker(monkeypatch, rows=14, hovers={6: "Contact Aya"})
+
+    assert npc_contact.find_master_row(_ctx(), "KURADAL") is None
+
+
+def test_the_empty_rows_past_the_end_are_never_chosen(monkeypatch):
+    """Slots 14+ hover 'Walk here'. Clicking one walks the player instead of taking a task, which
+    is exactly what the gate prevented live."""
+    _blank_picker(monkeypatch, rows=23,
+            hovers={6: "Contact Aya", 18: "Walk here", 20: "Walk here"})
+
+    row = npc_contact.find_master_row(_ctx(), "AYA")
+    assert row["index"] == 6
+
+
+def test_the_measured_slot_is_tried_FIRST_so_no_scan_happens_normally(monkeypatch):
+    """USER 2026-09-21, watching it sweep the grid: "We can't have it jump each entry in the
+    contact ui, aya wont move in that window so just always pick nr 6."
+
+    Right on both counts. The slots do not move for an account, and sweeping them is slow and looks
+    nothing like a person. So the MEASURED slots are tried first and the scan is what happens only
+    when that one does not hover as the master -- which is the case that the old, wrong hints
+    (18 and 33) would have hit on every cast."""
+    moved = _blank_picker(monkeypatch, rows=14,
+                          hovers={0: "Contact Honest Jimmy", 6: "Contact Aya", 11: "Contact Kuradal"})
+
+    row = npc_contact.find_master_row(_ctx(), "AYA")
+
+    assert row["index"] == 6
+    assert len(moved) == 1, "one hover, straight at the known slot -- no sweep"
+
+
+def test_a_measured_slot_that_no_longer_hovers_right_falls_back_to_the_scan(monkeypatch):
+    """The seed is a shortcut, not a promise. An account with different unlocks has a different
+    layout, and that must still work rather than contact the wrong master."""
+    moved = _blank_picker(monkeypatch, rows=14, hovers={9: "Contact Aya"})
+
+    row = npc_contact.find_master_row(_ctx(), "AYA")
+
+    assert row["index"] == 9
+    assert len(moved) > 1, "it had to look"
+
+
+def test_a_menu_still_rendering_is_waited_out_not_escaped(monkeypatch):
+    """FOUND LIVE 2026-09-21, six tasks into an unattended run:
+
+        AYA's dialogue showed a menu this routine does not know, and it was escaped without
+        choosing: [Please wait... | Oh okay then, I'll go talk to Vannaka.]
+
+    "Please wait..." is the client's PLACEHOLDER for an option that has not rendered yet, so that
+    is a half-built menu, not an unknown one. The option the routine wants -- the one that keeps
+    the task with Aya rather than sending her to Vannaka -- simply had not appeared.
+
+    Escaping on it is wrong twice over: it abandons a menu that was about to be answerable, and it
+    reports a wording problem that does not exist. Wait for the menu to finish instead, which is
+    the same rule the loop already applies to a menu it has just answered."""
+    assert npc_contact.still_loading(["Please wait...", "Oh okay then, I'll go talk to Vannaka."])
+    assert npc_contact.still_loading(["please wait"]), "case and punctuation vary"
+    assert not npc_contact.still_loading(["Yes, I'd like a new assignment.",
+                                          "Oh okay then, I'll go talk to Vannaka."])
+    assert not npc_contact.still_loading([]), "no menu at all is not a loading menu"
