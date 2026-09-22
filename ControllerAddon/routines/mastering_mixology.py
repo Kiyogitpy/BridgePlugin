@@ -392,13 +392,23 @@ def _hover_object(ctx, name: str, exclude: str = None, **kwargs):
     return entity
 
 
+def _aim_offset(name: str):
+    """The aim nudge for a pre-hover or click on `name`: the model's CENTRE for a lever, the
+    shared (-7, +7) default for everything else. LIVE 2026-09-22: a lever pre-hover parked at
+    projection + (-7, +7) sat just off the thin lever model, the in-place click there resolved
+    as "Walk here" (last-action target ''), and every retry counted as already-in-place and hit
+    the same pixel -- three misses inside a second and a safety stop. CLAUDE.md's standing
+    remedy for small targets is offset=(0, 0)."""
+    return (0, 0) if "lever" in (name or "").lower() else (-7, 7)
+
+
 def _player_moving() -> bool:
     """/player's per-frame `moving` flag (uncached). False when unreadable, so a bridge hiccup
     ends a track early rather than holding it to the ceiling."""
     return bool((controller.get_player() or {}).get("moving"))
 
 
-def _hover_when_settled(ctx, station_name: str, **kwargs):
+def _hover_when_settled(ctx, station_name: str, stop=None, **kwargs):
     """Park the cursor on an object and KEEP it there while the player walks up to it.
 
     USER 2026-09-17, watching it live: "we dont wait until we are stopped to hover meaning the
@@ -421,16 +431,23 @@ def _hover_when_settled(ctx, station_name: str, **kwargs):
     reports the player moving, up to HOVER_TRACK_MAX_S. The time is not lost: every caller's
     next outcome (the pull landing, the take, the station start) needs the player to arrive
     first. A still player (the levers stand side by side) takes the old two-read settle.
+
+    `stop`: the caller's own outcome check (the pull landed, the base is in the inventory),
+    which ends the follow the moment it holds. MEASURED live 2026-09-22 that /player's `moving`
+    reads False a full tick AFTER arrival -- the lever/belt animation has already started while
+    it still says True -- so without this the follow held the cursor ~0.5s past the outcome, and
+    the cycle came out ~1s slower per base.
     Past the ceiling the hover stands regardless: _click_station_in_place and click_entity's
     in-place test both verify before committing."""
     entity = find_object(station_name)
     if entity is None:
         return None
+    kwargs.setdefault("offset", _aim_offset(station_name))
     refresh = _refresh_for(entity)
     if refresh is None:
         return _hover_object(ctx, station_name, **kwargs)
 
-    offset = kwargs.get("offset", (-7, 7))
+    offset = kwargs["offset"]
     hovered = False
     prev = None
     still_reads = 0
@@ -448,6 +465,8 @@ def _hover_when_settled(ctx, station_name: str, **kwargs):
             if drifted:
                 target = dict(entity, screenX=int(cur[0]), screenY=int(cur[1]))
                 hovered = controller.hover_entity(ctx.ser, target, refresh_target=refresh, **kwargs) or hovered
+        if hovered and stop is not None and stop():
+            break
         if _player_moving():
             still_reads = 0
         else:
@@ -1046,7 +1065,12 @@ def _pull_lever(ctx, paste: str, next_name: str = None) -> bool:
         baseline_tick = controller.get_last_action().get("tick")
         slots_before = _mixer_slots()
         mark = _mark(ctx)
-        lever = _click_object(ctx, lever_name, check_ui_blockers=False)
+        if attempt > 0:
+            # The last click MISSED from where the cursor is resting, so a click "in place" would
+            # only repeat it (LIVE 2026-09-22: three identical misses and a safety stop). Re-aim
+            # at the lever's live centre first; the click below then goes from there.
+            _hover_object(ctx, lever_name, check_ui_blockers=False, offset=(0, 0))
+        lever = _click_object(ctx, lever_name, check_ui_blockers=False, offset=_aim_offset(lever_name))
         if lever is None:
             debug_log.log("mixology", f"{lever_name} not found near the player (or the click was refused)")
             return False
@@ -1065,8 +1089,13 @@ def _pull_lever(ctx, paste: str, next_name: str = None) -> bool:
         verdict = _await(ctx, {"MENU_CLICKED": lambda p: want in (p.get("target") or "").lower()},
                          MENU_VERDICT_S, confirm=verdict_ok, since=mark, reaction=False,
                          shorten={"MENU_CLICKED": MENU_VERDICT_SHORTEN_S})
+        def landed():
+            now = _mixer_slots()
+            return now is not None and now != slots_before
+
         if verdict and next_name:
-            _hover_when_settled(ctx, next_name, check_ui_blockers=False)
+            _hover_when_settled(ctx, next_name, check_ui_blockers=False,
+                                stop=landed if slots_before is not None else None)
         if not verdict:
             debug_log.log(
                 "mixology",
@@ -1079,10 +1108,6 @@ def _pull_lever(ctx, paste: str, next_name: str = None) -> bool:
             # Mixer varbits unreadable: trust the verdict and give the pull its tick.
             _tick_pause(ctx, 1)
             return True
-
-        def landed():
-            now = _mixer_slots()
-            return now is not None and now != slots_before
 
         if _await(ctx, {"VARBIT_CHANGED": _varbit_in(VB_MIXER_SLOTS)},
                   PULL_LAND_S + _walk_budget(lever), confirm=landed, since=mark, reaction=False):
@@ -1164,7 +1189,8 @@ def _make_base(ctx, order: dict, next_name: str = None) -> bool:
         ctx.state.trigger_safety_stop("no mixing vessel found near the player")
         return False
     if next_name:
-        _hover_when_settled(ctx, next_name, check_ui_blockers=False)
+        _hover_when_settled(ctx, next_name, check_ui_blockers=False,
+                            stop=lambda: _count_item(target_id) > before)
 
     # The game can refuse the take (insufficient paste or Herblore level) and click_entity's own
     # simulated misclick can miss -- the base is made only when its id is in the inventory.

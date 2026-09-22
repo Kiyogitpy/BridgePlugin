@@ -1208,6 +1208,20 @@ def test_station_hover_on_a_still_player_costs_only_the_settle(game, monkeypatch
     assert game.clock["t"] <= 1000.0 + mm.HOVER_SETTLE_POLL_S * 2
 
 
+def test_station_hover_follow_ends_the_moment_the_outcome_lands(game, monkeypatch):
+    """/player's `moving` lags arrival by a tick (MEASURED live 2026-09-22), so the caller's own
+    outcome check is what ends the follow -- not the flag."""
+    monkeypatch.setattr(mm, "_refresh_for", lambda e: (lambda: (200, 240)))
+    monkeypatch.setattr(controller, "get_player", lambda: {"moving": True})   # flag still lagging
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (193, 247))
+    checks = iter([False, True])
+    ctx = FakeCtx()
+
+    mm._hover_when_settled(ctx, "Retort", check_ui_blockers=False, stop=lambda: next(checks, True))
+
+    assert game.clock["t"] <= 1000.0 + mm.HOVER_SETTLE_POLL_S * 2
+
+
 def test_station_hover_gives_up_following_at_the_ceiling(game, monkeypatch):
     monkeypatch.setattr(mm, "_refresh_for", lambda e: (lambda: (200, 240)))
     monkeypatch.setattr(controller, "get_player", lambda: {"moving": True})   # never arrives
@@ -1515,6 +1529,38 @@ def test_pull_lever_prehovers_the_next_target_while_the_pull_lands(game, monkeyp
     )
     assert mm._pull_lever(ctx, "mox", next_name="Aga lever") is True
     assert hovers == ["Aga lever"]
+
+
+def test_a_missed_lever_pull_is_re_aimed_at_the_centre_not_clicked_in_place_again(game, monkeypatch):
+    """LIVE 2026-09-22: a pre-hover parked just off the thin lever model; the in-place click
+    resolved as "Walk here", and each retry repeated the same pixel -- a safety stop in ~1s."""
+    hovers = []
+    monkeypatch.setattr(controller, "hover_entity",
+                        lambda ser, entity, **kw: hovers.append((entity.get("name"), kw.get("offset"))) or True)
+    offsets = []
+    real_click = controller.click_entity
+
+    def click_entity(ser, entity, **kw):
+        offsets.append(kw.get("offset"))
+        return real_click(ser, entity, **kw)
+    monkeypatch.setattr(controller, "click_entity", click_entity)
+    ctx = _ctx_with_events()
+    calls = {"n": 0}
+
+    def on_click(g):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            g.feed(("MENU_CLICKED", {"target": "", "tick": 5},
+                    lambda: g.last_action.update({"target": "", "tick": 5})))
+        else:
+            g.feed(("MENU_CLICKED", {"target": "Mox lever", "tick": 6},
+                    lambda: g.last_action.update({"target": "Mox lever", "tick": 6})),
+                   ("VARBIT_CHANGED", _varbit(11324, 1), lambda: g.varbits.update({11324: 1})))
+    game.on_click["Mox lever"] = on_click
+
+    assert mm._pull_lever(ctx, "mox") is True
+    assert offsets == [(0, 0), (0, 0)], "a lever is clicked at its centre"
+    assert hovers == [("Mox lever", (0, 0))], "the retry re-aims before clicking again"
 
 
 def test_make_base_prehovers_the_vessel_on_the_last_pull_and_the_next_lever_on_the_take(game, monkeypatch):
