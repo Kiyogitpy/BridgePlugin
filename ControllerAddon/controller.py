@@ -3132,6 +3132,18 @@ def hover_entity(ser: serial.Serial, entity: dict, offset=(-7, 7), refresh_targe
     sites there already pass check_ui_blockers=False.
     """
     x, y = entity.get("screenX"), entity.get("screenY")
+    # DEPART TOWARD THE LIVE PROJECTION, same fix click_entity got 2026-08-30 (see its comment):
+    # `entity` is usually a bulk-scan snapshot, so while the player walks a hover used to set off
+    # toward where the target HAD been and only get hauled forward mid-flight. USER 2026-09-22,
+    # on mixology's lever and vessel pre-hovers: "the hover not accounting for our movement ...
+    # ends up looking really strange". Falls back to the snapshot when the refresh cannot answer.
+    if refresh_target is not None:
+        try:
+            fresh = refresh_target()
+        except Exception:
+            fresh = None
+        if fresh:
+            x, y = fresh
     if x is None or y is None:
         return False
 

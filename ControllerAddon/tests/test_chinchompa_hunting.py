@@ -439,6 +439,9 @@ def test_retrieve_trap_re_aims_off_the_tile_not_an_object_scan(monkeypatch):
     passed = {}
     used = []
     monkeypatch.setattr(ch.controller, "wait_until_player_idle", lambda **kw: True)
+    # The pre-hover is not what this test is about (and hover_entity now resolves its departure
+    # through the refresh, which would otherwise spend one of the projections counted below).
+    monkeypatch.setattr(ch.controller, "hover_entity", lambda *a, **kw: True)
     monkeypatch.setattr(ch.controller, "get_object_at", lambda x, y, p, i, radius=0: trap)
     monkeypatch.setattr(ch.controller, "get_objects", lambda **kw: [_obj(9380, 2518, 9302)])
     monkeypatch.setattr(ch.controller, "click_entity",

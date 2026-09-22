@@ -1654,6 +1654,22 @@ def test_click_entity_departs_from_the_refreshed_position_not_the_stale_one(monk
     )
 
 
+def test_hover_entity_departs_from_the_refreshed_position_not_the_stale_one(monkeypatch):
+    """Same contract as click_entity's, for the pre-hover. USER 2026-09-22 (mixology levers and
+    vessel): "the hover not accounting for our movement ... ends up looking really strange"."""
+    flights = []
+    monkeypatch.setattr(controller, "move_to_human",
+                        lambda ser, x, y, **kw: flights.append((x, y)))
+    monkeypatch.setattr(controller, "is_point_within_window", lambda x, y: True)
+
+    stale = {"name": "Mox lever", "screenX": 900, "screenY": 400}
+
+    controller.hover_entity(object(), stale, offset=(0, 0),
+                            refresh_target=lambda: (1180, 660), check_ui_blockers=False)
+
+    assert flights == [(1180, 660)]
+
+
 # --- panic/pause must not depend on a single hook ---------------------------------------------
 
 def test_async_key_watchdog_fires_the_action_once_per_press(monkeypatch):

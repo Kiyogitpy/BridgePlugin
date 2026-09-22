@@ -235,8 +235,10 @@ def _paste_withdraw_harness(monkeypatch, game, stock):
     """Stub the bank around _withdraw_banked_paste and record the typed Withdraw-X amounts.
     Also asserts nothing uses banker.search_and_withdraw, which clicks once PER ITEM."""
     typed = []
-    monkeypatch.setattr(banker, "search_bank", lambda _ctx, q: True)
-    monkeypatch.setattr(banker, "clear_bank_search", lambda _ctx: True)
+    # The paste is read straight off the herb tab -- a second search_bank click toggles the
+    # first search OFF (live 2026-09-22), so the paste step must never search.
+    monkeypatch.setattr(banker, "search_bank",
+                        lambda *a, **k: pytest.fail("paste lives in the herb tab -- never search"))
     monkeypatch.setattr(banker, "search_and_withdraw",
                         lambda *a, **k: pytest.fail("search_and_withdraw clicks once per item"))
     # The bank always holds 'Swamp paste' -- an exact-name match must never select it.
@@ -787,6 +789,8 @@ def game(monkeypatch):
     monkeypatch.setattr(controller, "get_graphics_objects", lambda fresh=False: list(g.graphics))
     monkeypatch.setattr(controller, "object_refresh_target", lambda *a, **k: (lambda: None))
     monkeypatch.setattr(controller, "hover_entity", lambda ser, entity, **kw: True)
+    monkeypatch.setattr(controller, "get_player", lambda: {"moving": False})
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (0, 0))
     monkeypatch.setattr(controller, "human_delay", lambda a, b: None)
     monkeypatch.setattr(controller, "sample_human_delay", lambda a, b: 0.0)
     monkeypatch.setattr(controller, "wait_until_player_idle", lambda **kw: True)
@@ -1160,21 +1164,58 @@ def test_retort_speedup_stops_once_the_station_holds_a_DIFFERENT_potion(game, mo
     assert game.in_place == 1, "clicks must stop the moment the station is not on our potion"
 
 
-def test_station_hover_waits_for_the_projection_to_stop_sliding(game, monkeypatch):
-    """USER 2026-09-17: "we dont wait until we are stopped to hover meaning the cursor slips
-    out" -- a hover taken mid-walk aims at a projection that keeps moving."""
+def test_station_hover_follows_the_target_while_the_player_walks(game, monkeypatch):
+    """USER 2026-09-22: "the hover not accounting for our movement in a few tasks like levers and
+    take from mixing vessel, ends up looking really strange" -- the old 0.4s settle parked the
+    cursor mid-walk and left it behind. The cursor now goes at once and re-aims each time the
+    projection drifts, until the player has stopped and the projection agrees twice."""
     moving = iter([(100, 100), (140, 160), (180, 220), (200, 240), (200, 240), (200, 240)])
     monkeypatch.setattr(mm, "_refresh_for", lambda e: (lambda: next(moving, (200, 240))))
+    walking = iter([True, True, True, False, False, False])
+    monkeypatch.setattr(controller, "get_player", lambda: {"moving": next(walking, False)})
+    cursor = {"pos": (0, 0)}
     hovered = []
-    monkeypatch.setattr(controller, "hover_entity",
-                        lambda ser, entity, **kw: hovered.append(entity.get("name")) or True)
+
+    def hover_entity(ser, entity, **kw):
+        off = kw.get("offset", (-7, 7))
+        cursor["pos"] = (entity["screenX"] + off[0], entity["screenY"] + off[1])
+        hovered.append((entity["screenX"], entity["screenY"]))
+        return True
+    monkeypatch.setattr(controller, "hover_entity", hover_entity)
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: cursor["pos"])
     ctx = FakeCtx()
 
     mm._hover_when_settled(ctx, "Retort", check_ui_blockers=False)
 
-    # It waited out the three moving reads and only parked once two agreed.
+    # Went at once, followed each slide, and did not re-aim once the projection stood still.
+    assert hovered == [(100, 100), (140, 160), (180, 220), (200, 240)]
+    assert cursor["pos"] == (193, 247)
+
+
+def test_station_hover_on_a_still_player_costs_only_the_settle(game, monkeypatch):
+    """The levers stand side by side: no walk, so the follow must not hold the cursor for the
+    track ceiling (USER 2026-09-17: "significantly slower on the lever" at a 1.2s cap)."""
+    monkeypatch.setattr(mm, "_refresh_for", lambda e: (lambda: (200, 240)))
+    hovered = []
+    monkeypatch.setattr(controller, "hover_entity",
+                        lambda ser, entity, **kw: hovered.append(entity.get("name")) or True)
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: (193, 247))
+    ctx = FakeCtx()
+
+    mm._hover_when_settled(ctx, "Retort", check_ui_blockers=False)
+
     assert hovered == ["Retort"]
-    assert game.clock["t"] >= 1000.0 + mm.HOVER_SETTLE_POLL_S * 3
+    assert game.clock["t"] <= 1000.0 + mm.HOVER_SETTLE_POLL_S * 2
+
+
+def test_station_hover_gives_up_following_at_the_ceiling(game, monkeypatch):
+    monkeypatch.setattr(mm, "_refresh_for", lambda e: (lambda: (200, 240)))
+    monkeypatch.setattr(controller, "get_player", lambda: {"moving": True})   # never arrives
+    ctx = FakeCtx()
+
+    mm._hover_when_settled(ctx, "Retort", check_ui_blockers=False)
+
+    assert game.clock["t"] <= 1000.0 + mm.HOVER_TRACK_MAX_S + mm.HOVER_SETTLE_POLL_S
 
 
 def test_retort_speedup_stops_when_http_says_the_station_is_empty(game):

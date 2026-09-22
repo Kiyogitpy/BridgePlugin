@@ -200,6 +200,11 @@ RESTART_CONFIRM_S = 3.0         # restart click -> progress moving again / the p
 HOVER_SETTLE_MAX_S = 0.4        # the walk-in plus the camera glide; past this, hover anyway
 HOVER_SETTLE_POLL_S = 0.08
 HOVER_SETTLE_PX = 3             # two consecutive projection reads this close = settled
+# FOLLOWING the target while the player walks (2026-09-22, see _hover_when_settled). The track
+# runs only while /player says we are moving, so a still player pays the old settle and no more;
+# the ceiling is the longest in-lab walk (vessel -> Retort/belt is ~5 tiles) with margin.
+HOVER_TRACK_MAX_S = 3.5
+HOVER_TRACK_DRIFT_PX = 6        # re-aim past this: under CLICK_IN_PLACE_RADIUS_PX (12) with jitter
 
 # Where the stations stand (hex-agon plugin's AlchemyObject, world tiles): vessel (1394,9326),
 # Alembic (1391,9325), Agitator (1393,9329), Retort (1397,9325), belt (1394,9331). The Retort
@@ -387,8 +392,14 @@ def _hover_object(ctx, name: str, exclude: str = None, **kwargs):
     return entity
 
 
+def _player_moving() -> bool:
+    """/player's per-frame `moving` flag (uncached). False when unreadable, so a bridge hiccup
+    ends a track early rather than holding it to the ceiling."""
+    return bool((controller.get_player() or {}).get("moving"))
+
+
 def _hover_when_settled(ctx, station_name: str, **kwargs):
-    """Park the cursor on an object only once its projection has STOPPED MOVING.
+    """Park the cursor on an object and KEEP it there while the player walks up to it.
 
     USER 2026-09-17, watching it live: "we dont wait until we are stopped to hover meaning the
     cursor slips out". The hover that parks the cursor for a station's speedup is taken right
@@ -399,26 +410,63 @@ def _hover_when_settled(ctx, station_name: str, **kwargs):
     pre-hovers: "still doing hovering on the levers without settling so they are pointless" --
     so this is used for EVERY anticipatory hover, not just the station parks.
 
-    Two consecutive projection reads within HOVER_SETTLE_PX mean it has stopped, which costs
-    only two reads (~0.16s) when the projection is already still -- and when it is NOT still the
-    hover was going to be wasted anyway. Past HOVER_SETTLE_MAX_S the hover is taken regardless:
-    a late hover still beats no hover, and _click_station_in_place verifies before committing."""
+    REWRITTEN 2026-09-22 (USER: "the hover not accounting for our movement in a few tasks like
+    levers and take from mixing vessel, ends up looking really strange"). The settle above was
+    capped at HOVER_SETTLE_MAX_S (0.4s, kept short because the levers paid it nine times a
+    cycle), and a walk to the lever or the vessel lasts longer than that -- so the hover parked
+    mid-walk on a projection still sliding, the cursor was left behind as the player carried on,
+    and the next click flew after it. hover_entity also departed toward the bulk-scan SNAPSHOT
+    (fixed there). Now the cursor goes to the target at once and FOLLOWS it -- one short re-aim
+    whenever the live projection drifts past HOVER_TRACK_DRIFT_PX -- for as long as /player
+    reports the player moving, up to HOVER_TRACK_MAX_S. The time is not lost: every caller's
+    next outcome (the pull landing, the take, the station start) needs the player to arrive
+    first. A still player (the levers stand side by side) takes the old two-read settle.
+    Past the ceiling the hover stands regardless: _click_station_in_place and click_entity's
+    in-place test both verify before committing."""
     entity = find_object(station_name)
     if entity is None:
         return None
     refresh = _refresh_for(entity)
-    if refresh is not None:
-        prev = None
-        deadline = _now() + HOVER_SETTLE_MAX_S
-        while _now() < deadline:
-            cur = refresh()
-            if (cur is not None and prev is not None
-                    and abs(cur[0] - prev[0]) <= HOVER_SETTLE_PX
-                    and abs(cur[1] - prev[1]) <= HOVER_SETTLE_PX):
-                break
-            prev = cur
-            _sleep(HOVER_SETTLE_POLL_S)
-    return _hover_object(ctx, station_name, **kwargs)
+    if refresh is None:
+        return _hover_object(ctx, station_name, **kwargs)
+
+    offset = kwargs.get("offset", (-7, 7))
+    hovered = False
+    prev = None
+    still_reads = 0
+    deadline = _now() + HOVER_TRACK_MAX_S
+    while True:
+        cur = refresh()
+        if cur is None:
+            break                          # unresolvable (gone, off-scene): the fallback below
+        else:
+            aim =(int(cur[0]) + offset[0], int(cur[1]) + offset[1])
+            drifted = True
+            if hovered:
+                cx, cy = controller.get_cursor_pos()
+                drifted = abs(aim[0] - cx) > HOVER_TRACK_DRIFT_PX or abs(aim[1] - cy) > HOVER_TRACK_DRIFT_PX
+            if drifted:
+                target = dict(entity, screenX=int(cur[0]), screenY=int(cur[1]))
+                hovered = controller.hover_entity(ctx.ser, target, refresh_target=refresh, **kwargs) or hovered
+        if _player_moving():
+            still_reads = 0
+        else:
+            still_reads += 1
+        settled = (cur is not None and prev is not None
+                   and abs(cur[0] - prev[0]) <= HOVER_SETTLE_PX
+                   and abs(cur[1] - prev[1]) <= HOVER_SETTLE_PX)
+        # Stopped walking AND the projection has stopped sliding (the camera glide outlasts the
+        # walk by a frame or two). A projection that never converges -- the lab's camera -- is
+        # what HOVER_SETTLE_MAX_S bounded before; still_reads bounds it the same way here.
+        if hovered and still_reads >= 1 and (settled or still_reads * HOVER_SETTLE_POLL_S >= HOVER_SETTLE_MAX_S):
+            break
+        if _now() >= deadline:
+            break
+        prev = cur
+        _sleep(HOVER_SETTLE_POLL_S)
+    if not hovered:
+        return _hover_object(ctx, station_name, **kwargs)
+    return entity
 
 
 def _click_station_in_place(ctx, station_name: str) -> bool:
@@ -531,6 +579,18 @@ def bank_herbs_phase(ctx, config: dict) -> None:
             _await(ctx, "INVENTORY_CHANGED", 1.5, confirm=lambda: not controller.get_inventory(),
                    since=mark)
 
+    # CONFIRMED live 2026-08-12 (user report): searching each configured herb name one at a
+    # time raced against reality (a candidate in stock at selection time could be out of stock by
+    # the click-specific read). Tab 8 (user's own dedicated herb-storage tab) surfaces every herb
+    # in one view, so candidate selection and the withdrawal read the same live state.
+    # MOVED AHEAD OF THE PASTE STEP 2026-09-22 (USER: "No need to search for mox etc its also in
+    # the herb tab"): banked paste sits in tab 8 too, so one tab switch serves both steps and the
+    # bank search is gone entirely -- see _withdraw_banked_paste for the live failure it caused.
+    if not banker.switch_bank_tab(ctx, 8):
+        banker.close_bank(ctx)
+        ctx.state.trigger_safety_stop("could not switch to the herb bank tab")
+        return
+
     # BANKED PASTE FIRST. It is already refined, so it goes straight to the hopper -- no herbs to
     # withdraw, clean or refine. Whatever the bank cannot cover falls through to the herb path
     # below, so a half-stocked paste type still works.
@@ -544,15 +604,6 @@ def bank_herbs_phase(ctx, config: dict) -> None:
     # every slot here holds a raw herb, nothing else competes for the space during this phase.
     # Computed AFTER the paste step, over the types it could not cover.
     per_type_qty = 28 // len(needed_types)
-
-    # CONFIRMED live 2026-08-12 (user report): searching each configured herb name one at a
-    # time raced against reality (a candidate in stock at selection time could be out of stock by
-    # the click-specific read). Tab 8 (user's own dedicated herb-storage tab) surfaces every herb
-    # in one view, so candidate selection and the withdrawal read the same live state.
-    if not banker.switch_bank_tab(ctx, 8):
-        banker.close_bank(ctx)
-        ctx.state.trigger_safety_stop("could not switch to the herb bank tab")
-        return
 
     bank_contents = controller.get_bank(fresh=True).get("items", [])
     chosen_names = {}
@@ -635,9 +686,16 @@ def _withdraw_banked_paste(ctx, needed_types, hopper, target):
     inventory slots however much is taken -- the quantity asked for is the hopper's actual
     shortfall rather than a slot count.
 
-    banker.search_bank is what scrolls the item into a clickable position (`/bank` only reports
-    what the interface is DRAWING), and the slot is then matched on EXACT name -- 'Mox paste' must
-    never select the 'Swamp paste' this account also banks 547 of.
+    Reads the herb tab (tab 8) the caller has already switched to -- the paste is stored there
+    alongside the herbs, and `/bank` only reports what the interface is DRAWING. The slot is
+    matched on EXACT name -- 'Mox paste' must never select the 'Swamp paste' this account also
+    banks 547 of.
+
+    NO BANK SEARCH, deliberately (2026-09-22). This used to banker.search_bank each paste name in
+    turn, and LIVE the second search broke the trip: clicking the search icon while the previous
+    search is still up TOGGLES THE SEARCH OFF (clear_bank_search relies on exactly that), so 'Aga
+    paste' was typed into nothing, and the following tab switch found no tab buttons and
+    safety-stopped with 'could not switch to the herb bank tab'.
 
     The withdrawal is Withdraw-X with a typed amount, NOT banker.search_and_withdraw: that helper
     sets quantity mode to "one" and clicks once per item, so asking it for a shortfall of 800
@@ -657,9 +715,6 @@ def _withdraw_banked_paste(ctx, needed_types, hopper, target):
             return sum((i.get("qty") or 1) for i in controller.get_inventory()
                        if i.get("id") == _id)
 
-        if not banker.search_bank(ctx, name):
-            remaining.append(paste_type)
-            continue
         slot = next(
             (s for s in controller.get_bank(fresh=True).get("items", [])
              if (s.get("name") or "").lower() == name.lower() and s.get("qty", 0) > 0),
@@ -687,7 +742,6 @@ def _withdraw_banked_paste(ctx, needed_types, hopper, target):
             debug_log.log("mixology", f"withdrawal of '{name}' didn't confirm landing")
             remaining.append(paste_type)
 
-    banker.clear_bank_search(ctx)
     if withdrew:
         debug_log.log("mixology", f"withdrew banked paste {withdrew} -- straight to the hopper, no refining")
     return remaining
