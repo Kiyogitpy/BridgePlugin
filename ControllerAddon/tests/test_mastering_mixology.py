@@ -1222,6 +1222,28 @@ def test_station_hover_follow_ends_the_moment_the_outcome_lands(game, monkeypatc
     assert game.clock["t"] <= 1000.0 + mm.HOVER_SETTLE_POLL_S * 2
 
 
+def test_station_hover_keeps_following_the_camera_glide_after_the_outcome(game, monkeypatch):
+    """Run e 2026-09-22: the pull lands on arrival, but the camera is still gliding; the next
+    lever slid ~25px after the follow had stopped and its in-place click missed."""
+    sliding = iter([(200, 240), (200, 230), (200, 220), (200, 215), (200, 215)])
+    monkeypatch.setattr(mm, "_refresh_for", lambda e: (lambda: next(sliding, (200, 215))))
+    cursor = {"pos": (0, 0)}
+
+    def hover_entity(ser, entity, **kw):
+        off = kw.get("offset", (-7, 7))
+        cursor["pos"] = (entity["screenX"] + off[0], entity["screenY"] + off[1])
+        return True
+    monkeypatch.setattr(controller, "hover_entity", hover_entity)
+    monkeypatch.setattr(controller, "get_cursor_pos", lambda: cursor["pos"])
+    ctx = FakeCtx()
+
+    mm._hover_when_settled(ctx, "Retort", check_ui_blockers=False, stop=lambda: True)
+
+    # The glide ended at (200, 215): the cursor must be within the drift tolerance of that aim,
+    # not left on the 240 the outcome landed at.
+    assert abs(cursor["pos"][1] - (215 + 7)) <= mm.HOVER_TRACK_DRIFT_PX
+
+
 def test_station_hover_gives_up_following_at_the_ceiling(game, monkeypatch):
     monkeypatch.setattr(mm, "_refresh_for", lambda e: (lambda: (200, 240)))
     monkeypatch.setattr(controller, "get_player", lambda: {"moving": True})   # never arrives

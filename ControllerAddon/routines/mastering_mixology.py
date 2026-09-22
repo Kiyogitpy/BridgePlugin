@@ -452,6 +452,7 @@ def _hover_when_settled(ctx, station_name: str, stop=None, **kwargs):
     prev = None
     still_reads = 0
     deadline = _now() + HOVER_TRACK_MAX_S
+    landed_by = None           # once `stop` holds: the deadline for the camera glide to settle
     while True:
         cur = refresh()
         if cur is None:
@@ -465,8 +466,8 @@ def _hover_when_settled(ctx, station_name: str, stop=None, **kwargs):
             if drifted:
                 target = dict(entity, screenX=int(cur[0]), screenY=int(cur[1]))
                 hovered = controller.hover_entity(ctx.ser, target, refresh_target=refresh, **kwargs) or hovered
-        if hovered and stop is not None and stop():
-            break
+        if hovered and landed_by is None and stop is not None and stop():
+            landed_by = _now() + HOVER_SETTLE_MAX_S
         if _player_moving():
             still_reads = 0
         else:
@@ -474,6 +475,13 @@ def _hover_when_settled(ctx, station_name: str, stop=None, **kwargs):
         settled = (cur is not None and prev is not None
                    and abs(cur[0] - prev[0]) <= HOVER_SETTLE_PX
                    and abs(cur[1] - prev[1]) <= HOVER_SETTLE_PX)
+        # The outcome landed: the player has arrived, but the camera is still gliding after it.
+        # MEASURED runs e 2026-09-22: ending the follow AT the outcome left the second lever of
+        # a run clicked in place ~20-30px below where it had slid to ("Walk here", retry lands
+        # at the re-aimed point 0.3s later) -- 7 retries in 19 cycles. So follow on until the
+        # projection agrees twice, bounded by the same settle ceiling as ever.
+        if landed_by is not None and (settled or _now() >= landed_by):
+            break
         # Stopped walking AND the projection has stopped sliding (the camera glide outlasts the
         # walk by a frame or two). A projection that never converges -- the lab's camera -- is
         # what HOVER_SETTLE_MAX_S bounded before; still_reads bounds it the same way here.
