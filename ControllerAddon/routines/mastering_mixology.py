@@ -1067,10 +1067,14 @@ def _pull_lever(ctx, paste: str, next_name: str = None) -> bool:
         baseline_was_this_lever = want in (baseline.get("target") or "").lower()
         slots_before = _mixer_slots()
         mark = _mark(ctx)
-        if attempt > 0:
-            # The last click MISSED from where the cursor is resting, so a click "in place" would
-            # only repeat it (LIVE 2026-09-22: three identical misses and a safety stop). Re-aim
-            # at the lever's live centre first; the click below then goes from there.
+        # Re-aim at the lever's live centre whenever the cursor is not provably ON it: after a
+        # miss (a click "in place" would only repeat it -- LIVE 2026-09-22, three identical misses
+        # and a safety stop), and before the first click too, because the parked pre-hover can
+        # sit just off the thin model. MEASURED runs c/d 2026-09-22: 32 single retries in 83
+        # cycles, every one an in-place click from a parked cursor resolving as "Walk here". One
+        # /hover read at rest (tries=1: a far cursor is an expected mismatch, not a stale frame);
+        # hover_matches answers True when it cannot verify, so nothing new can block.
+        if attempt > 0 or not controller.hover_matches(expected_target=lever_name, tries=1):
             _hover_object(ctx, lever_name, check_ui_blockers=False, offset=(0, 0))
         lever = _click_object(ctx, lever_name, check_ui_blockers=False, offset=_aim_offset(lever_name))
         if lever is None:

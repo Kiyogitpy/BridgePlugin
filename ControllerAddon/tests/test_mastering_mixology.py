@@ -1584,6 +1584,22 @@ def test_a_retry_landing_in_the_same_tick_as_the_miss_still_confirms(game, monke
     assert calls["n"] == 2
 
 
+def test_a_parked_cursor_off_the_lever_is_re_aimed_before_the_first_click(game, monkeypatch):
+    hovers = []
+    monkeypatch.setattr(controller, "hover_entity",
+                        lambda ser, entity, **kw: hovers.append(kw.get("offset")) or True)
+    game.hover_ok = False                      # /hover names something else under the cursor
+    ctx = _ctx_with_events()
+    game.on_click["Mox lever"] = lambda g: (
+        g.feed(("MENU_CLICKED", {"target": "Mox lever", "tick": 5},
+                lambda: g.last_action.update({"target": "Mox lever", "tick": 5}))),
+        g.feed(("VARBIT_CHANGED", _varbit(11324, 1), lambda: g.varbits.update({11324: 1}))),
+    )
+    assert mm._pull_lever(ctx, "mox") is True
+    assert hovers == [(0, 0)], "one centred re-aim, then the click"
+    assert game.clicks == ["Mox lever"]
+
+
 def test_make_base_prehovers_the_vessel_on_the_last_pull_and_the_next_lever_on_the_take(game, monkeypatch):
     hovers = []
     monkeypatch.setattr(controller, "hover_entity",
