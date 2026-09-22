@@ -681,7 +681,7 @@ file of the form "see the X.py section/notes" point there. One-line status:
 | `mining_guild_iron.py` | Live-debugged to 1674 ore/hr (2026-09-11); 52-min unattended run clean |
 | `blast_furnace.py` | Live: gold 24-25s/trip, adamantite 2-trip cycle ~48s (2026-09-04) |
 | `giants_foundry.py` | Full loop unattended live (2026-09-03/04), incl. metal substitution |
-| `mastering_mixology.py` | Was working live 2026-08-13; 2026-09-06 event-driven rewrite NOT yet run live |
+| `mastering_mixology.py` | Event-driven version ran unattended 2h live 2026-09-22 (128 cycles, ~48s median) until the bank ran out of lye herbs; last hover fix (camera glide) not yet run live. Report: `docs/mixology-live-2026-09-22.md` |
 | `motherlode_mine.py` | Whole loop verified live 2026-09-07 (mine/hopper/sack/bank); repairs and breaks unrun |
 | `mining.py` / `woodcutting.py` (`gathering.py`) | Shared loop; mining live-proven, woodcutting first live run OK 2026-09-08 |
 | `shipwreck_salvaging.py` | Last live 2026-08-05; three offline passes since NOT run live, needs client rebuild |

@@ -1469,6 +1469,14 @@ MEASURED that day, and the quality work is where the session ended.
 
 ## Current state of routines/mastering_mixology.py
 
+**2026-09-22: the event-driven version RAN LIVE, unattended, for about 2 hours** (128 cycles,
+median about 48 s, 7 hopper refills), ending on the intended no-lye-herbs stop. Five fixes that
+day: paste read off tab 8 (no bank search), pre-hovers FOLLOW the target while walking (and
+`hover_entity` departs toward the live projection), levers aimed at the centre, the
+same-tick lever verdict, and the follow continuing through the camera glide (NOT yet run live).
+Full report with numbers: `docs/mixology-live-2026-09-22.md`. MEASURED: `/player.moving` reads
+false a full tick AFTER arrival, so it is not an arrival signal.
+
 Live-debugged to a working state 2026-08-12/13 (every MEASURED fact from those sessions is in the
 module docstring and the per-function comments), then **converted to event-driven outcomes
 2026-09-06 (USER: "make it as tick perfect as can be with our new events"). Not yet run live in
