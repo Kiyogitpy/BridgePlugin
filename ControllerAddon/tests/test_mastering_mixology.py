@@ -1563,6 +1563,27 @@ def test_a_missed_lever_pull_is_re_aimed_at_the_centre_not_clicked_in_place_agai
     assert hovers == [("Mox lever", (0, 0))], "the retry re-aims before clicking again"
 
 
+def test_a_retry_landing_in_the_same_tick_as_the_miss_still_confirms(game, monkeypatch):
+    """LIVE 2026-09-22: the miss ('Walk here', target '') and the retry's hit share one game
+    tick; the tick-only verdict threw the hit away."""
+    ctx = _ctx_with_events()
+    calls = {"n": 0}
+
+    def on_click(g):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            g.feed(("MENU_CLICKED", {"target": "", "tick": 5},
+                    lambda: g.last_action.update({"target": "", "tick": 5})))
+        else:
+            g.feed(("MENU_CLICKED", {"target": "Mox lever", "tick": 5},
+                    lambda: g.last_action.update({"target": "Mox lever", "tick": 5})),
+                   ("VARBIT_CHANGED", _varbit(11324, 1), lambda: g.varbits.update({11324: 1})))
+    game.on_click["Mox lever"] = on_click
+
+    assert mm._pull_lever(ctx, "mox") is True
+    assert calls["n"] == 2
+
+
 def test_make_base_prehovers_the_vessel_on_the_last_pull_and_the_next_lever_on_the_take(game, monkeypatch):
     hovers = []
     monkeypatch.setattr(controller, "hover_entity",

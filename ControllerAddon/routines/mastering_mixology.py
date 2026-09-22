@@ -1062,7 +1062,9 @@ def _pull_lever(ctx, paste: str, next_name: str = None) -> bool:
     lever_name = LEVER_NAMES[paste]
     want = lever_name.lower()
     for attempt in range(LEVER_PULL_MAX_ATTEMPTS):
-        baseline_tick = controller.get_last_action().get("tick")
+        baseline = controller.get_last_action()
+        baseline_tick = baseline.get("tick")
+        baseline_was_this_lever = want in (baseline.get("target") or "").lower()
         slots_before = _mixer_slots()
         mark = _mark(ctx)
         if attempt > 0:
@@ -1078,10 +1080,16 @@ def _pull_lever(ctx, paste: str, next_name: str = None) -> bool:
         def verdict_ok():
             action = controller.get_last_action()
             tick = action.get("tick")
+            # A newer tick, OR the same tick with the target CHANGED to this lever. /last-action
+            # carries no per-click sequence, and LIVE 2026-09-22 a retry fired 0.27s after a
+            # missed click landed in the SAME game tick: 'Operate / Mox lever' was on screen and
+            # the tick-only test rejected it -- one attempt from a safety stop. A baseline that
+            # already named this lever on this tick is still rejected (that click is not ours).
             return (
                 tick is not None
-                and (baseline_tick is None or tick > baseline_tick)
                 and want in (action.get("target") or "").lower()
+                and (baseline_tick is None or tick > baseline_tick
+                     or (tick == baseline_tick and not baseline_was_this_lever))
             )
 
         # shorten: ANY MENU_CLICKED is the game's verdict -- one for the wrong target means the
