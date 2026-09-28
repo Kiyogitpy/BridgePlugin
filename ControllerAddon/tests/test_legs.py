@@ -90,27 +90,67 @@ def test_a_poh_pool_leg_delegates_to_poh_drink_pool_and_never_fails_when_it_retu
     assert legs.run_next(_Ctx(), [legs.pool()], 0) == (legs.FAILED, 0)
 
 
-def test_a_poh_box_leg_confirms_arrival_after_use_box_succeeds(monkeypatch):
+IN_HOUSE = {"x": 1933, "y": 7105, "plane": 1, "instPlane": 0, "inInstance": True,
+            "instX": 11669, "instY": 1449, "regionId": 7791}          # MEASURED 2026-09-20
+
+
+@pytest.fixture
+def in_the_house(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: dict(IN_HOUSE))
+
+
+def test_a_poh_box_leg_confirms_arrival_after_use_box_succeeds(monkeypatch, in_the_house):
     seen = {}
     monkeypatch.setattr(poh, "use_box", lambda ctx, option, log: seen.setdefault("option", option) or True)
     monkeypatch.setattr(poh, "await_left_house", lambda budget_s: seen.setdefault("budget", budget_s) or True)
     leg = legs.house_box("Cooking Guild", (3143, 3442, 0))
     assert legs.run_next(_Ctx(), [leg], 0) == (legs.DONE, 1)
-    assert seen == {"option": "Cooking Guild", "budget": legs.ITEM_BUDGET_S}, \
+    assert seen == {"option": "Cooking Guild", "budget": poh.ENTER_BUDGET_S}, \
         "confirmed by LEAVING THE HOUSE, not by a landing tile our own tables disagree about"
 
 
-def test_a_poh_box_leg_fails_when_use_box_fails(monkeypatch):
+def test_a_poh_box_leg_fails_when_use_box_fails(monkeypatch, in_the_house):
     monkeypatch.setattr(poh, "use_box", lambda ctx, option, log: False)
     leg = legs.house_box("Cooking Guild", (3143, 3442, 0))
     assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
 
 
-def test_a_poh_box_leg_fails_when_the_landing_never_confirms(monkeypatch):
+def test_a_poh_box_leg_fails_when_the_landing_never_confirms(monkeypatch, in_the_house):
     monkeypatch.setattr(poh, "use_box", lambda ctx, option, log: True)
     monkeypatch.setattr(poh, "await_left_house", lambda budget_s: False)
     leg = legs.house_box("Cooking Guild", (3143, 3442, 0))
     assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
+
+
+def test_a_house_hop_that_landed_after_the_wait_is_done_on_the_retry_not_failed(monkeypatch):
+    """Phase-B fix-wave re-review: the landing outran the wait, the leg FAILED, and on the retry
+    the box is not in the scene out here -- three FAILs and a safety stop after a GOOD teleport.
+    The mounted pendant leg has the same shape."""
+    monkeypatch.setattr(controller, "get_player",
+                        lambda: {"x": 3143, "y": 3442, "plane": 0, "inInstance": False})
+    used = []
+    monkeypatch.setattr(poh, "use_box", lambda ctx, option, log: used.append(1) or False)
+    monkeypatch.setattr(poh, "use_mounted", lambda ctx, name, action, log: used.append(2) or False)
+    assert legs.run_next(_Ctx(), [legs.house_box("Cooking Guild", (3143, 3442, 0))], 0) == (legs.DONE, 1)
+    assert legs.run_next(_Ctx(), [legs.house_mounted("digsite pendant", "Digsite", (3341, 3445, 0))], 0) \
+        == (legs.DONE, 1)
+    assert used == [], "no second click on an object that is not there"
+
+
+def test_a_house_hop_leg_on_an_empty_player_read_does_not_count_as_hopped(monkeypatch):
+    monkeypatch.setattr(controller, "get_player", lambda: {})
+    monkeypatch.setattr(poh, "use_box", lambda ctx, option, log: False)
+    assert legs.run_next(_Ctx(), [legs.house_box("Cooking Guild", (3143, 3442, 0))], 0) == (legs.FAILED, 0)
+
+
+def test_a_tablet_landing_still_pending_is_progress_not_a_failure(monkeypatch):
+    """Phase-B fix-wave re-review: enter() refuses a second tablet for 60 s, so a slow landing
+    used to spend all three FAILED retries in about a second."""
+    monkeypatch.setattr(poh, "enter", lambda ctx, log: False)
+    monkeypatch.setattr(poh, "landing_pending", lambda ctx: True)
+    assert legs.run_next(_Ctx(), [legs.house()], 0) == (legs.PROGRESS, 0)
+    monkeypatch.setattr(poh, "landing_pending", lambda ctx: False)
+    assert legs.run_next(_Ctx(), [legs.house()], 0) == (legs.FAILED, 0)
 
 
 def test_a_poh_ring_leg_reports_progress_while_the_hop_is_underway(monkeypatch):
@@ -705,7 +745,7 @@ def test_a_spell_that_is_not_clickable_or_never_lands_fails_the_leg(monkeypatch)
     assert legs.run_next(_Ctx(), [leg], 0) == (legs.FAILED, 0)
 
 
-def test_a_mounted_house_item_leg_is_confirmed_by_leaving_the_house(monkeypatch):
+def test_a_mounted_house_item_leg_is_confirmed_by_leaving_the_house(monkeypatch, in_the_house):
     seen = []
     monkeypatch.setattr(poh, "use_mounted", lambda ctx, name, action, log: seen.append((name, action)) or True)
     monkeypatch.setattr(poh, "await_left_house", lambda budget_s: True)

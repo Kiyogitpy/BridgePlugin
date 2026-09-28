@@ -79,8 +79,14 @@ MENU_ROW = re.compile(r"^\s*(\d+)\s*:\s*(.+?)\s*$")
 #: case-insensitively: the two objects disagree about capitalising "menu".
 MENU_ACTION = "teleport menu"
 TABLET_COOLDOWN_S = 60.0       # never break a second tablet this soon after the last one
-HOUSE_REGIONS = (7791,)        # MEASURED 2026-09-20 on this account's house
-HOUSE_TEMPLATE_BOX = (1850, 2050, 7000, 7200)   # x0, x1, y0, y1 -- the POH template chunks
+# 7791 MEASURED 2026-09-20 on this account's house. 7769 and the y~5700 box are NOT measured:
+# vendor/teleportation_items.tsv puts the inside-the-house tablet landing at (1923,5709), region
+# 7769, where the classic POH room templates live (phase-B fix-wave re-review, 2026-09-28). A house
+# built from those chunks would otherwise never confirm. Both still need inInstance, so an
+# overworld tile there can never read as a house.
+HOUSE_REGIONS = (7791, 7769)
+HOUSE_TEMPLATE_BOXES = ((1850, 2050, 7000, 7200),               # x0, x1, y0, y1
+                        (1850, 2050, 5690, 5770))
 TELEPORT_INSIDE_VARBIT = 4744  # vendor/teleportation_items.tsv: 0 = a plain Break lands INSIDE
 
 
@@ -129,8 +135,9 @@ def is_house_player(player) -> bool:
     if player.get("regionId") in HOUSE_REGIONS:
         return True
     x, y = player.get("x"), player.get("y")
-    x0, x1, y0, y1 = HOUSE_TEMPLATE_BOX
-    return x is not None and y is not None and x0 <= x <= x1 and y0 <= y <= y1
+    if x is None or y is None:
+        return False
+    return any(x0 <= x <= x1 and y0 <= y <= y1 for x0, x1, y0, y1 in HOUSE_TEMPLATE_BOXES)
 
 
 def in_house(player=None) -> bool:
@@ -145,10 +152,32 @@ def tablets_held() -> int:
                if TABLET in (i.get("name") or "").lower())
 
 
+def landing_pending(ctx) -> bool:
+    """A tablet was SPENT inside TABLET_COOLDOWN_S and the house has not been confirmed since.
+    The caller should wait and re-check rather than count a failure: enter() refuses a second
+    tablet in that window, so a landing slower than ENTER_BUDGET_S used to spend all three travel
+    retries in about a second and safety-stop after a GOOD teleport (phase-B fix-wave re-review,
+    2026-09-28). A tablet that was never actually spent is not pending -- enter() retries that
+    itself (FOUND LIVE 2026-09-21).
+
+    Kept in ctx.state.data, which resets on a restart or a panel hot-swap of the routine file, so
+    a restart right after an unconfirmed tablet can break a second one. Accepted: bounded at one."""
+    at = ctx.state.data.get("poh_tablet_at")
+    if at is None or time.time() - at >= TABLET_COOLDOWN_S:
+        return False
+    before = ctx.state.data.get("poh_tablets_before")
+    return before is None or tablets_held() < before
+
+
+def _confirmed(ctx) -> bool:
+    ctx.state.data.pop("poh_tablet_at", None)   # a confirmed landing ends the cooldown
+    return True
+
+
 def enter(ctx, log: str = "poh") -> bool:
     """Break a house tablet if we are not already inside. True once `in_house` confirms it."""
     if in_house():
-        return True
+        return _confirmed(ctx)
     item = next((i for i in (controller.get_inventory() or [])
                  if TABLET in (i.get("name") or "").lower()), None)
     if item is None:
@@ -172,9 +201,15 @@ def enter(ctx, log: str = "poh") -> bool:
                                f"never confirmed -- not breaking another")
             return False
     # 4744 = 1 means a plain Break lands OUTSIDE at the portal (its "(Inside)" row is a separate
-    # menu option), where in_house() stays False forever. None = unreadable: carry on.
+    # menu option), where in_house() stays False forever. Unreadable fails CLOSED, like every other
+    # varbit gate here (phase-B fix-wave re-review): carrying on could spend a tablet on an
+    # account whose teleports land outside.
     setting = controller.get_varbit(TELEPORT_INSIDE_VARBIT)
-    if setting not in (None, 0):
+    if setting is None:
+        debug_log.log(log, f"varbit {TELEPORT_INSIDE_VARBIT} (house teleports land inside?) is "
+                           f"unreadable -- refusing to break a tablet on a guess")
+        return False
+    if setting != 0:
         debug_log.log(log, f"varbit {TELEPORT_INSIDE_VARBIT} = {setting}: house teleports land "
                            f"OUTSIDE the portal on this account -- refusing to break a tablet")
         return False
@@ -203,7 +238,7 @@ def enter(ctx, log: str = "poh") -> bool:
     deadline = time.time() + ENTER_BUDGET_S
     while time.time() < deadline:
         if in_house():
-            return True
+            return _confirmed(ctx)
         time.sleep(POLL_S)
     debug_log.log(log, f"never confirmed inside the house within {ENTER_BUDGET_S}s of breaking the tablet")
     return False
@@ -438,6 +473,12 @@ def use_mounted(ctx, name_fragment, action, log: str = "poh") -> bool:
     return False
 
 
+def is_outside_house(player) -> bool:
+    """A READ position that is not the house. An empty or failed read is NOT outside -- during a
+    LOADING flicker the bridge answers nothing, and that must never count as having left."""
+    return bool(player) and player.get("x") is not None and not is_house_player(player)
+
+
 def await_left_house(budget_s: float) -> bool:
     """True once /player no longer reads as inside the house. How a jewellery-box hop is confirmed:
     landing tiles disagree between our own vendored tables (Mining Guild is 28 tiles apart in
@@ -445,8 +486,7 @@ def await_left_house(budget_s: float) -> bool:
     and the walk leg that follows re-plans from wherever we really are."""
     deadline = time.time() + budget_s
     while time.time() < deadline:
-        player = controller.get_player()
-        if player and player.get("x") is not None and not is_house_player(player):
+        if is_outside_house(controller.get_player()):
             return True
         time.sleep(POLL_S)
     return False

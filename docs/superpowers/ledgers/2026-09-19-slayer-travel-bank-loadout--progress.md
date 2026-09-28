@@ -191,3 +191,12 @@ E-pre: complete -- controller, inline TDD (11 new tests, all watched fail first)
   Two of my own tools were broken and only running them found it: slayer_dry_run CRASHED with no task held (a bool stub read as a TaskState -- a path never exercised because every prior run held a task), and it tested against Shark and Prayer potion, which this bank does not contain at all.
   LIVE FACTS THAT MOVED since this morning: Super restore(4) is down to 7 from 27, so every Kuradal task is one short (bites only on the 10th task). The base gear is now a Dragon scimitar + Dragon defender -- ONE-HANDED -- so the "basilisks stops because the account fights with a two-handed blowpipe" finding is RESOLVED.
   KNOWN GAP, deliberately not fixed: _Pack.doses only withdraws full (4) potions, so 23 Prayer potion(1) and 9 partial Super restores are invisible. Using them costs more slots for the same doses, which is a design decision rather than an oversight.
+
+## 2026-09-28 (desktop): phase B fix-wave re-review
+The house fix wave f4aac3a was never re-reviewed. An Opus reviewer (read-only; bridge down) found, verified against the code, all fixed in the commit after this line:
+  I1 a box / mounted-pendant hop that landed after the 6 s wait FAILED, and every retry needs an object not in the scene outside -> 3 FAILs and a stop after a GOOD teleport. legs._leave_house: DONE when /player reads a real position outside the house; the wait is now ENTER_BUDGET_S (10 s).
+  I2 the 60 s tablet cooldown spent all three FAILED retries in ~1 s. poh_enter reports PROGRESS while poh.landing_pending() -- which honours the 2026-09-21 "never actually spent" rule, so a free retry is still a FAILED retry. A confirmed landing now pops poh_tablet_at.
+  I3 (PLAUSIBLE, unmeasured) region 7769 and a y 5690-5770 template box count as the house: the vendored inside-landing is (1923,5709). Still requires inInstance.
+  M4 varbit 4744 unreadable now fails CLOSED. M5 one empty /player read in TRAVEL/FIGHT does nothing instead of a stranded stop. M6 (cooldown in ctx.state.data) accepted, documented.
+The same desktop session had also redone E-pre and a phase C plan against a checkout 75 commits stale; those were superseded by this branch and are kept only on local branch backup/desktop-2026-09-28 (not pushed).
+Tests: test_poh, test_legs, test_slayer_routes, test_slayer_routine (223 passed), test_slayer_end_to_end (13 passed). Full suite not run (user: at the end of the project).

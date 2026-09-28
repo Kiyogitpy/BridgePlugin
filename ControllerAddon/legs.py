@@ -213,24 +213,17 @@ def run_next(ctx, leg_list, cursor: int, log: str = "travel"):
         ok = len(dest) == 3 and walk_across(ctx, tuple(dest), log=log)
         return (DONE, cursor + 1) if ok else (FAILED, cursor)
     if kind == "poh_enter":
-        return (DONE, cursor + 1) if poh.enter(ctx, log) else (FAILED, cursor)
+        if poh.enter(ctx, log):
+            return DONE, cursor + 1
+        # A tablet already spent and not yet confirmed: wait and re-check next tick (bounded by the
+        # caller's PROGRESS ceiling) instead of spending the three FAILED retries in one second.
+        return (PROGRESS, cursor) if poh.landing_pending(ctx) else (FAILED, cursor)
     if kind == "poh_pool":
         return (DONE, cursor + 1) if poh.drink_pool(ctx, log) else (FAILED, cursor)
     if kind == "poh_box":
-        if not poh.use_box(ctx, leg.get("option"), log):
-            return FAILED, cursor
-        # Confirmed by LEAVING THE HOUSE, not by a landing tile: our own vendored tables disagree
-        # about where the box lands (phase-B review), and the walk leg re-plans from the live tile.
-        if not poh.await_left_house(ITEM_BUDGET_S):
-            return FAILED, cursor
-        return DONE, cursor + 1
+        return _leave_house(cursor, lambda: poh.use_box(ctx, leg.get("option"), log))
     if kind == "poh_mounted":
-        if not poh.use_mounted(ctx, leg.get("item"), leg.get("option"), log):
-            return FAILED, cursor
-        # Confirmed by LEAVING THE HOUSE, like the box: the walk leg re-plans from the live tile.
-        if not poh.await_left_house(ITEM_BUDGET_S):
-            return FAILED, cursor
-        return DONE, cursor + 1
+        return _leave_house(cursor, lambda: poh.use_mounted(ctx, leg.get("item"), leg.get("option"), log))
     if kind == "poh_ring":
         ok = poh.use_ring(ctx, leg.get("code"), leg.get("expect"), log=log)
         if not ok:
@@ -241,6 +234,25 @@ def run_next(ctx, leg_list, cursor: int, log: str = "travel"):
         return DONE, cursor + 1
     ok = run_leg(ctx, leg, log=log)
     return (DONE, cursor + 1) if ok else (FAILED, cursor)
+
+
+def _leave_house(cursor, use):
+    """A house object that teleports OUT (the jewellery box, a mounted pendant), confirmed by
+    LEAVING THE HOUSE, not by a landing tile our own vendored tables disagree about; the walk leg
+    re-plans from the live tile.
+
+    If we are ALREADY outside, the hop happened: a landing slower than the wait FAILED this leg
+    last tick, and the object is not in the scene out here, so a retry could only fail three times
+    and strand us after a GOOD teleport (phase-B fix-wave re-review, 2026-09-28). The cursor only
+    reaches these legs after the house was confirmed, so "outside" means we hopped. The wait is the
+    tablet's budget, not an item's: both are a teleport across an instance boundary."""
+    if poh.is_outside_house(controller.get_player()):
+        return DONE, cursor + 1
+    if not use():
+        return FAILED, cursor
+    if not poh.await_left_house(poh.ENTER_BUDGET_S):
+        return FAILED, cursor
+    return DONE, cursor + 1
 
 
 def await_arrival(dest, budget_s: float = ITEM_BUDGET_S, radius: int = ARRIVAL_TILES) -> bool:

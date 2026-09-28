@@ -190,6 +190,19 @@ def test_away_from_the_site_it_stops_and_says_where_to_go(monkeypatch):
     assert "bears" in ctx.state.stops[0].lower() and "Legends" in ctx.state.stops[0]
 
 
+def test_one_failed_player_read_with_a_task_does_nothing_rather_than_stop(monkeypatch):
+    """Phase-B fix-wave re-review 2026-09-28: {} derived TRAVEL, plan() said 'position unknown',
+    and _stranded safety-stopped over a single failed read."""
+    monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Bears", count=15))
+    monkeypatch.setattr(controller, "get_player", lambda: {})
+    _carry(monkeypatch)
+    planned = []
+    monkeypatch.setattr(slayer_routes, "plan", lambda *a, **k: planned.append(1) or (None, "x"))
+    ctx = _Ctx()
+    routine.tick(ctx)
+    assert ctx.state.stops == [] and planned == []
+
+
 def test_at_the_site_it_fights_with_the_tasks_monsters_and_restores_the_config(monkeypatch):
     monkeypatch.setattr(controller, "get_slayer_task", lambda: _task("Banshees"))
     monkeypatch.setattr(controller, "get_player", lambda: {"x": 3440, "y": 3545, "plane": 0})

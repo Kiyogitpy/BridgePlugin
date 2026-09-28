@@ -826,6 +826,12 @@ def tick(ctx):
     _reset_slot_counters(ctx, state)
     player = controller.get_player()
     phase = derive_phase(state, tasks_cfg, player)
+    if phase in (TRAVEL, FIGHT) and (player or {}).get("x") is None:
+        # An empty /player read derives TRAVEL (not at the site), and plan() then answers "position
+        # unknown", which _stranded turned into a safety stop over one failed read. Unavailable
+        # means do nothing (phase-B fix-wave re-review, 2026-09-28).
+        debug_log.log(LOG, "GET /player gave no position -- doing nothing this tick")
+        return
     _capture_base_gear(ctx, state)
     if phase == ACQUIRE:
         if not _restore_base_gear(ctx):        # a finished task's gear comes off before the next ask

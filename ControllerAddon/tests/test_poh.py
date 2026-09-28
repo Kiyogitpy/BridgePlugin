@@ -418,14 +418,78 @@ def test_a_house_teleport_that_lands_outside_is_refused_before_a_tablet_is_spent
     assert poh.enter(_Ctx()) is False and breaks == []
 
 
-def test_an_unreadable_setting_does_not_block_the_tablet(monkeypatch):
+def test_an_unreadable_setting_fails_closed_and_spends_no_tablet(monkeypatch):
+    """Phase-B fix-wave re-review 2026-09-28: the first draft carried on when varbit 4744 was
+    unreadable. Every other varbit gate here fails CLOSED on unknown."""
     _quiet(monkeypatch)
     monkeypatch.setattr(controller, "get_varbit", lambda varbit_id: None)
-    state = {"in": False}
-    monkeypatch.setattr(poh, "in_house", lambda player=None: state["in"])
+    monkeypatch.setattr(poh, "in_house", lambda player=None: False)
     _tablet(monkeypatch)
-    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: state.update({"in": True}) or True)
-    assert poh.enter(_Ctx()) is True
+    breaks = []
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: breaks.append(1) or True)
+    assert poh.enter(_Ctx()) is False and breaks == []
+
+
+def _spending_tablets(monkeypatch, lands=False):
+    """A tablet stack that really drops by one per Break; `lands` flips in_house on the break."""
+    held = {"qty": 10, "in": False}
+    monkeypatch.setattr(controller, "get_inventory", lambda: [
+        {"name": "Teleport to house", "qty": held["qty"], "id": 8013, "screenX": 1357, "screenY": 614}])
+    monkeypatch.setattr(controller, "open_inventory_tab", lambda ser: True)
+    monkeypatch.setattr(poh, "in_house", lambda player=None: held["in"])
+
+    def break_it(ser, entity, **kw):
+        held["qty"] -= 1
+        held["in"] = lands
+        return True
+    monkeypatch.setattr(controller, "click_entity", break_it)
+    return held
+
+
+def test_a_confirmed_landing_ends_the_cooldown(monkeypatch):
+    """Otherwise a re-plan through the house within 60 s was refused as 'never confirmed'."""
+    _quiet(monkeypatch)
+    _spending_tablets(monkeypatch, lands=True)
+    ctx = _Ctx()
+    assert poh.enter(ctx) is True
+    assert not poh.landing_pending(ctx) and "poh_tablet_at" not in ctx.state.data
+
+
+def test_a_spent_unconfirmed_tablet_is_pending_until_the_cooldown_runs_out(monkeypatch):
+    _quiet(monkeypatch)
+    monkeypatch.setattr(poh, "ENTER_BUDGET_S", 0.05)
+    _spending_tablets(monkeypatch, lands=False)
+    ctx = _Ctx()
+    assert poh.enter(ctx) is False and poh.landing_pending(ctx)
+    ctx.state.data["poh_tablet_at"] -= poh.TABLET_COOLDOWN_S + 1
+    assert not poh.landing_pending(ctx)
+    assert not poh.landing_pending(_Ctx()), "no tablet ever broken: nothing pending"
+
+
+def test_a_tablet_never_actually_spent_is_not_pending(monkeypatch):
+    """enter() retries a break that consumed nothing (FOUND LIVE 2026-09-21), so the leg must
+    count that as a failure to retry, not wait on a landing that cannot come."""
+    _quiet(monkeypatch)
+    monkeypatch.setattr(poh, "ENTER_BUDGET_S", 0.05)
+    monkeypatch.setattr(poh, "in_house", lambda player=None: False)
+    _tablet(monkeypatch)                                 # a stock that never drops
+    monkeypatch.setattr(controller, "click_entity", lambda *a, **k: True)
+    ctx = _Ctx()
+    assert poh.enter(ctx) is False and not poh.landing_pending(ctx)
+
+
+def test_the_classic_house_template_chunks_count_as_the_house():
+    """vendor/teleportation_items.tsv lands inside the house at (1923,5709), region 7769 -- not
+    measured on this account, but a house built there must still confirm."""
+    assert poh.is_house_player({"inInstance": True, "x": 1923, "y": 5709, "plane": 0, "regionId": 7769})
+    assert poh.is_house_player({"inInstance": True, "x": 1900, "y": 5700, "plane": 0, "regionId": 1})
+    assert not poh.is_house_player({"inInstance": False, "x": 1923, "y": 5709, "regionId": 7769})
+
+
+def test_outside_the_house_needs_a_real_position():
+    assert poh.is_outside_house({"x": 3143, "y": 3442, "plane": 0, "inInstance": False})
+    assert not poh.is_outside_house({}) and not poh.is_outside_house(None)
+    assert not poh.is_outside_house(dict(PLAYER))
 
 
 def test_a_failed_entry_click_closes_the_menu_it_opened(monkeypatch):
