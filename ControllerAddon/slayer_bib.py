@@ -51,7 +51,10 @@
 # BANK, which is the thing we actually care about: the view is on when `/bank` has collapsed to a
 # small set. That is a better test anyway -- it confirms the outcome we want rather than a label.
 
+import re
 import sys
+import time
+from dataclasses import dataclass, field
 
 import banker
 import controller
@@ -138,12 +141,23 @@ def toggle(ctx, want_active: bool = True) -> bool:
     return ok
 
 
+# The view swap is ON-CLIENT and immediate, so the answer is on /bank a frame after the click. This
+# used to wait for a WIDGET_LOADED that never arrives for it, so every toggle spent its whole budget
+# before the deadline read confirmed it -- MEASURED 3.1s per toggle, two per trip, in every
+# slayer_auto log. Polling the thing we actually want answers as soon as it is true.
+TOGGLE_BUDGET_S = 3.0
+TOGGLE_POLL_S = 0.15
+
+
 def _confirm_changed(ctx, before_n: int, want_active: bool) -> bool:
-    import bridge_events
-    outcome = bridge_events.await_outcome(
-        getattr(ctx, "events", None), ("WIDGET_LOADED",), 3.0,
-        confirm=lambda: view_is_active() == want_active and len(bank_items() or []) != before_n)
-    return bool(outcome and outcome.ok)
+    deadline = time.time() + TOGGLE_BUDGET_S
+    while True:
+        items = bank_items()
+        if items is not None and view_is_active() == want_active and len(items) != before_n:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(TOGGLE_POLL_S)
 
 
 def recommendations(ctx):
@@ -198,6 +212,85 @@ def _split_loadout(items):
     return loadout, [i for i in items if (i.get("screenY") or -1) >= boundary]
 
 
+# ---------------- one pick per slot ----------------
+#
+# The column split above is not enough on its own. MEASURED LIVE 2026-09-21 (logs/slayer_auto_14):
+# inside the 4-wide sections SBIB listed Rada's, War AND Peaceful blessing -- three ammo-slot items
+# -- and we wore Rada's, then War over it. And on every later trip it "withdrew" Rada's blessing,
+# the tasset and the boots while they were already WORN: the clicks landed on the qty-0
+# placeholders worn items leave in the bank, and nothing was equipped.
+#
+# So the plan keys on the bridge's `equipSlot` (EquipSlotUtil.java, client rebuild 2026-09-28):
+# the FIRST pick SBIB lists for a slot claims it, in the plugin's own order, and a placeholder
+# claims its slot too -- it just is never clicked. Without equipSlot (an un-rebuilt client) the
+# plan degrades to the old behaviour minus the obvious consumables, so nothing is lost.
+
+_DOSE = re.compile(r"\(\d\)\s*$")          # "Prayer potion(4)", "Teleport crystal (3)"
+
+
+@dataclass
+class LoadoutPlan:
+    withdraw: list = field(default_factory=list)   # bank item dicts, SBIB order
+    wear: list = field(default_factory=list)       # lowercase names, weapon first
+    skipped: list = field(default_factory=list)    # (name, reason)
+
+
+def _looks_consumable(item) -> bool:
+    name = item.get("name") or ""
+    return bool(item.get("isFood") or item.get("isPrayerPotion") or _DOSE.search(name))
+
+
+def plan_loadout(items, worn, carried) -> LoadoutPlan:
+    """What to withdraw and what to wear, from SBIB's loadout items (already past _split_loadout).
+
+    `worn`/`carried` are sets of lowercase names (gear.worn_names / gear.carried_names). Pure."""
+    plan = LoadoutPlan()
+    has_slots = any(i.get("equipSlot") for i in items)
+    claimed = {}                                   # slot -> the name that claimed it
+
+    # A two-handed WEAPON pick closes the shield slot before any shield is looked at, whatever
+    # order SBIB listed them in: a shield worn after it would knock the weapon straight off.
+    weapon = next((i for i in items if i.get("equipSlot") == "weapon"), None)
+    if weapon is not None and weapon.get("twoHanded"):
+        claimed["shield"] = weapon.get("name")
+
+    weapon_wear = []
+    for item in items:
+        name = item.get("name") or ""
+        low = name.lower()
+        slot = item.get("equipSlot")
+        placeholder = (item.get("qty") or 0) <= 0
+
+        if slot:
+            if slot in claimed:
+                plan.skipped.append((name, f"{slot} slot already taken by {claimed[slot]}"))
+                continue
+            claimed[slot] = name
+            if low in worn:
+                plan.skipped.append((name, "already worn"))
+                continue
+            target = weapon_wear if slot == "weapon" else plan.wear
+            if low in carried:
+                target.append(low)
+                continue
+            if placeholder:
+                plan.skipped.append((name, "placeholder (none in the bank)"))
+                continue
+            plan.withdraw.append(item)
+            target.append(low)
+            continue
+
+        if placeholder:
+            plan.skipped.append((name, "placeholder (none in the bank)"))
+            continue
+        plan.withdraw.append(item)
+        if not has_slots and not _looks_consumable(item) and low not in worn:
+            plan.wear.append(low)                  # legacy: try it, /hover withholds a non-wearable
+
+    plan.wear = weapon_wear + plan.wear
+    return plan
+
+
 def _withdraw(ctx, slot, quantity: int) -> bool:
     """Click one recommended bank slot. No search fallback and no scroll handling, deliberately:
     the whole point of the Best-in-Bank view is that it has already re-laid every recommended item
@@ -213,11 +306,12 @@ def _withdraw(ctx, slot, quantity: int) -> bool:
 
 
 def gear_up(ctx, quantities=None, equip=True):
-    """Open the Best-in-Bank view, withdraw everything it recommends, and wear what can be worn.
+    """Open the Best-in-Bank view, withdraw what plan_loadout says, and wear the plan's picks.
 
     THE BANK MUST ALREADY BE OPEN -- this is a step inside a bank trip, not a trip of its own.
 
-    Returns a dict: {"withdrew": [names], "equipped": [names], "alternatives": n, "ok": bool}.
+    Returns a dict: {"withdrew": [names], "equipped": [names], "skipped": [(name, reason)],
+    "alternatives": n, "ok": bool}.
 
     `quantities` maps a lowercase name fragment -> how many to take, for the consumables. It is
     needed because SBIB's recommended COUNTS live in `SupplyRecommendation`, which is plugin state
@@ -229,10 +323,11 @@ def gear_up(ctx, quantities=None, equip=True):
     deposit or a `/bank` read by anything else would otherwise see the filtered set and conclude
     the bank is nearly empty.
     """
-    result = {"withdrew": [], "equipped": [], "alternatives": 0, "ok": False}
+    result = {"withdrew": [], "equipped": [], "skipped": [], "alternatives": 0, "ok": False}
     if not toggle(ctx, True):
         return result
 
+    plan = LoadoutPlan()
     try:
         items = controller.get_bank(fresh=True).get("items", []) or []
         loadout, alternatives = _split_loadout(items)
@@ -240,13 +335,18 @@ def gear_up(ctx, quantities=None, equip=True):
         if alternatives:
             debug_log.log(LOG, f"leaving {len(alternatives)} Tier 2/3 alternatives in the bank")
 
+        plan = plan_loadout(loadout, worn=gear.worn_names(), carried=gear.carried_names())
+        result["skipped"] = plan.skipped
+        for name, reason in plan.skipped:
+            debug_log.log(LOG, f"not taking {name}: {reason}")
+
         # One click = one item. Without this a bank left in "10" or "All" mode from an earlier
         # trip withdraws that many of the first gear slot clicked -- withdraw_loadout sets the
         # same mode for the same reason.
-        banker.set_quantity_mode(ctx, "one")
+        if plan.withdraw:
+            banker.set_quantity_mode(ctx, "one")
 
-        before = set(gear.carried_names())
-        for slot in loadout:
+        for slot in plan.withdraw:
             name = (slot.get("name") or "")
             quantity = 1
             for fragment, count in (quantities or {}).items():
@@ -262,37 +362,24 @@ def gear_up(ctx, quantities=None, equip=True):
         toggle(ctx, False)
 
     if equip:
-        result["equipped"] = _equip_new(ctx, before)
+        result["equipped"] = _equip_planned(ctx, plan.wear)
     return result
 
 
-def _equip_new(ctx, before):
-    """Wear everything newly withdrawn that is wearable.
+def _equip_planned(ctx, wear):
+    """Put on every planned pick that is carried and not already on, in the plan's order (weapon
+    first). From the PLAN, not from what this trip newly added to the inventory: MEASURED LIVE
+    2026-09-21, trip 1's Rune boots were withdrawn and never worn because that diff missed them.
 
-    The ITEM decides, not a table: we try Wear/Wield and keep what sticks. That is what makes this
-    work for a loadout we did not choose and do not have a schema for -- SBIB may recommend any
-    slot, and hardcoding which of its picks are equipment would be a second copy of its knowledge,
-    which is the thing this whole approach exists to avoid.
-
-    A two-handed weapon displaced by a shield is NOT a stop here (unlike routines/slayer._wear):
-    SBIB recommends a coherent whole loadout, so if it names a shield it has also named the
-    one-handed weapon to go with it. Order matters for that -- weapon before shield -- and comes
-    from the plugin's own slot ordering, which the zigzag preserves.
-    """
-    # Skip what the bridge already knows is drinkable/edible. equip_from_inventory would WITHHOLD
-    # on those anyway (its /hover gate sees no Wear/Wield), so this is not about correctness -- it
-    # is about not flying the cursor to all fifteen potions to discover that, which is both slow
-    # and nothing a human would ever do.
-    consumable = set()
-    for items in (controller.get_consumables() or {}).values():
-        for item in items or ():
-            name = (item.get("name") or "").lower()
-            if name:
-                consumable.add(name)
-
+    With slot data the plan holds only wearables. Without it (an un-rebuilt client) it can still
+    hold a non-wearable the name check did not catch; equip_from_inventory's /hover gate withholds
+    that click, so it costs a cursor move and never a wrong action."""
     worn = []
-    for name in sorted(gear.carried_names() - before):
-        if name in consumable:
+    for name in wear:
+        if gear.is_worn(name):
+            continue
+        if not any(name in held for held in gear.carried_names()):
+            debug_log.log(LOG, f"{name} is not in the inventory to put on (the withdraw missed?)")
             continue
         if gear.equip_from_inventory(ctx, name):
             worn.append(name)
@@ -333,10 +420,21 @@ def _probe():
         return 1
     print(f"bank is drawing {len(items)} items -- view_is_active()={view_is_active()}")
     for item in items[:40]:
-        print(f"  {item.get('name')!r} x{item.get('qty')} "
+        print(f"  {item.get('name')!r} x{item.get('qty')} slot={item.get('equipSlot')}"
+              f"{' 2h' if item.get('twoHanded') else ''} "
               f"screen=({item.get('screenX')},{item.get('screenY')})")
     if len(items) > 40:
         print(f"  ... and {len(items) - 40} more")
+    if view_is_active():
+        loadout, alternatives = _split_loadout(items)
+        plan = plan_loadout(loadout, worn=gear.worn_names(), carried=gear.carried_names())
+        if not any(i.get("equipSlot") for i in items):
+            print("\nNO equipSlot on any item -- the client predates 2026-09-28; rebuild it")
+        print(f"\nplan ({len(alternatives)} Tier 2/3 alternatives left out):")
+        print(f"  withdraw: {[i.get('name') for i in plan.withdraw]}")
+        print(f"  wear:     {plan.wear}")
+        for name, reason in plan.skipped:
+            print(f"  skip:     {name} -- {reason}")
     return 0
 
 

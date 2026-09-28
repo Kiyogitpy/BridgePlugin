@@ -152,8 +152,8 @@ public class ControllerPlugin extends Plugin
 		new SkillProvider(client, clientThread, server).register();
 		new CameraProvider(client, clientThread, server).register();
 		new EquipmentProvider(client, clientThread, server).register();
-		new InventoryProvider(client, clientThread, server).register();
-		new BankProvider(client, clientThread, server, tickClock).register();
+		new InventoryProvider(client, clientThread, server, itemManager).register();
+		new BankProvider(client, clientThread, server, tickClock, itemManager).register();
 		// A remembered copy of the bank, so a routine can ask what it owns while nowhere near
 		// one -- and, unlike /bank, one that a bank search or a non-active tab cannot truncate.
 		// Held in a field because it owns an EventBus subscription and a writer thread that

@@ -1,12 +1,14 @@
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
+import com.example.util.EquipSlotUtil;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.*;
 import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetInfo;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.game.ItemManager;
 
 import java.awt.Point;
 import java.awt.Rectangle;
@@ -17,9 +19,12 @@ public class InventoryProvider extends BridgeProvider
 	/** Game enum mapping a rune-pouch slot's type value to the rune's item id. */
 	private static final int RUNEPOUCH_RUNE_ENUM = 982;
 
-	public InventoryProvider(Client client, ClientThread clientThread, BridgeHttpServer server)
+	private final ItemManager itemManager;
+
+	public InventoryProvider(Client client, ClientThread clientThread, BridgeHttpServer server, ItemManager itemManager)
 	{
 		super(client, clientThread, server);
+		this.itemManager = itemManager;
 	}
 
 	@Override
@@ -246,6 +251,8 @@ public class InventoryProvider extends BridgeProvider
 		{
 			data.put("name", comp.getName());
 		}
+		// equipSlot/twoHanded: lets a caller tell a wearable from a potion without hovering it.
+		EquipSlotUtil.describe(item.getId(), itemManager::canonicalize, itemManager::getItemStats, data);
 
 		Widget slotWidget = invWidget.getChild(slot);
 		if (slotWidget != null)

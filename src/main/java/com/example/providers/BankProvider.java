@@ -1,6 +1,7 @@
 package com.example.providers;
 
 import com.example.bridge.BridgeHttpServer;
+import com.example.util.EquipSlotUtil;
 import com.example.util.FoodUtil;
 import com.example.util.RuneLiteUtil;
 import net.runelite.api.Client;
@@ -10,6 +11,7 @@ import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetInfo;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.game.ItemManager;
 
 import java.awt.Point;
 import java.awt.Rectangle;
@@ -27,11 +29,14 @@ public class BankProvider extends BridgeProvider
 	// a shared cache.
 	private final TickClock tickClock;
 	private final TickCache<Map<String, Object>> cache = new TickCache<>();
+	private final ItemManager itemManager;
 
-	public BankProvider(Client client, ClientThread clientThread, BridgeHttpServer server, TickClock tickClock)
+	public BankProvider(Client client, ClientThread clientThread, BridgeHttpServer server, TickClock tickClock,
+						ItemManager itemManager)
 	{
 		super(client, clientThread, server);
 		this.tickClock = tickClock;
+		this.itemManager = itemManager;
 	}
 
 	@Override
@@ -162,6 +167,9 @@ public class BankProvider extends BridgeProvider
 			data.put("heal", FoodUtil.getHealAmount(name));
 			data.put("isPrayerPotion", FoodUtil.isPrayerPotion(name));
 		}
+		// equipSlot/twoHanded: which slot a pick claims, for slayer_bib's one-pick-per-slot rule.
+		// Canonicalized inside, so a placeholder (qty 0) reports its real item's slot.
+		EquipSlotUtil.describe(itemWidget.getItemId(), itemManager::canonicalize, itemManager::getItemStats, data);
 
 		Rectangle bounds = itemWidget.getBounds();
 		if (bounds != null)
